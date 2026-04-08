@@ -3,7 +3,7 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
-from promptmaster.control_prompts import heartbeat_prompt, operator_prompt
+from promptmaster.agent_profiles.builtin import heartbeat_prompt, polly_prompt
 from promptmaster.models import (
     AccountConfig,
     MemorySettings,
@@ -76,6 +76,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PromptMasterConfig:
             cwd=_resolve_path(base, session_raw.get("cwd", ".")),
             project=session_raw.get("project", "promptmaster"),
             prompt=session_raw.get("prompt"),
+            agent_profile=session_raw.get("agent_profile"),
             args=[str(arg) for arg in session_raw.get("args", [])],
             enabled=bool(session_raw.get("enabled", True)),
             window_name=session_raw.get("window_name"),
@@ -96,6 +97,8 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PromptMasterConfig:
         open_permissions_by_default=open_permissions_by_default,
         failover_enabled=failover_enabled,
         failover_accounts=failover_accounts,
+        heartbeat_backend=str(promptmaster_raw.get("heartbeat_backend", "local")),
+        scheduler_backend=str(promptmaster_raw.get("scheduler_backend", "inline")),
     )
 
     memory_raw = raw.get("memory", {})
@@ -137,6 +140,8 @@ def render_config(config: PromptMasterConfig) -> str:
         f'controller_account = "{config.promptmaster.controller_account}"',
         f"open_permissions_by_default = {'true' if config.promptmaster.open_permissions_by_default else 'false'}",
         f"failover_enabled = {'true' if config.promptmaster.failover_enabled else 'false'}",
+        f'heartbeat_backend = "{config.promptmaster.heartbeat_backend}"',
+        f'scheduler_backend = "{config.promptmaster.scheduler_backend}"',
     ]
     if config.promptmaster.failover_accounts:
         items = ", ".join(f'"{name}"' for name in config.promptmaster.failover_accounts)
@@ -192,6 +197,8 @@ def render_config(config: PromptMasterConfig) -> str:
         if session.prompt:
             escaped = session.prompt.replace("\\", "\\\\").replace('"', '\\"')
             lines.append(f'prompt = "{escaped}"')
+        if session.agent_profile:
+            lines.append(f'agent_profile = "{session.agent_profile}"')
         if session.args:
             items = ", ".join(f'"{arg}"' for arg in session.args)
             lines.append(f"args = [{items}]")
@@ -236,6 +243,8 @@ def render_example_config() -> str:
             open_permissions_by_default=True,
             failover_enabled=True,
             failover_accounts=["claude_primary"],
+            heartbeat_backend="local",
+            scheduler_backend="inline",
         ),
         accounts={
             "codex_primary": AccountConfig(
@@ -263,6 +272,7 @@ def render_example_config() -> str:
                 project="promptmaster",
                 window_name="pm-heartbeat",
                 prompt=heartbeat_prompt(),
+                agent_profile="heartbeat",
             ),
             "operator": SessionConfig(
                 name="operator",
@@ -272,7 +282,8 @@ def render_example_config() -> str:
                 cwd=root,
                 project="promptmaster",
                 window_name="pm-operator",
-                prompt=operator_prompt(),
+                prompt=polly_prompt(),
+                agent_profile="polly",
             ),
             "worker_demo": SessionConfig(
                 name="worker_demo",

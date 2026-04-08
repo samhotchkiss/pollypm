@@ -36,7 +36,7 @@ from promptmaster.supervisor import Supervisor
 from promptmaster.worktrees import list_worktrees as list_project_worktrees
 
 
-app = typer.Typer(help="Prompt Master CLI", invoke_without_command=True, no_args_is_help=False)
+app = typer.Typer(help="PollyPM CLI", invoke_without_command=True, no_args_is_help=False)
 
 
 def _load_supervisor(config_path: Path) -> Supervisor:
@@ -381,7 +381,7 @@ def status(
     _require_promptmaster_session(supervisor)
     launches, windows, alerts, leases, errors = supervisor.status()
 
-    typer.echo("Prompt Master control plane:")
+    typer.echo("PollyPM control plane:")
     typer.echo(
         f"- controller_account={_account_label(supervisor, supervisor.config.promptmaster.controller_account)} "
         f"failover_enabled={supervisor.config.promptmaster.failover_enabled}"

@@ -13,8 +13,8 @@ from pathlib import Path
 
 import typer
 
+from promptmaster.agent_profiles.builtin import heartbeat_prompt, polly_prompt
 from promptmaster.config import load_config, write_config
-from promptmaster.control_prompts import heartbeat_prompt, operator_prompt
 from promptmaster.models import AccountConfig, PromptMasterConfig, ProviderKind, SessionConfig
 from promptmaster.onboarding import (
     _decode_jwt_payload,
@@ -476,7 +476,7 @@ def relogin_account(config_path: Path, identifier: str) -> tuple[str, str]:
         return account_name, detected_email
 
     raise typer.BadParameter(
-        f"Prompt Master could not verify an authenticated {account.provider.value} session in the managed profile "
+        f"PollyPM could not verify an authenticated {account.provider.value} session in the managed profile "
         f"for {account.email or account_name}."
     )
 
@@ -510,13 +510,15 @@ def set_controller_account(config_path: Path, identifier: str) -> tuple[str, str
     config.sessions["heartbeat"].account = account_name
     config.sessions["heartbeat"].provider = account.provider
     config.sessions["heartbeat"].prompt = heartbeat_prompt()
+    config.sessions["heartbeat"].agent_profile = "heartbeat"
     config.sessions["heartbeat"].args = default_control_args(
         account.provider,
         open_permissions=config.promptmaster.open_permissions_by_default,
     )
     config.sessions["operator"].account = account_name
     config.sessions["operator"].provider = account.provider
-    config.sessions["operator"].prompt = operator_prompt()
+    config.sessions["operator"].prompt = polly_prompt()
+    config.sessions["operator"].agent_profile = "polly"
     config.sessions["operator"].args = default_control_args(
         account.provider,
         open_permissions=config.promptmaster.open_permissions_by_default,
@@ -569,7 +571,7 @@ def toggle_failover_account(config_path: Path, identifier: str) -> tuple[str, bo
 def _validate_account_removal(config: PromptMasterConfig, account_name: str) -> None:
     if account_name == config.promptmaster.controller_account:
         raise typer.BadParameter(
-            f"Account {account_name} is the Prompt Master controller account. Reassign it before removal."
+            f"Account {account_name} is the PollyPM controller account. Reassign it before removal."
         )
     session_refs = [session.name for session in config.sessions.values() if session.account == account_name]
     if session_refs:

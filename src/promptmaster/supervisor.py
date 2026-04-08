@@ -9,9 +9,11 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from promptmaster.agent_profiles import get_agent_profile
+from promptmaster.agent_profiles.base import AgentProfileContext
 from promptmaster.checkpoints import record_checkpoint, snapshot_hash, write_mechanical_checkpoint
 from promptmaster.config import PromptMasterConfig
-from promptmaster.control_prompts import heartbeat_prompt, operator_prompt
+from promptmaster.heartbeats import get_heartbeat_backend
 from promptmaster.messaging import ensure_inbox
 from promptmaster.models import AccountConfig, ProviderKind, SessionConfig, SessionLaunchSpec
 from promptmaster.onboarding import _prime_claude_home, default_control_args, default_session_args
@@ -19,6 +21,7 @@ from promptmaster.providers import get_provider
 from promptmaster.providers.base import LaunchCommand
 from promptmaster.projects import ensure_project_scaffold
 from promptmaster.runtimes import get_runtime
+from promptmaster.schedulers import ScheduledJob, get_scheduler_backend
 from promptmaster.storage.state import AlertRecord, LeaseRecord, StateStore
 from promptmaster.tmux.client import TmuxClient, TmuxWindow
 
@@ -51,16 +54,18 @@ class Supervisor:
             account = self.config.accounts[override_account]
             effective = replace(effective, provider=account.provider, account=override_account)
         account = self.config.accounts[effective.account]
+        profile_prompt = self._resolve_profile_prompt(effective, account)
         if effective.role in self._CONTROL_ROLES:
-            prompt = heartbeat_prompt() if effective.role == "heartbeat-supervisor" else operator_prompt()
             effective = replace(
                 effective,
-                prompt=prompt,
+                prompt=profile_prompt or effective.prompt,
                 args=default_control_args(
                     account.provider,
                     open_permissions=self.config.promptmaster.open_permissions_by_default,
                 ),
             )
+        elif profile_prompt and not effective.prompt:
+            effective = replace(effective, prompt=profile_prompt)
         elif not effective.args:
             effective = replace(
                 effective,
@@ -70,6 +75,28 @@ class Supervisor:
                 ),
             )
         return effective
+
+    def _default_agent_profile(self, session: SessionConfig) -> str | None:
+        if session.role == "heartbeat-supervisor":
+            return "heartbeat"
+        if session.role == "operator-pm":
+            return "polly"
+        if session.role == "worker":
+            return "worker"
+        return None
+
+    def _resolve_profile_prompt(self, session: SessionConfig, account: AccountConfig) -> str | None:
+        profile_name = session.agent_profile or self._default_agent_profile(session)
+        if not profile_name:
+            return None
+        profile = get_agent_profile(profile_name, root_dir=self.config.project.root_dir)
+        return profile.build_prompt(
+            AgentProfileContext(
+                config=self.config,
+                session=session,
+                account=account,
+            )
+        )
 
     def heartbeat_tmux_session_name(self) -> str:
         return f"{self.config.project.tmux_session}{self._HEARTBEAT_SESSION_SUFFIX}"
@@ -301,6 +328,13 @@ class Supervisor:
         self.tmux.select_window(f"{tmux_session}:{self._CONSOLE_WINDOW}")
 
     def run_heartbeat(self, snapshot_lines: int = 200) -> list[AlertRecord]:
+        backend = get_heartbeat_backend(
+            self.config.promptmaster.heartbeat_backend,
+            root_dir=self.config.project.root_dir,
+        )
+        return backend.run(self, snapshot_lines=snapshot_lines)
+
+    def _run_heartbeat_local(self, snapshot_lines: int = 200) -> list[AlertRecord]:
         window_map = self._window_map()
         name_by_window = self._session_name_by_window()
 
@@ -397,6 +431,40 @@ class Supervisor:
             f"Heartbeat sweep completed with {len(self.store.open_alerts())} open alerts",
         )
         return self.store.open_alerts()
+
+    def schedule_job(
+        self,
+        *,
+        kind: str,
+        run_at: datetime,
+        payload: dict[str, object] | None = None,
+        interval_seconds: int | None = None,
+    ) -> ScheduledJob:
+        backend = get_scheduler_backend(
+            self.config.promptmaster.scheduler_backend,
+            root_dir=self.config.project.root_dir,
+        )
+        return backend.schedule(
+            self,
+            kind=kind,
+            run_at=run_at,
+            payload=payload,
+            interval_seconds=interval_seconds,
+        )
+
+    def list_scheduled_jobs(self) -> list[ScheduledJob]:
+        backend = get_scheduler_backend(
+            self.config.promptmaster.scheduler_backend,
+            root_dir=self.config.project.root_dir,
+        )
+        return backend.list_jobs(self)
+
+    def run_scheduled_jobs(self) -> list[ScheduledJob]:
+        backend = get_scheduler_backend(
+            self.config.promptmaster.scheduler_backend,
+            root_dir=self.config.project.root_dir,
+        )
+        return backend.run_due(self)
 
     def _write_snapshot(self, window: TmuxWindow, snapshot_lines: int) -> tuple[Path, str]:
         content = self.tmux.capture_pane(f"{window.session}:{window.name}", lines=snapshot_lines)

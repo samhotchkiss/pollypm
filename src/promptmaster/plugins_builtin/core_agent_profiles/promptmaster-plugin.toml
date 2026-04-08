@@ -1,0 +1,7 @@
+api_version = "1"
+name = "core_agent_profiles"
+kind = "agent_profile"
+version = "0.1.0"
+entrypoint = "plugin.py:plugin"
+capabilities = ["agent_profile"]
+description = "Built-in PollyPM agent profiles."

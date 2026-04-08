@@ -16,3 +16,9 @@
 - Implemented issue `0011` by adding a pluggable memory backend interface with a default file-plus-SQLite implementation and checkpoint integration, then moved the issue to review.
 - Added ready issues for a pluggable scheduler/cron backend, a pluggable heartbeat backend, and an agent profile backend so timing, monitoring, and agent behavior can be swapped like other platform subsystems.
 - Implemented issue `0013` by adding a concrete provider SDK with transcript discovery, resume hooks, and usage snapshot collection, then moved the issue to review.
+- Implemented issue `0010` by moving the TUI/control plane onto `PromptMasterService` for session bootstrap, account mutation, project mutation, lease control, and worker/session operations, then moved the issue to review.
+- Implemented issue `0012` by broadening the file task backend seam across project scaffolding and control-room/task flows, adding note/count coverage, and moved the issue to review.
+- Implemented issue `0014` by adding a pluggable scheduler seam with an inline backend, due-job execution, recurring jobs, and service/supervisor delegation.
+- Implemented issue `0015` by delegating heartbeat execution through a pluggable heartbeat backend and shipping the built-in local monitor backend.
+- Implemented issue `0016` by adding built-in agent profiles for Polly, heartbeat, and workers, then routing control-session prompts through the profile seam.
+- Began swapping user-facing naming from Prompt Master toward PollyPM and Polly in onboarding and control-session prompts.

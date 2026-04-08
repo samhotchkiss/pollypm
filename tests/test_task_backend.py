@@ -27,6 +27,21 @@ def test_file_task_backend_moves_tasks_between_states(tmp_path: Path) -> None:
     assert not task.path.exists()
 
 
+def test_file_task_backend_tracks_notes_and_counts(tmp_path: Path) -> None:
+    backend = FileTaskBackend(tmp_path)
+    backend.ensure_tracker()
+    backend.create_task(title="Build plugin host")
+    backend.create_task(title="Review plugin host", state="02-in-progress")
+
+    note_path = backend.append_note("notes.md", "Remember to review the service seam.\n")
+
+    assert note_path.exists()
+    assert "Remember to review the service seam." in note_path.read_text()
+    counts = backend.state_counts()
+    assert counts["01-ready"] == 1
+    assert counts["02-in-progress"] == 1
+
+
 def test_get_task_backend_returns_file_backend(tmp_path: Path) -> None:
     backend = get_task_backend(tmp_path)
     assert isinstance(backend, FileTaskBackend)

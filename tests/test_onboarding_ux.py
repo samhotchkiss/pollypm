@@ -42,6 +42,7 @@ def test_detect_codex_email_from_status_pane() -> None:
 
 def test_login_completion_marker_seen() -> None:
     assert _login_completion_marker_seen("Prompt Master: login window complete.")
+    assert _login_completion_marker_seen("PollyPM: login window complete.")
 
 
 def test_login_shell_exports_provider_native_profile_envs(tmp_path: Path) -> None:
@@ -128,7 +129,7 @@ def test_connect_account_via_tmux_requires_verified_claude_auth(monkeypatch, tmp
     class FakeTmux:
         pass
 
-    monkeypatch.setattr("promptmaster.onboarding._run_login_window", lambda *args, **kwargs: "Prompt Master: login window complete.")
+    monkeypatch.setattr("promptmaster.onboarding._run_login_window", lambda *args, **kwargs: "PollyPM: login window complete.")
     monkeypatch.setattr("promptmaster.onboarding._detect_account_email", lambda provider, home: None)
 
     import pytest
@@ -142,4 +143,4 @@ def test_connect_account_via_tmux_requires_verified_claude_auth(monkeypatch, tmp
             quiet=True,
         )
 
-    assert "managed Prompt Master profile is still not authenticated" in str(exc.value)
+    assert "managed PollyPM profile is still not authenticated" in str(exc.value)

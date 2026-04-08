@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from promptmaster.service_api import PromptMasterService
@@ -63,3 +64,27 @@ def test_service_focus_and_send_input_use_supervisor(monkeypatch, tmp_path: Path
         ("focus", "operator", None),
         ("send", "operator", "Continue"),
     ]
+
+
+def test_service_schedule_job_uses_supervisor(monkeypatch, tmp_path: Path) -> None:
+    service = PromptMasterService(tmp_path / "promptmaster.toml")
+    captured: list[tuple[str, object, object]] = []
+
+    class FakeSupervisor:
+        def schedule_job(self, *, kind: str, run_at: datetime, payload=None, interval_seconds=None):
+            captured.append((kind, run_at, payload))
+            return "job"
+
+        def list_scheduled_jobs(self):
+            return ["job"]
+
+        def run_scheduled_jobs(self):
+            return ["job"]
+
+    monkeypatch.setattr(service, "load_supervisor", lambda: FakeSupervisor())
+
+    run_at = datetime.now(UTC) + timedelta(minutes=5)
+    assert service.schedule_job(kind="heartbeat", run_at=run_at) == "job"
+    assert service.list_jobs() == ["job"]
+    assert service.run_scheduled_jobs() == ["job"]
+    assert captured == [("heartbeat", run_at, None)]

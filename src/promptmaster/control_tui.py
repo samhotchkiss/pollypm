@@ -25,12 +25,6 @@ from textual.widgets import Button, DataTable, Header, Input, Static, TabbedCont
 
 from promptmaster.accounts import (
     AccountStatus,
-    add_account_via_login,
-    relogin_account,
-    remove_account,
-    set_open_permissions_default,
-    set_controller_account,
-    toggle_failover_account,
 )
 from promptmaster.config import DEFAULT_CONFIG_PATH, load_config
 from promptmaster.messaging import list_open_messages
@@ -47,10 +41,6 @@ from promptmaster.service_api import PromptMasterService
 from promptmaster.supervisor import Supervisor
 from promptmaster.task_backends import get_task_backend
 from promptmaster.worktrees import list_worktrees
-from promptmaster.workers import (
-    remove_worker_session,
-    stop_worker_session,
-)
 
 
 @dataclass(slots=True)
@@ -573,13 +563,13 @@ class PromptMasterApp(App[None]):
         if supervisor is None or config is None:
             self.hero_bar.update(
                 Panel(
-                    "Prompt Master is not configured yet.\nRun onboarding to connect an agent and bring the control room online.",
-                    title="Prompt Master",
+                    "PollyPM is not configured yet.\nRun onboarding to connect an agent and bring the control room online.",
+                    title="PollyPM",
                     border_style="#566574",
                 )
             )
             self.status_bar.update(f"Config not found at {self.config_path}. Run onboarding first.")
-            self.dashboard.update("Prompt Master is not configured yet.")
+            self.dashboard.update("PollyPM is not configured yet.")
             return
 
         self._ensure_account_statuses(force=force)
@@ -709,8 +699,12 @@ class PromptMasterApp(App[None]):
         healthy_accounts = sum(1 for account in self.account_statuses if account.logged_in and account.health == "healthy")
         active_windows = sum(1 for window in windows if not window.pane_dead)
         left = Text()
-        left.append("Prompt Master\n", style="bold white")
-        left.append("Project control room for live Claude CLI and Codex CLI sessions.", style="#b8c2cc")
+        left.append("██████   ██████  ██      ██   ██    ██\n", style="bold #f2f4f8")
+        left.append("██   ██ ██    ██ ██      ██    ██  ██\n", style="bold #f2f4f8")
+        left.append("██████  ██    ██ ██      ██      ██\n", style="bold #f2f4f8")
+        left.append("██      ██    ██ ██      ██    ██  ██\n", style="bold #f2f4f8")
+        left.append("██       ██████  ███████ ██████    ██\n", style="bold #f2f4f8")
+        left.append("PollyPM control room for live Claude CLI and Codex CLI sessions.", style="#b8c2cc")
 
         metrics = [
             self._metric_panel("Accounts", f"{healthy_accounts}/{len(self.account_statuses)} healthy", "#2d6a4f"),
@@ -977,7 +971,7 @@ class PromptMasterApp(App[None]):
     ) -> DetailResult:
         supervisor, config = self._load_context()
         if supervisor is None or config is None:
-            return DetailResult(request_id=request_id, tab_id=active, content="Prompt Master is not configured yet.")
+            return DetailResult(request_id=request_id, tab_id=active, content="PollyPM is not configured yet.")
         if active == "accounts-tab":
             text = self._account_detail(supervisor, selection if isinstance(selection, str) else None, status_map)
         elif active == "dashboard-tab":
@@ -1388,13 +1382,9 @@ class PromptMasterApp(App[None]):
         def _ensure() -> None:
             supervisor, _config = self._load_context()
             if supervisor is None:
-                raise RuntimeError("Prompt Master is not configured.")
-            session_name = supervisor.config.project.tmux_session
-            if not supervisor.tmux.has_session(session_name):
-                controller = supervisor.bootstrap_tmux()
-                self._notify(f"Started {session_name} with controller {controller}.")
-                return
-            supervisor.ensure_console_window()
+                raise RuntimeError("PollyPM is not configured.")
+            controller = self.service.ensure_promptmaster()
+            self._notify(f"Started control room with controller {controller}.")
 
         self._run("Ensure session", _ensure)
 
@@ -1402,7 +1392,7 @@ class PromptMasterApp(App[None]):
         def _heartbeat() -> None:
             supervisor, _config = self._load_context()
             if supervisor is None:
-                raise RuntimeError("Prompt Master is not configured.")
+                raise RuntimeError("PollyPM is not configured.")
             self.service.run_heartbeat()
 
         self._run("Heartbeat", _heartbeat)
@@ -1411,21 +1401,21 @@ class PromptMasterApp(App[None]):
         def _toggle() -> None:
             supervisor, _config = self._load_context()
             if supervisor is None:
-                raise RuntimeError("Prompt Master is not configured.")
+                raise RuntimeError("PollyPM is not configured.")
             enabled = not supervisor.config.promptmaster.open_permissions_by_default
-            set_open_permissions_default(self.config_path, enabled)
+            self.service.set_open_permissions_default(enabled)
 
         self._run("Toggle open permissions default", _toggle)
 
     def action_add_codex_account(self) -> None:
         if self._active_tab() != "accounts-tab":
             return
-        self._run("Add Codex account", lambda: add_account_via_login(self.config_path, ProviderKind.CODEX))
+        self._run("Add Codex account", lambda: self.service.add_account(ProviderKind.CODEX))
 
     def action_add_claude_account(self) -> None:
         if self._active_tab() != "accounts-tab":
             return
-        self._run("Add Claude account", lambda: add_account_via_login(self.config_path, ProviderKind.CLAUDE))
+        self._run("Add Claude account", lambda: self.service.add_account(ProviderKind.CLAUDE))
 
     def action_context_action_r(self) -> None:
         active = self._active_tab()
@@ -1448,7 +1438,7 @@ class PromptMasterApp(App[None]):
         if key is None:
             self._notify("No account selected.")
             return
-        self._run("Re-authenticate account", lambda: relogin_account(self.config_path, key))
+        self._run("Re-authenticate account", lambda: self.service.relogin_account(key))
 
     def _spawn_usage_refresh(self, account_key: str, *, notify: bool = True) -> None:
         self.pending_usage_refreshes[account_key] = datetime.now()
@@ -1482,11 +1472,11 @@ class PromptMasterApp(App[None]):
             ConfirmModal(
                 ConfirmRequest(
                     title="Remove account",
-                    prompt=f"Remove account {key} from Prompt Master config?",
+                    prompt=f"Remove account {key} from PollyPM config?",
                     confirm_label="Remove",
                 )
             ),
-            lambda confirmed: self._run("Remove account", lambda: remove_account(self.config_path, key, delete_home=False))
+            lambda confirmed: self._run("Remove account", lambda: self.service.remove_account(key, delete_home=False))
             if confirmed else None,
         )
 
@@ -1497,7 +1487,7 @@ class PromptMasterApp(App[None]):
         if key is None:
             self._notify("No account selected.")
             return
-        self._run("Set controller account", lambda: set_controller_account(self.config_path, key))
+        self._run("Set controller account", lambda: self.service.set_controller_account(key))
 
     def action_toggle_failover(self) -> None:
         if self._active_tab() != "accounts-tab":
@@ -1506,7 +1496,7 @@ class PromptMasterApp(App[None]):
         if key is None:
             self._notify("No account selected.")
             return
-        self._run("Toggle failover", lambda: toggle_failover_account(self.config_path, key))
+        self._run("Toggle failover", lambda: self.service.toggle_failover_account(key))
 
     def action_switch_operator(self) -> None:
         if self._active_tab() != "accounts-tab":
@@ -1519,8 +1509,8 @@ class PromptMasterApp(App[None]):
         def _switch() -> None:
             supervisor, _config = self._load_context()
             if supervisor is None:
-                raise RuntimeError("Prompt Master is not configured.")
-            supervisor.switch_session_account("operator", key)
+                raise RuntimeError("PollyPM is not configured.")
+            self.service.switch_session_account("operator", key)
 
         self._run("Switch operator", _switch)
 
@@ -1529,7 +1519,7 @@ class PromptMasterApp(App[None]):
             return
         supervisor, config = self._load_context()
         if supervisor is None or config is None:
-            self._notify("Prompt Master is not configured.")
+            self._notify("PollyPM is not configured.")
             return
 
         repos = discover_git_repositories(Path.home(), known_paths={item.path for item in config.projects.values()})
@@ -1543,7 +1533,7 @@ class PromptMasterApp(App[None]):
                 self._notify("Project scan closed.")
                 return
             for repo_path in paths:
-                register_project(self.config_path, repo_path)
+                self.service.register_project(repo_path)
             self._notify(f"Added {len(paths)} project(s).")
             self.action_refresh_all()
 
@@ -1562,7 +1552,7 @@ class PromptMasterApp(App[None]):
                     button_label="Register",
                 )
             ),
-            lambda value: self._run("Register project", lambda: register_project(self.config_path, Path(value)))
+            lambda value: self._run("Register project", lambda: self.service.register_project(Path(value)))
             if value else None,
         )
 
@@ -1573,14 +1563,14 @@ class PromptMasterApp(App[None]):
         if key is None:
             self._notify("No project selected.")
             return
-        self._run("Initialize project tracker", lambda: enable_tracked_project(self.config_path, key))
+        self._run("Initialize project tracker", lambda: self.service.enable_tracked_project(key))
 
     def action_set_workspace_root(self) -> None:
         if self._active_tab() != "projects-tab":
             return
         supervisor, _config = self._load_context()
         if supervisor is None:
-            self._notify("Prompt Master is not configured.")
+            self._notify("PollyPM is not configured.")
             return
         current = str(supervisor.config.project.workspace_root)
         self.push_screen(
@@ -1593,7 +1583,7 @@ class PromptMasterApp(App[None]):
                     button_label="Save",
                 )
             ),
-            lambda value: self._run("Set workspace root", lambda: set_workspace_root(self.config_path, Path(value)))
+            lambda value: self._run("Set workspace root", lambda: self.service.set_workspace_root(Path(value)))
             if value else None,
         )
 
@@ -1606,11 +1596,11 @@ class PromptMasterApp(App[None]):
             ConfirmModal(
                 ConfirmRequest(
                     title="Remove project",
-                    prompt=f"Remove project {key} from Prompt Master?",
+                    prompt=f"Remove project {key} from PollyPM?",
                     confirm_label="Remove",
                 )
             ),
-            lambda confirmed: self._run("Remove project", lambda: remove_project(self.config_path, key))
+            lambda confirmed: self._run("Remove project", lambda: self.service.remove_project(key))
             if confirmed else None,
         )
 
@@ -1682,7 +1672,7 @@ class PromptMasterApp(App[None]):
         if session_name is None:
             self._notify("No session selected.")
             return
-        self._run("Stop session", lambda: stop_worker_session(self.config_path, session_name))
+        self._run("Stop session", lambda: self.service.stop_session(session_name))
 
     def action_remove_selected_session(self) -> None:
         session_name = self._selected_value(self.sessions_table)
@@ -1691,8 +1681,8 @@ class PromptMasterApp(App[None]):
             return
 
         def _remove() -> None:
-            stop_worker_session(self.config_path, session_name)
-            remove_worker_session(self.config_path, session_name)
+            self.service.stop_session(session_name)
+            self.service.remove_session(session_name)
 
         self.push_screen(
             ConfirmModal(
@@ -1734,7 +1724,7 @@ class PromptMasterApp(App[None]):
             return
         self._run(
             "Claim lease",
-            lambda: Supervisor(load_config(self.config_path)).claim_lease(session_name, "human", "claimed from TUI"),
+            lambda: self.service.claim_lease(session_name, "human", "claimed from TUI"),
         )
 
     def action_release_selected_session(self) -> None:
@@ -1744,7 +1734,7 @@ class PromptMasterApp(App[None]):
             return
         self._run(
             "Release lease",
-            lambda: Supervisor(load_config(self.config_path)).release_lease(session_name),
+            lambda: self.service.release_lease(session_name),
         )
 
     def action_focus_alert_session(self) -> None:

@@ -337,7 +337,7 @@ class OnboardingApp(App[Path | None]):
     def _refresh_rail(self) -> None:
         self.brand.update(
             Panel.fit(
-                "[b]Prompt Master[/b]\n[dim]Bring your CLI agents online with live accounts, recent projects, and a real control room.[/dim]",
+                "[b]PollyPM[/b]\n[dim]Bring your CLI agents online with live accounts, recent projects, and a real control room.[/dim]",
                 border_style="#5b6570",
             )
         )
@@ -405,7 +405,7 @@ class OnboardingApp(App[Path | None]):
         self.eyebrow_widget.update("Setup Step 1")
         self.title_widget.update("Connect your first agent account")
         self.intro_widget.update(
-            "Prompt Master will open a real Claude or Codex login window, detect the account automatically, "
+            "PollyPM will open a real Claude or Codex login window, detect the account automatically, "
             "and save it as a reusable profile."
         )
         stage = Vertical(classes="stage")
@@ -414,7 +414,7 @@ class OnboardingApp(App[Path | None]):
         if not self._tmux_ready():
             stage.mount(
                 Panel(
-                    "[red]tmux is required before Prompt Master can continue.[/red]\n"
+                    "[red]tmux is required before PollyPM can continue.[/red]\n"
                     "Install tmux, then rerun `promptmaster`.",
                     title="tmux Required",
                     border_style="red",
@@ -474,9 +474,9 @@ class OnboardingApp(App[Path | None]):
 
     def _render_controller_step(self) -> None:
         self.eyebrow_widget.update("Setup Step 2")
-        self.title_widget.update("Choose the account that runs Prompt Master")
+        self.title_widget.update("Choose the account that runs PollyPM")
         self.intro_widget.update(
-            "The control account runs the operator and heartbeat sessions. If it runs low, Prompt Master can fail over "
+            "The control account runs the operator and heartbeat sessions. If it runs low, PollyPM can fail over "
             "to another healthy connected account."
         )
         stage = Vertical(classes="stage")
@@ -505,7 +505,7 @@ class OnboardingApp(App[Path | None]):
         control_section.mount(Static("Control Account", classes="section-title"))
         control_section.mount(
             Static(
-                "Pick the account that should own Prompt Master itself. This can be a workhorse account, but it will "
+                "Pick the account that should own PollyPM itself. This can be a workhorse account, but it will "
                 "be treated as the last resort for new worker assignment."
             )
         )
@@ -520,7 +520,7 @@ class OnboardingApp(App[Path | None]):
             )
         control_section.mount(
             Static(
-                "By default, Prompt Master can launch sessions in permissive mode so agents can keep moving without repeated approval prompts."
+                "By default, PollyPM can launch sessions in permissive mode so agents can keep moving without repeated approval prompts."
             )
         )
         control_section.mount(self.permissions_checkbox)
@@ -534,7 +534,7 @@ class OnboardingApp(App[Path | None]):
         self.eyebrow_widget.update("Setup Step 3")
         self.title_widget.update("Add active projects")
         self.intro_widget.update(
-            "Prompt Master looked through your home folder for git repos where your local git identity made a commit "
+            "PollyPM looked through your home folder for git repos where your local git identity made a commit "
             "in the last 14 days. These are the repos most likely to matter right now."
         )
         stage = Vertical(classes="stage")
@@ -584,7 +584,7 @@ class OnboardingApp(App[Path | None]):
             stage.mount(project_section)
             project_section.mount(Static("Recently Active Repositories", classes="section-title"))
             project_section.mount(
-                Static("Choose the repos you want Prompt Master to start tracking now. You can add more later.")
+                Static("Choose the repos you want PollyPM to start tracking now. You can add more later.")
             )
             project_section.mount(self.project_selection)
 
@@ -596,7 +596,7 @@ class OnboardingApp(App[Path | None]):
 
     def _render_tour_step(self) -> None:
         self.eyebrow_widget.update("Launch")
-        self.title_widget.update("Prompt Master is ready")
+        self.title_widget.update("PollyPM is ready")
         self.intro_widget.update(
             "You are done with setup. Here is the shape of the control room you are about to land in."
         )
@@ -611,9 +611,9 @@ class OnboardingApp(App[Path | None]):
         table.add_column(style="bold #c7d0d6", width=10)
         table.add_column(style="#f5f7fa")
         table.add_row("Heartbeat", "Runs in its own tmux session and stays out of your main interface.")
-        table.add_row("Operator", "The Prompt Master PM session for guidance, interventions, and direction changes.")
+        table.add_row("Operator", "The Polly session for guidance, interventions, and direction changes.")
         table.add_row("Control", "Your dashboard for accounts, projects, sessions, alerts, and events.")
-        table.add_row("Projects", "Each project keeps Prompt Master state in .promptmaster/ inside that folder.")
+        table.add_row("Projects", "Each project keeps PollyPM state in .promptmaster/ inside that folder.")
         table.add_row("Accounts", "You can add or reauth accounts later from the Accounts tab.")
         table.add_row("Keys", "1-6 switch tabs. O opens a worker window. P claims a pane. I sends input.")
         section.mount(Static(Panel(table, border_style="#4a525a")))
@@ -621,7 +621,7 @@ class OnboardingApp(App[Path | None]):
         actions = Horizontal(classes="button-row")
         stage.mount(actions)
         actions.mount(Button("Back", id="tour-back"))
-        self.launch_button = Button("Launch Prompt Master", id="tour-launch", variant="success")
+        self.launch_button = Button("Launch PollyPM", id="tour-launch", variant="success")
         actions.mount(self.launch_button)
         self.call_after_refresh(self._focus_launch_button)
 

@@ -237,6 +237,16 @@ def test_control_sessions_use_dedicated_control_homes(tmp_path: Path) -> None:
     assert launches["operator"].resume_marker == operator_home / ".promptmaster" / "session-markers" / "operator.resume"
 
 
+def test_control_sessions_use_agent_profiles_for_prompts(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+
+    launches = {launch.session.name: launch for launch in supervisor.plan_launches()}
+
+    assert "Polly" in launches["operator"].session.prompt
+    assert "heartbeat supervisor" in launches["heartbeat"].session.prompt
+
+
 def test_open_permissions_default_can_disable_launch_args(tmp_path: Path) -> None:
     config = _config(tmp_path)
     config.promptmaster.open_permissions_by_default = False
@@ -257,6 +267,28 @@ def test_open_permissions_default_can_disable_launch_args(tmp_path: Path) -> Non
     assert launches["heartbeat"].session.args == []
     assert launches["operator"].session.args == []
     assert launches["worker"].session.args == []
+
+
+def test_run_heartbeat_delegates_to_configured_backend(monkeypatch, tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    called: dict[str, int] = {}
+
+    class FakeHeartbeatBackend:
+        name = "fake"
+
+        def run(self, _supervisor, *, snapshot_lines=200):
+            called["snapshot_lines"] = snapshot_lines
+            return []
+
+    monkeypatch.setattr(
+        "promptmaster.supervisor.get_heartbeat_backend",
+        lambda name, root_dir=None: FakeHeartbeatBackend(),
+    )
+
+    supervisor.run_heartbeat(snapshot_lines=77)
+
+    assert called == {"snapshot_lines": 77}
 
 
 def test_codex_stabilizer_accepts_mixed_case_banner(monkeypatch, tmp_path: Path) -> None:

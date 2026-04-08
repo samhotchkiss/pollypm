@@ -20,8 +20,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from promptmaster.agent_profiles.builtin import heartbeat_prompt, polly_prompt
 from promptmaster.config import DEFAULT_CONFIG_PATH, load_config, write_config
-from promptmaster.control_prompts import heartbeat_prompt, operator_prompt
 from promptmaster.models import (
     AccountConfig,
     KnownProject,
@@ -137,7 +137,7 @@ def _available_clis() -> list[CliAvailability]:
 def _render_intro(statuses: list[CliAvailability]) -> None:
     console = Console()
     hero_text = Text(justify="left")
-    hero_text.append("Prompt Master\n", style="bold bright_white")
+    hero_text.append("PollyPM\n", style="bold bright_white")
     hero_text.append("Set up your CLI agents, detect active projects, and bring the control room online.", style="white")
     hero = Panel(
         hero_text,
@@ -200,7 +200,7 @@ def _render_account_step_intro(installed: list[CliAvailability], accounts: dict[
     body.append(_starting_provider_message(installed), style="bold white")
     body.append("\n")
     body.append(
-        "Prompt Master opens a real login window, detects the account automatically, and saves it as a reusable profile.",
+        "PollyPM opens a real login window, detects the account automatically, and saves it as a reusable profile.",
         style="dim",
     )
     if not accounts:
@@ -306,7 +306,7 @@ def _scan_recent_projects(config_path: Path) -> list[KnownProject]:
         return []
 
     typer.echo("")
-    typer.echo("Prompt Master found recently active repositories:")
+    typer.echo("PollyPM found recently active repositories:")
     selected: list[Path] = []
     for repo_path in discovered:
         if typer.confirm(f"Add project {repo_path.name} at {repo_path}?", default=True):
@@ -371,7 +371,7 @@ def _default_failover_accounts(accounts: dict[str, ConnectedAccount], controller
     if not remaining:
         return []
     typer.echo("")
-    typer.echo("Prompt Master failover order:")
+    typer.echo("PollyPM failover order:")
     for name in remaining:
         typer.echo(f"- {_display_label(accounts[name])}")
     return remaining
@@ -414,10 +414,10 @@ def _build_login_shell(
             parts.append("codex logout || true")
     parts.append(_login_command(provider, interactive=interactive))
     if return_to_caller:
-        parts.append('printf "\\nPrompt Master: login window complete. Returning to onboarding...\\n"')
+        parts.append('printf "\\nPollyPM: login window complete. Returning to onboarding...\\n"')
         parts.append("sleep 1")
     else:
-        parts.append('printf "\\nPrompt Master: login window complete. Detach with Ctrl-b d to continue onboarding.\\n"')
+        parts.append('printf "\\nPollyPM: login window complete. Detach with Ctrl-b d to continue onboarding.\\n"')
         parts.append('exec "${SHELL:-/bin/zsh}" -l')
     return "sh -lc " + shlex.quote(" && ".join(parts))
 
@@ -508,7 +508,7 @@ def _claude_prompt_ready(pane_text: str) -> bool:
 
 
 def _login_completion_marker_seen(pane_text: str) -> bool:
-    return "Prompt Master: login window complete." in pane_text
+    return "PollyPM: login window complete." in pane_text or "Prompt Master: login window complete." in pane_text
 
 
 def _wait_for_login_completion(
@@ -632,7 +632,7 @@ def _run_login_window(
         tmux.select_window(f"{current_tmux}:{window_label}")
         if not quiet:
             typer.echo(
-                f"Finish login in window `{window_label}`. Prompt Master will switch you back automatically "
+                f"Finish login in window `{window_label}`. PollyPM will switch you back automatically "
                 "when the login completes."
             )
         completed, pane_text = _wait_for_login_completion(
@@ -646,7 +646,7 @@ def _run_login_window(
             tmux.select_window(f"{current_tmux}:{current_window}")
         if not completed:
             if not quiet:
-                typer.echo("Prompt Master did not detect completion automatically.")
+                typer.echo("PollyPM did not detect completion automatically.")
                 typer.echo(f"Finish login in window `{window_label}`, then press Enter here to continue.")
                 typer.prompt("Press Enter after login is complete", default="", show_default=False)
             pane_text = tmux.capture_pane(f"{current_tmux}:{window_label}", lines=200)
@@ -658,7 +658,7 @@ def _run_login_window(
     if tmux.has_session(temp_session):
         tmux.kill_session(temp_session)
     if not quiet:
-        typer.echo("Complete login in that tmux session. Prompt Master will return here automatically.")
+        typer.echo("Complete login in that tmux session. PollyPM will return here automatically.")
     tmux.create_session(
         temp_session,
         "login",
@@ -710,7 +710,7 @@ def _connect_account_via_tmux(
     email = _detect_email_from_pane(provider, pane_text) or _detect_account_email(provider, home)
     if provider is ProviderKind.CLAUDE and email is None:
         message = (
-            "Claude login finished, but the managed Prompt Master profile is still not authenticated. "
+            "Claude login finished, but the managed PollyPM profile is still not authenticated. "
             "This usually means Claude completed browser auth without persisting credentials into the "
             "managed CLAUDE_CONFIG_DIR profile."
         )
@@ -720,11 +720,11 @@ def _connect_account_via_tmux(
     if email is None:
         if quiet:
             raise typer.BadParameter(
-                "Prompt Master could not auto-detect the connected account email. "
+                "PollyPM could not auto-detect the connected account email. "
                 "Try running the login again and, for Codex, open `/status` once login completes."
             )
         typer.echo("")
-        typer.echo("Prompt Master could not auto-detect the account email from the completed login.")
+        typer.echo("PollyPM could not auto-detect the account email from the completed login.")
         email = typer.prompt(f"Email address for this {label} account").strip().lower()
 
     final_home = _promote_onboarding_home(
@@ -787,7 +787,7 @@ def build_onboarded_config(
 
     return PromptMasterConfig(
         project=ProjectSettings(
-            name="promptmaster",
+            name="pollypm",
             root_dir=root_dir,
             tmux_session="promptmaster",
             workspace_root=DEFAULT_WORKSPACE_ROOT,
@@ -813,6 +813,7 @@ def build_onboarded_config(
                 project="promptmaster",
                 window_name="pm-heartbeat",
                 prompt=heartbeat_prompt(),
+                agent_profile="heartbeat",
                 args=default_control_args(controller.provider, open_permissions=open_permissions_by_default),
             ),
             "operator": SessionConfig(
@@ -823,7 +824,8 @@ def build_onboarded_config(
                 cwd=root_dir,
                 project="promptmaster",
                 window_name="pm-operator",
-                prompt=operator_prompt(),
+                prompt=polly_prompt(),
+                agent_profile="polly",
                 args=default_control_args(controller.provider, open_permissions=open_permissions_by_default),
             ),
         },

@@ -33,6 +33,9 @@ def test_extension_host_loads_builtin_provider_and_runtime(tmp_path: Path) -> No
     assert host.get_provider("codex").name == "codex"
     assert type(host.get_runtime("local")).__name__ == "LocalRuntimeAdapter"
     assert type(host.get_runtime("docker")).__name__ == "DockerRuntimeAdapter"
+    assert type(host.get_heartbeat_backend("local")).__name__ == "LocalHeartbeatBackend"
+    assert type(host.get_scheduler_backend("inline")).__name__ == "InlineSchedulerBackend"
+    assert host.get_agent_profile("polly").name == "polly"
 
 
 def test_repo_local_plugin_overrides_user_plugin(monkeypatch, tmp_path: Path) -> None:

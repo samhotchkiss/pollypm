@@ -1,0 +1,7 @@
+api_version = "1"
+name = "local_heartbeat"
+kind = "heartbeat"
+version = "0.1.0"
+entrypoint = "plugin.py:plugin"
+capabilities = ["heartbeat"]
+description = "Built-in local heartbeat backend."

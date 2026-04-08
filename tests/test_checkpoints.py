@@ -12,6 +12,7 @@ from promptmaster.models import (
     SessionConfig,
     SessionLaunchSpec,
 )
+from promptmaster.memory_backends import get_memory_backend
 from promptmaster.storage.state import StateStore
 
 
@@ -74,8 +75,14 @@ def test_mechanical_checkpoint_persists_files_and_state(tmp_path: Path) -> None:
         level="level0",
         artifact=artifact,
         snapshot_path=tmp_path / ".promptmaster/snapshots/worker-demo.txt",
+        memory_backend_name="file",
     )
     latest = store.latest_checkpoint("worker")
     assert latest is not None
     assert latest.level == "level0"
     assert latest.project_key == "demo"
+
+    memory_backend = get_memory_backend(tmp_path, "file")
+    entries = memory_backend.list_entries(scope="demo", kind="checkpoint")
+    assert len(entries) == 1
+    assert entries[0].title == "Checkpoint worker"

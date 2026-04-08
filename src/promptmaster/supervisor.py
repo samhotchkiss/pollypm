@@ -375,6 +375,7 @@ class Supervisor:
                 level="level0",
                 artifact=artifact,
                 snapshot_path=snapshot_path,
+                memory_backend_name=self.config.memory.backend,
             )
             failure = self._primary_failure(active_alerts)
             if failure is not None:

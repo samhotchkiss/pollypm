@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -145,6 +146,32 @@ CREATE TABLE IF NOT EXISTS token_usage_hourly (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (hour_bucket, account_name, provider, model_name, project_key)
 );
+
+CREATE TABLE IF NOT EXISTS memory_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    tags TEXT NOT NULL,
+    source TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    summary_path TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_entries_scope
+ON memory_entries(scope, id DESC);
+
+CREATE TABLE IF NOT EXISTS memory_summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL,
+    summary_text TEXT NOT NULL,
+    summary_path TEXT NOT NULL,
+    entry_count INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -273,6 +300,31 @@ class TokenUsageHourlyRecord:
     project_key: str
     tokens_used: int
     updated_at: str
+
+
+@dataclass(slots=True)
+class MemoryEntryRecord:
+    entry_id: int
+    scope: str
+    kind: str
+    title: str
+    body: str
+    tags: tuple[str, ...]
+    source: str
+    file_path: str
+    summary_path: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(slots=True)
+class MemorySummaryRecord:
+    summary_id: int
+    scope: str
+    summary_text: str
+    summary_path: str
+    entry_count: int
+    created_at: str
 
 
 class StateStore:
@@ -943,6 +995,160 @@ class StateStore:
             )
             for row in rows
         ]
+
+    def record_memory_entry(
+        self,
+        *,
+        scope: str,
+        kind: str,
+        title: str,
+        body: str,
+        tags: list[str],
+        source: str,
+        file_path: str,
+        summary_path: str,
+    ) -> MemoryEntryRecord:
+        now = self._now()
+        tags_json = json.dumps([str(tag) for tag in tags], ensure_ascii=True)
+        cursor = self.conn.execute(
+            """
+            INSERT INTO memory_entries (
+                scope, kind, title, body, tags, source, file_path, summary_path, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (scope, kind, title, body, tags_json, source, file_path, summary_path, now, now),
+        )
+        self.conn.commit()
+        return MemoryEntryRecord(
+            entry_id=int(cursor.lastrowid),
+            scope=scope,
+            kind=kind,
+            title=title,
+            body=body,
+            tags=tuple(tags),
+            source=source,
+            file_path=file_path,
+            summary_path=summary_path,
+            created_at=now,
+            updated_at=now,
+        )
+
+    def get_memory_entry(self, entry_id: int) -> MemoryEntryRecord | None:
+        row = self.conn.execute(
+            """
+            SELECT id, scope, kind, title, body, tags, source, file_path, summary_path, created_at, updated_at
+            FROM memory_entries
+            WHERE id = ?
+            """,
+            (entry_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return MemoryEntryRecord(
+            entry_id=int(row[0]),
+            scope=row[1],
+            kind=row[2],
+            title=row[3],
+            body=row[4],
+            tags=tuple(json.loads(row[5] or "[]")),
+            source=row[6],
+            file_path=row[7],
+            summary_path=row[8],
+            created_at=row[9],
+            updated_at=row[10],
+        )
+
+    def list_memory_entries(
+        self,
+        *,
+        scope: str | None = None,
+        kind: str | None = None,
+        limit: int = 50,
+    ) -> list[MemoryEntryRecord]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if scope is not None:
+            clauses.append("scope = ?")
+            params.append(scope)
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT id, scope, kind, title, body, tags, source, file_path, summary_path, created_at, updated_at
+            FROM memory_entries
+            {where}
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        ).fetchall()
+        return [
+            MemoryEntryRecord(
+                entry_id=int(row[0]),
+                scope=row[1],
+                kind=row[2],
+                title=row[3],
+                body=row[4],
+                tags=tuple(json.loads(row[5] or "[]")),
+                source=row[6],
+                file_path=row[7],
+                summary_path=row[8],
+                created_at=row[9],
+                updated_at=row[10],
+            )
+            for row in rows
+        ]
+
+    def record_memory_summary(
+        self,
+        *,
+        scope: str,
+        summary_text: str,
+        summary_path: str,
+        entry_count: int,
+    ) -> MemorySummaryRecord:
+        now = self._now()
+        cursor = self.conn.execute(
+            """
+            INSERT INTO memory_summaries (scope, summary_text, summary_path, entry_count, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (scope, summary_text, summary_path, entry_count, now),
+        )
+        self.conn.commit()
+        return MemorySummaryRecord(
+            summary_id=int(cursor.lastrowid),
+            scope=scope,
+            summary_text=summary_text,
+            summary_path=summary_path,
+            entry_count=entry_count,
+            created_at=now,
+        )
+
+    def latest_memory_summary(self, scope: str) -> MemorySummaryRecord | None:
+        row = self.conn.execute(
+            """
+            SELECT id, scope, summary_text, summary_path, entry_count, created_at
+            FROM memory_summaries
+            WHERE scope = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (scope,),
+        ).fetchone()
+        if row is None:
+            return None
+        return MemorySummaryRecord(
+            summary_id=int(row[0]),
+            scope=row[1],
+            summary_text=row[2],
+            summary_path=row[3],
+            entry_count=int(row[4]),
+            created_at=row[5],
+        )
 
     def update_worktree_status(self, project_key: str, lane_kind: str, lane_key: str, status: str) -> None:
         self.conn.execute(

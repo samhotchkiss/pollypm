@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Protocol
 
 from promptmaster.models import AccountConfig, SessionConfig
+from promptmaster.provider_sdk import ProviderUsageSnapshot, TranscriptSource
 
 
 @dataclass(slots=True)
@@ -27,3 +28,24 @@ class ProviderAdapter(Protocol):
         session: SessionConfig,
         account: AccountConfig,
     ) -> LaunchCommand: ...
+
+    def build_resume_command(
+        self,
+        session: SessionConfig,
+        account: AccountConfig,
+    ) -> LaunchCommand | None: ...
+
+    def transcript_sources(
+        self,
+        account: AccountConfig,
+        session: SessionConfig | None = None,
+    ) -> tuple[TranscriptSource, ...]: ...
+
+    def collect_usage_snapshot(
+        self,
+        tmux: object,
+        target: str,
+        *,
+        account: AccountConfig,
+        session: SessionConfig,
+    ) -> ProviderUsageSnapshot: ...

@@ -6,6 +6,9 @@ from typing import Any, Callable
 
 ProviderFactory = Callable[[], object]
 RuntimeFactory = Callable[[], object]
+HeartbeatBackendFactory = Callable[[], object]
+SchedulerBackendFactory = Callable[[], object]
+AgentProfileFactory = Callable[[], object]
 ObserverHandler = Callable[["HookContext"], None]
 FilterHandler = Callable[["HookContext"], "HookFilterResult | None"]
 
@@ -34,5 +37,8 @@ class PromptMasterPlugin:
     capabilities: tuple[str, ...] = ()
     providers: dict[str, ProviderFactory] = field(default_factory=dict)
     runtimes: dict[str, RuntimeFactory] = field(default_factory=dict)
+    heartbeat_backends: dict[str, HeartbeatBackendFactory] = field(default_factory=dict)
+    scheduler_backends: dict[str, SchedulerBackendFactory] = field(default_factory=dict)
+    agent_profiles: dict[str, AgentProfileFactory] = field(default_factory=dict)
     observers: dict[str, list[ObserverHandler]] = field(default_factory=dict)
     filters: dict[str, list[FilterHandler]] = field(default_factory=dict)

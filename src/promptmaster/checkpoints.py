@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from promptmaster.models import PromptMasterConfig, SessionLaunchSpec
+from promptmaster.memory_backends import get_memory_backend
 from promptmaster.projects import ensure_project_scaffold, project_checkpoints_dir
 from promptmaster.storage.state import StateStore
 
@@ -86,6 +87,7 @@ def record_checkpoint(
     level: str,
     artifact: CheckpointArtifact,
     snapshot_path: Path,
+    memory_backend_name: str = "file",
 ) -> None:
     store.record_checkpoint(
         session_name=launch.session.name,
@@ -101,6 +103,18 @@ def record_checkpoint(
         status="healthy",
         last_checkpoint_path=str(artifact.summary_path),
     )
+    try:
+        memory_backend = get_memory_backend(launch.session.cwd, memory_backend_name)
+        memory_backend.write_entry(
+            scope=launch.session.project,
+            title=f"Checkpoint {launch.session.name}",
+            body=artifact.summary_text,
+            kind="checkpoint",
+            tags=[launch.session.name, launch.session.role, launch.session.provider.value],
+            source="checkpoint",
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _project_root(config: PromptMasterConfig, project_key: str) -> Path:

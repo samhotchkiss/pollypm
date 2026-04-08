@@ -6,6 +6,7 @@ from pathlib import Path
 from promptmaster.control_prompts import heartbeat_prompt, operator_prompt
 from promptmaster.models import (
     AccountConfig,
+    MemorySettings,
     KnownProject,
     ProjectKind,
     ProjectSettings,
@@ -97,6 +98,9 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PromptMasterConfig:
         failover_accounts=failover_accounts,
     )
 
+    memory_raw = raw.get("memory", {})
+    memory = MemorySettings(backend=str(memory_raw.get("backend", "file")))
+
     projects: dict[str, KnownProject] = {}
     for project_key, item_raw in raw.get("projects", {}).items():
         projects[project_key] = KnownProject(
@@ -113,6 +117,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PromptMasterConfig:
         accounts=accounts,
         sessions=sessions,
         projects=projects,
+        memory=memory,
     )
 
 
@@ -137,6 +142,14 @@ def render_config(config: PromptMasterConfig) -> str:
         items = ", ".join(f'"{name}"' for name in config.promptmaster.failover_accounts)
         lines.append(f"failover_accounts = [{items}]")
     lines.append("")
+
+    lines.extend(
+        [
+            "[memory]",
+            f'backend = "{config.memory.backend}"',
+            "",
+        ]
+    )
 
     for account_name, account in config.accounts.items():
         lines.extend(
@@ -243,32 +256,32 @@ def render_example_config() -> str:
         sessions={
             "heartbeat": SessionConfig(
                 name="heartbeat",
-                    role="heartbeat-supervisor",
-                    provider=ProviderKind.CODEX,
-                    account="codex_primary",
-                    cwd=root,
-                    project="promptmaster",
-                    window_name="pm-heartbeat",
+                role="heartbeat-supervisor",
+                provider=ProviderKind.CODEX,
+                account="codex_primary",
+                cwd=root,
+                project="promptmaster",
+                window_name="pm-heartbeat",
                 prompt=heartbeat_prompt(),
             ),
             "operator": SessionConfig(
                 name="operator",
-                    role="operator-pm",
-                    provider=ProviderKind.CODEX,
-                    account="codex_primary",
-                    cwd=root,
-                    project="promptmaster",
-                    window_name="pm-operator",
+                role="operator-pm",
+                provider=ProviderKind.CODEX,
+                account="codex_primary",
+                cwd=root,
+                project="promptmaster",
+                window_name="pm-operator",
                 prompt=operator_prompt(),
             ),
             "worker_demo": SessionConfig(
                 name="worker_demo",
-                    role="worker",
-                    provider=ProviderKind.CLAUDE,
-                    account="claude_primary",
-                    cwd=root,
-                    project="demo-project",
-                    window_name="worker-demo",
+                role="worker",
+                provider=ProviderKind.CLAUDE,
+                account="claude_primary",
+                cwd=root,
+                project="demo-project",
+                window_name="worker-demo",
                 prompt="Inspect the repository and propose the next high-leverage implementation step.",
             ),
         },
@@ -280,6 +293,7 @@ def render_example_config() -> str:
                 kind=ProjectKind.GIT if (root / ".git").exists() else ProjectKind.FOLDER,
             ),
         },
+        memory=MemorySettings(backend="file"),
     )
     return render_config(config)
 

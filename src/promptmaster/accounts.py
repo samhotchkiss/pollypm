@@ -15,7 +15,7 @@ import typer
 
 from promptmaster.config import load_config, write_config
 from promptmaster.control_prompts import heartbeat_prompt, operator_prompt
-from promptmaster.models import AccountConfig, PromptMasterConfig, ProviderKind
+from promptmaster.models import AccountConfig, PromptMasterConfig, ProviderKind, SessionConfig
 from promptmaster.onboarding import (
     _decode_jwt_payload,
     _detect_account_email,
@@ -29,7 +29,6 @@ from promptmaster.providers import get_provider
 from promptmaster.runtimes import get_runtime
 from promptmaster.runtime_env import claude_config_dir, codex_home_dir, provider_profile_env
 from promptmaster.storage.state import StateStore
-from promptmaster.models import SessionConfig
 from promptmaster.tmux.client import TmuxClient
 
 
@@ -134,6 +133,29 @@ def _effective_logged_in(
     return logged_in
 
 
+def _parse_claude_usage_text(text: str) -> tuple[str, str]:
+    weekly_match = re.search(
+        r"Current week \(all models\).*?(\d+)% used.*?Resets ([^\n]+)",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not weekly_match:
+        return ("unknown", "usage unavailable")
+    used = int(weekly_match.group(1))
+    remaining = max(0, 100 - used)
+    reset = weekly_match.group(2).strip()
+    return ("healthy", f"{remaining}% left this week · resets {reset}")
+
+
+def _parse_codex_status_text(text: str) -> tuple[str, str]:
+    summary_match = re.search(r"(\d+)% left", text)
+    if summary_match:
+        return ("healthy", f"{summary_match.group(1)}% left")
+    if "usage limit" in text.lower():
+        return ("capacity-exhausted", "usage limit reached")
+    return ("unknown", "usage unavailable")
+
+
 def _codex_credentials_store(home: Path) -> str:
     config_path = codex_home_dir(home) / "config.toml"
     if not config_path.exists():
@@ -231,40 +253,6 @@ def inspect_account_isolation(account: AccountConfig) -> tuple[str, str, str, st
     return ("unknown", "Unknown provider isolation status.", "", "unknown", None)
 
 
-def _parse_claude_usage_text(text: str) -> tuple[str, str]:
-    weekly_match = re.search(
-        r"Current week \(all models\).*?(\d+)% used.*?Resets ([^\n]+)",
-        text,
-        re.IGNORECASE | re.DOTALL,
-    )
-    if not weekly_match:
-        return ("unknown", "usage unavailable")
-    used = int(weekly_match.group(1))
-    reset = " ".join(weekly_match.group(2).split())
-    left = max(0, 100 - used)
-    if used >= 95:
-        health = "exhausted"
-    elif used >= 80:
-        health = "near-limit"
-    else:
-        health = "healthy"
-    return (health, f"{left}% left this week · resets {reset}")
-
-
-def _parse_codex_status_text(text: str) -> tuple[str, str]:
-    match = re.search(r"(\d+)% left", text, re.IGNORECASE)
-    if not match:
-        return ("unknown", "usage unavailable")
-    left = int(match.group(1))
-    if left <= 5:
-        health = "exhausted"
-    elif left <= 20:
-        health = "near-limit"
-    else:
-        health = "healthy"
-    return (health, f"{left}% left")
-
-
 def _build_probe_command(config, account: AccountConfig) -> str:
     session = SessionConfig(
         name=f"probe_{account.name}",
@@ -280,44 +268,6 @@ def _build_probe_command(config, account: AccountConfig) -> str:
     return runtime.wrap_command(launch, account, config.project)
 
 
-def _stabilize_probe_session(tmux: TmuxClient, target: str, provider: ProviderKind) -> None:
-    deadline = time.monotonic() + 60
-    last_action = ""
-    while time.monotonic() < deadline:
-        pane = tmux.capture_pane(target, lines=320)
-        lowered = pane.lower()
-        if provider is ProviderKind.CLAUDE:
-            if "select login method:" in lowered or "please run /login" in lowered:
-                raise RuntimeError("Claude probe session is not authenticated.")
-            if "choose the text style that looks best with your terminal" in lowered and last_action != "theme":
-                tmux.send_keys(target, "", press_enter=True)
-                last_action = "theme"
-                time.sleep(1)
-                continue
-            if "quick safety check" in lowered and "yes, i trust this folder" in lowered and last_action != "trust":
-                tmux.send_keys(target, "", press_enter=True)
-                last_action = "trust"
-                time.sleep(1)
-                continue
-            if "we recommend medium effort for opus" in lowered and last_action != "effort":
-                tmux.send_keys(target, "", press_enter=True)
-                last_action = "effort"
-                time.sleep(1)
-                continue
-            if "❯" in pane and ("welcome back" in lowered or "/usage" not in lowered):
-                return
-        else:
-            if "do you trust the contents of this directory" in lowered and "1. yes, continue" in lowered and last_action != "trust":
-                tmux.send_keys(target, "", press_enter=True)
-                last_action = "trust"
-                time.sleep(1)
-                continue
-            if "openai codex" in pane and ("›" in pane or "% left" in lowered):
-                return
-        time.sleep(1)
-    raise RuntimeError(f"{provider.value} probe session did not reach an interactive prompt in time.")
-
-
 def _run_usage_probe(config_path: Path, account_name: str) -> tuple[str, str, str]:
     config = load_config(config_path)
     account = config.accounts[account_name]
@@ -326,22 +276,23 @@ def _run_usage_probe(config_path: Path, account_name: str) -> tuple[str, str, st
     try:
         tmux.create_session(probe_session, "probe", _build_probe_command(config, account))
         target = f"{probe_session}:0"
-        if account.provider is ProviderKind.CLAUDE:
-            _stabilize_probe_session(tmux, target, account.provider)
-            tmux.send_keys(target, "/usage", press_enter=True)
-            time.sleep(3)
-            text = tmux.capture_pane(target, lines=320)
-            health, summary = _parse_claude_usage_text(text)
-        else:
-            deadline = time.monotonic() + 20
-            text = ""
-            while time.monotonic() < deadline:
-                text = tmux.capture_pane(target, lines=320)
-                health, summary = _parse_codex_status_text(text)
-                if health != "unknown":
-                    return (health, summary, text)
-                time.sleep(1)
-            health, summary = _parse_codex_status_text(text)
+        provider = get_provider(account.provider, root_dir=config.project.root_dir)
+        usage_snapshot = provider.collect_usage_snapshot(
+            tmux,
+            target,
+            account=account,
+            session=SessionConfig(
+                name=f"probe_{account.name}",
+                role="usage-probe",
+                provider=account.provider,
+                account=account.name,
+                cwd=config.project.root_dir,
+                args=[],
+            ),
+        )
+        health = usage_snapshot.health
+        summary = usage_snapshot.summary
+        text = usage_snapshot.raw_text
         return (health, summary, text)
     finally:
         if tmux.has_session(probe_session):

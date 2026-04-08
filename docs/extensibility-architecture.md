@@ -113,8 +113,11 @@ Plugin families:
 
 - provider plugins
 - runtime plugins
+- scheduler/cron backends
+- heartbeat backends
 - memory backends
 - task backends
+- agent profile backends
 - frontend transports
 - transcript source plugins
 - hook/filter plugins
@@ -164,6 +167,66 @@ Interface should include:
 - path mapping
 - auth/profile mount handling
 - transcript path mapping back to host
+
+### Scheduler / Cron Backend
+
+Purpose:
+
+- control recurring and delayed orchestration work without hardwiring one timing loop into core
+
+Examples:
+
+- in-process scheduler
+- cron-compatible backend
+- APScheduler-style backend
+- external scheduler service later
+
+Interface should include:
+
+- register recurring job
+- register one-shot delayed job
+- cancel job
+- pause/resume job
+- list scheduled jobs
+- emit execution events back into Prompt Master
+
+Typical jobs:
+
+- usage refreshes
+- delayed retries
+- inbox digests
+- project check-ins
+- automatic resumes when capacity returns
+
+### Heartbeat Backend
+
+Purpose:
+
+- make session monitoring execution replaceable instead of coupling it to one local loop
+
+Examples:
+
+- local default heartbeat worker
+- transcript-first heartbeat worker
+- external monitor process
+- future distributed heartbeat service
+
+Interface should include:
+
+- enumerate monitored sessions
+- schedule heartbeat cadence
+- collect heartbeat signals
+- normalize heartbeat results
+- request recovery or raise alerts
+
+Heartbeat sources may include:
+
+- transcript JSONL tails
+- tmux pane liveness
+- process/runtime health
+- account capacity refreshes
+
+Core should own heartbeat policy. Backends should own heartbeat execution.
 
 ### Transcript Source Plugin
 
@@ -220,6 +283,44 @@ Memory scopes:
 - issue
 - session
 - inbox thread
+
+### Agent Profile Backend
+
+Purpose:
+
+- make agent behavior and identity pluggable instead of baking Polly/PA/reviewer behavior into fixed prompts
+
+Examples:
+
+- built-in `polly`
+- built-in `heartbeat`
+- built-in `pa`
+- project-specific reviewer or architect profile
+- user-local custom profiles that survive upgrades
+
+Interface should include:
+
+- `system_prompt_blocks()`
+- `behavior_rules()`
+- `preferred_provider()`
+- `preferred_model()`
+- `preferred_reasoning_level()`
+- `capability_policy()`
+- `memory_policy()`
+- `task_policy()`
+- `review_policy()`
+
+Important distinction:
+
+- provider/model = what brain is running
+- agent profile = how that brain behaves
+
+Profiles should be composable from:
+
+- built-in role base
+- user-local override
+- project-local override
+- session-local override
 
 ### Task Backend
 
@@ -499,5 +600,7 @@ The current codebase can evolve toward this incrementally rather than via a big-
 3. Add a normalized event bus and transcript-ingest service.
 4. Extract the file-based issue tracker behind a task-backend interface.
 5. Extract the default memory system behind a memory-backend interface.
-6. Add a service API layer for TUI, web, and Discord clients.
-
+6. Add a scheduler/cron backend interface.
+7. Add a heartbeat backend interface.
+8. Add an agent profile backend interface.
+9. Add a service API layer for TUI, web, and Discord clients.

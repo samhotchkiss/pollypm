@@ -62,6 +62,7 @@ class SessionConfig:
     cwd: Path
     project: str = "promptmaster"
     prompt: str | None = None
+    agent_profile: str | None = None
     args: list[str] = field(default_factory=list)
     enabled: bool = True
     window_name: str | None = None
@@ -73,6 +74,13 @@ class PromptMasterSettings:
     open_permissions_by_default: bool = True
     failover_enabled: bool = False
     failover_accounts: list[str] = field(default_factory=list)
+    heartbeat_backend: str = "local"
+    scheduler_backend: str = "inline"
+
+
+@dataclass(slots=True)
+class MemorySettings:
+    backend: str = "file"
 
 
 @dataclass(slots=True)
@@ -82,6 +90,7 @@ class PromptMasterConfig:
     accounts: dict[str, AccountConfig]
     sessions: dict[str, SessionConfig]
     projects: dict[str, KnownProject] = field(default_factory=dict)
+    memory: MemorySettings = field(default_factory=MemorySettings)
 
 
 @dataclass(slots=True)

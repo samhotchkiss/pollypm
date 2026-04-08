@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import re
 import shutil
+import time
 from pathlib import Path
 
 from promptmaster.models import AccountConfig, SessionConfig
 from promptmaster.providers.base import LaunchCommand
+from promptmaster.provider_sdk import ProviderAdapterBase, ProviderUsageSnapshot, TranscriptSource
+from promptmaster.runtime_env import codex_home_dir
+from promptmaster.tmux.client import TmuxClient
 
 
-class CodexAdapter:
+class CodexAdapter(ProviderAdapterBase):
     name = "codex"
     binary = "codex"
 
@@ -34,4 +39,67 @@ class CodexAdapter:
             cwd=session.cwd,
             resume_argv=resume_argv,
             resume_marker=resume_marker,
+        )
+
+    def build_resume_command(
+        self,
+        session: SessionConfig,
+        account: AccountConfig,
+    ) -> LaunchCommand | None:
+        if session.role not in {"heartbeat-supervisor", "operator-pm"} or account.home is None:
+            return None
+        return self.build_launch_command(session, account)
+
+    def transcript_sources(
+        self,
+        account: AccountConfig,
+        session: SessionConfig | None = None,
+    ) -> tuple[TranscriptSource, ...]:
+        if account.home is None:
+            return ()
+        return (
+            TranscriptSource(
+                root=codex_home_dir(account.home) / "sessions",
+                pattern="**/rollout-*.jsonl",
+                description="Codex session transcript JSONL",
+            ),
+        )
+
+    def collect_usage_snapshot(
+        self,
+        tmux: TmuxClient,
+        target: str,
+        *,
+        account: AccountConfig,
+        session: SessionConfig,
+    ) -> ProviderUsageSnapshot:
+        deadline = time.monotonic() + 20
+        text = ""
+        while time.monotonic() < deadline:
+            text = tmux.capture_pane(target, lines=320)
+            lowered = text.lower()
+            if "do you trust the contents of this directory" in lowered and "1. yes, continue" in lowered:
+                tmux.send_keys(target, "", press_enter=True)
+                time.sleep(1)
+                continue
+            if "openai codex" in lowered and ("›" in lowered or "% left" in lowered):
+                return self._parse_usage_text(text)
+            time.sleep(1)
+        return self._parse_usage_text(text)
+
+    def _parse_usage_text(self, text: str) -> ProviderUsageSnapshot:
+        match = re.search(r"(\d+)% left", text, re.IGNORECASE)
+        if not match:
+            return ProviderUsageSnapshot(raw_text=text)
+        left = int(match.group(1))
+        if left <= 5:
+            health = "exhausted"
+        elif left <= 20:
+            health = "near-limit"
+        else:
+            health = "healthy"
+        return ProviderUsageSnapshot(
+            health=health,
+            summary=f"{left}% left",
+            raw_text=text,
         )

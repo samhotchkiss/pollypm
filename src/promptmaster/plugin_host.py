@@ -38,24 +38,29 @@ class ExtensionHost:
         return dict(self._plugins)
 
     def get_provider(self, name: str) -> object:
-        registry: dict[str, object] = {}
-        for plugin in self.plugins().values():
-            for provider_name, factory in plugin.providers.items():
-                registry[provider_name] = factory
-        factory = registry.get(name)
-        if factory is not None:
-            return factory()
-        raise ValueError(f"Unsupported provider: {name}")
+        return self._resolve_factory(name, lambda plugin: plugin.providers, "provider")
 
     def get_runtime(self, name: str) -> object:
+        return self._resolve_factory(name, lambda plugin: plugin.runtimes, "runtime")
+
+    def get_heartbeat_backend(self, name: str) -> object:
+        return self._resolve_factory(name, lambda plugin: plugin.heartbeat_backends, "heartbeat backend")
+
+    def get_scheduler_backend(self, name: str) -> object:
+        return self._resolve_factory(name, lambda plugin: plugin.scheduler_backends, "scheduler backend")
+
+    def get_agent_profile(self, name: str) -> object:
+        return self._resolve_factory(name, lambda plugin: plugin.agent_profiles, "agent profile")
+
+    def _resolve_factory(self, name: str, registry_getter, kind: str) -> object:
         registry: dict[str, object] = {}
         for plugin in self.plugins().values():
-            for runtime_name, factory in plugin.runtimes.items():
-                registry[runtime_name] = factory
+            for item_name, factory in registry_getter(plugin).items():
+                registry[item_name] = factory
         factory = registry.get(name)
         if factory is not None:
             return factory()
-        raise ValueError(f"Unsupported runtime: {name}")
+        raise ValueError(f"Unsupported {kind}: {name}")
 
     def run_observers(self, hook_name: str, payload: object, *, metadata: dict[str, object] | None = None) -> list[str]:
         context = HookContext(hook_name=hook_name, payload=payload, root_dir=self.root_dir, metadata=dict(metadata or {}))

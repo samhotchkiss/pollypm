@@ -28,3 +28,4 @@
 - Split adjacent polish work out of `0002` into fresh ready slices: `0017` for onboarding/project-discovery wording and `0018` for worker-lane kickoff/project launch polish.
 - Implemented `0018` by making worker kickoff prompts project-aware, seeding tracked projects from the next real issue, and validating the new-worker modal in the live tmux control room before moving it to review.
 - Implemented `0017` by tightening onboarding copy around recent local commits, preselected project suggestions, and the handoff into PollyPM, then validated the setup shell in tmux before moving it to review.
+- Reviewed and closed the remaining operator-experience items: `0002`, `0006`, `0017`, and `0018` all passed targeted tests plus live tmux validation and moved to `05-completed`.

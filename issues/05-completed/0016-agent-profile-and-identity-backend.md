@@ -14,7 +14,7 @@ Extract agent behavior and identity into a pluggable profile backend so Polly, h
 
 ## Acceptance Criteria
 
-- Prompt Master can resolve an agent profile separately from provider/model choice.
+- PollyPM can resolve an agent profile separately from provider/model choice.
 - Built-in and local custom profiles use the same interface.
 - Project-specific agent behavior can be overridden without editing core prompts directly.
 

@@ -2,7 +2,7 @@
 
 ## Goal
 
-Define the plugin, hook/filter, service API, and backend-swapping architecture that lets Prompt Master grow into a platform.
+Define the plugin, hook/filter, service API, and backend-swapping architecture that lets PollyPM grow into a platform.
 
 ## Deliverables
 

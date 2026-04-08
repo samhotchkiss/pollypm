@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+import shutil
 import re
 
 
@@ -20,7 +21,18 @@ class InboxMessage:
 
 
 def inbox_root(root_dir: Path) -> Path:
-    return root_dir / "promptmaster" / "inbox"
+    root_dir = root_dir.resolve()
+    new_root = root_dir / "pollypm" / "inbox"
+    old_root = root_dir / "promptmaster" / "inbox"
+    if old_root.exists() and not new_root.exists():
+        new_root.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(old_root), str(new_root))
+        try:
+            if old_root.parent.exists() and not any(old_root.parent.iterdir()):
+                old_root.parent.rmdir()
+        except OSError:
+            pass
+    return new_root
 
 
 def ensure_inbox(root_dir: Path) -> Path:

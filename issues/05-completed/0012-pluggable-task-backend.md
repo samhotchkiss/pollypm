@@ -12,6 +12,6 @@ Extract the file-based issue tracker behind a replaceable task backend contract.
 
 ## Acceptance Criteria
 
-- Prompt Master core depends on a task backend interface instead of folder paths directly.
+- PollyPM core depends on a task backend interface instead of folder paths directly.
 - The current issue tracker continues to work as the default backend.
 

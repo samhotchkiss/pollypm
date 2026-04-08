@@ -2,24 +2,24 @@
 
 ## Goal
 
-Define how Prompt Master should integrate, expose, and supervise skills and MCPs without turning the operator flow into a bag of hidden magic.
+Define how PollyPM should integrate, expose, and supervise skills and MCPs without turning the operator flow into a bag of hidden magic.
 
 ## Proposal
 
-Prompt Master should treat skills and MCPs as first-class but explicitly scoped capabilities, not as ambient hidden context.
+PollyPM should treat skills and MCPs as first-class but explicitly scoped capabilities, not as ambient hidden context.
 
 The operating model is:
 
 - `skills` are declarative bundles of instructions, allowed tools, and optional MCP dependencies.
 - `MCPs` are runtime services that expose concrete tools.
-- `Prompt Master` is the policy and visibility layer that decides which skills and MCPs are available to each session, at what scope, and with what authority.
+- `PollyPM` is the policy and visibility layer that decides which skills and MCPs are available to each session, at what scope, and with what authority.
 
 ### 1. Capability model
 
 Split the capability stack into three layers:
 
 1. `global baseline`
-   - safe, read-only capabilities that every Prompt Master session may inspect
+   - safe, read-only capabilities that every PollyPM session may inspect
    - examples: local repo metadata, session status, health snapshots, non-destructive project listing
 
 2. `project scope`
@@ -30,7 +30,7 @@ Split the capability stack into three layers:
    - ephemeral capabilities granted to one live PM or PA session
    - examples: temporary access to a troubleshooting MCP, a human-approved write action, or a debug-only skill
 
-Prompt Master should never let a session discover a capability that is not in its assigned scope. The session prompt can mention only the allowed surface for that role and project.
+PollyPM should never let a session discover a capability that is not in its assigned scope. The session prompt can mention only the allowed surface for that role and project.
 
 ### 2. Skill integration
 
@@ -43,9 +43,9 @@ Skills should be represented as declarative records with:
 - side-effect class: `read-only`, `write`, or `destructive`
 - project scope: `global`, `project`, or `session`
 
-Prompt Master should load skills at launch time and compile them into a capability manifest for each session. The manifest is what the operator sees in the control room and what the worker session receives as its authoritative tool surface summary.
+PollyPM should load skills at launch time and compile them into a capability manifest for each session. The manifest is what the operator sees in the control room and what the worker session receives as its authoritative tool surface summary.
 
-Worker sessions should not discover installed skills by scanning the filesystem directly. They should only receive the compiled manifest that Prompt Master has approved.
+Worker sessions should not discover installed skills by scanning the filesystem directly. They should only receive the compiled manifest that PollyPM has approved.
 
 ### 3. MCP integration
 
@@ -55,7 +55,7 @@ MCP servers should be modeled as runtime resources with explicit ownership and s
 - `project MCPs` are bound to one project and can be reused by all sessions in that project
 - `private MCPs` are bound to one live session and are useful for temporary debugging or one-off task tooling
 
-Prompt Master should launch MCPs separately from worker sessions and track them as managed runtime units. A worker session can only attach to MCPs that Prompt Master has already marked available for that project or session.
+PollyPM should launch MCPs separately from worker sessions and track them as managed runtime units. A worker session can only attach to MCPs that PollyPM has already marked available for that project or session.
 
 ### 4. Policy boundaries
 
@@ -63,8 +63,8 @@ Policy should be enforced before launch and at runtime.
 
 Before launch:
 
-- Prompt Master validates that a session’s skills only request MCPs allowed by the project policy.
-- Prompt Master rejects any capability that widens scope silently.
+- PollyPM validates that a session’s skills only request MCPs allowed by the project policy.
+- PollyPM rejects any capability that widens scope silently.
 - The control room must show the exact policy delta before a project-scoped MCP is enabled.
 
 At runtime:
@@ -74,7 +74,7 @@ At runtime:
 - destructive MCPs require operator confirmation plus a narrow session lease
 - secrets-bearing MCPs must be scoped to the minimum possible project or session boundary
 
-No skill may increase its own authority. A skill can request capabilities, but Prompt Master decides whether the request is valid for that project and role.
+No skill may increase its own authority. A skill can request capabilities, but PollyPM decides whether the request is valid for that project and role.
 
 ### 5. Operator visibility
 
@@ -100,7 +100,7 @@ The control room should expose three views:
    - auth freshness or token expiry signal when available
    - last error and current degraded state
 
-For session detail pages, Prompt Master should render a compact capability banner:
+For session detail pages, PollyPM should render a compact capability banner:
 
 - active skills
 - attached MCPs
@@ -121,7 +121,7 @@ Each skill or MCP runtime should produce a health record with:
 - `active_sessions`
 - `policy_scope`
 
-Health is not just process liveness. Prompt Master should consider a runtime degraded if it is:
+Health is not just process liveness. PollyPM should consider a runtime degraded if it is:
 
 - running but missing required auth
 - running but failing handshake
@@ -138,7 +138,7 @@ PM and PA should see different slices of the same capability graph:
 - PA sees what is available for execution and what is blocked
 - worker sessions see only the capabilities they can actually use
 
-This keeps Prompt Master aligned with its supervision model:
+This keeps PollyPM aligned with its supervision model:
 
 - PM manages scope and approvals
 - PA executes within the approved surface
@@ -161,6 +161,6 @@ The config file should remain the source of truth, while the control room become
 ## Acceptance Criteria
 
 - The design clearly separates discovery, policy, runtime availability, and UI exposure.
-- The report ties the plan back to Prompt Master’s PM/PA supervision model.
+- The report ties the plan back to PollyPM’s PM/PA supervision model.
 - The proposal makes clear which capabilities are global, project-scoped, and session-scoped.
 - The proposal defines how the control room reports capability inventory, policy state, and runtime health.

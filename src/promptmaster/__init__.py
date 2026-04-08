@@ -1,4 +1,4 @@
-"""Prompt Master package."""
+"""PollyPM package."""
 
 __all__ = ["__version__"]
 

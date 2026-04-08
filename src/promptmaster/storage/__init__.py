@@ -1,1 +1,1 @@
-"""Persistence helpers for Prompt Master."""
+"""Persistence helpers for PollyPM."""

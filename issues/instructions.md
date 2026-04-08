@@ -1,6 +1,6 @@
-# Prompt Master Issue Tracker
+# PollyPM Issue Tracker
 
-This is the default local issue-tracker workflow for substantial Prompt Master projects.
+This is the default local issue-tracker workflow for substantial PollyPM projects.
 
 ## Purpose
 
@@ -37,7 +37,7 @@ PM responsibilities:
 
 ## Queue Files
 
-Prompt Master initializes:
+PollyPM initializes:
 
 - `issues/instructions.md`
 - `issues/notes.md`

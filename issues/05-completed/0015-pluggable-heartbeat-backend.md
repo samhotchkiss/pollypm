@@ -14,7 +14,7 @@ Extract session heartbeat and monitoring execution behind a replaceable backend 
 
 ## Acceptance Criteria
 
-- Prompt Master core defines heartbeat policy, but heartbeat execution is delegated to a backend interface.
+- PollyPM core defines heartbeat policy, but heartbeat execution is delegated to a backend interface.
 - The default backend can monitor local sessions using transcript and liveness signals.
 - A future external or distributed heartbeat worker could replace the default backend.
 

@@ -1,8 +1,8 @@
-# Prompt Master Inbox Reply And Thread Model
+# PollyPM Inbox Reply And Thread Model
 
 ## Goal
 
-Define how inbox items are stored, how replies become threads, and when Prompt Master keeps a conversation inside PM versus routing it to PA or a worker session.
+Define how inbox items are stored, how replies become threads, and when PollyPM keeps a conversation inside PM versus routing it to PA or a worker session.
 
 ## Scope
 

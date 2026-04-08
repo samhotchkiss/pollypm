@@ -61,7 +61,7 @@ def test_up_surfaces_bootstrap_failure_cleanly(monkeypatch, tmp_path: Path) -> N
             return None
 
         def bootstrap_tmux(self) -> str:
-            raise RuntimeError("Prompt Master could not launch any controller account: claude_demo: probe failed")
+            raise RuntimeError("PollyPM could not launch any controller account: claude_demo: probe failed")
 
     monkeypatch.setattr(cli, "_load_supervisor", lambda path: FakeSupervisor())
 
@@ -69,4 +69,4 @@ def test_up_surfaces_bootstrap_failure_cleanly(monkeypatch, tmp_path: Path) -> N
     result = runner.invoke(cli.app, ["up", "--config", str(config_path)])
 
     assert result.exit_code != 0
-    assert "Prompt Master could not launch any controller account" in result.output
+    assert "PollyPM could not launch any controller account" in result.output

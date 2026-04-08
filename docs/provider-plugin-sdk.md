@@ -1,6 +1,6 @@
 # Provider Plugin SDK
 
-Prompt Master exposes a stable provider SDK in `promptmaster.provider_sdk` for authors who want to add a new CLI provider without editing core orchestration code.
+PollyPM exposes a stable provider SDK in `promptmaster.provider_sdk` for authors who want to add a new CLI provider without editing core orchestration code.
 
 ## What The SDK Covers
 
@@ -30,7 +30,7 @@ Optional hooks:
 - `build_resume_command(session, account)`
 - `transcript_sources(account, session=None)`
 
-The launch command still carries the provider-specific resume args/marker so Prompt Master can restart controller sessions in place.
+The launch command still carries the provider-specific resume args/marker so PollyPM can restart controller sessions in place.
 
 ## Example
 
@@ -62,4 +62,4 @@ class GeminiAdapter(ProviderAdapterBase):
 
 ## Built-In Providers
 
-Claude and Codex now implement the SDK directly. That keeps third-party providers aligned with the same launch, transcript, and usage hooks Prompt Master uses internally.
+Claude and Codex now implement the SDK directly. That keeps third-party providers aligned with the same launch, transcript, and usage hooks PollyPM uses internally.

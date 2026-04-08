@@ -1,1 +1,1 @@
-# Built-in Prompt Master plugins live in child directories with manifests.
+# Built-in PollyPM plugins live in child directories with manifests.

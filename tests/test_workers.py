@@ -77,7 +77,7 @@ def _config(tmp_path: Path) -> tuple[PromptMasterConfig, Path]:
             "promptmaster": KnownProject(
                 key="promptmaster",
                 path=tmp_path,
-                name="Prompt Master",
+                name="PollyPM",
                 kind=ProjectKind.FOLDER,
             )
         },

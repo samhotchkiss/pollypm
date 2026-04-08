@@ -2,7 +2,7 @@
 
 ## Goal
 
-Keep iterating on the Prompt Master control room until it feels faster, clearer, and more intentional in tmux.
+Keep iterating on the PollyPM control room until it feels faster, clearer, and more intentional in tmux.
 
 ## Scope
 

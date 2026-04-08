@@ -2,7 +2,7 @@
 
 ## Goal
 
-Extract Prompt Master memory into a replaceable backend contract.
+Extract PollyPM memory into a replaceable backend contract.
 
 ## Scope
 
@@ -14,5 +14,5 @@ Extract Prompt Master memory into a replaceable backend contract.
 ## Acceptance Criteria
 
 - The default memory system is behind an interface instead of being hardwired into core orchestration.
-- A user could add a custom memory backend without editing Prompt Master internals.
+- A user could add a custom memory backend without editing PollyPM internals.
 

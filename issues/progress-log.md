@@ -2,7 +2,7 @@
 
 ## 2026-04-08
 
-- Initialized the repo-local issue tracker for Prompt Master overnight work.
+- Initialized the repo-local issue tracker for PollyPM overnight work.
 - Backfilled the current work into explicit issues so active/queued/completed state is visible.
 - Completed issue 0004 with a concrete Otter Camp docsv2 review report and moved it to `05-completed`.
 - Completed issue `0007` by adding the inbox/thread model spec and moving the issue record to `05-completed`.
@@ -22,7 +22,7 @@
 - Implemented issue `0015` by delegating heartbeat execution through a pluggable heartbeat backend and shipping the built-in local monitor backend.
 - Implemented issue `0016` by adding built-in agent profiles for Polly, heartbeat, and workers, then routing control-session prompts through the profile seam.
 - Implemented issue `0003` by switching token accounting over to JSONL transcript ingestion for Claude/Codex, adding hourly token rollups, and moving the issue to review.
-- Began swapping user-facing naming from Prompt Master toward PollyPM and Polly in onboarding and control-session prompts.
+- Began swapping user-facing naming from PollyPM toward PollyPM and Polly in onboarding and control-session prompts.
 - Tightened the control room for issue `0006`: PollyPM branding now reaches the live tmux header and CLI help, the cockpit rail boots focused, dashboard rows act more intentionally, and the live tmux validation pass moved the issue to review.
 - Closed review on implemented platform seams and docs: `0003`, `0005`, `0008`, `0009`, `0010`, `0011`, `0012`, `0013`, `0014`, `0015`, and `0016` are now in `05-completed`.
 - Split adjacent polish work out of `0002` into fresh ready slices: `0017` for onboarding/project-discovery wording and `0018` for worker-lane kickoff/project launch polish.

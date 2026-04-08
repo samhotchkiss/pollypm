@@ -70,7 +70,7 @@ def _config(tmp_path: Path) -> PromptMasterConfig:
             "promptmaster": KnownProject(
                 key="promptmaster",
                 path=tmp_path,
-                name="Prompt Master",
+                name="PollyPM",
                 kind=ProjectKind.FOLDER,
             )
         },

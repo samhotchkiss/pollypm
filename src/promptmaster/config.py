@@ -21,6 +21,12 @@ from promptmaster.models import (
 DEFAULT_CONFIG_PATH = Path("promptmaster.toml")
 
 
+def _normalize_project_display_name(key: str, name: str | None) -> str | None:
+    if key == "promptmaster" and (name is None or name.strip().casefold() in {"promptmaster", "prompt master", "pollypm"}):
+        return "PollyPM"
+    return name
+
+
 def _resolve_path(base: Path, raw_path: str) -> Path:
     path = Path(raw_path)
     if path.is_absolute():
@@ -43,7 +49,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PromptMasterConfig:
     project_raw = raw.get("project", {})
     base_dir = _resolve_path(base, project_raw.get("base_dir", ".promptmaster"))
     project = ProjectSettings(
-        name=project_raw.get("name", "promptmaster"),
+        name=_normalize_project_display_name("promptmaster", project_raw.get("name")) or "PollyPM",
         root_dir=base,
         tmux_session=project_raw.get("tmux_session", "promptmaster"),
         workspace_root=_resolve_path(base, project_raw.get("workspace_root", str(Path.home() / "dev"))),
@@ -109,7 +115,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PromptMasterConfig:
         projects[project_key] = KnownProject(
             key=project_key,
             path=_resolve_path(base, item_raw["path"]),
-            name=item_raw.get("name"),
+            name=_normalize_project_display_name(project_key, item_raw.get("name")),
             kind=ProjectKind(item_raw.get("kind", "folder")),
             tracked=bool(item_raw.get("tracked", False)),
         )
@@ -229,7 +235,7 @@ def render_example_config() -> str:
     base_dir = root / ".promptmaster"
     config = PromptMasterConfig(
         project=ProjectSettings(
-            name="promptmaster",
+            name="PollyPM",
             root_dir=root,
             tmux_session="promptmaster",
             workspace_root=Path.home() / "dev",
@@ -300,7 +306,7 @@ def render_example_config() -> str:
             "promptmaster": KnownProject(
                 key="promptmaster",
                 path=root,
-                name="Prompt Master",
+                name="PollyPM",
                 kind=ProjectKind.GIT if (root / ".git").exists() else ProjectKind.FOLDER,
             ),
         },

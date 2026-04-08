@@ -1,1 +1,1 @@
-"""Tmux integration layer for Prompt Master."""
+"""Tmux integration layer for PollyPM."""

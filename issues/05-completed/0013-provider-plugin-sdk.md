@@ -14,6 +14,6 @@ Define and implement the first provider-plugin API so additional CLI tools like 
 
 ## Acceptance Criteria
 
-- A user can add a provider plugin locally without editing Prompt Master core.
-- The extension path is compatible with upstream PRs back to Prompt Master.
+- A user can add a provider plugin locally without editing PollyPM core.
+- The extension path is compatible with upstream PRs back to PollyPM.
 

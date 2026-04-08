@@ -117,7 +117,7 @@ def onboard(
         typer.echo("Could not auto-install the global `promptmaster` command.")
         if install_output:
             typer.echo(install_output)
-    typer.echo("Next step: run `promptmaster up` or `uv run pm up` to create or attach to the promptmaster tmux session.")
+    typer.echo("Next step: run `promptmaster up` or `uv run pm up` to create or attach to the PollyPM tmux session.")
 
 
 @app.command()

@@ -14,7 +14,7 @@ Extract scheduling and cron-like behavior behind a replaceable backend contract.
 
 ## Acceptance Criteria
 
-- Prompt Master core depends on a scheduler interface instead of embedding all timing logic directly.
+- PollyPM core depends on a scheduler interface instead of embedding all timing logic directly.
 - The default scheduler can support recurring refreshes, delayed retries, and scheduled PM jobs.
 - A future cron-compatible or external scheduler backend could replace the default one.
 

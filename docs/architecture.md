@@ -1,8 +1,8 @@
-# Prompt Master Architecture
+# PollyPM Architecture
 
 ## Goal
 
-Prompt Master orchestrates multiple interactive CLI agent sessions from one control plane without replacing the native tools. Every worker remains a real `claude`, `codex`, or future CLI session inside tmux. Prompt Master supervises those sessions, logs them, and assists the operator.
+PollyPM orchestrates multiple interactive CLI agent sessions from one control plane without replacing the native tools. Every worker remains a real `claude`, `codex`, or future CLI session inside tmux. PollyPM supervises those sessions, logs them, and assists the operator.
 
 ## Non-goals for MVP
 
@@ -14,7 +14,7 @@ Prompt Master orchestrates multiple interactive CLI agent sessions from one cont
 ## Core principles
 
 1. Tmux is the shared cockpit.
-2. Prompt Master is the supervisor and state authority.
+2. PollyPM is the supervisor and state authority.
 3. Providers are adapters, not the center of the design.
 4. Runtime isolation is a separate concern from provider behavior.
 5. Human takeover must always be possible.
@@ -44,7 +44,7 @@ Prompt Master orchestrates multiple interactive CLI agent sessions from one cont
 
 ## System components
 
-### 1. Prompt Master core
+### 1. PollyPM core
 
 Responsibilities:
 
@@ -91,7 +91,7 @@ Planned runtime:
 
 Tmux is the operator-facing execution surface.
 
-Prompt Master uses tmux for:
+PollyPM uses tmux for:
 
 - window creation
 - pane output logging
@@ -101,14 +101,14 @@ Prompt Master uses tmux for:
 
 Operational rule:
 
-- Prompt Master operational commands should run only from inside the `promptmaster` tmux session
+- PollyPM operational commands should run only from inside the `promptmaster` tmux session
 - startup is the exception: `pm up` may be run outside tmux to create or attach to the session
 
 Important rule:
 
 - only one active writer should control a worker pane at a time
 
-The lease model is implemented for manual control and input arbitration. Prompt Master records lease ownership and blocks conflicting input, stop, and recovery actions unless explicitly bypassed.
+The lease model is implemented for manual control and input arbitration. PollyPM records lease ownership and blocks conflicting input, stop, and recovery actions unless explicitly bypassed.
 
 ### 5. State store
 
@@ -119,11 +119,11 @@ SQLite tracks:
 - operational events
 - future heartbeat snapshots and alerts
 
-This gives Prompt Master a durable source of truth separate from the terminal UI.
+This gives PollyPM a durable source of truth separate from the terminal UI.
 
 ## Logging model
 
-Prompt Master should log three streams per worker:
+PollyPM should log three streams per worker:
 
 1. pane output stream via `tmux pipe-pane`
 2. supervisor-issued actions and injected prompts
@@ -133,7 +133,7 @@ This scaffold implements the first and the persistent event log foundation.
 
 ## Recovery model
 
-Prompt Master does not assume it can resume exact internal provider state. Recovery is defined as rebuilding a session from:
+PollyPM does not assume it can resume exact internal provider state. Recovery is defined as rebuilding a session from:
 
 - git/worktree state
 - session definition
@@ -143,16 +143,16 @@ Prompt Master does not assume it can resume exact internal provider state. Recov
 
 ## Configuration model
 
-Prompt Master config separates:
+PollyPM config separates:
 
 - `accounts`: credentials and isolation boundaries
 - `promptmaster`: control-plane account selection and failover policy
 - `sessions`: role and provider declarations
 
-Worker sessions should be modeled per project, and Prompt Master should enforce one active worker session per project at a time.
+Worker sessions should be modeled per project, and PollyPM should enforce one active worker session per project at a time.
 - `project`: shared tmux and storage settings
 
-This lets Prompt Master roles run on any provider:
+This lets PollyPM roles run on any provider:
 
 - session `heartbeat` can use `claude` today and `codex` tomorrow
 - session `operator` can switch independently
@@ -198,6 +198,6 @@ This lets Prompt Master roles run on any provider:
 
 The first version should answer one question well:
 
-Can Prompt Master reliably launch, log, inspect, and restart multiple native CLI agent sessions in tmux while preserving direct human control?
+Can PollyPM reliably launch, log, inspect, and restart multiple native CLI agent sessions in tmux while preserving direct human control?
 
 If the answer is yes, the higher-order project-management features are worth adding.

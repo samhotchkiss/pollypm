@@ -9,6 +9,7 @@ def test_load_example_config(tmp_path: Path) -> None:
 
     config = load_config(config_path)
 
+    assert config.project.name == "PollyPM"
     assert config.project.tmux_session == "promptmaster"
     assert config.project.workspace_root == Path.home() / "dev"
     assert config.promptmaster.controller_account == "codex_primary"

@@ -106,7 +106,7 @@ def test_new_worker_modal_prefills_default_prompt(tmp_path: Path) -> None:
             app.service.suggest_worker_prompt = lambda *, project_key: f"Scoped kickoff for {project_key}"  # type: ignore[method-assign]
             app._replace_table_rows(
                 app.projects_table,
-                [(("promptmaster", "Prompt Master", "git", "", str(tmp_path)), "promptmaster")],
+                [(("promptmaster", "PollyPM", "git", "", str(tmp_path)), "promptmaster")],
             )
             app.projects_table.move_cursor(row=0, animate=False, scroll=False)
 

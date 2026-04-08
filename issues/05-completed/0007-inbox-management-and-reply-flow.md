@@ -2,7 +2,7 @@
 
 ## Goal
 
-Define how Prompt Master inbox messages behave when the operator replies, how follow-up conversation threads are handled, and how those threads connect back to PM/PA sessions.
+Define how PollyPM inbox messages behave when the operator replies, how follow-up conversation threads are handled, and how those threads connect back to PM/PA sessions.
 
 ## Completed
 

@@ -1,8 +1,8 @@
-# Prompt Master Extensibility Architecture
+# PollyPM Extensibility Architecture
 
 ## Goal
 
-Make Prompt Master a pluggable orchestration platform instead of a fixed tmux/TUI app. The core should support:
+Make PollyPM a pluggable orchestration platform instead of a fixed tmux/TUI app. The core should support:
 
 - alternate frontends like a Web UI and Discord bot
 - replaceable memory backends
@@ -22,7 +22,7 @@ Make Prompt Master a pluggable orchestration platform instead of a fixed tmux/TU
 
 ## Core Shape
 
-Prompt Master should be split into five layers:
+PollyPM should be split into five layers:
 
 1. `core`
 2. `extension_host`
@@ -188,7 +188,7 @@ Interface should include:
 - cancel job
 - pause/resume job
 - list scheduled jobs
-- emit execution events back into Prompt Master
+- emit execution events back into PollyPM
 
 Typical jobs:
 
@@ -256,7 +256,7 @@ Normalized transcript event types:
 
 Purpose:
 
-- allow Prompt Master’s smart memory system to be swapped out
+- allow PollyPM’s smart memory system to be swapped out
 
 Default backend:
 
@@ -348,7 +348,7 @@ Interface should include:
 - attach handoff metadata
 - query next available task
 
-Prompt Master core should depend on this interface, not on folder paths directly.
+PollyPM core should depend on this interface, not on folder paths directly.
 
 ### Frontend Transport Plugin
 
@@ -367,7 +367,7 @@ Interface should include:
 - receive operator actions
 - present PM responses
 - subscribe to event stream
-- map identity/channel back to a Prompt Master operator identity
+- map identity/channel back to a PollyPM operator identity
 
 ### Skill / MCP Provider
 
@@ -392,7 +392,7 @@ This should support:
 
 ## Hook And Filter Architecture
 
-Prompt Master should expose lifecycle hooks with two modes:
+PollyPM should expose lifecycle hooks with two modes:
 
 - observers
 - filters
@@ -457,12 +457,12 @@ Filter return model should be explicit:
 
 ## Plugin Packaging And Discovery
 
-Prompt Master should support four plugin locations in precedence order:
+PollyPM should support four plugin locations in precedence order:
 
 1. repo-local plugins: `<project>/.promptmaster/plugins/`
 2. user-local plugins: `~/.config/promptmaster/plugins/`
 3. installed package plugins via Python entry points
-4. built-in plugins shipped with Prompt Master
+4. built-in plugins shipped with PollyPM
 
 Why this order:
 
@@ -498,7 +498,7 @@ Manifest fields:
 
 ## Stability Contract
 
-Prompt Master should expose a versioned plugin API, not random internal modules.
+PollyPM should expose a versioned plugin API, not random internal modules.
 
 Recommended structure:
 

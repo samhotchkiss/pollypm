@@ -45,6 +45,7 @@ from promptmaster.projects import (
 )
 from promptmaster.service_api import PromptMasterService
 from promptmaster.supervisor import Supervisor
+from promptmaster.task_backends import get_task_backend
 from promptmaster.worktrees import list_worktrees
 from promptmaster.workers import (
     remove_worker_session,
@@ -1106,7 +1107,9 @@ class PromptMasterApp(App[None]):
             if session.project == key and session.enabled
         ]
         worktrees = [item for item in list_worktrees(self.config_path, key) if item.status == "active"]
-        issues_dir = project_issues_dir(project.path)
+        task_backend = get_task_backend(project.path)
+        issues_dir = task_backend.issues_root()
+        state_counts = task_backend.state_counts() if task_backend.exists() else {}
         lines = [
             f"Key: {project.key}",
             f"Name: {project.name or project.key}",
@@ -1117,6 +1120,12 @@ class PromptMasterApp(App[None]):
             f"Active Worktrees: {len(worktrees)}",
             f"Sessions: {', '.join(sessions) if sessions else 'none'}",
         ]
+        if state_counts:
+            lines.append(
+                "Task States: "
+                + ", ".join(f"{state}={count}" for state, count in state_counts.items() if count)
+                or "Task States: empty"
+            )
         if worktrees:
             lines.extend(["", "Worktrees:"])
             lines.extend(f"- {item.lane_kind}/{item.lane_key}: {item.path}" for item in worktrees[:5])

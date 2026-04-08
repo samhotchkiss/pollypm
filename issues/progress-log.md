@@ -12,3 +12,4 @@
 - Added ready implementation issues for plugin host, service API/frontend transport, pluggable memory, pluggable task backend, and provider plugin SDK work.
 - Implemented the first plugin host with manifest discovery, built-in/user/repo precedence, API version checks, provider/runtime resolution, and safe observer/filter execution.
 - Started issue `0010` by adding a first `PromptMasterService` layer and migrating worker creation/launch plus session focus/input flows in the TUI onto it.
+- Started issue `0012` by extracting the default file issue tracker behind a task backend interface and routing tracker/scaffold/detail logic through it.

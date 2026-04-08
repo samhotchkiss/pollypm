@@ -12,6 +12,7 @@ import typer
 
 from promptmaster.config import load_config, write_config
 from promptmaster.models import KnownProject, ProjectKind
+from promptmaster.task_backends import get_task_backend
 
 
 DEFAULT_WORKSPACE_ROOT = Path.home() / "dev"
@@ -76,7 +77,7 @@ def project_worktrees_dir(project_path: Path) -> Path:
 
 
 def project_issues_dir(project_path: Path) -> Path:
-    return normalize_project_path(project_path) / "issues"
+    return get_task_backend(project_path).issues_root()
 
 
 def ensure_project_scaffold(project_path: Path) -> Path:
@@ -96,27 +97,9 @@ def ensure_project_scaffold(project_path: Path) -> Path:
 
 def scaffold_issue_tracker(project_path: Path) -> Path:
     project_root = normalize_project_path(project_path)
-    issues_dir = project_issues_dir(project_root)
     ensure_project_scaffold(project_root)
-    for name in [
-        "00-not-ready",
-        "01-ready",
-        "02-in-progress",
-        "03-needs-review",
-        "04-in-review",
-        "05-completed",
-    ]:
-        (issues_dir / name).mkdir(parents=True, exist_ok=True)
-    (issues_dir / ".latest_issue_number").write_text(
-        (issues_dir / ".latest_issue_number").read_text().strip() if (issues_dir / ".latest_issue_number").exists() else "0\n"
-    )
-    for file_name, default_content in {
-        "notes.md": "# Notes\n",
-        "progress-log.md": "# Progress Log\n",
-    }.items():
-        target = issues_dir / file_name
-        if not target.exists():
-            target.write_text(default_content)
+    backend = get_task_backend(project_root)
+    issues_dir = backend.ensure_tracker()
     instructions_target = issues_dir / "instructions.md"
     if TRACKER_TEMPLATE.exists() and not instructions_target.exists():
         shutil.copyfile(TRACKER_TEMPLATE, instructions_target)

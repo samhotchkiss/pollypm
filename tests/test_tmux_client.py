@@ -15,6 +15,13 @@ def test_current_window_index_returns_none_outside_tmux(monkeypatch) -> None:
     assert client.current_window_index() is None
 
 
+def test_current_pane_id_returns_none_outside_tmux(monkeypatch) -> None:
+    monkeypatch.delenv("TMUX", raising=False)
+    client = TmuxClient()
+
+    assert client.current_pane_id() is None
+
+
 def test_new_session_attached_invokes_tmux(monkeypatch) -> None:
     captured: dict[str, object] = {}
 

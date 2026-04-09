@@ -80,3 +80,26 @@ def test_codex_provider_exposes_transcript_sources_and_usage_snapshot(tmp_path: 
     assert snapshot.health == "healthy"
     assert snapshot.summary == "100% left"
     assert adapter.build_resume_command(session, account) is not None
+
+
+def test_codex_provider_uses_cli_prompt_for_fresh_launch(tmp_path: Path) -> None:
+    adapter = CodexAdapter()
+    account = AccountConfig(
+        name="codex_primary",
+        provider=ProviderKind.CODEX,
+        home=tmp_path / "home",
+    )
+    session = SessionConfig(
+        name="worker",
+        role="worker",
+        provider=ProviderKind.CODEX,
+        account="codex_primary",
+        cwd=tmp_path,
+        project="promptmaster",
+        prompt="Investigate the issue queue",
+    )
+
+    launch = adapter.build_launch_command(session, account)
+
+    assert launch.argv == ["codex"]
+    assert launch.initial_input == "Investigate the issue queue"

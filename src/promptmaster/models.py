@@ -22,9 +22,9 @@ class ProjectKind(StrEnum):
 
 @dataclass(slots=True)
 class ProjectSettings:
-    name: str = "promptmaster"
+    name: str = "PollyPM"
     root_dir: Path = Path(".")
-    tmux_session: str = "promptmaster"
+    tmux_session: str = "pollypm"
     workspace_root: Path = Path.home() / "dev"
     base_dir: Path = Path(".promptmaster")
     logs_dir: Path = Path(".promptmaster/logs")
@@ -101,3 +101,5 @@ class SessionLaunchSpec:
     log_path: Path
     command: str
     resume_marker: Path | None = None
+    initial_input: str | None = None
+    fresh_launch_marker: Path | None = None

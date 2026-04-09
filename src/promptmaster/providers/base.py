@@ -15,6 +15,8 @@ class LaunchCommand:
     cwd: Path
     resume_argv: list[str] | None = None
     resume_marker: Path | None = None
+    initial_input: str | None = None
+    fresh_launch_marker: Path | None = None
 
 
 class ProviderAdapter(Protocol):

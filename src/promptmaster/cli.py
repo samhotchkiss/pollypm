@@ -16,6 +16,7 @@ from promptmaster.accounts import (
     relogin_account,
     remove_account as remove_account_entry,
 )
+from promptmaster.cockpit_ui import PollyCockpitApp, PollyCockpitPaneApp, PollySettingsPaneApp
 from promptmaster.config import (
     DEFAULT_CONFIG_PATH,
     load_config,
@@ -34,10 +35,56 @@ from promptmaster.projects import (
 )
 from promptmaster.providers import get_provider
 from promptmaster.supervisor import Supervisor
+from promptmaster.tmux.client import TmuxClient
 from promptmaster.worktrees import list_worktrees as list_project_worktrees
 
 
 app = typer.Typer(help="PollyPM CLI", invoke_without_command=True, no_args_is_help=False)
+
+
+def _session_name_candidates() -> list[str]:
+    return ["pollypm", "promptmaster"]
+
+
+def _discover_config_path(config_path: Path) -> Path:
+    if config_path.exists() or config_path.is_absolute() or config_path != DEFAULT_CONFIG_PATH:
+        return config_path
+
+    for candidate_dir in [Path.cwd(), *Path.cwd().parents]:
+        candidate = candidate_dir / DEFAULT_CONFIG_PATH
+        if candidate.exists():
+            return candidate
+
+    tmux = TmuxClient()
+    for session_name in _session_name_candidates():
+        if not tmux.has_session(session_name):
+            continue
+        try:
+            windows = tmux.list_windows(session_name)
+        except Exception:  # noqa: BLE001
+            continue
+        for window in windows:
+            window_path = Path(window.pane_current_path)
+            for candidate_dir in [window_path, *window_path.parents]:
+                candidate = candidate_dir / DEFAULT_CONFIG_PATH
+                if candidate.exists():
+                    return candidate
+
+    return config_path
+
+
+def _attach_existing_session_without_config() -> bool:
+    tmux = TmuxClient()
+    current_tmux = tmux.current_session_name()
+    for session_name in _session_name_candidates():
+        if not tmux.has_session(session_name):
+            continue
+        if current_tmux == session_name:
+            return True
+        if current_tmux:
+            raise typer.Exit(code=tmux.switch_client(session_name))
+        raise typer.Exit(code=tmux.attach_session(session_name))
+    return False
 
 
 def _load_supervisor(config_path: Path) -> Supervisor:
@@ -81,8 +128,11 @@ def main(
     ctx: typer.Context,
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
+    config_path = _discover_config_path(config_path)
     if ctx.invoked_subcommand is None:
         if not config_path.exists():
+            if config_path == DEFAULT_CONFIG_PATH and _attach_existing_session_without_config():
+                return
             _first_run_setup_and_launch(config_path=config_path)
             return
         up(config_path=config_path)
@@ -231,6 +281,25 @@ def ui(
 
 
 @app.command()
+def cockpit(
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    PollyCockpitApp(config_path).run(mouse=True)
+
+
+@app.command("cockpit-pane")
+def cockpit_pane(
+    kind: str = typer.Argument(..., help="Pane type: inbox, settings, or project."),
+    target: str | None = typer.Argument(None, help="Optional project key for project panes."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    if kind == "settings":
+        PollySettingsPaneApp(config_path).run(mouse=True)
+        return
+    PollyCockpitPaneApp(config_path, kind, target).run(mouse=True)
+
+
+@app.command()
 def projects(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
@@ -355,7 +424,10 @@ def remove_account(
 def up(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
+    config_path = _discover_config_path(config_path)
     if not config_path.exists():
+        if config_path == DEFAULT_CONFIG_PATH and _attach_existing_session_without_config():
+            return
         typer.echo(f"Config not found at {config_path}. Starting onboarding.")
         onboard(config_path=config_path, force=False)
         return

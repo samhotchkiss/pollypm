@@ -27,6 +27,33 @@ def _normalize_project_display_name(key: str, name: str | None) -> str | None:
     return name
 
 
+def _normalize_tmux_session_name(name: str | None) -> str:
+    if name is None:
+        return "pollypm"
+    normalized = name.strip()
+    if normalized in {"", "promptmaster"}:
+        return "pollypm"
+    return normalized
+
+
+def _normalize_session_prompt(session_name: str, prompt: str | None) -> str | None:
+    if prompt is None:
+        return None
+    if session_name == "heartbeat" and (
+        "You are Prompt Master session 0." in prompt
+        or "You are PollyPM session 0," in prompt
+    ):
+        return heartbeat_prompt()
+    if session_name == "operator" and (
+        "You are Prompt Master session 1." in prompt
+        or "You are Polly, the PollyPM project manager, in session 1." in prompt
+    ):
+        return polly_prompt()
+    if "Read the Prompt Master issue queue" in prompt:
+        return prompt.replace("Prompt Master issue queue", "PollyPM issue queue")
+    return prompt
+
+
 def _resolve_path(base: Path, raw_path: str) -> Path:
     path = Path(raw_path)
     if path.is_absolute():
@@ -51,7 +78,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PromptMasterConfig:
     project = ProjectSettings(
         name=_normalize_project_display_name("promptmaster", project_raw.get("name")) or "PollyPM",
         root_dir=base,
-        tmux_session=project_raw.get("tmux_session", "promptmaster"),
+        tmux_session=_normalize_tmux_session_name(project_raw.get("tmux_session")),
         workspace_root=_resolve_path(base, project_raw.get("workspace_root", str(Path.home() / "dev"))),
         base_dir=base_dir,
         logs_dir=_resolve_path(base, project_raw.get("logs_dir", str(base_dir / "logs"))),
@@ -81,7 +108,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PromptMasterConfig:
             account=session_raw["account"],
             cwd=_resolve_path(base, session_raw.get("cwd", ".")),
             project=session_raw.get("project", "promptmaster"),
-            prompt=session_raw.get("prompt"),
+            prompt=_normalize_session_prompt(session_name, session_raw.get("prompt")),
             agent_profile=session_raw.get("agent_profile"),
             args=[str(arg) for arg in session_raw.get("args", [])],
             enabled=bool(session_raw.get("enabled", True)),
@@ -237,7 +264,7 @@ def render_example_config() -> str:
         project=ProjectSettings(
             name="PollyPM",
             root_dir=root,
-            tmux_session="promptmaster",
+            tmux_session="pollypm",
             workspace_root=Path.home() / "dev",
             base_dir=base_dir,
             logs_dir=base_dir / "logs",

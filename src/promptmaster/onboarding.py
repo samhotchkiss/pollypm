@@ -7,6 +7,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -532,9 +533,6 @@ def _wait_for_login_completion(
         if _login_completion_marker_seen(last_pane):
             return True, last_pane
 
-        if provider is ProviderKind.CLAUDE and _claude_prompt_ready(last_pane):
-            return True, last_pane
-
         if _detect_email_from_pane(provider, last_pane):
             return True, last_pane
         if allow_existing_auth_shortcut and _detect_account_email(provider, home):
@@ -665,21 +663,39 @@ def _run_login_window(
         _build_login_shell(
             provider,
             home,
-            return_to_caller=True,
             interactive=(provider is ProviderKind.CLAUDE),
             force_fresh_auth=force_fresh_auth,
         ),
         remain_on_exit=False,
     )
+    watch_result: dict[str, str | bool] = {"pane_text": "", "completed": False}
+
+    def _watch_for_completion() -> None:
+        completed, pane_text = _wait_for_login_completion(
+            tmux,
+            target=f"{temp_session}:0",
+            provider=provider,
+            home=home,
+            allow_existing_auth_shortcut=allow_existing_auth_shortcut,
+        )
+        watch_result["completed"] = completed
+        watch_result["pane_text"] = pane_text
+        if completed and tmux.has_session(temp_session):
+            tmux.kill_session(temp_session)
+
+    watcher = threading.Thread(target=_watch_for_completion, daemon=True)
+    watcher.start()
     raise_code = tmux.attach_session(temp_session)
+    watcher.join(timeout=1.0)
     if raise_code != 0:
         if tmux.has_session(temp_session):
             tmux.kill_session(temp_session)
         raise typer.Exit(code=raise_code)
 
-    pane_text = ""
+    pane_text = str(watch_result.get("pane_text") or "")
     if tmux.has_session(temp_session):
-        pane_text = tmux.capture_pane(f"{temp_session}:0", lines=200)
+        if not pane_text:
+            pane_text = tmux.capture_pane(f"{temp_session}:0", lines=200)
         tmux.kill_session(temp_session)
     return pane_text
 
@@ -787,9 +803,9 @@ def build_onboarded_config(
 
     return PromptMasterConfig(
         project=ProjectSettings(
-            name="pollypm",
+            name="PollyPM",
             root_dir=root_dir,
-            tmux_session="promptmaster",
+            tmux_session="pollypm",
             workspace_root=DEFAULT_WORKSPACE_ROOT,
             base_dir=base_dir,
             logs_dir=base_dir / "logs",

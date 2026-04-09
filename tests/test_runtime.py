@@ -32,9 +32,10 @@ def test_local_runtime_wraps_home_and_command(tmp_path: Path) -> None:
         ProjectSettings(root_dir=tmp_path),
     )
 
-    assert "export HOME=" not in wrapped
-    assert "export CODEX_HOME=" in wrapped
-    assert "codex --no-alt-screen hello" in wrapped
+    assert "CODEX_HOME" not in wrapped
+    assert "runtime_launcher" in wrapped
+    assert "promptmaster.runtime_launcher" in wrapped
+    assert "PYTHONPATH=" in wrapped
 
 
 def test_docker_runtime_mounts_workspace_and_home(tmp_path: Path) -> None:
@@ -98,9 +99,9 @@ def test_claude_runtime_sets_provider_native_config_dir(tmp_path: Path) -> None:
         ProjectSettings(root_dir=tmp_path),
     )
 
-    assert "export CLAUDE_CONFIG_DIR=" in wrapped
-    assert "export HOME=" not in wrapped
-    assert "claude --verbose 'watch the project'" in wrapped
+    assert "CLAUDE_CONFIG_DIR" not in wrapped
+    assert "promptmaster.runtime_launcher" in wrapped
+    assert "PYTHONPATH=" in wrapped
 
 
 def test_control_sessions_wrap_with_resume_fallback(tmp_path: Path) -> None:
@@ -124,6 +125,6 @@ def test_control_sessions_wrap_with_resume_fallback(tmp_path: Path) -> None:
     command = CodexAdapter().build_launch_command(session, account)
     wrapped = LocalRuntimeAdapter().wrap_command(command, account, ProjectSettings(root_dir=tmp_path))
 
-    assert "codex resume --last --no-alt-screen" in wrapped
-    assert "session-markers/operator.resume" in wrapped
-    assert "exec codex --no-alt-screen 'watch the project'" in wrapped
+    assert "promptmaster.runtime_launcher" in wrapped
+    assert "session-markers/operator.resume" not in wrapped
+    assert "history.jsonl" not in wrapped

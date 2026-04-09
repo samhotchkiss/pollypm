@@ -177,7 +177,7 @@ def test_session_detail_uses_role_specific_tmux_session(tmp_path: Path) -> None:
             self.targets: list[str] = []
 
         def has_session(self, name: str) -> bool:
-            return name == "promptmaster-heartbeat"
+            return name == "pollypm-storage-closet"
 
         def capture_pane(self, target: str, lines: int = 200) -> str:
             self.targets.append(target)
@@ -195,7 +195,7 @@ def test_session_detail_uses_role_specific_tmux_session(tmp_path: Path) -> None:
             return [launch]
 
         def _tmux_session_for_launch(self, _launch: SessionLaunchSpec) -> str:
-            return "promptmaster-heartbeat"
+            return "pollypm-storage-closet"
 
         def _window_map(self) -> dict[str, FakeWindow]:
             return {"pm-heartbeat": FakeWindow()}
@@ -204,7 +204,7 @@ def test_session_detail_uses_role_specific_tmux_session(tmp_path: Path) -> None:
     detail = app._session_detail(supervisor, "heartbeat")
 
     assert "heartbeat preview" in detail
-    assert supervisor.tmux.targets == ["promptmaster-heartbeat:pm-heartbeat"]
+    assert supervisor.tmux.targets == ["pollypm-storage-closet:pm-heartbeat"]
 
 
 def test_numeric_keys_switch_tabs_even_with_table_focus(tmp_path: Path) -> None:

@@ -12,6 +12,16 @@ class DockerRuntimeAdapter:
     workspace_mount = "/workspace"
     home_mount = "/home/promptmaster"
 
+    def _fresh_codex_cleanup(self, codex_home: str, resume_marker: str) -> str:
+        home = shlex.quote(codex_home)
+        return (
+            f"if [ ! -f {resume_marker} ]; then "
+            f"rm -f {home}/history.jsonl; "
+            f"rm -rf {home}/sessions {home}/shell_snapshots; "
+            f"find {home} -maxdepth 1 \\( -name 'logs_*.sqlite*' -o -name 'state_*.sqlite*' \\) -delete; "
+            f"fi"
+        )
+
     def _container_path_for_home_file(self, account: AccountConfig, path: Path) -> Path:
         if account.home is None:
             raise ValueError(f"Account {account.name} needs a persistent home for docker runtime")
@@ -52,16 +62,29 @@ class DockerRuntimeAdapter:
             inner_parts.append(
                 f"mkdir -p {shlex.quote(str(self._container_path_for_home_file(account, command.resume_marker).parent))}"
             )
+        if command.fresh_launch_marker is not None:
+            inner_parts.append(
+                f"mkdir -p {shlex.quote(str(self._container_path_for_home_file(account, command.fresh_launch_marker).parent))}"
+            )
         for key, value in env.items():
             inner_parts.append(f"export {key}={shlex.quote(value)}")
         if command.resume_argv and command.resume_marker is not None:
             resume_marker = self._container_path_for_home_file(account, command.resume_marker)
+            quoted_resume_marker = shlex.quote(str(resume_marker))
+            if command.fresh_launch_marker is not None:
+                inner_parts.append(f"rm -f {shlex.quote(str(self._container_path_for_home_file(account, command.fresh_launch_marker)))}")
+            if "CODEX_HOME" in env:
+                inner_parts.append(self._fresh_codex_cleanup(env["CODEX_HOME"], quoted_resume_marker))
             inner_parts.append(
-                f"if [ -f {shlex.quote(str(resume_marker))} ]; then {shlex.join(command.resume_argv)}; "
+                f"if [ -f {quoted_resume_marker} ]; then {shlex.join(command.resume_argv)}; "
                 f"_pm_status=$?; if [ $_pm_status -eq 0 ]; then exit 0; fi; fi"
             )
+            if command.fresh_launch_marker is not None:
+                inner_parts.append(f"touch {shlex.quote(str(self._container_path_for_home_file(account, command.fresh_launch_marker)))}")
             inner_parts.append(f"exec {shlex.join(command.argv)}")
         else:
+            if command.fresh_launch_marker is not None:
+                inner_parts.append(f"touch {shlex.quote(str(self._container_path_for_home_file(account, command.fresh_launch_marker)))}")
             inner_parts.append(f"exec {shlex.join(command.argv)}")
         inner = " && ".join(inner_parts)
 

@@ -1,3 +1,6 @@
+import base64
+import json
+import shlex
 from pathlib import Path
 
 from promptmaster.models import (
@@ -136,6 +139,7 @@ def test_heartbeat_uses_separate_tmux_session(monkeypatch, tmp_path: Path) -> No
     created_sessions: list[tuple[str, str, str]] = []
     created_windows: list[tuple[str, str, str]] = []
     piped_targets: list[str] = []
+    window_options: list[tuple[str, str, str]] = []
 
     monkeypatch.setattr(supervisor, "_probe_controller_account", lambda account_name: None)
     monkeypatch.setattr(supervisor, "_stabilize_launch", lambda launch, target: None)
@@ -144,12 +148,17 @@ def test_heartbeat_uses_separate_tmux_session(monkeypatch, tmp_path: Path) -> No
     monkeypatch.setattr(
         supervisor.tmux,
         "create_session",
-        lambda name, window_name, command: created_sessions.append((name, window_name, command)),
+        lambda name, window_name, command, **kwargs: created_sessions.append((name, window_name, command)),
     )
     monkeypatch.setattr(
         supervisor.tmux,
         "create_window",
         lambda name, window_name, command, detached=False: created_windows.append((name, window_name, command, detached)),
+    )
+    monkeypatch.setattr(
+        supervisor.tmux,
+        "set_window_option",
+        lambda target, option, value: window_options.append((target, option, value)),
     )
     monkeypatch.setattr(supervisor.tmux, "pipe_pane", lambda target, path: piped_targets.append(target))
     monkeypatch.setattr(supervisor, "ensure_console_window", lambda: None)
@@ -158,11 +167,14 @@ def test_heartbeat_uses_separate_tmux_session(monkeypatch, tmp_path: Path) -> No
     controller = supervisor.bootstrap_tmux()
 
     assert controller == "claude_controller"
-    assert created_sessions[0][0] == config.project.tmux_session
-    assert created_sessions[0][1] == "pm-operator"
-    assert created_sessions[1][0] == supervisor.heartbeat_tmux_session_name()
-    assert created_sessions[1][1] == "pm-heartbeat"
-    assert piped_targets == [f"{config.project.tmux_session}:0", f"{supervisor.heartbeat_tmux_session_name()}:0"]
+    assert created_sessions[0][0] == supervisor.storage_closet_session_name()
+    assert created_sessions[0][1] == "pm-heartbeat"
+    assert created_sessions[1][0] == config.project.tmux_session
+    assert created_sessions[1][1] == supervisor.console_window_name()
+    assert piped_targets == [f"{supervisor.storage_closet_session_name()}:0", f"{supervisor.storage_closet_session_name()}:pm-operator"]
+    assert (f"{supervisor.storage_closet_session_name()}:0", "focus-events", "on") in window_options
+    assert (f"{supervisor.storage_closet_session_name()}:pm-operator", "focus-events", "on") in window_options
+    assert (f"{config.project.tmux_session}:{supervisor.console_window_name()}", "focus-events", "on") in window_options
 
 
 def test_launch_session_creates_worker_window_detached(monkeypatch, tmp_path: Path) -> None:
@@ -187,6 +199,7 @@ def test_launch_session_creates_worker_window_detached(monkeypatch, tmp_path: Pa
         "create_window",
         lambda name, window_name, command, detached=False: created_windows.append((name, window_name, command, detached)),
     )
+    monkeypatch.setattr(supervisor.tmux, "set_window_option", lambda target, option, value: None)
     monkeypatch.setattr(supervisor.tmux, "pipe_pane", lambda target, path: None)
     monkeypatch.setattr(supervisor, "_record_launch", lambda launch: None)
     monkeypatch.setattr(supervisor, "_stabilize_launch", lambda launch, target: None)
@@ -194,7 +207,7 @@ def test_launch_session_creates_worker_window_detached(monkeypatch, tmp_path: Pa
     supervisor.launch_session("worker")
 
     assert len(created_windows) == 1
-    assert created_windows[0][0] == config.project.tmux_session
+    assert created_windows[0][0] == supervisor.storage_closet_session_name()
     assert created_windows[0][1] == "worker-promptmaster"
     assert created_windows[0][3] is True
 
@@ -235,6 +248,39 @@ def test_control_sessions_use_dedicated_control_homes(tmp_path: Path) -> None:
     assert (operator_home / ".claude" / ".credentials.json").exists()
     assert launches["heartbeat"].resume_marker == heartbeat_home / ".promptmaster" / "session-markers" / "heartbeat.resume"
     assert launches["operator"].resume_marker == operator_home / ".promptmaster" / "session-markers" / "operator.resume"
+
+
+def test_codex_control_home_syncs_global_state(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.accounts["codex_backup"] = AccountConfig(
+        name="codex_backup",
+        provider=ProviderKind.CODEX,
+        email="codex@example.com",
+        home=tmp_path / ".promptmaster" / "homes" / "codex_backup",
+    )
+    config.sessions["operator"] = SessionConfig(
+        name="operator",
+        role="operator-pm",
+        provider=ProviderKind.CODEX,
+        account="codex_backup",
+        cwd=tmp_path,
+        project="promptmaster",
+        prompt="watch the project",
+        window_name="pm-operator",
+    )
+    source_home = config.accounts["codex_backup"].home
+    assert source_home is not None
+    (source_home / ".codex").mkdir(parents=True, exist_ok=True)
+    (source_home / ".codex" / "auth.json").write_text('{"token":"base"}\n')
+    (source_home / ".codex" / "config.toml").write_text('model = "gpt-5.4"\n')
+    (source_home / ".codex" / ".codex-global-state.json").write_text('{"thread-horizontal:split-left-width":0.5}\n')
+
+    supervisor = Supervisor(config)
+    launches = {launch.session.name: launch for launch in supervisor.plan_launches()}
+    operator_home = launches["operator"].account.home
+    assert operator_home is not None
+
+    assert (operator_home / ".codex" / ".codex-global-state.json").exists()
 
 
 def test_control_sessions_use_agent_profiles_for_prompts(tmp_path: Path) -> None:
@@ -308,6 +354,76 @@ def test_codex_stabilizer_accepts_mixed_case_banner(monkeypatch, tmp_path: Path)
     monkeypatch.setattr("time.sleep", lambda _seconds: None)
 
     supervisor._stabilize_codex_launch("promptmaster:0")
+
+
+def test_codex_stabilizer_accepts_active_working_state(monkeypatch, tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    pane = """
+╭───────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.118.0)            │
+│ model:     gpt-5.4                    │
+╰───────────────────────────────────────╯
+
+• Working (12s • esc to interrupt)
+
+› Implement {feature}
+""".strip()
+    monkeypatch.setattr(supervisor.tmux, "capture_pane", lambda target, lines=260: pane)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+
+    supervisor._stabilize_codex_launch("promptmaster:0")
+
+
+def test_codex_control_launches_use_agents_md_instead_of_visible_prompt(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.sessions["operator"] = SessionConfig(
+        name="operator",
+        role="operator-pm",
+        provider=ProviderKind.CODEX,
+        account="codex_backup",
+        cwd=tmp_path,
+        project="promptmaster",
+        prompt="x" * 400,
+        window_name="pm-operator",
+    )
+    supervisor = Supervisor(config)
+
+    launch = next(item for item in supervisor.plan_launches() if item.session.name == "operator")
+
+    payload = shlex.split(launch.command)[-1]
+    raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+    decoded = json.loads(raw.decode("utf-8"))
+    argv = decoded["argv"]
+    env = decoded["env"]
+
+    assert argv[-1] == "--dangerously-bypass-approvals-and-sandbox"
+    assert "PM_CODEX_HOME_AGENTS_MD" in env
+    assert "Polly" in env["PM_CODEX_HOME_AGENTS_MD"]
+    assert launch.initial_input is None
+
+
+def test_codex_worker_launches_still_use_compact_prompt_argument(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.sessions["worker"] = SessionConfig(
+        name="worker",
+        role="worker",
+        provider=ProviderKind.CODEX,
+        account="codex_backup",
+        cwd=tmp_path,
+        project="promptmaster",
+        prompt="x" * 400,
+        window_name="worker-promptmaster",
+    )
+    supervisor = Supervisor(config)
+
+    launch = next(item for item in supervisor.plan_launches() if item.session.name == "worker")
+    payload = shlex.split(launch.command)[-1]
+    raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+    decoded = json.loads(raw.decode("utf-8"))
+
+    assert decoded["argv"][-1].startswith("Read .promptmaster/control-prompts/worker.md")
+    assert launch.initial_input is None
 
 
 def test_switch_session_account_restarts_in_place(monkeypatch, tmp_path: Path) -> None:

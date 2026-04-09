@@ -16,7 +16,7 @@ def test_service_create_and_launch_worker_uses_worker_api(monkeypatch, tmp_path:
             return True
 
     class FakeConfigProject:
-        tmux_session = "promptmaster"
+        tmux_session = "pollypm"
 
     class FakeConfig:
         project = FakeConfigProject()

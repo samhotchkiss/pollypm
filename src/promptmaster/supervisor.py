@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import shlex
 import shutil
@@ -29,8 +30,8 @@ from promptmaster.tmux.client import TmuxClient, TmuxWindow
 
 class Supervisor:
     _CONTROL_ROLES = {"heartbeat-supervisor", "operator-pm"}
-    _CONSOLE_WINDOW = "pm-control"
-    _HEARTBEAT_SESSION_SUFFIX = "-heartbeat"
+    _CONSOLE_WINDOW = "PollyPM"
+    _STORAGE_CLOSET_SESSION_SUFFIX = "-storage-closet"
     _CONTROL_HOMES_DIR = "control-homes"
     _RECOVERY_WINDOW = timedelta(minutes=30)
     _RECOVERY_LIMIT = 5
@@ -99,13 +100,14 @@ class Supervisor:
             )
         )
 
+    def storage_closet_session_name(self) -> str:
+        return f"{self.config.project.tmux_session}{self._STORAGE_CLOSET_SESSION_SUFFIX}"
+
     def heartbeat_tmux_session_name(self) -> str:
-        return f"{self.config.project.tmux_session}{self._HEARTBEAT_SESSION_SUFFIX}"
+        return self.storage_closet_session_name()
 
     def _tmux_session_for_role(self, role: str) -> str:
-        if role == "heartbeat-supervisor":
-            return self.heartbeat_tmux_session_name()
-        return self.config.project.tmux_session
+        return self.storage_closet_session_name()
 
     def _tmux_session_for_launch(self, launch: SessionLaunchSpec) -> str:
         return self._tmux_session_for_role(launch.session.role)
@@ -116,9 +118,9 @@ class Supervisor:
 
     def _all_tmux_session_names(self) -> list[str]:
         names = [self.config.project.tmux_session]
-        heartbeat = self.heartbeat_tmux_session_name()
-        if heartbeat not in names:
-            names.append(heartbeat)
+        storage = self.storage_closet_session_name()
+        if storage not in names:
+            names.append(storage)
         return names
 
     def plan_launches(self, *, controller_account: str | None = None) -> list[SessionLaunchSpec]:
@@ -144,6 +146,16 @@ class Supervisor:
                 )
             provider = get_provider(effective.provider, root_dir=self.config.project.root_dir)
             launch = provider.build_launch_command(effective, account)
+            if effective.provider is ProviderKind.CODEX and effective.role in self._CONTROL_ROLES and launch.initial_input:
+                env = dict(launch.env)
+                env["PM_CODEX_HOME_AGENTS_MD"] = launch.initial_input
+                launch = replace(launch, env=env, initial_input=None)
+            elif effective.provider is ProviderKind.CODEX and launch.initial_input:
+                launch = replace(
+                    launch,
+                    argv=[*launch.argv, self._prepare_initial_input(effective.name, launch.initial_input)],
+                    initial_input=None,
+                )
             runtime = get_runtime(account.runtime, root_dir=self.config.project.root_dir)
             window_name = effective.window_name or effective.name
             log_path = self.config.project.logs_dir / f"{window_name}.log"
@@ -155,6 +167,8 @@ class Supervisor:
                     log_path=log_path,
                     command=runtime.wrap_command(launch, account, self.config.project),
                     resume_marker=launch.resume_marker,
+                    initial_input=launch.initial_input,
+                    fresh_launch_marker=launch.fresh_launch_marker,
                 )
             )
         return launches
@@ -189,44 +203,35 @@ class Supervisor:
         raise RuntimeError("PollyPM could not launch any controller account: " + "; ".join(failures))
 
     def _bootstrap_launches(self, session_name: str, launches: list[SessionLaunchSpec]) -> None:
-        grouped: dict[str, list[SessionLaunchSpec]] = {}
-        for launch in launches:
-            grouped.setdefault(self._tmux_session_for_launch(launch), []).append(launch)
-
-        main_launches = grouped.get(session_name, [])
-        if not main_launches:
-            raise RuntimeError("No main-session launches found for PollyPM bootstrap")
-
-        first = main_launches[0]
-        self.tmux.create_session(session_name, first.window_name, first.command)
-        self.tmux.pipe_pane(f"{session_name}:0", first.log_path)
-        self._record_launch(first)
-        self._stabilize_launch(first, f"{session_name}:0")
-
-        for launch in main_launches[1:]:
-            self.tmux.create_window(session_name, launch.window_name, launch.command, detached=True)
-            target = f"{session_name}:{launch.window_name}"
-            self.tmux.pipe_pane(target, launch.log_path)
-            self._record_launch(launch)
-            self._stabilize_launch(launch, target)
-
-        for tmux_session, session_launches in grouped.items():
-            if tmux_session == session_name:
-                continue
-            first = session_launches[0]
-            self.tmux.create_session(tmux_session, first.window_name, first.command)
-            self.tmux.pipe_pane(f"{tmux_session}:0", first.log_path)
+        storage_session = self.storage_closet_session_name()
+        (self.config.project.base_dir / "cockpit_state.json").unlink(missing_ok=True)
+        if launches:
+            first = launches[0]
+            self.tmux.create_session(storage_session, first.window_name, first.command)
+            self.tmux.set_window_option(f"{storage_session}:0", "allow-passthrough", "on")
+            self.tmux.set_window_option(f"{storage_session}:0", "focus-events", "on")
+            self.tmux.pipe_pane(f"{storage_session}:0", first.log_path)
             self._record_launch(first)
-            self._stabilize_launch(first, f"{tmux_session}:0")
-            for launch in session_launches[1:]:
-                self.tmux.create_window(tmux_session, launch.window_name, launch.command, detached=True)
-                target = f"{tmux_session}:{launch.window_name}"
+            self._stabilize_launch(first, f"{storage_session}:0")
+            for launch in launches[1:]:
+                self.tmux.create_window(storage_session, launch.window_name, launch.command, detached=True)
+                target = f"{storage_session}:{launch.window_name}"
+                self.tmux.set_window_option(target, "allow-passthrough", "on")
+                self.tmux.set_window_option(target, "focus-events", "on")
                 self.tmux.pipe_pane(target, launch.log_path)
                 self._record_launch(launch)
                 self._stabilize_launch(launch, target)
-
-        self.ensure_console_window()
+        self.tmux.create_session(session_name, self._CONSOLE_WINDOW, self._console_command(), remain_on_exit=False)
+        self.tmux.set_window_option(f"{session_name}:{self._CONSOLE_WINDOW}", "allow-passthrough", "on")
+        self.tmux.set_window_option(f"{session_name}:{self._CONSOLE_WINDOW}", "focus-events", "on")
+        self.tmux.set_window_option(f"{session_name}:{self._CONSOLE_WINDOW}", "window-size", "latest")
+        self.tmux.set_window_option(f"{session_name}:{self._CONSOLE_WINDOW}", "aggressive-resize", "on")
         self.focus_console()
+
+    def shutdown_tmux(self) -> None:
+        for session_name in reversed(self._all_tmux_session_names()):
+            if self.tmux.has_session(session_name):
+                self.tmux.kill_session(session_name)
 
     def _record_launch(self, launch: SessionLaunchSpec) -> None:
         self.store.upsert_session(
@@ -265,7 +270,43 @@ class Supervisor:
                 continue
             for window in self.tmux.list_windows(session_name):
                 windows[window.name] = window
+        mounted = self._mounted_window_override()
+        if mounted is not None:
+            windows[mounted.name] = mounted
         return windows
+
+    def _mounted_window_override(self) -> TmuxWindow | None:
+        state_path = self.config.project.base_dir / "cockpit_state.json"
+        if not state_path.exists():
+            return None
+        try:
+            data = json.loads(state_path.read_text())
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(data, dict):
+            return None
+        mounted_session = data.get("mounted_session")
+        if not isinstance(mounted_session, str) or not mounted_session:
+            return None
+        launch = self._launch_by_session(mounted_session)
+        target = f"{self.config.project.tmux_session}:{self._CONSOLE_WINDOW}"
+        try:
+            panes = self.tmux.list_panes(target)
+        except Exception:  # noqa: BLE001
+            return None
+        if len(panes) < 2:
+            return None
+        right_pane = max(panes, key=lambda pane: pane.pane_left)
+        return TmuxWindow(
+            session=self.config.project.tmux_session,
+            index=0,
+            name=launch.window_name,
+            active=True,
+            pane_id=right_pane.pane_id,
+            pane_current_command=right_pane.pane_current_command,
+            pane_current_path=right_pane.pane_current_path,
+            pane_dead=right_pane.pane_dead,
+        )
 
     def status(self) -> tuple[list[SessionLaunchSpec], list[TmuxWindow], list[AlertRecord], list[LeaseRecord], list[str]]:
         launches = self.plan_launches()
@@ -320,6 +361,9 @@ class Supervisor:
         if self._CONSOLE_WINDOW in self._window_map():
             return
         self.tmux.create_window(tmux_session, self._CONSOLE_WINDOW, self._console_command(), detached=True)
+        self.tmux.set_window_option(f"{tmux_session}:{self._CONSOLE_WINDOW}", "allow-passthrough", "on")
+        self.tmux.set_window_option(f"{tmux_session}:{self._CONSOLE_WINDOW}", "window-size", "latest")
+        self.tmux.set_window_option(f"{tmux_session}:{self._CONSOLE_WINDOW}", "aggressive-resize", "on")
 
     def focus_console(self) -> None:
         tmux_session = self.config.project.tmux_session
@@ -940,9 +984,11 @@ class Supervisor:
         if not self.tmux.has_session(tmux_session):
             self.tmux.create_session(tmux_session, launch.window_name, launch.command)
             target = f"{tmux_session}:0"
+            self.tmux.set_window_option(target, "allow-passthrough", "on")
         else:
             self.tmux.create_window(tmux_session, launch.window_name, launch.command, detached=True)
             target = f"{tmux_session}:{launch.window_name}"
+            self.tmux.set_window_option(target, "allow-passthrough", "on")
         self.tmux.pipe_pane(target, launch.log_path)
         self._record_launch(launch)
         self._stabilize_launch(launch, target)
@@ -1013,7 +1059,7 @@ class Supervisor:
 
     def _console_command(self) -> str:
         root = shlex.quote(str(self.config.project.root_dir))
-        return f"sh -lc 'cd {root} && uv run pm ui'"
+        return f"sh -lc 'cd {root} && uv run pm cockpit'"
 
     def _controller_candidates(self) -> list[str]:
         ordered = [self.config.promptmaster.controller_account, *self.config.promptmaster.failover_accounts]
@@ -1097,6 +1143,7 @@ class Supervisor:
             self._sync_file(source_home / ".claude" / "settings.json", target_home / ".claude" / "settings.json")
             _prime_claude_home(target_home)
         elif account.provider is ProviderKind.CODEX:
+            self._sync_file(source_home / ".codex" / ".codex-global-state.json", target_home / ".codex" / ".codex-global-state.json")
             self._sync_file(source_home / ".codex" / "auth.json", target_home / ".codex" / "auth.json")
             self._sync_file(source_home / ".codex" / "config.toml", target_home / ".codex" / "config.toml")
 
@@ -1113,6 +1160,7 @@ class Supervisor:
             self._stabilize_claude_launch(target)
         elif launch.session.provider is ProviderKind.CODEX:
             self._stabilize_codex_launch(target)
+        self._send_initial_input_if_fresh(launch, target)
         self._mark_session_resume_ready(launch)
 
     def _mark_session_resume_ready(self, launch: SessionLaunchSpec) -> None:
@@ -1121,6 +1169,30 @@ class Supervisor:
             return
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(datetime.now(UTC).isoformat().replace("+00:00", "Z") + "\n")
+
+    def _send_initial_input_if_fresh(self, launch: SessionLaunchSpec, target: str) -> None:
+        initial_input = launch.initial_input
+        fresh_marker = launch.fresh_launch_marker
+        if not initial_input or fresh_marker is None or not fresh_marker.exists():
+            return
+        kickoff = self._prepare_initial_input(launch.session.name, initial_input)
+        self.tmux.send_keys(target, kickoff)
+        fresh_marker.unlink(missing_ok=True)
+
+    def _prepare_initial_input(self, session_name: str, initial_input: str) -> str:
+        if len(initial_input) <= 280:
+            return initial_input
+        prompts_dir = self.config.project.base_dir / "control-prompts"
+        prompts_dir.mkdir(parents=True, exist_ok=True)
+        prompt_path = prompts_dir / f"{session_name}.md"
+        prompt_path.write_text(initial_input.rstrip() + "\n")
+        try:
+            display_path = prompt_path.relative_to(self.config.project.root_dir)
+        except ValueError:
+            display_path = prompt_path
+        return (
+            f'Read {display_path}, adopt it as your operating instructions, reply only "ready", then wait.'
+        )
 
     def _stabilize_claude_launch(self, target: str) -> None:
         deadline = time.monotonic() + 90
@@ -1173,6 +1245,7 @@ class Supervisor:
     def _stabilize_codex_launch(self, target: str) -> None:
         deadline = time.monotonic() + 60
         last_action = ""
+        ready_streak = 0
         while time.monotonic() < deadline:
             pane = self.tmux.capture_pane(target, lines=260)
             lowered = pane.lower()
@@ -1197,8 +1270,16 @@ class Supervisor:
                     last_action = "trust"
                 time.sleep(1)
                 continue
-            if "openai codex" in lowered and ("model:" in lowered or "working" in lowered or "›" in pane):
-                return
+            prompt_visible = "% left" in lowered or "›" in pane
+            working = "working (" in lowered and "esc to interrupt" in lowered
+            booting = "booting mcp server" in lowered
+            if "openai codex" in lowered and (prompt_visible or working) and not booting:
+                ready_streak += 1
+                if ready_streak >= 2:
+                    return
+                time.sleep(1)
+                continue
+            ready_streak = 0
             time.sleep(1)
 
         raise RuntimeError("Codex did not reach an interactive prompt in time")

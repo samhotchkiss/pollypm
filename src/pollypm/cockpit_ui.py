@@ -550,18 +550,7 @@ class PollyCockpitPaneApp(App[None]):
         background: #111820;
         padding: 1 2;
     }
-    #launch-row {
-        height: auto;
-        padding-top: 1;
-    }
-    #launch-btn {
-        min-width: 24;
-    }
     """
-
-    BINDINGS = [
-        Binding("n", "launch_worker", "New Worker"),
-    ]
 
     def __init__(self, config_path: Path, kind: str, target: str | None = None) -> None:
         super().__init__()
@@ -569,12 +558,9 @@ class PollyCockpitPaneApp(App[None]):
         self.kind = kind
         self.target = target
         self.body = Static("", id="body")
-        self.launch_row = Horizontal(id="launch-row")
-        self._launch_btn: Button | None = None
 
     def compose(self) -> ComposeResult:
         yield self.body
-        yield self.launch_row
 
     def on_mount(self) -> None:
         self._refresh()
@@ -582,36 +568,6 @@ class PollyCockpitPaneApp(App[None]):
 
     def _refresh(self) -> None:
         self.body.update(build_cockpit_detail(self.config_path, self.kind, self.target))
-        if self.kind == "project" and self.target and self._launch_btn is None:
-            self._launch_btn = Button(
-                "\u25b6  Launch Worker Session",
-                id="launch-btn",
-                variant="success",
-            )
-            self.launch_row.mount(self._launch_btn)
-
-    def action_launch_worker(self) -> None:
-        self._do_launch()
-
-    @on(Button.Pressed, "#launch-btn")
-    def on_launch_pressed(self, event: Button.Pressed) -> None:
-        self._do_launch()
-
-    def _do_launch(self) -> None:
-        if self.kind != "project" or not self.target:
-            return
-        self.body.update("Launching worker session...")
-        try:
-            subprocess.run(
-                ["uv", "run", "pm", "new-worker", self.target],
-                cwd=str(self.config_path.parent),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        self._refresh()
 
 
 class PollySettingsPaneApp(App[None]):

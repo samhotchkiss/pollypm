@@ -242,8 +242,19 @@ class CockpitRouter:
             self.tmux.select_pane(right_pane)
 
     def create_worker_and_route(self, project_key: str) -> None:
-        prompt = self.service.suggest_worker_prompt(project_key=project_key)
-        self.service.create_and_launch_worker(project_key=project_key, prompt=prompt)
+        supervisor = self._load_supervisor()
+        launches = supervisor.plan_launches()
+        session_name = self._project_session_map(launches).get(project_key)
+        storage_session = supervisor.storage_closet_session_name()
+        storage_windows = {w.name for w in self.tmux.list_windows(storage_session)}
+
+        if session_name is not None:
+            launch = next(l for l in launches if l.session.name == session_name)
+            if launch.window_name not in storage_windows:
+                supervisor.launch_session(session_name)
+        else:
+            prompt = self.service.suggest_worker_prompt(project_key=project_key)
+            self.service.create_and_launch_worker(project_key=project_key, prompt=prompt)
         self.route_selected(f"project:{project_key}")
 
     def _show_live_session(self, supervisor: Supervisor, session_name: str, window_target: str) -> None:

@@ -94,6 +94,7 @@ class CockpitRouter:
             CockpitItem("inbox", f"Inbox ({inbox_count})", "mail" if inbox_count else "clear"),
         ]
 
+        selected = self.selected_key()
         project_session_map = self._project_session_map(launches)
         for project_key, project in config.projects.items():
             session_name = project_session_map.get(project_key)
@@ -102,6 +103,10 @@ class CockpitRouter:
             else:
                 state = self._session_state(session_name, launches, windows, alerts, spinner_index)
             items.append(CockpitItem(f"project:{project_key}", project.name or project.key, state))
+            # Unfold sub-items for the selected project
+            if selected.startswith(f"project:{project_key}"):
+                items.append(CockpitItem(f"project:{project_key}:settings", "  Settings", "sub"))
+                items.append(CockpitItem(f"project:{project_key}:issues", "  Issues", "sub"))
 
         items.append(CockpitItem("settings", "Settings", "config"))
         return items
@@ -249,7 +254,12 @@ class CockpitRouter:
             self._show_static_view(supervisor, window_target, "settings")
             return
         if key.startswith("project:"):
-            project_key = key.split(":", 1)[1]
+            parts = key.split(":")
+            project_key = parts[1]
+            sub_view = parts[2] if len(parts) > 2 else None
+            if sub_view in ("settings", "issues"):
+                self._show_static_view(supervisor, window_target, sub_view, project_key)
+                return
             launches = supervisor.plan_launches()
             session_name = self._project_session_map(launches).get(project_key)
             if session_name is not None and self._session_available_for_mount(supervisor, session_name, window_target):
@@ -556,6 +566,27 @@ def _build_cockpit_detail_inner(config_path: Path, kind: str, target: str | None
             for state, count in state_counts.items():
                 if count:
                     lines.append(f"- {state}: {count}")
+        return "\n".join(lines)
+
+    if kind == "issues" and target:
+        project = config.projects.get(target)
+        if not project:
+            return f"Project '{target}' not found."
+        task_backend = get_task_backend(project.path)
+        if not task_backend.exists():
+            return f"{project.name or project.key} · Issues\n\nNo issue tracker initialized.\nUse `pm init-tracker {target}` to create one."
+        state_counts = task_backend.state_counts()
+        lines = [f"{project.name or project.key} · Issues", ""]
+        for state_name in ["01-ready", "02-in-progress", "03-needs-review", "04-done", "05-completed"]:
+            count = state_counts.get(state_name, 0)
+            if count:
+                tasks = task_backend.list_tasks(states=[state_name])
+                lines.append(f"─── {state_name} ({count}) ───")
+                for task in tasks[:8]:
+                    lines.append(f"  {task.task_id}: {task.title}")
+                lines.append("")
+        if not any(state_counts.values()):
+            lines.append("No issues found.")
         return "\n".join(lines)
 
     return "PollyPM\n\nSelect Polly, Inbox, a project, or Settings from the left rail."

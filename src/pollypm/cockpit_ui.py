@@ -207,6 +207,8 @@ class RailItem(ListItem):
             if "(" in label and not label.endswith("(0)"):
                 return "\u25c6", "#f0c45a"
             return "\u25c7", "#4a5568"
+        if self.item.state == "sub":
+            return " ", "#4a5568"
         return "\u25cb", "#4a5568"
 
 

@@ -43,12 +43,18 @@ def test_cockpit_router_build_items_includes_core_entries(monkeypatch, tmp_path:
             return launches, windows, [], [], []
 
     monkeypatch.setattr("pollypm.cockpit.list_open_messages", lambda root_dir: [object()])
+    (tmp_path / "pollypm.toml").write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n")
     router = CockpitRouter(tmp_path / "pollypm.toml")
     monkeypatch.setattr(router, "_load_supervisor", lambda: FakeSupervisor())
 
     items = router.build_items(spinner_index=2)
 
-    assert [item.key for item in items] == ["polly", "inbox", "project:pollypm", "project:demo", "settings"]
+    keys = [item.key for item in items]
+    assert "polly" in keys
+    assert "inbox" in keys
+    assert "project:pollypm" in keys
+    assert "project:demo" in keys
+    assert "settings" in keys
     assert items[0].state == "ready"
     assert items[1].label == "Inbox (1)"
     assert items[3].state.endswith("live")

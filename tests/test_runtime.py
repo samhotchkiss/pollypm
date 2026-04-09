@@ -35,7 +35,6 @@ def test_local_runtime_wraps_home_and_command(tmp_path: Path) -> None:
     assert "CODEX_HOME" not in wrapped
     assert "runtime_launcher" in wrapped
     assert "pollypm.runtime_launcher" in wrapped
-    assert "PYTHONPATH=" in wrapped
 
 
 def test_docker_runtime_mounts_workspace_and_home(tmp_path: Path) -> None:
@@ -101,7 +100,6 @@ def test_claude_runtime_sets_provider_native_config_dir(tmp_path: Path) -> None:
 
     assert "CLAUDE_CONFIG_DIR" not in wrapped
     assert "pollypm.runtime_launcher" in wrapped
-    assert "PYTHONPATH=" in wrapped
 
 
 def test_control_sessions_wrap_with_resume_fallback(tmp_path: Path) -> None:

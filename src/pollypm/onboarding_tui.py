@@ -500,7 +500,15 @@ class OnboardingApp(App[Path | None]):
         self.step_host.mount(stage)
         default_choice = self.state.controller_account or default_controller_account(self.state.accounts)
         self.state.controller_account = default_choice
-        self.controller_radio = RadioSet(id="controller-radio")
+        radio_buttons = [
+            RadioButton(
+                _display_label(account),
+                value=account_name == default_choice,
+                id=f"controller-{account_name}",
+            )
+            for account_name, account in self.state.accounts.items()
+        ]
+        self.controller_radio = RadioSet(*radio_buttons, id="controller-radio")
         self.failover_checkbox = Checkbox(
             "Fail over automatically if the control account becomes unavailable",
             value=self.state.failover_enabled and len(self.state.accounts) > 1,
@@ -522,14 +530,6 @@ class OnboardingApp(App[Path | None]):
             )
         )
         control_section.mount(self.controller_radio)
-        for account_name, account in self.state.accounts.items():
-            self.controller_radio.mount(
-                RadioButton(
-                    _display_label(account),
-                    value=account_name == default_choice,
-                    id=f"controller-{account_name}",
-                )
-            )
         control_section.mount(
             Static(
                 "By default, PollyPM can launch sessions in permissive mode so agents can keep moving without repeated approval prompts."
@@ -610,33 +610,54 @@ class OnboardingApp(App[Path | None]):
         actions.mount(Button(finish_label, id="projects-finish", variant="success"))
 
     def _render_tour_step(self) -> None:
-        self.eyebrow_widget.update("Launch")
-        self.title_widget.update("PollyPM is ready")
-        self.intro_widget.update(
-            "Setup is complete. Launch PollyPM and you will land in the control room with Polly and heartbeat already online."
-        )
+        self.eyebrow_widget.update("Ready to launch")
+        self.title_widget.update("Your cockpit is ready")
+        self.intro_widget.update("")
         stage = Vertical(classes="stage")
         self.step_host.mount(stage)
 
-        section = Vertical(classes="section")
-        stage.mount(section)
-        section.mount(Static("Quick Tour", classes="section-title"))
+        # ── What you'll see
+        layout_section = Vertical(classes="section")
+        stage.mount(layout_section)
+        layout_section.mount(Static("What you'll see", classes="section-title"))
+        layout_table = Table.grid(expand=True, padding=(0, 1))
+        layout_table.add_column(style="bold #5b8aff", width=14)
+        layout_table.add_column(style="#a8b8c4")
+        layout_table.add_row("Left rail", "Navigate between Polly, your inbox, projects, and settings.")
+        layout_table.add_row("Right pane", "Shows the live agent session or project details for whatever you select.")
+        layout_table.add_row("Polly", "Your AI project manager. Tell Polly what to build and she'll spin up workers.")
+        layout_table.add_row("Heartbeat", "Runs quietly in the background monitoring all sessions for drift or stalls.")
+        layout_section.mount(Static(Group(layout_table)))
 
-        table = Table.grid(expand=True, padding=(0, 1))
-        table.add_column(style="bold #5b8aff", width=12)
-        table.add_column(style="#e0e8ef")
-        table.add_row("Heartbeat", "Runs in its own tmux session and stays out of your main interface.")
-        table.add_row("Polly", "Your operator-facing PM session for strategy, direction changes, and starting work.")
-        table.add_row("Control", "Your dashboard for accounts, projects, sessions, alerts, and events.")
-        table.add_row("Projects", "Each project keeps PollyPM state in .pollypm/ inside that folder.")
-        table.add_row("Accounts", "You can add or reauth accounts later from the Accounts tab.")
-        table.add_row("Keys", "1-6 switch tabs. O follows the selected rail row. P claims a pane. I sends input.")
-        section.mount(Static(Panel(table, title="Quick Reference", border_style="#253140")))
+        # ── Key controls
+        keys_section = Vertical(classes="section")
+        stage.mount(keys_section)
+        keys_section.mount(Static("Key controls", classes="section-title"))
+        keys_table = Table.grid(expand=True, padding=(0, 1))
+        keys_table.add_column(style="bold #e0e8ef", width=14)
+        keys_table.add_column(style="#a8b8c4")
+        keys_table.add_row("j / k", "Move up and down in the sidebar.")
+        keys_table.add_row("Enter", "Open the selected item in the right pane.")
+        keys_table.add_row("N", "Launch a new worker session for the selected project.")
+        keys_table.add_row("S", "Jump to settings (accounts, failover, permissions).")
+        keys_table.add_row("Ctrl-W", "Detach from PollyPM. Everything keeps running in the background.")
+        keys_table.add_row("Ctrl-Q", "Shut down PollyPM and stop all agent sessions.")
+        keys_section.mount(Static(Group(keys_table)))
+
+        # ── Tips
+        tips_section = Vertical(classes="section")
+        stage.mount(tips_section)
+        tips_section.mount(Static("Tips", classes="section-title"))
+        tips_section.mount(Static(
+            "[#a8b8c4]You can reopen PollyPM anytime with [bold #e0e8ef]pm[/] from any terminal.\n"
+            "Add more accounts or projects later from settings.\n"
+            "PollyPM stores all state in [bold #e0e8ef]~/.pollypm/[/] — nothing is written to your project repos.[/]"
+        ))
 
         actions = Horizontal(classes="button-row")
         stage.mount(actions)
         actions.mount(Button("Back", id="tour-back"))
-        self.launch_button = Button("Open PollyPM", id="tour-launch", variant="success")
+        self.launch_button = Button("\u25b6  Open PollyPM", id="tour-launch", variant="success")
         actions.mount(self.launch_button)
         self.call_after_refresh(self._focus_launch_button)
 

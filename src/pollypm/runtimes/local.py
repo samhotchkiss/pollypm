@@ -15,7 +15,9 @@ class LocalRuntimeAdapter:
         venv_python = project.root_dir / ".venv" / "bin" / "python"
         if venv_python.exists():
             return str(venv_python)
-        return "python3"
+        # When installed globally (uv tool install), use the current interpreter
+        import sys
+        return sys.executable
 
     def _encode_payload(
         self,
@@ -46,8 +48,10 @@ class LocalRuntimeAdapter:
     ) -> str:
         python = shlex.quote(self._launcher_python(project))
         payload = shlex.quote(self._encode_payload(command, account, project))
-        pythonpath = shlex.quote(str((project.root_dir / "src").resolve()))
-        return (
-            f"PYTHONPATH={pythonpath}${{PYTHONPATH:+:${{PYTHONPATH}}}} "
-            f"exec {python} -m pollypm.runtime_launcher {payload}"
-        )
+        src_dir = (project.root_dir / "src").resolve()
+        if src_dir.is_dir():
+            pythonpath = shlex.quote(str(src_dir))
+            prefix = f"PYTHONPATH={pythonpath}${{PYTHONPATH:+:${{PYTHONPATH}}}} "
+        else:
+            prefix = ""
+        return f"{prefix}exec {python} -m pollypm.runtime_launcher {payload}"

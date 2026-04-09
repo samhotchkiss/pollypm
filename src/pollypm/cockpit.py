@@ -318,7 +318,30 @@ class CockpitRouter:
         storage_session = supervisor.storage_closet_session_name()
         storage_windows = {window.name for window in self.tmux.list_windows(storage_session)}
         if launch.window_name not in storage_windows:
-            # Session is not running -- fall back to static detail view
+            # Session is not running -- try to relaunch it
+            if launch.session.role in self.service._CONTROL_ROLES if hasattr(self.service, '_CONTROL_ROLES') else launch.session.role in {"operator-pm", "heartbeat-supervisor"}:
+                try:
+                    supervisor.launch_session(session_name)
+                    # Successfully relaunched -- now join from storage
+                    storage_windows = {w.name for w in self.tmux.list_windows(storage_session)}
+                    if launch.window_name in storage_windows:
+                        if right_pane_id is not None:
+                            self.tmux.kill_pane(right_pane_id)
+                        source = f"{storage_session}:{launch.window_name}.0"
+                        self.tmux.join_pane(source, left_pane_id, horizontal=True)
+                        panes = self.tmux.list_panes(window_target)
+                        left_pane = min(panes, key=self._pane_left)
+                        if hasattr(self.tmux, "resize_pane_width"):
+                            self.tmux.resize_pane_width(left_pane.pane_id, self._LEFT_PANE_WIDTH)
+                        right_pane = max(panes, key=self._pane_left)
+                        state = self._load_state()
+                        state["mounted_session"] = session_name
+                        state["right_pane_id"] = right_pane.pane_id
+                        self._write_state(state)
+                        return
+                except Exception:  # noqa: BLE001
+                    pass
+            # Fall back to static detail view
             fallback_kind = "polly" if launch.session.role in {"operator-pm", "heartbeat-supervisor"} else "project"
             fallback_target = launch.session.project if fallback_kind == "project" else None
             if right_pane_id is None:

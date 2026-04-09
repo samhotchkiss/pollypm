@@ -727,7 +727,7 @@ class PollyProjectSettingsApp(App[None]):
         try:
             from pollypm.supervisor import Supervisor
             supervisor = Supervisor(config)
-            supervisor.switch_session_account(worker.name, target_account, force=True)
+            supervisor.switch_session_account(worker.name, target_account)
             self._notify(f"Switched to {target_provider.value} ({target_account}). Session restarted.")
         except Exception as exc:  # noqa: BLE001
             self._notify(f"Switch failed: {exc}")

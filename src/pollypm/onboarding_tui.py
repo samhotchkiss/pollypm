@@ -88,11 +88,12 @@ class ExitModal(ModalScreen[None]):
         width: 66;
         height: auto;
         padding: 1 2;
-        background: $panel;
-        border: heavy $accent;
+        background: #141a20;
+        border: heavy #ff5f6d;
     }
     #exit-title {
         text-style: bold;
+        color: #ff5f6d;
         padding-bottom: 1;
     }
     #exit-buttons {
@@ -112,7 +113,7 @@ class ExitModal(ModalScreen[None]):
             yield Static("Leave onboarding?", id="exit-title")
             yield Static("Your current onboarding progress will be lost.")
             with Horizontal(id="exit-buttons"):
-                yield Button("Stay", id="stay")
+                yield Button("Stay", variant="primary", id="stay")
                 yield Button("Quit", variant="error", id="quit")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -127,16 +128,11 @@ class ExitModal(ModalScreen[None]):
 class OnboardingApp(App[Path | None]):
     TITLE = "PollyPM"
     SUB_TITLE = "Setup"
-    SCAN_FRAMES = [
-        "Scanning your home folder for recently active repositories   ",
-        "Scanning your home folder for recently active repositories.  ",
-        "Scanning your home folder for recently active repositories.. ",
-        "Scanning your home folder for recently active repositories...",
-    ]
+    SCAN_FRAMES = ["◜", "◝", "◞", "◟"]
 
     CSS = """
     Screen {
-        background: #111316;
+        background: #0c0f12;
         color: #eef2f3;
     }
 
@@ -147,13 +143,13 @@ class OnboardingApp(App[Path | None]):
 
     #rail {
         width: 34;
-        background: #161a1d;
-        border-right: solid #2b3137;
+        background: #0f1317;
+        border-right: solid #1a2230;
         padding: 1 1 1 2;
     }
 
     #brand {
-        color: #f4f6f7;
+        color: #f0f4f8;
         text-style: bold;
         padding-bottom: 1;
     }
@@ -161,8 +157,8 @@ class OnboardingApp(App[Path | None]):
     .rail-block {
         margin-bottom: 1;
         padding: 1;
-        border: round #394047;
-        background: #1d2227;
+        border: round #253140;
+        background: #141a20;
     }
 
     #main {
@@ -171,25 +167,25 @@ class OnboardingApp(App[Path | None]):
     }
 
     #eyebrow {
-        color: #93a1ad;
+        color: #6b7a88;
         padding-bottom: 1;
     }
 
     #title {
-        color: #f8f9fa;
+        color: #f0f4f8;
         text-style: bold;
         padding-bottom: 1;
     }
 
     #intro {
-        color: #c9d3d9;
+        color: #a8b8c4;
         padding-bottom: 1;
     }
 
     #message {
         height: auto;
         min-height: 1;
-        color: #d5df88;
+        color: #7ee8a4;
         padding-bottom: 1;
     }
 
@@ -203,14 +199,14 @@ class OnboardingApp(App[Path | None]):
 
     .section {
         padding: 1;
-        border: round #3d444b;
-        background: #171b1f;
+        border: round #253140;
+        background: #111820;
         margin-bottom: 1;
     }
 
     .section-title {
         text-style: bold;
-        color: #f5f7f8;
+        color: #e0e8ef;
         padding-bottom: 1;
     }
 
@@ -226,7 +222,7 @@ class OnboardingApp(App[Path | None]):
 
     .provider-button {
         width: 1fr;
-        min-height: 5;
+        min-height: 3;
         margin-right: 1;
     }
 
@@ -241,6 +237,11 @@ class OnboardingApp(App[Path | None]):
     #project-list {
         height: 1fr;
         min-height: 12;
+    }
+
+    Footer {
+        background: #0f1317;
+        color: #4a5568;
     }
     """
 
@@ -339,8 +340,10 @@ class OnboardingApp(App[Path | None]):
     def _refresh_rail(self) -> None:
         self.brand.update(
             Panel.fit(
-                "[b]PollyPM[/b]\n[dim]Bring your CLI agents online with live accounts, recent projects, and a real control room.[/dim]",
-                border_style="#5b6570",
+                "[#5b8aff bold]█▀█ █▀█ █   █   █▄█[/]\n"
+                "[#3d6bcc]█▀▀ █▄█ █▄▄ █▄▄  █[/]\n\n"
+                "[dim]Bring your CLI agents online with live accounts, recent projects, and a real control room.[/dim]",
+                border_style="#3d6bcc",
             )
         )
         self.machine_check.update(self._machine_check_panel())
@@ -352,11 +355,11 @@ class OnboardingApp(App[Path | None]):
         table.add_column(ratio=3)
         table.add_column(justify="right")
         for item in self.state.statuses:
-            status = "[green]ready[/green]" if item.installed else "[red]missing[/red]"
+            status = "[green]✓[/green]" if item.installed else "[red]✗[/red]"
             table.add_row(item.label, status)
-        tmux_status = "[green]ready[/green]" if self._tmux_ready() else "[red]missing[/red]"
+        tmux_status = "[green]✓[/green]" if self._tmux_ready() else "[red]✗[/red]"
         table.add_row("tmux", tmux_status)
-        return Panel(table, title="Machine", border_style="#4a525a")
+        return Panel(table, title="Machine", border_style="#253140")
 
     def _account_summary_panel(self) -> Panel:
         lines: list[str] = []
@@ -364,25 +367,32 @@ class OnboardingApp(App[Path | None]):
             lines.append("[dim]No connected accounts yet.[/dim]")
         else:
             for account in self.state.accounts.values():
-                lines.append(f"[b]{account.email}[/b]")
-                lines.append(f"[dim]{account.provider.value} · {account.account_name}[/dim]")
-        return Panel("\n".join(lines), title="Connected Accounts", border_style="#4a525a")
+                lines.append(f"[green]●[/green] [b]{account.email}[/b]")
+                lines.append(f"  [dim]{account.provider.value} · {account.account_name}[/dim]")
+        return Panel("\n".join(lines), title="Connected Accounts", border_style="#253140")
 
     def _progress_panel(self) -> Panel:
         stages = [
-            ("accounts", "1. Connect agent accounts"),
-            ("controller", "2. Choose Polly's control account"),
-            ("projects", "3. Review suggested projects"),
+            ("accounts", "Connect agent accounts"),
+            ("controller", "Choose Polly's control account"),
+            ("projects", "Review suggested projects"),
         ]
+        step_order = [s[0] for s in stages]
+        current_index = step_order.index(self.step) if self.step in step_order else -1
         lines = []
-        for step_id, label in stages:
-            marker = "[green]●[/green]" if step_id == self.step else "[dim]○[/dim]"
-            if step_id == "controller" and not self.state.accounts:
-                marker = "[dim]○[/dim]"
-            lines.append(f"{marker} {label}")
+        for i, (step_id, label) in enumerate(stages):
+            if i < current_index:
+                marker = "[#3ddc84]━[/]"
+                lines.append(f"{marker} [#3ddc84]{label}[/]")
+            elif step_id == self.step:
+                marker = "[#5b8aff]►[/]"
+                lines.append(f"{marker} [#5b8aff bold]{label}[/]")
+            else:
+                marker = "[#3e4c5a]─[/]"
+                lines.append(f"{marker} [#3e4c5a]{label}[/]")
         lines.append("")
         lines.append("[dim]Mouse is enabled. Click buttons, choices, and project selections directly.[/dim]")
-        return Panel("\n".join(lines), title="Setup", border_style="#4a525a")
+        return Panel("\n".join(lines), title="Setup", border_style="#253140")
 
     def _tmux_ready(self) -> bool:
         return shutil.which("tmux") is not None
@@ -612,16 +622,16 @@ class OnboardingApp(App[Path | None]):
         stage.mount(section)
         section.mount(Static("Quick Tour", classes="section-title"))
 
-        table = Table.grid(expand=True)
-        table.add_column(style="bold #c7d0d6", width=10)
-        table.add_column(style="#f5f7fa")
+        table = Table.grid(expand=True, padding=(0, 1))
+        table.add_column(style="bold #5b8aff", width=12)
+        table.add_column(style="#e0e8ef")
         table.add_row("Heartbeat", "Runs in its own tmux session and stays out of your main interface.")
         table.add_row("Polly", "Your operator-facing PM session for strategy, direction changes, and starting work.")
         table.add_row("Control", "Your dashboard for accounts, projects, sessions, alerts, and events.")
         table.add_row("Projects", "Each project keeps PollyPM state in .pollypm/ inside that folder.")
         table.add_row("Accounts", "You can add or reauth accounts later from the Accounts tab.")
         table.add_row("Keys", "1-6 switch tabs. O follows the selected rail row. P claims a pane. I sends input.")
-        section.mount(Static(Panel(table, border_style="#4a525a")))
+        section.mount(Static(Panel(table, title="Quick Reference", border_style="#253140")))
 
         actions = Horizontal(classes="button-row")
         stage.mount(actions)
@@ -643,7 +653,7 @@ class OnboardingApp(App[Path | None]):
             return
         frame = self.SCAN_FRAMES[self.scan_frame_index % len(self.SCAN_FRAMES)]
         self.scan_loading_widget.update(
-            f"{frame}\n\n[dim]This can take a moment if your home folder has a lot of repositories.[/dim]"
+            f"{frame} Scanning for recently active repositories...\n\n[dim]This can take a moment if your home folder has a lot of repositories.[/dim]"
         )
 
     def _tick_scan_animation(self) -> None:

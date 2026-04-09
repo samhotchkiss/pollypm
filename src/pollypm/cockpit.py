@@ -128,7 +128,7 @@ class CockpitRouter:
         if window.pane_dead:
             return "dead"
         if launch.session.role == "worker":
-            return ["·", "•", "●", "•"][spinner_index % 4] + " live"
+            return ["\u25dc", "\u25dd", "\u25de", "\u25df"][spinner_index % 4] + " live"
         if launch.session.role == "operator-pm":
             return "ready"
         if launch.session.role == "heartbeat-supervisor":

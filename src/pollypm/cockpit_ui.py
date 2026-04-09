@@ -174,6 +174,10 @@ class RailItem(ListItem):
 
     def update_body(self) -> None:
         text = Text()
+        if self.has_class("active-view"):
+            text.append("\u258c", style="#5b8aff")
+        else:
+            text.append("  ")
         indicator, indicator_style = self._indicator()
         if indicator:
             text.append(f"{indicator} ", style=indicator_style)
@@ -184,14 +188,19 @@ class RailItem(ListItem):
 
     def _indicator(self) -> tuple[str, str]:
         if self.item.state.endswith("live"):
-            return self.item.state.split(" ", 1)[0], "#63d48b"
+            return self.item.state.split(" ", 1)[0], "#3ddc84"
         if self.item.state.startswith("!"):
-            return "!", "#d9767b"
+            return "\u25b2", "#ff5f6d"
         if self.item.key == "polly":
-            return "•", "#8aa8c2"
+            return "\u2022", "#5b8aff"
         if self.item.key == "settings":
-            return "•", "#8aa8c2"
-        return "", ""
+            return "\u2699", "#6b7a88"
+        if self.item.key == "inbox":
+            label = self.item.label
+            if "(" in label and not label.endswith("(0)"):
+                return "\u25c6", "#f0c45a"
+            return "\u25c7", "#4a5568"
+        return "\u25cb", "#4a5568"
 
 
 class PollyCockpitApp(App[None]):
@@ -202,9 +211,11 @@ class PollyCockpitApp(App[None]):
         background: #0f1317;
         color: #eef2f4;
         padding: 0;
+        border-right: solid #1e2730;
     }
     #brand {
         padding: 1 0 0 0;
+        margin-bottom: 0;
         color: #f5f7fa;
     }
     #tagline {
@@ -229,7 +240,13 @@ class PollyCockpitApp(App[None]):
         margin-top: 1;
     }
     #nav > .rail-row.project-start {
-        margin-top: 1;
+        margin-top: 0;
+    }
+    #nav > .section-sep {
+        height: 1;
+        padding: 0 1;
+        color: #2a3440;
+        background: transparent;
     }
     #nav > .rail-row.-highlight {
         background: #1e2730;
@@ -248,13 +265,13 @@ class PollyCockpitApp(App[None]):
         color: #dcf4e6;
     }
     #nav > .rail-row.active-view {
-        background: #183c68;
+        background: #1a3a5c;
         color: #eef6ff;
         text-style: bold;
     }
     #nav > .rail-row.active-view.-highlight,
     #nav:focus > .rail-row.active-view.-highlight {
-        background: #22528c;
+        background: #1f4d7a;
         color: #eef6ff;
     }
     #nav > .rail-row .rail-item-body {
@@ -268,7 +285,7 @@ class PollyCockpitApp(App[None]):
         background: transparent;
     }
     #settings-row.active-view {
-        background: #183c68;
+        background: #1a3a5c;
         color: #eef6ff;
         text-style: bold;
     }
@@ -278,7 +295,7 @@ class PollyCockpitApp(App[None]):
     }
     #hint {
         height: 3;
-        color: #8f9da9;
+        color: #3e4c5a;
         padding: 1 0 0 0;
     }
     """
@@ -294,10 +311,15 @@ class PollyCockpitApp(App[None]):
         super().__init__()
         self.config_path = config_path
         self.router = CockpitRouter(config_path)
-        self.brand = Static(ASCII_POLLY, id="brand")
+        _lines = ASCII_POLLY.split("\n")
+        self.brand = Static(
+            f"[#5b8aff]{_lines[0]}[/]\n[#3d6bcc]{_lines[1]}[/]",
+            id="brand",
+            markup=True,
+        )
         self.tagline = Static("\n" + POLLY_SLOGANS[0], id="tagline")
         self.nav = ListView(id="nav")
-        self.settings_row = Static("• Settings", id="settings-row")
+        self.settings_row = Static("\u2699 Settings", id="settings-row")
         self.hint = Static("", id="hint")
         self.spinner_index = 0
         self.slogan_index = 0
@@ -305,6 +327,7 @@ class PollyCockpitApp(App[None]):
         self.selected_key = "polly"
         self._items: list[CockpitItem] = []
         self._row_widgets: dict[str, RailItem] = {}
+        self._section_sep: ListItem | None = None
         self._suspend_selection_events = False
 
     def compose(self) -> ComposeResult:
@@ -348,14 +371,25 @@ class PollyCockpitApp(App[None]):
         rebuild = keys != list(self._row_widgets)
         if rebuild:
             self._row_widgets = {}
+            self._section_sep: ListItem | None = None
         first_project_seen = False
-        rows: list[RailItem] = []
+        rows: list[ListItem] = []
+        nav_index = 0
         restore_index: int | None = 0 if selected_key is not None else None
-        for index, item in enumerate(nav_items):
+        for item in nav_items:
             first_project = False
             if item.key.startswith("project:") and not first_project_seen:
                 first_project = True
                 first_project_seen = True
+                if rebuild:
+                    self._section_sep = ListItem(
+                        Static("  \u2500\u2500 projects \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"),
+                        classes="section-sep",
+                        disabled=True,
+                    )
+                if self._section_sep is not None:
+                    rows.append(self._section_sep)
+                    nav_index += 1
             if rebuild:
                 row = RailItem(
                     item,
@@ -368,7 +402,8 @@ class PollyCockpitApp(App[None]):
                 row.apply_item(item, active_view=item.key == self.selected_key, first_project=first_project)
             rows.append(row)
             if selected_key is not None and item.key == selected_key:
-                restore_index = index
+                restore_index = nav_index
+            nav_index += 1
         if rebuild:
             self.nav.clear()
             self.nav.extend(rows)
@@ -395,26 +430,18 @@ class PollyCockpitApp(App[None]):
 
     def _selected_row_key(self) -> str | None:
         index = self.nav.index
-        nav_items = self._nav_items()
-        if index is None or index < 0 or index >= len(nav_items):
+        if index is None or index < 0:
             return None
-        return nav_items[index].key
+        children = list(self.nav.children)
+        if index >= len(children):
+            return None
+        child = children[index]
+        if isinstance(child, RailItem):
+            return child.cockpit_key
+        return None
 
     def _update_hint(self) -> None:
-        key = self._selected_row_key() or self.selected_key
-        if key == "settings":
-            self.hint.update("Press S to open\nSettings.")
-            return
-        if key == "polly":
-            self.hint.update("Enter opens\nPolly.")
-            return
-        if key == "inbox":
-            self.hint.update("Enter opens\nInbox.")
-            return
-        if key and key.startswith("project:"):
-            self.hint.update("Enter opens.\nN starts work.")
-            return
-        self.hint.update("Choose a lane.")
+        self.hint.update("j/k move \u00b7 \u21b5 open \u00b7 n new")
 
     def action_open_selected(self) -> None:
         key = self._selected_row_key()
@@ -511,29 +538,30 @@ class PollySettingsPaneApp(App[None]):
     SUB_TITLE = "Settings"
     CSS = """
     Screen {
-        background: #10161b;
+        background: #0c0f12;
         color: #eef2f4;
         padding: 1;
         layout: vertical;
     }
     #status {
         height: 1;
-        color: #cfd7de;
-        background: #141c23;
+        color: #a8b8c4;
+        background: #111820;
         padding: 0 1;
     }
     #message {
         height: 1;
-        color: #f4d76e;
-        background: #1a222a;
+        color: #7ee8a4;
+        background: #111820;
         padding: 0 1;
     }
     #actions {
         height: auto;
-        margin: 1 0;
+        padding: 1 0;
     }
     #actions Button {
         margin-right: 1;
+        min-width: 10;
     }
     #layout {
         height: 1fr;
@@ -542,27 +570,28 @@ class PollySettingsPaneApp(App[None]):
         width: 58;
         min-width: 42;
         height: 1fr;
-        border: round #41505f;
-        background: #131a20;
+        border: round #1a2230;
+        background: #0f1317;
     }
     #detail-pane {
         height: 1fr;
-        border: round #41505f;
-        background: #131a20;
-        padding: 1;
+        border: round #1a2230;
+        background: #0f1317;
+        padding: 1 2;
     }
     .section-title {
-        color: #eef4f8;
+        color: #5b8aff;
         text-style: bold;
         padding-bottom: 1;
     }
     #detail {
         height: 1fr;
-        color: #d9e1e7;
+        color: #b8c4cf;
     }
     #help {
         height: 2;
-        color: #8f9da9;
+        color: #3e4c5a;
+        background: #0c0f12;
         padding-top: 1;
     }
     """
@@ -688,31 +717,36 @@ class PollySettingsPaneApp(App[None]):
         if status is None:
             self.detail.update("No connected accounts.\n\nUse Add Codex or Add Claude to connect one.")
             return
+        sep = "[dim]" + "\u2500" * 40 + "[/dim]"
+        is_ctrl = config.pollypm.controller_account == status.key
+        is_fo = status.key in config.pollypm.failover_accounts
         detail_lines = [
-            f"Account: {status.key}",
-            f"Email: {status.email or '-'}",
-            f"Provider: {status.provider.value}",
-            f"Logged in: {'yes' if status.logged_in else 'no'}",
-            f"Health: {status.health}",
-            f"Plan: {status.plan}",
-            f"Usage: {status.usage_summary}",
-            f"Controller: {'yes' if config.pollypm.controller_account == status.key else 'no'}",
-            f"Failover: {'yes' if status.key in config.pollypm.failover_accounts else 'no'}",
-            f"Home: {status.home or '-'}",
-            "",
-            f"Isolation: {status.isolation_status}",
-            f"Storage: {status.auth_storage}",
+            f"[bold]Account: {status.key}[/bold]",
+            sep,
+            f"[dim]Email:[/dim]      {status.email or '-'}",
+            f"[dim]Provider:[/dim]   {status.provider.value}",
+            f"[dim]Logged in:[/dim]  {'yes' if status.logged_in else 'no'}",
+            f"[dim]Health:[/dim]     {status.health}",
+            f"[dim]Plan:[/dim]       {status.plan}",
+            f"[dim]Usage:[/dim]      {status.usage_summary}",
+            sep,
+            f"[dim]Controller:[/dim] {'yes' if is_ctrl else 'no'}",
+            f"[dim]Failover:[/dim]   {'yes' if is_fo else 'no'}",
+            f"[dim]Home:[/dim]       {status.home or '-'}",
+            sep,
+            f"[dim]Isolation:[/dim]  {status.isolation_status}",
+            f"[dim]Storage:[/dim]    {status.auth_storage}",
         ]
         if status.available_at:
-            detail_lines.append(f"Available at: {status.available_at}")
+            detail_lines.append(f"[dim]Available:[/dim]  {status.available_at}")
         if status.access_expires_at:
-            detail_lines.append(f"Access expires: {status.access_expires_at}")
+            detail_lines.append(f"[dim]Expires:[/dim]    {status.access_expires_at}")
         if status.reason:
-            detail_lines.extend(["", f"Reason: {status.reason}"])
+            detail_lines.extend([sep, f"[dim]Reason:[/dim]     {status.reason}"])
         if status.usage_raw_text:
             snippet = status.usage_raw_text.strip().splitlines()[:8]
             if snippet:
-                detail_lines.extend(["", "Latest usage snapshot:"])
+                detail_lines.extend([sep, "[dim]Latest usage snapshot:[/dim]"])
                 detail_lines.extend(f"  {line}" for line in snippet)
         self.detail.update("\n".join(detail_lines))
 

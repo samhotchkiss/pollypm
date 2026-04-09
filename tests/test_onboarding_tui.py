@@ -90,5 +90,5 @@ def test_scan_loading_message_animates(tmp_path: Path) -> None:
     app._tick_scan_animation()
     second = app.scan_loading_widget.updated
 
-    assert "Scanning your home folder" in first
+    assert "Scanning" in first
     assert first != second

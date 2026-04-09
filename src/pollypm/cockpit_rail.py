@@ -7,15 +7,48 @@ import sys
 import termios
 import time
 import tty
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from pollypm.cockpit import CockpitItem, CockpitRouter
 
 
+# ── Color palette ────────────────────────────────────────────────────────────
+
+_C = tuple[int, int, int]
+
+PALETTE: dict[str, _C] = {
+    "bg":              (15, 19, 23),
+    "wordmark_hi":     (91, 138, 255),
+    "wordmark_lo":     (55, 95, 195),
+    "slogan":          (92, 106, 119),
+    "slogan_fade":     (42, 52, 64),
+    "section_rule":    (30, 39, 48),
+    "section_label":   (74, 85, 104),
+    "item_normal":     (184, 196, 207),
+    "item_muted":      (92, 106, 119),
+    "sel_bg":          (26, 58, 92),
+    "sel_text":        (238, 246, 255),
+    "sel_accent":      (91, 138, 255),
+    "active_bg":       (22, 42, 64),
+    "live_bg":         (19, 42, 30),
+    "live_text":       (126, 232, 164),
+    "live_indicator":  (61, 220, 132),
+    "alert_bg":        (53, 26, 29),
+    "alert_text":      (242, 184, 188),
+    "alert_indicator": (255, 95, 109),
+    "inbox_has":       (240, 196, 90),
+    "inbox_empty":     (74, 85, 104),
+    "idle":            (74, 85, 104),
+    "dead":            (255, 95, 109),
+    "hint":            (52, 64, 77),
+}
+
+ARC_SPINNER = ("◜", "◝", "◞", "◟")
+
 ASCII_POLLY = (
-    "┏━ POLLY ━┓",
-    "┗━━━━━━━━━━┛",
+    "█▀█ █▀█ █   █   █▄█",
+    "█▀▀ █▄█ █▄▄ █▄▄  █ ",
 )
 
 POLLY_SLOGANS = [
@@ -37,14 +70,27 @@ POLLY_SLOGANS = [
     ("One project.", "Many good turns."),
 ]
 
+GUTTER = 2
+
+
+# ── Render row ───────────────────────────────────────────────────────────────
 
 @dataclass(slots=True)
 class RenderRow:
     text: str
-    fg: str = "37"
-    bg: str | None = None
+    fg: _C = field(default_factory=lambda: PALETTE["item_normal"])
+    bg: _C = field(default_factory=lambda: PALETTE["bg"])
     bold: bool = False
 
+
+def _sgr(row: RenderRow) -> str:
+    fr, fg, fb = row.fg
+    br, bg, bb = row.bg
+    bold = "1;" if row.bold else ""
+    return f"\x1b[{bold}38;2;{fr};{fg};{fb};48;2;{br};{bg};{bb}m"
+
+
+# ── Rail renderer ────────────────────────────────────────────────────────────
 
 class PollyCockpitRail:
     def __init__(self, config_path: Path) -> None:
@@ -53,6 +99,7 @@ class PollyCockpitRail:
         self.spinner_index = 0
         self.slogan_started_at = time.time()
         self._last_items: list[CockpitItem] = []
+        self._slogan_phase = 0
 
     def run(self) -> None:
         fd = sys.stdin.fileno()
@@ -67,6 +114,7 @@ class PollyCockpitRail:
                 self._clamp_selection(items)
                 self._render(items)
                 self.spinner_index = (self.spinner_index + 1) % 4
+                self._tick_slogan()
                 ready, _, _ = select.select([sys.stdin], [], [], 1.0)
                 if not ready:
                     continue
@@ -110,6 +158,8 @@ class PollyCockpitRail:
             return True
         return True
 
+    # ── Navigation ───────────────────────────────────────────────────────
+
     def _move(self, delta: int, items: list[CockpitItem]) -> None:
         keys = [item.key for item in items if item.selectable]
         if not keys:
@@ -143,83 +193,183 @@ class PollyCockpitRail:
             self.selected_key = next(iter(keys))
             self.router.set_selected_key(self.selected_key)
 
-    def _render(self, items: list[CockpitItem]) -> None:
-        size = shutil.get_terminal_size((16, 24))
-        width = max(16, size.columns)
-        height = max(8, size.lines)
-        lines: list[RenderRow] = []
-        for wordmark in ASCII_POLLY:
-            lines.append(RenderRow(wordmark[:width], fg="255", bold=True))
-        lines.append(RenderRow(""))
-        slogan = self._current_slogan()
-        lines.append(RenderRow(slogan[0][:width], fg="245"))
-        lines.append(RenderRow(slogan[1][:width], fg="245"))
-        lines.append(RenderRow(""))
-        settings_item = next((item for item in items if item.key == "settings"), None)
-        body_items = [item for item in items if item.key != "settings"]
-        first_project = True
-        active_view = self.router.selected_key()
-        for item in body_items:
-            label = self._item_label(item, width)
-            row = RenderRow(label)
-            if item.key == self.selected_key or item.key == active_view:
-                row.bg = "24"
-                row.fg = "255"
-                row.bold = True
-            if item.state.startswith("!"):
-                row.bg = "52" if row.bg is None else row.bg
-                row.fg = "224"
-            if item.state.endswith("live"):
-                row.bg = "22" if row.bg is None else row.bg
-                row.fg = "157" if row.bg != "24" else "255"
-            if item.key.startswith("project:") and first_project:
-                lines.append(RenderRow(""))
-                first_project = False
-            lines.append(row)
-        if settings_item is not None:
-            reserved_lines = len(lines) + 2
-            while reserved_lines < height - 1:
-                lines.append(RenderRow(""))
-                reserved_lines += 1
-            lines.append(RenderRow(""))
-            label = self._item_label(settings_item, width)
-            row = RenderRow(label)
-            if settings_item.key == self.selected_key or settings_item.key == active_view:
-                row.bg = "24"
-                row.fg = "255"
-                row.bold = True
-            lines.append(row)
-        self._write("\x1b[H\x1b[2J")
-        for row in lines:
-            self._write(self._style(row) + row.text.ljust(width)[:width] + "\x1b[0m\r\n")
+    # ── Slogan rotation ─────────────────────────────────────────────────
 
-    def _item_label(self, item: CockpitItem, width: int) -> str:
-        indicator = "  "
-        if item.state.endswith("live"):
-            indicator = item.state.split(" ", 1)[0] + " "
-        elif item.state.startswith("!"):
-            indicator = "! "
-        elif item.key in {"polly", "settings"}:
-            indicator = "• "
-        text = f"{indicator}{item.label}"
-        return text[:width]
+    def _tick_slogan(self) -> None:
+        elapsed = time.time() - self.slogan_started_at
+        cycle = 60
+        pos = elapsed % cycle
+        if pos >= cycle - 1:
+            self._slogan_phase = -1  # fade out
+        elif pos < 1:
+            self._slogan_phase = 1   # fade in
+        else:
+            self._slogan_phase = 0   # normal
 
     def _current_slogan(self) -> tuple[str, str]:
         index = int((time.time() - self.slogan_started_at) // 60) % len(POLLY_SLOGANS)
         return POLLY_SLOGANS[index]
 
-    def _style(self, row: RenderRow) -> str:
-        codes: list[str] = []
-        if row.bold:
-            codes.append("1")
-        codes.append(row.fg)
-        if row.bg is not None:
-            codes.append(f"48;5;{row.bg}")
-        return f"\x1b[{';'.join(codes)}m"
+    def _slogan_color(self) -> _C:
+        if self._slogan_phase != 0:
+            return PALETTE["slogan_fade"]
+        return PALETTE["slogan"]
+
+    # ── Rendering ────────────────────────────────────────────────────────
+
+    def _render(self, items: list[CockpitItem]) -> None:
+        size = shutil.get_terminal_size((30, 24))
+        width = max(16, size.columns)
+        height = max(8, size.lines)
+        lines: list[RenderRow] = []
+        pad = " " * GUTTER
+
+        # ── Wordmark
+        lines.append(RenderRow(""))
+        lines.append(RenderRow(pad + ASCII_POLLY[0][:width - GUTTER], fg=PALETTE["wordmark_hi"], bold=True))
+        lines.append(RenderRow(pad + ASCII_POLLY[1][:width - GUTTER], fg=PALETTE["wordmark_lo"]))
+        lines.append(RenderRow(""))
+
+        # ── Slogan
+        slogan = self._current_slogan()
+        sc = self._slogan_color()
+        lines.append(RenderRow(pad + slogan[0][:width - GUTTER], fg=sc))
+        lines.append(RenderRow(pad + slogan[1][:width - GUTTER], fg=sc))
+        lines.append(RenderRow(""))
+
+        # ── Section: navigation
+        settings_item = next((item for item in items if item.key == "settings"), None)
+        body_items = [item for item in items if item.key != "settings"]
+        active_view = self.router.selected_key()
+
+        first_project = True
+        for item in body_items:
+            if item.key.startswith("project:") and first_project:
+                lines.append(RenderRow(""))
+                lines.append(self._section_header("projects", width))
+                first_project = False
+            lines.append(self._item_row(item, width, active_view))
+
+        # ── Spacer + settings at bottom
+        if settings_item is not None:
+            target_lines = len(lines) + 4  # section header + blank + item + hint
+            while len(lines) < height - target_lines + len(lines):
+                if len(lines) >= height - 4:
+                    break
+                lines.append(RenderRow(""))
+            lines.append(RenderRow(""))
+            lines.append(self._section_header("system", width))
+            lines.append(self._item_row(settings_item, width, active_view))
+
+        # ── Hint line
+        while len(lines) < height - 2:
+            lines.append(RenderRow(""))
+        lines.append(RenderRow(""))
+        hint = f"{pad}j/k move \u00b7 \u21b5 open \u00b7 n new"
+        lines.append(RenderRow(hint[:width], fg=PALETTE["hint"]))
+
+        # ── Flush
+        bg = PALETTE["bg"]
+        clear_line = f"\x1b[48;2;{bg[0]};{bg[1]};{bg[2]}m" + " " * width + "\x1b[0m"
+        self._write("\x1b[H")
+        for i in range(height):
+            if i < len(lines):
+                row = lines[i]
+                if isinstance(row, _RawRow):
+                    self._write(_sgr(row) + row.text + "\x1b[0m\r\n")
+                else:
+                    self._write(_sgr(row) + row.text.ljust(width)[:width] + "\x1b[0m\r\n")
+            else:
+                self._write(clear_line + "\r\n")
+
+    def _section_header(self, label: str, width: int) -> RenderRow:
+        pad = " " * GUTTER
+        prefix = f"{pad}\u2500\u2500 {label} "
+        remaining = width - len(prefix)
+        rule = "\u2500" * max(0, remaining)
+        return RenderRow((prefix + rule)[:width], fg=PALETTE["section_rule"])
+
+    def _item_row(self, item: CockpitItem, width: int, active_view: str) -> RenderRow:
+        is_selected = item.key == self.selected_key
+        is_active = item.key == active_view
+        indicator, ind_color = self._indicator(item)
+
+        # Build the text with gutter
+        bar = "\u258c" if is_selected else " "
+        text = f" {bar}{indicator} {item.label}"
+        text = text[:width]
+
+        # Determine colors
+        fg = PALETTE["item_normal"]
+        bg = PALETTE["bg"]
+        bold = False
+
+        if item.state.startswith("!"):
+            fg = PALETTE["alert_text"]
+            bg = PALETTE["alert_bg"]
+        elif item.state.endswith("live") and not is_selected:
+            fg = PALETTE["live_text"]
+            bg = PALETTE["live_bg"]
+
+        if is_selected:
+            fg = PALETTE["sel_text"]
+            bg = PALETTE["sel_bg"]
+            bold = True
+        elif is_active and not is_selected:
+            fg = PALETTE["sel_text"]
+            bg = PALETTE["active_bg"]
+
+        row = RenderRow(text, fg=fg, bg=bg, bold=bold)
+
+        # Apply indicator color inline via ANSI if indicator is present
+        if ind_color and indicator.strip():
+            # Rebuild text with colored indicator
+            bar_sgr = ""
+            if is_selected:
+                bar_sgr = f"\x1b[38;2;{PALETTE['sel_accent'][0]};{PALETTE['sel_accent'][1]};{PALETTE['sel_accent'][2]}m"
+            label_part = f" {item.label}"
+            ind_sgr = f"\x1b[38;2;{ind_color[0]};{ind_color[1]};{ind_color[2]}m"
+            text_sgr = _sgr(row)
+            row.text = f" {bar_sgr}{bar}\x1b[0m{text_sgr}{ind_sgr}{indicator} \x1b[0m{text_sgr}{label_part}"
+            # Pad manually since we have inline escapes
+            visible_len = 1 + 1 + len(indicator) + 1 + len(item.label)
+            if visible_len < width:
+                row.text += " " * (width - visible_len)
+            row.text = row.text  # already formatted
+            # Return a special row that writes raw (skip _sgr in render)
+            return _RawRow(row.text, fg=fg, bg=bg, bold=bold)
+
+        return row
+
+    def _indicator(self, item: CockpitItem) -> tuple[str, _C | None]:
+        if item.state.endswith("live"):
+            char = ARC_SPINNER[self.spinner_index]
+            return char, PALETTE["live_indicator"]
+        if item.state.startswith("!"):
+            return "\u25b2", PALETTE["alert_indicator"]
+        if item.state == "dead":
+            return "\u2715", PALETTE["dead"]
+        if item.key == "inbox":
+            has_items = "(" in item.label and not item.label.endswith("(0)")
+            if has_items:
+                return "\u25c6", PALETTE["inbox_has"]
+            return "\u25c7", PALETTE["inbox_empty"]
+        if item.key == "polly":
+            return "\u2022", PALETTE["sel_accent"]
+        if item.key == "settings":
+            return "\u2699", PALETTE["item_muted"]
+        if item.key.startswith("project:"):
+            return "\u25cb", PALETTE["idle"]
+        return " ", None
 
     def _write(self, text: str) -> None:
         sys.stdout.write(text)
         sys.stdout.flush()
+
+
+class _RawRow(RenderRow):
+    """A row whose .text already contains ANSI escapes -- render without wrapping in _sgr()."""
+    pass
 
 
 def run_cockpit_rail(config_path: Path) -> None:

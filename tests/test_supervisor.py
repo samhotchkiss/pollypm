@@ -225,12 +225,12 @@ def test_control_session_args_follow_override_provider(tmp_path: Path) -> None:
         assert launch.session.args == ["--dangerously-bypass-approvals-and-sandbox"]
 
 
-def test_control_sessions_use_dedicated_control_homes(tmp_path: Path) -> None:
+def test_claude_control_sessions_use_original_account_home(tmp_path: Path) -> None:
+    """Claude control sessions must use the original account home so macOS Keychain auth is preserved."""
     config = _config(tmp_path)
     source_home = config.accounts["claude_controller"].home
     assert source_home is not None
     (source_home / ".claude").mkdir(parents=True, exist_ok=True)
-    (source_home / ".claude" / ".credentials.json").write_text('{"token":"base"}\n')
     (source_home / ".claude" / "settings.json").write_text('{"theme":"dark"}\n')
     (source_home / ".claude.json").write_text('{"hasCompletedOnboarding": true}\n')
 
@@ -241,13 +241,9 @@ def test_control_sessions_use_dedicated_control_homes(tmp_path: Path) -> None:
     heartbeat_home = launches["heartbeat"].account.home
     operator_home = launches["operator"].account.home
 
-    assert heartbeat_home == tmp_path / ".pollypm" / "control-homes" / "heartbeat"
-    assert operator_home == tmp_path / ".pollypm" / "control-homes" / "operator"
-    assert heartbeat_home != operator_home
-    assert (heartbeat_home / ".claude" / ".credentials.json").exists()
-    assert (operator_home / ".claude" / ".credentials.json").exists()
-    assert launches["heartbeat"].resume_marker == heartbeat_home / ".pollypm" / "session-markers" / "heartbeat.resume"
-    assert launches["operator"].resume_marker == operator_home / ".pollypm" / "session-markers" / "operator.resume"
+    # Claude accounts keep their original home for Keychain auth
+    assert heartbeat_home == source_home
+    assert operator_home == source_home
 
 
 def test_codex_control_home_syncs_global_state(tmp_path: Path) -> None:

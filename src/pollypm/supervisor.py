@@ -1127,6 +1127,12 @@ class Supervisor:
     def _effective_account(self, session: SessionConfig, account: AccountConfig) -> AccountConfig:
         if session.role not in self._CONTROL_ROLES or account.home is None:
             return account
+        # Claude auth tokens live in the macOS Keychain, keyed to the CLAUDE_CONFIG_DIR path hash.
+        # Using a different home (control-homes/) would lose the keychain entry.
+        # For Claude accounts, use the original account home directly.
+        if account.provider is ProviderKind.CLAUDE:
+            _prime_claude_home(account.home)
+            return account
         control_home = self._sync_control_home(account, session.name)
         return replace(account, home=control_home)
 

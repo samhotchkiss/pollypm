@@ -149,13 +149,13 @@ class CockpitRouter:
     def _is_pane_working(self, window, provider) -> bool:
         """Check if a session pane has an active turn (agent is working, not idle at prompt)."""
         try:
-            pane_text = self.tmux.capture_pane(window.pane_id, lines=8)
+            pane_text = self.tmux.capture_pane(window.pane_id, lines=15)
         except Exception:  # noqa: BLE001
             return False
         stripped = pane_text.rstrip()
         if not stripped:
             return False
-        tail = stripped[-120:]
+        tail = stripped[-200:]
         lowered = tail.lower()
         provider_value = provider.value if hasattr(provider, "value") else str(provider)
         if provider_value == "claude":
@@ -163,7 +163,14 @@ class CockpitRouter:
         if provider_value == "codex":
             if "working" in lowered and "esc to interrupt" in lowered:
                 return True
-            return "\u203a" not in tail
+            # Codex idle: › prompt, or permission prompt, or "% left" usage line
+            if "\u203a" in tail:
+                return False
+            if "press enter to confirm" in lowered:
+                return False
+            if "% left" in lowered:
+                return False
+            return bool(stripped)
         return False
 
     def ensure_cockpit_layout(self) -> None:

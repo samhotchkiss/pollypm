@@ -433,7 +433,7 @@ def up(
             typer.echo(f"Restored tmux session {session_name} (storage-closet still alive)")
         else:
             try:
-                controller_account = supervisor.bootstrap_tmux()
+                controller_account = supervisor.bootstrap_tmux(skip_probe=True)
             except RuntimeError as exc:
                 raise typer.BadParameter(str(exc)) from exc
             created = True

@@ -405,7 +405,7 @@ def add_account_via_login(config_path: Path, provider: ProviderKind) -> tuple[st
 
     existing = [account for account in config.accounts.values() if account.provider is provider]
     next_index = len(existing) + 1
-    home = root_dir / ".pollypm" / "homes" / f"ad-hoc-{provider.value}-{next_index}"
+    home = config.project.base_dir / "homes" / f"ad-hoc-{provider.value}-{next_index}"
     pane_text = _run_login_window(
         tmux,
         provider=provider,
@@ -418,7 +418,7 @@ def add_account_via_login(config_path: Path, provider: ProviderKind) -> tuple[st
         raise typer.BadParameter(f"Could not detect the logged-in email for the new {provider.value} account.")
 
     key = _slugify_email(provider, email)
-    final_home = root_dir / ".pollypm" / "homes" / key
+    final_home = config.project.base_dir / "homes" / key
     if key in config.accounts:
         if home.exists() and home != final_home:
             shutil.rmtree(home, ignore_errors=True)

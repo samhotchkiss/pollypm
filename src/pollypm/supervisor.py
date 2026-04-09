@@ -167,7 +167,7 @@ class Supervisor:
             )
         return launches
 
-    def bootstrap_tmux(self) -> str:
+    def bootstrap_tmux(self, *, skip_probe: bool = False) -> str:
         session_name = self.config.project.tmux_session
         existing = [name for name in self._all_tmux_session_names() if self.tmux.has_session(name)]
         if existing:
@@ -180,7 +180,10 @@ class Supervisor:
                 raise RuntimeError("No enabled sessions found in config.")
 
             try:
-                self._probe_controller_account(controller_account)
+                if skip_probe:
+                    pass
+                else:
+                    self._probe_controller_account(controller_account)
                 self._bootstrap_launches(session_name, launches)
                 self.store.record_event(
                     "pollypm",

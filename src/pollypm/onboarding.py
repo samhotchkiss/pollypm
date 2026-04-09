@@ -379,7 +379,7 @@ def _default_failover_accounts(accounts: dict[str, ConnectedAccount], controller
 
 
 def _runtime_home(root_dir: Path, provider: ProviderKind, index: int) -> Path:
-    return root_dir / ".pollypm" / "homes" / f"onboarding_{provider.value}_{index}"
+    return root_dir / "homes" / f"onboarding_{provider.value}_{index}"
 
 
 def _login_command(provider: ProviderKind, *, interactive: bool = False) -> str:
@@ -544,7 +544,7 @@ def _wait_for_login_completion(
 
 
 def _final_account_home(root_dir: Path, account_name: str) -> Path:
-    return root_dir / ".pollypm" / "homes" / account_name
+    return root_dir / "homes" / account_name
 
 
 def _promote_onboarding_home(temp_home: Path, final_home: Path) -> Path:
@@ -568,7 +568,7 @@ def _provider_from_home_name(name: str) -> ProviderKind | None:
 
 
 def _recover_existing_accounts(root_dir: Path) -> dict[str, ConnectedAccount]:
-    homes_dir = root_dir / ".pollypm" / "homes"
+    homes_dir = root_dir / "homes"
     if not homes_dir.exists():
         return {}
 
@@ -789,7 +789,7 @@ def build_onboarded_config(
         raise ValueError(f"Unknown controller account: {controller_account}")
 
     controller = accounts[controller_account]
-    base_dir = root_dir / ".pollypm"
+    base_dir = root_dir
 
     config_accounts = {
         name: AccountConfig(

@@ -642,6 +642,7 @@ class PollySettingsPaneApp(App[None]):
         Binding("b", "toggle_permissions", "Permissions"),
         Binding("c", "add_codex", "Add Codex"),
         Binding("l", "add_claude", "Add Claude"),
+        Binding("d", "remove_selected", "Remove"),
         Binding("u", "refresh", "Refresh"),
     ]
 
@@ -654,7 +655,7 @@ class PollySettingsPaneApp(App[None]):
         self.accounts = DataTable(id="accounts")
         self.detail = Static("", id="detail")
         self.help = Static(
-            "C add Codex · L add Claude · Y usage · R relogin · J operator · M controller · V failover · B permissions · U refresh",
+            "C add Codex · L add Claude · Y usage · R relogin · D remove · J operator · M controller · V failover · B permissions · U refresh",
             id="help",
         )
         self._selected_account_key: str | None = None
@@ -671,6 +672,7 @@ class PollySettingsPaneApp(App[None]):
             yield Button("Controller", id="controller")
             yield Button("Failover", id="failover")
             yield Button("Permissions", id="permissions")
+            yield Button("Remove", id="remove", variant="error")
             yield Button("Refresh", id="refresh")
         with Horizontal(id="layout"):
             yield self.accounts
@@ -858,6 +860,12 @@ class PollySettingsPaneApp(App[None]):
         enabled = not config.pollypm.open_permissions_by_default
         self._run_action("Toggle open permissions", lambda: self.service.set_open_permissions_default(enabled))
 
+    def action_remove_selected(self) -> None:
+        key = self._selected_key_or_notice()
+        if key is None:
+            return
+        self._run_action("Remove account", lambda: self.service.remove_account(key))
+
     @on(Button.Pressed)
     def on_button_pressed(self, event: Button.Pressed) -> None:
         actions = {
@@ -865,6 +873,7 @@ class PollySettingsPaneApp(App[None]):
             "add-claude": self.action_add_claude,
             "usage": self.action_refresh_usage,
             "relogin": self.action_relogin_selected,
+            "remove": self.action_remove_selected,
             "operator": self.action_switch_operator,
             "controller": self.action_make_controller,
             "failover": self.action_toggle_failover,

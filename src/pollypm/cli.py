@@ -43,7 +43,7 @@ app = typer.Typer(help="PollyPM CLI", invoke_without_command=True, no_args_is_he
 
 
 def _session_name_candidates() -> list[str]:
-    return ["pollypm", "pollypm"]
+    return ["pollypm", "pollypm-storage-closet"]
 
 
 def _discover_config_path(config_path: Path) -> Path:

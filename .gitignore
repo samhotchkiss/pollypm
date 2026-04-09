@@ -1,12 +1,10 @@
 .DS_Store
-.promptmaster/
 .pytest_cache/
 .uv-cache/
 .venv/
 __pycache__/
 *.pyc
 src/*.egg-info/
-promptmaster.toml
-/promptmaster/
 
 .pollypm/
+.pollypm-state/

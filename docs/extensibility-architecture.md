@@ -459,7 +459,7 @@ Filter return model should be explicit:
 
 PollyPM should support four plugin locations in precedence order:
 
-1. repo-local plugins: `<project>/.pollypm/plugins/`
+1. repo-local plugins: `<project>/.pollypm-state/plugins/`
 2. user-local plugins: `~/.config/pollypm/plugins/`
 3. installed package plugins via Python entry points
 4. built-in plugins shipped with PollyPM

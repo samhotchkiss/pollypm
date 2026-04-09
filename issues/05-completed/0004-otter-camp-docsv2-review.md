@@ -34,12 +34,12 @@ PollyPM should borrow those patterns selectively. Its core job is narrower than 
 
 ## Concrete Implementation Candidates
 
-- Add a `session_event` ledger in `src/promptmaster/storage/state.py` for launches, heartbeats, leases, takeovers, recoveries, and exits.
-- Add structured checkpoint records in `src/promptmaster/checkpoints.py` that capture last-good workspace state, operator intent, and recovery reason.
-- Add a persistent operator inbox in `src/promptmaster/messaging.py` for actions that need approval or follow-up, such as stuck sessions and manual restarts.
-- Extend `src/promptmaster/control_tui.py` with a command-palette flow for `pause`, `resume`, `takeover`, `restart`, and `show history`.
-- Tighten `src/promptmaster/supervisor.py` so destructive actions and cross-session interventions are policy-gated and leave explicit audit records.
-- Use `src/promptmaster/worktrees.py` and `src/promptmaster/workers.py` to keep recovery anchored to the live workspace and the active session lease, not stale metadata.
+- Add a `session_event` ledger in `src/pollypm/storage/state.py` for launches, heartbeats, leases, takeovers, recoveries, and exits.
+- Add structured checkpoint records in `src/pollypm/checkpoints.py` that capture last-good workspace state, operator intent, and recovery reason.
+- Add a persistent operator inbox in `src/pollypm/messaging.py` for actions that need approval or follow-up, such as stuck sessions and manual restarts.
+- Extend `src/pollypm/control_tui.py` with a command-palette flow for `pause`, `resume`, `takeover`, `restart`, and `show history`.
+- Tighten `src/pollypm/supervisor.py` so destructive actions and cross-session interventions are policy-gated and leave explicit audit records.
+- Use `src/pollypm/worktrees.py` and `src/pollypm/workers.py` to keep recovery anchored to the live workspace and the active session lease, not stale metadata.
 
 ## Result
 

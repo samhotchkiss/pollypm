@@ -6,6 +6,7 @@ import shlex
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -168,7 +169,12 @@ class Supervisor:
             )
         return launches
 
-    def bootstrap_tmux(self, *, skip_probe: bool = False) -> str:
+    def bootstrap_tmux(
+        self,
+        *,
+        skip_probe: bool = False,
+        on_status: Callable[[str], None] | None = None,
+    ) -> str:
         session_name = self.config.project.tmux_session
         existing = [name for name in self._all_tmux_session_names() if self.tmux.has_session(name)]
         if existing:
@@ -185,7 +191,7 @@ class Supervisor:
                     pass
                 else:
                     self._probe_controller_account(controller_account)
-                self._bootstrap_launches(session_name, launches)
+                self._bootstrap_launches(session_name, launches, on_status=on_status)
                 self.store.record_event(
                     "pollypm",
                     "controller_selected",
@@ -204,35 +210,66 @@ class Supervisor:
         """Clear stale session markers so all sessions start fresh."""
         for homes_dir in [self.config.project.base_dir / "homes", self.config.project.base_dir / "control-homes"]:
             if homes_dir.is_dir():
-                for marker in homes_dir.glob("*/.pollypm/session-markers/*"):
+                for marker in homes_dir.glob("*/.pollypm-state/session-markers/*"):
                     marker.unlink(missing_ok=True)
 
-    def _bootstrap_launches(self, session_name: str, launches: list[SessionLaunchSpec]) -> None:
+    def _bootstrap_launches(
+        self,
+        session_name: str,
+        launches: list[SessionLaunchSpec],
+        on_status: Callable[[str], None] | None = None,
+    ) -> None:
+        import threading
+
         storage_session = self.storage_closet_session_name()
         (self.config.project.base_dir / "cockpit_state.json").unlink(missing_ok=True)
         self._bootstrap_clear_markers()
+
+
+        # Phase 1: Create all tmux windows up front (fast, no blocking).
+        targets: list[tuple[SessionLaunchSpec, str]] = []
         if launches:
             first = launches[0]
+            if on_status:
+                on_status(f"Creating {first.session.name}...")
             self.tmux.create_session(storage_session, first.window_name, first.command)
-            self.tmux.set_window_option(f"{storage_session}:0", "allow-passthrough", "on")
-            self.tmux.set_window_option(f"{storage_session}:0", "focus-events", "on")
-            self.tmux.pipe_pane(f"{storage_session}:0", first.log_path)
+            target = f"{storage_session}:0"
+            self.tmux.set_window_option(target, "allow-passthrough", "on")
+            self.tmux.set_window_option(target, "focus-events", "on")
+            self.tmux.pipe_pane(target, first.log_path)
             self._record_launch(first)
-            self._stabilize_launch(first, f"{storage_session}:0")
+            targets.append((first, target))
             for launch in launches[1:]:
+                if on_status:
+                    on_status(f"Creating {launch.session.name}...")
                 self.tmux.create_window(storage_session, launch.window_name, launch.command, detached=True)
                 target = f"{storage_session}:{launch.window_name}"
                 self.tmux.set_window_option(target, "allow-passthrough", "on")
                 self.tmux.set_window_option(target, "focus-events", "on")
                 self.tmux.pipe_pane(target, launch.log_path)
                 self._record_launch(launch)
-                self._stabilize_launch(launch, target)
+                targets.append((launch, target))
+
+        # Phase 2: Create the cockpit session so the user can attach immediately.
         self.tmux.create_session(session_name, self._CONSOLE_WINDOW, self._console_command(), remain_on_exit=False)
-        self.tmux.set_window_option(f"{session_name}:{self._CONSOLE_WINDOW}", "allow-passthrough", "on")
-        self.tmux.set_window_option(f"{session_name}:{self._CONSOLE_WINDOW}", "focus-events", "on")
-        self.tmux.set_window_option(f"{session_name}:{self._CONSOLE_WINDOW}", "window-size", "latest")
-        self.tmux.set_window_option(f"{session_name}:{self._CONSOLE_WINDOW}", "aggressive-resize", "on")
+        console_target = f"{session_name}:{self._CONSOLE_WINDOW}"
+        self.tmux.set_window_option(console_target, "allow-passthrough", "on")
+        self.tmux.set_window_option(console_target, "focus-events", "on")
+        self.tmux.set_window_option(console_target, "window-size", "latest")
+        self.tmux.set_window_option(console_target, "aggressive-resize", "on")
         self.focus_console()
+
+        # Phase 3: Stabilize all sessions in parallel background threads.
+        # These are daemon threads so the CLI can attach to tmux immediately
+        # without waiting for stabilization to complete.
+        def _stabilize_one(launch: SessionLaunchSpec, tgt: str) -> None:
+            try:
+                self._stabilize_launch(launch, tgt)
+            except Exception:  # noqa: BLE001
+                pass
+
+        for launch, tgt in targets:
+            threading.Thread(target=_stabilize_one, args=(launch, tgt), daemon=True).start()
 
     def shutdown_tmux(self) -> None:
         for session_name in reversed(self._all_tmux_session_names()):
@@ -1055,13 +1092,34 @@ class Supervisor:
     def _require_session(self, session_name: str) -> None:
         self._launch_by_session(session_name)
 
-    def launch_session(self, session_name: str) -> SessionLaunchSpec:
+    def launch_session(
+        self,
+        session_name: str,
+        on_status: Callable[[str], None] | None = None,
+    ) -> SessionLaunchSpec:
+        launch, target = self.create_session_window(session_name, on_status=on_status)
+        if target is not None:
+            self._stabilize_launch(launch, target, on_status=on_status)
+        return launch
+
+    def create_session_window(
+        self,
+        session_name: str,
+        on_status: Callable[[str], None] | None = None,
+    ) -> tuple[SessionLaunchSpec, str | None]:
+        """Create the tmux window for a session without stabilizing it.
+
+        Returns ``(launch, target)`` where *target* is the tmux pane
+        address.  If the window already exists, *target* is ``None``.
+        """
         launch = self._launch_by_session(session_name)
         tmux_session = self._tmux_session_for_launch(launch)
         window_map = self._window_map()
         if launch.window_name in window_map:
-            return launch
+            return launch, None
 
+        if on_status:
+            on_status(f"Creating tmux window for {session_name}...")
         if not self.tmux.has_session(tmux_session):
             self.tmux.create_session(tmux_session, launch.window_name, launch.command)
             target = f"{tmux_session}:0"
@@ -1072,8 +1130,7 @@ class Supervisor:
             self.tmux.set_window_option(target, "allow-passthrough", "on")
         self.tmux.pipe_pane(target, launch.log_path)
         self._record_launch(launch)
-        self._stabilize_launch(launch, target)
-        return launch
+        return launch, target
 
     def stop_session(self, session_name: str) -> None:
         launch = self._launch_by_session(session_name)
@@ -1140,10 +1197,10 @@ class Supervisor:
 
     def _console_command(self) -> str:
         root = shlex.quote(str(self.config.project.root_dir))
-        # Use 'pm' directly if installed globally; fall back to 'uv run pm' for dev
         import shutil
-        if shutil.which("pm"):
-            return f"sh -lc 'cd {root} && pm cockpit'"
+        pm_path = shutil.which("pm")
+        if pm_path:
+            return f"{shlex.quote(pm_path)} cockpit"
         return f"sh -lc 'cd {root} && uv run pm cockpit'"
 
     def _controller_candidates(self) -> list[str]:
@@ -1246,11 +1303,23 @@ class Supervisor:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
 
-    def _stabilize_launch(self, launch: SessionLaunchSpec, target: str) -> None:
+    def _stabilize_launch(
+        self,
+        launch: SessionLaunchSpec,
+        target: str,
+        on_status: Callable[[str], None] | None = None,
+    ) -> None:
+        name = launch.session.name
+
+        def _prefixed_status(msg: str) -> None:
+            if on_status:
+                on_status(f"[{name}] {msg}")
+
         if launch.session.provider is ProviderKind.CLAUDE:
-            self._stabilize_claude_launch(target)
+            self._stabilize_claude_launch(target, on_status=_prefixed_status)
         elif launch.session.provider is ProviderKind.CODEX:
-            self._stabilize_codex_launch(target)
+            self._stabilize_codex_launch(target, on_status=_prefixed_status)
+        _prefixed_status("Sending initial input...")
         self._send_initial_input_if_fresh(launch, target)
         self._mark_session_resume_ready(launch)
 
@@ -1287,24 +1356,35 @@ class Supervisor:
             f'Read {display_path}, adopt it as your operating instructions, reply only "ready", then wait.'
         )
 
-    def _stabilize_claude_launch(self, target: str) -> None:
-        deadline = time.monotonic() + 90
+    def _stabilize_claude_launch(
+        self, target: str, on_status: Callable[[str], None] | None = None,
+    ) -> None:
+        timeout = 90
+        start = time.monotonic()
+        deadline = start + timeout
         last_action = ""
+        _status = on_status or (lambda _msg: None)
+        _status("Waiting for Claude Code to start...")
         while time.monotonic() < deadline:
+            elapsed = int(time.monotonic() - start)
             try:
                 pane = self.tmux.capture_pane(target, lines=320)
             except Exception:  # noqa: BLE001
+                _status(f"Waiting for Claude Code to start... ({elapsed}s)")
                 time.sleep(1)
                 continue
             lowered = pane.lower()
 
             if "select login method:" in lowered or "paste code here if prompted" in lowered:
-                return  # Leave at login screen; user can authenticate from the cockpit
+                _status("Login required — authenticate from the cockpit")
+                return
             if "please run /login" in lowered or "invalid authentication credentials" in lowered:
-                return  # Leave at login prompt; user can re-auth interactively
+                _status("Login required — re-authenticate interactively")
+                return
 
             if "choose the text style that looks best with your terminal" in lowered:
                 if last_action != "theme":
+                    _status(f"Dismissing theme picker... ({elapsed}s)")
                     self.tmux.send_keys(target, "", press_enter=True)
                     last_action = "theme"
                 time.sleep(1)
@@ -1312,6 +1392,7 @@ class Supervisor:
 
             if "quick safety check" in lowered and "yes, i trust this folder" in lowered:
                 if last_action != "trust":
+                    _status(f"Accepting trust prompt... ({elapsed}s)")
                     self.tmux.send_keys(target, "", press_enter=True)
                     last_action = "trust"
                 time.sleep(1)
@@ -1319,6 +1400,7 @@ class Supervisor:
 
             if "warning: claude code running in bypass permissions mode" in lowered:
                 if last_action != "bypass-confirm":
+                    _status(f"Confirming bypass permissions mode... ({elapsed}s)")
                     self.tmux.send_keys(target, "2", press_enter=False)
                     self.tmux.send_keys(target, "", press_enter=True)
                     last_action = "bypass-confirm"
@@ -1327,32 +1409,45 @@ class Supervisor:
 
             if "we recommend medium effort for opus" in lowered:
                 if last_action != "effort":
+                    _status(f"Dismissing effort recommendation... ({elapsed}s)")
                     self.tmux.send_keys(target, "", press_enter=True)
                     last_action = "effort"
                 time.sleep(1)
                 continue
 
             if "❯" in pane and ("welcome back" in lowered or "0 tokens" in lowered or "/buddy" in pane):
+                _status("Claude Code ready")
                 return
 
+            _status(f"Waiting for Claude Code to start... ({elapsed}s)")
             time.sleep(1)
 
-        return  # Timed out waiting for Claude; leave session as-is for user to handle
+        _status("Timed out waiting for Claude Code")
+        return
 
-    def _stabilize_codex_launch(self, target: str) -> None:
-        deadline = time.monotonic() + 60
+    def _stabilize_codex_launch(
+        self, target: str, on_status: Callable[[str], None] | None = None,
+    ) -> None:
+        timeout = 60
+        start = time.monotonic()
+        deadline = start + timeout
         last_action = ""
         ready_streak = 0
+        _status = on_status or (lambda _msg: None)
+        _status("Waiting for Codex to start...")
         while time.monotonic() < deadline:
+            elapsed = int(time.monotonic() - start)
             try:
                 pane = self.tmux.capture_pane(target, lines=260)
             except Exception:  # noqa: BLE001
+                _status(f"Waiting for Codex to start... ({elapsed}s)")
                 time.sleep(1)
                 continue
             lowered = pane.lower()
 
             if "approaching rate limits" in lowered and "switch to gpt-5.1-codex-mini" in lowered:
                 if last_action != "switch-mini":
+                    _status(f"Switching to codex-mini due to rate limits... ({elapsed}s)")
                     self.tmux.send_keys(target, "", press_enter=True)
                     last_action = "switch-mini"
                 time.sleep(1)
@@ -1361,12 +1456,14 @@ class Supervisor:
                 raise RuntimeError("Codex account is out of credits")
             if "press enter to continue" in lowered:
                 if last_action != "continue":
+                    _status(f"Dismissing continue prompt... ({elapsed}s)")
                     self.tmux.send_keys(target, "", press_enter=True)
                     last_action = "continue"
                 time.sleep(1)
                 continue
             if "do you trust the contents of this directory" in lowered and "1. yes, continue" in lowered:
                 if last_action != "trust":
+                    _status(f"Accepting trust prompt... ({elapsed}s)")
                     self.tmux.send_keys(target, "", press_enter=True)
                     last_action = "trust"
                 time.sleep(1)
@@ -1377,13 +1474,16 @@ class Supervisor:
             if "openai codex" in lowered and (prompt_visible or working) and not booting:
                 ready_streak += 1
                 if ready_streak >= 2:
+                    _status("Codex ready")
                     return
                 time.sleep(1)
                 continue
             ready_streak = 0
+            _status(f"Waiting for Codex to start... ({elapsed}s)")
             time.sleep(1)
 
-        return  # Timed out waiting for Codex; leave session as-is for user to handle
+        _status("Timed out waiting for Codex")
+        return
 
 
 _TOKEN_RE = re.compile(r"(\d[\d,]*)\s+tokens\b", re.IGNORECASE)

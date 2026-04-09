@@ -11,12 +11,12 @@
 - Added a first-pass extensibility/platform architecture in `docs/extensibility-architecture.md` and moved issue `0008` into review.
 - Added ready implementation issues for plugin host, service API/frontend transport, pluggable memory, pluggable task backend, and provider plugin SDK work.
 - Implemented the first plugin host with manifest discovery, built-in/user/repo precedence, API version checks, provider/runtime resolution, and safe observer/filter execution.
-- Started issue `0010` by adding a first `PromptMasterService` layer and migrating worker creation/launch plus session focus/input flows in the TUI onto it.
+- Started issue `0010` by adding a first `PollyPMService` layer and migrating worker creation/launch plus session focus/input flows in the TUI onto it.
 - Started issue `0012` by extracting the default file issue tracker behind a task backend interface and routing tracker/scaffold/detail logic through it.
 - Implemented issue `0011` by adding a pluggable memory backend interface with a default file-plus-SQLite implementation and checkpoint integration, then moved the issue to review.
 - Added ready issues for a pluggable scheduler/cron backend, a pluggable heartbeat backend, and an agent profile backend so timing, monitoring, and agent behavior can be swapped like other platform subsystems.
 - Implemented issue `0013` by adding a concrete provider SDK with transcript discovery, resume hooks, and usage snapshot collection, then moved the issue to review.
-- Implemented issue `0010` by moving the TUI/control plane onto `PromptMasterService` for session bootstrap, account mutation, project mutation, lease control, and worker/session operations, then moved the issue to review.
+- Implemented issue `0010` by moving the TUI/control plane onto `PollyPMService` for session bootstrap, account mutation, project mutation, lease control, and worker/session operations, then moved the issue to review.
 - Implemented issue `0012` by broadening the file task backend seam across project scaffolding and control-room/task flows, adding note/count coverage, and moved the issue to review.
 - Implemented issue `0014` by adding a pluggable scheduler seam with an inline backend, due-job execution, recurring jobs, and service/supervisor delegation.
 - Implemented issue `0015` by delegating heartbeat execution through a pluggable heartbeat backend and shipping the built-in local monitor backend.

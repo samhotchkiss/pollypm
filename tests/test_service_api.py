@@ -31,7 +31,7 @@ def test_service_create_and_launch_worker_uses_worker_api(monkeypatch, tmp_path:
     )
     monkeypatch.setattr(
         "pollypm.service_api.launch_worker_session",
-        lambda config_path, session_name: calls.append(("launch", session_name)),
+        lambda config_path, session_name, on_status=None, skip_stabilize=False: calls.append(("launch", session_name)),
     )
     monkeypatch.setattr(service, "load_supervisor", lambda: FakeSupervisor())
 

@@ -125,7 +125,7 @@ class ExtensionHost:
     def _plugin_search_paths(self) -> list[tuple[str, Path]]:
         builtins = Path(__file__).resolve().parent / "plugins_builtin"
         user = Path.home() / ".config" / "pollypm" / "plugins"
-        repo = self.root_dir / ".pollypm" / "plugins"
+        repo = self.root_dir / ".pollypm-state" / "plugins"
         return [
             ("builtin", builtins),
             ("user", user),

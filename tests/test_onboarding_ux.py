@@ -41,7 +41,6 @@ def test_detect_codex_email_from_status_pane() -> None:
 
 
 def test_login_completion_marker_seen() -> None:
-    assert _login_completion_marker_seen("Prompt Master: login window complete.")
     assert _login_completion_marker_seen("PollyPM: login window complete.")
 
 

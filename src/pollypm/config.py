@@ -23,7 +23,7 @@ DEFAULT_CONFIG_PATH = GLOBAL_CONFIG_DIR / "pollypm.toml"
 
 
 def _normalize_project_display_name(key: str, name: str | None) -> str | None:
-    if key == "pollypm" and (name is None or name.strip().casefold() in {"pollypm", "prompt master", "pollypm"}):
+    if key == "pollypm" and (name is None or name.strip().casefold() == "pollypm"):
         return "PollyPM"
     return name
 
@@ -40,18 +40,10 @@ def _normalize_tmux_session_name(name: str | None) -> str:
 def _normalize_session_prompt(session_name: str, prompt: str | None) -> str | None:
     if prompt is None:
         return None
-    if session_name == "heartbeat" and (
-        "You are Prompt Master session 0." in prompt
-        or "You are PollyPM session 0," in prompt
-    ):
+    if session_name == "heartbeat" and "You are PollyPM session 0," in prompt:
         return heartbeat_prompt()
-    if session_name == "operator" and (
-        "You are Prompt Master session 1." in prompt
-        or "You are Polly, the PollyPM project manager, in session 1." in prompt
-    ):
+    if session_name == "operator" and "You are Polly, the PollyPM project manager, in session 1." in prompt:
         return polly_prompt()
-    if "Read the Prompt Master issue queue" in prompt:
-        return prompt.replace("Prompt Master issue queue", "PollyPM issue queue")
     return prompt
 
 
@@ -279,7 +271,7 @@ def render_config(config: PollyPMConfig) -> str:
 
 def render_example_config() -> str:
     root = Path.cwd()
-    base_dir = root / ".pollypm"
+    base_dir = root / ".pollypm-state"
     config = PollyPMConfig(
         project=ProjectSettings(
             name="PollyPM",

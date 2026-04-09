@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -65,7 +66,14 @@ class PollyPMService:
     def list_account_statuses(self) -> list[AccountStatus]:
         return list_account_statuses(self.config_path)
 
-    def create_and_launch_worker(self, *, project_key: str, prompt: str | None):
+    def create_and_launch_worker(
+        self,
+        *,
+        project_key: str,
+        prompt: str | None,
+        on_status: Callable[[str], None] | None = None,
+        skip_stabilize: bool = False,
+    ):
         session = create_worker_session(
             self.config_path,
             project_key=project_key,
@@ -73,7 +81,10 @@ class PollyPMService:
         )
         supervisor = self.load_supervisor()
         if supervisor.tmux.has_session(supervisor.config.project.tmux_session):
-            launch_worker_session(self.config_path, session.name)
+            launch_worker_session(
+                self.config_path, session.name,
+                on_status=on_status, skip_stabilize=skip_stabilize,
+            )
         return session
 
     def suggest_worker_prompt(self, *, project_key: str) -> str:

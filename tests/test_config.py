@@ -25,7 +25,7 @@ def test_load_example_config(tmp_path: Path) -> None:
     assert config.sessions["heartbeat"].provider.value == "codex"
 
 
-def test_load_config_normalizes_legacy_branding_and_control_prompts(tmp_path: Path) -> None:
+def test_load_config_normalizes_control_prompts(tmp_path: Path) -> None:
     config_path = tmp_path / "pollypm.toml"
     config_path.write_text(
         """
@@ -38,28 +38,28 @@ controller_account = "claude_primary"
 
 [accounts.claude_primary]
 provider = "claude"
-home = ".pollypm/homes/claude_primary"
+home = ".pollypm-state/homes/claude_primary"
 
 [sessions.heartbeat]
 role = "heartbeat-supervisor"
 provider = "claude"
 account = "claude_primary"
 cwd = "."
-prompt = "You are Prompt Master session 0. Remain as a true interactive CLI session."
+prompt = "You are PollyPM session 0, remain as a true interactive CLI session."
 
 [sessions.operator]
 role = "operator-pm"
 provider = "claude"
 account = "claude_primary"
 cwd = "."
-prompt = "You are Prompt Master session 1. Remain as a true interactive CLI session."
+prompt = "You are Polly, the PollyPM project manager, in session 1."
 
 [sessions.worker_pollypm]
 role = "worker"
 provider = "claude"
 account = "claude_primary"
 cwd = "."
-prompt = "Read the Prompt Master issue queue, start with the highest-leverage open issue."
+prompt = "Read the PollyPM issue queue, start with the highest-leverage open issue."
 
 [projects.pollypm]
 path = "."
@@ -74,4 +74,4 @@ name = "pollypm"
     assert config.projects["pollypm"].name == "PollyPM"
     assert config.sessions["heartbeat"].prompt == heartbeat_prompt()
     assert config.sessions["operator"].prompt == polly_prompt()
-    assert "PollyPM issue queue" in (config.sessions["worker_pollypm"].prompt or "")
+    assert config.sessions["worker_pollypm"].prompt == "Read the PollyPM issue queue, start with the highest-leverage open issue."

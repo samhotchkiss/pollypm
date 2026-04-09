@@ -12,13 +12,13 @@ def test_build_onboarded_config_uses_controller_for_pollypm_sessions(tmp_path: P
             provider=ProviderKind.CODEX,
             email="codex@example.com",
             account_name="codex_1",
-            home=tmp_path / ".pollypm" / "homes" / "codex_1",
+            home=tmp_path / ".pollypm-state" / "homes" / "codex_1",
         ),
         "claude_1": ConnectedAccount(
             provider=ProviderKind.CLAUDE,
             email="claude@example.com",
             account_name="claude_1",
-            home=tmp_path / ".pollypm" / "homes" / "claude_1",
+            home=tmp_path / ".pollypm-state" / "homes" / "claude_1",
         ),
     }
 
@@ -56,7 +56,7 @@ def test_rendered_onboarding_config_round_trips(tmp_path: Path) -> None:
             provider=ProviderKind.CODEX,
             email="codex@example.com",
             account_name="codex_1",
-            home=tmp_path / ".pollypm" / "homes" / "codex_1",
+            home=tmp_path / ".pollypm-state" / "homes" / "codex_1",
         ),
     }
     config = build_onboarded_config(
@@ -83,7 +83,7 @@ def test_build_onboarded_config_can_disable_open_permissions(tmp_path: Path) -> 
             provider=ProviderKind.CLAUDE,
             email="claude@example.com",
             account_name="claude_1",
-            home=tmp_path / ".pollypm" / "homes" / "claude_1",
+            home=tmp_path / ".pollypm-state" / "homes" / "claude_1",
         ),
     }
     config = build_onboarded_config(

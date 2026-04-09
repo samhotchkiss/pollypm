@@ -934,6 +934,15 @@ class Supervisor:
         )
         try:
             self.launch_session(session_name)
+        except RuntimeError as exc:
+            # Retry once if window name collision
+            if "already exists" in str(exc).lower() or "duplicate" in str(exc).lower():
+                import time as _time
+                _time.sleep(0.5)
+                try:
+                    self.launch_session(session_name)
+                except Exception:
+                    pass
         except Exception:
             self.store.upsert_session_runtime(
                 session_name=session_name,

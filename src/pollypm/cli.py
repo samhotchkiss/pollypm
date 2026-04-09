@@ -602,6 +602,65 @@ def alerts(
         typer.echo(f"- {alert.severity} {alert.session_name}/{alert.alert_type}: {alert.message}")
 
 
+@app.command("failover")
+def failover(
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    """Show failover configuration: controller account and failover order."""
+    config = load_config(config_path)
+    typer.echo(f"Controller: {config.pollypm.controller_account}")
+    typer.echo(f"Failover enabled: {'yes' if config.pollypm.failover_enabled else 'no'}")
+    if config.pollypm.failover_accounts:
+        typer.echo("Failover order:")
+        for i, name in enumerate(config.pollypm.failover_accounts, 1):
+            account = config.accounts.get(name)
+            label = f"{account.email} [{account.provider.value}]" if account else name
+            typer.echo(f"  {i}. {label}")
+    else:
+        typer.echo("No failover accounts configured.")
+
+
+@app.command("debug")
+def debug_command(
+    session: str | None = typer.Option(None, "--session", "-s", help="Filter to a specific session."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    """Show diagnostic info: open alerts, session states, recent events. Works outside tmux."""
+    supervisor = _load_supervisor(config_path)
+
+    # Alerts
+    all_alerts = supervisor.open_alerts()
+    alerts_list = [a for a in all_alerts if session is None or a.session_name == session]
+    typer.echo(f"Open alerts: {len(alerts_list)}")
+    for alert in alerts_list:
+        typer.echo(f"  {alert.severity} {alert.session_name}/{alert.alert_type}: {alert.message}")
+
+    # Sessions
+    typer.echo("")
+    launches = supervisor.plan_launches()
+    windows = supervisor._window_map()
+    for launch in launches:
+        if session is not None and launch.session.name != session:
+            continue
+        window = windows.get(launch.window_name)
+        if window is None:
+            state = "not running"
+        elif window.pane_dead:
+            state = "dead"
+        else:
+            state = f"running ({window.pane_current_command})"
+        typer.echo(f"  {launch.session.name}: {state} [{launch.session.provider.value}/{launch.account.name}]")
+
+    # Recent events
+    typer.echo("")
+    events_list = supervisor.store.recent_events(limit=5)
+    if session is not None:
+        events_list = [e for e in events_list if e.session_name == session]
+    typer.echo(f"Recent events: {len(events_list)}")
+    for event in events_list[:5]:
+        typer.echo(f"  {event.created_at} {event.session_name}/{event.event_type}: {event.message}")
+
+
 @app.command()
 def events(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),

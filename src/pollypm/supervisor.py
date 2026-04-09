@@ -202,6 +202,11 @@ class Supervisor:
     def _bootstrap_launches(self, session_name: str, launches: list[SessionLaunchSpec]) -> None:
         storage_session = self.storage_closet_session_name()
         (self.config.project.base_dir / "cockpit_state.json").unlink(missing_ok=True)
+        # Clear stale session markers so all sessions start fresh
+        for homes_dir in [self.config.project.base_dir / "homes", self.config.project.base_dir / "control-homes"]:
+            if homes_dir.is_dir():
+                for marker in homes_dir.glob("*/.pollypm/session-markers/*"):
+                    marker.unlink(missing_ok=True)
         if launches:
             first = launches[0]
             self.tmux.create_session(storage_session, first.window_name, first.command)

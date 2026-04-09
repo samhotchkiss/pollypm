@@ -128,12 +128,38 @@ class CockpitRouter:
         if window.pane_dead:
             return "dead"
         if launch.session.role == "worker":
-            return ["\u25dc", "\u25dd", "\u25de", "\u25df"][spinner_index % 4] + " live"
+            working = self._is_pane_working(window, launch.session.provider)
+            if working:
+                return ["\u25dc", "\u25dd", "\u25de", "\u25df"][spinner_index % 4] + " working"
+            return "\u25cf live"
         if launch.session.role == "operator-pm":
+            working = self._is_pane_working(window, launch.session.provider)
+            if working:
+                return ["\u25dc", "\u25dd", "\u25de", "\u25df"][spinner_index % 4] + " working"
             return "ready"
         if launch.session.role == "heartbeat-supervisor":
             return "watch"
         return "live"
+
+    def _is_pane_working(self, window, provider) -> bool:
+        """Check if a session pane has an active turn (agent is working, not idle at prompt)."""
+        try:
+            pane_text = self.tmux.capture_pane(window.pane_id, lines=8)
+        except Exception:  # noqa: BLE001
+            return False
+        stripped = pane_text.rstrip()
+        if not stripped:
+            return False
+        tail = stripped[-120:]
+        lowered = tail.lower()
+        provider_value = provider.value if hasattr(provider, "value") else str(provider)
+        if provider_value == "claude":
+            return "\u276f" not in tail
+        if provider_value == "codex":
+            if "working" in lowered and "esc to interrupt" in lowered:
+                return True
+            return "\u203a" not in tail
+        return False
 
     def ensure_cockpit_layout(self) -> None:
         config = load_config(self.config_path)

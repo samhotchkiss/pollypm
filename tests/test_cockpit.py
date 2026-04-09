@@ -23,12 +23,13 @@ def test_cockpit_router_build_items_includes_core_entries(monkeypatch, tmp_path:
     class FakeLaunch:
         def __init__(self, name: str, role: str, project: str, window_name: str) -> None:
             self.window_name = window_name
-            self.session = type("Session", (), {"name": name, "role": role, "project": project})()
+            self.session = type("Session", (), {"name": name, "role": role, "project": project, "provider": type("P", (), {"value": "claude"})()})()
 
     class FakeWindow:
         def __init__(self, name: str, pane_dead: bool = False) -> None:
             self.name = name
             self.pane_dead = pane_dead
+            self.pane_id = f"%{name}"
 
     class FakeSupervisor:
         config = FakeConfig()

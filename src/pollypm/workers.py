@@ -6,6 +6,7 @@ import typer
 
 from pollypm.accounts import _account_logged_in
 from pollypm.config import load_config, write_config
+from pollypm.onboarding import default_session_args
 from pollypm.models import ProviderKind, SessionConfig
 from pollypm.supervisor import Supervisor
 from pollypm.storage.state import StateStore
@@ -125,6 +126,7 @@ def create_worker_session(
         project=project_key,
         window_name=f"worker-{project_key}",
         prompt=prompt,
+        args=default_session_args(account.provider, open_permissions=config.pollypm.open_permissions_by_default),
     )
     config.sessions[session_key] = worker
     write_config(config, config_path, force=True)

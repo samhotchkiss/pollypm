@@ -167,7 +167,7 @@ class RailItem(ListItem):
             self.add_class("project-row")
         if item.state.startswith("!"):
             self.add_class("needs-user")
-        if item.state.endswith("live"):
+        if item.state.endswith("live") or item.state.endswith("working"):
             self.add_class("live")
         if active_view:
             self.add_class("active-view")
@@ -188,11 +188,17 @@ class RailItem(ListItem):
         self.body.update(text)
 
     def _indicator(self) -> tuple[str, str]:
-        if self.item.state.endswith("live"):
+        if self.item.state.endswith("working"):
             return self.item.state.split(" ", 1)[0], "#3ddc84"
+        if self.item.state.endswith("live"):
+            return "\u25cf", "#3ddc84"
         if self.item.state.startswith("!"):
             return "\u25b2", "#ff5f6d"
         if self.item.key == "polly":
+            if self.item.state in {"ready", "idle"}:
+                return "\u2022", "#5b8aff"
+            if self.item.state.endswith("working"):
+                return self.item.state.split(" ", 1)[0], "#3ddc84"
             return "\u2022", "#5b8aff"
         if self.item.key == "settings":
             return "\u2699", "#6b7a88"
@@ -217,12 +223,14 @@ class PollyCockpitApp(App[None]):
     #brand {
         padding: 1 0 0 0;
         margin-bottom: 0;
+        text-align: center;
         color: #f5f7fa;
     }
     #tagline {
         color: #97a6b2;
         padding: 0 0 1 0;
         height: 4;
+        text-align: center;
     }
     #nav {
         height: 1fr;
@@ -246,8 +254,9 @@ class PollyCockpitApp(App[None]):
     #nav > .section-sep {
         height: 1;
         padding: 0 1;
-        color: #2a3440;
+        color: #4a5568;
         background: transparent;
+        margin-top: 1;
     }
     #nav > .rail-row.-highlight {
         background: #1e2730;

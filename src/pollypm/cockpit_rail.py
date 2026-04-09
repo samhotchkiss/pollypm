@@ -224,17 +224,19 @@ class PollyCockpitRail:
         lines: list[RenderRow] = []
         pad = " " * GUTTER
 
-        # ── Wordmark
+        # ── Wordmark (centered)
         lines.append(RenderRow(""))
-        lines.append(RenderRow(pad + ASCII_POLLY[0][:width - GUTTER], fg=PALETTE["wordmark_hi"], bold=True))
-        lines.append(RenderRow(pad + ASCII_POLLY[1][:width - GUTTER], fg=PALETTE["wordmark_lo"]))
+        wm0 = ASCII_POLLY[0]
+        wm1 = ASCII_POLLY[1]
+        lines.append(RenderRow(wm0.center(width)[:width], fg=PALETTE["wordmark_hi"], bold=True))
+        lines.append(RenderRow(wm1.center(width)[:width], fg=PALETTE["wordmark_lo"]))
         lines.append(RenderRow(""))
 
-        # ── Slogan
+        # ── Slogan (centered)
         slogan = self._current_slogan()
         sc = self._slogan_color()
-        lines.append(RenderRow(pad + slogan[0][:width - GUTTER], fg=sc))
-        lines.append(RenderRow(pad + slogan[1][:width - GUTTER], fg=sc))
+        lines.append(RenderRow(slogan[0].center(width)[:width], fg=sc))
+        lines.append(RenderRow(slogan[1].center(width)[:width], fg=sc))
         lines.append(RenderRow(""))
 
         # ── Section: navigation
@@ -284,10 +286,10 @@ class PollyCockpitRail:
 
     def _section_header(self, label: str, width: int) -> RenderRow:
         pad = " " * GUTTER
-        prefix = f"{pad}\u2500\u2500 {label} "
+        prefix = f"{pad}\u2500\u2500 {label.upper()} "
         remaining = width - len(prefix)
         rule = "\u2500" * max(0, remaining)
-        return RenderRow((prefix + rule)[:width], fg=PALETTE["section_rule"])
+        return RenderRow((prefix + rule)[:width], fg=PALETTE["section_label"])
 
     def _item_row(self, item: CockpitItem, width: int, active_view: str) -> RenderRow:
         is_selected = item.key == self.selected_key
@@ -342,9 +344,11 @@ class PollyCockpitRail:
         return row
 
     def _indicator(self, item: CockpitItem) -> tuple[str, _C | None]:
-        if item.state.endswith("live"):
+        if item.state.endswith("working"):
             char = ARC_SPINNER[self.spinner_index]
             return char, PALETTE["live_indicator"]
+        if item.state.endswith("live"):
+            return "\u25cf", PALETTE["live_indicator"]
         if item.state.startswith("!"):
             return "\u25b2", PALETTE["alert_indicator"]
         if item.state == "dead":

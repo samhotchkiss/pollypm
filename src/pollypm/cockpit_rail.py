@@ -296,9 +296,13 @@ class PollyCockpitRail:
         is_active = item.key == active_view
         indicator, ind_color = self._indicator(item)
 
-        # Build the text with gutter
-        bar = "\u258c" if is_selected else " "
-        text = f" {bar}{indicator} {item.label}"
+        # Build the text with gutter (2-char prefix for alignment)
+        bar = "\u258c " if is_selected else "  "
+        label = item.label
+        max_label = width - 6  # 2 bar + 1 indicator + 1 space + 2 margin
+        if len(label) > max_label and max_label > 3:
+            label = label[: max_label - 1] + "\u2026"
+        text = f" {bar}{indicator} {label}"
         text = text[:width]
 
         # Determine colors

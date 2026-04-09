@@ -176,7 +176,7 @@ class RailItem(ListItem):
     def update_body(self) -> None:
         text = Text()
         if self.has_class("active-view"):
-            text.append("\u258c", style="#5b8aff")
+            text.append("\u258c ", style="#5b8aff")
         else:
             text.append("  ")
         indicator, indicator_style = self._indicator()
@@ -184,7 +184,11 @@ class RailItem(ListItem):
             text.append(f"{indicator} ", style=indicator_style)
         else:
             text.append("  ")
-        text.append(self.item.label)
+        label = self.item.label
+        max_label = 22  # 30 col pane - 2 prefix - 2 indicator - 2 padding
+        if len(label) > max_label:
+            label = label[: max_label - 1] + "\u2026"
+        text.append(label)
         self.body.update(text)
 
     def _indicator(self) -> tuple[str, str]:

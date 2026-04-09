@@ -1210,9 +1210,9 @@ class Supervisor:
             lowered = pane.lower()
 
             if "select login method:" in lowered or "paste code here if prompted" in lowered:
-                raise RuntimeError("Claude landed in interactive login instead of a ready session")
+                return  # Leave at login screen; user can authenticate from the cockpit
             if "please run /login" in lowered or "invalid authentication credentials" in lowered:
-                raise RuntimeError("Claude account failed authentication during startup")
+                return  # Leave at login prompt; user can re-auth interactively
 
             if "choose the text style that looks best with your terminal" in lowered:
                 if last_action != "theme":
@@ -1248,7 +1248,7 @@ class Supervisor:
 
             time.sleep(1)
 
-        raise RuntimeError("Claude did not reach an interactive prompt in time")
+        return  # Timed out waiting for Claude; leave session as-is for user to handle
 
     def _stabilize_codex_launch(self, target: str) -> None:
         deadline = time.monotonic() + 60
@@ -1290,7 +1290,7 @@ class Supervisor:
             ready_streak = 0
             time.sleep(1)
 
-        raise RuntimeError("Codex did not reach an interactive prompt in time")
+        return  # Timed out waiting for Codex; leave session as-is for user to handle
 
 
 _TOKEN_RE = re.compile(r"(\d[\d,]*)\s+tokens\b", re.IGNORECASE)

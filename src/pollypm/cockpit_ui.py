@@ -357,7 +357,10 @@ class PollyCockpitApp(App[None]):
             yield self.hint
 
     def on_mount(self) -> None:
-        self.router.ensure_cockpit_layout()
+        try:
+            self.router.ensure_cockpit_layout()
+        except Exception:  # noqa: BLE001
+            pass
         self.selected_key = self.router.selected_key()
         self._refresh_rows()
         self.set_interval(0.8, self._tick)
@@ -375,8 +378,11 @@ class PollyCockpitApp(App[None]):
             self._slogan_tick = 0
             self.slogan_index = (self.slogan_index + 1) % len(POLLY_SLOGANS)
             self.tagline.update("\n" + POLLY_SLOGANS[self.slogan_index])
-        self._enforce_rail_width()
-        self._refresh_rows()
+        try:
+            self._enforce_rail_width()
+            self._refresh_rows()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _enforce_rail_width(self) -> None:
         try:
@@ -486,13 +492,19 @@ class PollyCockpitApp(App[None]):
         if key is None:
             return
         self.selected_key = key
-        self.router.route_selected(key)
-        self._focus_right_if_live()
+        try:
+            self.router.route_selected(key)
+            self._focus_right_if_live()
+        except Exception as exc:  # noqa: BLE001
+            self.hint.update(f"Error: {exc}"[:60])
         self._refresh_rows()
 
     def action_open_settings(self) -> None:
         self.selected_key = "settings"
-        self.router.route_selected("settings")
+        try:
+            self.router.route_selected("settings")
+        except Exception as exc:  # noqa: BLE001
+            self.hint.update(f"Error: {exc}"[:60])
         self._refresh_rows()
 
     def action_new_worker(self) -> None:
@@ -510,7 +522,10 @@ class PollyCockpitApp(App[None]):
         self._refresh_rows()
 
     def action_refresh(self) -> None:
-        self.router.ensure_cockpit_layout()
+        try:
+            self.router.ensure_cockpit_layout()
+        except Exception:  # noqa: BLE001
+            pass
         self._refresh_rows()
 
     def action_request_quit(self) -> None:
@@ -543,8 +558,11 @@ class PollyCockpitApp(App[None]):
         if not isinstance(row, RailItem):
             return
         self.selected_key = row.cockpit_key
-        self.router.route_selected(row.cockpit_key)
-        self._focus_right_if_live()
+        try:
+            self.router.route_selected(row.cockpit_key)
+            self._focus_right_if_live()
+        except Exception as exc:  # noqa: BLE001
+            self.hint.update(f"Error: {exc}"[:60])
         self._refresh_rows()
 
     @on(events.Click, "#settings-row")

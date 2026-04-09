@@ -180,6 +180,32 @@ class CockpitRouter:
         state = self._load_state()
         right_pane_id = state.get("right_pane_id")
         right_pane_present = isinstance(right_pane_id, str) and any(pane.pane_id == right_pane_id for pane in panes)
+        if len(panes) == 1 and right_pane_present and panes[0].pane_id == right_pane_id:
+            # The rail (left) pane died, only the worker (right) pane survived.
+            # Park the worker back to storage and clear stale state so the
+            # split below creates a fresh right pane from the cockpit pane.
+            supervisor = self._load_supervisor()
+            mounted = state.get("mounted_session")
+            if isinstance(mounted, str) and mounted:
+                launch = next(
+                    (item for item in supervisor.plan_launches() if item.session.name == mounted),
+                    None,
+                )
+                storage_session = supervisor.storage_closet_session_name()
+                if launch is not None and self.tmux.has_session(storage_session):
+                    try:
+                        self.tmux.break_pane(panes[0].pane_id, storage_session, launch.window_name)
+                    except Exception:  # noqa: BLE001
+                        pass
+            state.pop("right_pane_id", None)
+            state.pop("mounted_session", None)
+            self._write_state(state)
+            try:
+                panes = self.tmux.list_panes(target)
+            except Exception:  # noqa: BLE001
+                panes = []
+            right_pane_id = None
+            right_pane_present = False
         if len(panes) < 2:
             right_pane_id = self.tmux.split_window(
                 target,

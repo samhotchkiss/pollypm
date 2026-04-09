@@ -459,8 +459,8 @@ Filter return model should be explicit:
 
 PollyPM should support four plugin locations in precedence order:
 
-1. repo-local plugins: `<project>/.promptmaster/plugins/`
-2. user-local plugins: `~/.config/promptmaster/plugins/`
+1. repo-local plugins: `<project>/.pollypm/plugins/`
+2. user-local plugins: `~/.config/pollypm/plugins/`
 3. installed package plugins via Python entry points
 4. built-in plugins shipped with PollyPM
 
@@ -473,7 +473,7 @@ Why this order:
 
 ## Plugin Manifest
 
-Each plugin should include a manifest, for example `promptmaster-plugin.toml`:
+Each plugin should include a manifest, for example `pollypm-plugin.toml`:
 
 ```toml
 api_version = "1"
@@ -502,8 +502,8 @@ PollyPM should expose a versioned plugin API, not random internal modules.
 
 Recommended structure:
 
-- `promptmaster.plugin_api.v1`
-- `promptmaster.service_api.v1`
+- `pollypm.plugin_api.v1`
+- `pollypm.service_api.v1`
 
 Anything outside those namespaces is internal and not stable for external plugins.
 
@@ -542,16 +542,16 @@ Recommended model:
 Examples:
 
 - `@Polly what needs attention?`
-- `@Polly start work on promptmaster`
+- `@Polly start work on pollypm`
 - `@Polly check inbox`
-- `@Polly send this to worker promptmaster`
+- `@Polly send this to worker pollypm`
 
 Discord should never bypass the PM core and write directly to worker sessions without routing and audit.
 
 ## Suggested Internal Module Boundaries
 
 ```text
-promptmaster/
+pollypm/
   core/
   service_api/
   extension_host/

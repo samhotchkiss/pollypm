@@ -1,4 +1,4 @@
-from promptmaster.messaging import close_message, create_message, ensure_inbox, list_open_messages
+from pollypm.messaging import close_message, create_message, ensure_inbox, list_open_messages
 
 
 def test_file_backed_inbox_round_trip(tmp_path) -> None:
@@ -19,8 +19,8 @@ def test_file_backed_inbox_round_trip(tmp_path) -> None:
     assert list_open_messages(tmp_path) == []
 
 
-def test_inbox_root_migrates_old_promptmaster_directory(tmp_path) -> None:
-    old_root = tmp_path / "promptmaster" / "inbox" / "00-open"
+def test_inbox_root_migrates_old_pollypm_directory(tmp_path) -> None:
+    old_root = tmp_path / "pollypm" / "inbox" / "00-open"
     old_root.mkdir(parents=True)
     legacy_message = old_root / "legacy.md"
     legacy_message.write_text("Subject: Legacy\nSender: pa\nCreated-At: now\n\nbody\n")

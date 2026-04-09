@@ -2,8 +2,8 @@ import base64
 import json
 from pathlib import Path
 
-from promptmaster.models import ProviderKind
-from promptmaster.onboarding import (
+from pollypm.models import ProviderKind
+from pollypm.onboarding import (
     _build_login_shell,
     _detect_claude_email,
     _connect_account_via_tmux,
@@ -95,7 +95,7 @@ def test_detect_claude_email_requires_logged_in_flag(monkeypatch, tmp_path: Path
             self.returncode = returncode
 
     monkeypatch.setattr(
-        "promptmaster.onboarding.subprocess.run",
+        "pollypm.onboarding.subprocess.run",
         lambda *args, **kwargs: Result('{"loggedIn": false, "email": "pearl@swh.me"}'),
     )
 
@@ -129,8 +129,8 @@ def test_connect_account_via_tmux_requires_verified_claude_auth(monkeypatch, tmp
     class FakeTmux:
         pass
 
-    monkeypatch.setattr("promptmaster.onboarding._run_login_window", lambda *args, **kwargs: "PollyPM: login window complete.")
-    monkeypatch.setattr("promptmaster.onboarding._detect_account_email", lambda provider, home: None)
+    monkeypatch.setattr("pollypm.onboarding._run_login_window", lambda *args, **kwargs: "PollyPM: login window complete.")
+    monkeypatch.setattr("pollypm.onboarding._detect_account_email", lambda provider, home: None)
 
     import pytest
 

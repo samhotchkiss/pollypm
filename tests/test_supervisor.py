@@ -3,17 +3,17 @@ import json
 import shlex
 from pathlib import Path
 
-from promptmaster.models import (
+from pollypm.models import (
     AccountConfig,
     KnownProject,
     ProjectKind,
     ProjectSettings,
-    PromptMasterConfig,
-    PromptMasterSettings,
+    PollyPMConfig,
+    PollyPMSettings,
     ProviderKind,
     SessionConfig,
 )
-from promptmaster.supervisor import (
+from pollypm.supervisor import (
     Supervisor,
     _extract_claude_model_name,
     _extract_codex_model_name,
@@ -21,16 +21,16 @@ from promptmaster.supervisor import (
 )
 
 
-def _config(tmp_path: Path) -> PromptMasterConfig:
-    return PromptMasterConfig(
+def _config(tmp_path: Path) -> PollyPMConfig:
+    return PollyPMConfig(
         project=ProjectSettings(
             root_dir=tmp_path,
-            base_dir=tmp_path / ".promptmaster",
-            logs_dir=tmp_path / ".promptmaster/logs",
-            snapshots_dir=tmp_path / ".promptmaster/snapshots",
-            state_db=tmp_path / ".promptmaster/state.db",
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
         ),
-        promptmaster=PromptMasterSettings(
+        pollypm=PollyPMSettings(
             controller_account="claude_controller",
             failover_enabled=True,
             failover_accounts=["codex_backup"],
@@ -40,13 +40,13 @@ def _config(tmp_path: Path) -> PromptMasterConfig:
                 name="claude_controller",
                 provider=ProviderKind.CLAUDE,
                 email="claude@example.com",
-                home=tmp_path / ".promptmaster/homes/claude_controller",
+                home=tmp_path / ".pollypm/homes/claude_controller",
             ),
             "codex_backup": AccountConfig(
                 name="codex_backup",
                 provider=ProviderKind.CODEX,
                 email="codex@example.com",
-                home=tmp_path / ".promptmaster/homes/codex_backup",
+                home=tmp_path / ".pollypm/homes/codex_backup",
             ),
         },
         sessions={
@@ -56,7 +56,7 @@ def _config(tmp_path: Path) -> PromptMasterConfig:
                 provider=ProviderKind.CLAUDE,
                 account="claude_controller",
                 cwd=tmp_path,
-                project="promptmaster",
+                project="pollypm",
                 window_name="pm-heartbeat",
             ),
             "operator": SessionConfig(
@@ -65,13 +65,13 @@ def _config(tmp_path: Path) -> PromptMasterConfig:
                 provider=ProviderKind.CLAUDE,
                 account="claude_controller",
                 cwd=tmp_path,
-                project="promptmaster",
+                project="pollypm",
                 window_name="pm-operator",
             )
         },
         projects={
-            "promptmaster": KnownProject(
-                key="promptmaster",
+            "pollypm": KnownProject(
+                key="pollypm",
                 path=tmp_path,
                 name="PollyPM",
                 kind=ProjectKind.FOLDER,
@@ -185,9 +185,9 @@ def test_launch_session_creates_worker_window_detached(monkeypatch, tmp_path: Pa
         provider=ProviderKind.CODEX,
         account="codex_backup",
         cwd=tmp_path,
-        project="promptmaster",
+        project="pollypm",
         prompt="Inspect the repo",
-        window_name="worker-promptmaster",
+        window_name="worker-pollypm",
     )
     supervisor = Supervisor(config)
 
@@ -208,7 +208,7 @@ def test_launch_session_creates_worker_window_detached(monkeypatch, tmp_path: Pa
 
     assert len(created_windows) == 1
     assert created_windows[0][0] == supervisor.storage_closet_session_name()
-    assert created_windows[0][1] == "worker-promptmaster"
+    assert created_windows[0][1] == "worker-pollypm"
     assert created_windows[0][3] is True
 
 
@@ -241,13 +241,13 @@ def test_control_sessions_use_dedicated_control_homes(tmp_path: Path) -> None:
     heartbeat_home = launches["heartbeat"].account.home
     operator_home = launches["operator"].account.home
 
-    assert heartbeat_home == tmp_path / ".promptmaster" / "control-homes" / "heartbeat"
-    assert operator_home == tmp_path / ".promptmaster" / "control-homes" / "operator"
+    assert heartbeat_home == tmp_path / ".pollypm" / "control-homes" / "heartbeat"
+    assert operator_home == tmp_path / ".pollypm" / "control-homes" / "operator"
     assert heartbeat_home != operator_home
     assert (heartbeat_home / ".claude" / ".credentials.json").exists()
     assert (operator_home / ".claude" / ".credentials.json").exists()
-    assert launches["heartbeat"].resume_marker == heartbeat_home / ".promptmaster" / "session-markers" / "heartbeat.resume"
-    assert launches["operator"].resume_marker == operator_home / ".promptmaster" / "session-markers" / "operator.resume"
+    assert launches["heartbeat"].resume_marker == heartbeat_home / ".pollypm" / "session-markers" / "heartbeat.resume"
+    assert launches["operator"].resume_marker == operator_home / ".pollypm" / "session-markers" / "operator.resume"
 
 
 def test_codex_control_home_syncs_global_state(tmp_path: Path) -> None:
@@ -256,7 +256,7 @@ def test_codex_control_home_syncs_global_state(tmp_path: Path) -> None:
         name="codex_backup",
         provider=ProviderKind.CODEX,
         email="codex@example.com",
-        home=tmp_path / ".promptmaster" / "homes" / "codex_backup",
+        home=tmp_path / ".pollypm" / "homes" / "codex_backup",
     )
     config.sessions["operator"] = SessionConfig(
         name="operator",
@@ -264,7 +264,7 @@ def test_codex_control_home_syncs_global_state(tmp_path: Path) -> None:
         provider=ProviderKind.CODEX,
         account="codex_backup",
         cwd=tmp_path,
-        project="promptmaster",
+        project="pollypm",
         prompt="watch the project",
         window_name="pm-operator",
     )
@@ -295,16 +295,16 @@ def test_control_sessions_use_agent_profiles_for_prompts(tmp_path: Path) -> None
 
 def test_open_permissions_default_can_disable_launch_args(tmp_path: Path) -> None:
     config = _config(tmp_path)
-    config.promptmaster.open_permissions_by_default = False
+    config.pollypm.open_permissions_by_default = False
     config.sessions["worker"] = SessionConfig(
         name="worker",
         role="worker",
         provider=ProviderKind.CODEX,
         account="codex_backup",
         cwd=tmp_path,
-        project="promptmaster",
+        project="pollypm",
         prompt="Inspect the repo",
-        window_name="worker-promptmaster",
+        window_name="worker-pollypm",
     )
     supervisor = Supervisor(config)
 
@@ -328,7 +328,7 @@ def test_run_heartbeat_delegates_to_configured_backend(monkeypatch, tmp_path: Pa
             return []
 
     monkeypatch.setattr(
-        "promptmaster.supervisor.get_heartbeat_backend",
+        "pollypm.supervisor.get_heartbeat_backend",
         lambda name, root_dir=None: FakeHeartbeatBackend(),
     )
 
@@ -353,7 +353,7 @@ def test_codex_stabilizer_accepts_mixed_case_banner(monkeypatch, tmp_path: Path)
     monkeypatch.setattr(supervisor.tmux, "capture_pane", lambda target, lines=260: panes[0])
     monkeypatch.setattr("time.sleep", lambda _seconds: None)
 
-    supervisor._stabilize_codex_launch("promptmaster:0")
+    supervisor._stabilize_codex_launch("pollypm:0")
 
 
 def test_codex_stabilizer_accepts_active_working_state(monkeypatch, tmp_path: Path) -> None:
@@ -372,7 +372,7 @@ def test_codex_stabilizer_accepts_active_working_state(monkeypatch, tmp_path: Pa
     monkeypatch.setattr(supervisor.tmux, "capture_pane", lambda target, lines=260: pane)
     monkeypatch.setattr("time.sleep", lambda _seconds: None)
 
-    supervisor._stabilize_codex_launch("promptmaster:0")
+    supervisor._stabilize_codex_launch("pollypm:0")
 
 
 def test_codex_control_launches_use_agents_md_instead_of_visible_prompt(tmp_path: Path) -> None:
@@ -383,7 +383,7 @@ def test_codex_control_launches_use_agents_md_instead_of_visible_prompt(tmp_path
         provider=ProviderKind.CODEX,
         account="codex_backup",
         cwd=tmp_path,
-        project="promptmaster",
+        project="pollypm",
         prompt="x" * 400,
         window_name="pm-operator",
     )
@@ -411,9 +411,9 @@ def test_codex_worker_launches_still_use_compact_prompt_argument(tmp_path: Path)
         provider=ProviderKind.CODEX,
         account="codex_backup",
         cwd=tmp_path,
-        project="promptmaster",
+        project="pollypm",
         prompt="x" * 400,
-        window_name="worker-promptmaster",
+        window_name="worker-pollypm",
     )
     supervisor = Supervisor(config)
 
@@ -422,7 +422,7 @@ def test_codex_worker_launches_still_use_compact_prompt_argument(tmp_path: Path)
     raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
     decoded = json.loads(raw.decode("utf-8"))
 
-    assert decoded["argv"][-1].startswith("Read .promptmaster/control-prompts/worker.md")
+    assert decoded["argv"][-1].startswith("Read .pollypm/control-prompts/worker.md")
     assert launch.initial_input is None
 
 
@@ -501,7 +501,7 @@ def test_switch_session_account_rejects_conflicting_lease(tmp_path: Path) -> Non
         raise AssertionError("expected account switch to fail while human lease is active")
 
 
-def test_recovery_waits_on_non_promptmaster_lease(tmp_path: Path) -> None:
+def test_recovery_waits_on_non_pollypm_lease(tmp_path: Path) -> None:
     config = _config(tmp_path)
     supervisor = Supervisor(config)
     supervisor.ensure_layout()

@@ -1,10 +1,10 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from promptmaster.config import write_config
-from promptmaster.models import ProjectSettings, PromptMasterConfig, PromptMasterSettings
+from pollypm.config import write_config
+from pollypm.models import ProjectSettings, PollyPMConfig, PollyPMSettings
 
-from promptmaster.projects import (
+from pollypm.projects import (
     detect_project_kind,
     discover_git_repositories,
     discover_recent_git_repositories,
@@ -51,7 +51,7 @@ def test_discover_recent_git_repositories_filters_by_recent_commit(monkeypatch, 
             return recent_cutoff - timedelta(days=30)
         return None
 
-    monkeypatch.setattr("promptmaster.projects.repository_last_local_commit_at", fake_last_commit)
+    monkeypatch.setattr("pollypm.projects.repository_last_local_commit_at", fake_last_commit)
 
     found = discover_recent_git_repositories(tmp_path, recent_days=14)
 
@@ -62,7 +62,7 @@ def test_discover_recent_git_repositories_skips_repos_without_local_commits(monk
     repo = tmp_path / "dev" / "foreign"
     (repo / ".git").mkdir(parents=True)
 
-    monkeypatch.setattr("promptmaster.projects.repository_last_local_commit_at", lambda _path: None)
+    monkeypatch.setattr("pollypm.projects.repository_last_local_commit_at", lambda _path: None)
 
     assert discover_recent_git_repositories(tmp_path, recent_days=14) == []
 
@@ -75,19 +75,19 @@ def test_make_project_key_adds_suffix_for_duplicates() -> None:
 def test_register_project_accepts_plain_folder_and_can_enable_tracker(tmp_path: Path) -> None:
     project_path = tmp_path / "plain-project"
     project_path.mkdir()
-    config = PromptMasterConfig(
-        project=ProjectSettings(root_dir=tmp_path, base_dir=tmp_path / ".promptmaster", logs_dir=tmp_path / ".promptmaster/logs", snapshots_dir=tmp_path / ".promptmaster/snapshots", state_db=tmp_path / ".promptmaster/state.db"),
-        promptmaster=PromptMasterSettings(controller_account=""),
+    config = PollyPMConfig(
+        project=ProjectSettings(root_dir=tmp_path, base_dir=tmp_path / ".pollypm", logs_dir=tmp_path / ".pollypm/logs", snapshots_dir=tmp_path / ".pollypm/snapshots", state_db=tmp_path / ".pollypm/state.db"),
+        pollypm=PollyPMSettings(controller_account=""),
         accounts={},
         sessions={},
         projects={},
     )
-    config_path = tmp_path / "promptmaster.toml"
+    config_path = tmp_path / "pollypm.toml"
     write_config(config, config_path, force=True)
 
     project = register_project(config_path, project_path, name="Plain")
     assert detect_project_kind(project.path).value == "folder"
-    assert (project_path / ".promptmaster").exists()
+    assert (project_path / ".pollypm").exists()
 
     tracked = enable_tracked_project(config_path, project.key)
     assert tracked.tracked is True

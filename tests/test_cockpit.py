@@ -1,22 +1,22 @@
 import asyncio
 from pathlib import Path
 
-from promptmaster.cockpit import CockpitRouter
-from promptmaster.cockpit_ui import PollyCockpitApp, PollySettingsPaneApp
-from promptmaster.models import ProviderKind
-from promptmaster.models import KnownProject, ProjectKind
+from pollypm.cockpit import CockpitRouter
+from pollypm.cockpit_ui import PollyCockpitApp, PollySettingsPaneApp
+from pollypm.models import ProviderKind
+from pollypm.models import KnownProject, ProjectKind
 
 
 def test_cockpit_router_build_items_includes_core_entries(monkeypatch, tmp_path: Path) -> None:
     class FakeConfig:
         class Project:
             root_dir = tmp_path
-            base_dir = tmp_path / ".promptmaster"
+            base_dir = tmp_path / ".pollypm"
             tmux_session = "pollypm"
 
         project = Project()
         projects = {
-            "promptmaster": KnownProject(key="promptmaster", path=tmp_path, name="PollyPM", kind=ProjectKind.GIT),
+            "pollypm": KnownProject(key="pollypm", path=tmp_path, name="PollyPM", kind=ProjectKind.GIT),
             "demo": KnownProject(key="demo", path=tmp_path / "demo", name="Demo", kind=ProjectKind.GIT),
         }
 
@@ -35,19 +35,19 @@ def test_cockpit_router_build_items_includes_core_entries(monkeypatch, tmp_path:
 
         def status(self):
             launches = [
-                FakeLaunch("operator", "operator-pm", "promptmaster", "pm-operator"),
+                FakeLaunch("operator", "operator-pm", "pollypm", "pm-operator"),
                 FakeLaunch("worker_demo", "worker", "demo", "worker-demo"),
             ]
             windows = [FakeWindow("pm-operator"), FakeWindow("worker-demo")]
             return launches, windows, [], [], []
 
-    monkeypatch.setattr("promptmaster.cockpit.list_open_messages", lambda root_dir: [object()])
-    router = CockpitRouter(tmp_path / "promptmaster.toml")
+    monkeypatch.setattr("pollypm.cockpit.list_open_messages", lambda root_dir: [object()])
+    router = CockpitRouter(tmp_path / "pollypm.toml")
     monkeypatch.setattr(router, "_load_supervisor", lambda: FakeSupervisor())
 
     items = router.build_items(spinner_index=2)
 
-    assert [item.key for item in items] == ["polly", "inbox", "project:promptmaster", "project:demo", "settings"]
+    assert [item.key for item in items] == ["polly", "inbox", "project:pollypm", "project:demo", "settings"]
     assert items[0].state == "ready"
     assert items[1].label == "Inbox (1)"
     assert items[3].state.endswith("live")
@@ -76,9 +76,9 @@ def test_cockpit_router_ensure_layout_splits_when_missing_right_pane(tmp_path: P
         def run(self, *args, **kwargs):
             calls.setdefault("run", []).append(args)
 
-    router = CockpitRouter(tmp_path / "promptmaster.toml")
+    router = CockpitRouter(tmp_path / "pollypm.toml")
     router.tmux = FakeTmux()  # type: ignore[assignment]
-    config_path = tmp_path / "promptmaster.toml"
+    config_path = tmp_path / "pollypm.toml"
     config_path.write_text("[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\n")
 
     router.ensure_cockpit_layout()
@@ -112,9 +112,9 @@ def test_cockpit_router_ensure_layout_resizes_existing_left_pane(tmp_path: Path)
         def swap_pane(self, source: str, target: str):
             calls["swap"] = (source, target)
 
-    router = CockpitRouter(tmp_path / "promptmaster.toml")
+    router = CockpitRouter(tmp_path / "pollypm.toml")
     router.tmux = FakeTmux()  # type: ignore[assignment]
-    config_path = tmp_path / "promptmaster.toml"
+    config_path = tmp_path / "pollypm.toml"
     config_path.write_text("[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\n")
     router._write_state({"right_pane_id": "%2"})
 
@@ -125,7 +125,7 @@ def test_cockpit_router_ensure_layout_resizes_existing_left_pane(tmp_path: Path)
 
 def test_cockpit_router_routes_idle_project_to_detail_pane(monkeypatch, tmp_path: Path) -> None:
     calls: dict[str, object] = {}
-    (tmp_path / "promptmaster.toml").write_text("[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\n")
+    (tmp_path / "pollypm.toml").write_text("[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\n")
 
     class FakeTmux:
         def list_panes(self, target: str):
@@ -140,7 +140,7 @@ def test_cockpit_router_routes_idle_project_to_detail_pane(monkeypatch, tmp_path
     class FakeConfig:
         class Project:
             root_dir = tmp_path
-            base_dir = tmp_path / ".promptmaster"
+            base_dir = tmp_path / ".pollypm"
             tmux_session = "pollypm"
 
         project = Project()
@@ -157,7 +157,7 @@ def test_cockpit_router_routes_idle_project_to_detail_pane(monkeypatch, tmp_path
         def plan_launches(self):
             return []
 
-    router = CockpitRouter(tmp_path / "promptmaster.toml")
+    router = CockpitRouter(tmp_path / "pollypm.toml")
     router.tmux = FakeTmux()  # type: ignore[assignment]
     monkeypatch.setattr(router, "_load_supervisor", lambda: FakeSupervisor())
     monkeypatch.setattr(router, "set_selected_key", lambda key: calls.setdefault("selected", key))
@@ -173,12 +173,12 @@ def test_cockpit_router_routes_idle_project_to_detail_pane(monkeypatch, tmp_path
 
 def test_cockpit_router_prefers_visible_boot_over_storage_mount(monkeypatch, tmp_path: Path) -> None:
     calls: dict[str, object] = {}
-    (tmp_path / "promptmaster.toml").write_text("[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\n")
+    (tmp_path / "pollypm.toml").write_text("[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\n")
 
     class FakeLaunch:
         def __init__(self) -> None:
             self.window_name = "pm-operator"
-            self.session = type("Session", (), {"name": "operator", "project": "promptmaster", "provider": type("P", (), {"value": "codex"})()})()
+            self.session = type("Session", (), {"name": "operator", "project": "pollypm", "provider": type("P", (), {"value": "codex"})()})()
 
     class FakeSupervisor:
         class Config:
@@ -203,7 +203,7 @@ def test_cockpit_router_prefers_visible_boot_over_storage_mount(monkeypatch, tmp
         def list_windows(self, target: str):
             return [FakeWindow("pm-operator")]
 
-    router = CockpitRouter(tmp_path / "promptmaster.toml")
+    router = CockpitRouter(tmp_path / "pollypm.toml")
     router.tmux = FakeTmux()  # type: ignore[assignment]
     monkeypatch.setattr(router, "_load_supervisor", lambda: FakeSupervisor())
     monkeypatch.setattr(router, "set_selected_key", lambda key: None)
@@ -230,20 +230,20 @@ def test_cockpit_router_prefers_visible_boot_over_storage_mount(monkeypatch, tmp
 
 def test_cockpit_router_infers_mounted_session_from_live_right_pane(monkeypatch, tmp_path: Path) -> None:
     calls: dict[str, object] = {}
-    (tmp_path / "promptmaster.toml").write_text("[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\n")
-    worker_cwd = tmp_path / ".promptmaster" / "worktrees" / "promptmaster-pa-worker_promptmaster"
+    (tmp_path / "pollypm.toml").write_text("[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\n")
+    worker_cwd = tmp_path / ".pollypm" / "worktrees" / "pollypm-pa-worker_pollypm"
     worker_cwd.mkdir(parents=True)
 
     class FakeLaunch:
         def __init__(self) -> None:
-            self.window_name = "worker-promptmaster"
+            self.window_name = "worker-pollypm"
             self.session = type(
                 "Session",
                 (),
                 {
-                    "name": "worker_promptmaster",
+                    "name": "worker_pollypm",
                     "role": "worker",
-                    "project": "promptmaster",
+                    "project": "pollypm",
                     "provider": type("P", (), {"value": "codex"})(),
                     "cwd": worker_cwd,
                 },
@@ -281,7 +281,7 @@ def test_cockpit_router_infers_mounted_session_from_live_right_pane(monkeypatch,
         def list_windows(self, target: str):
             return []
 
-    router = CockpitRouter(tmp_path / "promptmaster.toml")
+    router = CockpitRouter(tmp_path / "pollypm.toml")
     router.tmux = FakeTmux()  # type: ignore[assignment]
     monkeypatch.setattr(router, "_load_supervisor", lambda: FakeSupervisor())
     monkeypatch.setattr(router, "ensure_cockpit_layout", lambda: None)
@@ -289,41 +289,41 @@ def test_cockpit_router_infers_mounted_session_from_live_right_pane(monkeypatch,
     monkeypatch.setattr(router, "_park_mounted_session", lambda supervisor, target: calls.setdefault("park", True))
     monkeypatch.setattr(router, "_right_pane_id", lambda target: "%2")
 
-    router.route_selected("project:promptmaster")
+    router.route_selected("project:pollypm")
 
     assert "park" not in calls
     state = router._load_state()
-    assert state["mounted_session"] == "worker_promptmaster"
+    assert state["mounted_session"] == "worker_pollypm"
 
 
 def test_cockpit_router_project_click_does_not_launch_configured_but_unmounted_worker(monkeypatch, tmp_path: Path) -> None:
     calls: dict[str, object] = {}
-    (tmp_path / "promptmaster.toml").write_text("[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\n")
+    (tmp_path / "pollypm.toml").write_text("[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\n")
 
     class FakeLaunch:
         def __init__(self) -> None:
-            self.window_name = "worker-promptmaster"
+            self.window_name = "worker-pollypm"
             self.session = type(
                 "Session",
                 (),
                 {
-                    "name": "worker_promptmaster",
+                    "name": "worker_pollypm",
                     "role": "worker",
-                    "project": "promptmaster",
+                    "project": "pollypm",
                     "provider": type("P", (), {"value": "codex"})(),
-                    "cwd": tmp_path / ".promptmaster" / "worktrees" / "promptmaster-pa-worker_promptmaster",
+                    "cwd": tmp_path / ".pollypm" / "worktrees" / "pollypm-pa-worker_pollypm",
                 },
             )()
 
     class FakeConfig:
         class Project:
             root_dir = tmp_path
-            base_dir = tmp_path / ".promptmaster"
+            base_dir = tmp_path / ".pollypm"
             tmux_session = "pollypm"
 
         project = Project()
         projects = {
-            "promptmaster": KnownProject(key="promptmaster", path=tmp_path, name="PollyPM", kind=ProjectKind.GIT),
+            "pollypm": KnownProject(key="pollypm", path=tmp_path, name="PollyPM", kind=ProjectKind.GIT),
         }
 
     class FakeSupervisor:
@@ -348,7 +348,7 @@ def test_cockpit_router_project_click_does_not_launch_configured_but_unmounted_w
                 type("Pane", (), {"pane_id": "%2", "pane_left": 30, "pane_current_command": "bash", "pane_current_path": str(tmp_path)})(),
             ]
 
-    router = CockpitRouter(tmp_path / "promptmaster.toml")
+    router = CockpitRouter(tmp_path / "pollypm.toml")
     router.tmux = FakeTmux()  # type: ignore[assignment]
     monkeypatch.setattr(router, "_load_supervisor", lambda: FakeSupervisor())
     monkeypatch.setattr(router, "set_selected_key", lambda key: calls.setdefault("selected", key))
@@ -362,17 +362,17 @@ def test_cockpit_router_project_click_does_not_launch_configured_but_unmounted_w
         lambda supervisor, target, kind, project_key=None: calls.setdefault("static", (kind, project_key)),
     )
 
-    router.route_selected("project:promptmaster")
+    router.route_selected("project:pollypm")
 
-    assert calls["selected"] == "project:promptmaster"
-    assert calls["static"] == ("project", "promptmaster")
+    assert calls["selected"] == "project:pollypm"
+    assert calls["static"] == ("project", "pollypm")
     assert "live" not in calls
 
 
 def test_cockpit_router_visible_boot_preserves_ui_initialized_on_state_write(monkeypatch, tmp_path: Path) -> None:
     """Regression: _show_live_session must not overwrite ui_initialized_sessions saved by _mark_ui_initialized."""
     calls: dict[str, object] = {}
-    (tmp_path / "promptmaster.toml").write_text("[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\n")
+    (tmp_path / "pollypm.toml").write_text("[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\n")
 
     class FakeLaunch:
         def __init__(self) -> None:
@@ -383,7 +383,7 @@ def test_cockpit_router_visible_boot_preserves_ui_initialized_on_state_write(mon
                 {
                     "name": "operator",
                     "role": "operator-pm",
-                    "project": "promptmaster",
+                    "project": "pollypm",
                     "provider": type("P", (), {"value": "claude"})(),
                 },
             )()
@@ -411,7 +411,7 @@ def test_cockpit_router_visible_boot_preserves_ui_initialized_on_state_write(mon
         def list_windows(self, target: str):
             return [FakeWindow("pm-operator")]
 
-    router = CockpitRouter(tmp_path / "promptmaster.toml")
+    router = CockpitRouter(tmp_path / "pollypm.toml")
     router.tmux = FakeTmux()  # type: ignore[assignment]
     monkeypatch.setattr(router, "_load_supervisor", lambda: FakeSupervisor())
     monkeypatch.setattr(router, "set_selected_key", lambda key: None)
@@ -454,7 +454,7 @@ def test_cockpit_ui_arrow_and_enter_route_selected(tmp_path: Path) -> None:
             return "polly"
 
         def build_items(self, *, spinner_index: int = 0):
-            from promptmaster.cockpit import CockpitItem
+            from pollypm.cockpit import CockpitItem
 
             return [
                 CockpitItem("polly", "Polly", "ready"),
@@ -469,7 +469,7 @@ def test_cockpit_ui_arrow_and_enter_route_selected(tmp_path: Path) -> None:
         def create_worker_and_route(self, project_key: str) -> None:
             self.calls.append(f"new:{project_key}")
 
-    app = PollyCockpitApp(tmp_path / "promptmaster.toml")
+    app = PollyCockpitApp(tmp_path / "pollypm.toml")
     app.router = FakeRouter()  # type: ignore[assignment]
 
     async def exercise() -> None:
@@ -506,9 +506,9 @@ def test_settings_pane_renders_accounts_and_toggles_permissions(monkeypatch, tmp
             self.isolation_recommendation = ""
             self.auth_storage = "file"
             self.profile_root = str(tmp_path / ".claude")
-            self.home = tmp_path / ".promptmaster" / "homes" / "claude_demo"
+            self.home = tmp_path / ".pollypm" / "homes" / "claude_demo"
 
-    class FakePromptMaster:
+    class FakePollyPM:
         controller_account = "claude_demo"
         failover_accounts = ["claude_demo"]
         open_permissions_by_default = True
@@ -517,7 +517,7 @@ def test_settings_pane_renders_accounts_and_toggles_permissions(monkeypatch, tmp
         workspace_root = tmp_path
 
     class FakeConfig:
-        promptmaster = FakePromptMaster()
+        pollypm = FakePollyPM()
         project = FakeProject()
 
     calls: list[str] = []
@@ -530,9 +530,9 @@ def test_settings_pane_renders_accounts_and_toggles_permissions(monkeypatch, tmp
             calls.append(f"permissions:{enabled}")
             return enabled
 
-    monkeypatch.setattr("promptmaster.cockpit_ui.load_config", lambda path: FakeConfig())
+    monkeypatch.setattr("pollypm.cockpit_ui.load_config", lambda path: FakeConfig())
 
-    app = PollySettingsPaneApp(tmp_path / "promptmaster.toml")
+    app = PollySettingsPaneApp(tmp_path / "pollypm.toml")
     app.service = FakeService()  # type: ignore[assignment]
 
     async def exercise() -> None:

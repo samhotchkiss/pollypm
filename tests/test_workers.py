@@ -1,31 +1,31 @@
 from pathlib import Path
 
-from promptmaster.config import write_config
-from promptmaster.models import (
+from pollypm.config import write_config
+from pollypm.models import (
     AccountConfig,
     ProjectKind,
     ProjectSettings,
-    PromptMasterConfig,
-    PromptMasterSettings,
+    PollyPMConfig,
+    PollyPMSettings,
     ProviderKind,
     RuntimeKind,
     SessionConfig,
     KnownProject,
 )
-from promptmaster.storage.state import StateStore
-from promptmaster.workers import auto_select_worker_account, suggest_worker_prompt
+from pollypm.storage.state import StateStore
+from pollypm.workers import auto_select_worker_account, suggest_worker_prompt
 
 
-def _config(tmp_path: Path) -> tuple[PromptMasterConfig, Path]:
-    config = PromptMasterConfig(
+def _config(tmp_path: Path) -> tuple[PollyPMConfig, Path]:
+    config = PollyPMConfig(
         project=ProjectSettings(
             root_dir=tmp_path,
-            base_dir=tmp_path / ".promptmaster",
-            logs_dir=tmp_path / ".promptmaster/logs",
-            snapshots_dir=tmp_path / ".promptmaster/snapshots",
-            state_db=tmp_path / ".promptmaster/state.db",
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
         ),
-        promptmaster=PromptMasterSettings(
+        pollypm=PollyPMSettings(
             controller_account="claude_controller",
             failover_enabled=True,
             failover_accounts=["codex_backup"],
@@ -36,21 +36,21 @@ def _config(tmp_path: Path) -> tuple[PromptMasterConfig, Path]:
                 provider=ProviderKind.CLAUDE,
                 email="claude@example.com",
                 runtime=RuntimeKind.LOCAL,
-                home=tmp_path / ".promptmaster/homes/claude_controller",
+                home=tmp_path / ".pollypm/homes/claude_controller",
             ),
             "codex_backup": AccountConfig(
                 name="codex_backup",
                 provider=ProviderKind.CODEX,
                 email="codex@example.com",
                 runtime=RuntimeKind.LOCAL,
-                home=tmp_path / ".promptmaster/homes/codex_backup",
+                home=tmp_path / ".pollypm/homes/codex_backup",
             ),
             "claude_worker": AccountConfig(
                 name="claude_worker",
                 provider=ProviderKind.CLAUDE,
                 email="worker@example.com",
                 runtime=RuntimeKind.LOCAL,
-                home=tmp_path / ".promptmaster/homes/claude_worker",
+                home=tmp_path / ".pollypm/homes/claude_worker",
             ),
         },
         sessions={
@@ -60,7 +60,7 @@ def _config(tmp_path: Path) -> tuple[PromptMasterConfig, Path]:
                 provider=ProviderKind.CLAUDE,
                 account="claude_controller",
                 cwd=tmp_path,
-                project="promptmaster",
+                project="pollypm",
                 window_name="pm-heartbeat",
             ),
             "operator": SessionConfig(
@@ -69,13 +69,13 @@ def _config(tmp_path: Path) -> tuple[PromptMasterConfig, Path]:
                 provider=ProviderKind.CLAUDE,
                 account="claude_controller",
                 cwd=tmp_path,
-                project="promptmaster",
+                project="pollypm",
                 window_name="pm-operator",
             ),
         },
         projects={
-            "promptmaster": KnownProject(
-                key="promptmaster",
+            "pollypm": KnownProject(
+                key="pollypm",
                 path=tmp_path,
                 name="PollyPM",
                 kind=ProjectKind.FOLDER,
@@ -91,7 +91,7 @@ def _config(tmp_path: Path) -> tuple[PromptMasterConfig, Path]:
             else:
                 (account.home / ".codex").mkdir(parents=True, exist_ok=True)
                 (account.home / ".codex" / "auth.json").write_text("{}")
-    config_path = tmp_path / "promptmaster.toml"
+    config_path = tmp_path / "pollypm.toml"
     write_config(config, config_path)
     return config, config_path
 
@@ -106,7 +106,7 @@ def test_auto_select_worker_avoids_effective_live_controller(tmp_path: Path, mon
         effective_provider=ProviderKind.CODEX.value,
     )
 
-    monkeypatch.setattr("promptmaster.workers._account_logged_in", lambda account: True)
+    monkeypatch.setattr("pollypm.workers._account_logged_in", lambda account: True)
 
     selected = auto_select_worker_account(config_path)
 
@@ -123,7 +123,7 @@ def test_auto_select_worker_skips_runtime_unhealthy_account(tmp_path: Path, monk
         reason="failed auth",
     )
 
-    monkeypatch.setattr("promptmaster.workers._account_logged_in", lambda account: True)
+    monkeypatch.setattr("pollypm.workers._account_logged_in", lambda account: True)
 
     selected = auto_select_worker_account(config_path)
 
@@ -144,7 +144,7 @@ def test_auto_select_worker_uses_control_plane_account_before_controller_last_re
     del config.accounts["claude_worker"]
     write_config(config, config_path, force=True)
 
-    monkeypatch.setattr("promptmaster.workers._account_logged_in", lambda account: True)
+    monkeypatch.setattr("pollypm.workers._account_logged_in", lambda account: True)
 
     selected = auto_select_worker_account(config_path)
 
@@ -153,7 +153,7 @@ def test_auto_select_worker_uses_control_plane_account_before_controller_last_re
 
 def test_suggest_worker_prompt_uses_tracked_ready_issue(tmp_path: Path) -> None:
     config, config_path = _config(tmp_path)
-    project = config.projects["promptmaster"]
+    project = config.projects["pollypm"]
     project.tracked = True
     write_config(config, config_path, force=True)
 
@@ -163,7 +163,7 @@ def test_suggest_worker_prompt_uses_tracked_ready_issue(tmp_path: Path) -> None:
         "# 0017 Build Launch Flow\n\nTighten launch behavior.\n"
     )
 
-    prompt = suggest_worker_prompt(config_path, project_key="promptmaster")
+    prompt = suggest_worker_prompt(config_path, project_key="pollypm")
 
     assert "0017" in prompt
     assert "Build Launch Flow" in prompt
@@ -173,7 +173,7 @@ def test_suggest_worker_prompt_uses_tracked_ready_issue(tmp_path: Path) -> None:
 def test_suggest_worker_prompt_for_untracked_project_is_concrete(tmp_path: Path) -> None:
     _config_data, config_path = _config(tmp_path)
 
-    prompt = suggest_worker_prompt(config_path, project_key="promptmaster")
+    prompt = suggest_worker_prompt(config_path, project_key="pollypm")
 
     assert "single highest-leverage next slice" in prompt
     assert "concrete handoff for Polly" in prompt

@@ -1,8 +1,8 @@
 from pathlib import Path
 
-from promptmaster.models import KnownProject, ProviderKind
-from promptmaster.onboarding import CliAvailability, ConnectedAccount
-from promptmaster.onboarding_tui import (
+from pollypm.models import KnownProject, ProviderKind
+from pollypm.onboarding import CliAvailability, ConnectedAccount
+from pollypm.onboarding_tui import (
     OnboardingApp,
     default_controller_account,
     installed_provider_statuses,
@@ -72,15 +72,15 @@ def test_run_onboarding_app_runs_textual_app_directly(monkeypatch, tmp_path: Pat
             assert mouse is True
             return self.config_path
 
-    monkeypatch.setattr("promptmaster.onboarding_tui.OnboardingApp", FakeApp)
+    monkeypatch.setattr("pollypm.onboarding_tui.OnboardingApp", FakeApp)
 
-    result = run_onboarding_app(tmp_path / "promptmaster.toml", force=True)
+    result = run_onboarding_app(tmp_path / "pollypm.toml", force=True)
 
-    assert result == tmp_path / "promptmaster.toml"
+    assert result == tmp_path / "pollypm.toml"
 
 
 def test_scan_loading_message_animates(tmp_path: Path) -> None:
-    app = OnboardingApp(tmp_path / "promptmaster.toml")
+    app = OnboardingApp(tmp_path / "pollypm.toml")
     app.scan_loading_widget = type("Widget", (), {"updated": None, "update": lambda self, value: setattr(self, "updated", value)})()
     app.step = "projects"
     app.state.scan_complete = False

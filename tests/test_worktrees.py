@@ -1,17 +1,17 @@
 import subprocess
 from pathlib import Path
 
-from promptmaster.config import write_config
-from promptmaster.models import (
+from pollypm.config import write_config
+from pollypm.models import (
     AccountConfig,
     KnownProject,
     ProjectKind,
     ProjectSettings,
-    PromptMasterConfig,
-    PromptMasterSettings,
+    PollyPMConfig,
+    PollyPMSettings,
     ProviderKind,
 )
-from promptmaster.worktrees import cleanup_worktree, ensure_worktree, list_worktrees
+from pollypm.worktrees import cleanup_worktree, ensure_worktree, list_worktrees
 
 
 def _git_project(tmp_path: Path) -> Path:
@@ -28,15 +28,15 @@ def _git_project(tmp_path: Path) -> Path:
 
 def test_worktree_lifecycle(tmp_path: Path) -> None:
     repo = _git_project(tmp_path)
-    config = PromptMasterConfig(
-        project=ProjectSettings(root_dir=tmp_path, base_dir=tmp_path / ".promptmaster", logs_dir=tmp_path / ".promptmaster/logs", snapshots_dir=tmp_path / ".promptmaster/snapshots", state_db=tmp_path / ".promptmaster/state.db"),
-        promptmaster=PromptMasterSettings(controller_account="codex_primary"),
+    config = PollyPMConfig(
+        project=ProjectSettings(root_dir=tmp_path, base_dir=tmp_path / ".pollypm", logs_dir=tmp_path / ".pollypm/logs", snapshots_dir=tmp_path / ".pollypm/snapshots", state_db=tmp_path / ".pollypm/state.db"),
+        pollypm=PollyPMSettings(controller_account="codex_primary"),
         accounts={
             "codex_primary": AccountConfig(
                 name="codex_primary",
                 provider=ProviderKind.CODEX,
                 email="codex@example.com",
-                home=tmp_path / ".promptmaster/homes/codex_primary",
+                home=tmp_path / ".pollypm/homes/codex_primary",
             )
         },
         sessions={},
@@ -44,7 +44,7 @@ def test_worktree_lifecycle(tmp_path: Path) -> None:
             "demo": KnownProject(key="demo", path=repo, name="Demo", kind=ProjectKind.GIT, tracked=True)
         },
     )
-    config_path = tmp_path / "promptmaster.toml"
+    config_path = tmp_path / "pollypm.toml"
     write_config(config, config_path, force=True)
 
     worktree = ensure_worktree(

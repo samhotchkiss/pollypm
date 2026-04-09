@@ -13,7 +13,7 @@ The core design goal is simple:
 
 This repository currently provides:
 
-- an architecture and MVP plan in [`docs/architecture.md`](/Users/sam/dev/promptmaster/docs/architecture.md)
+- an architecture and MVP plan in [`docs/architecture.md`](/Users/sam/dev/pollypm/docs/architecture.md)
 - a Python CLI scaffold
 - a config model for accounts and sessions
 - provider adapters for `claude` and `codex`
@@ -40,7 +40,7 @@ The guided onboarding now asks only for:
 
 For each account, PollyPM opens a temporary tmux login window, you complete the real provider login there, and PollyPM detects the connected identity from that isolated account home. The local runtime uses provider-native profile isolation when available, including `CLAUDE_CONFIG_DIR` for Claude and `CODEX_HOME` for Codex. If a provider does not expose enough information for automatic detection, onboarding falls back to asking for the email once.
 
-At the end of onboarding, PollyPM also installs global `promptmaster` and `pm` commands with `uv tool install -e`, so you can launch it from any shell instead of only from the repo directory.
+At the end of onboarding, PollyPM also installs global `pollypm` and `pm` commands with `uv tool install -e`, so you can launch it from any shell instead of only from the repo directory.
 
 PollyPM defaults new project worktrees under `~/dev`, but it can register repositories from anywhere on disk. During onboarding, it can scan your home directory for git repos and ask which ones should be tracked as known projects.
 
@@ -80,12 +80,12 @@ uv run pm add-project ~/dev/wire
 Start PollyPM:
 
 ```bash
-promptmaster up
+pollypm up
 ```
 
 `pm up` does two things:
 
-- if tmux session `promptmaster` already exists, it attaches to it
+- if tmux session `pollypm` already exists, it attaches to it
 - if it does not exist, it creates the session and then attaches
 - it opens or focuses the `pm-control` TUI window so you land in the main control surface
 
@@ -109,17 +109,17 @@ Most normal operation should now happen from the `pm-control` TUI. From there yo
 If you want to open the TUI directly from a shell:
 
 ```bash
-promptmaster ui
+pollypm ui
 ```
 
-Operational CLI commands are still available from inside the `promptmaster` tmux session:
+Operational CLI commands are still available from inside the `pollypm` tmux session:
 
 ```bash
 uv run pm plan
 uv run pm status
 ```
 
-If you use the CLI for debugging or scripting, create an extra shell window inside the `promptmaster` tmux session and run `pm` there.
+If you use the CLI for debugging or scripting, create an extra shell window inside the `pollypm` tmux session and run `pm` there.
 
 Run a heartbeat sweep:
 
@@ -155,4 +155,4 @@ uv run pm send worker_demo "Continue with the next implementation step."
 - Docker runtime wrapping is implemented, but you still need to supply a suitable agent image per account before using it in production.
 - PollyPM treats tmux as the operator cockpit, not the only source of truth.
 - Recovery is based on logs, git state, and checkpoints, not exact hidden model session state.
-- The intended startup path is `pm up`; PollyPM rejects operational commands outside the `promptmaster` tmux session.
+- The intended startup path is `pm up`; PollyPM rejects operational commands outside the `pollypm` tmux session.

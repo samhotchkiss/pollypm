@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from promptmaster.task_backends import FileTaskBackend, get_task_backend
+from pollypm.task_backends import FileTaskBackend, get_task_backend
 
 
 def test_file_task_backend_creates_tracker_and_tasks(tmp_path: Path) -> None:

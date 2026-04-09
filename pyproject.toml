@@ -1,5 +1,5 @@
 [project]
-name = "promptmaster"
+name = "pollypm"
 version = "0.1.0"
 description = "Tmux-first orchestration for interactive CLI coding agents."
 readme = "README.md"
@@ -15,8 +15,8 @@ dev = [
 ]
 
 [project.scripts]
-pm = "promptmaster.cli:app"
-promptmaster = "promptmaster.cli:app"
+pm = "pollypm.cli:app"
+pollypm = "pollypm.cli:app"
 
 [build-system]
 requires = ["setuptools>=80", "wheel"]
@@ -29,7 +29,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-promptmaster = ["plugins_builtin/*/promptmaster-plugin.toml"]
+pollypm = ["plugins_builtin/*/pollypm-plugin.toml"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

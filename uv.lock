@@ -119,7 +119,7 @@ wheels = [
 ]
 
 [[package]]
-name = "promptmaster"
+name = "pollypm"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

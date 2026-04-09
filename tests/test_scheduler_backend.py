@@ -1,30 +1,30 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from promptmaster.models import (
+from pollypm.models import (
     AccountConfig,
     KnownProject,
     ProjectKind,
     ProjectSettings,
-    PromptMasterConfig,
-    PromptMasterSettings,
+    PollyPMConfig,
+    PollyPMSettings,
     ProviderKind,
     SessionConfig,
 )
-from promptmaster.schedulers import get_scheduler_backend
-from promptmaster.supervisor import Supervisor
+from pollypm.schedulers import get_scheduler_backend
+from pollypm.supervisor import Supervisor
 
 
-def _config(tmp_path: Path) -> PromptMasterConfig:
-    return PromptMasterConfig(
+def _config(tmp_path: Path) -> PollyPMConfig:
+    return PollyPMConfig(
         project=ProjectSettings(
             root_dir=tmp_path,
-            base_dir=tmp_path / ".promptmaster",
-            logs_dir=tmp_path / ".promptmaster/logs",
-            snapshots_dir=tmp_path / ".promptmaster/snapshots",
-            state_db=tmp_path / ".promptmaster/state.db",
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
         ),
-        promptmaster=PromptMasterSettings(
+        pollypm=PollyPMSettings(
             controller_account="claude_controller",
             failover_enabled=True,
             failover_accounts=["codex_backup"],
@@ -34,13 +34,13 @@ def _config(tmp_path: Path) -> PromptMasterConfig:
                 name="claude_controller",
                 provider=ProviderKind.CLAUDE,
                 email="claude@example.com",
-                home=tmp_path / ".promptmaster/homes/claude_controller",
+                home=tmp_path / ".pollypm/homes/claude_controller",
             ),
             "codex_backup": AccountConfig(
                 name="codex_backup",
                 provider=ProviderKind.CODEX,
                 email="codex@example.com",
-                home=tmp_path / ".promptmaster/homes/codex_backup",
+                home=tmp_path / ".pollypm/homes/codex_backup",
             ),
         },
         sessions={
@@ -50,7 +50,7 @@ def _config(tmp_path: Path) -> PromptMasterConfig:
                 provider=ProviderKind.CLAUDE,
                 account="claude_controller",
                 cwd=tmp_path,
-                project="promptmaster",
+                project="pollypm",
                 window_name="pm-heartbeat",
             ),
             "operator": SessionConfig(
@@ -59,13 +59,13 @@ def _config(tmp_path: Path) -> PromptMasterConfig:
                 provider=ProviderKind.CLAUDE,
                 account="claude_controller",
                 cwd=tmp_path,
-                project="promptmaster",
+                project="pollypm",
                 window_name="pm-operator",
             ),
         },
         projects={
-            "promptmaster": KnownProject(
-                key="promptmaster",
+            "pollypm": KnownProject(
+                key="pollypm",
                 path=tmp_path,
                 name="PollyPM",
                 kind=ProjectKind.FOLDER,

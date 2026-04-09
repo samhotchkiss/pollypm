@@ -1,35 +1,35 @@
 import json
 from pathlib import Path
 
-from promptmaster.config import write_config
-from promptmaster.models import AccountConfig, KnownProject, ProjectKind, ProjectSettings, PromptMasterConfig, PromptMasterSettings, ProviderKind
-from promptmaster.transcript_ledger import sync_token_ledger
-from promptmaster.storage.state import StateStore
+from pollypm.config import write_config
+from pollypm.models import AccountConfig, KnownProject, ProjectKind, ProjectSettings, PollyPMConfig, PollyPMSettings, ProviderKind
+from pollypm.transcript_ledger import sync_token_ledger
+from pollypm.storage.state import StateStore
 
 
 def _config(tmp_path: Path) -> Path:
     root = tmp_path / "repo"
     root.mkdir()
-    config = PromptMasterConfig(
+    config = PollyPMConfig(
         project=ProjectSettings(
             name="pollypm",
             root_dir=root,
-            base_dir=root / ".promptmaster",
-            logs_dir=root / ".promptmaster/logs",
-            snapshots_dir=root / ".promptmaster/snapshots",
-            state_db=root / ".promptmaster/state.db",
+            base_dir=root / ".pollypm",
+            logs_dir=root / ".pollypm/logs",
+            snapshots_dir=root / ".pollypm/snapshots",
+            state_db=root / ".pollypm/state.db",
         ),
-        promptmaster=PromptMasterSettings(controller_account="claude_main"),
+        pollypm=PollyPMSettings(controller_account="claude_main"),
         accounts={
             "claude_main": AccountConfig(
                 name="claude_main",
                 provider=ProviderKind.CLAUDE,
-                home=root / ".promptmaster/homes/claude_main",
+                home=root / ".pollypm/homes/claude_main",
             ),
             "codex_main": AccountConfig(
                 name="codex_main",
                 provider=ProviderKind.CODEX,
-                home=root / ".promptmaster/homes/codex_main",
+                home=root / ".pollypm/homes/codex_main",
             ),
         },
         sessions={},
@@ -42,7 +42,7 @@ def _config(tmp_path: Path) -> Path:
             )
         },
     )
-    config_path = root / "promptmaster.toml"
+    config_path = root / "pollypm.toml"
     write_config(config, config_path, force=True)
     return config_path
 
@@ -51,8 +51,8 @@ def test_sync_token_ledger_reads_claude_and_codex_jsonl(tmp_path: Path) -> None:
     config_path = _config(tmp_path)
     root = config_path.parent
 
-    claude_home = root / ".promptmaster/homes/claude_main"
-    claude_file = claude_home / ".claude/projects/-Users-sam-dev-promptmaster/session-a.jsonl"
+    claude_home = root / ".pollypm/homes/claude_main"
+    claude_file = claude_home / ".claude/projects/-Users-sam-dev-pollypm/session-a.jsonl"
     claude_file.parent.mkdir(parents=True, exist_ok=True)
     claude_file.write_text(
         "\n".join(
@@ -96,7 +96,7 @@ def test_sync_token_ledger_reads_claude_and_codex_jsonl(tmp_path: Path) -> None:
         + "\n"
     )
 
-    codex_home = root / ".promptmaster/homes/codex_main"
+    codex_home = root / ".pollypm/homes/codex_main"
     codex_file = codex_home / ".codex/sessions/2026/04/08/rollout-test.jsonl"
     codex_file.parent.mkdir(parents=True, exist_ok=True)
     codex_file.write_text(
@@ -161,7 +161,7 @@ def test_sync_token_ledger_reads_claude_and_codex_jsonl(tmp_path: Path) -> None:
     )
 
     samples = sync_token_ledger(config_path)
-    store = StateStore(root / ".promptmaster/state.db")
+    store = StateStore(root / ".pollypm/state.db")
     usage = store.recent_token_usage(limit=10)
 
     assert len(samples) == 2

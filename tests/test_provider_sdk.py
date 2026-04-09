@@ -1,8 +1,8 @@
 from pathlib import Path
 
-from promptmaster.models import AccountConfig, ProviderKind, SessionConfig
-from promptmaster.providers.claude import ClaudeAdapter
-from promptmaster.providers.codex import CodexAdapter
+from pollypm.models import AccountConfig, ProviderKind, SessionConfig
+from pollypm.providers.claude import ClaudeAdapter
+from pollypm.providers.codex import CodexAdapter
 
 
 class _FakeTmux:
@@ -32,7 +32,7 @@ def test_claude_provider_exposes_transcript_sources_and_usage_snapshot(tmp_path:
         provider=ProviderKind.CLAUDE,
         account="claude_primary",
         cwd=tmp_path,
-        project="promptmaster",
+        project="pollypm",
     )
     tmux = _FakeTmux(
         [
@@ -64,7 +64,7 @@ def test_codex_provider_exposes_transcript_sources_and_usage_snapshot(tmp_path: 
         provider=ProviderKind.CODEX,
         account="codex_primary",
         cwd=tmp_path,
-        project="promptmaster",
+        project="pollypm",
     )
     tmux = _FakeTmux(
         [
@@ -95,7 +95,7 @@ def test_codex_provider_uses_cli_prompt_for_fresh_launch(tmp_path: Path) -> None
         provider=ProviderKind.CODEX,
         account="codex_primary",
         cwd=tmp_path,
-        project="promptmaster",
+        project="pollypm",
         prompt="Investigate the issue queue",
     )
 

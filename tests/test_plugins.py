@@ -1,16 +1,16 @@
 from pathlib import Path
 import shutil
 
-from promptmaster.models import ProviderKind, RuntimeKind
-from promptmaster.plugin_api.v1 import HookFilterResult
-from promptmaster.plugin_host import ExtensionHost
-from promptmaster.providers import get_provider
-from promptmaster.runtimes import get_runtime
+from pollypm.models import ProviderKind, RuntimeKind
+from pollypm.plugin_api.v1 import HookFilterResult
+from pollypm.plugin_host import ExtensionHost
+from pollypm.providers import get_provider
+from pollypm.runtimes import get_runtime
 
 
 def _write_plugin(plugin_dir: Path, *, name: str, body: str, api_version: str = "1") -> None:
     plugin_dir.mkdir(parents=True, exist_ok=True)
-    (plugin_dir / "promptmaster-plugin.toml").write_text(
+    (plugin_dir / "pollypm-plugin.toml").write_text(
         "\n".join(
             [
                 f'api_version = "{api_version}"',
@@ -39,11 +39,11 @@ def test_extension_host_loads_builtin_provider_and_runtime(tmp_path: Path) -> No
 
 
 def test_repo_local_plugin_overrides_user_plugin(monkeypatch, tmp_path: Path) -> None:
-    builtin_root = Path(__file__).resolve().parents[1] / "src" / "promptmaster" / "plugins_builtin"
+    builtin_root = Path(__file__).resolve().parents[1] / "src" / "pollypm" / "plugins_builtin"
     user_root = tmp_path / "user-plugins"
-    repo_root = tmp_path / ".promptmaster" / "plugins"
+    repo_root = tmp_path / ".pollypm" / "plugins"
     user_plugin = user_root / "override_provider_test"
-    repo_plugin = tmp_path / ".promptmaster" / "plugins" / "override_provider_test"
+    repo_plugin = tmp_path / ".pollypm" / "plugins" / "override_provider_test"
     monkeypatch.setattr(
         ExtensionHost,
         "_plugin_search_paths",
@@ -54,18 +54,18 @@ def test_repo_local_plugin_overrides_user_plugin(monkeypatch, tmp_path: Path) ->
             user_plugin,
             name="override_provider_test",
             body=(
-                "from promptmaster.plugin_api.v1 import PromptMasterPlugin\n"
-                "from promptmaster.providers.claude import ClaudeAdapter\n"
-                "plugin = PromptMasterPlugin(name='override_provider_test', providers={'claude': ClaudeAdapter})\n"
+                "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+                "from pollypm.providers.claude import ClaudeAdapter\n"
+                "plugin = PollyPMPlugin(name='override_provider_test', providers={'claude': ClaudeAdapter})\n"
             ),
         )
         _write_plugin(
             repo_plugin,
             name="override_provider_test",
             body=(
-                "from promptmaster.plugin_api.v1 import PromptMasterPlugin\n"
-                "from promptmaster.providers.codex import CodexAdapter\n"
-                "plugin = PromptMasterPlugin(name='override_provider_test', providers={'claude': CodexAdapter})\n"
+                "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+                "from pollypm.providers.codex import CodexAdapter\n"
+                "plugin = PollyPMPlugin(name='override_provider_test', providers={'claude': CodexAdapter})\n"
             ),
         )
 
@@ -79,12 +79,12 @@ def test_repo_local_plugin_overrides_user_plugin(monkeypatch, tmp_path: Path) ->
 
 
 def test_extension_host_rejects_wrong_api_version(tmp_path: Path) -> None:
-    bad_plugin = tmp_path / ".promptmaster" / "plugins" / "bad"
+    bad_plugin = tmp_path / ".pollypm" / "plugins" / "bad"
     _write_plugin(
         bad_plugin,
         name="bad",
         api_version="99",
-        body="from promptmaster.plugin_api.v1 import PromptMasterPlugin\nplugin = PromptMasterPlugin(name='bad')\n",
+        body="from pollypm.plugin_api.v1 import PollyPMPlugin\nplugin = PollyPMPlugin(name='bad')\n",
     )
 
     host = ExtensionHost(tmp_path)
@@ -94,12 +94,12 @@ def test_extension_host_rejects_wrong_api_version(tmp_path: Path) -> None:
 
 
 def test_extension_host_runs_observers_and_filters_safely(tmp_path: Path) -> None:
-    plugin_dir = tmp_path / ".promptmaster" / "plugins" / "hooks"
+    plugin_dir = tmp_path / ".pollypm" / "plugins" / "hooks"
     _write_plugin(
         plugin_dir,
         name="hooks",
         body=(
-            "from promptmaster.plugin_api.v1 import HookFilterResult, PromptMasterPlugin\n"
+            "from pollypm.plugin_api.v1 import HookFilterResult, PollyPMPlugin\n"
             "events = []\n"
             "def observer(ctx):\n"
             "    events.append(('observe', ctx.hook_name, ctx.payload))\n"
@@ -107,7 +107,7 @@ def test_extension_host_runs_observers_and_filters_safely(tmp_path: Path) -> Non
             "    return HookFilterResult(action='mutate', payload={'value': ctx.payload['value'] + 1})\n"
             "def broken(ctx):\n"
             "    raise RuntimeError('boom')\n"
-            "plugin = PromptMasterPlugin(\n"
+            "plugin = PollyPMPlugin(\n"
             "    name='hooks',\n"
             "    observers={'session.after_launch': [observer, broken]},\n"
             "    filters={'session.before_launch': [mutate, broken]},\n"

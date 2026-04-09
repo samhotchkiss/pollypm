@@ -1,10 +1,10 @@
 from pathlib import Path
 
-from promptmaster.models import AccountConfig, ProjectSettings, ProviderKind, RuntimeKind, SessionConfig
-from promptmaster.providers.claude import ClaudeAdapter
-from promptmaster.providers.codex import CodexAdapter
-from promptmaster.runtimes.docker import DockerRuntimeAdapter
-from promptmaster.runtimes.local import LocalRuntimeAdapter
+from pollypm.models import AccountConfig, ProjectSettings, ProviderKind, RuntimeKind, SessionConfig
+from pollypm.providers.claude import ClaudeAdapter
+from pollypm.providers.codex import CodexAdapter
+from pollypm.runtimes.docker import DockerRuntimeAdapter
+from pollypm.runtimes.local import LocalRuntimeAdapter
 
 
 def test_local_runtime_wraps_home_and_command(tmp_path: Path) -> None:
@@ -34,7 +34,7 @@ def test_local_runtime_wraps_home_and_command(tmp_path: Path) -> None:
 
     assert "CODEX_HOME" not in wrapped
     assert "runtime_launcher" in wrapped
-    assert "promptmaster.runtime_launcher" in wrapped
+    assert "pollypm.runtime_launcher" in wrapped
     assert "PYTHONPATH=" in wrapped
 
 
@@ -60,7 +60,7 @@ def test_docker_runtime_mounts_workspace_and_home(tmp_path: Path) -> None:
         email="codex@example.com",
         runtime=RuntimeKind.DOCKER,
         home=home,
-        docker_image="ghcr.io/example/promptmaster-agent:latest",
+        docker_image="ghcr.io/example/pollypm-agent:latest",
     )
     project = ProjectSettings(root_dir=project_root)
 
@@ -68,10 +68,10 @@ def test_docker_runtime_mounts_workspace_and_home(tmp_path: Path) -> None:
     wrapped = DockerRuntimeAdapter().wrap_command(command, account, project)
 
     assert "docker run" in wrapped
-    assert "ghcr.io/example/promptmaster-agent:latest" in wrapped
+    assert "ghcr.io/example/pollypm-agent:latest" in wrapped
     assert f"{project_root.resolve()}:/workspace" in wrapped
-    assert f"{home.resolve()}:/home/promptmaster" in wrapped
-    assert "CODEX_HOME=/home/promptmaster/.codex" in wrapped
+    assert f"{home.resolve()}:/home/pollypm" in wrapped
+    assert "CODEX_HOME=/home/pollypm/.codex" in wrapped
 
 
 def test_claude_runtime_sets_provider_native_config_dir(tmp_path: Path) -> None:
@@ -81,7 +81,7 @@ def test_claude_runtime_sets_provider_native_config_dir(tmp_path: Path) -> None:
         provider=ProviderKind.CLAUDE,
         account="claude_primary",
         cwd=tmp_path,
-        project="promptmaster",
+        project="pollypm",
         prompt="watch the project",
     )
     account = AccountConfig(
@@ -100,7 +100,7 @@ def test_claude_runtime_sets_provider_native_config_dir(tmp_path: Path) -> None:
     )
 
     assert "CLAUDE_CONFIG_DIR" not in wrapped
-    assert "promptmaster.runtime_launcher" in wrapped
+    assert "pollypm.runtime_launcher" in wrapped
     assert "PYTHONPATH=" in wrapped
 
 
@@ -111,7 +111,7 @@ def test_control_sessions_wrap_with_resume_fallback(tmp_path: Path) -> None:
         provider=ProviderKind.CODEX,
         account="codex_primary",
         cwd=tmp_path,
-        project="promptmaster",
+        project="pollypm",
         prompt="watch the project",
     )
     account = AccountConfig(
@@ -125,6 +125,6 @@ def test_control_sessions_wrap_with_resume_fallback(tmp_path: Path) -> None:
     command = CodexAdapter().build_launch_command(session, account)
     wrapped = LocalRuntimeAdapter().wrap_command(command, account, ProjectSettings(root_dir=tmp_path))
 
-    assert "promptmaster.runtime_launcher" in wrapped
+    assert "pollypm.runtime_launcher" in wrapped
     assert "session-markers/operator.resume" not in wrapped
     assert "history.jsonl" not in wrapped

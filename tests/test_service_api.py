@@ -1,15 +1,15 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from promptmaster.service_api import PromptMasterService
+from pollypm.service_api import PollyPMService
 
 
 def test_service_create_and_launch_worker_uses_worker_api(monkeypatch, tmp_path: Path) -> None:
-    service = PromptMasterService(tmp_path / "promptmaster.toml")
+    service = PollyPMService(tmp_path / "pollypm.toml")
     calls: list[tuple[str, object]] = []
 
     class FakeSession:
-        name = "worker_promptmaster"
+        name = "worker_pollypm"
 
     class FakeTmux:
         def has_session(self, _name: str) -> bool:
@@ -26,37 +26,37 @@ def test_service_create_and_launch_worker_uses_worker_api(monkeypatch, tmp_path:
         config = FakeConfig()
 
     monkeypatch.setattr(
-        "promptmaster.service_api.create_worker_session",
+        "pollypm.service_api.create_worker_session",
         lambda config_path, project_key, prompt: calls.append(("create", project_key, prompt)) or FakeSession(),
     )
     monkeypatch.setattr(
-        "promptmaster.service_api.launch_worker_session",
+        "pollypm.service_api.launch_worker_session",
         lambda config_path, session_name: calls.append(("launch", session_name)),
     )
     monkeypatch.setattr(service, "load_supervisor", lambda: FakeSupervisor())
 
-    session = service.create_and_launch_worker(project_key="promptmaster", prompt="Do the next task")
+    session = service.create_and_launch_worker(project_key="pollypm", prompt="Do the next task")
 
-    assert session.name == "worker_promptmaster"
+    assert session.name == "worker_pollypm"
     assert calls == [
-        ("create", "promptmaster", "Do the next task"),
-        ("launch", "worker_promptmaster"),
+        ("create", "pollypm", "Do the next task"),
+        ("launch", "worker_pollypm"),
     ]
 
 
 def test_service_suggest_worker_prompt_uses_worker_api(monkeypatch, tmp_path: Path) -> None:
-    service = PromptMasterService(tmp_path / "promptmaster.toml")
+    service = PollyPMService(tmp_path / "pollypm.toml")
 
     monkeypatch.setattr(
-        "promptmaster.service_api.suggest_worker_prompt",
+        "pollypm.service_api.suggest_worker_prompt",
         lambda config_path, project_key: f"Kick off {project_key}",
     )
 
-    assert service.suggest_worker_prompt(project_key="promptmaster") == "Kick off promptmaster"
+    assert service.suggest_worker_prompt(project_key="pollypm") == "Kick off pollypm"
 
 
 def test_service_focus_and_send_input_use_supervisor(monkeypatch, tmp_path: Path) -> None:
-    service = PromptMasterService(tmp_path / "promptmaster.toml")
+    service = PollyPMService(tmp_path / "pollypm.toml")
     calls: list[tuple[str, str, str | None]] = []
 
     class FakeSupervisor:
@@ -78,7 +78,7 @@ def test_service_focus_and_send_input_use_supervisor(monkeypatch, tmp_path: Path
 
 
 def test_service_schedule_job_uses_supervisor(monkeypatch, tmp_path: Path) -> None:
-    service = PromptMasterService(tmp_path / "promptmaster.toml")
+    service = PollyPMService(tmp_path / "pollypm.toml")
     captured: list[tuple[str, object, object]] = []
 
     class FakeSupervisor:

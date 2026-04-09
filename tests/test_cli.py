@@ -2,13 +2,13 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-import promptmaster.cli as cli
+import pollypm.cli as cli
 
 
 def test_root_command_defaults_to_up(monkeypatch, tmp_path: Path) -> None:
     called: dict[str, Path] = {}
-    config_path = tmp_path / "promptmaster.toml"
-    config_path.write_text("[project]\nname = \"promptmaster\"\n")
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text("[project]\nname = \"pollypm\"\n")
 
     def fake_up(config_path: Path) -> None:
         called["config_path"] = config_path
@@ -35,22 +35,22 @@ def test_root_command_runs_onboarding_when_config_missing(monkeypatch, tmp_path:
     monkeypatch.setattr(cli, "up", fail_up)
 
     runner = CliRunner()
-    result = runner.invoke(cli.app, ["--config", str(tmp_path / "promptmaster.toml")])
+    result = runner.invoke(cli.app, ["--config", str(tmp_path / "pollypm.toml")])
 
     assert result.exit_code == 0
-    assert called["config_path"] == tmp_path / "promptmaster.toml"
+    assert called["config_path"] == tmp_path / "pollypm.toml"
 
 
 def test_discover_config_path_walks_up_parents(monkeypatch, tmp_path: Path) -> None:
     root = tmp_path / "repo"
     nested = root / "a" / "b"
     nested.mkdir(parents=True)
-    config_path = root / "promptmaster.toml"
+    config_path = root / "pollypm.toml"
     config_path.write_text("[project]\nname = \"PollyPM\"\n")
 
     monkeypatch.chdir(nested)
 
-    resolved = cli._discover_config_path(Path("promptmaster.toml"))
+    resolved = cli._discover_config_path(Path("pollypm.toml"))
 
     assert resolved == config_path
 
@@ -81,8 +81,8 @@ def test_root_command_attaches_existing_session_when_default_config_missing(monk
 
 
 def test_up_surfaces_bootstrap_failure_cleanly(monkeypatch, tmp_path: Path) -> None:
-    config_path = tmp_path / "promptmaster.toml"
-    config_path.write_text("[project]\nname = \"promptmaster\"\n")
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text("[project]\nname = \"pollypm\"\n")
 
     class FakeTmux:
         def has_session(self, name: str) -> bool:

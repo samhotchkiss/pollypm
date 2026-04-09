@@ -101,7 +101,7 @@ PollyPM uses tmux for:
 
 Operational rule:
 
-- PollyPM operational commands should run only from inside the `promptmaster` tmux session
+- PollyPM operational commands should run only from inside the `pollypm` tmux session
 - startup is the exception: `pm up` may be run outside tmux to create or attach to the session
 
 Important rule:
@@ -146,7 +146,7 @@ PollyPM does not assume it can resume exact internal provider state. Recovery is
 PollyPM config separates:
 
 - `accounts`: credentials and isolation boundaries
-- `promptmaster`: control-plane account selection and failover policy
+- `pollypm`: control-plane account selection and failover policy
 - `sessions`: role and provider declarations
 
 Worker sessions should be modeled per project, and PollyPM should enforce one active worker session per project at a time.

@@ -1,4 +1,4 @@
-from promptmaster.tmux.client import TmuxClient
+from pollypm.tmux.client import TmuxClient
 
 
 def test_current_session_name_returns_none_outside_tmux(monkeypatch) -> None:
@@ -37,7 +37,7 @@ def test_new_session_attached_invokes_tmux(monkeypatch) -> None:
     monkeypatch.setattr("subprocess.run", fake_run)
     client = TmuxClient()
 
-    result = client.new_session_attached("promptmaster-onboarding", "onboarding", "echo hello")
+    result = client.new_session_attached("pollypm-onboarding", "onboarding", "echo hello")
 
     assert result == 0
     assert captured["check"] is False
@@ -46,7 +46,7 @@ def test_new_session_attached_invokes_tmux(monkeypatch) -> None:
         "new-session",
         "-A",
         "-s",
-        "promptmaster-onboarding",
+        "pollypm-onboarding",
         "-n",
         "onboarding",
         "echo hello",

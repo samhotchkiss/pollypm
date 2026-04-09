@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from promptmaster.memory_backends import FileMemoryBackend, get_memory_backend
+from pollypm.memory_backends import FileMemoryBackend, get_memory_backend
 
 
 def test_file_memory_backend_writes_reads_and_compacts(tmp_path: Path) -> None:

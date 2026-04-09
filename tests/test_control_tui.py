@@ -1,13 +1,13 @@
 import asyncio
 from pathlib import Path
 
-from promptmaster.control_tui import InputModal, PromptMasterApp
-from promptmaster.models import AccountConfig, ProviderKind, SessionConfig, SessionLaunchSpec
+from pollypm.control_tui import InputModal, PollyPMApp
+from pollypm.models import AccountConfig, ProviderKind, SessionConfig, SessionLaunchSpec
 
 
 def test_accounts_table_preserves_selection_by_row_key(tmp_path: Path) -> None:
     async def run() -> None:
-        app = PromptMasterApp(tmp_path / "missing.toml")
+        app = PollyPMApp(tmp_path / "missing.toml")
 
         async with app.run_test():
             table = app.accounts_table
@@ -36,7 +36,7 @@ def test_accounts_table_preserves_selection_by_row_key(tmp_path: Path) -> None:
 
 def test_control_tui_renders_cockpit_shell(tmp_path: Path) -> None:
     async def run() -> None:
-        app = PromptMasterApp(tmp_path / "missing.toml")
+        app = PollyPMApp(tmp_path / "missing.toml")
 
         async with app.run_test():
             assert app.title == "PollyPM"
@@ -49,7 +49,7 @@ def test_control_tui_renders_cockpit_shell(tmp_path: Path) -> None:
 
 def test_cockpit_table_contains_polly_inbox_and_settings(tmp_path: Path) -> None:
     async def run() -> None:
-        app = PromptMasterApp(tmp_path / "missing.toml")
+        app = PollyPMApp(tmp_path / "missing.toml")
 
         async with app.run_test():
             rows = [
@@ -72,7 +72,7 @@ def test_cockpit_table_contains_polly_inbox_and_settings(tmp_path: Path) -> None
 
 def test_dashboard_settings_selection_jumps_to_accounts(tmp_path: Path) -> None:
     async def run() -> None:
-        app = PromptMasterApp(tmp_path / "missing.toml")
+        app = PollyPMApp(tmp_path / "missing.toml")
 
         async with app.run_test():
             app._replace_table_rows(
@@ -98,7 +98,7 @@ def test_dashboard_settings_selection_jumps_to_accounts(tmp_path: Path) -> None:
 
 def test_new_worker_modal_prefills_default_prompt(tmp_path: Path) -> None:
     async def run() -> None:
-        app = PromptMasterApp(tmp_path / "missing.toml")
+        app = PollyPMApp(tmp_path / "missing.toml")
         captured: dict[str, object] = {}
 
         async with app.run_test():
@@ -106,7 +106,7 @@ def test_new_worker_modal_prefills_default_prompt(tmp_path: Path) -> None:
             app.service.suggest_worker_prompt = lambda *, project_key: f"Scoped kickoff for {project_key}"  # type: ignore[method-assign]
             app._replace_table_rows(
                 app.projects_table,
-                [(("promptmaster", "PollyPM", "git", "", str(tmp_path)), "promptmaster")],
+                [(("pollypm", "PollyPM", "git", "", str(tmp_path)), "pollypm")],
             )
             app.projects_table.move_cursor(row=0, animate=False, scroll=False)
 
@@ -120,21 +120,21 @@ def test_new_worker_modal_prefills_default_prompt(tmp_path: Path) -> None:
 
             screen = captured["screen"]
             assert isinstance(screen, InputModal)
-            assert screen.request.value == "Scoped kickoff for promptmaster"
+            assert screen.request.value == "Scoped kickoff for pollypm"
 
     asyncio.run(run())
 
 
 def test_send_input_modal_prefills_default_text(tmp_path: Path) -> None:
     async def run() -> None:
-        app = PromptMasterApp(tmp_path / "missing.toml")
+        app = PollyPMApp(tmp_path / "missing.toml")
         captured: dict[str, object] = {}
 
         async with app.run_test():
             app._set_active_tab("sessions-tab")
             app._replace_table_rows(
                 app.sessions_table,
-                [(("worker_promptmaster", "worker", "promptmaster", "codex_s_swh_me", "running", "", ""), "worker_promptmaster")],
+                [(("worker_pollypm", "worker", "pollypm", "codex_s_swh_me", "running", "", ""), "worker_pollypm")],
             )
             app.sessions_table.move_cursor(row=0, animate=False, scroll=False)
 
@@ -154,7 +154,7 @@ def test_send_input_modal_prefills_default_text(tmp_path: Path) -> None:
 
 
 def test_session_detail_uses_role_specific_tmux_session(tmp_path: Path) -> None:
-    app = PromptMasterApp(tmp_path / "missing.toml")
+    app = PollyPMApp(tmp_path / "missing.toml")
     session = SessionConfig(
         name="heartbeat",
         role="heartbeat-supervisor",
@@ -209,7 +209,7 @@ def test_session_detail_uses_role_specific_tmux_session(tmp_path: Path) -> None:
 
 def test_numeric_keys_switch_tabs_even_with_table_focus(tmp_path: Path) -> None:
     async def run() -> None:
-        app = PromptMasterApp(tmp_path / "missing.toml")
+        app = PollyPMApp(tmp_path / "missing.toml")
 
         async with app.run_test() as pilot:
             app._set_active_tab("alerts-tab")

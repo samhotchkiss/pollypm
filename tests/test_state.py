@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from promptmaster.storage.state import StateStore
+from pollypm.storage.state import StateStore
 
 
 def test_state_store_alerts_leases_and_heartbeats(tmp_path: Path) -> None:
@@ -55,7 +55,7 @@ def test_state_store_records_hourly_token_usage_deltas(tmp_path: Path) -> None:
         account_name="claude_primary",
         provider="claude",
         model_name="Opus 4.6 (1M context)",
-        project_key="promptmaster",
+        project_key="pollypm",
         cumulative_tokens=2000,
     )
     second = store.record_token_sample(
@@ -63,7 +63,7 @@ def test_state_store_records_hourly_token_usage_deltas(tmp_path: Path) -> None:
         account_name="claude_primary",
         provider="claude",
         model_name="Opus 4.6 (1M context)",
-        project_key="promptmaster",
+        project_key="pollypm",
         cumulative_tokens=2600,
     )
 

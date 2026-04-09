@@ -1,31 +1,31 @@
 from pathlib import Path
 
-from promptmaster.checkpoints import record_checkpoint, write_mechanical_checkpoint
-from promptmaster.models import (
+from pollypm.checkpoints import record_checkpoint, write_mechanical_checkpoint
+from pollypm.models import (
     AccountConfig,
     KnownProject,
     ProjectKind,
     ProjectSettings,
-    PromptMasterConfig,
-    PromptMasterSettings,
+    PollyPMConfig,
+    PollyPMSettings,
     ProviderKind,
     SessionConfig,
     SessionLaunchSpec,
 )
-from promptmaster.memory_backends import get_memory_backend
-from promptmaster.storage.state import StateStore
+from pollypm.memory_backends import get_memory_backend
+from pollypm.storage.state import StateStore
 
 
 def test_mechanical_checkpoint_persists_files_and_state(tmp_path: Path) -> None:
-    config = PromptMasterConfig(
-        project=ProjectSettings(root_dir=tmp_path, base_dir=tmp_path / ".promptmaster", logs_dir=tmp_path / ".promptmaster/logs", snapshots_dir=tmp_path / ".promptmaster/snapshots", state_db=tmp_path / ".promptmaster/state.db"),
-        promptmaster=PromptMasterSettings(controller_account="codex_primary"),
+    config = PollyPMConfig(
+        project=ProjectSettings(root_dir=tmp_path, base_dir=tmp_path / ".pollypm", logs_dir=tmp_path / ".pollypm/logs", snapshots_dir=tmp_path / ".pollypm/snapshots", state_db=tmp_path / ".pollypm/state.db"),
+        pollypm=PollyPMSettings(controller_account="codex_primary"),
         accounts={
             "codex_primary": AccountConfig(
                 name="codex_primary",
                 provider=ProviderKind.CODEX,
                 email="codex@example.com",
-                home=tmp_path / ".promptmaster/homes/codex_primary",
+                home=tmp_path / ".pollypm/homes/codex_primary",
             )
         },
         sessions={
@@ -53,14 +53,14 @@ def test_mechanical_checkpoint_persists_files_and_state(tmp_path: Path) -> None:
         session=config.sessions["worker"],
         account=config.accounts["codex_primary"],
         window_name="worker-demo",
-        log_path=tmp_path / ".promptmaster/logs/worker-demo.log",
+        log_path=tmp_path / ".pollypm/logs/worker-demo.log",
         command="codex",
     )
     store = StateStore(config.project.state_db)
     artifact = write_mechanical_checkpoint(
         config,
         launch,
-        snapshot_path=tmp_path / ".promptmaster/snapshots/worker-demo.txt",
+        snapshot_path=tmp_path / ".pollypm/snapshots/worker-demo.txt",
         snapshot_content="Line 1\nLine 2\n",
         log_bytes=42,
         alerts=["idle_output"],
@@ -74,7 +74,7 @@ def test_mechanical_checkpoint_persists_files_and_state(tmp_path: Path) -> None:
         project_key="demo",
         level="level0",
         artifact=artifact,
-        snapshot_path=tmp_path / ".promptmaster/snapshots/worker-demo.txt",
+        snapshot_path=tmp_path / ".pollypm/snapshots/worker-demo.txt",
         memory_backend_name="file",
     )
     latest = store.latest_checkpoint("worker")

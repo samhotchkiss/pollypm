@@ -1,6 +1,6 @@
 # Provider Plugin SDK
 
-PollyPM exposes a stable provider SDK in `promptmaster.provider_sdk` for authors who want to add a new CLI provider without editing core orchestration code.
+PollyPM exposes a stable provider SDK in `pollypm.provider_sdk` for authors who want to add a new CLI provider without editing core orchestration code.
 
 ## What The SDK Covers
 
@@ -12,7 +12,7 @@ PollyPM exposes a stable provider SDK in `promptmaster.provider_sdk` for authors
 
 ## Core Types
 
-Import these from `promptmaster.provider_sdk`:
+Import these from `pollypm.provider_sdk`:
 
 - `ProviderAdapterBase`
 - `ProviderUsageSnapshot`
@@ -35,9 +35,9 @@ The launch command still carries the provider-specific resume args/marker so Pol
 ## Example
 
 ```python
-from promptmaster.models import AccountConfig, SessionConfig
-from promptmaster.provider_sdk import ProviderAdapterBase, ProviderUsageSnapshot, TranscriptSource
-from promptmaster.providers.base import LaunchCommand
+from pollypm.models import AccountConfig, SessionConfig
+from pollypm.provider_sdk import ProviderAdapterBase, ProviderUsageSnapshot, TranscriptSource
+from pollypm.providers.base import LaunchCommand
 
 
 class GeminiAdapter(ProviderAdapterBase):

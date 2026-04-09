@@ -2,10 +2,10 @@
 name = "PollyPM"
 tmux_session = "pollypm"
 workspace_root = "/Users/sam/dev"
-base_dir = ".pollypm"
-logs_dir = ".pollypm/logs"
-snapshots_dir = ".pollypm/snapshots"
-state_db = ".pollypm/state.db"
+base_dir = ".pollypm-state"
+logs_dir = ".pollypm-state/logs"
+snapshots_dir = ".pollypm-state/snapshots"
+state_db = ".pollypm-state/state.db"
 
 [pollypm]
 controller_account = "claude_pearl_swh_me"
@@ -21,17 +21,17 @@ backend = "file"
 [accounts.claude_pearl_swh_me]
 provider = "claude"
 email = "pearl@swh.me"
-home = ".pollypm/homes/claude_pearl_swh_me"
+home = ".pollypm-state/homes/claude_pearl_swh_me"
 
 [accounts.codex_s_swh_me]
 provider = "codex"
 email = "s@swh.me"
-home = ".pollypm/homes/codex_s_swh_me"
+home = ".pollypm-state/homes/codex_s_swh_me"
 
 [accounts.codex_gpt_swh_me]
 provider = "codex"
 email = "gpt@swh.me"
-home = ".pollypm/homes/codex_gpt_swh_me"
+home = ".pollypm-state/homes/codex_gpt_swh_me"
 
 [sessions.heartbeat]
 role = "heartbeat-supervisor"
@@ -51,12 +51,12 @@ window_name = "pm-operator"
 prompt = "You are Polly, the PollyPM project manager. Remain as a true interactive CLI session. You are the operator-facing project manager, not the default implementation agent. Your first job when the user wants to start or continue work is to kick off, resume, and oversee a work session: clarify the goal, decide whether the project needs structure, pick the right provider/model/reasoning level, choose the right healthy agent account automatically when the user did not explicitly name one, and start, resume, or redirect a worker session. Then keep supervising. Assume the user wants you to move work forward through managed project sessions unless they are clearly asking for strategy-only discussion. Do not default to simply answering with implementation advice if you can instead launch, resume, steer, review, or reassign a real work session. Your ongoing job is to look for ended turns, incomplete work, missing verification, low-value loops, drift from the project's north star, oversized or untestable chunks, and opportunities to break work into smaller measurable steps. Push for meaningful progress, regular commits, and modular testable changes. If the user asked only for an end result, you may redirect method and execution automatically. If the user explicitly required a build mechanism or architecture, escalate with concise pushback instead of silently overriding it. Do not jump into doing the project work yourself unless you are explicitly acting as a review/merge lane or the user asks you to work directly. By default, oversee, coordinate, review, and keep the project moving."
 args = ["--dangerously-skip-permissions"]
 
-[sessions.worker_promptmaster]
+[sessions.worker_pollypm]
 role = "worker"
 provider = "codex"
 account = "codex_gpt_swh_me"
-cwd = ".pollypm/worktrees/promptmaster-pa-worker_promptmaster"
-window_name = "worker-promptmaster"
+cwd = ".pollypm-state/worktrees/pollypm-pa-worker_pollypm"
+window_name = "worker-pollypm"
 prompt = "Read the PollyPM issue queue, start with the highest-leverage open issue, and move the project forward in small verified chunks."
 
 [projects.news]

@@ -512,7 +512,7 @@ def _claude_prompt_ready(pane_text: str) -> bool:
 
 
 def _login_completion_marker_seen(pane_text: str) -> bool:
-    return "PollyPM: login window complete." in pane_text or "Prompt Master: login window complete." in pane_text
+    return "PollyPM: login window complete." in pane_text
 
 
 def _wait_for_login_completion(
@@ -796,7 +796,7 @@ def build_onboarded_config(
         raise ValueError(f"Unknown controller account: {controller_account}")
 
     controller = accounts[controller_account]
-    base_dir = root_dir
+    base_dir = root_dir / ".pollypm-state"
 
     config_accounts = {
         name: AccountConfig(

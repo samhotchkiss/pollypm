@@ -14,7 +14,7 @@ from pollypm.memory_backends.base import MemoryBackend, MemoryEntry, MemorySumma
 class FileMemoryBackend(MemoryBackend):
     def __init__(self, project_path: Path, *, state_db: Path | None = None) -> None:
         self.project_path = project_path.expanduser().resolve()
-        self.state_db = state_db or (self.project_path / ".pollypm" / "state.db")
+        self.state_db = state_db or (self.project_path / ".pollypm-state" / "state.db")
         self.store = StateStore(self.state_db)
         self.plugins = extension_host_for_root(str(self.project_path))
 

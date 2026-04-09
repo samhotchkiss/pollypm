@@ -30,10 +30,10 @@ class ClaudeAdapter(ProviderAdapterBase):
         resume_marker: Path | None = None
         fresh_launch_marker: Path | None = None
         if account.home is not None:
-            fresh_launch_marker = account.home / ".pollypm" / "session-markers" / f"{session.name}.fresh"
+            fresh_launch_marker = account.home / ".pollypm-state" / "session-markers" / f"{session.name}.fresh"
         if session.role in {"heartbeat-supervisor", "operator-pm"} and account.home is not None:
             resume_argv = [self.binary, "--continue", *session.args]
-            resume_marker = account.home / ".pollypm" / "session-markers" / f"{session.name}.resume"
+            resume_marker = account.home / ".pollypm-state" / "session-markers" / f"{session.name}.resume"
         return LaunchCommand(
             argv=argv,
             env=dict(account.env),

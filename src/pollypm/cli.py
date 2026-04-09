@@ -81,6 +81,11 @@ def _account_label(supervisor: Supervisor, account_name: str) -> str:
     return account.email or account.name
 
 
+def _cli_status(msg: str) -> None:
+    """Print a status update on its own line."""
+    typer.echo(msg)
+
+
 def _install_global_pollypm(root_dir: Path) -> tuple[bool, str]:
     result = subprocess.run(
         ["uv", "tool", "install", "--editable", "--reinstall", str(root_dir)],
@@ -269,7 +274,15 @@ def ui(
 def cockpit(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
-    PollyCockpitApp(config_path).run(mouse=True)
+    import traceback
+    crash_log = config_path.parent / "cockpit_crash.log"
+    try:
+        PollyCockpitApp(config_path).run(mouse=True)
+    except Exception:
+        with open(crash_log, "a") as f:
+            f.write(f"\n--- {__import__('datetime').datetime.now().isoformat()} ---\n")
+            traceback.print_exc(file=f)
+        raise
 
 
 @app.command("cockpit-pane")
@@ -439,7 +452,7 @@ def up(
             typer.echo(f"Restored tmux session {session_name} (storage-closet still alive)")
         else:
             try:
-                controller_account = supervisor.bootstrap_tmux(skip_probe=True)
+                controller_account = supervisor.bootstrap_tmux(skip_probe=True, on_status=_cli_status)
             except RuntimeError as exc:
                 raise typer.BadParameter(str(exc)) from exc
             created = True

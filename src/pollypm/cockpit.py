@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shlex
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -214,11 +215,13 @@ class CockpitRouter:
                 detached=True,
                 percent=80,
             )
-            left_pane = min(self.tmux.list_panes(target), key=self._pane_left)
-            if hasattr(self.tmux, "resize_pane_width"):
-                self.tmux.resize_pane_width(left_pane.pane_id, self._LEFT_PANE_WIDTH)
             state["right_pane_id"] = right_pane_id
             self._write_state(state)
+            try:
+                left_pane = min(self.tmux.list_panes(target), key=self._pane_left)
+                self._try_resize_rail(left_pane.pane_id)
+            except Exception:  # noqa: BLE001
+                pass
             panes = self.tmux.list_panes(target)
         elif len(panes) > 2:
             for pane in panes:
@@ -236,13 +239,19 @@ class CockpitRouter:
             self._normalize_layout(target, panes)
             panes = self.tmux.list_panes(target)
             left_pane = min(panes, key=self._pane_left)
-            if hasattr(self.tmux, "resize_pane_width"):
-                self.tmux.resize_pane_width(left_pane.pane_id, self._LEFT_PANE_WIDTH)
             state["right_pane_id"] = max(panes, key=self._pane_left).pane_id
             self._write_state(state)
+            self._try_resize_rail(left_pane.pane_id)
 
     def _pane_left(self, pane) -> int:
         return int(getattr(pane, "pane_left", 0))
+
+    def _try_resize_rail(self, pane_id: str) -> None:
+        """Best-effort resize of the rail pane. Never raises."""
+        try:
+            self.tmux.resize_pane_width(pane_id, self._LEFT_PANE_WIDTH)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _normalize_layout(self, target: str, panes) -> None:
         if len(panes) != 2:
@@ -310,21 +319,47 @@ class CockpitRouter:
         if right_pane is not None:
             self.tmux.select_pane(right_pane)
 
-    def create_worker_and_route(self, project_key: str) -> None:
+    def create_worker_and_route(
+        self,
+        project_key: str,
+        on_status: Callable[[str], None] | None = None,
+    ) -> None:
         supervisor = self._load_supervisor()
         launches = supervisor.plan_launches()
         session_name = self._project_session_map(launches).get(project_key)
         storage_session = supervisor.storage_closet_session_name()
         storage_windows = {w.name for w in self.tmux.list_windows(storage_session)}
 
+        target: str | None = None
         if session_name is not None:
             launch = next(l for l in launches if l.session.name == session_name)
             if launch.window_name not in storage_windows:
-                supervisor.launch_session(session_name)
+                _launch, target = supervisor.create_session_window(session_name, on_status=on_status)
         else:
             prompt = self.service.suggest_worker_prompt(project_key=project_key)
-            self.service.create_and_launch_worker(project_key=project_key, prompt=prompt)
+            self.service.create_and_launch_worker(
+                project_key=project_key, prompt=prompt, on_status=on_status, skip_stabilize=True,
+            )
+            # Re-read launches to pick up the newly created session
+            supervisor = self._load_supervisor()
+            launches = supervisor.plan_launches()
+            session_name = self._project_session_map(launches).get(project_key)
+            if session_name is not None:
+                launch = next(l for l in launches if l.session.name == session_name)
+                tmux_session = supervisor._tmux_session_for_launch(launch)
+                window_map = supervisor._window_map()
+                if launch.window_name in window_map:
+                    target_key = f"{tmux_session}:{launch.window_name}"
+                    # Window exists but hasn't been stabilized yet
+                    target = target_key
+
+        # Route immediately so the user sees the session booting live
         self.route_selected(f"project:{project_key}")
+
+        # Stabilize in the background (dismisses prompts, waits for ready)
+        if target is not None and session_name is not None:
+            launch = next(l for l in supervisor.plan_launches() if l.session.name == session_name)
+            supervisor._stabilize_launch(launch, target, on_status=on_status)
 
     def _show_live_session(self, supervisor: Supervisor, session_name: str, window_target: str) -> None:
         mounted_session = self._mounted_session_name(supervisor, window_target)
@@ -357,8 +392,7 @@ class CockpitRouter:
                         self.tmux.join_pane(source, left_pane_id, horizontal=True)
                         panes = self.tmux.list_panes(window_target)
                         left_pane = min(panes, key=self._pane_left)
-                        if hasattr(self.tmux, "resize_pane_width"):
-                            self.tmux.resize_pane_width(left_pane.pane_id, self._LEFT_PANE_WIDTH)
+                        self._try_resize_rail(left_pane.pane_id)
                         right_pane = max(panes, key=self._pane_left)
                         state = self._load_state()
                         state["mounted_session"] = session_name
@@ -381,8 +415,7 @@ class CockpitRouter:
             else:
                 self.tmux.respawn_pane(right_pane_id, self._right_pane_command(fallback_kind, fallback_target))
             left_pane = min(self.tmux.list_panes(window_target), key=self._pane_left)
-            if hasattr(self.tmux, "resize_pane_width"):
-                self.tmux.resize_pane_width(left_pane.pane_id, self._LEFT_PANE_WIDTH)
+            self._try_resize_rail(left_pane.pane_id)
             state = self._load_state()
             state.pop("mounted_session", None)
             state["right_pane_id"] = self._right_pane_id(window_target)
@@ -394,8 +427,7 @@ class CockpitRouter:
         self.tmux.join_pane(source, left_pane_id, horizontal=True)
         panes = self.tmux.list_panes(window_target)
         left_pane = min(panes, key=self._pane_left)
-        if hasattr(self.tmux, "resize_pane_width"):
-            self.tmux.resize_pane_width(left_pane.pane_id, self._LEFT_PANE_WIDTH)
+        self._try_resize_rail(left_pane.pane_id)
         right_pane = max(panes, key=self._pane_left)
         state = self._load_state()
         state["mounted_session"] = session_name
@@ -438,8 +470,7 @@ class CockpitRouter:
         supervisor._stabilize_launch(visible_launch, right_pane_id)
         panes = self.tmux.list_panes(window_target)
         left_pane = min(panes, key=self._pane_left)
-        if hasattr(self.tmux, "resize_pane_width"):
-            self.tmux.resize_pane_width(left_pane.pane_id, self._LEFT_PANE_WIDTH)
+        self._try_resize_rail(left_pane.pane_id)
         return max(self.tmux.list_panes(window_target), key=self._pane_left)
 
     def _park_mounted_session(self, supervisor: Supervisor, window_target: str) -> None:
@@ -498,7 +529,15 @@ class CockpitRouter:
         return None
 
     def _is_live_provider_pane(self, pane) -> bool:
-        return getattr(pane, "pane_current_command", "") in {"node", "claude", "codex"}
+        cmd = getattr(pane, "pane_current_command", "")
+        # Claude Code may report the version string (e.g. "2.1.98") as the
+        # current command instead of "claude" or "node".
+        if cmd in {"node", "claude", "codex"}:
+            return True
+        # Treat any version-like string (digits and dots) as a live Claude pane.
+        if cmd and all(c.isdigit() or c == "." for c in cmd):
+            return True
+        return False
 
     def _session_available_for_mount(self, supervisor: Supervisor, session_name: str, window_target: str) -> bool:
         """Return True only if the session is already running (mounted or in storage)."""
@@ -536,8 +575,7 @@ class CockpitRouter:
         else:
             self.tmux.respawn_pane(right_pane_id, self._right_pane_command(kind, project_key))
         left_pane = min(self.tmux.list_panes(window_target), key=self._pane_left)
-        if hasattr(self.tmux, "resize_pane_width"):
-            self.tmux.resize_pane_width(left_pane.pane_id, self._LEFT_PANE_WIDTH)
+        self._try_resize_rail(left_pane.pane_id)
         state = self._load_state()
         state.pop("mounted_session", None)
         state["right_pane_id"] = self._right_pane_id(window_target)

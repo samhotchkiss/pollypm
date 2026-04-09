@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 import typer
@@ -149,14 +150,22 @@ def suggest_worker_prompt(config_path: Path, *, project_key: str) -> str:
     return ""
 
 
-def launch_worker_session(config_path: Path, session_name: str) -> SessionConfig:
+def launch_worker_session(
+    config_path: Path,
+    session_name: str,
+    on_status: Callable[[str], None] | None = None,
+    skip_stabilize: bool = False,
+) -> SessionConfig:
     config = load_config(config_path)
     if session_name not in config.sessions:
         raise typer.BadParameter(f"Unknown session: {session_name}")
 
     supervisor = Supervisor(config)
     supervisor.ensure_layout()
-    supervisor.launch_session(session_name)
+    if skip_stabilize:
+        supervisor.create_session_window(session_name, on_status=on_status)
+    else:
+        supervisor.launch_session(session_name, on_status=on_status)
     return config.sessions[session_name]
 
 

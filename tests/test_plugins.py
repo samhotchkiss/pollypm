@@ -41,9 +41,9 @@ def test_extension_host_loads_builtin_provider_and_runtime(tmp_path: Path) -> No
 def test_repo_local_plugin_overrides_user_plugin(monkeypatch, tmp_path: Path) -> None:
     builtin_root = Path(__file__).resolve().parents[1] / "src" / "pollypm" / "plugins_builtin"
     user_root = tmp_path / "user-plugins"
-    repo_root = tmp_path / ".pollypm" / "plugins"
+    repo_root = tmp_path / ".pollypm-state" / "plugins"
     user_plugin = user_root / "override_provider_test"
-    repo_plugin = tmp_path / ".pollypm" / "plugins" / "override_provider_test"
+    repo_plugin = tmp_path / ".pollypm-state" / "plugins" / "override_provider_test"
     monkeypatch.setattr(
         ExtensionHost,
         "_plugin_search_paths",
@@ -79,7 +79,7 @@ def test_repo_local_plugin_overrides_user_plugin(monkeypatch, tmp_path: Path) ->
 
 
 def test_extension_host_rejects_wrong_api_version(tmp_path: Path) -> None:
-    bad_plugin = tmp_path / ".pollypm" / "plugins" / "bad"
+    bad_plugin = tmp_path / ".pollypm-state" / "plugins" / "bad"
     _write_plugin(
         bad_plugin,
         name="bad",
@@ -94,7 +94,7 @@ def test_extension_host_rejects_wrong_api_version(tmp_path: Path) -> None:
 
 
 def test_extension_host_runs_observers_and_filters_safely(tmp_path: Path) -> None:
-    plugin_dir = tmp_path / ".pollypm" / "plugins" / "hooks"
+    plugin_dir = tmp_path / ".pollypm-state" / "plugins" / "hooks"
     _write_plugin(
         plugin_dir,
         name="hooks",

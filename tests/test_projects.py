@@ -76,7 +76,7 @@ def test_register_project_accepts_plain_folder_and_can_enable_tracker(tmp_path: 
     project_path = tmp_path / "plain-project"
     project_path.mkdir()
     config = PollyPMConfig(
-        project=ProjectSettings(root_dir=tmp_path, base_dir=tmp_path / ".pollypm", logs_dir=tmp_path / ".pollypm/logs", snapshots_dir=tmp_path / ".pollypm/snapshots", state_db=tmp_path / ".pollypm/state.db"),
+        project=ProjectSettings(root_dir=tmp_path, base_dir=tmp_path / ".pollypm-state", logs_dir=tmp_path / ".pollypm-state/logs", snapshots_dir=tmp_path / ".pollypm-state/snapshots", state_db=tmp_path / ".pollypm-state/state.db"),
         pollypm=PollyPMSettings(controller_account=""),
         accounts={},
         sessions={},
@@ -87,7 +87,7 @@ def test_register_project_accepts_plain_folder_and_can_enable_tracker(tmp_path: 
 
     project = register_project(config_path, project_path, name="Plain")
     assert detect_project_kind(project.path).value == "folder"
-    assert (project_path / ".pollypm").exists()
+    assert (project_path / ".pollypm-state").exists()
 
     tracked = enable_tracked_project(config_path, project.key)
     assert tracked.tracked is True

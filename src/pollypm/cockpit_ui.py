@@ -357,14 +357,20 @@ class PollyCockpitApp(App[None]):
             yield self.hint
 
     def on_mount(self) -> None:
-        try:
-            self.router.ensure_cockpit_layout()
-        except Exception:  # noqa: BLE001
-            pass
         self.selected_key = self.router.selected_key()
         self._refresh_rows()
         self.set_interval(0.8, self._tick)
         self.nav.focus()
+        # Delay the cockpit layout split so Textual finishes its first render
+        # before the pane is resized.  An immediate split sends SIGWINCH before
+        # the alternate screen is active, which can leave the pane in copy mode.
+        self.set_timer(0.5, self._deferred_layout)
+
+    def _deferred_layout(self) -> None:
+        try:
+            self.router.ensure_cockpit_layout()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _focus_right_pane(self) -> None:
         focus_method = getattr(self.router, "focus_right_pane", None)
@@ -385,15 +391,18 @@ class PollyCockpitApp(App[None]):
             pass
 
     def _enforce_rail_width(self) -> None:
+        """Recover missing panes and fix rail width if it drifted."""
         try:
             from pollypm.config import load_config
             config = load_config(self.config_path)
             target = f"{config.project.tmux_session}:{self.router._COCKPIT_WINDOW}"
             panes = self.router.tmux.list_panes(target)
-            if len(panes) >= 2:
+            if len(panes) < 2:
+                self.router.ensure_cockpit_layout()
+            elif len(panes) >= 2:
                 left_pane = min(panes, key=lambda p: p.pane_left)
                 if left_pane.pane_width != self.router._LEFT_PANE_WIDTH:
-                    self.router.tmux.resize_pane_width(left_pane.pane_id, self.router._LEFT_PANE_WIDTH)
+                    self.router._try_resize_rail(left_pane.pane_id)
         except Exception:  # noqa: BLE001
             pass
 
@@ -513,13 +522,24 @@ class PollyCockpitApp(App[None]):
             return
         project_key = key.split(":", 1)[1]
         self.hint.update(f"Launching worker for {project_key}...")
+        self.run_worker(
+            lambda: self._launch_worker_sync(project_key, key),
+            thread=True,
+            exclusive=True,
+            group="new_worker",
+        )
+
+    def _launch_worker_sync(self, project_key: str, key: str) -> None:
+        def _on_status(msg: str) -> None:
+            self.call_from_thread(self.hint.update, msg)
+
         try:
-            self.router.create_worker_and_route(project_key)
-            self._focus_right_pane()
+            self.router.create_worker_and_route(project_key, on_status=_on_status)
+            self.call_from_thread(self._focus_right_pane)
         except Exception as exc:  # noqa: BLE001
-            self.hint.update(f"Launch failed: {exc}")
-        self.selected_key = key
-        self._refresh_rows()
+            self.call_from_thread(self.hint.update, f"Launch failed: {exc}")
+        self.call_from_thread(setattr, self, "selected_key", key)
+        self.call_from_thread(self._refresh_rows)
 
     def action_refresh(self) -> None:
         try:

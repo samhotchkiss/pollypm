@@ -24,7 +24,7 @@ SKIP_DIR_NAMES = {
     ".local",
     ".npm",
     ".pnpm-store",
-    ".pollypm",
+    ".pollypm-state",
     ".rustup",
     ".Trash",
     ".venv",
@@ -53,7 +53,7 @@ def detect_project_kind(path: Path) -> ProjectKind:
 
 
 def project_pollypm_dir(project_path: Path) -> Path:
-    return normalize_project_path(project_path) / ".pollypm"
+    return normalize_project_path(project_path) / ".pollypm-state"
 
 
 def project_dossier_dir(project_path: Path) -> Path:
@@ -91,7 +91,7 @@ def ensure_project_scaffold(project_path: Path) -> Path:
         project_worktrees_dir(project_path),
     ]:
         directory.mkdir(parents=True, exist_ok=True)
-    _ensure_gitignore_entry(normalize_project_path(project_path), ".pollypm/")
+    _ensure_gitignore_entry(normalize_project_path(project_path), ".pollypm-state/")
     return pollypm_dir
 
 

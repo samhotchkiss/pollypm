@@ -37,10 +37,10 @@ def _config(tmp_path: Path) -> PollyPMConfig:
     return PollyPMConfig(
         project=ProjectSettings(
             root_dir=tmp_path,
-            base_dir=tmp_path / ".pollypm",
-            logs_dir=tmp_path / ".pollypm/logs",
-            snapshots_dir=tmp_path / ".pollypm/snapshots",
-            state_db=tmp_path / ".pollypm/state.db",
+            base_dir=tmp_path / ".pollypm-state",
+            logs_dir=tmp_path / ".pollypm-state/logs",
+            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
+            state_db=tmp_path / ".pollypm-state/state.db",
         ),
         pollypm=PollyPMSettings(
             controller_account="claude_controller",
@@ -52,13 +52,13 @@ def _config(tmp_path: Path) -> PollyPMConfig:
                 name="claude_controller",
                 provider=ProviderKind.CLAUDE,
                 email="claude@example.com",
-                home=tmp_path / ".pollypm/homes/claude_controller",
+                home=tmp_path / ".pollypm-state/homes/claude_controller",
             ),
             "codex_backup": AccountConfig(
                 name="codex_backup",
                 provider=ProviderKind.CODEX,
                 email="codex@example.com",
-                home=tmp_path / ".pollypm/homes/codex_backup",
+                home=tmp_path / ".pollypm-state/homes/codex_backup",
             ),
         },
         sessions={
@@ -154,7 +154,7 @@ def test_heartbeat_uses_separate_tmux_session(monkeypatch, tmp_path: Path) -> No
     window_options: list[tuple[str, str, str]] = []
 
     monkeypatch.setattr(supervisor, "_probe_controller_account", lambda account_name: None)
-    monkeypatch.setattr(supervisor, "_stabilize_launch", lambda launch, target: None)
+    monkeypatch.setattr(supervisor, "_stabilize_launch", lambda launch, target, on_status=None: None)
     monkeypatch.setattr(supervisor, "_record_launch", lambda launch: None)
     monkeypatch.setattr(supervisor.tmux, "has_session", lambda name: False)
     monkeypatch.setattr(
@@ -214,7 +214,7 @@ def test_launch_session_creates_worker_window_detached(monkeypatch, tmp_path: Pa
     monkeypatch.setattr(supervisor.tmux, "set_window_option", lambda target, option, value: None)
     monkeypatch.setattr(supervisor.tmux, "pipe_pane", lambda target, path: None)
     monkeypatch.setattr(supervisor, "_record_launch", lambda launch: None)
-    monkeypatch.setattr(supervisor, "_stabilize_launch", lambda launch, target: None)
+    monkeypatch.setattr(supervisor, "_stabilize_launch", lambda launch, target, on_status=None: None)
 
     supervisor.launch_session("worker")
 
@@ -264,7 +264,7 @@ def test_codex_control_home_syncs_global_state(tmp_path: Path) -> None:
         name="codex_backup",
         provider=ProviderKind.CODEX,
         email="codex@example.com",
-        home=tmp_path / ".pollypm" / "homes" / "codex_backup",
+        home=tmp_path / ".pollypm-state" / "homes" / "codex_backup",
     )
     config.sessions["operator"] = SessionConfig(
         name="operator",

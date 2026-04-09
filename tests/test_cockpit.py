@@ -11,7 +11,7 @@ def test_cockpit_router_build_items_includes_core_entries(monkeypatch, tmp_path:
     class FakeConfig:
         class Project:
             root_dir = tmp_path
-            base_dir = tmp_path / ".pollypm"
+            base_dir = tmp_path / ".pollypm-state"
             tmux_session = "pollypm"
 
         project = Project()
@@ -43,7 +43,7 @@ def test_cockpit_router_build_items_includes_core_entries(monkeypatch, tmp_path:
             return launches, windows, [], [], []
 
     monkeypatch.setattr("pollypm.cockpit.list_open_messages", lambda root_dir: [object()])
-    (tmp_path / "pollypm.toml").write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n")
+    (tmp_path / "pollypm.toml").write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm-state'}\"\n")
     router = CockpitRouter(tmp_path / "pollypm.toml")
     monkeypatch.setattr(router, "_load_supervisor", lambda: FakeSupervisor())
 
@@ -86,7 +86,7 @@ def test_cockpit_router_ensure_layout_splits_when_missing_right_pane(tmp_path: P
     router = CockpitRouter(tmp_path / "pollypm.toml")
     router.tmux = FakeTmux()  # type: ignore[assignment]
     config_path = tmp_path / "pollypm.toml"
-    config_path.write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n")
+    config_path.write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm-state'}\"\n")
 
     router.ensure_cockpit_layout()
 
@@ -122,7 +122,7 @@ def test_cockpit_router_ensure_layout_resizes_existing_left_pane(tmp_path: Path)
     router = CockpitRouter(tmp_path / "pollypm.toml")
     router.tmux = FakeTmux()  # type: ignore[assignment]
     config_path = tmp_path / "pollypm.toml"
-    config_path.write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n")
+    config_path.write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm-state'}\"\n")
     router._write_state({"right_pane_id": "%2"})
 
     router.ensure_cockpit_layout()
@@ -132,7 +132,7 @@ def test_cockpit_router_ensure_layout_resizes_existing_left_pane(tmp_path: Path)
 
 def test_cockpit_router_routes_idle_project_to_detail_pane(monkeypatch, tmp_path: Path) -> None:
     calls: dict[str, object] = {}
-    (tmp_path / "pollypm.toml").write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n")
+    (tmp_path / "pollypm.toml").write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm-state'}\"\n")
 
     class FakeTmux:
         def list_panes(self, target: str):
@@ -147,7 +147,7 @@ def test_cockpit_router_routes_idle_project_to_detail_pane(monkeypatch, tmp_path
     class FakeConfig:
         class Project:
             root_dir = tmp_path
-            base_dir = tmp_path / ".pollypm"
+            base_dir = tmp_path / ".pollypm-state"
             tmux_session = "pollypm"
 
         project = Project()
@@ -180,7 +180,7 @@ def test_cockpit_router_routes_idle_project_to_detail_pane(monkeypatch, tmp_path
 
 def test_cockpit_router_joins_session_from_storage(monkeypatch, tmp_path: Path) -> None:
     calls: dict[str, object] = {}
-    (tmp_path / "pollypm.toml").write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n")
+    (tmp_path / "pollypm.toml").write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm-state'}\"\n")
 
     class FakeLaunch:
         def __init__(self) -> None:
@@ -247,8 +247,8 @@ def test_cockpit_router_joins_session_from_storage(monkeypatch, tmp_path: Path) 
 
 def test_cockpit_router_infers_mounted_session_from_live_right_pane(monkeypatch, tmp_path: Path) -> None:
     calls: dict[str, object] = {}
-    (tmp_path / "pollypm.toml").write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n")
-    worker_cwd = tmp_path / ".pollypm" / "worktrees" / "pollypm-pa-worker_pollypm"
+    (tmp_path / "pollypm.toml").write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm-state'}\"\n")
+    worker_cwd = tmp_path / ".pollypm-state" / "worktrees" / "pollypm-pa-worker_pollypm"
     worker_cwd.mkdir(parents=True)
 
     class FakeLaunch:
@@ -324,7 +324,7 @@ def test_cockpit_router_infers_mounted_session_from_live_right_pane(monkeypatch,
 
 def test_cockpit_router_project_click_does_not_launch_configured_but_unmounted_worker(monkeypatch, tmp_path: Path) -> None:
     calls: dict[str, object] = {}
-    (tmp_path / "pollypm.toml").write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n")
+    (tmp_path / "pollypm.toml").write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm-state'}\"\n")
 
     class FakeLaunch:
         def __init__(self) -> None:
@@ -337,14 +337,14 @@ def test_cockpit_router_project_click_does_not_launch_configured_but_unmounted_w
                     "role": "worker",
                     "project": "pollypm",
                     "provider": type("P", (), {"value": "codex"})(),
-                    "cwd": tmp_path / ".pollypm" / "worktrees" / "pollypm-pa-worker_pollypm",
+                    "cwd": tmp_path / ".pollypm-state" / "worktrees" / "pollypm-pa-worker_pollypm",
                 },
             )()
 
     class FakeConfig:
         class Project:
             root_dir = tmp_path
-            base_dir = tmp_path / ".pollypm"
+            base_dir = tmp_path / ".pollypm-state"
             tmux_session = "pollypm"
 
         project = Project()
@@ -398,7 +398,7 @@ def test_cockpit_router_project_click_does_not_launch_configured_but_unmounted_w
 def test_cockpit_router_falls_back_to_static_when_session_not_in_storage(monkeypatch, tmp_path: Path) -> None:
     """When a configured session is not running in storage, show the static project detail instead of auto-launching."""
     calls: dict[str, object] = {}
-    (tmp_path / "pollypm.toml").write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n")
+    (tmp_path / "pollypm.toml").write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm-state'}\"\n")
 
     class FakeLaunch:
         def __init__(self) -> None:
@@ -530,7 +530,7 @@ def test_settings_pane_renders_accounts_and_toggles_permissions(monkeypatch, tmp
             self.isolation_recommendation = ""
             self.auth_storage = "file"
             self.profile_root = str(tmp_path / ".claude")
-            self.home = tmp_path / ".pollypm" / "homes" / "claude_demo"
+            self.home = tmp_path / ".pollypm-state" / "homes" / "claude_demo"
 
     class FakePollyPM:
         controller_account = "claude_demo"

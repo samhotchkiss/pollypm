@@ -17,10 +17,10 @@ def _config(tmp_path: Path) -> PollyPMConfig:
     return PollyPMConfig(
         project=ProjectSettings(
             root_dir=tmp_path,
-            base_dir=tmp_path / ".pollypm",
-            logs_dir=tmp_path / ".pollypm/logs",
-            snapshots_dir=tmp_path / ".pollypm/snapshots",
-            state_db=tmp_path / ".pollypm/state.db",
+            base_dir=tmp_path / ".pollypm-state",
+            logs_dir=tmp_path / ".pollypm-state/logs",
+            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
+            state_db=tmp_path / ".pollypm-state/state.db",
         ),
         pollypm=PollyPMSettings(controller_account="", failover_enabled=False),
         accounts={},
@@ -32,7 +32,7 @@ def _config(tmp_path: Path) -> PollyPMConfig:
 def test_add_account_reuses_orphaned_home_with_same_email(monkeypatch, tmp_path: Path) -> None:
     config_path = tmp_path / "pollypm.toml"
     write_config(_config(tmp_path), config_path)
-    orphan_home = tmp_path / ".pollypm" / "homes" / "claude_s_example_com"
+    orphan_home = tmp_path / ".pollypm-state" / "homes" / "claude_s_example_com"
     orphan_home.mkdir(parents=True, exist_ok=True)
     (orphan_home / "stale.txt").write_text("keep me")
 
@@ -57,14 +57,14 @@ def test_add_account_reuses_orphaned_home_with_same_email(monkeypatch, tmp_path:
     assert key == "claude_s_example_com"
     assert email == "s@example.com"
     # Claude keeps the ad-hoc home in place (keychain auth is tied to the path)
-    ad_hoc_home = next(path for path in (tmp_path / ".pollypm" / "homes").iterdir() if path.name.startswith("ad-hoc-claude"))
+    ad_hoc_home = next(path for path in (tmp_path / ".pollypm-state" / "homes").iterdir() if path.name.startswith("ad-hoc-claude"))
     assert ad_hoc_home.exists()
 
 
 def test_add_account_replaces_orphaned_home_when_stale(monkeypatch, tmp_path: Path) -> None:
     config_path = tmp_path / "pollypm.toml"
     write_config(_config(tmp_path), config_path)
-    orphan_home = tmp_path / ".pollypm" / "homes" / "claude_s_example_com"
+    orphan_home = tmp_path / ".pollypm-state" / "homes" / "claude_s_example_com"
     orphan_home.mkdir(parents=True, exist_ok=True)
     (orphan_home / "stale.txt").write_text("stale")
 
@@ -88,7 +88,7 @@ def test_add_account_replaces_orphaned_home_when_stale(monkeypatch, tmp_path: Pa
 
     assert key == "claude_s_example_com"
     # Claude keeps the ad-hoc home in place (keychain auth is tied to the path)
-    ad_hoc_home = next(path for path in (tmp_path / ".pollypm" / "homes").iterdir() if path.name.startswith("ad-hoc-claude"))
+    ad_hoc_home = next(path for path in (tmp_path / ".pollypm-state" / "homes").iterdir() if path.name.startswith("ad-hoc-claude"))
     assert ad_hoc_home.exists()
     assert (ad_hoc_home / "fresh.txt").exists()
 
@@ -100,7 +100,7 @@ def test_add_account_rejects_duplicate_configured_account(monkeypatch, tmp_path:
         name="claude_s_example_com",
         provider=ProviderKind.CLAUDE,
         email="s@example.com",
-        home=tmp_path / ".pollypm" / "homes" / "claude_s_example_com",
+        home=tmp_path / ".pollypm-state" / "homes" / "claude_s_example_com",
     )
     write_config(config, config_path)
 

@@ -651,7 +651,7 @@ class OnboardingApp(App[Path | None]):
         tips_section.mount(Static(
             "[#a8b8c4]You can reopen PollyPM anytime with [bold #e0e8ef]pm[/] from any terminal.\n"
             "Add more accounts or projects later from settings.\n"
-            "PollyPM stores all state in [bold #e0e8ef]~/.pollypm/[/] — nothing is written to your project repos.[/]"
+            "PollyPM stores all state in [bold #e0e8ef]~/.pollypm-state/[/] — nothing is written to your project repos.[/]"
         ))
 
         actions = Horizontal(classes="button-row")

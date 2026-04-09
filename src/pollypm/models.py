@@ -26,10 +26,10 @@ class ProjectSettings:
     root_dir: Path = Path(".")
     tmux_session: str = "pollypm"
     workspace_root: Path = Path.home() / "dev"
-    base_dir: Path = Path(".pollypm")
-    logs_dir: Path = Path(".pollypm/logs")
-    snapshots_dir: Path = Path(".pollypm/snapshots")
-    state_db: Path = Path(".pollypm/state.db")
+    base_dir: Path = Path(".pollypm-state")
+    logs_dir: Path = Path(".pollypm-state/logs")
+    snapshots_dir: Path = Path(".pollypm-state/snapshots")
+    state_db: Path = Path(".pollypm-state/state.db")
 
 
 @dataclass(slots=True)

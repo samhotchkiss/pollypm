@@ -129,7 +129,14 @@ def create_worker_session(
         args=default_session_args(account.provider, open_permissions=config.pollypm.open_permissions_by_default),
     )
     config.sessions[session_key] = worker
-    write_config(config, config_path, force=True)
+    try:
+        write_config(config, config_path, force=True)
+    except Exception as exc:
+        del config.sessions[session_key]
+        if worktree is not None and worktree.path and Path(worktree.path).exists():
+            import shutil
+            shutil.rmtree(worktree.path, ignore_errors=True)
+        raise typer.BadParameter(f"Failed to save worker session config: {exc}") from exc
     return worker
 
 

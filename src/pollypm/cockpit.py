@@ -485,6 +485,13 @@ class CockpitRouter:
 
 
 def build_cockpit_detail(config_path: Path, kind: str, target: str | None = None) -> str:
+    try:
+        return _build_cockpit_detail_inner(config_path, kind, target)
+    except Exception as exc:  # noqa: BLE001
+        return f"Error loading {kind} view: {exc}"
+
+
+def _build_cockpit_detail_inner(config_path: Path, kind: str, target: str | None = None) -> str:
     supervisor = Supervisor(load_config(config_path))
     supervisor.ensure_layout()
     config = supervisor.config

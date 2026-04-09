@@ -148,6 +148,25 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
             tracked=bool(item_raw.get("tracked", False)),
         )
 
+    # Validate cross-references
+    for session_name, session in sessions.items():
+        if session.account and session.account not in accounts:
+            raise ValueError(
+                f"Session '{session_name}' references unknown account '{session.account}'. "
+                f"Known accounts: {', '.join(accounts) or 'none'}"
+            )
+    if pollypm.controller_account and pollypm.controller_account not in accounts and accounts:
+        raise ValueError(
+            f"Controller account '{pollypm.controller_account}' not found. "
+            f"Known accounts: {', '.join(accounts)}"
+        )
+    for account_name in pollypm.failover_accounts:
+        if account_name not in accounts:
+            raise ValueError(
+                f"Failover account '{account_name}' not found. "
+                f"Known accounts: {', '.join(accounts)}"
+            )
+
     return PollyPMConfig(
         project=project,
         pollypm=pollypm,

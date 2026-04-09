@@ -75,7 +75,9 @@ def _load_supervisor(config_path: Path) -> Supervisor:
 
 
 def _account_label(supervisor: Supervisor, account_name: str) -> str:
-    account = supervisor.config.accounts[account_name]
+    account = supervisor.config.accounts.get(account_name)
+    if account is None:
+        return account_name
     return account.email or account.name
 
 

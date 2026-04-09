@@ -368,8 +368,71 @@ class Supervisor:
         if not self.tmux.has_session(tmux_session):
             return
         if self._CONSOLE_WINDOW in self._window_map():
+            self._repair_console_if_broken(tmux_session)
             return
         self.tmux.create_window(tmux_session, self._CONSOLE_WINDOW, self._console_command(), detached=True)
+        self.tmux.set_window_option(f"{tmux_session}:{self._CONSOLE_WINDOW}", "allow-passthrough", "on")
+        self.tmux.set_window_option(f"{tmux_session}:{self._CONSOLE_WINDOW}", "window-size", "latest")
+        self.tmux.set_window_option(f"{tmux_session}:{self._CONSOLE_WINDOW}", "aggressive-resize", "on")
+
+    def _repair_console_if_broken(self, tmux_session: str) -> None:
+        """Detect and repair a cockpit window where the rail pane died leaving only a worker."""
+        target = f"{tmux_session}:{self._CONSOLE_WINDOW}"
+        try:
+            panes = self.tmux.list_panes(target)
+        except Exception:  # noqa: BLE001
+            return
+        if len(panes) != 1:
+            return
+        pane = panes[0]
+        # Check if the surviving pane is the right (worker) pane from cockpit state.
+        # If so, the rail (left) pane died and we need to repair.
+        state_path = self.config.project.base_dir / "cockpit_state.json"
+        try:
+            state_data = json.loads(state_path.read_text()) if state_path.exists() else {}
+        except (json.JSONDecodeError, OSError):
+            state_data = {}
+        saved_right_id = state_data.get("right_pane_id") if isinstance(state_data, dict) else None
+        if not isinstance(saved_right_id, str) or saved_right_id != pane.pane_id:
+            return
+        # Try to park the worker pane back to storage-closet
+        mounted_session = state_data.get("mounted_session") if isinstance(state_data, dict) else None
+        if isinstance(mounted_session, str) and mounted_session:
+            launch = next(
+                (item for item in self.plan_launches() if item.session.name == mounted_session),
+                None,
+            )
+            storage_session = self.storage_closet_session_name()
+            if launch is not None and self.tmux.has_session(storage_session):
+                try:
+                    self.tmux.break_pane(pane.pane_id, storage_session, launch.window_name)
+                except Exception:  # noqa: BLE001
+                    pass
+        # Clear stale cockpit state
+        if isinstance(state_data, dict):
+            state_data.pop("right_pane_id", None)
+            state_data.pop("mounted_session", None)
+            try:
+                state_path.write_text(json.dumps(state_data, indent=2) + "\n")
+            except OSError:
+                pass
+        # Recreate the cockpit.  If break_pane removed the last pane the
+        # session itself is gone, so we need create_session instead of create_window.
+        if not self.tmux.has_session(tmux_session):
+            self.tmux.create_session(
+                tmux_session, self._CONSOLE_WINDOW, self._console_command(), remain_on_exit=False,
+            )
+        else:
+            try:
+                remaining_panes = self.tmux.list_panes(target)
+            except Exception:  # noqa: BLE001
+                remaining_panes = []
+            if len(remaining_panes) == 0:
+                self.tmux.create_window(
+                    tmux_session, self._CONSOLE_WINDOW, self._console_command(), detached=True,
+                )
+            else:
+                self.tmux.respawn_pane(remaining_panes[0].pane_id, self._console_command())
         self.tmux.set_window_option(f"{tmux_session}:{self._CONSOLE_WINDOW}", "allow-passthrough", "on")
         self.tmux.set_window_option(f"{tmux_session}:{self._CONSOLE_WINDOW}", "window-size", "latest")
         self.tmux.set_window_option(f"{tmux_session}:{self._CONSOLE_WINDOW}", "aggressive-resize", "on")

@@ -278,6 +278,10 @@ def cockpit_pane(
     target: str | None = typer.Argument(None, help="Optional project key for project panes."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
+    if kind == "settings" and target:
+        from pollypm.cockpit_ui import PollyProjectSettingsApp
+        PollyProjectSettingsApp(config_path, target).run(mouse=True)
+        return
     if kind == "settings":
         PollySettingsPaneApp(config_path).run(mouse=True)
         return

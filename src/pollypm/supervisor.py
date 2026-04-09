@@ -66,16 +66,17 @@ class Supervisor:
                     open_permissions=self.config.pollypm.open_permissions_by_default,
                 ),
             )
-        elif profile_prompt and not effective.prompt:
-            effective = replace(effective, prompt=profile_prompt)
-        elif not effective.args:
-            effective = replace(
-                effective,
-                args=default_session_args(
-                    account.provider,
-                    open_permissions=self.config.pollypm.open_permissions_by_default,
-                ),
-            )
+        else:
+            if profile_prompt and not effective.prompt:
+                effective = replace(effective, prompt=profile_prompt)
+            if not effective.args:
+                effective = replace(
+                    effective,
+                    args=default_session_args(
+                        account.provider,
+                        open_permissions=self.config.pollypm.open_permissions_by_default,
+                    ),
+                )
         return effective
 
     def _default_agent_profile(self, session: SessionConfig) -> str | None:

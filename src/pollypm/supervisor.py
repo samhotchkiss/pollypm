@@ -1211,7 +1211,11 @@ class Supervisor:
         deadline = time.monotonic() + 90
         last_action = ""
         while time.monotonic() < deadline:
-            pane = self.tmux.capture_pane(target, lines=320)
+            try:
+                pane = self.tmux.capture_pane(target, lines=320)
+            except Exception:  # noqa: BLE001
+                time.sleep(1)
+                continue
             lowered = pane.lower()
 
             if "select login method:" in lowered or "paste code here if prompted" in lowered:
@@ -1260,7 +1264,11 @@ class Supervisor:
         last_action = ""
         ready_streak = 0
         while time.monotonic() < deadline:
-            pane = self.tmux.capture_pane(target, lines=260)
+            try:
+                pane = self.tmux.capture_pane(target, lines=260)
+            except Exception:  # noqa: BLE001
+                time.sleep(1)
+                continue
             lowered = pane.lower()
 
             if "approaching rate limits" in lowered and "switch to gpt-5.1-codex-mini" in lowered:

@@ -485,8 +485,12 @@ class PollyCockpitApp(App[None]):
         if key is None or not key.startswith("project:"):
             return
         project_key = key.split(":", 1)[1]
-        self.router.create_worker_and_route(project_key)
-        self._focus_right_pane()
+        self.hint.update(f"Launching worker for {project_key}...")
+        try:
+            self.router.create_worker_and_route(project_key)
+            self._focus_right_pane()
+        except Exception as exc:  # noqa: BLE001
+            self.hint.update(f"Launch failed: {exc}")
         self.selected_key = key
         self._refresh_rows()
 

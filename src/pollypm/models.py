@@ -37,8 +37,15 @@ class KnownProject:
     key: str
     path: Path
     name: str | None = None
+    persona_name: str | None = None
     kind: ProjectKind = ProjectKind.FOLDER
     tracked: bool = False
+
+    def display_label(self) -> str:
+        label = self.name or self.key
+        if self.persona_name:
+            return f"{label} ({self.persona_name})"
+        return label
 
 
 @dataclass(slots=True)

@@ -16,8 +16,8 @@ def test_cockpit_router_build_items_includes_core_entries(monkeypatch, tmp_path:
 
         project = Project()
         projects = {
-            "pollypm": KnownProject(key="pollypm", path=tmp_path, name="PollyPM", kind=ProjectKind.GIT),
-            "demo": KnownProject(key="demo", path=tmp_path / "demo", name="Demo", kind=ProjectKind.GIT),
+            "pollypm": KnownProject(key="pollypm", path=tmp_path, name="PollyPM", persona_name="Pete", kind=ProjectKind.GIT),
+            "demo": KnownProject(key="demo", path=tmp_path / "demo", name="Demo", persona_name="Dora", kind=ProjectKind.GIT),
         }
 
     class FakeLaunch:
@@ -55,6 +55,8 @@ def test_cockpit_router_build_items_includes_core_entries(monkeypatch, tmp_path:
     assert "project:pollypm" in keys
     assert "project:demo" in keys
     assert "settings" in keys
+    assert items[2].label == "PollyPM (Pete)"
+    assert items[3].label == "Demo (Dora)"
     assert items[0].state == "ready"
     assert items[1].label == "Inbox (1)"
     assert items[3].state.endswith("live")

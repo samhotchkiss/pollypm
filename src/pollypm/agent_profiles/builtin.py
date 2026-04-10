@@ -12,10 +12,19 @@ class StaticPromptProfile(AgentProfile):
     prompt: str
 
     def build_prompt(self, context: AgentProfileContext) -> str | None:
+        prompt = self.prompt
+        if self.name == "worker":
+            project = context.config.projects.get(context.session.project)
+            if project and project.persona_name:
+                prompt = (
+                    f"{prompt} Your name for this project is {project.persona_name}. "
+                    "If the user asks you to change your name, update `.pollypm/config/project.toml` "
+                    "to set `[project].persona_name` to the requested value so it persists immediately."
+                )
         manifest = render_session_manifest(context.config.project.root_dir)
         if not manifest:
-            return self.prompt
-        return f"{self.prompt}\n\n{manifest}"
+            return prompt
+        return f"{prompt}\n\n{manifest}"
 
 
 def polly_prompt() -> str:

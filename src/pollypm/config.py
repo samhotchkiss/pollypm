@@ -180,6 +180,7 @@ def _parse_known_projects(raw: dict[str, object], *, base: Path) -> dict[str, Kn
             key=project_key,
             path=_resolve_path(base, item_raw["path"]),
             name=_normalize_project_display_name(project_key, item_raw.get("name")),
+            persona_name=item_raw.get("persona_name") if isinstance(item_raw.get("persona_name"), str) else None,
             kind=ProjectKind(item_raw.get("kind", "folder")),
             tracked=bool(item_raw.get("tracked", False)),
         )
@@ -200,6 +201,9 @@ def _merge_project_local_config(
             display_name = project_raw.get("display_name") or project_raw.get("name")
             if isinstance(display_name, str) and display_name.strip():
                 project.name = display_name.strip()
+            persona_name = project_raw.get("persona_name")
+            if isinstance(persona_name, str) and persona_name.strip():
+                project.persona_name = persona_name.strip()
         for session_name, session in _parse_sessions(raw, base=project.path, default_project=project_key).items():
             session.project = project_key
             if session_name in sessions:
@@ -348,6 +352,8 @@ def _render_global_config(config: PollyPMConfig) -> str:
         )
         if project.name:
             lines.append(f'name = "{project.name}"')
+        if project.persona_name:
+            lines.append(f'persona_name = "{project.persona_name}"')
         if project.kind is not ProjectKind.FOLDER:
             lines.append(f'kind = "{project.kind.value}"')
         if project.tracked:
@@ -362,8 +368,10 @@ def _render_project_local_config(config: PollyPMConfig, project_key: str) -> str
     lines = [
         "[project]",
         f'display_name = "{project.name or project.key}"',
+        f'persona_name = "{project.persona_name}"' if project.persona_name else None,
         "",
     ]
+    lines = [line for line in lines if line is not None]
 
     for session_name, session in config.sessions.items():
         if session.role != "worker" or session.project != project_key:

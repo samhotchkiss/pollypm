@@ -94,6 +94,7 @@ def test_load_config_merges_project_local_worker_sessions(tmp_path: Path) -> Non
         """
 [project]
 display_name = "Wire"
+persona_name = "Wren"
 
 [sessions.worker_wire]
 role = "worker"
@@ -137,6 +138,7 @@ path = "wire"
     config = load_config(config_path)
 
     assert config.projects["wire"].name == "Wire"
+    assert config.projects["wire"].persona_name == "Wren"
     assert config.sessions["worker_wire"].project == "wire"
     assert config.sessions["worker_wire"].cwd == project_root
 
@@ -183,6 +185,7 @@ def test_write_config_splits_worker_sessions_into_project_local_files(tmp_path: 
                 key="wire",
                 path=project_root,
                 name="Wire",
+                persona_name="Wren",
             )
         },
     )
@@ -195,9 +198,12 @@ def test_write_config_splits_worker_sessions_into_project_local_files(tmp_path: 
 
     assert "[sessions.worker_wire]" not in global_text
     assert '[projects.wire]' in global_text
+    assert 'persona_name = "Wren"' in global_text
     assert '[project]' in local_text
+    assert 'persona_name = "Wren"' in local_text
     assert '[sessions.worker_wire]' in local_text
 
     loaded = load_config(config_path)
     assert "worker_wire" in loaded.sessions
     assert loaded.sessions["worker_wire"].project == "wire"
+    assert loaded.projects["wire"].persona_name == "Wren"

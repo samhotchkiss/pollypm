@@ -107,7 +107,7 @@ class CockpitRouter:
                 state = "idle"
             else:
                 state = self._session_state(session_name, launches, windows, alerts, spinner_index)
-            items.append(CockpitItem(f"project:{project_key}", project.name or project.key, state))
+            items.append(CockpitItem(f"project:{project_key}", project.display_label(), state))
             # Unfold sub-items for the selected project
             if selected.startswith(f"project:{project_key}"):
                 items.append(CockpitItem(f"project:{project_key}:settings", "  Settings", "sub"))

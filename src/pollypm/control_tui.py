@@ -653,7 +653,7 @@ class PollyPMApp(App[None]):
         project_session_map = self._project_session_map(launches)
         for project_key, project in config.projects.items():
             session_name = project_session_map.get(project_key)
-            label = project.name or project.key
+            label = project.display_label()
             state = self._cockpit_state_for_session(session_name, launches, windows, alerts) if session_name else "idle"
             rows.append(((label, state), f"project:{project_key}"))
 

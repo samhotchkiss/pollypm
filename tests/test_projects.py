@@ -5,6 +5,7 @@ from pollypm.config import write_config
 from pollypm.models import ProjectSettings, PollyPMConfig, PollyPMSettings
 
 from pollypm.projects import (
+    default_persona_name,
     detect_project_kind,
     discover_git_repositories,
     discover_recent_git_repositories,
@@ -71,6 +72,8 @@ def test_discover_recent_git_repositories_skips_repos_without_local_commits(monk
 def test_make_project_key_adds_suffix_for_duplicates() -> None:
     assert make_project_key(Path("/Users/sam/dev/wire"), {"wire"}) == "wire_2"
     assert normalize_project_path(Path("~/dev")).is_absolute()
+    assert default_persona_name("pollypm") == "Pete"
+    assert default_persona_name("news") == "Nora"
 
 
 def test_register_project_accepts_plain_folder_and_can_enable_tracker(tmp_path: Path) -> None:
@@ -88,8 +91,10 @@ def test_register_project_accepts_plain_folder_and_can_enable_tracker(tmp_path: 
 
     project = register_project(config_path, project_path, name="Plain")
     assert detect_project_kind(project.path).value == "folder"
+    assert project.persona_name == "Pete"
     assert (project_path / ".pollypm-state").exists()
     assert (project_path / ".pollypm" / "config" / "project.toml").exists()
+    assert 'persona_name = "Pete"' in (project_path / ".pollypm" / "config" / "project.toml").read_text()
 
     tracked = enable_tracked_project(config_path, project.key)
     assert tracked.tracked is True

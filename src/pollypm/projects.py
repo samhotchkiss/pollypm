@@ -39,6 +39,35 @@ SKIP_DIR_NAMES = {
     "vendor",
 }
 
+PERSONA_NAMES_BY_INITIAL = {
+    "a": "Ada",
+    "b": "Bea",
+    "c": "Cole",
+    "d": "Dora",
+    "e": "Eli",
+    "f": "Finn",
+    "g": "Gia",
+    "h": "Hugo",
+    "i": "Iris",
+    "j": "June",
+    "k": "Kai",
+    "l": "Lena",
+    "m": "Milo",
+    "n": "Nora",
+    "o": "Olive",
+    "p": "Pete",
+    "q": "Quinn",
+    "r": "Ruby",
+    "s": "Sage",
+    "t": "Theo",
+    "u": "Uma",
+    "v": "Vera",
+    "w": "Wren",
+    "x": "Xena",
+    "y": "Yara",
+    "z": "Zoe",
+}
+
 
 def slugify_project_key(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", name.strip().lower()).strip("_") or "project"
@@ -46,6 +75,13 @@ def slugify_project_key(name: str) -> str:
 
 def normalize_project_path(path: Path) -> Path:
     return path.expanduser().resolve()
+
+
+def default_persona_name(project_name: str) -> str:
+    for char in project_name.strip().casefold():
+        if char.isalpha():
+            return PERSONA_NAMES_BY_INITIAL.get(char, "Pete")
+    return "Pete"
 
 
 def detect_project_kind(path: Path) -> ProjectKind:
@@ -303,6 +339,7 @@ def register_project(config_path: Path, repo_path: Path, *, name: str | None = N
         key=key,
         path=normalized_path,
         name=name or normalized_path.name,
+        persona_name=default_persona_name(name or normalized_path.name),
         kind=detect_project_kind(normalized_path),
     )
     config.projects[key] = project
@@ -355,6 +392,7 @@ def scan_projects(
             key=make_project_key(repo_path, set(config.projects) | {item.key for item in added}),
             path=repo_path,
             name=repo_path.name,
+            persona_name=default_persona_name(repo_path.name),
             kind=ProjectKind.GIT,
         )
         config.projects[project.key] = project

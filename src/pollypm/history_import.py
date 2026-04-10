@@ -365,46 +365,111 @@ def extract_understanding(
 def _extract_with_llm(
     timeline: list[TimelineEntry],
     project_name: str,
+    *,
+    chunk_size: int = 50,
 ) -> ExtractedUnderstanding | None:
-    """Use Haiku via PollyPM's account system to extract understanding."""
-    # Build a compact representation of the timeline
+    """Walk the timeline chronologically, oldest to newest, in chunks.
+
+    Each chunk updates the accumulated understanding. Newer information
+    supersedes older — if the project was renamed, the new name wins.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    # Sort oldest first (should already be, but ensure)
+    sorted_timeline = sorted(timeline, key=lambda e: e.timestamp)
+
+    # Build compact entries
     compact_entries: list[dict[str, str]] = []
-    for entry in timeline[:500]:
+    for entry in sorted_timeline:
         compact_entries.append({
             "ts": entry.timestamp,
             "type": entry.source_type,
             "summary": entry.summary[:200],
         })
 
-    prompt = "\n".join([
-        f"Analyze this project timeline for '{project_name}' and extract understanding.",
-        "Return ONLY valid JSON (no markdown fences, no explanation) with these keys:",
-        "- overview: 2-5 sentence project overview describing what the project does and its current state",
-        "- decisions: array of key technical decisions with rationale (strings)",
-        "- architecture: array describing system components, data flow, and boundaries (strings)",
-        "- history: array of chronological milestones in the project's evolution (strings)",
-        "- conventions: array of coding patterns, naming conventions, and testing approaches (strings)",
-        "- goals: array of stated or implied project goals and priorities (strings)",
-        "- open_questions: array of things that could not be determined from the timeline (strings)",
-        "Be specific and concrete. Extract actual project details, not generic observations.",
-        "Never include secrets, tokens, or credentials.",
-        "",
-        json.dumps(compact_entries),
-    ])
+    # Break into chunks
+    chunks = [compact_entries[i:i + chunk_size] for i in range(0, len(compact_entries), chunk_size)]
+    if not chunks:
+        return None
 
-    payload = run_haiku_json(prompt)
-    if payload is None:
+    # Walk chronologically, accumulating understanding
+    accumulated: dict[str, Any] = {
+        "overview": "",
+        "decisions": [],
+        "architecture": [],
+        "history": [],
+        "conventions": [],
+        "goals": [],
+        "open_questions": [],
+    }
+
+    for i, chunk in enumerate(chunks):
+        is_first = i == 0
+        is_last = i == len(chunks) - 1
+
+        if is_first:
+            prompt = "\n".join([
+                f"You are analyzing the history of project '{project_name}', reading events chronologically.",
+                f"This is chunk {i+1} of {len(chunks)} (the earliest events).",
+                "Extract your initial understanding.",
+                "Return ONLY valid JSON (no markdown fences) with keys:",
+                "  overview, decisions, architecture, history, conventions, goals, open_questions",
+                "Each value must be an array of strings, except overview which is a string.",
+                "Be specific and concrete. Never include secrets or tokens.",
+                "",
+                json.dumps(chunk),
+            ])
+        else:
+            prompt = "\n".join([
+                f"You are analyzing the history of project '{project_name}', reading events chronologically.",
+                f"This is chunk {i+1} of {len(chunks)}." + (" This is the FINAL chunk — your output is the definitive understanding." if is_last else ""),
+                "",
+                "Here is your current accumulated understanding:",
+                json.dumps(accumulated),
+                "",
+                "Here are the next chronological events. UPDATE your understanding:",
+                "- If the project was renamed, use the NEW name",
+                "- If architecture changed, describe the CURRENT architecture, not the old one",
+                "- If conventions changed, describe the CURRENT conventions",
+                "- Add new decisions, milestones, and goals as discovered",
+                "- Remove or update anything that was superseded by newer events",
+                "- The overview should describe the project AS IT IS NOW",
+                "",
+                "Return ONLY valid JSON (no markdown fences) with the same keys.",
+                "Never include secrets or tokens.",
+                "",
+                json.dumps(chunk),
+            ])
+
+        payload = run_haiku_json(prompt)
+        if payload is None:
+            logger.warning("Chunk %d/%d failed, continuing with accumulated state", i+1, len(chunks))
+            continue
+
+        # Update accumulated state — newer chunks override
+        if isinstance(payload.get("overview"), str) and payload["overview"]:
+            accumulated["overview"] = payload["overview"]
+        for key in ("decisions", "architecture", "history", "conventions", "goals", "open_questions"):
+            val = payload.get(key)
+            if isinstance(val, list) and val:
+                accumulated[key] = val  # Replace with latest understanding
+
+        logger.info("Chunk %d/%d processed (%d events)", i+1, len(chunks), len(chunk))
+
+    # Check we got something meaningful
+    if not accumulated["overview"]:
         return None
 
     return ExtractedUnderstanding(
         project_name=project_name,
-        overview=_sanitize_text(str(payload.get("overview", ""))),
-        decisions=_sanitize_items(payload.get("decisions")),
-        architecture=_sanitize_items(payload.get("architecture")),
-        history=_sanitize_items(payload.get("history")),
-        conventions=_sanitize_items(payload.get("conventions")),
-        goals=_sanitize_items(payload.get("goals")),
-        open_questions=_sanitize_items(payload.get("open_questions")),
+        overview=_sanitize_text(accumulated["overview"]),
+        decisions=_sanitize_items(accumulated.get("decisions")),
+        architecture=_sanitize_items(accumulated.get("architecture")),
+        history=_sanitize_items(accumulated.get("history")),
+        conventions=_sanitize_items(accumulated.get("conventions")),
+        goals=_sanitize_items(accumulated.get("goals")),
+        open_questions=_sanitize_items(accumulated.get("open_questions")),
     )
 
 

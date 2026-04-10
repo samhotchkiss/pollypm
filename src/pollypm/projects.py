@@ -10,7 +10,7 @@ from pathlib import Path
 
 import typer
 
-from pollypm.config import load_config, write_config
+from pollypm.config import PROJECT_CONFIG_DIRNAME, load_config, write_config
 from pollypm.models import KnownProject, ProjectKind
 from pollypm.task_backends import get_task_backend
 
@@ -93,6 +93,7 @@ def ensure_project_scaffold(project_path: Path) -> Path:
     pollypm_dir = project_pollypm_dir(project_path)
     for directory in [
         project_instruction_dir(project_path),
+        normalize_project_path(project_path) / PROJECT_CONFIG_DIRNAME,
         pollypm_dir,
         project_dossier_dir(project_path),
         project_logs_dir(project_path),

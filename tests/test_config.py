@@ -1,7 +1,16 @@
 from pathlib import Path
 
 from pollypm.agent_profiles.builtin import heartbeat_prompt, polly_prompt
-from pollypm.config import load_config, render_example_config
+from pollypm.config import load_config, project_config_path, render_example_config, write_config
+from pollypm.models import (
+    AccountConfig,
+    KnownProject,
+    PollyPMConfig,
+    PollyPMSettings,
+    ProjectSettings,
+    ProviderKind,
+    SessionConfig,
+)
 
 
 def test_load_example_config(tmp_path: Path) -> None:
@@ -19,7 +28,7 @@ def test_load_example_config(tmp_path: Path) -> None:
     assert config.pollypm.failover_accounts == ["claude_primary"]
     assert config.memory.backend == "file"
     assert set(config.accounts) == {"codex_primary", "claude_primary"}
-    assert set(config.sessions) == {"heartbeat", "operator", "worker_demo"}
+    assert set(config.sessions) == {"heartbeat", "operator"}
     assert set(config.projects) == {"pollypm"}
     assert config.sessions["operator"].provider.value == "codex"
     assert config.sessions["heartbeat"].provider.value == "codex"
@@ -75,3 +84,120 @@ name = "pollypm"
     assert config.sessions["heartbeat"].prompt == heartbeat_prompt()
     assert config.sessions["operator"].prompt == polly_prompt()
     assert config.sessions["worker_pollypm"].prompt == "Read the PollyPM issue queue, start with the highest-leverage open issue."
+
+
+def test_load_config_merges_project_local_worker_sessions(tmp_path: Path) -> None:
+    project_root = tmp_path / "wire"
+    project_root.mkdir()
+    (project_root / ".pollypm" / "config").mkdir(parents=True)
+    (project_root / ".pollypm" / "config" / "project.toml").write_text(
+        """
+[project]
+display_name = "Wire"
+
+[sessions.worker_wire]
+role = "worker"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+prompt = "Implement issue #1."
+"""
+    )
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        """
+[project]
+name = "PollyPM"
+tmux_session = "pollypm"
+
+[pollypm]
+controller_account = "claude_primary"
+
+[accounts.claude_primary]
+provider = "claude"
+home = ".pollypm-state/homes/claude_primary"
+
+[sessions.heartbeat]
+role = "heartbeat-supervisor"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[sessions.operator]
+role = "operator-pm"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[projects.wire]
+path = "wire"
+"""
+    )
+
+    config = load_config(config_path)
+
+    assert config.projects["wire"].name == "Wire"
+    assert config.sessions["worker_wire"].project == "wire"
+    assert config.sessions["worker_wire"].cwd == project_root
+
+
+def test_write_config_splits_worker_sessions_into_project_local_files(tmp_path: Path) -> None:
+    project_root = tmp_path / "wire"
+    project_root.mkdir()
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            base_dir=tmp_path / ".pollypm-state",
+            logs_dir=tmp_path / ".pollypm-state/logs",
+            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
+            state_db=tmp_path / ".pollypm-state/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="claude_primary"),
+        accounts={
+            "claude_primary": AccountConfig(
+                name="claude_primary",
+                provider=ProviderKind.CLAUDE,
+                home=tmp_path / ".pollypm-state" / "homes" / "claude_primary",
+            )
+        },
+        sessions={
+            "heartbeat": SessionConfig(
+                name="heartbeat",
+                role="heartbeat-supervisor",
+                provider=ProviderKind.CLAUDE,
+                account="claude_primary",
+                cwd=tmp_path,
+            ),
+            "worker_wire": SessionConfig(
+                name="worker_wire",
+                role="worker",
+                provider=ProviderKind.CLAUDE,
+                account="claude_primary",
+                cwd=project_root,
+                project="wire",
+                prompt="Implement issue #1.",
+            ),
+        },
+        projects={
+            "wire": KnownProject(
+                key="wire",
+                path=project_root,
+                name="Wire",
+            )
+        },
+    )
+
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path, force=True)
+
+    global_text = config_path.read_text()
+    local_text = project_config_path(project_root).read_text()
+
+    assert "[sessions.worker_wire]" not in global_text
+    assert '[projects.wire]' in global_text
+    assert '[project]' in local_text
+    assert '[sessions.worker_wire]' in local_text
+
+    loaded = load_config(config_path)
+    assert "worker_wire" in loaded.sessions
+    assert loaded.sessions["worker_wire"].project == "wire"

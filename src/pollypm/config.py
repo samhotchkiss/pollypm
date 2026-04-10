@@ -20,6 +20,8 @@ from pollypm.models import (
 
 GLOBAL_CONFIG_DIR = Path.home() / ".pollypm"
 DEFAULT_CONFIG_PATH = GLOBAL_CONFIG_DIR / "pollypm.toml"
+PROJECT_CONFIG_DIRNAME = ".pollypm/config"
+PROJECT_CONFIG_FILENAME = "project.toml"
 
 
 def _normalize_project_display_name(key: str, name: str | None) -> str | None:
@@ -61,26 +63,39 @@ def _format_path(path: Path, root: Path) -> str:
         return str(path)
 
 
-def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
-    config_path = path.resolve()
-    base = config_path.parent
-    raw = tomllib.loads(config_path.read_text())
+def project_config_path(project_root: Path) -> Path:
+    return project_root / PROJECT_CONFIG_DIRNAME / PROJECT_CONFIG_FILENAME
 
+
+def _load_raw_toml(path: Path) -> dict[str, object]:
+    return tomllib.loads(path.read_text())
+
+
+def _parse_project_settings(raw: dict[str, object], *, base: Path) -> ProjectSettings:
     project_raw = raw.get("project", {})
-    base_dir = _resolve_path(base, project_raw.get("base_dir", str(GLOBAL_CONFIG_DIR)))
-    project = ProjectSettings(
+    if not isinstance(project_raw, dict):
+        project_raw = {}
+    base_dir = _resolve_path(base, str(project_raw.get("base_dir", str(GLOBAL_CONFIG_DIR))))
+    return ProjectSettings(
         name=_normalize_project_display_name("pollypm", project_raw.get("name")) or "PollyPM",
         root_dir=base,
         tmux_session=_normalize_tmux_session_name(project_raw.get("tmux_session")),
-        workspace_root=_resolve_path(base, project_raw.get("workspace_root", str(Path.home() / "dev"))),
+        workspace_root=_resolve_path(base, str(project_raw.get("workspace_root", str(Path.home() / "dev")))),
         base_dir=base_dir,
-        logs_dir=_resolve_path(base, project_raw.get("logs_dir", str(base_dir / "logs"))),
-        snapshots_dir=_resolve_path(base, project_raw.get("snapshots_dir", str(base_dir / "snapshots"))),
-        state_db=_resolve_path(base, project_raw.get("state_db", str(base_dir / "state.db"))),
+        logs_dir=_resolve_path(base, str(project_raw.get("logs_dir", str(base_dir / "logs")))),
+        snapshots_dir=_resolve_path(base, str(project_raw.get("snapshots_dir", str(base_dir / "snapshots")))),
+        state_db=_resolve_path(base, str(project_raw.get("state_db", str(base_dir / "state.db")))),
     )
 
+
+def _parse_accounts(raw: dict[str, object], *, base: Path) -> dict[str, AccountConfig]:
     accounts: dict[str, AccountConfig] = {}
-    for account_name, account_raw in raw.get("accounts", {}).items():
+    accounts_raw = raw.get("accounts", {})
+    if not isinstance(accounts_raw, dict):
+        return accounts
+    for account_name, account_raw in accounts_raw.items():
+        if not isinstance(account_raw, dict):
+            continue
         accounts[account_name] = AccountConfig(
             name=account_name,
             provider=ProviderKind(account_raw["provider"]),
@@ -91,24 +106,42 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
             docker_image=account_raw.get("docker_image"),
             docker_extra_args=[str(arg) for arg in account_raw.get("docker_extra_args", [])],
         )
+    return accounts
 
+
+def _parse_sessions(
+    raw: dict[str, object],
+    *,
+    base: Path,
+    default_project: str = "pollypm",
+) -> dict[str, SessionConfig]:
     sessions: dict[str, SessionConfig] = {}
-    for session_name, session_raw in raw.get("sessions", {}).items():
+    sessions_raw = raw.get("sessions", {})
+    if not isinstance(sessions_raw, dict):
+        return sessions
+    for session_name, session_raw in sessions_raw.items():
+        if not isinstance(session_raw, dict):
+            continue
         sessions[session_name] = SessionConfig(
             name=session_name,
             role=session_raw["role"],
             provider=ProviderKind(session_raw["provider"]),
             account=session_raw["account"],
             cwd=_resolve_path(base, session_raw.get("cwd", ".")),
-            project=session_raw.get("project", "pollypm"),
+            project=session_raw.get("project", default_project),
             prompt=_normalize_session_prompt(session_name, session_raw.get("prompt")),
             agent_profile=session_raw.get("agent_profile"),
             args=[str(arg) for arg in session_raw.get("args", [])],
             enabled=bool(session_raw.get("enabled", True)),
             window_name=session_raw.get("window_name"),
         )
+    return sessions
 
+
+def _parse_pollypm_settings(raw: dict[str, object], sessions: dict[str, SessionConfig]) -> PollyPMSettings:
     pollypm_raw = raw.get("pollypm", {})
+    if not isinstance(pollypm_raw, dict):
+        pollypm_raw = {}
     controller_account = pollypm_raw.get("controller_account")
     if controller_account is None:
         operator = sessions.get("operator")
@@ -118,7 +151,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
     failover_accounts = [str(item) for item in pollypm_raw.get("failover_accounts", [])]
     failover_enabled = bool(pollypm_raw.get("failover_enabled", bool(failover_accounts)))
     open_permissions_by_default = bool(pollypm_raw.get("open_permissions_by_default", True))
-    pollypm = PollyPMSettings(
+    return PollyPMSettings(
         controller_account=controller_account,
         open_permissions_by_default=open_permissions_by_default,
         failover_enabled=failover_enabled,
@@ -127,11 +160,22 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
         scheduler_backend=str(pollypm_raw.get("scheduler_backend", "inline")),
     )
 
-    memory_raw = raw.get("memory", {})
-    memory = MemorySettings(backend=str(memory_raw.get("backend", "file")))
 
+def _parse_memory_settings(raw: dict[str, object]) -> MemorySettings:
+    memory_raw = raw.get("memory", {})
+    if not isinstance(memory_raw, dict):
+        memory_raw = {}
+    return MemorySettings(backend=str(memory_raw.get("backend", "file")))
+
+
+def _parse_known_projects(raw: dict[str, object], *, base: Path) -> dict[str, KnownProject]:
     projects: dict[str, KnownProject] = {}
-    for project_key, item_raw in raw.get("projects", {}).items():
+    projects_raw = raw.get("projects", {})
+    if not isinstance(projects_raw, dict):
+        return projects
+    for project_key, item_raw in projects_raw.items():
+        if not isinstance(item_raw, dict):
+            continue
         projects[project_key] = KnownProject(
             key=project_key,
             path=_resolve_path(base, item_raw["path"]),
@@ -139,8 +183,36 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
             kind=ProjectKind(item_raw.get("kind", "folder")),
             tracked=bool(item_raw.get("tracked", False)),
         )
+    return projects
 
-    # Validate cross-references
+
+def _merge_project_local_config(
+    sessions: dict[str, SessionConfig],
+    projects: dict[str, KnownProject],
+) -> None:
+    for project_key, project in projects.items():
+        local_path = project_config_path(project.path)
+        if not local_path.exists():
+            continue
+        raw = _load_raw_toml(local_path)
+        project_raw = raw.get("project", {})
+        if isinstance(project_raw, dict):
+            display_name = project_raw.get("display_name") or project_raw.get("name")
+            if isinstance(display_name, str) and display_name.strip():
+                project.name = display_name.strip()
+        for session_name, session in _parse_sessions(raw, base=project.path, default_project=project_key).items():
+            session.project = project_key
+            if session_name in sessions:
+                raise ValueError(f"Duplicate session name '{session_name}' found while loading project '{project_key}'.")
+            sessions[session_name] = session
+
+
+def _validate_cross_references(
+    *,
+    accounts: dict[str, AccountConfig],
+    sessions: dict[str, SessionConfig],
+    pollypm: PollyPMSettings,
+) -> None:
     for session_name, session in sessions.items():
         if session.account and session.account not in accounts:
             raise ValueError(
@@ -159,6 +231,20 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
                 f"Known accounts: {', '.join(accounts)}"
             )
 
+
+def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
+    config_path = path.resolve()
+    base = config_path.parent
+    raw = _load_raw_toml(config_path)
+    project = _parse_project_settings(raw, base=base)
+    accounts = _parse_accounts(raw, base=base)
+    sessions = _parse_sessions(raw, base=base)
+    pollypm = _parse_pollypm_settings(raw, sessions)
+    memory = _parse_memory_settings(raw)
+    projects = _parse_known_projects(raw, base=base)
+    _merge_project_local_config(sessions, projects)
+    _validate_cross_references(accounts=accounts, sessions=sessions, pollypm=pollypm)
+
     return PollyPMConfig(
         project=project,
         pollypm=pollypm,
@@ -169,7 +255,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
     )
 
 
-def render_config(config: PollyPMConfig) -> str:
+def _render_global_config(config: PollyPMConfig) -> str:
     root = config.project.root_dir
     lines = [
         "[project]",
@@ -226,6 +312,8 @@ def render_config(config: PollyPMConfig) -> str:
         lines.append("")
 
     for session_name, session in config.sessions.items():
+        if session.role == "worker" and session.project != "pollypm":
+            continue
         lines.extend(
             [
                 f"[sessions.{session_name}]",
@@ -269,10 +357,55 @@ def render_config(config: PollyPMConfig) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _render_project_local_config(config: PollyPMConfig, project_key: str) -> str:
+    project = config.projects[project_key]
+    lines = [
+        "[project]",
+        f'display_name = "{project.name or project.key}"',
+        "",
+    ]
+
+    for session_name, session in config.sessions.items():
+        if session.role != "worker" or session.project != project_key:
+            continue
+        lines.extend(
+            [
+                f"[sessions.{session_name}]",
+                f'role = "{session.role}"',
+                f'provider = "{session.provider.value}"',
+                f'account = "{session.account}"',
+                f'cwd = "{_format_path(session.cwd, project.path)}"',
+            ]
+        )
+        if session.window_name:
+            lines.append(f'window_name = "{session.window_name}"')
+        if session.prompt:
+            escaped = session.prompt.replace("\\", "\\\\").replace('"', '\\"')
+            lines.append(f'prompt = "{escaped}"')
+        if session.agent_profile:
+            lines.append(f'agent_profile = "{session.agent_profile}"')
+        if session.args:
+            items = ", ".join(f'"{arg}"' for arg in session.args)
+            lines.append(f"args = [{items}]")
+        if not session.enabled:
+            lines.append("enabled = false")
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render_config(config: PollyPMConfig) -> str:
+    return _render_global_config(config)
+
+
 def render_example_config() -> str:
     root = Path.cwd()
+    return render_config(_build_example_config(root))
+
+
+def _build_example_config(root: Path) -> PollyPMConfig:
     base_dir = root / ".pollypm-state"
-    config = PollyPMConfig(
+    return PollyPMConfig(
         project=ProjectSettings(
             name="PollyPM",
             root_dir=root,
@@ -351,19 +484,22 @@ def render_example_config() -> str:
         },
         memory=MemorySettings(backend="file"),
     )
-    return render_config(config)
 
 
 def write_example_config(path: Path = DEFAULT_CONFIG_PATH, force: bool = False) -> Path:
     if path.exists() and not force:
         raise FileExistsError(f"Config already exists: {path}")
-    path.write_text(render_example_config())
-    return path
+    root = path.resolve().parent
+    return write_config(_build_example_config(root), path, force=True)
 
 
 def write_config(config: PollyPMConfig, path: Path = DEFAULT_CONFIG_PATH, force: bool = False) -> Path:
     if path.exists() and not force:
         raise FileExistsError(f"Config already exists: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render_config(config))
+    path.write_text(_render_global_config(config))
+    for project_key, project in config.projects.items():
+        local_path = project_config_path(project.path)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_text(_render_project_local_config(config, project_key))
     return path

@@ -163,12 +163,17 @@ class SupervisorHeartbeatAPI:
             pane_command: str | None = None
             pane_dead = False
             if window is not None:
-                raw_snapshot_path, pane_text = self.supervisor._write_snapshot(window, self.snapshot_lines)
-                snapshot_path = str(raw_snapshot_path)
-                current_snapshot_hash = snapshot_hash(pane_text)
                 pane_id = window.pane_id
                 pane_command = window.pane_current_command
                 pane_dead = window.pane_dead
+                try:
+                    raw_snapshot_path, pane_text = self.supervisor._write_snapshot(window, self.snapshot_lines)
+                except Exception:
+                    window = None
+                    pane_text = ""
+                else:
+                    snapshot_path = str(raw_snapshot_path)
+                    current_snapshot_hash = snapshot_hash(pane_text)
             previous = self.supervisor.store.latest_heartbeat(launch.session.name)
             contexts.append(
                 HeartbeatSessionContext(

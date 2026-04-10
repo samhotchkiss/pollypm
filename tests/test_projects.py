@@ -89,6 +89,7 @@ def test_register_project_accepts_plain_folder_and_can_enable_tracker(tmp_path: 
     project = register_project(config_path, project_path, name="Plain")
     assert detect_project_kind(project.path).value == "folder"
     assert (project_path / ".pollypm-state").exists()
+    assert (project_path / ".pollypm" / "config" / "project.toml").exists()
 
     tracked = enable_tracked_project(config_path, project.key)
     assert tracked.tracked is True

@@ -219,6 +219,7 @@ class RailItem(ListItem):
 class PollyCockpitApp(App[None]):
     TITLE = "PollyPM"
     SUB_TITLE = "Cockpit"
+    SCHEDULER_POLL_INTERVAL_SECONDS = 5
     CSS = """
     Screen {
         background: #0f1317;
@@ -329,6 +330,7 @@ class PollyCockpitApp(App[None]):
         super().__init__()
         self.config_path = config_path
         self.router = CockpitRouter(config_path)
+        self.service = PollyPMService(config_path)
         _lines = ASCII_POLLY.split("\n")
         self.brand = Static(
             f"[#5b8aff]{_lines[0]}[/]\n[#3d6bcc]{_lines[1]}[/]",
@@ -347,6 +349,7 @@ class PollyCockpitApp(App[None]):
         self._row_widgets: dict[str, RailItem] = {}
         self._section_sep: ListItem | None = None
         self._suspend_selection_events = False
+        self._scheduler_tick_running = False
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -360,6 +363,7 @@ class PollyCockpitApp(App[None]):
         self.selected_key = self.router.selected_key()
         self._refresh_rows()
         self.set_interval(0.8, self._tick)
+        self.set_interval(self.SCHEDULER_POLL_INTERVAL_SECONDS, self._tick_scheduler)
         self.nav.focus()
         # Delay the cockpit layout split so Textual finishes its first render
         # before the pane is resized.  An immediate split sends SIGWINCH before
@@ -390,12 +394,31 @@ class PollyCockpitApp(App[None]):
         except Exception:  # noqa: BLE001
             pass
 
+    def _tick_scheduler(self) -> None:
+        if self._scheduler_tick_running:
+            return
+        self._scheduler_tick_running = True
+        self.run_worker(
+            self._run_scheduled_jobs,
+            thread=True,
+            group="scheduler",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    def _run_scheduled_jobs(self) -> None:
+        try:
+            self.service.run_scheduled_jobs()
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            self._scheduler_tick_running = False
+
     def _enforce_rail_width(self) -> None:
         """Recover missing panes and fix rail width if it drifted."""
         try:
-            from pollypm.config import load_config
-            config = load_config(self.config_path)
-            target = f"{config.project.tmux_session}:{self.router._COCKPIT_WINDOW}"
+            supervisor = self.router._load_supervisor()
+            target = f"{supervisor.config.project.tmux_session}:{self.router._COCKPIT_WINDOW}"
             panes = self.router.tmux.list_panes(target)
             if len(panes) < 2:
                 self.router.ensure_cockpit_layout()

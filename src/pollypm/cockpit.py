@@ -39,6 +39,8 @@ class CockpitRouter:
 
     def _load_supervisor(self, *, fresh: bool = False) -> Supervisor:
         if fresh or self._supervisor is None:
+            if self._supervisor is not None:
+                self._supervisor.store.close()
             self._supervisor = self.service.load_supervisor()
             self._supervisor.ensure_layout()
         return self._supervisor

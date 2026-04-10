@@ -337,6 +337,12 @@ class StateStore:
         self._migrate()
         self.conn.commit()
 
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
     def _now(self) -> str:
         return datetime.now(UTC).isoformat()
 

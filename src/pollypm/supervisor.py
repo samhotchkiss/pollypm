@@ -16,6 +16,7 @@ from pollypm.agent_profiles.base import AgentProfileContext
 from pollypm.checkpoints import record_checkpoint, snapshot_hash, write_mechanical_checkpoint
 from pollypm.config import PollyPMConfig
 from pollypm.heartbeats import get_heartbeat_backend
+from pollypm.heartbeats.api import SupervisorHeartbeatAPI
 from pollypm.messaging import ensure_inbox
 from pollypm.models import AccountConfig, ProviderKind, SessionConfig, SessionLaunchSpec
 from pollypm.onboarding import _prime_claude_home, default_control_args, default_session_args
@@ -192,6 +193,7 @@ class Supervisor:
                 else:
                     self._probe_controller_account(controller_account)
                 self._bootstrap_launches(session_name, launches, on_status=on_status)
+                self.ensure_heartbeat_schedule()
                 self.store.record_event(
                     "pollypm",
                     "controller_selected",
@@ -493,7 +495,24 @@ class Supervisor:
             self.config.pollypm.heartbeat_backend,
             root_dir=self.config.project.root_dir,
         )
-        return backend.run(self, snapshot_lines=snapshot_lines)
+        api = SupervisorHeartbeatAPI(self, snapshot_lines=snapshot_lines)
+        return backend.run(api, snapshot_lines=snapshot_lines)
+
+    def ensure_heartbeat_schedule(self) -> None:
+        backend = get_scheduler_backend(
+            self.config.pollypm.scheduler_backend,
+            root_dir=self.config.project.root_dir,
+        )
+        for job in backend.list_jobs(self):
+            if job.kind == "heartbeat" and job.interval_seconds == 60 and job.status == "pending":
+                return
+        backend.schedule(
+            self,
+            kind="heartbeat",
+            run_at=datetime.now(UTC) + timedelta(minutes=1),
+            payload={},
+            interval_seconds=60,
+        )
 
     def _run_heartbeat_local(self, snapshot_lines: int = 200) -> list[AlertRecord]:
         window_map = self._window_map()

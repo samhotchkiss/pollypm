@@ -1,7 +1,9 @@
 from pathlib import Path
 
 from pollypm.models import ProviderKind
-from pollypm.onboarding import _run_login_window, _wait_for_login_completion
+import pytest
+
+from pollypm.onboarding import LoginCancelled, _run_login_window, _wait_for_login_completion
 
 
 def test_run_login_window_outside_tmux_uses_non_persistent_temp_session(tmp_path: Path, monkeypatch) -> None:
@@ -70,3 +72,45 @@ def test_wait_for_login_completion_requires_real_claude_auth(monkeypatch, tmp_pa
 
     assert completed is False
     assert "Welcome back" in pane_text
+
+
+def test_run_login_window_cancelled_attach_returns_cleanly_to_caller(tmp_path: Path, monkeypatch) -> None:
+    calls: dict[str, object] = {}
+    session_alive = False
+
+    class FakeTmux:
+        def current_session_name(self):
+            return None
+
+        def has_session(self, name: str) -> bool:
+            return session_alive
+
+        def kill_session(self, name: str) -> None:
+            nonlocal session_alive
+            calls["killed"] = name
+            session_alive = False
+
+        def create_session(self, name: str, window_name: str, command: str, *, remain_on_exit: bool = True) -> None:
+            nonlocal session_alive
+            session_alive = True
+
+        def attach_session(self, name: str) -> int:
+            calls["attached"] = name
+            return 1
+
+    monkeypatch.setattr(
+        "pollypm.onboarding._wait_for_login_completion",
+        lambda *args, **kwargs: (False, ""),
+    )
+
+    with pytest.raises(LoginCancelled):
+        _run_login_window(
+            FakeTmux(),
+            provider=ProviderKind.CODEX,
+            home=tmp_path / "codex-home",
+            window_label="onboard-codex-1",
+            quiet=True,
+        )
+
+    assert calls["attached"] == "pollypm-login-onboard-codex-1"
+    assert calls["killed"] == "pollypm-login-onboard-codex-1"

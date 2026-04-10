@@ -14,6 +14,7 @@ from pollypm.models import (
 )
 from pollypm.storage.state import StateStore
 from pollypm.workers import auto_select_worker_account, suggest_worker_prompt
+from pollypm.agent_profiles.builtin import worker_prompt
 
 
 def _config(tmp_path: Path) -> tuple[PollyPMConfig, Path]:
@@ -157,3 +158,10 @@ def test_suggest_worker_prompt_returns_empty(tmp_path: Path) -> None:
     prompt = suggest_worker_prompt(config_path, project_key="pollypm")
 
     assert prompt == ""
+
+
+def test_worker_prompt_requires_project_instructions() -> None:
+    prompt = worker_prompt()
+
+    assert ".pollypm/INSTRUCT.md" in prompt
+    assert "follow it religiously" in prompt

@@ -9,6 +9,7 @@ from pollypm.projects import (
     discover_git_repositories,
     discover_recent_git_repositories,
     enable_tracked_project,
+    ensure_project_scaffold,
     make_project_key,
     normalize_project_path,
     register_project,
@@ -93,3 +94,14 @@ def test_register_project_accepts_plain_folder_and_can_enable_tracker(tmp_path: 
     assert tracked.tracked is True
     assert (project_path / "issues" / "03-needs-review").exists()
     assert (project_path / "issues" / ".latest_issue_number").exists()
+
+
+def test_ensure_project_scaffold_copies_project_instructions(tmp_path: Path) -> None:
+    project_path = tmp_path / "sample-project"
+    project_path.mkdir()
+
+    ensure_project_scaffold(project_path)
+
+    instructions_path = project_path / ".pollypm" / "INSTRUCT.md"
+    assert instructions_path.exists()
+    assert "Test and operate PollyPM through Polly chat" in instructions_path.read_text()

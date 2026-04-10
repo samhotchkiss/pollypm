@@ -10,7 +10,7 @@ from rich.table import Table
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import CenterMiddle, Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.worker import Worker, WorkerState
 from textual.widgets import Button, Checkbox, Footer, RadioButton, RadioSet, SelectionList, Static
@@ -20,6 +20,8 @@ from pollypm.models import KnownProject, ProjectKind, PollyPMConfig, ProviderKin
 from pollypm.onboarding import (
     CliAvailability,
     ConnectedAccount,
+    LoginPreferences,
+    LoginCancelled,
     _available_clis,
     _connect_account_via_tmux,
     _default_failover_accounts,
@@ -70,6 +72,7 @@ class OnboardingState:
     statuses: list[CliAvailability]
     accounts: dict[str, ConnectedAccount]
     known_projects: dict[str, KnownProject]
+    login_preferences: LoginPreferences = field(default_factory=LoginPreferences)
     controller_account: str | None = None
     open_permissions_by_default: bool = True
     failover_enabled: bool = True
@@ -79,10 +82,17 @@ class OnboardingState:
     scan_started: bool = False
 
 
+@dataclass(slots=True)
+class OnboardingResult:
+    config_path: Path
+    launch_requested: bool = False
+
+
 class ExitModal(ModalScreen[None]):
     CSS = """
-    Screen {
+    ModalScreen {
         align: center middle;
+        background: rgba(0, 0, 0, 0.55);
     }
     #exit-dialog {
         width: 66;
@@ -109,12 +119,13 @@ class ExitModal(ModalScreen[None]):
     BINDINGS = [Binding("escape", "cancel", "Stay")]
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="exit-dialog"):
-            yield Static("Leave onboarding?", id="exit-title")
-            yield Static("Your current onboarding progress will be lost.")
-            with Horizontal(id="exit-buttons"):
-                yield Button("Stay", variant="primary", id="stay")
-                yield Button("Quit", variant="error", id="quit")
+        with CenterMiddle():
+            with Vertical(id="exit-dialog"):
+                yield Static("Leave onboarding?", id="exit-title")
+                yield Static("Your current onboarding progress will be lost.")
+                with Horizontal(id="exit-buttons"):
+                    yield Button("Stay", variant="primary", id="stay")
+                    yield Button("Quit", variant="error", id="quit")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(None if event.button.id == "stay" else None)
@@ -125,7 +136,71 @@ class ExitModal(ModalScreen[None]):
         self.dismiss(None)
 
 
-class OnboardingApp(App[Path | None]):
+class CodexLoginModeModal(ModalScreen[str | None]):
+    CSS = """
+    ModalScreen {
+        align: center middle;
+        background: rgba(0, 0, 0, 0.55);
+    }
+    #codex-mode-dialog {
+        width: 72;
+        height: auto;
+        padding: 1 2;
+        background: #141a20;
+        border: heavy #5b8aff;
+    }
+    #codex-mode-title {
+        text-style: bold;
+        color: #f0f4f8;
+        padding-bottom: 1;
+    }
+    .codex-mode-button {
+        width: 1fr;
+        min-height: 4;
+        margin-right: 1;
+    }
+    #codex-mode-actions {
+        height: auto;
+        padding-top: 1;
+    }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Back")]
+
+    def compose(self) -> ComposeResult:
+        with CenterMiddle():
+            with Vertical(id="codex-mode-dialog"):
+                yield Static("Where is Polly running?", id="codex-mode-title")
+                yield Static(
+                    "Choose the Codex login path that matches this environment. "
+                    "Local launches the normal browser-based flow. Remote/headless uses device auth."
+                )
+                with Horizontal(id="codex-mode-actions"):
+                    yield Button(
+                        "Local Machine\nBrowser-based login on this machine",
+                        id="codex-mode-local",
+                        variant="primary",
+                        classes="codex-mode-button",
+                    )
+                    yield Button(
+                        "Remote Or Headless\nUse device auth for VM/server sessions",
+                        id="codex-mode-remote",
+                        variant="warning",
+                        classes="codex-mode-button",
+                    )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "codex-mode-local":
+            self.dismiss("local")
+            return
+        if event.button.id == "codex-mode-remote":
+            self.dismiss("remote")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class OnboardingApp(App[OnboardingResult | None]):
     TITLE = "PollyPM"
     SUB_TITLE = "Setup"
     SCAN_FRAMES = ["◜", "◝", "◞", "◟"]
@@ -454,7 +529,9 @@ class OnboardingApp(App[Path | None]):
         provider_section = Vertical(classes="section")
         stage.mount(provider_section)
         provider_section.mount(Static("Available Providers", classes="section-title"))
-        provider_section.mount(Static("Click a provider to open its native login window in tmux."))
+        provider_section.mount(
+            Static("Click a provider to choose its login path and open the native login window in tmux.")
+        )
         provider_section.mount(provider_buttons)
         for status in installed:
             provider_buttons.mount(
@@ -703,9 +780,10 @@ class OnboardingApp(App[Path | None]):
             projects=projects,
         )
 
-    def _connect_provider(self, provider: ProviderKind) -> None:
+    def _connect_provider(self, provider: ProviderKind, *, login_preferences: LoginPreferences | None = None) -> None:
         index = len([account for account in self.state.accounts.values() if account.provider is provider]) + 1
         self._set_message(f"Opening a {provider.value} login window…")
+        preferences = login_preferences or self.state.login_preferences
         try:
             with self.suspend():
                 account = _connect_account_via_tmux(
@@ -714,11 +792,17 @@ class OnboardingApp(App[Path | None]):
                     provider=provider,
                     index=index,
                     quiet=True,
+                    preferences=preferences,
                 )
+        except LoginCancelled as exc:
+            self.refresh(repaint=True, layout=True)
+            self._render_current_step()
+            self._set_message(str(exc))
+            return
         except Exception as exc:  # noqa: BLE001
             self.refresh(repaint=True, layout=True)
-            self._set_message(f"Login did not complete cleanly: {exc}")
             self._render_current_step()
+            self._set_message(f"Login did not complete cleanly: {exc}")
             return
         self.refresh(repaint=True, layout=True)
         if account.account_name in self.state.accounts:
@@ -738,7 +822,7 @@ class OnboardingApp(App[Path | None]):
             self._connect_provider(ProviderKind.CLAUDE)
             return
         if button_id == "connect-codex":
-            self._connect_provider(ProviderKind.CODEX)
+            self.push_screen(CodexLoginModeModal(), self._handle_codex_login_mode)
             return
         if button_id == "accounts-continue":
             self.step = "controller"
@@ -769,7 +853,7 @@ class OnboardingApp(App[Path | None]):
             self._render_current_step()
             return
         if button_id == "tour-launch":
-            self.exit(self.config_path)
+            self.exit(OnboardingResult(config_path=self.config_path, launch_requested=True))
 
     @on(RadioSet.Changed)
     def on_controller_changed(self, event: RadioSet.Changed) -> None:
@@ -786,6 +870,14 @@ class OnboardingApp(App[Path | None]):
                 self.state.open_permissions_by_default = event.value
             return
         self.state.failover_enabled = event.value
+
+    def _handle_codex_login_mode(self, mode: str | None) -> None:
+        if mode is None:
+            self._set_message("Codex login cancelled.")
+            return
+        preferences = LoginPreferences(codex_headless=(mode == "remote"))
+        self.state.login_preferences = preferences
+        self._connect_provider(ProviderKind.CODEX, login_preferences=preferences)
 
     @on(SelectionList.SelectedChanged)
     def on_project_selection_changed(self, event: SelectionList.SelectedChanged) -> None:
@@ -815,7 +907,7 @@ class OnboardingApp(App[Path | None]):
         self._render_current_step()
 
 
-def run_onboarding_app(config_path: Path, force: bool = False) -> Path:
+def run_onboarding_app(config_path: Path, force: bool = False) -> OnboardingResult:
     app = OnboardingApp(config_path=config_path, force=force)
     result = app.run(mouse=True)
     if result is None:

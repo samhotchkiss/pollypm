@@ -25,6 +25,7 @@ from pollypm.projects import (
 )
 from pollypm.schedulers.base import ScheduledJob
 from pollypm.supervisor import Supervisor
+from pollypm.transcript_ingest import start_transcript_ingestion
 from pollypm.transcript_ledger import recent_token_usage as list_recent_token_usage
 from pollypm.transcript_ledger import sync_token_ledger
 from pollypm.workers import (
@@ -50,7 +51,9 @@ class PollyPMService:
         self.config_path = config_path
 
     def load_supervisor(self) -> Supervisor:
-        return Supervisor(load_config(self.config_path))
+        config = load_config(self.config_path)
+        start_transcript_ingestion(config)
+        return Supervisor(config)
 
     def status_snapshot(self) -> StatusSnapshot:
         supervisor = self.load_supervisor()

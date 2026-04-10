@@ -313,7 +313,7 @@ class PollyCockpitRail:
         if item.state.startswith("!"):
             fg = PALETTE["alert_text"]
             bg = PALETTE["alert_bg"]
-        elif item.state.endswith("live") and not is_selected:
+        elif (item.state.endswith("live") or item.state.endswith("working") or item.state == "watch") and not is_selected:
             fg = PALETTE["live_text"]
             bg = PALETTE["live_bg"]
 
@@ -348,6 +348,7 @@ class PollyCockpitRail:
         return row
 
     def _indicator(self, item: CockpitItem) -> tuple[str, _C | None]:
+        # State-based indicators first (apply to any item type including projects)
         if item.state.endswith("working"):
             char = ARC_SPINNER[self.spinner_index]
             return char, PALETTE["live_indicator"]
@@ -357,18 +358,25 @@ class PollyCockpitRail:
             return "\u25b2", PALETTE["alert_indicator"]
         if item.state == "dead":
             return "\u2715", PALETTE["dead"]
+        if item.state == "watch":
+            return "\u25ce", PALETTE["live_indicator"]
+        if item.state == "ready":
+            return "\u25cf", PALETTE["sel_accent"]
+        # Key-based fallbacks for items with no meaningful state
         if item.key == "inbox":
             has_items = "(" in item.label and not item.label.endswith("(0)")
             if has_items:
                 return "\u25c6", PALETTE["inbox_has"]
             return "\u25c7", PALETTE["inbox_empty"]
-        if item.key == "polly":
-            return "\u2022", PALETTE["sel_accent"]
+        if item.key == "polly" and item.state == "idle":
+            return "\u2022", PALETTE["item_muted"]
         if item.key == "settings":
             return "\u2699", PALETTE["item_muted"]
-        if item.key.startswith("project:"):
+        if item.state == "idle":
             return "\u25cb", PALETTE["idle"]
-        return " ", None
+        if item.state == "sub":
+            return " ", None
+        return "\u25cb", PALETTE["idle"]
 
     def _write(self, text: str) -> None:
         sys.stdout.write(text)

@@ -18,6 +18,17 @@ from pollypm.accounts import (
     toggle_failover_account,
 )
 from pollypm.config import load_config
+from pollypm.messaging import (
+    append_thread_message,
+    create_message,
+    create_thread,
+    get_thread,
+    list_open_messages,
+    list_threads,
+    read_handoff,
+    set_handoff,
+    transition_thread,
+)
 from pollypm.models import ProviderKind
 from pollypm.projects import (
     enable_tracked_project,
@@ -286,6 +297,40 @@ class PollyPMService:
 
     def remove_session(self, session_name: str) -> None:
         remove_worker_session(self.config_path, session_name)
+
+    def create_inbox_item(self, *, sender: str, subject: str, body: str) -> Path:
+        config = load_config(self.config_path)
+        return create_message(config.project.root_dir, sender=sender, subject=subject, body=body)
+
+    def list_inbox_items(self) -> list[object]:
+        config = load_config(self.config_path)
+        return list_open_messages(config.project.root_dir)
+
+    def triage_inbox_item(self, item_name: str, *, actor: str, owner: str = "pm") -> object:
+        config = load_config(self.config_path)
+        return create_thread(config.project.root_dir, item_name, actor=actor, owner=owner)
+
+    def list_inbox_threads(self, *, include_closed: bool = False) -> list[object]:
+        config = load_config(self.config_path)
+        return list_threads(config.project.root_dir, include_closed=include_closed)
+
+    def get_inbox_thread(self, thread_id: str) -> object:
+        config = load_config(self.config_path)
+        return get_thread(config.project.root_dir, thread_id)
+
+    def transition_inbox_thread(self, thread_id: str, state: str, *, actor: str, note: str = "") -> object:
+        config = load_config(self.config_path)
+        return transition_thread(config.project.root_dir, thread_id, state, actor=actor, note=note)
+
+    def handoff_inbox_thread(self, thread_id: str, *, owner: str, actor: str, note: str = "") -> dict[str, object]:
+        config = load_config(self.config_path)
+        set_handoff(config.project.root_dir, thread_id, owner=owner, actor=actor, note=note)
+        payload = read_handoff(config.project.root_dir, thread_id)
+        return {str(key): value for key, value in payload.items()}
+
+    def append_inbox_thread_message(self, thread_id: str, *, sender: str, subject: str, body: str) -> Path:
+        config = load_config(self.config_path)
+        return append_thread_message(config.project.root_dir, thread_id, sender=sender, subject=subject, body=body)
 
 
 def render_json(data: object) -> str:

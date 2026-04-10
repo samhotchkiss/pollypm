@@ -22,7 +22,7 @@ from pollypm.models import AccountConfig, ProviderKind, SessionConfig, SessionLa
 from pollypm.onboarding import _prime_claude_home, default_control_args, default_session_args
 from pollypm.providers import get_provider
 from pollypm.providers.base import LaunchCommand
-from pollypm.projects import ensure_project_scaffold
+from pollypm.projects import ensure_project_scaffold, ensure_session_lock
 from pollypm.runtimes import get_runtime
 from pollypm.schedulers import ScheduledJob, get_scheduler_backend
 from pollypm.transcript_ledger import sync_token_ledger_for_config
@@ -155,7 +155,9 @@ class Supervisor:
                 launch = replace(launch, env=env, initial_input=None)
             runtime = get_runtime(account.runtime, root_dir=self.config.project.root_dir)
             window_name = effective.window_name or effective.name
-            log_path = self.config.project.logs_dir / f"{window_name}.log"
+            log_dir = self.config.project.logs_dir / effective.name
+            ensure_session_lock(log_dir, effective.name)
+            log_path = log_dir / f"{window_name}.log"
             launches.append(
                 SessionLaunchSpec(
                     session=effective,
@@ -647,9 +649,11 @@ class Supervisor:
         return backend.run_due(self)
 
     def _write_snapshot(self, window: TmuxWindow, snapshot_lines: int) -> tuple[Path, str]:
-        content = self.tmux.capture_pane(f"{window.session}:{window.name}", lines=snapshot_lines)
+        target = window.pane_id or f"{window.session}:{window.name}"
+        content = self.tmux.capture_pane(target, lines=snapshot_lines)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         snapshot_path = self.config.project.snapshots_dir / f"{window.name}-{stamp}.txt"
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
         snapshot_path.write_text(content)
         return snapshot_path, content
 

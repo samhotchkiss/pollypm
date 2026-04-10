@@ -53,7 +53,7 @@ def test_mechanical_checkpoint_persists_files_and_state(tmp_path: Path) -> None:
         session=config.sessions["worker"],
         account=config.accounts["codex_primary"],
         window_name="worker-demo",
-        log_path=tmp_path / ".pollypm-state/logs/worker-demo.log",
+        log_path=tmp_path / ".pollypm-state/logs/worker/worker-demo.log",
         command="codex",
     )
     store = StateStore(config.project.state_db)
@@ -67,6 +67,8 @@ def test_mechanical_checkpoint_persists_files_and_state(tmp_path: Path) -> None:
     )
     assert artifact.json_path.exists()
     assert artifact.summary_path.exists()
+    assert artifact.json_path.parent.name == "worker"
+    assert (artifact.json_path.parent / ".session.lock").exists()
 
     record_checkpoint(
         store,
@@ -125,7 +127,7 @@ def test_record_checkpoint_preserves_existing_runtime_status(tmp_path: Path) -> 
         session=config.sessions["worker"],
         account=config.accounts["codex_primary"],
         window_name="worker-demo",
-        log_path=tmp_path / ".pollypm-state/logs/worker-demo.log",
+        log_path=tmp_path / ".pollypm-state/logs/worker/worker-demo.log",
         command="codex",
     )
     store = StateStore(config.project.state_db)

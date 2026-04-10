@@ -11,6 +11,7 @@ from typing import Any
 from pollypm.models import AccountConfig, ProviderKind
 from pollypm.providers import get_provider
 from pollypm.provider_sdk import TranscriptSource
+from pollypm.projects import ensure_session_lock, project_transcripts_dir, session_scoped_dir
 
 
 POLL_INTERVAL_SECONDS = 1.0
@@ -94,7 +95,7 @@ def _project_root_for_key(config, project_key: str) -> Path:
 
 
 def _transcript_root(project_root: Path) -> Path:
-    return project_root / ".pollypm" / "transcripts"
+    return project_transcripts_dir(project_root)
 
 
 def _cursor_state_path(config) -> Path:
@@ -145,7 +146,9 @@ def _save_cursor_state(config, state: TranscriptCursorState) -> None:
 def _append_event(config, event: dict[str, Any]) -> None:
     session_id = str(event["session_id"])
     project_root = _project_root_for_key(config, str(event["project_key"]))
-    output_path = _transcript_root(project_root) / session_id / "events.jsonl"
+    output_root = session_scoped_dir(_transcript_root(project_root), session_id)
+    ensure_session_lock(output_root, session_id)
+    output_path = output_root / "events.jsonl"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, separators=(",", ":")) + "\n")

@@ -5,6 +5,7 @@ import pwd
 import re
 import shutil
 import subprocess
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -106,11 +107,11 @@ def project_dossier_dir(project_path: Path) -> Path:
 
 
 def project_logs_dir(project_path: Path) -> Path:
-    return project_pollypm_dir(project_path) / "logs"
+    return project_instruction_dir(project_path) / "logs"
 
 
 def project_artifacts_dir(project_path: Path) -> Path:
-    return project_pollypm_dir(project_path) / "artifacts"
+    return project_instruction_dir(project_path) / "artifacts"
 
 
 def project_checkpoints_dir(project_path: Path) -> Path:
@@ -118,7 +119,35 @@ def project_checkpoints_dir(project_path: Path) -> Path:
 
 
 def project_worktrees_dir(project_path: Path) -> Path:
-    return project_pollypm_dir(project_path) / "worktrees"
+    return project_instruction_dir(project_path) / "worktrees"
+
+
+def project_transcripts_dir(project_path: Path) -> Path:
+    return project_instruction_dir(project_path) / "transcripts"
+
+
+def session_scoped_dir(base_dir: Path, session_id: str) -> Path:
+    return base_dir / session_id
+
+
+def session_lock_path(base_dir: Path) -> Path:
+    return base_dir / ".session.lock"
+
+
+def ensure_session_lock(base_dir: Path, session_id: str) -> Path:
+    base_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = session_lock_path(base_dir)
+    payload = {"session_id": session_id}
+    if lock_path.exists():
+        try:
+            existing = json.loads(lock_path.read_text())
+        except Exception:  # noqa: BLE001
+            existing = {}
+        existing_session = existing.get("session_id")
+        if isinstance(existing_session, str) and existing_session and existing_session != session_id:
+            raise RuntimeError(f"Session lock conflict at {base_dir}: owned by {existing_session}")
+    lock_path.write_text(json.dumps(payload, indent=2) + "\n")
+    return lock_path
 
 
 def project_issues_dir(project_path: Path) -> Path:
@@ -132,7 +161,7 @@ def ensure_project_scaffold(project_path: Path) -> Path:
         normalize_project_path(project_path) / PROJECT_CONFIG_DIRNAME,
         project_instruction_dir(project_path) / "rules",
         project_instruction_dir(project_path) / "magic",
-        project_instruction_dir(project_path) / "transcripts",
+        project_transcripts_dir(project_path),
         pollypm_dir,
         project_dossier_dir(project_path),
         project_logs_dir(project_path),

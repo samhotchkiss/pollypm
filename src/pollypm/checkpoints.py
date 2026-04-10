@@ -8,7 +8,7 @@ from pathlib import Path
 
 from pollypm.models import PollyPMConfig, SessionLaunchSpec
 from pollypm.memory_backends import get_memory_backend
-from pollypm.projects import ensure_project_scaffold, project_checkpoints_dir
+from pollypm.projects import ensure_project_scaffold, ensure_session_lock, project_checkpoints_dir, session_scoped_dir
 from pollypm.storage.state import StateStore
 
 
@@ -34,7 +34,8 @@ def write_mechanical_checkpoint(
 ) -> CheckpointArtifact:
     project_path = _project_root(config, launch.session.project)
     ensure_project_scaffold(project_path)
-    checkpoint_root = project_checkpoints_dir(project_path) / launch.session.name
+    checkpoint_root = session_scoped_dir(project_checkpoints_dir(project_path), launch.session.name)
+    ensure_session_lock(checkpoint_root, launch.session.name)
     checkpoint_root.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     json_path = checkpoint_root / f"{stamp}.json"

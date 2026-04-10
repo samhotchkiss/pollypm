@@ -141,6 +141,8 @@ def test_sync_transcripts_once_normalizes_claude_and_codex_events(tmp_path: Path
     assert claude_events[-1]["payload"]["total_tokens"] == 15
     assert [event["event_type"] for event in codex_events] == ["session_state", "token_usage"]
     assert codex_events[-1]["payload"]["total_tokens"] == 21
+    assert (config.project.root_dir / ".pollypm/transcripts/session-a/.session.lock").exists()
+    assert (config.project.root_dir / ".pollypm/transcripts/session-b/.session.lock").exists()
 
 
 def test_sync_transcripts_once_resumes_and_picks_up_rotated_file(tmp_path: Path) -> None:

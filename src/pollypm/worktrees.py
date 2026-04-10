@@ -6,7 +6,7 @@ from pathlib import Path
 import typer
 
 from pollypm.config import load_config
-from pollypm.projects import ensure_project_scaffold, project_worktrees_dir
+from pollypm.projects import ensure_project_scaffold, ensure_session_lock, project_worktrees_dir, session_scoped_dir
 from pollypm.storage.state import StateStore, WorktreeRecord
 
 
@@ -32,7 +32,10 @@ def ensure_worktree(
     if existing is not None and Path(existing.path).exists():
         return existing
 
-    path = project_worktrees_dir(project.path) / f"{project_key}-{lane_kind}-{lane_key}"
+    session_id = session_name or f"{lane_kind}-{lane_key}"
+    worktree_root = session_scoped_dir(project_worktrees_dir(project.path), session_id)
+    ensure_session_lock(worktree_root, session_id)
+    path = worktree_root / f"{project_key}-{lane_kind}-{lane_key}"
     branch = f"pollypm/{project_key}/{lane_kind}/{lane_key}"
     if not path.exists():
         result = subprocess.run(

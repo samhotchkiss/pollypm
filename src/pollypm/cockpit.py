@@ -193,6 +193,8 @@ class CockpitRouter:
         lowered = tail.lower()
         provider_value = provider.value if hasattr(provider, "value") else str(provider)
         if provider_value == "claude":
+            if "esc to interrupt" in lowered:
+                return True
             return "\u276f" not in tail
         if provider_value == "codex":
             if "working" in lowered and "esc to interrupt" in lowered:

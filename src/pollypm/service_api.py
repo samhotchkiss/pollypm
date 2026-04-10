@@ -23,6 +23,7 @@ from pollypm.messaging import (
     create_message,
     create_thread,
     get_thread,
+    InboxMessage,
     list_open_messages,
     list_threads,
     read_handoff,
@@ -56,6 +57,15 @@ class StatusSnapshot:
     alerts: list[object]
     leases: list[object]
     errors: list[str]
+
+
+@dataclass(slots=True)
+class InboxRouteDecision:
+    thread_id: str
+    owner: str
+    state: str
+    note: str
+    reason: str
 
 
 class PollyPMService:
@@ -308,6 +318,40 @@ class PollyPMService:
         config = load_config(self.config_path)
         return create_thread(config.project.root_dir, item_name, actor=actor, owner=owner)
 
+    def route_inbox_thread(self, thread_id: str, *, actor: str = "pm") -> InboxRouteDecision:
+        config = load_config(self.config_path)
+        thread = get_thread(config.project.root_dir, thread_id)
+        latest = self._latest_thread_message(thread)
+        if self._message_needs_pm_ownership(latest):
+            note = "PM kept ownership because the thread needs policy, scope, or priority judgment."
+            set_handoff(config.project.root_dir, thread_id, owner="pm", actor=actor, note=note)
+            return InboxRouteDecision(
+                thread_id=thread_id,
+                owner="pm",
+                state=thread.state,
+                note=note,
+                reason="policy",
+            )
+
+        note = "PM routed an execution-only task to PA."
+        set_handoff(config.project.root_dir, thread_id, owner="pa", actor=actor, note=note)
+        next_thread = thread
+        if thread.state == "threaded":
+            next_thread = transition_thread(
+                config.project.root_dir,
+                thread_id,
+                "waiting-on-pa",
+                actor=actor,
+                note=note,
+            )
+        return InboxRouteDecision(
+            thread_id=thread_id,
+            owner="pa",
+            state=next_thread.state,
+            note=note,
+            reason="execution",
+        )
+
     def list_inbox_threads(self, *, include_closed: bool = False) -> list[object]:
         config = load_config(self.config_path)
         return list_threads(config.project.root_dir, include_closed=include_closed)
@@ -329,6 +373,75 @@ class PollyPMService:
     def append_inbox_thread_message(self, thread_id: str, *, sender: str, subject: str, body: str) -> Path:
         config = load_config(self.config_path)
         return append_thread_message(config.project.root_dir, thread_id, sender=sender, subject=subject, body=body)
+
+    def record_worker_reply_via_pa(
+        self,
+        thread_id: str,
+        *,
+        worker_name: str,
+        subject: str,
+        body: str,
+        actor: str = "pa",
+    ) -> object:
+        config = load_config(self.config_path)
+        append_thread_message(
+            config.project.root_dir,
+            thread_id,
+            sender=worker_name,
+            subject=subject,
+            body=body,
+        )
+        note = "PA surfaced a worker reply back to PM."
+        thread = get_thread(config.project.root_dir, thread_id)
+        if thread.state == "waiting-on-pa":
+            thread = transition_thread(
+                config.project.root_dir,
+                thread_id,
+                "waiting-on-pm",
+                actor=actor,
+                note=note,
+            )
+        set_handoff(config.project.root_dir, thread_id, owner="pm", actor=actor, note=note)
+        return get_thread(config.project.root_dir, thread_id)
+
+    def _latest_thread_message(self, thread: object) -> InboxMessage:
+        thread_paths = getattr(thread, "message_paths", [])
+        if not thread_paths:
+            raise RuntimeError(f"Inbox thread {getattr(thread, 'thread_id', 'unknown')} has no messages.")
+        latest = thread_paths[-1]
+        raw = latest.read_text()
+        header, _, body = raw.partition("\n\n")
+        fields = {}
+        for line in header.splitlines():
+            key, _, value = line.partition(":")
+            fields[key.strip()] = value.strip()
+        return InboxMessage(
+            path=latest,
+            subject=fields.get("Subject", latest.stem),
+            sender=fields.get("Sender", "unknown"),
+            created_at=fields.get("Created-At", ""),
+            body=body.strip(),
+        )
+
+    def _message_needs_pm_ownership(self, message: InboxMessage) -> bool:
+        text = f"{message.subject}\n{message.body}".lower()
+        policy_markers = (
+            "should",
+            "scope",
+            "priority",
+            "plan",
+            "policy",
+            "approve",
+            "approval",
+            "decide",
+            "direction",
+            "strategy",
+        )
+        if any(marker in text for marker in policy_markers):
+            return True
+        if "?" not in text:
+            return False
+        return any(marker in text for marker in ("what", "which", "why", "should", "priority", "scope"))
 
 
 def render_json(data: object) -> str:

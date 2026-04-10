@@ -190,14 +190,14 @@ def test_sync_transcripts_once_resumes_and_picks_up_rotated_file(tmp_path: Path)
     assert assistant_texts == ["First", "Second"]
 
 
-def test_service_load_supervisor_starts_transcript_ingestion(monkeypatch, tmp_path: Path) -> None:
+def test_service_load_supervisor_does_not_start_transcript_ingestion(monkeypatch, tmp_path: Path) -> None:
     _loaded_config, config_path = _config(tmp_path)
     calls: list[str] = []
-    monkeypatch.setattr("pollypm.service_api.start_transcript_ingestion", lambda config: calls.append(str(config.project.base_dir)))
+    monkeypatch.setattr("pollypm.cli.start_transcript_ingestion", lambda config: calls.append(str(config.project.base_dir)))
 
     PollyPMService(config_path).load_supervisor()
 
-    assert calls == [str(config_path.parent / ".pollypm-state")]
+    assert calls == []
 
 
 def test_up_starts_transcript_ingestion(monkeypatch, tmp_path: Path) -> None:

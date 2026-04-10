@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from pollypm.agent_profiles.base import AgentProfile, AgentProfileContext
+from pollypm.messaging import list_open_messages
 from pollypm.rules import render_session_manifest
 
 
@@ -13,6 +14,8 @@ class StaticPromptProfile(AgentProfile):
 
     def build_prompt(self, context: AgentProfileContext) -> str | None:
         prompt = self.prompt
+        if self.name == "polly":
+            prompt = f"{prompt}\n\n{_render_operator_inbox_brief(context)}"
         if self.name == "worker":
             project = context.config.projects.get(context.session.project)
             if project and project.persona_name:
@@ -71,3 +74,22 @@ def worker_prompt() -> str:
         "throughout the session. If the file is missing, say so immediately. Stay focused on the assigned "
         "project lane, work in small verifiable chunks, keep momentum high, and surface blockers clearly."
     )
+
+
+def _render_operator_inbox_brief(context: AgentProfileContext) -> str:
+    items = list_open_messages(context.config.project.root_dir)
+    lines = [
+        "Monitor `.pollypm/inbox/open/` continuously.",
+        "PM owns inbox triage. Keep policy, scope, and priority questions with PM.",
+        "Route execution-only requests to PA.",
+        "Worker replies must return through PA before the thread is updated for PM review.",
+    ]
+    if not items:
+        lines.append("Open inbox items right now: none.")
+        return " ".join(lines)
+    lines.append("Open inbox items right now:")
+    for item in items[:5]:
+        lines.append(f"- {item.subject} [{item.sender}]")
+    if len(items) > 5:
+        lines.append(f"- ... and {len(items) - 5} more")
+    return "\n".join(lines)

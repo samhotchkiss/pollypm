@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pollypm.checkpoints import record_checkpoint, snapshot_hash, write_mechanical_checkpoint
-from pollypm.heartbeats.base import HeartbeatCursor, HeartbeatSessionContext
+from pollypm.heartbeats.base import HeartbeatCursor, HeartbeatSessionContext, HeartbeatUnmanagedWindow
 
 if TYPE_CHECKING:
     from pollypm.supervisor import Supervisor
@@ -21,6 +21,26 @@ class SupervisorHeartbeatAPI:
 
     def list_sessions(self) -> list[HeartbeatSessionContext]:
         return list(self._contexts)
+
+    def list_unmanaged_windows(self) -> list[HeartbeatUnmanagedWindow]:
+        expected_window_names = {launch.window_name for launch in self.supervisor.plan_launches()}
+        expected_window_names.add(self.supervisor.console_window_name())
+        unmanaged: list[HeartbeatUnmanagedWindow] = []
+        for window in self.supervisor._window_map().values():
+            if window.name in expected_window_names:
+                continue
+            unmanaged.append(
+                HeartbeatUnmanagedWindow(
+                    tmux_session=window.session,
+                    window_name=window.name,
+                    pane_id=window.pane_id,
+                    pane_command=window.pane_current_command,
+                    pane_dead=window.pane_dead,
+                    pane_path=window.pane_current_path,
+                )
+            )
+        unmanaged.sort(key=lambda item: (item.tmux_session, item.window_name))
+        return unmanaged
 
     def get_cursor(self, session_name: str) -> HeartbeatCursor | None:
         return self._load_cursors().get(session_name)

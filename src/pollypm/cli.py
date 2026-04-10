@@ -36,6 +36,7 @@ from pollypm.projects import (
 from pollypm.providers import get_provider
 from pollypm.supervisor import Supervisor
 from pollypm.tmux.client import TmuxClient
+from pollypm.workers import create_worker_session, launch_worker_session
 from pollypm.worktrees import list_worktrees as list_project_worktrees
 
 
@@ -101,7 +102,8 @@ def _install_global_pollypm(root_dir: Path) -> tuple[bool, str]:
 def _require_pollypm_session(supervisor: Supervisor) -> None:
     current_tmux = supervisor.tmux.current_session_name()
     expected = supervisor.config.project.tmux_session
-    if current_tmux != expected:
+    allowed = {expected, supervisor.storage_closet_session_name()}
+    if current_tmux not in allowed:
         raise typer.BadParameter(
             f"This command must run inside tmux session '{expected}'. Use `pm up` to attach first."
         )
@@ -464,6 +466,8 @@ def up(
     else:
         supervisor.ensure_console_window()
 
+    supervisor.ensure_heartbeat_schedule()
+
     if current_tmux == session_name:
         supervisor.focus_console()
         typer.echo(f"Already inside tmux session {session_name}")
@@ -730,3 +734,29 @@ def send(
     _require_pollypm_session(supervisor)
     supervisor.send_input(session_name, text, owner=owner, force=force, press_enter=not no_enter)
     typer.echo(f"Sent input to {session_name}")
+
+
+@app.command("worker-start")
+def worker_start(
+    project_key: str = typer.Argument(..., help="Tracked project key."),
+    prompt: str | None = typer.Option(None, "--prompt", help="Optional initial worker prompt."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    supervisor = _load_supervisor(config_path)
+    _require_pollypm_session(supervisor)
+    existing = next(
+        (
+            session
+            for session in supervisor.config.sessions.values()
+            if session.role == "worker" and session.project == project_key and session.enabled
+        ),
+        None,
+    )
+    session = existing or create_worker_session(config_path, project_key=project_key, prompt=prompt)
+    launch_worker_session(config_path, session.name)
+    refreshed = _load_supervisor(config_path)
+    launch = next(item for item in refreshed.plan_launches() if item.session.name == session.name)
+    typer.echo(
+        f"Managed worker {session.name} ready for project {project_key} "
+        f"in {refreshed._tmux_session_for_launch(launch)}:{launch.window_name}"
+    )

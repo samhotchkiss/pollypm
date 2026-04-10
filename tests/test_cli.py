@@ -112,3 +112,146 @@ def test_up_surfaces_bootstrap_failure_cleanly(monkeypatch, tmp_path: Path) -> N
 
     assert result.exit_code != 0
     assert "PollyPM could not launch any controller account" in result.output
+
+
+def test_up_ensures_heartbeat_schedule_for_existing_session(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text("[project]\nname = \"pollypm\"\n")
+    calls: list[str] = []
+
+    class FakeTmux:
+        def has_session(self, name: str) -> bool:
+            return name == "pollypm"
+
+        def current_session_name(self):
+            return "pollypm"
+
+    class FakeSupervisor:
+        def __init__(self) -> None:
+            self.tmux = FakeTmux()
+            self.config = type("Config", (), {"project": type("Project", (), {"tmux_session": "pollypm"})()})()
+
+        def ensure_layout(self) -> None:
+            return None
+
+        def ensure_console_window(self) -> None:
+            calls.append("console")
+
+        def ensure_heartbeat_schedule(self) -> None:
+            calls.append("heartbeat")
+
+        def focus_console(self) -> None:
+            calls.append("focus")
+
+    monkeypatch.setattr(cli, "_load_supervisor", lambda path: FakeSupervisor())
+
+    runner = CliRunner()
+    result = runner.invoke(cli.app, ["up", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert calls == ["console", "heartbeat", "focus"]
+    assert "Already inside tmux session pollypm" in result.output
+
+
+def test_require_pollypm_session_allows_storage_closet() -> None:
+    class FakeTmux:
+        def current_session_name(self):
+            return "pollypm-storage-closet"
+
+    class FakeSupervisor:
+        def __init__(self) -> None:
+            self.tmux = FakeTmux()
+            self.config = type("Config", (), {"project": type("Project", (), {"tmux_session": "pollypm"})()})()
+
+        def storage_closet_session_name(self) -> str:
+            return "pollypm-storage-closet"
+
+    cli._require_pollypm_session(FakeSupervisor())
+
+
+def test_worker_start_creates_and_launches_managed_worker(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text("[project]\nname = \"pollypm\"\n")
+    created: list[tuple[Path, str, str | None]] = []
+    launched: list[tuple[Path, str]] = []
+
+    class FakeSupervisor:
+        def __init__(self) -> None:
+            self.config = type(
+                "Config",
+                (),
+                {
+                    "sessions": {},
+                    "project": type("Project", (), {"tmux_session": "pollypm"})(),
+                },
+            )()
+
+        def _tmux_session_for_launch(self, launch) -> str:
+            return "pollypm-storage-closet"
+
+        def plan_launches(self):
+            session = type("Session", (), {"name": "worker_pollypm"})()
+            return [type("Launch", (), {"session": session, "window_name": "worker-pollypm"})()]
+
+    monkeypatch.setattr(cli, "_require_pollypm_session", lambda supervisor: None)
+    monkeypatch.setattr(cli, "_load_supervisor", lambda path: FakeSupervisor())
+    monkeypatch.setattr(
+        cli,
+        "create_worker_session",
+        lambda path, project_key, prompt=None: (
+            created.append((path, project_key, prompt))
+            or type("Session", (), {"name": "worker_pollypm"})()
+        ),
+    )
+    monkeypatch.setattr(cli, "launch_worker_session", lambda path, session_name: launched.append((path, session_name)))
+
+    runner = CliRunner()
+    result = runner.invoke(cli.app, ["worker-start", "pollypm", "--prompt", "Do the next task", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert created == [(config_path, "pollypm", "Do the next task")]
+    assert launched == [(config_path, "worker_pollypm")]
+    assert "Managed worker worker_pollypm ready for project pollypm" in result.output
+
+
+def test_worker_start_reuses_existing_managed_worker(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text("[project]\nname = \"pollypm\"\n")
+    launched: list[tuple[Path, str]] = []
+    existing_session = type(
+        "Session",
+        (),
+        {"role": "worker", "project": "pollypm", "enabled": True, "name": "worker_pollypm"},
+    )()
+
+    class FakeSupervisor:
+        def __init__(self) -> None:
+            self.config = type(
+                "Config",
+                (),
+                {
+                    "sessions": {"worker_pollypm": existing_session},
+                    "project": type("Project", (), {"tmux_session": "pollypm"})(),
+                },
+            )()
+
+        def _tmux_session_for_launch(self, launch) -> str:
+            return "pollypm-storage-closet"
+
+        def plan_launches(self):
+            return [type("Launch", (), {"session": existing_session, "window_name": "worker-pollypm"})()]
+
+    monkeypatch.setattr(cli, "_require_pollypm_session", lambda supervisor: None)
+    monkeypatch.setattr(cli, "_load_supervisor", lambda path: FakeSupervisor())
+    monkeypatch.setattr(
+        cli,
+        "create_worker_session",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not create a new worker")),
+    )
+    monkeypatch.setattr(cli, "launch_worker_session", lambda path, session_name: launched.append((path, session_name)))
+
+    runner = CliRunner()
+    result = runner.invoke(cli.app, ["worker-start", "pollypm", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert launched == [(config_path, "worker_pollypm")]

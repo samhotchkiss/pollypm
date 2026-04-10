@@ -46,8 +46,20 @@ class HeartbeatSessionContext:
     cursor: HeartbeatCursor | None = None
 
 
+@dataclass(slots=True)
+class HeartbeatUnmanagedWindow:
+    tmux_session: str
+    window_name: str
+    pane_id: str
+    pane_command: str
+    pane_dead: bool
+    pane_path: str
+
+
 class HeartbeatAPI(Protocol):
     def list_sessions(self) -> list[HeartbeatSessionContext]: ...
+
+    def list_unmanaged_windows(self) -> list[HeartbeatUnmanagedWindow]: ...
 
     def get_cursor(self, session_name: str) -> HeartbeatCursor | None: ...
 

@@ -8,17 +8,25 @@ from pollypm.providers import get_provider
 from pollypm.runtimes import get_runtime
 
 
-def _write_plugin(plugin_dir: Path, *, name: str, body: str, api_version: str = "1") -> None:
+def _write_plugin(
+    plugin_dir: Path,
+    *,
+    name: str,
+    body: str,
+    api_version: str = "1",
+    kind: str = "provider",
+    capabilities: tuple[str, ...] = ("provider", "hook"),
+) -> None:
     plugin_dir.mkdir(parents=True, exist_ok=True)
     (plugin_dir / "pollypm-plugin.toml").write_text(
         "\n".join(
             [
                 f'api_version = "{api_version}"',
                 f'name = "{name}"',
-                'kind = "provider"',
+                f'kind = "{kind}"',
                 'version = "0.1.0"',
                 'entrypoint = "plugin.py:plugin"',
-                'capabilities = ["provider", "hook"]',
+                'capabilities = [' + ', '.join(f'"{item}"' for item in capabilities) + ']',
             ]
         )
         + "\n"
@@ -132,3 +140,38 @@ def test_get_provider_and_runtime_resolve_through_extension_host(tmp_path: Path)
 
     assert provider.name == "claude"
     assert type(runtime).__name__ == "LocalRuntimeAdapter"
+
+
+def test_repo_heartbeat_plugin_overrides_builtin_backend(monkeypatch, tmp_path: Path) -> None:
+    builtin_root = Path(__file__).resolve().parents[1] / "src" / "pollypm" / "plugins_builtin"
+    user_root = tmp_path / "user-plugins"
+    repo_root = tmp_path / ".pollypm-state" / "plugins"
+    repo_plugin = repo_root / "override_heartbeat_test"
+    monkeypatch.setattr(
+        ExtensionHost,
+        "_plugin_search_paths",
+        lambda self: [("builtin", builtin_root), ("user", user_root), ("repo", repo_root)],
+    )
+    try:
+        _write_plugin(
+            repo_plugin,
+            name="override_heartbeat_test",
+            kind="heartbeat",
+            capabilities=("heartbeat",),
+            body=(
+                "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+                "class RepoHeartbeatBackend:\n"
+                '    name = "local"\n'
+                "    def run(self, api, *, snapshot_lines=200):\n"
+                "        return []\n"
+                'plugin = PollyPMPlugin(name="override_heartbeat_test", heartbeat_backends={"local": RepoHeartbeatBackend})\n'
+            ),
+        )
+
+        host = ExtensionHost(tmp_path)
+        backend = host.get_heartbeat_backend("local")
+
+        assert type(backend).__name__ == "RepoHeartbeatBackend"
+    finally:
+        if repo_plugin.exists():
+            shutil.rmtree(repo_plugin)

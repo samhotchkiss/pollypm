@@ -98,9 +98,10 @@ def record_checkpoint(
         snapshot_path=str(snapshot_path),
         summary_text=artifact.summary_text,
     )
+    current = store.get_session_runtime(launch.session.name)
     store.upsert_session_runtime(
         session_name=launch.session.name,
-        status="healthy",
+        status=current.status if current is not None else "healthy",
         last_checkpoint_path=str(artifact.summary_path),
     )
     try:

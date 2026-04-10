@@ -33,3 +33,31 @@ Verify that the cockpit (status dashboard) displays accurate, real-time session 
 - `pm up` restores all sessions to running state in the display
 
 ## Log
+
+### Test Execution — 2026-04-10 11:48 AM
+
+**Result: PASS**
+
+**Steps executed:**
+1. Captured cockpit rail — shows centered wordmark, slogans, all projects
+2. Polly shows • (blue dot) = ready/idle — operator is at ❯ prompt ✓
+3. otter-camp shows ● (green solid) = live session, idle — worker at › prompt ✓
+4. PollyPM shows ● (green solid) = live session, idle — worker at › prompt ✓
+5. pollypm-website shows ● (green solid) = live session, idle — worker at › prompt ✓
+6. sam-blog-rebuild-rest… shows ○ (dim circle) = no running session ✓
+7. news (Nora) shows ○ (dim circle) = no running session ✓
+8. Inbox shows ◇ (0) = empty inbox ✓
+9. Section separator "── projects ────────" visible ✓
+10. Settings at bottom with ⚙ icon ✓
+
+**Turn detection accuracy:**
+- All 3 codex workers confirmed idle at › prompt → ● shown correctly
+- Heartbeat and operator confirmed at ❯ prompt (Claude idle)
+- No false positives (no spinning indicators on idle sessions)
+
+**Observations:**
+- Project names properly truncated (sam-blog-rebuild-rest…)
+- Polly indicator uses • not ● (different styling for operator vs worker)
+- Persona names shown: "news (Nora)"
+
+**Issues found:** None

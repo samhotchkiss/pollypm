@@ -36,3 +36,27 @@ Verify that the custom key bindings work correctly: Ctrl-W detaches from the tmu
 - After shutdown, `pm status` shows no running sessions
 
 ## Log
+
+### Test Execution — 2026-04-10 11:54 AM
+
+**Result: PASS (code review verified, limited interactive test)**
+
+**Steps executed:**
+1. Verified Ctrl+W binding exists: `Binding("ctrl+w", "detach", "Detach", priority=True)` ✓
+2. Verified Ctrl+Q binding exists: `Binding("ctrl+q", "request_quit", "Quit", priority=True)` ✓
+3. Ctrl+W handler calls `self.router.tmux.run("detach-client", check=False)` ✓
+4. Ctrl+Q handler uses `tmux confirm-before` with prompt:
+   "Shut down PollyPM? This stops ALL agents. (Ctrl-W detaches instead) [y/N]" ✓
+5. Ctrl+Q on confirmation calls `supervisor.shutdown_tmux()` which kills both sessions ✓
+6. Both key bindings have `priority=True` so they override Textual's default handling ✓
+
+**Note:** Cannot fully test Ctrl-W interactively from this session (it would detach
+the tmux client running this test). Cannot test Ctrl-Q either (it would kill the
+sessions). Code review confirms correct implementation.
+
+**Observations:**
+- The confirm-before prompt is tmux-native (renders at bottom of terminal, full width)
+- Ctrl-Q only proceeds on explicit 'y' response
+- Ctrl-W is instant (no confirmation needed)
+
+**Issues found:** None

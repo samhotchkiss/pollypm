@@ -4,9 +4,9 @@
 
 | State | Count |
 |-------|-------|
-| 01-ready | 105 |
+| 01-ready | 99 |
 | 02-running | 0 |
-| 03-complete | 0 |
+| 03-complete | 6 |
 | **Total** | **105** |
 
 ## 01-Architecture & Domain (v1/01)
@@ -207,4 +207,4 @@
 
 ## Current Progress
 
-Not started. Awaiting approval to begin testing.
+In progress. Started 2026-04-10.

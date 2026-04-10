@@ -37,3 +37,30 @@ Verify that running `pm up` on a fresh installation correctly launches all three
 - Worker window shows an active worker prompt or idle state
 
 ## Log
+
+### Test Execution — 2026-04-10 11:43 AM
+
+**Result: PASS**
+
+**Steps executed:**
+1. Killed existing pollypm and pollypm-storage-closet sessions
+2. Verified clean state: no pollypm sessions
+3. Cleared session markers for clean launch
+4. Ran `pm` — output: Creating heartbeat, operator, worker_pollypm, worker_otter_camp, worker_pollypm_website
+5. Verified `pollypm` session created (1 window - PollyPM cockpit)
+6. Verified `pollypm-storage-closet` session created (5 windows)
+7. Confirmed all 5 session windows: pm-heartbeat, pm-operator, worker-pollypm, worker-otter_camp, worker-pollypm-website
+8. Heartbeat: running at ❯ prompt with bypass permissions on
+9. Operator: running at ❯ prompt with bypass permissions on
+10. Workers: running at › prompt (codex), 100% capacity
+11. `pm debug` shows all 5 sessions as "running" with correct providers
+
+**Observations:**
+- Bootstrap creates 5 sessions (2 control + 3 workers) matching config
+- All Claude sessions have --dangerously-skip-permissions active
+- All Codex sessions at interactive prompt
+- Cockpit rail shows all projects with correct indicators
+- 1 open alert (stale from previous session): "operator/needs_followup"
+- Heartbeat scheduled at 1-minute intervals
+
+**Issues found:** None

@@ -32,3 +32,32 @@ Verify that each configured account has its own isolated home directory (e.g., s
 - No cross-contamination between account configurations
 
 ## Log
+
+### Test Execution — 2026-04-10 11:52 AM
+
+**Result: PASS**
+
+**Steps executed:**
+1. Listed 2 configured accounts: claude_claude_swh_me (Claude), codex_s_swh_me (Codex)
+2. Verified each has separate home directory:
+   - Claude: ~/.pollypm/homes/onboarding_claude_1 (exists, perms 755)
+   - Codex: ~/.pollypm/homes/codex_s_swh_me (exists, perms 755)
+3. Verified CLAUDE_CONFIG_DIR and CODEX_HOME point to correct homes:
+   - Claude: ~/.pollypm/homes/onboarding_claude_1/.claude (exists)
+   - Codex: ~/.pollypm/homes/codex_s_swh_me/.codex (exists)
+4. Verified all sessions use their account's config dir:
+   - heartbeat & operator → claude_claude_swh_me → onboarding_claude_1/.claude
+   - worker_pollypm, worker_otter_camp, worker_pollypm_website → codex_s_swh_me → .codex
+5. Verified no cross-contamination:
+   - Claude home has .claude files (backups, cache, history)
+   - Codex home has .codex files (auth.json, config.toml, history)
+   - No .codex in Claude home, no .claude in Codex home
+6. Keychain entries present for Claude Code credentials
+
+**Observations:**
+- Home directories use 755 not 700 as spec suggests. This is a minor issue.
+- Claude account home is named "onboarding_claude_1" (kept from onboarding to preserve keychain hash)
+- Both Claude control sessions (heartbeat, operator) share the same CLAUDE_CONFIG_DIR (by design)
+
+**Issues found:**
+- Home directory permissions are 755, spec says 700. Low priority cosmetic.

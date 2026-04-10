@@ -40,3 +40,30 @@ Verify that creating a new issue via the CLI results in a correctly formatted is
 - Issue status starts as "open" or "ready"
 
 ## Log
+
+### Test Execution — 2026-04-10 11:56 AM
+
+**Result: PASS**
+
+**Steps executed:**
+1. Verified issue tracker exists at /Users/sam/dev/pollypm/issues/ with proper state dirs
+2. Counter at .latest_issue_number = 19 (18 completed + 1 ready issue)
+3. Backend type confirmed: FileTaskBackend
+4. Created test issue #0020 "Test Issue for UAT" → appeared in 01-ready/ ✓
+5. Counter incremented to 20 ✓
+6. Issue file properly formatted with markdown heading and body ✓
+7. Moved 0020 to 02-in-progress → file moved to correct directory ✓
+8. Moved to 03-needs-review → file moved correctly ✓
+9. State counts verified: 01-ready:1, 03-needs-review:1, 05-completed:18 ✓
+10. Completed issue moved to 05-completed ✓
+
+**Full lifecycle tested:** ready → in-progress → needs-review → completed
+
+**Observations:**
+- Counter is atomic (single file, incremented per create_task)
+- File naming follows pattern: {number}-{slugified-title}.md
+- State transitions are file moves between directories
+- 04-in-review directory exists but not tested (would need PM review step)
+- 19 existing issues in the tracker from previous work
+
+**Issues found:** None

@@ -133,23 +133,52 @@ class CockpitRouter:
             return "idle"
         window_map = {window.name: window for window in windows}
         window = window_map.get(launch.window_name)
+        # If the session is mounted in the cockpit, its storage window is gone.
+        # Check the cockpit right pane instead.
+        if window is None:
+            state = self._load_state()
+            if state.get("mounted_session") == session_name:
+                window = self._mounted_window_proxy(launch, windows)
         if window is None:
             return "idle"
         if window.pane_dead:
             return "dead"
-        if launch.session.role == "worker":
+        spinners = ["\u25dc", "\u25dd", "\u25de", "\u25df"]
+        if launch.session.role in ("worker", "operator-pm"):
             working = self._is_pane_working(window, launch.session.provider)
             if working:
-                return ["\u25dc", "\u25dd", "\u25de", "\u25df"][spinner_index % 4] + " working"
-            return "\u25cf live"
-        if launch.session.role == "operator-pm":
-            working = self._is_pane_working(window, launch.session.provider)
-            if working:
-                return ["\u25dc", "\u25dd", "\u25de", "\u25df"][spinner_index % 4] + " working"
+                return spinners[spinner_index % 4] + " working"
+            if launch.session.role == "worker":
+                return "\u25cf live"
             return "ready"
         if launch.session.role == "heartbeat-supervisor":
             return "watch"
         return "live"
+
+    def _mounted_window_proxy(self, launch, windows):
+        """Return a window-like object for a session mounted in the cockpit pane."""
+        cockpit_windows = [w for w in windows if w.name == self._COCKPIT_WINDOW]
+        if not cockpit_windows:
+            return None
+        # The cockpit window has multiple panes; the right pane is the mounted session.
+        try:
+            supervisor = self._load_supervisor()
+            target = f"{supervisor.config.project.tmux_session}:{self._COCKPIT_WINDOW}"
+            panes = self.tmux.list_panes(target)
+            if len(panes) < 2:
+                return None
+            right_pane = max(panes, key=self._pane_left)
+            # Return the cockpit window but with the right pane's info
+            cockpit_win = cockpit_windows[0]
+            from dataclasses import replace as dc_replace
+            return dc_replace(
+                cockpit_win,
+                pane_id=right_pane.pane_id,
+                pane_current_command=right_pane.pane_current_command,
+                pane_dead=right_pane.pane_dead,
+            )
+        except Exception:  # noqa: BLE001
+            return None
 
     def _is_pane_working(self, window, provider) -> bool:
         """Check if a session pane has an active turn (agent is working, not idle at prompt)."""

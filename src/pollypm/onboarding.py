@@ -66,6 +66,21 @@ class ProviderChoice:
     provider: ProviderKind | None
 
 
+@dataclass(slots=True)
+class LoginPreferences:
+    codex_headless: bool = False
+
+
+@dataclass(slots=True)
+class OnboardingResult:
+    config_path: Path
+    launch_requested: bool = False
+
+
+class LoginCancelled(Exception):
+    pass
+
+
 def default_session_args(provider: ProviderKind, *, open_permissions: bool = True) -> list[str]:
     if not open_permissions:
         return []
@@ -385,8 +400,15 @@ def _runtime_home(root_dir: Path, provider: ProviderKind, index: int) -> Path:
     return root_dir / "homes" / f"onboarding_{provider.value}_{index}"
 
 
-def _login_command(provider: ProviderKind, *, interactive: bool = False) -> str:
+def _login_command(
+    provider: ProviderKind,
+    *,
+    interactive: bool = False,
+    preferences: LoginPreferences | None = None,
+) -> str:
     if provider is ProviderKind.CODEX:
+        if preferences is not None and preferences.codex_headless:
+            return "codex login --device-auth"
         return "codex login"
     if provider is ProviderKind.CLAUDE:
         if interactive:
@@ -402,6 +424,7 @@ def _build_login_shell(
     return_to_caller: bool = False,
     interactive: bool = False,
     force_fresh_auth: bool = False,
+    preferences: LoginPreferences | None = None,
 ) -> str:
     env = provider_profile_env_for_provider(provider, home)
     parts = [f"mkdir -p {shlex.quote(str(home))}"]
@@ -416,7 +439,7 @@ def _build_login_shell(
             parts.append("claude auth logout || true")
         elif provider is ProviderKind.CODEX:
             parts.append("codex logout || true")
-    parts.append(_login_command(provider, interactive=interactive))
+    parts.append(_login_command(provider, interactive=interactive, preferences=preferences))
     if return_to_caller:
         parts.append('printf "\\nPollyPM: login window complete. Returning to onboarding...\\n"')
         parts.append("sleep 1")
@@ -613,6 +636,7 @@ def _run_login_window(
     quiet: bool = False,
     allow_existing_auth_shortcut: bool = True,
     force_fresh_auth: bool = False,
+    preferences: LoginPreferences | None = None,
 ) -> str:
     current_tmux = tmux.current_session_name()
     temp_session = f"pollypm-login-{window_label}"
@@ -628,6 +652,7 @@ def _run_login_window(
                 home,
                 interactive=(provider is ProviderKind.CLAUDE),
                 force_fresh_auth=force_fresh_auth,
+                preferences=preferences,
             ),
         )
         tmux.select_window(f"{current_tmux}:{window_label}")
@@ -668,6 +693,7 @@ def _run_login_window(
             home,
             interactive=(provider is ProviderKind.CLAUDE),
             force_fresh_auth=force_fresh_auth,
+            preferences=preferences,
         ),
         remain_on_exit=False,
     )
@@ -693,7 +719,7 @@ def _run_login_window(
     if raise_code != 0:
         if tmux.has_session(temp_session):
             tmux.kill_session(temp_session)
-        raise typer.Exit(code=raise_code)
+        raise LoginCancelled("Login cancelled. Returned to onboarding.")
 
     pane_text = str(watch_result.get("pane_text") or "")
     if tmux.has_session(temp_session):
@@ -710,6 +736,7 @@ def _connect_account_via_tmux(
     provider: ProviderKind,
     index: int,
     quiet: bool = False,
+    preferences: LoginPreferences | None = None,
 ) -> ConnectedAccount:
     label = "Codex" if provider is ProviderKind.CODEX else "Claude"
     home = _runtime_home(root_dir, provider, index)
@@ -724,6 +751,7 @@ def _connect_account_via_tmux(
         home=home,
         window_label=temp_window,
         quiet=quiet,
+        preferences=preferences,
     )
 
     email = _detect_email_from_pane(provider, pane_text) or _detect_account_email(provider, home)
@@ -856,7 +884,7 @@ def build_onboarded_config(
     )
 
 
-def run_onboarding(config_path: Path = DEFAULT_CONFIG_PATH, force: bool = False) -> Path:
+def run_onboarding(config_path: Path = DEFAULT_CONFIG_PATH, force: bool = False) -> OnboardingResult:
     from pollypm.onboarding_tui import run_onboarding_app
 
     return run_onboarding_app(config_path=config_path, force=force)

@@ -18,6 +18,7 @@ from pollypm.task_backends import get_task_backend
 DEFAULT_WORKSPACE_ROOT = Path.home() / "dev"
 DEFAULT_SCAN_ROOT = Path.home()
 TRACKER_TEMPLATE = Path(__file__).resolve().parents[2] / "docs" / "issue-tracker.md"
+PROJECT_INSTRUCTIONS_TEMPLATE = Path(__file__).resolve().parents[2] / ".pollypm" / "INSTRUCT.md"
 SKIP_DIR_NAMES = {
     ".cache",
     ".cargo",
@@ -56,6 +57,14 @@ def project_pollypm_dir(project_path: Path) -> Path:
     return normalize_project_path(project_path) / ".pollypm-state"
 
 
+def project_instruction_dir(project_path: Path) -> Path:
+    return normalize_project_path(project_path) / ".pollypm"
+
+
+def project_instruction_file(project_path: Path) -> Path:
+    return project_instruction_dir(project_path) / "INSTRUCT.md"
+
+
 def project_dossier_dir(project_path: Path) -> Path:
     return project_pollypm_dir(project_path) / "dossier"
 
@@ -83,6 +92,7 @@ def project_issues_dir(project_path: Path) -> Path:
 def ensure_project_scaffold(project_path: Path) -> Path:
     pollypm_dir = project_pollypm_dir(project_path)
     for directory in [
+        project_instruction_dir(project_path),
         pollypm_dir,
         project_dossier_dir(project_path),
         project_logs_dir(project_path),
@@ -91,6 +101,9 @@ def ensure_project_scaffold(project_path: Path) -> Path:
         project_worktrees_dir(project_path),
     ]:
         directory.mkdir(parents=True, exist_ok=True)
+    instructions_target = project_instruction_file(project_path)
+    if PROJECT_INSTRUCTIONS_TEMPLATE.exists() and not instructions_target.exists():
+        shutil.copyfile(PROJECT_INSTRUCTIONS_TEMPLATE, instructions_target)
     _ensure_gitignore_entry(normalize_project_path(project_path), ".pollypm-state/")
     return pollypm_dir
 

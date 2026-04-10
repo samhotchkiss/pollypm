@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 from pollypm.models import KnownProject, ProviderKind
@@ -92,3 +93,106 @@ def test_scan_loading_message_animates(tmp_path: Path) -> None:
 
     assert "Scanning" in first
     assert first != second
+
+
+def test_codex_login_mode_routes_remote_to_headless(monkeypatch, tmp_path: Path) -> None:
+    app = OnboardingApp(tmp_path / "pollypm.toml")
+    captured: list[tuple[ProviderKind, bool]] = []
+    monkeypatch.setattr(
+        app,
+        "_connect_provider",
+        lambda provider, login_preferences=None: captured.append(
+            (provider, bool(login_preferences and login_preferences.codex_headless))
+        ),
+    )
+
+    app._handle_codex_login_mode("remote")
+
+    assert captured == [(ProviderKind.CODEX, True)]
+
+
+def test_codex_login_mode_routes_local_to_standard_login(monkeypatch, tmp_path: Path) -> None:
+    app = OnboardingApp(tmp_path / "pollypm.toml")
+    captured: list[tuple[ProviderKind, bool]] = []
+    monkeypatch.setattr(
+        app,
+        "_connect_provider",
+        lambda provider, login_preferences=None: captured.append(
+            (provider, bool(login_preferences and login_preferences.codex_headless))
+        ),
+    )
+
+    app._handle_codex_login_mode("local")
+
+    assert captured == [(ProviderKind.CODEX, False)]
+
+
+def test_codex_login_modal_is_centered(monkeypatch, tmp_path: Path) -> None:
+    async def run() -> None:
+        monkeypatch.setattr("pollypm.onboarding_tui._recover_existing_accounts", lambda _root: {})
+        monkeypatch.setattr(
+            "pollypm.onboarding_tui._available_clis",
+            lambda: [
+                CliAvailability(provider=ProviderKind.CLAUDE, label="Claude CLI", binary="claude", installed=True),
+                CliAvailability(provider=ProviderKind.CODEX, label="Codex CLI", binary="codex", installed=True),
+            ],
+        )
+
+        app = OnboardingApp(tmp_path / "pollypm.toml")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await pilot.click("#connect-codex")
+            await pilot.pause()
+
+            dialog = app.screen.query_one("#codex-mode-dialog")
+            region = dialog.region
+            size = app.screen.size
+            expected_x = (size.width - region.width) // 2
+            expected_y = (size.height - region.height) // 2
+
+            assert abs(region.x - expected_x) <= 1
+            assert abs(region.y - expected_y) <= 1
+
+    asyncio.run(run())
+
+
+def test_connect_provider_cancel_returns_to_onboarding(monkeypatch, tmp_path: Path) -> None:
+    from pollypm.onboarding import LoginCancelled
+
+    app = OnboardingApp(tmp_path / "pollypm.toml")
+    app.state = type(
+        "State",
+        (),
+        {
+            "accounts": {},
+            "login_preferences": None,
+            "controller_account": None,
+            "failover_enabled": False,
+            "open_permissions_by_default": True,
+            "known_projects": {},
+            "selected_project_paths": [],
+        },
+    )()
+    messages: list[str] = []
+    rendered: list[str] = []
+    monkeypatch.setattr(app, "_set_message", lambda message="": messages.append(message))
+    monkeypatch.setattr(app, "_render_current_step", lambda: rendered.append("rendered"))
+    monkeypatch.setattr(app, "refresh", lambda *args, **kwargs: None)
+
+    class _Suspend:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(app, "suspend", lambda: _Suspend())
+    monkeypatch.setattr(
+        "pollypm.onboarding_tui._connect_account_via_tmux",
+        lambda *args, **kwargs: (_ for _ in ()).throw(LoginCancelled("Login cancelled. Returned to onboarding.")),
+    )
+
+    app._connect_provider(ProviderKind.CODEX)
+
+    assert rendered == ["rendered"]
+    assert messages[-1] == "Login cancelled. Returned to onboarding."

@@ -14,6 +14,7 @@ from pollypm.onboarding import (
     _slugify_email,
     CliAvailability,
     ConnectedAccount,
+    LoginPreferences,
 )
 
 
@@ -81,6 +82,16 @@ def test_login_shell_can_force_fresh_auth(tmp_path: Path) -> None:
 
     assert "claude auth logout || true" in claude_shell
     assert "codex logout || true" in codex_shell
+
+
+def test_login_shell_can_use_headless_codex_auth(tmp_path: Path) -> None:
+    shell = _build_login_shell(
+        ProviderKind.CODEX,
+        tmp_path / "codex-home",
+        preferences=LoginPreferences(codex_headless=True),
+    )
+
+    assert "codex login --device-auth" in shell
 
 
 def test_detect_email_from_pane_only_trusts_codex_status_line() -> None:

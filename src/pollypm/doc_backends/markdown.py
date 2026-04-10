@@ -32,6 +32,7 @@ class MarkdownDocBackend:
         last_updated: str | None = None,
     ) -> DocEntry:
         """Write or overwrite a document."""
+        _validate_doc_name(name)
         self._docs_dir.mkdir(parents=True, exist_ok=True)
         ts = last_updated or _utc_now()
         path = self._docs_dir / f"{name}.md"
@@ -56,6 +57,7 @@ class MarkdownDocBackend:
 
     def read_document(self, name: str) -> DocEntry | None:
         """Read a document by name."""
+        _validate_doc_name(name)
         path = self._docs_dir / f"{name}.md"
         if not path.exists():
             return None
@@ -180,3 +182,9 @@ def _extract_last_updated(content: str) -> str:
         if line.startswith("*Last updated:") and line.endswith("*"):
             return line[len("*Last updated:"):].rstrip("*").strip()
     return ""
+
+
+def _validate_doc_name(name: str) -> None:
+    """Reject document names that could escape the docs/ directory."""
+    if "/" in name or "\\" in name or ".." in name or name.startswith("."):
+        raise ValueError(f"Invalid document name: {name!r}. Names must not contain path separators or '..'.")

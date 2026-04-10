@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import asdict, is_dataclass
 from dataclasses import dataclass
 from datetime import datetime
+import json
 from pathlib import Path
 
 from pollypm.accounts import (
@@ -66,6 +68,42 @@ class PollyPMService:
             errors=errors,
         )
 
+    def session_status(self, session_name: str | None = None) -> dict[str, object]:
+        supervisor = self.load_supervisor()
+        launches, windows, alerts, leases, errors = supervisor.status()
+        window_map = {window.name: window for window in windows}
+        alert_counts: dict[str, int] = {}
+        for alert in alerts:
+            alert_counts[alert.session_name] = alert_counts.get(alert.session_name, 0) + 1
+        lease_map = {lease.session_name: lease for lease in leases}
+
+        sessions: list[dict[str, object]] = []
+        for launch in launches:
+            if session_name is not None and launch.session.name != session_name:
+                continue
+            runtime = supervisor.store.get_session_runtime(launch.session.name)
+            window = window_map.get(launch.window_name)
+            lease = lease_map.get(launch.session.name)
+            sessions.append(
+                {
+                    "name": launch.session.name,
+                    "role": launch.session.role,
+                    "project": launch.session.project,
+                    "provider": launch.session.provider.value,
+                    "account": launch.account.name,
+                    "window_name": launch.window_name,
+                    "running": window is not None,
+                    "pane_dead": None if window is None else window.pane_dead,
+                    "pane_command": None if window is None else window.pane_current_command,
+                    "status": runtime.status if runtime else "healthy",
+                    "last_failure_message": runtime.last_failure_message if runtime else None,
+                    "alert_count": alert_counts.get(launch.session.name, 0),
+                    "lease_owner": None if lease is None else lease.owner,
+                    "lease_note": None if lease is None else lease.note,
+                }
+            )
+        return {"sessions": sessions, "errors": errors}
+
     def list_account_statuses(self) -> list[AccountStatus]:
         return list_account_statuses(self.config_path)
 
@@ -98,6 +136,72 @@ class PollyPMService:
 
     def send_input(self, session_name: str, text: str, *, owner: str = "human") -> None:
         self.load_supervisor().send_input(session_name, text, owner=owner)
+
+    def raise_alert(self, alert_type: str, session_name: str, message: str, *, severity: str = "warn") -> object:
+        supervisor = self.load_supervisor()
+        supervisor._require_session(session_name)
+        supervisor.store.upsert_alert(session_name, alert_type, severity, message)
+        alert = next(
+            (
+                item
+                for item in supervisor.store.open_alerts()
+                if item.session_name == session_name and item.alert_type == alert_type
+            ),
+            None,
+        )
+        if alert is None:
+            raise RuntimeError(f"Alert {alert_type} for {session_name} was not persisted")
+        supervisor.store.record_event(session_name, "alert", f"Raised {severity} alert {alert_type}: {message}")
+        return alert
+
+    def list_alerts(self) -> list[object]:
+        return self.load_supervisor().store.open_alerts()
+
+    def clear_alert(self, alert_id: int) -> object:
+        supervisor = self.load_supervisor()
+        alert = supervisor.store.clear_alert_by_id(alert_id)
+        if alert is None:
+            raise KeyError(f"Unknown alert id: {alert_id}")
+        supervisor.store.record_event(
+            alert.session_name,
+            "alert",
+            f"Cleared alert {alert.alert_type}#{alert_id}",
+        )
+        return alert
+
+    def set_session_status(self, session_name: str, status: str, *, reason: str = "") -> object:
+        supervisor = self.load_supervisor()
+        supervisor._require_session(session_name)
+        supervisor.store.upsert_session_runtime(
+            session_name=session_name,
+            status=status,
+            last_failure_message=reason or None,
+        )
+        supervisor.store.record_event(session_name, "session_status", f"Set status to {status}: {reason}".rstrip(": "))
+        runtime = supervisor.store.get_session_runtime(session_name)
+        if runtime is None:
+            raise RuntimeError(f"Session runtime for {session_name} was not updated")
+        return runtime
+
+    def record_heartbeat(self, session_name: str, payload: dict[str, object]) -> object:
+        supervisor = self.load_supervisor()
+        supervisor._require_session(session_name)
+        launch = supervisor._launch_by_session(session_name)
+        supervisor.store.record_heartbeat(
+            session_name=session_name,
+            tmux_window=str(payload.get("tmux_window", launch.window_name)),
+            pane_id=str(payload.get("pane_id", "")),
+            pane_command=str(payload.get("pane_command", "")),
+            pane_dead=bool(payload.get("pane_dead", False)),
+            log_bytes=int(payload.get("log_bytes", 0)),
+            snapshot_path=str(payload.get("snapshot_path", "")),
+            snapshot_hash=str(payload.get("snapshot_hash", "")),
+        )
+        supervisor.store.record_event(session_name, "heartbeat", "Recorded heartbeat snapshot")
+        record = supervisor.store.latest_heartbeat(session_name)
+        if record is None:
+            raise RuntimeError(f"Heartbeat for {session_name} was not recorded")
+        return record
 
     def run_heartbeat(self) -> None:
         self.load_supervisor().run_heartbeat()
@@ -182,3 +286,18 @@ class PollyPMService:
 
     def remove_session(self, session_name: str) -> None:
         remove_worker_session(self.config_path, session_name)
+
+
+def render_json(data: object) -> str:
+    def _normalize(value: object) -> object:
+        if is_dataclass(value):
+            return {key: _normalize(item) for key, item in asdict(value).items()}
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {str(key): _normalize(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_normalize(item) for item in value]
+        return value
+
+    return json.dumps(_normalize(data), indent=2) + "\n"

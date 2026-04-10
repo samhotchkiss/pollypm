@@ -205,6 +205,7 @@ class AlertRecord:
     status: str
     created_at: str
     updated_at: str
+    alert_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -586,13 +587,62 @@ class StateStore:
     def open_alerts(self) -> list[AlertRecord]:
         rows = self.conn.execute(
             """
-            SELECT session_name, alert_type, severity, message, status, created_at, updated_at
+            SELECT id, session_name, alert_type, severity, message, status, created_at, updated_at
             FROM alerts
             WHERE status = 'open'
             ORDER BY updated_at DESC
             """
         ).fetchall()
-        return [AlertRecord(*row) for row in rows]
+        return [
+            AlertRecord(
+                session_name=row[1],
+                alert_type=row[2],
+                severity=row[3],
+                message=row[4],
+                status=row[5],
+                created_at=row[6],
+                updated_at=row[7],
+                alert_id=int(row[0]),
+            )
+            for row in rows
+        ]
+
+    def get_alert(self, alert_id: int) -> AlertRecord | None:
+        row = self.conn.execute(
+            """
+            SELECT id, session_name, alert_type, severity, message, status, created_at, updated_at
+            FROM alerts
+            WHERE id = ?
+            """,
+            (alert_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return AlertRecord(
+            session_name=row[1],
+            alert_type=row[2],
+            severity=row[3],
+            message=row[4],
+            status=row[5],
+            created_at=row[6],
+            updated_at=row[7],
+            alert_id=int(row[0]),
+        )
+
+    def clear_alert_by_id(self, alert_id: int) -> AlertRecord | None:
+        alert = self.get_alert(alert_id)
+        if alert is None:
+            return None
+        self.conn.execute(
+            """
+            UPDATE alerts
+            SET status = 'cleared', updated_at = ?
+            WHERE id = ? AND status = 'open'
+            """,
+            (self._now(), alert_id),
+        )
+        self.conn.commit()
+        return self.get_alert(alert_id)
 
     def set_lease(self, session_name: str, owner: str, note: str = "") -> None:
         now = self._now()

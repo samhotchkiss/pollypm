@@ -255,3 +255,15 @@ def test_worker_start_reuses_existing_managed_worker(monkeypatch, tmp_path: Path
 
     assert result.exit_code == 0
     assert launched == [(config_path, "worker_pollypm")]
+
+
+def test_help_lists_heartbeat_agent_commands() -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli.app, ["--help"])
+
+    assert result.exit_code == 0
+    assert "status" in result.output
+    assert "send" in result.output
+    assert "alert" in result.output
+    assert "session" in result.output
+    assert "heartbeat" in result.output

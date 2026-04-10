@@ -28,6 +28,7 @@ from pollypm.models import ProviderKind
 from pollypm.onboarding import run_onboarding
 from pollypm.control_tui import PollyPMApp
 from pollypm.service_api import PollyPMService
+from pollypm.service_api import render_json
 from pollypm.projects import (
     enable_tracked_project,
     register_project,
@@ -42,6 +43,12 @@ from pollypm.worktrees import list_worktrees as list_project_worktrees
 
 
 app = typer.Typer(help="PollyPM CLI", invoke_without_command=True, no_args_is_help=False)
+alert_app = typer.Typer(help="Manage durable alerts.")
+session_app = typer.Typer(help="Manage session runtime state.")
+heartbeat_app = typer.Typer(help="Run or record heartbeat state.")
+app.add_typer(alert_app, name="alert")
+app.add_typer(session_app, name="session")
+app.add_typer(heartbeat_app, name="heartbeat")
 
 
 def _session_name_candidates() -> list[str]:
@@ -86,6 +93,10 @@ def _account_label(supervisor: Supervisor, account_name: str) -> str:
 def _cli_status(msg: str) -> None:
     """Print a status update on its own line."""
     typer.echo(msg)
+
+
+def _emit_json(payload: object) -> None:
+    typer.echo(render_json(payload), nl=False)
 
 
 def _install_global_pollypm(root_dir: Path) -> tuple[bool, str]:
@@ -496,95 +507,30 @@ def launch(
 
 @app.command()
 def status(
+    session_name: str | None = typer.Argument(None, help="Optional session name from config."),
+    json_output: bool = typer.Option(False, "--json", help="Emit structured JSON."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
-    supervisor = _load_supervisor(config_path)
-    _require_pollypm_session(supervisor)
-    launches, windows, alerts, leases, errors = supervisor.status()
-
-    typer.echo("PollyPM control plane:")
-    typer.echo(
-        f"- controller_account={_account_label(supervisor, supervisor.config.pollypm.controller_account)} "
-        f"failover_enabled={supervisor.config.pollypm.failover_enabled}"
-    )
-    if supervisor.config.pollypm.failover_accounts:
+    payload = PollyPMService(config_path).session_status(session_name)
+    sessions = payload["sessions"]
+    if session_name is not None and not sessions:
+        raise typer.BadParameter(f"Unknown session: {session_name}")
+    if json_output:
+        _emit_json(payload)
+        return
+    if not sessions:
+        typer.echo("No sessions configured.")
+        return
+    for item in sessions:
         typer.echo(
-            "- failover_order="
-            + ", ".join(_account_label(supervisor, name) for name in supervisor.config.pollypm.failover_accounts)
+            f"- {item['name']}: status={item['status']} running={'yes' if item['running'] else 'no'} "
+            f"alerts={item['alert_count']} lease={item['lease_owner'] or '-'} "
+            f"project={item['project']} role={item['role']}"
         )
-    else:
-        typer.echo("- failover_order=none")
-
-    typer.echo("")
-    typer.echo("Configured sessions:")
-    for launch in launches:
-        account_label = launch.account.email or launch.account.name
-        typer.echo(
-            f"- {launch.session.name}: role={launch.session.role} provider={launch.session.provider.value} "
-            f"account={account_label} project={launch.session.project} "
-            f"runtime={launch.account.runtime.value} window={launch.window_name}"
-        )
-
-    typer.echo("")
-    typer.echo("Project assignments:")
-    for project_name, project_launches in supervisor.project_assignments().items():
-        labels = ", ".join(
-            f"{launch.session.name}->{launch.account.email or launch.account.name}"
-            for launch in project_launches
-        )
-        typer.echo(f"- {project_name}: {labels}")
-
-    typer.echo("")
-    typer.echo("Provider availability:")
-    seen: set[str] = set()
-    for launch in launches:
-        provider = get_provider(launch.session.provider, root_dir=supervisor.config.project.root_dir)
-        if provider.name in seen:
-            continue
-        seen.add(provider.name)
-        typer.echo(f"- {provider.name}: {'ok' if provider.is_available() else 'missing'}")
-
-    typer.echo("")
-    typer.echo("Tmux windows:")
-    if windows:
-        for window in windows:
-            typer.echo(
-                f"- {window.session}:{window.index} name={window.name} active={window.active} "
-                f"pane={window.pane_id} cmd={window.pane_current_command} dead={window.pane_dead}"
-            )
-    else:
-        typer.echo("- none")
-
-    typer.echo("")
-    typer.echo("Open alerts:")
-    if alerts:
-        for alert in alerts:
-            typer.echo(f"- {alert.severity} {alert.session_name}/{alert.alert_type}: {alert.message}")
-    else:
-        typer.echo("- none")
-
-    typer.echo("")
-    typer.echo("Leases:")
-    if leases:
-        for lease in leases:
-            typer.echo(f"- {lease.session_name}: owner={lease.owner} note={lease.note or '-'}")
-    else:
-        typer.echo("- none")
-
-    typer.echo("")
-    typer.echo("Open mail:")
-    messages = list_open_messages(supervisor.config.project.root_dir)
-    if messages:
-        for item in messages:
-            typer.echo(f"- {item.path.name}: {item.subject} [{item.sender}]")
-    else:
-        typer.echo("- none")
-
-    if errors:
-        typer.echo("")
-        typer.echo("Errors:")
-        for error in errors:
-            typer.echo(f"- {error}")
+        if item["last_failure_message"]:
+            typer.echo(f"  reason={item['last_failure_message']}")
+    for error in payload["errors"]:
+        typer.echo(f"- error: {error}")
 
 
 @app.command()
@@ -601,31 +547,39 @@ def plan(
         typer.echo("")
 
 
-@app.command()
+@heartbeat_app.callback(invoke_without_command=True)
 def heartbeat(
+    ctx: typer.Context,
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     snapshot_lines: int = typer.Option(200, "--snapshot-lines", min=20, help="Lines to capture per pane."),
+    json_output: bool = typer.Option(False, "--json", help="Emit structured JSON."),
 ) -> None:
+    if ctx.invoked_subcommand is not None:
+        return
     supervisor = _load_supervisor(config_path)
-    _require_pollypm_session(supervisor)
     alerts = supervisor.run_heartbeat(snapshot_lines=snapshot_lines)
+    if json_output:
+        _emit_json({"alerts": alerts})
+        return
     typer.echo(f"Heartbeat completed. Open alerts: {len(alerts)}")
     for alert in alerts:
-        typer.echo(f"- {alert.severity} {alert.session_name}/{alert.alert_type}: {alert.message}")
+        typer.echo(f"- {alert.severity} {alert.session_name}/{alert.alert_type}#{alert.alert_id}: {alert.message}")
 
 
 @app.command()
 def alerts(
+    json_output: bool = typer.Option(False, "--json", help="Emit structured JSON."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
-    supervisor = _load_supervisor(config_path)
-    _require_pollypm_session(supervisor)
-    items = supervisor.open_alerts()
+    items = PollyPMService(config_path).list_alerts()
     if not items:
         typer.echo("No open alerts.")
         return
+    if json_output:
+        _emit_json({"alerts": items})
+        return
     for alert in items:
-        typer.echo(f"- {alert.severity} {alert.session_name}/{alert.alert_type}: {alert.message}")
+        typer.echo(f"- #{alert.alert_id} {alert.severity} {alert.session_name}/{alert.alert_type}: {alert.message}")
 
 
 @app.command("failover")
@@ -733,12 +687,109 @@ def send(
     owner: str = typer.Option("pollypm", "--owner", help="Sender label for lease checks."),
     force: bool = typer.Option(False, "--force", help="Bypass a conflicting lease."),
     no_enter: bool = typer.Option(False, "--no-enter", help="Do not send Enter after the text."),
+    json_output: bool = typer.Option(False, "--json", help="Emit structured JSON."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
     supervisor = _load_supervisor(config_path)
-    _require_pollypm_session(supervisor)
-    supervisor.send_input(session_name, text, owner=owner, force=force, press_enter=not no_enter)
+    try:
+        supervisor.send_input(session_name, text, owner=owner, force=force, press_enter=not no_enter)
+    except RuntimeError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        _emit_json(
+            {
+                "session_name": session_name,
+                "owner": owner,
+                "text": text,
+                "press_enter": not no_enter,
+                "forced": force,
+            }
+        )
+        return
     typer.echo(f"Sent input to {session_name}")
+
+
+@alert_app.command("raise")
+def alert_raise(
+    alert_type: str = typer.Argument(..., help="Alert type."),
+    session_name: str = typer.Argument(..., help="Session name from config."),
+    message: str = typer.Argument(..., help="Alert message."),
+    severity: str = typer.Option("warn", "--severity", help="Alert severity."),
+    json_output: bool = typer.Option(False, "--json", help="Emit structured JSON."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    alert = PollyPMService(config_path).raise_alert(alert_type, session_name, message, severity=severity)
+    if json_output:
+        _emit_json({"alert": alert})
+        return
+    typer.echo(f"Raised alert #{alert.alert_id} for {session_name}: {alert.alert_type}")
+
+
+@alert_app.command("clear")
+def alert_clear(
+    alert_id: int = typer.Argument(..., help="Alert id."),
+    json_output: bool = typer.Option(False, "--json", help="Emit structured JSON."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    try:
+        alert = PollyPMService(config_path).clear_alert(alert_id)
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        _emit_json({"alert": alert})
+        return
+    typer.echo(f"Cleared alert #{alert_id}")
+
+
+@alert_app.command("list")
+def alert_list(
+    json_output: bool = typer.Option(False, "--json", help="Emit structured JSON."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    items = PollyPMService(config_path).list_alerts()
+    if json_output:
+        _emit_json({"alerts": items})
+        return
+    if not items:
+        typer.echo("No open alerts.")
+        return
+    for alert in items:
+        typer.echo(f"- #{alert.alert_id} {alert.severity} {alert.session_name}/{alert.alert_type}: {alert.message}")
+
+
+@session_app.command("set-status")
+def session_set_status(
+    session_name: str = typer.Argument(..., help="Session name from config."),
+    status: str = typer.Argument(..., help="Runtime status label."),
+    reason: str = typer.Option("", "--reason", help="Optional status reason."),
+    json_output: bool = typer.Option(False, "--json", help="Emit structured JSON."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    runtime = PollyPMService(config_path).set_session_status(session_name, status, reason=reason)
+    if json_output:
+        _emit_json({"session_runtime": runtime})
+        return
+    typer.echo(f"Updated {session_name} to {status}")
+
+
+@heartbeat_app.command("record")
+def heartbeat_record(
+    session_name: str = typer.Argument(..., help="Session name from config."),
+    payload_json: str = typer.Argument(..., help="Heartbeat snapshot payload as JSON."),
+    json_output: bool = typer.Option(False, "--json", help="Emit structured JSON."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    try:
+        payload = json.loads(payload_json)
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"Invalid heartbeat JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise typer.BadParameter("Heartbeat payload must be a JSON object.")
+    record = PollyPMService(config_path).record_heartbeat(session_name, payload)
+    if json_output:
+        _emit_json({"heartbeat": record})
+        return
+    typer.echo(f"Recorded heartbeat for {session_name}")
 
 
 @app.command("worker-start")

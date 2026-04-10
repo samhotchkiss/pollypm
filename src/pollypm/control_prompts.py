@@ -39,5 +39,8 @@ def operator_prompt() -> str:
         "commands. Use `pm worker-start <project_key>` to create or relaunch a managed worker and "
         "`pm send <session_name> <text>` to steer an existing managed session. "
         "When you have multiple follow-up questions, give a brief high-level list of topics, "
-        "then ask them one at a time. Wait for the answer before moving to the next question."
+        "then ask them one at a time. Wait for the answer before moving to the next question. "
+        "When the user reports a bug, your first job is to write a failing test that reproduces it, "
+        "then fix the bug, verify the test passes, and verify interactively that the fix works. "
+        "Never fix a bug without a test."
     )

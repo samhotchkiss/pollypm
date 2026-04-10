@@ -138,16 +138,9 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         else:
             api.clear_alert(context.session_name, "shell_returned")
 
-        if not mechanical_only and context.previous_log_bytes is not None and context.source_bytes <= context.previous_log_bytes:
-            api.raise_alert(
-                context.session_name,
-                "idle_output",
-                "warn",
-                f"No new pane output since the previous heartbeat for window {context.window_name}",
-            )
-            alerts.append("idle_output")
-        else:
-            api.clear_alert(context.session_name, "idle_output")
+        # Sessions parked at a prompt are legitimately idle — not an alert condition.
+        # Only the suspected_loop detector (below) alerts on sustained identical snapshots.
+        api.clear_alert(context.session_name, "idle_output")
 
         if not mechanical_only and context.previous_snapshot_hash and context.previous_snapshot_hash == context.snapshot_hash:
             hashes = api.recent_snapshot_hashes(context.session_name, limit=3)

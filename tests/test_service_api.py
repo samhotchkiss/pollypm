@@ -99,3 +99,39 @@ def test_service_schedule_job_uses_supervisor(monkeypatch, tmp_path: Path) -> No
     assert service.list_jobs() == ["job"]
     assert service.run_scheduled_jobs() == ["job"]
     assert captured == [("heartbeat", run_at, None)]
+
+
+def test_service_ensure_pollypm_ensures_console_and_heartbeat(monkeypatch, tmp_path: Path) -> None:
+    service = PollyPMService(tmp_path / "pollypm.toml")
+    calls: list[str] = []
+
+    class FakeTmux:
+        def has_session(self, _name: str) -> bool:
+            return True
+
+    class FakePollyPM:
+        controller_account = "claude_controller"
+
+    class FakeConfigProject:
+        tmux_session = "pollypm"
+
+    class FakeConfig:
+        project = FakeConfigProject()
+        pollypm = FakePollyPM()
+
+    class FakeSupervisor:
+        tmux = FakeTmux()
+        config = FakeConfig()
+
+        def ensure_console_window(self) -> None:
+            calls.append("console")
+
+        def ensure_heartbeat_schedule(self) -> None:
+            calls.append("heartbeat")
+
+    monkeypatch.setattr(service, "load_supervisor", lambda: FakeSupervisor())
+
+    account = service.ensure_pollypm()
+
+    assert account == "claude_controller"
+    assert calls == ["console", "heartbeat"]

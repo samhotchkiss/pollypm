@@ -569,3 +569,45 @@ def test_settings_pane_renders_accounts_and_toggles_permissions(monkeypatch, tmp
             assert calls == ["permissions:False"]
 
     asyncio.run(exercise())
+
+
+def test_cockpit_app_tick_scheduler_runs_jobs_once(monkeypatch, tmp_path: Path) -> None:
+    app = PollyCockpitApp(tmp_path / "pollypm.toml")
+    calls: list[str] = []
+
+    class FakeService:
+        def run_scheduled_jobs(self):
+            calls.append("ran")
+
+    app.service = FakeService()  # type: ignore[assignment]
+
+    def fake_run_worker(fn, **kwargs):
+        fn()
+        return None
+
+    monkeypatch.setattr(app, "run_worker", fake_run_worker)
+
+    app._tick_scheduler()
+    app._tick_scheduler()
+
+    assert calls == ["ran", "ran"]
+    assert app._scheduler_tick_running is False
+
+
+def test_cockpit_app_tick_scheduler_skips_while_worker_running(monkeypatch, tmp_path: Path) -> None:
+    app = PollyCockpitApp(tmp_path / "pollypm.toml")
+    calls: list[str] = []
+
+    class FakeService:
+        def run_scheduled_jobs(self):
+            calls.append("ran")
+
+    app.service = FakeService()  # type: ignore[assignment]
+    app._scheduler_tick_running = True
+
+    monkeypatch.setattr(app, "run_worker", lambda fn, **kwargs: (_ for _ in ()).throw(AssertionError("run_worker should not be called")))
+
+    app._tick_scheduler()
+
+    assert calls == []
+    assert app._scheduler_tick_running is True

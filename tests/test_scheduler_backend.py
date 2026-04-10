@@ -115,3 +115,18 @@ def test_inline_scheduler_runs_due_jobs(monkeypatch, tmp_path: Path) -> None:
 
     assert len(ran) == 1
     assert sent == {"session": "operator", "text": "hello", "owner": "human"}
+
+
+def test_ensure_heartbeat_schedule_is_idempotent(tmp_path: Path) -> None:
+    supervisor = Supervisor(_config(tmp_path))
+    supervisor.ensure_layout()
+
+    supervisor.ensure_heartbeat_schedule()
+    supervisor.ensure_heartbeat_schedule()
+
+    backend = get_scheduler_backend("inline", root_dir=tmp_path)
+    jobs = [job for job in backend.list_jobs(supervisor) if job.kind == "heartbeat"]
+
+    assert len(jobs) == 1
+    assert jobs[0].interval_seconds == 60
+    assert jobs[0].status == "pending"

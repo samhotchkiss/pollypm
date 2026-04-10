@@ -105,6 +105,7 @@ class PollyPMService:
         if not supervisor.tmux.has_session(session_name):
             return supervisor.bootstrap_tmux()
         supervisor.ensure_console_window()
+        supervisor.ensure_heartbeat_schedule()
         return supervisor.config.pollypm.controller_account
 
     def add_account(self, provider: ProviderKind) -> tuple[str, str]:

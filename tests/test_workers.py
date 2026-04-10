@@ -13,6 +13,7 @@ from pollypm.models import (
     KnownProject,
 )
 from pollypm.storage.state import StateStore
+from pollypm.control_prompts import operator_prompt
 from pollypm.workers import auto_select_worker_account, suggest_worker_prompt
 from pollypm.agent_profiles.builtin import worker_prompt
 
@@ -165,3 +166,11 @@ def test_worker_prompt_requires_project_instructions() -> None:
 
     assert ".pollypm/INSTRUCT.md" in prompt
     assert "follow it religiously" in prompt
+
+
+def test_operator_prompt_requires_managed_worker_commands() -> None:
+    prompt = operator_prompt()
+
+    assert "worker-start" in prompt
+    assert "pm worker-start <project_key>" in prompt
+    assert "Never create ad hoc worker panes with tmux new-window" in prompt

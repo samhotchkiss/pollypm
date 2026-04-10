@@ -195,6 +195,10 @@ class CockpitRouter:
         if provider_value == "claude":
             if "esc to interrupt" in lowered:
                 return True
+            # Idle indicators — if any of these are in the tail, the session is not working
+            idle_markers = ("bypass permissions", "new task?", "/clear to save", "shift+tab to cycle")
+            if any(marker in lowered for marker in idle_markers):
+                return False
             return "\u276f" not in tail
         if provider_value == "codex":
             if "working" in lowered and "esc to interrupt" in lowered:

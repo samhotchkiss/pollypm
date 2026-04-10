@@ -36,6 +36,7 @@ from pollypm.projects import (
 from pollypm.providers import get_provider
 from pollypm.supervisor import Supervisor
 from pollypm.tmux.client import TmuxClient
+from pollypm.transcript_ingest import start_transcript_ingestion
 from pollypm.workers import create_worker_session, launch_worker_session
 from pollypm.worktrees import list_worktrees as list_project_worktrees
 
@@ -437,6 +438,10 @@ def up(
         return
     supervisor = _load_supervisor(config_path)
     supervisor.ensure_layout()
+    if all(hasattr(supervisor.config, field) for field in ("project", "accounts", "projects")) and hasattr(
+        supervisor.config.project, "base_dir"
+    ):
+        start_transcript_ingestion(supervisor.config)
     session_name = supervisor.config.project.tmux_session
     current_tmux = supervisor.tmux.current_session_name()
     created = False

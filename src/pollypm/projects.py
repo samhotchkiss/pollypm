@@ -94,6 +94,7 @@ def ensure_project_scaffold(project_path: Path) -> Path:
     for directory in [
         project_instruction_dir(project_path),
         normalize_project_path(project_path) / PROJECT_CONFIG_DIRNAME,
+        project_instruction_dir(project_path) / "transcripts",
         pollypm_dir,
         project_dossier_dir(project_path),
         project_logs_dir(project_path),

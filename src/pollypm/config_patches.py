@@ -166,4 +166,4 @@ def remove_project_override(project_root: Path, kind: str, target_name: str) -> 
 
 
 def _escape(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"').strip()
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").replace("\r", " ").strip()

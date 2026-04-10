@@ -69,12 +69,18 @@ def test_thread_transition_rejects_skips_and_backwards_moves(tmp_path) -> None:
     message_path = create_message(tmp_path, sender="pa", subject="Review needed", body="Issue 012 is ready.")
     thread = create_thread(tmp_path, message_path.name, actor="pm", owner="pm")
 
-    with pytest.raises(ValueError, match="Illegal inbox state transition"):
-        transition_thread(tmp_path, thread.thread_id, "closed", actor="pm")
+    # PM can always jump to resolved or closed from any state
+    transition_thread(tmp_path, thread.thread_id, "closed", actor="pm")
 
-    transition_thread(tmp_path, thread.thread_id, "waiting-on-pa", actor="pm")
+    # Create a fresh thread to test backwards rejection
+    message_path2 = create_message(tmp_path, sender="pa", subject="Another review", body="Issue 013.")
+    thread2 = create_thread(tmp_path, message_path2.name, actor="pm", owner="pm")
+    transition_thread(tmp_path, thread2.thread_id, "waiting-on-pa", actor="pm")
+    # Cannot go backwards to threaded
     with pytest.raises(ValueError, match="Illegal inbox state transition"):
-        transition_thread(tmp_path, thread.thread_id, "threaded", actor="pa")
+        transition_thread(tmp_path, thread2.thread_id, "threaded", actor="pa")
+    # PM/PA cycling is allowed
+    transition_thread(tmp_path, thread2.thread_id, "waiting-on-pm", actor="pa")
 
 
 def test_inbox_root_migrates_old_pollypm_directory(tmp_path) -> None:

@@ -359,6 +359,14 @@ def _validate_transition(current_state: str, next_state: str) -> None:
     next_index = THREAD_STATE_INDEX.get(next_state)
     if current_index is None or next_index is None:
         raise ValueError(f"Unknown inbox state transition: {current_state} -> {next_state}")
+    # Allow forward steps, PM/PA cycling (waiting-on-pa <-> waiting-on-pm),
+    # and PM jumping to resolved/closed from any state
+    if next_state in ("resolved", "closed"):
+        return  # PM can always close or resolve
+    if current_state == "waiting-on-pa" and next_state == "waiting-on-pm":
+        return  # PA returns to PM
+    if current_state == "waiting-on-pm" and next_state == "waiting-on-pa":
+        return  # PM routes back to PA
     if next_index != current_index + 1:
         raise ValueError(f"Illegal inbox state transition: {current_state} -> {next_state}")
 

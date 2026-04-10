@@ -139,16 +139,18 @@ def _extract_with_haiku_or_fallback(events: list[dict[str, Any]]) -> KnowledgeDe
     return _heuristic_extract(events)
 
 
-def _extract_with_haiku(events: list[dict[str, Any]]) -> KnowledgeDelta | None:
+def _extract_with_haiku(events: list[dict[str, Any]], *, max_events: int = 200) -> KnowledgeDelta | None:
     if shutil.which("claude") is None:
         return None
+    # Truncate to avoid exceeding CLI argument limits or excessive token usage
+    truncated = events[:max_events]
     prompt_lines = [
         "Extract project knowledge from transcript events as compact JSON.",
         f"Use model {HAIKU_MODEL}.",
         "Return keys: goals, architecture_changes, convention_shifts, decisions, risks, ideas.",
         "Each value must be an array of short bullet strings.",
         "Never include secrets or tokens.",
-        json.dumps(events, indent=2),
+        json.dumps(truncated, indent=2),
     ]
     result = subprocess.run(
         ["claude", "-p", "\n".join(prompt_lines), "--model", HAIKU_MODEL],

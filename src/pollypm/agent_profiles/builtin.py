@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from pollypm.agent_profiles.base import AgentProfile, AgentProfileContext
 from pollypm.messaging import list_open_messages
 from pollypm.rules import render_session_manifest
+from pollypm.storage.state import StateStore
+from pollypm.task_backends import get_task_backend
 
 
 @dataclass(slots=True)
@@ -14,6 +17,7 @@ class StaticPromptProfile(AgentProfile):
 
     def build_prompt(self, context: AgentProfileContext) -> str | None:
         prompt = self.prompt
+        project_root = _project_root(context)
         if self.name == "polly":
             prompt = f"{prompt}\n\n{_render_operator_inbox_brief(context)}"
         if self.name == "worker":
@@ -24,10 +28,13 @@ class StaticPromptProfile(AgentProfile):
                     "If the user asks you to change your name, update `.pollypm/config/project.toml` "
                     "to set `[project].persona_name` to the requested value so it persists immediately."
                 )
-        manifest = render_session_manifest(context.config.project.root_dir)
-        if not manifest:
-            return prompt
-        return f"{prompt}\n\n{manifest}"
+            prompt = _assemble_worker_prompt(prompt, context, project_root)
+        manifest = render_session_manifest(project_root)
+        if self.name != "worker":
+            if not manifest:
+                return prompt
+            return f"{prompt}\n\n{manifest}"
+        return prompt
 
 
 def polly_prompt() -> str:
@@ -93,3 +100,58 @@ def _render_operator_inbox_brief(context: AgentProfileContext) -> str:
     if len(items) > 5:
         lines.append(f"- ... and {len(items) - 5} more")
     return "\n".join(lines)
+
+
+def _project_root(context: AgentProfileContext) -> Path:
+    project = context.config.projects.get(context.session.project)
+    if project is not None:
+        return project.path
+    return context.config.project.root_dir
+
+
+def _assemble_worker_prompt(prompt: str, context: AgentProfileContext, project_root: Path) -> str:
+    parts = [prompt]
+    overview = _read_project_overview(project_root)
+    if overview:
+        parts.append(overview)
+    manifest = render_session_manifest(project_root)
+    if manifest:
+        parts.append(manifest)
+    active_issue = _read_active_issue(project_root)
+    if active_issue:
+        parts.append(active_issue)
+    checkpoint = _read_latest_checkpoint(context)
+    if checkpoint:
+        parts.append(checkpoint)
+    return "\n\n".join(part for part in parts if part)
+
+
+def _read_project_overview(project_root: Path) -> str:
+    path = project_root / "docs" / "project-overview.md"
+    if not path.exists():
+        return ""
+    return f"## Project Overview\nRead `{path.relative_to(project_root)}` before starting.\n\n{path.read_text().strip()}"
+
+
+def _read_active_issue(project_root: Path) -> str:
+    backend = get_task_backend(project_root)
+    if not backend.exists():
+        return ""
+    tasks = backend.list_tasks(states=["02-in-progress", "01-ready"])
+    if not tasks:
+        return ""
+    task = tasks[0]
+    relative = task.path.relative_to(project_root)
+    body = task.path.read_text().strip()
+    return f"## Active Issue\nSource: `{relative}`\n\n{body}"
+
+
+def _read_latest_checkpoint(context: AgentProfileContext) -> str:
+    store = StateStore(context.config.project.state_db)
+    runtime = store.get_session_runtime(context.session.name)
+    if runtime is None or not runtime.last_checkpoint_path:
+        return ""
+    path = Path(runtime.last_checkpoint_path)
+    if not path.exists():
+        return ""
+    return f"## Latest Checkpoint\nSource: `{path}`\n\n{path.read_text().strip()}"

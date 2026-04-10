@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 @dataclass(slots=True)
-class RuleFile:
+class CatalogFile:
     name: str
     description: str
     trigger: str
@@ -15,7 +15,13 @@ class RuleFile:
     content: str
 
 
-def _parse_rule_metadata(path: Path, content: str) -> RuleFile:
+def _parse_catalog_metadata(
+    path: Path,
+    content: str,
+    *,
+    default_description: str,
+    default_trigger: str,
+) -> CatalogFile:
     name = path.stem
     description = ""
     trigger = ""
@@ -27,9 +33,9 @@ def _parse_rule_metadata(path: Path, content: str) -> RuleFile:
         elif lowered.startswith("trigger:"):
             trigger = stripped.split(":", 1)[1].strip()
     if not description:
-        description = f"Instructions for {name} work"
+        description = default_description.format(name=name)
     if not trigger:
-        trigger = f"When doing {name} work"
+        trigger = default_trigger.format(name=name)
     display_path = str(path)
     try:
         home = Path.home().resolve()
@@ -38,7 +44,7 @@ def _parse_rule_metadata(path: Path, content: str) -> RuleFile:
             display_path = f"~/{resolved.relative_to(home)}"
     except ValueError:
         pass
-    return RuleFile(
+    return CatalogFile(
         name=name,
         description=description,
         trigger=trigger,
@@ -52,23 +58,83 @@ def _builtin_rules_dir() -> Path:
     return Path(str(resources.files("pollypm.defaults.rules")))
 
 
-def _scan_rule_dir(directory: Path, *, display_base: str | None = None) -> dict[str, RuleFile]:
+def _builtin_magic_dir() -> Path:
+    return Path(str(resources.files("pollypm.defaults.magic")))
+
+
+def _scan_catalog_dir(
+    directory: Path,
+    *,
+    display_base: str | None = None,
+    default_description: str,
+    default_trigger: str,
+) -> dict[str, CatalogFile]:
     if not directory.exists():
         return {}
-    merged: dict[str, RuleFile] = {}
+    merged: dict[str, CatalogFile] = {}
     for path in sorted(directory.glob("*.md")):
         content = path.read_text()
-        rule = _parse_rule_metadata(path, content)
+        rule = _parse_catalog_metadata(
+            path,
+            content,
+            default_description=default_description,
+            default_trigger=default_trigger,
+        )
         if display_base is not None:
             rule.display_path = f"{display_base}/{path.name}"
         merged[rule.name] = rule
     return merged
 
 
-def discover_rules(project_root: Path) -> dict[str, RuleFile]:
-    merged = _scan_rule_dir(_builtin_rules_dir(), display_base="pollypm/defaults/rules")
-    merged.update(_scan_rule_dir(Path.home() / ".pollypm" / "rules", display_base="~/.pollypm/rules"))
-    merged.update(_scan_rule_dir(project_root / ".pollypm" / "rules", display_base=".pollypm/rules"))
+def discover_rules(project_root: Path) -> dict[str, CatalogFile]:
+    merged = _scan_catalog_dir(
+        _builtin_rules_dir(),
+        display_base="pollypm/defaults/rules",
+        default_description="Instructions for {name} work",
+        default_trigger="When doing {name} work",
+    )
+    merged.update(
+        _scan_catalog_dir(
+            Path.home() / ".pollypm" / "rules",
+            display_base="~/.pollypm/rules",
+            default_description="Instructions for {name} work",
+            default_trigger="When doing {name} work",
+        )
+    )
+    merged.update(
+        _scan_catalog_dir(
+            project_root / ".pollypm" / "rules",
+            display_base=".pollypm/rules",
+            default_description="Instructions for {name} work",
+            default_trigger="When doing {name} work",
+        )
+    )
+    return merged
+
+
+def discover_magic(project_root: Path) -> dict[str, CatalogFile]:
+    merged = _scan_catalog_dir(
+        _builtin_magic_dir(),
+        display_base="pollypm/defaults/magic",
+        default_description="Capability for {name}",
+        default_trigger="When {name} would help",
+    )
+    merged.update(
+        _scan_catalog_dir(
+            Path.home() / ".pollypm" / "magic",
+            display_base="~/.pollypm/magic",
+            default_description="Capability for {name}",
+            default_trigger="When {name} would help",
+        )
+    )
+    merged.update(
+        _scan_catalog_dir(
+            project_root / ".pollypm" / "magic",
+            display_base=".pollypm/magic",
+            default_description="Capability for {name}",
+            default_trigger="When {name} would help",
+        )
+    )
     return merged
 
 
@@ -84,3 +150,22 @@ def render_rules_manifest(project_root: Path) -> str:
         rule = rules[name]
         lines.append(f"- {rule.name}: {rule.description} -> {rule.display_path} ({rule.trigger})")
     return "\n".join(lines)
+
+
+def render_magic_manifest(project_root: Path) -> str:
+    magic = discover_magic(project_root)
+    if not magic:
+        return ""
+    lines = [
+        "## Available Magic",
+        "You have access to these capabilities. Use them when the situation calls for it.",
+    ]
+    for name in sorted(magic):
+        entry = magic[name]
+        lines.append(f"- {entry.name}: {entry.description} -> {entry.display_path} ({entry.trigger})")
+    return "\n".join(lines)
+
+
+def render_session_manifest(project_root: Path) -> str:
+    parts = [render_rules_manifest(project_root), render_magic_manifest(project_root)]
+    return "\n\n".join(part for part in parts if part)

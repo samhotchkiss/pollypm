@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from pollypm.agent_profiles.base import AgentProfile, AgentProfileContext
-from pollypm.rules import render_rules_manifest
+from pollypm.rules import render_session_manifest
 
 
 @dataclass(slots=True)
@@ -12,7 +12,7 @@ class StaticPromptProfile(AgentProfile):
     prompt: str
 
     def build_prompt(self, context: AgentProfileContext) -> str | None:
-        manifest = render_rules_manifest(context.config.project.root_dir)
+        manifest = render_session_manifest(context.config.project.root_dir)
         if not manifest:
             return self.prompt
         return f"{self.prompt}\n\n{manifest}"

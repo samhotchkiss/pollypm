@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pollypm.rules import discover_rules, render_rules_manifest
+from pollypm.rules import discover_magic, discover_rules, render_magic_manifest, render_rules_manifest
 
 
 def test_discover_rules_includes_packaged_defaults(tmp_path: Path) -> None:
@@ -46,3 +46,41 @@ def test_rules_manifest_lists_merged_rules(monkeypatch, tmp_path: Path) -> None:
     assert "## Available Rules" in manifest
     assert "- audit: Project audit flow -> .pollypm/rules/audit.md (when reviewing code in this project)" in manifest
     assert "- build: Feature building process -> pollypm/defaults/rules/build.md" in manifest
+
+
+def test_discover_magic_respects_override_hierarchy(monkeypatch, tmp_path: Path) -> None:
+    fake_home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+    (fake_home / ".pollypm" / "magic").mkdir(parents=True)
+    (fake_home / ".pollypm" / "magic" / "deploy-site.md").write_text(
+        "Description: User deploy path\nTrigger: when user deploy flow applies\n"
+    )
+    (tmp_path / ".pollypm" / "magic").mkdir(parents=True)
+    (tmp_path / ".pollypm" / "magic" / "deploy-site.md").write_text(
+        "Description: Project deploy path\nTrigger: when project deploy flow applies\n"
+    )
+    (tmp_path / ".pollypm" / "magic" / "screenshot-verify.md").write_text(
+        "Description: Screenshot verification\nTrigger: when verifying UI visually\n"
+    )
+
+    magic = discover_magic(tmp_path)
+
+    assert magic["deploy-site"].description == "Project deploy path"
+    assert magic["deploy-site"].display_path == ".pollypm/magic/deploy-site.md"
+    assert magic["screenshot-verify"].description == "Screenshot verification"
+
+
+def test_magic_manifest_lists_merged_magic(monkeypatch, tmp_path: Path) -> None:
+    fake_home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    (tmp_path / ".pollypm" / "magic").mkdir(parents=True)
+    (tmp_path / ".pollypm" / "magic" / "screenshot-verify.md").write_text(
+        "Description: Screenshot verification\nTrigger: when checking UI output visually\n"
+    )
+
+    manifest = render_magic_manifest(tmp_path)
+
+    assert "## Available Magic" in manifest
+    assert "- screenshot-verify: Screenshot verification -> .pollypm/magic/screenshot-verify.md (when checking UI output visually)" in manifest
+    assert "- deploy-site: Put a site online quickly -> pollypm/defaults/magic/deploy-site.md" in manifest

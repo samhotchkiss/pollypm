@@ -82,9 +82,11 @@ class TmuxClient:
             return None
         return result.stdout.strip() or None
 
-    def create_session(self, name: str, window_name: str, command: str, *, remain_on_exit: bool = True) -> None:
+    def create_session(self, name: str, window_name: str, command: str, *, remain_on_exit: bool = True, history_limit: int | None = 500) -> None:
         self.run("new-session", "-d", "-s", name, "-n", window_name, command)
         self.run("set-option", "-t", self._exact_target(f"{name}:"), "remain-on-exit", "on" if remain_on_exit else "off")
+        if history_limit is not None:
+            self.run("set-option", "-t", self._exact_target(f"{name}:"), "history-limit", str(history_limit))
 
     def new_session_attached(self, name: str, window_name: str, command: str) -> int:
         result = subprocess.run(
@@ -136,6 +138,12 @@ class TmuxClient:
 
     def resize_pane_width(self, target: str, width: int) -> None:
         self.run("resize-pane", "-t", self._exact_target(target), "-x", str(width))
+
+    def clear_history(self, target: str) -> None:
+        self.run("clear-history", "-t", self._exact_target(target), check=False)
+
+    def set_pane_history_limit(self, target: str, limit: int) -> None:
+        self.run("set-option", "-p", "-t", self._exact_target(target), "history-limit", str(limit), check=False)
 
     def break_pane(self, source: str, target_session: str, window_name: str) -> None:
         self.run(

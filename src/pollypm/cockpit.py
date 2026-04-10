@@ -501,6 +501,7 @@ class CockpitRouter:
             detached=False,
             percent=80,
         )
+        self.tmux.set_pane_history_limit(right_pane_id, 500)
         self.tmux.pipe_pane(right_pane_id, visible_launch.log_path)
         supervisor._stabilize_launch(visible_launch, right_pane_id)
         panes = self.tmux.list_panes(window_target)

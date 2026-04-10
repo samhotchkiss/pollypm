@@ -31,6 +31,7 @@ from pollypm.supervisor import (
     _extract_codex_model_name,
     _extract_token_metrics,
 )
+from pollypm.tmux.client import TmuxWindow
 
 
 def _config(tmp_path: Path) -> PollyPMConfig:
@@ -222,6 +223,36 @@ def test_launch_session_creates_worker_window_detached(monkeypatch, tmp_path: Pa
     assert created_windows[0][0] == supervisor.storage_closet_session_name()
     assert created_windows[0][1] == "worker-pollypm"
     assert created_windows[0][3] is True
+
+
+def test_write_snapshot_targets_pane_id_for_mounted_windows(tmp_path: Path, monkeypatch) -> None:
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    captured: dict[str, object] = {}
+
+    def fake_capture_pane(target: str, lines: int = 200) -> str:
+        captured["target"] = target
+        captured["lines"] = lines
+        return "snapshot\n"
+
+    monkeypatch.setattr(supervisor.tmux, "capture_pane", fake_capture_pane)
+    window = TmuxWindow(
+        session="pollypm",
+        index=0,
+        name="worker-pollypm",
+        active=True,
+        pane_id="%42",
+        pane_current_command="node",
+        pane_current_path=str(tmp_path),
+        pane_dead=False,
+    )
+
+    snapshot_path, content = supervisor._write_snapshot(window, 180)
+
+    assert captured == {"target": "%42", "lines": 180}
+    assert content == "snapshot\n"
+    assert snapshot_path.exists()
 
 
 def test_control_session_args_follow_override_provider(tmp_path: Path) -> None:

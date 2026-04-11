@@ -867,6 +867,11 @@ class Supervisor:
         target = f"{self._tmux_session_for_launch(launch)}:{launch.window_name}"
         prefixed = _prefix_for_owner(owner, text)
         self.tmux.send_keys(target, prefixed, press_enter=press_enter)
+        # Codex CLI buffers input and requires a second Enter to submit.
+        if press_enter and launch.session.provider is ProviderKind.CODEX:
+            import time
+            time.sleep(0.3)
+            self.tmux.send_keys(target, "", press_enter=True)
         if owner == "human":
             self.store.set_lease(session_name, "human", "automatic lease from direct human input")
         self.store.record_event(session_name, "send_input", f"{owner} sent input: {text}")

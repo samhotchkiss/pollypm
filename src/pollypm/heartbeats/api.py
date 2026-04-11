@@ -148,7 +148,12 @@ class SupervisorHeartbeatAPI:
         try:
             self.supervisor.send_input(
                 "operator",
-                f"Heartbeat follow-up: inspect session {session_name}. Reason: {reason}",
+                (
+                    f"H: Heartbeat alert for {session_name}. {reason}. "
+                    f"Options: (1) send a nudge via `pm send {session_name} 'continue'`, "
+                    f"(2) check the pane with `tmux capture-pane -t pollypm-storage-closet:{session_name} -p | tail -20`, "
+                    f"(3) reassign if stuck."
+                ),
                 owner="heartbeat",
             )
         except Exception:  # noqa: BLE001

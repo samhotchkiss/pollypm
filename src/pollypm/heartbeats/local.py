@@ -152,6 +152,13 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     f"Window {context.window_name} has produced effectively the same snapshot for 3 heartbeats",
                 )
                 alerts.append("suspected_loop")
+                # On first detection (5 consecutive identical), notify the operator
+                longer_hashes = api.recent_snapshot_hashes(context.session_name, limit=5)
+                if len(longer_hashes) == 5 and len(set(longer_hashes)) == 1:
+                    api.queue_polly_followup(
+                        context.session_name,
+                        f"Session idle for 5+ heartbeat cycles — may need a nudge or reassignment",
+                    )
             else:
                 api.clear_alert(context.session_name, "suspected_loop")
         else:

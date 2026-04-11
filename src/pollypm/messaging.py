@@ -227,6 +227,15 @@ def transition_thread(
         closed_root.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(thread_root), str(closed_root))
         thread_root = closed_root
+    elif state == "open" and current_state == "closed":
+        # Reopen: move from closed/ back to threads/
+        threads_root = root / THREADS_DIR / thread_id
+        threads_root.parent.mkdir(parents=True, exist_ok=True)
+        if threads_root.exists():
+            shutil.rmtree(threads_root)
+        shutil.move(str(thread_root), str(threads_root))
+        thread_root = threads_root
+        payload.pop("closed_at", None)
     _write_json(thread_root / STATE_FILE, payload)
     return get_thread(root_dir, thread_id)
 
@@ -360,9 +369,11 @@ def _validate_transition(current_state: str, next_state: str) -> None:
     if current_index is None or next_index is None:
         raise ValueError(f"Unknown inbox state transition: {current_state} -> {next_state}")
     # Allow forward steps, PM/PA cycling (waiting-on-pa <-> waiting-on-pm),
-    # and PM jumping to resolved/closed from any state
+    # PM jumping to resolved/closed from any state, and reopening closed threads
     if next_state in ("resolved", "closed"):
         return  # PM can always close or resolve
+    if current_state == "closed" and next_state == "open":
+        return  # Reopen a closed thread
     if current_state == "waiting-on-pa" and next_state == "waiting-on-pm":
         return  # PA returns to PM
     if current_state == "waiting-on-pm" and next_state == "waiting-on-pa":

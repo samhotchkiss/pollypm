@@ -54,6 +54,7 @@ class KnowledgeDelta:
 def extract_knowledge_once(config) -> dict[str, int]:
     updated_docs = 0
     processed_events = 0
+    memory_entries = 0
     for project_root in _all_project_roots(config):
         events, checkpoint = _read_new_events(project_root)
         if not events:
@@ -61,8 +62,56 @@ def extract_knowledge_once(config) -> dict[str, int]:
         processed_events += len(events)
         delta = _extract_with_haiku_or_fallback(events)
         updated_docs += _apply_docs_delta(project_root, delta)
+        memory_entries += _store_memory_entries(config, project_root, delta)
         _save_checkpoint(project_root, checkpoint)
-    return {"processed_events": processed_events, "updated_docs": updated_docs}
+    return {"processed_events": processed_events, "updated_docs": updated_docs, "memory_entries": memory_entries}
+
+
+def _store_memory_entries(config, project_root: Path, delta: "KnowledgeDelta") -> int:
+    """Store extracted knowledge as memory entries in SQLite."""
+    from pollypm.storage.state import StateStore
+    try:
+        store = StateStore(config.project.state_db)
+    except Exception:  # noqa: BLE001
+        return 0
+    count = 0
+    project_name = project_root.name
+    kind_map = {
+        "decision": delta.decisions,
+        "goal": delta.goals,
+        "risk": delta.risks,
+        "idea": delta.ideas,
+        "architecture": delta.architecture_changes,
+        "convention": delta.convention_shifts,
+    }
+    summary_paths = {
+        "decision": project_root / "docs" / "decisions.md",
+        "goal": project_root / "docs" / "project-overview.md",
+        "risk": project_root / "docs" / "risks.md",
+        "idea": project_root / "docs" / "ideas.md",
+        "architecture": project_root / "docs" / "project-overview.md",
+        "convention": project_root / "docs" / "project-overview.md",
+    }
+    for kind, items in kind_map.items():
+        summary_path = summary_paths[kind]
+        for item in items:
+            # Check for duplicates by title+scope
+            existing = store.list_memory_entries(scope=project_name, kind=kind, limit=200)
+            if any(e.title == item for e in existing):
+                continue
+            store.record_memory_entry(
+                scope=project_name,
+                kind=kind,
+                title=item,
+                body="",
+                tags=[project_name, kind],
+                source="knowledge_extract",
+                file_path=str(summary_path),
+                summary_path=str(summary_path),
+            )
+            count += 1
+    store.close()
+    return count
 
 
 def _all_project_roots(config) -> list[Path]:

@@ -804,6 +804,47 @@ def session_set_status(
     typer.echo(f"Updated {session_name} to {status}")
 
 
+@heartbeat_app.command("install")
+def heartbeat_install(
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    """Install a cron job that runs the heartbeat sweep every minute."""
+    pm_path = shutil.which("pm")
+    if pm_path is None:
+        raise typer.BadParameter("Cannot find `pm` on PATH.")
+    cron_line = f"* * * * * {pm_path} heartbeat --config {config_path} >> /tmp/pollypm-heartbeat.log 2>&1"
+    marker = "# pollypm-heartbeat"
+    full_line = f"{cron_line}  {marker}"
+
+    result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    existing = result.stdout if result.returncode == 0 else ""
+
+    if marker in existing:
+        typer.echo("Heartbeat cron job already installed. Use `pm heartbeat uninstall` to remove it first.")
+        return
+
+    new_crontab = existing.rstrip("\n") + "\n" + full_line + "\n" if existing.strip() else full_line + "\n"
+    subprocess.run(["crontab", "-"], input=new_crontab, text=True, check=True)
+    typer.echo(f"Installed heartbeat cron job (runs every minute).")
+    typer.echo(f"  {cron_line}")
+    typer.echo(f"Log: /tmp/pollypm-heartbeat.log")
+
+
+@heartbeat_app.command("uninstall")
+def heartbeat_uninstall() -> None:
+    """Remove the heartbeat cron job."""
+    marker = "# pollypm-heartbeat"
+    result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    if result.returncode != 0 or marker not in result.stdout:
+        typer.echo("No heartbeat cron job found.")
+        return
+
+    lines = [line for line in result.stdout.splitlines() if marker not in line]
+    new_crontab = "\n".join(lines) + "\n" if lines else ""
+    subprocess.run(["crontab", "-"], input=new_crontab, text=True, check=True)
+    typer.echo("Removed heartbeat cron job.")
+
+
 @heartbeat_app.command("record")
 def heartbeat_record(
     session_name: str = typer.Argument(..., help="Session name from config."),

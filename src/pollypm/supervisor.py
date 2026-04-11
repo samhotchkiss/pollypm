@@ -1427,10 +1427,15 @@ class Supervisor:
         return target_home
 
     def _sync_file(self, source: Path, target: Path) -> None:
-        if not source.exists():
-            return
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
+        if source.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+        elif target.exists() and not source.exists():
+            # Reverse sync: if the control-home has the file but the
+            # account home lost it (e.g. during a recovery reset),
+            # copy it back to prevent auth loss.
+            source.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(target, source)
 
     def _stabilize_launch(
         self,

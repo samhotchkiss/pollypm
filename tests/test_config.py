@@ -86,6 +86,50 @@ name = "pollypm"
     assert config.sessions["worker_pollypm"].prompt == "Read the PollyPM issue queue, start with the highest-leverage open issue."
 
 
+def test_control_sessions_use_workspace_root_for_dot_cwd(tmp_path: Path) -> None:
+    """Control sessions with cwd='.' should resolve to workspace_root, not base_dir."""
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        """
+[project]
+name = "pollypm"
+tmux_session = "pollypm"
+workspace_root = "/Users/test/dev"
+
+[pollypm]
+controller_account = "claude_primary"
+
+[accounts.claude_primary]
+provider = "claude"
+home = ".pollypm-state/homes/claude_primary"
+
+[sessions.heartbeat]
+role = "heartbeat-supervisor"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[sessions.operator]
+role = "operator-pm"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[sessions.worker]
+role = "worker"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+"""
+    )
+    config = load_config(config_path)
+    # Control sessions should use workspace_root
+    assert config.sessions["heartbeat"].cwd == Path("/Users/test/dev")
+    assert config.sessions["operator"].cwd == Path("/Users/test/dev")
+    # Workers should use base_dir (config parent)
+    assert config.sessions["worker"].cwd == tmp_path
+
+
 def test_load_config_merges_project_local_worker_sessions(tmp_path: Path) -> None:
     project_root = tmp_path / "wire"
     project_root.mkdir()

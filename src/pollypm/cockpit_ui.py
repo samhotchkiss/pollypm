@@ -358,6 +358,8 @@ class PollyCockpitApp(App[None]):
         self._scheduler_tick_running = False
         self._working_keys: set[str] = set()
         self._unread_keys: set[str] = set()
+        self._tick_count = 0
+        self._last_nav_change = -10  # last tick when user navigated
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -390,6 +392,7 @@ class PollyCockpitApp(App[None]):
             focus_method()
 
     def _tick(self) -> None:
+        self._tick_count += 1
         self.spinner_index = (self.spinner_index + 1) % 4
         self._slogan_tick += 1
         if self._slogan_tick >= 75:
@@ -499,7 +502,10 @@ class PollyCockpitApp(App[None]):
         if rebuild:
             self.nav.clear()
             self.nav.extend(rows)
-        if rows:
+        # Don't override the cursor position if the user recently
+        # navigated with j/k — wait a few ticks for the dust to settle.
+        recently_navigated = (self._tick_count - self._last_nav_change) < 5
+        if rows and not recently_navigated:
             if restore_index is None:
                 if self.nav.index is not None:
                     self._suspend_selection_events = True
@@ -546,6 +552,7 @@ class PollyCockpitApp(App[None]):
         key = self._selected_row_key()
         if key is not None:
             self.selected_key = key
+            self._last_nav_change = self._tick_count
 
     def action_cursor_down(self) -> None:
         if self.nav.index is None:

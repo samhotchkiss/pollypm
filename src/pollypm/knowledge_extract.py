@@ -195,7 +195,24 @@ def _heuristic_extract(events: list[dict[str, Any]]) -> KnowledgeDelta:
 def _sanitize_items(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
-    return _dedupe([_sanitize_text(str(item)) for item in value if str(item).strip()])
+    cleaned = []
+    for item in value:
+        text = _sanitize_text(str(item)).strip()
+        if not text:
+            continue
+        # Reject items that are raw JSON, escaped strings, or transcript noise
+        if text.startswith("{") or text.startswith("[") or text.startswith("```"):
+            continue
+        if "\\\\" in text or "\\n" in text:
+            continue
+        if '"timestamp"' in text or '"event_type"' in text or '"payload"' in text:
+            continue
+        if text.startswith("I'm ready to extract") or text.startswith("For example"):
+            continue
+        if len(text) > 500:
+            text = text[:500]
+        cleaned.append(text)
+    return _dedupe(cleaned)
 
 
 def _sanitize_text(text: str) -> str:

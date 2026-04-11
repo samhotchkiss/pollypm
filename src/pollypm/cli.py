@@ -508,6 +508,36 @@ def launch(
 
 
 @app.command()
+def reset(
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation prompt."),
+) -> None:
+    """Kill all PollyPM tmux sessions (cockpit + storage closet). Use `pm up` to restart."""
+    config_path = _discover_config_path(config_path)
+    if not config_path.exists():
+        typer.echo(f"Config not found at {config_path}.")
+        raise typer.Exit(code=1)
+    supervisor = _load_supervisor(config_path)
+    session_name = supervisor.config.project.tmux_session
+    storage_name = supervisor.storage_closet_session_name()
+    sessions_to_kill = [
+        name for name in [session_name, storage_name]
+        if supervisor.tmux.has_session(name)
+    ]
+    if not sessions_to_kill:
+        typer.echo("No PollyPM tmux sessions found.")
+        return
+    if not force:
+        names = ", ".join(sessions_to_kill)
+        typer.confirm(
+            f"This will kill all PollyPM sessions ({names}). Continue?",
+            abort=True,
+        )
+    supervisor.shutdown_tmux()
+    typer.echo(f"Killed {len(sessions_to_kill)} session(s): {', '.join(sessions_to_kill)}")
+
+
+@app.command()
 def status(
     session_name: str | None = typer.Argument(None, help="Optional session name from config."),
     json_output: bool = typer.Option(False, "--json", help="Emit structured JSON."),

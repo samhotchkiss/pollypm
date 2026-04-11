@@ -417,11 +417,14 @@ class CockpitRouter:
         storage_session = supervisor.storage_closet_session_name()
         storage_windows = {window.name for window in self.tmux.list_windows(storage_session)}
         if launch.window_name not in storage_windows:
-            # Session is not running -- try to relaunch it
-            if launch.session.role in self.service._CONTROL_ROLES if hasattr(self.service, '_CONTROL_ROLES') else launch.session.role in {"operator-pm", "heartbeat-supervisor"}:
+            # Session is not running — show a static view instead of
+            # blocking the UI with a synchronous relaunch attempt.
+            self._show_static_view(supervisor, window_target, "polly" if session_name == "operator" else "project")
+            return
+        if False:  # dead code — kept for reference
+            if launch.session.role in {"operator-pm", "heartbeat-supervisor"}:
                 try:
                     supervisor.launch_session(session_name)
-                    # Successfully relaunched -- now join from storage
                     storage_windows = {w.name for w in self.tmux.list_windows(storage_session)}
                     if launch.window_name in storage_windows:
                         if right_pane_id is not None:

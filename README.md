@@ -1,69 +1,60 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/tmux-first-blue?style=flat-square" alt="tmux-first"/>
-  <img src="https://img.shields.io/badge/agents-Claude%20%2B%20Codex-purple?style=flat-square" alt="Claude + Codex"/>
-  <img src="https://img.shields.io/badge/tests-404%20passing-brightgreen?style=flat-square" alt="404 tests"/>
-  <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT"/>
+  <img src="https://img.shields.io/badge/tmux-native-blue?style=flat-square" alt="tmux-native"/>
+  <img src="https://img.shields.io/badge/Claude%20%2B%20Codex-multi--provider-purple?style=flat-square" alt="multi-provider"/>
+  <img src="https://img.shields.io/badge/can't%20be%20blocked-green?style=flat-square" alt="unblockable"/>
+  <img src="https://img.shields.io/badge/tests-404-brightgreen?style=flat-square" alt="404 tests"/>
 </p>
 
 <h1 align="center">PollyPM</h1>
 
 <p align="center">
-  <strong>A tmux-native supervisor for AI coding agents.</strong>
-  <br>
-  Run Claude and Codex in parallel. Watch every session. Take the wheel anytime.
+  <strong>An AI project manager that runs your coding agents, keeps them moving, and stays out of the way.</strong>
 </p>
 
 ---
 
-## What It Does
+PollyPM is a management and orchestration layer on top of Claude Code and Codex CLI. It uses the native CLI apps through tmux — interacting no differently from a live human operator. That means it can't be blocked, can't be rate-limited differently than you, and every session is a real terminal you can attach to and take over at any time.
 
-PollyPM manages multiple AI coding sessions from one control plane. Each agent runs in its own tmux window — a real `claude` or `codex` process, not an abstraction. You get a cockpit UI, a heartbeat supervisor, and a project manager agent that coordinates work across sessions.
+Give it your projects and your subscriptions. It gives you **Polly**, your AI project manager, who watches all your sessions, nudges them forward when there's a clear next step, automatically documents your projects, and manages your usage across multiple Claude and Codex accounts — rotating between subscriptions when you run out of quota and doing extra work when you have quota to spare.
 
-```
-     You (human)
-       │
-  ┌────┴────┐
-  │ Cockpit │  ← Textual TUI: navigate, mount, inspect
-  └────┬────┘
-       │
-  ┌────┴────────────────────────────────┐
-  │         tmux storage closet         │
-  │                                     │
-  │  heartbeat   operator   worker-1    │
-  │  (Claude)    (Polly)    (Codex)     │
-  │  monitors    manages    implements  │
-  │  recovers    triages    executes    │
-  └─────────────────────────────────────┘
-```
+## What You Get
 
-**Every session is a real terminal.** You can attach to any window and type. The heartbeat watches for stuck, looping, or crashed sessions and recovers them automatically. The operator (Polly) creates issues, assigns work, and reviews results. Workers execute.
+**A project manager that actually manages**
+- Polly creates issues, assigns them to workers, reviews the results, and sends work back if it's not good enough
+- Workers get nudged when they stall: *"state the remaining task in one sentence, execute the next step now"*
+- Your projects get automatically documented — decisions, architecture, risks, ideas — extracted from your agent transcripts
 
-## Key Features
+**Supervision that doesn't sleep**
+- Heartbeat runs every 60 seconds via cron — works even when you close your laptop lid and come back
+- Detects stuck, looping, and crashed sessions. Recovers them automatically with provider failover
+- Monitors your interactions and can teach you better ways to instruct your agents
 
-**Supervision that actually works**
-- Heartbeat runs via cron every 60 seconds — independent of the UI
-- Detects stuck sessions (3 identical snapshots), dead panes, auth failures
-- Auto-recovers crashed sessions with provider failover
-- Hard limit prevents infinite crash loops (20 attempts, then stops)
-- Nudges stalled workers directly: *"state the remaining task, execute the next step"*
+**Multi-provider, multi-account, multi-project**
+- Claude and Codex running side by side, each in their own tmux window
+- Stack multiple subscriptions — Polly rotates between them based on quota and health
+- Manage as many projects as you want, each with isolated workers and git worktrees
 
-**Multi-provider, multi-project**
-- Claude (Opus, Sonnet, Haiku) and OpenAI Codex (GPT-5.4) side by side
-- Isolated account homes with 700 permissions and Keychain auth
-- Failover from Claude to Codex when one provider is down
-- Git worktrees per worker — no file conflicts between parallel agents
+**A cockpit, not a cage**
+- Textual TUI: navigate with `j`/`k`, mount any session, type directly into Claude or Codex
+- You're never locked out. Every agent is a real tmux window. Attach anytime, take the wheel
+- The heartbeat backs off when you're working — auto-claims a lease so it won't interfere
 
-**Project management built in**
-- File-based issue tracker (6 states: not-ready → ready → in-progress → review → completed)
-- GitHub issue backend (`polly:*` labels, auto-close on completion)
-- Inbox with thread state machine (triage → route → resolve → close → reopen)
-- Knowledge extraction: Haiku scans transcripts and updates `docs/decisions.md`
+## The Architecture Idea
 
-**A cockpit you can actually use**
-- Textual TUI rail with `j`/`k` navigation, session spinners, alert indicators
-- Mount any session in the right pane — type directly into Claude or Codex
-- Settings view with account management, relogin, failover config
-- Lease system: cockpit auto-claims leases so the heartbeat won't interfere while you're typing
+PollyPM is **highly opinionated but highly pluggable**.
+
+It works the way we think is best out of the box. But everything is a plugin. Tell Polly *"I don't want markdown docs anymore, build me a wiki for each project"* and she knows how to create a plugin that still lets the core update while using your functionality on top.
+
+The core primitives are **memory**, **tasks**, and **sessions**. Whether you store your task list in SQLite, GitHub Issues, or files on disk, the task plugin transforms them into a format the TUI can display and the heartbeat can keep moving forward.
+
+| Layer | Built-in | Pluggable |
+|-------|----------|-----------|
+| **Task tracking** | File-based (6 states) + GitHub Issues (`polly:*` labels) | Any backend that implements 7 methods |
+| **Documentation** | Markdown in `docs/` with Haiku extraction | Custom doc backends (wiki, Notion, etc.) |
+| **Heartbeat** | Local snapshot + classify + recover | Custom health checks and interventions |
+| **Providers** | Claude Code + OpenAI Codex | Any CLI agent that runs in a terminal |
+| **Runtime** | Local tmux + Docker | Custom execution environments |
+| **Messaging** | File-based inbox with thread state machine | Discord, Telegram, Slack (coming soon) |
 
 ## Quick Start
 
@@ -71,65 +62,47 @@ PollyPM manages multiple AI coding sessions from one control plane. Each agent r
 # Install
 uv tool install pollypm
 
-# Onboard accounts
+# Onboard your Claude and Codex accounts
 pm onboard
 
-# Launch everything
+# Launch everything — heartbeat, operator, workers
 pm up
 
-# Install the heartbeat cron (runs even when cockpit is closed)
+# Install the heartbeat so it runs even when the cockpit is closed
 pm heartbeat install
-```
 
-Attach to the cockpit:
-```bash
+# Attach to the cockpit
 tmux attach -t pollypm
 ```
 
-Navigate with `j`/`k`, press `Enter` to mount a session, `n` to launch a new worker, `s` for settings.
-
-## Architecture
-
-```
-src/pollypm/
-├── supervisor.py        # Session lifecycle, recovery, failover
-├── cockpit.py           # Pane routing, session mounting
-├── cockpit_ui.py        # Textual TUI rail
-├── heartbeats/          # Health classification, alerts, nudges
-├── schedulers/          # Cron-driven recurring jobs
-├── providers/           # Claude + Codex adapters
-├── runtimes/            # Local + Docker execution
-├── task_backends/       # File-based + GitHub issue trackers
-├── knowledge_extract.py # LLM-powered doc extraction
-├── recovery_prompt.py   # Checkpoint-based session recovery
-├── messaging.py         # Inbox threads + state machine
-└── storage/state.py     # SQLite: events, heartbeats, checkpoints, alerts
-```
+Navigate with `j`/`k`. Press `Enter` to mount a session. Press `n` to launch a new worker. Press `s` for settings. Press `Ctrl-W` to detach.
 
 ## How the Heartbeat Works
 
-Every 60 seconds (via cron), `pm heartbeat` runs a sweep:
-
-1. **Capture** — snapshot every session's tmux pane
-2. **Classify** — healthy, needs_followup, blocked, done (with transcript snippet)
-3. **Detect** — stuck (3 identical snapshots), dead panes, auth failures, loops
-4. **Alert** — raise/clear alerts in SQLite with severity levels
-5. **Recover** — relaunch dead sessions, failover to backup accounts
-6. **Nudge** — after 5 idle cycles, send a direct message to stalled workers
-7. **Checkpoint** — save state for recovery prompts
+Every 60 seconds, `pm heartbeat` runs a sweep across all your sessions:
 
 ```
-$ pm heartbeat
-Heartbeat completed. Open alerts: 2
-- warn worker_pollypm/suspected_loop: same snapshot for 3 heartbeats
-- warn worker_website/needs_followup: Additional work remains
+Capture pane snapshots
+    → Classify health (healthy / stuck / needs_followup / blocked / dead)
+    → Detect problems (3 identical snapshots = stuck, pane_dead = crashed)
+    → Alert (raise/clear in SQLite, notify the operator)
+    → Recover (relaunch dead sessions, failover to backup accounts)
+    → Nudge (after 5 idle cycles, tell the worker to get moving)
+    → Checkpoint (save state for recovery prompts)
 ```
+
+The heartbeat runs via cron — it doesn't care if your cockpit is open or closed, if you're asleep, or if your terminal crashed. As long as the machine is on, Polly is watching.
+
+## Coming Soon
+
+- **Discord and Telegram integrations** — get notifications, send commands from your phone
+- **Web interface** — manage sessions from a browser
+- **Apple Voice Notes plugin** — record a voice note on your phone or Apple Watch, Polly figures out what you want done
+- **Agent coaching** — Polly watches your interactions and suggests better prompting techniques
 
 ## Status
 
-PollyPM is in active daily use managing 5 projects with 3 Codex workers, a Claude heartbeat, and a Claude operator. It has survived extended unattended operation, recovered from dozens of session crashes, and processed over 16,000 heartbeat cycles.
-
-**404 tests.** Every fix ships with a regression test.
+In active daily use managing 5 projects. 16,000+ heartbeat cycles. Dozens of auto-recovered crashes. 404 tests.
 
 ## License
 

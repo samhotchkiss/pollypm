@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from pollypm.task_backends.base import TaskBackend, TaskRecord
 
@@ -62,17 +65,43 @@ class FileTaskBackend(TaskBackend):
 
     def create_task(self, *, title: str, body: str = "", state: str = "01-ready") -> TaskRecord:
         self.ensure_tracker()
-        task_id = f"{self.latest_issue_number() + 1:04d}"
+        # Use the higher of the counter file and the max existing issue ID
+        # to avoid collisions when issues are created outside this API.
+        counter_value = self.latest_issue_number()
+        max_existing = counter_value
+        for task in self.list_tasks():
+            try:
+                existing_num = int(task.task_id)
+                max_existing = max(max_existing, existing_num)
+            except ValueError:
+                pass
+        next_id = max(counter_value, max_existing) + 1
+        task_id = f"{next_id:04d}"
         slug = _slugify(title)
         path = self.issues_root() / state / f"{task_id}-{slug}.md"
         path.write_text(f"# {task_id} {title}\n\n{body}".rstrip() + "\n")
-        (self.issues_root() / ".latest_issue_number").write_text(f"{int(task_id)}\n")
+        (self.issues_root() / ".latest_issue_number").write_text(f"{next_id}\n")
         return TaskRecord(task_id=task_id, title=title, state=state, path=path)
 
     def move_task(self, task_id: str, to_state: str) -> TaskRecord:
         for task in self.list_tasks():
             if task.task_id != task_id:
                 continue
+            # Validate: warn if states are skipped or reversed
+            if task.state in TRACKER_STATES and to_state in TRACKER_STATES:
+                from_idx = TRACKER_STATES.index(task.state)
+                to_idx = TRACKER_STATES.index(to_state)
+                if to_idx < from_idx:
+                    logger.warning(
+                        "Issue %s moving backward: %s → %s (rework?)",
+                        task_id, task.state, to_state,
+                    )
+                elif to_idx > from_idx + 1:
+                    skipped = TRACKER_STATES[from_idx + 1 : to_idx]
+                    logger.warning(
+                        "Issue %s skipping states %s → %s (skipped: %s)",
+                        task_id, task.state, to_state, ", ".join(skipped),
+                    )
             destination = self.issues_root() / to_state / task.path.name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(task.path), str(destination))

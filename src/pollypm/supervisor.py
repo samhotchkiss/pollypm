@@ -54,6 +54,7 @@ class Supervisor:
     _CONTROL_HOMES_DIR = "control-homes"
     _RECOVERY_WINDOW = timedelta(minutes=30)
     _RECOVERY_LIMIT = 5
+    _RECOVERY_HARD_LIMIT = 20  # stop entirely after this many total attempts
 
     def __init__(self, config: PollyPMConfig) -> None:
         self.config = config
@@ -986,6 +987,9 @@ class Supervisor:
             last_failure_type=failure_type,
             last_failure_message=failure_message,
         )
+        # Hard limit: stop entirely after too many total attempts across all windows
+        if attempts > self._RECOVERY_HARD_LIMIT:
+            return False, attempts
         return attempts <= self._RECOVERY_LIMIT, attempts
 
     def _maybe_recover_session(self, launch: SessionLaunchSpec, *, failure_type: str, failure_message: str) -> None:
@@ -1017,11 +1021,17 @@ class Supervisor:
             failure_message=failure_message,
         )
         if not allowed:
+            msg = f"Automatic recovery paused after {attempts} rapid failures"
+            if attempts >= self._RECOVERY_HARD_LIMIT:
+                msg = (
+                    f"Automatic recovery STOPPED after {attempts} total failures. "
+                    f"Session requires manual intervention (pm up or account re-auth)."
+                )
             self.store.upsert_alert(
                 launch.session.name,
                 "recovery_limit",
                 "error",
-                f"Automatic recovery paused after {attempts} rapid failures",
+                msg,
             )
             self.store.upsert_session_runtime(
                 session_name=launch.session.name,

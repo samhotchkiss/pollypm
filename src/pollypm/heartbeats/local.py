@@ -152,13 +152,22 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     f"Window {context.window_name} has produced effectively the same snapshot for 3 heartbeats",
                 )
                 alerts.append("suspected_loop")
-                # On first detection (5 consecutive identical), notify the operator
+                # After 5 consecutive identical snapshots, notify operator AND nudge worker directly
                 longer_hashes = api.recent_snapshot_hashes(context.session_name, limit=5)
                 if len(longer_hashes) == 5 and len(set(longer_hashes)) == 1:
                     api.queue_polly_followup(
                         context.session_name,
                         f"Session idle for 5+ heartbeat cycles — may need a nudge or reassignment",
                     )
+                    # Direct nudge to the worker — only for worker roles, not control sessions
+                    if context.role == "worker":
+                        api.send_session_message(
+                            context.session_name,
+                            "You appear stalled and additional work remains. "
+                            "Stop looping, state the remaining task in one sentence, "
+                            "execute the next concrete step now, and report verification or blocker.",
+                            owner="heartbeat",
+                        )
             else:
                 api.clear_alert(context.session_name, "suspected_loop")
         else:

@@ -61,3 +61,27 @@ Verify that the cockpit (status dashboard) displays accurate, real-time session 
 - Persona names shown: "news (Nora)"
 
 **Issues found:** None
+
+### Re-test — 2026-04-10 1:28 PM
+
+**Result: PASS — real-time state transitions verified**
+
+Tested by sending a task to the Codex worker while watching the cockpit rail indicator:
+
+1. **Idle state:** PollyPM shows `●` (green solid dot = live, idle at prompt)
+2. **Sent task:** "List every file in docs/v1/ with their sizes"
+3. **Working state captured:** PollyPM shows `◟ ◜ ◝` (rotating spinner = actively working)
+```
+▌ ◟ PollyPM    (t+0.3s)
+▌ ◜ PollyPM    (t+0.9s)
+▌ ◝ PollyPM    (t+1.5s)
+```
+4. **Back to idle:** After Codex finished (listed 17 files), indicator returned to `●`
+
+Other indicators confirmed:
+- `▲` = active with alerts (otter-camp had suspected_loop alert)
+- `○` = idle/no session (sam-blog, news)
+- `◇` = empty inbox
+- `•` = operator ready (Polly)
+
+Turn detection works correctly for both Claude (❯ prompt) and Codex (› prompt) sessions.

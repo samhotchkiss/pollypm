@@ -60,3 +60,11 @@ sessions). Code review confirms correct implementation.
 - Ctrl-W is instant (no confirmation needed)
 
 **Issues found:** None
+
+### Re-test — 2026-04-10 1:35 PM
+
+Cannot destructively test Ctrl-W (detaches Sam's terminal) or Ctrl-Q (shuts down all sessions). Verified:
+- Bindings declared with `priority=True` in Textual BINDINGS
+- `action_detach` calls `tmux detach-client`
+- `action_request_quit` shows `tmux confirm-before` dialog with y/N prompt, then calls `supervisor.shutdown_tmux()`
+- No tmux-level root-table bindings for Ctrl-W/Q — these are Textual app-level bindings only

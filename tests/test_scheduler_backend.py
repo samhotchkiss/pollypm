@@ -117,6 +117,33 @@ def test_inline_scheduler_runs_due_jobs(monkeypatch, tmp_path: Path) -> None:
     assert sent == {"session": "operator", "text": "hello", "owner": "human"}
 
 
+def test_inline_scheduler_reschedules_recurring_job_after_failure(monkeypatch, tmp_path: Path) -> None:
+    """Recurring jobs should stay pending (rescheduled) even after failure."""
+    supervisor = Supervisor(_config(tmp_path))
+    supervisor.ensure_layout()
+    # Make run_heartbeat raise to simulate a failure
+    monkeypatch.setattr(supervisor, "run_heartbeat", lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    backend = get_scheduler_backend("inline", root_dir=tmp_path)
+    backend.schedule(
+        supervisor,
+        kind="heartbeat",
+        run_at=datetime.now(UTC) - timedelta(seconds=1),
+        payload={},
+        interval_seconds=60,
+    )
+
+    ran = backend.run_due(supervisor)
+
+    assert len(ran) == 0  # nothing succeeded
+    jobs = backend.list_jobs(supervisor)
+    hb_jobs = [j for j in jobs if j.kind == "heartbeat"]
+    assert len(hb_jobs) == 1
+    assert hb_jobs[0].status == "pending"  # rescheduled, NOT stuck in "failed"
+    assert hb_jobs[0].last_error == "boom"
+    assert hb_jobs[0].run_at > datetime.now(UTC)  # pushed forward
+
+
 def test_ensure_heartbeat_schedule_is_idempotent(tmp_path: Path) -> None:
     supervisor = Supervisor(_config(tmp_path))
     supervisor.ensure_layout()

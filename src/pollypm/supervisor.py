@@ -834,6 +834,8 @@ class Supervisor:
 
         return active_alerts
 
+    _LEASE_TIMEOUT_SECONDS = 1800  # 30 minutes
+
     def claim_lease(self, session_name: str, owner: str, note: str = "") -> None:
         self._require_session(session_name)
         self._assert_lease_available(
@@ -846,9 +848,27 @@ class Supervisor:
         if note:
             message = f"{message}: {note}"
         self.store.record_event(session_name, "lease", message)
+        # Schedule auto-release after timeout
+        try:
+            backend = get_scheduler_backend(
+                self.config.pollypm.scheduler_backend,
+                root_dir=self.config.project.root_dir,
+            )
+            backend.schedule(
+                self,
+                kind="release_lease",
+                run_at=datetime.now(UTC) + timedelta(seconds=self._LEASE_TIMEOUT_SECONDS),
+                payload={"session_name": session_name, "owner": owner},
+            )
+        except Exception:  # noqa: BLE001
+            pass  # Best-effort — lease still works without auto-release
 
-    def release_lease(self, session_name: str) -> None:
+    def release_lease(self, session_name: str, expected_owner: str | None = None) -> None:
         self._require_session(session_name)
+        if expected_owner is not None:
+            current = self.store.get_lease(session_name)
+            if current is None or current.owner != expected_owner:
+                return  # Lease was already released or reclaimed by someone else
         self.store.clear_lease(session_name)
         self.store.record_event(session_name, "lease", "Lease released")
 

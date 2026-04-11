@@ -5,13 +5,7 @@
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT"/>
 </p>
 
-<h1 align="center">
-<pre>
-█▀█ █▀█ █   █   █▄█
-█▀▀ █▄█ █▄▄ █▄▄  █
-</pre>
-PollyPM
-</h1>
+<h1 align="center">PollyPM</h1>
 
 <p align="center">
   <strong>A tmux-native supervisor for AI coding agents.</strong>

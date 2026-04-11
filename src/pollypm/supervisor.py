@@ -533,31 +533,45 @@ class Supervisor:
             self.config.pollypm.scheduler_backend,
             root_dir=self.config.project.root_dir,
         )
-        for job in backend.list_jobs(self):
-            if job.kind == "heartbeat" and job.interval_seconds == 60 and job.status == "pending":
-                return
-        backend.schedule(
-            self,
-            kind="heartbeat",
-            run_at=datetime.now(UTC) + timedelta(minutes=1),
-            payload={},
-            interval_seconds=60,
-        )
+        self._dedup_recurring_jobs(backend, "heartbeat", 60)
 
     def ensure_knowledge_extraction_schedule(self) -> None:
         backend = get_scheduler_backend(
             self.config.pollypm.scheduler_backend,
             root_dir=self.config.project.root_dir,
         )
-        for job in backend.list_jobs(self):
-            if job.kind == "knowledge_extract" and job.interval_seconds == EXTRACTION_INTERVAL_SECONDS and job.status == "pending":
-                return
+        self._dedup_recurring_jobs(backend, "knowledge_extract", EXTRACTION_INTERVAL_SECONDS, payload={"model": "haiku"})
+
+    def _dedup_recurring_jobs(
+        self,
+        backend,
+        kind: str,
+        interval: int,
+        payload: dict[str, object] | None = None,
+    ) -> None:
+        """Ensure exactly one pending recurring job of the given kind exists.
+
+        Removes duplicates that accumulate from cockpit restarts.
+        """
+        jobs = backend.list_jobs(self)
+        matching = [j for j in jobs if j.kind == kind and j.interval_seconds == interval]
+        pending = [j for j in matching if j.status == "pending"]
+        if len(pending) == 1:
+            return  # exactly one — nothing to do
+        if len(pending) > 1:
+            # Keep the one with the earliest run_at, mark the rest as done
+            pending.sort(key=lambda j: j.run_at)
+            for dup in pending[1:]:
+                dup.status = "done"
+            backend._save_jobs(self, jobs)
+            return
+        # No pending job — schedule a new one
         backend.schedule(
             self,
-            kind="knowledge_extract",
-            run_at=datetime.now(UTC) + timedelta(seconds=EXTRACTION_INTERVAL_SECONDS),
-            payload={"model": "haiku"},
-            interval_seconds=EXTRACTION_INTERVAL_SECONDS,
+            kind=kind,
+            run_at=datetime.now(UTC) + timedelta(seconds=interval),
+            payload=payload or {},
+            interval_seconds=interval,
         )
 
     def _run_heartbeat_local(self, snapshot_lines: int = 200) -> list[AlertRecord]:

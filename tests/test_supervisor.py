@@ -167,6 +167,35 @@ def test_send_input_no_prefix_for_human(monkeypatch, tmp_path: Path) -> None:
     assert sent[0][1] == "hello"
 
 
+def test_send_input_sends_extra_enter_for_codex(monkeypatch, tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.sessions["operator"] = SessionConfig(
+        name="operator",
+        role="operator-pm",
+        provider=ProviderKind.CODEX,
+        account="codex_backup",
+        cwd=tmp_path,
+        project="pollypm",
+        window_name="pm-operator",
+    )
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    sent: list[tuple[str, str, bool]] = []
+    monkeypatch.setattr(
+        supervisor.tmux,
+        "send_keys",
+        lambda target, text, press_enter=True: sent.append((target, text, press_enter)),
+    )
+
+    supervisor.send_input("operator", "continue", owner="human")
+
+    assert len(sent) == 2
+    assert sent[0][1:] == ("continue", True)
+    assert sent[1][1:] == ("", True)
+    assert sent[0][0] == sent[1][0]
+    assert sent[0][0].endswith(":pm-operator")
+
+
 def test_claim_lease_rejects_conflicting_owner(tmp_path: Path) -> None:
     config = _config(tmp_path)
     supervisor = Supervisor(config)

@@ -788,22 +788,31 @@ class StateStore:
             updated_at=row[7],
         )
 
+    _UNSET = object()  # sentinel: "not provided" (keeps existing value)
+
     def upsert_session_runtime(
         self,
         *,
         session_name: str,
         status: str,
-        effective_account: str | None = None,
-        effective_provider: str | None = None,
-        recovery_attempts: int | None = None,
-        recovery_window_started_at: str | None = None,
-        last_failure_type: str | None = None,
-        last_failure_message: str | None = None,
-        last_checkpoint_path: str | None = None,
-        retry_at: str | None = None,
-        last_recovered_at: str | None = None,
+        effective_account: str | None | object = _UNSET,
+        effective_provider: str | None | object = _UNSET,
+        recovery_attempts: int | None | object = _UNSET,
+        recovery_window_started_at: str | None | object = _UNSET,
+        last_failure_type: str | None | object = _UNSET,
+        last_failure_message: str | None | object = _UNSET,
+        last_checkpoint_path: str | None | object = _UNSET,
+        retry_at: str | None | object = _UNSET,
+        last_recovered_at: str | None | object = _UNSET,
     ) -> None:
+        _U = self._UNSET
         current = self.get_session_runtime(session_name)
+
+        def _resolve(new, old_val, default=None):
+            if new is not _U:
+                return new  # explicitly provided (including None → NULL)
+            return old_val if current else default
+
         self.conn.execute(
             """
             INSERT INTO session_runtime (
@@ -828,15 +837,15 @@ class StateStore:
             (
                 session_name,
                 status,
-                effective_account if effective_account is not None else (current.effective_account if current else None),
-                effective_provider if effective_provider is not None else (current.effective_provider if current else None),
-                recovery_attempts if recovery_attempts is not None else (current.recovery_attempts if current else 0),
-                recovery_window_started_at if recovery_window_started_at is not None else (current.recovery_window_started_at if current else None),
-                last_failure_type if last_failure_type is not None else (current.last_failure_type if current else None),
-                last_failure_message if last_failure_message is not None else (current.last_failure_message if current else None),
-                last_checkpoint_path if last_checkpoint_path is not None else (current.last_checkpoint_path if current else None),
-                retry_at if retry_at is not None else (current.retry_at if current else None),
-                last_recovered_at if last_recovered_at is not None else (current.last_recovered_at if current else None),
+                _resolve(effective_account, current.effective_account if current else None),
+                _resolve(effective_provider, current.effective_provider if current else None),
+                _resolve(recovery_attempts, current.recovery_attempts if current else 0, default=0),
+                _resolve(recovery_window_started_at, current.recovery_window_started_at if current else None),
+                _resolve(last_failure_type, current.last_failure_type if current else None),
+                _resolve(last_failure_message, current.last_failure_message if current else None),
+                _resolve(last_checkpoint_path, current.last_checkpoint_path if current else None),
+                _resolve(retry_at, current.retry_at if current else None),
+                _resolve(last_recovered_at, current.last_recovered_at if current else None),
                 self._now(),
             ),
         )

@@ -1138,11 +1138,21 @@ class Supervisor:
             "recovered",
             f"Recovered {launch.window_name} in place using {account_name}",
         )
+        # If recovered on the config-default account, clear the override
+        # so the session doesn't carry a stale effective_account that blocks
+        # future recovery from choosing the correct provider.
+        config_default = launch.session.account if hasattr(launch.session, "account") else None
+        if account_name == config_default:
+            eff_account = None
+            eff_provider = None
+        else:
+            eff_account = account_name
+            eff_provider = account.provider.value
         self.store.upsert_session_runtime(
             session_name=session_name,
             status="healthy",
-            effective_account=account_name,
-            effective_provider=account.provider.value,
+            effective_account=eff_account,
+            effective_provider=eff_provider,
             last_recovered_at=datetime.now(UTC).isoformat(),
         )
         for alert_type in [

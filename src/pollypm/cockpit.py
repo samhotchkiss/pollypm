@@ -73,6 +73,47 @@ class CockpitRouter:
     def _write_state(self, data: dict[str, object]) -> None:
         self._state_path().write_text(json.dumps(data, indent=2) + "\n")
 
+    def _validate_state(self) -> None:
+        """Clear stale entries from cockpit_state.json.
+
+        Checks that right_pane_id points to a real pane and that
+        mounted_session is actually alive. Prevents stale state from
+        blocking heartbeat recovery or causing wrong session mounts.
+        """
+        state = self._load_state()
+        dirty = False
+        config = load_config(self.config_path)
+        target = f"{config.project.tmux_session}:{self._COCKPIT_WINDOW}"
+
+        right_pane_id = state.get("right_pane_id")
+        if isinstance(right_pane_id, str):
+            try:
+                panes = self.tmux.list_panes(target)
+                if not any(p.pane_id == right_pane_id for p in panes):
+                    state.pop("right_pane_id", None)
+                    state.pop("mounted_session", None)
+                    dirty = True
+            except Exception:  # noqa: BLE001
+                state.pop("right_pane_id", None)
+                state.pop("mounted_session", None)
+                dirty = True
+
+        mounted = state.get("mounted_session")
+        if isinstance(mounted, str) and mounted:
+            try:
+                supervisor = self._load_supervisor()
+                launches = supervisor.plan_launches()
+                launch = next((l for l in launches if l.session.name == mounted), None)
+                if launch is None:
+                    state.pop("mounted_session", None)
+                    dirty = True
+            except Exception:  # noqa: BLE001
+                state.pop("mounted_session", None)
+                dirty = True
+
+        if dirty:
+            self._write_state(state)
+
     def _ui_initialized_sessions(self) -> set[str]:
         data = self._load_state()
         value = data.get("ui_initialized_sessions")
@@ -213,6 +254,7 @@ class CockpitRouter:
         return False
 
     def ensure_cockpit_layout(self) -> None:
+        self._validate_state()
         config = load_config(self.config_path)
         target = f"{config.project.tmux_session}:{self._COCKPIT_WINDOW}"
         panes = self.tmux.list_panes(target)

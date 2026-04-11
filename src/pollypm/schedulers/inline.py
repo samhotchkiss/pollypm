@@ -54,8 +54,14 @@ class InlineSchedulerBackend(SchedulerBackend):
             try:
                 self._execute(supervisor, job)
             except Exception as exc:  # noqa: BLE001
-                job.status = "failed"
                 job.last_error = str(exc)
+                if job.interval_seconds:
+                    # Recurring jobs reschedule even after failure so they
+                    # retry on the next cycle instead of being stuck forever.
+                    job.run_at = current + timedelta(seconds=job.interval_seconds)
+                    job.status = "pending"
+                else:
+                    job.status = "failed"
                 supervisor.store.record_event(
                     "scheduler",
                     "failed",

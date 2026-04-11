@@ -112,7 +112,7 @@ def _detected_claude_version() -> str:
 
 
 def _prime_claude_home(home: Path) -> None:
-    home.mkdir(parents=True, exist_ok=True)
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
     claude_dir = home / ".claude"
     claude_dir.mkdir(parents=True, exist_ok=True)
 
@@ -580,7 +580,7 @@ def _promote_onboarding_home(temp_home: Path, final_home: Path) -> Path:
     if temp_home.resolve() == final_home.resolve():
         return final_home
 
-    final_home.parent.mkdir(parents=True, exist_ok=True)
+    final_home.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if final_home.exists():
         shutil.rmtree(temp_home, ignore_errors=True)
         return final_home

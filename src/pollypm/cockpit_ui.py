@@ -324,6 +324,10 @@ class PollyCockpitApp(App[None]):
         Binding("n", "new_worker", "New Worker"),
         Binding("r", "refresh", "Refresh"),
         Binding("s", "open_settings", "Settings"),
+        Binding("j,down", "cursor_down", "Down", show=False),
+        Binding("k,up", "cursor_up", "Up", show=False),
+        Binding("g,home", "cursor_first", "First", show=False),
+        Binding("G,end", "cursor_last", "Last", show=False),
         Binding("ctrl+q", "request_quit", "Quit", priority=True),
         Binding("ctrl+w", "detach", "Detach", priority=True),
     ]
@@ -536,6 +540,36 @@ class PollyCockpitApp(App[None]):
         state = self.router._load_state()
         if state.get("mounted_session"):
             self._focus_right_pane()
+
+    def _sync_selected_from_nav(self) -> None:
+        """Update selected_key from the current ListView cursor position."""
+        key = self._selected_row_key()
+        if key is not None:
+            self.selected_key = key
+
+    def action_cursor_down(self) -> None:
+        if self.nav.index is None:
+            self.nav.index = 0
+        else:
+            self.nav.action_cursor_down()
+        self._sync_selected_from_nav()
+
+    def action_cursor_up(self) -> None:
+        if self.nav.index is None:
+            self.nav.index = 0
+        else:
+            self.nav.action_cursor_up()
+        self._sync_selected_from_nav()
+
+    def action_cursor_first(self) -> None:
+        self.nav.index = 0
+        self._sync_selected_from_nav()
+
+    def action_cursor_last(self) -> None:
+        children = list(self.nav.children)
+        if children:
+            self.nav.index = len(children) - 1
+        self._sync_selected_from_nav()
 
     def action_open_selected(self) -> None:
         key = self._selected_row_key()

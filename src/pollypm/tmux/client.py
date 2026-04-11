@@ -36,11 +36,16 @@ class TmuxPane:
 
 class TmuxClient:
     def _exact_target(self, target: str) -> str:
+        """Prefix bare session names with ``=`` for exact matching.
+
+        tmux 3.6+ does not support ``=session:window`` — the ``=`` prefix
+        only works for bare session names.  When the target contains a colon,
+        skip the prefix to avoid a lookup failure.
+        """
         if not target or target.startswith(("=", "%", "@")):
             return target
         if ":" in target:
-            session, rest = target.split(":", 1)
-            return f"={session}:{rest}"
+            return target
         return f"={target}"
 
     def _inside_tmux(self) -> bool:

@@ -98,10 +98,12 @@ def run_haiku(
     env = dict(os.environ)
     env["CLAUDE_CONFIG_DIR"] = config_dir
 
-    cmd = ["claude", "-p", prompt, "--model", model]
+    cmd = ["claude", "-p", "--model", model]
     if max_tokens:
         cmd.extend(["--max-tokens", str(max_tokens)])
 
+    # Pipe the prompt via stdin to avoid "Argument list too long" when the
+    # prompt exceeds the OS command-line length limit (~256 KB on macOS).
     result = subprocess.run(
         cmd,
         check=False,
@@ -109,6 +111,7 @@ def run_haiku(
         capture_output=True,
         env=env,
         timeout=120,
+        input=prompt,
     )
 
     if result.returncode != 0:
@@ -139,7 +142,11 @@ def run_haiku_json(
         lines = [l for l in lines if not l.strip().startswith("```")]
         text = "\n".join(lines).strip()
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
     except (json.JSONDecodeError, ValueError):
         logger.warning("Failed to parse LLM response as JSON: %s", text[:200])
         return None
+    if not isinstance(parsed, dict):
+        logger.warning("LLM returned non-dict JSON (got %s), ignoring", type(parsed).__name__)
+        return None
+    return parsed

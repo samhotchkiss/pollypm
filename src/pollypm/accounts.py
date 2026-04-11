@@ -430,7 +430,7 @@ def add_account_via_login(config_path: Path, provider: ProviderKind) -> tuple[st
     else:
         final_home = config.project.base_dir / "homes" / key
         if home.exists() and home != final_home:
-            final_home.parent.mkdir(parents=True, exist_ok=True)
+            final_home.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             if final_home.exists():
                 existing_email = _detect_account_email(provider, final_home)
                 if existing_email == email:

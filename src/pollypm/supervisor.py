@@ -32,6 +32,21 @@ from pollypm.storage.state import AlertRecord, LeaseRecord, StateStore
 from pollypm.tmux.client import TmuxClient, TmuxWindow
 
 
+_OWNER_PREFIXES = {
+    "heartbeat": "H:",
+    "polly": "P:",
+    "operator": "P:",
+}
+
+
+def _prefix_for_owner(owner: str, text: str) -> str:
+    """Prepend an owner tag so recipients can identify who injected a message."""
+    prefix = _OWNER_PREFIXES.get(owner)
+    if prefix is None:
+        return text
+    return f"{prefix} {text}"
+
+
 class Supervisor:
     _CONTROL_ROLES = {"heartbeat-supervisor", "operator-pm"}
     _CONSOLE_WINDOW = "PollyPM"
@@ -386,12 +401,12 @@ class Supervisor:
             ensure_project_scaffold(known_project.path)
         for account in self.config.accounts.values():
             if account.home is not None:
-                account.home.mkdir(parents=True, exist_ok=True)
+                account.home.mkdir(parents=True, exist_ok=True, mode=0o700)
                 if account.provider is ProviderKind.CLAUDE:
                     _prime_claude_home(account.home)
                 self._refresh_account_runtime_metadata(account.name)
         control_homes_root = self.config.project.base_dir / self._CONTROL_HOMES_DIR
-        control_homes_root.mkdir(parents=True, exist_ok=True)
+        control_homes_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         for session in self.config.sessions.values():
             if session.role not in self._CONTROL_ROLES:
                 continue
@@ -826,7 +841,8 @@ class Supervisor:
         self._assert_lease_available(session_name, owner=owner, force=force, action="send input to")
 
         target = f"{self._tmux_session_for_launch(launch)}:{launch.window_name}"
-        self.tmux.send_keys(target, text, press_enter=press_enter)
+        prefixed = _prefix_for_owner(owner, text)
+        self.tmux.send_keys(target, prefixed, press_enter=press_enter)
         if owner == "human":
             self.store.set_lease(session_name, "human", "automatic lease from direct human input")
         self.store.record_event(session_name, "send_input", f"{owner} sent input: {text}")
@@ -1346,7 +1362,7 @@ class Supervisor:
             raise RuntimeError(f"Account {account.name} has no home configured")
         source_home = account.home
         target_home = self._control_home(session_name)
-        target_home.mkdir(parents=True, exist_ok=True)
+        target_home.mkdir(parents=True, exist_ok=True, mode=0o700)
 
         if account.provider is ProviderKind.CLAUDE:
             self._sync_file(source_home / ".claude.json", target_home / ".claude.json")

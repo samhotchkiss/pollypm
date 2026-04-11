@@ -138,14 +138,22 @@ class SupervisorHeartbeatAPI:
         self.supervisor._maybe_recover_session(launch, failure_type=failure_type, failure_message=message)
 
     def send_session_message(self, session_name: str, text: str, *, owner: str = "heartbeat") -> None:
-        self.supervisor.send_input(session_name, text, owner=owner)
+        try:
+            self.supervisor.send_input(session_name, text, owner=owner)
+        except Exception:  # noqa: BLE001
+            # Session may be dead or missing — don't crash the sweep.
+            pass
 
     def queue_polly_followup(self, session_name: str, reason: str) -> None:
-        self.supervisor.send_input(
-            "operator",
-            f"Heartbeat follow-up: inspect session {session_name}. Reason: {reason}",
-            owner="heartbeat",
-        )
+        try:
+            self.supervisor.send_input(
+                "operator",
+                f"Heartbeat follow-up: inspect session {session_name}. Reason: {reason}",
+                owner="heartbeat",
+            )
+        except Exception:  # noqa: BLE001
+            # Operator may be dead — don't crash the sweep.
+            pass
 
     def _build_contexts(self) -> list[HeartbeatSessionContext]:
         window_map = self.supervisor._window_map()

@@ -60,4 +60,26 @@ Verify that each configured account has its own isolated home directory (e.g., s
 - Both Claude control sessions (heartbeat, operator) share the same CLAUDE_CONFIG_DIR (by design)
 
 **Issues found:**
-- Home directory permissions are 755, spec says 700. Low priority cosmetic.
+- Home directory permissions were 755 — **FIXED in T080** (added mode=0o700 to all mkdir calls, chmod'd existing dirs).
+
+### Re-test — 2026-04-10 1:27 PM (via tmux interaction)
+
+**Result: PASS**
+
+#### Operator config dir (via Claude in-session)
+```
+❯ Run echo $CLAUDE_CONFIG_DIR in your shell
+⏺ /Users/sam/.pollypm/homes/onboarding_claude_1/.claude
+```
+
+#### Worker config dir (via Codex in-session)
+```
+› Run echo $CODEX_HOME in the shell
+• Ran echo $CODEX_HOME
+  └ /Users/sam/.pollypm/homes/codex_s_swh_me/.codex
+```
+
+#### Cross-contamination test
+1. Worker created `.isolation-test-marker` in its home (`codex_s_swh_me/`)
+2. Operator confirmed: "The file .isolation-test-marker doesn't exist at /Users/sam/.pollypm/homes/.isolation-test-marker" (its home is `onboarding_claude_1/`)
+3. Verified: marker exists ONLY in codex home, NOT in claude home ✅

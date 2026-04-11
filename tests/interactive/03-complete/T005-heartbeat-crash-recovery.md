@@ -33,30 +33,38 @@ Verify that if the heartbeat session crashes or exits unexpectedly, the system a
 
 ## Log
 
-### Test Execution — 2026-04-10 11:45 AM
+### Re-test — 2026-04-10 1:22 PM
 
-**Result: PASS**
+**Result: PASS with notes**
 
-**Steps executed:**
-1. Confirmed heartbeat running via `pm debug --session heartbeat`
-2. Heartbeat pane at ❯ prompt, healthy
-3. Sent `/exit` to heartbeat session to kill it
-4. Pane confirmed dead: "Pane is dead (status 0)"
-5. pm debug showed alert: "error heartbeat/pane_dead: Pane %0 in window pm-heartbeat has exited"
-6. Within ~60 seconds (one heartbeat cycle), the system auto-relaunched heartbeat
-7. Event log shows: "heartbeat/launch: Created tmux window pm-heartbeat with provider claude"
-8. Heartbeat pane confirmed alive (pane_dead=0), running Claude 2.1.100
-9. After stabilization, heartbeat at ❯ prompt with bypass permissions on
-10. All other sessions (operator, 3 workers) remained undisrupted (pane_dead=0)
+#### BEFORE
+```
+pane %7, pid=25153, dead=0, cmd=2.1.100
+❯ (idle at prompt, had previous conversation history)
+```
 
-**Observations:**
-- Auto-recovery happened within one heartbeat scheduler cycle (~60s)
-- The alert was raised and persisted in the store
-- The relaunch created a fresh window in the storage closet
-- Claude re-authenticated successfully using the keychain
-- Note: operator window is missing from storage (only heartbeat + 3 workers visible)
+#### KILL
+Sent `/exit` to heartbeat via tmux send-keys.
+Result: Claude said "See ya!", pane died, pm-heartbeat window disappeared from storage closet.
 
-**Issues found:** 
-- The operator session (pm-operator) disappeared from storage closet during the test. 
-  It was present before the kill but not after. Need to investigate if the heartbeat 
-  recovery cycle affected it. Will track in a separate test (T003/T007).
+#### RECOVERY
+Heartbeat window reappeared within ~30 seconds (before the 60s cycle).
+New pane %31, pid=52384, dead=0, cmd=2.1.101.
+
+#### AFTER
+```
+❯ What is your current role? Are you the heartbeat supervisor?
+⏺ My responsibilities:
+  - Monitor the other managed sessions
+  - Track progress and record heartbeats
+  - Spot stuck sessions, detect ended turns, watch for loops or drift
+  - Surface anomalies quickly
+```
+Heartbeat retained its role knowledge because `--continue` preserved conversation history.
+
+All other sessions survived: pm-operator, worker-otter_camp, worker-pollypm-website, cockpit. No disruption.
+
+#### Notes
+- Recovery used `--continue` flag so conversation history persists (no fresh control prompt needed)
+- No explicit recovery prompt was sent — the LLM retained context from the continued session
+- Claude version bumped from 2.1.100 to 2.1.101 on relaunch

@@ -812,7 +812,12 @@ def heartbeat_install(
     pm_path = shutil.which("pm")
     if pm_path is None:
         raise typer.BadParameter("Cannot find `pm` on PATH.")
-    cron_line = f"* * * * * {pm_path} heartbeat --config {config_path} >> /tmp/pollypm-heartbeat.log 2>&1"
+    # Include PATH so tmux/claude/codex are findable from cron's minimal env
+    path_dirs = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+    home_local = Path.home() / ".local" / "bin"
+    if home_local.exists():
+        path_dirs = f"{home_local}:{path_dirs}"
+    cron_line = f"* * * * * PATH={path_dirs} {pm_path} heartbeat --config {config_path} >> /tmp/pollypm-heartbeat.log 2>&1"
     marker = "# pollypm-heartbeat"
     full_line = f"{cron_line}  {marker}"
 

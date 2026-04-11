@@ -406,24 +406,11 @@ class PollyCockpitApp(App[None]):
             pass
 
     def _tick_scheduler(self) -> None:
-        if self._scheduler_tick_running:
-            return
-        self._scheduler_tick_running = True
-        self.run_worker(
-            self._run_scheduled_jobs,
-            thread=True,
-            group="scheduler",
-            exclusive=True,
-            exit_on_error=False,
-        )
-
-    def _run_scheduled_jobs(self) -> None:
-        try:
-            self.service.run_scheduled_jobs()
-        except Exception:  # noqa: BLE001
-            pass
-        finally:
-            self._scheduler_tick_running = False
+        # The heartbeat and knowledge extraction now run via cron
+        # (pm heartbeat install), not from the cockpit event loop.
+        # Running them here caused UI freezes during long sweeps and
+        # duplicate jobs on cockpit restarts.
+        pass
 
     def _enforce_rail_width(self) -> None:
         """Recover missing panes and fix rail width if it drifted."""

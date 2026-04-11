@@ -103,6 +103,16 @@ class DiscoveredSources:
 
 
 @dataclass(slots=True)
+class DeprecatedFact:
+    """A fact that was believed and later superseded."""
+
+    category: str  # e.g. "overview", "architecture", "conventions"
+    superseded_at_chunk: int  # which chunk caused the replacement
+    old_value: str
+    new_value: str
+
+
+@dataclass(slots=True)
 class ExtractedUnderstanding:
     """Structured understanding extracted from the timeline."""
 
@@ -114,6 +124,7 @@ class ExtractedUnderstanding:
     conventions: list[str] = field(default_factory=list)
     goals: list[str] = field(default_factory=list)
     open_questions: list[str] = field(default_factory=list)
+    deprecated_facts: list[DeprecatedFact] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -403,6 +414,7 @@ def _extract_with_llm(
         "goals": [],
         "open_questions": [],
     }
+    deprecated_facts: list[DeprecatedFact] = []
 
     for i, chunk in enumerate(chunks):
         is_first = i == 0
@@ -448,11 +460,33 @@ def _extract_with_llm(
             continue
 
         # Update accumulated state — newer chunks override
+        # Track what was superseded
         if isinstance(payload.get("overview"), str) and payload["overview"]:
+            old_overview = accumulated["overview"]
+            if old_overview and old_overview != payload["overview"]:
+                deprecated_facts.append(DeprecatedFact(
+                    category="overview",
+                    superseded_at_chunk=i + 1,
+                    old_value=old_overview,
+                    new_value=payload["overview"],
+                ))
             accumulated["overview"] = payload["overview"]
         for key in ("decisions", "architecture", "history", "conventions", "goals", "open_questions"):
             val = payload.get(key)
             if isinstance(val, list) and val:
+                old_val = accumulated[key]
+                # Detect items that were dropped (superseded)
+                if old_val:
+                    old_set = set(str(item) for item in old_val)
+                    new_set = set(str(item) for item in val)
+                    dropped = old_set - new_set
+                    for item in dropped:
+                        deprecated_facts.append(DeprecatedFact(
+                            category=key,
+                            superseded_at_chunk=i + 1,
+                            old_value=item,
+                            new_value="(removed or replaced in later events)",
+                        ))
                 accumulated[key] = val  # Replace with latest understanding
 
         logger.info("Chunk %d/%d processed (%d events)", i+1, len(chunks), len(chunk))
@@ -470,6 +504,7 @@ def _extract_with_llm(
         conventions=_sanitize_items(accumulated.get("conventions")),
         goals=_sanitize_items(accumulated.get("goals")),
         open_questions=_sanitize_items(accumulated.get("open_questions")),
+        deprecated_facts=deprecated_facts,
     )
 
 
@@ -601,6 +636,12 @@ def generate_docs(
     (docs_dir / "conventions.md").write_text(conventions_content)
     generated += 1
 
+    # deprecated-facts.md (only if there are deprecated facts)
+    if understanding.deprecated_facts:
+        deprecated_content = _render_deprecated_facts(understanding.deprecated_facts, ts)
+        (docs_dir / "deprecated-facts.md").write_text(deprecated_content)
+        generated += 1
+
     return generated
 
 
@@ -668,6 +709,32 @@ def _render_list_doc(
     else:
         lines.append("- None recorded yet.")
     lines.append("")
+    lines.append(f"*Last updated: {timestamp}*")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _render_deprecated_facts(facts: list[DeprecatedFact], timestamp: str) -> str:
+    """Render deprecated-facts.md — a log of beliefs that were superseded."""
+    lines = [
+        "# Deprecated Facts",
+        "",
+        "## Summary",
+        "",
+        "Facts that were believed at earlier points in the project timeline",
+        "but were later superseded by newer information. This log exists so",
+        "that future agents and humans can understand what changed and why.",
+        "",
+        "## Deprecated Facts",
+        "",
+    ]
+    for fact in facts:
+        lines.append(f"### {fact.category} (superseded at chunk {fact.superseded_at_chunk})")
+        lines.append("")
+        lines.append(f"**Was:** {_sanitize_text(fact.old_value)}")
+        lines.append("")
+        lines.append(f"**Became:** {_sanitize_text(fact.new_value)}")
+        lines.append("")
     lines.append(f"*Last updated: {timestamp}*")
     lines.append("")
     return "\n".join(lines)

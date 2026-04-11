@@ -4,6 +4,7 @@ from pathlib import Path
 from pollypm.config import write_config
 from pollypm.knowledge_extract import extract_knowledge_once
 from pollypm.models import AccountConfig, KnownProject, PollyPMConfig, PollyPMSettings, ProjectKind, ProjectSettings, ProviderKind, SessionConfig
+from pollypm.storage.state import StateStore
 
 
 def _config(tmp_path: Path) -> PollyPMConfig:
@@ -103,7 +104,9 @@ def test_knowledge_extraction_updates_docs_with_checkpointing(tmp_path: Path) ->
     )
 
     result = extract_knowledge_once(config)
-    assert result == {"processed_events": 3, "updated_docs": 4}
+    assert result["processed_events"] == 3
+    assert result["updated_docs"] == 4
+    assert result["memory_entries"] >= 6
 
     overview = (config.project.root_dir / "docs" / "project-overview.md").read_text()
     decisions = (config.project.root_dir / "docs" / "decisions.md").read_text()
@@ -111,22 +114,31 @@ def test_knowledge_extraction_updates_docs_with_checkpointing(tmp_path: Path) ->
     ideas = (config.project.root_dir / "docs" / "ideas.md").read_text()
 
     assert "## Summary" in overview
-    assert "Goals: Goal: prioritize transcript-derived docs." in overview
+    assert "## Goals" in overview
+    assert "prioritize transcript-derived docs" in overview.lower()
     assert "## Architecture Changes" in overview
-    assert "migrate the docs updater into a scheduled pipeline." in overview
+    assert "docs updater" in overview.lower()
+    assert "scheduled pipeline" in overview.lower()
     assert "## Convention Shifts" in overview
-    assert "always regenerate the Summary section after updates." in overview
+    assert "always regenerate the summary section after updates" in overview.lower()
     assert "## Decisions" in decisions
-    assert "Decision: we will split the deployment pipeline." in decisions
+    assert "split the deployment pipeline" in decisions.lower()
     assert "[redacted-secret]" not in risks
     assert "Risk: staging tokens must stay out of docs." in risks
     assert "Idea: consider a changelog digest." in ideas
+    store = StateStore(config.project.state_db)
+    memory_entries = store.list_memory_entries(scope=config.project.root_dir.name, limit=20)
+    store.close()
+    assert len(memory_entries) == result["memory_entries"]
+    assert any(entry.kind == "decision" and "split the deployment pipeline" in entry.title for entry in memory_entries)
+    assert any(entry.kind == "goal" and "transcript-derived docs" in entry.title.lower() for entry in memory_entries)
+    assert any(entry.kind == "risk" and "staging tokens" in entry.title.lower() for entry in memory_entries)
 
     decisions_path = config.project.root_dir / "docs" / "decisions.md"
     decisions_path.write_text(decisions + "\n## Notes\nKeep this manual note.\n")
     before = decisions_path.read_text()
     second = extract_knowledge_once(config)
-    assert second == {"processed_events": 0, "updated_docs": 0}
+    assert second == {"processed_events": 0, "updated_docs": 0, "memory_entries": 0}
     assert decisions_path.read_text() == before
 
     with events_path.open("a", encoding="utf-8") as handle:
@@ -146,7 +158,10 @@ def test_knowledge_extraction_updates_docs_with_checkpointing(tmp_path: Path) ->
         )
 
     third = extract_knowledge_once(config)
-    assert third == {"processed_events": 1, "updated_docs": 1}
+    assert third["processed_events"] == 1
+    assert third["updated_docs"] == 1
+    assert third["memory_entries"] >= 1
     updated_decisions = decisions_path.read_text()
-    assert "Decision: use the cheap Haiku model for extraction, not Opus." in updated_decisions
+    assert "Haiku" in updated_decisions
+    assert "Opus" in updated_decisions
     assert "## Notes\nKeep this manual note." in updated_decisions

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from pollypm.history_import import (
+    DeprecatedFact,
     DiscoveredSources,
     ExtractedUnderstanding,
     ImportResult,
@@ -20,6 +21,7 @@ from pollypm.history_import import (
     load_import_state,
     lock_import,
     save_import_state,
+    _extract_with_llm,
     _dedupe,
     _heuristic_understanding,
     _jsonl_file_to_timeline,
@@ -336,6 +338,77 @@ class TestHeuristicUnderstanding:
         assert len(understanding.decisions) == 1
 
 
+class TestLlmUnderstanding:
+    def test_tracks_deprecated_facts_when_later_chunks_replace_earlier_understanding(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        timeline = [
+            TimelineEntry(
+                timestamp="2026-01-01T00:00:00Z",
+                source_type="jsonl_event",
+                summary="Initial architecture decision",
+            ),
+            TimelineEntry(
+                timestamp="2026-01-02T00:00:00Z",
+                source_type="jsonl_event",
+                summary="Later architecture revision",
+            ),
+        ]
+
+        responses = iter(
+            [
+                {
+                    "overview": "The system uses Redis for state.",
+                    "decisions": ["Use Redis for state storage"],
+                    "architecture": ["Redis-backed state store"],
+                    "history": ["Initial prototype landed"],
+                    "conventions": ["snake_case"],
+                    "goals": ["Ship the first prototype"],
+                    "open_questions": [],
+                },
+                {
+                    "overview": "The system uses SQLite for state.",
+                    "decisions": ["Use SQLite for state storage"],
+                    "architecture": ["SQLite-backed state store"],
+                    "history": ["Initial prototype landed", "Migrated state layer"],
+                    "conventions": ["snake_case"],
+                    "goals": ["Ship the first prototype"],
+                    "open_questions": [],
+                },
+            ]
+        )
+
+        monkeypatch.setattr(
+            "pollypm.history_import.run_haiku_json",
+            lambda prompt: next(responses),
+        )
+
+        understanding = _extract_with_llm(timeline, "TestProject", chunk_size=1)
+
+        assert understanding is not None
+        assert understanding.overview == "The system uses SQLite for state."
+        assert understanding.decisions == ["Use SQLite for state storage"]
+        assert understanding.architecture == ["SQLite-backed state store"]
+        assert len(understanding.deprecated_facts) == 3
+        assert any(
+            fact.category == "overview"
+            and fact.old_value == "The system uses Redis for state."
+            and fact.new_value == "The system uses SQLite for state."
+            for fact in understanding.deprecated_facts
+        )
+        assert any(
+            fact.category == "decisions"
+            and fact.old_value == "Use Redis for state storage"
+            for fact in understanding.deprecated_facts
+        )
+        assert any(
+            fact.category == "architecture"
+            and fact.old_value == "Redis-backed state store"
+            for fact in understanding.deprecated_facts
+        )
+
+
 # ---------------------------------------------------------------------------
 # Stage 4: Generate Documentation
 # ---------------------------------------------------------------------------
@@ -414,6 +487,28 @@ class TestGenerateDocs:
             content = (tmp_path / "docs" / doc_name).read_text()
             assert "ghp_" not in content
             assert "aabbccddeeff00112233445566778899aabbccdd" not in content
+
+    def test_generates_deprecated_facts_doc_when_present(self, tmp_path: Path) -> None:
+        understanding = ExtractedUnderstanding(
+            project_name="TestProject",
+            deprecated_facts=[
+                DeprecatedFact(
+                    category="overview",
+                    superseded_at_chunk=2,
+                    old_value="The system uses Redis for state.",
+                    new_value="The system uses SQLite for state.",
+                )
+            ],
+        )
+
+        count = generate_docs(tmp_path, understanding, timestamp="2026-04-10T00:00:00Z")
+        assert count == 6
+
+        content = (tmp_path / "docs" / "deprecated-facts.md").read_text()
+        assert "## Deprecated Facts" in content
+        assert "overview (superseded at chunk 2)" in content
+        assert "The system uses Redis for state." in content
+        assert "The system uses SQLite for state." in content
 
 
 # ---------------------------------------------------------------------------

@@ -29,3 +29,10 @@
 - Implemented `0018` by making worker kickoff prompts project-aware, seeding tracked projects from the next real issue, and validating the new-worker modal in the live tmux control room before moving it to review.
 - Implemented `0017` by tightening onboarding copy around recent local commits, preselected project suggestions, and the handoff into PollyPM, then validated the setup shell in tmux before moving it to review.
 - Reviewed and closed the remaining operator-experience items: `0002`, `0006`, `0017`, and `0018` all passed targeted tests plus live tmux validation and moved to `05-completed`.
+
+## 2026-04-11
+
+- Completed issue `0024` by adding Codex `send_input` regression coverage for the extra submit Enter, updating stale docs that still described the behavior as broken, and validating the targeted supervisor tests.
+- Continued `0024` cleanup by removing stale launch-blocker references from the readiness docs/visuals and reconciling the blocker counts and timeline estimate with the remaining three launch blockers.
+- Completed issue `0025` by tracking superseded facts in `history_import.py`, generating `deprecated-facts.md`, and adding direct/unit/integration coverage for both supersession tracking and resilient knowledge-extraction assertions.
+- Verified issue `0025` across the full repo with `pytest -q` (`460 passed`), so the history-import and extraction changes are green in the broader suite, not just the targeted tests.

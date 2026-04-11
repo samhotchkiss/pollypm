@@ -1549,7 +1549,13 @@ class Supervisor:
                 time.sleep(1)
                 continue
 
-            if "❯" in pane and ("welcome back" in lowered or "0 tokens" in lowered or "/buddy" in pane):
+            if "❯" in pane and (
+                "welcome back" in lowered
+                or "0 tokens" in lowered
+                or "/buddy" in pane
+                or "bypass permissions" in lowered
+                or "shift+tab" in lowered
+            ):
                 _status("Claude Code ready")
                 return
 

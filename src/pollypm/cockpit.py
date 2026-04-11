@@ -517,6 +517,12 @@ class CockpitRouter:
         state["mounted_session"] = session_name
         state["right_pane_id"] = right_pane.pane_id
         self._write_state(state)
+        # Auto-claim a cockpit lease so the heartbeat won't send
+        # nudges while a human is viewing/typing in this session.
+        try:
+            supervisor.claim_lease(session_name, "cockpit", "mounted in cockpit")
+        except Exception:  # noqa: BLE001
+            pass  # Lease may conflict — best effort
 
     def _should_boot_visible(self, launch) -> bool:
         if launch.session.name in self._ui_initialized_sessions():
@@ -586,6 +592,11 @@ class CockpitRouter:
                     break
         state.pop("mounted_session", None)
         self._write_state(state)
+        # Release the cockpit lease when unmounting
+        try:
+            supervisor.release_lease(mounted_session, expected_owner="cockpit")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _mounted_session_name(self, supervisor: Supervisor, window_target: str) -> str | None:
         state = self._load_state()

@@ -73,7 +73,7 @@ class GitHubTaskBackend(TaskBackend):
 
     def exists(self) -> bool:
         try:
-            _gh("repo", "view", "--json", "name")
+            _gh("repo", "view", self.repo, "--json", "nameWithOwner")
             return True
         except (RuntimeError, FileNotFoundError):
             return False
@@ -197,14 +197,14 @@ class GitHubTaskBackend(TaskBackend):
             "issue", "list",
             "--label", STATE_TO_LABEL["01-ready"],
             "--state", "all",
-            "--json", "number,title,state",
+            "--json", "number,title,state,createdAt",
             "--repo", self.repo,
-            "--limit", "1",
+            "--limit", "200",
         )
         issues = json.loads(result.stdout) if result.stdout.strip() else []
         if not issues:
             return None
-        issue = issues[0]
+        issue = min(issues, key=lambda item: str(item.get("createdAt", "")))
         issue_id = str(issue["number"])
         return TaskRecord(
             task_id=issue_id,
@@ -335,11 +335,13 @@ class GitHubTaskBackend(TaskBackend):
                 "--state", "all",
                 "--json", "number",
                 "--repo", self.repo,
-                "--limit", "1",
-                "-q", ".[0].number",
+                "--limit", "200",
             )
-            return int(result.stdout.strip() or "0")
-        except (RuntimeError, ValueError):
+            issues = json.loads(result.stdout) if result.stdout.strip() else []
+            if not issues:
+                return 0
+            return max(int(issue.get("number", 0)) for issue in issues)
+        except (RuntimeError, ValueError, json.JSONDecodeError, TypeError):
             return 0
 
     def state_counts(self) -> dict[str, int]:

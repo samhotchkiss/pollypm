@@ -147,7 +147,10 @@ def test_github_task_backend_get_task_and_next_available(monkeypatch, tmp_path: 
         if args[:2] == ("issue", "view"):
             return Result('{"number":42,"title":"Wire the backend","labels":[{"name":"polly:needs-review"}]}')
         if args[:2] == ("issue", "list"):
-            return Result('[{"number":41,"title":"First ready","state":"OPEN"}]')
+            return Result(
+                '[{"number":41,"title":"First ready","state":"OPEN","createdAt":"2026-04-01T10:00:00Z"},'
+                '{"number":43,"title":"Later ready","state":"OPEN","createdAt":"2026-04-02T10:00:00Z"}]'
+            )
         raise AssertionError(f"Unexpected gh call: {args}")
 
     monkeypatch.setattr("pollypm.task_backends.github._gh", fake_gh)
@@ -159,6 +162,24 @@ def test_github_task_backend_get_task_and_next_available(monkeypatch, tmp_path: 
     assert task.state == "03-needs-review"
     assert next_task is not None
     assert next_task.task_id == "41"
+
+
+def test_github_task_backend_exists_checks_configured_repo(monkeypatch, tmp_path: Path) -> None:
+    backend = GitHubTaskBackend(tmp_path, repo="acme/widgets")
+    calls: list[tuple[str, ...]] = []
+
+    def fake_gh(*args: str, check: bool = True):
+        calls.append(args)
+
+        class Result:
+            stdout = '{"nameWithOwner":"acme/widgets"}'
+
+        return Result()
+
+    monkeypatch.setattr("pollypm.task_backends.github._gh", fake_gh)
+
+    assert backend.exists() is True
+    assert calls == [("repo", "view", "acme/widgets", "--json", "nameWithOwner")]
 
 
 def test_github_task_backend_history_reads_issue_comments(monkeypatch, tmp_path: Path) -> None:
@@ -426,3 +447,17 @@ def test_github_task_backend_validate_reports_repo_failure(monkeypatch, tmp_path
     assert result.passed is False
     assert result.checks == []
     assert result.errors == ["repo_accessible: gh auth failed"]
+
+
+def test_github_task_backend_latest_issue_number_uses_max_number(monkeypatch, tmp_path: Path) -> None:
+    backend = GitHubTaskBackend(tmp_path, repo="acme/widgets")
+
+    def fake_gh(*args: str, check: bool = True):
+        class Result:
+            stdout = '[{"number":12},{"number":44},{"number":7}]'
+
+        return Result()
+
+    monkeypatch.setattr("pollypm.task_backends.github._gh", fake_gh)
+
+    assert backend.latest_issue_number() == 44

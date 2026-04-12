@@ -106,10 +106,10 @@ def test_worker_prompt_reads_active_issue_from_github_backend(monkeypatch, tmp_p
             def __init__(self, stdout: str) -> None:
                 self.stdout = stdout
 
-        if args[:3] == ("repo", "view", "--json"):
+        if args[:2] == ("repo", "view"):
             return Result('{"name":"widgets"}')
         if args[:2] == ("issue", "list"):
-            return Result('[{"number":42,"title":"Wire the backend","state":"OPEN"}]')
+            return Result('[{"number":42,"title":"Wire the backend","state":"OPEN","createdAt":"2026-04-01T10:00:00Z"}]')
         if args[:2] == ("issue", "view"):
             return Result('{"number":42,"title":"Wire the backend","body":"Implement the gh-backed tracker."}')
         raise AssertionError(f"Unexpected gh call: {args}")

@@ -255,7 +255,7 @@ repo = "acme/widgets"
             def __init__(self, stdout: str) -> None:
                 self.stdout = stdout
 
-        if args[:3] == ("repo", "view", "--json"):
+        if args[:2] == ("repo", "view"):
             return Result('{"name":"widgets"}')
         label = args[args.index("--label") + 1]
         payloads = {

@@ -10,3 +10,9 @@ Add a `README.md` to the root of the pollypm repository. The README should descr
 
 ## Assigned To
 worker_pollypm
+
+## Review Handoff
+
+- Scope delivered: replaced the oversized marketing-style root README with the concise project description requested by the issue.
+- Key verification: [README.md](/Users/sam/dev/pollypm/README.md) now contains a 4-sentence overview covering PollyPM's purpose, intended operator audience, and tmux-based multi-session coordination model.
+- Reviewer focus: confirm the new README stays within the intentionally minimal scope for this issue and does not need the removed badges, install steps, or boilerplate restored.

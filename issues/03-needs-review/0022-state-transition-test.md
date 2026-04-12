@@ -40,3 +40,9 @@ Validate PollyPM's six-state task lifecycle through the task backend API rather 
 
 - This issue's original filesystem-only verification is now superseded by API-level state machine coverage.
 - The next review decision should focus on whether this documented test evidence is sufficient to close the issue, not on raw file movement through directories.
+
+## Review Handoff
+
+- Scope delivered: this issue now documents the actual API-level state-machine work that was added for task transitions, including sequential moves, skip-state rejection, and the allowed review rejection loop.
+- Key verification: `uv run pytest -q tests/test_task_backend.py tests/test_service_api.py tests/test_cli_issue.py` passed with `38 passed in 0.54s`, and the broader workflow slice passed with `71 passed in 4.71s`.
+- Reviewer focus: confirm the documented evidence is sufficient to close the original state-transition concern, since the underlying implementation now lives in the shared task backend validation layer rather than in a standalone feature branch.

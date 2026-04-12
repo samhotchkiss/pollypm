@@ -286,3 +286,59 @@ def test_github_task_backend_lists_tasks_for_requested_states(monkeypatch, tmp_p
         ("10", "Spec the change", "01-ready"),
         ("11", "Review the change", "03-needs-review"),
     ]
+
+
+def test_github_task_backend_validate_runs_roundtrip_and_cleanup(monkeypatch, tmp_path: Path) -> None:
+    backend = GitHubTaskBackend(tmp_path, repo="acme/widgets")
+    calls: list[tuple[str, ...]] = []
+
+    def fake_gh(*args: str, check: bool = True):
+        calls.append(args)
+
+        class Result:
+            def __init__(self, stdout: str = "") -> None:
+                self.stdout = stdout
+
+        if args[:3] == ("repo", "view", "--json"):
+            return Result('{"nameWithOwner":"acme/widgets"}')
+        if args[:2] == ("label", "list"):
+            return Result("\n".join(["polly:not-ready", "polly:ready", "polly:in-progress", "polly:needs-review", "polly:in-review", "polly:completed"]))
+        if args[:2] == ("issue", "create"):
+            return Result("https://github.com/acme/widgets/issues/42\n")
+        if args[:2] == ("issue", "view"):
+            return Result('{"number":42,"title":"PollyPM GitHub backend validation","labels":[{"name":"polly:in-progress"}]}')
+        return Result()
+
+    monkeypatch.setattr("pollypm.task_backends.github._gh", fake_gh)
+
+    result = backend.validate()
+
+    assert result.passed is True
+    assert result.errors == []
+    assert result.checks == [
+        "repo_accessible",
+        "labels_ensured",
+        "create_task",
+        "move_task",
+        "get_task",
+        "append_note",
+        "cleanup",
+    ]
+    assert ("issue", "create", "--title", "PollyPM GitHub backend validation", "--body", "Temporary validation issue created by PollyPM.", "--label", "polly:ready", "--repo", "acme/widgets") in calls
+    assert ("issue", "comment", "42", "--body", "Validation cleanup: closing temporary issue.", "--repo", "acme/widgets") in calls
+    assert ("issue", "close", "42", "--repo", "acme/widgets") in calls
+
+
+def test_github_task_backend_validate_reports_repo_failure(monkeypatch, tmp_path: Path) -> None:
+    backend = GitHubTaskBackend(tmp_path, repo="acme/widgets")
+
+    def fake_gh(*args: str, check: bool = True):
+        raise RuntimeError("gh auth failed")
+
+    monkeypatch.setattr("pollypm.task_backends.github._gh", fake_gh)
+
+    result = backend.validate()
+
+    assert result.passed is False
+    assert result.checks == []
+    assert result.errors == ["repo_accessible: gh auth failed"]

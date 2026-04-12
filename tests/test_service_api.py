@@ -4,6 +4,7 @@ from pathlib import Path
 from pollypm.config import write_config
 from pollypm.models import AccountConfig, KnownProject, PollyPMConfig, PollyPMSettings, ProjectKind, ProjectSettings, ProviderKind
 from pollypm.service_api import PollyPMService, render_json
+from pollypm.task_backends.github import GitHubTaskBackendValidation
 
 
 def test_service_create_and_launch_worker_uses_worker_api(monkeypatch, tmp_path: Path) -> None:
@@ -271,3 +272,56 @@ repo = "acme/widgets"
     assert next_task is not None
     assert next_task.task_id == "42"
     assert counts["01-ready"] == 3
+
+
+def test_service_validate_task_backend_uses_backend_validation(monkeypatch, tmp_path: Path) -> None:
+    project_root = tmp_path / "demo"
+    project_root.mkdir()
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            base_dir=tmp_path / ".pollypm-state",
+            logs_dir=tmp_path / ".pollypm-state/logs",
+            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
+            state_db=tmp_path / ".pollypm-state/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="claude_main"),
+        accounts={
+            "claude_main": AccountConfig(
+                name="claude_main",
+                provider=ProviderKind.CLAUDE,
+                home=tmp_path / ".pollypm-state" / "homes" / "claude_main",
+            )
+        },
+        sessions={},
+        projects={
+            "demo": KnownProject(key="demo", path=project_root, name="Demo", kind=ProjectKind.GIT, tracked=True),
+        },
+    )
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path, force=True)
+    config_dir = project_root / ".pollypm" / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "project.toml").write_text(
+        """
+[project]
+display_name = "Demo"
+
+[plugins]
+issue_backend = "github"
+
+[plugins.github_issues]
+repo = "acme/widgets"
+"""
+    )
+    service = PollyPMService(config_path)
+
+    monkeypatch.setattr(
+        "pollypm.task_backends.github.GitHubTaskBackend.validate",
+        lambda self: GitHubTaskBackendValidation(passed=True, checks=["repo_accessible"], errors=[]),
+    )
+
+    result = service.validate_task_backend("demo")
+
+    assert result.passed is True
+    assert result.checks == ["repo_accessible"]

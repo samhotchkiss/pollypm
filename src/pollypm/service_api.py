@@ -42,6 +42,7 @@ from pollypm.schedulers.base import ScheduledJob
 from pollypm.supervisor import Supervisor
 from pollypm.task_backends import get_task_backend
 from pollypm.task_backends.base import TaskRecord
+from pollypm.task_backends.github import GitHubTaskBackendValidation
 from pollypm.transcript_ledger import recent_token_usage as list_recent_token_usage
 from pollypm.transcript_ledger import sync_token_ledger
 from pollypm.workers import (
@@ -305,6 +306,14 @@ class PollyPMService:
     def next_available_task(self, project_key: str) -> TaskRecord | None:
         config = load_config(self.config_path)
         return self._task_backend(config, project_key).next_available()
+
+    def validate_task_backend(self, project_key: str) -> GitHubTaskBackendValidation | dict[str, object]:
+        config = load_config(self.config_path)
+        backend = self._task_backend(config, project_key)
+        validate = getattr(backend, "validate", None)
+        if callable(validate):
+            return validate()
+        return {"passed": True, "checks": ["not_applicable"], "errors": []}
 
     def create_task(self, project_key: str, *, title: str, body: str = "", state: str = "01-ready") -> TaskRecord:
         config = load_config(self.config_path)

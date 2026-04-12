@@ -450,6 +450,25 @@ def issue_counts(
         typer.echo(f"{state}: {count}")
 
 
+@issue_app.command("validate")
+def issue_validate(
+    project: str = typer.Option(..., "--project", help="Project key."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    service = PollyPMService(config_path)
+    result = service.validate_task_backend(project)
+    if getattr(result, "passed", False):
+        typer.echo("Task backend validation passed.")
+    else:
+        typer.echo("Task backend validation failed.")
+    for check in getattr(result, "checks", []):
+        typer.echo(f"check: {check}")
+    for error in getattr(result, "errors", []):
+        typer.echo(f"error: {error}")
+    if not getattr(result, "passed", False):
+        raise typer.Exit(code=1)
+
+
 @app.command("notify")
 def notify(
     subject: str = typer.Argument(..., help="Short message subject."),

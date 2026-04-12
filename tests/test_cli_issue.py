@@ -181,3 +181,24 @@ def test_issue_cli_uses_github_backend_when_project_is_configured(monkeypatch, t
     assert counts.exit_code == 0
     assert "01-ready: 2" in counts.stdout
     assert ("issue", "create", "--title", "Wire backend", "--body", "Implement it", "--label", "polly:ready", "--repo", "acme/widgets") in calls
+
+
+def test_issue_cli_validate_reports_backend_validation(monkeypatch, tmp_path: Path) -> None:
+    runner = CliRunner()
+    config_path = _config(tmp_path)
+    _configure_github_backend(tmp_path / "demo")
+
+    monkeypatch.setattr(
+        "pollypm.task_backends.github.GitHubTaskBackend.validate",
+        lambda self: type("Result", (), {"passed": True, "checks": ["repo_accessible", "labels_ensured"], "errors": []})(),
+    )
+
+    result = runner.invoke(
+        app,
+        ["issue", "validate", "--config", str(config_path), "--project", "demo"],
+    )
+
+    assert result.exit_code == 0
+    assert "Task backend validation passed." in result.stdout
+    assert "check: repo_accessible" in result.stdout
+    assert "check: labels_ensured" in result.stdout

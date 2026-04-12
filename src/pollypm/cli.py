@@ -295,13 +295,22 @@ def cockpit(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
     import traceback
+    from datetime import datetime
     crash_log = config_path.parent / "cockpit_crash.log"
+    debug_log = config_path.parent / "cockpit_debug.log"
     try:
+        with open(debug_log, "a") as dl:
+            dl.write(f"\n--- START {datetime.now().isoformat()} ---\n")
         PollyCockpitApp(config_path).run(mouse=True)
+        with open(debug_log, "a") as dl:
+            dl.write(f"--- CLEAN EXIT {datetime.now().isoformat()} ---\n")
     except Exception:
         with open(crash_log, "a") as f:
-            f.write(f"\n--- {__import__('datetime').datetime.now().isoformat()} ---\n")
+            f.write(f"\n--- {datetime.now().isoformat()} ---\n")
             traceback.print_exc(file=f)
+        with open(debug_log, "a") as dl:
+            dl.write(f"--- CRASH {datetime.now().isoformat()} ---\n")
+            traceback.print_exc(file=dl)
         raise
 
 
@@ -711,6 +720,17 @@ def up(
     supervisor.ensure_heartbeat_schedule()
     if hasattr(supervisor, "ensure_knowledge_extraction_schedule"):
         supervisor.ensure_knowledge_extraction_schedule()
+
+    # Set up the cockpit layout (split panes) BEFORE the TUI starts,
+    # then launch the TUI into the rail pane.
+    from pollypm.cockpit import CockpitRouter
+    router = CockpitRouter(config_path)
+    try:
+        router.ensure_cockpit_layout()
+        import time; time.sleep(0.3)  # let tmux settle after the split
+        supervisor.start_cockpit_tui(session_name)
+    except Exception:  # noqa: BLE001
+        pass  # layout will be fixed on next cockpit launch
 
     if current_tmux == session_name:
         supervisor.focus_console()

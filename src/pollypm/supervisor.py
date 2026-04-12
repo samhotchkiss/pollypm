@@ -1583,20 +1583,34 @@ class Supervisor:
             return project.path
         return self.config.project.root_dir
 
-    def _console_command(self) -> str:
-        root = shlex.quote(str(self.config.project.root_dir))
+    def _cockpit_cmd(self) -> str:
+        """The pm cockpit command string for the current environment."""
         import shutil
         pm_path = shutil.which("pm")
         if pm_path:
-            cockpit_cmd = f"{shlex.quote(pm_path)} cockpit"
-        else:
-            cockpit_cmd = f"cd {root} && uv run pm cockpit"
-        # Wrap in a restart loop so the rail auto-recovers from crashes.
-        # 2s cooldown prevents tight crash loops; exits cleanly on SIGTERM.
-        return (
-            f"sh -lc 'while true; do {cockpit_cmd}; "
-            f"echo \"[Rail exited — restarting in 2s]\"; sleep 2; done'"
+            return shlex.quote(pm_path) + " cockpit"
+        root = shlex.quote(str(self.config.project.root_dir))
+        return f"cd {root} && uv run pm cockpit"
+
+    def _console_command(self) -> str:
+        """Shell command for the cockpit rail pane — just a login shell.
+
+        The TUI is launched separately AFTER the layout split is done,
+        to avoid SIGWINCH crashes during the initial split.
+        """
+        return "bash -l"
+
+    def start_cockpit_tui(self, session_name: str) -> None:
+        """Send the cockpit TUI command to the rail pane with a restart loop."""
+        cockpit_cmd = self._cockpit_cmd()
+        target = f"{session_name}:{self._CONSOLE_WINDOW}"
+        panes = self.tmux.list_panes(target)
+        rail_pane = min(panes, key=lambda p: int(getattr(p, "pane_left", 0)))
+        loop_cmd = (
+            f"while true; do {cockpit_cmd}; "
+            f'echo "[Rail exited — restarting in 2s]"; sleep 2; done'
         )
+        self.tmux.send_keys(rail_pane.pane_id, loop_cmd)
 
     def _controller_candidates(self) -> list[str]:
         ordered = [self.config.pollypm.controller_account, *self.config.pollypm.failover_accounts]

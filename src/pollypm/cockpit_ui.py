@@ -392,10 +392,10 @@ class PollyCockpitApp(App[None]):
         self.set_timer(0.5, self._deferred_layout)
 
     def _deferred_layout(self) -> None:
-        try:
-            self.router.ensure_cockpit_layout()
-        except Exception:  # noqa: BLE001
-            pass
+        # Layout is now handled by pm up / ensure_cockpit_layout at startup,
+        # NOT from inside the running TUI. Splitting panes while the TUI is
+        # rendering sends SIGWINCH that can crash the Textual event loop.
+        pass
 
     def _focus_right_pane(self) -> None:
         focus_method = getattr(self.router, "focus_right_pane", None)

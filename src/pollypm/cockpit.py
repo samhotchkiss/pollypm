@@ -203,10 +203,20 @@ class CockpitRouter:
             project_session_map.setdefault(launch.session.project, launch.session.name)
         return project_session_map
 
+    # Alert types that are informational / auto-managed — don't show red triangle
+    _SILENT_ALERT_TYPES = frozenset({
+        "suspected_loop",      # auto-clears when snapshot changes
+        "stabilize_failed",    # stale after successful recovery
+        "needs_followup",      # informational, handled by heartbeat
+    })
+
     def _session_state(self, session_name: str, launches, windows, alerts, spinner_index: int) -> str:
-        alert_count = sum(1 for alert in alerts if alert.session_name == session_name)
-        if alert_count:
-            return f"! {alert_count}"
+        actionable = [
+            a for a in alerts
+            if a.session_name == session_name and a.alert_type not in self._SILENT_ALERT_TYPES
+        ]
+        if actionable:
+            return f"! {len(actionable)}"
         launch = next((item for item in launches if item.session.name == session_name), None)
         if launch is None:
             return "idle"
@@ -767,39 +777,58 @@ def _build_cockpit_detail_inner(config_path: Path, kind: str, target: str | None
             storage_windows = {w.name for w in supervisor.tmux.list_windows(storage_session)}
             operator_alive = operator_launch.window_name in storage_windows
 
-        lines = [
-            "Polly",
-            "",
-            "Polly is your AI project manager. She runs as an interactive",
-            "Claude session and can start, steer, and review worker sessions.",
+        import random
+        tips = [
+            "Tip: Use `pm notify` from any session to send yourself a message.",
+            "Tip: Press j/k to navigate the rail, Enter to connect to a session.",
+            "Tip: Workers are autonomous — they'll commit, test, and report back.",
+            "Tip: Check `pm alerts` for a quick health overview from any terminal.",
+            "Tip: Polly delegates to workers. Tell her what you want, she'll handle the rest.",
+            "Tip: The heartbeat monitors all sessions every 60s and auto-recovers crashes.",
+            "Tip: Use `pm send <session> \"message\"` to talk to any session from the CLI.",
+            "Tip: Press S for settings — you can re-authenticate accounts from there.",
+            "Tip: `pm repair` checks and fixes project scaffolding across all projects.",
+            "Tip: Your inbox (in the rail) collects things that need your attention.",
         ]
+        tip = random.choice(tips)
+
+        # Build system status summary
+        all_runtimes = supervisor.store.list_session_runtimes()
+        waiting = sum(1 for rt in all_runtimes if rt.status == "waiting_on_user")
+        open_alerts = len(supervisor.store.open_alerts())
+        inbox_count = len(list_open_messages(config.project.root_dir))
+        project_count = len(config.projects)
+
+        lines = [
+            "PollyPM",
+            "",
+            f"  {project_count} project(s)  ·  {len(config.sessions)} session(s)  ·  {open_alerts} alert(s)",
+        ]
+        if inbox_count:
+            lines.append(f"  {inbox_count} inbox item(s) waiting for you")
+        if waiting:
+            lines.append(f"  {waiting} session(s) waiting on your input")
+        lines.extend([
+            "",
+            "Polly is your AI project manager. She delegates to workers,",
+            "reviews results, and keeps projects moving. Click to connect.",
+            "",
+        ])
         if operator_alive:
-            lines.extend([
-                "",
-                "The Polly session is running. Click to connect.",
-            ])
+            lines.append("  Status: Running  ·  Click to connect")
         elif runtime and runtime.status == "degraded":
             lines.extend([
                 "",
-                "The Polly session is not currently running.",
+                f"  Status: DEGRADED ({runtime.recovery_attempts} recovery attempts)",
+                f"  Last failure: {runtime.last_failure_type or 'unknown'}",
                 "",
-                f"Status: DEGRADED after {runtime.recovery_attempts} recovery attempts.",
-                f"Last failure: {runtime.last_failure_type or 'unknown'}",
-                "",
-                "This usually means Claude needs to be re-authenticated.",
-                "To fix:",
-                "  1. Press S to open Settings",
-                "  2. Select the Claude account",
-                "  3. Press R to re-authenticate",
-                "",
-                "Or from a terminal: pm relogin claude_claude_swh_me",
+                "  Claude may need re-authentication:",
+                "    1. Press S for Settings → select account → R to relogin",
+                f"    Or: pm relogin {runtime.effective_account or 'claude_claude_swh_me'}",
             ])
         else:
-            lines.extend([
-                "",
-                "The Polly session is not currently running.",
-                "Use `pm up` to restart all sessions.",
-            ])
+            lines.append("  Status: Not running  ·  Use `pm up` to start")
+        lines.extend(["", "", tip])
         return "\n".join(lines)
 
     if kind == "inbox":

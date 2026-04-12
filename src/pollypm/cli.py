@@ -440,7 +440,11 @@ def issue_transition(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
     service = PollyPMService(config_path)
-    task = service.move_task(project, task_id, to_state=to_state)
+    try:
+        task = service.move_task(project, task_id, to_state=to_state)
+    except ValueError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
     typer.echo(f"Moved issue {task.task_id} to {task.state}")
 
 

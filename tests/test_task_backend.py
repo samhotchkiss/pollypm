@@ -21,11 +21,36 @@ def test_file_task_backend_moves_tasks_between_states(tmp_path: Path) -> None:
     backend = FileTaskBackend(tmp_path)
     task = backend.create_task(title="Review plugin host")
 
+    backend.move_task(task.task_id, "02-in-progress")
     moved = backend.move_task(task.task_id, "03-needs-review")
 
     assert moved.state == "03-needs-review"
     assert moved.path.exists()
     assert not task.path.exists()
+
+
+def test_file_task_backend_rejects_skipped_transition(tmp_path: Path) -> None:
+    backend = FileTaskBackend(tmp_path)
+    task = backend.create_task(title="Review plugin host")
+
+    try:
+        backend.move_task(task.task_id, "03-needs-review")
+    except ValueError as exc:
+        assert "Invalid transition 01-ready -> 03-needs-review" in str(exc)
+    else:
+        raise AssertionError("Expected skipped transition to fail")
+
+
+def test_file_task_backend_allows_review_rejection_loop(tmp_path: Path) -> None:
+    backend = FileTaskBackend(tmp_path)
+    task = backend.create_task(title="Review plugin host")
+    backend.move_task(task.task_id, "02-in-progress")
+    backend.move_task(task.task_id, "03-needs-review")
+    backend.move_task(task.task_id, "04-in-review")
+
+    moved = backend.move_task(task.task_id, "02-in-progress")
+
+    assert moved.state == "02-in-progress"
 
 
 def test_file_task_backend_get_task_and_next_available(tmp_path: Path) -> None:
@@ -168,18 +193,40 @@ def test_github_task_backend_moves_state_by_relabeling_issue(monkeypatch, tmp_pa
                 self.stdout = stdout
 
         if args[:2] == ("issue", "view"):
-            return Result('{"title":"Wire the backend","labels":[{"name":"polly:ready"},{"name":"bug"}]}')
+            return Result('{"title":"Wire the backend","labels":[{"name":"polly:needs-review"},{"name":"bug"}]}')
         return Result()
 
     monkeypatch.setattr("pollypm.task_backends.github._gh", fake_gh)
 
-    moved = backend.move_task("42", "03-needs-review")
+    moved = backend.move_task("42", "04-in-review")
 
     assert moved.task_id == "42"
-    assert moved.state == "03-needs-review"
-    assert (("issue", "edit", "42", "--remove-label", "polly:ready", "--repo", "acme/widgets"), False) in calls
-    assert (("issue", "edit", "42", "--add-label", "polly:needs-review", "--repo", "acme/widgets"), True) in calls
+    assert moved.state == "04-in-review"
+    assert (("issue", "edit", "42", "--remove-label", "polly:needs-review", "--repo", "acme/widgets"), False) in calls
+    assert (("issue", "edit", "42", "--add-label", "polly:in-review", "--repo", "acme/widgets"), True) in calls
     assert (("issue", "reopen", "42", "--repo", "acme/widgets"), False) in calls
+
+
+def test_github_task_backend_rejects_skipped_transition(monkeypatch, tmp_path: Path) -> None:
+    backend = GitHubTaskBackend(tmp_path, repo="acme/widgets")
+
+    def fake_gh(*args: str, check: bool = True):
+        class Result:
+            def __init__(self, stdout: str = "") -> None:
+                self.stdout = stdout
+
+        if args[:2] == ("issue", "view"):
+            return Result('{"title":"Wire the backend","labels":[{"name":"polly:ready"}]}')
+        raise AssertionError(f"Unexpected gh call: {args}")
+
+    monkeypatch.setattr("pollypm.task_backends.github._gh", fake_gh)
+
+    try:
+        backend.move_task("42", "03-needs-review")
+    except ValueError as exc:
+        assert "Invalid transition 01-ready -> 03-needs-review" in str(exc)
+    else:
+        raise AssertionError("Expected skipped transition to fail")
 
 
 def test_github_task_backend_appends_issue_comment(monkeypatch, tmp_path: Path) -> None:
@@ -323,8 +370,10 @@ def test_github_task_backend_lists_tasks_for_requested_states(monkeypatch, tmp_p
 def test_github_task_backend_validate_runs_roundtrip_and_cleanup(monkeypatch, tmp_path: Path) -> None:
     backend = GitHubTaskBackend(tmp_path, repo="acme/widgets")
     calls: list[tuple[str, ...]] = []
+    current_label = "polly:ready"
 
     def fake_gh(*args: str, check: bool = True):
+        nonlocal current_label
         calls.append(args)
 
         class Result:
@@ -338,7 +387,10 @@ def test_github_task_backend_validate_runs_roundtrip_and_cleanup(monkeypatch, tm
         if args[:2] == ("issue", "create"):
             return Result("https://github.com/acme/widgets/issues/42\n")
         if args[:2] == ("issue", "view"):
-            return Result('{"number":42,"title":"PollyPM GitHub backend validation","labels":[{"name":"polly:in-progress"}]}')
+            return Result(f'{{"number":42,"title":"PollyPM GitHub backend validation","labels":[{{"name":"{current_label}"}}]}}')
+        if args[:2] == ("issue", "edit") and "--add-label" in args:
+            current_label = args[args.index("--add-label") + 1]
+            return Result()
         return Result()
 
     monkeypatch.setattr("pollypm.task_backends.github._gh", fake_gh)

@@ -5,12 +5,53 @@ from pathlib import Path
 from typing import Protocol
 
 
+TRACKER_STATES = [
+    "00-not-ready",
+    "01-ready",
+    "02-in-progress",
+    "03-needs-review",
+    "04-in-review",
+    "05-completed",
+]
+
+
+class InvalidTaskTransition(ValueError):
+    """Raised when a task moves outside the allowed six-state pipeline."""
+
+
 @dataclass(slots=True)
 class TaskRecord:
     task_id: str
     title: str
     state: str
     path: Path
+
+
+def validate_task_transition(current_state: str, to_state: str) -> None:
+    if current_state == to_state:
+        return
+    if current_state not in TRACKER_STATES:
+        raise InvalidTaskTransition(f"Unknown current state: {current_state}")
+    if to_state not in TRACKER_STATES:
+        raise InvalidTaskTransition(f"Unknown destination state: {to_state}")
+
+    from_idx = TRACKER_STATES.index(current_state)
+    to_idx = TRACKER_STATES.index(to_state)
+    if to_idx == from_idx + 1:
+        return
+
+    if to_state == "02-in-progress" and current_state in {"03-needs-review", "04-in-review"}:
+        return
+
+    if to_idx > from_idx + 1:
+        skipped = TRACKER_STATES[from_idx + 1 : to_idx]
+        raise InvalidTaskTransition(
+            f"Invalid transition {current_state} -> {to_state}; skipped states: {', '.join(skipped)}"
+        )
+
+    raise InvalidTaskTransition(
+        f"Invalid transition {current_state} -> {to_state}; only review rejection may move backward"
+    )
 
 
 class TaskBackend(Protocol):

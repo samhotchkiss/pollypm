@@ -236,8 +236,10 @@ repo = "acme/widgets"
     )
     service = PollyPMService(config_path)
     calls: list[tuple[str, ...]] = []
+    current_label = "polly:ready"
 
     def fake_gh(*args: str, check: bool = True):
+        nonlocal current_label
         calls.append(args)
 
         class Result:
@@ -249,11 +251,14 @@ repo = "acme/widgets"
         if args[:2] == ("issue", "view"):
             if "--json" in args and "comments" in args:
                 return Result('{"comments":[{"author":{"login":"polly"},"body":"Ready for review."}]}')
-            return Result('{"number":42,"title":"Wire the backend","labels":[{"name":"polly:ready"}]}')
+            return Result(f'{{"number":42,"title":"Wire the backend","labels":[{{"name":"{current_label}"}}]}}')
         if args[:2] == ("issue", "list"):
             if "--json" in args and "-q" in args:
                 return Result("3")
             return Result('[{"number":42,"title":"Wire the backend","state":"OPEN"}]')
+        if args[:2] == ("issue", "edit") and "--add-label" in args:
+            current_label = args[args.index("--add-label") + 1]
+            return Result()
         if args[:2] == ("issue", "comment"):
             return Result()
         return Result()
@@ -261,6 +266,7 @@ repo = "acme/widgets"
     monkeypatch.setattr("pollypm.task_backends.github._gh", fake_gh)
 
     task = service.create_task("demo", title="Wire the backend", body="Implement the gh-backed task flow.")
+    service.move_task("demo", "42", to_state="02-in-progress")
     moved = service.move_task("demo", "42", to_state="03-needs-review")
     note_path = service.append_task_note("demo", "#42", text="Implemented and verified.")
     listed = service.list_tasks("demo", states=["01-ready"])
@@ -377,3 +383,40 @@ def test_service_append_task_handoff_writes_structured_note(tmp_path: Path) -> N
     assert "Run the targeted pytest suite." in text
     assert "### Deviations" in text
     assert "Skipped live gh auth in unit tests." in text
+
+
+def test_service_move_task_rejects_skipped_transition(tmp_path: Path) -> None:
+    project_root = tmp_path / "demo"
+    project_root.mkdir()
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            base_dir=tmp_path / ".pollypm-state",
+            logs_dir=tmp_path / ".pollypm-state/logs",
+            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
+            state_db=tmp_path / ".pollypm-state/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="claude_main"),
+        accounts={
+            "claude_main": AccountConfig(
+                name="claude_main",
+                provider=ProviderKind.CLAUDE,
+                home=tmp_path / ".pollypm-state" / "homes" / "claude_main",
+            )
+        },
+        sessions={},
+        projects={
+            "demo": KnownProject(key="demo", path=project_root, name="Demo", kind=ProjectKind.GIT, tracked=True),
+        },
+    )
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path, force=True)
+    service = PollyPMService(config_path)
+    task = service.create_task("demo", title="Wire the backend")
+
+    try:
+        service.move_task("demo", task.task_id, to_state="03-needs-review")
+    except ValueError as exc:
+        assert "Invalid transition 01-ready -> 03-needs-review" in str(exc)
+    else:
+        raise AssertionError("Expected skipped transition to fail")

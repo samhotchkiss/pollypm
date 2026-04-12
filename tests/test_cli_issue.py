@@ -164,8 +164,10 @@ def test_issue_cli_uses_github_backend_when_project_is_configured(monkeypatch, t
     config_path = _config(tmp_path)
     _configure_github_backend(tmp_path / "demo")
     calls: list[tuple[str, ...]] = []
+    current_label = "polly:ready"
 
     def fake_gh(*args: str, check: bool = True):
+        nonlocal current_label
         calls.append(args)
 
         class Result:
@@ -177,11 +179,14 @@ def test_issue_cli_uses_github_backend_when_project_is_configured(monkeypatch, t
         if args[:2] == ("issue", "view"):
             if "--json" in args and "comments" in args:
                 return Result('{"comments":[{"author":{"login":"polly"},"body":"Ready for review."}]}')
-            return Result('{"number":42,"title":"Wire backend","labels":[{"name":"polly:ready"}]}')
+            return Result(f'{{"number":42,"title":"Wire backend","labels":[{{"name":"{current_label}"}}]}}')
         if args[:2] == ("issue", "list"):
             if "--json" in args and "-q" in args:
                 return Result("2")
             return Result('[{"number":42,"title":"Wire backend","state":"OPEN"}]')
+        if args[:2] == ("issue", "edit") and "--add-label" in args:
+            current_label = args[args.index("--add-label") + 1]
+            return Result()
         if args[:2] == ("issue", "comment"):
             return Result()
         return Result()
@@ -209,6 +214,10 @@ def test_issue_cli_uses_github_backend_when_project_is_configured(monkeypatch, t
         ["issue", "history", "--config", str(config_path), "--project", "demo", "42"],
     )
     transitioned = runner.invoke(
+        app,
+        ["issue", "transition", "--config", str(config_path), "--project", "demo", "42", "02-in-progress"],
+    )
+    transitioned_review = runner.invoke(
         app,
         ["issue", "transition", "--config", str(config_path), "--project", "demo", "42", "03-needs-review"],
     )
@@ -240,7 +249,9 @@ def test_issue_cli_uses_github_backend_when_project_is_configured(monkeypatch, t
     assert history.exit_code == 0
     assert "polly: Ready for review." in history.stdout
     assert transitioned.exit_code == 0
-    assert "Moved issue 42 to 03-needs-review" in transitioned.stdout
+    assert "Moved issue 42 to 02-in-progress" in transitioned.stdout
+    assert transitioned_review.exit_code == 0
+    assert "Moved issue 42 to 03-needs-review" in transitioned_review.stdout
     assert commented.exit_code == 0
     assert "#42" in commented.stdout
     assert counts.exit_code == 0
@@ -271,3 +282,20 @@ def test_issue_cli_validate_reports_backend_validation(monkeypatch, tmp_path: Pa
     assert "Task backend validation passed." in result.stdout
     assert "check: repo_accessible" in result.stdout
     assert "check: labels_ensured" in result.stdout
+
+
+def test_issue_cli_rejects_skipped_transition(tmp_path: Path) -> None:
+    runner = CliRunner()
+    config_path = _config(tmp_path)
+
+    runner.invoke(
+        app,
+        ["issue", "create", "--config", str(config_path), "--project", "demo", "--title", "Wire backend"],
+    )
+    result = runner.invoke(
+        app,
+        ["issue", "transition", "--config", str(config_path), "--project", "demo", "0001", "03-needs-review"],
+    )
+
+    assert result.exit_code == 1
+    assert "Invalid transition 01-ready -> 03-needs-review" in result.stdout

@@ -12,7 +12,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from pollypm.task_backends.base import TaskBackend, TaskRecord
+from pollypm.task_backends.base import TaskBackend, TaskRecord, TRACKER_STATES, validate_task_transition
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +27,6 @@ STATE_TO_LABEL: dict[str, str] = {
 }
 
 LABEL_TO_STATE: dict[str, str] = {v: k for k, v in STATE_TO_LABEL.items()}
-
-TRACKER_STATES = list(STATE_TO_LABEL.keys())
 
 ALL_POLLY_LABELS = list(STATE_TO_LABEL.values())
 
@@ -118,6 +116,8 @@ class GitHubTaskBackend(TaskBackend):
             if validation_task is not None:
                 try:
                     self.append_note(validation_task.task_id, "Validation cleanup: closing temporary issue.")
+                    self.move_task(validation_task.task_id, "03-needs-review")
+                    self.move_task(validation_task.task_id, "04-in-review")
                     self.move_task(validation_task.task_id, "05-completed")
                     checks.append("cleanup")
                 except Exception as exc:  # noqa: BLE001
@@ -270,15 +270,8 @@ class GitHubTaskBackend(TaskBackend):
                 current_state = LABEL_TO_STATE[lbl]
                 break
 
-        # Validate transition
-        if strict and current_state and current_state in TRACKER_STATES and to_state in TRACKER_STATES:
-            from_idx = TRACKER_STATES.index(current_state)
-            to_idx = TRACKER_STATES.index(to_state)
-            if to_idx > from_idx + 1:
-                skipped = TRACKER_STATES[from_idx + 1 : to_idx]
-                raise ValueError(
-                    f"Issue {task_id} skipping states {current_state} → {to_state} (skipped: {', '.join(skipped)})"
-                )
+        if current_state:
+            validate_task_transition(current_state, to_state)
 
         # Remove all polly:* labels, add the new one
         new_label = STATE_TO_LABEL.get(to_state)

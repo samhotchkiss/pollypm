@@ -7,17 +7,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-from pollypm.task_backends.base import TaskBackend, TaskRecord
-
-
-TRACKER_STATES = [
-    "00-not-ready",
-    "01-ready",
-    "02-in-progress",
-    "03-needs-review",
-    "04-in-review",
-    "05-completed",
-]
+from pollypm.task_backends.base import TaskBackend, TaskRecord, TRACKER_STATES, validate_task_transition
 
 
 class FileTaskBackend(TaskBackend):
@@ -105,20 +95,7 @@ class FileTaskBackend(TaskBackend):
         for task in self.list_tasks():
             if task.task_id != task_id:
                 continue
-            # Validate state transitions
-            if task.state in TRACKER_STATES and to_state in TRACKER_STATES:
-                from_idx = TRACKER_STATES.index(task.state)
-                to_idx = TRACKER_STATES.index(to_state)
-                if to_idx < from_idx:
-                    msg = f"Issue {task_id} moving backward: {task.state} → {to_state} (rework?)"
-                    logger.warning(msg)
-                    # Backward moves are always allowed (rework)
-                elif to_idx > from_idx + 1:
-                    skipped = TRACKER_STATES[from_idx + 1 : to_idx]
-                    msg = f"Issue {task_id} skipping states {task.state} → {to_state} (skipped: {', '.join(skipped)})"
-                    if strict:
-                        raise ValueError(msg)
-                    logger.warning(msg)
+            validate_task_transition(task.state, to_state)
             destination = self.issues_root() / to_state / task.path.name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(task.path), str(destination))

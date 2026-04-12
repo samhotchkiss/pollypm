@@ -46,9 +46,11 @@ app = typer.Typer(help="PollyPM CLI", invoke_without_command=True, no_args_is_he
 alert_app = typer.Typer(help="Manage durable alerts.")
 session_app = typer.Typer(help="Manage session runtime state.")
 heartbeat_app = typer.Typer(help="Run or record heartbeat state.")
+issue_app = typer.Typer(help="Manage project issues through the configured backend.")
 app.add_typer(alert_app, name="alert")
 app.add_typer(session_app, name="session")
 app.add_typer(heartbeat_app, name="heartbeat")
+app.add_typer(issue_app, name="issue")
 
 
 def _session_name_candidates() -> list[str]:
@@ -359,6 +361,69 @@ def init_tracker(
 ) -> None:
     tracked = enable_tracked_project(config_path, project)
     typer.echo(f"Enabled tracked-project mode for {tracked.name or tracked.key}")
+
+
+@issue_app.command("list")
+def issue_list(
+    project: str = typer.Option(..., "--project", help="Project key."),
+    state: list[str] | None = typer.Option(None, "--state", help="Optional tracker state filter."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    service = PollyPMService(config_path)
+    tasks = service.list_tasks(project, states=state)
+    if not tasks:
+        typer.echo("No issues found.")
+        return
+    for task in tasks:
+        typer.echo(f"{task.task_id} [{task.state}] {task.title}")
+
+
+@issue_app.command("create")
+def issue_create(
+    project: str = typer.Option(..., "--project", help="Project key."),
+    title: str = typer.Option(..., "--title", help="Issue title."),
+    body: str = typer.Option("", "--body", help="Issue body."),
+    state: str = typer.Option("01-ready", "--state", help="Initial tracker state."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    service = PollyPMService(config_path)
+    task = service.create_task(project, title=title, body=body, state=state)
+    typer.echo(f"Created issue {task.task_id} [{task.state}] {task.title}")
+
+
+@issue_app.command("transition")
+def issue_transition(
+    task_id: str = typer.Argument(..., help="Issue id."),
+    to_state: str = typer.Argument(..., help="Destination tracker state."),
+    project: str = typer.Option(..., "--project", help="Project key."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    service = PollyPMService(config_path)
+    task = service.move_task(project, task_id, to_state=to_state)
+    typer.echo(f"Moved issue {task.task_id} to {task.state}")
+
+
+@issue_app.command("comment")
+def issue_comment(
+    task_name: str = typer.Argument(..., help="Issue id or note target."),
+    text: str = typer.Option(..., "--text", help="Comment text."),
+    project: str = typer.Option(..., "--project", help="Project key."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    service = PollyPMService(config_path)
+    path = service.append_task_note(project, task_name, text=text)
+    typer.echo(f"Updated {path}")
+
+
+@issue_app.command("counts")
+def issue_counts(
+    project: str = typer.Option(..., "--project", help="Project key."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    service = PollyPMService(config_path)
+    counts = service.task_state_counts(project)
+    for state, count in counts.items():
+        typer.echo(f"{state}: {count}")
 
 
 @app.command("notify")

@@ -28,6 +28,19 @@ def test_file_task_backend_moves_tasks_between_states(tmp_path: Path) -> None:
     assert not task.path.exists()
 
 
+def test_file_task_backend_get_task_and_next_available(tmp_path: Path) -> None:
+    backend = FileTaskBackend(tmp_path)
+    first = backend.create_task(title="First ready")
+    backend.create_task(title="Second ready")
+
+    task = backend.get_task(first.task_id)
+    next_task = backend.next_available()
+
+    assert task.task_id == first.task_id
+    assert next_task is not None
+    assert next_task.task_id == first.task_id
+
+
 def test_file_task_backend_tracks_notes_and_counts(tmp_path: Path) -> None:
     backend = FileTaskBackend(tmp_path)
     backend.ensure_tracker()
@@ -84,6 +97,31 @@ def test_github_task_backend_reads_issue_body(monkeypatch, tmp_path: Path) -> No
 
     assert body.startswith("# 42 Wire the backend")
     assert "Implement the gh-backed tracker." in body
+
+
+def test_github_task_backend_get_task_and_next_available(monkeypatch, tmp_path: Path) -> None:
+    backend = GitHubTaskBackend(tmp_path, repo="acme/widgets")
+
+    def fake_gh(*args: str, check: bool = True):
+        class Result:
+            def __init__(self, stdout: str) -> None:
+                self.stdout = stdout
+
+        if args[:2] == ("issue", "view"):
+            return Result('{"number":42,"title":"Wire the backend","labels":[{"name":"polly:needs-review"}]}')
+        if args[:2] == ("issue", "list"):
+            return Result('[{"number":41,"title":"First ready","state":"OPEN"}]')
+        raise AssertionError(f"Unexpected gh call: {args}")
+
+    monkeypatch.setattr("pollypm.task_backends.github._gh", fake_gh)
+
+    task = backend.get_task("42")
+    next_task = backend.next_available()
+
+    assert task.task_id == "42"
+    assert task.state == "03-needs-review"
+    assert next_task is not None
+    assert next_task.task_id == "41"
 
 
 def test_github_task_backend_moves_state_by_relabeling_issue(monkeypatch, tmp_path: Path) -> None:

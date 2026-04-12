@@ -118,6 +118,48 @@ class GitHubTaskBackend(TaskBackend):
                 ))
         return tasks
 
+    def get_task(self, task_id: str) -> TaskRecord:
+        result = _gh(
+            "issue", "view", task_id,
+            "--json", "number,title,labels",
+            "--repo", self.repo,
+        )
+        issue = json.loads(result.stdout)
+        state = "01-ready"
+        for label in issue.get("labels", []):
+            name = label.get("name")
+            if isinstance(name, str) and name in LABEL_TO_STATE:
+                state = LABEL_TO_STATE[name]
+                break
+        issue_id = str(issue["number"])
+        return TaskRecord(
+            task_id=issue_id,
+            title=str(issue["title"]),
+            state=state,
+            path=self.project_path / f"#{issue_id}",
+        )
+
+    def next_available(self) -> TaskRecord | None:
+        result = _gh(
+            "issue", "list",
+            "--label", STATE_TO_LABEL["01-ready"],
+            "--state", "all",
+            "--json", "number,title,state",
+            "--repo", self.repo,
+            "--limit", "1",
+        )
+        issues = json.loads(result.stdout) if result.stdout.strip() else []
+        if not issues:
+            return None
+        issue = issues[0]
+        issue_id = str(issue["number"])
+        return TaskRecord(
+            task_id=issue_id,
+            title=str(issue["title"]),
+            state="01-ready",
+            path=self.project_path / f"#{issue_id}",
+        )
+
     def create_task(self, *, title: str, body: str = "", state: str = "01-ready") -> TaskRecord:
         label = STATE_TO_LABEL.get(state, "polly:ready")
         args = [

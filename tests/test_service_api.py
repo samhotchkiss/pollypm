@@ -179,11 +179,15 @@ def test_service_task_operations_use_file_backend(tmp_path: Path) -> None:
     moved = service.move_task("demo", task.task_id, to_state="02-in-progress")
     note_path = service.append_task_note("demo", "notes.md", text="Remember to verify the happy path.\n")
     listed = service.list_tasks("demo", states=["02-in-progress"])
+    fetched = service.get_task("demo", "0001")
+    next_task = service.next_available_task("demo")
 
     assert task.task_id == "0001"
     assert moved.state == "02-in-progress"
     assert note_path.exists()
     assert listed[0].task_id == "0001"
+    assert fetched.task_id == "0001"
+    assert next_task is None
     assert service.task_state_counts("demo")["02-in-progress"] == 1
 
 
@@ -240,7 +244,7 @@ repo = "acme/widgets"
         if args[:2] == ("issue", "create"):
             return Result("https://github.com/acme/widgets/issues/42\n")
         if args[:2] == ("issue", "view"):
-            return Result('{"title":"Wire the backend","labels":[{"name":"polly:ready"}]}')
+            return Result('{"number":42,"title":"Wire the backend","labels":[{"name":"polly:ready"}]}')
         if args[:2] == ("issue", "list"):
             if "--json" in args and "-q" in args:
                 return Result("3")
@@ -255,10 +259,15 @@ repo = "acme/widgets"
     moved = service.move_task("demo", "42", to_state="03-needs-review")
     note_path = service.append_task_note("demo", "#42", text="Implemented and verified.")
     listed = service.list_tasks("demo", states=["01-ready"])
+    fetched = service.get_task("demo", "42")
+    next_task = service.next_available_task("demo")
     counts = service.task_state_counts("demo")
 
     assert task.task_id == "42"
     assert moved.state == "03-needs-review"
     assert note_path == project_root / "#42"
     assert listed[0].task_id == "42"
+    assert fetched.task_id == "42"
+    assert next_task is not None
+    assert next_task.task_id == "42"
     assert counts["01-ready"] == 3

@@ -63,6 +63,16 @@ class FileTaskBackend(TaskBackend):
                 ))
         return tasks
 
+    def get_task(self, task_id: str) -> TaskRecord:
+        for task in self.list_tasks():
+            if task.task_id == task_id:
+                return task
+        raise FileNotFoundError(f"Unknown task id: {task_id}")
+
+    def next_available(self) -> TaskRecord | None:
+        tasks = self.list_tasks(states=["01-ready"])
+        return tasks[0] if tasks else None
+
     def create_task(self, *, title: str, body: str = "", state: str = "01-ready") -> TaskRecord:
         self.ensure_tracker()
         # Use the higher of the counter file and the max existing issue ID

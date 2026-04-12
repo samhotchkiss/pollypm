@@ -89,6 +89,10 @@ def test_issue_cli_create_list_transition_and_counts(tmp_path: Path) -> None:
         app,
         ["issue", "report", "--config", str(config_path), "--project", "demo"],
     )
+    report_status = runner.invoke(
+        app,
+        ["report", "status", "--config", str(config_path), "--project", "demo"],
+    )
 
     assert created.exit_code == 0
     assert "Created issue 0001 [01-ready] Wire backend" in created.stdout
@@ -106,6 +110,8 @@ def test_issue_cli_create_list_transition_and_counts(tmp_path: Path) -> None:
     assert "02-in-progress: 1" in counts.stdout
     assert report.exit_code == 0
     assert report.stdout == counts.stdout
+    assert report_status.exit_code == 0
+    assert report_status.stdout == counts.stdout
 
 
 def test_issue_cli_comment_updates_notes_file(tmp_path: Path) -> None:
@@ -218,6 +224,10 @@ def test_issue_cli_uses_github_backend_when_project_is_configured(monkeypatch, t
         app,
         ["issue", "report", "--config", str(config_path), "--project", "demo"],
     )
+    report_status = runner.invoke(
+        app,
+        ["report", "status", "--config", str(config_path), "--project", "demo"],
+    )
 
     assert created.exit_code == 0
     assert "Created issue 42 [01-ready] Wire backend" in created.stdout
@@ -237,6 +247,8 @@ def test_issue_cli_uses_github_backend_when_project_is_configured(monkeypatch, t
     assert "01-ready: 2" in counts.stdout
     assert report.exit_code == 0
     assert report.stdout == counts.stdout
+    assert report_status.exit_code == 0
+    assert report_status.stdout == counts.stdout
     assert ("issue", "create", "--title", "Wire backend", "--body", "Implement it", "--label", "polly:ready", "--repo", "acme/widgets") in calls
 
 

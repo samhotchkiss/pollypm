@@ -47,10 +47,12 @@ alert_app = typer.Typer(help="Manage durable alerts.")
 session_app = typer.Typer(help="Manage session runtime state.")
 heartbeat_app = typer.Typer(help="Run or record heartbeat state.")
 issue_app = typer.Typer(help="Manage project issues through the configured backend.")
+report_app = typer.Typer(help="Report project status summaries.")
 app.add_typer(alert_app, name="alert")
 app.add_typer(session_app, name="session")
 app.add_typer(heartbeat_app, name="heartbeat")
 app.add_typer(issue_app, name="issue")
+app.add_typer(report_app, name="report")
 
 
 def _session_name_candidates() -> list[str]:
@@ -487,6 +489,14 @@ def issue_counts(
 
 @issue_app.command("report")
 def issue_report(
+    project: str = typer.Option(..., "--project", help="Project key."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    issue_counts(project=project, config_path=config_path)
+
+
+@report_app.command("status")
+def report_status(
     project: str = typer.Option(..., "--project", help="Project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:

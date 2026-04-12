@@ -42,3 +42,4 @@
 - Updated issue `0022` with explicit API-level state-transition acceptance criteria, implementation notes, and concrete backend/service/CLI test evidence, then moved it to `03-needs-review`.
 - Reviewed issue `0023` against its acceptance criteria, approved the concise root README, and moved it to `05-completed`.
 - Reviewed issue `0022` against its API-level transition criteria, approved the documented backend/service/CLI evidence, and moved it to `05-completed`.
+- Reviewed issue `0027` against its coverage-audit acceptance criteria, approved the new test coverage and full-suite results, and moved it to `05-completed`.

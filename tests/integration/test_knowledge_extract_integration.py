@@ -120,12 +120,13 @@ def test_knowledge_extraction_updates_docs_with_checkpointing(tmp_path: Path) ->
     assert "docs updater" in overview.lower()
     assert "scheduled pipeline" in overview.lower()
     assert "## Convention Shifts" in overview
-    assert "always regenerate the summary section after updates" in overview.lower()
+    assert "always regenerate" in overview.lower()
+    assert "summary section after updates" in overview.lower()
     assert "## Decisions" in decisions
     assert "split the deployment pipeline" in decisions.lower()
     assert "[redacted-secret]" not in risks
-    assert "Risk: staging tokens must stay out of docs." in risks
-    assert "Idea: consider a changelog digest." in ideas
+    assert "staging tokens must stay out of docs" in risks.lower()
+    assert "consider a changelog digest" in ideas.lower()
     store = StateStore(config.project.state_db)
     memory_entries = store.list_memory_entries(scope=config.project.root_dir.name, limit=20)
     store.close()

@@ -12,6 +12,7 @@ from pathlib import Path
 import typer
 
 from pollypm.config import PROJECT_CONFIG_DIRNAME, load_config, write_config
+from pollypm.doc_scaffold import scaffold_docs
 from pollypm.models import KnownProject, ProjectKind
 from pollypm.task_backends import FileTaskBackend, get_task_backend
 
@@ -134,10 +135,13 @@ def session_lock_path(base_dir: Path) -> Path:
     return base_dir / ".session.lock"
 
 
+_LOCK_STALE_SECONDS = 1800  # 30 minutes — locks older than this are considered stale
+
+
 def ensure_session_lock(base_dir: Path, session_id: str) -> Path:
     base_dir.mkdir(parents=True, exist_ok=True)
     lock_path = session_lock_path(base_dir)
-    payload = {"session_id": session_id}
+    payload = {"session_id": session_id, "created_at": datetime.now(UTC).isoformat()}
     try:
         fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     except FileExistsError:
@@ -148,7 +152,16 @@ def ensure_session_lock(base_dir: Path, session_id: str) -> Path:
         existing_session = existing.get("session_id")
         if isinstance(existing_session, str) and existing_session == session_id:
             return lock_path
-        raise RuntimeError(f"Session lock conflict at {base_dir}: owned by {existing_session or 'unknown'}")
+        # Check if the lock is stale (older than 30 minutes)
+        try:
+            age = (datetime.now(UTC) - datetime.fromisoformat(existing.get("created_at", ""))).total_seconds()
+        except (ValueError, TypeError):
+            age = _LOCK_STALE_SECONDS + 1  # unparseable = treat as stale
+        if age > _LOCK_STALE_SECONDS:
+            lock_path.unlink(missing_ok=True)
+        else:
+            raise RuntimeError(f"Session lock conflict at {base_dir}: owned by {existing_session or 'unknown'}")
+        fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
         handle.write("\n")
@@ -198,6 +211,8 @@ def ensure_project_scaffold(project_path: Path) -> Path:
     instructions_target = project_instruction_file(project_path)
     if PROJECT_INSTRUCTIONS_TEMPLATE.exists() and not instructions_target.exists():
         shutil.copyfile(PROJECT_INSTRUCTIONS_TEMPLATE, instructions_target)
+    # Generate system reference docs for agent consumption
+    scaffold_docs(normalize_project_path(project_path))
     _ensure_gitignore_entry(normalize_project_path(project_path), ".pollypm-state/")
     return pollypm_dir
 

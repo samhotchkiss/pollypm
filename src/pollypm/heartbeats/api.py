@@ -178,7 +178,10 @@ class SupervisorHeartbeatAPI:
         for launch in self.supervisor.plan_launches():
             cursor = self.get_cursor(launch.session.name)
             source_path = launch.log_path
-            source_bytes = source_path.stat().st_size if source_path.exists() else 0
+            try:
+                source_bytes = source_path.stat().st_size
+            except (FileNotFoundError, OSError):
+                source_bytes = 0
             transcript_delta = self._read_transcript_delta(source_path, cursor.last_offset if cursor else 0)
             window = window_map.get(launch.window_name)
             snapshot_path: str | None = None
@@ -248,12 +251,16 @@ class SupervisorHeartbeatAPI:
         atomic_write_json(path, raw)
 
     def _read_transcript_delta(self, path: Path, last_offset: int) -> str:
-        if not path.exists():
+        try:
+            size = path.stat().st_size
+        except (FileNotFoundError, OSError):
             return ""
-        size = path.stat().st_size
         start = min(max(0, last_offset), size)
         if start == size:
             return ""
-        with path.open("r", encoding="utf-8", errors="ignore") as handle:
-            handle.seek(start)
-            return handle.read()
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                handle.seek(start)
+                return handle.read()
+        except (FileNotFoundError, OSError):
+            return ""

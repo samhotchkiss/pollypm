@@ -666,7 +666,10 @@ class Supervisor:
                 continue
 
             snapshot_path, snapshot_content = self._write_snapshot(window, snapshot_lines)
-            log_bytes = launch.log_path.stat().st_size if launch.log_path.exists() else 0
+            try:
+                log_bytes = launch.log_path.stat().st_size
+            except (FileNotFoundError, OSError):
+                log_bytes = 0
             previous = self.store.latest_heartbeat(session_key)
             current_snapshot_hash = snapshot_hash(snapshot_content)
 

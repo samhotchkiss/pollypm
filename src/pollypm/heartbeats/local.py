@@ -53,7 +53,18 @@ class LocalHeartbeatBackend(HeartbeatBackend):
     def run(self, api, *, snapshot_lines: int = 200):
         self._process_unmanaged_windows(api)
         for context in api.list_sessions():
-            self._process_session(api, context)
+            try:
+                self._process_session(api, context)
+            except Exception as exc:  # noqa: BLE001
+                # Log and continue — don't let one session abort the entire sweep
+                try:
+                    api.record_event(
+                        context.session_name,
+                        "heartbeat_error",
+                        f"Error processing session: {exc}",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
         api.record_event(
             "heartbeat",
             "heartbeat",

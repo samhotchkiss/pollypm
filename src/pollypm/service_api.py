@@ -338,6 +338,7 @@ class PollyPMService:
         *,
         what_done: str,
         how_to_test: str,
+        branch_or_pr: str = "",
         deviations: str = "",
     ) -> Path:
         sections = [
@@ -349,6 +350,14 @@ class PollyPMService:
             "### How To Test",
             how_to_test.strip(),
         ]
+        if branch_or_pr.strip():
+            sections.extend(
+                [
+                    "",
+                    "### Branch / PR",
+                    branch_or_pr.strip(),
+                ]
+            )
         if deviations.strip():
             sections.extend(
                 [

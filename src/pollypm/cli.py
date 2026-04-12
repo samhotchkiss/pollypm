@@ -465,6 +465,7 @@ def issue_handoff(
     task_name: str = typer.Argument(..., help="Issue id or note target."),
     what_done: str = typer.Option(..., "--done", help="Summary of what was completed."),
     how_to_test: str = typer.Option(..., "--test", help="How to verify the work."),
+    branch_or_pr: str = typer.Option("", "--branch-or-pr", help="Branch name or PR link for review."),
     deviations: str = typer.Option("", "--deviations", help="Any spec deviations and why."),
     project: str = typer.Option(..., "--project", help="Project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
@@ -475,6 +476,7 @@ def issue_handoff(
         task_name,
         what_done=what_done,
         how_to_test=how_to_test,
+        branch_or_pr=branch_or_pr,
         deviations=deviations,
     )
     typer.echo(f"Updated {path}")

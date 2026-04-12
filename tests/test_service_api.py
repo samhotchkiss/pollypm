@@ -372,6 +372,7 @@ def test_service_append_task_handoff_writes_structured_note(tmp_path: Path) -> N
         "notes.md",
         what_done="Implemented the GitHub-backed issue flow.",
         how_to_test="Run the targeted pytest suite.",
+        branch_or_pr="https://github.com/acme/widgets/pull/42",
         deviations="Skipped live gh auth in unit tests.",
     )
 
@@ -381,6 +382,8 @@ def test_service_append_task_handoff_writes_structured_note(tmp_path: Path) -> N
     assert "Implemented the GitHub-backed issue flow." in text
     assert "### How To Test" in text
     assert "Run the targeted pytest suite." in text
+    assert "### Branch / PR" in text
+    assert "https://github.com/acme/widgets/pull/42" in text
     assert "### Deviations" in text
     assert "Skipped live gh auth in unit tests." in text
 

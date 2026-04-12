@@ -145,6 +145,8 @@ def test_issue_cli_handoff_writes_structured_note(tmp_path: Path) -> None:
             "Implemented the issue commands.",
             "--test",
             "Run pytest on CLI and service tests.",
+            "--branch-or-pr",
+            "https://github.com/acme/widgets/pull/42",
             "--deviations",
             "No live gh call in unit coverage.",
             "notes.md",
@@ -156,6 +158,7 @@ def test_issue_cli_handoff_writes_structured_note(tmp_path: Path) -> None:
     assert "## Handoff" in text
     assert "Implemented the issue commands." in text
     assert "Run pytest on CLI and service tests." in text
+    assert "https://github.com/acme/widgets/pull/42" in text
     assert "No live gh call in unit coverage." in text
 
 

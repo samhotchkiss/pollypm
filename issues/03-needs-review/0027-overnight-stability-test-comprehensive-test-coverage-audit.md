@@ -97,3 +97,9 @@ Coverage spot-check identified zero-coverage functions in `supervisor.py`; added
 `uv run pytest -q`
 
 - `470 passed in 141.56s (0:02:21)`
+
+## Review Handoff
+- Ready for PM review.
+- New direct test files: `tests/test_runtime_env.py`, `tests/test_runtime_launcher.py`, `tests/test_models.py`
+- New `supervisor.py` coverage added in `tests/test_supervisor.py`
+- Final verification rerun after issue handoff prep: `uv run pytest -q`

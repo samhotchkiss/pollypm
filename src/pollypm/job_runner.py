@@ -106,6 +106,13 @@ def _run_gc_maintenance(supervisor: Supervisor, payload: dict[str, Any]) -> None
     gc.collect()
 
 
+@register_job("inbox_escalation")
+def _run_inbox_escalation(supervisor: Supervisor, payload: dict[str, Any]) -> None:
+    """Escalate unattended waiting_on_user sessions to the inbox."""
+    from pollypm.inbox_escalation import escalate_waiting_sessions
+    escalate_waiting_sessions(supervisor.store, supervisor.config.project.root_dir)
+
+
 @register_job("prune_state")
 def _run_prune_state(supervisor: Supervisor, payload: dict[str, Any]) -> None:
     """Prune old events and heartbeat data to prevent unbounded growth."""

@@ -921,6 +921,26 @@ class StateStore:
             updated_at=row[11],
         )
 
+    def list_session_runtimes(self) -> list[SessionRuntimeRecord]:
+        rows = self.execute(
+            """
+            SELECT session_name, status, effective_account, effective_provider, recovery_attempts,
+                   recovery_window_started_at, last_failure_type, last_failure_message, last_checkpoint_path,
+                   retry_at, last_recovered_at, updated_at
+            FROM session_runtime
+            """
+        ).fetchall()
+        return [
+            SessionRuntimeRecord(
+                session_name=row[0], status=row[1], effective_account=row[2],
+                effective_provider=row[3], recovery_attempts=int(row[4]),
+                recovery_window_started_at=row[5], last_failure_type=row[6],
+                last_failure_message=row[7], last_checkpoint_path=row[8],
+                retry_at=row[9], last_recovered_at=row[10], updated_at=row[11],
+            )
+            for row in rows
+        ]
+
     def record_checkpoint(
         self,
         *,

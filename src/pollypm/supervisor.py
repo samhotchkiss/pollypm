@@ -628,6 +628,7 @@ class Supervisor:
         from pollypm.job_runner import submit_jobs_parallel
         submit_jobs_parallel(self, [
             ("version_check", {}),
+            ("inbox_escalation", {}),
         ])
         return alerts
 

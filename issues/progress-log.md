@@ -41,3 +41,4 @@
 - Completed issue `0023` by replacing the oversized root README with the requested concise 4-sentence project description and moving it to `03-needs-review`.
 - Updated issue `0022` with explicit API-level state-transition acceptance criteria, implementation notes, and concrete backend/service/CLI test evidence, then moved it to `03-needs-review`.
 - Reviewed issue `0023` against its acceptance criteria, approved the concise root README, and moved it to `05-completed`.
+- Reviewed issue `0022` against its API-level transition criteria, approved the documented backend/service/CLI evidence, and moved it to `05-completed`.

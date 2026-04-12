@@ -182,6 +182,7 @@ def test_service_task_operations_use_file_backend(tmp_path: Path) -> None:
     listed = service.list_tasks("demo", states=["02-in-progress"])
     fetched = service.get_task("demo", "0001")
     next_task = service.next_available_task("demo")
+    history = service.task_history("demo", "0001")
 
     assert task.task_id == "0001"
     assert moved.state == "02-in-progress"
@@ -189,6 +190,7 @@ def test_service_task_operations_use_file_backend(tmp_path: Path) -> None:
     assert listed[0].task_id == "0001"
     assert fetched.task_id == "0001"
     assert next_task is None
+    assert "Remember to verify the happy path." in history
     assert service.task_state_counts("demo")["02-in-progress"] == 1
 
 
@@ -245,6 +247,8 @@ repo = "acme/widgets"
         if args[:2] == ("issue", "create"):
             return Result("https://github.com/acme/widgets/issues/42\n")
         if args[:2] == ("issue", "view"):
+            if "--json" in args and "comments" in args:
+                return Result('{"comments":[{"author":{"login":"polly"},"body":"Ready for review."}]}')
             return Result('{"number":42,"title":"Wire the backend","labels":[{"name":"polly:ready"}]}')
         if args[:2] == ("issue", "list"):
             if "--json" in args and "-q" in args:
@@ -262,6 +266,7 @@ repo = "acme/widgets"
     listed = service.list_tasks("demo", states=["01-ready"])
     fetched = service.get_task("demo", "42")
     next_task = service.next_available_task("demo")
+    history = service.task_history("demo", "42")
     counts = service.task_state_counts("demo")
 
     assert task.task_id == "42"
@@ -271,6 +276,7 @@ repo = "acme/widgets"
     assert fetched.task_id == "42"
     assert next_task is not None
     assert next_task.task_id == "42"
+    assert history == ["polly: Ready for review."]
     assert counts["01-ready"] == 3
 
 

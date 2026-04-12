@@ -41,6 +41,18 @@ def test_file_task_backend_get_task_and_next_available(tmp_path: Path) -> None:
     assert next_task.task_id == first.task_id
 
 
+def test_file_task_backend_history_includes_state_and_notes(tmp_path: Path) -> None:
+    backend = FileTaskBackend(tmp_path)
+    task = backend.create_task(title="First ready")
+    backend.append_note("notes.md", "Remember to review the edge case.\n")
+
+    history = backend.task_history(task.task_id)
+
+    assert "state=01-ready" in history
+    assert "title=First ready" in history
+    assert "Remember to review the edge case." in history
+
+
 def test_file_task_backend_tracks_notes_and_counts(tmp_path: Path) -> None:
     backend = FileTaskBackend(tmp_path)
     backend.ensure_tracker()
@@ -122,6 +134,26 @@ def test_github_task_backend_get_task_and_next_available(monkeypatch, tmp_path: 
     assert task.state == "03-needs-review"
     assert next_task is not None
     assert next_task.task_id == "41"
+
+
+def test_github_task_backend_history_reads_issue_comments(monkeypatch, tmp_path: Path) -> None:
+    backend = GitHubTaskBackend(tmp_path, repo="acme/widgets")
+
+    def fake_gh(*args: str, check: bool = True):
+        class Result:
+            def __init__(self, stdout: str) -> None:
+                self.stdout = stdout
+
+        return Result('{"comments":[{"author":{"login":"polly"},"body":"Moved to review."},{"author":{"login":"opus"},"body":"Needs one more test."}]}')
+
+    monkeypatch.setattr("pollypm.task_backends.github._gh", fake_gh)
+
+    history = backend.task_history("42")
+
+    assert history == [
+        "polly: Moved to review.",
+        "opus: Needs one more test.",
+    ]
 
 
 def test_github_task_backend_moves_state_by_relabeling_issue(monkeypatch, tmp_path: Path) -> None:

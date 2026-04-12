@@ -213,6 +213,22 @@ class GitHubTaskBackend(TaskBackend):
             path=self.project_path / f"#{issue_id}",
         )
 
+    def task_history(self, task_id: str) -> list[str]:
+        result = _gh(
+            "issue", "view", task_id,
+            "--json", "comments",
+            "--repo", self.repo,
+        )
+        issue = json.loads(result.stdout)
+        comments = issue.get("comments", [])
+        history: list[str] = []
+        for item in comments:
+            author = item.get("author", {}).get("login", "unknown")
+            body = str(item.get("body", "")).strip()
+            if body:
+                history.append(f"{author}: {body}")
+        return history
+
     def create_task(self, *, title: str, body: str = "", state: str = "01-ready") -> TaskRecord:
         label = STATE_TO_LABEL.get(state, "polly:ready")
         args = [

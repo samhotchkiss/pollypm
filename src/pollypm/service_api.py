@@ -307,6 +307,10 @@ class PollyPMService:
         config = load_config(self.config_path)
         return self._task_backend(config, project_key).next_available()
 
+    def task_history(self, project_key: str, task_id: str) -> list[str]:
+        config = load_config(self.config_path)
+        return self._task_backend(config, project_key).task_history(task_id)
+
     def validate_task_backend(self, project_key: str) -> GitHubTaskBackendValidation | dict[str, object]:
         config = load_config(self.config_path)
         backend = self._task_backend(config, project_key)

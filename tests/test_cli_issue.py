@@ -73,6 +73,10 @@ def test_issue_cli_create_list_transition_and_counts(tmp_path: Path) -> None:
         app,
         ["issue", "next", "--config", str(config_path), "--project", "demo"],
     )
+    history = runner.invoke(
+        app,
+        ["issue", "history", "--config", str(config_path), "--project", "demo", "0001"],
+    )
     transitioned = runner.invoke(
         app,
         ["issue", "transition", "--config", str(config_path), "--project", "demo", "0001", "02-in-progress"],
@@ -90,6 +94,8 @@ def test_issue_cli_create_list_transition_and_counts(tmp_path: Path) -> None:
     assert "0001 [01-ready] Wire backend" in info.stdout
     assert next_ready.exit_code == 0
     assert "0001 [01-ready] Wire backend" in next_ready.stdout
+    assert history.exit_code == 0
+    assert "state=01-ready" in history.stdout
     assert transitioned.exit_code == 0
     assert "Moved issue 0001 to 02-in-progress" in transitioned.stdout
     assert counts.exit_code == 0
@@ -157,6 +163,8 @@ def test_issue_cli_uses_github_backend_when_project_is_configured(monkeypatch, t
         if args[:2] == ("issue", "create"):
             return Result("https://github.com/acme/widgets/issues/42\n")
         if args[:2] == ("issue", "view"):
+            if "--json" in args and "comments" in args:
+                return Result('{"comments":[{"author":{"login":"polly"},"body":"Ready for review."}]}')
             return Result('{"number":42,"title":"Wire backend","labels":[{"name":"polly:ready"}]}')
         if args[:2] == ("issue", "list"):
             if "--json" in args and "-q" in args:
@@ -184,6 +192,10 @@ def test_issue_cli_uses_github_backend_when_project_is_configured(monkeypatch, t
         app,
         ["issue", "next", "--config", str(config_path), "--project", "demo"],
     )
+    history = runner.invoke(
+        app,
+        ["issue", "history", "--config", str(config_path), "--project", "demo", "42"],
+    )
     transitioned = runner.invoke(
         app,
         ["issue", "transition", "--config", str(config_path), "--project", "demo", "42", "03-needs-review"],
@@ -205,6 +217,8 @@ def test_issue_cli_uses_github_backend_when_project_is_configured(monkeypatch, t
     assert "42 [01-ready] Wire backend" in info.stdout
     assert next_ready.exit_code == 0
     assert "42 [01-ready] Wire backend" in next_ready.stdout
+    assert history.exit_code == 0
+    assert "polly: Ready for review." in history.stdout
     assert transitioned.exit_code == 0
     assert "Moved issue 42 to 03-needs-review" in transitioned.stdout
     assert commented.exit_code == 0

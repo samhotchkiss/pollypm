@@ -402,6 +402,21 @@ def issue_next(
     typer.echo(f"{task.task_id} [{task.state}] {task.title}")
 
 
+@issue_app.command("history")
+def issue_history(
+    task_id: str = typer.Argument(..., help="Issue id."),
+    project: str = typer.Option(..., "--project", help="Project key."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    service = PollyPMService(config_path)
+    entries = service.task_history(project, task_id)
+    if not entries:
+        typer.echo("No history found.")
+        return
+    for entry in entries:
+        typer.echo(entry)
+
+
 @issue_app.command("create")
 def issue_create(
     project: str = typer.Option(..., "--project", help="Project key."),

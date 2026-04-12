@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from pollypm.config import write_config
-from pollypm.models import ProjectSettings, PollyPMConfig, PollyPMSettings
+from pollypm.models import KnownProject, ProjectKind, ProjectSettings, PollyPMConfig, PollyPMSettings
 import pytest
 from pollypm.task_backends.github import GitHubTaskBackendValidation
 
@@ -193,6 +193,78 @@ repo = "acme/widgets"
 
     with pytest.raises(RuntimeError, match="Task backend validation failed: auth failed"):
         scaffold_issue_tracker(project_path)
+
+
+def test_enable_tracked_project_supports_file_and_github_backends_side_by_side(monkeypatch, tmp_path: Path) -> None:
+    file_project = tmp_path / "file-project"
+    github_project = tmp_path / "github-project"
+    file_project.mkdir()
+    github_project.mkdir()
+
+    config_dir = github_project / ".pollypm" / "config"
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            base_dir=tmp_path / ".pollypm-state",
+            logs_dir=tmp_path / ".pollypm-state/logs",
+            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
+            state_db=tmp_path / ".pollypm-state/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account=""),
+        accounts={},
+        sessions={},
+        projects={
+            "file_demo": KnownProject(
+                key="file_demo",
+                path=file_project,
+                name="File Demo",
+                kind=ProjectKind.FOLDER,
+                tracked=False,
+            ),
+            "github_demo": KnownProject(
+                key="github_demo",
+                path=github_project,
+                name="GitHub Demo",
+                kind=ProjectKind.FOLDER,
+                tracked=False,
+            ),
+        },
+    )
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path, force=True)
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "project.toml").write_text(
+        """
+[plugins]
+issue_backend = "github"
+
+[plugins.github_issues]
+repo = "acme/widgets"
+"""
+    )
+
+    monkeypatch.setattr(
+        "pollypm.task_backends.github.GitHubTaskBackend.validate",
+        lambda self: GitHubTaskBackendValidation(passed=True, checks=["repo_accessible"], errors=[]),
+    )
+
+    enable_tracked_project(config_path, "file_demo")
+    (config_dir / "project.toml").write_text(
+        """
+[plugins]
+issue_backend = "github"
+
+[plugins.github_issues]
+repo = "acme/widgets"
+"""
+    )
+    enable_tracked_project(config_path, "github_demo")
+
+    assert (file_project / "issues" / "01-ready").exists()
+    assert (file_project / "issues" / ".latest_issue_number").exists()
+    assert not (github_project / "issues").exists()
+    gitignore_text = (github_project / ".gitignore").read_text() if (github_project / ".gitignore").exists() else ""
+    assert "issues/" not in gitignore_text
 
 
 def test_session_lock_is_atomic_idempotent_and_releasable(tmp_path: Path) -> None:

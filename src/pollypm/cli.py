@@ -534,13 +534,19 @@ def reset(
             abort=True,
         )
     supervisor.shutdown_tmux()
-    # Clean up scheduler jobs and cockpit state so pm up starts fresh
+    # Clean up all transient state so pm up starts fresh
     jobs_path = supervisor.config.project.base_dir / "scheduler" / "jobs.json"
     if jobs_path.exists():
         jobs_path.unlink()
     cockpit_state = supervisor.config.project.base_dir / "cockpit_state.json"
     if cockpit_state.exists():
         cockpit_state.unlink()
+    # Clear stale leases — mounted cockpit leases would block recovery on restart
+    try:
+        supervisor.store.conn.execute("DELETE FROM leases")
+        supervisor.store.conn.commit()
+    except Exception:  # noqa: BLE001
+        pass
     typer.echo(f"Killed {len(sessions_to_kill)} session(s): {', '.join(sessions_to_kill)}")
 
 

@@ -756,18 +756,32 @@ def _build_cockpit_detail_inner(config_path: Path, kind: str, target: str | None
     supervisor.ensure_layout()
     config = supervisor.config
     if kind == "polly":
-        # Check WHY the operator isn't running
+        # Check whether the operator is actually running in tmux
         runtime = supervisor.store.get_session_runtime("operator")
+        storage_session = supervisor.storage_closet_session_name()
+        operator_launch = next(
+            (l for l in supervisor.plan_launches() if l.session.name == "operator"), None
+        )
+        operator_alive = False
+        if operator_launch and supervisor.tmux.has_session(storage_session):
+            storage_windows = {w.name for w in supervisor.tmux.list_windows(storage_session)}
+            operator_alive = operator_launch.window_name in storage_windows
+
         lines = [
             "Polly",
             "",
             "Polly is your AI project manager. She runs as an interactive",
             "Claude session and can start, steer, and review worker sessions.",
-            "",
-            "The Polly session is not currently running.",
         ]
-        if runtime and runtime.status == "degraded":
+        if operator_alive:
             lines.extend([
+                "",
+                "The Polly session is running. Click to connect.",
+            ])
+        elif runtime and runtime.status == "degraded":
+            lines.extend([
+                "",
+                "The Polly session is not currently running.",
                 "",
                 f"Status: DEGRADED after {runtime.recovery_attempts} recovery attempts.",
                 f"Last failure: {runtime.last_failure_type or 'unknown'}",
@@ -780,14 +794,12 @@ def _build_cockpit_detail_inner(config_path: Path, kind: str, target: str | None
                 "",
                 "Or from a terminal: pm relogin claude_claude_swh_me",
             ])
-        elif runtime and runtime.recovery_attempts and runtime.recovery_attempts > 0:
+        else:
             lines.extend([
                 "",
-                f"Recovery in progress ({runtime.recovery_attempts} attempts).",
-                "The heartbeat is trying to relaunch the session.",
+                "The Polly session is not currently running.",
+                "Use `pm up` to restart all sessions.",
             ])
-        else:
-            lines.append("Use `pm up` to restart all sessions.")
         return "\n".join(lines)
 
     if kind == "inbox":

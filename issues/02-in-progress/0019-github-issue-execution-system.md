@@ -146,16 +146,22 @@ repo = "samhotchkiss/pollypm"    # owner/repo
 
 ## Acceptance Criteria
 
-- [ ] GitHub issue backend plugin implements all 7 interface methods
-- [ ] Labels are auto-created on first use if missing
-- [ ] Plugin passes automated validation on activation
+- [x] GitHub issue backend plugin implements all 7 interface methods
+- [x] Labels are auto-created on first use if missing
+- [x] Plugin passes automated validation on activation
 - [ ] Three-session pipeline works end-to-end: Opus creates issue → Codex implements → Opus reviews and merges
-- [ ] State transitions are reflected in GitHub labels in real-time
-- [ ] Handoff comments contain structured information (what was done, how to test, deviations)
-- [ ] Review session runs independent verification, not just re-running implementer's tests
-- [ ] Change requests cycle back to in-progress correctly
-- [ ] `report_status()` returns accurate counts across all states
-- [ ] Works alongside file-based tracker (different projects can use different backends)
+- [x] State transitions are reflected in GitHub labels in real-time
+- [x] Handoff comments contain structured information (what was done, how to test, deviations)
+- [x] Review session runs independent verification, not just re-running implementer's tests
+- [x] Change requests cycle back to in-progress correctly
+- [x] `report_status()` returns accurate counts across all states
+- [x] Works alongside file-based tracker (different projects can use different backends)
+
+## Implementation Status
+
+- Backend and CLI coverage now include GitHub issue CRUD, next-issue selection, status reporting, history, validation, handoff notes, review approve/reject flows, and mixed file/GitHub project coexistence.
+- Activation now validates the GitHub backend immediately when a project tracker is enabled.
+- Remaining gap: a real end-to-end three-session run that includes branch/PR handoff and review-to-merge completion still needs live execution coverage, not just mocked/unit coverage.
 
 ## Test Instructions
 

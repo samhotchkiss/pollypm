@@ -156,7 +156,26 @@ class SupervisorHeartbeatAPI:
             # Session may be dead or missing — don't crash the sweep.
             pass
 
+    # Only alert the operator about a session once every 10 minutes to avoid noise
+    _FOLLOWUP_COOLDOWN_SECONDS = 600
+
     def queue_polly_followup(self, session_name: str, reason: str) -> None:
+        # Rate-limit: check recent events for a followup already sent
+        try:
+            recent = self.supervisor.store.recent_events(limit=50)
+            now = datetime.now(UTC)
+            for event in recent:
+                if (
+                    event.session_name == session_name
+                    and event.event_type == "polly_followup"
+                ):
+                    age = (now - datetime.fromisoformat(event.created_at)).total_seconds()
+                    if age < self._FOLLOWUP_COOLDOWN_SECONDS:
+                        return  # already notified recently
+                    break  # found the most recent one but it's old enough
+        except Exception:  # noqa: BLE001
+            pass  # if we can't check, send anyway
+
         try:
             self.supervisor.send_input(
                 "operator",
@@ -168,8 +187,8 @@ class SupervisorHeartbeatAPI:
                 ),
                 owner="heartbeat",
             )
+            self.supervisor.store.record_event(session_name, "polly_followup", reason)
         except Exception:  # noqa: BLE001
-            # Operator may be dead — don't crash the sweep.
             pass
 
     def _build_contexts(self) -> list[HeartbeatSessionContext]:

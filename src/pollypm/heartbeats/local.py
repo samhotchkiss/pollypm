@@ -163,13 +163,9 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     f"Window {context.window_name} has produced effectively the same snapshot for 3 heartbeats",
                 )
                 alerts.append("suspected_loop")
-                # After 5 consecutive identical snapshots, notify operator AND nudge worker directly
+                # After 5 consecutive identical snapshots, nudge the worker directly
                 longer_hashes = api.recent_snapshot_hashes(context.session_name, limit=5)
                 if len(longer_hashes) == 5 and len(set(longer_hashes)) == 1:
-                    api.queue_polly_followup(
-                        context.session_name,
-                        f"Session idle for 5+ heartbeat cycles — may need a nudge or reassignment",
-                    )
                     # Direct nudge to the worker — only for worker roles, not control sessions
                     if context.role == "worker":
                         api.send_session_message(
@@ -218,8 +214,9 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 api.raise_alert(context.session_name, "needs_followup", "warn", reason)
                 if not status_locked:
                     api.set_session_status(context.session_name, "needs_followup", reason=reason)
-                if self._should_queue_followup(context):
-                    api.queue_polly_followup(context.session_name, reason)
+                # Alerts are visible in the cockpit and via `pm alerts`.
+                # No need to inject messages into the operator chat —
+                # the operator gets nudged only when *it* is stalled.
                 alerts.append("needs_followup")
             else:
                 api.clear_alert(context.session_name, "needs_followup")

@@ -382,32 +382,17 @@ def test_local_heartbeat_backend_marks_auth_broken() -> None:
     assert ("worker_pollypm", "auth_broken") in api.alerts
 
 
-def test_local_heartbeat_backend_queues_operator_followup_once_per_unfinished_turn() -> None:
+def test_local_heartbeat_backend_raises_alert_for_unfinished_turn() -> None:
+    """Heartbeat raises an alert for needs_followup but does NOT inject messages into operator chat."""
     api = FakeHeartbeatAPI([_context(transcript_delta="Implemented the parser. Next step: add coverage.")])
 
     LocalHeartbeatBackend().run(api)
 
-    assert len(api.messages) == 1
-    assert api.messages[0][0] == "operator"
-    assert "Additional work remains" in api.messages[0][1]
-    assert "add coverage" in api.messages[0][1]  # snippet from transcript
-    assert api.messages[0][2] == "heartbeat"
-
-
-def test_local_heartbeat_backend_does_not_repeat_followup_for_same_snapshot() -> None:
-    cursor = HeartbeatCursor(
-        session_name="worker_pollypm",
-        source_path="/tmp/worker.log",
-        last_offset=64,
-        last_snapshot_hash="hash-1",
-        last_verdict="needs_followup",
-        last_reason="Additional work remains — Implemented the parser. Next step: add coverage.",
-    )
-    api = FakeHeartbeatAPI([_context(transcript_delta="Implemented the parser. Next step: add coverage.", cursor=cursor)])
-
-    LocalHeartbeatBackend().run(api)
-
+    # Alert raised but NO message injected into operator chat
     assert api.messages == []
+    key = ("worker_pollypm", "needs_followup")
+    assert key in api.alerts
+    assert "Additional work remains" in api.alerts[key].message
 
 
 def test_local_heartbeat_backend_uses_mechanical_checks_only_for_heartbeat_supervisor() -> None:

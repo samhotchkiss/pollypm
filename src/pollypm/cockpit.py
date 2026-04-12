@@ -168,6 +168,7 @@ class CockpitRouter:
         self._write_state(data)
 
     def build_items(self, *, spinner_index: int = 0) -> list[CockpitItem]:
+        self._validate_state()
         supervisor = self._load_supervisor()
         config = supervisor.config
         launches, windows, alerts, _leases, _errors = supervisor.status()

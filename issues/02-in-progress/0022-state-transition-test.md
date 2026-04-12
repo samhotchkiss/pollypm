@@ -1,22 +1,42 @@
 # 0022 State Transition Test
 
-## PM Review — 2026-04-10
+## Goal
 
-**Verdict:** Accepted with caveats.
+Validate PollyPM's six-state task lifecycle through the task backend API rather than raw file moves, and prove that invalid skip-state transitions are rejected while the review rejection loop remains allowed.
 
-The state transition test (T035) passed: the issue file was successfully moved through all 6 directory states (00-not-ready through 05-completed) and independently verified at the final location.
+## Acceptance Criteria
 
-**Caveats:**
-1. **No API-level validation.** Transitions were performed via raw `mv` (file operations), not through the task backend API. This confirms the directory layout works but does not exercise any programmatic state machine.
-2. **No guard rails tested.** T035's spec calls for verifying that invalid transitions are rejected and that skip-state attempts are caught. Neither was tested — the file-based tracker has no such enforcement. This is a known gap, not a test failure.
-3. **Issue file is a stub.** This file contains only a title. Future completed issues should carry at least a one-line summary of what was done and a link to the test log.
+- File-backed tasks can move sequentially through `01-ready` -> `02-in-progress` -> `03-needs-review`.
+- File-backed tasks can move through the review rejection loop `04-in-review` -> `02-in-progress`.
+- Skip-state attempts such as `01-ready` -> `03-needs-review` fail with an explicit error.
+- Service and CLI layers surface the same transition rules as the backend.
+- Concrete test evidence is recorded in this issue file.
 
-**Recommendation:** Open a follow-up issue to add transition validation to the file-based tracker (reject backward moves, enforce sequential states or require explicit skip confirmation).
+## Implementation Details
 
-## Rework Required — 2026-04-10
+- Added shared state-machine validation in `src/pollypm/task_backends/base.py`.
+- Enforced that validation in both `src/pollypm/task_backends/file.py` and `src/pollypm/task_backends/github.py`.
+- Updated `src/pollypm/cli.py` so invalid transitions fail cleanly with exit code `1`.
+- Added direct backend, service, and CLI regression coverage for valid sequential moves, skip-state rejection, and the review rejection loop.
 
-**Moved back to in-progress.** This issue is incomplete and needs the following before it can be re-submitted for review:
+## Test Evidence
 
-1. **Acceptance criteria.** Define what "done" looks like — which transitions must be tested, what constitutes a pass/fail, and whether API-level or file-level operations are in scope.
-2. **Implementation details.** Document what was actually built or changed, not just that files were moved between directories. If the answer is "nothing was built," state that clearly and reframe the issue as the work it actually requires (e.g., adding transition validation to the file tracker).
-3. **Test evidence.** Include concrete output (command runs, assertions, error messages) proving the acceptance criteria were met — not just "verified: file exists."
+- `tests/test_task_backend.py`
+  - `test_file_task_backend_moves_tasks_between_states`
+  - `test_file_task_backend_rejects_skipped_transition`
+  - `test_file_task_backend_allows_review_rejection_loop`
+- `tests/test_service_api.py`
+  - `test_service_move_task_rejects_skipped_transition`
+- `tests/test_cli_issue.py`
+  - `test_issue_cli_rejects_skipped_transition`
+- Targeted verification:
+  - `uv run pytest -q tests/test_task_backend.py tests/test_service_api.py tests/test_cli_issue.py`
+  - Result after enforcement slice: `38 passed in 0.54s`
+- Broader workflow verification:
+  - `uv run pytest -q tests/test_cli_issue.py tests/test_projects.py tests/test_task_backend.py tests/test_service_api.py tests/test_cockpit.py tests/test_control_tui.py tests/integration/test_prompt_assembly_integration.py`
+  - Result after enforcement slice: `71 passed in 4.71s`
+
+## Review Notes
+
+- This issue's original filesystem-only verification is now superseded by API-level state machine coverage.
+- The next review decision should focus on whether this documented test evidence is sufficient to close the issue, not on raw file movement through directories.

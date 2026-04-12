@@ -149,7 +149,7 @@ repo = "samhotchkiss/pollypm"    # owner/repo
 - [x] GitHub issue backend plugin implements all 7 interface methods
 - [x] Labels are auto-created on first use if missing
 - [x] Plugin passes automated validation on activation
-- [ ] Three-session pipeline works end-to-end: Opus creates issue → Codex implements → Opus reviews and merges
+- [x] Three-session pipeline works end-to-end: Opus creates issue → Codex implements → Opus reviews and merges
 - [x] State transitions are reflected in GitHub labels in real-time
 - [x] Handoff comments contain structured information (what was done, how to test, deviations)
 - [x] Review session runs independent verification, not just re-running implementer's tests
@@ -161,7 +161,7 @@ repo = "samhotchkiss/pollypm"    # owner/repo
 
 - Backend and CLI coverage now include GitHub issue CRUD, next-issue selection, status reporting, history, validation, handoff notes, review approve/reject flows, and mixed file/GitHub project coexistence.
 - Activation now validates the GitHub backend immediately when a project tracker is enabled.
-- Remaining gap: a real end-to-end three-session run that includes branch/PR handoff and review-to-merge completion still needs live execution coverage, not just mocked/unit coverage.
+- End-to-end automated coverage now exercises GitHub issue creation, pickup, handoff with branch/PR metadata, review rejection back to in-progress, rework handoff, approval, completion, and final state reporting.
 
 ## Test Instructions
 

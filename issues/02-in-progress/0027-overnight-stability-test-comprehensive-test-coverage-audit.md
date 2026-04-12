@@ -81,3 +81,8 @@ Source files in `src/pollypm/` with no direct `tests/test_<module>.py` counterpa
 - `src/pollypm/task_backends/github.py`
 - `src/pollypm/tmux/__init__.py`
 - `src/pollypm/tmux/client.py`
+
+## Task 3 Full Suite Result
+`uv run pytest -q`
+
+- `466 passed in 118.23s (0:01:58)`

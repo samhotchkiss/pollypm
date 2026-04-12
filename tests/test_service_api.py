@@ -1,6 +1,8 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from pollypm.config import write_config
+from pollypm.models import AccountConfig, KnownProject, PollyPMConfig, PollyPMSettings, ProjectKind, ProjectSettings, ProviderKind
 from pollypm.service_api import PollyPMService, render_json
 
 
@@ -143,3 +145,120 @@ def test_render_json_serializes_datetime() -> None:
     rendered = render_json(payload)
 
     assert '"run_at": "2026-04-10T12:00:00+00:00"' in rendered
+
+
+def test_service_task_operations_use_file_backend(tmp_path: Path) -> None:
+    project_root = tmp_path / "demo"
+    project_root.mkdir()
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            base_dir=tmp_path / ".pollypm-state",
+            logs_dir=tmp_path / ".pollypm-state/logs",
+            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
+            state_db=tmp_path / ".pollypm-state/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="claude_main"),
+        accounts={
+            "claude_main": AccountConfig(
+                name="claude_main",
+                provider=ProviderKind.CLAUDE,
+                home=tmp_path / ".pollypm-state" / "homes" / "claude_main",
+            )
+        },
+        sessions={},
+        projects={
+            "demo": KnownProject(key="demo", path=project_root, name="Demo", kind=ProjectKind.GIT, tracked=True),
+        },
+    )
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path, force=True)
+    service = PollyPMService(config_path)
+
+    task = service.create_task("demo", title="Wire the backend", body="Implement the file-backed task flow.")
+    moved = service.move_task("demo", task.task_id, to_state="02-in-progress")
+    note_path = service.append_task_note("demo", "notes.md", text="Remember to verify the happy path.\n")
+    listed = service.list_tasks("demo", states=["02-in-progress"])
+
+    assert task.task_id == "0001"
+    assert moved.state == "02-in-progress"
+    assert note_path.exists()
+    assert listed[0].task_id == "0001"
+    assert service.task_state_counts("demo")["02-in-progress"] == 1
+
+
+def test_service_task_operations_use_github_backend(monkeypatch, tmp_path: Path) -> None:
+    project_root = tmp_path / "demo"
+    project_root.mkdir()
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            base_dir=tmp_path / ".pollypm-state",
+            logs_dir=tmp_path / ".pollypm-state/logs",
+            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
+            state_db=tmp_path / ".pollypm-state/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="claude_main"),
+        accounts={
+            "claude_main": AccountConfig(
+                name="claude_main",
+                provider=ProviderKind.CLAUDE,
+                home=tmp_path / ".pollypm-state" / "homes" / "claude_main",
+            )
+        },
+        sessions={},
+        projects={
+            "demo": KnownProject(key="demo", path=project_root, name="Demo", kind=ProjectKind.GIT, tracked=True),
+        },
+    )
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path, force=True)
+    config_dir = project_root / ".pollypm" / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "project.toml").write_text(
+        """
+[project]
+display_name = "Demo"
+
+[plugins]
+issue_backend = "github"
+
+[plugins.github_issues]
+repo = "acme/widgets"
+"""
+    )
+    service = PollyPMService(config_path)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_gh(*args: str, check: bool = True):
+        calls.append(args)
+
+        class Result:
+            def __init__(self, stdout: str = "") -> None:
+                self.stdout = stdout
+
+        if args[:2] == ("issue", "create"):
+            return Result("https://github.com/acme/widgets/issues/42\n")
+        if args[:2] == ("issue", "view"):
+            return Result('{"title":"Wire the backend","labels":[{"name":"polly:ready"}]}')
+        if args[:2] == ("issue", "list"):
+            if "--json" in args and "-q" in args:
+                return Result("3")
+            return Result('[{"number":42,"title":"Wire the backend","state":"OPEN"}]')
+        if args[:2] == ("issue", "comment"):
+            return Result()
+        return Result()
+
+    monkeypatch.setattr("pollypm.task_backends.github._gh", fake_gh)
+
+    task = service.create_task("demo", title="Wire the backend", body="Implement the gh-backed task flow.")
+    moved = service.move_task("demo", "42", to_state="03-needs-review")
+    note_path = service.append_task_note("demo", "#42", text="Implemented and verified.")
+    listed = service.list_tasks("demo", states=["01-ready"])
+    counts = service.task_state_counts("demo")
+
+    assert task.task_id == "42"
+    assert moved.state == "03-needs-review"
+    assert note_path == project_root / "#42"
+    assert listed[0].task_id == "42"
+    assert counts["01-ready"] == 3

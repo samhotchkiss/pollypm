@@ -802,7 +802,7 @@ def _build_cockpit_detail_inner(config_path: Path, kind: str, target: str | None
             f"Path: {project.path}",
             f"Kind: {project.kind.value}",
             f"Tracked: {'yes' if project.tracked else 'no'}",
-            f"Issue tracker: {issues_root if issues_root.exists() else 'not initialized'}",
+            f"Issue tracker: {issues_root if task_backend.exists() else 'not initialized'}",
             f"Active worktrees: {len(worktrees)}",
             "",
             "No active live lane is running for this project.",

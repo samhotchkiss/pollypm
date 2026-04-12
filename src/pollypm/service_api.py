@@ -40,6 +40,8 @@ from pollypm.projects import (
 )
 from pollypm.schedulers.base import ScheduledJob
 from pollypm.supervisor import Supervisor
+from pollypm.task_backends import get_task_backend
+from pollypm.task_backends.base import TaskRecord
 from pollypm.transcript_ledger import recent_token_usage as list_recent_token_usage
 from pollypm.transcript_ledger import sync_token_ledger
 from pollypm.workers import (
@@ -292,6 +294,26 @@ class PollyPMService:
     def register_project(self, path: Path) -> tuple[str, str]:
         return register_project(self.config_path, path)
 
+    def list_tasks(self, project_key: str, *, states: list[str] | None = None) -> list[TaskRecord]:
+        config = load_config(self.config_path)
+        return self._task_backend(config, project_key).list_tasks(states=states)
+
+    def create_task(self, project_key: str, *, title: str, body: str = "", state: str = "01-ready") -> TaskRecord:
+        config = load_config(self.config_path)
+        return self._task_backend(config, project_key).create_task(title=title, body=body, state=state)
+
+    def move_task(self, project_key: str, task_id: str, *, to_state: str) -> TaskRecord:
+        config = load_config(self.config_path)
+        return self._task_backend(config, project_key).move_task(task_id, to_state)
+
+    def append_task_note(self, project_key: str, task_name: str, *, text: str) -> Path:
+        config = load_config(self.config_path)
+        return self._task_backend(config, project_key).append_note(task_name, text)
+
+    def task_state_counts(self, project_key: str) -> dict[str, int]:
+        config = load_config(self.config_path)
+        return self._task_backend(config, project_key).state_counts()
+
     def detect_preference_override(self, project_key: str, text: str) -> object | None:
         config = load_config(self.config_path)
         project_root = self._project_root(config, project_key)
@@ -478,6 +500,9 @@ class PollyPMService:
         if project is not None:
             return project.path
         return config.project.root_dir
+
+    def _task_backend(self, config, project_key: str):
+        return get_task_backend(self._project_root(config, project_key))
 
 
 def render_json(data: object) -> str:

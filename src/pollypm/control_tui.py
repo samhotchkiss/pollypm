@@ -1113,7 +1113,7 @@ class PollyPMApp(App[None]):
             f"Path: {project.path}",
             f"Kind: {project.kind.value}",
             f"Tracked: {'yes' if project.tracked else 'no'}",
-            f"Issue Tracker: {issues_dir if issues_dir.exists() else 'not initialized'}",
+            f"Issue Tracker: {issues_dir if task_backend.exists() else 'not initialized'}",
             f"Active Worktrees: {len(worktrees)}",
             f"Sessions: {', '.join(sessions) if sessions else 'none'}",
         ]

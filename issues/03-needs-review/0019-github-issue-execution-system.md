@@ -178,3 +178,9 @@ repo = "samhotchkiss/pollypm"    # owner/repo
 ## Dependencies
 
 - None — the plugin interface (doc 06) is already specified. This is a new backend implementation.
+
+## Review Handoff
+
+- Scope delivered: GitHub task backend support is now wired through project activation, service APIs, CLI issue commands, cockpit/control surfaces, structured handoff and review flows, activation-time validation, and mixed-backend coexistence.
+- Key verification: `uv run pytest -q tests/test_cli_issue.py tests/test_projects.py tests/test_task_backend.py tests/test_service_api.py tests/test_cockpit.py tests/test_control_tui.py tests/integration/test_prompt_assembly_integration.py tests/integration/test_github_issue_pipeline_integration.py` passed with `80 passed in 13.28s`.
+- Reviewer focus: confirm the mocked GitHub integration behavior is sufficient for merge, and decide whether additional live-`gh` interactive validation is needed beyond the automated suite already added here.

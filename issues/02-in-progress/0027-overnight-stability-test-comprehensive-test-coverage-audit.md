@@ -86,3 +86,14 @@ Source files in `src/pollypm/` with no direct `tests/test_<module>.py` counterpa
 `uv run pytest -q`
 
 - `466 passed in 118.23s (0:01:58)`
+
+## Task 4 Supervisor Zero-Coverage Targets
+Coverage spot-check identified zero-coverage functions in `supervisor.py`; added tests for:
+
+- `release_lease()`
+- `_account_is_viable()`
+
+## Task 5 Final Suite Result
+`uv run pytest -q`
+
+- `470 passed in 141.56s (0:02:21)`

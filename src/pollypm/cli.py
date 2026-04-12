@@ -485,6 +485,14 @@ def issue_counts(
         typer.echo(f"{state}: {count}")
 
 
+@issue_app.command("report")
+def issue_report(
+    project: str = typer.Option(..., "--project", help="Project key."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    issue_counts(project=project, config_path=config_path)
+
+
 @issue_app.command("validate")
 def issue_validate(
     project: str = typer.Option(..., "--project", help="Project key."),

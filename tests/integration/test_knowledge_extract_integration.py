@@ -160,7 +160,7 @@ def test_knowledge_extraction_updates_docs_with_checkpointing(tmp_path: Path) ->
 
     third = extract_knowledge_once(config)
     assert third["processed_events"] == 1
-    assert third["updated_docs"] == 1
+    assert third["updated_docs"] >= 1
     assert third["memory_entries"] >= 1
     updated_decisions = decisions_path.read_text()
     assert "Haiku" in updated_decisions

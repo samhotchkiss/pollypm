@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -332,24 +333,38 @@ class StateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(path)
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.executescript(SCHEMA)
-        self._migrate()
-        self.conn.commit()
+        self._lock = threading.RLock()
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        with self._lock:
+            self.execute("PRAGMA journal_mode=WAL")
+            self.execute("PRAGMA busy_timeout=5000")
+            self.conn.executescript(SCHEMA)
+            self._migrate()
+            self.commit()
 
     def close(self) -> None:
-        try:
-            self.conn.close()
-        except Exception:  # noqa: BLE001
-            pass
+        with self._lock:
+            try:
+                self.conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
+        """Thread-safe execute."""
+        with self._lock:
+            return self.conn.execute(sql, params)
+
+    def commit(self) -> None:
+        """Thread-safe commit."""
+        with self._lock:
+            self.conn.commit()
 
     def _now(self) -> str:
         return datetime.now(UTC).isoformat()
 
     def _migrate(self) -> None:
-        self.conn.execute("DROP INDEX IF EXISTS idx_alerts_open")
-        self.conn.execute(
+        self.execute("DROP INDEX IF EXISTS idx_alerts_open")
+        self.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_open
             ON alerts(session_name, alert_type)
@@ -358,16 +373,16 @@ class StateStore:
         )
         columns = {
             row[1]
-            for row in self.conn.execute("PRAGMA table_info(sessions)").fetchall()
+            for row in self.execute("PRAGMA table_info(sessions)").fetchall()
         }
         if "project" not in columns:
-            self.conn.execute("ALTER TABLE sessions ADD COLUMN project TEXT NOT NULL DEFAULT 'pollypm'")
+            self.execute("ALTER TABLE sessions ADD COLUMN project TEXT NOT NULL DEFAULT 'pollypm'")
         heartbeat_columns = {
             row[1]
-            for row in self.conn.execute("PRAGMA table_info(heartbeats)").fetchall()
+            for row in self.execute("PRAGMA table_info(heartbeats)").fetchall()
         }
         if "snapshot_hash" not in heartbeat_columns:
-            self.conn.execute("ALTER TABLE heartbeats ADD COLUMN snapshot_hash TEXT NOT NULL DEFAULT ''")
+            self.execute("ALTER TABLE heartbeats ADD COLUMN snapshot_hash TEXT NOT NULL DEFAULT ''")
 
     def upsert_session(
         self,
@@ -380,7 +395,7 @@ class StateStore:
         cwd: str,
         window_name: str,
     ) -> None:
-        self.conn.execute(
+        self.execute(
             """
             INSERT INTO sessions (name, role, project, provider, account, cwd, window_name)
             VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -394,22 +409,22 @@ class StateStore:
             """,
             (name, role, project, provider, account, cwd, window_name),
         )
-        self.conn.commit()
+        self.commit()
 
     def prune_sessions(self, valid_session_names: set[str]) -> None:
         now = self._now()
         if valid_session_names:
             placeholders = ", ".join("?" for _ in valid_session_names)
             params = (*sorted(valid_session_names),)
-            self.conn.execute(
+            self.execute(
                 f"DELETE FROM sessions WHERE name NOT IN ({placeholders})",
                 params,
             )
-            self.conn.execute(
+            self.execute(
                 f"DELETE FROM leases WHERE session_name NOT IN ({placeholders})",
                 params,
             )
-            self.conn.execute(
+            self.execute(
                 f"""
                 UPDATE alerts
                 SET status = 'cleared', updated_at = ?
@@ -418,9 +433,9 @@ class StateStore:
                 (now, *sorted(valid_session_names)),
             )
         else:
-            self.conn.execute("DELETE FROM sessions")
-            self.conn.execute("DELETE FROM leases")
-            self.conn.execute(
+            self.execute("DELETE FROM sessions")
+            self.execute("DELETE FROM leases")
+            self.execute(
                 """
                 UPDATE alerts
                 SET status = 'cleared', updated_at = ?
@@ -428,27 +443,27 @@ class StateStore:
                 """,
                 (now,),
             )
-        self.conn.commit()
+        self.commit()
 
     def get_session_window(self, session_name: str) -> str | None:
-        row = self.conn.execute(
+        row = self.execute(
             "SELECT window_name FROM sessions WHERE name = ?",
             (session_name,),
         ).fetchone()
         return None if row is None else str(row[0])
 
     def record_event(self, session_name: str, event_type: str, message: str) -> None:
-        self.conn.execute(
+        self.execute(
             """
             INSERT INTO events (session_name, event_type, message, created_at)
             VALUES (?, ?, ?, ?)
             """,
             (session_name, event_type, message, self._now()),
         )
-        self.conn.commit()
+        self.commit()
 
     def recent_events(self, limit: int = 20) -> list[EventRecord]:
-        rows = self.conn.execute(
+        rows = self.execute(
             """
             SELECT session_name, event_type, message, created_at
             FROM events
@@ -471,7 +486,7 @@ class StateStore:
         snapshot_path: str,
         snapshot_hash: str,
     ) -> None:
-        self.conn.execute(
+        self.execute(
             """
             INSERT INTO heartbeats (
                 session_name, tmux_window, pane_id, pane_command, pane_dead, log_bytes, snapshot_path, snapshot_hash, created_at
@@ -490,10 +505,10 @@ class StateStore:
                 self._now(),
             ),
         )
-        self.conn.commit()
+        self.commit()
 
     def latest_heartbeat(self, session_name: str) -> HeartbeatRecord | None:
-        row = self.conn.execute(
+        row = self.execute(
             """
             SELECT session_name, tmux_window, pane_id, pane_command, pane_dead, log_bytes, snapshot_path, snapshot_hash, created_at
             FROM heartbeats
@@ -519,7 +534,7 @@ class StateStore:
         )
 
     def recent_heartbeats(self, session_name: str, limit: int = 3) -> list[HeartbeatRecord]:
-        rows = self.conn.execute(
+        rows = self.execute(
             """
             SELECT session_name, tmux_window, pane_id, pane_command, pane_dead, log_bytes, snapshot_path, snapshot_hash, created_at
             FROM heartbeats
@@ -546,7 +561,7 @@ class StateStore:
 
     def upsert_alert(self, session_name: str, alert_type: str, severity: str, message: str) -> None:
         now = self._now()
-        existing = self.conn.execute(
+        existing = self.execute(
             """
             SELECT id, message, severity
             FROM alerts
@@ -555,7 +570,7 @@ class StateStore:
             (session_name, alert_type),
         ).fetchone()
         if existing is None:
-            self.conn.execute(
+            self.execute(
                 """
                 INSERT INTO alerts (session_name, alert_type, severity, message, status, created_at, updated_at)
                 VALUES (?, ?, ?, ?, 'open', ?, ?)
@@ -563,7 +578,7 @@ class StateStore:
                 (session_name, alert_type, severity, message, now, now),
             )
         else:
-            self.conn.execute(
+            self.execute(
                 """
                 UPDATE alerts
                 SET severity = ?, message = ?, updated_at = ?
@@ -571,10 +586,10 @@ class StateStore:
                 """,
                 (severity, message, now, existing[0]),
             )
-        self.conn.commit()
+        self.commit()
 
     def clear_alert(self, session_name: str, alert_type: str) -> None:
-        self.conn.execute(
+        self.execute(
             """
             UPDATE alerts
             SET status = 'cleared', updated_at = ?
@@ -582,10 +597,10 @@ class StateStore:
             """,
             (self._now(), session_name, alert_type),
         )
-        self.conn.commit()
+        self.commit()
 
     def open_alerts(self) -> list[AlertRecord]:
-        rows = self.conn.execute(
+        rows = self.execute(
             """
             SELECT id, session_name, alert_type, severity, message, status, created_at, updated_at
             FROM alerts
@@ -608,7 +623,7 @@ class StateStore:
         ]
 
     def get_alert(self, alert_id: int) -> AlertRecord | None:
-        row = self.conn.execute(
+        row = self.execute(
             """
             SELECT id, session_name, alert_type, severity, message, status, created_at, updated_at
             FROM alerts
@@ -633,7 +648,7 @@ class StateStore:
         alert = self.get_alert(alert_id)
         if alert is None:
             return None
-        self.conn.execute(
+        self.execute(
             """
             UPDATE alerts
             SET status = 'cleared', updated_at = ?
@@ -641,12 +656,12 @@ class StateStore:
             """,
             (self._now(), alert_id),
         )
-        self.conn.commit()
+        self.commit()
         return self.get_alert(alert_id)
 
     def set_lease(self, session_name: str, owner: str, note: str = "") -> None:
         now = self._now()
-        self.conn.execute(
+        self.execute(
             """
             INSERT INTO leases (session_name, owner, note, updated_at)
             VALUES (?, ?, ?, ?)
@@ -657,14 +672,14 @@ class StateStore:
             """,
             (session_name, owner, note, now),
         )
-        self.conn.commit()
+        self.commit()
 
     def clear_lease(self, session_name: str) -> None:
-        self.conn.execute("DELETE FROM leases WHERE session_name = ?", (session_name,))
-        self.conn.commit()
+        self.execute("DELETE FROM leases WHERE session_name = ?", (session_name,))
+        self.commit()
 
     def get_lease(self, session_name: str) -> LeaseRecord | None:
-        row = self.conn.execute(
+        row = self.execute(
             """
             SELECT session_name, owner, note, updated_at
             FROM leases
@@ -677,7 +692,7 @@ class StateStore:
         return LeaseRecord(*row)
 
     def list_leases(self) -> list[LeaseRecord]:
-        rows = self.conn.execute(
+        rows = self.execute(
             """
             SELECT session_name, owner, note, updated_at
             FROM leases
@@ -696,7 +711,7 @@ class StateStore:
         usage_summary: str,
         raw_text: str,
     ) -> None:
-        self.conn.execute(
+        self.execute(
             """
             INSERT INTO account_usage (
                 account_name, provider, plan, health, usage_summary, raw_text, updated_at
@@ -712,10 +727,10 @@ class StateStore:
             """,
             (account_name, provider, plan, health, usage_summary, raw_text, self._now()),
         )
-        self.conn.commit()
+        self.commit()
 
     def get_account_usage(self, account_name: str) -> AccountUsageRecord | None:
-        row = self.conn.execute(
+        row = self.execute(
             """
             SELECT account_name, provider, plan, health, usage_summary, raw_text, updated_at
             FROM account_usage
@@ -738,7 +753,7 @@ class StateStore:
         access_expires_at: str | None = None,
         refresh_available: bool = False,
     ) -> None:
-        self.conn.execute(
+        self.execute(
             """
             INSERT INTO account_runtime (
                 account_name, provider, status, reason, available_at, access_expires_at, refresh_available, updated_at
@@ -764,10 +779,10 @@ class StateStore:
                 self._now(),
             ),
         )
-        self.conn.commit()
+        self.commit()
 
     def get_account_runtime(self, account_name: str) -> AccountRuntimeRecord | None:
-        row = self.conn.execute(
+        row = self.execute(
             """
             SELECT account_name, provider, status, reason, available_at, access_expires_at, refresh_available, updated_at
             FROM account_runtime
@@ -813,7 +828,7 @@ class StateStore:
                 return new  # explicitly provided (including None → NULL)
             return old_val if current else default
 
-        self.conn.execute(
+        self.execute(
             """
             INSERT INTO session_runtime (
                 session_name, status, effective_account, effective_provider, recovery_attempts,
@@ -849,10 +864,10 @@ class StateStore:
                 self._now(),
             ),
         )
-        self.conn.commit()
+        self.commit()
 
     def get_session_runtime(self, session_name: str) -> SessionRuntimeRecord | None:
-        row = self.conn.execute(
+        row = self.execute(
             """
             SELECT session_name, status, effective_account, effective_provider, recovery_attempts,
                    recovery_window_started_at, last_failure_type, last_failure_message, last_checkpoint_path,
@@ -890,7 +905,7 @@ class StateStore:
         snapshot_path: str,
         summary_text: str,
     ) -> None:
-        self.conn.execute(
+        self.execute(
             """
             INSERT INTO checkpoints (
                 session_name, project_key, level, json_path, summary_path, snapshot_path, summary_text, created_at
@@ -899,10 +914,10 @@ class StateStore:
             """,
             (session_name, project_key, level, json_path, summary_path, snapshot_path, summary_text, self._now()),
         )
-        self.conn.commit()
+        self.commit()
 
     def latest_checkpoint(self, session_name: str) -> CheckpointRecord | None:
-        row = self.conn.execute(
+        row = self.execute(
             """
             SELECT session_name, project_key, level, json_path, summary_path, snapshot_path, summary_text, created_at
             FROM checkpoints
@@ -929,7 +944,7 @@ class StateStore:
         status: str,
     ) -> None:
         now = self._now()
-        existing = self.conn.execute(
+        existing = self.execute(
             """
             SELECT id, created_at
             FROM worktrees
@@ -938,7 +953,7 @@ class StateStore:
             (project_key, lane_kind, lane_key, status),
         ).fetchone()
         if existing is None:
-            self.conn.execute(
+            self.execute(
                 """
                 INSERT INTO worktrees (
                     project_key, lane_kind, lane_key, session_name, issue_key, path, branch, status, created_at, updated_at
@@ -948,7 +963,7 @@ class StateStore:
                 (project_key, lane_kind, lane_key, session_name, issue_key, path, branch, status, now, now),
             )
         else:
-            self.conn.execute(
+            self.execute(
                 """
                 UPDATE worktrees
                 SET session_name = ?, issue_key = ?, path = ?, branch = ?, updated_at = ?
@@ -956,10 +971,10 @@ class StateStore:
                 """,
                 (session_name, issue_key, path, branch, now, existing[0]),
             )
-        self.conn.commit()
+        self.commit()
 
     def get_token_sample(self, session_name: str) -> TokenSampleRecord | None:
-        row = self.conn.execute(
+        row = self.execute(
             """
             SELECT session_name, account_name, provider, model_name, project_key, cumulative_tokens, observed_at
             FROM token_samples
@@ -1005,7 +1020,7 @@ class StateStore:
             else:
                 delta = 0
 
-        self.conn.execute(
+        self.execute(
             """
             INSERT INTO token_samples (
                 session_name, account_name, provider, model_name, project_key, cumulative_tokens, observed_at
@@ -1024,7 +1039,7 @@ class StateStore:
 
         if delta > 0:
             hour_bucket = now[:13] + ":00:00+00:00"
-            self.conn.execute(
+            self.execute(
                 """
                 INSERT INTO token_usage_hourly (
                     hour_bucket, account_name, provider, model_name, project_key, tokens_used, updated_at
@@ -1036,7 +1051,7 @@ class StateStore:
                 """,
                 (hour_bucket, account_name, provider, model_name, project_key, delta, now),
             )
-        self.conn.commit()
+        self.commit()
         return delta
 
     def upsert_token_sample(
@@ -1050,7 +1065,7 @@ class StateStore:
         cumulative_tokens: int,
         observed_at: str,
     ) -> None:
-        self.conn.execute(
+        self.execute(
             """
             INSERT INTO token_samples (
                 session_name, account_name, provider, model_name, project_key, cumulative_tokens, observed_at
@@ -1066,7 +1081,7 @@ class StateStore:
             """,
             (session_name, account_name, provider, model_name, project_key, cumulative_tokens, observed_at),
         )
-        self.conn.commit()
+        self.commit()
 
     def replace_token_usage_hourly(
         self,
@@ -1076,14 +1091,14 @@ class StateStore:
     ) -> None:
         if account_names:
             placeholders = ", ".join("?" for _ in account_names)
-            self.conn.execute(
+            self.execute(
                 f"DELETE FROM token_usage_hourly WHERE account_name IN ({placeholders})",
                 tuple(account_names),
             )
         else:
-            self.conn.execute("DELETE FROM token_usage_hourly")
+            self.execute("DELETE FROM token_usage_hourly")
         for row in rows:
-            self.conn.execute(
+            self.execute(
                 """
                 INSERT INTO token_usage_hourly (
                     hour_bucket, account_name, provider, model_name, project_key, tokens_used, updated_at
@@ -1100,10 +1115,10 @@ class StateStore:
                     row.updated_at,
                 ),
             )
-        self.conn.commit()
+        self.commit()
 
     def recent_token_usage(self, limit: int = 24) -> list[TokenUsageHourlyRecord]:
-        rows = self.conn.execute(
+        rows = self.execute(
             """
             SELECT hour_bucket, account_name, provider, model_name, project_key, tokens_used, updated_at
             FROM token_usage_hourly
@@ -1139,7 +1154,7 @@ class StateStore:
     ) -> MemoryEntryRecord:
         now = self._now()
         tags_json = json.dumps([str(tag) for tag in tags], ensure_ascii=True)
-        cursor = self.conn.execute(
+        cursor = self.execute(
             """
             INSERT INTO memory_entries (
                 scope, kind, title, body, tags, source, file_path, summary_path, created_at, updated_at
@@ -1148,7 +1163,7 @@ class StateStore:
             """,
             (scope, kind, title, body, tags_json, source, file_path, summary_path, now, now),
         )
-        self.conn.commit()
+        self.commit()
         return MemoryEntryRecord(
             entry_id=int(cursor.lastrowid),
             scope=scope,
@@ -1164,7 +1179,7 @@ class StateStore:
         )
 
     def get_memory_entry(self, entry_id: int) -> MemoryEntryRecord | None:
-        row = self.conn.execute(
+        row = self.execute(
             """
             SELECT id, scope, kind, title, body, tags, source, file_path, summary_path, created_at, updated_at
             FROM memory_entries
@@ -1204,7 +1219,7 @@ class StateStore:
             clauses.append("kind = ?")
             params.append(kind)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        rows = self.conn.execute(
+        rows = self.execute(
             f"""
             SELECT id, scope, kind, title, body, tags, source, file_path, summary_path, created_at, updated_at
             FROM memory_entries
@@ -1240,14 +1255,14 @@ class StateStore:
         entry_count: int,
     ) -> MemorySummaryRecord:
         now = self._now()
-        cursor = self.conn.execute(
+        cursor = self.execute(
             """
             INSERT INTO memory_summaries (scope, summary_text, summary_path, entry_count, created_at)
             VALUES (?, ?, ?, ?, ?)
             """,
             (scope, summary_text, summary_path, entry_count, now),
         )
-        self.conn.commit()
+        self.commit()
         return MemorySummaryRecord(
             summary_id=int(cursor.lastrowid),
             scope=scope,
@@ -1258,7 +1273,7 @@ class StateStore:
         )
 
     def latest_memory_summary(self, scope: str) -> MemorySummaryRecord | None:
-        row = self.conn.execute(
+        row = self.execute(
             """
             SELECT id, scope, summary_text, summary_path, entry_count, created_at
             FROM memory_summaries
@@ -1280,7 +1295,7 @@ class StateStore:
         )
 
     def update_worktree_status(self, project_key: str, lane_kind: str, lane_key: str, status: str) -> None:
-        self.conn.execute(
+        self.execute(
             """
             UPDATE worktrees
             SET status = ?, updated_at = ?
@@ -1288,11 +1303,11 @@ class StateStore:
             """,
             (status, self._now(), project_key, lane_kind, lane_key),
         )
-        self.conn.commit()
+        self.commit()
 
     def list_worktrees(self, project_key: str | None = None) -> list[WorktreeRecord]:
         if project_key is None:
-            rows = self.conn.execute(
+            rows = self.execute(
                 """
                 SELECT project_key, lane_kind, lane_key, session_name, issue_key, path, branch, status, created_at, updated_at
                 FROM worktrees
@@ -1300,7 +1315,7 @@ class StateStore:
                 """
             ).fetchall()
         else:
-            rows = self.conn.execute(
+            rows = self.execute(
                 """
                 SELECT project_key, lane_kind, lane_key, session_name, issue_key, path, branch, status, created_at, updated_at
                 FROM worktrees

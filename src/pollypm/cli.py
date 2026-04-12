@@ -19,11 +19,13 @@ from pollypm.accounts import (
 from pollypm.cockpit_ui import PollyCockpitApp, PollyCockpitPaneApp, PollySettingsPaneApp
 from pollypm.config import (
     DEFAULT_CONFIG_PATH,
+    GLOBAL_CONFIG_DIR,
     load_config,
     render_example_config,
     write_example_config,
 )
-from pollypm.messaging import close_message, create_message, list_open_messages
+from pollypm.doc_scaffold import repair_docs, scaffold_docs, verify_docs
+from pollypm.messaging import close_message, create_message, list_closed_messages, list_open_messages
 from pollypm.models import ProviderKind
 from pollypm.onboarding import run_onboarding
 from pollypm.control_tui import PollyPMApp
@@ -591,12 +593,21 @@ def notify(
 @app.command("mail")
 def mail(
     close: str | None = typer.Option(None, "--close", help="Close a specific open message by filename."),
+    archived: bool = typer.Option(False, "--archived", "-a", help="Show archived (closed) messages."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
     config = load_config(config_path)
     if close:
-        archived = close_message(config.project.root_dir, close)
-        typer.echo(f"Archived {archived.name}")
+        closed = close_message(config.project.root_dir, close)
+        typer.echo(f"Archived {closed.name}")
+        return
+    if archived:
+        messages = list_closed_messages(config.project.root_dir)
+        if not messages:
+            typer.echo("No archived mail.")
+            return
+        for item in messages:
+            typer.echo(f"- {item.path.name}: {item.subject} [{item.sender}] {item.created_at}")
         return
     messages = list_open_messages(config.project.root_dir)
     if not messages:
@@ -758,8 +769,8 @@ def reset(
         cockpit_state.unlink()
     # Clear stale leases — mounted cockpit leases would block recovery on restart
     try:
-        supervisor.store.conn.execute("DELETE FROM leases")
-        supervisor.store.conn.commit()
+        supervisor.store.execute("DELETE FROM leases")
+        supervisor.store.commit()
     except Exception:  # noqa: BLE001
         pass
     typer.echo(f"Killed {len(sessions_to_kill)} session(s): {', '.join(sessions_to_kill)}")
@@ -1122,3 +1133,189 @@ def worker_start(
         f"Managed worker {session.name} ready for project {project_key} "
         f"in {refreshed._tmux_session_for_launch(launch)}:{launch.window_name}"
     )
+
+
+@app.command()
+def repair(
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+    check_only: bool = typer.Option(False, "--check", help="Report problems without fixing."),
+) -> None:
+    """Check and repair PollyPM project scaffolding, docs, and state."""
+    config_path = _discover_config_path(config_path)
+    if not config_path.exists():
+        typer.echo(f"Config not found at {config_path}.")
+        raise typer.Exit(code=1)
+    config = load_config(config_path)
+    all_problems: list[str] = []
+    all_actions: list[str] = []
+
+    # -- Global docs (in ~/.pollypm itself) --
+    global_dir = GLOBAL_CONFIG_DIR
+    global_problems = verify_docs(global_dir)
+    if global_problems:
+        for p in global_problems:
+            all_problems.append(f"[global] {p}")
+        if not check_only:
+            actions = repair_docs(global_dir)
+            for a in actions:
+                all_actions.append(f"[global] {a}")
+
+    # -- Per-project scaffolding --
+    for key, project in config.projects.items():
+        project_root = project.path
+        if not project_root.exists():
+            all_problems.append(f"[{key}] project path does not exist: {project_root}")
+            continue
+
+        # Check .pollypm-state scaffold dirs
+        state_dir = project_root / ".pollypm-state"
+        for subdir in ["dossier", "logs", "artifacts", "checkpoints", "worktrees"]:
+            d = state_dir / subdir
+            if not d.exists():
+                all_problems.append(f"[{key}] missing {d.relative_to(project_root)}")
+                if not check_only:
+                    d.mkdir(parents=True, exist_ok=True)
+                    all_actions.append(f"[{key}] created {d.relative_to(project_root)}")
+
+        # Check instruction dir
+        instruction_dir = project_root / ".pollypm"
+        for subdir in ["rules", "magic"]:
+            d = instruction_dir / subdir
+            if not d.exists():
+                all_problems.append(f"[{key}] missing .pollypm/{subdir}")
+                if not check_only:
+                    d.mkdir(parents=True, exist_ok=True)
+                    all_actions.append(f"[{key}] created .pollypm/{subdir}")
+
+        # Check docs
+        doc_problems = verify_docs(project_root)
+        for p in doc_problems:
+            all_problems.append(f"[{key}] {p}")
+        if not check_only and doc_problems:
+            actions = repair_docs(project_root)
+            for a in actions:
+                all_actions.append(f"[{key}] {a}")
+
+        # Check .gitignore entry
+        gitignore = project_root / ".gitignore"
+        if gitignore.exists():
+            content = gitignore.read_text()
+            if ".pollypm-state/" not in content:
+                all_problems.append(f"[{key}] .gitignore missing .pollypm-state/ entry")
+                if not check_only:
+                    with gitignore.open("a") as f:
+                        f.write("\n.pollypm-state/\n")
+                    all_actions.append(f"[{key}] added .pollypm-state/ to .gitignore")
+
+    # -- Report --
+    if not all_problems:
+        typer.echo("All projects healthy. No repairs needed.")
+        return
+    typer.echo(f"Found {len(all_problems)} problem(s):")
+    for p in all_problems:
+        typer.echo(f"  - {p}")
+    if check_only:
+        typer.echo("\nRun `pm repair` (without --check) to fix.")
+    else:
+        typer.echo(f"\nApplied {len(all_actions)} fix(es):")
+        for a in all_actions:
+            typer.echo(f"  + {a}")
+
+
+@app.command()
+def upgrade(
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+    check_only: bool = typer.Option(False, "--check", help="Only check if an upgrade is available."),
+) -> None:
+    """Check for and install PollyPM updates from GitHub."""
+    import importlib.metadata
+
+    try:
+        current = importlib.metadata.version("pollypm")
+    except importlib.metadata.PackageNotFoundError:
+        current = "dev"
+
+    # Check latest version from GitHub
+    try:
+        result = subprocess.run(
+            ["gh", "api", "repos/samhotchkiss/pollypm/releases/latest", "-q", ".tag_name"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            # Fallback: check git tags
+            result = subprocess.run(
+                ["git", "ls-remote", "--tags", "https://github.com/samhotchkiss/pollypm.git"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                typer.echo("Could not check for updates. Are you online?")
+                raise typer.Exit(code=1)
+            tags = [line.split("refs/tags/")[-1] for line in result.stdout.strip().splitlines() if "refs/tags/" in line]
+            tags = [t.lstrip("v") for t in tags if not t.endswith("^{}")]
+            if not tags:
+                typer.echo(f"Current version: {current}. No releases found on GitHub.")
+                return
+            latest = sorted(tags)[-1]
+        else:
+            latest = result.stdout.strip().lstrip("v")
+    except FileNotFoundError:
+        typer.echo("Neither `gh` nor `git` found. Cannot check for updates.")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"Current: {current}")
+    typer.echo(f"Latest:  {latest}")
+
+    if current == latest or current == "dev":
+        if current == "dev":
+            typer.echo("Running from source (dev). Use `git pull` to update.")
+        else:
+            typer.echo("Already up to date.")
+        if not check_only:
+            # Still regenerate docs in case templates changed
+            typer.echo("\nRegenerating docs from current templates...")
+            config = load_config(config_path)
+            repair_docs(GLOBAL_CONFIG_DIR)
+            for key, project in config.projects.items():
+                if project.path.exists():
+                    actions = repair_docs(project.path)
+                    if actions:
+                        typer.echo(f"  [{key}] {len(actions)} doc(s) updated")
+            typer.echo("Done.")
+        return
+
+    if check_only:
+        typer.echo(f"\nUpgrade available: {current} -> {latest}")
+        typer.echo("Run `pm upgrade` to install.")
+        return
+
+    # Install the update
+    typer.echo(f"\nUpgrading {current} -> {latest}...")
+    uv = shutil.which("uv")
+    pip_cmd: list[str]
+    if uv:
+        pip_cmd = [uv, "pip", "install", "--upgrade", f"pollypm=={latest}"]
+    else:
+        pip_cmd = ["pip", "install", "--upgrade", f"pollypm=={latest}"]
+
+    install_result = subprocess.run(pip_cmd, capture_output=True, text=True)
+    if install_result.returncode != 0:
+        # Try installing from GitHub directly
+        typer.echo("PyPI install failed, trying GitHub source...")
+        if uv:
+            pip_cmd = [uv, "pip", "install", f"git+https://github.com/samhotchkiss/pollypm.git@v{latest}"]
+        else:
+            pip_cmd = ["pip", "install", f"git+https://github.com/samhotchkiss/pollypm.git@v{latest}"]
+        install_result = subprocess.run(pip_cmd, capture_output=True, text=True)
+        if install_result.returncode != 0:
+            typer.echo(f"Upgrade failed:\n{install_result.stderr}")
+            raise typer.Exit(code=1)
+
+    typer.echo("Package updated. Regenerating docs...")
+    config = load_config(config_path)
+    repair_docs(GLOBAL_CONFIG_DIR)
+    for key, project in config.projects.items():
+        if project.path.exists():
+            actions = repair_docs(project.path)
+            if actions:
+                typer.echo(f"  [{key}] {len(actions)} doc(s) updated")
+    typer.echo(f"Upgrade to {latest} complete. Running sessions are unaffected — restart with `pm reset && pm up` when ready.")

@@ -227,7 +227,8 @@ class Supervisor:
         session_name = self.config.project.tmux_session
         existing = [name for name in self._all_tmux_session_names() if self.tmux.has_session(name)]
         if existing:
-            raise RuntimeError(f"tmux session already exists: {', '.join(existing)}")
+            # Sessions already running — reconcile instead of failing
+            return self._reconcile_existing(session_name, on_status=on_status)
 
         failures: list[str] = []
         for controller_account in self._controller_candidates():
@@ -263,6 +264,44 @@ class Supervisor:
             if homes_dir.is_dir():
                 for marker in homes_dir.glob("*/.pollypm-state/session-markers/*"):
                     marker.unlink(missing_ok=True)
+
+    def _reconcile_existing(
+        self,
+        session_name: str,
+        on_status: Callable[[str], None] | None = None,
+    ) -> str:
+        """Reconcile running state: create missing windows without killing existing ones."""
+        _status = on_status or (lambda _: None)
+        storage_session = self.storage_closet_session_name()
+        launches = self.plan_launches()
+        existing_windows: set[str] = set()
+        if self.tmux.has_session(storage_session):
+            for w in self.tmux.list_windows(storage_session):
+                existing_windows.add(w.name)
+
+        created = 0
+        for launch in launches:
+            if launch.window_name in existing_windows:
+                continue
+            _status(f"Recreating {launch.session.name}...")
+            if not self.tmux.has_session(storage_session):
+                self.tmux.create_session(storage_session, launch.window_name, launch.command)
+            else:
+                self.tmux.create_window(storage_session, launch.window_name, launch.command, detached=True)
+            target = f"{storage_session}:{launch.window_name}"
+            self.tmux.set_window_option(target, "allow-passthrough", "on")
+            self.tmux.set_window_option(target, "focus-events", "on")
+            self.tmux.pipe_pane(target, launch.log_path)
+            self._record_launch(launch)
+            created += 1
+
+        if not self.tmux.has_session(session_name):
+            self.tmux.create_session(session_name, self._CONSOLE_WINDOW, self._console_command(), remain_on_exit=False)
+
+        self.ensure_heartbeat_schedule()
+        self.ensure_knowledge_extraction_schedule()
+        _status(f"Reconciled: {created} session(s) created, {len(existing_windows)} already running")
+        return self.config.pollypm.controller_account
 
     def _bootstrap_launches(
         self,
@@ -440,7 +479,17 @@ class Supervisor:
         except Exception as exc:  # noqa: BLE001
             errors.append(str(exc))
 
-        return launches, windows, self.store.open_alerts(), self.store.list_leases(), errors
+        try:
+            alerts = self.store.open_alerts()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"store.open_alerts: {exc}")
+            alerts = []
+        try:
+            leases = self.store.list_leases()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"store.list_leases: {exc}")
+            leases = []
+        return launches, windows, alerts, leases, errors
 
     def ensure_layout(self) -> Path:
         project = self.config.project

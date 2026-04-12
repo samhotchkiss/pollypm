@@ -156,8 +156,8 @@ def ensure_session_lock(base_dir: Path, session_id: str) -> Path:
         try:
             age = (datetime.now(UTC) - datetime.fromisoformat(existing.get("created_at", ""))).total_seconds()
         except (ValueError, TypeError):
-            age = _LOCK_STALE_SECONDS + 1  # unparseable = treat as stale
-        if age > _LOCK_STALE_SECONDS:
+            age = None
+        if age is not None and age > _LOCK_STALE_SECONDS:
             lock_path.unlink(missing_ok=True)
         else:
             raise RuntimeError(f"Session lock conflict at {base_dir}: owned by {existing_session or 'unknown'}")

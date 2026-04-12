@@ -81,14 +81,36 @@ class LoginCancelled(Exception):
     pass
 
 
-def default_session_args(provider: ProviderKind, *, open_permissions: bool = True) -> list[str]:
-    if not open_permissions:
-        return []
+_CLAUDE_OPERATOR_TOOLS = "Read,Glob,Grep,LS,Bash,WebFetch,WebSearch,TodoWrite,Task"
+_CLAUDE_HEARTBEAT_TOOLS = "Read,Glob,Grep,LS,WebFetch,WebSearch,TodoWrite,Task"
+_CLAUDE_NO_WRITE_TOOLS = "Edit,Write,MultiEdit,NotebookEdit"
+
+
+def default_session_args(
+    provider: ProviderKind,
+    *,
+    open_permissions: bool = True,
+    role: str = "",
+) -> list[str]:
+    args: list[str] = []
     if provider is ProviderKind.CLAUDE:
-        return ["--dangerously-skip-permissions"]
+        if open_permissions and role not in {"heartbeat-supervisor", "operator-pm"}:
+            args.append("--dangerously-skip-permissions")
+        if role == "heartbeat-supervisor":
+            args.extend(["--allowedTools", _CLAUDE_HEARTBEAT_TOOLS])
+            args.extend(["--disallowedTools", _CLAUDE_NO_WRITE_TOOLS])
+        elif role == "operator-pm":
+            args.extend(["--allowedTools", _CLAUDE_OPERATOR_TOOLS])
+            args.extend(["--disallowedTools", _CLAUDE_NO_WRITE_TOOLS])
+        return args
     if provider is ProviderKind.CODEX:
-        return ["--dangerously-bypass-approvals-and-sandbox"]
-    return []
+        if role in {"heartbeat-supervisor", "operator-pm"}:
+            return ["--sandbox", "read-only", "--ask-for-approval", "never"]
+        if role == "worker":
+            return ["--sandbox", "workspace-write", "--ask-for-approval", "never"]
+        if open_permissions:
+            return ["--dangerously-bypass-approvals-and-sandbox"]
+    return args
 
 
 def default_control_args(
@@ -97,11 +119,7 @@ def default_control_args(
     open_permissions: bool = True,
     role: str = "",
 ) -> list[str]:
-    args = default_session_args(provider, open_permissions=open_permissions)
-    # Add role-based tool restrictions for Claude sessions
-    if provider is ProviderKind.CLAUDE and role == "heartbeat-supervisor":
-        args.extend(["--disallowedTools", "Edit,Write,NotebookEdit"])
-    return args
+    return default_session_args(provider, open_permissions=open_permissions, role=role)
 
 
 def _detected_claude_version() -> str:

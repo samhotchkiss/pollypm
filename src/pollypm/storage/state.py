@@ -339,7 +339,11 @@ class StateStore:
             self.execute("PRAGMA journal_mode=WAL")
             self.execute("PRAGMA busy_timeout=5000")
             self.conn.executescript(SCHEMA)
-            self._migrate()
+            try:
+                self._migrate()
+            except Exception:
+                self.conn.rollback()
+                raise
             self.commit()
 
     def close(self) -> None:
@@ -462,6 +466,13 @@ class StateStore:
         )
         self.commit()
 
+    def last_heartbeat_at(self) -> str | None:
+        """Return the ISO timestamp of the most recent heartbeat sweep, or None."""
+        row = self.execute(
+            "SELECT created_at FROM events WHERE event_type = 'heartbeat' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return row[0] if row else None
+
     def recent_events(self, limit: int = 20) -> list[EventRecord]:
         rows = self.execute(
             """
@@ -473,6 +484,22 @@ class StateStore:
             (limit,),
         ).fetchall()
         return [EventRecord(*row) for row in rows]
+
+    def prune_old_data(self, *, event_days: int = 7, heartbeat_hours: int = 24) -> dict[str, int]:
+        """Remove old events and heartbeat observations. Returns counts of pruned rows."""
+        from datetime import timedelta
+        now = datetime.now(UTC)
+        event_cutoff = (now - timedelta(days=event_days)).isoformat()
+        heartbeat_cutoff = (now - timedelta(hours=heartbeat_hours)).isoformat()
+        with self._lock:
+            e_cursor = self.conn.execute("DELETE FROM events WHERE created_at < ?", (event_cutoff,))
+            events_pruned = e_cursor.rowcount
+            h_cursor = self.conn.execute("DELETE FROM heartbeats WHERE created_at < ?", (heartbeat_cutoff,))
+            heartbeats_pruned = h_cursor.rowcount
+            # WAL checkpoint to reclaim disk space
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self.conn.commit()
+        return {"events": events_pruned, "heartbeats": heartbeats_pruned}
 
     def record_heartbeat(
         self,

@@ -68,7 +68,16 @@ def project_config_path(project_root: Path) -> Path:
 
 
 def _load_raw_toml(path: Path) -> dict[str, object]:
-    return tomllib.loads(path.read_text())
+    try:
+        return tomllib.loads(path.read_text())
+    except FileNotFoundError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to parse config at {path}: {exc}\n"
+            f"The config file may be corrupted. Try `pm repair` to regenerate defaults, "
+            f"or check the file manually for syntax errors."
+        ) from exc
 
 
 def _parse_project_settings(raw: dict[str, object], *, base: Path) -> ProjectSettings:

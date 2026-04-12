@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 
 from pollypm.config import project_config_path
+from pollypm.doc_scaffold import scaffold_docs
 from pollypm.plugin_host import PLUGIN_MANIFEST
 from pollypm.projects import ensure_project_scaffold
 from pollypm.rules import discover_magic, discover_rules
@@ -145,6 +146,8 @@ def write_plugin_override(project_root: Path, plugin_name: str, body: str) -> Pa
         )
     )
     (plugin_dir / "plugin.py").write_text(body)
+    # Regenerate docs so reference material reflects the new plugin
+    scaffold_docs(project_root, force=True)
     return plugin_dir
 
 

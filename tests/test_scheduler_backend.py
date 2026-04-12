@@ -159,12 +159,77 @@ def test_ensure_heartbeat_schedule_is_idempotent(tmp_path: Path) -> None:
     assert jobs[0].status == "pending"
 
 
+def test_ensure_scheduler_setup_prunes_duplicate_recurring_jobs(tmp_path: Path) -> None:
+    supervisor = Supervisor(_config(tmp_path))
+    supervisor.ensure_layout()
+    backend = get_scheduler_backend("inline", root_dir=tmp_path)
+
+    backend.schedule(
+        supervisor,
+        kind="heartbeat",
+        run_at=datetime.now(UTC) + timedelta(seconds=60),
+        payload={},
+        interval_seconds=60,
+    )
+    backend.schedule(
+        supervisor,
+        kind="heartbeat",
+        run_at=datetime.now(UTC) + timedelta(seconds=120),
+        payload={},
+        interval_seconds=60,
+    )
+    backend.schedule(
+        supervisor,
+        kind="knowledge_extract",
+        run_at=datetime.now(UTC) + timedelta(seconds=900),
+        payload={"model": "haiku"},
+        interval_seconds=900,
+    )
+    backend.schedule(
+        supervisor,
+        kind="knowledge_extract",
+        run_at=datetime.now(UTC) + timedelta(seconds=1800),
+        payload={"model": "haiku"},
+        interval_seconds=900,
+    )
+    backend.schedule(
+        supervisor,
+        kind="send_input",
+        run_at=datetime.now(UTC) + timedelta(seconds=30),
+        payload={"session_name": "operator", "text": "still here"},
+    )
+
+    jobs = backend.list_jobs(supervisor)
+    jobs[1].status = "done"
+    jobs[3].status = "failed"
+    jobs[3].last_error = "boom"
+    backend._save_jobs(supervisor, jobs)
+
+    supervisor.ensure_heartbeat_schedule()
+    supervisor.ensure_knowledge_extraction_schedule()
+
+    jobs = backend.list_jobs(supervisor)
+    heartbeat_jobs = [job for job in jobs if job.kind == "heartbeat"]
+    extract_jobs = [job for job in jobs if job.kind == "knowledge_extract"]
+    send_jobs = [job for job in jobs if job.kind == "send_input"]
+
+    assert len(heartbeat_jobs) == 1
+    assert heartbeat_jobs[0].status == "pending"
+    assert heartbeat_jobs[0].interval_seconds == 60
+    assert heartbeat_jobs[0].payload == {}
+    assert len(extract_jobs) == 1
+    assert extract_jobs[0].status == "pending"
+    assert extract_jobs[0].interval_seconds == 900
+    assert extract_jobs[0].payload == {"model": "haiku"}
+    assert len(send_jobs) == 1
+
+
 def test_knowledge_extract_schedule_is_idempotent_and_runs(monkeypatch, tmp_path: Path) -> None:
     supervisor = Supervisor(_config(tmp_path))
     supervisor.ensure_layout()
     calls: list[Path] = []
     monkeypatch.setattr(
-        "pollypm.schedulers.inline.extract_knowledge_once",
+        "pollypm.knowledge_extract.extract_knowledge_once",
         lambda config: calls.append(config.project.root_dir) or {"processed_events": 1, "updated_docs": 1},
     )
 

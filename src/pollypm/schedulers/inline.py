@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
@@ -96,11 +97,21 @@ class InlineSchedulerBackend(SchedulerBackend):
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
+    def _lock_path(self, supervisor) -> Path:
+        return self._jobs_path(supervisor).with_suffix(".lock")
+
     def _load_jobs(self, supervisor) -> list[ScheduledJob]:
         path = self._jobs_path(supervisor)
         if not path.exists():
             return []
-        raw = json.loads(path.read_text())
+        lock = self._lock_path(supervisor)
+        lock.touch(exist_ok=True)
+        with lock.open("r") as lf:
+            fcntl.flock(lf, fcntl.LOCK_SH)
+            try:
+                raw = json.loads(path.read_text())
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
         return [
             ScheduledJob(
                 job_id=str(item["job_id"]),
@@ -116,9 +127,16 @@ class InlineSchedulerBackend(SchedulerBackend):
 
     def _save_jobs(self, supervisor, jobs: list[ScheduledJob]) -> None:
         path = self._jobs_path(supervisor)
+        lock = self._lock_path(supervisor)
+        lock.touch(exist_ok=True)
         raw: list[dict[str, object]] = []
         for job in jobs:
             item = asdict(job)
             item["run_at"] = job.run_at.isoformat()
             raw.append(item)
-        atomic_write_json(path, raw)
+        with lock.open("r") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                atomic_write_json(path, raw)
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)

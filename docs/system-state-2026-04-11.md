@@ -41,7 +41,7 @@ PollyPM is a tmux-first supervisor for coordinating multiple interactive AI codi
 | File-based issue tracker | **Working** | 23 issues across 6 states |
 | Account isolation | **Working** | Separate homes, 700 permissions, keychain auth |
 | Git worktree per worker | **Working** | otter-camp worker in dedicated worktree |
-| Pytest suite | **Working** | 402 tests, 0 failures |
+| Pytest suite | **Working** | 530+ tests |
 
 ### Session Health (Right Now)
 ```
@@ -49,7 +49,7 @@ PollyPM is a tmux-first supervisor for coordinating multiple interactive AI codi
   worker-pollypm     [Codex gpt-5.4]    IDLE      cwd=/Users/sam/dev/pollypm
   worker-otter_camp  [Codex gpt-5.4]    IDLE      cwd=.pollypm/worktrees/otter_camp-pa
   worker-pollypm-web [Codex gpt-5.4]    IDLE      cwd=/Users/sam/dev/pollypm-website
-  operator (Polly)   [Claude]           DOWN      139 recovery attempts, needs re-auth
+  operator (Polly)   [Claude]           RUNNING   operator session active
 ```
 
 ### Scheduler Jobs
@@ -151,28 +151,22 @@ PollyPM is a tmux-first supervisor for coordinating multiple interactive AI codi
 ### Critical (Blocks Daily Use)
 | Issue | Impact | Root Cause |
 |-------|--------|------------|
-| **Operator won't recover** | No PM to manage workers | Claude auth needs re-login on macOS Keychain. Not a code bug. |
-| **No role enforcement** | Any session does whatever asked | Prompt-based only, no tool restrictions. LLMs ignore role boundaries. |
-| **Lease blind to cockpit** | Human typing unprotected | Direct tmux input bypasses supervisor.send_input() which creates leases. |
+| **Review gate enforcement still in progress** | Issues can still bypass intended review path in edge cases | Issue 0036 is not complete yet. |
+| **Thread reopen still in progress** | Forward-only thread handling remains in some paths | Issue 0037 is still being implemented. |
 
 ### Annoying (Degrades Experience)
 | Issue | Impact | Root Cause |
 |-------|--------|------------|
 | Cockpit cursor drift | Navigation sometimes lands wrong | Textual ListView + 0.8s refresh tick. Debounce helps but imperfect. |
-| Workers stall after planning | Need manual nudge to continue | Codex tends to plan then wait. Heartbeat escalates but doesn't nudge directly. |
-| Codex needs double-Enter | Implementation must send a second Enter to submit | Codex CLI input buffering. `Supervisor.send_input()` handles this for Codex sessions and is now regression-tested. |
-| Duplicate heartbeat jobs | 7 heartbeat jobs in scheduler | Jobs accumulate when cockpit restarts. No dedup on restart. |
-| Stale cockpit_state.json | Mounted session can be wrong | File persists across cockpit restarts with stale pane IDs. |
+| Review gate edge cases | Some flows still need manual scrutiny | Issue 0036 is in progress, not finished. |
+| Thread reopen edge cases | Reopening/resuming threads is not fully reliable yet | Issue 0037 is in progress, not finished. |
 
 ### Gaps (Feature Missing)
 | Feature | Status | Spec Reference |
 |---------|--------|----------------|
 | GitHub issue backend | Not built | T101-T105, issue 0019 |
-| Memory system | Schema only, unused | T049 |
-| Level 1/2 checkpoints | Infrastructure exists, never triggered | T074/T075 |
-| Thread reopen | Forward-only state machine | T058 |
-| Lease timeout | No auto-release | T018 |
-| Review gate enforcement | Issues skip 03/04 states | T041 |
+| Review gate enforcement | In progress | T041, issue 0036 |
+| Thread reopen | In progress | T058, issue 0037 |
 
 ## What We Fixed Today (14 Commits)
 
@@ -195,67 +189,76 @@ PollyPM is a tmux-first supervisor for coordinating multiple interactive AI codi
 
 ## Next 10 Things To Make It Better
 
-### 1. Fix Operator Recovery (P0, 1 day)
-The operator's Claude auth expired. Add `pm reauth <account>` that re-runs the Claude login flow from within a running session. Until this works, the PM role is dead.
+### 1. Finish Review Gate Enforcement (P0, in progress)
+Issue 0036 is in flight. The remaining work is to make the review gate airtight so issues cannot skip the intended states in edge cases.
 
-### 2. Deduplicate Scheduler Jobs (P0, 2 hours)
-7 duplicate heartbeat jobs accumulate when the cockpit restarts. `ensure_heartbeat_schedule` should clean stale/duplicate jobs, not just check if one exists.
+### 2. Finish Thread Reopen (P0, in progress)
+Issue 0037 is in flight. Remaining work is to complete reopen/resume behavior so thread state is no longer effectively forward-only in edge cases.
 
-### 3. Add Codex Auto-Submit to pm send (P1, 2 hours)
-When `pm send` delivers text to a Codex session, follow up with an Enter keypress so the message actually submits. Currently requires manual Enter.
+### 3. GitHub Issue Backend (P1, 3 days)
+Issue 0019 specifies the design. Needs: 7 interface methods, `polly:*` label management, gh CLI integration. The file-based tracker contract is already defined.
 
-### 4. Lease Integration with Cockpit (P1, 1 day)
-When the cockpit mounts a session pane, auto-claim a "cockpit" lease. When unmounted, release it. This protects human input from heartbeat interference.
+### 4. Multi-user / operator-sharing hardening (P2)
+The current system is still effectively single-operator even though the lease model is now stronger. Shared operation paths still need design and implementation.
 
-### 5. Worker Nudge on Stall (P1, 4 hours)
-When a worker has been idle for 5+ cycles, the heartbeat should send a direct nudge (not just tell the operator). Something like: "You appear stalled. State the remaining task in one sentence, execute the next step now."
+### 5. GitHub-native issue sync polish (P2)
+Once the backend exists, issue mirroring, reconciliation, and operator-facing visibility still need polish.
 
-### 6. GitHub Issue Backend (P1, 3 days)
-Issue 0019 specifies the design. Needs: 7 interface methods, polly:* label management, gh CLI integration. The file-based tracker contract is already defined.
+### 6. Review UX polish in cockpit (P2)
+With review-gate enforcement nearly there, the next improvement is making review state and pending operator actions clearer in the TUI.
 
-### 7. Clean Cockpit State on Restart (P1, 2 hours)
-When the cockpit starts, validate cockpit_state.json — check that right_pane_id and mounted_session point to real, alive panes. Clear stale entries.
+### 7. Reopen/resume UX polish (P2)
+Once thread reopen lands, the operator-facing flow for reopening and continuing threads should be made explicit and low-friction.
 
-### 8. Memory System Integration (P2, 2 days)
-The memory_entries and memory_summaries tables exist but are empty. Wire them into the heartbeat sweep so it records project learnings automatically.
+### 8. Higher-level checkpoint policy (P2)
+Level 1 checkpoints are now in place; the next step is deciding when to emit higher-level checkpoints and how operators consume them.
 
-### 9. Level 1 Checkpoints on Issue Completion (P2, 4 hours)
-When a worker completes an issue (file moves to 05-completed), create a Level 1 checkpoint with the work summary. Currently only Level 0 (raw snapshots) exists.
+### 9. Broader role policy hardening (P2)
+Role enforcement landed, but longer-term policy hardening is still useful as session types and tools expand.
 
-### 10. Role Enforcement via Tool Restrictions (P2, 2 days)
-Use Claude's `--allowedTools` and Codex's sandbox to restrict what each role can do. Heartbeat: read-only (no file writes). Operator: no direct code changes. Workers: no tmux/session management.
+### 10. Launch-readiness burn-down (P2)
+After issues 0036 and 0037 land, re-audit the remaining rough edges and convert any true blockers into explicit launch criteria.
 
 ## Launch Readiness
 
 ### Must Have (Not Ready)
-- [ ] **Operator session working** — needs re-auth or fallback to Codex operator
-- [ ] **Scheduler dedup** — cockpit restarts create duplicate jobs
+- [x] **Operator session working** — operator session is running
+- [x] **Scheduler dedup** — completed in issue 0028
 - [x] **Codex auto-submit** — `Supervisor.send_input()` sends the extra submit Enter for Codex and is regression-tested
-- [ ] **Cockpit state cleanup** — stale state blocks recovery
+- [x] **Cockpit state cleanup** — completed in issue 0029
 
 ### Should Have (Partially Ready)
 - [ ] GitHub issue backend (spec exists, not built)
-- [ ] Lease/cockpit integration (lease works for API, not cockpit)
-- [ ] Worker nudge automation (heartbeat alerts but doesn't nudge directly)
+- [x] Lease/cockpit integration — completed in issue 0031
+- [x] Worker nudge automation — completed in issue 0030
 
 ### Nice to Have (Not Started)
-- [ ] Memory system
-- [ ] Level 1/2 checkpoints
-- [ ] Role enforcement via tool restrictions
+- [x] Memory system — completed in issue 0033
+- [x] Level 1 checkpoints — completed in issue 0032
+- [x] Role enforcement via tool restrictions — completed in issue 0034
 - [ ] Multi-user support
 
 ### Already Solid
 - [x] Core tmux management
 - [x] Heartbeat monitoring + alerting
 - [x] Recovery pipeline with failover
+- [x] Operator recovery
 - [x] Knowledge extraction
 - [x] Token/cost tracking
 - [x] File-based issue tracker
 - [x] Account isolation + security
-- [x] 402-test suite
+- [x] 530+ test suite
 - [x] Cockpit TUI with navigation
 - [x] Onboarding flow
 - [x] 5 managed projects
+- [x] Lease timeout handling
+- [x] Lease/cockpit integration
+- [x] Scheduler dedup
+- [x] Worker nudge
+- [x] Cockpit state cleanup
+- [x] Memory system
+- [x] Level 1 checkpoints
+- [x] Role enforcement
 
 ### Verdict
-**Not launch-ready yet.** The operator crash loop and other remaining operational issues mean the system can't run autonomously. A human still needs to babysit sessions. Fix the remaining top blockers and the system can run a real multi-project workload without constant intervention.
+**Close, but not launch-ready yet.** Most of the operational blockers from the April 11 snapshot are now resolved: operator recovery is working, scheduler dedup is done, Codex auto-submit is done, cockpit state cleanup is done, worker nudge is done, lease/cockpit integration is done, level 1 checkpoints are live, the memory system is integrated, role enforcement landed, and lease timeout handling is done. The remaining launch blockers are the in-progress review gate work (issue 0036) and thread reopen work (issue 0037), plus the still-missing GitHub issue backend.

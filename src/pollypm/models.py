@@ -83,6 +83,7 @@ class PollyPMSettings:
     failover_accounts: list[str] = field(default_factory=list)
     heartbeat_backend: str = "local"
     scheduler_backend: str = "inline"
+    lease_timeout_minutes: int = 30
 
 
 @dataclass(slots=True)

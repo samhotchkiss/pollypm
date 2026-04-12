@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from pollypm.heartbeats.api import SupervisorHeartbeatAPI
 from pollypm.heartbeats.base import HeartbeatCursor, HeartbeatSessionContext, HeartbeatUnmanagedWindow
 from pollypm.heartbeats.local import LocalHeartbeatBackend
+from pollypm.memory_backends import get_memory_backend
 from pollypm.models import (
     AccountConfig,
     KnownProject,
@@ -273,6 +274,72 @@ def test_supervisor_heartbeat_api_lists_unmanaged_windows(tmp_path: Path, monkey
             pane_path=str(tmp_path / "sandbox"),
         )
     ]
+
+
+def test_supervisor_heartbeat_api_records_snapshot_learnings_into_memory(tmp_path: Path, monkeypatch) -> None:
+    supervisor = Supervisor(_config(tmp_path))
+    supervisor.ensure_layout()
+    monkeypatch.setattr("pollypm.knowledge_extract.run_haiku_json", lambda prompt: None)
+    api = SupervisorHeartbeatAPI(supervisor)
+    snapshot_path = supervisor.config.project.snapshots_dir / "pm-operator-test.txt"
+    context = _context(
+        session_name="operator",
+        role="operator-pm",
+        project_key="pollypm",
+        cwd=str(tmp_path),
+        window_name="pm-operator",
+        source_path=str(tmp_path / ".pollypm-state" / "logs" / "operator.log"),
+        snapshot_path=str(snapshot_path),
+        pane_text=(
+            "Decision: use the heartbeat snapshot as a memory source. "
+            "Risk: duplicate learnings will pollute search. "
+            "Idea: compact project memory after new learnings are stored."
+        ),
+        pane_command="claude",
+    )
+
+    api.record_checkpoint(context, alerts=[])
+
+    backend = get_memory_backend(tmp_path, "file")
+    decisions = backend.list_entries(scope="pollypm", kind="decision")
+    risks = backend.list_entries(scope="pollypm", kind="risk")
+    ideas = backend.list_entries(scope="pollypm", kind="idea")
+    checkpoints = backend.list_entries(scope="pollypm", kind="checkpoint")
+
+    assert any("heartbeat snapshot as a memory source" in entry.title.lower() for entry in decisions)
+    assert any("duplicate learnings" in entry.title.lower() for entry in risks)
+    assert any("compact project memory" in entry.title.lower() for entry in ideas)
+    assert len(checkpoints) == 1
+    assert backend.store.latest_memory_summary("pollypm") is not None
+
+
+def test_supervisor_heartbeat_api_deduplicates_snapshot_learnings(tmp_path: Path, monkeypatch) -> None:
+    supervisor = Supervisor(_config(tmp_path))
+    supervisor.ensure_layout()
+    monkeypatch.setattr("pollypm.knowledge_extract.run_haiku_json", lambda prompt: None)
+    api = SupervisorHeartbeatAPI(supervisor)
+    snapshot_path = supervisor.config.project.snapshots_dir / "pm-operator-test.txt"
+    context = _context(
+        session_name="operator",
+        role="operator-pm",
+        project_key="pollypm",
+        cwd=str(tmp_path),
+        window_name="pm-operator",
+        source_path=str(tmp_path / ".pollypm-state" / "logs" / "operator.log"),
+        snapshot_path=str(snapshot_path),
+        pane_text="Decision: keep heartbeat learnings deduplicated.",
+        pane_command="claude",
+    )
+
+    api.record_checkpoint(context, alerts=[])
+    api.record_checkpoint(context, alerts=[])
+
+    backend = get_memory_backend(tmp_path, "file")
+    decisions = backend.list_entries(scope="pollypm", kind="decision")
+    checkpoints = backend.list_entries(scope="pollypm", kind="checkpoint")
+
+    assert len([entry for entry in decisions if "heartbeat learnings deduplicated" in entry.title.lower()]) == 1
+    assert len(checkpoints) == 2
 
 
 def test_local_heartbeat_backend_marks_followup_when_work_remains() -> None:

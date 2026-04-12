@@ -35,12 +35,17 @@ def validate_task_transition(current_state: str, to_state: str) -> None:
     if to_state not in TRACKER_STATES:
         raise InvalidTaskTransition(f"Unknown destination state: {to_state}")
 
+    if to_state == "05-completed" and current_state != "04-in-review":
+        raise InvalidTaskTransition(
+            f"Invalid transition {current_state} -> {to_state}; issues must pass through 04-in-review before completion"
+        )
+
     from_idx = TRACKER_STATES.index(current_state)
     to_idx = TRACKER_STATES.index(to_state)
     if to_idx == from_idx + 1:
         return
 
-    if to_state == "02-in-progress" and current_state in {"03-needs-review", "04-in-review"}:
+    if to_state == "02-in-progress" and current_state in {"03-needs-review", "04-in-review", "05-completed"}:
         return
 
     if to_idx > from_idx + 1:
@@ -50,7 +55,7 @@ def validate_task_transition(current_state: str, to_state: str) -> None:
         )
 
     raise InvalidTaskTransition(
-        f"Invalid transition {current_state} -> {to_state}; only review rejection may move backward"
+        f"Invalid transition {current_state} -> {to_state}; only request-changes or reopen may move backward to 02-in-progress"
     )
 
 

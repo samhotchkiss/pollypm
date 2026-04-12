@@ -41,6 +41,19 @@ def test_file_task_backend_rejects_skipped_transition(tmp_path: Path) -> None:
         raise AssertionError("Expected skipped transition to fail")
 
 
+def test_file_task_backend_rejects_completion_without_review_gate(tmp_path: Path) -> None:
+    backend = FileTaskBackend(tmp_path)
+    task = backend.create_task(title="Review plugin host")
+    backend.move_task(task.task_id, "02-in-progress")
+
+    try:
+        backend.move_task(task.task_id, "05-completed")
+    except ValueError as exc:
+        assert "must pass through 04-in-review before completion" in str(exc)
+    else:
+        raise AssertionError("Expected direct completion to fail")
+
+
 def test_file_task_backend_allows_review_rejection_loop(tmp_path: Path) -> None:
     backend = FileTaskBackend(tmp_path)
     task = backend.create_task(title="Review plugin host")
@@ -51,6 +64,24 @@ def test_file_task_backend_allows_review_rejection_loop(tmp_path: Path) -> None:
     moved = backend.move_task(task.task_id, "02-in-progress")
 
     assert moved.state == "02-in-progress"
+
+    progress_log = (tmp_path / "issues" / "progress-log.md").read_text()
+    assert f"{task.task_id} request-changes: 04-in-review -> 02-in-progress" in progress_log
+
+
+def test_file_task_backend_allows_reopen_from_completed(tmp_path: Path) -> None:
+    backend = FileTaskBackend(tmp_path)
+    task = backend.create_task(title="Reopen plugin host")
+    backend.move_task(task.task_id, "02-in-progress")
+    backend.move_task(task.task_id, "03-needs-review")
+    backend.move_task(task.task_id, "04-in-review")
+    backend.move_task(task.task_id, "05-completed")
+
+    moved = backend.move_task(task.task_id, "02-in-progress")
+
+    assert moved.state == "02-in-progress"
+    progress_log = (tmp_path / "issues" / "progress-log.md").read_text()
+    assert f"{task.task_id} reopen: 05-completed -> 02-in-progress" in progress_log
 
 
 def test_file_task_backend_get_task_and_next_available(tmp_path: Path) -> None:
@@ -248,6 +279,31 @@ def test_github_task_backend_rejects_skipped_transition(monkeypatch, tmp_path: P
         assert "Invalid transition 01-ready -> 03-needs-review" in str(exc)
     else:
         raise AssertionError("Expected skipped transition to fail")
+
+
+def test_github_task_backend_allows_reopen_from_completed(monkeypatch, tmp_path: Path) -> None:
+    backend = GitHubTaskBackend(tmp_path, repo="acme/widgets")
+    calls: list[tuple[tuple[str, ...], bool]] = []
+
+    def fake_gh(*args: str, check: bool = True):
+        calls.append((args, check))
+
+        class Result:
+            def __init__(self, stdout: str = "") -> None:
+                self.stdout = stdout
+
+        if args[:2] == ("issue", "view"):
+            return Result('{"title":"Wire the backend","labels":[{"name":"polly:completed"},{"name":"bug"}]}')
+        return Result()
+
+    monkeypatch.setattr("pollypm.task_backends.github._gh", fake_gh)
+
+    moved = backend.move_task("42", "02-in-progress")
+
+    assert moved.state == "02-in-progress"
+    assert (("issue", "edit", "42", "--remove-label", "polly:completed", "--repo", "acme/widgets"), False) in calls
+    assert (("issue", "edit", "42", "--add-label", "polly:in-progress", "--repo", "acme/widgets"), True) in calls
+    assert (("issue", "reopen", "42", "--repo", "acme/widgets"), False) in calls
 
 
 def test_github_task_backend_appends_issue_comment(monkeypatch, tmp_path: Path) -> None:

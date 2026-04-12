@@ -1,0 +1,56 @@
+# PollyPM Operating Instructions
+
+You are running inside PollyPM, a tmux-based supervisor that coordinates AI coding sessions. You are one of several managed sessions — a heartbeat supervisor, an operator (PM), or a worker. Your role is defined in the control prompt you received at startup.
+
+Read the sections below that are relevant to your current task. Each linked document starts with a summary — read the summary first, then drill deeper only if needed.
+
+## Your Project
+
+These documents describe the project you are working on. Read them to understand context, goals, and recent decisions.
+
+| Document | What it contains | Path |
+|----------|-----------------|------|
+| Project Overview | What this project is, its goals, architecture, and current state | docs/project-overview.md |
+| Decisions | Key technical and design decisions made so far | docs/decisions.md |
+| Architecture | System architecture and component design | docs/architecture.md |
+| Risks | Known risks, concerns, and open questions | docs/risks.md |
+| Ideas | Proposed features and improvements | docs/ideas.md |
+
+## PollyPM System Reference
+
+These documents describe how PollyPM itself works. Read them when you need to use a command, manage sessions, or understand the system.
+
+| Document | When to read | Path |
+|----------|-------------|------|
+| Commands | You need to run a `pm` command | .pollypm/docs/reference/commands.md |
+| Session Management | Starting, steering, or recovering sessions | .pollypm/docs/reference/sessions.md |
+| Task Management | Working with issues, reviews, or the task pipeline | .pollypm/docs/reference/tasks.md |
+| Accounts & Providers | Managing Claude/Codex accounts, failover, quota | .pollypm/docs/reference/accounts.md |
+| Rules & Magic | Specialized instructions or capabilities available to you | .pollypm/docs/reference/rules-and-magic.md |
+| Plugin System | Creating or installing custom plugins | .pollypm/docs/reference/plugins.md |
+
+## Quick Reference
+
+**Key commands you will use most often:**
+- `pm status` — check health of all sessions
+- `pm send <session> "<text>"` — send a message to another session
+- `pm worker-start <project>` — launch or relaunch a worker for a project
+- `pm alerts` — see open alerts
+- `pm debug` — diagnostic info (alerts, states, recent events)
+- `pm heartbeat` — run a heartbeat sweep manually
+
+**Session roles:**
+- **heartbeat** — monitors all sessions, detects problems, triggers recovery. Does NOT implement.
+- **operator (Polly)** — manages projects, triages inbox, assigns work, reviews results. Delegates, does NOT implement directly.
+- **worker** — implements assigned tasks. Reads code, writes code, runs tests, commits.
+
+**Issue lifecycle:**
+`00-not-ready → 01-ready → 02-in-progress → 03-needs-review → 04-in-review → 05-completed`
+
+**Where things live:**
+- Config: `~/.pollypm/pollypm.toml`
+- Issues: `<project>/issues/` (file backend) or GitHub Issues with `polly:*` labels
+- Inbox: `~/.pollypm/.pollypm/inbox/{open,threads,closed}/`
+- Logs: `~/.pollypm/logs/`
+- Snapshots: `~/.pollypm/snapshots/`
+- State DB: `~/.pollypm/state.db`

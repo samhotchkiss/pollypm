@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 from pollypm.llm_runner import HAIKU_MODEL, run_haiku_json
+from pollypm.memory_backends import get_memory_backend
 
 EXTRACTION_INTERVAL_SECONDS = 15 * 60
 SUMMARY_HEADER = "## Summary"
@@ -65,6 +66,71 @@ def extract_knowledge_once(config) -> dict[str, int]:
         memory_entries += _store_memory_entries(config, project_root, delta)
         _save_checkpoint(project_root, checkpoint)
     return {"processed_events": processed_events, "updated_docs": updated_docs, "memory_entries": memory_entries}
+
+
+def store_snapshot_learnings(
+    config,
+    *,
+    project_root: Path,
+    scope: str,
+    snapshot_text: str,
+    memory_backend_name: str = "file",
+    source: str = "heartbeat",
+) -> int:
+    text = _sanitize_text(snapshot_text).strip()
+    if not text:
+        return 0
+    delta = _extract_with_haiku_or_fallback(
+        [
+            {
+                "event_type": "heartbeat_snapshot",
+                "payload": {"text": text},
+            }
+        ]
+    )
+    if delta.is_empty():
+        return 0
+    try:
+        backend = get_memory_backend(project_root, memory_backend_name)
+    except Exception:  # noqa: BLE001
+        return 0
+
+    count = 0
+    kind_map = {
+        "decision": delta.decisions,
+        "goal": delta.goals,
+        "risk": delta.risks,
+        "idea": delta.ideas,
+        "architecture": delta.architecture_changes,
+        "convention": delta.convention_shifts,
+    }
+    for kind, items in kind_map.items():
+        if not items:
+            continue
+        existing_titles = {
+            entry.title.strip()
+            for entry in backend.list_entries(scope=scope, kind=kind, limit=500)
+        }
+        for item in items:
+            title = item.strip()
+            if not title or title in existing_titles:
+                continue
+            backend.write_entry(
+                scope=scope,
+                title=title,
+                body=title,
+                kind=kind,
+                tags=[scope, kind, source],
+                source=source,
+            )
+            existing_titles.add(title)
+            count += 1
+    if count > 0:
+        try:
+            backend.compact(scope)
+        except Exception:  # noqa: BLE001
+            pass
+    return count
 
 
 def _store_memory_entries(config, project_root: Path, delta: "KnowledgeDelta") -> int:

@@ -1,6 +1,7 @@
 import base64
 import json
 import shlex
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 
@@ -241,6 +242,64 @@ def test_release_lease_preserves_reclaimed_lease_for_different_owner(tmp_path: P
     assert lease.owner == "human"
 
 
+def test_release_expired_leases_clears_stale_lease_and_records_event(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.pollypm.lease_timeout_minutes = 30
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    supervisor.claim_lease("operator", "human", "manual takeover")
+    expired_at = (datetime.now(UTC) - timedelta(minutes=31)).isoformat()
+    supervisor.store.execute(
+        "UPDATE leases SET updated_at = ? WHERE session_name = ?",
+        (expired_at, "operator"),
+    )
+    supervisor.store.commit()
+
+    released = supervisor.release_expired_leases(now=datetime.now(UTC))
+
+    assert [lease.session_name for lease in released] == ["operator"]
+    assert supervisor.store.get_lease("operator") is None
+    events = supervisor.store.recent_events(limit=5)
+    assert any(
+        event.session_name == "operator"
+        and event.event_type == "lease"
+        and "Auto-released expired lease held by human" in event.message
+        for event in events
+    )
+
+
+def test_run_heartbeat_releases_expired_leases_before_backend(monkeypatch, tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.pollypm.lease_timeout_minutes = 30
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    supervisor.claim_lease("operator", "human", "manual takeover")
+    expired_at = (datetime.now(UTC) - timedelta(minutes=31)).isoformat()
+    supervisor.store.execute(
+        "UPDATE leases SET updated_at = ? WHERE session_name = ?",
+        (expired_at, "operator"),
+    )
+    supervisor.store.commit()
+    seen: dict[str, object] = {}
+
+    class FakeHeartbeatBackend:
+        name = "fake"
+
+        def run(self, _api, *, snapshot_lines=200):
+            seen["lease"] = supervisor.store.get_lease("operator")
+            return []
+
+    monkeypatch.setattr(
+        "pollypm.supervisor.get_heartbeat_backend",
+        lambda name, root_dir=None: FakeHeartbeatBackend(),
+    )
+    monkeypatch.setattr("pollypm.supervisor.sync_token_ledger_for_config", lambda config: [])
+
+    supervisor.run_heartbeat()
+
+    assert seen["lease"] is None
+
+
 def test_heartbeat_uses_separate_tmux_session(monkeypatch, tmp_path: Path) -> None:
     config = _config(tmp_path)
     supervisor = Supervisor(config)
@@ -361,7 +420,7 @@ def test_control_session_args_follow_override_provider(tmp_path: Path) -> None:
 
     for launch in launches:
         assert launch.session.provider is ProviderKind.CODEX
-        assert launch.session.args == ["--dangerously-bypass-approvals-and-sandbox"]
+        assert launch.session.args == ["--sandbox", "read-only", "--ask-for-approval", "never"]
 
 
 def test_claude_control_sessions_use_original_account_home(tmp_path: Path) -> None:
@@ -445,11 +504,14 @@ def test_open_permissions_default_can_disable_launch_args(tmp_path: Path) -> Non
 
     launches = {launch.session.name: launch for launch in supervisor.plan_launches()}
 
-    # Heartbeat always gets --disallowedTools even without open permissions
+    # Role restrictions apply even without open-permissions defaults.
+    assert "--allowedTools" in launches["heartbeat"].session.args
     assert "--disallowedTools" in launches["heartbeat"].session.args
+    assert "--allowedTools" in launches["operator"].session.args
+    assert "--disallowedTools" in launches["operator"].session.args
     assert "--dangerously-skip-permissions" not in launches["heartbeat"].session.args
     assert "--dangerously-skip-permissions" not in launches["operator"].session.args
-    assert launches["worker"].session.args == []
+    assert launches["worker"].session.args == ["--sandbox", "workspace-write", "--ask-for-approval", "never"]
 
 
 def test_run_heartbeat_delegates_to_configured_backend(monkeypatch, tmp_path: Path) -> None:
@@ -532,7 +594,7 @@ def test_codex_control_launches_use_agents_md_instead_of_visible_prompt(tmp_path
     argv = decoded["argv"]
     env = decoded["env"]
 
-    assert argv[-1] == "--dangerously-bypass-approvals-and-sandbox"
+    assert argv == ["codex", "--sandbox", "read-only", "--ask-for-approval", "never"]
     assert "PM_CODEX_HOME_AGENTS_MD" in env
     assert "Polly" in env["PM_CODEX_HOME_AGENTS_MD"]
     assert launch.initial_input is None
@@ -557,6 +619,37 @@ def test_codex_worker_launches_do_not_auto_send_prompt(tmp_path: Path) -> None:
 
     # Worker prompt should NOT be baked into argv
     assert not any("do some work" in arg for arg in decoded["argv"])
+    assert decoded["argv"] == ["codex", "--sandbox", "workspace-write", "--ask-for-approval", "never"]
+    shim_path = Path(decoded["env"]["PATH"].split(":")[0])
+    assert shim_path.name == "worker"
+    assert (shim_path / "tmux").exists()
+    assert (shim_path / "pm").exists()
+
+
+def test_worker_launch_env_blocks_tmux_and_session_pm_commands(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.sessions["worker"] = SessionConfig(
+        name="worker",
+        role="worker",
+        provider=ProviderKind.CODEX,
+        account="codex_backup",
+        cwd=tmp_path,
+        project="pollypm",
+        prompt="do some work",
+        window_name="worker-pollypm",
+    )
+    supervisor = Supervisor(config)
+
+    launch = next(item for item in supervisor.plan_launches() if item.session.name == "worker")
+    decoded = _decode_launch_payload(launch.command)
+    shim_dir = Path(decoded["env"]["PATH"].split(":")[0])
+
+    tmux_text = (shim_dir / "tmux").read_text()
+    pm_text = (shim_dir / "pm").read_text()
+
+    assert "may not manage tmux directly" in tmux_text
+    assert "pm send" in pm_text
+    assert "pm console" in pm_text
 
 
 def test_switch_session_account_restarts_in_place(monkeypatch, tmp_path: Path) -> None:
@@ -677,6 +770,152 @@ def test_recovery_waits_on_non_pollypm_lease(tmp_path: Path) -> None:
     assert len(alerts) == 1
     assert alerts[0].alert_type == "recovery_waiting_on_human"
     assert "lease owner human" in alerts[0].message
+
+
+def test_stalled_worker_gets_heartbeat_nudge_after_five_identical_cycles(monkeypatch, tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.sessions["worker"] = SessionConfig(
+        name="worker",
+        role="worker",
+        provider=ProviderKind.CODEX,
+        account="codex_backup",
+        cwd=tmp_path,
+        project="pollypm",
+        prompt="Ship the fix",
+        window_name="worker-pollypm",
+    )
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    launch = next(item for item in supervisor.plan_launches() if item.session.name == "worker")
+    window = TmuxWindow(
+        session=supervisor.storage_closet_session_name(),
+        index=1,
+        name="worker-pollypm",
+        active=False,
+        pane_id="%42",
+        pane_current_command="codex",
+        pane_current_path=str(tmp_path),
+        pane_dead=False,
+    )
+
+    for index in range(4):
+        supervisor.store.record_heartbeat(
+            session_name="worker",
+            tmux_window=window.name,
+            pane_id=window.pane_id,
+            pane_command=window.pane_current_command,
+            pane_dead=False,
+            log_bytes=100 + index,
+            snapshot_path=str(tmp_path / f"snapshot-{index}.txt"),
+            snapshot_hash="same-hash",
+        )
+    supervisor.store.record_heartbeat(
+        session_name="worker",
+        tmux_window=window.name,
+        pane_id=window.pane_id,
+        pane_command=window.pane_current_command,
+        pane_dead=False,
+        log_bytes=200,
+        snapshot_path=str(tmp_path / "snapshot-current.txt"),
+        snapshot_hash="same-hash",
+    )
+
+    sent: list[tuple[str, str, bool]] = []
+    monkeypatch.setattr(
+        supervisor,
+        "send_input",
+        lambda session_name, text, owner="pollypm", force=False, press_enter=True: sent.append(
+            (session_name, text, force)
+        ),
+    )
+
+    alerts = supervisor._update_alerts(
+        launch,
+        window,
+        pane_text="Still stalled",
+        previous_log_bytes=150,
+        previous_snapshot_hash="same-hash",
+        current_log_bytes=200,
+        current_snapshot_hash="same-hash",
+    )
+
+    assert "suspected_loop" in alerts
+    assert sent == [("worker", Supervisor._STALL_NUDGE_MESSAGE, False)]
+
+
+def test_stalled_worker_nudge_skips_when_human_holds_lease(monkeypatch, tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.sessions["worker"] = SessionConfig(
+        name="worker",
+        role="worker",
+        provider=ProviderKind.CODEX,
+        account="codex_backup",
+        cwd=tmp_path,
+        project="pollypm",
+        prompt="Ship the fix",
+        window_name="worker-pollypm",
+    )
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    launch = next(item for item in supervisor.plan_launches() if item.session.name == "worker")
+    window = TmuxWindow(
+        session=supervisor.storage_closet_session_name(),
+        index=1,
+        name="worker-pollypm",
+        active=False,
+        pane_id="%42",
+        pane_current_command="codex",
+        pane_current_path=str(tmp_path),
+        pane_dead=False,
+    )
+
+    for index in range(4):
+        supervisor.store.record_heartbeat(
+            session_name="worker",
+            tmux_window=window.name,
+            pane_id=window.pane_id,
+            pane_command=window.pane_current_command,
+            pane_dead=False,
+            log_bytes=100 + index,
+            snapshot_path=str(tmp_path / f"snapshot-{index}.txt"),
+            snapshot_hash="same-hash",
+        )
+    supervisor.store.record_heartbeat(
+        session_name="worker",
+        tmux_window=window.name,
+        pane_id=window.pane_id,
+        pane_command=window.pane_current_command,
+        pane_dead=False,
+        log_bytes=200,
+        snapshot_path=str(tmp_path / "snapshot-current.txt"),
+        snapshot_hash="same-hash",
+    )
+    supervisor.claim_lease("worker", "human", "manual takeover")
+
+    monkeypatch.setattr(
+        supervisor,
+        "send_input",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("nudge should be skipped")),
+    )
+
+    alerts = supervisor._update_alerts(
+        launch,
+        window,
+        pane_text="Still stalled",
+        previous_log_bytes=150,
+        previous_snapshot_hash="same-hash",
+        current_log_bytes=200,
+        current_snapshot_hash="same-hash",
+    )
+
+    assert "suspected_loop" in alerts
+    events = supervisor.store.recent_events(limit=5)
+    assert any(
+        event.session_name == "worker"
+        and event.event_type == "heartbeat_nudge_skipped"
+        and "leased to human" in event.message
+        for event in events
+    )
 
 
 def test_recovery_hard_limit_stops_after_many_failures(tmp_path: Path) -> None:

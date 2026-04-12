@@ -62,6 +62,182 @@ def test_cockpit_router_build_items_includes_core_entries(monkeypatch, tmp_path:
     assert items[3].state.endswith("live")
 
 
+def test_cockpit_router_selected_key_clears_missing_right_pane_state(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm-state'}\"\n"
+    )
+    worker_cwd = tmp_path / "worker"
+    worker_cwd.mkdir()
+
+    class FakeLaunch:
+        def __init__(self) -> None:
+            self.session = type(
+                "Session",
+                (),
+                {
+                    "name": "worker_demo",
+                    "cwd": worker_cwd,
+                    "provider": type("P", (), {"value": "codex"})(),
+                },
+            )()
+
+    class FakeSupervisor:
+        def ensure_layout(self) -> None:
+            return None
+
+        def plan_launches(self):
+            return [FakeLaunch()]
+
+    class FakePane:
+        def __init__(self, pane_id: str, *, pane_dead: bool, command: str, path: Path) -> None:
+            self.pane_id = pane_id
+            self.pane_dead = pane_dead
+            self.pane_current_command = command
+            self.pane_current_path = str(path)
+
+    class FakeTmux:
+        def list_panes(self, target: str):
+            return [FakePane("%1", pane_dead=False, command="uv", path=tmp_path)]
+
+    router = CockpitRouter(config_path)
+    router.tmux = FakeTmux()  # type: ignore[assignment]
+    monkeypatch.setattr(router, "_load_supervisor", lambda fresh=False: FakeSupervisor())
+    router._write_state(
+        {
+            "selected": "project:demo",
+            "right_pane_id": "%9",
+            "mounted_session": "worker_demo",
+        }
+    )
+
+    assert router.selected_key() == "project:demo"
+    state = router._load_state()
+    assert state["selected"] == "project:demo"
+    assert "right_pane_id" not in state
+    assert "mounted_session" not in state
+
+
+def test_cockpit_router_selected_key_clears_dead_right_pane_state(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm-state'}\"\n"
+    )
+    worker_cwd = tmp_path / "worker"
+    worker_cwd.mkdir()
+
+    class FakeLaunch:
+        def __init__(self) -> None:
+            self.session = type(
+                "Session",
+                (),
+                {
+                    "name": "worker_demo",
+                    "cwd": worker_cwd,
+                    "provider": type("P", (), {"value": "codex"})(),
+                },
+            )()
+
+    class FakeSupervisor:
+        def ensure_layout(self) -> None:
+            return None
+
+        def plan_launches(self):
+            return [FakeLaunch()]
+
+    class FakePane:
+        def __init__(self, pane_id: str, *, pane_dead: bool, command: str, path: Path) -> None:
+            self.pane_id = pane_id
+            self.pane_dead = pane_dead
+            self.pane_current_command = command
+            self.pane_current_path = str(path)
+
+    class FakeTmux:
+        def list_panes(self, target: str):
+            return [
+                FakePane("%1", pane_dead=False, command="uv", path=tmp_path),
+                FakePane("%2", pane_dead=True, command="node", path=worker_cwd),
+            ]
+
+    router = CockpitRouter(config_path)
+    router.tmux = FakeTmux()  # type: ignore[assignment]
+    monkeypatch.setattr(router, "_load_supervisor", lambda fresh=False: FakeSupervisor())
+    router._write_state(
+        {
+            "selected": "project:demo",
+            "right_pane_id": "%2",
+            "mounted_session": "worker_demo",
+        }
+    )
+
+    assert router.selected_key() == "project:demo"
+    state = router._load_state()
+    assert state["selected"] == "project:demo"
+    assert "right_pane_id" not in state
+    assert "mounted_session" not in state
+
+
+def test_cockpit_router_selected_key_clears_stale_mounted_session_only(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm-state'}\"\n"
+    )
+    worker_cwd = tmp_path / "worker"
+    other_cwd = tmp_path / "other"
+    worker_cwd.mkdir()
+    other_cwd.mkdir()
+
+    class FakeLaunch:
+        def __init__(self) -> None:
+            self.session = type(
+                "Session",
+                (),
+                {
+                    "name": "worker_demo",
+                    "cwd": worker_cwd,
+                    "provider": type("P", (), {"value": "codex"})(),
+                },
+            )()
+
+    class FakeSupervisor:
+        def ensure_layout(self) -> None:
+            return None
+
+        def plan_launches(self):
+            return [FakeLaunch()]
+
+    class FakePane:
+        def __init__(self, pane_id: str, *, pane_dead: bool, command: str, path: Path) -> None:
+            self.pane_id = pane_id
+            self.pane_dead = pane_dead
+            self.pane_current_command = command
+            self.pane_current_path = str(path)
+
+    class FakeTmux:
+        def list_panes(self, target: str):
+            return [
+                FakePane("%1", pane_dead=False, command="uv", path=tmp_path),
+                FakePane("%2", pane_dead=False, command="node", path=other_cwd),
+            ]
+
+    router = CockpitRouter(config_path)
+    router.tmux = FakeTmux()  # type: ignore[assignment]
+    monkeypatch.setattr(router, "_load_supervisor", lambda fresh=False: FakeSupervisor())
+    router._write_state(
+        {
+            "selected": "project:demo",
+            "right_pane_id": "%2",
+            "mounted_session": "worker_demo",
+        }
+    )
+
+    assert router.selected_key() == "project:demo"
+    state = router._load_state()
+    assert state["selected"] == "project:demo"
+    assert state["right_pane_id"] == "%2"
+    assert "mounted_session" not in state
+
+
 def test_build_cockpit_detail_shows_github_issue_counts(monkeypatch, tmp_path: Path) -> None:
     config = PollyPMConfig(
         project=ProjectSettings(
@@ -373,6 +549,9 @@ def test_cockpit_router_joins_session_from_storage(monkeypatch, tmp_path: Path) 
         def plan_launches(self):
             return [FakeLaunch()]
 
+        def claim_lease(self, session_name: str, owner: str, note: str = "") -> None:
+            calls["claimed"] = (session_name, owner, note)
+
     class FakeWindow:
         def __init__(self, name: str) -> None:
             self.name = name
@@ -414,6 +593,155 @@ def test_cockpit_router_joins_session_from_storage(monkeypatch, tmp_path: Path) 
 
     assert calls["killed"] == "%2"
     assert calls["joined"] == ("pollypm-storage-closet:pm-operator.0", "%1")
+    assert calls["claimed"] == ("operator", "cockpit", "mounted in cockpit")
+
+
+def test_cockpit_router_releases_lease_when_unmounting_static_view(monkeypatch, tmp_path: Path) -> None:
+    calls: dict[str, object] = {}
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm-state'}\"\n"
+    )
+
+    class FakeLaunch:
+        def __init__(self) -> None:
+            self.window_name = "worker-demo"
+            self.session = type(
+                "Session",
+                (),
+                {
+                    "name": "worker_demo",
+                    "project": "demo",
+                    "provider": type("P", (), {"value": "codex"})(),
+                },
+            )()
+
+    class FakeWindow:
+        def __init__(self, index: int, name: str) -> None:
+            self.index = index
+            self.name = name
+
+    class FakeSupervisor:
+        class Config:
+            class Project:
+                tmux_session = "pollypm"
+
+            project = Project()
+
+        config = Config()
+
+        def plan_launches(self):
+            return [FakeLaunch()]
+
+        def storage_closet_session_name(self) -> str:
+            return "pollypm-storage-closet"
+
+        def release_lease(self, session_name: str, expected_owner: str | None = None) -> None:
+            calls["released"] = (session_name, expected_owner)
+
+    class FakePane:
+        def __init__(self, pane_id: str, pane_left: int, command: str) -> None:
+            self.pane_id = pane_id
+            self.pane_left = pane_left
+            self.pane_current_command = command
+
+    class FakeTmux:
+        def list_panes(self, target: str):
+            return [
+                FakePane("%1", 0, "uv"),
+                FakePane("%2", 30, "node"),
+            ]
+
+        def list_windows(self, target: str):
+            return [FakeWindow(1, "worker-demo")]
+
+        def break_pane(self, source: str, target_session: str, window_name: str) -> None:
+            calls["break"] = (source, target_session, window_name)
+
+        def rename_window(self, target: str, name: str) -> None:
+            calls["renamed"] = (target, name)
+
+        def respawn_pane(self, target: str, command: str) -> None:
+            calls["respawn"] = (target, command)
+
+        def resize_pane_width(self, target: str, width: int) -> None:
+            calls["resize"] = (target, width)
+
+    router = CockpitRouter(config_path)
+    router.tmux = FakeTmux()  # type: ignore[assignment]
+    monkeypatch.setattr(router, "_load_supervisor", lambda fresh=False: FakeSupervisor())
+    monkeypatch.setattr(router, "_mounted_session_name", lambda supervisor, target: "worker_demo")
+    monkeypatch.setattr(router, "_left_pane_id", lambda target: "%1")
+    monkeypatch.setattr(router, "_right_pane_id", lambda target: "%2")
+    router._write_state({"mounted_session": "worker_demo", "right_pane_id": "%2"})
+
+    router._show_static_view(FakeSupervisor(), "pollypm:PollyPM", "settings")
+
+    state = router._load_state()
+    assert "mounted_session" not in state
+    assert calls["released"] == ("worker_demo", "cockpit")
+
+
+def test_cockpit_router_validation_releases_stale_cockpit_lease(monkeypatch, tmp_path: Path) -> None:
+    calls: dict[str, object] = {}
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm-state'}\"\n"
+    )
+    worker_cwd = tmp_path / "worker"
+    other_cwd = tmp_path / "other"
+    worker_cwd.mkdir()
+    other_cwd.mkdir()
+
+    class FakeLaunch:
+        def __init__(self) -> None:
+            self.session = type(
+                "Session",
+                (),
+                {
+                    "name": "worker_demo",
+                    "cwd": worker_cwd,
+                    "provider": type("P", (), {"value": "codex"})(),
+                },
+            )()
+
+    class FakeSupervisor:
+        def ensure_layout(self) -> None:
+            return None
+
+        def plan_launches(self):
+            return [FakeLaunch()]
+
+        def release_lease(self, session_name: str, expected_owner: str | None = None) -> None:
+            calls["released"] = (session_name, expected_owner)
+
+    class FakePane:
+        def __init__(self, pane_id: str, *, pane_dead: bool, command: str, path: Path) -> None:
+            self.pane_id = pane_id
+            self.pane_dead = pane_dead
+            self.pane_current_command = command
+            self.pane_current_path = str(path)
+
+    class FakeTmux:
+        def list_panes(self, target: str):
+            return [
+                FakePane("%1", pane_dead=False, command="uv", path=tmp_path),
+                FakePane("%2", pane_dead=False, command="node", path=other_cwd),
+            ]
+
+    router = CockpitRouter(config_path)
+    router.tmux = FakeTmux()  # type: ignore[assignment]
+    monkeypatch.setattr(router, "_load_supervisor", lambda fresh=False: FakeSupervisor())
+    router._write_state(
+        {
+            "selected": "project:demo",
+            "right_pane_id": "%2",
+            "mounted_session": "worker_demo",
+        }
+    )
+
+    assert router.selected_key() == "project:demo"
+    assert calls["released"] == ("worker_demo", "cockpit")
 
 
 def test_cockpit_router_infers_mounted_session_from_live_right_pane(monkeypatch, tmp_path: Path) -> None:

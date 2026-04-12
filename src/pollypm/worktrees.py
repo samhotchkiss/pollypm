@@ -29,18 +29,19 @@ def ensure_worktree(
     project = config.projects.get(project_key)
     if project is None:
         raise typer.BadParameter(f"Unknown project: {project_key}")
+
+    ensure_project_scaffold(project.path)
+    session_id = session_name or f"{lane_kind}-{lane_key}"
+    worktree_root = session_scoped_dir(project_worktrees_dir(project.path), session_id)
+    ensure_session_lock(worktree_root, session_id)
     if not (project.path / ".git").exists():
         return None
 
-    ensure_project_scaffold(project.path)
     store = StateStore(config.project.state_db)
     existing = _active_worktree(store, project_key, lane_kind, lane_key)
     if existing is not None and Path(existing.path).exists():
         return existing
 
-    session_id = session_name or f"{lane_kind}-{lane_key}"
-    worktree_root = session_scoped_dir(project_worktrees_dir(project.path), session_id)
-    ensure_session_lock(worktree_root, session_id)
     path = worktree_root / f"{project_key}-{lane_kind}-{lane_key}"
     branch = f"pollypm/{project_key}/{lane_kind}/{lane_key}"
     if not path.exists():

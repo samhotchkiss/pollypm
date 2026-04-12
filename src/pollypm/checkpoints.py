@@ -424,6 +424,97 @@ def create_level1_checkpoint(
     return data, artifact
 
 
+def create_issue_completion_checkpoint(
+    config: PollyPMConfig,
+    launch: SessionLaunchSpec,
+    *,
+    task_title: str,
+    task_path: Path,
+    review_summary: str = "",
+    verification: str = "",
+) -> tuple[CheckpointData, CheckpointArtifact]:
+    """Create a Level 1 checkpoint when a task transitions to completed."""
+    checkpoint_root = _checkpoint_root(config, launch.session.name, launch.session.project)
+    ensure_session_lock(checkpoint_root, launch.session.name)
+
+    cwd = str(launch.session.cwd)
+    git_branch = _git_output(cwd, ["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    git_status = _git_output(cwd, ["git", "status", "--porcelain"])
+    git_diff_stat = _git_output(cwd, ["git", "diff", "--stat"])
+    if not git_diff_stat:
+        git_diff_stat = _git_output(cwd, ["git", "diff", "--cached", "--stat"])
+
+    files_changed: list[str] = []
+    seen_files: set[str] = set()
+    file_lists = [
+        _git_output(cwd, ["git", "diff", "--name-only"]),
+        _git_output(cwd, ["git", "diff", "--cached", "--name-only"]),
+        _git_output(cwd, ["git", "ls-files", "--others", "--exclude-standard"]),
+    ]
+    for output in file_lists:
+        for line in output.splitlines():
+            path_text = line.strip()
+            if path_text and path_text not in seen_files:
+                seen_files.add(path_text)
+                files_changed.append(path_text)
+    if not files_changed and git_status:
+        for line in git_status.strip().splitlines():
+            if not line.strip():
+                continue
+            path_text = line[3:].strip() if len(line) >= 4 else ""
+            if path_text and path_text not in seen_files:
+                seen_files.add(path_text)
+                files_changed.append(path_text)
+
+    test_files = [
+        path for path in files_changed
+        if "/test" in path or path.startswith("test") or "/tests/" in path or path.startswith("tests/")
+    ]
+    work_completed: list[str] = []
+    if files_changed:
+        work_completed.append(
+            f"Modified {len(files_changed)} file(s): {', '.join(files_changed[:5])}"
+        )
+    if test_files:
+        work_completed.append(
+            f"Tests added or updated: {', '.join(test_files[:5])}"
+        )
+    if review_summary.strip():
+        work_completed.append(f"Review summary: {review_summary.strip()}")
+    if verification.strip():
+        work_completed.append(f"Verification: {verification.strip()}")
+    if not work_completed:
+        work_completed.append("Issue transitioned to completed.")
+
+    transcript_tail = [line for line in task_path.read_text().splitlines()[-40:] if line.strip()] if task_path.exists() else []
+    data = CheckpointData(
+        checkpoint_id=_checkpoint_id(),
+        session_name=launch.session.name,
+        project=launch.session.project,
+        role=launch.session.role,
+        level=1,
+        trigger="issue_completed",
+        created_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        is_canonical=True,
+        transcript_tail=transcript_tail,
+        files_changed=files_changed,
+        git_branch=git_branch,
+        git_status=git_status,
+        git_diff_stat=git_diff_stat,
+        test_results={},
+        worktree_path=str(launch.session.cwd),
+        provider=launch.session.provider.value,
+        account=launch.account.name,
+        objective=task_title,
+        work_completed=work_completed,
+        recommended_next_step="Pick up the next ready issue.",
+        snapshot_hash=snapshot_hash(task_path.read_text() if task_path.exists() else task_title),
+    )
+
+    artifact = _write_checkpoint_files(checkpoint_root, data)
+    return data, artifact
+
+
 # ---------------------------------------------------------------------------
 # Level 2: Strategic Summary
 # ---------------------------------------------------------------------------

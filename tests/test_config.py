@@ -26,6 +26,7 @@ def test_load_example_config(tmp_path: Path) -> None:
     assert config.pollypm.open_permissions_by_default is True
     assert config.pollypm.failover_enabled is True
     assert config.pollypm.failover_accounts == ["claude_primary"]
+    assert config.pollypm.lease_timeout_minutes == 30
     assert config.memory.backend == "file"
     assert set(config.accounts) == {"codex_primary", "claude_primary"}
     assert set(config.sessions) == {"heartbeat", "operator"}
@@ -128,6 +129,39 @@ cwd = "."
     assert config.sessions["operator"].cwd == Path("/Users/test/dev")
     # Workers should use base_dir (config parent)
     assert config.sessions["worker"].cwd == tmp_path
+
+
+def test_load_config_parses_custom_lease_timeout_minutes(tmp_path: Path) -> None:
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        """
+[project]
+name = "pollypm"
+tmux_session = "pollypm"
+
+[pollypm]
+controller_account = "claude_primary"
+lease_timeout_minutes = 5
+
+[accounts.claude_primary]
+provider = "claude"
+home = ".pollypm-state/homes/claude_primary"
+
+[sessions.operator]
+role = "operator-pm"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[projects.pollypm]
+path = "."
+name = "pollypm"
+"""
+    )
+
+    config = load_config(config_path)
+
+    assert config.pollypm.lease_timeout_minutes == 5
 
 
 def test_load_config_merges_project_local_worker_sessions(tmp_path: Path) -> None:

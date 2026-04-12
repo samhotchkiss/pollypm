@@ -1,7 +1,17 @@
 from __future__ import annotations
 
+import gc
+import resource
 from pathlib import Path
 import subprocess
+
+# Raise FD limit early — the cockpit opens many subprocesses and file handles.
+try:
+    _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if _soft < 4096:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (min(4096, _hard), _hard))
+except (ValueError, OSError):
+    pass
 
 from rich.text import Text
 from textual import events, on
@@ -391,6 +401,12 @@ class PollyCockpitApp(App[None]):
         if callable(focus_method):
             focus_method()
 
+    # Only query tmux/state every N ticks to avoid FD exhaustion.
+    # At 0.8s/tick, _DATA_REFRESH_INTERVAL=5 means data refreshes every 4s.
+    _DATA_REFRESH_INTERVAL = 5
+    # Force GC every N ticks to reclaim leaked FDs from plugin/provider loading.
+    _GC_INTERVAL = 150  # ~2 minutes at 0.8s/tick
+
     def _tick(self) -> None:
         self._tick_count += 1
         self.spinner_index = (self.spinner_index + 1) % 4
@@ -399,11 +415,27 @@ class PollyCockpitApp(App[None]):
             self._slogan_tick = 0
             self.slogan_index = (self.slogan_index + 1) % len(POLLY_SLOGANS)
             self.tagline.update("\n" + POLLY_SLOGANS[self.slogan_index])
-        try:
-            self._enforce_rail_width()
-            self._refresh_rows()
-        except Exception:  # noqa: BLE001
-            pass
+        # Periodic GC to reclaim FDs from uncollected objects
+        if self._tick_count % self._GC_INTERVAL == 0:
+            gc.collect()
+        # Full data refresh (tmux subprocesses, file reads) only every N ticks
+        if self._tick_count % self._DATA_REFRESH_INTERVAL == 0:
+            try:
+                self._enforce_rail_width()
+                self._refresh_rows()
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            # Cheap UI-only update: cycle spinner on working items without I/O
+            spinners = ["\u25dc", "\u25dd", "\u25de", "\u25df"]
+            frame = spinners[self.spinner_index % 4]
+            for item in self._items:
+                if item.state.endswith("working"):
+                    item.state = f"{frame} working"
+            for key, row in self._row_widgets.items():
+                if row.item.state.endswith("working"):
+                    row.item.state = f"{frame} working"
+                    row.update_body()
 
     def _tick_scheduler(self) -> None:
         # The heartbeat and knowledge extraction now run via cron
@@ -431,7 +463,10 @@ class PollyCockpitApp(App[None]):
         return [item for item in self._items if item.key != "settings"]
 
     def _refresh_rows(self) -> None:
-        self._items = self.router.build_items(spinner_index=self.spinner_index)
+        try:
+            self._items = self.router.build_items(spinner_index=self.spinner_index)
+        except Exception:  # noqa: BLE001
+            return  # keep previous items rather than crashing the rail
         # Track working→idle transitions for unread indicators
         new_working: set[str] = set()
         for item in self._items:
@@ -525,8 +560,22 @@ class PollyCockpitApp(App[None]):
             return child.cockpit_key
         return None
 
+    _HEARTBEAT_STALE_SECONDS = 180  # warn if no heartbeat in 3 minutes
+
     def _update_hint(self) -> None:
-        self.hint.update("j/k move \u00b7 \u21b5 open \u00b7 n new")
+        hint_text = "j/k move \u00b7 \u21b5 open \u00b7 n new"
+        try:
+            supervisor = self.router._load_supervisor()
+            last_hb = supervisor.store.last_heartbeat_at()
+            if last_hb:
+                from datetime import UTC, datetime
+                elapsed = (datetime.now(UTC) - datetime.fromisoformat(last_hb)).total_seconds()
+                if elapsed > self._HEARTBEAT_STALE_SECONDS:
+                    mins = int(elapsed // 60)
+                    hint_text = f"\u26a0 Heartbeat offline ({mins}m) \u2014 run `pm heartbeat install`"
+        except Exception:  # noqa: BLE001
+            pass
+        self.hint.update(hint_text)
 
     def _focus_right_if_live(self) -> None:
         """Focus the right pane only if it shows a live agent session."""
@@ -636,6 +685,19 @@ class PollyCockpitApp(App[None]):
 
     def action_detach(self) -> None:
         self.router.tmux.run("detach-client", check=False)
+
+    def on_unmount(self) -> None:
+        """Clean up resources on exit — close store, release leases."""
+        try:
+            sup = self.router._supervisor
+            if sup is not None:
+                # Release any cockpit-held leases
+                for lease in sup.store.list_leases():
+                    if lease.owner == "cockpit":
+                        sup.store.clear_lease(lease.session_name)
+                sup.store.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     @on(ListView.Selected, "#nav")
     def on_nav_selected(self, event: ListView.Selected) -> None:

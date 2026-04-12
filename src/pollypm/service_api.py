@@ -17,6 +17,7 @@ from pollypm.accounts import (
     set_open_permissions_default,
     toggle_failover_account,
 )
+from pollypm.checkpoints import create_issue_completion_checkpoint, record_checkpoint
 from pollypm.config_patches import apply_preference_patch, detect_preference_patch, list_project_overrides
 from pollypm.config import load_config
 from pollypm.messaging import (
@@ -31,7 +32,7 @@ from pollypm.messaging import (
     set_handoff,
     transition_thread,
 )
-from pollypm.models import ProviderKind
+from pollypm.models import ProviderKind, SessionConfig, SessionLaunchSpec
 from pollypm.projects import (
     enable_tracked_project,
     register_project,
@@ -39,8 +40,9 @@ from pollypm.projects import (
     set_workspace_root,
 )
 from pollypm.schedulers.base import ScheduledJob
+from pollypm.storage.state import StateStore
 from pollypm.supervisor import Supervisor
-from pollypm.task_backends import get_task_backend
+from pollypm.task_backends import FileTaskBackend, get_task_backend
 from pollypm.task_backends.base import TaskRecord
 from pollypm.task_backends.github import GitHubTaskBackendValidation
 from pollypm.transcript_ledger import recent_token_usage as list_recent_token_usage
@@ -325,7 +327,17 @@ class PollyPMService:
 
     def move_task(self, project_key: str, task_id: str, *, to_state: str) -> TaskRecord:
         config = load_config(self.config_path)
-        return self._task_backend(config, project_key).move_task(task_id, to_state)
+        backend = self._task_backend(config, project_key)
+        task = backend.get_task(task_id)
+        moved = backend.move_task(task_id, to_state)
+        self._record_completion_checkpoint_if_needed(
+            config,
+            project_key,
+            backend,
+            task=task,
+            moved=moved,
+        )
+        return moved
 
     def append_task_note(self, project_key: str, task_name: str, *, text: str) -> Path:
         config = load_config(self.config_path)
@@ -412,7 +424,17 @@ class PollyPMService:
             )
         text = "\n".join(sections).rstrip() + "\n"
         backend.append_note(task_id, text)
-        return backend.move_task(task_id, "05-completed" if approved else "02-in-progress")
+        moved = backend.move_task(task_id, "05-completed" if approved else "02-in-progress")
+        self._record_completion_checkpoint_if_needed(
+            config,
+            project_key,
+            backend,
+            task=task,
+            moved=moved,
+            review_summary=summary,
+            verification=verification,
+        )
+        return moved
 
     def task_state_counts(self, project_key: str) -> dict[str, int]:
         config = load_config(self.config_path)
@@ -446,6 +468,77 @@ class PollyPMService:
         config = load_config(self.config_path)
         project_root = self._project_root(config, project_key)
         return [str(path) for path in list_project_overrides(project_root)]
+
+    def _record_completion_checkpoint_if_needed(
+        self,
+        config,
+        project_key: str,
+        backend,
+        *,
+        task: TaskRecord,
+        moved: TaskRecord,
+        review_summary: str = "",
+        verification: str = "",
+    ) -> None:
+        if moved.state != "05-completed" or not isinstance(backend, FileTaskBackend):
+            return
+        launch = self._checkpoint_launch_for_project(config, project_key)
+        checkpoint_data, checkpoint_artifact = create_issue_completion_checkpoint(
+            config,
+            launch,
+            task_title=task.title,
+            task_path=moved.path,
+            review_summary=review_summary,
+            verification=verification,
+        )
+        store = StateStore(config.project.state_db)
+        record_checkpoint(
+            store,
+            launch,
+            project_key=project_key,
+            level="level1",
+            artifact=checkpoint_artifact,
+            snapshot_path=moved.path,
+            memory_backend_name=config.memory.backend,
+        )
+        store.record_event(
+            launch.session.name,
+            "checkpoint",
+            f"Recorded Level 1 checkpoint for completed issue {task.task_id}: {checkpoint_data.checkpoint_id}",
+        )
+
+    def _checkpoint_launch_for_project(self, config, project_key: str) -> SessionLaunchSpec:
+        project = config.projects[project_key]
+        for session in config.sessions.values():
+            if session.role == "worker" and session.project == project_key:
+                account = config.accounts[session.account]
+                return SessionLaunchSpec(
+                    session=session,
+                    account=account,
+                    window_name=session.window_name or session.name,
+                    log_path=config.project.logs_dir / f"{session.name}.log",
+                    command="checkpoint",
+                )
+
+        session_name = f"worker_{project_key}"
+        account_name = config.pollypm.controller_account
+        account = config.accounts[account_name]
+        session = SessionConfig(
+            name=session_name,
+            role="worker",
+            provider=account.provider,
+            account=account_name,
+            cwd=project.path,
+            project=project_key,
+            window_name=f"worker-{project_key}",
+        )
+        return SessionLaunchSpec(
+            session=session,
+            account=account,
+            window_name=session.window_name,
+            log_path=config.project.logs_dir / f"{session.name}.log",
+            command="checkpoint",
+        )
 
     def enable_tracked_project(self, key: str) -> tuple[str, bool]:
         return enable_tracked_project(self.config_path, key)

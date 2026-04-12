@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 import logging
 import re
 import shutil
@@ -99,6 +100,7 @@ class FileTaskBackend(TaskBackend):
             destination = self.issues_root() / to_state / task.path.name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(task.path), str(destination))
+            self._record_transition(task, to_state)
             return TaskRecord(task_id=task.task_id, title=task.title, state=to_state, path=destination)
         raise FileNotFoundError(f"Unknown task id: {task_id}")
 
@@ -128,6 +130,26 @@ class FileTaskBackend(TaskBackend):
             state: len(list((self.issues_root() / state).glob("*.md"))) if (self.issues_root() / state).exists() else 0
             for state in TRACKER_STATES
         }
+
+    def _record_transition(self, task: TaskRecord, to_state: str) -> None:
+        if task.state == to_state:
+            return
+        progress_log = self.issues_root() / "progress-log.md"
+        stamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        if task.state == "04-in-review" and to_state == "02-in-progress":
+            action = "request-changes"
+        elif task.state == "05-completed" and to_state == "02-in-progress":
+            action = "reopen"
+        else:
+            action = "transition"
+        entry = (
+            f"- {stamp} {task.task_id} {action}: "
+            f"{task.state} -> {to_state} ({task.title})\n"
+        )
+        existing = progress_log.read_text() if progress_log.exists() else "# Progress Log\n"
+        if existing and not existing.endswith("\n"):
+            existing += "\n"
+        progress_log.write_text(existing + entry)
 
 
 def _slugify(title: str) -> str:

@@ -467,3 +467,24 @@ def test_issue_cli_rejects_skipped_transition(tmp_path: Path) -> None:
 
     assert result.exit_code == 1
     assert "Invalid transition 01-ready -> 03-needs-review" in result.stdout
+
+
+def test_issue_cli_rejects_direct_completion_without_review(tmp_path: Path) -> None:
+    runner = CliRunner()
+    config_path = _config(tmp_path)
+
+    runner.invoke(
+        app,
+        ["issue", "create", "--config", str(config_path), "--project", "demo", "--title", "Wire backend"],
+    )
+    runner.invoke(
+        app,
+        ["issue", "transition", "--config", str(config_path), "--project", "demo", "0001", "02-in-progress"],
+    )
+    result = runner.invoke(
+        app,
+        ["issue", "transition", "--config", str(config_path), "--project", "demo", "0001", "05-completed"],
+    )
+
+    assert result.exit_code == 1
+    assert "must pass through 04-in-review before completion" in result.stdout

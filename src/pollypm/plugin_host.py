@@ -59,7 +59,11 @@ class ExtensionHost:
                 registry[item_name] = factory
         factory = registry.get(name)
         if factory is not None:
-            return factory()
+            try:
+                return factory()
+            except Exception as exc:
+                self.errors.append(f"Plugin factory for {kind} '{name}' crashed: {exc}")
+                raise ValueError(f"Plugin {kind} '{name}' failed to initialize: {exc}") from exc
         raise ValueError(f"Unsupported {kind}: {name}")
 
     def run_observers(self, hook_name: str, payload: object, *, metadata: dict[str, object] | None = None) -> list[str]:

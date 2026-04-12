@@ -1,9 +1,12 @@
 from datetime import UTC, datetime, timedelta
+import json
 from pathlib import Path
+import subprocess
 
 from pollypm.config import write_config
 from pollypm.models import AccountConfig, KnownProject, PollyPMConfig, PollyPMSettings, ProjectKind, ProjectSettings, ProviderKind
 from pollypm.service_api import PollyPMService, render_json
+from pollypm.storage.state import StateStore
 from pollypm.task_backends.github import GitHubTaskBackendValidation
 
 
@@ -576,6 +579,111 @@ repo = "acme/widgets"
     assert any("### Change Requests" in comment and "Add reject-loop coverage." in comment for comment in comments)
 
 
+def test_service_review_task_records_level1_checkpoint_on_file_completion(tmp_path: Path) -> None:
+    project_root = tmp_path / "demo"
+    project_root.mkdir()
+    subprocess.run(["git", "init"], cwd=project_root, check=True, capture_output=True, text=True)
+    (project_root / "src").mkdir()
+    (project_root / "tests").mkdir()
+    (project_root / "src" / "backend.py").write_text("print('ok')\n")
+    (project_root / "tests" / "test_backend.py").write_text("def test_ok():\n    assert True\n")
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            base_dir=tmp_path / ".pollypm-state",
+            logs_dir=tmp_path / ".pollypm-state/logs",
+            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
+            state_db=tmp_path / ".pollypm-state/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="claude_main"),
+        accounts={
+            "claude_main": AccountConfig(
+                name="claude_main",
+                provider=ProviderKind.CLAUDE,
+                home=tmp_path / ".pollypm-state" / "homes" / "claude_main",
+            )
+        },
+        sessions={},
+        projects={
+            "demo": KnownProject(key="demo", path=project_root, name="Demo", kind=ProjectKind.GIT, tracked=True),
+        },
+    )
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path, force=True)
+    service = PollyPMService(config_path)
+
+    task = service.create_task("demo", title="Wire the backend", body="Implement it.")
+    service.move_task("demo", task.task_id, to_state="02-in-progress")
+    service.move_task("demo", task.task_id, to_state="03-needs-review")
+    approved = service.review_task(
+        "demo",
+        task.task_id,
+        approved=True,
+        summary="Looks correct.",
+        verification="Added source and test coverage.",
+    )
+
+    assert approved.state == "05-completed"
+    store = StateStore(config.project.state_db)
+    checkpoint = store.latest_checkpoint("worker_demo")
+    assert checkpoint is not None
+    assert checkpoint.level == "level1"
+    assert checkpoint.project_key == "demo"
+    payload = json.loads(Path(checkpoint.json_path).read_text())
+    assert payload["level"] == 1
+    assert payload["trigger"] == "issue_completed"
+    assert payload["objective"] == "Wire the backend"
+    assert "src/backend.py" in payload["files_changed"]
+    assert "tests/test_backend.py" in payload["files_changed"]
+    assert any("Tests added or updated" in item for item in payload["work_completed"])
+
+
+def test_service_move_task_to_completed_records_level1_checkpoint_for_file_backend(tmp_path: Path) -> None:
+    project_root = tmp_path / "demo"
+    project_root.mkdir()
+    subprocess.run(["git", "init"], cwd=project_root, check=True, capture_output=True, text=True)
+    (project_root / "pkg").mkdir()
+    (project_root / "pkg" / "feature.py").write_text("FEATURE = True\n")
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            base_dir=tmp_path / ".pollypm-state",
+            logs_dir=tmp_path / ".pollypm-state/logs",
+            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
+            state_db=tmp_path / ".pollypm-state/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="claude_main"),
+        accounts={
+            "claude_main": AccountConfig(
+                name="claude_main",
+                provider=ProviderKind.CLAUDE,
+                home=tmp_path / ".pollypm-state" / "homes" / "claude_main",
+            )
+        },
+        sessions={},
+        projects={
+            "demo": KnownProject(key="demo", path=project_root, name="Demo", kind=ProjectKind.GIT, tracked=True),
+        },
+    )
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path, force=True)
+    service = PollyPMService(config_path)
+
+    task = service.create_task("demo", title="Ship it", body="Done.")
+    service.move_task("demo", task.task_id, to_state="02-in-progress")
+    service.move_task("demo", task.task_id, to_state="03-needs-review")
+    service.move_task("demo", task.task_id, to_state="04-in-review")
+    moved = service.move_task("demo", task.task_id, to_state="05-completed")
+
+    assert moved.state == "05-completed"
+    store = StateStore(config.project.state_db)
+    checkpoint = store.latest_checkpoint("worker_demo")
+    assert checkpoint is not None
+    payload = json.loads(Path(checkpoint.json_path).read_text())
+    assert payload["objective"] == "Ship it"
+    assert "pkg/feature.py" in payload["files_changed"]
+
+
 def test_service_move_task_rejects_skipped_transition(tmp_path: Path) -> None:
     project_root = tmp_path / "demo"
     project_root.mkdir()
@@ -611,3 +719,41 @@ def test_service_move_task_rejects_skipped_transition(tmp_path: Path) -> None:
         assert "Invalid transition 01-ready -> 03-needs-review" in str(exc)
     else:
         raise AssertionError("Expected skipped transition to fail")
+
+
+def test_service_move_task_rejects_direct_completion_without_review(tmp_path: Path) -> None:
+    project_root = tmp_path / "demo"
+    project_root.mkdir()
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            base_dir=tmp_path / ".pollypm-state",
+            logs_dir=tmp_path / ".pollypm-state/logs",
+            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
+            state_db=tmp_path / ".pollypm-state/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="claude_main"),
+        accounts={
+            "claude_main": AccountConfig(
+                name="claude_main",
+                provider=ProviderKind.CLAUDE,
+                home=tmp_path / ".pollypm-state" / "homes" / "claude_main",
+            )
+        },
+        sessions={},
+        projects={
+            "demo": KnownProject(key="demo", path=project_root, name="Demo", kind=ProjectKind.GIT, tracked=True),
+        },
+    )
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path, force=True)
+    service = PollyPMService(config_path)
+    task = service.create_task("demo", title="Wire the backend")
+    service.move_task("demo", task.task_id, to_state="02-in-progress")
+
+    try:
+        service.move_task("demo", task.task_id, to_state="05-completed")
+    except ValueError as exc:
+        assert "must pass through 04-in-review before completion" in str(exc)
+    else:
+        raise AssertionError("Expected direct completion to fail")

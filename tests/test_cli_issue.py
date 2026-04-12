@@ -349,6 +349,88 @@ def test_issue_cli_uses_github_backend_when_project_is_configured(monkeypatch, t
     assert ("issue", "create", "--title", "Wire backend", "--body", "Implement it", "--label", "polly:ready", "--repo", "acme/widgets") in calls
 
 
+def test_issue_cli_review_commands_use_github_backend(monkeypatch, tmp_path: Path) -> None:
+    runner = CliRunner()
+    config_path = _config(tmp_path)
+    _configure_github_backend(tmp_path / "demo")
+    calls: list[tuple[str, ...]] = []
+    current_label = "polly:needs-review"
+    comments: list[str] = []
+
+    def fake_gh(*args: str, check: bool = True):
+        nonlocal current_label
+        calls.append(args)
+
+        class Result:
+            def __init__(self, stdout: str = "") -> None:
+                self.stdout = stdout
+
+        if args[:2] == ("issue", "view"):
+            if "--json" in args and "comments" in args:
+                payload = ",".join(f'{{"author":{{"login":"polly"}},"body":{comment!r}}}' for comment in comments)
+                return Result(f'{{"comments":[{payload}]}}'.replace("'", '"'))
+            return Result(f'{{"number":42,"title":"Wire backend","labels":[{{"name":"{current_label}"}}]}}')
+        if args[:2] == ("issue", "edit") and "--add-label" in args:
+            current_label = args[args.index("--add-label") + 1]
+            return Result()
+        if args[:2] == ("issue", "comment"):
+            comments.append(args[args.index("--body") + 1])
+            return Result()
+        if args[:2] == ("issue", "close"):
+            return Result()
+        if args[:2] == ("issue", "reopen"):
+            return Result()
+        return Result()
+
+    monkeypatch.setattr("pollypm.task_backends.github._gh", fake_gh)
+
+    approve = runner.invoke(
+        app,
+        [
+            "issue",
+            "approve",
+            "--config",
+            str(config_path),
+            "--project",
+            "demo",
+            "--summary",
+            "Looks correct.",
+            "--verification",
+            "Ran pytest independently.",
+            "42",
+        ],
+    )
+
+    assert approve.exit_code == 0
+    assert "Approved issue 42 to 05-completed" in approve.stdout
+    assert any("### Independent Verification" in comment for comment in comments)
+
+    current_label = "polly:needs-review"
+    comments.clear()
+    request_changes = runner.invoke(
+        app,
+        [
+            "issue",
+            "request-changes",
+            "--config",
+            str(config_path),
+            "--project",
+            "demo",
+            "--summary",
+            "Needs more work.",
+            "--verification",
+            "Reviewed the workflow independently.",
+            "--changes",
+            "Add reject-loop coverage.",
+            "42",
+        ],
+    )
+
+    assert request_changes.exit_code == 0
+    assert "Returned issue 42 to 02-in-progress" in request_changes.stdout
+    assert any("### Change Requests" in comment and "Add reject-loop coverage." in comment for comment in comments)
+
+
 def test_issue_cli_validate_reports_backend_validation(monkeypatch, tmp_path: Path) -> None:
     runner = CliRunner()
     config_path = _config(tmp_path)

@@ -472,10 +472,11 @@ class Supervisor:
         errors: list[str] = []
         windows: list[TmuxWindow] = []
 
+        # Single subprocess call to get ALL windows across all sessions
         try:
-            for session_name in self._all_tmux_session_names():
-                if self.tmux.has_session(session_name):
-                    windows.extend(self.tmux.list_windows(session_name))
+            all_windows = self.tmux.list_all_windows()
+            our_sessions = set(self._all_tmux_session_names())
+            windows = [w for w in all_windows if w.session in our_sessions]
         except Exception as exc:  # noqa: BLE001
             errors.append(str(exc))
 

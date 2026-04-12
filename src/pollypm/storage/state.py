@@ -359,9 +359,14 @@ class StateStore:
             return self.conn.execute(sql, params)
 
     def commit(self) -> None:
-        """Thread-safe commit."""
+        """Thread-safe commit. Bumps the state epoch so subscribers know to refresh."""
         with self._lock:
             self.conn.commit()
+        try:
+            from pollypm.state_epoch import bump
+            bump()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _now(self) -> str:
         return datetime.now(UTC).isoformat()

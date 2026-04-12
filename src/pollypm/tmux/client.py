@@ -209,6 +209,35 @@ class TmuxClient:
             )
         return windows
 
+    def list_all_windows(self) -> list[TmuxWindow]:
+        """List windows across ALL tmux sessions in a single subprocess call."""
+        fmt = (
+            "#{session_name}\t#{window_index}\t#{window_name}\t#{window_active}\t#{pane_id}\t"
+            "#{pane_current_command}\t#{pane_current_path}\t#{pane_dead}"
+        )
+        result = self.run("list-windows", "-a", "-F", fmt, check=False)
+        if result.returncode != 0:
+            return []
+        windows: list[TmuxWindow] = []
+        for line in result.stdout.splitlines():
+            parts = line.split("\t", 7)
+            if len(parts) < 8:
+                continue
+            session, index, window_name, active, pane_id, pane_cmd, pane_path, pane_dead = parts
+            windows.append(
+                TmuxWindow(
+                    session=session,
+                    index=int(index),
+                    name=window_name,
+                    active=active == "1",
+                    pane_id=pane_id,
+                    pane_current_command=pane_cmd,
+                    pane_current_path=pane_path,
+                    pane_dead=pane_dead == "1",
+                )
+            )
+        return windows
+
     def list_panes(self, target: str) -> list[TmuxPane]:
         fmt = (
             "#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_id}\t#{pane_active}\t"

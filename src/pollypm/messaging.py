@@ -95,6 +95,11 @@ def create_message(root_dir: Path, *, sender: str, subject: str, body: str) -> P
         ]
     )
     path.write_text(content)
+    try:
+        from pollypm.state_epoch import bump
+        bump()
+    except Exception:  # noqa: BLE001
+        pass
     return path
 
 

@@ -370,6 +370,7 @@ class PollyCockpitApp(App[None]):
         self._unread_keys: set[str] = set()
         self._tick_count = 0
         self._last_nav_change = -10  # last tick when user navigated
+        self._last_epoch_mtime = 0.0  # state epoch mtime for change detection
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -401,11 +402,10 @@ class PollyCockpitApp(App[None]):
         if callable(focus_method):
             focus_method()
 
-    # Only query tmux/state every N ticks to avoid FD exhaustion.
-    # At 0.8s/tick, _DATA_REFRESH_INTERVAL=5 means data refreshes every 4s.
-    _DATA_REFRESH_INTERVAL = 5
-    # Force GC every N ticks to reclaim leaked FDs from plugin/provider loading.
-    _GC_INTERVAL = 150  # ~2 minutes at 0.8s/tick
+    # Layout check (pane recovery, rail width) — only every ~30s
+    _LAYOUT_CHECK_INTERVAL = 38  # ~30s at 0.8s/tick
+    # Force GC every ~2 minutes
+    _GC_INTERVAL = 150
 
     def _tick(self) -> None:
         self._tick_count += 1
@@ -415,18 +415,21 @@ class PollyCockpitApp(App[None]):
             self._slogan_tick = 0
             self.slogan_index = (self.slogan_index + 1) % len(POLLY_SLOGANS)
             self.tagline.update("\n" + POLLY_SLOGANS[self.slogan_index])
-        # Periodic GC to reclaim FDs from uncollected objects
+        # Periodic GC
         if self._tick_count % self._GC_INTERVAL == 0:
             gc.collect()
-        # Full data refresh (tmux subprocesses, file reads) only every N ticks
-        if self._tick_count % self._DATA_REFRESH_INTERVAL == 0:
+        # Check if state changed (one stat() call — no subprocess, no FD leak)
+        from pollypm.state_epoch import mtime as epoch_mtime
+        current_epoch = epoch_mtime()
+        state_changed = current_epoch != self._last_epoch_mtime
+        if state_changed:
+            self._last_epoch_mtime = current_epoch
             try:
-                self._enforce_rail_width()
                 self._refresh_rows()
             except Exception:  # noqa: BLE001
                 pass
         else:
-            # Cheap UI-only update: cycle spinner on working items without I/O
+            # No state change — cheap spinner-only update
             spinners = ["\u25dc", "\u25dd", "\u25de", "\u25df"]
             frame = spinners[self.spinner_index % 4]
             for item in self._items:
@@ -436,6 +439,12 @@ class PollyCockpitApp(App[None]):
                 if row.item.state.endswith("working"):
                     row.item.state = f"{frame} working"
                     row.update_body()
+        # Layout check much less frequently
+        if self._tick_count % self._LAYOUT_CHECK_INTERVAL == 0:
+            try:
+                self._enforce_rail_width()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _tick_scheduler(self) -> None:
         # The heartbeat and knowledge extraction now run via cron

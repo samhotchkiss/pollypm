@@ -298,6 +298,14 @@ class PollyPMService:
         config = load_config(self.config_path)
         return self._task_backend(config, project_key).list_tasks(states=states)
 
+    def get_task(self, project_key: str, task_id: str) -> TaskRecord:
+        config = load_config(self.config_path)
+        return self._task_backend(config, project_key).get_task(task_id)
+
+    def next_available_task(self, project_key: str) -> TaskRecord | None:
+        config = load_config(self.config_path)
+        return self._task_backend(config, project_key).next_available()
+
     def create_task(self, project_key: str, *, title: str, body: str = "", state: str = "01-ready") -> TaskRecord:
         config = load_config(self.config_path)
         return self._task_backend(config, project_key).create_task(title=title, body=body, state=state)

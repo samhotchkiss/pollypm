@@ -4,6 +4,7 @@ from pathlib import Path
 from pollypm.config import write_config
 from pollypm.models import ProjectSettings, PollyPMConfig, PollyPMSettings
 import pytest
+from pollypm.task_backends.github import GitHubTaskBackendValidation
 
 from pollypm.projects import (
     default_persona_name,
@@ -117,7 +118,7 @@ def test_ensure_project_scaffold_copies_project_instructions(tmp_path: Path) -> 
     assert "Test and operate PollyPM through Polly chat" in instructions_path.read_text()
 
 
-def test_scaffold_issue_tracker_for_github_backend_does_not_create_local_issue_tracker(tmp_path: Path) -> None:
+def test_scaffold_issue_tracker_for_github_backend_does_not_create_local_issue_tracker(monkeypatch, tmp_path: Path) -> None:
     project_path = tmp_path / "sample-project"
     project_path.mkdir()
     config_dir = project_path / ".pollypm" / "config"
@@ -132,12 +133,66 @@ repo = "acme/widgets"
 """
     )
 
+    monkeypatch.setattr(
+        "pollypm.task_backends.github.GitHubTaskBackend.validate",
+        lambda self: GitHubTaskBackendValidation(passed=True, checks=["repo_accessible"], errors=[]),
+    )
+
     issues_root = scaffold_issue_tracker(project_path)
 
     assert issues_root == project_path
     assert not (project_path / "issues").exists()
     gitignore_text = (project_path / ".gitignore").read_text() if (project_path / ".gitignore").exists() else ""
     assert "issues/" not in gitignore_text
+
+
+def test_scaffold_issue_tracker_validates_github_backend_on_activation(monkeypatch, tmp_path: Path) -> None:
+    project_path = tmp_path / "sample-project"
+    project_path.mkdir()
+    config_dir = project_path / ".pollypm" / "config"
+    config_dir.mkdir(parents=True)
+    (config_dir / "project.toml").write_text(
+        """
+[plugins]
+issue_backend = "github"
+
+[plugins.github_issues]
+repo = "acme/widgets"
+"""
+    )
+
+    monkeypatch.setattr(
+        "pollypm.task_backends.github.GitHubTaskBackend.validate",
+        lambda self: GitHubTaskBackendValidation(passed=True, checks=["repo_accessible"], errors=[]),
+    )
+
+    issues_root = scaffold_issue_tracker(project_path)
+
+    assert issues_root == project_path
+
+
+def test_scaffold_issue_tracker_raises_when_github_backend_validation_fails(monkeypatch, tmp_path: Path) -> None:
+    project_path = tmp_path / "sample-project"
+    project_path.mkdir()
+    config_dir = project_path / ".pollypm" / "config"
+    config_dir.mkdir(parents=True)
+    (config_dir / "project.toml").write_text(
+        """
+[plugins]
+issue_backend = "github"
+
+[plugins.github_issues]
+repo = "acme/widgets"
+"""
+    )
+
+    monkeypatch.setattr(
+        "pollypm.task_backends.github.GitHubTaskBackend.validate",
+        lambda self: GitHubTaskBackendValidation(passed=False, checks=["repo_accessible"], errors=["auth failed"]),
+    )
+
+    with pytest.raises(RuntimeError, match="Task backend validation failed: auth failed"):
+        scaffold_issue_tracker(project_path)
 
 
 def test_session_lock_is_atomic_idempotent_and_releasable(tmp_path: Path) -> None:

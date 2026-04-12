@@ -83,7 +83,7 @@ class GitHubTaskBackend(TaskBackend):
         errors: list[str] = []
 
         try:
-            _gh("repo", "view", "--json", "nameWithOwner", "--repo", self.repo)
+            _gh("repo", "view", self.repo, "--json", "nameWithOwner")
             checks.append("repo_accessible")
         except Exception as exc:  # noqa: BLE001
             errors.append(f"repo_accessible: {exc}")

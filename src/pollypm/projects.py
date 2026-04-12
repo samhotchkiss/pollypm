@@ -207,6 +207,12 @@ def scaffold_issue_tracker(project_path: Path) -> Path:
     ensure_project_scaffold(project_root)
     backend = get_task_backend(project_root)
     issues_dir = backend.ensure_tracker()
+    validate = getattr(backend, "validate", None)
+    if callable(validate):
+        result = validate()
+        if not getattr(result, "passed", False):
+            errors = ", ".join(getattr(result, "errors", [])) or "unknown validation failure"
+            raise RuntimeError(f"Task backend validation failed: {errors}")
     if isinstance(backend, FileTaskBackend):
         instructions_target = issues_dir / "instructions.md"
         if TRACKER_TEMPLATE.exists() and not instructions_target.exists():

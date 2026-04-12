@@ -39,3 +39,4 @@
 - Completed issue `0027` by auditing direct module-to-test coverage gaps, adding baseline tests for `runtime_env.py`, `runtime_launcher.py`, and `models.py`, extending `supervisor.py` coverage for lease release and account viability, and moving the issue to `03-needs-review` after a final `uv run pytest -q` pass (`470 passed`).
 - Completed issue `0019` by wiring the GitHub task backend through project scaffolding, service and CLI issue flows, review/handoff workflows, activation-time validation, mixed-backend support, and end-to-end GitHub pipeline integration coverage; targeted validation now passes with `80 passed`.
 - Completed issue `0023` by replacing the oversized root README with the requested concise 4-sentence project description and moving it to `03-needs-review`.
+- Updated issue `0022` with explicit API-level state-transition acceptance criteria, implementation notes, and concrete backend/service/CLI test evidence, then moved it to `03-needs-review`.

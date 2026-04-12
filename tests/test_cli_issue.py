@@ -159,6 +159,89 @@ def test_issue_cli_handoff_writes_structured_note(tmp_path: Path) -> None:
     assert "No live gh call in unit coverage." in text
 
 
+def test_issue_cli_approve_and_request_changes(tmp_path: Path) -> None:
+    runner = CliRunner()
+    config_path = _config(tmp_path)
+    runner.invoke(
+        app,
+        ["issue", "create", "--config", str(config_path), "--project", "demo", "--title", "Wire backend"],
+    )
+    runner.invoke(
+        app,
+        ["issue", "transition", "--config", str(config_path), "--project", "demo", "0001", "02-in-progress"],
+    )
+    runner.invoke(
+        app,
+        ["issue", "transition", "--config", str(config_path), "--project", "demo", "0001", "03-needs-review"],
+    )
+
+    approve = runner.invoke(
+        app,
+        [
+            "issue",
+            "approve",
+            "--config",
+            str(config_path),
+            "--project",
+            "demo",
+            "--summary",
+            "Looks correct.",
+            "--verification",
+            "Ran pytest and checked the CLI manually.",
+            "0001",
+        ],
+    )
+    history = runner.invoke(
+        app,
+        ["issue", "history", "--config", str(config_path), "--project", "demo", "0001"],
+    )
+
+    assert approve.exit_code == 0
+    assert "Approved issue 0001 to 05-completed" in approve.stdout
+    assert "### Independent Verification" in history.stdout
+
+    second = runner.invoke(
+        app,
+        ["issue", "create", "--config", str(config_path), "--project", "demo", "--title", "Second backend"],
+    )
+    assert second.exit_code == 0
+    runner.invoke(
+        app,
+        ["issue", "transition", "--config", str(config_path), "--project", "demo", "0002", "02-in-progress"],
+    )
+    runner.invoke(
+        app,
+        ["issue", "transition", "--config", str(config_path), "--project", "demo", "0002", "03-needs-review"],
+    )
+    request_changes = runner.invoke(
+        app,
+        [
+            "issue",
+            "request-changes",
+            "--config",
+            str(config_path),
+            "--project",
+            "demo",
+            "--summary",
+            "Needs more work.",
+            "--verification",
+            "Ran pytest and inspected the issue history.",
+            "--changes",
+            "Add review-loop coverage.",
+            "0002",
+        ],
+    )
+    second_history = runner.invoke(
+        app,
+        ["issue", "history", "--config", str(config_path), "--project", "demo", "0002"],
+    )
+
+    assert request_changes.exit_code == 0
+    assert "Returned issue 0002 to 02-in-progress" in request_changes.stdout
+    assert "### Change Requests" in second_history.stdout
+    assert "Add review-loop coverage." in second_history.stdout
+
+
 def test_issue_cli_uses_github_backend_when_project_is_configured(monkeypatch, tmp_path: Path) -> None:
     runner = CliRunner()
     config_path = _config(tmp_path)

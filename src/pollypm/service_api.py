@@ -361,6 +361,50 @@ class PollyPMService:
         config = load_config(self.config_path)
         return self._task_backend(config, project_key).append_note(task_name, text)
 
+    def review_task(
+        self,
+        project_key: str,
+        task_id: str,
+        *,
+        approved: bool,
+        summary: str,
+        verification: str,
+        changes_requested: str = "",
+    ) -> TaskRecord:
+        config = load_config(self.config_path)
+        backend = self._task_backend(config, project_key)
+        task = backend.get_task(task_id)
+        if task.state == "03-needs-review":
+            backend.move_task(task_id, "04-in-review")
+        elif task.state != "04-in-review":
+            raise ValueError(
+                f"Review decisions require issue {task_id} to be in 03-needs-review or 04-in-review, not {task.state}"
+            )
+
+        sections = [
+            "## Review",
+            "",
+            "### Decision",
+            "Approved" if approved else "Request Changes",
+            "",
+            "### Summary",
+            summary.strip(),
+            "",
+            "### Independent Verification",
+            verification.strip(),
+        ]
+        if not approved and changes_requested.strip():
+            sections.extend(
+                [
+                    "",
+                    "### Change Requests",
+                    changes_requested.strip(),
+                ]
+            )
+        text = "\n".join(sections).rstrip() + "\n"
+        backend.append_note(task_id, text)
+        return backend.move_task(task_id, "05-completed" if approved else "02-in-progress")
+
     def task_state_counts(self, project_key: str) -> dict[str, int]:
         config = load_config(self.config_path)
         return self._task_backend(config, project_key).state_counts()

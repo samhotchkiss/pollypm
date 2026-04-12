@@ -480,6 +480,54 @@ def issue_handoff(
     typer.echo(f"Updated {path}")
 
 
+@issue_app.command("approve")
+def issue_approve(
+    task_id: str = typer.Argument(..., help="Issue id."),
+    summary: str = typer.Option(..., "--summary", help="Review summary."),
+    verification: str = typer.Option(..., "--verification", help="Independent verification performed."),
+    project: str = typer.Option(..., "--project", help="Project key."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    service = PollyPMService(config_path)
+    try:
+        task = service.review_task(
+            project,
+            task_id,
+            approved=True,
+            summary=summary,
+            verification=verification,
+        )
+    except ValueError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Approved issue {task.task_id} to {task.state}")
+
+
+@issue_app.command("request-changes")
+def issue_request_changes(
+    task_id: str = typer.Argument(..., help="Issue id."),
+    summary: str = typer.Option(..., "--summary", help="Review summary."),
+    verification: str = typer.Option(..., "--verification", help="Independent verification performed."),
+    changes: str = typer.Option(..., "--changes", help="Specific requested changes."),
+    project: str = typer.Option(..., "--project", help="Project key."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    service = PollyPMService(config_path)
+    try:
+        task = service.review_task(
+            project,
+            task_id,
+            approved=False,
+            summary=summary,
+            verification=verification,
+            changes_requested=changes,
+        )
+    except ValueError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Returned issue {task.task_id} to {task.state}")
+
+
 @issue_app.command("counts")
 def issue_counts(
     project: str = typer.Option(..., "--project", help="Project key."),

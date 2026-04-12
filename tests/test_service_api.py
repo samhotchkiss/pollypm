@@ -385,6 +385,97 @@ def test_service_append_task_handoff_writes_structured_note(tmp_path: Path) -> N
     assert "Skipped live gh auth in unit tests." in text
 
 
+def test_service_review_task_approves_and_records_verification(tmp_path: Path) -> None:
+    project_root = tmp_path / "demo"
+    project_root.mkdir()
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            base_dir=tmp_path / ".pollypm-state",
+            logs_dir=tmp_path / ".pollypm-state/logs",
+            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
+            state_db=tmp_path / ".pollypm-state/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="claude_main"),
+        accounts={
+            "claude_main": AccountConfig(
+                name="claude_main",
+                provider=ProviderKind.CLAUDE,
+                home=tmp_path / ".pollypm-state" / "homes" / "claude_main",
+            )
+        },
+        sessions={},
+        projects={
+            "demo": KnownProject(key="demo", path=project_root, name="Demo", kind=ProjectKind.GIT, tracked=True),
+        },
+    )
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path, force=True)
+    service = PollyPMService(config_path)
+    task = service.create_task("demo", title="Wire the backend")
+    service.move_task("demo", task.task_id, to_state="02-in-progress")
+    service.move_task("demo", task.task_id, to_state="03-needs-review")
+
+    moved = service.review_task(
+        "demo",
+        task.task_id,
+        approved=True,
+        summary="Looks correct.",
+        verification="Ran pytest and exercised the CLI flow independently.",
+    )
+
+    assert moved.state == "05-completed"
+    history = service.task_history("demo", task.task_id)
+    assert "### Independent Verification" in history
+    assert "Ran pytest and exercised the CLI flow independently." in history
+
+
+def test_service_review_task_requests_changes_and_returns_to_in_progress(tmp_path: Path) -> None:
+    project_root = tmp_path / "demo"
+    project_root.mkdir()
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            base_dir=tmp_path / ".pollypm-state",
+            logs_dir=tmp_path / ".pollypm-state/logs",
+            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
+            state_db=tmp_path / ".pollypm-state/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="claude_main"),
+        accounts={
+            "claude_main": AccountConfig(
+                name="claude_main",
+                provider=ProviderKind.CLAUDE,
+                home=tmp_path / ".pollypm-state" / "homes" / "claude_main",
+            )
+        },
+        sessions={},
+        projects={
+            "demo": KnownProject(key="demo", path=project_root, name="Demo", kind=ProjectKind.GIT, tracked=True),
+        },
+    )
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path, force=True)
+    service = PollyPMService(config_path)
+    task = service.create_task("demo", title="Wire the backend")
+    service.move_task("demo", task.task_id, to_state="02-in-progress")
+    service.move_task("demo", task.task_id, to_state="03-needs-review")
+
+    moved = service.review_task(
+        "demo",
+        task.task_id,
+        approved=False,
+        summary="The flow is close but incomplete.",
+        verification="Ran the review CLI and inspected history output.",
+        changes_requested="Add regression coverage for the reject loop.",
+    )
+
+    assert moved.state == "02-in-progress"
+    history = service.task_history("demo", task.task_id)
+    assert "### Change Requests" in history
+    assert "Add regression coverage for the reject loop." in history
+
+
 def test_service_move_task_rejects_skipped_transition(tmp_path: Path) -> None:
     project_root = tmp_path / "demo"
     project_root.mkdir()

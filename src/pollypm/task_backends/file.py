@@ -66,9 +66,9 @@ class FileTaskBackend(TaskBackend):
     def task_history(self, task_id: str) -> list[str]:
         task = self.get_task(task_id)
         history = [f"state={task.state}", f"title={task.title}"]
-        notes_path = self.issues_root() / "notes.md"
-        if notes_path.exists():
-            history.extend(line for line in notes_path.read_text().splitlines() if line.strip())
+        for notes_path in [self.issues_root() / task_id, self.issues_root() / f"#{task_id}", self.issues_root() / "notes.md"]:
+            if notes_path.exists():
+                history.extend(line for line in notes_path.read_text().splitlines() if line.strip())
         return history
 
     def create_task(self, *, title: str, body: str = "", state: str = "01-ready") -> TaskRecord:

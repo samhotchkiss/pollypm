@@ -9,6 +9,7 @@ import json
 import logging
 import re
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from pollypm.task_backends.base import TaskBackend, TaskRecord
@@ -30,6 +31,13 @@ LABEL_TO_STATE: dict[str, str] = {v: k for k, v in STATE_TO_LABEL.items()}
 TRACKER_STATES = list(STATE_TO_LABEL.keys())
 
 ALL_POLLY_LABELS = list(STATE_TO_LABEL.values())
+
+
+@dataclass(slots=True)
+class GitHubTaskBackendValidation:
+    passed: bool
+    checks: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
 
 def _gh(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -71,6 +79,51 @@ class GitHubTaskBackend(TaskBackend):
             return True
         except (RuntimeError, FileNotFoundError):
             return False
+
+    def validate(self) -> GitHubTaskBackendValidation:
+        checks: list[str] = []
+        errors: list[str] = []
+
+        try:
+            _gh("repo", "view", "--json", "nameWithOwner", "--repo", self.repo)
+            checks.append("repo_accessible")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"repo_accessible: {exc}")
+            return GitHubTaskBackendValidation(passed=False, checks=checks, errors=errors)
+
+        try:
+            self.ensure_tracker()
+            checks.append("labels_ensured")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"labels_ensured: {exc}")
+            return GitHubTaskBackendValidation(passed=False, checks=checks, errors=errors)
+
+        validation_task: TaskRecord | None = None
+        try:
+            validation_task = self.create_task(
+                title="PollyPM GitHub backend validation",
+                body="Temporary validation issue created by PollyPM.",
+                state="01-ready",
+            )
+            checks.append("create_task")
+            self.move_task(validation_task.task_id, "02-in-progress")
+            checks.append("move_task")
+            self.get_task(validation_task.task_id)
+            checks.append("get_task")
+            self.append_note(validation_task.task_id, "Validation comment from PollyPM.")
+            checks.append("append_note")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"roundtrip: {exc}")
+        finally:
+            if validation_task is not None:
+                try:
+                    self.append_note(validation_task.task_id, "Validation cleanup: closing temporary issue.")
+                    self.move_task(validation_task.task_id, "05-completed")
+                    checks.append("cleanup")
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"cleanup: {exc}")
+
+        return GitHubTaskBackendValidation(passed=not errors, checks=checks, errors=errors)
 
     def ensure_tracker(self) -> Path:
         """Ensure all polly:* labels exist on the repo."""

@@ -36,3 +36,4 @@
 - Continued `0024` cleanup by removing stale launch-blocker references from the readiness docs/visuals and reconciling the blocker counts and timeline estimate with the remaining three launch blockers.
 - Completed issue `0025` by tracking superseded facts in `history_import.py`, generating `deprecated-facts.md`, and adding direct/unit/integration coverage for both supersession tracking and resilient knowledge-extraction assertions.
 - Verified issue `0025` across the full repo with `pytest -q` (`460 passed`), so the history-import and extraction changes are green in the broader suite, not just the targeted tests.
+- Completed issue `0027` by auditing direct module-to-test coverage gaps, adding baseline tests for `runtime_env.py`, `runtime_launcher.py`, and `models.py`, extending `supervisor.py` coverage for lease release and account viability, and moving the issue to `03-needs-review` after a final `uv run pytest -q` pass (`470 passed`).

@@ -824,7 +824,7 @@ def _build_cockpit_detail_inner(config_path: Path, kind: str, target: str | None
             return f"{project.name or project.key} · Issues\n\nNo issue tracker initialized.\nUse `pm init-tracker {target}` to create one."
         state_counts = task_backend.state_counts()
         lines = [f"{project.name or project.key} · Issues", ""]
-        for state_name in ["01-ready", "02-in-progress", "03-needs-review", "04-done", "05-completed"]:
+        for state_name in ["01-ready", "02-in-progress", "03-needs-review", "04-in-review", "05-completed"]:
             count = state_counts.get(state_name, 0)
             if count:
                 tasks = task_backend.list_tasks(states=[state_name])

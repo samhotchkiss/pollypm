@@ -145,6 +145,92 @@ repo = "acme/widgets"
     assert "- 05-completed: 4" in detail
 
 
+def test_build_cockpit_detail_groups_in_review_issues(monkeypatch, tmp_path: Path) -> None:
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            base_dir=tmp_path / ".pollypm-state",
+            logs_dir=tmp_path / ".pollypm-state/logs",
+            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
+            state_db=tmp_path / ".pollypm-state/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="claude_main"),
+        accounts={
+            "claude_main": AccountConfig(
+                name="claude_main",
+                provider=ProviderKind.CLAUDE,
+                home=tmp_path / ".pollypm-state" / "homes" / "claude_main",
+            )
+        },
+        sessions={},
+        projects={
+            "demo": KnownProject(key="demo", path=tmp_path / "demo", name="Demo", kind=ProjectKind.GIT, tracked=True),
+        },
+    )
+    project_root = config.projects["demo"].path
+    project_root.mkdir()
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path, force=True)
+    (project_root / ".pollypm" / "config").mkdir(parents=True, exist_ok=True)
+    (project_root / ".pollypm" / "config" / "project.toml").write_text(
+        """
+[project]
+display_name = "Demo"
+
+[plugins]
+issue_backend = "github"
+
+[plugins.github_issues]
+repo = "acme/widgets"
+"""
+    )
+
+    class FakeStore:
+        def get_session_runtime(self, _session_name: str):
+            return None
+
+        def recent_token_usage(self, limit: int = 5):
+            return []
+
+    class FakeSupervisor:
+        def __init__(self) -> None:
+            self.config = config
+            self.store = FakeStore()
+
+    monkeypatch.setattr("pollypm.cockpit.PollyPMService.load_supervisor", lambda self: FakeSupervisor())
+
+    def fake_gh(*args: str, check: bool = True):
+        class Result:
+            def __init__(self, stdout: str) -> None:
+                self.stdout = stdout
+
+        if args[:3] == ("repo", "view", "--json"):
+            return Result('{"name":"widgets"}')
+        if args[:2] == ("issue", "list"):
+            label = args[args.index("--label") + 1]
+            if "-q" in args:
+                payloads = {
+                    "polly:not-ready": "0",
+                    "polly:ready": "0",
+                    "polly:in-progress": "0",
+                    "polly:needs-review": "0",
+                    "polly:in-review": "1",
+                    "polly:completed": "0",
+                }
+                return Result(payloads[label])
+            if label == "polly:in-review":
+                return Result('[{"number":17,"title":"Review the patch","state":"OPEN"}]')
+            return Result("[]")
+        raise AssertionError(f"Unexpected gh call: {args}")
+
+    monkeypatch.setattr("pollypm.task_backends.github._gh", fake_gh)
+
+    detail = build_cockpit_detail(config_path, "issues", "demo")
+
+    assert "─── 04-in-review (1) ───" in detail
+    assert "17: Review the patch" in detail
+
+
 def test_cockpit_router_ensure_layout_splits_when_missing_right_pane(tmp_path: Path) -> None:
     calls: dict[str, object] = {}
 

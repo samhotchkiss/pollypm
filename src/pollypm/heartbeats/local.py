@@ -343,6 +343,14 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             from datetime import UTC, datetime, timedelta
             recent = api.supervisor.store.recent_events(limit=200)
             now = datetime.now(UTC)
+            # Debounce: don't nudge if the session received input recently (avoid contaminating user messages)
+            for event in recent:
+                if (
+                    event.session_name == context.session_name
+                    and event.event_type == "send_input"
+                    and (now - datetime.fromisoformat(event.created_at)).total_seconds() < 120
+                ):
+                    return  # session just received input, let it process
             nudge_count = 0
             most_recent_nudge_age = None
             for event in recent:

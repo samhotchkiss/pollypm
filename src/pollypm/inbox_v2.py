@@ -207,10 +207,11 @@ def reply_to_message(
     recipient = _default_recipient(sender)
     delivery_state = "not_applicable" if recipient == "user" else "pending"
 
-    # Append review checklist when a worker reports back to polly
-    review_checklist = ""
+    # Append quality enforcement notes based on message direction
+    quality_note = ""
     if recipient == "polly" and sender not in ("user", "human", "polly", "heartbeat", "system"):
-        review_checklist = (
+        # Worker → Polly: review checklist
+        quality_note = (
             "\n\n---\n"
             "**Review checklist (complete before notifying user):**\n"
             "- [ ] Does this meet the user's stated goal?\n"
@@ -220,6 +221,18 @@ def reply_to_message(
             "- [ ] Quality bar: would the user say 'holy shit, that's done'?\n"
             "- [ ] Send notification: `pm notify \"Done: ...\" \"...\" --to user`"
         )
+    elif sender in ("polly",) and recipient not in ("user", "human", "polly", "heartbeat", "system"):
+        # Polly → Worker: quality expectations
+        quality_note = (
+            "\n\n---\n"
+            "**Before you report back:**\n"
+            "- Do the whole thing. Don't stop at 80% and ask if you should continue.\n"
+            "- Commit your work with a clear message.\n"
+            "- Run tests. If they fail, fix them.\n"
+            "- If this involves a deploy, deploy it.\n"
+            "- Reply to this thread with what you did, what changed, and how to verify.\n"
+            "- Use `pm reply <this_thread_id> 'your report'`"
+        )
 
     # Write the reply message
     msg_path = msg_dir / f"{index:04d}-{ts.strftime('%Y%m%dT%H%M%SZ')}.md"
@@ -228,7 +241,7 @@ def reply_to_message(
         f"To: {recipient}\n"
         f"Date: {ts.isoformat()}\n"
         f"Subject: Re: {state['subject']}\n\n"
-        f"{body.rstrip()}{review_checklist}\n"
+        f"{body.rstrip()}{quality_note}\n"
     )
 
     # Update history.md

@@ -753,6 +753,157 @@ class CockpitRouter:
         return f"sh -lc 'cd {root} && {joined}'"
 
 
+def _spark_bar(values: list[int], width: int = 30) -> str:
+    """Render a mini spark-line bar chart using Unicode block characters."""
+    if not values:
+        return ""
+    max_val = max(values) or 1
+    blocks = " ▁▂▃▄▅▆▇█"
+    return "".join(blocks[min(8, int(v / max_val * 8))] for v in values)
+
+
+def _build_dashboard(supervisor, config) -> str:
+    from datetime import UTC, datetime, timedelta
+
+    lines: list[str] = []
+    now = datetime.now(UTC)
+
+    # ── Header ──
+    project_count = len(config.projects)
+    session_count = len(config.sessions)
+    open_alerts = supervisor.store.open_alerts()
+    inbox_count = len(list_open_messages(config.project.root_dir))
+    actionable_alerts = [a for a in open_alerts if a.alert_type not in (
+        "suspected_loop", "stabilize_failed", "needs_followup",
+    )]
+
+    lines.append("  PollyPM Dashboard")
+    lines.append("")
+    status_parts = [f"{project_count} projects", f"{session_count} sessions"]
+    if actionable_alerts:
+        status_parts.append(f"{len(actionable_alerts)} alert(s)")
+    if inbox_count:
+        status_parts.append(f"{inbox_count} inbox")
+    lines.append("  " + "  ·  ".join(status_parts))
+    lines.append("")
+
+    # ── Currently Working On ──
+    lines.append("  ─── Active Work ───────────────────────────────────")
+    lines.append("")
+    all_runtimes = supervisor.store.list_session_runtimes()
+    runtime_map = {rt.session_name: rt for rt in all_runtimes}
+    launches = supervisor.plan_launches()
+    has_active = False
+    for launch in launches:
+        if launch.session.role in ("heartbeat-supervisor",):
+            continue
+        rt = runtime_map.get(launch.session.name)
+        status = rt.status if rt else "unknown"
+        project = config.projects.get(launch.session.project)
+        project_label = project.display_label() if project else launch.session.project
+
+        if status in ("healthy", "needs_followup", "waiting_on_user"):
+            icon = "●" if status == "healthy" else "◆" if status == "needs_followup" else "◇"
+            role_label = "Polly" if launch.session.role == "operator-pm" else project_label
+            reason = (rt.last_failure_message or "")[:60] if rt else ""
+            # Get a useful snippet from the session's latest status reason
+            status_reason = ""
+            if rt and hasattr(rt, "updated_at") and rt.updated_at:
+                try:
+                    age = (now - datetime.fromisoformat(rt.updated_at)).total_seconds()
+                    if age < 300:
+                        status_reason = " (active)"
+                    elif age < 3600:
+                        status_reason = f" ({int(age // 60)}m ago)"
+                except (ValueError, TypeError):
+                    pass
+            status_label = {"healthy": "working", "needs_followup": "in progress", "waiting_on_user": "waiting on you"}
+            lines.append(f"  {icon} {role_label}: {status_label.get(status, status)}{status_reason}")
+            has_active = True
+    if not has_active:
+        lines.append("  No active sessions.")
+    lines.append("")
+
+    # ── Recent Activity (last 24h) ──
+    lines.append("  ─── Last 24 Hours ─────────────────────────────────")
+    lines.append("")
+    recent = supervisor.store.recent_events(limit=200)
+    cutoff = (now - timedelta(hours=24)).isoformat()
+    day_events = [e for e in recent if e.created_at >= cutoff]
+
+    # Summarize by type
+    commits = [e for e in day_events if "commit" in e.message.lower()]
+    recoveries = [e for e in day_events if e.event_type in ("recover", "recovery", "stabilize_failed")]
+    sweeps = [e for e in day_events if e.event_type == "heartbeat"]
+    sends = [e for e in day_events if e.event_type == "send_input"]
+
+    summary_parts = []
+    if sweeps:
+        summary_parts.append(f"{len(sweeps)} heartbeat sweeps")
+    if sends:
+        summary_parts.append(f"{len(sends)} messages sent")
+    if commits:
+        summary_parts.append(f"{len(commits)} commits")
+    if recoveries:
+        summary_parts.append(f"{len(recoveries)} recoveries")
+    if summary_parts:
+        lines.append("  " + "  ·  ".join(summary_parts))
+    else:
+        lines.append("  No activity recorded.")
+    lines.append("")
+
+    # Show last few notable events
+    notable = [e for e in day_events if e.event_type not in ("heartbeat", "token_ledger", "polly_followup")][:8]
+    for event in notable:
+        try:
+            ts = datetime.fromisoformat(event.created_at)
+            age = now - ts
+            if age.total_seconds() < 3600:
+                time_str = f"{int(age.total_seconds() // 60)}m ago"
+            else:
+                time_str = f"{int(age.total_seconds() // 3600)}h ago"
+        except (ValueError, TypeError):
+            time_str = "?"
+        msg = event.message[:65]
+        lines.append(f"  {time_str:>7}  {event.session_name}: {msg}")
+    lines.append("")
+
+    # ── Token Usage (30 days) ──
+    lines.append("  ─── Token Usage (30 days) ──────────────────────────")
+    lines.append("")
+    daily = supervisor.store.daily_token_usage(days=30)
+    if daily:
+        values = [t for _, t in daily]
+        total = sum(values)
+        chart = _spark_bar(values, width=30)
+        # Label the axis
+        if len(daily) >= 2:
+            lines.append(f"  {daily[0][0][-5:]}{'':>20}{daily[-1][0][-5:]}")
+        lines.append(f"  {chart}")
+        lines.append(f"  Total: {total:,} tokens across {len(daily)} days")
+        # Today's usage
+        today_str = now.strftime("%Y-%m-%d")
+        today_tokens = next((t for d, t in daily if d == today_str), 0)
+        if today_tokens:
+            lines.append(f"  Today: {today_tokens:,} tokens")
+    else:
+        lines.append("  No token data yet.")
+    lines.append("")
+
+    # ── Alerts ──
+    if actionable_alerts:
+        lines.append("  ─── Alerts ────────────────────────────────────────")
+        lines.append("")
+        for alert in actionable_alerts[:5]:
+            lines.append(f"  ▲ {alert.session_name}: {alert.message[:60]}")
+        lines.append("")
+
+    # ── Footer ──
+    lines.append("  Click Polly to connect  ·  j/k navigate  ·  S settings")
+
+    return "\n".join(lines)
+
+
 def build_cockpit_detail(config_path: Path, kind: str, target: str | None = None) -> str:
     try:
         return _build_cockpit_detail_inner(config_path, kind, target)
@@ -764,71 +915,8 @@ def _build_cockpit_detail_inner(config_path: Path, kind: str, target: str | None
     supervisor = Supervisor(load_config(config_path))
     supervisor.ensure_layout()
     config = supervisor.config
-    if kind == "polly":
-        # Check whether the operator is actually running in tmux
-        runtime = supervisor.store.get_session_runtime("operator")
-        storage_session = supervisor.storage_closet_session_name()
-        operator_launch = next(
-            (l for l in supervisor.plan_launches() if l.session.name == "operator"), None
-        )
-        operator_alive = False
-        if operator_launch and supervisor.tmux.has_session(storage_session):
-            storage_windows = {w.name for w in supervisor.tmux.list_windows(storage_session)}
-            operator_alive = operator_launch.window_name in storage_windows
-
-        import random
-        tips = [
-            "Tip: Use `pm notify` from any session to send yourself a message.",
-            "Tip: Press j/k to navigate the rail, Enter to connect to a session.",
-            "Tip: Workers are autonomous — they'll commit, test, and report back.",
-            "Tip: Check `pm alerts` for a quick health overview from any terminal.",
-            "Tip: Polly delegates to workers. Tell her what you want, she'll handle the rest.",
-            "Tip: The heartbeat monitors all sessions every 60s and auto-recovers crashes.",
-            "Tip: Use `pm send <session> \"message\"` to talk to any session from the CLI.",
-            "Tip: Press S for settings — you can re-authenticate accounts from there.",
-            "Tip: `pm repair` checks and fixes project scaffolding across all projects.",
-            "Tip: Your inbox (in the rail) collects things that need your attention.",
-        ]
-        tip = random.choice(tips)
-
-        # Build system status summary
-        all_runtimes = supervisor.store.list_session_runtimes()
-        waiting = sum(1 for rt in all_runtimes if rt.status == "waiting_on_user")
-        open_alerts = len(supervisor.store.open_alerts())
-        inbox_count = len(list_open_messages(config.project.root_dir))
-        project_count = len(config.projects)
-
-        lines = [
-            "PollyPM",
-            "",
-            f"  {project_count} project(s)  ·  {len(config.sessions)} session(s)  ·  {open_alerts} alert(s)",
-        ]
-        if inbox_count:
-            lines.append(f"  {inbox_count} inbox item(s) waiting for you")
-        if waiting:
-            lines.append(f"  {waiting} session(s) waiting on your input")
-        lines.extend([
-            "",
-            "Polly is your AI project manager. She delegates to workers,",
-            "reviews results, and keeps projects moving. Click to connect.",
-            "",
-        ])
-        if operator_alive:
-            lines.append("  Status: Running  ·  Click to connect")
-        elif runtime and runtime.status == "degraded":
-            lines.extend([
-                "",
-                f"  Status: DEGRADED ({runtime.recovery_attempts} recovery attempts)",
-                f"  Last failure: {runtime.last_failure_type or 'unknown'}",
-                "",
-                "  Claude may need re-authentication:",
-                "    1. Press S for Settings → select account → R to relogin",
-                f"    Or: pm relogin {runtime.effective_account or 'claude_claude_swh_me'}",
-            ])
-        else:
-            lines.append("  Status: Not running  ·  Use `pm up` to start")
-        lines.extend(["", "", tip])
-        return "\n".join(lines)
+    if kind in ("polly", "dashboard"):
+        return _build_dashboard(supervisor, config)
 
     if kind == "inbox":
         messages = list_open_messages(config.project.root_dir)

@@ -692,6 +692,19 @@ class PollyCockpitApp(App[None]):
                 pass
             self.exit()
 
+    @on(events.Click, "#brand")
+    @on(events.Click, "#tagline")
+    def on_brand_click(self, event: events.Click) -> None:
+        """Clicking the Polly logo/tagline returns to the dashboard."""
+        try:
+            self.router._show_static_view(
+                self.router._load_supervisor(),
+                f"{self.router._load_supervisor().config.project.tmux_session}:{self.router._COCKPIT_WINDOW}",
+                "dashboard",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
     def action_detach(self) -> None:
         self.router.tmux.run("detach-client", check=False)
 

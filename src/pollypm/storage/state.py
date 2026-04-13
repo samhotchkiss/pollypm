@@ -1192,6 +1192,20 @@ class StateStore:
             for row in rows
         ]
 
+    def daily_token_usage(self, days: int = 30) -> list[tuple[str, int]]:
+        """Return (date_str, total_tokens) for the last N days."""
+        rows = self.execute(
+            """
+            SELECT substr(hour_bucket, 1, 10) AS day, SUM(tokens_used)
+            FROM token_usage_hourly
+            GROUP BY day
+            ORDER BY day DESC
+            LIMIT ?
+            """,
+            (days,),
+        ).fetchall()
+        return [(row[0], int(row[1])) for row in reversed(rows)]
+
     def record_memory_entry(
         self,
         *,

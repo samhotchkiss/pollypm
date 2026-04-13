@@ -1409,8 +1409,9 @@ class PollyInboxApp(App[None]):
                     parts: list[str] = []
                     for entry in entries:
                         ts = _fmt_time(entry.timestamp) if entry.timestamp else ""
+                        to_part = f" → {entry.to}" if entry.to else ""
                         body = _md_to_rich(entry.body)
-                        parts.append(f"[b][{entry.sender}][/b] [dim]{ts}[/dim]\n{body}")
+                        parts.append(f"[b][{entry.sender}{to_part}][/b] [dim]{ts}[/dim]\n{body}")
                     self._bodies[i] = "\n\n[dim]───[/dim]\n\n".join(parts)
             except Exception:  # noqa: BLE001
                 self._bodies[i] = ""

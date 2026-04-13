@@ -55,6 +55,7 @@ class MessageEntry:
     sender: str
     timestamp: str
     body: str
+    to: str = ""
     path: Path = field(default_factory=lambda: Path("."))
 
 
@@ -467,6 +468,7 @@ def read_message(project_root: Path, msg_id: str) -> tuple[str, str, list[Messag
     for msg_file in sorted(msg_dir.glob("[0-9]*.md")):
         text = msg_file.read_text()
         sender = ""
+        recipient = ""
         timestamp = ""
         body_lines: list[str] = []
         in_body = False
@@ -474,6 +476,8 @@ def read_message(project_root: Path, msg_id: str) -> tuple[str, str, list[Messag
             if not in_body:
                 if line.startswith("From: "):
                     sender = line[6:]
+                elif line.startswith("To: "):
+                    recipient = line[4:]
                 elif line.startswith("Date: "):
                     timestamp = line[6:]
                 elif line == "":
@@ -483,6 +487,7 @@ def read_message(project_root: Path, msg_id: str) -> tuple[str, str, list[Messag
         entries.append(MessageEntry(
             index=len(entries) + 1,
             sender=sender,
+            to=recipient,
             timestamp=timestamp,
             body="\n".join(body_lines).strip(),
             path=msg_file,

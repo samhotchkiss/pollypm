@@ -916,8 +916,9 @@ def mail(
         # Thread entries
         for entry in entries:
             sender_style = "bold cyan" if entry.sender in ("user", "human") else "bold yellow"
+            to_part = f" → {entry.to}" if entry.to else ""
             console.print()
-            console.print(f"  [{sender_style}]\\[{entry.sender}][/{sender_style}] [dim]{_fmt_time(entry.timestamp)}[/dim]")
+            console.print(f"  [{sender_style}]\\[{entry.sender}{to_part}][/{sender_style}] [dim]{_fmt_time(entry.timestamp)}[/dim]")
             console.print()
             # Render body as markdown for rich formatting
             md = Markdown(entry.body, code_theme="monokai")

@@ -1007,7 +1007,10 @@ class PollyDashboardApp(App[None]):
             parts.append(f"[#d29922][b]{data.inbox_count}[/b] inbox[/#d29922]")
         if data.alert_count:
             parts.append(f"[#f85149][b]{data.alert_count}[/b] alerts[/#f85149]")
-        self.header_w.update("  " + "  \u00b7  ".join(parts))
+        header_text = "  " + "  \u00b7  ".join(parts)
+        if data.briefing:
+            header_text += f"\n\n  [#58a6ff]{data.briefing}[/#58a6ff]"
+        self.header_w.update(header_text)
 
         # ── Now: what's being worked on ──
         lines: list[str] = []

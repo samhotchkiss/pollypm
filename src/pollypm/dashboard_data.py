@@ -51,6 +51,7 @@ class DashboardData:
     recovery_count_24h: int
     inbox_count: int
     alert_count: int
+    briefing: str = ""  # morning briefing narrative (if user was away)
 
 
 def _recent_commits(config: PollyPMConfig, hours: int = 24) -> list[CommitInfo]:
@@ -212,19 +213,41 @@ def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
     today_str = now.strftime("%Y-%m-%d")
     today_tokens = next((t for d, t in daily if d == today_str), 0)
 
+    commits = _recent_commits(config, hours=24)
+    completed = _completed_issues(config, hours=72)
+    inbox_count = len(list_open_messages(config.project.root_dir))
+    sweeps = sum(1 for e in day_events if e.event_type == "heartbeat")
+    recoveries = sum(1 for e in day_events if "recover" in e.event_type)
+
+    # Morning briefing: generate if there are overnight results
+    briefing = ""
+    if commits or completed or inbox_count:
+        parts: list[str] = []
+        if commits:
+            projects_touched = len({c.project for c in commits})
+            parts.append(f"{len(commits)} commits across {projects_touched} project(s)")
+        if completed:
+            parts.append(f"{len(completed)} issue(s) completed")
+        if inbox_count:
+            parts.append(f"{inbox_count} inbox item(s) waiting for you")
+        if recoveries:
+            parts.append(f"{recoveries} session recovery(ies)")
+        briefing = "While you were away: " + ", ".join(parts) + "."
+
     return DashboardData(
         active_sessions=active,
-        recent_commits=_recent_commits(config, hours=24),
-        completed_items=_completed_issues(config, hours=72),
+        recent_commits=commits,
+        completed_items=completed,
         daily_tokens=daily,
         today_tokens=today_tokens,
         total_tokens=sum(values),
-        sweep_count_24h=sum(1 for e in day_events if e.event_type == "heartbeat"),
+        sweep_count_24h=sweeps,
         message_count_24h=sum(1 for e in day_events if e.event_type == "send_input"),
-        recovery_count_24h=sum(1 for e in day_events if "recover" in e.event_type),
-        inbox_count=len(list_open_messages(config.project.root_dir)),
+        recovery_count_24h=recoveries,
+        inbox_count=inbox_count,
         alert_count=len([
             a for a in store.open_alerts()
             if a.alert_type not in ("suspected_loop", "stabilize_failed", "needs_followup")
         ]),
+        briefing=briefing,
     )

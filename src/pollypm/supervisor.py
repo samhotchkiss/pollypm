@@ -1122,8 +1122,12 @@ class Supervisor:
                         return right_pane  # target the pane directly
             except Exception:  # noqa: BLE001
                 pass
-        # Fallback to storage closet target (may fail, but that's the expected location)
-        return storage_target
+        # Session not found anywhere — raise a clear error
+        raise RuntimeError(
+            f"Session '{launch.session.name}' (window '{launch.window_name}') not found in "
+            f"storage closet or cockpit. The worker may have crashed or been decommissioned. "
+            f"Try `pm worker-start {launch.session.project}` to relaunch it."
+        )
 
     def send_input(
         self,

@@ -230,21 +230,18 @@ def test_send_input_targets_mounted_cockpit_pane_when_window_not_in_storage(monk
     assert sent == [("%42", "hello")]
 
 
-def test_send_input_falls_back_to_storage_target_when_mount_state_missing(monkeypatch, tmp_path: Path) -> None:
+def test_send_input_raises_when_session_not_found(monkeypatch, tmp_path: Path) -> None:
+    """send_input raises RuntimeError when the target session doesn't exist anywhere."""
+    import pytest
     config = _config(tmp_path)
     supervisor = Supervisor(config)
     supervisor.ensure_layout()
 
     monkeypatch.setattr(supervisor.tmux, "has_session", lambda name: True)
     monkeypatch.setattr(supervisor.tmux, "list_windows", lambda name: [])
-    sent: list[tuple[str, str]] = []
-    monkeypatch.setattr(supervisor.tmux, "send_keys", lambda target, text, **kw: sent.append((target, text)))
 
-    supervisor.send_input("operator", "hello", owner="human")
-
-    assert len(sent) == 1
-    assert sent[0][0].endswith(":pm-operator")
-    assert sent[0][1] == "hello"
+    with pytest.raises(RuntimeError, match="not found"):
+        supervisor.send_input("operator", "hello", owner="human")
 
 
 def test_claim_lease_rejects_conflicting_owner(tmp_path: Path) -> None:

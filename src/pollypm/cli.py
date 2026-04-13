@@ -1235,12 +1235,20 @@ def heartbeat_install(
     pm_path = shutil.which("pm")
     if pm_path is None:
         raise typer.BadParameter("Cannot find `pm` on PATH.")
-    # Include PATH so tmux/claude/codex are findable from cron's minimal env
+    # Include PATH so tmux/claude/codex are findable from cron's minimal env.
+    # Also include HOME and SECURITYSESSIONID for macOS Keychain auth
+    # (needed for claude CLI Haiku calls).
+    import os
     path_dirs = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
     home_local = Path.home() / ".local" / "bin"
     if home_local.exists():
         path_dirs = f"{home_local}:{path_dirs}"
-    cron_line = f"* * * * * PATH={path_dirs} {pm_path} heartbeat --config {config_path} >> /tmp/pollypm-heartbeat.log 2>&1"
+    env_parts = [f"PATH={path_dirs}", f"HOME={Path.home()}"]
+    session_id = os.environ.get("SECURITYSESSIONID", "")
+    if session_id:
+        env_parts.append(f"SECURITYSESSIONID={session_id}")
+    env_str = " ".join(env_parts)
+    cron_line = f"* * * * * {env_str} {pm_path} heartbeat --config {config_path} >> /tmp/pollypm-heartbeat.log 2>&1"
     marker = "# pollypm-heartbeat"
     full_line = f"{cron_line}  {marker}"
 

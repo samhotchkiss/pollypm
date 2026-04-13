@@ -296,24 +296,53 @@ class LocalHeartbeatBackend(HeartbeatBackend):
 
     # Rate limit nudges: max once per session per 10 minutes
     _NUDGE_COOLDOWN_SECONDS = 600
+    # Circuit breaker: after this many nudges with no change, stop and recover
+    _MAX_NUDGES_BEFORE_RECOVERY = 3
 
     def _nudge_stalled_session(self, api, context: HeartbeatSessionContext) -> None:
-        """Send a targeted nudge to a stalled session, with rate limiting."""
+        """Send a targeted nudge to a stalled session, with rate limiting and circuit breaker."""
         # Only nudge worker and operator roles
         if context.role not in ("worker", "operator-pm"):
             return
-        # Rate limit via events
+        # Circuit breaker: count recent nudges for this session
         try:
-            from datetime import UTC, datetime
-            recent = api.supervisor.store.recent_events(limit=100)
+            from datetime import UTC, datetime, timedelta
+            recent = api.supervisor.store.recent_events(limit=200)
             now = datetime.now(UTC)
+            nudge_count = 0
+            last_nudge_at = None
             for event in recent:
-                if (
-                    event.session_name == context.session_name
-                    and event.event_type == "nudge"
-                    and (now - datetime.fromisoformat(event.created_at)).total_seconds() < self._NUDGE_COOLDOWN_SECONDS
-                ):
-                    return  # already nudged recently
+                if event.session_name != context.session_name:
+                    continue
+                if event.event_type == "nudge":
+                    age = (now - datetime.fromisoformat(event.created_at)).total_seconds()
+                    if age < 3600:  # count nudges in last hour
+                        nudge_count += 1
+                    if last_nudge_at is None:
+                        last_nudge_at = datetime.fromisoformat(event.created_at)
+                    # Rate limit: skip if nudged recently
+                    if age < self._NUDGE_COOLDOWN_SECONDS:
+                        return
+
+            # Circuit breaker: too many nudges with no effect → recover instead
+            if nudge_count >= self._MAX_NUDGES_BEFORE_RECOVERY:
+                api.raise_alert(
+                    context.session_name,
+                    "nudge_circuit_breaker",
+                    "error",
+                    f"Session unresponsive after {nudge_count} nudges in the last hour — recovering",
+                )
+                api.recover_session(
+                    context.session_name,
+                    failure_type="unresponsive",
+                    message=f"Unresponsive after {nudge_count} nudges — force restart",
+                )
+                api.supervisor.store.record_event(
+                    context.session_name,
+                    "circuit_breaker",
+                    f"Circuit breaker triggered: {nudge_count} nudges with no response, recovering session",
+                )
+                return
         except Exception:  # noqa: BLE001
             pass
         # Build a context-aware nudge based on the pane snapshot

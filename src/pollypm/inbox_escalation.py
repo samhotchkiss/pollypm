@@ -98,6 +98,12 @@ def escalate_waiting_sessions(store: StateStore, project_root: Path) -> list[str
             ),
         )
         store.record_event(rt.session_name, "inbox_escalation", f"Escalated to inbox: {subject}")
+        # Send OS notification so the user knows even if they're not watching
+        try:
+            from pollypm.notifications import send_notification
+            send_notification("PollyPM", f"{rt.session_name} needs your input")
+        except Exception:  # noqa: BLE001
+            pass
         escalated.append(rt.session_name)
 
     return escalated

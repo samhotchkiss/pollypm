@@ -389,34 +389,54 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             pass
 
     def _triage_stalled_worker(self, api, context: HeartbeatSessionContext) -> None:
-        """Triage a worker idle for 5+ heartbeats.
+        """Triage a worker idle for 5+ heartbeats using Haiku LLM.
 
-        Heuristics (with hook for future Haiku LLM call):
-        - If there's a clear next step → nudge the worker
-        - Otherwise → do nothing (task-level completion summaries are Polly's job)
-
-        NOTE: The heartbeat does NOT create inbox items for completed work.
-        That's Polly's responsibility — she knows the task scope and can write
-        a proper summary. The heartbeat only nudges workers that are stuck
-        with an obvious next step.
+        Asks Haiku: should this worker be nudged, or is it legitimately idle?
+        Falls back to heuristics if Haiku is unavailable.
         """
         snapshot = (context.pane_text or "").strip()
-        lowered = snapshot.lower()
+        if not snapshot:
+            return
 
-        # Heuristic: is there a clear next step the worker should take?
+        # Try Haiku triage first
+        try:
+            from pollypm.llm_runner import run_haiku_json
+            result = run_haiku_json(
+                f"You are triaging a stalled AI coding worker session. "
+                f"The session has been idle (same output) for 5+ minutes. "
+                f"Here is the last snapshot of what the session shows:\n\n"
+                f"```\n{snapshot[-1000:]}\n```\n\n"
+                f"Respond with JSON: "
+                f'{{"action": "nudge"|"idle", "reason": "one sentence"}}\n'
+                f"- nudge: the worker has an obvious next step or is stuck on an error\n"
+                f"- idle: the worker finished its task or is legitimately waiting\n",
+            )
+            if result and isinstance(result, dict):
+                action = result.get("action", "idle")
+                if action == "nudge":
+                    reason = result.get("reason", "")
+                    self._nudge_stalled_worker(api, context)
+                    try:
+                        api.supervisor.store.record_event(
+                            context.session_name, "haiku_triage",
+                            f"Haiku: nudge — {reason[:80]}",
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                # else: idle — do nothing
+                return
+        except Exception:  # noqa: BLE001
+            pass  # Fall back to heuristics
+
+        # Fallback heuristics
+        lowered = snapshot.lower()
         next_step_signals = ["next step", "next,", "todo", "remaining", "should", "need to"]
         if any(sig in lowered for sig in next_step_signals):
             self._nudge_stalled_worker(api, context)
             return
-
-        # Heuristic: is the worker stuck on an error?
         if "error" in lowered or "failed" in lowered or "traceback" in lowered:
             self._nudge_stalled_worker(api, context)
             return
-
-        # Nothing actionable — worker is idle, that's fine.
-        # Polly handles task-level completion summaries via her prompt.
-        # Future: Haiku LLM call for smarter triage.
 
     def _classify(self, context: HeartbeatSessionContext) -> tuple[str, str]:
         text = (context.transcript_delta or context.pane_text or "").strip()

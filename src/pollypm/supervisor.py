@@ -1092,6 +1092,31 @@ class Supervisor:
         self.store.clear_lease(session_name)
         self.store.record_event(session_name, "lease", "Lease released")
 
+    def _resolve_send_target(self, launch: SessionLaunchSpec) -> str:
+        """Find the actual tmux target for a session, checking both storage closet and cockpit mount."""
+        storage = self.storage_closet_session_name()
+        storage_target = f"{storage}:{launch.window_name}"
+        # Check if the window exists in the storage closet
+        if self.tmux.has_session(storage):
+            windows = {w.name for w in self.tmux.list_windows(storage)}
+            if launch.window_name in windows:
+                return storage_target
+        # Not in storage — check if it's mounted in the cockpit
+        cockpit_session = self.config.project.tmux_session
+        state_path = self.config.project.base_dir / "cockpit_state.json"
+        if state_path.exists():
+            try:
+                import json
+                state = json.loads(state_path.read_text())
+                if state.get("mounted_session") == launch.session.name:
+                    right_pane = state.get("right_pane_id")
+                    if right_pane:
+                        return right_pane  # target the pane directly
+            except Exception:  # noqa: BLE001
+                pass
+        # Fallback to storage closet target (may fail, but that's the expected location)
+        return storage_target
+
     def send_input(
         self,
         session_name: str,
@@ -1104,7 +1129,7 @@ class Supervisor:
         launch = self._launch_by_session(session_name)
         self._assert_lease_available(session_name, owner=owner, force=force, action="send input to")
 
-        target = f"{self._tmux_session_for_launch(launch)}:{launch.window_name}"
+        target = self._resolve_send_target(launch)
         prefixed = _prefix_for_owner(owner, text)
         self.tmux.send_keys(target, prefixed, press_enter=press_enter)
         # Codex CLI buffers input and requires a second Enter to submit.

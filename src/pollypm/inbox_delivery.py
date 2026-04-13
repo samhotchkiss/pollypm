@@ -106,9 +106,17 @@ def ensure_inbox_progress(config: PollyPMConfig) -> dict[str, int]:
             except (ValueError, TypeError):
                 pass
 
-        # Poke: one short message listing the count
+        # Poke: specific and actionable — name the oldest unactioned item
         n = len(items)
-        poke = f"[Inbox] You have {n} item(s) waiting. Run: pm mail"
+        oldest = items[-1]  # sorted newest first, so last is oldest
+        if "finished" in oldest.subject.lower() or "complete" in oldest.subject.lower():
+            poke = (
+                f"[Inbox] ACTION REQUIRED: {oldest.subject[:50]}. "
+                f"The user has NOT been notified. Run: pm mail {oldest.id} — "
+                f"then: pm notify 'Done: ...' '...' --to user"
+            )
+        else:
+            poke = f"[Inbox] You have {n} item(s) needing action. Run: pm mail"
 
         try:
             sup.send_input(session_name, poke, owner="pollypm", force=True)

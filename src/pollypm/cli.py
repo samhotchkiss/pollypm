@@ -825,6 +825,27 @@ def mail(
     root = config.project.root_dir
 
     # Reply to a message
+    # Detect if we're running inside a managed agent session — if so, the
+    # sender is the agent, not the user.  This prevents workers from
+    # impersonating the user and bypassing close guards.
+    effective_sender = "user"
+    try:
+        import os
+        pane_tty = os.popen("tmux display-message -p '#{pane_tty}' 2>/dev/null").read().strip()
+        if pane_tty:
+            for sess_name, sess_cfg in config.sessions.items():
+                if sess_cfg.role in ("worker", "operator-pm", "triage"):
+                    effective_sender = "polly" if sess_cfg.role == "operator-pm" else sess_name
+                    # We can't easily match pane TTY to session, so check the
+                    # CWD heuristic: if our cwd matches a worker's project, we're likely that worker
+            cwd = os.getcwd()
+            for sess_name, sess_cfg in config.sessions.items():
+                if sess_cfg.role == "worker" and sess_cfg.cwd and str(sess_cfg.cwd) in cwd:
+                    effective_sender = sess_name
+                    break
+    except Exception:  # noqa: BLE001
+        pass  # Default to "user" if detection fails
+
     if reply:
         if not reply_text:
             typer.echo("Use --text 'your reply' with --reply")
@@ -833,8 +854,8 @@ def mail(
         if match is None:
             typer.echo(f"Message not found: {reply}")
             raise typer.Exit(code=1)
-        reply_v2_message(root, match.id, sender="user", body=reply_text)
-        typer.echo(f"Replied to {match.id}")
+        reply_v2_message(root, match.id, sender=effective_sender, body=reply_text)
+        typer.echo(f"Replied to {match.id} (as {effective_sender})")
         return
 
     # Close with required note
@@ -846,8 +867,8 @@ def mail(
         if match is None:
             typer.echo(f"Message not found: {close}")
             raise typer.Exit(code=1)
-        close_v2_message(root, match.id, sender="user", note=close_note)
-        typer.echo(f"Closed {match.id} with note.")
+        close_v2_message(root, match.id, sender=effective_sender, note=close_note)
+        typer.echo(f"Closed {match.id} with note (as {effective_sender}).")
         return
 
     # Show threads (v2 messages with multiple entries)

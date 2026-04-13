@@ -71,12 +71,59 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     )
                 except Exception:  # noqa: BLE001
                     pass
+        # Post-sweep: if operator is idle and workers are waiting, send supervision reminder
+        self._check_supervision_needed(api)
+
         api.record_event(
             "heartbeat",
             "heartbeat",
             f"Heartbeat sweep completed with {len(api.open_alerts())} open alerts",
         )
         return api.open_alerts()
+
+    def _check_supervision_needed(self, api) -> None:
+        """If the operator is idle and workers are waiting, remind Polly to supervise."""
+        try:
+            from datetime import UTC, datetime
+            contexts = api.list_sessions()
+            operator = next((c for c in contexts if c.role == "operator-pm"), None)
+            if operator is None or not operator.window_present:
+                return
+            workers = [c for c in contexts if c.role == "worker"]
+            idle_workers = []
+            for w in workers:
+                if not w.window_present:
+                    continue
+                rt = api.supervisor.store.get_session_runtime(w.session_name)
+                if rt and rt.status in ("waiting_on_user", "needs_followup", "healthy"):
+                    hashes = api.recent_snapshot_hashes(w.session_name, limit=3)
+                    if len(hashes) == 3 and len(set(hashes)) == 1:
+                        idle_workers.append(w.session_name)
+            if len(idle_workers) < 2:
+                return  # only remind if multiple workers are waiting
+            # Rate limit: check for recent supervision_reminder events
+            now = datetime.now(UTC)
+            recent = api.supervisor.store.recent_events(limit=50)
+            for event in recent:
+                if (
+                    event.event_type == "supervision_reminder"
+                    and (now - datetime.fromisoformat(event.created_at)).total_seconds() < 300
+                ):
+                    return  # sent one less than 5 min ago
+            # Send supervision reminder — different from nudge, bypasses nudge cooldown
+            names = ", ".join(idle_workers[:4])
+            api.send_session_message(
+                "operator",
+                f"Supervision check: {len(idle_workers)} workers idle ({names}). "
+                f"Run `pm status`, review their output, and send next instructions.",
+                owner="heartbeat",
+            )
+            api.supervisor.store.record_event(
+                "operator", "supervision_reminder",
+                f"Sent supervision reminder: {len(idle_workers)} idle workers",
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _process_unmanaged_windows(self, api) -> None:
         current_alert_types: set[str] = set()

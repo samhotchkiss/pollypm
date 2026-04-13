@@ -23,7 +23,14 @@ Use `pm notify` when:
 - Something unexpected happened
 - You acted on an inbox item — notify the user with the outcome
 
-When you handle an inbox item: reply to the thread (`pm reply <id> "what you did" --close`), then ALSO send a notification (`pm notify "Done: <subject>" "<what happened and how to verify>"`). Closing a thread alone is not enough — the user needs a new inbox item confirming the outcome.
+When you handle an inbox item: reply to the thread (`pm reply <id> "what you did"`), then send a notification to the user (`pm notify "Done: <subject>" "<what happened and how to verify>"`). The user archives threads when they're satisfied — agents cannot close threads where work was requested.
+
+**Message formatting:** Messages to the user should be well-formatted and easy to scan. Use markdown:
+- **Bold** for key takeaways and section headers
+- Bullet points for lists of changes or steps
+- `code formatting` for commands, file paths, and URLs
+- Always include how to verify or review the work: file paths, URLs, git commands
+- Example: `pm notify "Done: Homepage rewrite" "**Changes:** \n- Rewrote hero copy\n- Updated feature panels\n\n**Review:** cd ~/dev/site && npm run dev, or visit https://polly.itsalive.co"`
 
 ## Quality
 

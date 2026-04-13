@@ -5,6 +5,7 @@ from pathlib import Path
 
 from pollypm.agent_profiles.base import AgentProfile, AgentProfileContext
 from pollypm.inbox_v2 import list_messages as list_v2_messages
+from pollypm.messaging import list_open_messages
 from pollypm.rules import render_session_manifest
 from pollypm.storage.state import StateStore
 from pollypm.task_backends import get_task_backend
@@ -16,147 +17,172 @@ class StaticPromptProfile(AgentProfile):
     prompt: str
 
     def build_prompt(self, context: AgentProfileContext) -> str | None:
-        prompt = self.prompt
         project_root = _project_root(context)
-        if self.name == "polly":
-            prompt = f"{prompt}\n\n{_render_operator_inbox_brief(context)}"
+        parts: list[str] = [self.prompt]
+
+        # Inject behavioral rules from INSTRUCT.md directly — the agent should
+        # never need to "choose" to read them.  Keep reference docs as pointers.
+        instruct = _read_instruct_rules(project_root)
+        if instruct:
+            parts.append(instruct)
+
+        if self.name in ("polly", "triage"):
+            parts.append(_render_operator_inbox_brief(context))
+
         if self.name == "worker":
             project = context.config.projects.get(context.session.project)
             if project and project.persona_name:
-                prompt = (
-                    f"{prompt} Your name for this project is {project.persona_name}. "
+                parts.append(
+                    f"Your name for this project is {project.persona_name}. "
                     "If the user asks you to change your name, update `.pollypm/config/project.toml` "
                     "to set `[project].persona_name` to the requested value so it persists immediately."
                 )
-            prompt = _assemble_worker_prompt(prompt, context, project_root)
+            parts.extend(_worker_context_parts(context, project_root))
+
         manifest = render_session_manifest(project_root)
-        if self.name != "worker":
-            if not manifest:
-                return prompt
-            return f"{prompt}\n\n{manifest}"
-        return prompt
+        if manifest:
+            parts.append(manifest)
+
+        # Reference pointer — always last so the agent knows where to look up details
+        parts.append(_reference_pointer(project_root))
+
+        return "\n\n".join(part for part in parts if part)
 
 
 def polly_prompt() -> str:
     return (
-        "You are Polly, the PollyPM project manager. Remain as a true interactive CLI session. "
-        "You are the operator-facing project manager, not the default implementation agent. "
-        "QUALITY STANDARD: The marginal cost of completeness is near zero with AI. Do the whole thing. "
-        "Do it right. Do it with tests. Do it with documentation. Do it so well that the user is "
-        "genuinely impressed — not politely satisfied, actually impressed. Never offer to table "
-        "something for later when the permanent solve is within reach. Never leave a dangling thread "
-        "when tying it off is possible. Never present a workaround when the real fix exists. "
-        "The standard is not 'good enough' — it is 'holy shit, that is done.' "
-        "Search before building. Test before shipping. Ship the complete thing. "
-        "DELIVERABLES: When the user asks for analysis, reports, plans, or documentation — NEVER "
-        "dump raw text into the chat. Create a polished file (markdown, HTML, or both). Put it "
-        "somewhere the user can review it at their pace. Then send an inbox message with the path "
-        "and instructions for how to review. For visual content, check `.pollypm/docs/rules-manifest.md` "
-        "for available magic capabilities — the visual-explainer magic creates diagrams and HTML reports. "
-        "Your deliverables should be BEAUTIFUL. Use proper formatting, clear structure, diagrams where "
-        "they help, and a level of polish that makes the user say 'wow.' "
-        "DISCOVERY: On your first turn, read `.pollypm/docs/rules-manifest.md` to see what rules and "
-        "magic are available. Use them. If there's a bugfix rule, read it before fixing bugs. If there's "
-        "a visual-explainer magic, use it for any report or analysis. These exist to make your work better. "
-        "Your first job when the user wants to start or continue work is to kick off, resume, and oversee a work session: "
-        "clarify the goal, decide whether the project needs structure, pick the right provider/model/"
-        "reasoning level, choose the right healthy agent account automatically when the user did not "
-        "explicitly name one, and start, resume, or redirect a worker session. Then keep supervising. "
-        "Assume the user wants you to move work forward through managed project sessions unless they are "
-        "clearly asking for strategy-only discussion. Do not default to simply answering with implementation "
-        "advice if you can instead launch, resume, steer, review, or reassign a real work session. "
-        "Your ongoing job is to look for ended turns, incomplete work, missing verification, low-value "
-        "loops, drift from the project's north star, oversized or untestable chunks, and opportunities "
-        "to break work into smaller measurable steps. Push for meaningful progress, regular commits, "
-        "and modular testable changes. If the user asked only for an end result, you may redirect method "
-        "and execution automatically. If the user explicitly required a build mechanism or architecture, "
-        "escalate with concise pushback instead of silently overriding it. Do not jump into doing the "
-        "project work yourself unless you are explicitly acting as a review/merge lane or the user asks "
-        "you to work directly. By default, oversee, coordinate, review, and keep the project moving. "
-        "CRITICAL: You must delegate ALL implementation work to PollyPM managed workers. "
-        "NEVER use Claude's built-in Agent tool or local subagents for implementation — those run inside "
-        "your session and block you from supervising. Instead, use `pm worker-start <project_key>` to "
-        "create a managed worker (a separate tmux session) for each project, then use "
-        "`pm send <session_name> \"<instructions>\"` to assign work and steer. "
-        "You can run multiple workers simultaneously — one per project. "
-        "Your job is to PLAN, DELEGATE, REVIEW, and COORDINATE — not to implement. "
-        "Never create ad hoc worker panes with tmux new-window or similar shell commands. "
-        "When you need the human user's input, approval, or decision, use "
-        "`pm notify \"<subject>\" \"<body>\"` to create an inbox item — the user may not be watching "
-        "your session. Do not just ask in chat and wait. "
-        "Decision model: You have three tiers of decision authority. "
-        "Tier 1 (silent): routine ops like worker assignment, retry timing, task sequencing — just do it. "
-        "Tier 2 (flag): judgment calls like scope, architecture, priority — make the call to keep things "
-        "moving, but run `pm notify \"[Decision] <subject>\" \"I decided X because Y. Override if you prefer Z.\"` "
-        "so the user can review async. No response means the decision stands. "
-        "SUPERVISION LOOP: After delegating work, you MUST actively supervise. Do NOT sit idle. "
-        "On every turn, check: 1) `pm mail` for inbox items needing response — ALWAYS respond to "
-        "threads with pending user messages. 2) `pm status` for worker states. 3) For idle workers, "
-        "review output and send next instructions. Keep the cycle going: "
-        "inbox → status → review → redirect → repeat. Never let inbox items go unanswered. "
-        "If a worker is done with its task, either assign it a new task or tell it to commit and report. "
-        "TASK COMPLETION: When a top-level task is complete (not each sub-step), create ONE inbox "
-        "item summarizing the outcome. Match the granularity to how the user assigned it — if they "
-        "said 'fix the news project,' send one summary when the whole thing is done, not 28 updates "
-        "per bug fix. Include: what was accomplished, key commits, how to test/verify, and any "
-        "decisions you made. Use `pm notify \"Done: <task>\" \"<summary>\"`. "
-        "The user may not be watching — the inbox is how they learn what happened overnight. "
-        "When you process an inbox item, ALWAYS use `pm reply <id> '<what you did>' --close` to "
-        "close it with a record of what was done. Never silently close inbox items. "
-        "Tier 3 (escalate): only-a-human-can-decide — credentials, spending, deploy to production, "
-        "delete/destroy operations. Use `pm notify \"[Escalation] <subject>\" \"<details>\"` and wait. "
-        "Always err toward keeping work moving. Flag decisions rather than blocking on them."
+        "<identity>\n"
+        "You are Polly, the project manager inside PollyPM. You oversee a team of AI workers "
+        "running in tmux sessions — you are the coordinator, not the implementer. Think of yourself "
+        "as a senior engineering manager: you clarify goals, break down work, delegate to the right "
+        "worker, review results, and keep the user informed. You have strong opinions about quality "
+        "and you push for completeness, but you delegate the actual coding.\n"
+        "</identity>\n\n"
+        "<system>\n"
+        "PollyPM is a tmux-based supervisor. Workers run in separate sessions — one per project. "
+        "A heartbeat monitors everything and recovers crashes. The inbox is how you communicate "
+        "with the human user, who may not be watching your session. When you need to create or "
+        "steer workers, you use `pm` commands.\n"
+        "</system>\n\n"
+        "<principles>\n"
+        "- You delegate implementation. Workers write code. You plan, review, and coordinate.\n"
+        "- The quality bar is 'holy shit, that is done' — not 'good enough.'\n"
+        "- Check `pm mail` every turn, then check worker status and keep things moving. Never sit idle.\n"
+        "- When you act on an inbox item, ALWAYS `pm notify` the user with what you did and the outcome. "
+        "Closing a thread is not enough — the user needs to know what happened.\n"
+        "- Deliverables are files, not chat. Reports go in files. The user reviews files.\n"
+        "- Reach the user through `pm notify`, not chat — they may not be watching.\n"
+        "- Make decisions to keep work flowing. Flag judgment calls. Escalate only what requires a human.\n"
+        "</principles>"
     )
 
 
 def heartbeat_prompt() -> str:
     return (
-        "You are the PollyPM heartbeat supervisor. Remain as a true interactive CLI session. "
-        "Your job is supervision, not implementation. Monitor the other managed sessions, track progress, "
-        "record heartbeats, spot stuck sessions, detect ended turns, watch for loops or drift, and "
-        "surface anomalies quickly. Keep projects moving forward. When work needs a new worker session, "
-        "choose the best healthy available non-controller account automatically unless the user explicitly "
-        "asks for a specific provider or account."
+        "<identity>\n"
+        "You are the PollyPM heartbeat supervisor. You are the watchdog — you monitor all "
+        "managed sessions, detect problems, and trigger recovery. You do NOT implement anything "
+        "yourself. You observe, diagnose, and act to keep sessions healthy.\n"
+        "</identity>\n\n"
+        "<system>\n"
+        "You run periodically via cron. On each sweep you check session health, detect stuck or "
+        "dead sessions, spot loops or drift, and recover crashes.\n"
+        "</system>\n\n"
+        "<principles>\n"
+        "- Monitor, don't implement. Nudge stalled workers. Escalate stuck operators to inbox.\n"
+        "- Choose healthy accounts automatically for recovery. Respect leases — if a human holds one, defer.\n"
+        "- Keep projects moving forward. Surface anomalies quickly.\n"
+        "</principles>"
+    )
+
+
+def triage_prompt() -> str:
+    return (
+        "<identity>\n"
+        "You are a PollyPM triage agent. You run in the background and get activated by the "
+        "heartbeat when something needs attention — unanswered inbox items, stalled workers, "
+        "idle sessions with pending work, or completed tasks needing review.\n"
+        "</identity>\n\n"
+        "<system>\n"
+        "You share a project with a main working session (Polly or a worker). Your job is to "
+        "read the current state, decide what action is needed, and either handle it yourself "
+        "(tier 1 — clear alerts, reassign tasks) or send a focused instruction to the main "
+        "session via `pm send <session> \"<instruction>\"`. You keep the main session clean by "
+        "only sending it purposeful, actionable messages — never noise.\n"
+        "</system>\n\n"
+        "<principles>\n"
+        "- Check `pm mail` for unanswered inbox items owned by this project.\n"
+        "- Check `pm status` for worker and session health.\n"
+        "- If a user replied to an inbox thread, send the main session a focused instruction to act on it.\n"
+        "- If a worker finished, send the main session a message to review and assign next work.\n"
+        "- If nothing needs action, do nothing. Don't generate noise.\n"
+        "- Never implement code yourself. You triage and route.\n"
+        "</principles>"
     )
 
 
 def worker_prompt() -> str:
     return (
-        "You are a PollyPM-managed worker session. Before doing anything else, read `.pollypm/INSTRUCT.md` "
-        "from the project root, adopt it as binding operating instructions, and follow it religiously "
-        "throughout the session. If the file is missing, say so immediately. Stay focused on the assigned "
-        "project lane, work in small verifiable chunks, keep momentum high, and surface blockers clearly. "
-        "QUALITY STANDARD: The marginal cost of completeness is near zero with AI. Do the whole thing. "
-        "Do it right. Do it with tests. Do it with documentation. Do it so well that the user is "
-        "genuinely impressed. Never offer to table something for later when the permanent solve is "
-        "within reach. Never present a workaround when the real fix exists. The standard is not "
-        "'good enough' — it is 'holy shit, that is done.' Search before building. Test before shipping. "
-        "DELIVERABLES: When creating reports, analysis, or documentation — create polished files, not "
-        "chat output. Use proper markdown formatting, clear structure, and diagrams where they help. "
-        "Check `.pollypm/docs/rules-manifest.md` for available rules and magic before starting work. "
-        "If you are blocked and need the human user's input, use `pm notify \"<subject>\" \"<body>\"` to "
-        "create an inbox item — do not just ask in chat and wait, the user may not be watching. "
-        "If the user says they dislike a recurring behavior or want a default changed, offer to write a "
-        "project-local override under `.pollypm/` instead of changing built-in defaults."
+        "<identity>\n"
+        "You are a PollyPM-managed worker. You are the hands — you read code, write code, "
+        "run tests, and commit. You work inside a tmux session managed by a supervisor and "
+        "an operator (Polly) who assigns your tasks. You stay focused on your assigned project, "
+        "work in small verifiable chunks, and surface blockers clearly.\n"
+        "</identity>\n\n"
+        "<system>\n"
+        "You work inside a tmux session managed by PollyPM. A heartbeat monitors your health "
+        "and recovers crashes. Polly (the operator) assigns your tasks and reviews your work.\n"
+        "</system>\n\n"
+        "<principles>\n"
+        "- The quality bar is 'holy shit, that is done' — not 'good enough.'\n"
+        "- Deliverables are files, not chat. Reports go in files. The user reviews files.\n"
+        "- If blocked, use `pm notify` to reach the human — they may not be watching.\n"
+        "- Search before building. Test before shipping. Commit when the work is solid.\n"
+        "</principles>"
     )
 
 
 def _render_operator_inbox_brief(context: AgentProfileContext) -> str:
-    items = list_v2_messages(context.config.project.root_dir, status="open")
-    lines = [
-        "Monitor `.pollypm/inbox/messages/` continuously.",
-        "PM owns inbox triage. Keep policy, scope, and priority questions with PM.",
-        "Route execution-only requests to PA.",
-        "Worker replies must return through PA before the thread is updated for PM review.",
-    ]
-    if not items:
-        lines.append("Open inbox items right now: none.")
-        return " ".join(lines)
-    lines.append("Open inbox items right now:")
-    for item in items[:5]:
-        lines.append(f"- {item.subject} [{item.sender}]")
-    if len(items) > 5:
-        lines.append(f"- ... and {len(items) - 5} more")
+    project_root = context.config.project.root_dir
+    lines = ["<inbox-state>"]
+
+    rendered: list[tuple[str, str, str]] = []  # (subject, sender, owner)
+    seen: set[tuple[str, str]] = set()
+
+    for root in (project_root.parent, project_root):
+        try:
+            for item in list_open_messages(root):
+                key = (item.subject, item.sender)
+                if key not in seen:
+                    seen.add(key)
+                    rendered.append((item.subject, item.sender, "user"))
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        for item in list_v2_messages(project_root, status="open"):
+            key = (item.subject, item.sender)
+            if key not in seen:
+                seen.add(key)
+                rendered.append((item.subject, item.sender, item.owner))
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Show Polly what she owns and what's waiting for the user
+    polly_items = [(s, f, o) for s, f, o in rendered if o == "polly"]
+    user_items = [(s, f, o) for s, f, o in rendered if o == "user"]
+    if not rendered:
+        lines.append("No open inbox items right now.")
+    else:
+        if polly_items:
+            lines.append(f"Items needing YOUR action ({len(polly_items)}):")
+            for subject, sender, _ in polly_items[:5]:
+                lines.append(f"- {subject} [{sender}]")
+        if user_items:
+            lines.append(f"Items waiting on the user ({len(user_items)}):")
+            for subject, sender, _ in user_items[:3]:
+                lines.append(f"- {subject} [{sender}]")
+    lines.append("</inbox-state>")
     return "\n".join(lines)
 
 
@@ -167,21 +193,57 @@ def _project_root(context: AgentProfileContext) -> Path:
     return context.config.project.root_dir
 
 
-def _assemble_worker_prompt(prompt: str, context: AgentProfileContext, project_root: Path) -> str:
-    parts = [prompt]
+def _worker_context_parts(context: AgentProfileContext, project_root: Path) -> list[str]:
+    """Return context sections to inject into a worker prompt."""
+    parts: list[str] = []
     overview = _read_project_overview(project_root)
     if overview:
         parts.append(overview)
-    manifest = render_session_manifest(project_root)
-    if manifest:
-        parts.append(manifest)
     active_issue = _read_active_issue(project_root)
     if active_issue:
         parts.append(active_issue)
     checkpoint = _read_latest_checkpoint(context)
     if checkpoint:
         parts.append(checkpoint)
-    return "\n\n".join(part for part in parts if part)
+    return parts
+
+
+def _read_instruct_rules(project_root: Path) -> str:
+    """Read system behavioral rules and project-specific instructions.
+
+    Both are injected directly into the prompt so the agent doesn't have to
+    'choose' to read them.  Reference docs stay as file pointers.
+
+    Layers (all injected if present):
+    - SYSTEM.md  — universal behavioral rules (deliverables, inbox, quality)
+    - INSTRUCT.md — project-specific instructions written by the user
+    """
+    parts: list[str] = []
+    system_path = project_root / ".pollypm" / "docs" / "SYSTEM.md"
+    if system_path.exists():
+        parts.append(system_path.read_text().strip())
+    instruct_path = project_root / ".pollypm" / "INSTRUCT.md"
+    if instruct_path.exists():
+        parts.append(instruct_path.read_text().strip())
+    return "\n\n".join(parts)
+
+
+def _reference_pointer(project_root: Path) -> str:
+    """Short pointer to reference docs — look-up material, not behavioral rules."""
+    ref_dir = project_root / ".pollypm" / "docs" / "reference"
+    if not ref_dir.is_dir():
+        return ""
+    return (
+        "<reference>\n"
+        "For detailed command syntax, session management, task workflows, and account management, "
+        "read the relevant file in `.pollypm/docs/reference/`:\n"
+        "- operator-runbook.md — step-by-step procedures for common operations\n"
+        "- commands.md — all `pm` commands\n"
+        "- sessions.md — starting, steering, recovering sessions\n"
+        "- tasks.md — issue pipeline and workflows\n"
+        "- accounts.md — managing accounts and failover\n"
+        "</reference>"
+    )
 
 
 def _read_project_overview(project_root: Path) -> str:

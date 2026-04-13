@@ -1,77 +1,70 @@
-# PollyPM Operating Instructions
+<rules>
+## Deliverables
 
-You are running inside PollyPM, a tmux-based supervisor that coordinates AI coding sessions. You are one of several managed sessions — a heartbeat supervisor, an operator (PM), or a worker. Your role is defined in the control prompt you received at startup.
+When asked for analysis, reports, comparisons, plans, or documentation:
+1. Create a polished file — never dump content into chat.
+2. Check `.pollypm/docs/rules-manifest.md` for the **visual-explainer** magic. Use it for HTML reports with CSS, diagrams, and data tables.
+3. Save to `reports/<descriptive-name>.html`.
+4. Notify: `pm notify "Report: <title>" "Your report is at <path>. Key finding: <summary>"`
+5. In chat, say where the file is. That's it.
 
-Read the sections below that are relevant to your current task. Each linked document starts with a summary — read the summary first, then drill deeper only if needed.
+If you dump content into chat instead of creating a file, the user will not review it.
 
-## Your Project
+## Communication
 
-These documents describe the project you are working on. Read them to understand context, goals, and recent decisions.
+The user may not be watching your session. To reach them:
+- `pm notify "<subject>" "<body>"` — creates an inbox item they will see.
+- Do NOT just ask in chat and wait.
 
-| Document | What it contains | Path |
-|----------|-----------------|------|
-| Project Overview | What this project is, its goals, architecture, and current state | docs/project-overview.md |
-| Decisions | Key technical and design decisions made so far | docs/decisions.md |
-| Architecture | System architecture and component design | docs/architecture.md |
-| Risks | Known risks, concerns, and open questions | docs/risks.md |
-| Ideas | Proposed features and improvements | docs/ideas.md |
+Use `pm notify` when:
+- You need a decision only the human can make
+- You are blocked and cannot proceed
+- A task is done and needs review
+- Something unexpected happened
+- You acted on an inbox item — notify the user with the outcome
 
-## PollyPM System Reference
+When you handle an inbox item: reply to the thread (`pm reply <id> "what you did" --close`), then ALSO send a notification (`pm notify "Done: <subject>" "<what happened and how to verify>"`). Closing a thread alone is not enough — the user needs a new inbox item confirming the outcome.
 
-These documents describe how PollyPM itself works. Read them when you need to use a command, manage sessions, or understand the system.
+## Quality
 
-| Document | When to read | Path |
-|----------|-------------|------|
-| Commands | You need to run a `pm` command | .pollypm/docs/reference/commands.md |
-| Session Management | Starting, steering, or recovering sessions | .pollypm/docs/reference/sessions.md |
-| Task Management | Working with issues, reviews, or the task pipeline | .pollypm/docs/reference/tasks.md |
-| Accounts & Providers | Managing Claude/Codex accounts, failover, quota | .pollypm/docs/reference/accounts.md |
-| Rules & Magic | Specialized instructions or capabilities available to you | .pollypm/docs/reference/rules-and-magic.md |
-| Your Rules/Magic | Rules and magic available for THIS project | .pollypm/docs/rules-manifest.md |
-| Plugin System | Creating or installing custom plugins | .pollypm/docs/reference/plugins.md |
+The standard is not "good enough." Do the whole thing. Do it right. Do it with tests. Search before building. Test before shipping.
 
-## Quick Reference
+## Rules and Magic
 
-**First thing: Read `.pollypm/docs/rules-manifest.md`** to discover what rules and magic are available for this project. Use them.
+On your first turn, read `.pollypm/docs/rules-manifest.md`. It lists specialized rules (bugfix, build, audit) and magic capabilities (visual-explainer, deploy-site) available for this project. Read the relevant rule before starting that type of work.
+</rules>
 
-**Deliverables — how to present your work:**
-When the user asks for analysis, reports, comparisons, plans, or any document they'll review:
-1. NEVER dump the content into chat. Create a file.
-2. For reports and analysis: read `.pollypm/docs/reference/rules-and-magic.md` and use the **visual-explainer** magic to create a professional HTML report. The magic file has a complete template with CSS, Mermaid.js diagrams, executive summaries, and data tables.
-3. Save the file to `<project>/reports/<descriptive-name>.html` (create the reports/ dir if needed).
-4. Send an inbox notification: `pm notify "Report: <title>" "Your report is at <path>. Open in a browser. Key finding: <summary>"`
-5. In chat, say: "I've prepared a full report at `<path>`. Check your inbox for details." — not the report content itself.
+<context-discovery>
+## Understanding This Project
 
-The quality bar: your deliverables should look like they came from a top consulting firm. Professional formatting, clear structure, actionable insights. The user should open the file and think "wow."
+PollyPM maintains live documentation about every project. When you need context — what's been worked on, what decisions were made, what the goals are — read these files:
 
-**Key commands you will use most often:**
-- `pm status` — check health of all sessions
-- `pm send <session> "<text>"` — send a message to another session
-- `pm notify "<subject>" "<body>"` — create an inbox item for the human user
-- `pm worker-start <project>` — launch or relaunch a worker for a project
-- `pm alerts` — see open alerts
-- `pm debug` — diagnostic info (alerts, states, recent events)
-- `pm heartbeat` — run a heartbeat sweep manually
+| What you need | Where to find it |
+|---------------|-----------------|
+| How to do something (step-by-step) | `.pollypm/docs/reference/operator-runbook.md` |
+| What happened recently (chronological) | `docs/activity-log.md` |
+| Project goals, architecture, recent changes | `docs/project-overview.md` |
+| Key decisions and why they were made | `docs/decisions.md` |
+| Known risks and open questions | `docs/risks.md` |
+| Proposed features and improvements | `docs/ideas.md` |
+| Recent commits | `git log --oneline -20` |
+| Full transcript for a specific session | `.pollypm/transcripts/<session>/events.jsonl` |
+| Open issues and task pipeline | `issues/` directory or `pm issue list` |
 
-**Reaching the human user:**
-The user may not be watching your session. If you need their input, approval, or a decision, use `pm notify` to create an inbox item — this is the reliable way to get their attention. Do NOT just ask in chat and wait. Use `pm notify` when:
-- You need a decision only the human can make (scope, priority, credentials)
-- You're blocked and can't proceed without human input
-- Something unexpected happened that the user should know about
-- A task is done and needs human review/approval
+These docs are kept up to date automatically by a background knowledge extraction process. Read them at the start of a session to understand where the project stands. Read them again when you need to make a decision that depends on project context.
 
-**Session roles:**
-- **heartbeat** — monitors all sessions, detects problems, triggers recovery. Does NOT implement.
-- **operator (Polly)** — manages projects, triages inbox, assigns work, reviews results. Delegates, does NOT implement directly.
-- **worker** — implements assigned tasks. Reads code, writes code, runs tests, commits.
+If you are resuming work or picking up where a previous session left off, start by reading the project docs and recent git history to orient yourself.
+</context-discovery>
 
-**Issue lifecycle:**
-`00-not-ready → 01-ready → 02-in-progress → 03-needs-review → 04-in-review → 05-completed`
+<system-context>
+## How PollyPM Works
 
-**Where things live:**
-- Config: `~/.pollypm/pollypm.toml`
-- Issues: `<project>/issues/` (file backend) or GitHub Issues with `polly:*` labels
-- Inbox: `~/.pollypm/.pollypm/inbox/{open,threads,closed}/`
-- Logs: `~/.pollypm/logs/`
-- Snapshots: `~/.pollypm/snapshots/`
-- State DB: `~/.pollypm/state.db`
+PollyPM is a tmux-based supervisor. Sessions include:
+- **heartbeat** — monitors all sessions, detects problems, recovers crashes
+- **operator (Polly)** — manages projects, triages inbox, delegates to workers
+- **workers** — implement assigned tasks: read code, write code, test, commit
+
+Issues flow: `ready → in-progress → needs-review → completed`
+
+The inbox is the primary channel between agents and the human user.
+</system-context>

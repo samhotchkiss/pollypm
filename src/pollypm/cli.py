@@ -831,18 +831,16 @@ def mail(
     effective_sender = "user"
     try:
         import os
-        pane_tty = os.popen("tmux display-message -p '#{pane_tty}' 2>/dev/null").read().strip()
-        if pane_tty:
-            for sess_name, sess_cfg in config.sessions.items():
-                if sess_cfg.role in ("worker", "operator-pm", "triage"):
-                    effective_sender = "polly" if sess_cfg.role == "operator-pm" else sess_name
-                    # We can't easily match pane TTY to session, so check the
-                    # CWD heuristic: if our cwd matches a worker's project, we're likely that worker
-            cwd = os.getcwd()
-            for sess_name, sess_cfg in config.sessions.items():
-                if sess_cfg.role == "worker" and sess_cfg.cwd and str(sess_cfg.cwd) in cwd:
+        cwd = os.getcwd()
+        # Match CWD to a managed session — if we're inside a worker's
+        # project directory (or its worktree), we're that worker.
+        for sess_name, sess_cfg in config.sessions.items():
+            if sess_cfg.cwd and str(sess_cfg.cwd) in cwd:
+                if sess_cfg.role == "operator-pm":
+                    effective_sender = "polly"
+                elif sess_cfg.role in ("worker", "triage"):
                     effective_sender = sess_name
-                    break
+                break
     except Exception:  # noqa: BLE001
         pass  # Default to "user" if detection fails
 

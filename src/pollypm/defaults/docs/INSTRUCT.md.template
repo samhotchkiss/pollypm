@@ -32,6 +32,8 @@ These documents describe how PollyPM itself works. Read them when you need to us
 
 ## Quick Reference
 
+**First thing: Read `.pollypm/docs/rules-manifest.md`** to discover what rules and magic are available for this project. Use them.
+
 **Key commands you will use most often:**
 - `pm status` — check health of all sessions
 - `pm send <session> "<text>"` — send a message to another session

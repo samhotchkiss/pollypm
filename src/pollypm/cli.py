@@ -740,6 +740,57 @@ def reply_to_message(
         typer.echo(f"Thread closed.")
 
 
+@app.command("discuss")
+def discuss(
+    message_id: str = typer.Argument(..., help="Message ID to discuss."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    """Jump into a live discussion about an inbox message.
+
+    Mounts the relevant session in the cockpit and prefills context
+    so the agent knows what you want to discuss.
+    """
+    config = load_config(config_path)
+
+    # Find the message (try v2 first, then v1)
+    from pollypm.inbox_v2 import find_message as find_v2
+    msg = find_v2(config.project.root_dir, message_id)
+    subject = ""
+    msg_id = ""
+    target_session = "operator"
+
+    if msg:
+        subject = msg.subject
+        msg_id = msg.id
+        # Determine which session to discuss with based on project
+        if msg.project:
+            for sess in config.sessions.values():
+                if sess.project == msg.project and sess.role == "worker":
+                    target_session = sess.name
+                    break
+    else:
+        # Try v1
+        all_msgs = list_open_messages(config.project.root_dir) + list_closed_messages(config.project.root_dir)
+        match = next((m for m in all_msgs if message_id.lower() in m.path.name.lower()), None)
+        if match:
+            subject = match.subject
+            msg_id = match.path.stem
+        else:
+            typer.echo(f"Message not found: {message_id}")
+            raise typer.Exit(code=1)
+
+    # Send a context-setting message to the agent
+    supervisor = _load_supervisor(config_path)
+    context_msg = f"I'm here to discuss inbox message '{msg_id}': \"{subject}\". Let's talk about it."
+    try:
+        supervisor.send_input(target_session, context_msg, owner="human", force=True)
+        typer.echo(f"Discussion started with {target_session} about: {subject}")
+        typer.echo(f"Switch to the cockpit to continue the conversation.")
+    except Exception as exc:
+        typer.echo(f"Could not reach {target_session}: {exc}")
+        typer.echo(f"Try: pm send {target_session} \"{context_msg}\"")
+
+
 @app.command("mail")
 def mail(
     message_id: str | None = typer.Argument(None, help="Message ID to read. Omit to list all."),

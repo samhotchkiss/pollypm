@@ -381,40 +381,19 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             pass
 
     def _triage_stalled_worker(self, api, context: HeartbeatSessionContext) -> None:
-        """Triage a worker that's been idle for 5+ heartbeats.
+        """Triage a worker idle for 5+ heartbeats.
 
-        Uses heuristics (with hook for future Haiku LLM call) to decide:
-        - Nudge the worker with a specific instruction
-        - Create an inbox item for Polly (significant work done, needs review)
-        - Do nothing (worker is legitimately idle)
+        Heuristics (with hook for future Haiku LLM call):
+        - If there's a clear next step → nudge the worker
+        - Otherwise → do nothing (task-level completion summaries are Polly's job)
+
+        NOTE: The heartbeat does NOT create inbox items for completed work.
+        That's Polly's responsibility — she knows the task scope and can write
+        a proper summary. The heartbeat only nudges workers that are stuck
+        with an obvious next step.
         """
         snapshot = (context.pane_text or "").strip()
         lowered = snapshot.lower()
-
-        # Heuristic: does the snapshot show completed work?
-        done_signals = ["committed", "all tests pass", "pushed", "done", "completed", "ready for review"]
-        if any(sig in lowered for sig in done_signals):
-            # Work looks complete — notify Polly via inbox
-            try:
-                from pollypm.messaging import create_message
-                snippet = snapshot.splitlines()[-1][:100] if snapshot else "check worker output"
-                create_message(
-                    api.supervisor.config.project.root_dir,
-                    sender="heartbeat",
-                    subject=f"Review: {context.session_name} completed work",
-                    body=(
-                        f"Worker '{context.session_name}' appears to have completed a task.\n\n"
-                        f"Last output: {snippet}\n\n"
-                        f"Review with: `pm send {context.session_name} 'report status'`"
-                    ),
-                )
-                api.supervisor.store.record_event(
-                    context.session_name, "triage_review",
-                    f"Created inbox item for Polly: worker completed work",
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            return
 
         # Heuristic: is there a clear next step the worker should take?
         next_step_signals = ["next step", "next,", "todo", "remaining", "should", "need to"]
@@ -422,8 +401,14 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             self._nudge_stalled_worker(api, context)
             return
 
-        # Nothing actionable — do nothing. Worker is legitimately idle.
-        # Future: replace heuristics with a Haiku LLM call for smarter triage.
+        # Heuristic: is the worker stuck on an error?
+        if "error" in lowered or "failed" in lowered or "traceback" in lowered:
+            self._nudge_stalled_worker(api, context)
+            return
+
+        # Nothing actionable — worker is idle, that's fine.
+        # Polly handles task-level completion summaries via her prompt.
+        # Future: Haiku LLM call for smarter triage.
 
     def _classify(self, context: HeartbeatSessionContext) -> tuple[str, str]:
         text = (context.transcript_delta or context.pane_text or "").strip()

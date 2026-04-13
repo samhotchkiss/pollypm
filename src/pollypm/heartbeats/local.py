@@ -499,94 +499,30 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             pass
 
     def _detect_worker_completion(self, api, context: HeartbeatSessionContext) -> None:
-        """Detect when a worker is idle and ensure the user was notified.
+        """Detect when a worker is idle with open inbox threads it hasn't replied to.
 
-        Checks two things:
-        1. Was this worker recently assigned work (has closed threads to it)?
-        2. Was the user notified about the outcome?
-        If work was done but the user wasn't told, notify Polly to close the loop.
+        If the worker has open threads addressed to it and hasn't replied,
+        the delivery system will poke it on the next cycle. This method
+        just ensures delivery_state is reset to "pending" so the poke fires.
         """
         try:
-            from datetime import UTC, datetime
-            from pollypm.inbox_v2 import create_message, list_messages
+            from pollypm.inbox_v2 import list_messages, mark_delivered
 
-            store = api.supervisor.store
             config = api.supervisor.config
-
-            # Cooldown — don't re-fire within 10 minutes
-            last = store.last_event_at(context.session_name, "completion_detected")
-            if last is not None:
-                age = (datetime.now(UTC) - datetime.fromisoformat(last)).total_seconds()
-                if age < 600:
-                    return
-
             root = config.project.root_dir
 
-            # Check: are there recent closed threads TO this worker?
-            closed_to_worker = [
-                m for m in list_messages(root, status="closed")
+            # Find open threads addressed to this worker that are marked "delivered"
+            # but the worker hasn't replied (message_count still 1)
+            stale = [
+                m for m in list_messages(root, status="open")
                 if m.to == context.session_name
+                and m.delivery_state == "delivered"
+                and m.message_count <= 1
             ]
-            if not closed_to_worker:
-                return  # No work was assigned via inbox — nothing to check
 
-            # Check: was the user notified about any of these?
-            open_to_user = list_messages(root, status="open", owner="user")
-            closed_to_user = [m for m in list_messages(root, status="closed") if m.to == "user"]
-            all_user_msgs = open_to_user + closed_to_user
-
-            # Look for a user notification that references this worker's project
-            session = config.sessions.get(context.session_name)
-            project_key = session.project if session else ""
-            user_was_notified = any(
-                project_key and project_key in (m.subject.lower() + m.project)
-                for m in all_user_msgs
-                if m.created_at >= closed_to_worker[0].created_at  # only recent ones
-            )
-
-            if user_was_notified:
-                return  # User already knows
-
-            # User was NOT notified — notify them directly.
-            # Don't ask Polly to do it (she goes idle and forgets).
-            # The heartbeat has enough context to send a basic notification.
-            last_thread = closed_to_worker[0]
-            project = config.projects.get(project_key)
-            project_label = project.display_label() if project else project_key
-            project_path = project.path if project else ""
-
-            # Read the last reply in the thread for a summary
-            summary = ""
-            try:
-                from pollypm.inbox_v2 import read_message
-                _ctx, _hist, entries = read_message(root, last_thread.id)
-                if entries:
-                    # Last non-close entry
-                    for entry in reversed(entries):
-                        if not entry.body.startswith("[Closed]"):
-                            summary = entry.body[:300]
-                            break
-            except Exception:  # noqa: BLE001
-                pass
-
-            review_hint = f"`cd {project_path} && git log --oneline -5`" if project_path else "`pm status`"
-            create_message(
-                root,
-                sender="system",
-                subject=f"Done: {project_label} — work completed by {context.session_name}",
-                to="user",
-                owner="user",
-                body=(
-                    f"**Worker `{context.session_name}` finished its task on {project_label}.**\n\n"
-                    f"{summary}\n\n"
-                    f"**Review:** {review_hint}\n\n"
-                    f"Check the Agent tab in your inbox for the full thread."
-                ),
-            )
-            store.record_event(
-                context.session_name, "completion_detected",
-                f"Worker idle, user not notified — sent direct notification to user",
-            )
+            # Reset to pending so the delivery job pokes again
+            for m in stale:
+                mark_delivered(root, m.id, state="pending")
         except Exception:  # noqa: BLE001
             pass
 

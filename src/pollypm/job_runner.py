@@ -122,15 +122,14 @@ def _run_inbox_processor(supervisor: Supervisor, payload: dict[str, Any]) -> Non
 
 @register_job("inbox_delivery")
 def _run_inbox_delivery(supervisor: Supervisor, payload: dict[str, Any]) -> None:
-    """Deliver agent-targeted inbox messages and verify agents are working on them."""
-    from pollypm.inbox_delivery import check_active_work, deliver_pending_messages
-    result = deliver_pending_messages(supervisor.config)
-    if result["delivered"] or result["failed"]:
+    """Ensure every agent with open inbox items is actively working on them."""
+    from pollypm.inbox_delivery import ensure_inbox_progress
+    result = ensure_inbox_progress(supervisor.config)
+    if result["poked"]:
         supervisor.store.record_event(
             "inbox_delivery", "delivery",
-            f"Delivered {result['delivered']}, failed {result['failed']}, skipped {result['skipped']}",
+            f"Poked {result['poked']} idle agents, {result['active']} active, {result['skipped']} skipped",
         )
-    check_active_work(supervisor.config)
 
 
 @register_job("prune_state")

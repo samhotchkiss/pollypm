@@ -269,6 +269,8 @@ class SupervisorHeartbeatAPI:
         raw = {name: asdict(cursor) for name, cursor in cursors.items()}
         atomic_write_json(path, raw)
 
+    _MAX_TRANSCRIPT_DELTA = 64 * 1024  # 64KB max per heartbeat cycle
+
     def _read_transcript_delta(self, path: Path, last_offset: int) -> str:
         try:
             size = path.stat().st_size
@@ -277,9 +279,11 @@ class SupervisorHeartbeatAPI:
         start = min(max(0, last_offset), size)
         if start == size:
             return ""
+        # Cap the read to prevent huge transcripts from stalling the sweep
+        read_size = min(size - start, self._MAX_TRANSCRIPT_DELTA)
         try:
             with path.open("r", encoding="utf-8", errors="ignore") as handle:
                 handle.seek(start)
-                return handle.read()
+                return handle.read(read_size)
         except (FileNotFoundError, OSError):
             return ""

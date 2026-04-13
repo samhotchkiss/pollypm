@@ -1430,14 +1430,17 @@ class PollyInboxApp(App[None]):
         if index is None or index < 0 or index >= len(self._messages):
             return
         item = self._messages[index]
+        subject = item.subject if hasattr(item, "subject") else "message"
         try:
             from pollypm.messaging import close_message
             config = load_config(self.config_path)
             close_message(config.project.root_dir, item.path.name)
         except Exception:  # noqa: BLE001
+            self.notify("Archive failed", severity="error")
             return
         self.action_back()
         self._refresh_list()
+        self.notify(f"Archived: {subject[:40]}", severity="information")
 
     def _resolve_reply_target(self) -> str:
         """Determine which session to reply to."""
@@ -1484,6 +1487,7 @@ class PollyInboxApp(App[None]):
             sup.send_input(target, reply_text, owner="human", force=True)
             sup.store.close()
             status_w.update(f"[#3fb950]Sent to {target}[/#3fb950]")
+            self.notify(f"Reply sent to {target}", severity="information")
             # Auto-archive after reply
             if self._tab == "open" and self._reading_index < len(self._messages):
                 item = self._messages[self._reading_index]

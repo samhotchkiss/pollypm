@@ -899,6 +899,8 @@ def reset(
     # Clear stale leases — mounted cockpit leases would block recovery on restart
     try:
         supervisor.store.execute("DELETE FROM leases")
+        supervisor.store.execute("DELETE FROM session_runtime")
+        supervisor.store.execute("DELETE FROM alerts WHERE status = 'open'")
         supervisor.store.commit()
     except Exception:  # noqa: BLE001
         pass

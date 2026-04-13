@@ -934,6 +934,42 @@ def decisions(
         typer.echo()
 
 
+@app.command("costs")
+def costs(
+    project: str | None = typer.Option(None, "--project", help="Filter by project key."),
+    days: int = typer.Option(7, "--days", help="Look back N days."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    """Show token usage by project for the last N days."""
+    config = load_config(config_path)
+    from pollypm.storage.state import StateStore
+    store = StateStore(config.project.state_db)
+    rows = store.execute(
+        """
+        SELECT project_key, SUM(tokens_used) as total,
+               COUNT(DISTINCT substr(hour_bucket, 1, 10)) as days_active
+        FROM token_usage_hourly
+        WHERE hour_bucket >= date('now', ?)
+        GROUP BY project_key
+        ORDER BY total DESC
+        """,
+        (f"-{days} days",),
+    ).fetchall()
+    store.close()
+    if not rows:
+        typer.echo("No token usage data.")
+        return
+    typer.echo(f"Token usage (last {days} days):\n")
+    total_all = 0
+    for row in rows:
+        proj_key, total, days_active = row[0], int(row[1]), int(row[2])
+        if project and proj_key != project:
+            continue
+        typer.echo(f"  {proj_key}: {total:,} tokens ({days_active} active day(s))")
+        total_all += total
+    typer.echo(f"\n  Total: {total_all:,} tokens")
+
+
 @app.command("worktrees")
 def worktrees(
     project: str | None = typer.Option(None, "--project", help="Optional project key filter."),

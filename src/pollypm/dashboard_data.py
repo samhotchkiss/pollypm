@@ -138,6 +138,20 @@ def _session_description(status: str, role: str, snapshot_path: str | None) -> s
     if snapshot_path:
         try:
             text = Path(snapshot_path).read_text(errors="ignore")
+            # Check for progress indicators first
+            import re
+            for line in text.strip().splitlines():
+                stripped = line.strip()
+                # pytest: "312 passed in 24.80s" or "collecting ..."
+                if re.search(r"\d+ passed", stripped):
+                    return stripped[:70]
+                # npm/build progress
+                if "building" in stripped.lower() and ("%" in stripped or "/" in stripped):
+                    return stripped[:70]
+                # Working indicator with time
+                m = re.search(r"Working \((\d+[ms]\s?\d*s?)\s*", stripped)
+                if m:
+                    return f"working ({m.group(1)})"
             # Look for meaningful lines in the snapshot
             for line in reversed(text.strip().splitlines()):
                 line = line.strip()

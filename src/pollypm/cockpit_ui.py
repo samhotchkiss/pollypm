@@ -927,232 +927,185 @@ class PollyProjectSettingsApp(App[None]):
 
 
 class PollyDashboardApp(App[None]):
-    """Rich dashboard with live status, activity feed, and token chart."""
+    """Rich dashboard: what's happening, what got done, token usage."""
 
     TITLE = "PollyPM"
     SUB_TITLE = "Dashboard"
     CSS = """
     Screen {
         background: #0d1117;
-        color: #e6edf3;
+        color: #c9d1d9;
         padding: 0 1;
         layout: vertical;
         overflow-y: auto;
     }
-    .section-header {
+    .header { padding: 1 0 0 0; }
+    .header-title { color: #e6edf3; text-style: bold; }
+    .header-stats { color: #8b949e; }
+    .section-title {
         color: #58a6ff;
         text-style: bold;
         padding: 1 0 0 0;
     }
-    .section-rule {
-        color: #21262d;
-    }
-    #status-bar {
-        color: #8b949e;
-        padding: 0 0 1 0;
-    }
-    #active-work {
-        padding: 0 0 0 2;
-    }
-    #activity-feed {
-        padding: 0 0 0 2;
-        color: #8b949e;
-    }
-    #token-chart {
-        padding: 0 0 0 2;
-    }
-    #alerts-section {
-        padding: 0 0 0 2;
-        color: #f85149;
-    }
-    .session-working { color: #3fb950; }
-    .session-progress { color: #d29922; }
-    .session-waiting { color: #f85149; }
-    .session-idle { color: #484f58; }
-    .dim { color: #484f58; }
-    .accent { color: #58a6ff; }
-    .warn { color: #d29922; }
-    .good { color: #3fb950; }
+    .section-body { padding: 0 0 0 2; }
+    .done-section { padding: 0 0 0 2; }
+    .chart-section { padding: 0 0 0 2; }
+    .footer { color: #484f58; padding: 1 0 0 0; }
     """
 
     def __init__(self, config_path: Path) -> None:
         super().__init__()
         self.config_path = config_path
-        self.status_bar = Static("", id="status-bar", markup=True)
-        self.active_header = Static("[b]Active Work[/b]", classes="section-header", markup=True)
-        self.active_work = Static("", id="active-work", markup=True)
-        self.activity_header = Static("[b]Last 24 Hours[/b]", classes="section-header", markup=True)
-        self.activity_feed = Static("", id="activity-feed", markup=True)
-        self.token_header = Static("[b]Token Usage[/b]", classes="section-header", markup=True)
-        self.token_chart = Static("", id="token-chart", markup=True)
-        self.alerts_section = Static("", id="alerts-section", markup=True)
+        self.header_w = Static("", classes="header", markup=True)
+        self.now_title = Static("[b]Now[/b]", classes="section-title", markup=True)
+        self.now_body = Static("", classes="section-body", markup=True)
+        self.done_title = Static("[b]Done[/b]", classes="section-title", markup=True)
+        self.done_body = Static("", classes="done-section", markup=True)
+        self.chart_title = Static("[b]Tokens[/b]", classes="section-title", markup=True)
+        self.chart_body = Static("", classes="chart-section", markup=True)
+        self.footer_w = Static("", classes="footer", markup=True)
 
     def compose(self) -> ComposeResult:
-        yield self.status_bar
-        yield Static("", classes="section-rule")
-        yield self.active_header
-        yield self.active_work
-        yield Static("", classes="section-rule")
-        yield self.activity_header
-        yield self.activity_feed
-        yield Static("", classes="section-rule")
-        yield self.token_header
-        yield self.token_chart
-        yield self.alerts_section
+        yield self.header_w
+        yield self.now_title
+        yield self.now_body
+        yield self.done_title
+        yield self.done_body
+        yield self.chart_title
+        yield self.chart_body
+        yield self.footer_w
 
     def on_mount(self) -> None:
         self._refresh()
-        self.set_interval(8, self._refresh)
+        self.set_interval(10, self._refresh)
+
+    def _age_str(self, seconds: float) -> str:
+        if seconds < 60:
+            return "just now"
+        if seconds < 3600:
+            return f"{int(seconds // 60)}m ago"
+        if seconds < 86400:
+            return f"{int(seconds // 3600)}h ago"
+        return f"{int(seconds // 86400)}d ago"
 
     def _refresh(self) -> None:
-        from datetime import UTC, datetime, timedelta
-        from pollypm.messaging import list_open_messages
-
         try:
-            supervisor = Supervisor(load_config(self.config_path))
-        except Exception:  # noqa: BLE001
-            self.status_bar.update("[dim]Could not load config[/dim]")
+            from pollypm.dashboard_data import gather
+            config = load_config(self.config_path)
+            from pollypm.storage.state import StateStore
+            store = StateStore(config.project.state_db)
+            data = gather(config, store)
+            store.close()
+        except Exception as exc:  # noqa: BLE001
+            self.header_w.update(f"[dim]Error: {exc}[/dim]")
             return
 
-        config = supervisor.config
-        now = datetime.now(UTC)
+        # ── Header ──
+        parts = [f"[b]{len(config.projects)}[/b] projects", f"[b]{len(config.sessions)}[/b] agents"]
+        if data.inbox_count:
+            parts.append(f"[#d29922][b]{data.inbox_count}[/b] inbox[/#d29922]")
+        if data.alert_count:
+            parts.append(f"[#f85149][b]{data.alert_count}[/b] alerts[/#f85149]")
+        self.header_w.update("  " + "  \u00b7  ".join(parts))
 
-        # ── Status bar ──
-        project_count = len(config.projects)
-        session_count = len(config.sessions)
-        open_alerts = supervisor.store.open_alerts()
-        actionable = [a for a in open_alerts if a.alert_type not in (
-            "suspected_loop", "stabilize_failed", "needs_followup",
-        )]
-        inbox_count = len(list_open_messages(config.project.root_dir))
-        parts = [f"[b]{project_count}[/b] projects", f"[b]{session_count}[/b] sessions"]
-        if actionable:
-            parts.append(f"[#f85149][b]{len(actionable)}[/b] alerts[/#f85149]")
-        if inbox_count:
-            parts.append(f"[#d29922][b]{inbox_count}[/b] inbox[/#d29922]")
-        self.status_bar.update("  ".join(parts))
-
-        # ── Active Work ──
-        all_runtimes = supervisor.store.list_session_runtimes()
-        runtime_map = {rt.session_name: rt for rt in all_runtimes}
-        launches = supervisor.plan_launches()
-        work_lines: list[str] = []
-        for launch in launches:
-            if launch.session.role == "heartbeat-supervisor":
+        # ── Now: what's being worked on ──
+        lines: list[str] = []
+        for s in data.active_sessions:
+            if s.role == "heartbeat-supervisor":
                 continue
-            rt = runtime_map.get(launch.session.name)
-            status = rt.status if rt else "unknown"
-            project = config.projects.get(launch.session.project)
-            label = "Polly" if launch.session.role == "operator-pm" else (
-                project.display_label() if project else launch.session.project
-            )
-            age_str = ""
-            if rt and rt.updated_at:
-                try:
-                    age = (now - datetime.fromisoformat(rt.updated_at)).total_seconds()
-                    if age < 60:
-                        age_str = " [dim]just now[/dim]"
-                    elif age < 3600:
-                        age_str = f" [dim]{int(age // 60)}m ago[/dim]"
-                    else:
-                        age_str = f" [dim]{int(age // 3600)}h ago[/dim]"
-                except (ValueError, TypeError):
-                    pass
-            if status in ("healthy", "needs_followup"):
+            if s.status in ("healthy", "needs_followup"):
                 icon = "[#3fb950]\u25cf[/#3fb950]"
-                desc = "working"
-            elif status == "waiting_on_user":
+                name = f"[b]{s.project_label}[/b]" if s.role != "operator-pm" else "[b]Polly[/b]"
+                desc = s.description
+                age = f"[dim]{self._age_str(s.age_seconds)}[/dim]"
+                lines.append(f"{icon} {name}")
+                lines.append(f"  [dim]{desc}[/dim]  {age}")
+                lines.append("")
+            elif s.status == "waiting_on_user":
                 icon = "[#f85149]\u25c7[/#f85149]"
-                desc = "[#f85149]waiting on you[/#f85149]"
+                name = f"[b]{s.project_label}[/b]" if s.role != "operator-pm" else "[b]Polly[/b]"
+                lines.append(f"{icon} {name}")
+                lines.append(f"  [#f85149]{s.description}[/#f85149]")
+                lines.append("")
             else:
                 icon = "[dim]\u25cb[/dim]"
-                desc = f"[dim]{status}[/dim]"
-            work_lines.append(f"{icon} [b]{label}[/b]  {desc}{age_str}")
-        self.active_work.update("\n".join(work_lines) if work_lines else "[dim]No active sessions[/dim]")
+                name = f"[dim]{s.project_label}[/dim]" if s.role != "operator-pm" else "[dim]Polly[/dim]"
+                lines.append(f"{icon} {name}  [dim]{s.status}[/dim]")
+        self.now_body.update("\n".join(lines) if lines else "[dim]No active sessions[/dim]")
 
-        # ── Activity Feed ──
-        recent = supervisor.store.recent_events(limit=200)
-        cutoff = (now - timedelta(hours=24)).isoformat()
-        day_events = [e for e in recent if e.created_at >= cutoff]
-        sweeps = sum(1 for e in day_events if e.event_type == "heartbeat")
-        sends = sum(1 for e in day_events if e.event_type == "send_input")
-        recoveries = sum(1 for e in day_events if "recover" in e.event_type)
-        summary_parts: list[str] = []
-        if sweeps:
-            summary_parts.append(f"[#3fb950]{sweeps}[/#3fb950] heartbeat sweeps")
-        if sends:
-            summary_parts.append(f"[#58a6ff]{sends}[/#58a6ff] messages")
-        if recoveries:
-            summary_parts.append(f"[#d29922]{recoveries}[/#d29922] recoveries")
-        summary = "  \u00b7  ".join(summary_parts) if summary_parts else "[dim]No activity[/dim]"
+        # ── Done: commits + completed issues ──
+        done_lines: list[str] = []
+        if data.recent_commits:
+            done_lines.append(f"[#3fb950]\u2713[/#3fb950] [b]{len(data.recent_commits)}[/b] commits today")
+            for c in data.recent_commits[:6]:
+                age = self._age_str(c.age_seconds)
+                done_lines.append(
+                    f"  [dim]{c.hash}[/dim] {c.message}"
+                )
+            if len(data.recent_commits) > 6:
+                done_lines.append(f"  [dim]  + {len(data.recent_commits) - 6} more[/dim]")
+            done_lines.append("")
 
-        notable = [e for e in day_events if e.event_type not in (
-            "heartbeat", "token_ledger", "polly_followup", "scheduled", "ran",
-        )][:6]
-        feed_lines = [summary, ""]
-        for event in notable:
-            try:
-                ts = datetime.fromisoformat(event.created_at)
-                age = (now - ts).total_seconds()
-                if age < 60:
-                    t = "now"
-                elif age < 3600:
-                    t = f"{int(age // 60)}m"
-                else:
-                    t = f"{int(age // 3600)}h"
-            except (ValueError, TypeError):
-                t = "?"
-            msg = event.message[:55]
-            feed_lines.append(f"[dim]{t:>4}[/dim]  {event.session_name}: {msg}")
-        self.activity_feed.update("\n".join(feed_lines))
+        if data.completed_items:
+            done_lines.append(f"[#3fb950]\u2713[/#3fb950] [b]{len(data.completed_items)}[/b] issues completed")
+            for item in data.completed_items[:5]:
+                age = self._age_str(item.age_seconds)
+                done_lines.append(f"  [dim]\u2500[/dim] {item.title}  [dim]{age}[/dim]")
+            done_lines.append("")
 
-        # ── Token Chart ──
-        daily = supervisor.store.daily_token_usage(days=30)
-        if daily:
-            values = [t for _, t in daily]
+        if not data.recent_commits and not data.completed_items:
+            summary = []
+            if data.sweep_count_24h:
+                summary.append(f"[#3fb950]{data.sweep_count_24h}[/#3fb950] sweeps")
+            if data.message_count_24h:
+                summary.append(f"[#58a6ff]{data.message_count_24h}[/#58a6ff] messages")
+            if data.recovery_count_24h:
+                summary.append(f"[#d29922]{data.recovery_count_24h}[/#d29922] recoveries")
+            if summary:
+                done_lines.append("  ".join(summary))
+            else:
+                done_lines.append("[dim]No activity in the last 24 hours[/dim]")
+
+        self.done_body.update("\n".join(done_lines))
+
+        # ── Token chart ──
+        if data.daily_tokens:
+            values = [t for _, t in data.daily_tokens]
             max_val = max(values) or 1
-            total = sum(values)
-            today_str = now.strftime("%Y-%m-%d")
-            today_tokens = next((t for d, t in daily if d == today_str), 0)
+            chart_height = 6
+            bars = [max(0, min(chart_height, round(v / max_val * chart_height))) for v in values]
 
-            # Build a proper bar chart with labels
-            chart_height = 8
             chart_lines: list[str] = []
-            # Normalize to chart height
-            bars = [min(chart_height, int(v / max_val * chart_height)) for v in values]
-            # Render top-down
             for row in range(chart_height, 0, -1):
-                line = ""
+                line_chars: list[str] = []
                 for bar_h in bars:
                     if bar_h >= row:
-                        line += "[#58a6ff]\u2588[/#58a6ff]"
+                        line_chars.append("[#58a6ff]\u2588\u2588[/#58a6ff]")
                     else:
-                        line += " "
-                chart_lines.append(f"  {line}")
-            # X-axis
-            axis = "\u2500" * len(bars)
-            chart_lines.append(f"  {axis}")
-            if len(daily) >= 2:
-                first = daily[0][0][-5:]
-                last = daily[-1][0][-5:]
-                pad = len(bars) - len(first) - len(last)
-                chart_lines.append(f"  [dim]{first}{' ' * max(1, pad)}{last}[/dim]")
+                        line_chars.append("  ")
+                chart_lines.append("".join(line_chars))
+
+            axis = "[dim]" + "\u2500\u2500" * len(bars) + "[/dim]"
+            chart_lines.append(axis)
+            if len(data.daily_tokens) >= 2:
+                first = data.daily_tokens[0][0][-5:]
+                last = data.daily_tokens[-1][0][-5:]
+                pad = max(1, len(bars) * 2 - len(first) - len(last))
+                chart_lines.append(f"[dim]{first}{' ' * pad}{last}[/dim]")
             chart_lines.append("")
-            chart_lines.append(f"  [b]{total:,}[/b] tokens total  \u00b7  [b]{today_tokens:,}[/b] today")
-            self.token_chart.update("\n".join(chart_lines))
+            chart_lines.append(
+                f"[b]{data.total_tokens:,}[/b] total  \u00b7  [b]{data.today_tokens:,}[/b] today"
+            )
+            self.chart_body.update("\n".join(chart_lines))
         else:
-            self.token_chart.update("[dim]  No token data yet[/dim]")
+            self.chart_body.update("[dim]No token data yet[/dim]")
 
-        # ── Alerts ──
-        if actionable:
-            alert_lines = [""]
-            for a in actionable[:4]:
-                alert_lines.append(f"[#f85149]\u25b2[/#f85149] {a.session_name}: {a.message[:55]}")
-            self.alerts_section.update("\n".join(alert_lines))
-        else:
-            self.alerts_section.update("")
-
-        supervisor.store.close()
+        # ── Footer ──
+        self.footer_w.update(
+            "[dim]Click Polly to connect  \u00b7  "
+            f"{data.sweep_count_24h} sweeps today  \u00b7  "
+            f"{data.message_count_24h} messages[/dim]"
+        )
 
 
 class PollyCockpitPaneApp(App[None]):

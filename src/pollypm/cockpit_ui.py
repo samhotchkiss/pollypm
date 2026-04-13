@@ -1157,16 +1157,19 @@ class PollyInboxApp(App[None]):
         layout: vertical;
     }
     #tab-bar {
-        height: 3;
+        height: 5;
         background: #161b22;
         padding: 1 2;
     }
     .tab-btn {
         min-width: 14;
         margin-right: 1;
-        background: #21262d;
-        color: #8b949e;
-        border: none;
+        background: #30363d;
+        color: #e6edf3;
+        text-style: bold;
+    }
+    .tab-btn:hover {
+        background: #484f58;
     }
     .tab-btn.active {
         background: #1f6feb;
@@ -1202,12 +1205,22 @@ class PollyInboxApp(App[None]):
         padding: 1 0;
     }
     #detail-actions {
-        height: 3;
+        height: 5;
         padding: 1 0;
     }
     #detail-actions Button {
         margin-right: 1;
-        min-width: 10;
+        min-width: 12;
+        background: #30363d;
+        color: #e6edf3;
+        text-style: bold;
+    }
+    #detail-actions Button:hover {
+        background: #484f58;
+    }
+    #btn-archive {
+        background: #1f6feb;
+        color: #ffffff;
     }
     #hint {
         height: 1;
@@ -1247,6 +1260,8 @@ class PollyInboxApp(App[None]):
     def on_mount(self) -> None:
         self._refresh_list()
         self._update_hint()
+        # Focus the message list so keyboard works immediately
+        self.query_one("#msg-list", ListView).focus()
         self.set_interval(10, self._auto_refresh)
 
     def _auto_refresh(self) -> None:
@@ -1405,16 +1420,19 @@ class PollyInboxApp(App[None]):
         self._set_active_tab("open")
         self.action_back()
         self._refresh_list()
+        self.query_one("#msg-list", ListView).focus()
 
     def action_show_archived(self) -> None:
         self._set_active_tab("archived")
         self.action_back()
         self._refresh_list()
+        self.query_one("#msg-list", ListView).focus()
 
     def action_show_decisions(self) -> None:
         self._set_active_tab("decisions")
         self.action_back()
         self._refresh_list()
+        self.query_one("#msg-list", ListView).focus()
 
 
 class PollyCockpitPaneApp(App[None]):

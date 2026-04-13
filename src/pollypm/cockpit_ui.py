@@ -28,6 +28,45 @@ from pollypm.cockpit import CockpitItem, CockpitRouter, build_cockpit_detail
 from pollypm.supervisor import Supervisor
 
 
+import re as _re
+
+
+def _md_to_rich(text: str) -> str:
+    """Convert common markdown to Rich markup for Textual Static widgets."""
+    lines: list[str] = []
+    in_code = False
+    for line in text.splitlines():
+        if line.strip().startswith("```"):
+            in_code = not in_code
+            lines.append("[dim]" + line + "[/dim]" if not in_code else "[dim]" + line + "[/dim]")
+            continue
+        if in_code:
+            lines.append(f"[dim]{line}[/dim]")
+            continue
+        # Headers
+        if line.startswith("### "):
+            lines.append(f"[b]{line[4:]}[/b]")
+        elif line.startswith("## "):
+            lines.append(f"\n[b]{line[3:]}[/b]")
+        elif line.startswith("# "):
+            lines.append(f"\n[b u]{line[2:]}[/b u]")
+        else:
+            # Inline formatting first (applies to all non-code lines)
+            line = _re.sub(r"\*\*(.+?)\*\*", r"[b]\1[/b]", line)
+            line = _re.sub(r"\*(.+?)\*", r"[i]\1[/i]", line)
+            line = _re.sub(r"`(.+?)`", r"[dim]\1[/dim]", line)
+            # Bullet points
+            if line.strip().startswith("- "):
+                indent = len(line) - len(line.lstrip())
+                content = line.strip()[2:]
+                lines.append(f"{'  ' * (indent // 2)}  • {content}")
+            elif _re.match(r"\s*\d+\.\s", line):
+                lines.append(f"  {line.strip()}")
+            else:
+                lines.append(line)
+    return "\n".join(lines)
+
+
 ASCII_POLLY = "\n".join(
     [
         "█▀█ █▀█ █   █   █▄█",
@@ -1355,8 +1394,9 @@ class PollyInboxApp(App[None]):
                     parts: list[str] = []
                     for entry in entries:
                         ts = _fmt_time(entry.timestamp) if entry.timestamp else ""
-                        parts.append(f"[b][{entry.sender}][/b] [dim]{ts}[/dim]\n{entry.body}")
-                    self._bodies[i] = "\n\n───\n\n".join(parts)
+                        body = _md_to_rich(entry.body)
+                        parts.append(f"[b][{entry.sender}][/b] [dim]{ts}[/dim]\n{body}")
+                    self._bodies[i] = "\n\n[dim]───[/dim]\n\n".join(parts)
             except Exception:  # noqa: BLE001
                 self._bodies[i] = ""
 

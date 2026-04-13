@@ -887,24 +887,47 @@ def mail(
 
     # Read a specific message
     if message_id:
+        from rich.console import Console
+        from rich.markdown import Markdown
+        from rich.panel import Panel
+        from rich.text import Text
+
         match = find_v2_message(root, message_id)
         if match is None:
             typer.echo(f"Message not found: {message_id}")
             raise typer.Exit(code=1)
         _ctx, _hist, entries = read_v2_message(root, match.id)
-        typer.echo(f"Subject: {match.subject}")
-        typer.echo(f"From: {match.sender}")
-        typer.echo(f"Date: {_fmt_time(match.created_at)}")
-        typer.echo(f"Status: {match.status}")
-        typer.echo(f"Owner: {match.owner}")
-        typer.echo(f"{'─' * 60}")
+        console = Console()
+
+        # Header
+        header = Text()
+        header.append(f"{match.subject}\n", style="bold")
+        header.append(f"From: ", style="dim")
+        header.append(f"{match.sender}")
+        header.append(f"  ·  ", style="dim")
+        header.append(f"{_fmt_time(match.created_at)}")
+        header.append(f"  ·  ", style="dim")
+        header.append(f"{match.status}", style="bold green" if match.status == "open" else "dim")
+        if match.to:
+            header.append(f"  →  ", style="dim")
+            header.append(f"{match.to}")
+        console.print(Panel(header, border_style="blue"))
+
+        # Thread entries
         for entry in entries:
-            typer.echo(f"\n  [{entry.sender}] {_fmt_time(entry.timestamp)}")
-            typer.echo(f"  {entry.body}")
-        typer.echo(f"\n{'─' * 60}")
+            sender_style = "bold cyan" if entry.sender in ("user", "human") else "bold yellow"
+            console.print()
+            console.print(f"  [{sender_style}]\\[{entry.sender}][/{sender_style}] [dim]{_fmt_time(entry.timestamp)}[/dim]")
+            console.print()
+            # Render body as markdown for rich formatting
+            md = Markdown(entry.body, code_theme="monokai")
+            console.print(md, width=console.width - 4)
+            console.print(f"  [dim]{'─' * min(60, console.width - 6)}[/dim]")
+
+        console.print()
         if match.status != "closed":
-            typer.echo(f"Reply: pm mail --reply {match.id} --text 'your reply'")
-            typer.echo(f"Close: pm mail --close {match.id} --note 'what was done'")
+            console.print(f"[dim]Reply:[/dim] pm mail --reply {match.id} --text 'your reply'")
+            console.print(f"[dim]Close:[/dim] pm mail --close {match.id} --note 'what was done'")
         return
 
     # Default: list messages

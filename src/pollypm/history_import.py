@@ -219,14 +219,32 @@ def build_timeline(project_root: Path, sources: DiscoveredSources) -> list[Timel
     for config_path in sources.config_files:
         timeline.extend(_config_file_to_timeline(config_path, project_root))
 
+    # Filter out heartbeat/monitoring noise before extraction
+    _NOISE_PATTERNS = [
+        "heartbeat sweep completed",
+        "token_ledger",
+        "Standing by",
+        "You appear stalled",
+        "You appear idle",
+        "Supervision check",
+        "nudge",
+        "[token_usage]",
+    ]
+    filtered: list[TimelineEntry] = []
+    for entry in timeline:
+        summary_lower = entry.summary.lower()
+        if any(noise.lower() in summary_lower for noise in _NOISE_PATTERNS):
+            continue
+        filtered.append(entry)
+
     # Sort chronologically
-    timeline.sort(key=lambda entry: entry.sort_key())
+    filtered.sort(key=lambda entry: entry.sort_key())
 
     # Bound the timeline
-    if len(timeline) > MAX_TIMELINE_EVENTS:
-        timeline = timeline[-MAX_TIMELINE_EVENTS:]
+    if len(filtered) > MAX_TIMELINE_EVENTS:
+        filtered = filtered[-MAX_TIMELINE_EVENTS:]
 
-    return timeline
+    return filtered
 
 
 def _git_commits_to_timeline(project_root: Path) -> list[TimelineEntry]:
@@ -621,8 +639,10 @@ def generate_docs(
         )),
     ]
     if understanding.deprecated_facts:
+        # Cap deprecated facts to avoid enormous files (otter_camp generated 320KB)
+        capped = understanding.deprecated_facts[:100]
         docs_to_write.append(
-            ("deprecated-facts", "Deprecated Facts", _render_deprecated_facts(understanding.deprecated_facts, ts))
+            ("deprecated-facts", "Deprecated Facts", _render_deprecated_facts(capped, ts))
         )
 
     for name, title, content in docs_to_write:

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from pollypm.agent_profiles.base import AgentProfile, AgentProfileContext
-from pollypm.messaging import list_open_messages
+from pollypm.inbox_v2 import list_messages as list_v2_messages
 from pollypm.rules import render_session_manifest
 from pollypm.storage.state import StateStore
 from pollypm.task_backends import get_task_backend
@@ -129,9 +129,9 @@ def worker_prompt() -> str:
 
 
 def _render_operator_inbox_brief(context: AgentProfileContext) -> str:
-    items = list_open_messages(context.config.project.root_dir)
+    items = list_v2_messages(context.config.project.root_dir, status="open")
     lines = [
-        "Monitor `.pollypm/inbox/open/` continuously.",
+        "Monitor `.pollypm/inbox/messages/` continuously.",
         "PM owns inbox triage. Keep policy, scope, and priority questions with PM.",
         "Route execution-only requests to PA.",
         "Worker replies must return through PA before the thread is updated for PM review.",

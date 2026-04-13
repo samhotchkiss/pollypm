@@ -8,7 +8,7 @@ from pathlib import Path
 
 from pollypm.atomic_io import atomic_write_json
 from pollypm.config import load_config
-from pollypm.messaging import list_open_messages
+from pollypm.inbox_v2 import list_messages as list_v2_messages, read_message as read_v2_message
 from pollypm.providers import get_provider
 from pollypm.projects import ensure_project_scaffold
 from pollypm.runtimes import get_runtime
@@ -190,7 +190,7 @@ class CockpitRouter:
         supervisor = self._load_supervisor()
         config = supervisor.config
         launches, windows, alerts, _leases, _errors = supervisor.status()
-        inbox_count = len(list_open_messages(config.project.root_dir))
+        inbox_count = len(list_v2_messages(config.project.root_dir, status="open"))
         items = [
             CockpitItem("polly", "Polly", self._session_state("operator", launches, windows, alerts, spinner_index)),
             CockpitItem("inbox", f"Inbox ({inbox_count})", "mail" if inbox_count else "clear"),
@@ -791,7 +791,7 @@ def _build_dashboard(supervisor, config) -> str:
     project_count = len(config.projects)
     session_count = len(config.sessions)
     open_alerts = supervisor.store.open_alerts()
-    inbox_count = len(list_open_messages(config.project.root_dir))
+    inbox_count = len(list_v2_messages(config.project.root_dir, status="open"))
     actionable_alerts = [a for a in open_alerts if a.alert_type not in (
         "suspected_loop", "stabilize_failed", "needs_followup",
     )]
@@ -938,10 +938,9 @@ def _build_cockpit_detail_inner(config_path: Path, kind: str, target: str | None
         return _build_dashboard(supervisor, config)
 
     if kind == "inbox":
-        from pollypm.messaging import list_closed_messages
         from pollypm.inbox_processor import list_decisions
-        messages = list_open_messages(config.project.root_dir)
-        archived = list_closed_messages(config.project.root_dir)
+        messages = list_v2_messages(config.project.root_dir, status="open")
+        archived = list_v2_messages(config.project.root_dir, status="closed")
         decisions = list_decisions(config.project.root_dir, limit=5)
 
         lines = ["Inbox"]
@@ -958,8 +957,12 @@ def _build_cockpit_detail_inner(config_path: Path, kind: str, target: str | None
                         prefix = "◆ "
                     lines.append(f"  {prefix}{msg.subject}")
                     lines.append(f"    from {msg.sender} · {msg.created_at[:16]}")
-                    # Show first line of body
-                    first_line = msg.body.strip().split("\n")[0][:70] if msg.body else ""
+                    # Show first line of body from entries
+                    try:
+                        _ctx, _hist, entries = read_v2_message(config.project.root_dir, msg.id)
+                        first_line = entries[0].body.strip().split("\n")[0][:70] if entries else ""
+                    except Exception:  # noqa: BLE001
+                        first_line = ""
                     if first_line:
                         lines.append(f"    {first_line}")
                     lines.append("")

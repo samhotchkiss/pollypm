@@ -256,7 +256,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
     def _escalate_to_inbox(self, api, context: HeartbeatSessionContext, reason: str) -> None:
         """Escalate a stuck session to the inbox for Polly or user to handle."""
         try:
-            from pollypm.messaging import create_message
+            from pollypm.inbox_v2 import create_message
             snippet = (context.pane_text or "").strip()[-200:] if context.pane_text else "no snapshot available"
             create_message(
                 api.supervisor.config.project.root_dir,

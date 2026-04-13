@@ -9,7 +9,7 @@ from typing import Any
 from urllib import error, request
 
 from pollypm.atomic_io import atomic_write_json
-from pollypm.messaging import create_message
+from pollypm.inbox_v2 import create_message
 
 
 ITSALIVE_API = "https://api.itsalive.co"

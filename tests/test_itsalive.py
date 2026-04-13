@@ -32,8 +32,12 @@ def test_first_deploy_persists_pending_verification(tmp_path: Path, monkeypatch)
     pending = itsalive.pending_deploys(tmp_path)
     assert len(pending) == 1
     assert pending[0].deploy_id == "dep_123"
-    inbox = tmp_path / ".pollypm" / "inbox" / "open"
-    assert any("verification required" in path.read_text() for path in inbox.glob("*.md"))
+    inbox_msgs = tmp_path / ".pollypm" / "inbox" / "messages"
+    assert any(
+        "verification required" in path.read_text()
+        for msg_dir in inbox_msgs.iterdir() if msg_dir.is_dir()
+        for path in msg_dir.glob("0*.md")
+    )
 
 
 def test_verified_owner_skips_verification_and_completes(tmp_path: Path, monkeypatch) -> None:
@@ -115,8 +119,12 @@ def test_sweep_completes_verified_pending_deploy(tmp_path: Path, monkeypatch) ->
     assert outcomes[0].status == "deployed"
     assert uploads == ["index.html"]
     assert not list((tmp_path / ".pollypm-state" / "itsalive" / "pending").glob("*.json"))
-    inbox = tmp_path / ".pollypm" / "inbox" / "open"
-    assert any("deploy completed" in path.read_text() for path in inbox.glob("*.md"))
+    inbox_msgs = tmp_path / ".pollypm" / "inbox" / "messages"
+    assert any(
+        "deploy completed" in path.read_text()
+        for msg_dir in inbox_msgs.iterdir() if msg_dir.is_dir()
+        for path in msg_dir.glob("0*.md")
+    )
 
 
 def test_push_deploy_uses_existing_project_token(tmp_path: Path, monkeypatch) -> None:

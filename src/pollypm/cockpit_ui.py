@@ -1259,6 +1259,7 @@ class PollyInboxApp(App[None]):
         self.config_path = config_path
         self._tab = "open"
         self._messages: list = []
+        self._bodies: dict[int, str] = {}  # index -> body text cache
         self._reading = False
         self._reading_index = -1
 
@@ -1316,26 +1317,31 @@ class PollyInboxApp(App[None]):
         elif "[Decision]" in item.subject:
             icon = "[#d29922]\u25c6 [/#d29922]"
         subject = item.subject[:60]
-        preview = item.body.strip().split("\n")[0][:70] if item.body else ""
+        # v2 messages: look up cached body; v1 had .body directly
+        idx = next((i for i, m in enumerate(self._messages) if m is item), -1)
+        body = self._bodies.get(idx, "")
+        preview = body.strip().split("\n")[0][:70] if body else ""
         return f"{icon}[b]{subject}[/b]\n[dim]  {item.sender} \u00b7 {_fmt_time(item.created_at)}  \u00b7  {preview}[/dim]"
 
     def _load_messages(self) -> None:
-        from pollypm.messaging import list_closed_messages as _closed
+        from pollypm.inbox_v2 import list_messages as list_v2, read_message as read_v2
         from pollypm.inbox_processor import list_decisions as _decisions
-        from pollypm.inbox_v2 import list_messages as list_v2
         config = load_config(self.config_path)
+        self._bodies = {}
         if self._tab == "open":
-            # Show v2 messages (richer) + v1 messages (legacy)
-            from pollypm.messaging import list_open_messages as _open
-            v1_msgs = _open(config.project.root_dir)
-            v2_msgs = list_v2(config.project.root_dir, status="open")
-            # Convert v2 to a format the UI can render
-            self._messages = v1_msgs  # v1 for now, v2 shown in v2 tab
-            self._v2_messages = v2_msgs
+            self._messages = list_v2(config.project.root_dir, status="open")
         elif self._tab == "archived":
-            self._messages = _closed(config.project.root_dir)
+            self._messages = list_v2(config.project.root_dir, status="closed")
         elif self._tab == "decisions":
             self._messages = _decisions(config.project.root_dir, limit=30)
+            return
+        # Pre-fetch bodies for v2 messages
+        for i, msg in enumerate(self._messages):
+            try:
+                _ctx, _hist, entries = read_v2(config.project.root_dir, msg.id)
+                self._bodies[i] = entries[0].body if entries else ""
+            except Exception:  # noqa: BLE001
+                self._bodies[i] = ""
 
     def _show_detail(self, index: int) -> None:
         if index < 0 or index >= len(self._messages):
@@ -1367,7 +1373,7 @@ class PollyInboxApp(App[None]):
                 f"[dim]From:[/dim] {item.sender}  \u00b7  "
                 f"[dim]Date:[/dim] {_fmt_time(item.created_at)}"
             )
-            body.update(item.body)
+            body.update(self._bodies.get(index, ""))
         archive_btn = self.query_one("#btn-archive", Button)
         archive_btn.display = self._tab == "open"
         self._update_hint()
@@ -1441,9 +1447,9 @@ class PollyInboxApp(App[None]):
         item = self._messages[index]
         subject = item.subject if hasattr(item, "subject") else "message"
         try:
-            from pollypm.messaging import close_message
+            from pollypm.inbox_v2 import close_message as close_v2
             config = load_config(self.config_path)
-            close_message(config.project.root_dir, item.path.name)
+            close_v2(config.project.root_dir, item.id, sender="user", note="Archived from cockpit")
         except Exception:  # noqa: BLE001
             self.notify("Archive failed", severity="error")
             return
@@ -1462,7 +1468,7 @@ class PollyInboxApp(App[None]):
         session_map = {"heartbeat": "operator", "system": "operator", "polly": "operator"}
         target = session_map.get(sender, "operator")
         # Check if the message body mentions a specific session
-        body = item.body if hasattr(item, "body") else ""
+        body = self._bodies.get(self._reading_index, "")
         for word in body.split():
             if word.startswith(("worker_", "operator")):
                 cleaned = word.strip("'\".,;:()")
@@ -1494,23 +1500,10 @@ class PollyInboxApp(App[None]):
         # 1. Record reply in the thread (persistent history)
         if self._reading_index >= 0 and self._reading_index < len(self._messages):
             item = self._messages[self._reading_index]
-            if self._tab != "decisions" and hasattr(item, "path"):
+            if self._tab != "decisions" and hasattr(item, "id"):
                 try:
-                    from pollypm.messaging import create_thread, append_thread_message, list_threads
-                    # Check if already a thread
-                    threads = list_threads(config.project.root_dir, include_closed=True)
-                    thread = next(
-                        (t for t in threads if hasattr(item, "path") and item.path.stem in t.thread_id),
-                        None,
-                    )
-                    if thread is None and "open" in str(item.path.parent):
-                        # Convert to thread
-                        thread = create_thread(config.project.root_dir, item.path.name, actor="user", owner="pm")
-                    if thread:
-                        append_thread_message(
-                            config.project.root_dir, thread.thread_id,
-                            sender="user", subject=f"Re: {item.subject[:50]}", body=reply_text,
-                        )
+                    from pollypm.inbox_v2 import reply_to_message as reply_v2
+                    reply_v2(config.project.root_dir, item.id, sender="user", body=reply_text)
                 except Exception:  # noqa: BLE001
                     pass  # Thread recording is best-effort
 

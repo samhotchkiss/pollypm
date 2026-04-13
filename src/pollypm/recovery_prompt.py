@@ -212,20 +212,17 @@ def _build_from_checkpoint(
 def _pending_inbox_section(config: PollyPMConfig) -> RecoveryPromptSection | None:
     """Build a section listing pending inbox items the agent should address."""
     try:
-        from pollypm.messaging import list_open_messages, list_threads
-        messages = list_open_messages(config.project.root_dir)
-        threads = list_threads(config.project.root_dir)
-        if not messages and not threads:
+        from pollypm.inbox_v2 import list_messages as list_v2
+        messages = list_v2(config.project.root_dir, status="open")
+        if not messages:
             return None
         parts: list[str] = []
-        if messages:
-            parts.append(f"You have {len(messages)} pending inbox message(s):")
-            for msg in messages[:5]:
-                parts.append(f"  - {msg.subject} (from {msg.sender})")
-        if threads:
-            parts.append(f"You have {len(threads)} active thread(s):")
-            for t in threads[:5]:
-                parts.append(f"  - {t.subject} ({len(t.message_paths)} messages, owner: {t.owner})")
+        parts.append(f"You have {len(messages)} pending inbox message(s):")
+        for msg in messages[:5]:
+            parts.append(f"  - {msg.subject} (from {msg.sender}, owner: {msg.owner})")
+        threaded = [m for m in messages if m.message_count > 1]
+        if threaded:
+            parts.append(f"{len(threaded)} of these have multiple messages (threads).")
         parts.append("Check with: pm mail")
         return RecoveryPromptSection(
             key="pending_inbox",

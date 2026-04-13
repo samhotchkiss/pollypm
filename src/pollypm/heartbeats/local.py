@@ -242,10 +242,12 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             reason=reason,
         )
 
-        # Detect worker completion — if a worker was recently active and is now
-        # idle, notify Polly so the work gets reviewed and the user gets told.
-        if not mechanical_only and context.role == "worker" and verdict in ("done", "idle"):
-            self._detect_worker_completion(api, context)
+        # Detect worker completion — check on every sweep for workers showing
+        # identical snapshots (at a prompt, not actively working).
+        if not mechanical_only and context.role == "worker":
+            hashes = api.recent_snapshot_hashes(context.session_name, limit=2)
+            if len(hashes) >= 2 and hashes[0] == hashes[1]:
+                self._detect_worker_completion(api, context)
 
         # Use the structured classification engine for intervention decisions
         if not mechanical_only:
@@ -497,52 +499,71 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             pass
 
     def _detect_worker_completion(self, api, context: HeartbeatSessionContext) -> None:
-        """Detect when a worker finishes and notify Polly via inbox.
+        """Detect when a worker is idle and ensure the user was notified.
 
-        Fires when: worker was recently active (healthy/needs_followup) in the
-        last few heartbeats but is now idle/done. This means work was completed
-        but nobody was told.
+        Checks two things:
+        1. Was this worker recently assigned work (has closed threads to it)?
+        2. Was the user notified about the outcome?
+        If work was done but the user wasn't told, notify Polly to close the loop.
         """
         try:
+            from datetime import UTC, datetime
+            from pollypm.inbox_v2 import create_message, list_messages
+
             store = api.supervisor.store
-            # Check if we already sent a completion notice recently
+            config = api.supervisor.config
+
+            # Cooldown — don't re-fire within 10 minutes
             last = store.last_event_at(context.session_name, "completion_detected")
             if last is not None:
-                from datetime import UTC, datetime
                 age = (datetime.now(UTC) - datetime.fromisoformat(last)).total_seconds()
-                if age < 600:  # 10 minute cooldown
+                if age < 600:
                     return
 
-            # Check previous status — was the worker recently active?
-            rt = store.get_session_runtime(context.session_name)
-            if rt is None:
-                return
-            # If previous status was already idle, this isn't a transition
-            if rt.status in ("idle", "disabled", "switching"):
-                return
+            root = config.project.root_dir
 
-            # Worker was active and is now idle → completion detected
-            from pollypm.inbox_v2 import create_message
-            config = api.supervisor.config
+            # Check: are there recent closed threads TO this worker?
+            closed_to_worker = [
+                m for m in list_messages(root, status="closed")
+                if m.to == context.session_name
+            ]
+            if not closed_to_worker:
+                return  # No work was assigned via inbox — nothing to check
+
+            # Check: was the user notified about any of these?
+            open_to_user = list_messages(root, status="open", owner="user")
+            closed_to_user = [m for m in list_messages(root, status="closed") if m.to == "user"]
+            all_user_msgs = open_to_user + closed_to_user
+
+            # Look for a user notification that references this worker's project
             session = config.sessions.get(context.session_name)
-            project_key = session.project if session else "unknown"
+            project_key = session.project if session else ""
+            user_was_notified = any(
+                project_key and project_key in (m.subject.lower() + m.project)
+                for m in all_user_msgs
+                if m.created_at >= closed_to_worker[0].created_at  # only recent ones
+            )
 
+            if user_was_notified:
+                return  # User already knows
+
+            # User was NOT notified — tell Polly to close the loop
             create_message(
-                config.project.root_dir,
+                root,
                 sender="heartbeat",
-                subject=f"Worker {context.session_name} finished — review needed",
+                subject=f"Worker {context.session_name} finished but user not notified",
                 to="polly",
                 owner="polly",
                 body=(
-                    f"Worker '{context.session_name}' (project: {project_key}) appears to have "
-                    f"completed its work and is now idle. Please review the output, check git "
-                    f"for uncommitted changes, and notify the user of the result. "
-                    f"Use: pm notify '<what was done>' '<details>' --to user"
+                    f"Worker '{context.session_name}' (project: {project_key}) completed work "
+                    f"and the thread was closed, but no notification was sent to the user. "
+                    f"Review what was done and notify the user: "
+                    f"pm notify 'Done: <summary>' '<details>' --to user"
                 ),
             )
             store.record_event(
                 context.session_name, "completion_detected",
-                f"Worker went idle after being active — notified Polly",
+                f"Worker idle, user not notified — told Polly to close the loop",
             )
         except Exception:  # noqa: BLE001
             pass

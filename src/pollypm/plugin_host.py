@@ -108,6 +108,16 @@ class ExtensionHost:
             plugin = self._load_plugin_from_manifest(manifest)
             if plugin is None:
                 continue
+            # Validate the plugin implements its declared interfaces
+            try:
+                from pollypm.plugin_validate import validate_plugin
+                result = validate_plugin(plugin)
+                if not result.passed:
+                    failures = ", ".join(c.message for c in result.checks if not c.passed)
+                    self.errors.append(f"Plugin {manifest.name} failed validation: {failures}")
+                    continue  # skip broken plugins
+            except Exception as exc:  # noqa: BLE001
+                self.errors.append(f"Plugin {manifest.name} validation error: {exc}")
             loaded[manifest.name] = plugin
         return loaded
 

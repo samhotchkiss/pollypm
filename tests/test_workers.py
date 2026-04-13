@@ -13,7 +13,7 @@ from pollypm.models import (
     KnownProject,
 )
 from pollypm.storage.state import StateStore
-from pollypm.control_prompts import operator_prompt
+from pollypm.agent_profiles.builtin import polly_prompt as operator_prompt
 from pollypm.workers import auto_select_worker_account, suggest_worker_prompt
 from pollypm.agent_profiles.builtin import worker_prompt
 

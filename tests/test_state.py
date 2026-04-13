@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from pollypm.storage.state import TokenUsageHourlyRecord
 from pollypm.storage.state import StateStore
 
 
@@ -74,3 +75,43 @@ def test_state_store_records_hourly_token_usage_deltas(tmp_path: Path) -> None:
     assert usage[0].account_name == "claude_primary"
     assert usage[0].model_name == "Opus 4.6 (1M context)"
     assert usage[0].tokens_used == 600
+
+
+def test_state_store_daily_token_usage_aggregates_by_day(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.replace_token_usage_hourly(
+        [
+            TokenUsageHourlyRecord(
+                hour_bucket="2026-04-10T08:00:00+00:00",
+                account_name="claude_primary",
+                provider="claude",
+                model_name="Opus",
+                project_key="pollypm",
+                tokens_used=100,
+                updated_at="2026-04-10T08:05:00+00:00",
+            ),
+            TokenUsageHourlyRecord(
+                hour_bucket="2026-04-10T09:00:00+00:00",
+                account_name="codex_primary",
+                provider="openai",
+                model_name="gpt-5.4",
+                project_key="demo",
+                tokens_used=250,
+                updated_at="2026-04-10T09:05:00+00:00",
+            ),
+            TokenUsageHourlyRecord(
+                hour_bucket="2026-04-11T09:00:00+00:00",
+                account_name="claude_primary",
+                provider="claude",
+                model_name="Opus",
+                project_key="pollypm",
+                tokens_used=75,
+                updated_at="2026-04-11T09:05:00+00:00",
+            ),
+        ]
+    )
+
+    assert store.daily_token_usage(days=30) == [
+        ("2026-04-10", 350),
+        ("2026-04-11", 75),
+    ]

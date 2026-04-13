@@ -163,18 +163,10 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     f"Window {context.window_name} has produced effectively the same snapshot for 3 heartbeats",
                 )
                 alerts.append("suspected_loop")
-                # After 5 consecutive identical snapshots, nudge the worker directly
+                # After 5 consecutive identical snapshots, nudge the session
                 longer_hashes = api.recent_snapshot_hashes(context.session_name, limit=5)
                 if len(longer_hashes) == 5 and len(set(longer_hashes)) == 1:
-                    # Direct nudge to the worker — only for worker roles, not control sessions
-                    if context.role == "worker":
-                        api.send_session_message(
-                            context.session_name,
-                            "You appear stalled and additional work remains. "
-                            "Stop looping, state the remaining task in one sentence, "
-                            "execute the next concrete step now, and report verification or blocker.",
-                            owner="heartbeat",
-                        )
+                    self._nudge_stalled_session(api, context)
             else:
                 api.clear_alert(context.session_name, "suspected_loop")
         else:
@@ -257,6 +249,57 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             if not non_heartbeat_lines:
                 return False
         return True
+
+    # Rate limit nudges: max once per session per 10 minutes
+    _NUDGE_COOLDOWN_SECONDS = 600
+
+    def _nudge_stalled_session(self, api, context: HeartbeatSessionContext) -> None:
+        """Send a targeted nudge to a stalled session, with rate limiting."""
+        # Only nudge worker and operator roles
+        if context.role not in ("worker", "operator-pm"):
+            return
+        # Rate limit via events
+        try:
+            from datetime import UTC, datetime
+            recent = api.supervisor.store.recent_events(limit=100)
+            now = datetime.now(UTC)
+            for event in recent:
+                if (
+                    event.session_name == context.session_name
+                    and event.event_type == "nudge"
+                    and (now - datetime.fromisoformat(event.created_at)).total_seconds() < self._NUDGE_COOLDOWN_SECONDS
+                ):
+                    return  # already nudged recently
+        except Exception:  # noqa: BLE001
+            pass
+        # Build a context-aware nudge based on the pane snapshot
+        snippet = (context.pane_text or "").strip().splitlines()[-1][:80] if context.pane_text else ""
+        if context.role == "operator-pm":
+            message = (
+                "You appear idle. Check pm status for session health, "
+                "pm mail for inbox items, and pm alerts for open issues. "
+                "If there is pending work, delegate it to a worker."
+            )
+        elif "permission" in snippet.lower() or "approve" in snippet.lower():
+            message = (
+                "You appear stuck on a permissions prompt. "
+                "Try accepting the permissions or working around the restriction."
+            )
+        elif "error" in snippet.lower() or "failed" in snippet.lower():
+            message = (
+                f"You appear stuck after an error. Read the error carefully, "
+                f"fix the root cause, and continue. Don't retry the same approach."
+            )
+        else:
+            message = (
+                "You appear stalled. State the remaining task in one sentence, "
+                "execute the next concrete step now, and report verification or blocker."
+            )
+        api.send_session_message(context.session_name, message, owner="heartbeat")
+        try:
+            api.supervisor.store.record_event(context.session_name, "nudge", f"Sent nudge: {message[:80]}")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _classify(self, context: HeartbeatSessionContext) -> tuple[str, str]:
         text = (context.transcript_delta or context.pane_text or "").strip()

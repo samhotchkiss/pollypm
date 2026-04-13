@@ -1553,6 +1553,8 @@ class Supervisor:
             self.tmux.create_window(tmux_session, launch.window_name, launch.command, detached=True)
             target = f"{tmux_session}:{launch.window_name}"
             self.tmux.set_window_option(target, "allow-passthrough", "on")
+        # Cap scrollback to prevent slow pane-switching in the cockpit
+        self.tmux.set_pane_history_limit(target, 500)
         self.tmux.pipe_pane(target, launch.log_path)
         self._record_launch(launch)
         return launch, target

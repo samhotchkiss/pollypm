@@ -39,11 +39,24 @@ class CockpitRouter:
         self._supervisor: Supervisor | None = None
 
     def _load_supervisor(self, *, fresh: bool = False) -> Supervisor:
+        # Reload config if the file changed (picks up new projects, sessions, etc.)
+        if not fresh and self._supervisor is not None:
+            try:
+                config_mtime = self.config_path.stat().st_mtime
+                if not hasattr(self, "_config_mtime") or config_mtime != self._config_mtime:
+                    fresh = True
+                    self._config_mtime = config_mtime
+            except OSError:
+                pass
         if fresh or self._supervisor is None:
             if self._supervisor is not None:
                 self._supervisor.store.close()
             self._supervisor = self.service.load_supervisor()
             self._supervisor.ensure_layout()
+            try:
+                self._config_mtime = self.config_path.stat().st_mtime
+            except OSError:
+                pass
         return self._supervisor
 
     def _state_path(self) -> Path:

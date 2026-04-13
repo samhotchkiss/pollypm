@@ -29,7 +29,13 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-pollypm = ["plugins_builtin/*/pollypm-plugin.toml", "defaults/rules/*.md", "defaults/magic/*.md"]
+pollypm = [
+  "plugins_builtin/*/pollypm-plugin.toml",
+  "defaults/rules/*.md",
+  "defaults/magic/*.md",
+  "defaults/docs/*.template",
+  "defaults/docs/reference/*.md",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

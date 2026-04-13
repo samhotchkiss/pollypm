@@ -51,11 +51,13 @@ session_app = typer.Typer(help="Manage session runtime state.")
 heartbeat_app = typer.Typer(help="Run or record heartbeat state.")
 issue_app = typer.Typer(help="Manage project issues through the configured backend.")
 report_app = typer.Typer(help="Report project status summaries.")
+itsalive_app = typer.Typer(help="Manage itsalive deployments.")
 app.add_typer(alert_app, name="alert")
 app.add_typer(session_app, name="session")
 app.add_typer(heartbeat_app, name="heartbeat")
 app.add_typer(issue_app, name="issue")
 app.add_typer(report_app, name="report")
+app.add_typer(itsalive_app, name="itsalive")
 
 
 def _session_name_candidates() -> list[str]:
@@ -618,6 +620,57 @@ def report_status(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
     issue_counts(project=project, config_path=config_path)
+
+
+@itsalive_app.command("deploy")
+def itsalive_deploy(
+    project: str = typer.Option(..., "--project", help="Project key."),
+    subdomain: str | None = typer.Option(None, "--subdomain", help="itsalive subdomain for first deploy."),
+    email: str | None = typer.Option(None, "--email", help="Email for first deploy if not already verified."),
+    publish_dir: str = typer.Option(".", "--dir", help="Directory to deploy relative to the project root."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    service = PollyPMService(config_path)
+    outcome = service.itsalive_deploy(project_key=project, subdomain=subdomain, email=email, publish_dir=publish_dir)
+    typer.echo(f"status={outcome.status}")
+    typer.echo(f"message={outcome.message}")
+    typer.echo(f"subdomain={outcome.subdomain}")
+    if outcome.url:
+        typer.echo(f"url={outcome.url}")
+    if outcome.pending_path:
+        typer.echo(f"pending={outcome.pending_path}")
+    if outcome.expires_at:
+        typer.echo(f"expires_at={outcome.expires_at}")
+
+
+@itsalive_app.command("status")
+def itsalive_status(
+    project: str = typer.Option(..., "--project", help="Project key."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    service = PollyPMService(config_path)
+    items = service.itsalive_pending(project_key=project)
+    if not items:
+        typer.echo("No pending itsalive deployments.")
+        return
+    for item in items:
+        typer.echo(f"{item.subdomain} deploy_id={item.deploy_id} expires_at={item.expires_at} email={item.email}")
+
+
+@itsalive_app.command("sweep")
+def itsalive_sweep(
+    project: str = typer.Option(..., "--project", help="Project key."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    service = PollyPMService(config_path)
+    outcomes = service.itsalive_sweep(project_key=project)
+    if not outcomes:
+        typer.echo("No itsalive deployment updates.")
+        return
+    for outcome in outcomes:
+        typer.echo(f"{outcome.subdomain}: {outcome.status} {outcome.message}")
+        if outcome.url:
+            typer.echo(f"  {outcome.url}")
 
 
 @issue_app.command("validate")

@@ -46,7 +46,9 @@ def escalate_waiting_sessions(store: StateStore, project_root: Path) -> list[str
 
     # Find sessions that are waiting_on_user
     runtimes = store.list_session_runtimes()
-    existing_messages = list_open_messages(project_root)
+    # Check both open AND closed messages to avoid re-creating archived items
+    from pollypm.messaging import list_closed_messages
+    existing_messages = list_open_messages(project_root) + list_closed_messages(project_root)
     existing_subjects = {msg.subject for msg in existing_messages}
 
     for rt in runtimes:

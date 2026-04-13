@@ -20,6 +20,7 @@ from pollypm.accounts import (
 from pollypm.checkpoints import create_issue_completion_checkpoint, record_checkpoint
 from pollypm.config_patches import apply_preference_patch, detect_preference_patch, list_project_overrides
 from pollypm.config import load_config
+from pollypm.itsalive import deploy_site, pending_deploys, sweep_pending_deploys
 from pollypm.messaging import (
     append_thread_message,
     create_message,
@@ -230,6 +231,28 @@ class PollyPMService:
 
     def run_heartbeat(self) -> None:
         self.load_supervisor().run_heartbeat()
+
+    def itsalive_deploy(
+        self,
+        *,
+        project_key: str,
+        subdomain: str | None = None,
+        email: str | None = None,
+        publish_dir: str = ".",
+    ):
+        config = load_config(self.config_path)
+        project = config.projects[project_key]
+        return deploy_site(project.path, subdomain=subdomain, email=email, publish_dir=publish_dir)
+
+    def itsalive_pending(self, *, project_key: str):
+        config = load_config(self.config_path)
+        project = config.projects[project_key]
+        return pending_deploys(project.path)
+
+    def itsalive_sweep(self, *, project_key: str):
+        config = load_config(self.config_path)
+        project = config.projects[project_key]
+        return sweep_pending_deploys(project.path)
 
     def ensure_pollypm(self) -> str:
         supervisor = self.load_supervisor()

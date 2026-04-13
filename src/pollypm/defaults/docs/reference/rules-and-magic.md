@@ -19,6 +19,7 @@ Use these when the situation calls for them.
 | Magic | When to use | Path |
 |-------|------------|------|
 | deploy-site | Site needs staging or production deployment | pollypm/defaults/magic/deploy-site.md |
+| itsalive | Launching or extending an itsalive site | pollypm/defaults/magic/itsalive.md |
 | visual-explainer | A concept or architecture would be clearer with a diagram | pollypm/defaults/magic/visual-explainer.md |
 
 ## Adding Custom Rules or Magic

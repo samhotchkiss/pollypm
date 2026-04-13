@@ -20,6 +20,7 @@ from pollypm.checkpoints import record_checkpoint, snapshot_hash, write_mechanic
 from pollypm.config import PollyPMConfig
 from pollypm.heartbeats import get_heartbeat_backend
 from pollypm.heartbeats.api import SupervisorHeartbeatAPI
+from pollypm.itsalive import sweep_pending_deploys
 from pollypm.knowledge_extract import EXTRACTION_INTERVAL_SECONDS
 from pollypm.messaging import ensure_inbox
 from pollypm.models import AccountConfig, ProviderKind, SessionConfig, SessionLaunchSpec
@@ -613,6 +614,12 @@ class Supervisor:
                 "heartbeat",
                 "token_ledger",
                 f"Synced {len(transcript_samples)} transcript token sample(s)",
+            )
+        for outcome in sweep_pending_deploys(self.config.project.root_dir):
+            self.store.record_event(
+                "heartbeat",
+                "itsalive",
+                f"itsalive deploy sweep: {outcome.subdomain} -> {outcome.status}",
             )
         self.release_expired_leases()
 

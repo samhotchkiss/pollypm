@@ -258,7 +258,7 @@ def _build_fallback_prompt(
 def _render_claude(sections: list[RecoveryPromptSection]) -> str:
     """Render recovery prompt for Claude CLI."""
     parts: list[str] = [
-        "RECOVERY: Your previous session was interrupted and has been restarted.",
+        "RECOVERY: Your previous session was interrupted and has been restarted. You are resuming work.",
         "The context below describes what you were doing. Resume your work — do NOT",
         "treat this as a new task or analysis request. Pick up where you left off.",
         "",
@@ -358,6 +358,13 @@ def _load_project_context(config: PollyPMConfig, project_key: str) -> str:
     if "CATASTROPHIC" in content or "UNRECOVERABLE" in content:
         return ""  # Corrupted by stale analysis data
 
+    title_line = ""
+    for line in content.splitlines():
+        stripped_line = line.strip()
+        if stripped_line.startswith("# "):
+            title_line = stripped_line
+            break
+
     # Extract just the Summary section if present
     if "## Summary" in content:
         start = content.index("## Summary")
@@ -366,7 +373,8 @@ def _load_project_context(config: PollyPMConfig, project_key: str) -> str:
         end = rest.find("\n## ")
         summary = rest[:end].strip() if end != -1 else rest.strip()
         if summary and len(summary) > 20:
-            return f"## Project Summary\n{summary}"
+            title_prefix = f"{title_line}\n\n" if title_line else ""
+            return f"{title_prefix}## Project Summary\n{summary}"
 
     # Fallback: first 2000 chars, but skip if it's too long (likely corrupted)
     if len(content) > 10000:

@@ -1,10 +1,20 @@
 import asyncio
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from pollypm.cockpit import CockpitRouter, build_cockpit_detail
 from pollypm.config import write_config
 from pollypm.cockpit_ui import PollyCockpitApp, PollySettingsPaneApp
-from pollypm.models import AccountConfig, KnownProject, PollyPMConfig, PollyPMSettings, ProjectKind, ProjectSettings, ProviderKind
+from pollypm.models import (
+    AccountConfig,
+    KnownProject,
+    PollyPMConfig,
+    PollyPMSettings,
+    ProjectKind,
+    ProjectSettings,
+    ProviderKind,
+    SessionConfig,
+)
 
 
 def test_cockpit_router_build_items_includes_core_entries(monkeypatch, tmp_path: Path) -> None:
@@ -442,6 +452,130 @@ repo = "acme/widgets"
 
     assert "─── 04-in-review (1) ───" in detail
     assert "17: Review the patch" in detail
+
+
+def test_build_cockpit_detail_dashboard_shows_activity_and_tokens(monkeypatch, tmp_path: Path) -> None:
+    today_utc = datetime.now(UTC).strftime("%Y-%m-%d")
+    yesterday_utc = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            base_dir=tmp_path / ".pollypm-state",
+            logs_dir=tmp_path / ".pollypm-state/logs",
+            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
+            state_db=tmp_path / ".pollypm-state/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="claude_main"),
+        accounts={
+            "claude_main": AccountConfig(
+                name="claude_main",
+                provider=ProviderKind.CLAUDE,
+                home=tmp_path / ".pollypm-state" / "homes" / "claude_main",
+            )
+        },
+        sessions={
+            "operator": SessionConfig(
+                name="operator",
+                role="operator-pm",
+                provider=ProviderKind.CLAUDE,
+                account="claude_main",
+                cwd=tmp_path,
+            ),
+            "worker_demo": SessionConfig(
+                name="worker_demo",
+                role="worker",
+                provider=ProviderKind.CLAUDE,
+                account="claude_main",
+                cwd=tmp_path / "demo",
+                project="demo",
+            ),
+        },
+        projects={
+            "demo": KnownProject(key="demo", path=tmp_path / "demo", name="Demo", kind=ProjectKind.GIT, tracked=True),
+        },
+    )
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path, force=True)
+
+    class FakeRuntime:
+        def __init__(self, session_name: str, status: str, updated_at: str, last_failure_message: str = "") -> None:
+            self.session_name = session_name
+            self.status = status
+            self.updated_at = updated_at
+            self.last_failure_message = last_failure_message
+
+    class FakeEvent:
+        def __init__(self, created_at: str, event_type: str, message: str, session_name: str) -> None:
+            self.created_at = created_at
+            self.event_type = event_type
+            self.message = message
+            self.session_name = session_name
+
+    class FakeAlert:
+        def __init__(self, session_name: str, alert_type: str, message: str) -> None:
+            self.session_name = session_name
+            self.alert_type = alert_type
+            self.message = message
+
+    class FakeStore:
+        def open_alerts(self):
+            return [
+                FakeAlert("worker_demo", "pane_dead", "Worker pane exited"),
+                FakeAlert("worker_demo", "needs_followup", "Please review"),
+            ]
+
+        def list_session_runtimes(self):
+            return [
+                FakeRuntime("operator", "healthy", "2026-04-12T11:58:00+00:00"),
+                FakeRuntime("worker_demo", "waiting_on_user", "2026-04-12T11:40:00+00:00"),
+            ]
+
+        def recent_events(self, limit: int = 200):
+            return [
+                FakeEvent("2026-04-12T11:55:00+00:00", "heartbeat", "heartbeat sweep", "heartbeat"),
+                FakeEvent("2026-04-12T11:50:00+00:00", "send_input", "Sent follow-up to worker", "operator"),
+                FakeEvent("2026-04-12T10:30:00+00:00", "note", "Commit created for dashboard polish", "worker_demo"),
+            ]
+
+        def daily_token_usage(self, days: int = 30):
+            assert days == 30
+            return [
+                (yesterday_utc, 1200),
+                (today_utc, 345),
+            ]
+
+    class FakeLaunch:
+        def __init__(self, name: str, role: str, project: str) -> None:
+            self.session = type("Session", (), {"name": name, "role": role, "project": project})()
+
+    class FakeSupervisor:
+        def __init__(self) -> None:
+            self.config = config
+            self.store = FakeStore()
+
+        def ensure_layout(self) -> None:
+            return None
+
+        def plan_launches(self):
+            return [
+                FakeLaunch("operator", "operator-pm", "demo"),
+                FakeLaunch("worker_demo", "worker", "demo"),
+            ]
+
+    monkeypatch.setattr("pollypm.cockpit.load_config", lambda path: config)
+    monkeypatch.setattr("pollypm.cockpit.Supervisor", lambda cfg: FakeSupervisor())
+    monkeypatch.setattr("pollypm.cockpit.list_open_messages", lambda root_dir: [object(), object()])
+
+    detail = build_cockpit_detail(config_path, "dashboard")
+
+    assert "PollyPM Dashboard" in detail
+    assert "1 projects  ·  2 sessions  ·  1 alert(s)  ·  2 inbox" in detail
+    assert "Polly: working" in detail
+    assert "Demo: waiting on you" in detail
+    assert "1 heartbeat sweeps  ·  1 messages sent  ·  1 commits" in detail
+    assert "Total: 1,545 tokens across 2 days" in detail
+    assert "Today: 345 tokens" in detail
+    assert "▲ worker_demo: Worker pane exited" in detail
 
 
 def test_cockpit_router_ensure_layout_splits_when_missing_right_pane(tmp_path: Path) -> None:

@@ -197,6 +197,56 @@ def test_send_input_sends_extra_enter_for_codex(monkeypatch, tmp_path: Path) -> 
     assert sent[0][0].endswith(":pm-operator")
 
 
+def test_send_input_targets_mounted_cockpit_pane_when_window_not_in_storage(monkeypatch, tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    state_path = config.project.base_dir / "cockpit_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({"mounted_session": "operator", "right_pane_id": "%42"}))
+
+    monkeypatch.setattr(supervisor.tmux, "has_session", lambda name: True)
+    monkeypatch.setattr(
+        supervisor.tmux,
+        "list_windows",
+        lambda name: [
+            TmuxWindow(
+                session=name,
+                index=0,
+                name="pm-heartbeat",
+                active=True,
+                pane_id="%10",
+                pane_current_command="claude",
+                pane_current_path=str(tmp_path),
+                pane_dead=False,
+            )
+        ],
+    )
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(supervisor.tmux, "send_keys", lambda target, text, **kw: sent.append((target, text)))
+
+    supervisor.send_input("operator", "hello", owner="human")
+
+    assert sent == [("%42", "hello")]
+
+
+def test_send_input_falls_back_to_storage_target_when_mount_state_missing(monkeypatch, tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+
+    monkeypatch.setattr(supervisor.tmux, "has_session", lambda name: True)
+    monkeypatch.setattr(supervisor.tmux, "list_windows", lambda name: [])
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(supervisor.tmux, "send_keys", lambda target, text, **kw: sent.append((target, text)))
+
+    supervisor.send_input("operator", "hello", owner="human")
+
+    assert len(sent) == 1
+    assert sent[0][0].endswith(":pm-operator")
+    assert sent[0][1] == "hello"
+
+
 def test_claim_lease_rejects_conflicting_owner(tmp_path: Path) -> None:
     config = _config(tmp_path)
     supervisor = Supervisor(config)

@@ -83,8 +83,12 @@ def run_haiku(
         logger.warning("claude CLI not found, cannot run LLM task")
         return None
 
-    config = load_config(config_path)
-    store = StateStore(config.project.state_db)
+    try:
+        config = load_config(config_path)
+        store = StateStore(config.project.state_db)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Unable to initialize Haiku runner from %s: %s", config_path, exc)
+        return None
 
     account_name = select_background_account(config, store)
     if account_name is None:

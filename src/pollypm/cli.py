@@ -743,10 +743,6 @@ def up(
         typer.echo(f"PollyPM is running. Attach with: tmux switch-client -t {session_name}")
         return
 
-    if not created:
-        typer.echo(f"PollyPM is running. Attach with: tmux attach -t {session_name}")
-        return
-
     raise typer.Exit(code=supervisor.tmux.attach_session(session_name))
 
 

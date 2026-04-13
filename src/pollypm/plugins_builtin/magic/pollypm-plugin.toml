@@ -1,0 +1,7 @@
+api_version = "1"
+name = "magic"
+kind = "agent_profile"
+version = "0.1.0"
+entrypoint = "plugin.py:plugin"
+capabilities = ["agent_profile", "hook"]
+description = "itsalive.co deployment integration for polly agent sessions."

@@ -525,16 +525,20 @@ def test_build_cockpit_detail_dashboard_shows_activity_and_tokens(monkeypatch, t
             ]
 
         def list_session_runtimes(self):
+            from datetime import UTC, datetime, timedelta
+            now = datetime.now(UTC)
             return [
-                FakeRuntime("operator", "healthy", "2026-04-12T11:58:00+00:00"),
-                FakeRuntime("worker_demo", "waiting_on_user", "2026-04-12T11:40:00+00:00"),
+                FakeRuntime("operator", "healthy", (now - timedelta(minutes=2)).isoformat()),
+                FakeRuntime("worker_demo", "waiting_on_user", (now - timedelta(minutes=20)).isoformat()),
             ]
 
         def recent_events(self, limit: int = 200):
+            from datetime import UTC, datetime, timedelta
+            now = datetime.now(UTC)
             return [
-                FakeEvent("2026-04-12T11:55:00+00:00", "heartbeat", "heartbeat sweep", "heartbeat"),
-                FakeEvent("2026-04-12T11:50:00+00:00", "send_input", "Sent follow-up to worker", "operator"),
-                FakeEvent("2026-04-12T10:30:00+00:00", "note", "Commit created for dashboard polish", "worker_demo"),
+                FakeEvent((now - timedelta(minutes=5)).isoformat(), "heartbeat", "heartbeat sweep", "heartbeat"),
+                FakeEvent((now - timedelta(minutes=10)).isoformat(), "send_input", "Sent follow-up to worker", "operator"),
+                FakeEvent((now - timedelta(minutes=90)).isoformat(), "note", "Commit created for dashboard polish", "worker_demo"),
             ]
 
         def daily_token_usage(self, days: int = 30):

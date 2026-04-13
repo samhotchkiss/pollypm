@@ -171,16 +171,16 @@ def process_inbox(project_root: Path, store) -> dict[str, int]:
             # Archive the processed message
             try:
                 close_message(project_root, message.path.name)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to archive message %s: %s", message.path.name, exc)
             counts["polly_flagged"] += 1
 
         elif tier == "polly_handle":
             # Tier 1: Handle silently, archive
             try:
                 close_message(project_root, message.path.name)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to archive message %s: %s", message.path.name, exc)
             counts["polly_handled"] += 1
 
     # Record processing event

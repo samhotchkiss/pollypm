@@ -158,6 +158,18 @@ def _parse_sessions(
     return sessions
 
 
+def _validate_timezone(tz: str) -> str:
+    """Validate timezone is a valid IANA name. Returns empty string if invalid."""
+    if not tz:
+        return ""
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(tz)
+        return tz
+    except (KeyError, Exception):
+        return ""  # Invalid timezone, fall back to auto-detect
+
+
 def _parse_pollypm_settings(raw: dict[str, object], sessions: dict[str, SessionConfig]) -> PollyPMSettings:
     pollypm_raw = raw.get("pollypm", {})
     if not isinstance(pollypm_raw, dict):
@@ -179,7 +191,7 @@ def _parse_pollypm_settings(raw: dict[str, object], sessions: dict[str, SessionC
         heartbeat_backend=str(pollypm_raw.get("heartbeat_backend", "local")),
         scheduler_backend=str(pollypm_raw.get("scheduler_backend", "inline")),
         lease_timeout_minutes=max(1, int(pollypm_raw.get("lease_timeout_minutes", 30))),
-        timezone=str(pollypm_raw.get("timezone", "")),
+        timezone=_validate_timezone(str(pollypm_raw.get("timezone", ""))),
     )
 
 

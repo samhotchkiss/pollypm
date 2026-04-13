@@ -425,8 +425,9 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                         pass
                 # else: idle — do nothing
                 return
-        except Exception:  # noqa: BLE001
-            pass  # Fall back to heuristics
+        except Exception as exc:  # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).debug("Haiku triage failed, using heuristics: %s", exc)
 
         # Fallback heuristics
         lowered = snapshot.lower()

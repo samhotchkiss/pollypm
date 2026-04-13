@@ -1685,7 +1685,9 @@ def repair(
                 all_problems.append(f"[{key}] .gitignore missing .pollypm-state/ entry")
                 if not check_only:
                     with gitignore.open("a") as f:
-                        f.write("\n.pollypm-state/\n")
+                        if not content.endswith("\n"):
+                            f.write("\n")
+                        f.write(".pollypm-state/\n")
                     all_actions.append(f"[{key}] added .pollypm-state/ to .gitignore")
 
     # -- Report --

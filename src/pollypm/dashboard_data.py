@@ -235,7 +235,7 @@ def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
 
     # Morning briefing: generate if there are overnight results
     briefing = ""
-    if commits or completed or inbox_count:
+    if commits or completed or inbox_count or recoveries:
         parts: list[str] = []
         if commits:
             projects_touched = len({c.project for c in commits})

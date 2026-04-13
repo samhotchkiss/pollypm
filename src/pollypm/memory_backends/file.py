@@ -63,7 +63,7 @@ class FileMemoryBackend(MemoryBackend):
 
         self.ensure_memory()
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        slug = _slugify(title)
+        slug = _slugify(title)[:80]  # Truncate to avoid "File name too long" errors
         scope_dir = project_dossier_dir(self.project_path) / "memory" / scope
         scope_dir.mkdir(parents=True, exist_ok=True)
         file_path = scope_dir / f"{stamp}-{slug}.md"

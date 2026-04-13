@@ -110,14 +110,18 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     and (now - datetime.fromisoformat(event.created_at)).total_seconds() < 300
                 ):
                     return  # sent one less than 5 min ago
-            # Send supervision reminder — different from nudge, bypasses nudge cooldown
+            # Send supervision reminder — different from nudge, bypasses lease + nudge cooldown
             names = ", ".join(idle_workers[:4])
-            api.send_session_message(
-                "operator",
-                f"Supervision check: {len(idle_workers)} workers idle ({names}). "
-                f"Run `pm status`, review their output, and send next instructions.",
-                owner="heartbeat",
-            )
+            try:
+                api.supervisor.send_input(
+                    "operator",
+                    f"Supervision check: {len(idle_workers)} workers idle ({names}). "
+                    f"Run `pm status`, review their output, and send next instructions.",
+                    owner="heartbeat",
+                    force=True,  # bypass cockpit lease
+                )
+            except Exception:  # noqa: BLE001
+                pass
             api.supervisor.store.record_event(
                 "operator", "supervision_reminder",
                 f"Sent supervision reminder: {len(idle_workers)} idle workers",

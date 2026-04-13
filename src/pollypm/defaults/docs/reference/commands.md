@@ -100,8 +100,13 @@ When you add a project with `pm add-project`, the import runs automatically. Use
 |---------|-------------|
 | `pm notify "<subject>" "<body>"` | Create an inbox item for the human user |
 | `pm mail` | List open inbox items |
-| `pm mail --archived` | List archived inbox items |
-| `pm mail --close <filename>` | Archive a specific message |
+| `pm mail <id>` | Read a message or thread |
+| `pm mail --reply <id> --text "msg"` | Reply to a message (creates thread) |
+| `pm mail --close <id> --note "what was done"` | Close with required note |
+| `pm mail --archived` | List archived messages |
+| `pm mail --threads` | List active threads |
+| `pm reply <id> "text"` | Reply to a message (agent shorthand) |
+| `pm reply <id> "text" --close` | Reply and close in one step |
 
 **When to use `pm notify`:** Any time you need the human user's input, approval, or attention — and they may not be watching your session. The inbox is the reliable way to reach the user. Don't just ask in chat and hope they see it.
 

@@ -84,6 +84,8 @@ def polly_prompt() -> str:
         "per bug fix. Include: what was accomplished, key commits, how to test/verify, and any "
         "decisions you made. Use `pm notify \"Done: <task>\" \"<summary>\"`. "
         "The user may not be watching — the inbox is how they learn what happened overnight. "
+        "When you process an inbox item, ALWAYS use `pm reply <id> '<what you did>' --close` to "
+        "close it with a record of what was done. Never silently close inbox items. "
         "Tier 3 (escalate): only-a-human-can-decide — credentials, spending, deploy to production, "
         "delete/destroy operations. Use `pm notify \"[Escalation] <subject>\" \"<details>\"` and wait. "
         "Always err toward keeping work moving. Flag decisions rather than blocking on them."

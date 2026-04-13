@@ -368,8 +368,12 @@ def _render_global_config(config: PollyPMConfig) -> str:
         if session.window_name:
             lines.append(f'window_name = "{session.window_name}"')
         if session.prompt:
-            escaped = session.prompt.replace("\\", "\\\\").replace('"', '\\"')
-            lines.append(f'prompt = "{escaped}"')
+            if "\n" in session.prompt:
+                escaped = session.prompt.replace("\\", "\\\\").replace('"""', '\\"\\"\\"')
+                lines.append(f'prompt = """{escaped}"""')
+            else:
+                escaped = session.prompt.replace("\\", "\\\\").replace('"', '\\"')
+                lines.append(f'prompt = "{escaped}"')
         if session.agent_profile:
             lines.append(f'agent_profile = "{session.agent_profile}"')
         if session.args:
@@ -424,8 +428,12 @@ def _render_project_local_config(config: PollyPMConfig, project_key: str) -> str
         if session.window_name:
             lines.append(f'window_name = "{session.window_name}"')
         if session.prompt:
-            escaped = session.prompt.replace("\\", "\\\\").replace('"', '\\"')
-            lines.append(f'prompt = "{escaped}"')
+            if "\n" in session.prompt:
+                escaped = session.prompt.replace("\\", "\\\\").replace('"""', '\\"\\"\\"')
+                lines.append(f'prompt = """{escaped}"""')
+            else:
+                escaped = session.prompt.replace("\\", "\\\\").replace('"', '\\"')
+                lines.append(f'prompt = "{escaped}"')
         if session.agent_profile:
             lines.append(f'agent_profile = "{session.agent_profile}"')
         if session.args:

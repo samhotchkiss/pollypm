@@ -115,6 +115,21 @@ def create_message(
     }
     atomic_write_text(msg_dir / "state.json", json.dumps(state, indent=2) + "\n")
 
+    # Sync to DB for efficient querying
+    try:
+        from pollypm.config import load_config, DEFAULT_CONFIG_PATH
+        from pollypm.storage.state import StateStore
+        config = load_config(DEFAULT_CONFIG_PATH)
+        store = StateStore(config.project.state_db)
+        store.upsert_inbox_message(
+            id=msg_id, subject=subject, status="open", owner=owner,
+            sender=sender, project=project, message_count=1,
+            created_at=ts.isoformat(), updated_at=ts.isoformat(),
+        )
+        store.close()
+    except Exception:  # noqa: BLE001
+        pass  # DB sync is best-effort, files are source of truth
+
     return InboxMessage(
         id=msg_id, subject=subject, status="open", owner=owner,
         created_at=ts.isoformat(), updated_at=ts.isoformat(),
@@ -183,6 +198,22 @@ def reply_to_message(
         state["owner"] = "user"  # Agent replied, ball is in user's court
     atomic_write_text(msg_dir / "state.json", json.dumps(state, indent=2) + "\n")
 
+    # Sync to DB
+    try:
+        from pollypm.config import load_config, DEFAULT_CONFIG_PATH
+        from pollypm.storage.state import StateStore
+        config = load_config(DEFAULT_CONFIG_PATH)
+        store = StateStore(config.project.state_db)
+        store.upsert_inbox_message(
+            id=state["id"], subject=state["subject"], status=state["status"],
+            owner=state["owner"], sender=state["sender"],
+            project=state.get("project", ""), message_count=index,
+            updated_at=ts.isoformat(),
+        )
+        store.close()
+    except Exception:  # noqa: BLE001
+        pass
+
     return MessageEntry(
         index=index, sender=sender, timestamp=ts.isoformat(),
         body=body, path=msg_path,
@@ -211,8 +242,25 @@ def close_message(
     # Update state
     state = json.loads((msg_dir / "state.json").read_text())
     state["status"] = "closed"
-    state["updated_at"] = datetime.now(UTC).isoformat()
+    ts = datetime.now(UTC).isoformat()
+    state["updated_at"] = ts
     atomic_write_text(msg_dir / "state.json", json.dumps(state, indent=2) + "\n")
+
+    # Sync to DB
+    try:
+        from pollypm.config import load_config, DEFAULT_CONFIG_PATH
+        from pollypm.storage.state import StateStore
+        config = load_config(DEFAULT_CONFIG_PATH)
+        store = StateStore(config.project.state_db)
+        store.upsert_inbox_message(
+            id=state["id"], subject=state["subject"], status="closed",
+            owner=state.get("owner", ""), sender=state.get("sender", ""),
+            project=state.get("project", ""), message_count=state.get("message_count", 1),
+            updated_at=ts,
+        )
+        store.close()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ---------------------------------------------------------------------------

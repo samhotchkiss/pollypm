@@ -256,7 +256,10 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 prev = runtime.recovery_attempts if runtime else 0
                 intervention = select_intervention(health, signals, previous_interventions=prev)
                 if intervention:
-                    if intervention.action == "nudge" and context.role == "worker":
+                    # Skip interventions for workers with no pending work — they're legitimately idle
+                    if context.role == "worker" and not self._has_pending_work(api, context):
+                        pass
+                    elif intervention.action == "nudge" and context.role == "worker":
                         self._nudge_stalled_worker(api, context)
                     elif intervention.action == "escalate":
                         self._escalate_to_inbox(api, context, intervention.reason)

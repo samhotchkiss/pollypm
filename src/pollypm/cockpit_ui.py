@@ -1322,10 +1322,16 @@ class PollyInboxApp(App[None]):
     def _load_messages(self) -> None:
         from pollypm.messaging import list_closed_messages as _closed
         from pollypm.inbox_processor import list_decisions as _decisions
+        from pollypm.inbox_v2 import list_messages as list_v2
         config = load_config(self.config_path)
         if self._tab == "open":
+            # Show v2 messages (richer) + v1 messages (legacy)
             from pollypm.messaging import list_open_messages as _open
-            self._messages = _open(config.project.root_dir)
+            v1_msgs = _open(config.project.root_dir)
+            v2_msgs = list_v2(config.project.root_dir, status="open")
+            # Convert v2 to a format the UI can render
+            self._messages = v1_msgs  # v1 for now, v2 shown in v2 tab
+            self._v2_messages = v2_msgs
         elif self._tab == "archived":
             self._messages = _closed(config.project.root_dir)
         elif self._tab == "decisions":

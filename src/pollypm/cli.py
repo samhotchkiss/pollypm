@@ -16,7 +16,7 @@ from pollypm.accounts import (
     relogin_account,
     remove_account as remove_account_entry,
 )
-from pollypm.cockpit_ui import PollyCockpitApp, PollyCockpitPaneApp, PollySettingsPaneApp
+from pollypm.cockpit_ui import PollyCockpitApp, PollyCockpitPaneApp, PollyDashboardApp, PollySettingsPaneApp
 from pollypm.config import (
     DEFAULT_CONFIG_PATH,
     GLOBAL_CONFIG_DIR,
@@ -326,6 +326,10 @@ def cockpit_pane(
         return
     if kind == "settings":
         PollySettingsPaneApp(config_path).run(mouse=True)
+        return
+    if kind in ("polly", "dashboard"):
+        from pollypm.cockpit_ui import PollyDashboardApp
+        PollyDashboardApp(config_path).run(mouse=True)
         return
     PollyCockpitPaneApp(config_path, kind, target).run(mouse=True)
 

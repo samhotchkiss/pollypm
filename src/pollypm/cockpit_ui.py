@@ -926,6 +926,235 @@ class PollyProjectSettingsApp(App[None]):
         self._refresh()
 
 
+class PollyDashboardApp(App[None]):
+    """Rich dashboard with live status, activity feed, and token chart."""
+
+    TITLE = "PollyPM"
+    SUB_TITLE = "Dashboard"
+    CSS = """
+    Screen {
+        background: #0d1117;
+        color: #e6edf3;
+        padding: 0 1;
+        layout: vertical;
+        overflow-y: auto;
+    }
+    .section-header {
+        color: #58a6ff;
+        text-style: bold;
+        padding: 1 0 0 0;
+    }
+    .section-rule {
+        color: #21262d;
+    }
+    #status-bar {
+        color: #8b949e;
+        padding: 0 0 1 0;
+    }
+    #active-work {
+        padding: 0 0 0 2;
+    }
+    #activity-feed {
+        padding: 0 0 0 2;
+        color: #8b949e;
+    }
+    #token-chart {
+        padding: 0 0 0 2;
+    }
+    #alerts-section {
+        padding: 0 0 0 2;
+        color: #f85149;
+    }
+    .session-working { color: #3fb950; }
+    .session-progress { color: #d29922; }
+    .session-waiting { color: #f85149; }
+    .session-idle { color: #484f58; }
+    .dim { color: #484f58; }
+    .accent { color: #58a6ff; }
+    .warn { color: #d29922; }
+    .good { color: #3fb950; }
+    """
+
+    def __init__(self, config_path: Path) -> None:
+        super().__init__()
+        self.config_path = config_path
+        self.status_bar = Static("", id="status-bar", markup=True)
+        self.active_header = Static("[b]Active Work[/b]", classes="section-header", markup=True)
+        self.active_work = Static("", id="active-work", markup=True)
+        self.activity_header = Static("[b]Last 24 Hours[/b]", classes="section-header", markup=True)
+        self.activity_feed = Static("", id="activity-feed", markup=True)
+        self.token_header = Static("[b]Token Usage[/b]", classes="section-header", markup=True)
+        self.token_chart = Static("", id="token-chart", markup=True)
+        self.alerts_section = Static("", id="alerts-section", markup=True)
+
+    def compose(self) -> ComposeResult:
+        yield self.status_bar
+        yield Static("", classes="section-rule")
+        yield self.active_header
+        yield self.active_work
+        yield Static("", classes="section-rule")
+        yield self.activity_header
+        yield self.activity_feed
+        yield Static("", classes="section-rule")
+        yield self.token_header
+        yield self.token_chart
+        yield self.alerts_section
+
+    def on_mount(self) -> None:
+        self._refresh()
+        self.set_interval(8, self._refresh)
+
+    def _refresh(self) -> None:
+        from datetime import UTC, datetime, timedelta
+        from pollypm.messaging import list_open_messages
+
+        try:
+            supervisor = Supervisor(load_config(self.config_path))
+        except Exception:  # noqa: BLE001
+            self.status_bar.update("[dim]Could not load config[/dim]")
+            return
+
+        config = supervisor.config
+        now = datetime.now(UTC)
+
+        # ── Status bar ──
+        project_count = len(config.projects)
+        session_count = len(config.sessions)
+        open_alerts = supervisor.store.open_alerts()
+        actionable = [a for a in open_alerts if a.alert_type not in (
+            "suspected_loop", "stabilize_failed", "needs_followup",
+        )]
+        inbox_count = len(list_open_messages(config.project.root_dir))
+        parts = [f"[b]{project_count}[/b] projects", f"[b]{session_count}[/b] sessions"]
+        if actionable:
+            parts.append(f"[#f85149][b]{len(actionable)}[/b] alerts[/#f85149]")
+        if inbox_count:
+            parts.append(f"[#d29922][b]{inbox_count}[/b] inbox[/#d29922]")
+        self.status_bar.update("  ".join(parts))
+
+        # ── Active Work ──
+        all_runtimes = supervisor.store.list_session_runtimes()
+        runtime_map = {rt.session_name: rt for rt in all_runtimes}
+        launches = supervisor.plan_launches()
+        work_lines: list[str] = []
+        for launch in launches:
+            if launch.session.role == "heartbeat-supervisor":
+                continue
+            rt = runtime_map.get(launch.session.name)
+            status = rt.status if rt else "unknown"
+            project = config.projects.get(launch.session.project)
+            label = "Polly" if launch.session.role == "operator-pm" else (
+                project.display_label() if project else launch.session.project
+            )
+            age_str = ""
+            if rt and rt.updated_at:
+                try:
+                    age = (now - datetime.fromisoformat(rt.updated_at)).total_seconds()
+                    if age < 60:
+                        age_str = " [dim]just now[/dim]"
+                    elif age < 3600:
+                        age_str = f" [dim]{int(age // 60)}m ago[/dim]"
+                    else:
+                        age_str = f" [dim]{int(age // 3600)}h ago[/dim]"
+                except (ValueError, TypeError):
+                    pass
+            if status in ("healthy", "needs_followup"):
+                icon = "[#3fb950]\u25cf[/#3fb950]"
+                desc = "working"
+            elif status == "waiting_on_user":
+                icon = "[#f85149]\u25c7[/#f85149]"
+                desc = "[#f85149]waiting on you[/#f85149]"
+            else:
+                icon = "[dim]\u25cb[/dim]"
+                desc = f"[dim]{status}[/dim]"
+            work_lines.append(f"{icon} [b]{label}[/b]  {desc}{age_str}")
+        self.active_work.update("\n".join(work_lines) if work_lines else "[dim]No active sessions[/dim]")
+
+        # ── Activity Feed ──
+        recent = supervisor.store.recent_events(limit=200)
+        cutoff = (now - timedelta(hours=24)).isoformat()
+        day_events = [e for e in recent if e.created_at >= cutoff]
+        sweeps = sum(1 for e in day_events if e.event_type == "heartbeat")
+        sends = sum(1 for e in day_events if e.event_type == "send_input")
+        recoveries = sum(1 for e in day_events if "recover" in e.event_type)
+        summary_parts: list[str] = []
+        if sweeps:
+            summary_parts.append(f"[#3fb950]{sweeps}[/#3fb950] heartbeat sweeps")
+        if sends:
+            summary_parts.append(f"[#58a6ff]{sends}[/#58a6ff] messages")
+        if recoveries:
+            summary_parts.append(f"[#d29922]{recoveries}[/#d29922] recoveries")
+        summary = "  \u00b7  ".join(summary_parts) if summary_parts else "[dim]No activity[/dim]"
+
+        notable = [e for e in day_events if e.event_type not in (
+            "heartbeat", "token_ledger", "polly_followup", "scheduled", "ran",
+        )][:6]
+        feed_lines = [summary, ""]
+        for event in notable:
+            try:
+                ts = datetime.fromisoformat(event.created_at)
+                age = (now - ts).total_seconds()
+                if age < 60:
+                    t = "now"
+                elif age < 3600:
+                    t = f"{int(age // 60)}m"
+                else:
+                    t = f"{int(age // 3600)}h"
+            except (ValueError, TypeError):
+                t = "?"
+            msg = event.message[:55]
+            feed_lines.append(f"[dim]{t:>4}[/dim]  {event.session_name}: {msg}")
+        self.activity_feed.update("\n".join(feed_lines))
+
+        # ── Token Chart ──
+        daily = supervisor.store.daily_token_usage(days=30)
+        if daily:
+            values = [t for _, t in daily]
+            max_val = max(values) or 1
+            total = sum(values)
+            today_str = now.strftime("%Y-%m-%d")
+            today_tokens = next((t for d, t in daily if d == today_str), 0)
+
+            # Build a proper bar chart with labels
+            chart_height = 8
+            chart_lines: list[str] = []
+            # Normalize to chart height
+            bars = [min(chart_height, int(v / max_val * chart_height)) for v in values]
+            # Render top-down
+            for row in range(chart_height, 0, -1):
+                line = ""
+                for bar_h in bars:
+                    if bar_h >= row:
+                        line += "[#58a6ff]\u2588[/#58a6ff]"
+                    else:
+                        line += " "
+                chart_lines.append(f"  {line}")
+            # X-axis
+            axis = "\u2500" * len(bars)
+            chart_lines.append(f"  {axis}")
+            if len(daily) >= 2:
+                first = daily[0][0][-5:]
+                last = daily[-1][0][-5:]
+                pad = len(bars) - len(first) - len(last)
+                chart_lines.append(f"  [dim]{first}{' ' * max(1, pad)}{last}[/dim]")
+            chart_lines.append("")
+            chart_lines.append(f"  [b]{total:,}[/b] tokens total  \u00b7  [b]{today_tokens:,}[/b] today")
+            self.token_chart.update("\n".join(chart_lines))
+        else:
+            self.token_chart.update("[dim]  No token data yet[/dim]")
+
+        # ── Alerts ──
+        if actionable:
+            alert_lines = [""]
+            for a in actionable[:4]:
+                alert_lines.append(f"[#f85149]\u25b2[/#f85149] {a.session_name}: {a.message[:55]}")
+            self.alerts_section.update("\n".join(alert_lines))
+        else:
+            self.alerts_section.update("")
+
+        supervisor.store.close()
+
+
 class PollyCockpitPaneApp(App[None]):
     TITLE = "PollyPM"
     SUB_TITLE = "Pane"

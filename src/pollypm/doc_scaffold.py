@@ -31,6 +31,40 @@ def scaffold_docs(project_path: Path, *, force: bool = False) -> list[str]:
         shutil.copyfile(_INSTRUCT_TEMPLATE, system_dest)
         actions.append(f"{'overwrote' if force else 'created'} .pollypm/docs/SYSTEM.md")
 
+    # -- Rules/magic manifest (so agents know what's available) --
+    try:
+        from pollypm.rules import discover_rules, discover_magic
+        manifest_lines = ["# Available Rules & Magic", ""]
+        rules = discover_rules(project_path)
+        if rules:
+            manifest_lines.append("## Rules")
+            manifest_lines.append("Read the relevant rule file BEFORE starting that type of work.")
+            manifest_lines.append("")
+            manifest_lines.append("| Rule | When to use | Path |")
+            manifest_lines.append("|------|------------|------|")
+            for name, cat in sorted(rules.items()):
+                manifest_lines.append(f"| {name} | {cat.trigger} | {cat.display_path} |")
+            manifest_lines.append("")
+        magic = discover_magic(project_path)
+        if magic:
+            manifest_lines.append("## Magic")
+            manifest_lines.append("Use these when the situation calls for them.")
+            manifest_lines.append("")
+            manifest_lines.append("| Magic | When to use | Path |")
+            manifest_lines.append("|-------|------------|------|")
+            for name, cat in sorted(magic.items()):
+                manifest_lines.append(f"| {name} | {cat.trigger} | {cat.display_path} |")
+            manifest_lines.append("")
+        if rules or magic:
+            manifest_dest = instruction_dir / "docs" / "rules-manifest.md"
+            manifest_dest.parent.mkdir(parents=True, exist_ok=True)
+            manifest_content = "\n".join(manifest_lines)
+            if force or not manifest_dest.exists() or manifest_dest.read_text() != manifest_content:
+                manifest_dest.write_text(manifest_content)
+                actions.append(f"{'overwrote' if force else 'created'} .pollypm/docs/rules-manifest.md")
+    except Exception:  # noqa: BLE001
+        pass  # rules discovery is best-effort
+
     # -- Reference docs --
     if _REFERENCE_SRC.is_dir():
         ref_dest = instruction_dir / "docs" / "reference"

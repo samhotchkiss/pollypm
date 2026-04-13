@@ -27,6 +27,7 @@ These documents describe how PollyPM itself works. Read them when you need to us
 | Task Management | Working with issues, reviews, or the task pipeline | .pollypm/docs/reference/tasks.md |
 | Accounts & Providers | Managing Claude/Codex accounts, failover, quota | .pollypm/docs/reference/accounts.md |
 | Rules & Magic | Specialized instructions or capabilities available to you | .pollypm/docs/reference/rules-and-magic.md |
+| Your Rules/Magic | Rules and magic available for THIS project | .pollypm/docs/rules-manifest.md |
 | Plugin System | Creating or installing custom plugins | .pollypm/docs/reference/plugins.md |
 
 ## Quick Reference

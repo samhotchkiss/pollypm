@@ -1441,6 +1441,21 @@ class Supervisor:
                 last_recovered_at=previous_runtime.last_recovered_at if previous_runtime else None,
             )
             raise
+        # Inject recovery prompt so the agent knows what it was doing
+        try:
+            from pollypm.recovery_prompt import build_recovery_prompt
+            recovery = build_recovery_prompt(
+                self.config, session_name, launch.session.project,
+                provider=launch.session.provider,
+            )
+            rendered = recovery.render()
+            if rendered.strip():
+                target = self._resolve_send_target(launch)
+                self.tmux.send_keys(target, rendered)
+                self.store.record_event(session_name, "recovery_prompt", "Injected recovery prompt with checkpoint context")
+        except Exception:  # noqa: BLE001
+            pass  # recovery prompt is best-effort
+
         self.store.record_event(
             session_name,
             "recovered",

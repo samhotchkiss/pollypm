@@ -1,0 +1,7 @@
+api_version = "1"
+name = "itsalive"
+kind = "agent_profile"
+version = "0.2.0"
+entrypoint = "plugin.py:plugin"
+capabilities = ["agent_profile", "hook"]
+description = "Dedicated itsalive.co deployment integration with async verification and capability injection."

@@ -7,7 +7,7 @@ def test_discover_rules_includes_packaged_defaults(tmp_path: Path) -> None:
     rules = discover_rules(tmp_path)
 
     assert {"bugfix", "build", "audit"} <= set(rules)
-    assert rules["bugfix"].description == "Specialized bug fixing process"
+    assert rules["bugfix"].description == "How to fix bugs thoroughly"
 
 
 def test_discover_rules_respects_override_hierarchy(monkeypatch, tmp_path: Path) -> None:
@@ -45,7 +45,7 @@ def test_rules_manifest_lists_merged_rules(monkeypatch, tmp_path: Path) -> None:
 
     assert "## Available Rules" in manifest
     assert "- audit: Project audit flow -> .pollypm/rules/audit.md (when reviewing code in this project)" in manifest
-    assert "- build: Feature building process -> pollypm/defaults/rules/build.md" in manifest
+    assert "- build: How to build features that impress -> pollypm/defaults/rules/build.md" in manifest
 
 
 def test_discover_magic_respects_override_hierarchy(monkeypatch, tmp_path: Path) -> None:

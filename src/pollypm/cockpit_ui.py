@@ -1332,9 +1332,19 @@ class PollyInboxApp(App[None]):
         yield Static("", id="hint", markup=True)
 
     def on_mount(self) -> None:
+        # Default to whichever tab has content
+        from pollypm.inbox_v2 import list_messages as _lm
+        try:
+            config = load_config(self.config_path)
+            all_open = _lm(config.project.root_dir, status="open")
+            user_msgs = [m for m in all_open if m.to == "user" or m.sender in ("user", "human")]
+            agent_msgs = [m for m in all_open if m not in user_msgs]
+            if not user_msgs and agent_msgs:
+                self._set_active_tab("agent")
+        except Exception:  # noqa: BLE001
+            pass
         self._refresh_list()
         self._update_hint()
-        # Focus the message list so keyboard works immediately
         self.query_one("#msg-list", ListView).focus()
         self.set_interval(10, self._auto_refresh)
 

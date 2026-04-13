@@ -1128,15 +1128,22 @@ class PollyDashboardApp(App[None]):
             )
 
 
+class _InboxListItem(ListItem):
+    """A clickable message row in the inbox."""
+    def __init__(self, index: int, content: str) -> None:
+        self.msg_index = index
+        self._body = Static(content, markup=True)
+        super().__init__(self._body)
+
+
 class PollyInboxApp(App[None]):
-    """Interactive inbox — browse, read, and manage messages."""
+    """Interactive inbox — click to read, tabs to browse."""
 
     TITLE = "PollyPM"
     SUB_TITLE = "Inbox"
     BINDINGS = [
-        Binding("j", "cursor_down", "Down"),
-        Binding("k", "cursor_up", "Up"),
-        Binding("enter", "read_message", "Read"),
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
         Binding("a", "archive_message", "Archive"),
         Binding("escape", "back", "Back"),
         Binding("1", "show_open", "Open"),
@@ -1147,230 +1154,267 @@ class PollyInboxApp(App[None]):
     Screen {
         background: #0d1117;
         color: #c9d1d9;
-        padding: 0;
         layout: vertical;
     }
-    #tabs {
-        height: 1;
+    #tab-bar {
+        height: 3;
         background: #161b22;
-        color: #8b949e;
-        padding: 0 1;
-    }
-    .tab-active { color: #58a6ff; text-style: bold; }
-    #message-list {
-        height: 1fr;
-        padding: 0 1;
-    }
-    #message-detail {
-        height: 1fr;
         padding: 1 2;
+    }
+    .tab-btn {
+        min-width: 14;
+        margin-right: 1;
+        background: #21262d;
+        color: #8b949e;
+        border: none;
+    }
+    .tab-btn.active {
+        background: #1f6feb;
+        color: #ffffff;
+    }
+    #msg-list {
+        height: 1fr;
+        background: #0d1117;
+        padding: 0;
+    }
+    #msg-list > ListItem {
+        padding: 1 2;
+        background: #0d1117;
+        border-bottom: solid #21262d;
+    }
+    #msg-list > ListItem:hover {
+        background: #161b22;
+    }
+    #msg-list > ListItem.-selected {
+        background: #1c2128;
+    }
+    #detail-view {
+        height: 1fr;
+        padding: 2 3;
+        background: #0d1117;
         display: none;
     }
-    #hint-bar {
+    #detail-header {
+        padding: 0 0 1 0;
+        border-bottom: solid #21262d;
+    }
+    #detail-body {
+        padding: 1 0;
+    }
+    #detail-actions {
+        height: 3;
+        padding: 1 0;
+    }
+    #detail-actions Button {
+        margin-right: 1;
+        min-width: 10;
+    }
+    #hint {
         height: 1;
         background: #161b22;
         color: #484f58;
-        padding: 0 1;
+        padding: 0 2;
     }
-    .msg-row { height: 3; padding: 0 1; }
-    .msg-row:hover { background: #161b22; }
-    .msg-selected { background: #1c2128; }
-    .msg-escalation { color: #f85149; }
-    .msg-decision { color: #d29922; }
+    .empty-state {
+        padding: 3;
+        color: #484f58;
+        text-align: center;
+    }
     """
 
     def __init__(self, config_path: Path) -> None:
         super().__init__()
         self.config_path = config_path
-        self._tab = "open"  # open, archived, decisions
+        self._tab = "open"
         self._messages: list = []
-        self._selected_index = 0
         self._reading = False
-        self.tabs_w = Static("", id="tabs", markup=True)
-        self.message_list = Static("", id="message-list", markup=True)
-        self.message_detail = Static("", id="message-detail", markup=True)
-        self.hint_bar = Static("", id="hint-bar", markup=True)
+        self._reading_index = -1
 
     def compose(self) -> ComposeResult:
-        yield self.tabs_w
-        yield self.message_list
-        yield self.message_detail
-        yield self.hint_bar
+        with Horizontal(id="tab-bar"):
+            yield Button("Open", id="tab-open", classes="tab-btn active")
+            yield Button("Archived", id="tab-archived", classes="tab-btn")
+            yield Button("Decisions", id="tab-decisions", classes="tab-btn")
+        yield ListView(id="msg-list")
+        with Vertical(id="detail-view"):
+            yield Static("", id="detail-header", markup=True)
+            yield Static("", id="detail-body", markup=True)
+            with Horizontal(id="detail-actions"):
+                yield Button("Back", id="btn-back")
+                yield Button("Archive", id="btn-archive")
+        yield Static("", id="hint", markup=True)
 
     def on_mount(self) -> None:
-        self._refresh()
-        self.set_interval(10, self._refresh)
+        self._refresh_list()
+        self._update_hint()
+        self.set_interval(10, self._auto_refresh)
 
-    def _refresh(self) -> None:
-        if self._reading:
-            return  # don't refresh while reading a message
-        self._render_tabs()
+    def _auto_refresh(self) -> None:
+        if not self._reading:
+            self._refresh_list()
+
+    def _refresh_list(self) -> None:
         self._load_messages()
-        self._render_list()
-        self._render_hint()
+        msg_list = self.query_one("#msg-list", ListView)
+        msg_list.clear()
+        if not self._messages:
+            labels = {"open": "No open messages", "archived": "No archived messages", "decisions": "No decisions yet"}
+            msg_list.append(ListItem(Static(f"\n  {labels.get(self._tab, 'Empty')}", classes="empty-state"), disabled=True))
+            return
+        for i, item in enumerate(self._messages):
+            msg_list.append(_InboxListItem(i, self._format_item(item)))
 
-    def _render_tabs(self) -> None:
-        tabs = []
-        for key, label in [("open", "1 Open"), ("archived", "2 Archived"), ("decisions", "3 Decisions")]:
-            if key == self._tab:
-                tabs.append(f"[b #58a6ff]{label}[/]")
-            else:
-                tabs.append(f"[#484f58]{label}[/]")
-        self.tabs_w.update("  ".join(tabs))
+    def _format_item(self, item) -> str:
+        if self._tab == "decisions":
+            tier = item.get("tier", 2)
+            icon = "[#3fb950]\u2713[/#3fb950]" if tier <= 2 else "[#f85149]\u25b2[/#f85149]"
+            subject = item.get("subject", "?")[:60]
+            sender = item.get("original_sender", "?")
+            ts = item.get("timestamp", "")[:16]
+            decision = (item.get("decision") or "")[:70]
+            return f"{icon} [b]{subject}[/b]\n[dim]  {sender} \u00b7 {ts}  \u00b7  {decision}[/dim]"
+        icon = ""
+        if "[Escalation]" in item.subject:
+            icon = "[#f85149]\u25b2 [/#f85149]"
+        elif "[Decision]" in item.subject:
+            icon = "[#d29922]\u25c6 [/#d29922]"
+        subject = item.subject[:60]
+        preview = item.body.strip().split("\n")[0][:70] if item.body else ""
+        return f"{icon}[b]{subject}[/b]\n[dim]  {item.sender} \u00b7 {item.created_at[:16]}  \u00b7  {preview}[/dim]"
 
     def _load_messages(self) -> None:
-        from pollypm.messaging import list_closed_messages as _list_closed
-        from pollypm.inbox_processor import list_decisions as _list_decisions
+        from pollypm.messaging import list_closed_messages as _closed
+        from pollypm.inbox_processor import list_decisions as _decisions
         config = load_config(self.config_path)
         if self._tab == "open":
-            from pollypm.messaging import list_open_messages as _list_open
-            self._messages = _list_open(config.project.root_dir)
+            from pollypm.messaging import list_open_messages as _open
+            self._messages = _open(config.project.root_dir)
         elif self._tab == "archived":
-            self._messages = _list_closed(config.project.root_dir)
+            self._messages = _closed(config.project.root_dir)
         elif self._tab == "decisions":
-            self._messages = _list_decisions(config.project.root_dir, limit=30)
-        if self._selected_index >= len(self._messages):
-            self._selected_index = max(0, len(self._messages) - 1)
+            self._messages = _decisions(config.project.root_dir, limit=30)
 
-    def _render_list(self) -> None:
-        if not self._messages:
-            label = {"open": "No open messages", "archived": "No archived messages", "decisions": "No decisions yet"}
-            self.message_list.update(f"\n  [dim]{label.get(self._tab, 'Empty')}[/dim]")
+    def _show_detail(self, index: int) -> None:
+        if index < 0 or index >= len(self._messages):
             return
-        lines: list[str] = [""]
-        for i, item in enumerate(self._messages):
-            selected = i == self._selected_index
-            prefix = "[b #58a6ff]\u25b6[/] " if selected else "  "
-            bg = " on #1c2128" if selected else ""
-            if self._tab == "decisions":
-                tier = item.get("tier", 2)
-                icon = "[#3fb950]\u2713[/#3fb950]" if tier <= 2 else "[#f85149]\u25b2[/#f85149]"
-                subject = item.get("subject", "?")[:55]
-                sender = item.get("original_sender", "?")
-                ts = item.get("timestamp", "")[:16]
-                lines.append(f"{prefix}{icon} [{f'#e6edf3{bg}'}]{subject}[/]")
-                lines.append(f"    [dim]{sender} \u00b7 {ts}[/dim]")
-                lines.append("")
-            else:
-                icon = ""
-                if "[Escalation]" in item.subject:
-                    icon = "[#f85149]\u25b2[/#f85149] "
-                elif "[Decision]" in item.subject:
-                    icon = "[#d29922]\u25c6[/#d29922] "
-                subject = item.subject[:55]
-                lines.append(f"{prefix}{icon}[{f'#e6edf3{bg}'}]{subject}[/]")
-                lines.append(f"    [dim]{item.sender} \u00b7 {item.created_at[:16]}[/dim]")
-                lines.append("")
-        self.message_list.update("\n".join(lines))
+        self._reading = True
+        self._reading_index = index
+        item = self._messages[index]
+        self.query_one("#msg-list").display = False
+        detail = self.query_one("#detail-view")
+        detail.display = True
+        header = self.query_one("#detail-header", Static)
+        body = self.query_one("#detail-body", Static)
+        if self._tab == "decisions":
+            tier_label = {1: "Silent", 2: "Flagged for review", 3: "Escalated to user"}.get(item.get("tier", 2), "?")
+            header.update(
+                f"[b]{item.get('subject', '?')}[/b]\n\n"
+                f"[dim]From:[/dim] {item.get('original_sender', '?')}  \u00b7  "
+                f"[dim]Date:[/dim] {item.get('timestamp', '')[:16]}  \u00b7  "
+                f"[dim]Tier:[/dim] {tier_label}"
+            )
+            body.update(
+                f"[b]Decision[/b]\n{item.get('decision', 'N/A')}\n\n"
+                f"[b]Reasoning[/b]\n{item.get('reasoning', 'N/A')}\n\n"
+                f"[b]Action taken[/b]\n{item.get('action_taken', 'N/A')}"
+            )
+        else:
+            header.update(
+                f"[b]{item.subject}[/b]\n\n"
+                f"[dim]From:[/dim] {item.sender}  \u00b7  "
+                f"[dim]Date:[/dim] {item.created_at[:16]}"
+            )
+            body.update(item.body)
+        archive_btn = self.query_one("#btn-archive", Button)
+        archive_btn.display = self._tab == "open"
+        self._update_hint()
 
-    def _render_hint(self) -> None:
+    def _update_hint(self) -> None:
+        hint = self.query_one("#hint", Static)
         if self._reading:
-            self.hint_bar.update("[dim]esc[/dim] back  [dim]a[/dim] archive")
+            hint.update("[dim]esc[/dim] back  \u00b7  [dim]a[/dim] archive")
         else:
             n = len(self._messages)
-            self.hint_bar.update(
-                f"[dim]j/k[/dim] navigate  [dim]\u21b5[/dim] read  [dim]a[/dim] archive  "
-                f"[dim]1/2/3[/dim] tabs  \u00b7  {n} item(s)"
-            )
+            hint.update(f"[dim]j/k[/dim] navigate  \u00b7  click or [dim]\u21b5[/dim] to read  \u00b7  {n} item(s)")
+
+    @on(ListView.Selected, "#msg-list")
+    def on_msg_selected(self, event: ListView.Selected) -> None:
+        row = event.item
+        if isinstance(row, _InboxListItem):
+            self._show_detail(row.msg_index)
+
+    @on(Button.Pressed, "#btn-back")
+    def on_back_pressed(self, event: Button.Pressed) -> None:
+        self.action_back()
+
+    @on(Button.Pressed, "#btn-archive")
+    def on_archive_pressed(self, event: Button.Pressed) -> None:
+        self.action_archive_message()
+
+    @on(Button.Pressed, "#tab-open")
+    def on_tab_open(self, event: Button.Pressed) -> None:
+        self.action_show_open()
+
+    @on(Button.Pressed, "#tab-archived")
+    def on_tab_archived(self, event: Button.Pressed) -> None:
+        self.action_show_archived()
+
+    @on(Button.Pressed, "#tab-decisions")
+    def on_tab_decisions(self, event: Button.Pressed) -> None:
+        self.action_show_decisions()
+
+    def _set_active_tab(self, tab: str) -> None:
+        self._tab = tab
+        for btn_id, btn_tab in [("#tab-open", "open"), ("#tab-archived", "archived"), ("#tab-decisions", "decisions")]:
+            btn = self.query_one(btn_id, Button)
+            btn.set_class(btn_tab == tab, "active")
 
     def action_cursor_down(self) -> None:
-        if self._reading:
-            return
-        if self._selected_index < len(self._messages) - 1:
-            self._selected_index += 1
-            self._render_list()
+        if not self._reading:
+            self.query_one("#msg-list", ListView).action_cursor_down()
 
     def action_cursor_up(self) -> None:
-        if self._reading:
-            return
-        if self._selected_index > 0:
-            self._selected_index -= 1
-            self._render_list()
-
-    def action_read_message(self) -> None:
-        if not self._messages or self._selected_index >= len(self._messages):
-            return
-        item = self._messages[self._selected_index]
-        self._reading = True
-        self.message_list.display = False
-        self.message_detail.display = True
-        if self._tab == "decisions":
-            lines = [
-                f"[b]{item.get('subject', '?')}[/b]",
-                "",
-                f"[dim]From:[/dim] {item.get('original_sender', '?')}",
-                f"[dim]Date:[/dim] {item.get('timestamp', '?')[:16]}",
-                f"[dim]Tier:[/dim] {item.get('tier', '?')}",
-                f"[dim]Action:[/dim] {item.get('action_taken', '?')}",
-                "",
-                "[dim]{'─' * 50}[/dim]",
-                "",
-                f"[b]Decision:[/b] {item.get('decision', '?')}",
-                "",
-                f"[b]Reasoning:[/b] {item.get('reasoning', '?')}",
-            ]
-        else:
-            lines = [
-                f"[b]{item.subject}[/b]",
-                "",
-                f"[dim]From:[/dim] {item.sender}",
-                f"[dim]Date:[/dim] {item.created_at[:16]}",
-                "",
-                "\u2500" * 50,
-                "",
-                item.body,
-            ]
-        self.message_detail.update("\n".join(lines))
-        self._render_hint()
+        if not self._reading:
+            self.query_one("#msg-list", ListView).action_cursor_up()
 
     def action_back(self) -> None:
         if self._reading:
             self._reading = False
-            self.message_detail.display = False
-            self.message_list.display = True
-            self._render_list()
-            self._render_hint()
+            self._reading_index = -1
+            self.query_one("#detail-view").display = False
+            self.query_one("#msg-list").display = True
+            self._update_hint()
 
     def action_archive_message(self) -> None:
-        if self._tab != "open" or not self._messages:
+        if self._tab != "open":
             return
-        item = self._messages[self._selected_index]
+        index = self._reading_index if self._reading else getattr(self.query_one("#msg-list", ListView), "index", None)
+        if index is None or index < 0 or index >= len(self._messages):
+            return
+        item = self._messages[index]
         try:
             from pollypm.messaging import close_message
             config = load_config(self.config_path)
             close_message(config.project.root_dir, item.path.name)
         except Exception:  # noqa: BLE001
             return
-        self._reading = False
-        self.message_detail.display = False
-        self.message_list.display = True
-        self._load_messages()
-        self._render_list()
-        self._render_hint()
+        self.action_back()
+        self._refresh_list()
 
     def action_show_open(self) -> None:
-        self._tab = "open"
-        self._selected_index = 0
-        self._reading = False
-        self.message_detail.display = False
-        self.message_list.display = True
-        self._refresh()
+        self._set_active_tab("open")
+        self.action_back()
+        self._refresh_list()
 
     def action_show_archived(self) -> None:
-        self._tab = "archived"
-        self._selected_index = 0
-        self._reading = False
-        self.message_detail.display = False
-        self.message_list.display = True
-        self._refresh()
+        self._set_active_tab("archived")
+        self.action_back()
+        self._refresh_list()
 
     def action_show_decisions(self) -> None:
-        self._tab = "decisions"
-        self._selected_index = 0
-        self._reading = False
-        self.message_detail.display = False
-        self.message_list.display = True
-        self._refresh()
+        self._set_active_tab("decisions")
+        self.action_back()
+        self._refresh_list()
 
 
 class PollyCockpitPaneApp(App[None]):

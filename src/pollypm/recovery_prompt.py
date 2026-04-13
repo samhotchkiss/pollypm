@@ -258,7 +258,9 @@ def _build_fallback_prompt(
 def _render_claude(sections: list[RecoveryPromptSection]) -> str:
     """Render recovery prompt for Claude CLI."""
     parts: list[str] = [
-        "You are resuming a previously interrupted session. Here is your recovery context:",
+        "RECOVERY: Your previous session was interrupted and has been restarted.",
+        "The context below describes what you were doing. Resume your work — do NOT",
+        "treat this as a new task or analysis request. Pick up where you left off.",
         "",
     ]
     for section in sections:
@@ -335,15 +337,41 @@ def _truncate_sections(
 
 
 def _load_project_context(config: PollyPMConfig, project_key: str) -> str:
-    """Load project context from docs/project-overview.md."""
+    """Load project context from docs/project-overview.md.
+
+    Only extracts the Summary section to avoid injecting raw analysis
+    output or corrupted content from recent imports.
+    """
     project_root = _project_root(config, project_key)
     overview_path = project_root / "docs" / "project-overview.md"
     if not overview_path.exists():
         return ""
     try:
-        return overview_path.read_text(encoding="utf-8")[:4000]
+        content = overview_path.read_text(encoding="utf-8")
     except OSError:
         return ""
+
+    # Reject content that looks like raw JSON/analysis output
+    stripped = content.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        return ""
+    if "CATASTROPHIC" in content or "UNRECOVERABLE" in content:
+        return ""  # Corrupted by stale analysis data
+
+    # Extract just the Summary section if present
+    if "## Summary" in content:
+        start = content.index("## Summary")
+        # Find the next ## heading or end of file
+        rest = content[start + len("## Summary"):]
+        end = rest.find("\n## ")
+        summary = rest[:end].strip() if end != -1 else rest.strip()
+        if summary and len(summary) > 20:
+            return f"## Project Summary\n{summary}"
+
+    # Fallback: first 2000 chars, but skip if it's too long (likely corrupted)
+    if len(content) > 10000:
+        return content[:2000] + "\n...(truncated)"
+    return content[:4000]
 
 
 def _live_git_state(config: PollyPMConfig, project_key: str) -> str:

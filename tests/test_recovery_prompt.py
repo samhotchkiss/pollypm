@@ -71,7 +71,7 @@ class TestRecoveryPrompt:
         rendered = prompt.render()
         assert "## Test" in rendered
         assert "Hello" in rendered
-        assert "resuming" in rendered.lower()
+        assert "recovery" in rendered.lower()
 
     def test_render_codex(self) -> None:
         prompt = RecoveryPrompt(
@@ -107,7 +107,7 @@ class TestRenderClaude:
 
     def test_includes_preamble(self) -> None:
         text = _render_claude([])
-        assert "resuming" in text.lower()
+        assert "recovery" in text.lower()
 
 
 class TestRenderCodex:

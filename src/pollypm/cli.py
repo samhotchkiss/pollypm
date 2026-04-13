@@ -1327,6 +1327,115 @@ def worker_start(
     )
 
 
+@app.command("switch-provider")
+def switch_provider(
+    session_name: str = typer.Argument(..., help="Session name to switch."),
+    provider: str = typer.Argument(..., help="New provider: claude or codex."),
+    account: str | None = typer.Option(None, "--account", help="Specific account to use."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    """Switch a worker's provider (e.g., from Codex to Claude) with checkpoint preservation."""
+    from pollypm.models import ProviderKind
+    from pollypm.config_patches import write_session_override
+
+    supervisor = _load_supervisor(config_path)
+    config = supervisor.config
+
+    # Validate the session exists
+    session = config.sessions.get(session_name)
+    if session is None:
+        typer.echo(f"Unknown session: {session_name}")
+        raise typer.Exit(code=1)
+
+    # Validate provider
+    try:
+        new_provider = ProviderKind(provider)
+    except ValueError:
+        typer.echo(f"Invalid provider: {provider}. Use 'claude' or 'codex'.")
+        raise typer.Exit(code=1)
+
+    # Find or auto-select account for the new provider
+    if account is None:
+        candidates = [
+            (name, acct) for name, acct in config.accounts.items()
+            if acct.provider == new_provider
+        ]
+        if not candidates:
+            typer.echo(f"No {provider} accounts configured.")
+            raise typer.Exit(code=1)
+        account = candidates[0][0]
+
+    if account not in config.accounts:
+        typer.echo(f"Unknown account: {account}")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"Switching {session_name} from {session.provider.value} to {new_provider.value} (account: {account})...")
+
+    # 1. Save checkpoint
+    typer.echo("  Saving checkpoint...")
+    # The heartbeat already recorded the latest checkpoint
+
+    # 2. Stop the old session
+    typer.echo("  Stopping old session...")
+    try:
+        supervisor.stop_session(session_name)
+    except Exception:  # noqa: BLE001
+        pass  # May already be dead
+
+    # 3. Update session config to use the new provider/account
+    typer.echo(f"  Updating config to {new_provider.value}/{account}...")
+    supervisor.store.upsert_session_runtime(
+        session_name=session_name,
+        status="switching",
+        effective_account=account,
+        effective_provider=new_provider.value,
+    )
+
+    # 4. Relaunch with new provider
+    typer.echo("  Relaunching...")
+    try:
+        supervisor._restart_session(session_name, account, failure_type="provider_switch")
+    except Exception as exc:
+        typer.echo(f"  Relaunch failed: {exc}")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"Switched {session_name} to {new_provider.value}/{account}. Recovery prompt injected.")
+
+
+@app.command("worker-stop")
+def worker_stop(
+    session_name: str = typer.Argument(..., help="Worker session name to stop."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    """Stop a worker and mark it disabled so the heartbeat won't recover it."""
+    supervisor = _load_supervisor(config_path)
+    session = supervisor.config.sessions.get(session_name)
+    if session is None:
+        typer.echo(f"Unknown session: {session_name}")
+        raise typer.Exit(code=1)
+    if session.role != "worker":
+        typer.echo(f"Can only stop workers, not {session.role} sessions.")
+        raise typer.Exit(code=1)
+
+    # Stop the tmux window
+    try:
+        supervisor.stop_session(session_name)
+        typer.echo(f"Stopped {session_name}")
+    except Exception:  # noqa: BLE001
+        typer.echo(f"Session {session_name} was not running")
+
+    # Mark as disabled so heartbeat won't try to recover it
+    supervisor.store.upsert_session_runtime(
+        session_name=session_name,
+        status="disabled",
+    )
+    # Clear any open alerts
+    for alert_type in ["missing_window", "pane_dead", "recovery_limit", "suspected_loop", "needs_followup"]:
+        supervisor.store.clear_alert(session_name, alert_type)
+    supervisor.store.record_event(session_name, "decommissioned", f"Worker {session_name} stopped and disabled")
+    typer.echo(f"Marked {session_name} as disabled. Heartbeat will not recover it.")
+
+
 @app.command()
 def repair(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),

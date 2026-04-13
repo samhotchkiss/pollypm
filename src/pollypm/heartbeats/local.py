@@ -547,23 +547,45 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             if user_was_notified:
                 return  # User already knows
 
-            # User was NOT notified — tell Polly to close the loop
+            # User was NOT notified — notify them directly.
+            # Don't ask Polly to do it (she goes idle and forgets).
+            # The heartbeat has enough context to send a basic notification.
+            last_thread = closed_to_worker[0]
+            project = config.projects.get(project_key)
+            project_label = project.display_label() if project else project_key
+            project_path = project.path if project else ""
+
+            # Read the last reply in the thread for a summary
+            summary = ""
+            try:
+                from pollypm.inbox_v2 import read_message
+                _ctx, _hist, entries = read_message(root, last_thread.id)
+                if entries:
+                    # Last non-close entry
+                    for entry in reversed(entries):
+                        if not entry.body.startswith("[Closed]"):
+                            summary = entry.body[:300]
+                            break
+            except Exception:  # noqa: BLE001
+                pass
+
+            review_hint = f"`cd {project_path} && git log --oneline -5`" if project_path else "`pm status`"
             create_message(
                 root,
-                sender="heartbeat",
-                subject=f"Worker {context.session_name} finished but user not notified",
-                to="polly",
-                owner="polly",
+                sender="system",
+                subject=f"Done: {project_label} — work completed by {context.session_name}",
+                to="user",
+                owner="user",
                 body=(
-                    f"Worker '{context.session_name}' (project: {project_key}) completed work "
-                    f"and the thread was closed, but no notification was sent to the user. "
-                    f"Review what was done and notify the user: "
-                    f"pm notify 'Done: <summary>' '<details>' --to user"
+                    f"**Worker `{context.session_name}` finished its task on {project_label}.**\n\n"
+                    f"{summary}\n\n"
+                    f"**Review:** {review_hint}\n\n"
+                    f"Check the Agent tab in your inbox for the full thread."
                 ),
             )
             store.record_event(
                 context.session_name, "completion_detected",
-                f"Worker idle, user not notified — told Polly to close the loop",
+                f"Worker idle, user not notified — sent direct notification to user",
             )
         except Exception:  # noqa: BLE001
             pass

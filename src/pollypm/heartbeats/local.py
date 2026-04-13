@@ -101,9 +101,10 @@ class LocalHeartbeatBackend(HeartbeatBackend):
     def _process_session(self, api, context: HeartbeatSessionContext) -> None:
         alerts: list[str] = []
         # Skip disabled sessions (decommissioned via pm worker-stop)
+        # Also skip if the operator recently managed workers (avoid race with Polly)
         try:
             rt = api.supervisor.store.get_session_runtime(context.session_name)
-            if rt and rt.status == "disabled":
+            if rt and rt.status in ("disabled", "switching"):
                 return
         except (AttributeError, Exception):  # noqa: BLE001
             pass  # API may not have supervisor (e.g., tests)

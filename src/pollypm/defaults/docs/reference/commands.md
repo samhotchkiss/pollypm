@@ -29,6 +29,9 @@ All commands use the `pm` CLI. Run `pm --help` for the full list, or `pm <comman
 | `pm plan` | Show the launch plan (what sessions would be created) |
 | `pm worktrees` | List active git worktrees per worker |
 
+| `pm worker-stop <session>` | Stop a worker and disable heartbeat recovery |
+| `pm switch-provider <session> <provider>` | Switch a worker between Claude and Codex with checkpoint |
+
 ## Leases
 
 | Command | What it does |

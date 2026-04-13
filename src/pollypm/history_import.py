@@ -910,7 +910,7 @@ def import_project_history(
     # Stage 5b: Send interview questions to inbox for async review
     if result.interview_questions and not skip_interview:
         try:
-            from pollypm.messaging import create_message
+            from pollypm.inbox_v2 import create_message
             body_lines = [
                 f"The history import for {project_name} generated {result.docs_generated} docs.",
                 f"Please review the generated docs in {project_root}/docs/ and answer these questions:",

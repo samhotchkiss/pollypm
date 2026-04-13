@@ -176,7 +176,7 @@ def _session_description(status: str, role: str, snapshot_path: str | None) -> s
 
 def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
     """Gather all dashboard data."""
-    from pollypm.messaging import list_open_messages
+    from pollypm.inbox_v2 import list_messages as list_v2_messages
 
     now = datetime.now(UTC)
 
@@ -229,7 +229,7 @@ def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
 
     commits = _recent_commits(config, hours=24)
     completed = _completed_issues(config, hours=72)
-    inbox_count = len(list_open_messages(config.project.root_dir))
+    inbox_count = len(list_v2_messages(config.project.root_dir, status="open"))
     sweeps = sum(1 for e in day_events if e.event_type == "heartbeat")
     recoveries = sum(1 for e in day_events if "recover" in e.event_type)
 

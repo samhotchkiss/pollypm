@@ -18,11 +18,11 @@ import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
-from pollypm.messaging import (
+from pollypm.inbox_v2 import (
     InboxMessage,
     close_message,
-    create_message,
-    list_open_messages,
+    list_messages,
+    read_message,
 )
 
 logger = logging.getLogger(__name__)
@@ -78,13 +78,13 @@ def list_decisions(project_root: Path, *, limit: int = 20) -> list[dict]:
     return decisions
 
 
-def _classify_message(message: InboxMessage) -> str:
+def _classify_message(message: InboxMessage, body: str = "") -> str:
     """Classify an inbox message into a handling tier.
 
     Returns: 'polly_handle', 'polly_flag', or 'user_required'
     """
     subject_lower = message.subject.lower()
-    body_lower = message.body.lower()
+    body_lower = body.lower()
 
     # Tier 3: User-required keywords
     user_keywords = [
@@ -123,7 +123,7 @@ def process_inbox(project_root: Path, store) -> dict[str, int]:
     """
     from pollypm.supervisor import Supervisor
 
-    messages = list_open_messages(project_root)
+    messages = list_messages(project_root, status="open")
     if not messages:
         return {"processed": 0}
 
@@ -135,12 +135,20 @@ def process_inbox(project_root: Path, store) -> dict[str, int]:
             counts["skipped"] += 1
             continue
 
-        tier = _classify_message(message)
+        # Get body for classification
+        body = ""
+        try:
+            _ctx, _hist, entries = read_message(project_root, message.id)
+            if entries:
+                body = entries[0].body
+        except Exception:  # noqa: BLE001
+            pass
+
+        tier = _classify_message(message, body)
 
         if tier == "user_required":
             # Tier 3: Leave in inbox, add [Escalation] prefix if not already there
             if not message.subject.startswith("[Escalation]"):
-                # We can't rename the file easily, but we can flag via the decision log
                 _log_decision(
                     project_root,
                     subject=message.subject,
@@ -154,7 +162,6 @@ def process_inbox(project_root: Path, store) -> dict[str, int]:
 
         elif tier == "polly_flag":
             # Tier 2: Polly makes the call, logs the decision, sends response
-            # For now, create a decision record and notify the originating session
             decision_text = (
                 f"Acknowledged: {message.subject}. "
                 f"This has been logged as a decision point for user review."
@@ -170,17 +177,17 @@ def process_inbox(project_root: Path, store) -> dict[str, int]:
             )
             # Archive the processed message
             try:
-                close_message(project_root, message.path.name)
+                close_message(project_root, message.id, sender="polly", note="Processed by inbox processor")
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to archive message %s: %s", message.path.name, exc)
+                logger.warning("Failed to archive message %s: %s", message.id, exc)
             counts["polly_flagged"] += 1
 
         elif tier == "polly_handle":
             # Tier 1: Handle silently, archive
             try:
-                close_message(project_root, message.path.name)
+                close_message(project_root, message.id, sender="polly", note="Auto-handled by inbox processor")
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to archive message %s: %s", message.path.name, exc)
+                logger.warning("Failed to archive message %s: %s", message.id, exc)
             counts["polly_handled"] += 1
 
     # Record processing event

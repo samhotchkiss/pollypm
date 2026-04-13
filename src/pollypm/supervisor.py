@@ -22,7 +22,7 @@ from pollypm.heartbeats import get_heartbeat_backend
 from pollypm.heartbeats.api import SupervisorHeartbeatAPI
 from pollypm.itsalive import sweep_pending_deploys
 from pollypm.knowledge_extract import EXTRACTION_INTERVAL_SECONDS
-from pollypm.messaging import ensure_inbox
+from pollypm.inbox_v2 import _inbox_root as _ensure_inbox_v2
 from pollypm.models import AccountConfig, ProviderKind, SessionConfig, SessionLaunchSpec
 from pollypm.onboarding import _prime_claude_home, default_control_args, default_session_args
 from pollypm.providers import get_provider
@@ -498,7 +498,7 @@ class Supervisor:
         project.base_dir.mkdir(parents=True, exist_ok=True)
         project.logs_dir.mkdir(parents=True, exist_ok=True)
         project.snapshots_dir.mkdir(parents=True, exist_ok=True)
-        ensure_inbox(project.root_dir)
+        _ensure_inbox_v2(project.root_dir)
         ensure_project_scaffold(project.root_dir)
         for known_project in self.config.projects.values():
             ensure_project_scaffold(known_project.path)

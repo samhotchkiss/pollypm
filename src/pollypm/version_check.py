@@ -8,7 +8,7 @@ import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
-from pollypm.messaging import create_message, list_open_messages
+from pollypm.inbox_v2 import create_message, list_messages
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +114,7 @@ def _record_notification(state_dir: Path, latest: str) -> None:
 def _inbox_already_has_upgrade_message(project_root: Path, latest: str) -> bool:
     """Check if there's already an open inbox message about this version."""
     try:
-        messages = list_open_messages(project_root)
+        messages = list_messages(project_root, status="open")
         needle = f"PollyPM {latest}"
         return any(needle in msg.subject for msg in messages)
     except Exception:  # noqa: BLE001

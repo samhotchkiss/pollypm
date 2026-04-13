@@ -27,7 +27,7 @@ from pollypm.accounts import (
     AccountStatus,
 )
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config
-from pollypm.messaging import list_open_messages
+from pollypm.inbox_v2 import list_messages as list_v2_messages
 from pollypm.models import ProviderKind
 from pollypm.projects import (
     discover_git_repositories,
@@ -654,7 +654,7 @@ class PollyPMApp(App[None]):
     def _refresh_cockpit(self, supervisor: Supervisor, config, launches, windows, alerts, leases) -> None:
         rows: list[tuple[tuple[str, ...], str]] = []
         rows.append((("Polly", self._cockpit_state_for_session("operator", launches, windows, alerts)), "polly"))
-        inbox_count = len(list_open_messages(config.project.root_dir))
+        inbox_count = len(list_v2_messages(config.project.root_dir, status="open"))
         rows.append(((f"Inbox ({inbox_count})", "mail" if inbox_count else "clear"), "inbox"))
         rows.append((("Projects", "browse"), "section:projects"))
 
@@ -1146,7 +1146,7 @@ class PollyPMApp(App[None]):
         if key == "polly":
             return self._session_detail(supervisor, "operator")
         if key == "inbox":
-            messages = list_open_messages(config.project.root_dir)
+            messages = list_v2_messages(config.project.root_dir, status="open")
             if not messages:
                 return "Inbox is clear."
             lines = ["Open Inbox Messages:", ""]

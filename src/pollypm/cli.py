@@ -25,7 +25,14 @@ from pollypm.config import (
     write_example_config,
 )
 from pollypm.doc_scaffold import repair_docs, scaffold_docs, verify_docs
-from pollypm.messaging import close_message, create_message, list_closed_messages, list_open_messages
+from pollypm.inbox_v2 import (
+    close_message as close_v2_message,
+    create_message as create_v2_message,
+    find_message as find_v2_message,
+    list_messages as list_v2_messages,
+    read_message as read_v2_message,
+    reply_to_message as reply_v2_message,
+)
 from pollypm.tz import format_time as _fmt_time
 from pollypm.models import ProviderKind
 from pollypm.onboarding import run_onboarding
@@ -702,15 +709,11 @@ def notify(
 ) -> None:
     """Create an inbox message. Uses v2 threaded format with context + history."""
     config = load_config(config_path)
-    # Use v2 inbox
-    from pollypm.inbox_v2 import create_message as create_v2
-    msg = create_v2(
+    msg = create_v2_message(
         config.project.root_dir, sender=sender, subject=subject, body=body,
         project=project, owner="polly" if sender != "polly" else "user",
     )
     typer.echo(f"Created message {msg.id}")
-    # Also create v1 for backward compat (cockpit inbox app still reads v1)
-    create_message(config.project.root_dir, sender=sender, subject=subject, body=body)
 
 
 @app.command("reply")
@@ -722,42 +725,19 @@ def reply_to_message(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
     """Reply to an inbox message or thread. Use --close to close after replying."""
-    from pollypm.messaging import (
-        create_thread, append_thread_message, list_threads, transition_thread,
-    )
-    from pollypm.inbox_v2 import find_message as find_v2, reply_to_message as reply_v2, close_message as close_v2
     config = load_config(config_path)
     root = config.project.root_dir
 
-    # Try v2 first
-    v2_msg = find_v2(root, message_id)
-    if v2_msg:
-        reply_v2(root, v2_msg.id, sender=sender, body=text)
-        typer.echo(f"Reply added to {v2_msg.id}")
-        if close_after:
-            close_v2(root, v2_msg.id, sender=sender, note=text[:200])
-            typer.echo("Message closed.")
-        return
+    v2_msg = find_v2_message(root, message_id)
+    if v2_msg is None:
+        typer.echo(f"Message not found: {message_id}")
+        raise typer.Exit(code=1)
 
-    # Fall back to v1
-    active_threads = list_threads(root, include_closed=True)
-    thread = next((t for t in active_threads if message_id.lower() in t.thread_id.lower()), None)
-
-    if thread is None:
-        # Try as open message — convert to thread
-        msgs = list_open_messages(root)
-        match = next((m for m in msgs if message_id.lower() in m.path.name.lower()), None)
-        if match is None:
-            typer.echo(f"Message not found: {message_id}")
-            raise typer.Exit(code=1)
-        thread = create_thread(root, match.path.name, actor=sender, owner="pm")
-
-    append_thread_message(root, thread.thread_id, sender=sender, subject=f"Re: {thread.subject}", body=text)
-    typer.echo(f"Reply added to thread {thread.thread_id}")
-
+    reply_v2_message(root, v2_msg.id, sender=sender, body=text)
+    typer.echo(f"Reply added to {v2_msg.id}")
     if close_after:
-        transition_thread(root, thread.thread_id, "closed", actor=sender, note=text[:200])
-        typer.echo(f"Thread closed.")
+        close_v2_message(root, v2_msg.id, sender=sender, note=text[:200])
+        typer.echo("Message closed.")
 
 
 @app.command("discuss")
@@ -772,9 +752,7 @@ def discuss(
     """
     config = load_config(config_path)
 
-    # Find the message (try v2 first, then v1)
-    from pollypm.inbox_v2 import find_message as find_v2
-    msg = find_v2(config.project.root_dir, message_id)
+    msg = find_v2_message(config.project.root_dir, message_id)
     subject = ""
     msg_id = ""
     target_session = "operator"
@@ -789,15 +767,8 @@ def discuss(
                     target_session = sess.name
                     break
     else:
-        # Try v1
-        all_msgs = list_open_messages(config.project.root_dir) + list_closed_messages(config.project.root_dir)
-        match = next((m for m in all_msgs if message_id.lower() in m.path.name.lower()), None)
-        if match:
-            subject = match.subject
-            msg_id = match.path.stem
-        else:
-            typer.echo(f"Message not found: {message_id}")
-            raise typer.Exit(code=1)
+        typer.echo(f"Message not found: {message_id}")
+        raise typer.Exit(code=1)
 
     # Send a context-setting message to the agent
     supervisor = _load_supervisor(config_path)
@@ -823,9 +794,6 @@ def mail(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
     """View, read, reply to, and manage inbox messages."""
-    from pollypm.messaging import (
-        create_thread, append_thread_message, list_threads, get_thread, transition_thread,
-    )
     config = load_config(config_path)
     root = config.project.root_dir
 
@@ -834,150 +802,91 @@ def mail(
         if not reply_text:
             typer.echo("Use --text 'your reply' with --reply")
             raise typer.Exit(code=1)
-        # Find the message and convert to thread if needed
-        all_msgs = list_open_messages(root) + list_closed_messages(root)
-        match = next((m for m in all_msgs if reply.lower() in m.path.name.lower()), None)
-        if match:
-            # Convert to thread if it's a plain message
-            is_open = "open" in str(match.path.parent)
-            if is_open:
-                thread = create_thread(root, match.path.name, actor="user", owner="pm")
-                append_thread_message(root, thread.thread_id, sender="user", subject=f"Re: {match.subject}", body=reply_text)
-                typer.echo(f"Replied to thread {thread.thread_id}")
-                return
-        # Check if it's already a thread
-        active_threads = list_threads(root, include_closed=True)
-        thread_match = next((t for t in active_threads if reply.lower() in t.thread_id.lower() or reply.lower() in t.subject.lower()), None)
-        if thread_match:
-            append_thread_message(root, thread_match.thread_id, sender="user", subject=f"Re: {thread_match.subject}", body=reply_text)
-            typer.echo(f"Replied to thread {thread_match.thread_id}")
-            return
-        typer.echo(f"Message not found: {reply}")
-        raise typer.Exit(code=1)
+        match = find_v2_message(root, reply)
+        if match is None:
+            typer.echo(f"Message not found: {reply}")
+            raise typer.Exit(code=1)
+        reply_v2_message(root, match.id, sender="user", body=reply_text)
+        typer.echo(f"Replied to {match.id}")
+        return
 
     # Close with required note
     if close:
         if not close_note:
             typer.echo("Closing a message requires a note: --close <id> --note 'what was done'")
             raise typer.Exit(code=1)
-        # Try to find as a thread first
-        active_threads = list_threads(root)
-        thread_match = next((t for t in active_threads if close.lower() in t.thread_id.lower()), None)
-        if thread_match:
-            append_thread_message(root, thread_match.thread_id, sender="user", subject="Closing note", body=close_note)
-            transition_thread(root, thread_match.thread_id, "closed", actor="user", note=close_note)
-            typer.echo(f"Closed thread {thread_match.thread_id} with note.")
-            return
-        # Otherwise close as simple message, but record the note
-        all_msgs = list_open_messages(root)
-        match = next((m for m in all_msgs if close.lower() in m.path.name.lower()), None)
-        if match:
-            # Convert to thread, add closing note, then close
-            thread = create_thread(root, match.path.name, actor="user", owner="pm")
-            append_thread_message(root, thread.thread_id, sender="user", subject="Closing note", body=close_note)
-            transition_thread(root, thread.thread_id, "closed", actor="user", note=close_note)
-            typer.echo(f"Closed with note: {close_note[:60]}")
-            return
-        typer.echo(f"Message not found: {close}")
-        raise typer.Exit(code=1)
+        match = find_v2_message(root, close)
+        if match is None:
+            typer.echo(f"Message not found: {close}")
+            raise typer.Exit(code=1)
+        close_v2_message(root, match.id, sender="user", note=close_note)
+        typer.echo(f"Closed {match.id} with note.")
+        return
 
-    # Show threads
+    # Show threads (v2 messages with multiple entries)
     if threads:
-        active = list_threads(root, include_closed=False)
+        active = [m for m in list_v2_messages(root, status="open") if m.message_count > 1]
         if not active:
             typer.echo("No active threads.")
             return
         typer.echo(f"Active threads ({len(active)}):\n")
         for t in active:
-            msg_count = len(t.message_paths)
             typer.echo(f"  {t.subject}")
-            typer.echo(f"    {msg_count} message(s) · {t.state} · owner: {t.owner} · {_fmt_time(t.updated_at)}")
-            typer.echo(f"    {t.thread_id}")
+            typer.echo(f"    {t.message_count} message(s) · {t.status} · owner: {t.owner} · {_fmt_time(t.updated_at)}")
+            typer.echo(f"    {t.id}")
             typer.echo()
         return
 
-    # Read a specific message or thread
+    # Read a specific message
     if message_id:
-        # Check threads first
-        active_threads = list_threads(root, include_closed=True)
-        thread_match = next((t for t in active_threads if message_id.lower() in t.thread_id.lower() or message_id.lower() in t.subject.lower()), None)
-        if thread_match:
-            typer.echo(f"Thread: {thread_match.subject}")
-            typer.echo(f"State: {thread_match.state} · Owner: {thread_match.owner}")
-            typer.echo(f"{'─' * 60}")
-            for msg_path in thread_match.message_paths:
-                try:
-                    msg = _read_message(msg_path) if hasattr(msg_path, 'read_text') else None
-                    if msg is None:
-                        full_path = root / ".pollypm" / "inbox" / "threads" / thread_match.thread_id / msg_path
-                        if not full_path.exists():
-                            full_path = root / ".pollypm" / "inbox" / "closed" / thread_match.thread_id / msg_path
-                        from pollypm.messaging import _read_message
-                        msg = _read_message(full_path)
-                    typer.echo(f"\n  [{msg.sender}] {_fmt_time(msg.created_at)}")
-                    typer.echo(f"  {msg.body[:200]}")
-                except Exception:  # noqa: BLE001
-                    typer.echo(f"\n  (message: {msg_path})")
-            typer.echo(f"\n{'─' * 60}")
-            typer.echo(f"Reply: pm mail --reply {thread_match.thread_id} --text 'your reply'")
-            return
-
-        # Try as a simple message
-        all_messages = list_open_messages(root) + list_closed_messages(root)
-        match = next((m for m in all_messages if m.path.name == message_id or m.path.stem == message_id), None)
-        if match is None:
-            match = next((m for m in all_messages if message_id.lower() in m.path.name.lower()), None)
+        match = find_v2_message(root, message_id)
         if match is None:
             typer.echo(f"Message not found: {message_id}")
             raise typer.Exit(code=1)
+        _ctx, _hist, entries = read_v2_message(root, match.id)
         typer.echo(f"Subject: {match.subject}")
         typer.echo(f"From: {match.sender}")
         typer.echo(f"Date: {_fmt_time(match.created_at)}")
-        is_archived = "closed" in str(match.path.parent)
-        typer.echo(f"Status: {'archived' if is_archived else 'open'}")
+        typer.echo(f"Status: {match.status}")
+        typer.echo(f"Owner: {match.owner}")
         typer.echo(f"{'─' * 60}")
-        typer.echo(match.body)
-        if not is_archived:
-            typer.echo(f"\n{'─' * 60}")
-            typer.echo(f"Reply: pm mail --reply {match.path.stem} --text 'your reply'")
-            typer.echo(f"Close: pm mail --close {match.path.stem} --note 'what was done'")
+        for entry in entries:
+            typer.echo(f"\n  [{entry.sender}] {_fmt_time(entry.timestamp)}")
+            typer.echo(f"  {entry.body[:200]}")
+        typer.echo(f"\n{'─' * 60}")
+        if match.status != "closed":
+            typer.echo(f"Reply: pm mail --reply {match.id} --text 'your reply'")
+            typer.echo(f"Close: pm mail --close {match.id} --note 'what was done'")
         return
 
-    # Default: list open messages
+    # Default: list messages
     if archived:
-        messages = list_closed_messages(root)
+        messages = list_v2_messages(root, status="closed")
         if not messages:
             typer.echo("No archived mail.")
             return
         typer.echo(f"Archived ({len(messages)}):\n")
         for item in messages:
-            typer.echo(f"  {item.path.stem}")
+            typer.echo(f"  {item.id}")
             typer.echo(f"    {item.subject} [{item.sender}] {_fmt_time(item.created_at)}")
         typer.echo(f"\nRead with: pm mail <message-id>")
         return
-    messages = list_open_messages(root)
-    active_threads_list = list_threads(root)
-    if not messages and not active_threads_list:
+    messages = list_v2_messages(root, status="open")
+    if not messages:
         typer.echo("No open mail.")
         return
-    if messages:
-        typer.echo(f"Inbox ({len(messages)}):\n")
-        for item in messages:
-            prefix = ""
-            if "[Escalation]" in item.subject:
-                prefix = "▲ "
-            elif "[Decision]" in item.subject:
-                prefix = "◆ "
-            elif "[Complete]" in item.subject:
-                prefix = "✓ "
-            typer.echo(f"  {prefix}{item.subject}")
-            typer.echo(f"    from {item.sender} · {_fmt_time(item.created_at)}")
-            typer.echo(f"    {item.path.stem}")
-            typer.echo()
-    if active_threads_list:
-        typer.echo(f"Active threads ({len(active_threads_list)}):")
-        for t in active_threads_list:
-            typer.echo(f"  💬 {t.subject} ({len(t.message_paths)} msgs)")
+    typer.echo(f"Inbox ({len(messages)}):\n")
+    for item in messages:
+        prefix = ""
+        if "[Escalation]" in item.subject:
+            prefix = "▲ "
+        elif "[Decision]" in item.subject:
+            prefix = "◆ "
+        elif "[Complete]" in item.subject:
+            prefix = "✓ "
+        typer.echo(f"  {prefix}{item.subject}")
+        typer.echo(f"    from {item.sender} · {_fmt_time(item.created_at)}")
+        typer.echo(f"    {item.id}")
         typer.echo()
     typer.echo("Read: pm mail <id>  ·  Reply: pm mail --reply <id> --text 'msg'")
     typer.echo("Close: pm mail --close <id> --note 'what was done'")

@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from pollypm.messaging import create_message, list_open_messages
+from pollypm.inbox_v2 import create_message, list_messages
 from pollypm.storage.state import StateStore
 
 
@@ -47,8 +47,7 @@ def escalate_waiting_sessions(store: StateStore, project_root: Path) -> list[str
     # Find sessions that are waiting_on_user
     runtimes = store.list_session_runtimes()
     # Check both open AND closed messages to avoid re-creating archived items
-    from pollypm.messaging import list_closed_messages
-    existing_messages = list_open_messages(project_root) + list_closed_messages(project_root)
+    existing_messages = list_messages(project_root, status="all")
     existing_subjects = {msg.subject for msg in existing_messages}
 
     for rt in runtimes:

@@ -697,11 +697,20 @@ def notify(
     subject: str = typer.Argument(..., help="Short message subject."),
     body: str = typer.Argument(..., help="Message body."),
     sender: str = typer.Option("pa", "--sender", help="Message sender."),
+    project: str = typer.Option("", "--project", help="Related project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
+    """Create an inbox message. Uses v2 threaded format with context + history."""
     config = load_config(config_path)
-    path = create_message(config.project.root_dir, sender=sender, subject=subject, body=body)
-    typer.echo(f"Created message {path.name}")
+    # Use v2 inbox
+    from pollypm.inbox_v2 import create_message as create_v2
+    msg = create_v2(
+        config.project.root_dir, sender=sender, subject=subject, body=body,
+        project=project, owner="polly" if sender != "polly" else "user",
+    )
+    typer.echo(f"Created message {msg.id}")
+    # Also create v1 for backward compat (cockpit inbox app still reads v1)
+    create_message(config.project.root_dir, sender=sender, subject=subject, body=body)
 
 
 @app.command("reply")

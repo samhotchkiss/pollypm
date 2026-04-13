@@ -256,7 +256,10 @@ class PollyCockpitApp(App[None]):
         height: 1fr;
         background: transparent;
         border: none;
-        scrollbar-size: 0 0;
+        scrollbar-size: 1 1;
+        scrollbar-color: #2a3340;
+        scrollbar-color-hover: #3a4a5a;
+        scrollbar-color-active: #4a5a6a;
     }
     #nav > .rail-row {
         height: 1;

@@ -57,6 +57,12 @@ class CockpitRouter:
                 self._config_mtime = self.config_path.stat().st_mtime
             except OSError:
                 pass
+            # Bump epoch so the cockpit TUI refreshes on next tick
+            try:
+                from pollypm.state_epoch import bump
+                bump()
+            except Exception:  # noqa: BLE001
+                pass
         return self._supervisor
 
     def _state_path(self) -> Path:

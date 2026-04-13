@@ -392,6 +392,12 @@ class StateStore:
         }
         if "snapshot_hash" not in heartbeat_columns:
             self.execute("ALTER TABLE heartbeats ADD COLUMN snapshot_hash TEXT NOT NULL DEFAULT ''")
+        token_columns = {
+            row[1]
+            for row in self.execute("PRAGMA table_info(token_usage_hourly)").fetchall()
+        }
+        if "cache_read_tokens" not in token_columns:
+            self.execute("ALTER TABLE token_usage_hourly ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0")
 
     def upsert_session(
         self,

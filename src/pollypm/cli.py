@@ -947,6 +947,7 @@ def costs(
     rows = store.execute(
         """
         SELECT project_key, SUM(tokens_used) as total,
+               SUM(cache_read_tokens) as cache_total,
                COUNT(DISTINCT substr(hour_bucket, 1, 10)) as days_active
         FROM token_usage_hourly
         WHERE hour_bucket >= date('now', ?)
@@ -961,13 +962,17 @@ def costs(
         return
     typer.echo(f"Token usage (last {days} days):\n")
     total_all = 0
+    cache_all = 0
     for row in rows:
-        proj_key, total, days_active = row[0], int(row[1]), int(row[2])
+        proj_key, total, cache, days_active = row[0], int(row[1]), int(row[2] or 0), int(row[3])
         if project and proj_key != project:
             continue
-        typer.echo(f"  {proj_key}: {total:,} tokens ({days_active} active day(s))")
+        cache_str = f" + {cache:,} cached" if cache else ""
+        typer.echo(f"  {proj_key}: {total:,} tokens{cache_str} ({days_active} active day(s))")
         total_all += total
-    typer.echo(f"\n  Total: {total_all:,} tokens")
+        cache_all += cache
+    cache_str = f" + {cache_all:,} cached" if cache_all else ""
+    typer.echo(f"\n  Total: {total_all:,} tokens{cache_str}")
 
 
 @app.command("worktrees")

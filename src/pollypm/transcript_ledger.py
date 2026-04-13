@@ -29,6 +29,7 @@ class TranscriptUsageEvent:
     model_name: str
     project_key: str
     tokens_used: int
+    cache_read_tokens: int = 0
 
 
 @dataclass(slots=True)
@@ -115,6 +116,7 @@ def _scan_claude_transcript(path: Path, account_name: str, account: AccountConfi
                     )
                 )
             tokens_used = int(total or 0)
+            cache_read = int(usage.get("cache_read_input_tokens", 0) or 0)
             if tokens_used <= 0:
                 continue
             cumulative += tokens_used
@@ -125,6 +127,7 @@ def _scan_claude_transcript(path: Path, account_name: str, account: AccountConfi
                     model_name=model_name,
                     project_key=_project_key_for_cwd(config, cwd),
                     tokens_used=tokens_used,
+                    cache_read_tokens=cache_read,
                 )
             )
     except Exception:  # noqa: BLE001

@@ -106,7 +106,7 @@ def test_cockpit_router_session_state_ignores_silent_alerts(tmp_path: Path) -> N
     windows = [FakeWindow()]
 
     assert router._session_state("worker_demo", launches, windows, [make_alert("needs_followup")], 0).endswith("live")
-    assert router._session_state("worker_demo", launches, windows, [make_alert("pane_dead")], 0) == "! 1"
+    assert router._session_state("worker_demo", launches, windows, [make_alert("pane_dead")], 0) == "! pane dead"
 
 
 def test_cockpit_router_selected_key_clears_missing_right_pane_state(monkeypatch, tmp_path: Path) -> None:
@@ -568,12 +568,20 @@ def test_build_cockpit_detail_dashboard_shows_activity_and_tokens(monkeypatch, t
 
     monkeypatch.setattr("pollypm.cockpit.load_config", lambda path: config)
     monkeypatch.setattr("pollypm.cockpit.Supervisor", lambda cfg: FakeSupervisor())
-    monkeypatch.setattr("pollypm.cockpit.list_v2_messages", lambda root_dir, **kw: [type("M", (), {"subject": "test1", "id": "t1"})(), type("M", (), {"subject": "test2", "id": "t2"})()])
+    def _fake_v2_messages(root_dir, *, status="open", owner=None):
+        items = [
+            type("M", (), {"subject": "test1", "id": "t1", "sender": "polly", "owner": "user", "created_at": "2026-04-13T10:00:00+00:00"})(),
+            type("M", (), {"subject": "test2", "id": "t2", "sender": "user", "owner": "polly", "created_at": "2026-04-13T11:00:00+00:00"})(),
+        ]
+        if owner is not None:
+            items = [m for m in items if m.owner == owner]
+        return items
+    monkeypatch.setattr("pollypm.cockpit.list_v2_messages", _fake_v2_messages)
 
     detail = build_cockpit_detail(config_path, "dashboard")
 
     assert "PollyPM Dashboard" in detail
-    assert "1 projects  ·  2 sessions  ·  1 alert(s)  ·  2 inbox" in detail
+    assert "1 projects  ·  2 sessions  ·  1 alert(s)  ·  1 inbox" in detail
     assert "Polly: working" in detail
     assert "Demo: waiting on you" in detail
     assert "1 heartbeat sweeps  ·  1 messages sent  ·  1 commits" in detail
@@ -589,14 +597,14 @@ def test_cockpit_router_ensure_layout_splits_when_missing_right_pane(tmp_path: P
         def list_panes(self, target: str):
             calls.setdefault("list_targets", []).append(target)
             if "split" not in calls:
-                return [type("Pane", (), {"pane_id": "%1", "active": True})()]
+                return [type("Pane", (), {"pane_id": "%1", "active": True, "pane_width": 200})()]
             return [
-                type("Pane", (), {"pane_id": "%1", "active": True})(),
-                type("Pane", (), {"pane_id": "%2", "active": False})(),
+                type("Pane", (), {"pane_id": "%1", "active": True, "pane_width": 30})(),
+                type("Pane", (), {"pane_id": "%2", "active": False, "pane_width": 169})(),
             ]
 
-        def split_window(self, target: str, command: str, *, horizontal: bool = True, detached: bool = True, percent: int | None = None):
-            calls["split"] = (target, command, horizontal, detached, percent)
+        def split_window(self, target: str, command: str, *, horizontal: bool = True, detached: bool = True, percent: int | None = None, size: int | None = None):
+            calls["split"] = (target, command, horizontal, detached, size)
             return "%2"
 
         def select_pane(self, target: str):

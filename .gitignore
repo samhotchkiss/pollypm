@@ -9,3 +9,4 @@ src/*.egg-info/
 .pollypm/
 .pollypm-state/
 .claude/worktrees/
+reports/

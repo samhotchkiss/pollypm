@@ -62,7 +62,7 @@ def test_inbox_routing_and_handoff_flow(tmp_path: Path) -> None:
     )
     launches = {launch.session.name: launch for launch in service.load_supervisor().plan_launches()}
     operator_prompt = launches["operator"].session.prompt or ""
-    assert "Monitor `.pollypm/inbox/open/` continuously." in operator_prompt
+    assert "Check `pm mail` every turn" in operator_prompt
     assert "Deploy this to staging [operator]" in operator_prompt
 
     execution_thread = service.triage_inbox_item(execution_item.name, actor="pm", owner="pm")

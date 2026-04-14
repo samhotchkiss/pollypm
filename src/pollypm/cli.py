@@ -1722,8 +1722,24 @@ def switch_provider(
     except Exception:  # noqa: BLE001
         pass  # May already be dead
 
-    # 3. Update session config to use the new provider/account
+    # 3. Update session config to use the new provider/account + correct args
     typer.echo(f"  Updating config to {new_provider.value}/{account}...")
+    from pollypm.onboarding import default_session_args
+    new_args = default_session_args(new_provider, open_permissions=config.pollypm.open_permissions_by_default)
+    # Update the project-local config if it exists
+    project = config.projects.get(session.project)
+    if project:
+        from pollypm.config import project_config_path
+        local_path = project_config_path(project.path)
+        if local_path.exists():
+            local_content = local_path.read_text()
+            import re
+            local_content = re.sub(r'provider\s*=\s*"[^"]*"', f'provider = "{new_provider.value}"', local_content)
+            local_content = re.sub(r'account\s*=\s*"[^"]*"', f'account = "{account}"', local_content)
+            args_str = ", ".join(f'"{a}"' for a in new_args)
+            local_content = re.sub(r'args\s*=\s*\[.*?\]', f'args = [{args_str}]', local_content)
+            local_path.write_text(local_content)
+            typer.echo(f"  Updated project-local config with new args: {new_args}")
     supervisor.store.upsert_session_runtime(
         session_name=session_name,
         status="switching",

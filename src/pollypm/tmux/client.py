@@ -34,7 +34,21 @@ class TmuxPane:
     pane_width: int
 
 
+import re as _re
+
+# Safe characters for tmux session/window names
+_NAME_RE = _re.compile(r"^[a-zA-Z0-9_.-]+$")
+# Safe characters for tmux targets (session:window.pane or %pane_id)
+_TARGET_RE = _re.compile(r"^[a-zA-Z0-9_:.%-]+$")
+
+
 class TmuxClient:
+    @staticmethod
+    def _validate_name(name: str, context: str = "name") -> None:
+        """Validate a session or window name contains only safe characters."""
+        if not name or not _NAME_RE.match(name):
+            raise ValueError(f"Invalid tmux {context}: {name!r} (only [a-zA-Z0-9_.-] allowed)")
+
     def _exact_target(self, target: str) -> str:
         """Prefix bare session names with ``=`` for exact matching.
 
@@ -42,8 +56,12 @@ class TmuxClient:
         only works for bare session names.  When the target contains a colon,
         skip the prefix to avoid a lookup failure.
         """
-        if not target or target.startswith(("=", "%", "@")):
+        if not target:
+            raise ValueError("tmux target cannot be empty")
+        if target.startswith(("=", "%", "@")):
             return target
+        if not _TARGET_RE.match(target):
+            raise ValueError(f"Invalid tmux target: {target!r}")
         if ":" in target:
             return target
         return f"={target}"
@@ -91,6 +109,8 @@ class TmuxClient:
         return result.stdout.strip() or None
 
     def create_session(self, name: str, window_name: str, command: str, *, remain_on_exit: bool = True, history_limit: int | None = 500) -> None:
+        self._validate_name(name, "session name")
+        self._validate_name(window_name, "window name")
         self.run("new-session", "-d", "-s", name, "-n", window_name, command)
         self.run("set-option", "-t", self._exact_target(f"{name}:"), "remain-on-exit", "on" if remain_on_exit else "off")
         if history_limit is not None:
@@ -104,6 +124,7 @@ class TmuxClient:
         return result.returncode
 
     def create_window(self, name: str, window_name: str, command: str, *, detached: bool = False) -> None:
+        self._validate_name(window_name, "window name")
         args = ["new-window", "-t", self._exact_target(name), "-n", window_name]
         if detached:
             args.append("-d")
@@ -188,6 +209,9 @@ class TmuxClient:
         result = self.run("list-windows", "-t", self._exact_target(name), "-F", fmt)
         windows: list[TmuxWindow] = []
         for line in result.stdout.splitlines():
+            parts = line.split("\t", 7)
+            if len(parts) < 8:
+                continue
             (
                 session,
                 index,
@@ -197,7 +221,7 @@ class TmuxClient:
                 pane_current_command,
                 pane_current_path,
                 pane_dead,
-            ) = line.split("\t", 7)
+            ) = parts
             windows.append(
                 TmuxWindow(
                     session=session,
@@ -249,6 +273,9 @@ class TmuxClient:
         result = self.run("list-panes", "-t", self._exact_target(target), "-F", fmt)
         panes: list[TmuxPane] = []
         for line in result.stdout.splitlines():
+            parts = line.split("\t", 10)
+            if len(parts) < 11:
+                continue
             (
                 session,
                 window_index,
@@ -261,7 +288,7 @@ class TmuxClient:
                 pane_dead,
                 pane_left,
                 pane_width,
-            ) = line.split("\t", 10)
+            ) = parts
             panes.append(
                 TmuxPane(
                     session=session,

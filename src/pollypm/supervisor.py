@@ -538,9 +538,11 @@ class Supervisor:
             self._repair_console_if_broken(tmux_session)
             return
         self.tmux.create_window(tmux_session, self._CONSOLE_WINDOW, self._console_command(), detached=True)
-        self.tmux.set_window_option(f"{tmux_session}:{self._CONSOLE_WINDOW}", "allow-passthrough", "on")
-        self.tmux.set_window_option(f"{tmux_session}:{self._CONSOLE_WINDOW}", "window-size", "latest")
-        self.tmux.set_window_option(f"{tmux_session}:{self._CONSOLE_WINDOW}", "aggressive-resize", "on")
+        target = f"{tmux_session}:{self._CONSOLE_WINDOW}"
+        self.tmux.set_window_option(target, "allow-passthrough", "on")
+        self.tmux.set_window_option(target, "window-size", "latest")
+        self.tmux.set_window_option(target, "aggressive-resize", "on")
+        self.tmux.set_pane_history_limit(target, 500)
 
     def _repair_console_if_broken(self, tmux_session: str) -> None:
         """Detect and repair a cockpit window where the rail pane died leaving only a worker."""

@@ -101,9 +101,22 @@ def _run_token_ledger_sync(supervisor: Supervisor, payload: dict[str, Any]) -> N
 
 @register_job("gc_maintenance")
 def _run_gc_maintenance(supervisor: Supervisor, payload: dict[str, Any]) -> None:
-    """Force garbage collection to reclaim leaked FDs and memory."""
+    """Force garbage collection and trim tmux scrollback on all panes."""
     import gc
     gc.collect()
+    # Trim scrollback on all managed panes to prevent slow session switching
+    try:
+        for session_name in (
+            supervisor.config.project.tmux_session,
+            supervisor.storage_closet_session_name(),
+        ):
+            if not supervisor.tmux.has_session(session_name):
+                continue
+            for window in supervisor.tmux.list_windows(session_name):
+                target = f"{session_name}:{window.name}"
+                supervisor.tmux.set_pane_history_limit(target, 500)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 @register_job("inbox_escalation")

@@ -130,6 +130,11 @@ def classify_session_health(signals: SessionSignals) -> SessionHealth:
     if signals.has_transcript_delta:
         return SessionHealth.ACTIVE
 
+    # Check if the session was classified as "blocked" (waiting on input)
+    # by the heuristic classifier in _process_session
+    if signals.last_verdict == "blocked":
+        return SessionHealth.WAITING_ON_USER
+
     return SessionHealth.HEALTHY
 
 

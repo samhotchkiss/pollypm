@@ -269,11 +269,21 @@ class LocalHeartbeatBackend(HeartbeatBackend):
 
     def _escalate_to_inbox(self, api, context: HeartbeatSessionContext, reason: str) -> None:
         """Escalate a stuck session — activate the triage session if available, otherwise inbox."""
-        # Try triage session first — it can analyze and act without cluttering the main session
+        # Dedup: don't re-escalate if we escalated this session within 10 minutes
+        try:
+            from datetime import UTC, datetime
+            last = api.supervisor.store.last_event_at(context.session_name, "escalated")
+            if last:
+                age = (datetime.now(UTC) - datetime.fromisoformat(last)).total_seconds()
+                if age < 600:
+                    return
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Try triage session first
         if self._activate_triage(api, context, reason):
             return
         # Fall back to inbox — send to Polly first, not the user.
-        # Polly can try to resolve it; only escalate to user if Polly can't.
         try:
             from pollypm.inbox_v2 import create_message
             snippet = (context.pane_text or "").strip()[-200:] if context.pane_text else "no snapshot available"
@@ -418,26 +428,6 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             idle_cycles=repeated,
         )
 
-    def _should_queue_followup(self, context: HeartbeatSessionContext) -> bool:
-        cursor = context.cursor
-        if cursor is None:
-            return True
-        if cursor.last_verdict != "needs_followup":
-            return True
-        if cursor.last_snapshot_hash == context.snapshot_hash:
-            return False
-        # The snapshot changed, but if the ONLY new content is our own
-        # heartbeat messages, skip the followup to avoid a feedback loop.
-        delta = (context.transcript_delta or "").strip()
-        if delta:
-            non_heartbeat_lines = [
-                line for line in delta.splitlines()
-                if line.strip() and not line.strip().startswith(("H:", "H: Heartbeat"))
-            ]
-            if not non_heartbeat_lines:
-                return False
-        return True
-
     # Rate limit nudges: max once per session per 10 minutes
     # Rate limits for worker nudges
     _NUDGE_COOLDOWN_SECONDS = 600
@@ -557,7 +547,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 return True
             return False
         except Exception:  # noqa: BLE001
-            return False  # Assume no work on error — don't false-alert
+            return True  # Assume work exists on error — don't falsely recover idle workers
 
     def _triage_stalled_worker(self, api, context: HeartbeatSessionContext) -> None:
         """Fast heuristic triage for stalled workers (60s path).

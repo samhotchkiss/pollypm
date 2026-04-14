@@ -614,6 +614,15 @@ class Supervisor:
         self.tmux.select_window(f"{tmux_session}:{self._CONSOLE_WINDOW}")
 
     def run_heartbeat(self, snapshot_lines: int = 200) -> list[AlertRecord]:
+        # Phase 0: Ingest provider transcripts into events.jsonl
+        # This must run before everything else so Phase 2 snapshots and
+        # Phase 3 session_intelligence have fresh data to work with.
+        try:
+            from pollypm.transcript_ingest import sync_transcripts_once
+            sync_transcripts_once(self.config)
+        except Exception:  # noqa: BLE001
+            pass  # Ingest failure shouldn't block the heartbeat
+
         # Phase 1: Fast synchronous pre-work (token sync uses SQLite, must stay on main thread)
         transcript_samples = sync_token_ledger_for_config(self.config)
         if transcript_samples:

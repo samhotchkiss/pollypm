@@ -1139,7 +1139,19 @@ class Supervisor:
                 if state.get("mounted_session") == launch.session.name:
                     right_pane = state.get("right_pane_id")
                     if right_pane:
-                        return right_pane  # target the pane directly
+                        # Validate the pane still exists in tmux
+                        try:
+                            cockpit_window = f"{cockpit_session}:{self._CONSOLE_WINDOW}"
+                            panes = self.tmux.list_panes(cockpit_window)
+                            if any(p.pane_id == right_pane for p in panes):
+                                return right_pane
+                        except Exception:  # noqa: BLE001
+                            pass
+                        # Stale pane — clear state
+                        state.pop("right_pane_id", None)
+                        state.pop("mounted_session", None)
+                        from pollypm.atomic_io import atomic_write_json
+                        atomic_write_json(state_path, state)
             except Exception:  # noqa: BLE001
                 pass
         # Session not found anywhere — raise a clear error

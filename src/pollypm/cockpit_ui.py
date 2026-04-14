@@ -1431,8 +1431,10 @@ class PollyInboxApp(App[None]):
         if index < 0 or index >= len(self._messages):
             return
         self._reading = True
-        # Mark as read when viewed
+        # Store message ID (not just index) so auto-refresh can't cause mismatches
         item = self._messages[index]
+        self._reading_msg_id = getattr(item, "id", None)
+        # Mark as read when viewed
         if hasattr(item, "id") and hasattr(item, "read") and not item.read:
             try:
                 from pollypm.inbox_v2 import mark_read as _mark_read
@@ -1619,9 +1621,15 @@ class PollyInboxApp(App[None]):
 
         # 1. Record reply in the thread (persistent history)
         thread_saved = False
+        saved_msg_id = None
         if self._reading_index >= 0 and self._reading_index < len(self._messages):
             item = self._messages[self._reading_index]
+            # Verify we're still looking at the same message (auto-refresh guard)
+            if hasattr(self, "_reading_msg_id") and hasattr(item, "id") and item.id != self._reading_msg_id:
+                status_w.update("[#f85149]Message changed during reply — please try again[/#f85149]")
+                return
             if self._tab != "decisions" and hasattr(item, "id"):
+                saved_msg_id = item.id
                 try:
                     from pollypm.inbox_v2 import reply_to_message as reply_v2
                     reply_v2(config.project.root_dir, item.id, sender="user", body=reply_text)

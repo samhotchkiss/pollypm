@@ -646,7 +646,7 @@ class Supervisor:
             ("inbox_escalation", {}),
             ("inbox_processor", {}),
             ("inbox_delivery", {}),
-            ("knowledge_extract", {}),
+            ("project_intelligence", {}),
             ("gc_maintenance", {}),
         ])
         return alerts

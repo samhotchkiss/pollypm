@@ -77,26 +77,34 @@ def _run_release_lease(supervisor: Supervisor, payload: dict[str, Any]) -> None:
 
 @register_job("knowledge_extract")
 def _run_knowledge_extract(supervisor: Supervisor, payload: dict[str, Any]) -> None:
-    """Extract knowledge from transcripts and update project docs + activity log.
+    """Deprecated — knowledge extraction now happens via session_intelligence (Haiku)
+    and project_intelligence (Opus). Kept as no-op for backward compatibility."""
+    pass
 
-    Runs at most every 15 minutes (debounced by last run time).
-    Updates: docs/project-overview.md, docs/decisions.md, docs/risks.md,
-    docs/ideas.md, docs/activity-log.md
+
+@register_job("project_intelligence")
+def _run_project_intelligence(supervisor: Supervisor, payload: dict[str, Any]) -> None:
+    """Tier 2: Opus rewrites project docs from accumulated Haiku knowledge entries.
+
+    Runs at most every 60 minutes. Only fires if pending knowledge exists.
     """
     from datetime import UTC, datetime
-    last = supervisor.store.last_event_at("knowledge_extract", "completed")
+    last = supervisor.store.last_event_at("project_intelligence", "completed")
     if last:
         age = (datetime.now(UTC) - datetime.fromisoformat(last)).total_seconds()
-        if age < 900:  # 15 minutes
+        if age < 3600:  # 1 hour
             return
-    from pollypm.knowledge_extract import extract_knowledge_once
-    result = extract_knowledge_once(supervisor.config)
-    supervisor.store.record_event(
-        "knowledge_extract", "completed",
-        f"Processed {result.get('processed_events', 0)} events, "
-        f"updated {result.get('updated_docs', 0)} docs, "
-        f"{result.get('log_entries', 0)} log entries",
-    )
+    from pollypm.knowledge_extract import _all_project_roots
+    from pollypm.project_intelligence import run_project_intelligence
+    updated = 0
+    for project_root in _all_project_roots(supervisor.config):
+        if run_project_intelligence(supervisor.config, project_root):
+            updated += 1
+    if updated:
+        supervisor.store.record_event(
+            "project_intelligence", "completed",
+            f"Updated docs for {updated} project(s)",
+        )
 
 
 @register_job("version_check")

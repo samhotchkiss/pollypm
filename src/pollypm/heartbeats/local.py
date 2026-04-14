@@ -619,63 +619,63 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             return False  # Assume no work on error — don't false-alert
 
     def _triage_stalled_worker(self, api, context: HeartbeatSessionContext) -> None:
-        """Triage an idle worker using Haiku LLM.
+        """Unified session intelligence — triage + knowledge extraction + activity summary.
 
-        Haiku reads the session snapshot and decides:
-        - proceed: worker asked for permission to continue — tell it yes
-        - nudge: worker is stuck on an error or has an obvious next step
-        - idle: worker finished and has nothing to do
+        One Haiku call per stalled session. Results are acted on immediately
+        (triage) and staged for Opus to process later (knowledge).
         """
         snapshot = (context.pane_text or "").strip()
         if not snapshot:
             return
 
         try:
-            from pollypm.llm_runner import run_haiku_json
-            result = run_haiku_json(
-                f"You are triaging an AI coding worker session that has been idle. "
-                f"Read the snapshot and decide what action to take.\n\n"
-                f"```\n{snapshot[-1500:]}\n```\n\n"
-                f"Respond with JSON: "
-                f'{{"action": "proceed"|"nudge"|"idle", "reason": "one sentence", "message": "what to tell the worker"}}\n'
-                f"Actions:\n"
-                f"- proceed: the worker proposed a plan or asked 'should I continue?' / 'if you want' / 'shall I proceed?' — tell it to go ahead and do it\n"
-                f"- nudge: the worker is stuck on an error, permission prompt, or has a clear next step it hasn't taken\n"
-                f"- idle: the worker genuinely finished everything and has nothing left to do\n\n"
-                f"The default should be 'proceed' if the worker has outlined next steps. "
-                f"Workers should keep working autonomously, not wait for permission.\n",
+            from pollypm.session_intelligence import (
+                run_session_intelligence,
+                stage_pending_knowledge,
             )
-            if result and isinstance(result, dict):
-                action = result.get("action", "idle")
-                reason = result.get("reason", "")
-                message = result.get("message", "")
 
-                if action == "proceed":
-                    # Tell the worker to go ahead
-                    msg = message or "Yes, proceed with the plan you outlined. Do not wait for permission — keep working."
+            config = api.supervisor.config
+            session_cfg = config.sessions.get(context.session_name)
+            project_key = session_cfg.project if session_cfg else "pollypm"
+            project = config.projects.get(project_key)
+            project_root = project.path if project else config.project.root_dir
+
+            intel = run_session_intelligence(
+                snapshot=snapshot,
+                transcript_delta=context.transcript_delta or "",
+                session_name=context.session_name,
+                role=context.role,
+                has_pending_work=self._has_pending_work(api, context),
+            )
+
+            if intel is not None:
+                # Act on triage immediately
+                if intel.action == "proceed" and context.role == "worker":
+                    msg = intel.action_message or "Yes, proceed with the plan you outlined."
                     api.send_session_message(context.session_name, msg, owner="heartbeat")
-                    api.supervisor.store.record_event(
-                        context.session_name, "haiku_triage",
-                        f"Haiku: proceed — {reason[:80]}",
-                    )
-                elif action == "nudge":
-                    msg = message or "Continue working. Take the next step."
+                elif intel.action == "nudge" and context.role == "worker":
+                    msg = intel.action_message or "Continue working. Take the next step."
                     api.send_session_message(context.session_name, msg, owner="heartbeat")
-                    api.supervisor.store.record_event(
-                        context.session_name, "haiku_triage",
-                        f"Haiku: nudge — {reason[:80]}",
-                    )
-                else:
-                    api.supervisor.store.record_event(
-                        context.session_name, "haiku_triage",
-                        f"Haiku: idle — {reason[:80]}",
-                    )
+
+                # Stage knowledge for Opus
+                if intel.knowledge_entries:
+                    stage_pending_knowledge(project_root, context.session_name, intel.knowledge_entries)
+
+                # Append activity summary
+                if intel.activity_summary:
+                    self._append_activity_summary(project_root, intel.activity_summary)
+
+                api.supervisor.store.record_event(
+                    context.session_name, "session_intelligence",
+                    f"action={intel.action}, knowledge={len(intel.knowledge_entries)}, "
+                    f"work_product={intel.has_work_product}",
+                )
                 return
         except Exception as exc:  # noqa: BLE001
             import logging
-            logging.getLogger(__name__).debug("Haiku triage failed, using heuristics: %s", exc)
+            logging.getLogger(__name__).debug("Session intelligence failed, using heuristics: %s", exc)
 
-        # Fallback heuristics
+        # Fallback heuristics when Haiku is unavailable
         lowered = snapshot.lower()
         proceed_signals = ["if you want", "shall i", "should i", "want me to", "i can do"]
         if any(sig in lowered for sig in proceed_signals):
@@ -692,6 +692,24 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         if "error" in lowered or "failed" in lowered or "traceback" in lowered:
             self._nudge_stalled_worker(api, context)
             return
+
+    def _append_activity_summary(self, project_root: Path, summary: str) -> None:
+        """Append a one-line activity summary to the activity log."""
+        from datetime import UTC, datetime
+        log_path = project_root / "docs" / "activity-log.md"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M")
+        entry = f"- **{ts}** — {summary}\n"
+        if log_path.exists():
+            existing = log_path.read_text()
+        else:
+            existing = "# Activity Log\n\n"
+        # Prepend new entry after header
+        if "\n\n" in existing:
+            header, body = existing.split("\n\n", 1)
+            log_path.write_text(f"{header}\n\n{entry}{body}")
+        else:
+            log_path.write_text(f"{existing}\n{entry}")
 
     def _classify(self, context: HeartbeatSessionContext) -> tuple[str, str]:
         text = (context.transcript_delta or context.pane_text or "").strip()

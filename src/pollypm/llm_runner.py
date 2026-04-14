@@ -128,29 +128,109 @@ def run_haiku(
     return result.stdout.strip() or None
 
 
+def _parse_json_response(raw: str | None, label: str = "LLM") -> dict[str, Any] | None:
+    """Parse a raw LLM response as JSON, handling markdown fences."""
+    if raw is None:
+        return None
+    text = raw.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        text = "\n".join(lines).strip()
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("Failed to parse %s response as JSON: %s", label, text[:200])
+        return None
+    if not isinstance(parsed, dict):
+        logger.warning("%s returned non-dict JSON (got %s), ignoring", label, type(parsed).__name__)
+        return None
+    return parsed
+
+
 def run_haiku_json(
     prompt: str,
     *,
     config_path: Path = DEFAULT_CONFIG_PATH,
     model: str = HAIKU_MODEL,
 ) -> dict[str, Any] | None:
-    """Run a prompt and parse the result as JSON."""
+    """Run a prompt through Haiku and parse the result as JSON."""
     raw = run_haiku(prompt, config_path=config_path, model=model)
-    if raw is None:
+    return _parse_json_response(raw, label="Haiku")
+
+
+# ---------------------------------------------------------------------------
+# Opus
+# ---------------------------------------------------------------------------
+
+OPUS_MODEL = "claude-opus-4-6"
+
+
+def run_opus(
+    prompt: str,
+    *,
+    config_path: Path = DEFAULT_CONFIG_PATH,
+    model: str = OPUS_MODEL,
+    max_tokens: int | None = 8192,
+) -> str | None:
+    """Run a prompt through Opus using the best available Claude account.
+
+    Same as run_haiku but uses Opus model with a longer timeout.
+    Returns the raw stdout text, or None on failure.
+    """
+    if shutil.which("claude") is None:
+        logger.warning("claude CLI not found, cannot run LLM task")
         return None
-    # Try to extract JSON from the response (may have markdown fences)
-    text = raw.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        # Remove first and last fence lines
-        lines = [l for l in lines if not l.strip().startswith("```")]
-        text = "\n".join(lines).strip()
+
     try:
-        parsed = json.loads(text)
-    except (json.JSONDecodeError, ValueError):
-        logger.warning("Failed to parse LLM response as JSON: %s", text[:200])
+        config = load_config(config_path)
+        store = StateStore(config.project.state_db)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Unable to initialize Opus runner from %s: %s", config_path, exc)
         return None
-    if not isinstance(parsed, dict):
-        logger.warning("LLM returned non-dict JSON (got %s), ignoring", type(parsed).__name__)
+
+    account_name = select_background_account(config, store)
+    if account_name is None:
+        logger.warning("No healthy Claude account available for Opus task")
         return None
-    return parsed
+
+    account = config.accounts[account_name]
+    config_dir = str(claude_config_dir(account.home))
+    logger.info("Running Opus task on account %s (%s)", account_name, config_dir)
+
+    env = dict(os.environ)
+    env["CLAUDE_CONFIG_DIR"] = config_dir
+
+    cmd = ["claude", "-p", "--model", model]
+    if max_tokens:
+        cmd.extend(["--max-tokens", str(max_tokens)])
+
+    result = subprocess.run(
+        cmd,
+        check=False,
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=300,
+        input=prompt,
+    )
+
+    if result.returncode != 0:
+        logger.warning(
+            "Opus task failed (account=%s, rc=%d): %s",
+            account_name, result.returncode, result.stderr[:200],
+        )
+        return None
+
+    return result.stdout.strip() or None
+
+
+def run_opus_json(
+    prompt: str,
+    *,
+    config_path: Path = DEFAULT_CONFIG_PATH,
+    model: str = OPUS_MODEL,
+) -> dict[str, Any] | None:
+    """Run a prompt through Opus and parse the result as JSON."""
+    raw = run_opus(prompt, config_path=config_path, model=model)
+    return _parse_json_response(raw, label="Opus")

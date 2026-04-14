@@ -104,16 +104,8 @@ class SupervisorHeartbeatAPI:
             snapshot_path=Path(context.snapshot_path),
             memory_backend_name=self.supervisor.config.memory.backend,
         )
-        project = self.supervisor.config.projects.get(launch.session.project)
-        project_root = project.path if project is not None else Path(launch.session.cwd)
-        store_snapshot_learnings(
-            self.supervisor.config,
-            project_root=project_root,
-            scope=launch.session.project,
-            snapshot_text=context.pane_text,
-            memory_backend_name=self.supervisor.config.memory.backend,
-            source="heartbeat",
-        )
+        # Knowledge extraction now happens in session_intelligence (unified Haiku call)
+        # instead of per-checkpoint snapshot learning.
 
     def record_event(self, session_name: str, event_type: str, message: str) -> None:
         self.supervisor.store.record_event(session_name, event_type, message)

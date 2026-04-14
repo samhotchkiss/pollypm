@@ -619,64 +619,18 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             return False  # Assume no work on error — don't false-alert
 
     def _triage_stalled_worker(self, api, context: HeartbeatSessionContext) -> None:
-        """Unified session intelligence — triage + knowledge extraction + activity summary.
+        """Fast heuristic triage for stalled workers (60s path).
 
-        One Haiku call per stalled session. Results are acted on immediately
-        (triage) and staged for Opus to process later (knowledge).
+        No Haiku call — the 5-minute sweep handles LLM analysis.
+        This is just pattern matching on the snapshot for quick decisions.
         """
         snapshot = (context.pane_text or "").strip()
         if not snapshot:
             return
 
-        try:
-            from pollypm.session_intelligence import (
-                run_session_intelligence,
-                stage_pending_knowledge,
-            )
-
-            config = api.supervisor.config
-            session_cfg = config.sessions.get(context.session_name)
-            project_key = session_cfg.project if session_cfg else "pollypm"
-            project = config.projects.get(project_key)
-            project_root = project.path if project else config.project.root_dir
-
-            intel = run_session_intelligence(
-                snapshot=snapshot,
-                transcript_delta=context.transcript_delta or "",
-                session_name=context.session_name,
-                role=context.role,
-                has_pending_work=self._has_pending_work(api, context),
-            )
-
-            if intel is not None:
-                # Act on triage immediately
-                if intel.action == "proceed" and context.role == "worker":
-                    msg = intel.action_message or "Yes, proceed with the plan you outlined."
-                    api.send_session_message(context.session_name, msg, owner="heartbeat")
-                elif intel.action == "nudge" and context.role == "worker":
-                    msg = intel.action_message or "Continue working. Take the next step."
-                    api.send_session_message(context.session_name, msg, owner="heartbeat")
-
-                # Stage knowledge for Opus
-                if intel.knowledge_entries:
-                    stage_pending_knowledge(project_root, context.session_name, intel.knowledge_entries)
-
-                # Append activity summary
-                if intel.activity_summary:
-                    self._append_activity_summary(project_root, intel.activity_summary)
-
-                api.supervisor.store.record_event(
-                    context.session_name, "session_intelligence",
-                    f"action={intel.action}, knowledge={len(intel.knowledge_entries)}, "
-                    f"work_product={intel.has_work_product}",
-                )
-                return
-        except Exception as exc:  # noqa: BLE001
-            import logging
-            logging.getLogger(__name__).debug("Session intelligence failed, using heuristics: %s", exc)
-
-        # Fallback heuristics when Haiku is unavailable
         lowered = snapshot.lower()
+
+        # Worker asking for permission → push forward
         proceed_signals = ["if you want", "shall i", "should i", "want me to", "i can do"]
         if any(sig in lowered for sig in proceed_signals):
             api.send_session_message(
@@ -684,19 +638,21 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 "Yes, proceed. Do the next step you outlined.",
                 owner="heartbeat",
             )
+            api.supervisor.store.record_event(
+                context.session_name, "heuristic_triage", "Pushed forward: proceed signal detected",
+            )
             return
+
+        # Worker has obvious next steps
         next_step_signals = ["next step", "next,", "todo", "remaining", "need to"]
         if any(sig in lowered for sig in next_step_signals):
             self._nudge_stalled_worker(api, context)
             return
+
+        # Worker hit an error
         if "error" in lowered or "failed" in lowered or "traceback" in lowered:
             self._nudge_stalled_worker(api, context)
             return
-
-    def _append_activity_summary(self, project_root: Path, summary: str) -> None:
-        """Append a one-line activity summary to the activity log."""
-        from pollypm.session_intelligence import _append_activity_summary
-        _append_activity_summary(project_root, summary)
 
     def _classify(self, context: HeartbeatSessionContext) -> tuple[str, str]:
         text = (context.transcript_delta or context.pane_text or "").strip()

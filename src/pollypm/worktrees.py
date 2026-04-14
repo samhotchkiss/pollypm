@@ -25,6 +25,12 @@ def ensure_worktree(
     session_name: str | None = None,
     issue_key: str | None = None,
 ) -> WorktreeRecord | None:
+    import re
+    # Validate lane parameters to prevent path traversal
+    for param_name, param_value in [("lane_kind", lane_kind), ("lane_key", lane_key)]:
+        if not re.match(r"^[a-zA-Z0-9_-]+$", param_value):
+            raise typer.BadParameter(f"{param_name} contains invalid characters: {param_value}")
+
     config = load_config(config_path)
     project = config.projects.get(project_key)
     if project is None:
@@ -52,6 +58,8 @@ def ensure_worktree(
             capture_output=True,
         )
         if result.returncode != 0:
+            # Release the session lock so future calls don't get blocked
+            release_session_lock(worktree_root, session_id)
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "git worktree add failed")
 
     store.upsert_worktree(

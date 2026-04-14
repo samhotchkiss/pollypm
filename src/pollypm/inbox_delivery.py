@@ -95,6 +95,13 @@ def ensure_inbox_progress(config: PollyPMConfig) -> dict[str, int]:
             continue
 
         # Agent is idle — should we poke?
+        # Only poke if there are PENDING items (not yet delivered).
+        # Once delivered, the agent has been notified — don't spam.
+        pending_items = [m for m in items if m.delivery_state in ("pending", "failed")]
+        if not pending_items:
+            counts["skipped"] += 1
+            continue
+
         # Check cooldown: don't poke same agent more than once per window
         last_poke = store.last_event_at(session_name, "inbox_poke")
         if last_poke:

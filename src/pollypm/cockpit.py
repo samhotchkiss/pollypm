@@ -191,10 +191,12 @@ class CockpitRouter:
         supervisor = self._load_supervisor()
         config = supervisor.config
         launches, windows, alerts, _leases, _errors = supervisor.status()
-        user_inbox = len(list_v2_messages(config.project.root_dir, status="open", owner="user"))
+        user_msgs = list_v2_messages(config.project.root_dir, status="open", owner="user")
+        unread = sum(1 for m in user_msgs if not m.read)
+        inbox_label = f"Inbox ({unread})" if unread else f"Inbox ({len(user_msgs)})" if user_msgs else "Inbox"
         items = [
             CockpitItem("polly", "Polly", self._session_state("operator", launches, windows, alerts, spinner_index)),
-            CockpitItem("inbox", f"Inbox ({user_inbox})", "mail" if user_inbox else "clear"),
+            CockpitItem("inbox", inbox_label, "mail" if unread else ("clear" if not user_msgs else "read")),
         ]
 
         selected = self.selected_key()

@@ -1383,7 +1383,8 @@ class PollyInboxApp(App[None]):
         body = self._bodies.get(idx, "")
         preview = body.strip().split("\n")[0][:70] if body else ""
         to_label = f" → {item.to}" if hasattr(item, "to") and item.to else ""
-        return f"{icon}[b]{subject}[/b]\n[dim]  {item.sender}{to_label} · {_fmt_time(item.created_at)}  ·  {preview}[/dim]"
+        unread = "● " if hasattr(item, "read") and not item.read else ""
+        return f"{unread}{icon}[b]{subject}[/b]\n[dim]  {item.sender}{to_label} · {_fmt_time(item.created_at)}  ·  {preview}[/dim]"
 
     def _load_messages(self) -> None:
         from pollypm.inbox_v2 import list_messages as list_v2, read_message as read_v2
@@ -1430,6 +1431,16 @@ class PollyInboxApp(App[None]):
         if index < 0 or index >= len(self._messages):
             return
         self._reading = True
+        # Mark as read when viewed
+        item = self._messages[index]
+        if hasattr(item, "id") and hasattr(item, "read") and not item.read:
+            try:
+                from pollypm.inbox_v2 import mark_read as _mark_read
+                config = load_config(self.config_path)
+                _mark_read(config.project.root_dir, item.id)
+                item.read = True
+            except Exception:  # noqa: BLE001
+                pass
         self._reading_index = index
         item = self._messages[index]
         self.query_one("#msg-list").display = False

@@ -40,6 +40,7 @@ class InboxMessage:
     delivery_state: str = "pending"  # pending, delivered, failed, not_applicable
     last_delivered_at: str = ""
     parent_id: str = ""  # links to parent thread (e.g., user request that spawned this task)
+    read: bool = False  # has the recipient read this message?
     project: str = ""
     path: Path = field(default_factory=lambda: Path("."))
 
@@ -474,6 +475,7 @@ def list_messages(
                 delivery_state=msg_ds,
                 last_delivered_at=state.get("last_delivered_at", ""),
                 parent_id=state.get("parent_id", ""),
+                read=bool(state.get("read", False)),
                 project=state.get("project", ""),
                 path=msg_dir,
             ))
@@ -639,6 +641,21 @@ def mark_delivered(
     _append_audit(data, state, by="system", to=data.get("to", ""))
     if state == "delivered":
         data["last_delivered_at"] = datetime.now(UTC).isoformat()
+    atomic_write_text(state_path, json.dumps(data, indent=2) + "\n")
+
+
+def mark_read(project_root: Path, msg_id: str) -> None:
+    """Mark a message as read."""
+    msg_dir = _msg_dir(project_root, msg_id)
+    state_path = msg_dir / "state.json"
+    if not state_path.exists():
+        return
+    data = json.loads(state_path.read_text())
+    if data.get("read"):
+        return  # Already read
+    data["read"] = True
+    data["read_at"] = datetime.now(UTC).isoformat()
+    _append_audit(data, "read", by=data.get("to", "user"))
     atomic_write_text(state_path, json.dumps(data, indent=2) + "\n")
 
 

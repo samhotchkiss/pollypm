@@ -710,9 +710,19 @@ def notify(
 ) -> None:
     """Create an inbox message. Default recipient is the user; use --to for agents."""
     config = load_config(config_path)
+    root = config.project.root_dir
+
+    # Dedup: check for existing open message with similar subject to same recipient
+    existing = list_v2_messages(root, status="open")
+    subject_key = subject.lower().strip()
+    for m in existing:
+        if m.to == to and subject_key in m.subject.lower():
+            typer.echo(f"Skipped: similar message already open ({m.id[:30]}...)")
+            return
+
     owner = to if to != "user" else "user"
     msg = create_v2_message(
-        config.project.root_dir, sender=sender, subject=subject, body=body,
+        root, sender=sender, subject=subject, body=body,
         project=project, owner=owner, to=to,
     )
     typer.echo(f"Created message {msg.id}")

@@ -215,12 +215,15 @@ def reply_to_message(
         quality_note = (
             "\n\n---\n"
             "**Review checklist (complete before notifying user):**\n"
+            "- [ ] Did the worker actually produce anything? Check git log for commits, "
+            "check for new/changed files. If nothing was produced, do NOT notify the user.\n"
             "- [ ] Does this meet the user's stated goal?\n"
             "- [ ] Is the work committed to git?\n"
             "- [ ] Is it deployed/live (if applicable)?\n"
             "- [ ] Are tests passing?\n"
             "- [ ] Quality bar: would the user say 'holy shit, that's done'?\n"
-            "- [ ] Send notification: `pm notify \"Done: ...\" \"...\" --to user`"
+            "- [ ] Send notification with specifics: what changed, key commits, how to verify. "
+            "`pm notify \"Done: ...\" \"...\" --to user`"
         )
     elif sender in ("polly",) and recipient not in ("user", "human", "polly", "heartbeat", "system"):
         # Polly → Worker: quality expectations

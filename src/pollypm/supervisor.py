@@ -542,7 +542,7 @@ class Supervisor:
         self.tmux.set_window_option(target, "allow-passthrough", "on")
         self.tmux.set_window_option(target, "window-size", "latest")
         self.tmux.set_window_option(target, "aggressive-resize", "on")
-        self.tmux.set_pane_history_limit(target, 500)
+        self.tmux.set_pane_history_limit(target, 200)
 
     def _repair_console_if_broken(self, tmux_session: str) -> None:
         """Detect and repair a cockpit window where the rail pane died leaving only a worker."""
@@ -1568,7 +1568,7 @@ class Supervisor:
             target = f"{tmux_session}:{launch.window_name}"
             self.tmux.set_window_option(target, "allow-passthrough", "on")
         # Cap scrollback to prevent slow pane-switching in the cockpit
-        self.tmux.set_pane_history_limit(target, 500)
+        self.tmux.set_pane_history_limit(target, 200)
         self.tmux.pipe_pane(target, launch.log_path)
         self._record_launch(launch)
         return launch, target

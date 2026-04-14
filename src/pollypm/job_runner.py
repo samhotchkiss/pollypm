@@ -164,7 +164,7 @@ def _run_gc_maintenance(supervisor: Supervisor, payload: dict[str, Any]) -> None
                 continue
             for window in supervisor.tmux.list_windows(session_name):
                 target = f"{session_name}:{window.name}"
-                supervisor.tmux.set_pane_history_limit(target, 500)
+                supervisor.tmux.set_pane_history_limit(target, 200)
     except Exception:  # noqa: BLE001
         pass
 

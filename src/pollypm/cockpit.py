@@ -562,7 +562,7 @@ class CockpitRouter:
                         left_pane = min(panes, key=self._pane_left)
                         self._try_resize_rail(left_pane.pane_id)
                         right_pane = max(panes, key=self._pane_left)
-                        self.tmux.set_pane_history_limit(right_pane.pane_id, 500)
+                        self.tmux.set_pane_history_limit(right_pane.pane_id, 200)
                         state = self._load_state()
                         state["mounted_session"] = session_name
                         state["right_pane_id"] = right_pane.pane_id
@@ -597,7 +597,7 @@ class CockpitRouter:
         left_pane = min(panes, key=self._pane_left)
         self._try_resize_rail(left_pane.pane_id)
         right_pane = max(panes, key=self._pane_left)
-        self.tmux.set_pane_history_limit(right_pane.pane_id, 500)
+        self.tmux.set_pane_history_limit(right_pane.pane_id, 200)
         state = self._load_state()
         state["mounted_session"] = session_name
         state["right_pane_id"] = right_pane.pane_id
@@ -642,7 +642,7 @@ class CockpitRouter:
             detached=False,
             size=right_size,
         )
-        self.tmux.set_pane_history_limit(right_pane_id, 500)
+        self.tmux.set_pane_history_limit(right_pane_id, 200)
         self.tmux.pipe_pane(right_pane_id, visible_launch.log_path)
         supervisor._stabilize_launch(visible_launch, right_pane_id)
         return max(self.tmux.list_panes(window_target), key=self._pane_left)

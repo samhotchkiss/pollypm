@@ -712,18 +712,19 @@ def notify(
     config = load_config(config_path)
     root = config.project.root_dir
 
-    # Auto-detect sender from CWD if using default
+    # Auto-detect sender from CWD — longest match wins
     if sender == "polly":
         try:
             import os
             cwd = os.getcwd()
+            best_len = 0
             for sess_name, sess_cfg in config.sessions.items():
-                if sess_cfg.cwd and str(sess_cfg.cwd) in cwd:
+                if sess_cfg.cwd and str(sess_cfg.cwd) in cwd and len(str(sess_cfg.cwd)) > best_len:
+                    best_len = len(str(sess_cfg.cwd))
                     if sess_cfg.role == "operator-pm":
                         sender = "polly"
                     elif sess_cfg.role in ("worker", "triage"):
                         sender = sess_name
-                    break
         except Exception:  # noqa: BLE001
             pass
 
@@ -877,15 +878,18 @@ def mail(
     try:
         import os
         cwd = os.getcwd()
-        # Match CWD to a managed session — if we're inside a worker's
-        # project directory (or its worktree), we're that worker.
+        # Match CWD to the managed session with the LONGEST matching path.
+        # This prevents /Users/sam/dev (heartbeat) from matching before
+        # /Users/sam/dev/camptown/.pollypm/worktrees/... (worker).
+        best_match = ("", "user")  # (cwd_str, sender)
         for sess_name, sess_cfg in config.sessions.items():
             if sess_cfg.cwd and str(sess_cfg.cwd) in cwd:
-                if sess_cfg.role == "operator-pm":
-                    effective_sender = "polly"
-                elif sess_cfg.role in ("worker", "triage"):
-                    effective_sender = sess_name
-                break
+                if len(str(sess_cfg.cwd)) > len(best_match[0]):
+                    if sess_cfg.role == "operator-pm":
+                        best_match = (str(sess_cfg.cwd), "polly")
+                    elif sess_cfg.role in ("worker", "triage"):
+                        best_match = (str(sess_cfg.cwd), sess_name)
+        effective_sender = best_match[1]
     except Exception:  # noqa: BLE001
         pass  # Default to "user" if detection fails
 

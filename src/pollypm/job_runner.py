@@ -77,8 +77,26 @@ def _run_release_lease(supervisor: Supervisor, payload: dict[str, Any]) -> None:
 
 @register_job("knowledge_extract")
 def _run_knowledge_extract(supervisor: Supervisor, payload: dict[str, Any]) -> None:
+    """Extract knowledge from transcripts and update project docs + activity log.
+
+    Runs at most every 15 minutes (debounced by last run time).
+    Updates: docs/project-overview.md, docs/decisions.md, docs/risks.md,
+    docs/ideas.md, docs/activity-log.md
+    """
+    from datetime import UTC, datetime
+    last = supervisor.store.last_event_at("knowledge_extract", "completed")
+    if last:
+        age = (datetime.now(UTC) - datetime.fromisoformat(last)).total_seconds()
+        if age < 900:  # 15 minutes
+            return
     from pollypm.knowledge_extract import extract_knowledge_once
-    extract_knowledge_once(supervisor.config)
+    result = extract_knowledge_once(supervisor.config)
+    supervisor.store.record_event(
+        "knowledge_extract", "completed",
+        f"Processed {result.get('processed_events', 0)} events, "
+        f"updated {result.get('updated_docs', 0)} docs, "
+        f"{result.get('log_entries', 0)} log entries",
+    )
 
 
 @register_job("version_check")

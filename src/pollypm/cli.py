@@ -736,16 +736,24 @@ def notify(
         )
         raise typer.Exit(code=1)
 
-    # Dedup: check open AND recent closed messages (last hour) for similar subject
+    # Dedup: check open AND recent closed messages (last hour) for similar content
     from datetime import UTC, datetime
-    subject_key = subject.lower().strip()
     one_hour_ago = (datetime.now(UTC) - __import__("datetime").timedelta(hours=1)).isoformat()
+    # Extract significant words (3+ chars, skip common prefixes)
+    _skip = {"done", "task", "update", "the", "and", "for", "from", "with", "new"}
+    subject_words = {w for w in subject.lower().split() if len(w) >= 3 and w not in _skip}
     for status in ("open", "closed"):
         for m in list_v2_messages(root, status=status):
-            if m.to == to and subject_key in m.subject.lower():
-                if status == "open" or m.updated_at >= one_hour_ago:
-                    typer.echo(f"Skipped: similar message already exists ({m.id[:30]}...)")
-                    return
+            if m.to != to:
+                continue
+            if status == "closed" and m.updated_at < one_hour_ago:
+                continue
+            existing_words = {w for w in m.subject.lower().split() if len(w) >= 3 and w not in _skip}
+            overlap = subject_words & existing_words
+            # If 2+ significant words match, it's about the same thing
+            if len(overlap) >= 2:
+                typer.echo(f"Skipped: similar message already exists ({m.id[:30]}...)")
+                return
 
     owner = to if to != "user" else "user"
     msg = create_v2_message(

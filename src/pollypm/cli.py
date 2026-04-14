@@ -712,6 +712,15 @@ def notify(
     config = load_config(config_path)
     root = config.project.root_dir
 
+    # Quality gate: user-facing messages must have substance
+    if to == "user" and len(body.split()) < 20:
+        typer.echo(
+            "Blocked: user notifications must include enough context to be useful.\n"
+            "Include: what was done, key changes, and how to verify/review.\n"
+            f"Your message has {len(body.split())} words — need at least 20."
+        )
+        raise typer.Exit(code=1)
+
     # Dedup: check for existing open message with similar subject to same recipient
     existing = list_v2_messages(root, status="open")
     subject_key = subject.lower().strip()
@@ -905,6 +914,9 @@ def mail(
             typer.echo(f"Message not found: {message_id}")
             raise typer.Exit(code=1)
         _ctx, _hist, entries = read_v2_message(root, match.id)
+        # Mark as read when viewed
+        from pollypm.inbox_v2 import mark_read as _mark_read
+        _mark_read(root, match.id)
         console = Console()
 
         # Header
@@ -961,6 +973,7 @@ def mail(
     agent_msgs = [m for m in messages if m not in user_msgs]
 
     def _render_item(item):
+        read_indicator = "  " if item.read else "● "
         prefix = ""
         if "[Escalation]" in item.subject:
             prefix = "▲ "
@@ -968,13 +981,15 @@ def mail(
             prefix = "◆ "
         elif "[Complete]" in item.subject:
             prefix = "✓ "
-        typer.echo(f"  {prefix}{item.subject}")
+        typer.echo(f"  {read_indicator}{prefix}{item.subject}")
         typer.echo(f"    {item.sender} → {item.to} · {_fmt_time(item.created_at)}")
         typer.echo(f"    {item.id}")
         typer.echo()
 
     if user_msgs:
-        typer.echo(f"Inbox ({len(user_msgs)}):\n")
+        unread = sum(1 for m in user_msgs if not m.read)
+        label = f"Inbox ({len(user_msgs)}" + (f", {unread} unread" if unread else "") + ")"
+        typer.echo(f"{label}\n")
         for item in user_msgs:
             _render_item(item)
 

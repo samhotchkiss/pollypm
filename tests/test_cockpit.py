@@ -52,7 +52,7 @@ def test_cockpit_router_build_items_includes_core_entries(monkeypatch, tmp_path:
             windows = [FakeWindow("pm-operator"), FakeWindow("worker-demo")]
             return launches, windows, [], [], []
 
-    monkeypatch.setattr("pollypm.cockpit.list_v2_messages", lambda root_dir, **kw: [type("M", (), {"subject": "test", "id": "t1"})()])
+    monkeypatch.setattr("pollypm.cockpit.list_v2_messages", lambda root_dir, **kw: [type("M", (), {"subject": "test", "id": "t1", "read": False, "owner": "user", "sender": "polly", "to": "user"})()])
     (tmp_path / "pollypm.toml").write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm-state'}\"\n")
     router = CockpitRouter(tmp_path / "pollypm.toml")
     monkeypatch.setattr(router, "_load_supervisor", lambda: FakeSupervisor())
@@ -762,6 +762,9 @@ def test_cockpit_router_joins_session_from_storage(monkeypatch, tmp_path: Path) 
         def resize_pane_width(self, target: str, width: int):
             pass
 
+        def set_pane_history_limit(self, target: str, limit: int):
+            pass
+
     router = CockpitRouter(tmp_path / "pollypm.toml")
     router.tmux = FakeTmux()  # type: ignore[assignment]
     monkeypatch.setattr(router, "_load_supervisor", lambda: FakeSupervisor())
@@ -1125,6 +1128,9 @@ def test_cockpit_router_falls_back_to_static_when_session_not_in_storage(monkeyp
             ]
 
         def resize_pane_width(self, target: str, width: int):
+            pass
+
+        def set_pane_history_limit(self, target: str, limit: int):
             pass
 
     router = CockpitRouter(tmp_path / "pollypm.toml")

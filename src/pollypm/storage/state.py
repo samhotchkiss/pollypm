@@ -352,8 +352,10 @@ class StateStore:
         self._lock = threading.RLock()
         self.conn = sqlite3.connect(path, check_same_thread=False)
         with self._lock:
+            # WAL mode allows concurrent reads + single writer across processes
             self.execute("PRAGMA journal_mode=WAL")
-            self.execute("PRAGMA busy_timeout=5000")
+            # 30s busy timeout — enough for multi-process cron overlap
+            self.execute("PRAGMA busy_timeout=30000")
             self.conn.executescript(SCHEMA)
             try:
                 self._migrate()
@@ -362,12 +364,19 @@ class StateStore:
                 raise
             self.commit()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
     def close(self) -> None:
         with self._lock:
             try:
                 self.conn.close()
             except Exception:  # noqa: BLE001
-                pass
+                import logging
+                logging.getLogger(__name__).debug("Error closing StateStore", exc_info=True)
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         """Thread-safe execute."""
@@ -378,11 +387,11 @@ class StateStore:
         """Thread-safe commit. Bumps the state epoch so subscribers know to refresh."""
         with self._lock:
             self.conn.commit()
-        try:
-            from pollypm.state_epoch import bump
-            bump()
-        except Exception:  # noqa: BLE001
-            pass
+            try:
+                from pollypm.state_epoch import bump
+                bump()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _now(self) -> str:
         return datetime.now(UTC).isoformat()
@@ -623,32 +632,42 @@ class StateStore:
 
     def upsert_alert(self, session_name: str, alert_type: str, severity: str, message: str) -> None:
         now = self._now()
-        existing = self.execute(
-            """
-            SELECT id, message, severity
-            FROM alerts
-            WHERE session_name = ? AND alert_type = ? AND status = 'open'
-            """,
-            (session_name, alert_type),
-        ).fetchone()
-        if existing is None:
-            self.execute(
+        # Use INSERT OR IGNORE + UPDATE to avoid check-then-act race
+        with self._lock:
+            existing = self.conn.execute(
                 """
-                INSERT INTO alerts (session_name, alert_type, severity, message, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 'open', ?, ?)
+                SELECT id, message, severity
+                FROM alerts
+                WHERE session_name = ? AND alert_type = ? AND status = 'open'
                 """,
-                (session_name, alert_type, severity, message, now, now),
-            )
-        else:
-            self.execute(
-                """
-                UPDATE alerts
-                SET severity = ?, message = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (severity, message, now, existing[0]),
-            )
-        self.commit()
+                (session_name, alert_type),
+            ).fetchone()
+            if existing is None:
+                try:
+                    self.conn.execute(
+                        """
+                        INSERT INTO alerts (session_name, alert_type, severity, message, status, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, 'open', ?, ?)
+                        """,
+                        (session_name, alert_type, severity, message, now, now),
+                    )
+                except sqlite3.IntegrityError:
+                    pass  # Another process inserted first — that's fine
+            else:
+                self.conn.execute(
+                    """
+                    UPDATE alerts
+                    SET severity = ?, message = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (severity, message, now, existing[0]),
+                )
+            self.conn.commit()
+            try:
+                from pollypm.state_epoch import bump
+                bump()
+            except Exception:  # noqa: BLE001
+                pass
 
     def clear_alert(self, session_name: str, alert_type: str) -> None:
         self.execute(

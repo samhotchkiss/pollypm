@@ -53,7 +53,18 @@ def _resolve_path(base: Path, raw_path: str) -> Path:
     path = Path(raw_path)
     if path.is_absolute():
         return path
-    return base / path
+    resolved = (base / path).resolve()
+    # Block path traversal: relative paths must stay within base
+    try:
+        resolved.relative_to(base.resolve())
+    except ValueError:
+        raise ValueError(f"Path '{raw_path}' escapes base directory '{base}'")
+    return resolved
+
+
+def _toml_str(value: str) -> str:
+    """Escape a string for TOML double-quoted format."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _format_path(path: Path, root: Path) -> str:
@@ -238,9 +249,11 @@ def _merge_project_local_config(
             persona_name = project_raw.get("persona_name")
             if isinstance(persona_name, str) and persona_name.strip():
                 project.persona_name = persona_name.strip()
+        _PROTECTED_SESSIONS = {"heartbeat", "operator"}
         for session_name, session in _parse_sessions(raw, base=project.path, default_project=project_key).items():
+            if session_name in _PROTECTED_SESSIONS:
+                continue  # Never allow project-local configs to override control sessions
             session.project = project_key
-            # Project-local session config overrides global config for the same name
             sessions[session_name] = session
 
 
@@ -256,7 +269,7 @@ def _validate_cross_references(
                 f"Session '{session_name}' references unknown account '{session.account}'. "
                 f"Known accounts: {', '.join(accounts) or 'none'}"
             )
-    if pollypm.controller_account and pollypm.controller_account not in accounts and accounts:
+    if pollypm.controller_account and pollypm.controller_account not in accounts:
         raise ValueError(
             f"Controller account '{pollypm.controller_account}' not found. "
             f"Known accounts: {', '.join(accounts)}"
@@ -335,20 +348,20 @@ def _render_global_config(config: PollyPMConfig) -> str:
             ]
         )
         if account.email:
-            lines.append(f'email = "{account.email}"')
+            lines.append(f'email = "{_toml_str(account.email)}"')
         if account.runtime is not RuntimeKind.LOCAL:
             lines.append(f'runtime = "{account.runtime.value}"')
         if account.home is not None:
             lines.append(f'home = "{_format_path(account.home, root)}"')
         if account.docker_image:
-            lines.append(f'docker_image = "{account.docker_image}"')
+            lines.append(f'docker_image = "{_toml_str(account.docker_image)}"')
         if account.docker_extra_args:
-            items = ", ".join(f'"{arg}"' for arg in account.docker_extra_args)
+            items = ", ".join(f'"{_toml_str(arg)}"' for arg in account.docker_extra_args)
             lines.append(f"docker_extra_args = [{items}]")
         if account.env:
             lines.append("[accounts.%s.env]" % account_name)
             for key, value in account.env.items():
-                lines.append(f'{key} = "{value}"')
+                lines.append(f'{_toml_str(key)} = "{_toml_str(value)}"')
         lines.append("")
 
     for session_name, session in config.sessions.items():

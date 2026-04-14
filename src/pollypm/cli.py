@@ -736,13 +736,16 @@ def notify(
         )
         raise typer.Exit(code=1)
 
-    # Dedup: check for existing open message with similar subject to same recipient
-    existing = list_v2_messages(root, status="open")
+    # Dedup: check open AND recent closed messages (last hour) for similar subject
+    from datetime import UTC, datetime
     subject_key = subject.lower().strip()
-    for m in existing:
-        if m.to == to and subject_key in m.subject.lower():
-            typer.echo(f"Skipped: similar message already open ({m.id[:30]}...)")
-            return
+    one_hour_ago = (datetime.now(UTC) - __import__("datetime").timedelta(hours=1)).isoformat()
+    for status in ("open", "closed"):
+        for m in list_v2_messages(root, status=status):
+            if m.to == to and subject_key in m.subject.lower():
+                if status == "open" or m.updated_at >= one_hour_ago:
+                    typer.echo(f"Skipped: similar message already exists ({m.id[:30]}...)")
+                    return
 
     owner = to if to != "user" else "user"
     msg = create_v2_message(

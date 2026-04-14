@@ -264,6 +264,14 @@ def reply_to_message(
         atomic_write_text(msg_dir / "context.md", updated_context)
 
     # Update state — flip owner, set new recipient and delivery state
+    # Exception: heartbeat/system threads are internal — replies should NOT
+    # flip to user. Polly creates a separate pm notify for the user.
+    original_sender = state.get("sender", "")
+    if original_sender in ("heartbeat", "system"):
+        # Internal thread — keep between agents, don't flip to user
+        recipient = original_sender  # reply goes back to heartbeat/system
+        delivery_state = "not_applicable"
+
     state["message_count"] = index
     state["updated_at"] = ts.isoformat()
     state["to"] = recipient
@@ -272,6 +280,8 @@ def reply_to_message(
     state["last_delivered_at"] = ""
     if new_owner:
         state["owner"] = new_owner
+    elif original_sender in ("heartbeat", "system"):
+        pass  # Don't change owner on internal threads
     elif sender == "user":
         state["owner"] = "polly"
     elif sender in ("polly", "heartbeat", "system"):

@@ -267,14 +267,17 @@ def _events_to_transcript_delta(events: list[dict], max_chars: int = 2000) -> st
 def sweep_all_sessions(config) -> dict[str, int]:
     """Process ALL sessions with new transcript events since last cursor.
 
-    Makes one Haiku call per session with new data. Extracts knowledge
-    entries and activity summaries. Does NOT triage (that's the 60s path).
+    This is the ONLY Haiku path. One call per session with new data.
+    Returns triage actions + knowledge entries + activity summaries.
+    Triage actions are applied immediately (send_input to workers).
 
-    Returns: {sessions_processed, knowledge_entries, summaries}
+    Returns: {sessions_processed, knowledge_entries, summaries, actions_taken}
     """
     from pollypm.knowledge_extract import _all_project_roots
+    from pollypm.supervisor import Supervisor
 
-    counts = {"sessions_processed": 0, "knowledge_entries": 0, "summaries": 0}
+    counts = {"sessions_processed": 0, "knowledge_entries": 0, "summaries": 0, "actions_taken": 0}
+    sup = None
 
     for project_root in _all_project_roots(config):
         cursors = _load_cursors(project_root)
@@ -293,26 +296,45 @@ def sweep_all_sessions(config) -> dict[str, int]:
             if not events:
                 continue
 
-            # Build a transcript delta from the events
             transcript_delta = _events_to_transcript_delta(events)
             if not transcript_delta:
                 updated_cursors[f"{session_name}/events.jsonl"] = new_offset
                 continue
 
-            # Determine role
+            # Get current snapshot for triage
+            snapshot = ""
+            try:
+                if sup is None:
+                    sup = Supervisor(config)
+                snapshot_path = config.project.snapshots_dir / f"{session_name}.txt"
+                if snapshot_path.exists():
+                    snapshot = snapshot_path.read_text()[-1500:]
+            except Exception:  # noqa: BLE001
+                pass
+
             session_cfg = config.sessions.get(session_name)
             role = session_cfg.role if session_cfg else "worker"
 
-            # Call Haiku — knowledge extraction + activity summary only (no triage)
             intel = run_session_intelligence(
-                snapshot="",  # No snapshot needed for knowledge-only pass
+                snapshot=snapshot,
                 transcript_delta=transcript_delta,
                 session_name=session_name,
                 role=role,
-                has_pending_work=True,  # Assume work if there are events
+                has_pending_work=True,
             )
 
             if intel is not None:
+                # Act on triage — push workers forward
+                if intel.action in ("proceed", "nudge") and role == "worker":
+                    try:
+                        if sup is None:
+                            sup = Supervisor(config)
+                        msg = intel.action_message or "Continue working."
+                        sup.send_input(session_name, msg, owner="pollypm", force=True)
+                        counts["actions_taken"] += 1
+                    except Exception:  # noqa: BLE001
+                        pass
+
                 if intel.knowledge_entries:
                     stage_pending_knowledge(project_root, session_name, intel.knowledge_entries)
                     counts["knowledge_entries"] += len(intel.knowledge_entries)
@@ -324,6 +346,9 @@ def sweep_all_sessions(config) -> dict[str, int]:
             counts["sessions_processed"] += 1
 
         _save_cursors(project_root, updated_cursors)
+
+    if sup is not None:
+        sup.store.close()
 
     return counts
 

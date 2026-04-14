@@ -499,30 +499,65 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             pass
 
     def _detect_worker_completion(self, api, context: HeartbeatSessionContext) -> None:
-        """Detect when a worker is idle with open inbox threads it hasn't replied to.
+        """Track worker activity and ensure inbox threads exist for accountability.
 
-        If the worker has open threads addressed to it and hasn't replied,
-        the delivery system will poke it on the next cycle. This method
-        just ensures delivery_state is reset to "pending" so the poke fires.
+        1. If worker has open threads it hasn't replied to, reset delivery for re-poke.
+        2. If worker is active but has NO open inbox threads, create a tracking thread
+           so the work gets reported back through the inbox lifecycle.
         """
         try:
-            from pollypm.inbox_v2 import list_messages, mark_delivered
+            from pollypm.inbox_v2 import create_message, list_messages, mark_delivered
 
             config = api.supervisor.config
             root = config.project.root_dir
+            store = api.supervisor.store
 
-            # Find open threads addressed to this worker that are marked "delivered"
-            # but the worker hasn't replied (message_count still 1)
-            stale = [
+            # Find open threads addressed to this worker
+            worker_threads = [
                 m for m in list_messages(root, status="open")
                 if m.to == context.session_name
-                and m.delivery_state == "delivered"
-                and m.message_count <= 1
             ]
 
-            # Reset to pending so the delivery job pokes again
+            # Re-poke stale delivered threads
+            stale = [
+                m for m in worker_threads
+                if m.delivery_state == "delivered" and m.message_count <= 1
+            ]
             for m in stale:
                 mark_delivered(root, m.id, state="pending")
+
+            # If worker is active (snapshot changing) but has no inbox threads,
+            # create a tracking thread so the work gets reported back.
+            if not worker_threads:
+                hashes = api.recent_snapshot_hashes(context.session_name, limit=2)
+                is_active = len(hashes) >= 2 and hashes[0] != hashes[1]
+                if is_active:
+                    # Check cooldown — don't create tracking threads too often
+                    last = store.last_event_at(context.session_name, "tracking_thread_created")
+                    if last:
+                        from datetime import UTC, datetime
+                        age = (datetime.now(UTC) - datetime.fromisoformat(last)).total_seconds()
+                        if age < 1800:  # 30 minute cooldown
+                            return
+
+                    session = config.sessions.get(context.session_name)
+                    project_key = session.project if session else "unknown"
+                    create_message(
+                        root,
+                        sender="heartbeat",
+                        subject=f"Active work: {context.session_name} on {project_key}",
+                        to=context.session_name,
+                        owner=context.session_name,
+                        body=(
+                            f"You are actively working but have no open inbox thread. "
+                            f"When your current task is complete, reply to this thread with "
+                            f"what you did and what changed. Use: pm reply <this_id> 'your report'"
+                        ),
+                    )
+                    store.record_event(
+                        context.session_name, "tracking_thread_created",
+                        f"Created tracking thread for untracked work on {project_key}",
+                    )
         except Exception:  # noqa: BLE001
             pass
 

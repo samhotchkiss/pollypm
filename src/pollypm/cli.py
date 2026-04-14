@@ -703,7 +703,7 @@ def issue_validate(
 def notify(
     subject: str = typer.Argument(..., help="Short message subject."),
     body: str = typer.Argument(..., help="Message body."),
-    sender: str = typer.Option("pa", "--sender", help="Message sender."),
+    sender: str = typer.Option("polly", "--sender", help="Message sender."),
     to: str = typer.Option("user", "--to", help="Recipient: user, polly, or worker_<name>."),
     project: str = typer.Option("", "--project", help="Related project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
@@ -711,6 +711,21 @@ def notify(
     """Create an inbox message. Default recipient is the user; use --to for agents."""
     config = load_config(config_path)
     root = config.project.root_dir
+
+    # Auto-detect sender from CWD if using default
+    if sender == "polly":
+        try:
+            import os
+            cwd = os.getcwd()
+            for sess_name, sess_cfg in config.sessions.items():
+                if sess_cfg.cwd and str(sess_cfg.cwd) in cwd:
+                    if sess_cfg.role == "operator-pm":
+                        sender = "polly"
+                    elif sess_cfg.role in ("worker", "triage"):
+                        sender = sess_name
+                    break
+        except Exception:  # noqa: BLE001
+            pass
 
     # Quality gate: user-facing messages must have substance
     if to == "user" and len(body.split()) < 20:

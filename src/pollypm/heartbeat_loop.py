@@ -153,7 +153,14 @@ def select_intervention(
         return None
 
     if health == SessionHealth.WAITING_ON_USER:
-        return None  # Don't intervene when waiting for user
+        # Workers asking "should I continue?" should be pushed forward.
+        # The heartbeat triage will use Haiku to decide the right action.
+        # Only skip intervention for the operator (user interaction is expected).
+        return InterventionAction(
+            session_name=signals.session_name,
+            action="nudge",
+            reason="Session is waiting — triage will decide whether to push forward",
+        )
 
     if health == SessionHealth.IDLE:
         if previous_interventions == 0:

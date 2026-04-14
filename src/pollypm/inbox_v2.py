@@ -71,7 +71,14 @@ def _inbox_root(project_root: Path) -> Path:
 
 
 def _msg_dir(project_root: Path, msg_id: str) -> Path:
-    return _inbox_root(project_root) / msg_id
+    import re
+    if not re.match(r"^[a-zA-Z0-9._-]+$", msg_id):
+        raise ValueError(f"Invalid message ID (unsafe characters): {msg_id}")
+    result = _inbox_root(project_root) / msg_id
+    # Defense in depth: verify resolved path is under inbox root
+    if not str(result.resolve()).startswith(str(_inbox_root(project_root).resolve())):
+        raise ValueError(f"Path traversal detected in message ID: {msg_id}")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -214,16 +221,17 @@ def reply_to_message(
         # Worker → Polly: review checklist
         quality_note = (
             "\n\n---\n"
-            "**Review checklist (complete before notifying user):**\n"
-            "- [ ] Did the worker actually produce anything? Check git log for commits, "
-            "check for new/changed files. If nothing was produced, do NOT notify the user.\n"
-            "- [ ] Does this meet the user's stated goal?\n"
-            "- [ ] Is the work committed to git?\n"
-            "- [ ] Is it deployed/live (if applicable)?\n"
-            "- [ ] Are tests passing?\n"
-            "- [ ] Quality bar: would the user say 'holy shit, that's done'?\n"
-            "- [ ] Send notification with specifics: what changed, key commits, how to verify. "
-            "`pm notify \"Done: ...\" \"...\" --to user`"
+            "**REVIEW REQUIRED — do NOT rubber-stamp this.**\n"
+            "You are the quality gate. The user trusts you to hold the bar.\n\n"
+            "1. **CHECK THE ACTUAL OUTPUT.** Open the file, visit the URL, read the diff. "
+            "Do not just accept the worker's claim that it's done.\n"
+            "2. **Does it meet the user's goal?** Not 'did the worker do something' but "
+            "'would the user be impressed by this?'\n"
+            "3. **Is it committed and deployed?** Check `git log` and the live URL.\n"
+            "4. **SEND IT BACK if it's not right.** Use `pm notify '<feedback>' --to <worker>` "
+            "with specific, actionable critique. Don't accept mediocre work.\n"
+            "5. **Only when it's genuinely done:** `pm notify \"Done: ...\" \"...\" --to user` "
+            "with what changed, how to verify, and links."
         )
     elif sender in ("polly",) and recipient not in ("user", "human", "polly", "heartbeat", "system"):
         # Polly → Worker: quality expectations
@@ -281,7 +289,7 @@ def reply_to_message(
     if new_owner:
         state["owner"] = new_owner
     elif original_sender in ("heartbeat", "system"):
-        pass  # Don't change owner on internal threads
+        state["owner"] = recipient  # Sync owner with to for internal threads
     elif sender == "user":
         state["owner"] = "polly"
     elif sender in ("polly", "heartbeat", "system"):
@@ -389,12 +397,12 @@ def close_message(
                 last_user_msg = entry
 
         if user_involved:
-            # User is in this thread — they must ack before agent can close
-            if last_user_msg and not _is_simple_ack(last_user_msg.body):
-                raise ValueError(
-                    f"Cannot close: only the user can archive this thread. "
-                    f"Reply with `pm reply {msg_id} '<what you did>'` and the user will archive when ready."
-                )
+            # Agents CANNOT close user-involved threads, period.
+            # Only the user can archive their own threads.
+            raise ValueError(
+                f"Cannot close: only the user can archive threads they're involved in. "
+                f"Reply with `pm reply {msg_id} '<what you did>'` and the user will archive when ready."
+            )
         else:
             # Agent-to-agent thread (e.g., Polly → worker)
             # Can only close if a user notification was sent about the outcome.

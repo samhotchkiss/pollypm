@@ -94,9 +94,19 @@ def ensure_inbox_progress(config: PollyPMConfig) -> dict[str, int]:
                     mark_delivered(root, m.id, state="delivered")
             continue
 
-        # Agent is idle — should we poke?
+        # Agent is idle — check for stale delivered messages first.
+        # If a message was delivered 10+ minutes ago and the agent hasn't
+        # replied, reset to pending so it gets re-poked.
+        for m in items:
+            if m.delivery_state == "delivered" and m.last_delivered_at:
+                try:
+                    age = (datetime.now(UTC) - datetime.fromisoformat(m.last_delivered_at)).total_seconds()
+                    if age > 600:  # 10 minutes without action
+                        mark_delivered(root, m.id, state="pending")
+                except (ValueError, TypeError):
+                    pass
+
         # Only poke if there are PENDING items (not yet delivered).
-        # Once delivered, the agent has been notified — don't spam.
         pending_items = [m for m in items if m.delivery_state in ("pending", "failed")]
         if not pending_items:
             counts["skipped"] += 1

@@ -809,6 +809,22 @@ def reply_to_message(
         pass  # Delivery is best-effort here, heartbeat will pick it up
 
     if close_after:
+        # Only the user or Polly (operator) can close threads.
+        # Workers must reply and let Polly review before closing.
+        try:
+            import os
+            cwd = os.getcwd()
+            best_len = 0
+            caller_role = "user"
+            for sn, sc in config.sessions.items():
+                if sc.cwd and str(sc.cwd) in cwd and len(str(sc.cwd)) > best_len:
+                    best_len = len(str(sc.cwd))
+                    caller_role = sc.role
+            if caller_role == "worker":
+                typer.echo("Workers cannot close threads. Reply without --close and let Polly review.")
+                return
+        except Exception:  # noqa: BLE001
+            pass
         close_v2_message(root, v2_msg.id, sender=sender, note=text[:200])
         typer.echo("Message closed.")
 

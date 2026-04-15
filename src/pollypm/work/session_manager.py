@@ -563,7 +563,10 @@ class SessionManager:
             f"## Common Review Failures (avoid these)\n\n"
             f"- pyproject.toml: always use `build-backend = \"setuptools.build_meta\"` "
             f"(NOT setuptools.backends._legacy:_Backend)\n"
-            f"- Verify your code actually runs before signaling done\n"
+            f"- pyproject.toml: if using setuptools, add "
+            f"`[tool.setuptools.packages.find]` with `exclude = [\"issues*\", \"docs*\", \"tests*\"]` "
+            f"to prevent the issues/ directory from being treated as a package\n"
+            f"- Verify your code actually runs (`uv run python -m <package>`) before signaling done\n"
             f"- Check every acceptance criterion individually\n"
             f"- Include proper error handling for CLI tools\n"
         )

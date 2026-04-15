@@ -288,6 +288,8 @@ def reviewer_prompt() -> str:
         "acceptance criteria, or anything the user would notice — reject it.\n\n"
         "## Common rejection reasons (check for these)\n\n"
         "- pyproject.toml: wrong build-backend (should be setuptools.build_meta)\n"
+        "- pyproject.toml: missing packages.find exclude for issues/ directory\n"
+        "- Package fails to build (`uv run python -m <package>` errors)\n"
         "- Code committed to worktree but not merged to main\n"
         "- Tests missing for new functionality\n"
         "- Acceptance criteria not fully met (check each criterion individually)\n"

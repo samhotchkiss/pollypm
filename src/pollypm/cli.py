@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import typer
@@ -21,6 +22,7 @@ from pollypm.config import (
     DEFAULT_CONFIG_PATH,
     GLOBAL_CONFIG_DIR,
     load_config,
+    resolve_config_path,
     render_example_config,
     write_example_config,
 )
@@ -66,19 +68,21 @@ app.add_typer(issue_app, name="issue")
 app.add_typer(report_app, name="report")
 app.add_typer(itsalive_app, name="itsalive")
 
+from pollypm.work.cli import task_app, flow_app
+app.add_typer(task_app, name="task")
+app.add_typer(flow_app, name="flow")
+
 
 def _session_name_candidates() -> list[str]:
     return ["pollypm", "pollypm-storage-closet"]
 
 
 def _discover_config_path(config_path: Path) -> Path:
-    if config_path.exists():
-        return config_path
-    # If an explicit non-default path was given, respect it as-is
-    if config_path != DEFAULT_CONFIG_PATH:
-        return config_path
-    # The global config lives at ~/.pollypm/pollypm.toml
-    return DEFAULT_CONFIG_PATH
+    return resolve_config_path(config_path)
+
+
+def _config_option_was_explicit() -> bool:
+    return any(arg == "--config" or arg.startswith("--config=") for arg in sys.argv[1:])
 
 
 def _attach_existing_session_without_config() -> bool:
@@ -344,6 +348,10 @@ def cockpit_pane(
     if kind == "inbox":
         from pollypm.cockpit_ui import PollyInboxApp
         PollyInboxApp(config_path).run(mouse=True)
+        return
+    if kind == "issues" and target:
+        from pollypm.cockpit_ui import PollyTasksApp
+        PollyTasksApp(config_path, target).run(mouse=True)
         return
     PollyCockpitPaneApp(config_path, kind, target).run(mouse=True)
 
@@ -883,6 +891,8 @@ def mail(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
     """View, read, reply to, and manage inbox messages."""
+    if not _config_option_was_explicit():
+        config_path = _discover_config_path(config_path)
     config = load_config(config_path)
     root = config.project.root_dir
 
@@ -1291,6 +1301,8 @@ def status(
     json_output: bool = typer.Option(False, "--json", help="Emit structured JSON."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
+    if not _config_option_was_explicit():
+        config_path = _discover_config_path(config_path)
     payload = PollyPMService(config_path).session_status(session_name)
     sessions = payload["sessions"]
     if session_name is not None and not sessions:
@@ -1301,6 +1313,7 @@ def status(
     if not sessions:
         typer.echo("No sessions configured.")
         return
+    typer.echo(f"Config: {payload['config_path']}")
     for item in sessions:
         typer.echo(
             f"- {item['name']}: status={item['status']} running={'yes' if item['running'] else 'no'} "
@@ -1476,11 +1489,14 @@ def send(
     # The delivery system bypasses this by calling supervisor.send_input() directly.
     session_cfg = supervisor.config.sessions.get(session_name)
     if session_cfg and session_cfg.role == "worker":
+        project = session_cfg.project or session_name.replace("worker_", "", 1)
         typer.echo(
-            f"Blocked: use inbox to communicate with workers.\n"
-            f"  pm notify \"Task: ...\" \"<instructions>\" --to {session_name} --sender polly\n"
+            f"Blocked: dispatch work through the task system.\n"
+            f"  pm task create \"Title\" -p {project} -d \"description\" "
+            f"-f standard -r worker=worker -r reviewer=polly\n"
+            f"  pm task queue {project}/<number>\n"
             f"\n"
-            f"This creates a tracked thread. The heartbeat delivers it to the worker."
+            f"The worker picks up queued tasks automatically."
         )
         raise typer.Exit(code=1)
     try:

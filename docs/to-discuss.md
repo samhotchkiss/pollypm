@@ -179,3 +179,23 @@ Items that need human input or decision before proceeding.
   created via __new__
 
 ### Stats: 56 tasks done, 26 projects
+
+## Iteration 9: Scale Achieved
+
+### System Scale
+- 30 projects managed
+- 59+ tasks completed
+- 5+ tasks actively running
+- 885 PollyPM tests passing
+- Dashboard renders sub-second at 30 projects
+
+### New Projects Created This Iteration
+- polly-report: generates status reports from PollyPM task data
+- word-game: terminal word guessing game (2-task dependency chain)
+- data-viz: terminal bar chart renderer
+- tablefmt: markdown table formatter
+
+### Rework Feature
+- Implemented: when rejection finds dead worker, spawns new Claude
+  session with rejection reason prominently in the prompt
+- Tested: camptown/2 completed after 3 rejection cycles with real fixes

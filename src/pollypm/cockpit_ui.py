@@ -2133,8 +2133,11 @@ class PollySettingsPaneApp(App[None]):
         self.message_bar.update(message)
 
     def _refresh(self) -> None:
-        config = load_config(self.config_path)
-        statuses = self.service.list_account_statuses()
+        try:
+            config = load_config(self.config_path)
+            statuses = self.service.list_account_statuses()
+        except Exception:  # noqa: BLE001
+            return  # Don't crash the TUI on transient errors
         selected = self._selected_account_key or self._current_selected_key()
         rows: list[tuple[tuple[str, ...], str]] = []
         for status in statuses:

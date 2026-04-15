@@ -69,7 +69,10 @@ def _account_usage_summary(account: AccountConfig) -> tuple[str, str, str]:
                 capture_output=True,
                 text=True,
                 env=env,
+                timeout=5,
             )
+        except subprocess.TimeoutExpired:
+            return ("unknown", "timeout", "status check timed out")
         except FileNotFoundError:
             return ("unknown", "binary-missing", "claude CLI missing")
         if result.returncode != 0:

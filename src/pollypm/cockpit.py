@@ -404,6 +404,21 @@ class CockpitRouter:
                 persona = project.persona_name or "Polly"
                 items.append(CockpitItem(f"project:{project_key}:session", f"  PM Chat ({persona})", "sub"))
                 items.append(CockpitItem(f"project:{project_key}:issues", "  Tasks", "sub"))
+                # Show active per-task worker sessions under the project
+                try:
+                    storage = supervisor.storage_closet_session_name()
+                    task_prefix = f"task-{project_key}-"
+                    for win in self.tmux.list_windows(storage):
+                        if win.name.startswith(task_prefix):
+                            task_num = win.name[len(task_prefix):]
+                            task_label = f"  ⟳ Task #{task_num}"
+                            items.append(CockpitItem(
+                                f"project:{project_key}:task:{task_num}",
+                                task_label,
+                                "sub",
+                            ))
+                except Exception:  # noqa: BLE001
+                    pass
                 items.append(CockpitItem(f"project:{project_key}:settings", "  Settings", "sub"))
 
         for project_key, project in active_projects:
@@ -724,6 +739,39 @@ class CockpitRouter:
                 return
             if sub_view in ("settings", "issues"):
                 self._show_static_view(supervisor, window_target, sub_view, project_key)
+                return
+            if sub_view == "task" and len(parts) > 3:
+                # Per-task worker session — mount it from storage closet
+                task_num = parts[3]
+                window_name = f"task-{project_key}-{task_num}"
+                storage = supervisor.storage_closet_session_name()
+                try:
+                    storage_windows = self.tmux.list_windows(storage)
+                    target_win = next((w for w in storage_windows if w.name == window_name), None)
+                    if target_win is not None:
+                        self._park_mounted_session(supervisor, window_target)
+                        self._cleanup_extra_panes(window_target)
+                        left_pane = self._left_pane_id(window_target)
+                        right_pane_id = self._right_pane_id(window_target)
+                        if right_pane_id is not None:
+                            self.tmux.kill_pane(right_pane_id)
+                        source = f"{storage}:{target_win.index}.0"
+                        self.tmux.join_pane(source, left_pane, horizontal=True)
+                        panes = self.tmux.list_panes(window_target)
+                        left_p = min(panes, key=self._pane_left)
+                        self._try_resize_rail(left_p.pane_id)
+                        right_p = max(panes, key=self._pane_left)
+                        self.tmux.set_pane_history_limit(right_p.pane_id, 200)
+                        state = self._load_state()
+                        state["mounted_session"] = window_name
+                        state["right_pane_id"] = right_p.pane_id
+                        self._write_state(state)
+                        return
+                except Exception:  # noqa: BLE001
+                    pass
+                # Fallback to dashboard
+                self.set_selected_key(f"project:{project_key}:dashboard")
+                self._show_static_view(supervisor, window_target, "project", project_key)
                 return
             if sub_view == "session":
                 # PM Chat — mount live session, spawning if needed

@@ -1743,6 +1743,8 @@ class PollyTasksApp(App[None]):
     BINDINGS = [
         Binding("escape", "back", "Back to list"),
         Binding("r", "refresh", "Refresh"),
+        Binding("a", "approve_task", "Approve"),
+        Binding("x", "reject_task", "Reject"),
     ]
     CSS = """
     Screen { background: #10161b; color: #eef2f4; }
@@ -1857,40 +1859,97 @@ class PollyTasksApp(App[None]):
         icon = self._STATUS_ICONS.get(task.work_status.value, "·")
         lines = [
             f"{icon} #{task.task_number} {task.title}",
-            f"Status: {task.work_status.value}  |  Priority: {task.priority.value}",
-            f"Node: {task.current_node_id or '—'}  |  Owner: {owner or '—'}",
-            f"Flow: {task.flow_template_id}",
+            "",
+            f"  Status    {task.work_status.value}",
+            f"  Priority  {task.priority.value}",
+            f"  Flow      {task.flow_template_id}",
+            f"  Node      {task.current_node_id or '—'}",
+            f"  Owner     {owner or '—'}",
         ]
         if task.roles:
             roles = ", ".join(f"{k}={v}" for k, v in task.roles.items())
-            lines.append(f"Roles: {roles}")
-        if task.description:
-            lines.extend(["", "── Description ──", task.description])
-        if task.acceptance_criteria:
-            lines.extend(["", "── Acceptance Criteria ──", task.acceptance_criteria])
+            lines.append(f"  Roles     {roles}")
+        if task.assignee:
+            lines.append(f"  Assignee  {task.assignee}")
 
+        if task.description:
+            lines.extend(["", "── Description ──────────────────────────", "", task.description])
+        if task.acceptance_criteria:
+            lines.extend(["", "── Acceptance Criteria ──────────────────", "", task.acceptance_criteria])
+
+        # State progression timeline
         if task.executions:
-            lines.extend(["", "── Execution History ──"])
+            lines.extend(["", "── Timeline ─────────────────────────────", ""])
             for ex in task.executions:
                 status = ex.status.value if hasattr(ex.status, "value") else ex.status
-                decision = ""
+                # Visual timeline marker
+                if status == "active":
+                    marker = "⟳"
+                elif ex.decision:
+                    dec = ex.decision.value if hasattr(ex.decision, "value") else ex.decision
+                    marker = "✓" if dec == "approved" else "✗"
+                else:
+                    marker = "●"
+                # Node label with visit
+                visit_label = f" (attempt {ex.visit})" if ex.visit > 1 else ""
+                line = f"  {marker} {ex.node_id}{visit_label}"
+                # Add decision info
                 if ex.decision:
                     dec = ex.decision.value if hasattr(ex.decision, "value") else ex.decision
-                    decision = f" ({dec})"
+                    line += f" — {dec}"
                     if ex.decision_reason:
-                        decision += f": {ex.decision_reason}"
-                wo = ""
+                        lines.append(line)
+                        lines.append(f"    \"{ex.decision_reason}\"")
+                        line = None
+                if line is not None:
+                    lines.append(line)
+                # Show work output summary
                 if ex.work_output:
                     wo_obj = ex.work_output
                     if hasattr(wo_obj, "summary") and wo_obj.summary:
-                        wo = f"\n    → {wo_obj.summary}"
-                lines.append(f"  {ex.node_id} v{ex.visit}: {status}{decision}{wo}")
+                        lines.append(f"    → {wo_obj.summary}")
+                    if hasattr(wo_obj, "artifacts") and wo_obj.artifacts:
+                        for art in wo_obj.artifacts[:3]:
+                            kind = getattr(art, "kind", None)
+                            if hasattr(kind, "value"):
+                                kind = kind.value
+                            desc = getattr(art, "description", "") or getattr(art, "ref", "")
+                            if kind and desc:
+                                lines.append(f"    · {kind}: {desc}")
+                lines.append("")
 
+        # Context log
         if task.context:
-            lines.extend(["", "── Context Log ──"])
+            lines.extend(["── Context Log ──────────────────────────", ""])
             for c in task.context:
-                ts = str(c.timestamp)[:19] if c.timestamp else ""
-                lines.append(f"  [{c.actor}] {c.text}  ({ts})")
+                ts = str(c.timestamp)[:16] if c.timestamp else ""
+                lines.append(f"  [{c.actor}] {c.text}")
+                if ts:
+                    lines.append(f"    {ts}")
+            lines.append("")
+
+        # Transcript path hint
+        transcript_dir = Path(self.config_path).parent.parent
+        if hasattr(task, "project"):
+            config = load_config(self.config_path)
+            proj = config.projects.get(task.project)
+            if proj:
+                archive = proj.path / ".pollypm" / "transcripts" / "tasks" / task.task_id
+                if archive.exists():
+                    lines.extend([
+                        "── Transcript ───────────────────────────",
+                        "",
+                        f"  {archive}",
+                    ])
+
+        # Show action hint for tasks in review
+        if task.work_status.value == "review":
+            lines.extend([
+                "",
+                "── Actions ──────────────────────────────",
+                "",
+                "  [a] Approve   [x] Reject   [esc] Back",
+            ])
 
         detail = self.query_one("#task-detail", Static)
         detail.update("\n".join(lines))
@@ -1907,6 +1966,48 @@ class PollyTasksApp(App[None]):
             self._show_detail(self._selected_task_id)
         else:
             self._refresh_list()
+
+    def action_approve_task(self) -> None:
+        """Approve the currently viewed task (human review)."""
+        if not self._selected_task_id:
+            return
+        svc = self._get_svc()
+        if svc is None:
+            return
+        try:
+            task = svc.get(self._selected_task_id)
+            if task.work_status.value != "review":
+                self.notify("Task is not in review state", severity="warning")
+                return
+            svc.approve(self._selected_task_id, "user", "Approved from cockpit")
+            self.notify(f"Approved {self._selected_task_id}", severity="information")
+            self._show_detail(self._selected_task_id)
+        except Exception as exc:  # noqa: BLE001
+            self.notify(f"Approve failed: {exc}", severity="error")
+        finally:
+            svc.close()
+
+    def action_reject_task(self) -> None:
+        """Reject the currently viewed task (human review) — prompts for reason."""
+        if not self._selected_task_id:
+            return
+        svc = self._get_svc()
+        if svc is None:
+            return
+        try:
+            task = svc.get(self._selected_task_id)
+            if task.work_status.value != "review":
+                self.notify("Task is not in review state", severity="warning")
+                svc.close()
+                return
+            # For now, reject with a generic reason — TODO: add input prompt
+            svc.reject(self._selected_task_id, "user", "Rejected from cockpit — needs rework")
+            self.notify(f"Rejected {self._selected_task_id}", severity="information")
+            self._show_detail(self._selected_task_id)
+        except Exception as exc:  # noqa: BLE001
+            self.notify(f"Reject failed: {exc}", severity="error")
+        finally:
+            svc.close()
 
 
 class PollySettingsPaneApp(App[None]):

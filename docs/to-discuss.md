@@ -110,3 +110,28 @@ Items that need human input or decision before proceeding.
   when they need user approval. Fixed with node_id filter.
 
 ### Stats: 20 tasks completed tonight, 3 rejections, 2 human approvals
+
+## Iteration 7 Update
+
+### Key Finding: Russell's Quality Bar
+- Russell rejected rework submissions that hadn't actually changed anything
+- "No changes since v1 rejection" — he verified the same issues still existed
+- 6 total rejections tonight, Russell never approved unfixed work
+- This proves the review quality control is genuine, not rubber-stamping
+
+### Per-Task Worker Rework Gap (CRITICAL for demo)
+- When Russell rejects a task, the per-task worker session has already exited
+- No worker is alive to receive rejection feedback and do the rework
+- Manually signaling done without fixes doesn't fool Russell
+- **Fix needed**: On rejection, create a new per-task worker session
+  with the rejection reason in its prompt
+
+### Scale Test
+- 26 projects in the system
+- 23 tasks completed tonight
+- Dashboard renders quickly at this scale
+- Multiple per-task workers running simultaneously
+- Puzzle solver (8-queens) task created as algorithmic challenge
+
+### Dashboard Bug Fixed
+- PollyDashboardApp crash due to missing readonly_state on partial Supervisor

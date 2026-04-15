@@ -159,3 +159,23 @@ Items that need human input or decision before proceeding.
 - 885 PollyPM tests passing
 - All 4 flow types exercised + cancellation + hold/resume
 - Russell verified 8-queens solver produces exactly 92 valid solutions
+
+## Iteration 8: Rework Cycle Complete
+
+### camptown/2 Full Lifecycle
+- v1: rejected (missed docs references)
+- v2: rejected (no actual changes — Russell caught it)
+- v3: **APPROVED** (actually fixed project-overview.md)
+- 3 rejection/rework cycles, Russell only approved when fix was real
+
+### Rework Worker Spawning
+- Implemented: when rejection finds dead worker, spawns new Claude
+  session with rejection reason in prompt
+- Reuses existing worktree (preserves code changes)
+- Build-backend fixes applied for commit_validator/1 and md2html/1
+
+### Dashboard Bug Fix
+- PollyDashboardApp crash: missing readonly_state on partial Supervisor
+  created via __new__
+
+### Stats: 56 tasks done, 26 projects

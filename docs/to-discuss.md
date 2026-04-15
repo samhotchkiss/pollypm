@@ -240,3 +240,21 @@ so tasks go to a fallback DB in the CWD instead of the project's DB.
 Fix: `_resolve_db_path` should normalize hyphens to underscores when looking
 up project keys, or `pm add-project` should preserve the original directory
 name format.
+
+## Bug: Per-task worker session output invisible
+
+The per-task worker sessions (task-recipe_share-1, etc.) show no output when
+captured with `tmux capture-pane`. The Claude process is alive (confirmed via
+pane_pid/pane_current_command) but the pane content is empty.
+
+This likely happens because Claude Code with `-p` (prompt file mode) doesn't
+produce visible output in the same way as interactive mode. The worker is
+working but you can't watch it.
+
+This breaks Stage 5 of the test plan — "click the task session, watch what
+the worker is doing."
+
+Fix options:
+1. Use `claude --dangerously-skip-permissions` without `-p`, inject the prompt via send_keys after startup
+2. Use `claude --continue` with a saved conversation that includes the prompt
+3. Pipe Claude's output to a log file and show that in the pane

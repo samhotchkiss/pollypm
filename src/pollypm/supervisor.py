@@ -118,6 +118,14 @@ class Supervisor:
         else:
             if profile_prompt and not effective.prompt:
                 effective = replace(effective, prompt=profile_prompt)
+            elif profile_prompt and effective.prompt:
+                # Worker has a custom prompt — append the profile's task
+                # management section so the worker knows how to use the
+                # task system regardless of what the custom prompt says.
+                effective = replace(
+                    effective,
+                    prompt=effective.prompt.rstrip() + "\n\n" + profile_prompt,
+                )
             if not effective.args:
                 effective = replace(
                     effective,

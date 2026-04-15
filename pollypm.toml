@@ -21,17 +21,17 @@ backend = "file"
 [accounts.claude_pearl_swh_me]
 provider = "claude"
 email = "pearl@swh.me"
-home = ".pollypm-state/homes/claude_pearl_swh_me"
+home = "/Users/sam/.pollypm/agent_homes/claude_1"
 
 [accounts.codex_s_swh_me]
 provider = "codex"
 email = "s@swh.me"
-home = ".pollypm-state/homes/codex_s_swh_me"
+home = "/Users/sam/.pollypm/agent_homes/codex_1"
 
 [accounts.codex_gpt_swh_me]
 provider = "codex"
 email = "gpt@swh.me"
-home = ".pollypm-state/homes/codex_gpt_swh_me"
+home = "/Users/sam/.pollypm/agent_homes/codex_2"
 
 [sessions.heartbeat]
 role = "heartbeat-supervisor"

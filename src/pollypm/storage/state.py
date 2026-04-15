@@ -363,13 +363,32 @@ class StateStore:
                 # "readonly" mode we may have just created an empty DB
                 # (when the file didn't exist before connect).
                 self.execute("PRAGMA journal_mode=WAL")
-                self.conn.executescript(SCHEMA)
+                try:
+                    self.conn.executescript(SCHEMA)
+                except sqlite3.IntegrityError:
+                    # Duplicates exist that conflict with a UNIQUE index.
+                    # Deduplicate and retry.
+                    self._deduplicate_alerts()
+                    self.conn.executescript(SCHEMA)
                 try:
                     self._migrate()
                 except Exception:
                     self.conn.rollback()
                     raise
                 self.commit()
+
+    def _deduplicate_alerts(self) -> None:
+        """Remove duplicate alerts, keeping the most recently updated row."""
+        try:
+            self.conn.execute("""
+                DELETE FROM alerts WHERE rowid NOT IN (
+                    SELECT MAX(rowid) FROM alerts
+                    GROUP BY session_name, alert_type
+                )
+            """)
+            self.conn.commit()
+        except Exception:  # noqa: BLE001
+            pass
 
     def __enter__(self):
         return self

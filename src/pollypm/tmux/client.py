@@ -364,11 +364,22 @@ class TmuxClient:
         if target.startswith("%"):
             if not self.is_pane_alive(target):
                 raise DeadPaneError(f"Cannot send keys to dead pane {target!r}")
-        self.run("send-keys", "-l", "-t", resolved, text)
+        # Use tmux paste buffer for long text — more reliable than send-keys -l
+        # which can drop characters or cause rendering issues in Claude Code's
+        # input bar. Short text still uses send-keys -l for simplicity.
+        if len(text) > 100:
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+                f.write(text)
+                f.flush()
+                self.run("load-buffer", f.name)
+            self.run("paste-buffer", "-d", "-t", resolved)
+            import os
+            os.unlink(f.name)
+        else:
+            self.run("send-keys", "-l", "-t", resolved, text)
         if press_enter:
             # Delay to let the terminal process pasted text before Enter.
-            # Claude Code's input bar needs time to render long text before
-            # it can accept Enter as a submit action.
             time.sleep(0.5)
             self.run("send-keys", "-t", resolved, "Enter")
 

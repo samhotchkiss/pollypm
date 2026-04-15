@@ -348,20 +348,70 @@ class CockpitRouter:
 
         selected = self.selected_key()
         project_session_map = self._project_session_map(launches)
+
+        # Classify projects as active (task activity in last 24h or newly created) vs inactive
+        from datetime import UTC, datetime, timedelta
+        from pollypm.work.sqlite_service import SQLiteWorkService
+        cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+        active_projects: list[tuple[str, object]] = []
+        inactive_projects: list[tuple[str, object]] = []
+        project_has_active_task: dict[str, bool] = {}
         for project_key, project in config.projects.items():
-            session_name = project_session_map.get(project_key)
-            if session_name is None:
-                state = "idle"
+            is_active = False
+            has_working_task = False
+            db_path = project.path / ".pollypm" / "state.db"
+            if db_path.exists():
+                try:
+                    with SQLiteWorkService(db_path=db_path, project_path=project.path) as svc:
+                        tasks = svc.list_tasks(project=project_key)
+                        for t in tasks:
+                            if t.work_status.value in ("in_progress", "review"):
+                                has_working_task = True
+                                is_active = True
+                            if t.updated_at and t.updated_at >= cutoff:
+                                is_active = True
+                except Exception:  # noqa: BLE001
+                    pass
+            # Also check if project was recently created (git repo age < 24h)
+            try:
+                git_dir = project.path / ".git"
+                if git_dir.exists() and git_dir.stat().st_mtime > (datetime.now(UTC) - timedelta(hours=24)).timestamp():
+                    is_active = True
+            except Exception:  # noqa: BLE001
+                pass
+            project_has_active_task[project_key] = has_working_task
+            if is_active:
+                active_projects.append((project_key, project))
             else:
+                inactive_projects.append((project_key, project))
+
+        # Sort each group alphabetically by display label
+        active_projects.sort(key=lambda x: x[1].display_label().lower())
+        inactive_projects.sort(key=lambda x: x[1].display_label().lower())
+
+        def _add_project_items(project_key: str, project: object) -> None:
+            session_name = project_session_map.get(project_key)
+            # Determine state/color: yellow for active task, idle otherwise
+            if project_has_active_task.get(project_key):
+                state = "◆ working"  # yellow indicator
+            elif session_name is not None:
                 state = self._session_state(session_name, launches, windows, alerts, spinner_index)
+            else:
+                state = "idle"
             items.append(CockpitItem(f"project:{project_key}", project.display_label(), state))
-            # Unfold sub-items for the selected project
             if selected.startswith(f"project:{project_key}"):
                 items.append(CockpitItem(f"project:{project_key}:dashboard", "  Dashboard", "sub"))
                 persona = project.persona_name or "Polly"
                 items.append(CockpitItem(f"project:{project_key}:session", f"  PM Chat ({persona})", "sub"))
                 items.append(CockpitItem(f"project:{project_key}:issues", "  Tasks", "sub"))
                 items.append(CockpitItem(f"project:{project_key}:settings", "  Settings", "sub"))
+
+        for project_key, project in active_projects:
+            _add_project_items(project_key, project)
+        if active_projects and inactive_projects:
+            items.append(CockpitItem("_separator", "", "separator", selectable=False))
+        for project_key, project in inactive_projects:
+            _add_project_items(project_key, project)
 
         items.append(CockpitItem("settings", "Settings", "config"))
         return items
@@ -1043,159 +1093,181 @@ def _build_dashboard(supervisor, config) -> str:
     lines: list[str] = []
     now = datetime.now(UTC)
 
-    # ── Header ──
-    project_count = len(config.projects)
-    session_count = len(config.sessions)
+    def _age(ts_str: str) -> str:
+        try:
+            dt = datetime.fromisoformat(ts_str)
+            secs = (now - dt).total_seconds()
+            if secs < 60:
+                return "just now"
+            if secs < 3600:
+                return f"{int(secs // 60)}m ago"
+            if secs < 86400:
+                return f"{int(secs // 3600)}h ago"
+            return f"{int(secs // 86400)}d ago"
+        except (ValueError, TypeError):
+            return ""
+
+    # ── Gather task data across all projects ──
+    from pollypm.work.sqlite_service import SQLiteWorkService
+    all_active: list[tuple[str, object]] = []  # in_progress
+    all_review: list[tuple[str, object]] = []  # waiting for review
+    all_queued: list[tuple[str, object]] = []  # ready for pickup
+    all_blocked: list[tuple[str, object]] = []
+    all_done: list[tuple[str, object]] = []
+    total_counts: dict[str, int] = {}
+    for pk, proj in config.projects.items():
+        db_path = proj.path / ".pollypm" / "state.db"
+        if not db_path.exists():
+            continue
+        try:
+            with SQLiteWorkService(db_path=db_path, project_path=proj.path) as svc:
+                tasks = svc.list_tasks(project=pk)
+                counts = svc.state_counts(project=pk)
+                for s, n in counts.items():
+                    total_counts[s] = total_counts.get(s, 0) + n
+                for t in tasks:
+                    sv = t.work_status.value
+                    if sv == "in_progress":
+                        all_active.append((pk, t))
+                    elif sv == "review":
+                        all_review.append((pk, t))
+                    elif sv == "queued":
+                        all_queued.append((pk, t))
+                    elif sv == "blocked":
+                        all_blocked.append((pk, t))
+                    elif sv == "done":
+                        all_done.append((pk, t))
+        except Exception:  # noqa: BLE001
+            pass
+    all_done.sort(key=lambda x: x[1].updated_at or "", reverse=True)
+
+    # ── Gather system data ──
     open_alerts = supervisor.store.open_alerts()
     user_inbox = len(list_v2_messages(config.project.root_dir, status="open", owner="user"))
     actionable_alerts = [a for a in open_alerts if a.alert_type not in (
         "suspected_loop", "stabilize_failed", "needs_followup",
     )]
+    recent = supervisor.store.recent_events(limit=300)
+    cutoff_24h = (now - timedelta(hours=24)).isoformat()
+    day_events = [e for e in recent if e.created_at >= cutoff_24h]
 
-    lines.append("  PollyPM Dashboard")
+    # ── Header ──
+    lines.append("  PollyPM")
     lines.append("")
-    status_parts = [f"{project_count} projects", f"{session_count} sessions"]
-    if actionable_alerts:
-        status_parts.append(f"{len(actionable_alerts)} alert(s)")
+
+    # Status line: what needs YOUR attention right now (actionable items only)
+    attention: list[str] = []
+    if all_review:
+        attention.append(f"◉ {len(all_review)} awaiting review")
     if user_inbox:
-        status_parts.append(f"{user_inbox} inbox")
-    lines.append("  " + "  ·  ".join(status_parts))
-    lines.append("")
-
-    # ── Currently Working On ──
-    lines.append("  ─── Active Work ───────────────────────────────────")
-    lines.append("")
-    all_runtimes = supervisor.store.list_session_runtimes()
-    runtime_map = {rt.session_name: rt for rt in all_runtimes}
-    launches = supervisor.plan_launches()
-    has_active = False
-    for launch in launches:
-        if launch.session.role in ("heartbeat-supervisor",):
-            continue
-        rt = runtime_map.get(launch.session.name)
-        status = rt.status if rt else "unknown"
-        project = config.projects.get(launch.session.project)
-        project_label = project.display_label() if project else launch.session.project
-
-        if status in ("healthy", "needs_followup", "waiting_on_user"):
-            icon = "●" if status == "healthy" else "◆" if status == "needs_followup" else "◇"
-            role_label = "Polly" if launch.session.role == "operator-pm" else project_label
-            reason = (rt.last_failure_message or "")[:60] if rt else ""
-            # Get a useful snippet from the session's latest status reason
-            status_reason = ""
-            if rt and hasattr(rt, "updated_at") and rt.updated_at:
-                try:
-                    age = (now - datetime.fromisoformat(rt.updated_at)).total_seconds()
-                    if age < 300:
-                        status_reason = " (active)"
-                    elif age < 3600:
-                        status_reason = f" ({int(age // 60)}m ago)"
-                except (ValueError, TypeError):
-                    pass
-            status_label = {"healthy": "working", "needs_followup": "in progress", "waiting_on_user": "waiting on you"}
-            lines.append(f"  {icon} {role_label}: {status_label.get(status, status)}{status_reason}")
-            has_active = True
-    if not has_active:
-        lines.append("  No active sessions.")
-    lines.append("")
-
-    # ── Agent Workqueue ──
-    agent_items = list_v2_messages(config.project.root_dir, status="open", owner="polly")
-    if agent_items:
-        lines.append("  ─── Agent Workqueue ───────────────────────────────")
-        lines.append("")
-        import time
-        spinners = ["◜", "◝", "◞", "◟"]
-        spin_idx = int(time.time()) % 4
-        for item in agent_items[:5]:
-            # Show spinner if the operator is actively working (it might be on this item)
-            op_rt = runtime_map.get("operator")
-            if op_rt and op_rt.status in ("healthy", "needs_followup"):
-                spin = spinners[spin_idx]
-                lines.append(f"  {spin} {item.subject[:55]}")
-            else:
-                lines.append(f"  ◆ {item.subject[:55]}")
-            lines.append(f"    from {item.sender} · {_fmt_time(item.created_at)}")
-        if len(agent_items) > 5:
-            lines.append(f"  ... and {len(agent_items) - 5} more")
+        attention.append(f"✉ {user_inbox} inbox")
+    if actionable_alerts:
+        attention.append(f"▲ {len(actionable_alerts)} alert{'s' if len(actionable_alerts) != 1 else ''}")
+    if attention:
+        lines.append("  " + "  ·  ".join(attention))
         lines.append("")
 
-    # ── Recent Activity (last 24h) ──
-    lines.append("  ─── Last 24 Hours ─────────────────────────────────")
+    # Task count summary
+    count_parts = []
+    for status in ("in_progress", "review", "queued", "blocked"):
+        n = total_counts.get(status, 0)
+        if n:
+            icon = _STATUS_ICONS.get(status, "·")
+            count_parts.append(f"{icon} {n} {status.replace('_', ' ')}")
+    done_n = total_counts.get("done", 0)
+    if done_n:
+        count_parts.append(f"✓ {done_n} done")
+    if count_parts:
+        lines.append("  " + " · ".join(count_parts))
     lines.append("")
-    recent = supervisor.store.recent_events(limit=200)
-    cutoff = (now - timedelta(hours=24)).isoformat()
-    day_events = [e for e in recent if e.created_at >= cutoff]
 
-    # Summarize by type
+    # ── What's happening right now ──
+    if all_active or all_review:
+        lines.append("  ─── Now ───────────────────────────────────────────")
+        lines.append("")
+        for pk, t in all_active:
+            project = config.projects.get(pk)
+            proj_label = project.display_label() if project else pk
+            assignee = f" [{t.assignee}]" if t.assignee else ""
+            node = t.current_node_id or ""
+            age = _age(t.updated_at) if t.updated_at else ""
+            lines.append(f"  ⟳ {t.title}")
+            lines.append(f"    {proj_label}{assignee} · {node} · {age}")
+            lines.append("")
+        for pk, t in all_review:
+            project = config.projects.get(pk)
+            proj_label = project.display_label() if project else pk
+            age = _age(t.updated_at) if t.updated_at else ""
+            lines.append(f"  ◉ {t.title}")
+            lines.append(f"    {proj_label} · waiting for Russell · {age}")
+            lines.append("")
+
+    # ── Queued (ready for pickup) ──
+    if all_queued:
+        lines.append("  ─── Ready ─────────────────────────────────────────")
+        lines.append("")
+        for pk, t in all_queued[:5]:
+            project = config.projects.get(pk)
+            proj_label = project.display_label() if project else pk
+            lines.append(f"  ○ {t.title}  ({proj_label})")
+        if len(all_queued) > 5:
+            lines.append(f"    + {len(all_queued) - 5} more queued")
+        lines.append("")
+
+    # ── Recently completed ──
+    if all_done:
+        lines.append("  ─── Done ──────────────────────────────────────────")
+        lines.append("")
+        for pk, t in all_done[:8]:
+            project = config.projects.get(pk)
+            proj_label = project.display_label() if project else pk
+            age = _age(t.updated_at) if t.updated_at else ""
+            lines.append(f"  ✓ {t.title}  ({proj_label})  {age}")
+        if len(all_done) > 8:
+            lines.append(f"    + {len(all_done) - 8} more completed")
+        lines.append("")
+
+    # ── System activity ──
+    lines.append("  ─── Activity ──────────────────────────────────────")
+    lines.append("")
     commits = [e for e in day_events if "commit" in e.message.lower()]
     recoveries = [e for e in day_events if e.event_type in ("recover", "recovery", "stabilize_failed")]
-    sweeps = [e for e in day_events if e.event_type == "heartbeat"]
     sends = [e for e in day_events if e.event_type == "send_input"]
-
-    summary_parts = []
-    if sweeps:
-        summary_parts.append(f"{len(sweeps)} heartbeat sweeps")
-    if sends:
-        summary_parts.append(f"{len(sends)} messages sent")
+    task_events = [e for e in day_events if e.event_type in ("launch", "send_input", "auth_sync")]
+    activity_parts = []
     if commits:
-        summary_parts.append(f"{len(commits)} commits")
+        activity_parts.append(f"{len(commits)} commits")
+    if sends:
+        activity_parts.append(f"{len(sends)} messages")
     if recoveries:
-        summary_parts.append(f"{len(recoveries)} recoveries")
-    if summary_parts:
-        lines.append("  " + "  ·  ".join(summary_parts))
+        activity_parts.append(f"{len(recoveries)} recoveries")
+    if activity_parts:
+        lines.append("  Today: " + " · ".join(activity_parts))
     else:
-        lines.append("  No activity recorded.")
+        lines.append("  No notable activity today.")
     lines.append("")
 
-    # Show last few notable events
-    notable = [e for e in day_events if e.event_type not in ("heartbeat", "token_ledger", "polly_followup")][:8]
+    # Show last few notable events with timestamps
+    notable = [e for e in day_events if e.event_type not in ("heartbeat", "token_ledger", "polly_followup")][:6]
     for event in notable:
-        try:
-            ts = datetime.fromisoformat(event.created_at)
-            age = now - ts
-            if age.total_seconds() < 3600:
-                time_str = f"{int(age.total_seconds() // 60)}m ago"
-            else:
-                time_str = f"{int(age.total_seconds() // 3600)}h ago"
-        except (ValueError, TypeError):
-            time_str = "?"
-        msg = event.message[:65]
-        lines.append(f"  {time_str:>7}  {event.session_name}: {msg}")
-    lines.append("")
+        age = _age(event.created_at)
+        session = event.session_name
+        msg = event.message[:55]
+        lines.append(f"  {age:>8}  {session}: {msg}")
+    if notable:
+        lines.append("")
 
-    # ── Token Usage (30 days) ──
-    lines.append("  ─── Token Usage (30 days) ──────────────────────────")
-    lines.append("")
-    daily = supervisor.store.daily_token_usage(days=30)
-    if daily:
-        values = [t for _, t in daily]
-        total = sum(values)
-        chart = _spark_bar(values, width=30)
-        # Label the axis
-        if len(daily) >= 2:
-            lines.append(f"  {daily[0][0][-5:]}{'':>20}{daily[-1][0][-5:]}")
-        lines.append(f"  {chart}")
-        lines.append(f"  Total: {total:,} tokens across {len(daily)} days")
-        # Today's usage
-        today_str = now.strftime("%Y-%m-%d")
-        today_tokens = next((t for d, t in daily if d == today_str), 0)
-        if today_tokens:
-            lines.append(f"  Today: {today_tokens:,} tokens")
-    else:
-        lines.append("  No token data yet.")
-    lines.append("")
-
-    # ── Alerts ──
+    # ── Alerts (if any) ──
     if actionable_alerts:
         lines.append("  ─── Alerts ────────────────────────────────────────")
         lines.append("")
         for alert in actionable_alerts[:5]:
-            lines.append(f"  ▲ {alert.session_name}: {alert.message[:60]}")
+            lines.append(f"  ▲ {alert.session_name}: {alert.message[:55]}")
         lines.append("")
 
     # ── Footer ──
-    lines.append("  Click Polly to connect  ·  j/k navigate  ·  S settings")
+    project_count = len(config.projects)
+    lines.append(f"  {project_count} projects  ·  j/k navigate  ·  S settings")
 
     return "\n".join(lines)
 

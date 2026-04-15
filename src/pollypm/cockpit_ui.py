@@ -217,7 +217,7 @@ class RailItem(ListItem):
             self.add_class("project-row")
         if item.state.startswith("!"):
             self.add_class("needs-user")
-        if item.state.endswith("live") or item.state.endswith("working"):
+        if (item.state.endswith("live") or item.state.endswith("working")) and item.key in ("polly", "russell"):
             self.add_class("live")
         if active_view:
             self.add_class("active-view")
@@ -247,29 +247,39 @@ class RailItem(ListItem):
         self.body.update(text)
 
     def _indicator(self) -> tuple[str, str]:
-        if self.item.state.endswith("working"):
-            return self.item.state.split(" ", 1)[0], "#3ddc84"
-        if self.item.state == "unread":
-            return "\u25cf", "#f0a030"
-        if self.item.state.endswith("live"):
-            return "\u25cf", "#3ddc84"
+        # Alerts (red triangle)
         if self.item.state.startswith("!"):
             return "\u25b2", "#ff5f6d"
-        if self.item.key == "polly":
-            if self.item.state in {"ready", "idle"}:
-                return "\u2022", "#5b8aff"
+        # Separator
+        if self.item.state == "separator":
+            return "", "#4a5568"
+        # Top-level agents (Polly, Russell)
+        if self.item.key in ("polly", "russell"):
             if self.item.state.endswith("working"):
-                return self.item.state.split(" ", 1)[0], "#3ddc84"
+                return self.item.state.split(" ", 1)[0], "#3ddc84"  # green spinner
+            if self.item.state in {"ready", "idle"}:
+                return "\u2022", "#5b8aff"  # blue dot
             return "\u2022", "#5b8aff"
-        if self.item.key == "settings":
-            return "\u2699", "#6b7a88"
+        # Inbox
         if self.item.key == "inbox":
             label = self.item.label
             if "(" in label and not label.endswith("(0)"):
-                return "\u25c6", "#f0c45a"
+                return "\u25c6", "#f0c45a"  # yellow diamond
             return "\u25c7", "#4a5568"
+        # Settings
+        if self.item.key == "settings":
+            return "\u2699", "#6b7a88"
+        # Sub-items
         if self.item.state == "sub":
             return " ", "#4a5568"
+        # Unread
+        if self.item.state == "unread":
+            return "\u25cf", "#f0a030"  # orange dot
+        # Projects: yellow for active task, dim for idle
+        if self.item.key.startswith("project:"):
+            if "working" in self.item.state:
+                return "\u25c6", "#f0c45a"  # yellow diamond — active task
+            return "\u25cb", "#4a5568"  # dim circle — idle
         return "\u25cb", "#4a5568"
 
 

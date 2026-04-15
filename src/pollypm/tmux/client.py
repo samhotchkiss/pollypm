@@ -358,6 +358,7 @@ class TmuxClient:
 
     def send_keys(self, target: str, text: str, press_enter: bool = True) -> None:
         """Send keys to a pane. Raises DeadPaneError if the target pane is dead."""
+        import time
         resolved = self._exact_target(target)
         # If the target looks like a pane id, check liveness first
         if target.startswith("%"):
@@ -365,6 +366,8 @@ class TmuxClient:
                 raise DeadPaneError(f"Cannot send keys to dead pane {target!r}")
         self.run("send-keys", "-l", "-t", resolved, text)
         if press_enter:
+            # Brief delay to let the terminal process pasted text before Enter
+            time.sleep(0.15)
             self.run("send-keys", "-t", resolved, "Enter")
 
     def attach_session(self, name: str) -> int:

@@ -1728,7 +1728,10 @@ class SQLiteWorkService:
                 "WHERE project = ? AND task_number = ?",
                 (r["from_project"], r["from_task_number"]),
             ).fetchone()
-            if status_row and status_row["work_status"] != WorkStatus.DONE.value:
+            if status_row and status_row["work_status"] not in (
+                WorkStatus.DONE.value,
+                WorkStatus.CANCELLED.value,
+            ):
                 return True
         return False
 

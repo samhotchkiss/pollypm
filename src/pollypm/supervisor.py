@@ -1918,7 +1918,10 @@ class Supervisor:
         if not initial_input or fresh_marker is None or not fresh_marker.exists():
             return
         kickoff = self._prepare_initial_input(launch.session.name, initial_input)
+        # Small delay to let Claude Code's input bar fully initialize
+        time.sleep(0.5)
         self.tmux.send_keys(target, kickoff)
+        self._verify_input_submitted(target, kickoff, launch)
         fresh_marker.unlink(missing_ok=True)
 
     def _prepare_initial_input(self, session_name: str, initial_input: str) -> str:

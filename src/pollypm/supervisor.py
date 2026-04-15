@@ -1113,6 +1113,9 @@ class Supervisor:
                 with SQLiteWorkService(db_path=db_path) as svc:
                     tasks = svc.list_tasks(work_status="review", project=project_key)
                     for task in tasks:
+                        # Skip human-review tasks — those need user approval
+                        if task.current_node_id and "human" in task.current_node_id:
+                            continue
                         review_tasks.append(
                             f"  - {task.task_id}: {task.title}"
                         )

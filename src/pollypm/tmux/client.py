@@ -366,8 +366,10 @@ class TmuxClient:
                 raise DeadPaneError(f"Cannot send keys to dead pane {target!r}")
         self.run("send-keys", "-l", "-t", resolved, text)
         if press_enter:
-            # Brief delay to let the terminal process pasted text before Enter
-            time.sleep(0.15)
+            # Delay to let the terminal process pasted text before Enter.
+            # Claude Code's input bar needs time to render long text before
+            # it can accept Enter as a submit action.
+            time.sleep(0.5)
             self.run("send-keys", "-t", resolved, "Enter")
 
     def attach_session(self, name: str) -> int:

@@ -261,6 +261,49 @@ Every issue is a fix-it-now situation. Common problems to expect:
 
 ---
 
+## Dashboard & Tasks View Verification
+
+After each round, check both the dashboard and the interactive Tasks view.
+
+### Dashboard (click project name or "Dashboard" in rail)
+
+For each project with tasks, verify:
+- [ ] Project name as header
+- [ ] Summary bar: `○ 3 queued · ⟳ 1 in progress · ◉ 2 review` etc.
+- [ ] Active tasks sorted by status (in_progress first, then review, queued, blocked)
+- [ ] Each active task shows: status icon, task number, title, assignee, current node
+- [ ] Completed tasks section with count and last 5
+- [ ] Alerts section if alerts exist for this project
+- [ ] For projects without tasks: fallback info (path, kind, tracked, worktrees)
+- [ ] Dashboard refreshes within 5 seconds (not laggy)
+
+### Tasks view (click "Tasks" in rail sub-items)
+
+Interactive Textual list with drill-down:
+- [ ] Summary bar at top with status counts
+- [ ] Active tasks sorted: in_progress → review → queued → blocked → on_hold
+- [ ] Status icons correct: ○ queued, ⟳ in_progress, ◉ review, ⊘ blocked, ⏸ on_hold, ◌ draft, ✓ done, ✗ cancelled
+- [ ] Completed tasks in a separate section
+- [ ] Click a task → detail view shows:
+  - Status icon + task number + title
+  - Status, priority, current node, owner
+  - Flow template name
+  - Roles (worker, reviewer)
+  - Description (full text)
+  - Acceptance criteria (if any)
+  - Execution history: each node visit with status, decision, reason, work output summary
+  - Context log: last 10 entries with actor and timestamp
+- [ ] Press Escape → back to list
+- [ ] Press R → list refreshes with current state
+- [ ] Empty project (no DB) → shows "No tasks" message, not crash
+
+### Cross-check
+
+After each round, verify dashboard counts match `pm task counts -p weather_cli`
+and the file sync in `issues/` matches the task states.
+
+---
+
 ## Interaction Method
 
 All communication with Polly happens through tmux:

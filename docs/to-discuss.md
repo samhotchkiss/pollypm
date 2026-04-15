@@ -2,6 +2,34 @@
 
 Items that need human input or decision before proceeding.
 
+## Overnight Session Summary (April 14-15)
+
+### What was built
+- Russell the Reviewer agent — dedicated code review with high quality bar
+- Redesigned Polly dashboard — shows tasks across all projects, attention items, activity
+- Per-task worker sessions — isolated worktrees with task prompts
+- Human approval UX — [a] approve / [x] reject from task detail view
+- Rail improvements — active/inactive grouping, yellow for active tasks
+- Per-task worker sessions visible in rail under projects
+- Auth recovery — same-account retry for expired tokens
+- Heartbeat review nudge — notifies Russell when tasks enter review
+- Session manager lifecycle — claim/approve/cancel hooks
+
+### What was tested
+- 7 projects with active tasks (weather-cli, todo-api, camptown, mini-calc, link-checker, git-stats, shortlink)
+- All 4 flow types: standard, spike, bug, user-review
+- Dependency chains: todo-api (3-task chain, auto-unblock verified)
+- Human approval: weather-cli/4 approved as user
+- 40+ tasks through full lifecycle
+- Russell reviewing real code (git diffs, running CLIs)
+- WeatherCLI actually works: `uv run python -m weathercli --lat 40.7 --lon -74.0`
+
+### Remaining Issues
+- Input bar submission reliability (messages get stuck)
+- Per-task worker sessions exit after completion (need remain-on-exit for rejection flow)
+- Knowledge extraction pipeline appends indefinitely to project-overview.md
+- Polly's prompt in pollypm.toml overrides builtin.py changes
+
 ## Open Questions
 
 1. **Russell's account**: I assigned Russell to `claude_s_swh_me` (your personal Claude account). Should he use a different account, or is sharing with you fine? He'll consume tokens from that subscription.

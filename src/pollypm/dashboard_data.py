@@ -187,6 +187,7 @@ def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
     sup = Supervisor.__new__(Supervisor)
     sup.config = config
     sup.store = store
+    sup.readonly_state = True
     from pollypm.tmux.client import TmuxClient
     sup.tmux = TmuxClient()
     sup._cached_launches = None

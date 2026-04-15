@@ -135,3 +135,27 @@ Items that need human input or decision before proceeding.
 
 ### Dashboard Bug Fixed
 - PollyDashboardApp crash due to missing readonly_state on partial Supervisor
+
+## Final Overnight Stats
+
+### Completed Projects
+- **weather-cli**: 5 features, working CLI (city search, forecast, colors, units)
+- **todo-api**: 3 tasks, 30 passing tests, full CRUD
+- **md-render**: 3-task chain, markdown → styled terminal output
+- **shortlink**: 5-task dependency chain, all complete
+- **link-checker**: bug flow (reproduce → fix → review → done)
+- **mini-calc**: spike flow research
+- **git-stats**: statistics dashboard
+- **passgen**: password generator
+- **color-palette**: harmonious color generation
+- **file-sorter**: spike flow research
+- **pollypm-docs**: getting started guide (user-review flow)
+- **puzzle-solver**: 8-queens solver — 92 correct solutions verified by Russell
+
+### By the Numbers
+- 25+ tasks completed tonight
+- 6 rejections (Russell caught real issues every time)
+- 26 projects in system
+- 885 PollyPM tests passing
+- All 4 flow types exercised + cancellation + hold/resume
+- Russell verified 8-queens solver produces exactly 92 valid solutions

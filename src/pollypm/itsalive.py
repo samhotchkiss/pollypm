@@ -410,7 +410,7 @@ def _complete_pending(pending: PendingDeploy, *, notify: bool) -> DeployOutcome:
             "publishDir": pending.publish_dir,
         },
     )
-    owner_token = str(finalize.get("ownerToken") or "").strip()
+    owner_token = _extract_owner_token(finalize)
     if owner_token:
         write_global_config(str(finalize["email"]), owner_token)
     write_itsalive_docs(root, domain, publish_dir=pending.publish_dir)
@@ -478,3 +478,17 @@ def _parse_timestamp(value: str) -> datetime | None:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _extract_owner_token(payload: dict[str, Any]) -> str:
+    """Extract the owner token from finalize payloads with tolerant key handling."""
+    direct = payload.get("ownerToken") or payload.get("owner_token")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+
+    owner = payload.get("owner")
+    if isinstance(owner, dict):
+        nested = owner.get("token") or owner.get("ownerToken") or owner.get("owner_token")
+        if isinstance(nested, str) and nested.strip():
+            return nested.strip()
+    return ""

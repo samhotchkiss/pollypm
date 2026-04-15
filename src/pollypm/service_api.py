@@ -81,12 +81,12 @@ class PollyPMService:
     def __init__(self, config_path: Path) -> None:
         self.config_path = config_path
 
-    def load_supervisor(self) -> Supervisor:
+    def load_supervisor(self, *, readonly_state: bool = False) -> Supervisor:
         config = load_config(self.config_path)
-        return Supervisor(config)
+        return Supervisor(config, readonly_state=readonly_state)
 
     def status_snapshot(self) -> StatusSnapshot:
-        supervisor = self.load_supervisor()
+        supervisor = self.load_supervisor(readonly_state=True)
         launches, windows, alerts, leases, errors = supervisor.status()
         return StatusSnapshot(
             launches=launches,
@@ -97,7 +97,7 @@ class PollyPMService:
         )
 
     def session_status(self, session_name: str | None = None) -> dict[str, object]:
-        supervisor = self.load_supervisor()
+        supervisor = self.load_supervisor(readonly_state=True)
         launches, windows, alerts, leases, errors = supervisor.status()
         window_map = {window.name: window for window in windows}
         alert_counts: dict[str, int] = {}
@@ -130,7 +130,7 @@ class PollyPMService:
                     "lease_note": None if lease is None else lease.note,
                 }
             )
-        return {"sessions": sessions, "errors": errors}
+        return {"config_path": str(self.config_path), "sessions": sessions, "errors": errors}
 
     def list_account_statuses(self) -> list[AccountStatus]:
         return list_account_statuses(self.config_path)

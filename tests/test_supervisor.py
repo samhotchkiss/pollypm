@@ -32,7 +32,7 @@ from pollypm.supervisor import (
     _extract_codex_model_name,
     _extract_token_metrics,
 )
-from pollypm.tmux.client import TmuxWindow
+from pollypm.tmux.client import TmuxPane, TmuxWindow
 
 
 def _config(tmp_path: Path) -> PollyPMConfig:
@@ -219,6 +219,26 @@ def test_send_input_targets_mounted_cockpit_pane_when_window_not_in_storage(monk
                 pane_current_command="claude",
                 pane_current_path=str(tmp_path),
                 pane_dead=False,
+            )
+        ],
+    )
+    # Mock list_panes to validate the cockpit pane exists
+    monkeypatch.setattr(
+        supervisor.tmux,
+        "list_panes",
+        lambda target: [
+            TmuxPane(
+                session="pollypm",
+                window_index=0,
+                window_name="PollyPM",
+                pane_index=1,
+                pane_id="%42",
+                active=True,
+                pane_current_command="claude",
+                pane_current_path=str(tmp_path),
+                pane_dead=False,
+                pane_left=0,
+                pane_width=80,
             )
         ],
     )

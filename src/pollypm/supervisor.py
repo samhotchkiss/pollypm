@@ -54,7 +54,7 @@ def _prefix_for_owner(owner: str, text: str) -> str:
 
 
 class Supervisor:
-    _CONTROL_ROLES = {"heartbeat-supervisor", "operator-pm", "triage"}
+    _CONTROL_ROLES = {"heartbeat-supervisor", "operator-pm", "triage", "reviewer"}
     _CONSOLE_WINDOW = "PollyPM"
     _STORAGE_CLOSET_SESSION_SUFFIX = "-storage-closet"
     _CONTROL_HOMES_DIR = "control-homes"
@@ -144,6 +144,8 @@ class Supervisor:
             return "polly"
         if session.role == "worker":
             return "worker"
+        if session.role == "reviewer":
+            return "russell"
         return None
 
     def _resolve_profile_prompt(self, session: SessionConfig, account: AccountConfig) -> str | None:
@@ -1055,9 +1057,11 @@ class Supervisor:
         return active_alerts
 
     def _maybe_nudge_stalled_session(self, launch: SessionLaunchSpec) -> None:
-        if launch.session.role == "operator-pm":
-            self._maybe_nudge_operator_review(launch)
+        if launch.session.role == "reviewer":
+            self._maybe_nudge_reviewer_review(launch)
             return
+        if launch.session.role == "operator-pm":
+            return  # Polly no longer reviews — Russell handles it
         if launch.session.role != "worker":
             return
         lease = self.store.get_lease(launch.session.name)
@@ -1077,8 +1081,8 @@ class Supervisor:
             force=lease is not None and lease.owner != "human",
         )
 
-    def _maybe_nudge_operator_review(self, launch: SessionLaunchSpec) -> None:
-        """Nudge the operator if tasks are waiting for review."""
+    def _maybe_nudge_reviewer_review(self, launch: SessionLaunchSpec) -> None:
+        """Nudge the reviewer (Russell) if tasks are waiting for review."""
         lease = self.store.get_lease(launch.session.name)
         if lease is not None and lease.owner == "human":
             return
@@ -1118,7 +1122,7 @@ class Supervisor:
                 f"You have {len(review_tasks)} task(s) waiting for your review:",
                 *review_tasks,
                 "",
-                "Review with: pm task status <id>, then pm task approve <id> --actor polly or pm task reject <id> --actor polly --reason \"...\"",
+                "Review with: pm task status <id>, then pm task approve <id> --actor russell or pm task reject <id> --actor russell --reason \"...\"",
             ]
             return "\n".join(lines)
         except Exception:  # noqa: BLE001

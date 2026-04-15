@@ -342,6 +342,7 @@ class CockpitRouter:
         inbox_label = f"Inbox ({unread})" if unread else f"Inbox ({len(user_msgs)})" if user_msgs else "Inbox"
         items = [
             CockpitItem("polly", "Polly", self._session_state("operator", launches, windows, alerts, spinner_index)),
+            CockpitItem("russell", "Russell", self._session_state("reviewer", launches, windows, alerts, spinner_index)),
             CockpitItem("inbox", inbox_label, "mail" if unread else ("clear" if not user_msgs else "read")),
         ]
 
@@ -368,7 +369,7 @@ class CockpitRouter:
     def _project_session_map(self, launches) -> dict[str, str]:
         project_session_map: dict[str, str] = {}
         for launch in launches:
-            if launch.session.role in {"operator-pm", "heartbeat-supervisor", "triage"}:
+            if launch.session.role in {"operator-pm", "heartbeat-supervisor", "triage", "reviewer"}:
                 continue
             project_session_map.setdefault(launch.session.project, launch.session.name)
         return project_session_map
@@ -406,7 +407,7 @@ class CockpitRouter:
         if window.pane_dead:
             return "dead"
         spinners = ["\u25dc", "\u25dd", "\u25de", "\u25df"]
-        if launch.session.role in ("worker", "operator-pm"):
+        if launch.session.role in ("worker", "operator-pm", "reviewer"):
             working = self._is_pane_working(window, launch.session.provider)
             if working:
                 return spinners[spinner_index % 4] + " working"
@@ -635,6 +636,23 @@ class CockpitRouter:
                         pass
             try:
                 self._show_live_session(supervisor, "operator", window_target)
+            except Exception:
+                self._show_static_view(supervisor, window_target, "polly")
+            return
+        if key == "russell":
+            # Launch reviewer session if not running
+            launches = supervisor.plan_launches()
+            storage_session = supervisor.storage_closet_session_name()
+            rev_launch = next((l for l in launches if l.session.name == "reviewer"), None)
+            if rev_launch is not None:
+                storage_windows = {w.name for w in self.tmux.list_windows(storage_session)}
+                if rev_launch.window_name not in storage_windows:
+                    try:
+                        supervisor.launch_session("reviewer")
+                    except Exception:
+                        pass
+            try:
+                self._show_live_session(supervisor, "reviewer", window_target)
             except Exception:
                 self._show_static_view(supervisor, window_target, "polly")
             return

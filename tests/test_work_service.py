@@ -1,0 +1,440 @@
+"""Tests for SQLiteWorkService — task CRUD and state transitions."""
+
+from __future__ import annotations
+
+import pytest
+
+from pollypm.work.models import (
+    ExecutionStatus,
+    Priority,
+    TaskType,
+    WorkStatus,
+)
+from pollypm.work.sqlite_service import (
+    InvalidTransitionError,
+    SQLiteWorkService,
+    TaskNotFoundError,
+    ValidationError,
+)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def svc(tmp_path):
+    """Create a fresh SQLiteWorkService with an in-memory-equivalent temp DB."""
+    db_path = tmp_path / "work.db"
+    return SQLiteWorkService(db_path=db_path)
+
+
+def _create_standard_task(svc, project="proj", title="My task", description="Do the thing", **kwargs):
+    """Helper to create a task with the standard flow and valid roles."""
+    defaults = dict(
+        title=title,
+        description=description,
+        type="task",
+        project=project,
+        flow_template="standard",
+        roles={"worker": "agent-1", "reviewer": "agent-2"},
+        priority="normal",
+        created_by="tester",
+    )
+    defaults.update(kwargs)
+    return svc.create(**defaults)
+
+
+# ---------------------------------------------------------------------------
+# Task creation
+# ---------------------------------------------------------------------------
+
+
+class TestCreateTask:
+    def test_create_task(self, svc):
+        task = _create_standard_task(svc)
+        assert task.project == "proj"
+        assert task.task_number == 1
+        assert task.title == "My task"
+        assert task.description == "Do the thing"
+        assert task.type == TaskType.TASK
+        assert task.work_status == WorkStatus.DRAFT
+        assert task.flow_template_id == "standard"
+        assert task.priority == Priority.NORMAL
+        assert task.current_node_id is None
+        assert task.assignee is None
+        assert task.roles == {"worker": "agent-1", "reviewer": "agent-2"}
+        assert task.created_at is not None
+        assert task.created_by == "tester"
+
+    def test_create_validates_roles(self, svc):
+        with pytest.raises(ValidationError, match="Required role 'worker'"):
+            svc.create(
+                title="Missing roles",
+                type="task",
+                project="proj",
+                flow_template="standard",
+                roles={"reviewer": "agent-2"},  # missing 'worker'
+                priority="normal",
+            )
+
+    def test_create_optional_role_not_required(self, svc):
+        """The 'requester' role is optional in the standard flow."""
+        task = svc.create(
+            title="No requester",
+            description="Fine without requester",
+            type="task",
+            project="proj",
+            flow_template="standard",
+            roles={"worker": "agent-1", "reviewer": "agent-2"},
+            priority="normal",
+        )
+        assert task.task_number == 1
+
+    def test_create_sequential_ids(self, svc):
+        t1 = _create_standard_task(svc, title="First")
+        t2 = _create_standard_task(svc, title="Second")
+        assert t1.task_number == 1
+        assert t2.task_number == 2
+
+    def test_create_ids_per_project(self, svc):
+        t1 = _create_standard_task(svc, project="alpha")
+        t2 = _create_standard_task(svc, project="beta")
+        assert t1.task_number == 1
+        assert t2.task_number == 1
+
+    def test_create_with_labels(self, svc):
+        task = _create_standard_task(svc, labels=["bug", "urgent"])
+        assert task.labels == ["bug", "urgent"]
+
+    def test_create_with_acceptance_criteria(self, svc):
+        task = _create_standard_task(svc, acceptance_criteria="Tests pass")
+        assert task.acceptance_criteria == "Tests pass"
+
+
+# ---------------------------------------------------------------------------
+# Task retrieval
+# ---------------------------------------------------------------------------
+
+
+class TestGetTask:
+    def test_get_task(self, svc):
+        created = _create_standard_task(svc)
+        fetched = svc.get(f"{created.project}/{created.task_number}")
+        assert fetched.title == created.title
+        assert fetched.task_number == created.task_number
+        assert fetched.work_status == WorkStatus.DRAFT
+
+    def test_get_task_not_found(self, svc):
+        with pytest.raises(TaskNotFoundError):
+            svc.get("nonexistent/999")
+
+
+# ---------------------------------------------------------------------------
+# List tasks
+# ---------------------------------------------------------------------------
+
+
+class TestListTasks:
+    def test_list_tasks_by_status(self, svc):
+        t1 = _create_standard_task(svc, title="Draft task")
+        t2 = _create_standard_task(svc, title="Queued task", description="Has description")
+        svc.queue(t2.task_id, "actor")
+
+        drafts = svc.list_tasks(work_status="draft")
+        assert len(drafts) == 1
+        assert drafts[0].title == "Draft task"
+
+        queued = svc.list_tasks(work_status="queued")
+        assert len(queued) == 1
+        assert queued[0].title == "Queued task"
+
+    def test_list_tasks_by_project(self, svc):
+        _create_standard_task(svc, project="alpha")
+        _create_standard_task(svc, project="beta")
+        _create_standard_task(svc, project="alpha", title="Second alpha")
+
+        alpha = svc.list_tasks(project="alpha")
+        assert len(alpha) == 2
+
+        beta = svc.list_tasks(project="beta")
+        assert len(beta) == 1
+
+    def test_list_tasks_all(self, svc):
+        _create_standard_task(svc, title="A")
+        _create_standard_task(svc, title="B")
+        all_tasks = svc.list_tasks()
+        assert len(all_tasks) == 2
+
+    def test_list_tasks_by_type(self, svc):
+        _create_standard_task(svc, type="task")
+        _create_standard_task(svc, type="bug")
+        tasks = svc.list_tasks(type="task")
+        assert len(tasks) == 1
+
+
+# ---------------------------------------------------------------------------
+# Update
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateTask:
+    def test_update_task(self, svc):
+        task = _create_standard_task(svc)
+        updated = svc.update(task.task_id, title="New title", description="New desc")
+        assert updated.title == "New title"
+        assert updated.description == "New desc"
+
+    def test_update_labels(self, svc):
+        task = _create_standard_task(svc)
+        updated = svc.update(task.task_id, labels=["a", "b"])
+        assert updated.labels == ["a", "b"]
+
+    def test_update_roles(self, svc):
+        task = _create_standard_task(svc)
+        updated = svc.update(
+            task.task_id, roles={"worker": "new-agent", "reviewer": "agent-2"}
+        )
+        assert updated.roles["worker"] == "new-agent"
+
+    def test_update_cannot_change_status(self, svc):
+        task = _create_standard_task(svc)
+        with pytest.raises(ValidationError, match="Cannot change work_status"):
+            svc.update(task.task_id, work_status="queued")
+
+    def test_update_cannot_change_flow(self, svc):
+        task = _create_standard_task(svc)
+        with pytest.raises(ValidationError, match="Cannot change flow_template"):
+            svc.update(task.task_id, flow_template_id="spike")
+
+    def test_update_not_found(self, svc):
+        with pytest.raises(TaskNotFoundError):
+            svc.update("nope/1", title="x")
+
+
+# ---------------------------------------------------------------------------
+# Queue
+# ---------------------------------------------------------------------------
+
+
+class TestQueue:
+    def test_queue_from_draft(self, svc):
+        task = _create_standard_task(svc, description="Ready to go")
+        queued = svc.queue(task.task_id, "pm")
+        assert queued.work_status == WorkStatus.QUEUED
+
+    def test_queue_without_description(self, svc):
+        task = _create_standard_task(svc, description="")
+        with pytest.raises(ValidationError, match="description"):
+            svc.queue(task.task_id, "pm")
+
+    def test_queue_from_wrong_state(self, svc):
+        task = _create_standard_task(svc, description="Ready")
+        svc.queue(task.task_id, "pm")
+        svc.claim(task.task_id, "agent-1")
+        with pytest.raises(InvalidTransitionError, match="in_progress"):
+            svc.queue(task.task_id, "pm")
+
+    def test_queue_requires_human_review_rejected(self, svc):
+        task = _create_standard_task(
+            svc, description="Needs approval", requires_human_review=True
+        )
+        with pytest.raises(InvalidTransitionError, match="human review"):
+            svc.queue(task.task_id, "pm")
+
+
+# ---------------------------------------------------------------------------
+# Claim
+# ---------------------------------------------------------------------------
+
+
+class TestClaim:
+    def test_claim_from_queued(self, svc):
+        task = _create_standard_task(svc, description="Work to do")
+        svc.queue(task.task_id, "pm")
+        claimed = svc.claim(task.task_id, "agent-1")
+
+        assert claimed.work_status == WorkStatus.IN_PROGRESS
+        assert claimed.assignee == "agent-1"
+        assert claimed.current_node_id == "implement"  # standard flow start
+
+        # Should have an execution record
+        assert len(claimed.executions) == 1
+        ex = claimed.executions[0]
+        assert ex.node_id == "implement"
+        assert ex.visit == 1
+        assert ex.status == ExecutionStatus.ACTIVE
+        assert ex.started_at is not None
+
+    def test_claim_from_wrong_state(self, svc):
+        task = _create_standard_task(svc, description="Not queued yet")
+        with pytest.raises(InvalidTransitionError, match="draft"):
+            svc.claim(task.task_id, "agent-1")
+
+    def test_claim_is_atomic(self, svc):
+        """On claim failure, neither assignee nor status should change."""
+        task = _create_standard_task(svc, description="Draft only")
+        # Task is in draft, claim should fail
+        try:
+            svc.claim(task.task_id, "agent-1")
+        except InvalidTransitionError:
+            pass
+        reloaded = svc.get(task.task_id)
+        assert reloaded.work_status == WorkStatus.DRAFT
+        assert reloaded.assignee is None
+
+
+# ---------------------------------------------------------------------------
+# Cancel
+# ---------------------------------------------------------------------------
+
+
+class TestCancel:
+    def test_cancel_from_draft(self, svc):
+        task = _create_standard_task(svc)
+        cancelled = svc.cancel(task.task_id, "pm", "not needed")
+        assert cancelled.work_status == WorkStatus.CANCELLED
+
+    def test_cancel_from_queued(self, svc):
+        task = _create_standard_task(svc, description="Queue it")
+        svc.queue(task.task_id, "pm")
+        cancelled = svc.cancel(task.task_id, "pm", "changed mind")
+        assert cancelled.work_status == WorkStatus.CANCELLED
+
+    def test_cancel_from_in_progress(self, svc):
+        task = _create_standard_task(svc, description="Claim it")
+        svc.queue(task.task_id, "pm")
+        svc.claim(task.task_id, "agent-1")
+        cancelled = svc.cancel(task.task_id, "pm", "abort")
+        assert cancelled.work_status == WorkStatus.CANCELLED
+
+    def test_cancel_from_on_hold(self, svc):
+        task = _create_standard_task(svc, description="Hold it")
+        svc.queue(task.task_id, "pm")
+        svc.claim(task.task_id, "agent-1")
+        svc.hold(task.task_id, "pm")
+        cancelled = svc.cancel(task.task_id, "pm", "done waiting")
+        assert cancelled.work_status == WorkStatus.CANCELLED
+
+    def test_cancel_from_terminal(self, svc):
+        task = _create_standard_task(svc)
+        svc.cancel(task.task_id, "pm", "bye")
+        with pytest.raises(InvalidTransitionError, match="terminal"):
+            svc.cancel(task.task_id, "pm", "double cancel")
+
+
+# ---------------------------------------------------------------------------
+# Hold / Resume
+# ---------------------------------------------------------------------------
+
+
+class TestHoldResume:
+    def test_hold_from_in_progress(self, svc):
+        task = _create_standard_task(svc, description="Work")
+        svc.queue(task.task_id, "pm")
+        svc.claim(task.task_id, "agent-1")
+        held = svc.hold(task.task_id, "pm", "waiting for info")
+        assert held.work_status == WorkStatus.ON_HOLD
+
+    def test_hold_from_queued(self, svc):
+        task = _create_standard_task(svc, description="Queued")
+        svc.queue(task.task_id, "pm")
+        held = svc.hold(task.task_id, "pm")
+        assert held.work_status == WorkStatus.ON_HOLD
+
+    def test_hold_from_wrong_state(self, svc):
+        task = _create_standard_task(svc)
+        with pytest.raises(InvalidTransitionError, match="draft"):
+            svc.hold(task.task_id, "pm")
+
+    def test_resume_from_on_hold_with_active_execution(self, svc):
+        """Resume goes to in_progress when a flow node is active."""
+        task = _create_standard_task(svc, description="Hold me")
+        svc.queue(task.task_id, "pm")
+        svc.claim(task.task_id, "agent-1")
+        svc.hold(task.task_id, "pm")
+        resumed = svc.resume(task.task_id, "pm")
+        assert resumed.work_status == WorkStatus.IN_PROGRESS
+
+    def test_resume_from_on_hold_without_execution(self, svc):
+        """Resume goes to queued when no flow node is active."""
+        task = _create_standard_task(svc, description="Hold me")
+        svc.queue(task.task_id, "pm")
+        svc.hold(task.task_id, "pm")
+        resumed = svc.resume(task.task_id, "pm")
+        assert resumed.work_status == WorkStatus.QUEUED
+
+    def test_resume_from_wrong_state(self, svc):
+        task = _create_standard_task(svc, description="Not on hold")
+        svc.queue(task.task_id, "pm")
+        with pytest.raises(InvalidTransitionError, match="queued"):
+            svc.resume(task.task_id, "pm")
+
+
+# ---------------------------------------------------------------------------
+# Transitions
+# ---------------------------------------------------------------------------
+
+
+class TestTransitions:
+    def test_transitions_recorded(self, svc):
+        """Full lifecycle should record every transition."""
+        task = _create_standard_task(svc, description="Full lifecycle")
+        tid = task.task_id
+
+        svc.queue(tid, "pm")
+        svc.claim(tid, "agent-1")
+        svc.hold(tid, "pm", "waiting")
+        svc.resume(tid, "pm")
+        svc.cancel(tid, "pm", "done")
+
+        final = svc.get(tid)
+        assert len(final.transitions) == 5
+
+        states = [(t.from_state, t.to_state) for t in final.transitions]
+        assert states == [
+            ("draft", "queued"),
+            ("queued", "in_progress"),
+            ("in_progress", "on_hold"),
+            ("on_hold", "in_progress"),
+            ("in_progress", "cancelled"),
+        ]
+
+        # All transitions have timestamps and actors
+        for t in final.transitions:
+            assert t.timestamp is not None
+            assert t.actor in ("pm", "agent-1")
+
+        # Cancel transition has a reason
+        assert final.transitions[-1].reason == "done"
+
+
+# ---------------------------------------------------------------------------
+# Owner derivation
+# ---------------------------------------------------------------------------
+
+
+class TestOwnerDerivation:
+    def test_owner_draft(self, svc):
+        """Draft tasks are owned by the project manager."""
+        task = _create_standard_task(svc)
+        owner = svc.derive_owner(task)
+        assert owner == "project_manager"
+
+    def test_owner_in_progress(self, svc):
+        """In-progress task at implement node: owner is the worker role."""
+        task = _create_standard_task(svc, description="Work")
+        svc.queue(task.task_id, "pm")
+        claimed = svc.claim(task.task_id, "agent-1")
+        owner = svc.derive_owner(claimed)
+        # The implement node has actor_type=role, actor_role=worker
+        # roles["worker"] = "agent-1"
+        assert owner == "agent-1"
+
+    def test_owner_queued(self, svc):
+        """Queued tasks have no current_node_id, so owner is None."""
+        task = _create_standard_task(svc, description="Queue me")
+        queued = svc.queue(task.task_id, "pm")
+        owner = svc.derive_owner(queued)
+        assert owner is None

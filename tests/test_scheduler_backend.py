@@ -243,4 +243,7 @@ def test_knowledge_extract_schedule_is_idempotent_and_runs(monkeypatch, tmp_path
 
     ran = backend.run_due(supervisor, now=datetime.now(UTC) + timedelta(seconds=901))
     assert len(ran) == 1
-    assert calls == [tmp_path]
+    # The knowledge_extract job handler is now a no-op — extraction moved to
+    # session_intelligence. The job still fires (backward compat) but
+    # extract_knowledge_once is no longer called.
+    assert calls == []

@@ -10,3 +10,4 @@ src/*.egg-info/
 .pollypm-state/
 .claude/worktrees/
 reports/
+docs/project-overview.md

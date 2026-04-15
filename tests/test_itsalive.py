@@ -127,6 +127,46 @@ def test_sweep_completes_verified_pending_deploy(tmp_path: Path, monkeypatch) ->
     )
 
 
+def test_sweep_persists_owner_token_from_snake_case_finalize_response(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "dist" / "index.html").write_text("<h1>ok</h1>")
+    global_config = tmp_path / "global.json"
+    monkeypatch.setattr(itsalive, "GLOBAL_CONFIG_FILE", global_config)
+    pending = itsalive.PendingDeploy(
+        deploy_id="dep_snake",
+        subdomain="demo",
+        email="user@example.com",
+        publish_dir="dist",
+        files=["index.html"],
+        project_root=str(tmp_path),
+        api_url=itsalive.ITSALIVE_API,
+        created_at="2026-04-12T00:00:00+00:00",
+        expires_at="2099-04-13T00:00:00+00:00",
+    )
+    itsalive.write_pending_deploy(tmp_path, pending)
+
+    def fake_api(method: str, url: str, *, payload=None, headers=None):
+        if url.endswith("/deploy/dep_snake/status"):
+            return {"verified": True, "subdomain": "demo"}
+        if url.endswith("/deploy/dep_snake/finalize"):
+            return {
+                "subdomain": "demo",
+                "email": "user@example.com",
+                "deployToken": "deploy_tok",
+                "owner_token": "owner_tok_snake",
+            }
+        raise AssertionError(url)
+
+    monkeypatch.setattr(itsalive, "api_json", fake_api)
+    monkeypatch.setattr(itsalive, "_upload_file", lambda *args, **kwargs: None)
+
+    outcomes = itsalive.sweep_pending_deploys(tmp_path)
+
+    assert len(outcomes) == 1
+    saved_global = json.loads(global_config.read_text())
+    assert saved_global["ownerToken"] == "owner_tok_snake"
+
+
 def test_push_deploy_uses_existing_project_token(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "index.html").write_text("<h1>ok</h1>")
     (tmp_path / ".itsalive").write_text(json.dumps({"deployToken": "deploy_tok", "email": "user@example.com"}))

@@ -27,7 +27,7 @@ You are the operator. Workers implement. Dispatch all work through the task syst
 pm task create "Title" -p <project_key> \
   -d "Description. Acceptance criteria: ..." \
   -f standard --priority normal \
-  -r worker=worker -r reviewer=polly
+  -r worker=worker -r reviewer=russell
 
 # Queue it so the worker can pick it up
 pm task queue <project>/<number>
@@ -57,8 +57,8 @@ You can also mount the worker in the cockpit (click PM Chat in the rail) to read
 Then approve or reject:
 
 ```bash
-pm task approve <id> --actor polly --reason "Looks good"
-pm task reject <id> --actor polly --reason "Specific, actionable feedback"
+pm task approve <id> --actor russell --reason "Looks good"
+pm task reject <id> --actor russell --reason "Specific, actionable feedback"
 ```
 
 When the top-level goal is complete, notify the user:
@@ -102,7 +102,7 @@ This creates a managed worker session (separate tmux window) for the project. Th
 5. Restart: `pm worker-start <project_key>` (this will relaunch)
 6. Queue a task if the worker needs new work:
    ```bash
-   pm task create "Continue: <description>" -p <project> -d "..." -f standard -r worker=worker -r reviewer=polly
+   pm task create "Continue: <description>" -p <project> -d "..." -f standard -r worker=worker -r reviewer=russell
    pm task queue <project>/<number>
    ```
 

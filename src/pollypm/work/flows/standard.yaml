@@ -1,0 +1,32 @@
+name: standard
+description: Default work flow — worker implements, reviewer approves
+
+roles:
+  worker:
+    description: Implements the work
+  reviewer:
+    description: Reviews and approves
+  requester:
+    description: Who asked for this
+    optional: true
+
+nodes:
+  implement:
+    type: work
+    actor_type: role
+    actor_role: worker
+    next_node: code_review
+    gates: [has_assignee]
+
+  code_review:
+    type: review
+    actor_type: role
+    actor_role: reviewer
+    next_node: done
+    reject_node: implement
+    gates: [has_work_output]
+
+  done:
+    type: terminal
+
+start_node: implement

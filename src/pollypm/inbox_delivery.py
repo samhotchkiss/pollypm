@@ -11,6 +11,7 @@ reply is sent from the cockpit UI or CLI.
 from __future__ import annotations
 
 import logging
+import shlex
 from collections import defaultdict
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -35,6 +36,15 @@ _RECIPIENT_SESSION_MAP = {
 def _resolve_session_name(recipient: str) -> str:
     """Map a recipient name to a tmux session name."""
     return _RECIPIENT_SESSION_MAP.get(recipient, recipient)
+
+
+def _mail_command(config: PollyPMConfig, msg_id: str | None = None) -> str:
+    """Build an explicit mail command for the active PollyPM config."""
+    config_path = config.project.root_dir / "pollypm.toml"
+    parts = ["pm", "--config", shlex.quote(str(config_path)), "mail"]
+    if msg_id:
+        parts.append(shlex.quote(msg_id))
+    return " ".join(parts)
 
 
 def ensure_inbox_progress(config: PollyPMConfig) -> dict[str, int]:
@@ -129,11 +139,11 @@ def ensure_inbox_progress(config: PollyPMConfig) -> dict[str, int]:
         if "finished" in oldest.subject.lower() or "complete" in oldest.subject.lower():
             poke = (
                 f"[Inbox] ACTION REQUIRED: {oldest.subject[:50]}. "
-                f"The user has NOT been notified. Run: pm mail {oldest.id} — "
+                f"The user has NOT been notified. Run: {_mail_command(config, oldest.id)} — "
                 f"then: pm notify 'Done: ...' '...' --to user"
             )
         else:
-            poke = f"[Inbox] You have {n} item(s) needing action. Run: pm mail"
+            poke = f"[Inbox] You have {n} item(s) needing action. Run: {_mail_command(config)}"
 
         try:
             sup.send_input(session_name, poke, owner="pollypm", force=True)
@@ -169,7 +179,7 @@ def deliver_single_message(config: PollyPMConfig, msg_id: str) -> bool:
         return False
 
     session_name = _resolve_session_name(msg.to)
-    payload = f"[Inbox] New message: {msg.subject[:60]} — run: pm mail {msg_id}"
+    payload = f"[Inbox] New message: {msg.subject[:60]} — run: {_mail_command(config, msg_id)}"
 
     sup = Supervisor(config)
     try:

@@ -1,0 +1,22 @@
+name: spike
+description: Research and investigation flow — no review required
+
+roles:
+  worker:
+    description: Performs the research
+  requester:
+    description: Who asked for this
+    optional: true
+
+nodes:
+  research:
+    type: work
+    actor_type: role
+    actor_role: worker
+    next_node: done
+    gates: [has_assignee]
+
+  done:
+    type: terminal
+
+start_node: research

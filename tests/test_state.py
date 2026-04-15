@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from pollypm.storage.state import TokenUsageHourlyRecord
@@ -115,3 +116,35 @@ def test_state_store_daily_token_usage_aggregates_by_day(tmp_path: Path) -> None
         ("2026-04-10", 350),
         ("2026-04-11", 75),
     ]
+
+
+def test_state_store_readonly_mode_reads_existing_data(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    store.upsert_alert("worker", "idle_output", "warn", "No new output")
+    store.set_lease("worker", "human", "manual takeover")
+    store.upsert_session_runtime(
+        session_name="worker",
+        status="idle",
+        last_failure_message="Waiting for input",
+    )
+    store.close()
+
+    os.chmod(tmp_path, 0o555)
+    os.chmod(db_path, 0o444)
+    try:
+        readonly_store = StateStore(db_path, readonly=True)
+        alerts = readonly_store.open_alerts()
+        lease = readonly_store.get_lease("worker")
+        runtime = readonly_store.get_session_runtime("worker")
+        readonly_store.close()
+    finally:
+        os.chmod(db_path, 0o644)
+        os.chmod(tmp_path, 0o755)
+
+    assert len(alerts) == 1
+    assert alerts[0].alert_type == "idle_output"
+    assert lease is not None
+    assert lease.owner == "human"
+    assert runtime is not None
+    assert runtime.status == "idle"

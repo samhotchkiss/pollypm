@@ -1,0 +1,205 @@
+"""Tests for the work service CLI commands."""
+
+from __future__ import annotations
+
+import json
+import importlib.resources
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from pollypm.work.cli import task_app, flow_app
+
+
+runner = CliRunner()
+
+
+@pytest.fixture
+def db_path(tmp_path):
+    return str(tmp_path / "test.db")
+
+
+def _create_task(db_path, title="Test task", project="proj", priority="normal",
+                 roles=None, description="A test task", flow="standard", task_type="task"):
+    roles = roles or ["worker=agent-1", "reviewer=agent-2"]
+    args = [
+        "create", title,
+        "--project", project,
+        "--flow", flow,
+        "--priority", priority,
+        "--description", description,
+        "--type", task_type,
+        "--db", db_path,
+    ]
+    for r in roles:
+        args.extend(["--role", r])
+    result = runner.invoke(task_app, args)
+    assert result.exit_code == 0, f"create failed: {result.output}"
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Task CLI tests
+# ---------------------------------------------------------------------------
+
+
+class TestCliCreate:
+    def test_cli_create_and_get(self, db_path):
+        result = _create_task(db_path, title="My new task")
+        assert "Created proj/1" in result.output
+
+        # Get it back
+        result = runner.invoke(task_app, ["get", "proj/1", "--db", db_path])
+        assert result.exit_code == 0
+        assert "My new task" in result.output
+        assert "draft" in result.output
+
+
+class TestCliList:
+    def test_cli_list(self, db_path):
+        _create_task(db_path, title="Task A")
+        _create_task(db_path, title="Task B")
+
+        result = runner.invoke(task_app, ["list", "--db", db_path])
+        assert result.exit_code == 0
+        assert "Task A" in result.output
+        assert "Task B" in result.output
+
+
+class TestCliLifecycle:
+    def test_cli_lifecycle(self, db_path):
+        # Create
+        _create_task(db_path, title="Lifecycle task", roles=["worker=pete", "reviewer=polly"])
+
+        # Queue
+        result = runner.invoke(task_app, ["queue", "proj/1", "--db", db_path])
+        assert result.exit_code == 0
+        assert "Queued" in result.output
+
+        # Claim
+        result = runner.invoke(task_app, ["claim", "proj/1", "--actor", "pete", "--db", db_path])
+        assert result.exit_code == 0
+        assert "Claimed" in result.output
+
+        # Done (node_done with work output)
+        wo = json.dumps({
+            "type": "code_change",
+            "summary": "Implemented the feature",
+            "artifacts": [{"kind": "commit", "description": "abc123", "ref": "abc123"}],
+        })
+        result = runner.invoke(task_app, ["done", "proj/1", "--output", wo, "--actor", "pete", "--db", db_path])
+        assert result.exit_code == 0
+        assert "Node done" in result.output
+
+        # Approve
+        result = runner.invoke(task_app, ["approve", "proj/1", "--actor", "polly", "--db", db_path])
+        assert result.exit_code == 0
+        assert "Approved" in result.output
+
+        # Verify final state
+        result = runner.invoke(task_app, ["get", "proj/1", "--db", db_path, "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["work_status"] == "done"
+
+
+class TestCliNext:
+    def test_cli_next(self, db_path):
+        _create_task(db_path, title="High task", priority="high")
+        _create_task(db_path, title="Critical task", priority="critical")
+
+        runner.invoke(task_app, ["queue", "proj/1", "--db", db_path])
+        runner.invoke(task_app, ["queue", "proj/2", "--db", db_path])
+
+        result = runner.invoke(task_app, ["next", "--db", db_path])
+        assert result.exit_code == 0
+        assert "Critical task" in result.output
+
+    def test_cli_next_none(self, db_path):
+        result = runner.invoke(task_app, ["next", "--db", db_path])
+        assert result.exit_code == 0
+        assert "No tasks available" in result.output
+
+
+class TestCliJsonOutput:
+    def test_cli_json_output(self, db_path):
+        _create_task(db_path, title="JSON task")
+
+        result = runner.invoke(task_app, ["get", "proj/1", "--db", db_path, "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["title"] == "JSON task"
+        assert data["task_id"] == "proj/1"
+
+
+class TestCliContext:
+    def test_cli_context(self, db_path):
+        _create_task(db_path, title="Context task")
+
+        result = runner.invoke(task_app, ["context", "proj/1", "Hello context", "--db", db_path])
+        assert result.exit_code == 0
+        assert "Added context" in result.output
+
+        # Verify context shows in get
+        result = runner.invoke(task_app, ["get", "proj/1", "--db", db_path])
+        assert result.exit_code == 0
+        assert "Hello context" in result.output
+
+
+class TestCliCounts:
+    def test_cli_counts(self, db_path):
+        _create_task(db_path, title="Task 1")
+        _create_task(db_path, title="Task 2")
+        runner.invoke(task_app, ["queue", "proj/1", "--db", db_path])
+
+        result = runner.invoke(task_app, ["counts", "--db", db_path])
+        assert result.exit_code == 0
+        assert "draft" in result.output
+        assert "queued" in result.output
+
+    def test_cli_counts_json(self, db_path):
+        _create_task(db_path, title="Task 1")
+
+        result = runner.invoke(task_app, ["counts", "--db", db_path, "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["draft"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Flow CLI tests
+# ---------------------------------------------------------------------------
+
+
+class TestCliFlowList:
+    def test_cli_flow_list(self, db_path):
+        result = runner.invoke(flow_app, ["list", "--db", db_path])
+        assert result.exit_code == 0
+        assert "standard" in result.output
+
+    def test_cli_flow_list_json(self, db_path):
+        result = runner.invoke(flow_app, ["list", "--db", db_path, "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        names = [f["name"] for f in data]
+        assert "standard" in names
+
+
+class TestCliFlowValidate:
+    def test_cli_flow_validate(self, tmp_path):
+        # Use a built-in flow file
+        ref = importlib.resources.files("pollypm.work") / "flows" / "standard.yaml"
+        flow_path = str(ref)
+
+        result = runner.invoke(flow_app, ["validate", flow_path])
+        assert result.exit_code == 0
+        assert "Valid" in result.output
+
+    def test_cli_flow_validate_invalid(self, tmp_path):
+        bad = tmp_path / "bad.yaml"
+        bad.write_text("name: bad\n")  # Missing required fields
+
+        result = runner.invoke(flow_app, ["validate", str(bad)])
+        assert result.exit_code == 1
+        assert "Invalid" in result.output or "error" in result.output.lower()

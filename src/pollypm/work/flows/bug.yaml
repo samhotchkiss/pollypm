@@ -1,0 +1,38 @@
+name: bug
+description: Bug fix flow — reproduce, fix, then code review
+
+roles:
+  worker:
+    description: Reproduces and fixes the bug
+  reviewer:
+    description: Reviews and approves the fix
+  requester:
+    description: Who reported the bug
+    optional: true
+
+nodes:
+  reproduce:
+    type: work
+    actor_type: role
+    actor_role: worker
+    next_node: fix
+    gates: [has_assignee]
+
+  fix:
+    type: work
+    actor_type: role
+    actor_role: worker
+    next_node: code_review
+
+  code_review:
+    type: review
+    actor_type: role
+    actor_role: reviewer
+    next_node: done
+    reject_node: fix
+    gates: [has_work_output]
+
+  done:
+    type: terminal
+
+start_node: reproduce

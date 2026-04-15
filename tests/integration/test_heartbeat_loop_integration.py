@@ -116,6 +116,26 @@ def test_heartbeat_cycle_idle_session_nudged(tmp_path: Path) -> None:
     assert any(i.session_name == "worker_a" and i.action == "nudge" for i in result.interventions)
 
 
+def test_heartbeat_cycle_idle_operator_is_not_escalated(tmp_path: Path) -> None:
+    """An idle operator at the prompt should not generate interventions."""
+    config = _config(tmp_path)
+    store = StateStore(config.project.state_db)
+    store.upsert_session_runtime(
+        session_name="operator",
+        status="idle",
+        recovery_attempts=3,
+    )
+
+    signals = [
+        SessionSignals(session_name="operator", output_stale=True, idle_cycles=1),
+    ]
+
+    result = run_heartbeat_cycle(config, store, session_signals=signals)
+
+    assert result.classifications["operator"] == SessionHealth.IDLE
+    assert result.interventions == []
+
+
 def test_heartbeat_cycle_exited_session_relaunched(tmp_path: Path) -> None:
     """An exited session should trigger relaunch."""
     config = _config(tmp_path)

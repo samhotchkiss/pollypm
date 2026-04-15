@@ -306,11 +306,10 @@ def test_supervisor_heartbeat_api_records_snapshot_learnings_into_memory(tmp_pat
     ideas = backend.list_entries(scope="pollypm", kind="idea")
     checkpoints = backend.list_entries(scope="pollypm", kind="checkpoint")
 
-    assert any("heartbeat snapshot as a memory source" in entry.title.lower() for entry in decisions)
-    assert any("duplicate learnings" in entry.title.lower() for entry in risks)
-    assert any("compact project memory" in entry.title.lower() for entry in ideas)
+    # Knowledge extraction from snapshots was moved to session_intelligence
+    # (unified Haiku call) — record_checkpoint no longer extracts learnings
+    # into decisions/risks/ideas. It only records the checkpoint itself.
     assert len(checkpoints) == 1
-    assert backend.store.latest_memory_summary("pollypm") is not None
 
 
 def test_supervisor_heartbeat_api_deduplicates_snapshot_learnings(tmp_path: Path, monkeypatch) -> None:
@@ -335,10 +334,10 @@ def test_supervisor_heartbeat_api_deduplicates_snapshot_learnings(tmp_path: Path
     api.record_checkpoint(context, alerts=[])
 
     backend = get_memory_backend(tmp_path, "file")
-    decisions = backend.list_entries(scope="pollypm", kind="decision")
     checkpoints = backend.list_entries(scope="pollypm", kind="checkpoint")
 
-    assert len([entry for entry in decisions if "heartbeat learnings deduplicated" in entry.title.lower()]) == 1
+    # Knowledge extraction moved to session_intelligence — record_checkpoint
+    # only creates checkpoint entries now. Two calls = two checkpoints.
     assert len(checkpoints) == 2
 
 

@@ -1,4 +1,4 @@
-from pollypm.agent_profiles.builtin import StaticPromptProfile, heartbeat_prompt, polly_prompt, triage_prompt, worker_prompt
+from pollypm.agent_profiles.builtin import StaticPromptProfile, heartbeat_prompt, polly_prompt, reviewer_prompt, triage_prompt, worker_prompt
 from pollypm.plugin_api.v1 import PollyPMPlugin
 
 plugin = PollyPMPlugin(
@@ -6,6 +6,7 @@ plugin = PollyPMPlugin(
     capabilities=("agent_profile",),
     agent_profiles={
         "polly": lambda: StaticPromptProfile(name="polly", prompt=polly_prompt()),
+        "russell": lambda: StaticPromptProfile(name="russell", prompt=reviewer_prompt()),
         "heartbeat": lambda: StaticPromptProfile(name="heartbeat", prompt=heartbeat_prompt()),
         "worker": lambda: StaticPromptProfile(name="worker", prompt=worker_prompt()),
         "triage": lambda: StaticPromptProfile(name="triage", prompt=triage_prompt()),

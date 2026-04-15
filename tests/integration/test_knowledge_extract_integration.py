@@ -139,7 +139,7 @@ def test_knowledge_extraction_updates_docs_with_checkpointing(tmp_path: Path) ->
     decisions_path.write_text(decisions + "\n## Notes\nKeep this manual note.\n")
     before = decisions_path.read_text()
     second = extract_knowledge_once(config)
-    assert second == {"processed_events": 0, "updated_docs": 0, "memory_entries": 0}
+    assert second == {"processed_events": 0, "updated_docs": 0, "memory_entries": 0, "log_entries": 0}
     assert decisions_path.read_text() == before
 
     with events_path.open("a", encoding="utf-8") as handle:

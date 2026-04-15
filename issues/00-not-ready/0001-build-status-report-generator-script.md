@@ -1,0 +1,3 @@
+# Build status report generator script
+
+Create a Python script that generates a project status report from the task system. Requirements: (1) Read all tasks via pm task list --json, (2) Group tasks by status (draft, queued, in_progress, review, done, cancelled, on_hold, blocked), (3) Include task counts summary at top, (4) List tasks under each status heading with ID, title, priority, assignee, and current node, (5) Write output as markdown to docs/status-report.md, (6) Script should live at scripts/status_report.py and be runnable standalone. Keep it simple — no external dependencies beyond stdlib and subprocess.

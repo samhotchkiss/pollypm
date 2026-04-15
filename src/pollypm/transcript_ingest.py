@@ -563,17 +563,20 @@ def sync_transcripts_once(config) -> None:
     lock_path = _cursor_state_path(config).with_suffix(".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     import fcntl
-    with open(lock_path, "w") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        try:
-            state = _load_cursor_state(config)
-            for account_name, account in config.accounts.items():
-                provider = get_provider(account.provider, root_dir=config.project.root_dir)
-                for source in provider.transcript_sources(account, None):
-                    _scan_source(config, account_name, account, source, state)
-            _save_cursor_state(config, state)
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    try:
+        with open(lock_path, "w") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                state = _load_cursor_state(config)
+                for account_name, account in config.accounts.items():
+                    provider = get_provider(account.provider, root_dir=config.project.root_dir)
+                    for source in provider.transcript_sources(account, None):
+                        _scan_source(config, account_name, account, source, state)
+                _save_cursor_state(config, state)
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except BlockingIOError:
+        pass  # Another process holds the lock — skip this cycle
 
 
 class TranscriptIngestor:

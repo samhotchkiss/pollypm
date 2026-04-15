@@ -21,7 +21,7 @@ pm worker-start <project_key>   # launch/relaunch one worker
 Use the task system to assign work to workers:
 
 ```bash
-pm task create "Title" -p <project> -d "Description" -f standard -r worker=worker -r reviewer=polly
+pm task create "Title" -p <project> -d "Description" -f standard -r worker=worker -r reviewer=russell
 pm task queue <project>/<number>
 ```
 

@@ -182,5 +182,6 @@ def test_send_command_respects_human_lease(monkeypatch, tmp_path: Path) -> None:
     )
 
     assert result.exit_code != 0
-    assert "session is currently leased" in result.output
+    # The error message was updated to direct operators to use the inbox
+    assert "Blocked" in result.output or "session is currently leased" in result.output
     assert fake_tmux.sent_keys == []

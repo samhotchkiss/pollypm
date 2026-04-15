@@ -1,0 +1,228 @@
+"""Tests for work service query operations: next, my_tasks, state_counts, blocked_tasks."""
+
+from __future__ import annotations
+
+import time
+
+import pytest
+
+from pollypm.work.models import Priority, WorkStatus
+from pollypm.work.sqlite_service import SQLiteWorkService
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def svc(tmp_path):
+    db_path = tmp_path / "work.db"
+    return SQLiteWorkService(db_path=db_path)
+
+
+def _create_task(svc, project="proj", title="Task", description="desc", priority="normal", roles=None, **kwargs):
+    defaults = dict(
+        title=title,
+        description=description,
+        type="task",
+        project=project,
+        flow_template="standard",
+        roles=roles or {"worker": "agent-1", "reviewer": "agent-2"},
+        priority=priority,
+        created_by="tester",
+    )
+    defaults.update(kwargs)
+    return svc.create(**defaults)
+
+
+def _queue_task(svc, task):
+    return svc.queue(task.task_id, "tester")
+
+
+# ---------------------------------------------------------------------------
+# next() tests
+# ---------------------------------------------------------------------------
+
+
+class TestNext:
+    def test_next_returns_highest_priority(self, svc):
+        t_high = _create_task(svc, title="High", priority="high")
+        t_normal = _create_task(svc, title="Normal", priority="normal")
+        t_critical = _create_task(svc, title="Critical", priority="critical")
+
+        _queue_task(svc, t_high)
+        _queue_task(svc, t_normal)
+        _queue_task(svc, t_critical)
+
+        result = svc.next()
+        assert result is not None
+        assert result.title == "Critical"
+
+    def test_next_skips_blocked(self, svc):
+        # Create a blocker task that stays in draft
+        blocker = _create_task(svc, title="Blocker")
+
+        # Task A: will be blocked
+        task_a = _create_task(svc, title="Task A")
+        _queue_task(svc, task_a)
+
+        # Task B: not blocked
+        task_b = _create_task(svc, title="Task B")
+        _queue_task(svc, task_b)
+
+        # Link blocker -> task_a (blocker blocks task_a)
+        svc.link(blocker.task_id, task_a.task_id, "blocks")
+
+        result = svc.next()
+        assert result is not None
+        assert result.title == "Task B"
+
+    def test_next_filters_by_project(self, svc):
+        t_alpha = _create_task(svc, project="alpha", title="Alpha task")
+        t_beta = _create_task(svc, project="beta", title="Beta task")
+
+        _queue_task(svc, t_alpha)
+        _queue_task(svc, t_beta)
+
+        result = svc.next(project="alpha")
+        assert result is not None
+        assert result.project == "alpha"
+        assert result.title == "Alpha task"
+
+    def test_next_filters_by_agent(self, svc):
+        t_pete = _create_task(svc, title="Pete's task", roles={"worker": "pete", "reviewer": "polly"})
+        t_sam = _create_task(svc, title="Sam's task", roles={"worker": "sam", "reviewer": "polly"})
+
+        _queue_task(svc, t_pete)
+        _queue_task(svc, t_sam)
+
+        result = svc.next(agent="pete")
+        assert result is not None
+        assert result.title == "Pete's task"
+
+    def test_next_fifo_within_priority(self, svc):
+        # All normal priority; oldest should come first
+        t1 = _create_task(svc, title="First")
+        t2 = _create_task(svc, title="Second")
+        t3 = _create_task(svc, title="Third")
+
+        _queue_task(svc, t1)
+        _queue_task(svc, t2)
+        _queue_task(svc, t3)
+
+        result = svc.next()
+        assert result is not None
+        assert result.title == "First"
+
+    def test_next_returns_none_when_empty(self, svc):
+        # No tasks at all
+        assert svc.next() is None
+
+        # Tasks exist but none are queued
+        _create_task(svc, title="Draft task")
+        assert svc.next() is None
+
+
+# ---------------------------------------------------------------------------
+# my_tasks() tests
+# ---------------------------------------------------------------------------
+
+
+class TestMyTasks:
+    def test_my_tasks(self, svc):
+        # Create two tasks with different workers, claim them
+        t1 = _create_task(svc, title="Worker1 task", roles={"worker": "alice", "reviewer": "bob"})
+        t2 = _create_task(svc, title="Worker2 task", roles={"worker": "bob", "reviewer": "alice"})
+
+        _queue_task(svc, t1)
+        _queue_task(svc, t2)
+
+        # Claim both (sets current_node to 'implement' which has actor_role='worker')
+        svc.claim(t1.task_id, "alice")
+        svc.claim(t2.task_id, "bob")
+
+        # alice's tasks: she is worker on t1 -> implement node -> actor_role=worker
+        alice_tasks = svc.my_tasks("alice")
+        assert len(alice_tasks) == 1
+        assert alice_tasks[0].title == "Worker1 task"
+
+        # bob's tasks: he is worker on t2
+        bob_tasks = svc.my_tasks("bob")
+        assert len(bob_tasks) == 1
+        assert bob_tasks[0].title == "Worker2 task"
+
+
+# ---------------------------------------------------------------------------
+# state_counts() tests
+# ---------------------------------------------------------------------------
+
+
+class TestStateCounts:
+    def test_state_counts(self, svc):
+        _create_task(svc, title="Draft 1")
+        _create_task(svc, title="Draft 2")
+
+        t3 = _create_task(svc, title="Queued 1")
+        _queue_task(svc, t3)
+
+        counts = svc.state_counts()
+        assert counts["draft"] == 2
+        assert counts["queued"] == 1
+        assert counts["in_progress"] == 0
+        assert counts["done"] == 0
+
+    def test_state_counts_by_project(self, svc):
+        _create_task(svc, project="alpha", title="Alpha draft")
+        _create_task(svc, project="beta", title="Beta draft")
+
+        t = _create_task(svc, project="alpha", title="Alpha queued")
+        _queue_task(svc, t)
+
+        counts = svc.state_counts(project="alpha")
+        assert counts["draft"] == 1
+        assert counts["queued"] == 1
+
+        counts_beta = svc.state_counts(project="beta")
+        assert counts_beta["draft"] == 1
+        assert counts_beta["queued"] == 0
+
+
+# ---------------------------------------------------------------------------
+# blocked_tasks() tests
+# ---------------------------------------------------------------------------
+
+
+class TestBlockedTasks:
+    def test_blocked_tasks(self, svc):
+        blocker = _create_task(svc, title="Blocker")
+        target = _create_task(svc, title="Target")
+        unblocked = _create_task(svc, title="Unblocked")
+
+        _queue_task(svc, target)
+        _queue_task(svc, unblocked)
+
+        # blocker blocks target
+        svc.link(blocker.task_id, target.task_id, "blocks")
+
+        blocked = svc.blocked_tasks()
+        blocked_ids = [t.task_id for t in blocked]
+        assert target.task_id in blocked_ids
+        assert unblocked.task_id not in blocked_ids
+
+    def test_blocked_tasks_by_project(self, svc):
+        blocker = _create_task(svc, project="alpha", title="Blocker")
+        target_alpha = _create_task(svc, project="alpha", title="Alpha target")
+        target_beta = _create_task(svc, project="beta", title="Beta target")
+
+        _queue_task(svc, target_alpha)
+        _queue_task(svc, target_beta)
+
+        # blocker blocks both targets
+        svc.link(blocker.task_id, target_alpha.task_id, "blocks")
+        svc.link(blocker.task_id, target_beta.task_id, "blocks")
+
+        blocked_alpha = svc.blocked_tasks(project="alpha")
+        blocked_ids = [t.task_id for t in blocked_alpha]
+        assert target_alpha.task_id in blocked_ids
+        assert target_beta.task_id not in blocked_ids

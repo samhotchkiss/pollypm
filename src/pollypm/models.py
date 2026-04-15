@@ -42,10 +42,7 @@ class KnownProject:
     tracked: bool = False
 
     def display_label(self) -> str:
-        label = self.name or self.key
-        if self.persona_name:
-            return f"{label} ({self.persona_name})"
-        return label
+        return self.name or self.key
 
 
 @dataclass(slots=True)

@@ -81,6 +81,15 @@ def _msg_dir(project_root: Path, msg_id: str) -> Path:
     return result
 
 
+def _load_project_config(project_root: Path):
+    from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+
+    config_path = project_root / "pollypm.toml"
+    if not config_path.exists():
+        config_path = DEFAULT_CONFIG_PATH
+    return load_config(config_path)
+
+
 # ---------------------------------------------------------------------------
 # Create
 # ---------------------------------------------------------------------------
@@ -163,9 +172,8 @@ def create_message(
 
     # Sync to DB for efficient querying
     try:
-        from pollypm.config import load_config, DEFAULT_CONFIG_PATH
         from pollypm.storage.state import StateStore
-        config = load_config(DEFAULT_CONFIG_PATH)
+        config = _load_project_config(project_root)
         store = StateStore(config.project.state_db)
         store.upsert_inbox_message(
             id=msg_id, subject=subject, status="open", owner=owner,
@@ -298,9 +306,8 @@ def reply_to_message(
 
     # Sync to DB
     try:
-        from pollypm.config import load_config, DEFAULT_CONFIG_PATH
         from pollypm.storage.state import StateStore
-        config = load_config(DEFAULT_CONFIG_PATH)
+        config = _load_project_config(project_root)
         store = StateStore(config.project.state_db)
         store.upsert_inbox_message(
             id=state["id"], subject=state["subject"], status=state["status"],
@@ -438,9 +445,8 @@ def close_message(
 
     # Sync to DB
     try:
-        from pollypm.config import load_config, DEFAULT_CONFIG_PATH
         from pollypm.storage.state import StateStore
-        config = load_config(DEFAULT_CONFIG_PATH)
+        config = _load_project_config(project_root)
         store = StateStore(config.project.state_db)
         store.upsert_inbox_message(
             id=state["id"], subject=state["subject"], status="closed",
@@ -570,8 +576,7 @@ def _generate_context(project_root: Path, *, subject: str, project: str) -> str:
         project_path = project_root if not project else None
         # Try to find the project path from config
         try:
-            from pollypm.config import load_config, DEFAULT_CONFIG_PATH
-            config = load_config(DEFAULT_CONFIG_PATH)
+            config = _load_project_config(project_root)
             proj = config.projects.get(project)
             if proj:
                 project_path = proj.path

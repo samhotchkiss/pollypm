@@ -1,0 +1,29 @@
+name: user-review
+description: Worker implements, human must review and approve
+
+roles:
+  worker:
+    description: Implements the work
+  requester:
+    description: Who asked for this
+    optional: true
+
+nodes:
+  implement:
+    type: work
+    actor_type: role
+    actor_role: worker
+    next_node: human_review
+    gates: [has_assignee]
+
+  human_review:
+    type: review
+    actor_type: human
+    next_node: done
+    reject_node: implement
+    gates: [has_work_output]
+
+  done:
+    type: terminal
+
+start_node: implement

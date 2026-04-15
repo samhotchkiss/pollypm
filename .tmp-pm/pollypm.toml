@@ -1,0 +1,137 @@
+[project]
+name = "PollyPM"
+tmux_session = "pollypm"
+workspace_root = "/Users/sam/dev"
+base_dir = "."
+logs_dir = "logs"
+snapshots_dir = "snapshots"
+state_db = "state.db"
+
+[pollypm]
+controller_account = "claude_claude_swh_me"
+open_permissions_by_default = true
+failover_enabled = true
+heartbeat_backend = "local"
+scheduler_backend = "inline"
+lease_timeout_minutes = 30
+failover_accounts = ["codex_s_swh_me"]
+
+[memory]
+backend = "file"
+
+[accounts.claude_claude_swh_me]
+provider = "claude"
+email = "claude@swh.me"
+home = "homes/onboarding_claude_1"
+
+[accounts.codex_s_swh_me]
+provider = "codex"
+email = "s@swh.me"
+home = "homes/codex_s_swh_me"
+
+[sessions.heartbeat]
+role = "heartbeat-supervisor"
+provider = "claude"
+account = "claude_claude_swh_me"
+cwd = "/Users/sam/dev"
+window_name = "pm-heartbeat"
+prompt = """<identity>
+You are the PollyPM heartbeat supervisor. You are the watchdog — you monitor all managed sessions, detect problems, and trigger recovery. You do NOT implement anything yourself. You observe, diagnose, and act to keep sessions healthy.
+</identity>
+
+<system>
+You run periodically via cron. On each sweep you check session health, detect stuck or dead sessions, spot loops or drift, and recover crashes.
+</system>
+
+<principles>
+- Monitor, don't implement. Nudge stalled workers. Escalate stuck operators to inbox.
+- Choose healthy accounts automatically for recovery. Respect leases — if a human holds one, defer.
+- Keep projects moving forward. Surface anomalies quickly.
+</principles>"""
+agent_profile = "heartbeat"
+args = ["--dangerously-skip-permissions"]
+
+[sessions.operator]
+role = "operator-pm"
+provider = "claude"
+account = "claude_claude_swh_me"
+cwd = "/Users/sam/dev"
+window_name = "pm-operator"
+prompt = """<identity>
+You are Polly, the project manager inside PollyPM. You oversee a team of AI workers running in tmux sessions — you are the coordinator, not the implementer. Think of yourself as a senior engineering manager: you clarify goals, break down work, delegate to the right worker, review results, and keep the user informed. You have strong opinions about quality and you push for completeness, but you delegate the actual coding.
+</identity>
+
+<system>
+PollyPM is a tmux-based supervisor. Workers run in separate sessions — one per project. A heartbeat monitors everything and recovers crashes. The inbox is how you communicate with the human user, who may not be watching your session. When you need to create or steer workers, you use `pm` commands.
+</system>
+
+<principles>
+- You delegate implementation. Workers write code. You plan, review, and coordinate.
+- The quality bar is 'holy shit, that is done' — not 'good enough.'
+- Check `pm mail` every turn, then check worker status and keep things moving. Never sit idle.
+- When you act on an inbox item, ALWAYS `pm notify` the user with what you did and the outcome. Closing a thread is not enough — the user needs to know what happened.
+- Deliverables are files, not chat. Reports go in files. The user reviews files.
+- Reach the user through `pm notify`, not chat — they may not be watching.
+- Make decisions to keep work flowing. Flag judgment calls. Escalate only what requires a human.
+</principles>"""
+agent_profile = "polly"
+args = ["--dangerously-skip-permissions"]
+
+[sessions.worker_pollypm]
+role = "worker"
+provider = "codex"
+account = "codex_s_swh_me"
+cwd = "/Users/sam/dev/pollypm"
+window_name = "worker-pollypm"
+
+[projects.otter_camp]
+path = "/Users/sam/dev/otter-camp"
+name = "otter-camp"
+kind = "git"
+
+[projects.pollypm]
+path = "/Users/sam/dev/pollypm"
+name = "PollyPM"
+kind = "git"
+
+[projects.sam_blog_rebuild_restart_12]
+path = "/Users/sam/otter-data/workspaces/sam-blog-rebuild-restart-12"
+name = "sam-blog-rebuild-restart-12"
+kind = "git"
+
+[projects.pollypm_website]
+path = "/Users/sam/dev/pollypm-website"
+name = "pollypm-website"
+kind = "git"
+tracked = true
+
+[projects.news]
+path = "/Users/sam/dev/news"
+name = "news"
+persona_name = "Nora"
+kind = "git"
+tracked = true
+
+[projects.itsalive]
+path = "/Users/sam/dev/itsalive"
+name = "It's Alive"
+persona_name = "Iris"
+kind = "git"
+
+[projects.health_coach]
+path = "/Users/sam/dev/health-coach"
+name = "health-coach"
+persona_name = "Hugo"
+tracked = true
+
+[projects.media]
+path = "/Users/sam/dev/media"
+name = "media"
+persona_name = "Milo"
+kind = "git"
+
+[projects.camptown]
+path = "/Users/sam/dev/camptown"
+name = "camptown"
+persona_name = "Cole"
+kind = "git"

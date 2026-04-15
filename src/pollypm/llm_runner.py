@@ -107,8 +107,8 @@ def run_haiku(
     env["CLAUDE_CONFIG_DIR"] = config_dir
 
     cmd = ["claude", "-p", "--model", model]
-    if max_tokens:
-        cmd.extend(["--max-tokens", str(max_tokens)])
+    # Note: --max-tokens was removed from the Claude CLI.
+    # Token limits are now managed by the model/API, not the CLI flag.
 
     # Pipe the prompt via stdin to avoid "Argument list too long" when the
     # prompt exceeds the OS command-line length limit (~256 KB on macOS).
@@ -206,8 +206,7 @@ def run_opus(
     env["CLAUDE_CONFIG_DIR"] = config_dir
 
     cmd = ["claude", "-p", "--model", model]
-    if max_tokens:
-        cmd.extend(["--max-tokens", str(max_tokens)])
+    # Note: --max-tokens was removed from the Claude CLI.
 
     result = subprocess.run(
         cmd,

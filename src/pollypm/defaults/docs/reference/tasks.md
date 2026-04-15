@@ -13,7 +13,7 @@ draft → queued → claimed (in_progress) → node_done → review → approve/
 ```bash
 # Create a task with description and role assignments
 pm task create "Title" -p <project> -d "Description with acceptance criteria" \
-  -f standard --priority normal -r worker=worker -r reviewer=polly
+  -f standard --priority normal -r worker=worker -r reviewer=russell
 
 # Queue it — makes it available for worker pickup
 pm task queue <project>/<number>

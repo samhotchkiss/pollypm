@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
 import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -40,6 +43,10 @@ import re as _re
 _NAME_RE = _re.compile(r"^[a-zA-Z0-9_.-]+$")
 # Safe characters for tmux targets (session:window.pane or %pane_id)
 _TARGET_RE = _re.compile(r"^[a-zA-Z0-9_:.%-]+$")
+
+
+class DeadPaneError(RuntimeError):
+    """Raised when attempting to send keys to a dead pane."""
 
 
 class TmuxClient:
@@ -109,8 +116,12 @@ class TmuxClient:
         return result.stdout.strip() or None
 
     def create_session(self, name: str, window_name: str, command: str, *, remain_on_exit: bool = True, history_limit: int | None = 500) -> None:
+        """Create a tmux session. No-op if session already exists."""
         self._validate_name(name, "session name")
         self._validate_name(window_name, "window name")
+        if self.has_session(name):
+            logger.debug("Session %r already exists, skipping create", name)
+            return
         self.run("new-session", "-d", "-s", name, "-n", window_name, command)
         self.run("set-option", "-t", self._exact_target(f"{name}:"), "remain-on-exit", "on" if remain_on_exit else "off")
         if history_limit is not None:
@@ -124,7 +135,17 @@ class TmuxClient:
         return result.returncode
 
     def create_window(self, name: str, window_name: str, command: str, *, detached: bool = False) -> None:
+        """Create a window in a session. No-op if window already exists."""
         self._validate_name(window_name, "window name")
+        # Check if window already exists in this session
+        if self.has_session(name):
+            try:
+                windows = self.list_windows(name)
+                if any(w.name == window_name for w in windows):
+                    logger.debug("Window %r already exists in session %r, skipping create", window_name, name)
+                    return
+            except subprocess.CalledProcessError:
+                pass  # Session may have vanished; proceed with creation attempt
         args = ["new-window", "-t", self._exact_target(name), "-n", window_name]
         if detached:
             args.append("-d")
@@ -160,10 +181,19 @@ class TmuxClient:
         self.run("select-pane", "-t", self._exact_target(target))
 
     def kill_window(self, target: str) -> None:
-        self.run("kill-window", "-t", self._exact_target(target))
+        """Kill a window. No-op if it doesn't exist."""
+        result = self.run("kill-window", "-t", self._exact_target(target), check=False)
+        if result.returncode != 0:
+            logger.debug("kill-window %r returned %d (likely already gone)", target, result.returncode)
 
     def kill_session(self, name: str) -> None:
-        self.run("kill-session", "-t", self._exact_target(name))
+        """Kill a session. No-op if it doesn't exist."""
+        if not self.has_session(name):
+            logger.debug("Session %r does not exist, skipping kill", name)
+            return
+        result = self.run("kill-session", "-t", self._exact_target(name), check=False)
+        if result.returncode != 0:
+            logger.debug("kill-session %r returned %d (likely already gone)", name, result.returncode)
 
     def kill_pane(self, target: str) -> None:
         self.run("kill-pane", "-t", self._exact_target(target))
@@ -327,9 +357,15 @@ class TmuxClient:
         return result.stdout
 
     def send_keys(self, target: str, text: str, press_enter: bool = True) -> None:
-        self.run("send-keys", "-l", "-t", self._exact_target(target), text)
+        """Send keys to a pane. Raises DeadPaneError if the target pane is dead."""
+        resolved = self._exact_target(target)
+        # If the target looks like a pane id, check liveness first
+        if target.startswith("%"):
+            if not self.is_pane_alive(target):
+                raise DeadPaneError(f"Cannot send keys to dead pane {target!r}")
+        self.run("send-keys", "-l", "-t", resolved, text)
         if press_enter:
-            self.run("send-keys", "-t", self._exact_target(target), "Enter")
+            self.run("send-keys", "-t", resolved, "Enter")
 
     def attach_session(self, name: str) -> int:
         result = subprocess.run(["tmux", "attach", "-t", self._exact_target(name)], check=False)
@@ -338,3 +374,98 @@ class TmuxClient:
     def switch_client(self, name: str) -> int:
         result = subprocess.run(["tmux", "switch-client", "-t", self._exact_target(name)], check=False)
         return result.returncode
+
+    # -- Health check helpers --------------------------------------------------
+
+    def is_session_alive(self, name: str) -> bool:
+        """Return True if the session exists and has at least one live (non-dead) pane."""
+        if not self.has_session(name):
+            return False
+        try:
+            windows = self.list_windows(name)
+        except subprocess.CalledProcessError:
+            return False
+        return any(not w.pane_dead for w in windows)
+
+    def is_pane_alive(self, pane_id: str) -> bool:
+        """Return True if the pane exists and is not dead."""
+        fmt = "#{pane_id}\t#{pane_dead}\t#{pane_pid}"
+        result = self.run("list-panes", "-a", "-F", fmt, check=False)
+        if result.returncode != 0:
+            return False
+        for line in result.stdout.splitlines():
+            parts = line.split("\t", 2)
+            if len(parts) >= 2 and parts[0] == pane_id:
+                return parts[1] != "1"
+        return False
+
+    def get_pane_pid(self, pane_id: str) -> int | None:
+        """Get the PID of the process running in a pane, or None if pane not found."""
+        fmt = "#{pane_id}\t#{pane_pid}"
+        result = self.run("list-panes", "-a", "-F", fmt, check=False)
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) == 2 and parts[0] == pane_id:
+                try:
+                    return int(parts[1])
+                except ValueError:
+                    return None
+        return None
+
+    # -- Teardown helper -------------------------------------------------------
+
+    def teardown_session(self, name: str, capture_lines: int = 200) -> dict[str, str]:
+        """Tear down a session, capturing final pane output for archival.
+
+        Returns a dict mapping pane_id -> captured output.
+        No-op (returns empty dict) if the session doesn't exist.
+        """
+        if not self.has_session(name):
+            return {}
+
+        captured: dict[str, str] = {}
+        try:
+            windows = self.list_windows(name)
+            for w in windows:
+                try:
+                    output = self.capture_pane(w.pane_id, lines=capture_lines)
+                    captured[w.pane_id] = output
+                except subprocess.CalledProcessError:
+                    logger.debug("Failed to capture pane %s during teardown", w.pane_id)
+        except subprocess.CalledProcessError:
+            logger.debug("Failed to list windows for session %r during teardown", name)
+
+        self.kill_session(name)
+        return captured
+
+
+def recover_session(
+    tmux_client: TmuxClient,
+    name: str,
+    command: str,
+    working_dir: str | None = None,
+    *,
+    window_name: str = "main",
+    **kwargs: object,
+) -> bool:
+    """Restart a dead session with the same parameters.
+
+    Returns True if recovery was needed and performed, False if session was
+    already alive.
+    """
+    if tmux_client.is_session_alive(name):
+        return False
+
+    # Session is dead or doesn't exist; clean up if it lingers
+    tmux_client.kill_session(name)
+
+    # Build command with working directory if specified
+    full_command = command
+    if working_dir:
+        full_command = f"cd {shlex.quote(working_dir)} && {command}"
+
+    tmux_client.create_session(name, window_name, full_command, **kwargs)  # type: ignore[arg-type]
+    logger.info("Recovered session %r", name)
+    return True

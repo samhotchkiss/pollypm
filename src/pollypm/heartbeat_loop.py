@@ -118,6 +118,11 @@ def classify_session_health(signals: SessionSignals) -> SessionHealth:
     if signals.capacity_state in FAILOVER_TRIGGERS:
         return SessionHealth.BLOCKED_NO_CAPACITY
 
+    # Check if the session was classified as "blocked" (waiting on input)
+    # by the heuristic classifier in _process_session
+    if signals.last_verdict == "blocked":
+        return SessionHealth.WAITING_ON_USER
+
     if signals.snapshot_repeated >= 3:
         return SessionHealth.LOOPING
 
@@ -129,11 +134,6 @@ def classify_session_health(signals: SessionSignals) -> SessionHealth:
 
     if signals.has_transcript_delta:
         return SessionHealth.ACTIVE
-
-    # Check if the session was classified as "blocked" (waiting on input)
-    # by the heuristic classifier in _process_session
-    if signals.last_verdict == "blocked":
-        return SessionHealth.WAITING_ON_USER
 
     return SessionHealth.HEALTHY
 
@@ -160,7 +160,9 @@ def select_intervention(
     if health == SessionHealth.WAITING_ON_USER:
         # Workers asking "should I continue?" should be pushed forward.
         # The heartbeat triage will use Haiku to decide the right action.
-        # Only skip intervention for the operator (user interaction is expected).
+        # The operator can legitimately sit waiting for inbox/user direction.
+        if signals.session_name == "operator":
+            return None
         return InterventionAction(
             session_name=signals.session_name,
             action="nudge",
@@ -168,6 +170,10 @@ def select_intervention(
         )
 
     if health == SessionHealth.IDLE:
+        # The operator being idle at the prompt is normal when there is no
+        # queue to process. Avoid escalating prompt-idle control lanes.
+        if signals.session_name == "operator":
+            return None
         if previous_interventions == 0:
             return InterventionAction(
                 session_name=signals.session_name,

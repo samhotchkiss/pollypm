@@ -61,15 +61,19 @@ def test_cockpit_router_build_items_includes_core_entries(monkeypatch, tmp_path:
 
     keys = [item.key for item in items]
     assert "polly" in keys
+    assert "russell" in keys
     assert "inbox" in keys
     assert "project:pollypm" in keys
     assert "project:demo" in keys
     assert "settings" in keys
-    assert items[2].label == "PollyPM"
-    assert items[3].label == "Demo"
+    assert items[0].key == "polly"
     assert items[0].state == "ready"
-    assert items[1].label == "Inbox (1)"
-    assert items[3].state.endswith("live")
+    assert items[1].key == "russell"
+    assert items[2].key == "inbox"
+    assert items[2].label == "Inbox (1)"
+    assert items[3].label == "PollyPM"
+    assert items[4].label == "Demo"
+    assert items[4].state.endswith("live")
 
 
 def test_cockpit_router_session_state_ignores_silent_alerts(tmp_path: Path) -> None:

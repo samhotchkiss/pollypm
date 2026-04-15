@@ -161,16 +161,18 @@ def test_suggest_worker_prompt_returns_empty(tmp_path: Path) -> None:
     assert prompt == ""
 
 
-def test_worker_prompt_requires_project_instructions() -> None:
+def test_worker_prompt_requires_core_identity() -> None:
     prompt = worker_prompt()
 
-    assert ".pollypm/INSTRUCT.md" in prompt
-    assert "follow it religiously" in prompt
+    assert "<identity>" in prompt
+    assert "worker" in prompt.lower()
+    assert "<principles>" in prompt
 
 
-def test_operator_prompt_requires_managed_worker_commands() -> None:
+def test_operator_prompt_requires_delegation_instructions() -> None:
     prompt = operator_prompt()
 
-    assert "worker-start" in prompt
-    assert "pm worker-start <project_key>" in prompt
-    assert "Never create ad hoc worker panes with tmux new-window" in prompt
+    assert "<identity>" in prompt
+    assert "delegate" in prompt.lower()
+    assert "pm" in prompt  # references pm commands
+    assert "<principles>" in prompt

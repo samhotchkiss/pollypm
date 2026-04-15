@@ -70,6 +70,19 @@ class TestClassifySessionHealth:
         )
         assert classify_session_health(signals) == SessionHealth.ACTIVE
 
+    def test_waiting_on_user_when_blocked_verdict(self) -> None:
+        signals = SessionSignals(session_name="w", last_verdict="blocked")
+        assert classify_session_health(signals) == SessionHealth.WAITING_ON_USER
+
+    def test_waiting_on_user_takes_precedence_over_stuck(self) -> None:
+        signals = SessionSignals(
+            session_name="w",
+            output_stale=True,
+            idle_cycles=5,
+            last_verdict="blocked",
+        )
+        assert classify_session_health(signals) == SessionHealth.WAITING_ON_USER
+
     def test_healthy_default(self) -> None:
         signals = SessionSignals(session_name="w")
         assert classify_session_health(signals) == SessionHealth.HEALTHY
@@ -157,8 +170,23 @@ class TestSelectIntervention:
         assert result is not None
         assert result.action == "failover"
 
-    def test_no_intervention_waiting_on_user(self) -> None:
+    def test_nudge_intervention_waiting_on_user(self) -> None:
+        # Workers waiting on user get a nudge — triage decides whether to push forward.
         signals = SessionSignals(session_name="w")
+        result = select_intervention(SessionHealth.WAITING_ON_USER, signals)
+        assert result is not None
+        assert result.action == "nudge"
+
+    def test_no_intervention_for_idle_operator(self) -> None:
+        signals = SessionSignals(session_name="operator")
+        result = select_intervention(
+            SessionHealth.IDLE, signals,
+            previous_interventions=3,
+        )
+        assert result is None
+
+    def test_no_intervention_for_operator_waiting_on_user(self) -> None:
+        signals = SessionSignals(session_name="operator")
         result = select_intervention(SessionHealth.WAITING_ON_USER, signals)
         assert result is None
 

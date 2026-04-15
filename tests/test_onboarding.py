@@ -44,9 +44,9 @@ def test_build_onboarded_config_uses_controller_for_pollypm_sessions(tmp_path: P
     assert config.sessions["heartbeat"].account == "claude_1"
     assert config.sessions["heartbeat"].provider is ProviderKind.CLAUDE
     assert config.sessions["heartbeat"].project == "pollypm"
-    assert "true interactive CLI session" in config.sessions["operator"].prompt
-    assert "kick off, resume, and oversee a work session" in config.sessions["operator"].prompt
-    assert "supervision, not implementation" in config.sessions["heartbeat"].prompt
+    assert "<identity>" in config.sessions["operator"].prompt
+    assert "delegate" in config.sessions["operator"].prompt.lower()
+    assert "<identity>" in config.sessions["heartbeat"].prompt
     assert config.projects["wire"].name == "Wire"
 
 

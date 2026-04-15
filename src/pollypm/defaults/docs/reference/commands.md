@@ -17,12 +17,12 @@ All commands use the `pm` CLI. Run `pm --help` for the full list, or `pm <comman
 
 | Command | What it does |
 |---------|-------------|
-| `pm task create "Title" -p <project> -d "..." -f <flow> -r worker=worker -r reviewer=polly` | Create a task |
+| `pm task create "Title" -p <project> -d "..." -f <flow> -r worker=worker -r reviewer=russell` | Create a task |
 | `pm task queue <id>` | Move draft → queued (available for worker pickup) |
 | `pm task list -p <project>` | List tasks for a project |
 | `pm task status <id>` | Detailed task summary with flow state |
-| `pm task approve <id> --actor polly` | Approve at review node |
-| `pm task reject <id> --actor polly --reason "..."` | Reject with feedback |
+| `pm task approve <id> --actor russell` | Approve at review node |
+| `pm task reject <id> --actor russell --reason "..."` | Reject with feedback |
 | `pm task counts -p <project>` | Counts by status |
 | `pm flow list` | Show available flow templates |
 

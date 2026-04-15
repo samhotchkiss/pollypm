@@ -51,6 +51,20 @@ def test_discover_config_path_returns_global_default(monkeypatch, tmp_path: Path
     assert resolved == DEFAULT_CONFIG_PATH
 
 
+def test_discover_config_path_prefers_nearest_project_config(monkeypatch, tmp_path: Path) -> None:
+    project_root = tmp_path / "repo"
+    nested = project_root / "src" / "pkg"
+    nested.mkdir(parents=True)
+    config_path = project_root / "pollypm.toml"
+    config_path.write_text("[project]\nname = \"PollyPM\"\n")
+
+    monkeypatch.chdir(nested)
+
+    resolved = cli._discover_config_path(cli.DEFAULT_CONFIG_PATH)
+
+    assert resolved == config_path
+
+
 def test_root_command_attaches_existing_session_when_default_config_missing(monkeypatch, tmp_path: Path) -> None:
     called: dict[str, object] = {}
 

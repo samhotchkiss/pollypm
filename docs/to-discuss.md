@@ -92,3 +92,21 @@ Items that need human input or decision before proceeding.
 ### Working Software Built
 - WeatherCLI: `uv run python -m weathercli --city "San Francisco"` → real weather data
 - TodoAPI: 30 passing tests covering full CRUD lifecycle
+
+## Iteration 6 Update
+
+### Additional Completions
+- pollypm_docs/1: getting started guide (human review flow verified)  
+- passgen/1: password generator (approved)
+- shortlink/3: Web UI (approved, task 4 auto-unblocked)
+
+### Third Rejection
+- commit_validator/1: rejected for same build-backend issue as md2html/1
+- Pattern: Claude -p workers consistently generate invalid pyproject.toml build-backend
+- Russell catches it every time — quality control is working
+
+### Bug Found and Fixed
+- Review nudge was including human_review tasks, sending them to Russell
+  when they need user approval. Fixed with node_id filter.
+
+### Stats: 20 tasks completed tonight, 3 rejections, 2 human approvals

@@ -1,0 +1,686 @@
+"""CLI commands for the work service.
+
+Provides ``pm task ...`` and ``pm flow ...`` subcommands via Typer.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from typing import Optional
+
+import typer
+
+from pollypm.work.flow_engine import parse_flow_yaml
+from pollypm.work.models import (
+    Artifact,
+    ArtifactKind,
+    OutputType,
+    WorkOutput,
+    WorkStatus,
+)
+from pollypm.work.sqlite_service import (
+    SQLiteWorkService,
+    InvalidTransitionError,
+    TaskNotFoundError,
+    ValidationError,
+    WorkServiceError,
+)
+
+task_app = typer.Typer(help="Manage work tasks.")
+flow_app = typer.Typer(help="Manage flow templates.")
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_DB_OPTION = typer.Option(".pollypm/state.db", "--db", help="Path to SQLite database.")
+_PROJECT_OPTION = typer.Option(None, "--project", "-p", help="Project filter.")
+_JSON_OPTION = typer.Option(False, "--json", help="Output as JSON.")
+
+
+def _run(fn, *args, **kwargs):
+    """Call a work service method, catching errors for clean CLI output."""
+    try:
+        return fn(*args, **kwargs)
+    except WorkServiceError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+def _resolve_db_path(db: str, project: str | None = None) -> Path:
+    """Resolve the database path, trying the pollypm config for project root.
+
+    When *project* is given and the default ``--db`` wasn't overridden,
+    resolve to that project's ``.pollypm/state.db``.
+
+    When the default relative ``--db .pollypm/state.db`` doesn't exist in the
+    cwd, fall back to the pollypm config's known project paths so that agents
+    running in workspace-root (e.g. the operator in ``/Users/sam/dev``) find
+    the project-level database.
+    """
+    is_default = db == ".pollypm/state.db"
+
+    # If a specific project is requested, always use that project's db
+    if project and is_default:
+        try:
+            from pollypm.config import load_config
+            config = load_config()
+            if project in config.projects:
+                candidate = config.projects[project].path / ".pollypm" / "state.db"
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                return candidate
+        except Exception:
+            pass
+
+    db_path = Path(db)
+    if db_path.exists():
+        return db_path
+
+    # Fall back to any project with an existing db
+    if is_default:
+        try:
+            from pollypm.config import load_config
+            config = load_config()
+            for proj in config.projects.values():
+                candidate = proj.path / ".pollypm" / "state.db"
+                if candidate.exists():
+                    return candidate
+        except Exception:
+            pass
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    return db_path
+
+
+def _project_from_task_id(task_id: str) -> str | None:
+    """Extract project name from a task_id like 'project/number'."""
+    if "/" in task_id:
+        return task_id.split("/", 1)[0]
+    return None
+
+
+def _svc(db: str, project: str | None = None) -> SQLiteWorkService:
+    import atexit
+
+    from pollypm.work.sync import SyncManager
+    from pollypm.work.sync_file import FileSyncAdapter
+
+    db_path = _resolve_db_path(db, project=project)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    project_root = db_path.parent.parent
+    sync = SyncManager()
+    sync.register(FileSyncAdapter(issues_root=project_root / "issues"))
+
+    svc = SQLiteWorkService(
+        db_path=db_path, sync_manager=sync, project_path=project_root,
+    )
+
+    # Wire up the session manager for per-task worker lifecycle
+    try:
+        from pollypm.tmux.client import TmuxClient
+        from pollypm.work.session_manager import SessionManager
+        if project_root.exists() and (project_root / ".git").exists():
+            session_mgr = SessionManager(
+                tmux_client=TmuxClient(),
+                work_service=svc,
+                project_path=project_root,
+            )
+            svc._session_mgr = session_mgr
+    except Exception:  # noqa: BLE001
+        pass  # SessionManager is optional — CLI still works without it
+
+    atexit.register(svc.close)
+    return svc
+
+
+def _print_task(task, as_json: bool = False) -> None:
+    """Print a single task."""
+    if as_json:
+        typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
+    else:
+        typer.echo(f"ID:       {task.task_id}")
+        typer.echo(f"Title:    {task.title}")
+        typer.echo(f"Status:   {task.work_status.value}")
+        typer.echo(f"Priority: {task.priority.value}")
+        typer.echo(f"Project:  {task.project}")
+        typer.echo(f"Type:     {task.type.value}")
+        if task.assignee:
+            typer.echo(f"Assignee: {task.assignee}")
+        if task.current_node_id:
+            typer.echo(f"Node:     {task.current_node_id}")
+        if task.description:
+            typer.echo(f"Desc:     {task.description}")
+        if task.roles:
+            typer.echo(f"Roles:    {json.dumps(task.roles)}")
+        if task.executions:
+            typer.echo("Executions:")
+            for ex in task.executions:
+                status = ex.status.value if hasattr(ex.status, "value") else ex.status
+                line = f"  {ex.node_id} v{ex.visit}: {status}"
+                if ex.decision:
+                    dec = ex.decision.value if hasattr(ex.decision, "value") else ex.decision
+                    line += f" ({dec})"
+                typer.echo(line)
+        if task.context:
+            typer.echo("Context:")
+            for c in task.context:
+                typer.echo(f"  [{c.actor}] {c.text}")
+
+
+def _task_to_dict(task) -> dict:
+    """Serialize a task to a JSON-friendly dict."""
+    return {
+        "task_id": task.task_id,
+        "project": task.project,
+        "task_number": task.task_number,
+        "title": task.title,
+        "type": task.type.value,
+        "work_status": task.work_status.value,
+        "priority": task.priority.value,
+        "assignee": task.assignee,
+        "current_node_id": task.current_node_id,
+        "description": task.description,
+        "roles": task.roles,
+        "labels": task.labels,
+        "created_at": str(task.created_at) if task.created_at else None,
+        "updated_at": str(task.updated_at) if task.updated_at else None,
+        "executions": [
+            {
+                "node_id": ex.node_id,
+                "visit": ex.visit,
+                "status": ex.status.value if hasattr(ex.status, "value") else ex.status,
+                "decision": (ex.decision.value if ex.decision and hasattr(ex.decision, "value") else ex.decision),
+                "decision_reason": ex.decision_reason,
+            }
+            for ex in task.executions
+        ],
+    }
+
+
+def _print_task_table(tasks, as_json: bool = False) -> None:
+    """Print a list of tasks as a table or JSON."""
+    if as_json:
+        typer.echo(json.dumps([_task_to_dict(t) for t in tasks], indent=2, default=str))
+        return
+
+    if not tasks:
+        typer.echo("No tasks found.")
+        return
+
+    # Simple table
+    typer.echo(f"{'ID':<20} {'Status':<14} {'Priority':<10} {'Title'}")
+    typer.echo("-" * 70)
+    for t in tasks:
+        typer.echo(f"{t.task_id:<20} {t.work_status.value:<14} {t.priority.value:<10} {t.title}")
+
+
+def _parse_role(value: str) -> tuple[str, str]:
+    """Parse 'key=value' into (key, value)."""
+    if "=" not in value:
+        raise typer.BadParameter(f"Role must be key=value, got: {value}")
+    k, v = value.split("=", 1)
+    return k.strip(), v.strip()
+
+
+# ---------------------------------------------------------------------------
+# Task commands
+# ---------------------------------------------------------------------------
+
+
+@task_app.command("create")
+def task_create(
+    title: str = typer.Argument(..., help="Task title"),
+    project: str = typer.Option(..., "--project", "-p", help="Project name"),
+    flow: str = typer.Option("standard", "--flow", "-f", help="Flow template name"),
+    role: Optional[list[str]] = typer.Option(None, "--role", "-r", help="Role assignment (key=value)"),
+    priority: str = typer.Option("normal", "--priority", help="Priority: critical, high, normal, low"),
+    description: str = typer.Option("", "--description", "-d", help="Task description"),
+    task_type: str = typer.Option("task", "--type", "-t", help="Task type: task, bug, spike, epic, subtask"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Create a new task in draft state."""
+    roles: dict[str, str] = {}
+    for r in role or []:
+        k, v = _parse_role(r)
+        roles[k] = v
+
+    svc = _svc(db, project=project)
+    task = svc.create(
+        title=title,
+        description=description,
+        type=task_type,
+        project=project,
+        flow_template=flow,
+        roles=roles,
+        priority=priority,
+    )
+    if output_json:
+        typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
+    else:
+        typer.echo(f"Created {task.task_id}")
+
+
+@task_app.command("get")
+def task_get(
+    task_id: str = typer.Argument(..., help="Task ID (project/number)"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Get full details of a task."""
+    svc = _svc(db, project=_project_from_task_id(task_id))
+    task = _run(svc.get, task_id)
+    # Also load context
+    task.context = svc.get_context(task_id)
+    _print_task(task, as_json=output_json)
+
+
+@task_app.command("list")
+def task_list(
+    status: Optional[str] = typer.Option(None, "--status", "-s", help="Filter by work_status"),
+    project: Optional[str] = _PROJECT_OPTION,
+    assignee: Optional[str] = typer.Option(None, "--assignee", "-a", help="Filter by assignee"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """List tasks with optional filters."""
+    svc = _svc(db, project=project)
+    tasks = svc.list_tasks(work_status=status, project=project, assignee=assignee)
+    _print_task_table(tasks, as_json=output_json)
+
+
+@task_app.command("queue")
+def task_queue(
+    task_id: str = typer.Argument(..., help="Task ID (project/number)"),
+    actor: str = typer.Option("cli", "--actor", help="Actor performing the action"),
+    skip_gates: bool = typer.Option(False, "--skip-gates", help="Override gate checks (use with caution)"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Move a task from draft to queued."""
+    svc = _svc(db, project=_project_from_task_id(task_id))
+    task = _run(svc.queue, task_id, actor, skip_gates=skip_gates)
+    if output_json:
+        typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
+    else:
+        typer.echo(f"Queued {task.task_id}")
+
+
+@task_app.command("claim")
+def task_claim(
+    task_id: str = typer.Argument(..., help="Task ID (project/number)"),
+    actor: str = typer.Option("worker", "--actor", help="Actor claiming the task"),
+    skip_gates: bool = typer.Option(False, "--skip-gates", help="Override gate checks (use with caution)"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Claim a queued task and start the flow."""
+    svc = _svc(db, project=_project_from_task_id(task_id))
+    task = _run(svc.claim, task_id, actor, skip_gates=skip_gates)
+    if output_json:
+        typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
+    else:
+        typer.echo(f"Claimed {task.task_id}")
+
+
+@task_app.command("done")
+def task_done(
+    task_id: str = typer.Argument(..., help="Task ID (project/number)"),
+    output: str = typer.Option(..., "--output", "-o", help="Work output as JSON string"),
+    actor: str = typer.Option("worker", "--actor", help="Actor completing the node"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Signal that the current work node is complete."""
+    svc = _svc(db, project=_project_from_task_id(task_id))
+    wo_dict = json.loads(output)
+    task = _run(svc.node_done, task_id, actor, wo_dict)
+    if output_json:
+        typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
+    else:
+        typer.echo(f"Node done on {task.task_id} — status: {task.work_status.value}")
+
+
+@task_app.command("approve")
+def task_approve(
+    task_id: str = typer.Argument(..., help="Task ID (project/number)"),
+    reason: Optional[str] = typer.Option(None, "--reason", help="Approval reason"),
+    actor: str = typer.Option("cli", "--actor", help="Actor approving"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Approve at a review node."""
+    svc = _svc(db, project=_project_from_task_id(task_id))
+    task = _run(svc.approve, task_id, actor, reason)
+    if output_json:
+        typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
+    else:
+        typer.echo(f"Approved {task.task_id} — status: {task.work_status.value}")
+
+
+@task_app.command("reject")
+def task_reject(
+    task_id: str = typer.Argument(..., help="Task ID (project/number)"),
+    reason: str = typer.Option(..., "--reason", help="Rejection reason (required)"),
+    actor: str = typer.Option("cli", "--actor", help="Actor rejecting"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Reject at a review node."""
+    svc = _svc(db, project=_project_from_task_id(task_id))
+    task = _run(svc.reject, task_id, actor, reason)
+    if output_json:
+        typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
+    else:
+        typer.echo(f"Rejected {task.task_id} — status: {task.work_status.value}")
+
+
+@task_app.command("next")
+def task_next(
+    project: Optional[str] = _PROJECT_OPTION,
+    agent: Optional[str] = typer.Option(None, "--agent", help="Filter by agent (worker role)"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Return the highest-priority queued+unblocked task."""
+    svc = _svc(db, project=project)
+    task = svc.next(agent=agent, project=project)
+    if task is None:
+        if output_json:
+            typer.echo("null")
+        else:
+            typer.echo("No tasks available.")
+        return
+    if output_json:
+        typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
+    else:
+        _print_task(task)
+
+
+@task_app.command("cancel")
+def task_cancel(
+    task_id: str = typer.Argument(..., help="Task ID (project/number)"),
+    reason: str = typer.Option(..., "--reason", help="Cancellation reason (required)"),
+    actor: str = typer.Option("cli", "--actor", help="Actor cancelling"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Cancel a task."""
+    svc = _svc(db, project=_project_from_task_id(task_id))
+    task = _run(svc.cancel, task_id, actor, reason)
+    if output_json:
+        typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
+    else:
+        typer.echo(f"Cancelled {task.task_id}")
+
+
+@task_app.command("hold")
+def task_hold(
+    task_id: str = typer.Argument(..., help="Task ID (project/number)"),
+    actor: str = typer.Option("cli", "--actor", help="Actor"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Put a task on hold."""
+    svc = _svc(db, project=_project_from_task_id(task_id))
+    task = _run(svc.hold, task_id, actor)
+    if output_json:
+        typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
+    else:
+        typer.echo(f"On hold: {task.task_id}")
+
+
+@task_app.command("resume")
+def task_resume(
+    task_id: str = typer.Argument(..., help="Task ID (project/number)"),
+    actor: str = typer.Option("cli", "--actor", help="Actor"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Resume an on-hold task."""
+    svc = _svc(db, project=_project_from_task_id(task_id))
+    task = _run(svc.resume, task_id, actor)
+    if output_json:
+        typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
+    else:
+        typer.echo(f"Resumed {task.task_id}")
+
+
+@task_app.command("link")
+def task_link(
+    from_id: str = typer.Argument(..., help="Source task ID"),
+    to_id: str = typer.Argument(..., help="Target task ID"),
+    kind: str = typer.Option("blocks", "--kind", "-k", help="Link kind: blocks, relates_to, supersedes, parent"),
+    db: str = _DB_OPTION,
+) -> None:
+    """Create a relationship between two tasks."""
+    svc = _svc(db, project=_project_from_task_id(from_id))
+    _run(svc.link, from_id, to_id, kind)
+    typer.echo(f"Linked {from_id} --{kind}--> {to_id}")
+
+
+@task_app.command("context")
+def task_context(
+    task_id: str = typer.Argument(..., help="Task ID (project/number)"),
+    text: str = typer.Argument(..., help="Context message text"),
+    actor: str = typer.Option("worker", "--actor", help="Actor"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Add a context entry to a task."""
+    svc = _svc(db, project=_project_from_task_id(task_id))
+    entry = svc.add_context(task_id, actor, text)
+    if output_json:
+        typer.echo(json.dumps({
+            "actor": entry.actor,
+            "text": entry.text,
+            "timestamp": str(entry.timestamp),
+        }, indent=2))
+    else:
+        typer.echo(f"Added context to {task_id}")
+
+
+@task_app.command("status")
+def task_status(
+    task_id: str = typer.Argument(..., help="Task ID (project/number)"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Pretty-printed summary: node, owner, status, context, executions."""
+    svc = _svc(db, project=_project_from_task_id(task_id))
+    task = _run(svc.get, task_id)
+    task.context = svc.get_context(task_id, limit=5)
+    owner = svc.derive_owner(task)
+
+    if output_json:
+        d = _task_to_dict(task)
+        d["owner"] = owner
+        d["recent_context"] = [
+            {"actor": c.actor, "text": c.text, "timestamp": str(c.timestamp)}
+            for c in task.context
+        ]
+        typer.echo(json.dumps(d, indent=2, default=str))
+    else:
+        typer.echo(f"Task:   {task.task_id} — {task.title}")
+        typer.echo(f"Status: {task.work_status.value}")
+        typer.echo(f"Node:   {task.current_node_id or '(none)'}")
+        typer.echo(f"Owner:  {owner or '(none)'}")
+        if task.executions:
+            typer.echo("Executions:")
+            for ex in task.executions:
+                status = ex.status.value if hasattr(ex.status, "value") else ex.status
+                line = f"  {ex.node_id} v{ex.visit}: {status}"
+                if ex.decision:
+                    dec = ex.decision.value if hasattr(ex.decision, "value") else ex.decision
+                    line += f" ({dec})"
+                typer.echo(line)
+        if task.context:
+            typer.echo("Recent context:")
+            for c in task.context:
+                typer.echo(f"  [{c.actor}] {c.text}")
+
+
+@task_app.command("counts")
+def task_counts(
+    project: Optional[str] = _PROJECT_OPTION,
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Show task counts by status."""
+    svc = _svc(db, project=project)
+    counts = svc.state_counts(project=project)
+    if output_json:
+        typer.echo(json.dumps(counts, indent=2))
+    else:
+        typer.echo(f"{'Status':<14} {'Count':>6}")
+        typer.echo("-" * 22)
+        for status, count in sorted(counts.items()):
+            typer.echo(f"{status:<14} {count:>6}")
+
+
+@task_app.command("mine")
+def task_mine(
+    agent: str = typer.Option(..., "--agent", help="Agent name"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Show tasks where agent owns the current node."""
+    svc = _svc(db)
+    tasks = svc.my_tasks(agent)
+    _print_task_table(tasks, as_json=output_json)
+
+
+@task_app.command("blocked")
+def task_blocked(
+    project: Optional[str] = _PROJECT_OPTION,
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Show blocked tasks."""
+    svc = _svc(db, project=project)
+    tasks = svc.blocked_tasks(project=project)
+    _print_task_table(tasks, as_json=output_json)
+
+
+# ---------------------------------------------------------------------------
+# Flow commands
+# ---------------------------------------------------------------------------
+
+
+@flow_app.command("list")
+def flow_list(
+    project: Optional[str] = _PROJECT_OPTION,
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """List available flow templates."""
+    svc = _svc(db, project=project)
+    flows = svc.available_flows(project=project)
+    if output_json:
+        typer.echo(json.dumps(
+            [{"name": f.name, "description": f.description} for f in flows],
+            indent=2,
+        ))
+    else:
+        if not flows:
+            typer.echo("No flows found.")
+            return
+        typer.echo(f"{'Name':<20} {'Description'}")
+        typer.echo("-" * 60)
+        for f in flows:
+            typer.echo(f"{f.name:<20} {f.description}")
+
+
+@flow_app.command("validate")
+def flow_validate(
+    path: str = typer.Argument(..., help="Path to a flow YAML file"),
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Validate a flow YAML file."""
+    from pollypm.work.flow_engine import FlowValidationError
+
+    p = Path(path)
+    if not p.is_file():
+        if output_json:
+            typer.echo(json.dumps({"valid": False, "error": f"File not found: {path}"}))
+        else:
+            typer.echo(f"Error: file not found: {path}")
+        raise typer.Exit(1)
+
+    text = p.read_text(encoding="utf-8")
+    try:
+        template = parse_flow_yaml(text)
+        if output_json:
+            typer.echo(json.dumps({"valid": True, "name": template.name}))
+        else:
+            typer.echo(f"Valid: {template.name} — {template.description}")
+    except FlowValidationError as e:
+        if output_json:
+            typer.echo(json.dumps({"valid": False, "error": str(e)}))
+        else:
+            typer.echo(f"Invalid: {e}")
+        raise typer.Exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Sync / Migration commands
+# ---------------------------------------------------------------------------
+
+
+@task_app.command("sync")
+def task_sync(
+    project: Optional[str] = _PROJECT_OPTION,
+    issues_dir: str = typer.Option("issues", "--issues-dir", help="Path to issues directory for file sync"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Run all registered sync adapters for all tasks (or project-filtered)."""
+    from pollypm.work.sync import SyncManager
+    from pollypm.work.sync_file import FileSyncAdapter
+
+    svc = _svc(db)
+    tasks = svc.list_tasks(project=project)
+
+    manager = SyncManager()
+    manager.register(FileSyncAdapter(issues_root=Path(issues_dir)))
+
+    synced = 0
+    for task in tasks:
+        manager.on_create(task)
+        synced += 1
+
+    if output_json:
+        typer.echo(json.dumps({"synced": synced}))
+    else:
+        typer.echo(f"Synced {synced} task(s).")
+
+
+@task_app.command("migrate")
+def task_migrate(
+    issues_dir: str = typer.Argument(..., help="Path to issues directory"),
+    project: str = typer.Option(..., "--project", "-p", help="Target project name"),
+    flow: str = typer.Option("standard", "--flow", "-f", help="Flow template name"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Import existing issues/ directories into the work service."""
+    from pollypm.work.migrate import migrate_issues
+
+    svc = _svc(db)
+    result = migrate_issues(Path(issues_dir), svc, project=project, flow=flow)
+
+    if output_json:
+        typer.echo(json.dumps({
+            "created": result.created,
+            "skipped": result.skipped,
+            "errors": result.errors,
+        }, indent=2))
+    else:
+        typer.echo(f"Created: {result.created}")
+        typer.echo(f"Skipped: {result.skipped}")
+        if result.errors:
+            typer.echo(f"Errors:  {len(result.errors)}")
+            for err in result.errors:
+                typer.echo(f"  - {err}")

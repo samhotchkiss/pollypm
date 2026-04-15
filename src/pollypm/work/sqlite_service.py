@@ -97,10 +97,12 @@ class SQLiteWorkService:
         db_path: Path,
         project_path: Path | None = None,
         sync_manager: SyncManager | None = None,
+        session_manager: object | None = None,
     ) -> None:
         self._db_path = db_path
         self._project_path = project_path
         self._sync = sync_manager
+        self._session_mgr = session_manager
         self._conn = sqlite3.connect(str(db_path))
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -776,6 +778,12 @@ class SQLiteWorkService:
 
         result = self.get(task_id)
         self._sync_transition(result, WorkStatus.QUEUED.value, result.work_status.value)
+        # Provision a per-task worker session with worktree
+        if self._session_mgr is not None:
+            try:
+                self._session_mgr.provision_worker(task_id, actor)
+            except Exception:  # noqa: BLE001
+                pass  # Best-effort — task is claimed regardless
         return result
 
     def cancel(self, task_id: str, actor: str, reason: str) -> Task:
@@ -803,6 +811,12 @@ class SQLiteWorkService:
         )
         self._conn.commit()
         self._on_cancelled(task_id)
+        # Tear down the per-task worker session
+        if self._session_mgr is not None:
+            try:
+                self._session_mgr.teardown_worker(task_id)
+            except Exception:  # noqa: BLE001
+                pass
         result = self.get(task_id)
         self._sync_transition(result, task.work_status.value, WorkStatus.CANCELLED.value)
         return result
@@ -1190,6 +1204,11 @@ class SQLiteWorkService:
         result = self.get(task_id)
         if result.work_status == WorkStatus.DONE:
             self._check_auto_unblock(task_id)
+            if self._session_mgr is not None:
+                try:
+                    self._session_mgr.teardown_worker(task_id)
+                except Exception:  # noqa: BLE001
+                    pass
         self._sync_transition(result, task.work_status.value, result.work_status.value)
         return result
 
@@ -1269,6 +1288,12 @@ class SQLiteWorkService:
         result = self.get(task_id)
         if result.work_status == WorkStatus.DONE:
             self._check_auto_unblock(task_id)
+            # Tear down the per-task worker session
+            if self._session_mgr is not None:
+                try:
+                    self._session_mgr.teardown_worker(task_id)
+                except Exception:  # noqa: BLE001
+                    pass
         self._sync_transition(result, task.work_status.value, result.work_status.value)
         return result
 
@@ -1387,6 +1412,12 @@ class SQLiteWorkService:
 
         result = self.get(task_id)
         self._sync_transition(result, WorkStatus.REVIEW.value, WorkStatus.IN_PROGRESS.value)
+        # Notify the per-task worker session about the rejection
+        if self._session_mgr is not None:
+            try:
+                self._session_mgr.notify_rejection(task_id, reason)
+            except Exception:  # noqa: BLE001
+                pass
         return result
 
     def block(self, task_id: str, actor: str, blocker_task_id: str) -> Task:

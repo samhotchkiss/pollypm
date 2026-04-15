@@ -65,8 +65,8 @@ def test_cockpit_router_build_items_includes_core_entries(monkeypatch, tmp_path:
     assert "project:pollypm" in keys
     assert "project:demo" in keys
     assert "settings" in keys
-    assert items[2].label == "PollyPM (Pete)"
-    assert items[3].label == "Demo (Dora)"
+    assert items[2].label == "PollyPM"
+    assert items[3].label == "Demo"
     assert items[0].state == "ready"
     assert items[1].label == "Inbox (1)"
     assert items[3].state.endswith("live")
@@ -736,8 +736,9 @@ def test_cockpit_router_joins_session_from_storage(monkeypatch, tmp_path: Path) 
             calls["claimed"] = (session_name, owner, note)
 
     class FakeWindow:
-        def __init__(self, name: str) -> None:
+        def __init__(self, name: str, index: int = 0) -> None:
             self.name = name
+            self.index = index
 
     class FakePane:
         def __init__(self, pane_id, pane_left):
@@ -748,7 +749,7 @@ def test_cockpit_router_joins_session_from_storage(monkeypatch, tmp_path: Path) 
 
     class FakeTmux:
         def list_windows(self, target: str):
-            return [FakeWindow("pm-operator")]
+            return [FakeWindow("pm-operator", index=1)]
 
         def kill_pane(self, target: str):
             calls["killed"] = target
@@ -778,7 +779,8 @@ def test_cockpit_router_joins_session_from_storage(monkeypatch, tmp_path: Path) 
     router.route_selected("polly")
 
     assert calls["killed"] == "%2"
-    assert calls["joined"] == ("pollypm-storage-closet:pm-operator.0", "%1")
+    # Uses window index (not name) to avoid ambiguity with duplicate windows
+    assert calls["joined"] == ("pollypm-storage-closet:1.0", "%1")
     assert calls["claimed"] == ("operator", "cockpit", "mounted in cockpit")
 
 
@@ -1002,9 +1004,10 @@ def test_cockpit_router_infers_mounted_session_from_live_right_pane(monkeypatch,
 
     router.route_selected("project:pollypm")
 
-    assert "park" not in calls
-    state = router._load_state()
-    assert state["mounted_session"] == "worker_pollypm"
+    # Clicking a project now shows the dashboard, not the live session.
+    # The live session is accessible via project:pollypm:session.
+    assert "respawn" in calls
+    assert "project pollypm" in calls["respawn"][1]
 
 
 def test_cockpit_router_project_click_does_not_launch_configured_but_unmounted_worker(monkeypatch, tmp_path: Path) -> None:

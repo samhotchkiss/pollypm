@@ -77,15 +77,19 @@ class Supervisor:
         "switch-session-account",
     }
 
-    def __init__(self, config: PollyPMConfig) -> None:
+    def __init__(self, config: PollyPMConfig, *, readonly_state: bool = False) -> None:
         self.config = config
+        self.readonly_state = readonly_state
         self.tmux = TmuxClient()
-        self.store = StateStore(config.project.state_db)
+        self.store = StateStore(config.project.state_db, readonly=readonly_state)
         self._cached_launches: list[SessionLaunchSpec] | None = None
 
     def _effective_session(self, session: SessionConfig, controller_account: str | None = None) -> SessionConfig:
         effective = session
-        runtime = self.store.get_session_runtime(session.name)
+        try:
+            runtime = self.store.get_session_runtime(session.name)
+        except Exception:  # noqa: BLE001
+            runtime = None
         override_account: str | None = None
         override_applied = False
         if controller_account is not None and session.role in self._CONTROL_ROLES:
@@ -97,6 +101,8 @@ class Supervisor:
         if override_account is not None:
             account = self.config.accounts[override_account]
             effective = replace(effective, provider=account.provider, account=override_account)
+        if self.readonly_state:
+            return effective
         account = self.config.accounts[effective.account]
         profile_prompt = self._resolve_profile_prompt(effective, account)
         if effective.role in self._CONTROL_ROLES:
@@ -832,6 +838,8 @@ class Supervisor:
         session: SessionConfig,
         launch: LaunchCommand,
     ) -> LaunchCommand:
+        if self.readonly_state:
+            return launch
         if session.role != "worker":
             return launch
         env = dict(launch.env)
@@ -1049,12 +1057,36 @@ class Supervisor:
                 "Skipped stalled-worker nudge because session is leased to human",
             )
             return
+        # Check if there's a queued task the worker could pick up
+        nudge = self._build_task_nudge(launch)
         self.send_input(
             launch.session.name,
-            self._STALL_NUDGE_MESSAGE,
+            nudge or self._STALL_NUDGE_MESSAGE,
             owner="heartbeat",
             force=lease is not None and lease.owner != "human",
         )
+
+    def _build_task_nudge(self, launch: SessionLaunchSpec) -> str | None:
+        """Check for queued tasks assigned to this worker and build a nudge message."""
+        try:
+            from pollypm.work.cli import _resolve_db_path
+            from pollypm.work.sqlite_service import SQLiteWorkService
+
+            project = launch.session.project
+            db_path = _resolve_db_path(".pollypm/state.db", project=project)
+            if not db_path.exists():
+                return None
+            with SQLiteWorkService(db_path=db_path) as svc:
+                task = svc.next(project=project)
+                if task is None:
+                    return None
+                return (
+                    f"You have work waiting. Task {task.task_id} — \"{task.title}\" "
+                    f"is queued for your project. "
+                    f"Claim it: pm task claim {task.task_id}"
+                )
+        except Exception:
+            return None
 
     def _lease_timeout(self) -> timedelta:
         return timedelta(minutes=self.config.pollypm.lease_timeout_minutes)
@@ -1181,9 +1213,52 @@ class Supervisor:
             import time
             time.sleep(0.3)
             self.tmux.send_keys(target, "", press_enter=True)
+        # Verify the message left the input bar.
+        if press_enter:
+            self._verify_input_submitted(target, text, launch)
         if owner == "human":
             self.store.set_lease(session_name, "human", "automatic lease from direct human input")
         self.store.record_event(session_name, "send_input", f"{owner} sent input: {text}")
+
+    def _verify_input_submitted(
+        self,
+        target: str,
+        text: str,
+        launch: SessionLaunchSpec,
+        max_retries: int = 3,
+    ) -> None:
+        """Check that sent text is no longer sitting in the input bar.
+
+        Captures the last few lines of the pane. If the text still appears
+        on the final line (the input prompt), press Enter again.
+        """
+        import time
+
+        # Use a prefix of the message for matching (input may be truncated)
+        check_text = text[:60].strip()
+        if not check_text:
+            return
+
+        for attempt in range(max_retries):
+            time.sleep(0.4)
+            try:
+                snapshot = self.tmux.capture_pane(target, lines=5)
+            except Exception:
+                return  # Can't capture — skip verification
+            lines = snapshot.strip().splitlines()
+            if not lines:
+                return
+            # The input bar is typically the last non-empty line starting with
+            # the prompt marker (❯ for Claude, › for Codex, or just text)
+            last_lines = "\n".join(lines[-3:])
+            if check_text in last_lines:
+                # Message is still in the input bar — press Enter again
+                try:
+                    self.tmux.send_keys(target, "", press_enter=True)
+                except Exception:
+                    return
+            else:
+                return  # Message was submitted
 
     def open_alerts(self) -> list[AlertRecord]:
         return self.store.open_alerts()
@@ -1383,7 +1458,10 @@ class Supervisor:
             )
             return
 
-        allow_same = failure_type not in {"auth_broken", "capacity_exhausted"}
+        # For auth_broken on Claude accounts, allow retrying the same account —
+        # the refresh token is long-lived and Claude Code will refresh on restart.
+        # Only force failover for capacity_exhausted (a genuine account limit).
+        allow_same = failure_type not in {"capacity_exhausted"}
         candidates = self._candidate_accounts(launch, allow_same=allow_same)
         if not candidates:
             self.store.upsert_alert(
@@ -1763,6 +1841,8 @@ class Supervisor:
 
     def _effective_account(self, session: SessionConfig, account: AccountConfig) -> AccountConfig:
         if session.role not in self._CONTROL_ROLES or account.home is None:
+            return account
+        if self.readonly_state:
             return account
         # Claude auth tokens live in the macOS Keychain, keyed to the CLAUDE_CONFIG_DIR path hash.
         # Using a different home (control-homes/) would lose the keychain entry.

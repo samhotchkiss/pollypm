@@ -346,23 +346,30 @@ class MemorySummaryRecord:
 
 
 class StateStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, readonly: bool = False) -> None:
         self.path = path
+        self.readonly = readonly
+        # Always ensure the parent directory exists — SQLite can't create the
+        # database file if the directory is missing, even in read-only mode.
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self.conn = sqlite3.connect(path, check_same_thread=False)
+        use_readonly_uri = readonly and path.exists()
+        db_target = f"file:{path}?mode=ro&immutable=1" if use_readonly_uri else str(path)
+        self.conn = sqlite3.connect(db_target, check_same_thread=False, uri=use_readonly_uri)
         with self._lock:
-            # WAL mode allows concurrent reads + single writer across processes
-            self.execute("PRAGMA journal_mode=WAL")
-            # 30s busy timeout — enough for multi-process cron overlap
             self.execute("PRAGMA busy_timeout=30000")
-            self.conn.executescript(SCHEMA)
-            try:
-                self._migrate()
-            except Exception:
-                self.conn.rollback()
-                raise
-            self.commit()
+            if not use_readonly_uri:
+                # Apply schema for new or writable databases — even in
+                # "readonly" mode we may have just created an empty DB
+                # (when the file didn't exist before connect).
+                self.execute("PRAGMA journal_mode=WAL")
+                self.conn.executescript(SCHEMA)
+                try:
+                    self._migrate()
+                except Exception:
+                    self.conn.rollback()
+                    raise
+                self.commit()
 
     def __enter__(self):
         return self

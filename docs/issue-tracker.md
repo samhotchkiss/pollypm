@@ -1,23 +1,45 @@
 # PollyPM Issue Tracker
 
-This is the default local issue-tracker workflow for substantial PollyPM projects.
+> **Note**: This document describes the legacy file-based issue tracker.
+> The **work service** (`pm task`, `pm flow`) is now the source of truth
+> for all task management. The `issues/` folder is maintained as a
+> **read-only projection** by the file sync adapter — it mirrors work
+> service state for human inspection but is never the authority. See
+> `docs/work-service-spec.md` for the current system.
 
-## Purpose
+## Source of Truth
 
-Use this workflow when a project has enough moving parts that informal prompts are no longer enough. The tracker keeps work small, reviewable, and resumable.
+The work service SQLite database (`.pollypm/state.db` per project) owns
+all task state: status, flow position, execution history, context log,
+dependencies, and roles. Agents interact with it via `pm task` CLI
+commands, not by moving files.
 
-## Folder State Machine
+The `issues/` folder structure is kept in sync automatically so that
+`ls issues/01-ready/` still works for quick inspection, but:
 
-Issues live under `issues/` and move through these folders:
+- **Never move files manually** — the sync adapter will overwrite your
+  changes on the next transition.
+- **Never treat file presence/absence as authoritative** — if the sync
+  is stale, the work service is correct.
 
-- `00-not-ready`
-- `01-ready`
-- `02-in-progress`
-- `03-needs-review`
-- `04-in-review`
-- `05-completed`
+## Folder Mapping (projection only)
 
-## Role Split
+The file sync adapter maps work service status to folders:
+
+| Work Status   | Folder             |
+|---------------|--------------------|
+| draft         | `00-not-ready`     |
+| queued        | `01-ready`         |
+| in_progress   | `02-in-progress`   |
+| blocked       | `02-in-progress`   |
+| on_hold       | `00-not-ready`     |
+| review        | `03-needs-review`  |
+| done          | `05-completed`     |
+| cancelled     | `05-completed`     |
+
+## Legacy Role Split
+
+For projects still using the old file-based system (no `.pollypm/state.db`):
 
 - PA owns implementation.
 - PM owns review and merge.
@@ -34,17 +56,6 @@ PM responsibilities:
 - review and validate the work
 - request changes or move to `05-completed`
 - merge when approval criteria are satisfied
-
-## Queue Files
-
-PollyPM initializes:
-
-- `issues/instructions.md`
-- `issues/notes.md`
-- `issues/progress-log.md`
-- `issues/.latest_issue_number`
-
-The latest-number file is the canonical source of truth for the next issue number.
 
 ## Guidance
 

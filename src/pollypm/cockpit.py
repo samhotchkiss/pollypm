@@ -20,6 +20,152 @@ from pollypm.tmux.client import TmuxClient
 from pollypm.worktrees import list_worktrees
 
 
+_STATUS_ICONS = {
+    "draft": "◌",
+    "queued": "○",
+    "in_progress": "⟳",
+    "blocked": "⊘",
+    "on_hold": "⏸",
+    "review": "◉",
+    "done": "✓",
+    "cancelled": "✗",
+}
+
+
+def _render_work_service_issues(project: object) -> str:
+    """Render tasks from the work service for a project."""
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    db_path = project.path / ".pollypm" / "state.db"
+    if not db_path.exists():
+        raise FileNotFoundError(db_path)
+
+    with SQLiteWorkService(db_path=db_path, project_path=project.path) as svc:
+        counts = svc.state_counts(project=getattr(project, "key", None))
+        tasks = svc.list_tasks(project=getattr(project, "key", None))
+
+    name = getattr(project, "name", None) or getattr(project, "key", "Project")
+    lines = [f"{name} · Tasks", ""]
+
+    # Summary bar
+    count_parts = []
+    for status in ("queued", "in_progress", "review", "blocked", "on_hold", "draft"):
+        n = counts.get(status, 0)
+        if n:
+            icon = _STATUS_ICONS.get(status, "·")
+            count_parts.append(f"{icon} {n} {status.replace('_', ' ')}")
+    if count_parts:
+        lines.append(" · ".join(count_parts))
+        lines.append("")
+
+    # Active tasks (non-terminal) — sorted by status priority
+    _so = {"in_progress": 0, "review": 1, "queued": 2, "blocked": 3, "on_hold": 4, "draft": 5}
+    active = [t for t in tasks if t.work_status.value not in ("done", "cancelled")]
+    active.sort(key=lambda t: _so.get(t.work_status.value, 9))
+    if active:
+        for t in active:
+            icon = _STATUS_ICONS.get(t.work_status.value, "·")
+            assignee = f" [{t.assignee}]" if t.assignee else ""
+            lines.append(f"  {icon} #{t.task_number} {t.title}{assignee}")
+        lines.append("")
+
+    # Recently completed (last 10)
+    completed = [t for t in tasks if t.work_status.value in ("done", "cancelled")]
+    completed.sort(key=lambda t: t.updated_at or "", reverse=True)
+    if completed:
+        lines.append(f"─── completed ({len(completed)}) ───")
+        for t in completed[:10]:
+            icon = _STATUS_ICONS.get(t.work_status.value, "·")
+            lines.append(f"  {icon} #{t.task_number} {t.title}")
+        lines.append("")
+
+    if not tasks:
+        lines.append("No tasks found.")
+
+    return "\n".join(lines)
+
+
+def _render_project_dashboard(project: object, project_key: str, config_path, supervisor) -> str | None:
+    """Render a project dashboard with task counts, active tasks, alerts, and sessions."""
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    db_path = project.path / ".pollypm" / "state.db"
+    if not db_path.exists():
+        return None
+
+    with SQLiteWorkService(db_path=db_path, project_path=project.path) as svc:
+        counts = svc.state_counts(project=project_key)
+        tasks = svc.list_tasks(project=project_key)
+
+    name = getattr(project, "name", None) or project_key
+    lines = [f"{name}", ""]
+
+    # Summary bar
+    total = sum(counts.values())
+    count_parts = []
+    for status in ("queued", "in_progress", "review", "blocked", "on_hold", "draft"):
+        n = counts.get(status, 0)
+        if n:
+            icon = _STATUS_ICONS.get(status, "·")
+            count_parts.append(f"{icon} {n} {status.replace('_', ' ')}")
+    done_count = counts.get("done", 0)
+    if done_count:
+        count_parts.append(f"✓ {done_count} done")
+    if count_parts:
+        lines.append(" · ".join(count_parts))
+    else:
+        lines.append("No tasks yet.")
+    lines.append("")
+
+    # Active tasks (non-terminal) — sorted by status priority
+    _status_order = {"in_progress": 0, "review": 1, "queued": 2, "blocked": 3, "on_hold": 4, "draft": 5}
+    active = [t for t in tasks if t.work_status.value not in ("done", "cancelled")]
+    active.sort(key=lambda t: _status_order.get(t.work_status.value, 9))
+    if active:
+        lines.append("── Active ──")
+        for t in active:
+            icon = _STATUS_ICONS.get(t.work_status.value, "·")
+            assignee = f" [{t.assignee}]" if t.assignee else ""
+            node = f" @ {t.current_node_id}" if t.current_node_id else ""
+            lines.append(f"  {icon} #{t.task_number} {t.title}{assignee}{node}")
+        lines.append("")
+
+    # Recently completed (last 5)
+    completed = [t for t in tasks if t.work_status.value in ("done", "cancelled")]
+    completed.sort(key=lambda t: t.updated_at or "", reverse=True)
+    if completed:
+        lines.append(f"── Completed ({len(completed)}) ──")
+        for t in completed[:5]:
+            icon = _STATUS_ICONS.get(t.work_status.value, "·")
+            lines.append(f"  {icon} #{t.task_number} {t.title}")
+        if len(completed) > 5:
+            lines.append(f"  ... and {len(completed) - 5} more")
+        lines.append("")
+
+    # Alerts for this project
+    try:
+        project_alerts = [
+            a for a in supervisor.store.open_alerts()
+            if any(
+                l.session.project == project_key and l.session.name == a.session_name
+                for l in supervisor.plan_launches()
+            ) and a.alert_type not in ("suspected_loop", "stabilize_failed", "needs_followup")
+        ]
+        if project_alerts:
+            lines.append("── Alerts ──")
+            for a in project_alerts:
+                lines.append(f"  ⚠ {a.alert_type}: {a.message}")
+            lines.append("")
+    except Exception:
+        pass
+
+    if not active and not completed:
+        lines.append("No active live lane is running for this project.")
+        lines.append("Select the project in the left rail and press N to start a worker lane.")
+
+    return "\n".join(lines)
+
+
 @dataclass(slots=True)
 class CockpitItem:
     key: str
@@ -210,8 +356,11 @@ class CockpitRouter:
             items.append(CockpitItem(f"project:{project_key}", project.display_label(), state))
             # Unfold sub-items for the selected project
             if selected.startswith(f"project:{project_key}"):
+                items.append(CockpitItem(f"project:{project_key}:dashboard", "  Dashboard", "sub"))
+                persona = project.persona_name or "Polly"
+                items.append(CockpitItem(f"project:{project_key}:session", f"  PM Chat ({persona})", "sub"))
+                items.append(CockpitItem(f"project:{project_key}:issues", "  Tasks", "sub"))
                 items.append(CockpitItem(f"project:{project_key}:settings", "  Settings", "sub"))
-                items.append(CockpitItem(f"project:{project_key}:issues", "  Issues", "sub"))
 
         items.append(CockpitItem("settings", "Settings", "config"))
         return items
@@ -327,9 +476,31 @@ class CockpitRouter:
             return bool(stripped)
         return False
 
+    def _cleanup_duplicate_windows(self, storage_session: str) -> None:
+        """Kill duplicate windows in the storage closet, keeping only the first of each name."""
+        try:
+            windows = self.tmux.list_windows(storage_session)
+        except Exception:  # noqa: BLE001
+            return
+        seen: dict[str, int] = {}  # name -> first index
+        for window in windows:
+            if window.name in seen:
+                try:
+                    self.tmux.kill_window(f"{storage_session}:{window.index}")
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                seen[window.name] = window.index
+
     def ensure_cockpit_layout(self) -> None:
         self._validate_state()
         config = load_config(self.config_path)
+        # Clean up duplicate windows in the storage closet before layout setup
+        try:
+            supervisor = self._load_supervisor()
+            self._cleanup_duplicate_windows(supervisor.storage_closet_session_name())
+        except Exception:  # noqa: BLE001
+            pass
         target = f"{config.project.tmux_session}:{self._COCKPIT_WINDOW}"
         panes = self.tmux.list_panes(target)
         state = self._load_state()
@@ -451,7 +622,21 @@ class CockpitRouter:
 
         self.set_selected_key(key)
         if key == "polly":
-            self._show_live_session(supervisor, "operator", window_target)
+            # Launch operator session if not running
+            launches = supervisor.plan_launches()
+            storage_session = supervisor.storage_closet_session_name()
+            op_launch = next((l for l in launches if l.session.name == "operator"), None)
+            if op_launch is not None:
+                storage_windows = {w.name for w in self.tmux.list_windows(storage_session)}
+                if op_launch.window_name not in storage_windows:
+                    try:
+                        supervisor.launch_session("operator")
+                    except Exception:
+                        pass
+            try:
+                self._show_live_session(supervisor, "operator", window_target)
+            except Exception:
+                self._show_static_view(supervisor, window_target, "polly")
             return
         if key == "inbox":
             self._show_static_view(supervisor, window_target, "inbox")
@@ -463,15 +648,44 @@ class CockpitRouter:
             parts = key.split(":")
             project_key = parts[1]
             sub_view = parts[2] if len(parts) > 2 else None
+            if sub_view is None or sub_view == "dashboard":
+                # Clicking project parent or Dashboard — show dashboard,
+                # and set selection to the dashboard sub-item
+                self.set_selected_key(f"project:{project_key}:dashboard")
+                self._show_static_view(supervisor, window_target, "project", project_key)
+                return
             if sub_view in ("settings", "issues"):
                 self._show_static_view(supervisor, window_target, sub_view, project_key)
                 return
-            launches = supervisor.plan_launches()
-            session_name = self._project_session_map(launches).get(project_key)
-            if session_name is not None and self._session_available_for_mount(supervisor, session_name, window_target):
-                self._show_live_session(supervisor, session_name, window_target)
-            else:
-                self._show_static_view(supervisor, window_target, "project", project_key)
+            if sub_view == "session":
+                # PM Chat — mount live session, spawning if needed
+                launches = supervisor.plan_launches()
+                session_name = self._project_session_map(launches).get(project_key)
+                if session_name is not None:
+                    if not self._session_available_for_mount(supervisor, session_name, window_target):
+                        # Session exists in config but not running — launch it
+                        try:
+                            supervisor.launch_session(session_name)
+                        except Exception:
+                            pass
+                    try:
+                        self._show_live_session(supervisor, session_name, window_target)
+                    except Exception:
+                        # Mount failed (e.g. duplicate windows) — fall back to dashboard
+                        self.set_selected_key(f"project:{project_key}:dashboard")
+                        self._show_static_view(supervisor, window_target, "project", project_key)
+                else:
+                    # No session configured — try to create one
+                    try:
+                        self.create_worker_and_route(project_key)
+                    except Exception:
+                        # Creation failed (e.g. no git commits) — fall back to dashboard
+                        self.set_selected_key(f"project:{project_key}:dashboard")
+                        self._show_static_view(supervisor, window_target, "project", project_key)
+                return
+            # Unknown sub_view — fall back to dashboard
+            self.set_selected_key(f"project:{project_key}:dashboard")
+            self._show_static_view(supervisor, window_target, "project", project_key)
             return
         raise RuntimeError(f"Unknown cockpit item: {key}")
 
@@ -591,7 +805,16 @@ class CockpitRouter:
             return
         if right_pane_id is not None:
             self.tmux.kill_pane(right_pane_id)
-        source = f"{storage_session}:{launch.window_name}.0"
+        # Use window index to avoid ambiguity with duplicate window names
+        storage_windows = self.tmux.list_windows(storage_session)
+        target_window = next(
+            (w for w in storage_windows if w.name == launch.window_name),
+            None,
+        )
+        if target_window is None:
+            self._show_static_view(supervisor, window_target, "polly" if session_name == "operator" else "project")
+            return
+        source = f"{storage_session}:{target_window.index}.0"
         self.tmux.join_pane(source, left_pane_id, horizontal=True)
         panes = self.tmux.list_panes(window_target)
         left_pane = min(panes, key=self._pane_left)
@@ -780,9 +1003,9 @@ class CockpitRouter:
         root = shlex.quote(str(self.config_path.parent.resolve()))
         import shutil
         pm_cmd = "pm" if shutil.which("pm") else "uv run pm"
-        args = [pm_cmd, "cockpit-pane", kind]
+        args = [pm_cmd, "cockpit-pane", shlex.quote(kind)]
         if project_key is not None:
-            args.append(project_key)
+            args.append(shlex.quote(project_key))
         joined = " ".join(args)
         return f"sh -lc 'cd {root} && {joined}'"
 
@@ -968,7 +1191,17 @@ def build_cockpit_detail(config_path: Path, kind: str, target: str | None = None
 
 def _build_cockpit_detail_inner(config_path: Path, kind: str, target: str | None = None) -> str:
     supervisor = Supervisor(load_config(config_path))
-    supervisor.ensure_layout()
+    try:
+        supervisor.ensure_layout()
+        return _build_cockpit_detail_dispatch(supervisor, config_path, kind, target)
+    finally:
+        try:
+            supervisor.store.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _build_cockpit_detail_dispatch(supervisor, config_path: Path, kind: str, target: str | None = None) -> str:
     config = supervisor.config
     if kind in ("polly", "dashboard"):
         return _build_dashboard(supervisor, config)
@@ -1051,6 +1284,16 @@ def _build_cockpit_detail_inner(config_path: Path, kind: str, target: str | None
         if project is None:
             return f"Project '{target}' not found in config.\n\nIt may not have been saved. Try `pm add-project <path>` or check ~/.pollypm/pollypm.toml."
         ensure_project_scaffold(project.path)
+
+        # Try work service dashboard first
+        try:
+            dashboard = _render_project_dashboard(project, target, config_path, supervisor)
+            if dashboard:
+                return dashboard
+        except Exception:
+            pass
+
+        # Fallback to basic project info
         task_backend = get_task_backend(project.path)
         issues_root = task_backend.issues_root()
         state_counts = task_backend.state_counts() if task_backend.exists() else {}
@@ -1079,12 +1322,7 @@ def _build_cockpit_detail_inner(config_path: Path, kind: str, target: str | None
             lines.extend(["", "⚠ Alerts:"])
             for a in project_alerts:
                 lines.append(f"  {a.severity} {a.alert_type}: {a.message}")
-                if a.alert_type == "recovery_limit":
-                    lines.append(f"  → Recovery paused. Run `pm reset` to clear, or investigate the session.")
-                elif a.alert_type == "auth_broken":
-                    lines.append(f"  → Run `pm relogin {a.session_name}` to fix authentication.")
             lines.append("")
-
         if state_counts:
             lines.extend(["Task states:"])
             for state, count in state_counts.items():
@@ -1096,6 +1334,11 @@ def _build_cockpit_detail_inner(config_path: Path, kind: str, target: str | None
         project = config.projects.get(target)
         if not project:
             return f"Project '{target}' not found."
+        # Try the work service first, fall back to file-based backend
+        try:
+            return _render_work_service_issues(project)
+        except Exception:
+            pass
         task_backend = get_task_backend(project.path)
         if not task_backend.exists():
             return f"{project.name or project.key} · Issues\n\nNo issue tracker initialized.\nUse `pm init-tracker {target}` to create one."

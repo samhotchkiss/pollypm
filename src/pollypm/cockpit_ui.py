@@ -1042,8 +1042,10 @@ class PollyDashboardApp(App[None]):
             config = load_config(self.config_path)
             from pollypm.storage.state import StateStore
             store = StateStore(config.project.state_db)
-            data = gather(config, store)
-            store.close()
+            try:
+                data = gather(config, store)
+            finally:
+                store.close()
         except Exception as exc:  # noqa: BLE001
             self.header_w.update(f"[dim]Error: {exc}[/dim]")
             return
@@ -1717,6 +1719,180 @@ class PollyCockpitPaneApp(App[None]):
 
     def _refresh(self) -> None:
         self.body.update(build_cockpit_detail(self.config_path, self.kind, self.target))
+
+
+class PollyTasksApp(App[None]):
+    """Interactive task list with drill-down detail view."""
+
+    TITLE = "PollyPM"
+    SUB_TITLE = "Tasks"
+    BINDINGS = [
+        Binding("escape", "back", "Back to list"),
+        Binding("r", "refresh", "Refresh"),
+    ]
+    CSS = """
+    Screen { background: #10161b; color: #eef2f4; }
+    #task-list { height: 1fr; padding: 1 2; }
+    #task-detail { height: 1fr; padding: 1 2; display: none; }
+    #task-detail.visible { display: block; }
+    .task-row { padding: 0 1; }
+    .task-row:hover { background: #1a2530; }
+    """
+
+    _STATUS_ICONS = {
+        "draft": "◌", "queued": "○", "in_progress": "⟳", "blocked": "⊘",
+        "on_hold": "⏸", "review": "◉", "done": "✓", "cancelled": "✗",
+    }
+
+    def __init__(self, config_path: Path, project_key: str) -> None:
+        super().__init__()
+        self.config_path = config_path
+        self.project_key = project_key
+        self._tasks: list = []
+        self._selected_task_id: str | None = None
+
+    def compose(self) -> ComposeResult:
+        yield ListView(id="task-list")
+        yield Static("", id="task-detail")
+
+    def on_mount(self) -> None:
+        self._refresh_list()
+        self.set_interval(10, self._refresh_list)
+
+    def _get_svc(self):
+        from pollypm.work.sqlite_service import SQLiteWorkService
+        config = load_config(self.config_path)
+        project = config.projects.get(self.project_key)
+        if not project:
+            return None
+        db_path = project.path / ".pollypm" / "state.db"
+        if not db_path.exists():
+            return None
+        return SQLiteWorkService(db_path=db_path, project_path=project.path)
+
+    def _refresh_list(self) -> None:
+        svc = self._get_svc()
+        lv = self.query_one("#task-list", ListView)
+        lv.clear()
+        if svc is None:
+            lv.append(ListItem(Static("No tasks — work service not initialized for this project.")))
+            self._tasks = []
+            return
+        try:
+            self._tasks = svc.list_tasks(project=self.project_key)
+        finally:
+            svc.close()
+
+        # Summary bar
+        counts: dict[str, int] = {}
+        for t in self._tasks:
+            s = t.work_status.value
+            counts[s] = counts.get(s, 0) + 1
+        parts = []
+        for status in ("queued", "in_progress", "review", "blocked", "on_hold", "done"):
+            n = counts.get(status, 0)
+            if n:
+                icon = self._STATUS_ICONS.get(status, "·")
+                parts.append(f"{icon} {n} {status.replace('_', ' ')}")
+        summary = " · ".join(parts) if parts else "No tasks"
+        lv.append(ListItem(Static(Text(summary, style="bold"))))
+
+        # Active tasks — sorted by status priority
+        _STATUS_ORDER = {"in_progress": 0, "review": 1, "queued": 2, "blocked": 3, "on_hold": 4, "draft": 5}
+        active = [t for t in self._tasks if t.work_status.value not in ("done", "cancelled")]
+        active.sort(key=lambda t: _STATUS_ORDER.get(t.work_status.value, 9))
+        for t in active:
+            icon = self._STATUS_ICONS.get(t.work_status.value, "·")
+            assignee = f" [{t.assignee}]" if t.assignee else ""
+            label = f"  {icon} #{t.task_number} {t.title}{assignee}"
+            item = ListItem(Static(label), id=f"task-{t.project}-{t.task_number}")
+            item._task_id = t.task_id  # type: ignore[attr-defined]
+            lv.append(item)
+
+        # Completed
+        completed = [t for t in self._tasks if t.work_status.value in ("done", "cancelled")]
+        if completed:
+            lv.append(ListItem(Static(Text(f"── Completed ({len(completed)}) ──", style="dim"))))
+            for t in completed[:10]:
+                icon = self._STATUS_ICONS.get(t.work_status.value, "·")
+                label = f"  {icon} #{t.task_number} {t.title}"
+                item = ListItem(Static(label), id=f"task-{t.project}-{t.task_number}")
+                item._task_id = t.task_id  # type: ignore[attr-defined]
+                lv.append(item)
+
+    @on(ListView.Selected)
+    def _on_task_selected(self, event: ListView.Selected) -> None:
+        task_id = getattr(event.item, "_task_id", None)
+        if task_id is None:
+            return
+        self._selected_task_id = task_id
+        self._show_detail(task_id)
+
+    def _show_detail(self, task_id: str) -> None:
+        svc = self._get_svc()
+        if svc is None:
+            return
+        try:
+            task = svc.get(task_id)
+            task.context = svc.get_context(task_id, limit=10)
+            task.executions = svc.get_execution(task_id)
+            owner = svc.derive_owner(task)
+        finally:
+            svc.close()
+
+        icon = self._STATUS_ICONS.get(task.work_status.value, "·")
+        lines = [
+            f"{icon} #{task.task_number} {task.title}",
+            f"Status: {task.work_status.value}  |  Priority: {task.priority.value}",
+            f"Node: {task.current_node_id or '—'}  |  Owner: {owner or '—'}",
+            f"Flow: {task.flow_template_id}",
+        ]
+        if task.roles:
+            roles = ", ".join(f"{k}={v}" for k, v in task.roles.items())
+            lines.append(f"Roles: {roles}")
+        if task.description:
+            lines.extend(["", "── Description ──", task.description])
+        if task.acceptance_criteria:
+            lines.extend(["", "── Acceptance Criteria ──", task.acceptance_criteria])
+
+        if task.executions:
+            lines.extend(["", "── Execution History ──"])
+            for ex in task.executions:
+                status = ex.status.value if hasattr(ex.status, "value") else ex.status
+                decision = ""
+                if ex.decision:
+                    dec = ex.decision.value if hasattr(ex.decision, "value") else ex.decision
+                    decision = f" ({dec})"
+                    if ex.decision_reason:
+                        decision += f": {ex.decision_reason}"
+                wo = ""
+                if ex.work_output:
+                    wo_obj = ex.work_output
+                    if hasattr(wo_obj, "summary") and wo_obj.summary:
+                        wo = f"\n    → {wo_obj.summary}"
+                lines.append(f"  {ex.node_id} v{ex.visit}: {status}{decision}{wo}")
+
+        if task.context:
+            lines.extend(["", "── Context Log ──"])
+            for c in task.context:
+                ts = str(c.timestamp)[:19] if c.timestamp else ""
+                lines.append(f"  [{c.actor}] {c.text}  ({ts})")
+
+        detail = self.query_one("#task-detail", Static)
+        detail.update("\n".join(lines))
+        detail.add_class("visible")
+        self.query_one("#task-list", ListView).styles.display = "none"
+
+    def action_back(self) -> None:
+        self.query_one("#task-detail", Static).remove_class("visible")
+        self.query_one("#task-list", ListView).styles.display = "block"
+        self._selected_task_id = None
+
+    def action_refresh(self) -> None:
+        if self._selected_task_id:
+            self._show_detail(self._selected_task_id)
+        else:
+            self._refresh_list()
 
 
 class PollySettingsPaneApp(App[None]):

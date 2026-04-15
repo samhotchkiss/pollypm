@@ -70,7 +70,8 @@ def test_register_project_persists_persona_and_shows_it_in_left_rail(monkeypatch
     items = router.build_items()
 
     labels = {item.key: item.label for item in items}
-    assert labels[f"project:{project.key}"] == "Plain (Pete)"
+    # Project label in the rail shows just the name, not persona (persona is only in PM Chat label)
+    assert labels[f"project:{project.key}"] == "Plain"
 
 
 def test_worker_prompt_includes_persona_and_rename_instruction(tmp_path: Path) -> None:

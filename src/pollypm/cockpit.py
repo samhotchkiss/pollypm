@@ -874,12 +874,10 @@ class CockpitRouter:
         storage_session = supervisor.storage_closet_session_name()
         storage_windows = {window.name for window in self.tmux.list_windows(storage_session)}
         if launch.window_name not in storage_windows:
-            # Session is not running — show a static view instead of
-            # blocking the UI with a synchronous relaunch attempt.
-            self._show_static_view(supervisor, window_target, "polly" if session_name == "operator" else "project")
-            return
-        if False:  # dead code — kept for reference
-            if launch.session.role in {"operator-pm", "heartbeat-supervisor"}:
+            # Control sessions (operator, reviewer) should be respawned
+            # when missing — the user clicking on Polly expects to talk to
+            # Polly, not see a placeholder.
+            if launch.session.role in {"operator-pm", "reviewer"}:
                 try:
                     supervisor.launch_session(session_name)
                     storage_windows = {w.name for w in self.tmux.list_windows(storage_session)}
@@ -899,9 +897,9 @@ class CockpitRouter:
                         self._write_state(state)
                         return
                 except Exception:  # noqa: BLE001
-                    pass
-            # Fall back to static detail view
-            fallback_kind = "polly" if launch.session.role in {"operator-pm", "heartbeat-supervisor"} else "project"
+                    pass  # Fall through to static view if relaunch fails
+            # Non-control sessions or failed relaunch — show static view
+            fallback_kind = "polly" if session_name == "operator" else "project"
             fallback_target = launch.session.project if fallback_kind == "project" else None
             if right_pane_id is None:
                 right_size = self._right_pane_size(window_target)

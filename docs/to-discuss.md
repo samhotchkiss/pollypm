@@ -66,3 +66,29 @@ Items that need human input or decision before proceeding.
 - Role binding: tasks created before the Russell update use reviewer=polly, preventing Russell from approving as himself
 - Per-task worker window disappeared from storage closet during testing (may be duplicate cleanup or heartbeat interference)
 - Input bar submission: long messages still sometimes get stuck
+
+## Late Night Testing Stats (Iteration 3)
+
+### Projects Created Tonight
+1. weather-cli (5 tasks done, 1 cancelled)
+2. todo-api (3 tasks done — full dependency chain)
+3. mini-calc (1 spike task done)
+4. link-checker (1 bug flow in progress)
+5. git-stats (1 task done)
+6. md-render (1 in review, 2 blocked — dependency chain)
+
+### Flows Exercised
+- Standard: weather-cli/1,2,3,5, todo-api/1,2,3, camptown/1,2, git-stats/1, md-render/1
+- Spike: mini-calc/1 (no review, straight to done)
+- Bug: link-checker/1 (reproduce → fix → review)
+- User-review: weather-cli/4 (human approval)
+- Cancellation: weather-cli/6 (cancelled during implementation)
+- Hold/resume: weather-cli/5
+
+### Rejection Verified
+- camptown/2: Russell rejected for missed docs/project-overview.md references
+- Task cycled from implement v1 → code_review rejected → implement v2
+
+### Working Software Built
+- WeatherCLI: `uv run python -m weathercli --city "San Francisco"` → real weather data
+- TodoAPI: 30 passing tests covering full CRUD lifecycle

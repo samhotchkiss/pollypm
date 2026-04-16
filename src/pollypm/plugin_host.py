@@ -8,7 +8,7 @@ from pathlib import Path
 import tomllib
 import types
 
-from pollypm.plugin_api.v1 import HookContext, HookFilterResult, PollyPMPlugin
+from pollypm.plugin_api.v1 import HookContext, HookFilterResult, PollyPMPlugin, RosterAPI
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,38 @@ class ExtensionHost:
         return self._resolve_factory(
             name, lambda plugin: plugin.session_services, "session service", **kwargs,
         )
+
+    def build_roster(self) -> "Roster":
+        """Build a ``Roster`` by invoking every plugin's ``register_roster`` hook.
+
+        Plugins register in plugin-load order (which follows the search-path
+        sequence: builtin → user → repo). Collisions are logged but never
+        raise — see :class:`pollypm.plugin_api.v1.RosterAPI`.
+        """
+        # Local import to keep plugin_host importable without heartbeat deps.
+        from pollypm.heartbeat.roster import Roster
+
+        roster = Roster()
+
+        def _on_collision(plugin_name: str, handler_name: str, schedule: str) -> None:
+            logger.info(
+                "Plugin '%s' re-registered recurring handler '%s' "
+                "(schedule=%s) — collision deduped, keeping original",
+                plugin_name, handler_name, schedule,
+            )
+
+        for plugin in self.plugins().values():
+            hook = plugin.register_roster
+            if hook is None:
+                continue
+            api = RosterAPI(roster, plugin_name=plugin.name, on_collision=_on_collision)
+            try:
+                hook(api)
+            except Exception as exc:  # noqa: BLE001
+                message = f"Plugin {plugin.name} register_roster hook failed: {exc}"
+                self.errors.append(message)
+                logger.exception(message)
+        return roster
 
     def _resolve_factory(self, name: str, registry_getter, kind: str, **kwargs: object) -> object:
         registry: dict[str, object] = {}

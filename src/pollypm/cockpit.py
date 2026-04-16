@@ -1200,6 +1200,51 @@ def _spark_bar(values: list[int], width: int = 30) -> str:
     return "".join(blocks[min(8, int(v / max_val * 8))] for v in values)
 
 
+_DASHBOARD_PROJECT_CACHE: dict[str, tuple[float, dict[str, list], dict[str, int]]] = {}
+
+
+def _dashboard_project_tasks(
+    project_key: str, project_path: Path,
+) -> tuple[dict[str, list], dict[str, int]]:
+    """Return ({status -> [tasks]}, state_counts) for a project, cached by db_mtime.
+
+    At scale (100+ projects) this is the top hot path inside _build_dashboard:
+    previously every render opened SQLiteWorkService per project and hydrated
+    the full task list. Projects that haven't changed since last render reuse
+    the cached partition, so the dashboard's cost scales with changed projects,
+    not total projects.
+    """
+    db_path = project_path / ".pollypm" / "state.db"
+    if not db_path.exists():
+        return {}, {}
+    try:
+        db_mtime = db_path.stat().st_mtime
+    except OSError:
+        return {}, {}
+    cached = _DASHBOARD_PROJECT_CACHE.get(project_key)
+    if cached is not None and cached[0] == db_mtime:
+        return cached[1], cached[2]
+
+    from pollypm.work.sqlite_service import SQLiteWorkService
+    partitioned: dict[str, list] = {
+        "in_progress": [], "review": [], "queued": [], "blocked": [], "done": [],
+    }
+    counts: dict[str, int] = {}
+    try:
+        with SQLiteWorkService(db_path=db_path, project_path=project_path) as svc:
+            tasks = svc.list_tasks(project=project_key)
+            counts = svc.state_counts(project=project_key)
+            for t in tasks:
+                sv = t.work_status.value
+                if sv in partitioned:
+                    partitioned[sv].append(t)
+    except Exception:  # noqa: BLE001
+        return {}, {}
+
+    _DASHBOARD_PROJECT_CACHE[project_key] = (db_mtime, partitioned, counts)
+    return partitioned, counts
+
+
 def _build_dashboard(supervisor, config) -> str:
     from datetime import UTC, datetime, timedelta
 
@@ -1221,37 +1266,34 @@ def _build_dashboard(supervisor, config) -> str:
             return ""
 
     # ── Gather task data across all projects ──
-    from pollypm.work.sqlite_service import SQLiteWorkService
+    # Partition + counts are cached per project by state.db mtime; unchanged
+    # projects skip SQLite on each render.
     all_active: list[tuple[str, object]] = []  # in_progress
     all_review: list[tuple[str, object]] = []  # waiting for review
     all_queued: list[tuple[str, object]] = []  # ready for pickup
     all_blocked: list[tuple[str, object]] = []
     all_done: list[tuple[str, object]] = []
     total_counts: dict[str, int] = {}
+    live_keys: set[str] = set()
     for pk, proj in config.projects.items():
-        db_path = proj.path / ".pollypm" / "state.db"
-        if not db_path.exists():
-            continue
-        try:
-            with SQLiteWorkService(db_path=db_path, project_path=proj.path) as svc:
-                tasks = svc.list_tasks(project=pk)
-                counts = svc.state_counts(project=pk)
-                for s, n in counts.items():
-                    total_counts[s] = total_counts.get(s, 0) + n
-                for t in tasks:
-                    sv = t.work_status.value
-                    if sv == "in_progress":
-                        all_active.append((pk, t))
-                    elif sv == "review":
-                        all_review.append((pk, t))
-                    elif sv == "queued":
-                        all_queued.append((pk, t))
-                    elif sv == "blocked":
-                        all_blocked.append((pk, t))
-                    elif sv == "done":
-                        all_done.append((pk, t))
-        except Exception:  # noqa: BLE001
-            pass
+        live_keys.add(pk)
+        partitioned, counts = _dashboard_project_tasks(pk, proj.path)
+        for s, n in counts.items():
+            total_counts[s] = total_counts.get(s, 0) + n
+        for t in partitioned.get("in_progress", ()):
+            all_active.append((pk, t))
+        for t in partitioned.get("review", ()):
+            all_review.append((pk, t))
+        for t in partitioned.get("queued", ()):
+            all_queued.append((pk, t))
+        for t in partitioned.get("blocked", ()):
+            all_blocked.append((pk, t))
+        for t in partitioned.get("done", ()):
+            all_done.append((pk, t))
+    # Evict cache entries for projects no longer in config.
+    for stale_key in list(_DASHBOARD_PROJECT_CACHE.keys()):
+        if stale_key not in live_keys:
+            _DASHBOARD_PROJECT_CACHE.pop(stale_key, None)
     all_done.sort(key=lambda x: x[1].updated_at or "", reverse=True)
 
     # ── Gather system data ──

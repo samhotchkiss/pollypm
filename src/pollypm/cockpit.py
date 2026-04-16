@@ -184,6 +184,10 @@ class CockpitRouter:
         self.service = PollyPMService(config_path)
         self.tmux = create_tmux_client()
         self._supervisor: Supervisor | None = None
+        # Per-project activity cache keyed by project key.
+        # value: (db_mtime, git_mtime, is_active, has_working_task)
+        # Skips re-opening SQLite on every 0.8s cockpit tick when nothing changed.
+        self._project_activity_cache: dict[str, tuple[float, float, bool, bool]] = {}
 
     def _load_supervisor(self, *, fresh: bool = False) -> Supervisor:
         # Reload config if the file changed (picks up new projects, sessions, etc.)
@@ -346,41 +350,87 @@ class CockpitRouter:
         selected = self.selected_key()
         project_session_map = self._project_session_map(launches)
 
-        # Classify projects as active (task activity in last 24h or newly created) vs inactive
+        # Classify projects as active (task activity in last 24h or newly created)
+        # vs inactive. SQLite opens are expensive at cockpit tick rate (0.8s) and
+        # most projects don't change between ticks — cache by (db_mtime, git_mtime)
+        # and only re-open on change. Uses a single SQL aggregation per project
+        # (count + max(updated_at)) instead of loading all Task rows into memory.
         from datetime import UTC, datetime, timedelta
-        from pollypm.work.sqlite_service import SQLiteWorkService
-        cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+        import sqlite3
+        now = datetime.now(UTC)
+        cutoff_iso = (now - timedelta(hours=24)).isoformat()
+        cutoff_ts = (now - timedelta(hours=24)).timestamp()
         active_projects: list[tuple[str, object]] = []
         inactive_projects: list[tuple[str, object]] = []
         project_has_active_task: dict[str, bool] = {}
-        for project_key, project in config.projects.items():
+
+        def _project_activity(
+            project_key: str, project: object,
+        ) -> tuple[bool, bool]:
+            db_path = project.path / ".pollypm" / "state.db"
+            git_dir = project.path / ".git"
+            try:
+                db_mtime = db_path.stat().st_mtime if db_path.exists() else 0.0
+            except OSError:
+                db_mtime = 0.0
+            try:
+                git_mtime = git_dir.stat().st_mtime if git_dir.exists() else 0.0
+            except OSError:
+                git_mtime = 0.0
+            cached = self._project_activity_cache.get(project_key)
+            if cached is not None and cached[0] == db_mtime and cached[1] == git_mtime:
+                return cached[2], cached[3]
+
             is_active = False
             has_working_task = False
-            db_path = project.path / ".pollypm" / "state.db"
-            if db_path.exists():
+            if db_mtime > 0.0:
+                # Batched single-query classification: one count for working
+                # statuses, one max(updated_at) for recency. Avoids hydrating
+                # every Task row through the full service.
                 try:
-                    with SQLiteWorkService(db_path=db_path, project_path=project.path) as svc:
-                        tasks = svc.list_tasks(project=project_key)
-                        for t in tasks:
-                            if t.work_status.value in ("in_progress", "review"):
-                                has_working_task = True
-                                is_active = True
-                            if t.updated_at and t.updated_at >= cutoff:
-                                is_active = True
-                except Exception:  # noqa: BLE001
+                    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                    try:
+                        conn.row_factory = sqlite3.Row
+                        row = conn.execute(
+                            "SELECT "
+                            "  SUM(CASE WHEN work_status IN ('in_progress','review') "
+                            "           THEN 1 ELSE 0 END) AS working_count, "
+                            "  MAX(updated_at) AS max_updated "
+                            "FROM work_tasks WHERE project = ?",
+                            (project_key,),
+                        ).fetchone()
+                    finally:
+                        conn.close()
+                    if row is not None:
+                        working_count = row["working_count"] or 0
+                        max_updated = row["max_updated"] or ""
+                        if working_count > 0:
+                            has_working_task = True
+                            is_active = True
+                        if max_updated and max_updated >= cutoff_iso:
+                            is_active = True
+                except (sqlite3.Error, OSError):
                     pass
-            # Also check if project was recently created (git repo age < 24h)
-            try:
-                git_dir = project.path / ".git"
-                if git_dir.exists() and git_dir.stat().st_mtime > (datetime.now(UTC) - timedelta(hours=24)).timestamp():
-                    is_active = True
-            except Exception:  # noqa: BLE001
-                pass
+            if not is_active and git_mtime > cutoff_ts:
+                is_active = True
+            self._project_activity_cache[project_key] = (
+                db_mtime, git_mtime, is_active, has_working_task,
+            )
+            return is_active, has_working_task
+
+        for project_key, project in config.projects.items():
+            is_active, has_working_task = _project_activity(project_key, project)
             project_has_active_task[project_key] = has_working_task
             if is_active:
                 active_projects.append((project_key, project))
             else:
                 inactive_projects.append((project_key, project))
+
+        # Evict cache entries for projects no longer in config to bound memory.
+        live_keys = set(config.projects.keys())
+        for stale_key in list(self._project_activity_cache.keys()):
+            if stale_key not in live_keys:
+                self._project_activity_cache.pop(stale_key, None)
 
         # Sort each group alphabetically by display label
         active_projects.sort(key=lambda x: x[1].display_label().lower())

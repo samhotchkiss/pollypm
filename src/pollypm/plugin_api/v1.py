@@ -13,6 +13,8 @@ SessionServiceFactory = Callable[..., object]
 ObserverHandler = Callable[["HookContext"], None]
 FilterHandler = Callable[["HookContext"], "HookFilterResult | None"]
 RosterRegistrar = Callable[["RosterAPI"], None]
+JobHandlerRegistrar = Callable[["JobHandlerAPI"], None]
+JobHandlerCallable = Callable[[dict[str, Any]], Any]
 
 
 @dataclass(slots=True)
@@ -99,6 +101,51 @@ class RosterAPI:
         return list(self._roster.snapshot())
 
 
+class JobHandlerAPI:
+    """Stable façade plugins use to register job handlers.
+
+    Plugins receive a ``JobHandlerAPI`` in their ``register_handlers(api)``
+    hook during plugin host bootstrap. The API forwards calls to the
+    underlying ``JobHandlerRegistry`` singleton.
+
+    Collisions (same handler name across plugins) log a warning and let
+    the most recent registration win — matching the pattern established
+    by ``ExtensionHost._resolve_factory`` for providers/runtimes (see
+    commit e56ac22).
+    """
+
+    __slots__ = ("_registry", "_plugin_name")
+
+    def __init__(self, registry: Any, *, plugin_name: str) -> None:
+        self._registry = registry
+        self._plugin_name = plugin_name
+
+    @property
+    def plugin_name(self) -> str:
+        return self._plugin_name
+
+    def register_handler(
+        self,
+        name: str,
+        handler: JobHandlerCallable,
+        *,
+        max_attempts: int = 3,
+        timeout_seconds: float = 30.0,
+        retry_backoff: str = "exponential",
+    ) -> bool:
+        """Register a job handler. Returns ``True`` when new, ``False`` when
+        overriding an existing registration (logged by the registry).
+        """
+        return self._registry.register(
+            name=name,
+            handler=handler,
+            plugin_name=self._plugin_name,
+            max_attempts=max_attempts,
+            timeout_seconds=timeout_seconds,
+            retry_backoff=retry_backoff,
+        )
+
+
 @dataclass(slots=True)
 class PollyPMPlugin:
     name: str
@@ -115,3 +162,4 @@ class PollyPMPlugin:
     observers: dict[str, list[ObserverHandler]] = field(default_factory=dict)
     filters: dict[str, list[FilterHandler]] = field(default_factory=dict)
     register_roster: RosterRegistrar | None = None
+    register_handlers: JobHandlerRegistrar | None = None

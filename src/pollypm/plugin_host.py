@@ -8,7 +8,13 @@ from pathlib import Path
 import tomllib
 import types
 
-from pollypm.plugin_api.v1 import HookContext, HookFilterResult, PollyPMPlugin, RosterAPI
+from pollypm.plugin_api.v1 import (
+    HookContext,
+    HookFilterResult,
+    JobHandlerAPI,
+    PollyPMPlugin,
+    RosterAPI,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +40,8 @@ class ExtensionHost:
         self.root_dir = root_dir.resolve()
         self.errors: list[str] = []
         self._plugins: dict[str, PollyPMPlugin] | None = None
+        self._job_handler_registry = None
+        self._job_handlers_loaded = False
 
     def plugins(self) -> dict[str, PollyPMPlugin]:
         if self._plugins is None:
@@ -64,6 +72,34 @@ class ExtensionHost:
         return self._resolve_factory(
             name, lambda plugin: plugin.session_services, "session service", **kwargs,
         )
+
+    def job_handler_registry(self) -> "JobHandlerRegistry":
+        """Return the plugin host's ``JobHandlerRegistry`` singleton.
+
+        On first access we invoke every plugin's ``register_handlers`` hook
+        (after session-service registration) so the registry is populated
+        by the time callers look for a handler.
+        """
+        # Local import to avoid requiring the jobs package at plugin-host
+        # import time.
+        from pollypm.jobs.registry import JobHandlerRegistry
+
+        if self._job_handler_registry is None:
+            self._job_handler_registry = JobHandlerRegistry()
+        if not self._job_handlers_loaded:
+            self._job_handlers_loaded = True
+            for plugin in self.plugins().values():
+                hook = plugin.register_handlers
+                if hook is None:
+                    continue
+                api = JobHandlerAPI(self._job_handler_registry, plugin_name=plugin.name)
+                try:
+                    hook(api)
+                except Exception as exc:  # noqa: BLE001
+                    message = f"Plugin {plugin.name} register_handlers hook failed: {exc}"
+                    self.errors.append(message)
+                    logger.exception(message)
+        return self._job_handler_registry
 
     def build_roster(self) -> "Roster":
         """Build a ``Roster`` by invoking every plugin's ``register_roster`` hook.

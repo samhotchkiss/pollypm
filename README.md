@@ -260,17 +260,17 @@ Every major subsystem has a defined role, a fixed file path, and is independentl
 Plugins are Python packages with a `plugin.py` that exports a `PollyPMPlugin` instance:
 
 ```python
-from pollypm.plugin_api.v1 import PollyPMPlugin
+from pollypm.plugin_api.v1 import Capability, PollyPMPlugin
 from my_provider import MyAdapter
 
 plugin = PollyPMPlugin(
     name="my_provider",
-    capabilities=("provider",),
+    capabilities=(Capability(kind="provider", name="my_provider"),),
     providers={"my_provider": MyAdapter},
 )
 ```
 
-The plugin host discovers shipped plugins from `plugins_builtin/` and external plugins via `.pollypm-plugin.toml` manifests.
+The plugin host discovers plugins from four sources (precedence low → high): built-in, Python entry_points under `pollypm.plugins`, user-global `~/.pollypm/plugins/`, and project-local `<project>/.pollypm/plugins/`. See [docs/plugin-discovery-spec.md](docs/plugin-discovery-spec.md) for the full specification, [docs/plugin-authoring.md](docs/plugin-authoring.md) for a from-scratch walkthrough, and [docs/plugin-boundaries.md](docs/plugin-boundaries.md) for boundary contracts between plugins.
 
 ## Session Roles
 

@@ -230,6 +230,122 @@ def _parse_role(value: str) -> tuple[str, str]:
     return k.strip(), v.strip()
 
 
+def _sync_commits_to_task_branch(task_id: str) -> None:
+    """Sync worker commits to the task branch before signaling done.
+
+    When a persistent worker picks up a task, it works in its own worktree
+    (pa/worker_* branch) rather than the task worktree (task/* branch).
+    This causes reviewers to find zero commits on the task branch.
+
+    This function detects the mismatch and cherry-picks the worker's recent
+    commits onto the task branch so the reviewer can find them.
+    """
+    import os
+    import subprocess
+
+    project, number = task_id.split("/", 1) if "/" in task_id else (task_id, "")
+    if not number:
+        return
+
+    task_slug = f"{project}-{number}"
+    task_branch = f"task/{task_slug}"
+    cwd = os.getcwd()
+
+    # Check if we're in a git repo
+    result = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        return
+
+    # Get current branch
+    result = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        return
+    current_branch = result.stdout.strip()
+
+    # If we're already on the task branch, nothing to sync
+    if current_branch == task_branch:
+        return
+
+    # Check if the task branch exists
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", task_branch],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        return  # Task branch doesn't exist — nothing to sync to
+
+    # Find commits on current branch that aren't on main
+    result = subprocess.run(
+        ["git", "log", f"main..{current_branch}", "--oneline", "--no-merges"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return  # No commits to sync
+
+    # Check if task branch already has commits ahead of main
+    result = subprocess.run(
+        ["git", "log", f"main..{task_branch}", "--oneline"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        return  # Task branch already has work — don't overwrite
+
+    # Get the project root (top of git repo)
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        return
+    project_root = result.stdout.strip()
+
+    # Check if task worktree exists
+    task_worktree = os.path.join(project_root, ".pollypm", "worktrees", task_slug)
+    if os.path.isdir(task_worktree):
+        # Merge current branch into task worktree
+        merge_result = subprocess.run(
+            ["git", "-C", task_worktree, "merge", current_branch, "--no-edit"],
+            capture_output=True, text=True, check=False,
+        )
+        if merge_result.returncode == 0:
+            typer.echo(f"Synced commits from {current_branch} to {task_branch}")
+        else:
+            # Try cherry-pick of just the new commits instead
+            commits = subprocess.run(
+                ["git", "log", f"main..{current_branch}", "--format=%H", "--reverse", "--no-merges"],
+                capture_output=True, text=True, check=False,
+            )
+            if commits.returncode == 0 and commits.stdout.strip():
+                hashes = commits.stdout.strip().split("\n")
+                cp = subprocess.run(
+                    ["git", "-C", task_worktree, "cherry-pick"] + hashes,
+                    capture_output=True, text=True, check=False,
+                )
+                if cp.returncode == 0:
+                    typer.echo(f"Cherry-picked {len(hashes)} commit(s) to {task_branch}")
+                else:
+                    typer.echo(f"Warning: could not sync commits to {task_branch}: {cp.stderr.strip()}")
+    else:
+        # No task worktree — try updating the branch ref directly
+        current_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=False,
+        )
+        if current_head.returncode == 0:
+            update = subprocess.run(
+                ["git", "update-ref", f"refs/heads/{task_branch}", current_head.stdout.strip()],
+                capture_output=True, text=True, check=False,
+            )
+            if update.returncode == 0:
+                typer.echo(f"Updated {task_branch} to match {current_branch}")
+
+
 # ---------------------------------------------------------------------------
 # Task commands
 # ---------------------------------------------------------------------------
@@ -342,6 +458,8 @@ def task_done(
     """Signal that the current work node is complete."""
     svc = _svc(db, project=_project_from_task_id(task_id))
     wo_dict = json.loads(output)
+    # Sync worker commits to task branch before state transition
+    _sync_commits_to_task_branch(task_id)
     task = _run(svc.node_done, task_id, actor, wo_dict)
     if output_json:
         typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))

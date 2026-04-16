@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal, Union
 
 ProviderFactory = Callable[[], object]
 RuntimeFactory = Callable[[], object]
@@ -157,6 +157,246 @@ class Capability:
     name: str = ""
     replaces: tuple[str, ...] = ()
     requires_api: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Rail registration API — see docs/extensible-rail-spec.md.
+#
+# The cockpit rail is organised into five frozen sections: ``top``,
+# ``projects``, ``workflows``, ``tools``, ``system``. Plugins register
+# items against a section at an explicit integer ``index`` (convention:
+# core owns 0–99; plugins start at 100). Ties resolve by plugin name
+# alphabetically. Items outside ``workflows`` / ``tools`` require the
+# manifest flag ``contributes_to_reserved_section = true``.
+# ---------------------------------------------------------------------------
+
+RAIL_SECTIONS: tuple[str, ...] = ("top", "projects", "workflows", "tools", "system")
+RESERVED_RAIL_SECTIONS: frozenset[str] = frozenset({"top", "projects", "system"})
+
+VisibilityLiteral = Literal["always", "has_feature"]
+VisibilityPredicate = Callable[["RailContext"], bool]
+Visibility = Union[VisibilityLiteral, VisibilityPredicate]
+
+BadgeProvider = Callable[["RailContext"], "int | str | None"]
+RailHandler = Callable[["RailContext"], "PanelSpec | None"]
+
+
+@dataclass(slots=True)
+class RailContext:
+    """Context object passed to rail item handlers and predicates.
+
+    ``selected_project`` — the currently-selected project key, if any.
+    ``user`` — opaque user identity token (today always the default
+    actor; reserved for multi-user rails).
+    ``cockpit_state`` — the live cockpit state dict (keys like
+    ``selected``, ``mounted_session``, ``right_pane_id``). Handlers
+    should treat it as read-only; mutations belong to the router.
+
+    The field set is intentionally small and additive so future rails
+    can hang extra hints off the same object without breaking plugins.
+    """
+
+    selected_project: str | None = None
+    user: str | None = None
+    cockpit_state: dict[str, Any] = field(default_factory=dict)
+    extras: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class PanelSpec:
+    """Return value from a rail item handler.
+
+    ``widget`` — opaque payload the cockpit panel renderer knows how to
+    display (today a str or a Textual widget; typed ``Any`` so plugins
+    can hand back provider-specific payloads without a shared import).
+    ``focus_hint`` — optional hint the renderer may honour to decide
+    which pane or row gets keyboard focus after the panel loads.
+    """
+
+    widget: Any = None
+    focus_hint: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class RailItemRegistration:
+    """A single rail item registered by a plugin.
+
+    Collected on the plugin host at ``api.rail.register_item(...)``
+    time, then read by the cockpit rail builder. Frozen + slots so the
+    registry can be cached cheaply.
+    """
+
+    plugin_name: str
+    section: str
+    index: int
+    label: str
+    handler: RailHandler
+    icon: str | None = None
+    badge_provider: BadgeProvider | None = None
+    visibility: Visibility = "always"
+    feature_name: str | None = None  # for visibility="has_feature"
+    key: str | None = None  # optional stable id; falls back to section.label
+
+    @property
+    def item_key(self) -> str:
+        """Stable key for the item — ``section.label`` unless overridden.
+
+        Used by the ``pm rail hide/show`` CLI and by config matching.
+        """
+        return self.key if self.key else f"{self.section}.{self.label}"
+
+
+class RailAPI:
+    """Plugin-facing façade for cockpit rail item registration.
+
+    Plugins receive a ``RailAPI`` via ``api.rail`` inside their
+    ``initialize(api)`` hook. A single plugin may register multiple
+    items. Duplicate ``(section, index, plugin_name)`` triples are
+    deduped with a warning — the last registration wins.
+
+    Per spec §3 + er01 scope:
+
+    * ``section`` must be one of :data:`RAIL_SECTIONS` — unknown names
+      raise ``ValueError``.
+    * Registering into a :data:`RESERVED_RAIL_SECTIONS` section requires
+      the plugin manifest to set
+      ``contributes_to_reserved_section = true``; otherwise the call
+      logs a warning but does not raise (plugins may still register
+      for local testing / dev flows).
+    * ``index`` ties are resolved at render time by plugin name
+      alphabetically (lower name first).
+    """
+
+    __slots__ = ("_plugin_name", "_registry", "_reserved_allowed")
+
+    def __init__(
+        self,
+        *,
+        plugin_name: str,
+        registry: "RailRegistry",
+        reserved_allowed: bool = False,
+    ) -> None:
+        self._plugin_name = plugin_name
+        self._registry = registry
+        self._reserved_allowed = reserved_allowed
+
+    @property
+    def plugin_name(self) -> str:
+        return self._plugin_name
+
+    def register_item(
+        self,
+        section: str,
+        index: int,
+        label: str,
+        handler: RailHandler,
+        *,
+        icon: str | None = None,
+        badge_provider: BadgeProvider | None = None,
+        visibility: Visibility = "always",
+        feature_name: str | None = None,
+        key: str | None = None,
+    ) -> RailItemRegistration:
+        """Register a rail item.
+
+        Returns the ``RailItemRegistration`` so callers can keep a
+        reference (e.g. to test state).
+        """
+        if section not in RAIL_SECTIONS:
+            raise ValueError(
+                f"Unknown rail section '{section}' from plugin '{self._plugin_name}'. "
+                f"Must be one of: {', '.join(RAIL_SECTIONS)}."
+            )
+        if not isinstance(index, int):
+            raise TypeError(
+                f"Rail item index must be int; plugin '{self._plugin_name}' passed "
+                f"{type(index).__name__} for section '{section}' label '{label}'."
+            )
+        if not callable(handler):
+            raise TypeError(
+                f"Rail item handler must be callable; plugin '{self._plugin_name}' "
+                f"passed {type(handler).__name__} for section '{section}' label '{label}'."
+            )
+        if visibility != "always" and visibility != "has_feature" and not callable(visibility):
+            raise TypeError(
+                f"Rail item visibility must be 'always', 'has_feature', or a callable; "
+                f"plugin '{self._plugin_name}' passed {visibility!r} for section "
+                f"'{section}' label '{label}'."
+            )
+        if section in RESERVED_RAIL_SECTIONS and not self._reserved_allowed:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Plugin '%s' registering into reserved rail section '%s' without "
+                "contributes_to_reserved_section=true — item '%s' (index %d) will "
+                "be accepted but the plugin host may block it in the future.",
+                self._plugin_name, section, label, index,
+            )
+        reg = RailItemRegistration(
+            plugin_name=self._plugin_name,
+            section=section,
+            index=index,
+            label=label,
+            handler=handler,
+            icon=icon,
+            badge_provider=badge_provider,
+            visibility=visibility,
+            feature_name=feature_name,
+            key=key,
+        )
+        self._registry.add(reg)
+        return reg
+
+
+class RailRegistry:
+    """Collects every ``RailAPI.register_item`` call across all plugins.
+
+    Exposes a single ``items()`` accessor that returns registrations in
+    rail-render order: sections walked in :data:`RAIL_SECTIONS` order,
+    items within each section sorted by ``(index, plugin_name)``.
+
+    The registry is held on the ``ExtensionHost`` so it has the same
+    lifetime as the plugin host singleton — see
+    :meth:`pollypm.plugin_host.ExtensionHost.rail_registry`.
+    """
+
+    __slots__ = ("_items",)
+
+    def __init__(self) -> None:
+        self._items: list[RailItemRegistration] = []
+
+    def add(self, reg: RailItemRegistration) -> None:
+        # Dedupe identical (plugin, section, label) re-registrations —
+        # last write wins. This matches the provider/runtime override
+        # pattern in _resolve_factory.
+        for i, existing in enumerate(self._items):
+            if (
+                existing.plugin_name == reg.plugin_name
+                and existing.section == reg.section
+                and existing.label == reg.label
+            ):
+                self._items[i] = reg
+                return
+        self._items.append(reg)
+
+    def items(self) -> list[RailItemRegistration]:
+        """Return all registrations in rail-render order."""
+        section_order = {name: i for i, name in enumerate(RAIL_SECTIONS)}
+        return sorted(
+            self._items,
+            key=lambda r: (
+                section_order.get(r.section, len(RAIL_SECTIONS)),
+                r.index,
+                r.plugin_name,
+            ),
+        )
+
+    def items_for_section(self, section: str) -> list[RailItemRegistration]:
+        """Return all registrations for ``section`` in render order."""
+        return [r for r in self.items() if r.section == section]
+
+    def clear(self) -> None:
+        """Drop every registration — used by tests that swap registries."""
+        self._items.clear()
 
 
 class RosterAPI:
@@ -334,6 +574,7 @@ class PluginAPI:
         "_plugin_name",
         "_roster_api",
         "_jobs_api",
+        "_rail_api",
         "_host",
         "_config",
         "_state_store",
@@ -348,10 +589,12 @@ class PluginAPI:
         host: Any = None,
         config: Any = None,
         state_store: Any = None,
+        rail_api: "RailAPI | None" = None,
     ) -> None:
         self._plugin_name = plugin_name
         self._roster_api = roster_api
         self._jobs_api = jobs_api
+        self._rail_api = rail_api
         self._host = host
         self._config = config
         self._state_store = state_store
@@ -376,6 +619,15 @@ class PluginAPI:
                 "JobHandlerAPI not available — plugin host was built without a job registry."
             )
         return self._jobs_api
+
+    @property
+    def rail(self) -> "RailAPI":
+        """Rail-item registration façade. See docs/extensible-rail-spec.md."""
+        if self._rail_api is None:
+            raise RuntimeError(
+                "RailAPI not available — plugin host was built without a rail registry."
+            )
+        return self._rail_api
 
     @property
     def config(self) -> Any:

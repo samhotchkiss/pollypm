@@ -16,6 +16,8 @@ from pollypm.plugin_api.v1 import (
     KNOWN_CAPABILITY_KINDS,
     PluginAPI,
     PollyPMPlugin,
+    RailAPI,
+    RailRegistry,
     RosterAPI,
     check_requires_api,
     normalize_capabilities,
@@ -55,6 +57,9 @@ class PluginManifest:
     source: str
     requires_api: str | None = None
     content: ContentDeclaration = field(default_factory=ContentDeclaration)
+    # Rail items registered into reserved sections (top/projects/system)
+    # require this flag — see docs/extensible-rail-spec.md §2.
+    contributes_to_reserved_section: bool = False
 
 
 @dataclass(slots=True)
@@ -100,6 +105,14 @@ class ExtensionHost:
         # degraded" and surface in pm plugins show.
         self._degraded: dict[str, str] = {}  # plugin name -> reason
         self._initialize_called: set[str] = set()
+        # Rail item registrations collected from plugins' initialize()
+        # callbacks — see docs/extensible-rail-spec.md. Lazily populated
+        # by rail_registry() so tests that don't exercise the rail don't
+        # pay the cost.
+        self._rail_registry: RailRegistry | None = None
+        # Manifest flag per plugin name — whether this plugin is allowed
+        # to register into reserved rail sections (top/projects/system).
+        self._reserved_rail_allowed: set[str] = set()
 
     @property
     def disabled_plugins(self) -> dict[str, DisabledPluginRecord]:
@@ -224,6 +237,11 @@ class ExtensionHost:
                 if job_registry is not None
                 else None
             )
+            rail_api = RailAPI(
+                plugin_name=name,
+                registry=self.rail_registry(),
+                reserved_allowed=(name in self._reserved_rail_allowed),
+            )
             api = PluginAPI(
                 plugin_name=name,
                 roster_api=roster_api,
@@ -231,6 +249,7 @@ class ExtensionHost:
                 host=self,
                 config=config,
                 state_store=state_store,
+                rail_api=rail_api,
             )
             try:
                 plugin.initialize(api)
@@ -241,6 +260,17 @@ class ExtensionHost:
                 degraded[name] = reason
                 self._degraded[name] = reason
         return degraded
+
+    def rail_registry(self) -> RailRegistry:
+        """Return the shared :class:`RailRegistry` for this plugin host.
+
+        Lazily created on first call. Populated during
+        :meth:`initialize_plugins` — each plugin receives a ``RailAPI``
+        bound to this registry.
+        """
+        if self._rail_registry is None:
+            self._rail_registry = RailRegistry()
+        return self._rail_registry
 
     @property
     def degraded_plugins(self) -> dict[str, str]:
@@ -501,6 +531,8 @@ class ExtensionHost:
             self._plugin_dirs[manifest.name] = manifest.plugin_dir
             if manifest.content.kinds or manifest.content.user_paths:
                 self._content_declarations[manifest.name] = manifest.content
+            if manifest.contributes_to_reserved_section:
+                self._reserved_rail_allowed.add(manifest.name)
             _install(manifest.name, plugin, manifest.source)
 
         # Order matters: later sources win on name collision, matching
@@ -618,6 +650,7 @@ class ExtensionHost:
         name = str(raw["name"])
         capabilities = self._parse_capability_entries(raw.get("capabilities", []), plugin_name=name)
         content = self._parse_content_declaration(raw.get("content"), plugin_name=name)
+        reserved_flag = bool(raw.get("contributes_to_reserved_section", False))
         return PluginManifest(
             name=name,
             api_version=str(raw["api_version"]),
@@ -630,6 +663,7 @@ class ExtensionHost:
             source=source,
             requires_api=(str(raw["requires_api"]) if raw.get("requires_api") is not None else None),
             content=content,
+            contributes_to_reserved_section=reserved_flag,
         )
 
     def _parse_content_declaration(

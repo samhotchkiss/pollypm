@@ -372,14 +372,19 @@ class TmuxClient:
         # which can drop characters or cause rendering issues in Claude Code's
         # input bar. Short text still uses send-keys -l for simplicity.
         if len(text) > 100:
-            import tempfile
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-                f.write(text)
-                f.flush()
-                self.run("load-buffer", f.name)
-            self.run("paste-buffer", "-d", "-t", resolved)
             import os
-            os.unlink(f.name)
+            import tempfile
+            fd, tmp_path = tempfile.mkstemp(suffix=".txt")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(text)
+                self.run("load-buffer", tmp_path)
+                self.run("paste-buffer", "-d", "-t", resolved)
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
         else:
             self.run("send-keys", "-l", "-t", resolved, text)
         if press_enter:

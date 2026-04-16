@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from pollypm.plugin_host import ExtensionHost
-from pollypm.plugins_builtin.magic.plugin import (
+from pollypm.itsalive import (
     build_deploy_instructions,
     read_deploy_token,
     read_owner_token,

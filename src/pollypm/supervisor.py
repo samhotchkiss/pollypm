@@ -781,6 +781,7 @@ class Supervisor:
             ("session_intelligence_sweep", {}),
             ("project_intelligence", {}),
             ("gc_maintenance", {}),
+            ("prune_state", {}),
         ])
 
         # Re-arm the heartbeat schedule so the next sweep is always queued.
@@ -953,12 +954,13 @@ class Supervisor:
                 f"Expected tmux window {window_name} in session {self._tmux_session_for_session(session_key)}",
             )
 
+        current_alerts = self.store.open_alerts()
         self.store.record_event(
             "heartbeat",
             "heartbeat",
-            f"Heartbeat sweep completed with {len(self.store.open_alerts())} open alerts",
+            f"Heartbeat sweep completed with {len(current_alerts)} open alerts",
         )
-        return self.store.open_alerts()
+        return current_alerts
 
     def _apply_role_launch_restrictions(
         self,

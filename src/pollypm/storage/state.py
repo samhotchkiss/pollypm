@@ -419,11 +419,13 @@ class StateStore:
         """Thread-safe commit. Bumps the state epoch so subscribers know to refresh."""
         with self._lock:
             self.conn.commit()
-            try:
-                from pollypm.state_epoch import bump
-                bump()
-            except Exception:  # noqa: BLE001
-                pass
+        # Bump epoch outside the lock — commit is already durable and
+        # the bump only touches a sentinel file's mtime.
+        try:
+            from pollypm.state_epoch import bump
+            bump()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _now(self) -> str:
         return datetime.now(UTC).isoformat()
@@ -446,6 +448,10 @@ class StateStore:
         ]),
         (3, "Add snapshot_hash to heartbeats", []),
         (4, "Add cache_read_tokens to token_usage_hourly", []),
+        (5, "Add indexes on events and heartbeats for heartbeat sweep performance", [
+            "CREATE INDEX IF NOT EXISTS idx_events_session_type ON events(session_name, event_type, id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_heartbeats_session ON heartbeats(session_name, id DESC)",
+        ]),
     ]
 
     def _migrate(self) -> None:

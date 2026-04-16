@@ -2,12 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import Protocol
 
 from pollypm.storage.state import AlertRecord
-
-if TYPE_CHECKING:
-    from pollypm.models import ProviderKind
 
 
 @dataclass(slots=True)

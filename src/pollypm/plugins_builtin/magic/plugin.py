@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from pollypm.agent_profiles.builtin import StaticPromptProfile
+from pollypm.itsalive import build_deploy_instructions
 from pollypm.plugin_api.v1 import PollyPMPlugin
-from pollypm.plugins_builtin.itsalive.plugin import build_deploy_instructions, read_deploy_token, read_owner_token
 
 
 plugin = PollyPMPlugin(

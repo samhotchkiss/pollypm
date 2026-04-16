@@ -18,9 +18,7 @@ from pollypm.capacity import (
     FAILOVER_TRIGGERS,
     can_failover_session,
     probe_capacity,
-    select_failover_account,
 )
-from pollypm.heartbeats.base import HeartbeatSessionContext
 from pollypm.models import PollyPMConfig
 from pollypm.storage.state import StateStore
 

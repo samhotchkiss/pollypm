@@ -56,6 +56,7 @@ def ensure_worktree(
             check=False,
             text=True,
             capture_output=True,
+            timeout=300,
         )
         if result.returncode != 0:
             # Release the session lock so future calls don't get blocked
@@ -98,18 +99,20 @@ def cleanup_worktree(
             check=False,
             text=True,
             capture_output=True,
+            timeout=60,
         )
         if status.stdout.strip():
             raise typer.BadParameter(f"Worktree {path} has uncommitted changes; use force to clean it up.")
     remove_cmd = ["git", "-C", str(project.path), "worktree", "remove", str(path)]
     if force:
         remove_cmd.append("--force")
-    subprocess.run(remove_cmd, check=False, text=True, capture_output=True)
+    subprocess.run(remove_cmd, check=False, text=True, capture_output=True, timeout=300)
     subprocess.run(
         ["git", "-C", str(project.path), "worktree", "prune"],
         check=False,
         text=True,
         capture_output=True,
+        timeout=60,
     )
     release_session_lock(path.parent, record.session_name)
     store.update_worktree_status(project_key, lane_kind, lane_key, "closed")

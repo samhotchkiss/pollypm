@@ -293,6 +293,106 @@ def read_project_config(project_root: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def read_deploy_token(project_root: Path | None = None) -> str | None:
+    """Read the deploy token from the project's .itsalive config."""
+    root = Path.cwd() if project_root is None else Path(project_root)
+    config = read_project_config(root)
+    token = config.get("deployToken") or config.get("deploy_token")
+    if isinstance(token, str) and token.strip():
+        return token.strip()
+    return None
+
+
+def build_deploy_instructions() -> str:
+    """Build the full itsalive deployment instruction text for agent prompts."""
+    owner_token = read_owner_token()
+    verification = (
+        "Verified owners can skip the first-deploy email check entirely because PollyPM will include "
+        "the saved `owner_token` from `~/.itsalive` automatically."
+        if owner_token
+        else "If `~/.itsalive` already contains an `ownerToken`, PollyPM will include it automatically "
+        "and skip first-deploy email verification."
+    )
+    return f"""\
+## itsalive Deployment Workflow
+
+Use PollyPM's built-in wrapper instead of a raw `npx itsalive` polling loop when you want unattended deployment:
+
+- First deploy: `pm itsalive deploy --project <project_key> --subdomain <slug> --email <user@example.com> --dir <publish_dir>`
+- Re-deploy existing site: `pm itsalive deploy --project <project_key> --dir <publish_dir>`
+- Check pending verification: `pm itsalive status --project <project_key>`
+- Force a sweep now: `pm itsalive sweep --project <project_key>`
+
+Important behavior:
+- PollyPM writes first-deploy state under `.pollypm-state/itsalive/pending/`.
+- Verification links remain valid for 24 hours.
+- Heartbeat checks pending deploys and completes them automatically after the user clicks the email link.
+- Existing `.itsalive` deploy tokens trigger the fast push flow with no verification prompt.
+- {verification}
+
+Deploy API endpoints:
+- `POST {ITSALIVE_API}/check-subdomain`
+- `POST {ITSALIVE_API}/deploy/init`
+- `GET  {ITSALIVE_API}/deploy/<deploy_id>/status`
+- `PUT  {ITSALIVE_API}/deploy/<deploy_id>/upload?file=<path>`
+- `POST {ITSALIVE_API}/deploy/<deploy_id>/finalize`
+- `POST {ITSALIVE_API}/push`
+- `PUT  {ITSALIVE_API}/push/upload?file=<path>&token=<deployToken>`
+
+## itsalive App Capabilities
+
+Always use relative paths inside deployed apps and include `credentials: 'include'`.
+
+Authentication:
+- `POST /_auth/login`
+- `GET /_auth/me`
+- `POST /_auth/logout`
+
+Shared database:
+- `PUT /_db/:collection/:id`
+- `GET /_db/:collection/:id`
+- `GET /_db/:collection?status=published&sort=-created_at&limit=10&offset=0`
+- `DELETE /_db/:collection/:id`
+- `POST /_db/:collection/_bulk`
+- `PUT /_db/:collection/_settings`
+
+User-private data:
+- `GET /_me/:key`
+- `PUT /_me/:key`
+
+AI:
+- `POST /_ai/chat`
+- Providers include Claude, GPT, and Gemini.
+- Supports `response_format: 'json'` and vision inputs.
+
+Email and subscribers:
+- `POST /_email/send`
+- `POST /_email/send-bulk`
+- `PUT /settings/branding`
+- `POST /_subscribers`
+- `GET /_subscribers`
+- `PUT /_subscribers/:id`
+- `DELETE /_subscribers/:id`
+
+Automation:
+- `GET/POST /cron`
+- `PUT/DELETE /cron/:id`
+- `POST /jobs`
+- `GET /jobs`
+- `GET /jobs/:id`
+- `DELETE /jobs/:id`
+
+Growth and metadata:
+- `GET/PUT/DELETE /_og/routes`
+- Custom domains and email-domain verification exist in the itsalive platform.
+- Free-tier sites must include a visible `Powered by itsalive.co` footer with `?ref=SUBDOMAIN`.
+
+Deploy-token owner operations:
+- The `.itsalive` file stores `deployToken` for automation.
+- Deploy-token writes can configure collection settings and OG routes without interactive login.
+"""
+
+
 def write_project_config(project_root: Path, payload: dict[str, Any]) -> Path:
     path = project_root / CONFIG_FILE
     atomic_write_json(path, payload)

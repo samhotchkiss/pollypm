@@ -8,7 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from pollypm.atomic_io import atomic_write_json
-from pollypm.job_runner import get_executor, submit_job
+from pollypm.job_runner import get_executor
 from pollypm.schedulers.base import ScheduledJob, SchedulerBackend
 
 

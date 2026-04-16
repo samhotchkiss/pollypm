@@ -90,6 +90,19 @@ class MemorySettings:
 
 
 @dataclass(slots=True)
+class PluginSettings:
+    """Plugin-level configuration from the ``[plugins]`` TOML section.
+
+    ``disabled`` — names of plugins that should be discovered but not
+    loaded. User-global and project-local disables compose (project can
+    disable more, not re-enable a user-disabled plugin). See
+    docs/plugin-discovery-spec.md §8.
+    """
+
+    disabled: tuple[str, ...] = ()
+
+
+@dataclass(slots=True)
 class PollyPMConfig:
     project: ProjectSettings
     pollypm: PollyPMSettings
@@ -97,6 +110,7 @@ class PollyPMConfig:
     sessions: dict[str, SessionConfig]
     projects: dict[str, KnownProject] = field(default_factory=dict)
     memory: MemorySettings = field(default_factory=MemorySettings)
+    plugins: PluginSettings = field(default_factory=PluginSettings)
 
 
 @dataclass(slots=True)

@@ -40,14 +40,45 @@ class PluginManifest:
     requires_api: str | None = None
 
 
+@dataclass(slots=True)
+class DisabledPluginRecord:
+    """A plugin that was discovered but not activated.
+
+    ``reason`` is a short machine-parseable tag: ``config``,
+    ``api_version``, ``missing_dependency``, ``load_error``.
+    ``detail`` is a human-readable explanation for ``pm plugins show``.
+    """
+
+    name: str
+    source: str
+    reason: str
+    detail: str = ""
+
+
 class ExtensionHost:
-    def __init__(self, root_dir: Path) -> None:
+    def __init__(
+        self,
+        root_dir: Path,
+        *,
+        disabled: tuple[str, ...] = (),
+    ) -> None:
         self.root_dir = root_dir.resolve()
         self.errors: list[str] = []
         self._plugins: dict[str, PollyPMPlugin] | None = None
         self._plugin_sources: dict[str, str] = {}
+        # Plugins that were discovered but filtered out — keyed by name
+        # so ``pm plugins list`` can still show them with a reason.
+        self._disabled: dict[str, DisabledPluginRecord] = {}
+        self._disabled_names: frozenset[str] = frozenset(disabled)
         self._job_handler_registry = None
         self._job_handlers_loaded = False
+
+    @property
+    def disabled_plugins(self) -> dict[str, DisabledPluginRecord]:
+        """Plugins discovered-but-filtered, keyed by plugin name."""
+        if self._plugins is None:
+            self.plugins()
+        return dict(self._disabled)
 
     def plugin_source(self, name: str) -> str | None:
         """Return the discovery source tag (``builtin``, ``entry_point``,
@@ -262,7 +293,18 @@ class ExtensionHost:
         loaded: dict[str, PollyPMPlugin] = {}
         sources: dict[str, str] = {}  # plugin name -> source tag
 
+        def _mark_disabled(name: str, source: str, reason: str, detail: str = "") -> None:
+            self._disabled[name] = DisabledPluginRecord(
+                name=name, source=source, reason=reason, detail=detail,
+            )
+
         def _install(name: str, plugin: PollyPMPlugin, source: str) -> None:
+            # Per docs/plugin-discovery-spec.md §8: disabled plugins are
+            # discovered but not loaded. Track them so a future CLI can
+            # still surface their existence.
+            if name in self._disabled_names:
+                _mark_disabled(name, source, "config", "disabled by pollypm.toml [plugins].disabled")
+                return
             # Validate the plugin implements its declared interfaces
             try:
                 from pollypm.plugin_validate import validate_plugin
@@ -270,6 +312,7 @@ class ExtensionHost:
                 if not result.passed:
                     failures = ", ".join(c.message for c in result.checks if not c.passed)
                     self.errors.append(f"Plugin {name} failed validation: {failures}")
+                    _mark_disabled(name, source, "load_error", f"validation failed: {failures}")
                     return
             except Exception as exc:  # noqa: BLE001
                 self.errors.append(f"Plugin {name} validation error: {exc}")
@@ -284,6 +327,9 @@ class ExtensionHost:
         # Order matters: later sources win on name collision, matching
         # the spec §2 precedence table.
         for manifest in self._discover_directory_manifests(sources=("builtin",)):
+            if manifest.name in self._disabled_names:
+                _mark_disabled(manifest.name, manifest.source, "config", "disabled by pollypm.toml [plugins].disabled")
+                continue
             plugin = self._load_plugin_from_manifest(manifest)
             if plugin is not None:
                 _install(manifest.name, plugin, manifest.source)
@@ -294,6 +340,9 @@ class ExtensionHost:
         # "repo" is a legacy alias for "project" used by older tests; we
         # accept both so internal call sites can transition gradually.
         for manifest in self._discover_directory_manifests(sources=("user", "project", "repo")):
+            if manifest.name in self._disabled_names:
+                _mark_disabled(manifest.name, manifest.source, "config", "disabled by pollypm.toml [plugins].disabled")
+                continue
             plugin = self._load_plugin_from_manifest(manifest)
             if plugin is not None:
                 _install(manifest.name, plugin, manifest.source)
@@ -564,6 +613,27 @@ class ExtensionHost:
         return getattr(module, attr)
 
 
+def _load_disabled_from_config(root_dir: Path) -> tuple[str, ...]:
+    """Best-effort read of ``[plugins].disabled`` for an ExtensionHost.
+
+    Tries the user-global config (``~/.pollypm/pollypm.toml``); on any
+    parse/read error returns an empty tuple — plugin discovery must never
+    crash because of a malformed config.
+    """
+    try:
+        from pollypm.config import DEFAULT_CONFIG_PATH, load_config, resolve_config_path
+
+        config_path = resolve_config_path(DEFAULT_CONFIG_PATH)
+        if not config_path.exists():
+            return ()
+        cfg = load_config(config_path)
+        return tuple(cfg.plugins.disabled)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Could not load plugins.disabled from config: %s", exc)
+        return ()
+
+
 @lru_cache(maxsize=16)
 def extension_host_for_root(root_dir: str) -> ExtensionHost:
-    return ExtensionHost(Path(root_dir))
+    disabled = _load_disabled_from_config(Path(root_dir))
+    return ExtensionHost(Path(root_dir), disabled=disabled)

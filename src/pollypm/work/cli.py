@@ -438,6 +438,60 @@ def task_list(
     _print_task_table(tasks, as_json=output_json)
 
 
+@task_app.command("update")
+def task_update(
+    task_id: str = typer.Argument(..., help="Task ID (project/number)"),
+    title: Optional[str] = typer.Option(None, "--title", help="New title"),
+    description: Optional[str] = typer.Option(None, "--description", "-d", help="New description"),
+    priority: Optional[str] = typer.Option(None, "--priority", help="New priority: critical, high, normal, low"),
+    label: Optional[list[str]] = typer.Option(None, "--label", help="Replace labels (repeatable)"),
+    role: Optional[list[str]] = typer.Option(None, "--role", "-r", help="Replace roles (key=value, repeatable)"),
+    acceptance_criteria: Optional[str] = typer.Option(None, "--acceptance-criteria", help="New acceptance criteria"),
+    constraints: Optional[str] = typer.Option(None, "--constraints", help="New constraints"),
+    relevant_files: Optional[list[str]] = typer.Option(None, "--relevant-files", help="Replace relevant files (repeatable)"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Update mutable fields on a task.
+
+    Each provided flag replaces the corresponding value. Omitted flags are
+    left unchanged. Lists (labels, roles, relevant_files) are replaced
+    wholesale — not merged.
+    """
+    fields: dict[str, object] = {}
+    if title is not None:
+        fields["title"] = title
+    if description is not None:
+        fields["description"] = description
+    if priority is not None:
+        fields["priority"] = priority
+    if label is not None:
+        fields["labels"] = list(label)
+    if role is not None:
+        roles: dict[str, str] = {}
+        for r in role:
+            k, v = _parse_role(r)
+            roles[k] = v
+        fields["roles"] = roles
+    if acceptance_criteria is not None:
+        fields["acceptance_criteria"] = acceptance_criteria
+    if constraints is not None:
+        fields["constraints"] = constraints
+    if relevant_files is not None:
+        fields["relevant_files"] = list(relevant_files)
+
+    if not fields:
+        typer.echo("Error: no updatable fields provided.", err=True)
+        raise typer.Exit(code=1)
+
+    svc = _svc(db, project=_project_from_task_id(task_id))
+    task = _run(svc.update, task_id, **fields)
+    if output_json:
+        typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
+    else:
+        typer.echo(f"Updated {task.task_id} — fields: {', '.join(sorted(fields))}")
+
+
 @task_app.command("queue")
 def task_queue(
     task_id: str = typer.Argument(..., help="Task ID (project/number)"),
@@ -608,6 +662,182 @@ def task_link(
     svc = _svc(db, project=_project_from_task_id(from_id))
     _run(svc.link, from_id, to_id, kind)
     typer.echo(f"Linked {from_id} --{kind}--> {to_id}")
+
+
+@task_app.command("unlink")
+def task_unlink(
+    to_id: str = typer.Argument(..., help="Target task ID (the relationship's destination)"),
+    from_id: str = typer.Option(..., "--from", help="Source task ID (the relationship's origin)"),
+    kind: str = typer.Option("blocks", "--kind", "-k", help="Link kind: blocks, relates_to, supersedes, parent"),
+    db: str = _DB_OPTION,
+) -> None:
+    """Remove a relationship between two tasks."""
+    svc = _svc(db, project=_project_from_task_id(from_id))
+    _run(svc.unlink, from_id, to_id, kind)
+    typer.echo(f"Unlinked {from_id} --{kind}--> {to_id}")
+
+
+@task_app.command("block")
+def task_block(
+    task_id: str = typer.Argument(..., help="Task ID to mark as blocked"),
+    blocker: str = typer.Option(..., "--blocker", help="Blocker task ID"),
+    actor: str = typer.Option("cli", "--actor", help="Actor performing the block"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Mark a task as blocked by another task."""
+    svc = _svc(db, project=_project_from_task_id(task_id))
+    task = _run(svc.block, task_id, actor, blocker)
+    if output_json:
+        typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
+    else:
+        typer.echo(f"Blocked {task.task_id} on {blocker}")
+
+
+@task_app.command("dependents")
+def task_dependents(
+    task_id: str = typer.Argument(..., help="Task ID"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Show tasks transitively blocked by this task."""
+    svc = _svc(db, project=_project_from_task_id(task_id))
+    deps = _run(svc.dependents, task_id)
+    if output_json:
+        typer.echo(json.dumps([_task_to_dict(t) for t in deps], indent=2, default=str))
+        return
+    if not deps:
+        typer.echo(f"No dependents for {task_id}.")
+        return
+    typer.echo(f"Dependents of {task_id}:")
+    for t in deps:
+        typer.echo(f"  {t.task_id:<20} {t.work_status.value:<14} {t.title}")
+
+
+@task_app.command("get-execution")
+def task_get_execution(
+    task_id: str = typer.Argument(..., help="Task ID (project/number)"),
+    node: Optional[str] = typer.Option(None, "--node", help="Filter by node_id"),
+    visit: Optional[int] = typer.Option(None, "--visit", help="Filter by visit number"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Show flow node execution records for a task."""
+    svc = _svc(db, project=_project_from_task_id(task_id))
+    executions = _run(svc.get_execution, task_id, node, visit)
+
+    def _exec_to_dict(ex) -> dict:
+        status = ex.status.value if hasattr(ex.status, "value") else ex.status
+        decision = (
+            ex.decision.value
+            if ex.decision and hasattr(ex.decision, "value")
+            else ex.decision
+        )
+        wo = None
+        if ex.work_output:
+            wo = {
+                "type": ex.work_output.type.value
+                if hasattr(ex.work_output.type, "value")
+                else ex.work_output.type,
+                "summary": ex.work_output.summary,
+                "artifacts": [
+                    {
+                        "kind": a.kind.value if hasattr(a.kind, "value") else a.kind,
+                        "description": a.description,
+                        "ref": a.ref,
+                        "path": a.path,
+                        "external_ref": a.external_ref,
+                    }
+                    for a in ex.work_output.artifacts
+                ],
+            }
+        return {
+            "node_id": ex.node_id,
+            "visit": ex.visit,
+            "status": status,
+            "decision": decision,
+            "decision_reason": ex.decision_reason,
+            "started_at": str(ex.started_at) if ex.started_at else None,
+            "completed_at": str(ex.completed_at) if ex.completed_at else None,
+            "work_output": wo,
+        }
+
+    if output_json:
+        typer.echo(
+            json.dumps([_exec_to_dict(e) for e in executions], indent=2, default=str)
+        )
+        return
+
+    if not executions:
+        typer.echo("No execution records.")
+        return
+
+    for ex in executions:
+        status = ex.status.value if hasattr(ex.status, "value") else ex.status
+        line = f"{ex.node_id} v{ex.visit}: {status}"
+        if ex.decision:
+            dec = ex.decision.value if hasattr(ex.decision, "value") else ex.decision
+            line += f" ({dec})"
+            if ex.decision_reason:
+                line += f" — {ex.decision_reason}"
+        typer.echo(line)
+        if ex.work_output:
+            typer.echo(f"  output: {ex.work_output.summary}")
+
+
+@task_app.command("validate-advance")
+def task_validate_advance(
+    task_id: str = typer.Argument(..., help="Task ID (project/number)"),
+    actor: str = typer.Option(..., "--actor", help="Actor attempting to advance"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Dry-run: would this actor be allowed to advance the current node?
+
+    Evaluates all gates on the current node plus an actor-vs-role check
+    without modifying any state. Exits non-zero if any hard gate fails.
+    """
+    svc = _svc(db, project=_project_from_task_id(task_id))
+    results = _run(svc.validate_advance, task_id, actor)
+
+    def _result_to_dict(r) -> dict:
+        return {
+            "gate_name": r.gate_name,
+            "gate_type": r.gate_type,
+            "passed": r.passed,
+            "reason": r.reason,
+        }
+
+    hard_fails = [r for r in results if not r.passed and r.gate_type != "soft"]
+
+    if output_json:
+        typer.echo(
+            json.dumps(
+                {
+                    "task_id": task_id,
+                    "actor": actor,
+                    "results": [_result_to_dict(r) for r in results],
+                    "would_advance": not hard_fails,
+                },
+                indent=2,
+            )
+        )
+    else:
+        if not results:
+            typer.echo("No active node — nothing to validate.")
+            return
+        for r in results:
+            mark = "PASS" if r.passed else "FAIL"
+            gtype = f" ({r.gate_type})" if r.gate_type else ""
+            name = r.gate_name or "(unnamed)"
+            typer.echo(f"  {mark} {name}{gtype}: {r.reason}")
+        if hard_fails:
+            typer.echo(f"Would NOT advance: {len(hard_fails)} hard gate(s) failing.")
+        else:
+            typer.echo("Would advance.")
+
+    if hard_fails:
+        raise typer.Exit(code=1)
 
 
 @task_app.command("context")

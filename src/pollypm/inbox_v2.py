@@ -70,6 +70,142 @@ def _inbox_root(project_root: Path) -> Path:
     return root
 
 
+# ---------------------------------------------------------------------------
+# Dedup index — avoids O(n) scans over all message folders on every notify.
+# Keyed by hash(normalized subject + recipient); stored append-only in JSON.
+# File lives at .pollypm/inbox/messages/_dedup_index.json.
+# ---------------------------------------------------------------------------
+
+_DEDUP_INDEX_NAME = "_dedup_index.json"
+# Common short words stripped before hashing so dedup matches semantic subjects.
+_DEDUP_SKIP_WORDS = frozenset({
+    "done", "task", "update", "the", "and", "for", "from", "with", "new",
+})
+
+
+def _dedup_index_path(project_root: Path) -> Path:
+    return _inbox_root(project_root) / _DEDUP_INDEX_NAME
+
+
+def _subject_fingerprint(subject: str) -> str:
+    """Derive a stable fingerprint from a subject for dedup matching.
+
+    Lowercases, drops short/common words, sorts the remaining significant
+    words, and joins. Two subjects producing the same fingerprint are
+    considered "about the same thing".
+    """
+    words = sorted(
+        w for w in subject.lower().split()
+        if len(w) >= 3 and w not in _DEDUP_SKIP_WORDS
+    )
+    return " ".join(words)
+
+
+def _dedup_key(subject: str, to: str) -> str:
+    """Key for the dedup index: recipient + fingerprint."""
+    return f"{to}|{_subject_fingerprint(subject)}"
+
+
+def _load_dedup_index(project_root: Path) -> dict:
+    path = _dedup_index_path(project_root)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def _save_dedup_index(project_root: Path, index: dict) -> None:
+    try:
+        atomic_write_text(_dedup_index_path(project_root), json.dumps(index) + "\n")
+    except OSError:
+        pass  # Index is a cache, never block the write path on it.
+
+
+def _dedup_index_put(
+    project_root: Path, *, subject: str, to: str, msg_id: str, updated_at: str,
+) -> None:
+    """Insert/update the dedup index with a newly-created or replied-to message."""
+    fp = _subject_fingerprint(subject)
+    if not fp:
+        return  # No significant words — nothing to dedup on.
+    key = f"{to}|{fp}"
+    index = _load_dedup_index(project_root)
+    existing = index.get(key)
+    # Keep the most recent entry for a key.
+    if not existing or existing.get("updated_at", "") <= updated_at:
+        index[key] = {"id": msg_id, "updated_at": updated_at, "subject": subject}
+        _save_dedup_index(project_root, index)
+
+
+def find_recent_duplicate(
+    project_root: Path, *, subject: str, to: str, since_iso: str,
+) -> InboxMessage | None:
+    """Look up a recent duplicate message by subject fingerprint.
+
+    Returns the matching InboxMessage if one exists whose fingerprint matches
+    and whose updated_at >= since_iso. O(1) lookup via the dedup index, with a
+    lazy rebuild if the index is missing or stale for that key.
+    """
+    fp = _subject_fingerprint(subject)
+    if not fp:
+        return None
+    key = f"{to}|{fp}"
+    index = _load_dedup_index(project_root)
+    hit = index.get(key)
+    if hit and hit.get("updated_at", "") >= since_iso:
+        # Verify the message still exists and matches the recipient.
+        try:
+            state_path = _msg_dir(project_root, hit["id"]) / "state.json"
+            if state_path.exists():
+                state = json.loads(state_path.read_text())
+                msg_to = state.get("to") or (
+                    state["owner"] if state.get("owner") != "user" else "user"
+                )
+                if msg_to == to:
+                    return InboxMessage(
+                        id=state["id"],
+                        subject=state["subject"],
+                        status=state.get("status", "open"),
+                        owner=state.get("owner", ""),
+                        created_at=state.get("created_at", ""),
+                        updated_at=state.get("updated_at", ""),
+                        message_count=state.get("message_count", 1),
+                        sender=state.get("sender", ""),
+                        to=msg_to,
+                        delivery_state=state.get("delivery_state", ""),
+                        last_delivered_at=state.get("last_delivered_at", ""),
+                        parent_id=state.get("parent_id", ""),
+                        read=bool(state.get("read", False)),
+                        project=state.get("project", ""),
+                        path=state_path.parent,
+                    )
+        except (OSError, json.JSONDecodeError, KeyError, ValueError):
+            pass
+    return None
+
+
+def rebuild_dedup_index(project_root: Path) -> dict:
+    """Rebuild the dedup index from on-disk messages. O(n) one-time cost."""
+    index: dict = {}
+    for msg in list_messages(project_root, status="all"):
+        fp = _subject_fingerprint(msg.subject)
+        if not fp:
+            continue
+        key = f"{msg.to}|{fp}"
+        existing = index.get(key)
+        if not existing or existing.get("updated_at", "") <= msg.updated_at:
+            index[key] = {
+                "id": msg.id, "updated_at": msg.updated_at, "subject": msg.subject,
+            }
+    _save_dedup_index(project_root, index)
+    return index
+
+
 def _msg_dir(project_root: Path, msg_id: str) -> Path:
     import re
     if not re.match(r"^[a-zA-Z0-9._-]+$", msg_id):
@@ -169,6 +305,12 @@ def create_message(
     }
     _append_audit(state, "created", by=sender, to=recipient)
     atomic_write_text(msg_dir / "state.json", json.dumps(state, indent=2) + "\n")
+
+    # Update dedup index so future notify calls are O(1) instead of O(n).
+    _dedup_index_put(
+        project_root, subject=subject, to=recipient,
+        msg_id=msg_id, updated_at=ts.isoformat(),
+    )
 
     # Sync to DB for efficient querying
     try:
@@ -304,6 +446,12 @@ def reply_to_message(
         state["owner"] = "user"
     atomic_write_text(msg_dir / "state.json", json.dumps(state, indent=2) + "\n")
 
+    # Refresh dedup index — a reply bumps the thread's recency.
+    _dedup_index_put(
+        project_root, subject=state["subject"], to=recipient,
+        msg_id=state["id"], updated_at=ts.isoformat(),
+    )
+
     # Sync to DB
     try:
         from pollypm.storage.state import StateStore
@@ -350,6 +498,10 @@ def _user_was_notified(project_root: Path, parent_msg_id: str) -> bool:
 
     Looks for any message TO the user with this msg_id as parent_id,
     or whose subject contains the parent's subject.
+
+    Uses fields already loaded by list_messages (parent_id, subject, to) —
+    no per-message state.json re-reads, so cost is O(n) file reads instead of
+    O(2n). The one-time load for parent_subject uses the parent's own folder.
     """
     try:
         parent_dir = _msg_dir(project_root, parent_msg_id)
@@ -358,19 +510,16 @@ def _user_was_notified(project_root: Path, parent_msg_id: str) -> bool:
     except Exception:  # noqa: BLE001
         return False
 
-    # Check all messages for one that notifies the user about this thread
+    parent_prefix = parent_subject[:30].lower() if parent_subject else ""
     for msg in list_messages(project_root, status="all"):
-        if msg.to == "user" and msg.id != parent_msg_id:
-            # Check parent_id link
-            try:
-                msg_state = json.loads((_msg_dir(project_root, msg.id) / "state.json").read_text())
-                if msg_state.get("parent_id") == parent_msg_id:
-                    return True
-            except Exception:  # noqa: BLE001
-                pass
-            # Check subject overlap (fuzzy match for related notifications)
-            if parent_subject and parent_subject[:30].lower() in msg.subject.lower():
-                return True
+        if msg.to != "user" or msg.id == parent_msg_id:
+            continue
+        # parent_id is already loaded into InboxMessage — no extra I/O.
+        if msg.parent_id == parent_msg_id:
+            return True
+        # Fuzzy subject match for related notifications.
+        if parent_prefix and parent_prefix in msg.subject.lower():
+            return True
     return False
 
 

@@ -37,6 +37,7 @@ from pollypm.storage.state import AlertRecord, LeaseRecord, StateStore
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from pollypm.core import CoreRail
     from pollypm.tmux.client import TmuxWindow
 
 
@@ -120,13 +121,34 @@ class Supervisor:
         "switch-session-account",
     }
 
-    def __init__(self, config: PollyPMConfig, *, readonly_state: bool = False) -> None:
+    def __init__(
+        self,
+        config: PollyPMConfig,
+        *,
+        readonly_state: bool = False,
+        core_rail: "CoreRail | None" = None,
+    ) -> None:
         self.config = config
         self.readonly_state = readonly_state
-        self.store = StateStore(config.project.state_db, readonly=readonly_state)
+        if core_rail is not None:
+            self._core_rail = core_rail
+            self.store = core_rail.get_state_store()
+        else:
+            self.store = StateStore(config.project.state_db, readonly=readonly_state)
+            # Lazy-import to avoid import cycles (core imports nothing from
+            # supervisor, but keep the reference local to be safe).
+            from pollypm.core import CoreRail as _CoreRail
+            from pollypm.plugin_host import extension_host_for_root
+            plugin_host = extension_host_for_root(str(config.project.root_dir.resolve()))
+            self._core_rail = _CoreRail(config, self.store, plugin_host)
         self._cached_launches: list[SessionLaunchSpec] | None = None
         # Lazy-init session service to avoid circular imports at construction
         self._session_service = None
+
+    @property
+    def core_rail(self) -> "CoreRail":
+        """Return the CoreRail this Supervisor is bound to."""
+        return self._core_rail
 
     @property
     def session_service(self):

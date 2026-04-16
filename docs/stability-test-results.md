@@ -89,9 +89,17 @@
 - Russell ran pytest on expense-tracker (tests passed but CLI wasn't built)
 - Russell ran recipe_share CLI manually: tested list, search, export, edge cases
 - Russell checked git branches and found zero commits on expense_tracker task branches
-- Russell REJECTED 2 tasks with specific feedback (worktree code gap)
-- Russell APPROVED 1 task after manual verification
-- Rejection rate: 2/3 — quality gate is real, not rubber-stamp
+- Russell REJECTED expense_tracker/8,9 with specific feedback (worktree code gap)
+- Russell APPROVED recipe_share/10 after manual CLI verification
+- Russell APPROVED team_standup/13 — tested all 4 subcommands, found it also fixes merge conflicts on main
+- Russell's team_standup review: "Code is clean — stdlib only, good separation of concerns, type hints throughout"
+- expense_tracker/8,9 REWORKED and RESUBMITTED — reject → fix → resubmit cycle verified
+- Rejection rate: 2/5 decisions — quality gate is real, not rubber-stamp
+
+### CLI Verification
+- recipe_share CLI: WORKS (tested add, list, search by ingredient, export to markdown)
+- team_standup CLI: WORKS from task branch (post, list, missing, serve)
+- expense_tracker CLI: pending re-review
 
 ### Issues Found
 1. `worker-start` is a blocking call — Polly can't process other specs while waiting for it to finish. Should be async or have a timeout.

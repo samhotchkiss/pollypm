@@ -40,8 +40,6 @@ _SUPERVISOR_IMPORT_ALLOWLIST: frozenset[str] = frozenset(
         # Step 8 targets (internal integrations — migrate to CoreRail /
         # service_api as the rail grows):
         "src/pollypm/heartbeats/api.py",
-        "src/pollypm/inbox_delivery.py",
-        "src/pollypm/inbox_processor.py",
         "src/pollypm/job_runner.py",
         "src/pollypm/plugins_builtin/core_recurring/plugin.py",
         "src/pollypm/schedulers/base.py",

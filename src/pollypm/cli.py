@@ -9,7 +9,6 @@ from pathlib import Path
 
 import typer
 
-from pollypm.account_tui import AccountsApp
 from pollypm.accounts import (
     add_account_via_login,
     list_account_statuses,
@@ -17,7 +16,6 @@ from pollypm.accounts import (
     relogin_account,
     remove_account as remove_account_entry,
 )
-from pollypm.cockpit_ui import PollyCockpitApp, PollyCockpitPaneApp, PollyDashboardApp, PollySettingsPaneApp
 from pollypm.config import (
     DEFAULT_CONFIG_PATH,
     GLOBAL_CONFIG_DIR,
@@ -37,8 +35,6 @@ from pollypm.inbox_v2 import (
 )
 from pollypm.tz import format_time as _fmt_time
 from pollypm.models import ProviderKind
-from pollypm.onboarding import run_onboarding
-from pollypm.control_tui import PollyPMApp
 from pollypm.service_api import PollyPMService
 from pollypm.service_api import render_json
 from pollypm.projects import (
@@ -142,6 +138,7 @@ def _require_pollypm_session(supervisor: Supervisor) -> None:
 
 
 def _first_run_setup_and_launch(config_path: Path) -> None:
+    from pollypm.onboarding import run_onboarding
     path = run_onboarding(config_path=config_path, force=False)
     _install_global_pollypm(path.parent)
     up(config_path=path)
@@ -181,6 +178,7 @@ def onboard(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="Path to write the onboarding config."),
     force: bool = typer.Option(False, "--force", help="Overwrite an existing config file."),
 ) -> None:
+    from pollypm.onboarding import run_onboarding
     path = run_onboarding(config_path=config_path, force=force)
     installed, install_output = _install_global_pollypm(path.parent)
     typer.echo("")
@@ -294,6 +292,7 @@ def tokens(
 def accounts_ui(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
+    from pollypm.account_tui import AccountsApp
     AccountsApp(config_path).run()
 
 
@@ -301,6 +300,7 @@ def accounts_ui(
 def ui(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
+    from pollypm.control_tui import PollyPMApp
     PollyPMApp(config_path).run()
 
 
@@ -315,6 +315,7 @@ def cockpit(
     try:
         with open(debug_log, "a") as dl:
             dl.write(f"\n--- START {datetime.now().isoformat()} ---\n")
+        from pollypm.cockpit_ui import PollyCockpitApp
         PollyCockpitApp(config_path).run(mouse=True)
         with open(debug_log, "a") as dl:
             dl.write(f"--- CLEAN EXIT {datetime.now().isoformat()} ---\n")
@@ -339,6 +340,7 @@ def cockpit_pane(
         PollyProjectSettingsApp(config_path, target).run(mouse=True)
         return
     if kind == "settings":
+        from pollypm.cockpit_ui import PollySettingsPaneApp
         PollySettingsPaneApp(config_path).run(mouse=True)
         return
     if kind in ("polly", "dashboard"):
@@ -353,6 +355,7 @@ def cockpit_pane(
         from pollypm.cockpit_ui import PollyTasksApp
         PollyTasksApp(config_path, target).run(mouse=True)
         return
+    from pollypm.cockpit_ui import PollyCockpitPaneApp
     PollyCockpitPaneApp(config_path, kind, target).run(mouse=True)
 
 

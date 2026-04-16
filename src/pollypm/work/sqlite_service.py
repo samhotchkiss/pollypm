@@ -1993,7 +1993,7 @@ class SQLiteWorkService:
                     WorkStatus.BLOCKED.value,
                     WorkStatus.QUEUED.value,
                     "system",
-                    f"auto-unblocked, blocker #{task.task_id} completed",
+                    f"auto-unblocked, blocker {task.task_id} completed",
                 )
                 self._conn.execute(
                     "UPDATE work_tasks SET work_status = ?, updated_at = ? "
@@ -2024,7 +2024,7 @@ class SQLiteWorkService:
             self.add_context(
                 blocked_id,
                 "system",
-                f"blocker #{task.task_id} was cancelled "
+                f"blocker {task.task_id} was cancelled "
                 f"— PM must decide whether to unblock or cancel this task.",
             )
 

@@ -151,12 +151,23 @@ draft ──→ queued ──→ in_progress ──→ review ──→ done
             │
             ├── on_hold ◄── in_progress
             │     │
-            │     └── queued (resumed)
+            │     ├── queued (resumed — was queued)
+            │     │
+            │     └── in_progress (resumed mid-work — was in_progress)
             │
             └── on_hold (queued → on_hold)
 
 Any non-terminal state ──→ cancelled
 ```
+
+#### Hold / Resume Semantics
+
+`hold()` can pause a task from either `queued` or `in_progress`. `resume()` returns the task to the state it was in before the hold:
+
+- A task held from `queued` resumes to `queued`.
+- A task held from `in_progress` resumes to `in_progress`. Its `current_node_id` and the associated `FlowNodeExecution` record survive the hold — the worker picks up at the same node on the same visit. This preserves mid-work progress across intentional pauses (e.g., waiting out a dependency that isn't formally blocking, deferring to higher priority work).
+
+The resume path is determined by the active flow node: if a node is active, resume transitions to `in_progress`; otherwise it transitions to `queued`.
 
 ### Content
 
@@ -564,6 +575,21 @@ class SyncAdapter(Protocol):
 - `on_update` → rewrites the markdown content
 - `poll_inbound` → not implemented (one-way sync)
 
+The adapter projects every `work_status` onto one of five physical folders. Tooling (UIs, scripts, heartbeat checks) may rely on this mapping being stable:
+
+| `work_status` | Folder |
+|---------------|--------|
+| `draft` | `00-not-ready` |
+| `queued` | `01-ready` |
+| `in_progress` | `02-in-progress` |
+| `blocked` | `02-in-progress` |
+| `review` | `03-needs-review` |
+| `on_hold` | `00-not-ready` |
+| `done` | `05-completed` |
+| `cancelled` | `05-completed` |
+
+`blocked` and `on_hold` do not have dedicated folders. `blocked` maps to `02-in-progress` because a blocked task is still in an active work session (the worker is waiting on a dependency, not paused). `on_hold` maps to `00-not-ready` because a held task is intentionally not being worked on and behaves like a scoped-but-parked task for folder-listing purposes. Consumers that need to distinguish these states should read `work_status` from the task record rather than inferring state from folder position.
+
 **GitHub Adapter**: Syncs with GitHub Issues via labels.
 
 - `on_create` → creates a GitHub issue with the appropriate state label
@@ -654,11 +680,15 @@ If `pm task next` returns null, the worker goes idle. The heartbeat detects the 
 
 ## 12. Open Questions
 
-### ~~OQ-1: Task ID Format~~ — RESOLVED
+### ~~OQ-1: Task ID Format~~ — PARTIALLY RESOLVED, DOT-NOTATION DEFERRED (post-v1)
 
-Sequential numeric, scoped per project. Each project starts at `#0001`. Subtasks use dot notation: `#42.1`, `#42.2`. Cross-project references prepend the project slug: `otter-camp#42`. Within a project, the slug is optional — `#42` is sufficient. This mirrors GitHub's `owner/repo#123` convention.
+Sequential numeric, scoped per project. Each project starts at `#0001`. Cross-project references prepend the project slug: `otter-camp#42`. Within a project, the slug is optional — `#42` is sufficient. This mirrors GitHub's `owner/repo#123` convention.
 
 The work service stores `(project, task_number)` as the compound key. Display format is assembled by the caller based on context.
+
+**Dot-notation subtasks (`#42.1`, `#42.2`) are deferred post-v1.** Implementing dot-notation would require extending the primary key to `(project, parent_number, subtask_number)` or parsing subtask IDs into a nested structure — a non-trivial data model change that is not worth blocking v1. For v1, subtasks live as top-level tasks linked to their parent via the `parent` relationship (see §4 Relationships). This preserves the parent/child semantics and the `all_children_done` gate; what it loses is the display-level identity (a subtask of `#42` is `#43`, not `#42.1`).
+
+Future work tracker: see GitHub issue #141.
 
 ### ~~OQ-2: Context Log Compaction~~ — DEFERRED (post-v1)
 

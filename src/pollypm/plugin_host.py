@@ -60,7 +60,12 @@ class ExtensionHost:
     def get_agent_profile(self, name: str) -> object:
         return self._resolve_factory(name, lambda plugin: plugin.agent_profiles, "agent profile")
 
-    def _resolve_factory(self, name: str, registry_getter, kind: str) -> object:
+    def get_session_service(self, name: str, **kwargs: object) -> object:
+        return self._resolve_factory(
+            name, lambda plugin: plugin.session_services, "session service", **kwargs,
+        )
+
+    def _resolve_factory(self, name: str, registry_getter, kind: str, **kwargs: object) -> object:
         registry: dict[str, object] = {}
         sources: dict[str, str] = {}
         for plugin in self.plugins().values():
@@ -75,7 +80,7 @@ class ExtensionHost:
         factory = registry.get(name)
         if factory is not None:
             try:
-                return factory()
+                return factory(**kwargs)
             except Exception as exc:
                 self.errors.append(f"Plugin factory for {kind} '{name}' crashed: {exc}")
                 raise ValueError(f"Plugin {kind} '{name}' failed to initialize: {exc}") from exc

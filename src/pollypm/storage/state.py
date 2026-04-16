@@ -199,6 +199,17 @@ CREATE TABLE IF NOT EXISTS memory_summaries (
 
 
 @dataclass(slots=True)
+class SessionRecord:
+    name: str
+    role: str
+    project: str
+    provider: str
+    account: str
+    cwd: str
+    window_name: str
+
+
+@dataclass(slots=True)
 class EventRecord:
     session_name: str
     event_type: str
@@ -518,6 +529,18 @@ class StateStore:
             (name, role, project, provider, account, cwd, window_name),
         )
         self.commit()
+
+    def list_sessions(self) -> list[SessionRecord]:
+        rows = self.execute(
+            "SELECT name, role, project, provider, account, cwd, window_name FROM sessions"
+        ).fetchall()
+        return [
+            SessionRecord(
+                name=r[0], role=r[1], project=r[2], provider=r[3],
+                account=r[4], cwd=r[5], window_name=r[6],
+            )
+            for r in rows
+        ]
 
     def prune_sessions(self, valid_session_names: set[str]) -> None:
         now = self._now()

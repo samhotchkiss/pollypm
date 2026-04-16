@@ -121,6 +121,16 @@ class Supervisor:
         self.tmux = TmuxClient()
         self.store = StateStore(config.project.state_db, readonly=readonly_state)
         self._cached_launches: list[SessionLaunchSpec] | None = None
+        # Lazy-init session service to avoid circular imports at construction
+        self._session_service = None
+
+    @property
+    def session_service(self):
+        """The session service handles all tmux session mechanics."""
+        if self._session_service is None:
+            from pollypm.session_services.tmux import TmuxSessionService
+            self._session_service = TmuxSessionService(config=self.config, store=self.store)
+        return self._session_service
 
     def _effective_session(self, session: SessionConfig, controller_account: str | None = None) -> SessionConfig:
         effective = session

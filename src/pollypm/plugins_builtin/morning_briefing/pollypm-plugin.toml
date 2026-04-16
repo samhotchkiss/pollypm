@@ -1,0 +1,21 @@
+api_version = "1"
+name = "morning_briefing"
+kind = "recurring"
+version = "0.1.0"
+entrypoint = "plugin.py:plugin"
+description = "Morning briefing: once-a-day summary of yesterday's activity and today's priorities, delivered to the inbox at 6 a.m. local."
+
+[[capabilities]]
+kind = "agent_profile"
+name = "herald"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "job_handler"
+name = "briefing.tick"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "roster_entry"
+name = "briefing.tick"
+requires_api = ">=1,<2"

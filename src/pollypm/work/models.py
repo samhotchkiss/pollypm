@@ -166,6 +166,11 @@ class FlowNode:
     next_node_id: str | None = None
     reject_node_id: str | None = None
     gates: list[str] = field(default_factory=list)
+    # Optional per-node wall-clock budget in seconds. ``None`` means
+    # "no flow-level cap — whatever the session runtime imposes wins."
+    # Consumed by the planner's per-stage budget helper (pp07); other
+    # flows may adopt the same field if they want policy-driven caps.
+    budget_seconds: int | None = None
 
 
 @dataclass(slots=True)

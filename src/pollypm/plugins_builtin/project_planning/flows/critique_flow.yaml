@@ -5,6 +5,10 @@ description: >-
   The output_present gate ensures the critic supplied non-empty
   structured output before the task can move to terminal.
 
+  Per-critic budget default is 5 minutes per spec §6. Override via
+  [planner.budgets].critic in pollypm.toml (applies uniformly to all
+  critic subtasks).
+
 roles:
   critic:
     description: >-
@@ -23,6 +27,7 @@ nodes:
     actor_role: critic
     next_node: done
     gates: [output_present]
+    budget_seconds: 300  # 5 min per critic per spec §6
 
   done:
     type: terminal

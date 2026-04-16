@@ -787,3 +787,102 @@ def test_critic_panel_all_five_critics_assigned() -> None:
     )
     assert set(result.assignments.keys()) == set(CRITIC_NAMES)
     assert len(CRITIC_NAMES) == 5
+
+
+# ---------------------------------------------------------------------------
+# pp07 — per-stage time budgets via flow-engine node schema
+# ---------------------------------------------------------------------------
+
+
+def test_plan_project_nodes_have_default_budgets() -> None:
+    template = resolve_flow("plan_project")
+    # Every "work" node that has a spec-§6 default should carry a
+    # budget_seconds value on the YAML.
+    for stage in ("research", "discover", "decompose", "test_strategy",
+                  "magic", "synthesize"):
+        assert template.nodes[stage].budget_seconds is not None, (
+            f"{stage} missing budget_seconds"
+        )
+    # Terminal + user_approval + emit intentionally have no budgets.
+    assert template.nodes["user_approval"].budget_seconds is None
+    assert template.nodes["emit"].budget_seconds is None
+    assert template.nodes["done"].budget_seconds is None
+
+
+def test_critique_flow_has_per_critic_budget() -> None:
+    template = resolve_flow("critique_flow")
+    assert template.nodes["critique"].budget_seconds == 300
+
+
+def test_effective_budget_defaults_when_no_config() -> None:
+    from pollypm.plugins_builtin.project_planning.budgets import (
+        DEFAULT_BUDGETS, effective_budget,
+    )
+    assert effective_budget("research") == DEFAULT_BUDGETS["research"]
+    assert effective_budget("critic") == DEFAULT_BUDGETS["critic"]
+    # Unknown stage with no node default → None.
+    assert effective_budget("bogus") is None
+
+
+def test_effective_budget_honours_node_default() -> None:
+    from pollypm.plugins_builtin.project_planning.budgets import (
+        effective_budget,
+    )
+    # Node default overrides DEFAULT_BUDGETS when config is absent.
+    assert effective_budget("magic", node_default=1200) == 1200
+    # …but only when positive.
+    assert effective_budget("magic", node_default=0) == 600  # falls to default
+
+
+def test_effective_budget_config_override_lifts_cap() -> None:
+    """Acceptance gate for pp07: overriding [planner.budgets].decompose
+    in pollypm.toml lifts the cap."""
+    from pollypm.plugins_builtin.project_planning.budgets import (
+        effective_budget,
+    )
+    config = {"planner": {"budgets": {"decompose": 900}}}
+    assert effective_budget("decompose", config=config) == 900
+    # Other stages still use their defaults.
+    assert effective_budget("research", config=config) == 600
+
+
+def test_effective_budget_config_overrides_node_default() -> None:
+    from pollypm.plugins_builtin.project_planning.budgets import (
+        effective_budget,
+    )
+    config = {"planner": {"budgets": {"magic": 1800}}}
+    # Config beats node default.
+    assert effective_budget("magic", config=config, node_default=1200) == 1800
+
+
+def test_all_effective_budgets_merges_config_and_defaults() -> None:
+    from pollypm.plugins_builtin.project_planning.budgets import (
+        DEFAULT_BUDGETS, all_effective_budgets,
+    )
+    config = {"planner": {"budgets": {"decompose": 900}}}
+    snapshot = all_effective_budgets(config=config)
+    assert snapshot["decompose"] == 900
+    # Other stages unchanged.
+    assert snapshot["research"] == DEFAULT_BUDGETS["research"]
+
+
+def test_flow_engine_rejects_non_positive_budget(tmp_path: Path) -> None:
+    import pytest
+
+    from pollypm.work.flow_engine import FlowValidationError, parse_flow_yaml
+
+    text = """
+name: bad
+description: bad budget
+nodes:
+  work:
+    type: work
+    actor_type: human
+    next_node: done
+    budget_seconds: -5
+  done:
+    type: terminal
+start_node: work
+"""
+    with pytest.raises(FlowValidationError):
+        parse_flow_yaml(text)

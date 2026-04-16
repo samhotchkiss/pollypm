@@ -51,6 +51,14 @@ def _parse_node(name: str, data: dict) -> FlowNode:
                 f"Valid actor types: {[a.value for a in ActorType]}"
             )
 
+    budget_seconds = data.get("budget_seconds")
+    if budget_seconds is not None:
+        if not isinstance(budget_seconds, int) or budget_seconds <= 0:
+            raise FlowValidationError(
+                f"Node '{name}': budget_seconds must be a positive integer, "
+                f"got {budget_seconds!r}."
+            )
+
     return FlowNode(
         name=name,
         type=node_type,
@@ -60,6 +68,7 @@ def _parse_node(name: str, data: dict) -> FlowNode:
         next_node_id=data.get("next_node"),
         reject_node_id=data.get("reject_node"),
         gates=data.get("gates", []),
+        budget_seconds=budget_seconds,
     )
 
 

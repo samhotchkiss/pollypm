@@ -213,8 +213,12 @@ class SessionManager:
         try:
             prompt_path.parent.mkdir(parents=True, exist_ok=True)
             prompt_path.write_text(task_prompt)
-        except OSError:
-            logger.warning("Could not write task prompt to %s", prompt_path)
+        except OSError as exc:
+            # Worker's kickoff references this file — if we can't write
+            # it, the worker will fail to bootstrap. Surface the reason.
+            logger.warning(
+                "Could not write task prompt to %s: %s", prompt_path, exc,
+            )
 
         window_name = f"task-{task_slug}"
         session_name = self._storage_closet_name
@@ -352,7 +356,7 @@ class SessionManager:
             if not self._tmux.has_session(session_name):
                 return
         except Exception as exc:  # noqa: BLE001
-            logger.debug(
+            logger.warning(
                 "_kill_stale_task_window: has_session(%s) failed: %s",
                 session_name,
                 exc,
@@ -362,7 +366,7 @@ class SessionManager:
         try:
             windows = self._tmux.list_windows(session_name)
         except Exception as exc:  # noqa: BLE001
-            logger.debug(
+            logger.warning(
                 "_kill_stale_task_window: list_windows(%s) failed: %s",
                 session_name,
                 exc,
@@ -859,15 +863,15 @@ def _worktree_is_registered(project_path: Path, worktree_path: Path) -> bool:
             timeout=60,
         )
     except (subprocess.TimeoutExpired, OSError) as exc:
-        logger.debug(
+        logger.warning(
             "git worktree list failed for %s: %s", project_path, exc,
         )
         return False
 
     if result.returncode != 0:
-        logger.debug(
-            "git worktree list exit %d: %s",
-            result.returncode, result.stderr.strip(),
+        logger.warning(
+            "git worktree list exit %d for %s: %s",
+            result.returncode, project_path, result.stderr.strip(),
         )
         return False
 
@@ -966,7 +970,10 @@ def _parse_token_usage(jsonl_path: Path) -> tuple[int, int]:
                 if usage and isinstance(usage, dict):
                     input_tokens += usage.get("input_tokens", 0)
                     output_tokens += usage.get("output_tokens", 0)
-    except OSError:
-        logger.debug("Could not read JSONL file: %s", jsonl_path)
+    except OSError as exc:
+        logger.warning(
+            "Could not read JSONL file %s for token parsing: %s",
+            jsonl_path, exc,
+        )
 
     return input_tokens, output_tokens

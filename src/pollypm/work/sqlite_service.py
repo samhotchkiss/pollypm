@@ -941,8 +941,11 @@ class SQLiteWorkService:
         if self._session_mgr is not None:
             try:
                 self._session_mgr.teardown_worker(task_id)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "teardown_worker on cancel failed for %s: %s",
+                    task_id, exc,
+                )
         result = self.get(task_id)
         self._sync_transition(result, task.work_status.value, WorkStatus.CANCELLED.value)
         return result
@@ -1341,8 +1344,11 @@ class SQLiteWorkService:
             if self._session_mgr is not None:
                 try:
                     self._session_mgr.teardown_worker(task_id)
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "teardown_worker on done failed for %s: %s",
+                        task_id, exc,
+                    )
         self._sync_transition(result, task.work_status.value, result.work_status.value)
         return result
 
@@ -1426,8 +1432,11 @@ class SQLiteWorkService:
             if self._session_mgr is not None:
                 try:
                     self._session_mgr.teardown_worker(task_id)
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "teardown_worker on approve failed for %s: %s",
+                        task_id, exc,
+                    )
         self._sync_transition(result, task.work_status.value, result.work_status.value)
         return result
 
@@ -1550,8 +1559,10 @@ class SQLiteWorkService:
         if self._session_mgr is not None:
             try:
                 self._session_mgr.notify_rejection(task_id, reason)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "notify_rejection failed for %s: %s", task_id, exc,
+                )
         return result
 
     def block(self, task_id: str, actor: str, blocker_task_id: str) -> Task:

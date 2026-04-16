@@ -214,6 +214,11 @@ class SessionManager:
             f"claude --dangerously-skip-permissions"
         )
 
+        # Clear any stale window of the same name (e.g. a dead pane from
+        # a previous run that lingered because remain-on-exit=on). Without
+        # this, create_window is a no-op when the name already exists.
+        self._kill_stale_task_window(session_name, window_name)
+
         if self._session_service is not None:
             # Use a fresh_launch_marker so SessionService.create() knows
             # to send the kickoff as initial input.
@@ -256,6 +261,47 @@ class SessionManager:
                     break
         return pane_id
 
+    def _kill_stale_task_window(self, session_name: str, window_name: str) -> None:
+        """Kill a stale ``task-<slug>`` window before re-provisioning.
+
+        Because the storage-closet session is created with
+        ``remain-on-exit=on``, a prior worker's dead pane can linger in
+        the window and cause ``create_window`` to no-op. We defensively
+        clear it here.
+        """
+        try:
+            if not self._tmux.has_session(session_name):
+                return
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "_kill_stale_task_window: has_session(%s) failed: %s",
+                session_name,
+                exc,
+            )
+            return
+
+        try:
+            windows = self._tmux.list_windows(session_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "_kill_stale_task_window: list_windows(%s) failed: %s",
+                session_name,
+                exc,
+            )
+            return
+
+        for w in windows:
+            if getattr(w, "name", None) == window_name:
+                target = f"{session_name}:{window_name}"
+                try:
+                    self._tmux.kill_window(target)
+                    logger.debug("Cleared stale task window %s", target)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to clear stale task window %s: %s", target, exc,
+                    )
+                return
+
     # ------------------------------------------------------------------
     # Teardown
     # ------------------------------------------------------------------
@@ -295,12 +341,20 @@ class SessionManager:
             )
             jsonl_archived = archive_path is not None
 
-        # Kill tmux pane
-        if pane_id:
-            try:
-                self._tmux.kill_pane(pane_id)
-            except subprocess.CalledProcessError:
-                logger.debug("Pane %s already gone during teardown", pane_id)
+        # Kill tmux window (not just the pane). With remain-on-exit=on on
+        # the storage-closet session, kill_pane alone leaves a dead pane
+        # in a named window that blocks subsequent create_window calls.
+        task_slug = f"{project}-{task_number}"
+        window_name = f"task-{task_slug}"
+        window_target = f"{self._storage_closet_name}:{window_name}"
+        try:
+            self._tmux.kill_window(window_target)
+        except subprocess.CalledProcessError:
+            logger.debug("Window %s already gone during teardown", window_target)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "kill_window %s failed during teardown: %s", window_target, exc,
+            )
 
         # Remove worktree
         worktree_removed = False

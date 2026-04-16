@@ -214,14 +214,18 @@ class TestTeardownWorker:
         assert len(remove_calls) > 0
         assert result.worktree_removed is True
 
-    def test_teardown_worker_kills_pane(self, manager, mock_tmux, tmp_project):
-        session = self._provision(manager)
+    def test_teardown_worker_kills_window(self, manager, mock_tmux, tmp_project):
+        self._provision(manager)
 
         with patch("pollypm.work.session_manager.subprocess") as mock_sub:
             mock_sub.run.return_value = MagicMock(returncode=0, stderr="", stdout="")
             manager.teardown_worker("proj/1")
 
-        mock_tmux.kill_pane.assert_called_once_with(session.pane_id)
+        # Kill the window (not just the pane) so remain-on-exit=on can't
+        # leave a stale window blocking re-provision.
+        mock_tmux.kill_window.assert_called_once_with(
+            "pollypm-storage-closet:task-proj-1"
+        )
 
     def test_teardown_worker_idempotent(self, manager, mock_tmux, tmp_project):
         self._provision(manager)

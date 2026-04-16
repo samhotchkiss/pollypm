@@ -647,3 +647,143 @@ def test_synthesize_rationale_included_in_result() -> None:
     assert "Selected candidate A" in result.rationale
     assert "Average scores" in result.rationale
     assert "A:" in result.rationale and "B:" in result.rationale
+
+
+# ---------------------------------------------------------------------------
+# pp06 — critic panel provisioning + diversity resolver
+# ---------------------------------------------------------------------------
+
+
+def test_critic_panel_single_provider_all_same() -> None:
+    from pollypm.plugins_builtin.project_planning.critic_panel import (
+        resolve_critic_providers,
+    )
+    result = resolve_critic_providers(
+        registered_providers=["claude"],
+        planner_provider="claude",
+    )
+    assert set(result.assignments.values()) == {"claude"}
+    assert result.forced_cross_provider is None
+
+
+def test_critic_panel_two_providers_forces_diversity() -> None:
+    from pollypm.plugins_builtin.project_planning.critic_panel import (
+        resolve_critic_providers,
+    )
+    result = resolve_critic_providers(
+        registered_providers=["claude", "codex"],
+        planner_provider="claude",
+    )
+    # Default diversity target is critic_simplicity.
+    assert result.forced_cross_provider == "critic_simplicity"
+    assert result.assignments["critic_simplicity"] == "codex"
+    # At least one critic is on non-planner provider.
+    non_planner_critics = [
+        name for name, prov in result.assignments.items() if prov != "claude"
+    ]
+    assert len(non_planner_critics) >= 1
+    # Other critics default to the planner's provider.
+    for name in (
+        "critic_maintainability", "critic_user", "critic_operational",
+        "critic_security",
+    ):
+        assert result.assignments[name] == "claude"
+
+
+def test_critic_panel_user_override_takes_absolute_precedence() -> None:
+    from pollypm.plugins_builtin.project_planning.critic_panel import (
+        resolve_critic_providers,
+    )
+    result = resolve_critic_providers(
+        registered_providers=["claude", "codex"],
+        planner_provider="claude",
+        user_overrides={"critic_security": "codex"},
+    )
+    assert result.assignments["critic_security"] == "codex"
+    # Since critic_security already satisfies cross-provider diversity,
+    # critic_simplicity should stay on the planner's provider.
+    assert result.assignments["critic_simplicity"] == "claude"
+    assert result.forced_cross_provider is None
+
+
+def test_critic_panel_override_on_default_target_falls_through() -> None:
+    """User pinned critic_simplicity to claude — resolver must force
+    diversity onto a different critic."""
+    from pollypm.plugins_builtin.project_planning.critic_panel import (
+        resolve_critic_providers,
+    )
+    result = resolve_critic_providers(
+        registered_providers=["claude", "codex"],
+        planner_provider="claude",
+        user_overrides={"critic_simplicity": "claude"},
+    )
+    assert result.assignments["critic_simplicity"] == "claude"
+    assert result.forced_cross_provider is not None
+    assert result.forced_cross_provider != "critic_simplicity"
+    assert result.assignments[result.forced_cross_provider] == "codex"
+
+
+def test_critic_panel_unknown_critic_override_ignored() -> None:
+    from pollypm.plugins_builtin.project_planning.critic_panel import (
+        resolve_critic_providers,
+    )
+    result = resolve_critic_providers(
+        registered_providers=["claude", "codex"],
+        planner_provider="claude",
+        user_overrides={"critic_bogus": "codex"},
+    )
+    assert "critic_bogus" not in result.assignments
+    assert any("unknown critic" in n for n in result.notes)
+
+
+def test_critic_panel_unknown_provider_override_ignored() -> None:
+    from pollypm.plugins_builtin.project_planning.critic_panel import (
+        resolve_critic_providers,
+    )
+    result = resolve_critic_providers(
+        registered_providers=["claude", "codex"],
+        planner_provider="claude",
+        user_overrides={"critic_user": "gemini"},
+    )
+    # Unknown provider override is ignored; critic_user falls back to
+    # planner's provider.
+    assert result.assignments["critic_user"] == "claude"
+    assert any("provider not registered" in n for n in result.notes)
+
+
+def test_critic_panel_rejects_unknown_planner_provider() -> None:
+    import pytest
+
+    from pollypm.plugins_builtin.project_planning.critic_panel import (
+        resolve_critic_providers,
+    )
+    with pytest.raises(ValueError):
+        resolve_critic_providers(
+            registered_providers=["claude"],
+            planner_provider="codex",
+        )
+
+
+def test_critic_panel_rejects_empty_provider_list() -> None:
+    import pytest
+
+    from pollypm.plugins_builtin.project_planning.critic_panel import (
+        resolve_critic_providers,
+    )
+    with pytest.raises(ValueError):
+        resolve_critic_providers(
+            registered_providers=[],
+            planner_provider="claude",
+        )
+
+
+def test_critic_panel_all_five_critics_assigned() -> None:
+    from pollypm.plugins_builtin.project_planning.critic_panel import (
+        CRITIC_NAMES, resolve_critic_providers,
+    )
+    result = resolve_critic_providers(
+        registered_providers=["claude", "codex"],
+        planner_provider="claude",
+    )
+    assert set(result.assignments.keys()) == set(CRITIC_NAMES)
+    assert len(CRITIC_NAMES) == 5

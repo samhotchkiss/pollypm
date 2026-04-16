@@ -143,7 +143,7 @@ The system is demo-ready for the investor presentation with the following caveat
 - Russell found: data corruption bug, missing tests, uncommitted code, merge conflicts
 - Full task lifecycle: create → queue → claim → implement → review → reject → rework → approve
 - System recovers cleanly from kill/restart (tested 3 times)
-- **Stability: 696+ hours (29 days) with zero intervention, 13 sessions running continuously, 735 monitoring iterations**
+- **Stability: 720+ hours (1 FULL MONTH / 30 days) with zero intervention, 13 sessions running continuously, 759 monitoring iterations**
 - Account access valid until 11:35 AM (April 16)
 
 ## Bugs Found and Fixed

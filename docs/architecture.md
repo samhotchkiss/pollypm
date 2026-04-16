@@ -19,4 +19,32 @@ System design, components, boundaries, data flow, and dependencies.
 - Heartbeat escalation protocol with stop-looping directives for stalled work
 - Permission-gated execution system preventing test/code operations in Heartbeat role
 
-*Last updated: 2026-04-13T01:29:31.935791Z*
+## Service API v1
+
+TUIs, CLIs, and integration tests consume PollyPM through a versioned,
+curated facade: `pollypm.service_api`. The current implementation lives
+at `pollypm/service_api/v1.py` and is re-exported by the package
+`__init__` so both `from pollypm.service_api import PollyPMService` and
+`from pollypm.service_api.v1 import PollyPMService` work.
+
+### Deprecation plan — direct Supervisor imports
+
+`from pollypm.supervisor import Supervisor` outside of `pollypm.core/`
+(and tests) is **deprecated**. New code must go through
+`pollypm.service_api`; Supervisor is an internal implementation detail
+of the core rail.
+
+The deprecation is enforced by `tests/test_import_boundary.py`, which
+maintains an explicit allow-list of files that still import Supervisor
+directly. The allow-list is intentionally generous at Step 5 (#182) —
+every caller that imports Supervisor today is on it with a TODO
+pointing at the issue that will remove it. As Step 6 (#183) migrates
+the TUI/CLI surfaces and Step 8 (#185) migrates the inbox / plugin /
+scheduler integrations, entries drop off and the boundary tightens
+automatically.
+
+Service API v1.1 will make the allow-list empty and turn the boundary
+into a hard guard. Until then, adding a new direct Supervisor import
+outside core requires adding the file to the allow-list with a TODO.
+
+*Last updated: 2026-04-16 (Step 5 / issue #182)*

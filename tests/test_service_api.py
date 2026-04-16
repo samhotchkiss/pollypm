@@ -32,11 +32,11 @@ def test_service_create_and_launch_worker_uses_worker_api(monkeypatch, tmp_path:
         config = FakeConfig()
 
     monkeypatch.setattr(
-        "pollypm.service_api.create_worker_session",
+        "pollypm.service_api.v1.create_worker_session",
         lambda config_path, project_key, prompt: calls.append(("create", project_key, prompt)) or FakeSession(),
     )
     monkeypatch.setattr(
-        "pollypm.service_api.launch_worker_session",
+        "pollypm.service_api.v1.launch_worker_session",
         lambda config_path, session_name, on_status=None, skip_stabilize=False: calls.append(("launch", session_name)),
     )
     monkeypatch.setattr(service, "load_supervisor", lambda: FakeSupervisor())
@@ -54,7 +54,7 @@ def test_service_suggest_worker_prompt_uses_worker_api(monkeypatch, tmp_path: Pa
     service = PollyPMService(tmp_path / "pollypm.toml")
 
     monkeypatch.setattr(
-        "pollypm.service_api.suggest_worker_prompt",
+        "pollypm.service_api.v1.suggest_worker_prompt",
         lambda config_path, project_key: f"Kick off {project_key}",
     )
 

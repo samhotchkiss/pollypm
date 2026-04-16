@@ -1,3 +1,15 @@
+"""PollyPM Service API v1.
+
+Stable facade that TUIs, CLIs, and integration tests consume. Prefer this
+module over importing :class:`pollypm.supervisor.Supervisor` directly —
+outside of :mod:`pollypm.core`, direct Supervisor imports are deprecated and
+the import-boundary test (``tests/test_import_boundary.py``) enforces the
+allow-list.
+
+The public surface is re-exported from :mod:`pollypm.service_api`. Anything
+underscore-prefixed is internal.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -61,6 +73,8 @@ from pollypm.workers import (
 
 @dataclass(slots=True)
 class StatusSnapshot:
+    """Point-in-time read of launches, tmux windows, alerts, leases, and errors."""
+
     launches: list[object]
     windows: list[object]
     alerts: list[object]
@@ -70,6 +84,8 @@ class StatusSnapshot:
 
 @dataclass(slots=True)
 class InboxRouteDecision:
+    """Outcome of the PM inbox-routing heuristic for a single thread."""
+
     thread_id: str
     owner: str
     state: str
@@ -78,14 +94,19 @@ class InboxRouteDecision:
 
 
 class PollyPMService:
+    """Service facade for PollyPM — the stable surface TUIs and CLIs call."""
+
     def __init__(self, config_path: Path) -> None:
+        """Bind the service to a config file; all calls use this path."""
         self.config_path = config_path
 
     def load_supervisor(self, *, readonly_state: bool = False) -> Supervisor:
+        """Construct a fresh Supervisor from the bound config (internal helper)."""
         config = load_config(self.config_path)
         return Supervisor(config, readonly_state=readonly_state)
 
     def status_snapshot(self) -> StatusSnapshot:
+        """Return a read-only snapshot of launches/windows/alerts/leases/errors."""
         supervisor = self.load_supervisor(readonly_state=True)
         launches, windows, alerts, leases, errors = supervisor.status()
         return StatusSnapshot(
@@ -97,6 +118,7 @@ class PollyPMService:
         )
 
     def session_status(self, session_name: str | None = None) -> dict[str, object]:
+        """Return session status (one or all) with runtime, lease, and alert counts."""
         supervisor = self.load_supervisor(readonly_state=True)
         launches, windows, alerts, leases, errors = supervisor.status()
         window_map = {window.name: window for window in windows}
@@ -133,6 +155,7 @@ class PollyPMService:
         return {"config_path": str(self.config_path), "sessions": sessions, "errors": errors}
 
     def list_account_statuses(self) -> list[AccountStatus]:
+        """Return live status (logged-in / expired / etc.) for every configured account."""
         return list_account_statuses(self.config_path)
 
     def create_and_launch_worker(
@@ -143,6 +166,7 @@ class PollyPMService:
         on_status: Callable[[str], None] | None = None,
         skip_stabilize: bool = False,
     ):
+        """Create a worker session and launch it if the PollyPM tmux is running."""
         session = create_worker_session(
             self.config_path,
             project_key=project_key,
@@ -157,15 +181,19 @@ class PollyPMService:
         return session
 
     def suggest_worker_prompt(self, *, project_key: str) -> str:
+        """Return a PollyPM-curated launch prompt for a worker in this project."""
         return suggest_worker_prompt(self.config_path, project_key=project_key)
 
     def focus_session(self, session_name: str) -> None:
+        """Focus the given session in tmux (select its window and pane)."""
         self.load_supervisor().focus_session(session_name)
 
     def send_input(self, session_name: str, text: str, *, owner: str = "human") -> None:
+        """Send input text to a session's pane, attributed to ``owner``."""
         self.load_supervisor().send_input(session_name, text, owner=owner)
 
     def raise_alert(self, alert_type: str, session_name: str, message: str, *, severity: str = "warn") -> object:
+        """Raise a session alert; persists to state store and records an event."""
         supervisor = self.load_supervisor()
         supervisor.require_session(session_name)
         supervisor.store.upsert_alert(session_name, alert_type, severity, message)
@@ -183,9 +211,11 @@ class PollyPMService:
         return alert
 
     def list_alerts(self) -> list[object]:
+        """Return all currently open alerts across sessions."""
         return self.load_supervisor().store.open_alerts()
 
     def clear_alert(self, alert_id: int) -> object:
+        """Clear a single open alert by its id and record the clearance event."""
         supervisor = self.load_supervisor()
         alert = supervisor.store.clear_alert_by_id(alert_id)
         if alert is None:
@@ -198,6 +228,7 @@ class PollyPMService:
         return alert
 
     def set_session_status(self, session_name: str, status: str, *, reason: str = "") -> object:
+        """Override a session's runtime status with an optional failure reason."""
         supervisor = self.load_supervisor()
         supervisor.require_session(session_name)
         supervisor.store.upsert_session_runtime(
@@ -212,6 +243,7 @@ class PollyPMService:
         return runtime
 
     def record_heartbeat(self, session_name: str, payload: dict[str, object]) -> object:
+        """Persist a heartbeat snapshot (pane + log + hash) for a session."""
         supervisor = self.load_supervisor()
         supervisor.require_session(session_name)
         launch = supervisor.launch_by_session(session_name)
@@ -232,6 +264,7 @@ class PollyPMService:
         return record
 
     def run_heartbeat(self) -> None:
+        """Execute one heartbeat tick across all managed sessions."""
         self.load_supervisor().run_heartbeat()
 
     def itsalive_deploy(
@@ -242,21 +275,25 @@ class PollyPMService:
         email: str | None = None,
         publish_dir: str = ".",
     ):
+        """Deploy a project site via itsalive and return the deployment handle."""
         config = load_config(self.config_path)
         project = config.projects[project_key]
         return deploy_site(project.path, subdomain=subdomain, email=email, publish_dir=publish_dir)
 
     def itsalive_pending(self, *, project_key: str):
+        """Return the list of pending itsalive deploys for a project."""
         config = load_config(self.config_path)
         project = config.projects[project_key]
         return pending_deploys(project.path)
 
     def itsalive_sweep(self, *, project_key: str):
+        """Sweep completed pending itsalive deploys for a project."""
         config = load_config(self.config_path)
         project = config.projects[project_key]
         return sweep_pending_deploys(project.path)
 
     def ensure_pollypm(self) -> str:
+        """Ensure the PollyPM tmux session exists and return the controller account name."""
         supervisor = self.load_supervisor()
         session_name = supervisor.config.project.tmux_session
         if not supervisor.tmux.has_session(session_name):
@@ -266,30 +303,39 @@ class PollyPMService:
         return supervisor.config.pollypm.controller_account
 
     def add_account(self, provider: ProviderKind) -> tuple[str, str]:
+        """Drive the provider login flow and register a new account."""
         return add_account_via_login(self.config_path, provider)
 
     def relogin_account(self, identifier: str) -> tuple[str, str]:
+        """Re-run the login flow for an existing account to refresh credentials."""
         return relogin_account(self.config_path, identifier)
 
     def remove_account(self, identifier: str, *, delete_home: bool = False) -> tuple[str, str]:
+        """Delete an account config, optionally removing its home directory."""
         return remove_account(self.config_path, identifier, delete_home=delete_home)
 
     def set_controller_account(self, identifier: str) -> tuple[str, str]:
+        """Promote an account to be the PollyPM controller."""
         return set_controller_account(self.config_path, identifier)
 
     def set_open_permissions_default(self, enabled: bool) -> bool:
+        """Toggle the global default for bypassing session permission prompts."""
         return set_open_permissions_default(self.config_path, enabled)
 
     def toggle_failover_account(self, identifier: str) -> tuple[str, bool]:
+        """Toggle whether an account participates in failover and return the new state."""
         return toggle_failover_account(self.config_path, identifier)
 
     def claim_lease(self, session_name: str, owner: str, note: str = "") -> None:
+        """Claim an exclusive lease on a session for ``owner``."""
         self.load_supervisor().claim_lease(session_name, owner, note)
 
     def release_lease(self, session_name: str) -> None:
+        """Release the currently held lease on a session."""
         self.load_supervisor().release_lease(session_name)
 
     def switch_session_account(self, session_name: str, account_name: str) -> None:
+        """Rebind a session to a different configured account."""
         self.load_supervisor().switch_session_account(session_name, account_name)
 
     def schedule_job(
@@ -300,6 +346,7 @@ class PollyPMService:
         payload: dict[str, object] | None = None,
         interval_seconds: int | None = None,
     ) -> ScheduledJob:
+        """Schedule a recurring or one-shot job and return the persisted record."""
         return self.load_supervisor().schedule_job(
             kind=kind,
             run_at=run_at,
@@ -308,37 +355,47 @@ class PollyPMService:
         )
 
     def list_jobs(self) -> list[ScheduledJob]:
+        """List all currently scheduled jobs."""
         return self.load_supervisor().list_scheduled_jobs()
 
     def run_scheduled_jobs(self) -> list[ScheduledJob]:
+        """Run any due scheduled jobs and return the executed records."""
         return self.load_supervisor().run_scheduled_jobs()
 
     def sync_token_ledger(self, *, account: str | None = None) -> int:
+        """Pull new token-usage rows into the ledger and return the count synced."""
         return len(sync_token_ledger(self.config_path, account=account))
 
     def recent_token_usage(self, *, limit: int = 24):
+        """Return the most recent ``limit`` token-usage snapshots."""
         return list_recent_token_usage(self.config_path, limit=limit)
 
     def register_project(self, path: Path) -> tuple[str, str]:
+        """Register a new tracked project rooted at ``path``."""
         return register_project(self.config_path, path)
 
     def list_tasks(self, project_key: str, *, states: list[str] | None = None) -> list[TaskRecord]:
+        """List tasks for a project, optionally filtered by states."""
         config = load_config(self.config_path)
         return self._task_backend(config, project_key).list_tasks(states=states)
 
     def get_task(self, project_key: str, task_id: str) -> TaskRecord:
+        """Fetch a single task record by id for a project."""
         config = load_config(self.config_path)
         return self._task_backend(config, project_key).get_task(task_id)
 
     def next_available_task(self, project_key: str) -> TaskRecord | None:
+        """Return the next pickup-able task in a project, or ``None``."""
         config = load_config(self.config_path)
         return self._task_backend(config, project_key).next_available()
 
     def task_history(self, project_key: str, task_id: str) -> list[str]:
+        """Return the human-readable history entries for a task."""
         config = load_config(self.config_path)
         return self._task_backend(config, project_key).task_history(task_id)
 
     def validate_task_backend(self, project_key: str) -> GitHubTaskBackendValidation | dict[str, object]:
+        """Run backend-specific validation (e.g. GitHub auth/scopes) for a project."""
         config = load_config(self.config_path)
         backend = self._task_backend(config, project_key)
         validate = getattr(backend, "validate", None)
@@ -347,10 +404,12 @@ class PollyPMService:
         return {"passed": True, "checks": ["not_applicable"], "errors": []}
 
     def create_task(self, project_key: str, *, title: str, body: str = "", state: str = "01-ready") -> TaskRecord:
+        """Create a new task in a project with an initial state."""
         config = load_config(self.config_path)
         return self._task_backend(config, project_key).create_task(title=title, body=body, state=state)
 
     def move_task(self, project_key: str, task_id: str, *, to_state: str) -> TaskRecord:
+        """Transition a task to a new state and record a completion checkpoint if terminal."""
         config = load_config(self.config_path)
         backend = self._task_backend(config, project_key)
         task = backend.get_task(task_id)
@@ -365,6 +424,7 @@ class PollyPMService:
         return moved
 
     def append_task_note(self, project_key: str, task_name: str, *, text: str) -> Path:
+        """Append a free-form note to a task's history and return the note file path."""
         config = load_config(self.config_path)
         return self._task_backend(config, project_key).append_note(task_name, text)
 
@@ -378,6 +438,7 @@ class PollyPMService:
         branch_or_pr: str = "",
         deviations: str = "",
     ) -> Path:
+        """Append a structured handoff note (what done, how to test, branch/PR) to a task."""
         sections = [
             "## Handoff",
             "",
@@ -417,6 +478,7 @@ class PollyPMService:
         verification: str,
         changes_requested: str = "",
     ) -> TaskRecord:
+        """Record a review decision on a task and transition state accordingly."""
         config = load_config(self.config_path)
         backend = self._task_backend(config, project_key)
         task = backend.get_task(task_id)
@@ -462,10 +524,12 @@ class PollyPMService:
         return moved
 
     def task_state_counts(self, project_key: str) -> dict[str, int]:
+        """Return counts of tasks grouped by state for a project."""
         config = load_config(self.config_path)
         return self._task_backend(config, project_key).state_counts()
 
     def detect_preference_override(self, project_key: str, text: str) -> object | None:
+        """Detect a project-preference override in user text; return a patch dict or None."""
         config = load_config(self.config_path)
         project_root = self._project_root(config, project_key)
         patch = detect_preference_patch(project_root, text)
@@ -479,6 +543,7 @@ class PollyPMService:
         }
 
     def apply_preference_override(self, project_key: str, text: str) -> object:
+        """Apply a detected preference override to a project config."""
         config = load_config(self.config_path)
         project_root = self._project_root(config, project_key)
         patch = apply_preference_patch(project_root, text)
@@ -490,6 +555,7 @@ class PollyPMService:
         }
 
     def list_overrides(self, project_key: str) -> list[str]:
+        """List override file paths currently layered over a project's config."""
         config = load_config(self.config_path)
         project_root = self._project_root(config, project_key)
         return [str(path) for path in list_project_overrides(project_root)]
@@ -566,30 +632,39 @@ class PollyPMService:
         )
 
     def enable_tracked_project(self, key: str) -> tuple[str, bool]:
+        """Enable tracking for a known project and return the (key, toggled) result."""
         return enable_tracked_project(self.config_path, key)
 
     def remove_project(self, key: str) -> tuple[str, str]:
+        """Remove a project from tracking; returns (key, message)."""
         return remove_project(self.config_path, key)
 
     def set_workspace_root(self, path: Path) -> Path:
+        """Set the user's workspace root directory and return the resolved path."""
         return set_workspace_root(self.config_path, path)
 
     def stop_session(self, session_name: str) -> None:
+        """Stop a worker session (kills its tmux window) without removing config."""
         stop_worker_session(self.config_path, session_name)
 
     def remove_session(self, session_name: str) -> None:
+        """Stop and delete a worker session's config entry."""
         remove_worker_session(self.config_path, session_name)
 
     def create_inbox_item(self, *, sender: str, subject: str, body: str):
+        """Create a new inbox message and return its persisted record."""
         return create_message(self.config_path.parent, sender=sender, subject=subject, body=body)
 
     def list_inbox_items(self) -> list[object]:
+        """List open inbox messages awaiting triage."""
         return list_open_messages(self.config_path.parent)
 
     def triage_inbox_item(self, item_name: str, *, actor: str, owner: str = "pm") -> object:
+        """Promote an inbox message into a thread owned by ``owner``."""
         return create_thread(self.config_path.parent, item_name, actor=actor, owner=owner)
 
     def route_inbox_thread(self, thread_id: str, *, actor: str = "pm") -> InboxRouteDecision:
+        """Decide whether PM keeps a thread or hands it off to PA; returns the decision."""
         thread = get_thread(self.config_path.parent, thread_id)
         body = self._get_thread_body(thread)
         if self._message_needs_pm_ownership(thread.subject, body):
@@ -614,21 +689,26 @@ class PollyPMService:
         )
 
     def list_inbox_threads(self, *, include_closed: bool = False) -> list[object]:
+        """List inbox threads; ``include_closed`` selects open-only or all."""
         config = load_config(self.config_path)
         status = "all" if include_closed else "open"
         return list_messages(config.project.root_dir, status=status)
 
     def get_inbox_thread(self, thread_id: str) -> object:
+        """Fetch a single inbox thread by id."""
         return get_thread(self.config_path.parent, thread_id)
 
     def transition_inbox_thread(self, thread_id: str, state: str, *, actor: str, note: str = "") -> object:
+        """Transition an inbox thread to a new state and record the transition."""
         return transition_thread(self.config_path.parent, thread_id, state, actor=actor, note=note)
 
     def handoff_inbox_thread(self, thread_id: str, *, owner: str, actor: str, note: str = "") -> dict[str, object]:
+        """Set an inbox thread's handoff owner; returns the persisted handoff dict."""
         path = set_handoff(self.config_path.parent, thread_id, owner=owner, actor=actor, note=note)
         return json.loads(path.read_text())
 
     def append_inbox_thread_message(self, thread_id: str, *, sender: str, subject: str, body: str) -> object:
+        """Append a new message to an inbox thread."""
         return append_thread_message(self.config_path.parent, thread_id, sender=sender, subject=subject, body=body)
 
     def record_worker_reply_via_pa(
@@ -640,6 +720,7 @@ class PollyPMService:
         body: str,
         actor: str = "pa",
     ) -> object:
+        """Record a worker-originated reply back through the PA → PM handoff."""
         append_thread_message(self.config_path.parent, thread_id, sender=worker_name, subject=subject, body=body)
         note = "PA surfaced a worker reply back to PM."
         transition_thread(self.config_path.parent, thread_id, "waiting-on-pm", actor=actor, note=note)
@@ -692,6 +773,7 @@ class PollyPMService:
 
 
 def render_json(data: object) -> str:
+    """Render a value as pretty JSON, normalizing dataclasses / datetimes / Paths."""
     def _normalize(value: object) -> object:
         if is_dataclass(value):
             return {key: _normalize(item) for key, item in asdict(value).items()}
@@ -706,3 +788,11 @@ def render_json(data: object) -> str:
         return value
 
     return json.dumps(_normalize(data), indent=2) + "\n"
+
+
+__all__ = [
+    "InboxRouteDecision",
+    "PollyPMService",
+    "StatusSnapshot",
+    "render_json",
+]

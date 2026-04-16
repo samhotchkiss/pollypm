@@ -77,8 +77,27 @@
 - [ ] At least 1 rejection
 - [ ] Approved and working
 
+### Concurrency Status
+- All 3 projects running simultaneously: PASS
+- recipe_share/10: APPROVED by Russell — CLI tested manually (add, list, search, export)
+- expense_tracker/8: REJECTED by Russell — "No work done, task branch identical to main"
+- expense_tracker/9: REJECTED by Russell — same reason (worktree code gap)
+- team_standup/13: in review — waiting for Russell
+
+### Reviewer Quality Gate: PASS
+- Russell ran 2 parallel Explore agents (40+ tool uses each) to deeply read code
+- Russell ran pytest on expense-tracker (tests passed but CLI wasn't built)
+- Russell ran recipe_share CLI manually: tested list, search, export, edge cases
+- Russell checked git branches and found zero commits on expense_tracker task branches
+- Russell REJECTED 2 tasks with specific feedback (worktree code gap)
+- Russell APPROVED 1 task after manual verification
+- Rejection rate: 2/3 — quality gate is real, not rubber-stamp
+
 ### Issues Found
-- `worker-start` is a blocking call — Polly can't process other specs while waiting for it to finish. Should be async or have a timeout.
+1. `worker-start` is a blocking call — Polly can't process other specs while waiting for it to finish. Should be async or have a timeout.
+2. **Session identity swap**: Heartbeat got reviewer prompt, reviewer got heartbeat prompt during bootstrap. Root cause: parallel stabilization threads + first window targeted by index `:0` instead of name. Fixed by using window name for all targets.
+3. **Codex args on Claude workers**: recipe_share, media, news project-local configs had `--dangerously-bypass-approvals-and-sandbox` (Codex flag). Workers crashed silently in a loop. Fixed: sanitize provider args, updated project configs.
+4. **Stale resume markers**: `_bootstrap_clear_markers` missed account home dirs. Sessions used `--continue` and inherited wrong conversation context. Fixed: clear markers from account homes too.
 
 ## Phase 9: Inbox Hygiene — PARTIAL
 - [x] All 9 stale messages closed

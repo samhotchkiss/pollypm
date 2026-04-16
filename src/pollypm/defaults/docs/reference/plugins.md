@@ -15,12 +15,13 @@ PollyPM uses a file-based plugin system. Plugins are directories containing a ma
 ## Plugin Locations (Precedence: low → high)
 
 1. **Built-in** — shipped with PollyPM (lowest precedence)
-2. **User-global** — `~/.config/pollypm/plugins/<name>/` (overrides built-in)
-3. **Project-local** — `<project>/.pollypm-state/plugins/<name>/` (overrides everything)
+2. **Python entry_points** — `pollypm.plugins` group in installed packages
+3. **User-global** — `~/.pollypm/plugins/<name>/` (overrides built-in)
+4. **Project-local** — `<project>/.pollypm/plugins/<name>/` (overrides everything)
 
 ## Creating a Plugin
 
-1. Create a directory: `~/.config/pollypm/plugins/my-plugin/`
+1. Create a directory: `~/.pollypm/plugins/my-plugin/`
 2. Add a manifest `pollypm-plugin.toml`:
    ```toml
    api_version = "1"

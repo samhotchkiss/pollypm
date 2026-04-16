@@ -1,4 +1,4 @@
-from pollypm.plugin_api.v1 import PollyPMPlugin
+from pollypm.plugin_api.v1 import Capability, PollyPMPlugin
 from pollypm.plugins_builtin.core_agent_profiles.profiles import (
     StaticPromptProfile,
     heartbeat_prompt,
@@ -10,7 +10,13 @@ from pollypm.plugins_builtin.core_agent_profiles.profiles import (
 
 plugin = PollyPMPlugin(
     name="core_agent_profiles",
-    capabilities=("agent_profile",),
+    capabilities=(
+        Capability(kind="agent_profile", name="polly"),
+        Capability(kind="agent_profile", name="russell"),
+        Capability(kind="agent_profile", name="heartbeat"),
+        Capability(kind="agent_profile", name="worker"),
+        Capability(kind="agent_profile", name="triage"),
+    ),
     agent_profiles={
         "polly": lambda: StaticPromptProfile(name="polly", prompt=polly_prompt()),
         "russell": lambda: StaticPromptProfile(name="russell", prompt=reviewer_prompt()),

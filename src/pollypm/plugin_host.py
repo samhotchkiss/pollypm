@@ -45,8 +45,17 @@ class ExtensionHost:
         self.root_dir = root_dir.resolve()
         self.errors: list[str] = []
         self._plugins: dict[str, PollyPMPlugin] | None = None
+        self._plugin_sources: dict[str, str] = {}
         self._job_handler_registry = None
         self._job_handlers_loaded = False
+
+    def plugin_source(self, name: str) -> str | None:
+        """Return the discovery source tag (``builtin``, ``entry_point``,
+        ``user``, ``project``) for the named plugin, if loaded.
+        """
+        if self._plugins is None:
+            self.plugins()
+        return self._plugin_sources.get(name)
 
     def plugins(self) -> dict[str, PollyPMPlugin]:
         if self._plugins is None:
@@ -57,6 +66,7 @@ class ExtensionHost:
         """Remove a plugin from the loaded registry (e.g. after validation failure)."""
         if self._plugins is not None:
             self._plugins.pop(name, None)
+            self._plugin_sources.pop(name, None)
 
     def get_provider(self, name: str) -> object:
         return self._resolve_factory(name, lambda plugin: plugin.providers, "provider")
@@ -245,26 +255,64 @@ class ExtensionHost:
 
     def _load_plugins(self) -> dict[str, PollyPMPlugin]:
         loaded: dict[str, PollyPMPlugin] = {}
-        for manifest in self._discover_manifests():
-            plugin = self._load_plugin_from_manifest(manifest)
-            if plugin is None:
-                continue
+        sources: dict[str, str] = {}  # plugin name -> source tag
+
+        def _install(name: str, plugin: PollyPMPlugin, source: str) -> None:
             # Validate the plugin implements its declared interfaces
             try:
                 from pollypm.plugin_validate import validate_plugin
                 result = validate_plugin(plugin)
                 if not result.passed:
                     failures = ", ".join(c.message for c in result.checks if not c.passed)
-                    self.errors.append(f"Plugin {manifest.name} failed validation: {failures}")
-                    continue  # skip broken plugins
+                    self.errors.append(f"Plugin {name} failed validation: {failures}")
+                    return
             except Exception as exc:  # noqa: BLE001
-                self.errors.append(f"Plugin {manifest.name} validation error: {exc}")
-            loaded[manifest.name] = plugin
+                self.errors.append(f"Plugin {name} validation error: {exc}")
+            if name in loaded:
+                logger.warning(
+                    "Plugin '%s' from source '%s' overrides earlier registration from source '%s'",
+                    name, source, sources.get(name),
+                )
+            loaded[name] = plugin
+            sources[name] = source
+
+        # Order matters: later sources win on name collision, matching
+        # the spec §2 precedence table.
+        for manifest in self._discover_directory_manifests(sources=("builtin",)):
+            plugin = self._load_plugin_from_manifest(manifest)
+            if plugin is not None:
+                _install(manifest.name, plugin, manifest.source)
+
+        for name, plugin, source in self._discover_entry_points():
+            _install(name, plugin, source)
+
+        # "repo" is a legacy alias for "project" used by older tests; we
+        # accept both so internal call sites can transition gradually.
+        for manifest in self._discover_directory_manifests(sources=("user", "project", "repo")):
+            plugin = self._load_plugin_from_manifest(manifest)
+            if plugin is not None:
+                _install(manifest.name, plugin, manifest.source)
+
+        self._plugin_sources = sources  # exposed for doctor / CLI later
         return loaded
 
     def _discover_manifests(self) -> list[PluginManifest]:
+        """Compatibility shim: return manifests for all directory-style
+        sources (built-in, user-global, project-local). Entry-point
+        plugins are handled separately in ``_load_plugins``.
+        """
+        return self._discover_directory_manifests()
+
+    def _discover_directory_manifests(
+        self,
+        *,
+        sources: tuple[str, ...] | None = None,
+    ) -> list[PluginManifest]:
         manifests: list[PluginManifest] = []
+        allowed = set(sources) if sources is not None else None
         for source, base in self._plugin_search_paths():
+            if allowed is not None and source not in allowed:
+                continue
             if not base.exists():
                 continue
             for plugin_dir in sorted(path for path in base.iterdir() if path.is_dir()):
@@ -277,14 +325,69 @@ class ExtensionHost:
                     self.errors.append(f"Invalid plugin manifest at {manifest_path}: {exc}")
         return manifests
 
+    def _discover_entry_points(self) -> list[tuple[str, PollyPMPlugin, str]]:
+        """Discover plugins registered via the ``pollypm.plugins`` entry
+        point group. Each entry point's loaded object must be a
+        ``PollyPMPlugin`` instance; the entry-point name is used as the
+        plugin name if the instance doesn't set ``name``.
+        """
+        found: list[tuple[str, PollyPMPlugin, str]] = []
+        try:
+            from importlib.metadata import entry_points
+        except Exception:  # noqa: BLE001
+            return found
+        try:
+            eps = entry_points(group="pollypm.plugins")
+        except TypeError:
+            # Python <3.10 API fallback (should never hit on this rail).
+            try:
+                eps = entry_points().get("pollypm.plugins", [])  # type: ignore[assignment]
+            except Exception:  # noqa: BLE001
+                return found
+        except Exception as exc:  # noqa: BLE001
+            self.errors.append(f"Failed to enumerate pollypm.plugins entry points: {exc}")
+            return found
+        for ep in eps:
+            try:
+                obj = ep.load()
+            except Exception as exc:  # noqa: BLE001
+                self.errors.append(f"Entry-point plugin '{ep.name}' failed to load: {exc}")
+                continue
+            if not isinstance(obj, PollyPMPlugin):
+                self.errors.append(
+                    f"Entry-point plugin '{ep.name}' is not a PollyPMPlugin instance "
+                    f"(got {type(obj).__name__})"
+                )
+                continue
+            plugin_name = obj.name or ep.name
+            # Apply the same api_version / requires_api gating that
+            # directory plugins get through _load_plugin_from_manifest.
+            if obj.api_version != PLUGIN_API_VERSION:
+                self.errors.append(
+                    f"Entry-point plugin '{plugin_name}' uses API version {obj.api_version}; "
+                    f"expected {PLUGIN_API_VERSION}"
+                )
+                continue
+            found.append((plugin_name, obj, "entry_point"))
+        return found
+
     def _plugin_search_paths(self) -> list[tuple[str, Path]]:
+        """Directory-style search paths, in precedence order. Later
+        sources win on name collision.
+
+        Per docs/plugin-discovery-spec.md §2:
+        1. Built-in: ``src/pollypm/plugins_builtin/``
+        2. Python entry_points  (handled in ``_discover_entry_points``)
+        3. User-global: ``~/.pollypm/plugins/``
+        4. Project-local: ``<project>/.pollypm/plugins/``
+        """
         builtins = Path(__file__).resolve().parent / "plugins_builtin"
-        user = Path.home() / ".config" / "pollypm" / "plugins"
-        repo = self.root_dir / ".pollypm-state" / "plugins"
+        user = Path.home() / ".pollypm" / "plugins"
+        project = self.root_dir / ".pollypm" / "plugins"
         return [
             ("builtin", builtins),
             ("user", user),
-            ("repo", repo),
+            ("project", project),
         ]
 
     def _read_manifest(self, manifest_path: Path, source: str) -> PluginManifest:

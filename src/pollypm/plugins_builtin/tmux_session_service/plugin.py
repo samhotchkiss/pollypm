@@ -1,4 +1,4 @@
-from pollypm.plugin_api.v1 import PollyPMPlugin
+from pollypm.plugin_api.v1 import Capability, PollyPMPlugin
 
 
 def _factory(**kwargs):
@@ -8,6 +8,6 @@ def _factory(**kwargs):
 
 plugin = PollyPMPlugin(
     name="tmux_session_service",
-    capabilities=("session_service",),
+    capabilities=(Capability(kind="session_service", name="tmux"),),
     session_services={"tmux": _factory},
 )

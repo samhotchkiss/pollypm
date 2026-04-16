@@ -87,7 +87,8 @@ def test_repo_local_plugin_overrides_user_plugin(monkeypatch, tmp_path: Path) ->
 
 
 def test_extension_host_rejects_wrong_api_version(tmp_path: Path) -> None:
-    bad_plugin = tmp_path / ".pollypm-state" / "plugins" / "bad"
+    # Use the new project-local path per docs/plugin-discovery-spec.md §2.
+    bad_plugin = tmp_path / ".pollypm" / "plugins" / "bad"
     _write_plugin(
         bad_plugin,
         name="bad",
@@ -102,7 +103,7 @@ def test_extension_host_rejects_wrong_api_version(tmp_path: Path) -> None:
 
 
 def test_extension_host_runs_observers_and_filters_safely(tmp_path: Path) -> None:
-    plugin_dir = tmp_path / ".pollypm-state" / "plugins" / "hooks"
+    plugin_dir = tmp_path / ".pollypm" / "plugins" / "hooks"
     _write_plugin(
         plugin_dir,
         name="hooks",
@@ -434,3 +435,170 @@ def test_plugin_post_init_normalizes_bare_strings() -> None:
     assert kinds == {"provider", "hook"}
     # name falls through to plugin name
     assert all(c.name == "sample" for c in plugin.capabilities)
+
+
+# ---------------------------------------------------------------------------
+# Issue #167 — multi-path discovery (entry_points, user-global, project-local)
+# ---------------------------------------------------------------------------
+
+
+def test_user_global_plugin_loads_from_home_pollypm(monkeypatch, tmp_path: Path) -> None:
+    """A plugin in ~/.pollypm/plugins/ is discovered automatically."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    user_plugin = fake_home / ".pollypm" / "plugins" / "user_global_test"
+    _write_structured_plugin(
+        user_plugin,
+        name="user_global_test",
+        manifest_extras='[[capabilities]]\nkind = "provider"\nname = "mine"\n',
+        body=(
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "plugin = PollyPMPlugin(name='user_global_test')\n"
+        ),
+    )
+
+    host = ExtensionHost(tmp_path)
+    plugins = host.plugins()
+    assert "user_global_test" in plugins
+    assert host.plugin_source("user_global_test") == "user"
+
+
+def test_project_local_plugin_loads_from_dot_pollypm(tmp_path: Path) -> None:
+    """A plugin in <project>/.pollypm/plugins/ is discovered automatically."""
+    project_plugin = tmp_path / ".pollypm" / "plugins" / "project_local_test"
+    _write_structured_plugin(
+        project_plugin,
+        name="project_local_test",
+        manifest_extras='[[capabilities]]\nkind = "provider"\nname = "mine"\n',
+        body=(
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "plugin = PollyPMPlugin(name='project_local_test')\n"
+        ),
+    )
+
+    host = ExtensionHost(tmp_path)
+    plugins = host.plugins()
+    assert "project_local_test" in plugins
+    assert host.plugin_source("project_local_test") == "project"
+
+
+def test_project_plugin_shadows_user_plugin(monkeypatch, tmp_path: Path) -> None:
+    """Project-local plugin wins over user-global for name collision."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    user_plugin = fake_home / ".pollypm" / "plugins" / "shadow_test"
+    project_plugin = tmp_path / ".pollypm" / "plugins" / "shadow_test"
+
+    _write_structured_plugin(
+        user_plugin,
+        name="shadow_test",
+        manifest_extras='[[capabilities]]\nkind = "provider"\nname = "mine"\n',
+        body=(
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "class UserMarker: pass\n"
+            "plugin = PollyPMPlugin(name='shadow_test', providers={'x': UserMarker})\n"
+        ),
+    )
+    _write_structured_plugin(
+        project_plugin,
+        name="shadow_test",
+        manifest_extras='[[capabilities]]\nkind = "provider"\nname = "mine"\n',
+        body=(
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "class ProjectMarker: pass\n"
+            "plugin = PollyPMPlugin(name='shadow_test', providers={'x': ProjectMarker})\n"
+        ),
+    )
+
+    host = ExtensionHost(tmp_path)
+    plugin = host.plugins()["shadow_test"]
+    assert list(plugin.providers.values())[0].__name__ == "ProjectMarker"
+    assert host.plugin_source("shadow_test") == "project"
+
+
+def test_entry_point_plugin_loads_without_manifest(monkeypatch, tmp_path: Path) -> None:
+    """Entry-point plugins load from the pollypm.plugins group with no
+    on-disk manifest — the PollyPMPlugin carries all metadata.
+    """
+    from pollypm.plugin_api.v1 import Capability as Cap, PollyPMPlugin
+
+    sentinel_plugin = PollyPMPlugin(
+        name="ep_test",
+        capabilities=(Cap(kind="provider", name="ep_test"),),
+    )
+
+    class FakeEntryPoint:
+        name = "ep_test"
+
+        def load(self):
+            return sentinel_plugin
+
+    def fake_entry_points(*args, **kwargs):
+        if kwargs.get("group") == "pollypm.plugins":
+            return [FakeEntryPoint()]
+        return []
+
+    import importlib.metadata as im
+    monkeypatch.setattr(im, "entry_points", fake_entry_points)
+
+    host = ExtensionHost(tmp_path)
+    plugins = host.plugins()
+    assert "ep_test" in plugins
+    assert host.plugin_source("ep_test") == "entry_point"
+    assert plugins["ep_test"] is sentinel_plugin
+
+
+def test_entry_point_plugin_with_wrong_api_version_skipped(monkeypatch, tmp_path: Path) -> None:
+    from pollypm.plugin_api.v1 import PollyPMPlugin
+
+    bad = PollyPMPlugin(name="ep_bad", api_version="99")
+
+    class FakeEP:
+        name = "ep_bad"
+        def load(self): return bad
+
+    def fake_entry_points(*args, **kwargs):
+        if kwargs.get("group") == "pollypm.plugins":
+            return [FakeEP()]
+        return []
+
+    import importlib.metadata as im
+    monkeypatch.setattr(im, "entry_points", fake_entry_points)
+
+    host = ExtensionHost(tmp_path)
+    assert "ep_bad" not in host.plugins()
+    assert any("API version 99" in e for e in host.errors)
+
+
+def test_user_plugin_can_override_builtin(monkeypatch, tmp_path: Path) -> None:
+    """A plugin in the user-global directory with the same name as a
+    built-in supersedes the built-in (later source wins)."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    user_plugin = fake_home / ".pollypm" / "plugins" / "claude"
+    _write_structured_plugin(
+        user_plugin,
+        name="claude",
+        manifest_extras='[[capabilities]]\nkind = "provider"\nname = "claude"\n',
+        body=(
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "from pollypm.providers.codex import CodexAdapter\n"
+            "plugin = PollyPMPlugin(name='claude', providers={'claude': CodexAdapter})\n"
+        ),
+    )
+
+    host = ExtensionHost(tmp_path)
+    # The user-global "claude" plugin registers CodexAdapter under name
+    # 'claude', so resolving 'claude' gives a codex-named provider.
+    provider = host.get_provider("claude")
+    assert provider.name == "codex"
+    assert host.plugin_source("claude") == "user"

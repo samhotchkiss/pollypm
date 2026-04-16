@@ -291,7 +291,8 @@ class TestGateRegistry:
             user_gates_dir=tmp_path / "no_user_gates",
         )
         gates = registry.all_gates()
-        expected = {
+        # Core built-ins always present…
+        core_expected = {
             "has_description",
             "has_assignee",
             "has_work_output",
@@ -299,7 +300,15 @@ class TestGateRegistry:
             "acceptance_criteria",
             "all_children_done",
         }
-        assert expected == set(gates.keys())
+        assert core_expected <= set(gates.keys())
+        # …plus any plugin-hosted gates (planner plugin ships four).
+        planner_gates = {
+            "wait_for_children",
+            "output_present",
+            "log_present",
+            "user_level_tests_pass",
+        }
+        assert planner_gates <= set(gates.keys())
 
     def test_custom_discovery(self, tmp_path):
         gates_dir = tmp_path / ".pollypm" / "gates"

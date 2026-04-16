@@ -199,7 +199,23 @@ class GateRegistry:
         self._discover_custom_gates()
 
     def _discover_custom_gates(self) -> None:
-        """Load custom gate modules from filesystem directories."""
+        """Load custom gate modules from filesystem directories.
+
+        Precedence (later wins on name collision):
+
+          1. Built-in gates registered in ``__init__`` (lowest)
+          2. Plugin-hosted ``<plugin>/gates/`` — scans built-in, then
+             user-global, then project-local plugin roots (#195: same
+             pattern as flow templates)
+          3. User-global ``~/.pollypm/gates/``
+          4. Project-local ``<project>/.pollypm/gates/`` (highest)
+        """
+        # Plugin-hosted gates come before the standalone user / project
+        # gate directories so an advanced user who wants to shadow a
+        # plugin-shipped gate by name still wins.
+        for plugin_gate_dir in self._plugin_gate_dirs():
+            self._load_gates_from_dir(plugin_gate_dir)
+
         # User-global: ~/.pollypm/gates/
         user_dir = self._user_gates_dir or (Path.home() / ".pollypm" / "gates")
         self._load_gates_from_dir(user_dir)
@@ -208,6 +224,42 @@ class GateRegistry:
         if self._project_path is not None:
             proj_dir = self._project_path / ".pollypm" / "gates"
             self._load_gates_from_dir(proj_dir)
+
+    def _plugin_gate_dirs(self) -> list[Path]:
+        """Return every plugin-hosted ``gates/`` directory.
+
+        Mirrors ``flow_engine._plugin_flow_dirs``: scans the three
+        plugin search roots (built-in, user-global, project-local) for
+        directory-style plugins and yields ``<plugin_dir>/gates/`` when
+        the directory exists. A plugin opts in by shipping that
+        directory (and declaring it in the manifest's
+        ``[content].user_paths`` for documentation).
+        """
+        import importlib.resources
+
+        dirs: list[Path] = []
+        try:
+            builtin_root = Path(str(importlib.resources.files("pollypm.plugins_builtin")))
+        except (ModuleNotFoundError, TypeError):
+            builtin_root = None
+        if builtin_root is not None and builtin_root.is_dir():
+            for plugin_dir in sorted(builtin_root.iterdir()):
+                if plugin_dir.is_dir() and (plugin_dir / "gates").is_dir():
+                    dirs.append(plugin_dir / "gates")
+
+        user_plugin_root = Path.home() / ".pollypm" / "plugins"
+        if user_plugin_root.is_dir():
+            for plugin_dir in sorted(user_plugin_root.iterdir()):
+                if plugin_dir.is_dir() and (plugin_dir / "gates").is_dir():
+                    dirs.append(plugin_dir / "gates")
+
+        if self._project_path is not None:
+            proj_plugin_root = self._project_path / ".pollypm" / "plugins"
+            if proj_plugin_root.is_dir():
+                for plugin_dir in sorted(proj_plugin_root.iterdir()):
+                    if plugin_dir.is_dir() and (plugin_dir / "gates").is_dir():
+                        dirs.append(plugin_dir / "gates")
+        return dirs
 
     def _load_gates_from_dir(self, directory: Path) -> None:
         """Load all .py files from a directory, looking for Gate implementations."""

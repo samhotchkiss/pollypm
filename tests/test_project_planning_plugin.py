@@ -181,3 +181,204 @@ def test_task_create_with_plan_project_flow_succeeds(tmp_path: Path) -> None:
     assert task.flow_template_id == "plan_project"
     # Draft tasks do not yet set current_node_id (that's set on queue/claim);
     # the create succeeding is itself the pp02 acceptance gate.
+
+
+# ---------------------------------------------------------------------------
+# pp03 — gates: wait_for_children, output_present, log_present, user_level_tests_pass
+# ---------------------------------------------------------------------------
+
+
+PLANNER_GATES = (
+    "wait_for_children",
+    "output_present",
+    "log_present",
+    "user_level_tests_pass",
+)
+
+
+@pytest.mark.parametrize("gate_name", PLANNER_GATES)
+def test_planner_gate_registered(gate_name: str) -> None:
+    from pollypm.work.gates import GateRegistry
+
+    reg = GateRegistry()
+    gate = reg.get(gate_name)
+    assert gate is not None, f"{gate_name} not registered"
+    assert gate.gate_type == "hard"
+
+
+def _make_task(**overrides):
+    from pollypm.work.models import Task, TaskType, WorkStatus
+
+    defaults = dict(
+        project="demo",
+        task_number=1,
+        title="t",
+        type=TaskType.TASK,
+        work_status=WorkStatus.IN_PROGRESS,
+        flow_template_id="plan_project",
+    )
+    defaults.update(overrides)
+    return Task(**defaults)
+
+
+def test_wait_for_children_passes_when_no_children() -> None:
+    from pollypm.work.gates import GateRegistry
+
+    gate = GateRegistry().get("wait_for_children")
+    task = _make_task(children=[])
+    result = gate.check(task)
+    assert result.passed is True
+
+
+def test_wait_for_children_blocks_when_child_in_progress() -> None:
+    from pollypm.work.gates import GateRegistry
+    from pollypm.work.models import WorkStatus
+
+    gate = GateRegistry().get("wait_for_children")
+    parent = _make_task(children=[("demo", 2)])
+    child = _make_task(task_number=2, work_status=WorkStatus.IN_PROGRESS)
+
+    def get_task(task_id: str):
+        assert task_id == "demo/2"
+        return child
+
+    result = gate.check(parent, get_task=get_task)
+    assert result.passed is False
+    assert "in_progress" in result.reason
+
+
+def test_wait_for_children_passes_when_all_children_terminal() -> None:
+    from pollypm.work.gates import GateRegistry
+    from pollypm.work.models import WorkStatus
+
+    gate = GateRegistry().get("wait_for_children")
+    parent = _make_task(children=[("demo", 2), ("demo", 3)])
+    c1 = _make_task(task_number=2, work_status=WorkStatus.DONE)
+    c2 = _make_task(task_number=3, work_status=WorkStatus.CANCELLED)
+
+    def get_task(task_id: str):
+        return {"demo/2": c1, "demo/3": c2}[task_id]
+
+    result = gate.check(parent, get_task=get_task)
+    assert result.passed is True
+
+
+def test_output_present_blocks_with_no_executions() -> None:
+    from pollypm.work.gates import GateRegistry
+
+    gate = GateRegistry().get("output_present")
+    result = gate.check(_make_task())
+    assert result.passed is False
+
+
+def test_output_present_blocks_with_empty_summary() -> None:
+    from pollypm.work.gates import GateRegistry
+    from pollypm.work.models import (
+        Artifact, ArtifactKind, FlowNodeExecution, OutputType, WorkOutput,
+    )
+
+    gate = GateRegistry().get("output_present")
+    execution = FlowNodeExecution(
+        task_id="demo/1",
+        node_id="critique",
+        visit=1,
+        work_output=WorkOutput(
+            type=OutputType.DOCUMENT,
+            summary="",
+            artifacts=[Artifact(kind=ArtifactKind.NOTE, description="x")],
+        ),
+    )
+    task = _make_task(executions=[execution])
+    result = gate.check(task)
+    assert result.passed is False
+
+
+def test_output_present_passes_with_structured_output() -> None:
+    from pollypm.work.gates import GateRegistry
+    from pollypm.work.models import (
+        Artifact, ArtifactKind, FlowNodeExecution, OutputType, WorkOutput,
+    )
+
+    gate = GateRegistry().get("output_present")
+    execution = FlowNodeExecution(
+        task_id="demo/1",
+        node_id="critique",
+        visit=1,
+        work_output=WorkOutput(
+            type=OutputType.DOCUMENT,
+            summary="Simplicity critique",
+            artifacts=[Artifact(kind=ArtifactKind.NOTE, description="x")],
+        ),
+    )
+    task = _make_task(executions=[execution])
+    result = gate.check(task)
+    assert result.passed is True
+
+
+def test_log_present_blocks_when_log_missing(tmp_path: Path) -> None:
+    from pollypm.work.gates import GateRegistry
+
+    gate = GateRegistry().get("log_present")
+    result = gate.check(_make_task(), project_root=tmp_path)
+    assert result.passed is False
+
+
+def test_log_present_blocks_when_log_empty(tmp_path: Path) -> None:
+    from pollypm.work.gates import GateRegistry
+
+    gate = GateRegistry().get("log_present")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "planning-session-log.md").write_text("   \n")
+    result = gate.check(_make_task(), project_root=tmp_path)
+    assert result.passed is False
+
+
+def test_log_present_passes_with_populated_log(tmp_path: Path) -> None:
+    from pollypm.work.gates import GateRegistry
+
+    gate = GateRegistry().get("log_present")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "planning-session-log.md").write_text(
+        "# Session log\n\nThe architect said..."
+    )
+    result = gate.check(_make_task(), project_root=tmp_path)
+    assert result.passed is True
+
+
+def test_user_level_tests_pass_blocks_without_receipt(tmp_path: Path) -> None:
+    from pollypm.work.gates import GateRegistry
+
+    gate = GateRegistry().get("user_level_tests_pass")
+    result = gate.check(_make_task(), project_root=tmp_path)
+    assert result.passed is False
+
+
+def test_user_level_tests_pass_blocks_with_failing_receipt(tmp_path: Path) -> None:
+    import json as _json
+
+    from pollypm.work.gates import GateRegistry
+
+    gate = GateRegistry().get("user_level_tests_pass")
+    receipts = tmp_path / ".pollypm-state" / "test-receipts"
+    receipts.mkdir(parents=True)
+    receipts.joinpath("demo-1.json").write_text(
+        _json.dumps({"passed": False, "details": "3/5 scenarios failed"})
+    )
+    result = gate.check(_make_task(), project_root=tmp_path)
+    assert result.passed is False
+    assert "3/5" in result.reason
+
+
+def test_user_level_tests_pass_passes_with_receipt(tmp_path: Path) -> None:
+    import json as _json
+
+    from pollypm.work.gates import GateRegistry
+
+    gate = GateRegistry().get("user_level_tests_pass")
+    receipts = tmp_path / ".pollypm-state" / "test-receipts"
+    receipts.mkdir(parents=True)
+    receipts.joinpath("demo-1.json").write_text(
+        _json.dumps({"passed": True, "details": "Playwright 5/5"})
+    )
+    result = gate.check(_make_task(), project_root=tmp_path)
+    assert result.passed is True

@@ -3,5 +3,9 @@ name = "local_heartbeat"
 kind = "heartbeat"
 version = "0.1.0"
 entrypoint = "plugin.py:plugin"
-capabilities = ["heartbeat"]
 description = "Built-in local heartbeat backend."
+
+[[capabilities]]
+kind = "heartbeat"
+name = "local"
+requires_api = ">=1,<2"

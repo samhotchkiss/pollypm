@@ -33,6 +33,127 @@ class HookFilterResult:
     reason: str | None = None
 
 
+# Capability kinds recognised by the rail plugin API. See
+# docs/plugin-discovery-spec.md §4. Unknown kinds don't fail load —
+# they're preserved as-is so forward-compatible plugins keep working
+# on older rails with a logged warning.
+KNOWN_CAPABILITY_KINDS: frozenset[str] = frozenset(
+    {
+        "provider",
+        "runtime",
+        "session_service",
+        "heartbeat",
+        "scheduler",
+        "agent_profile",
+        "task_backend",
+        "memory_backend",
+        "doc_backend",
+        "sync_adapter",
+        "transcript_source",
+        "job_handler",
+        "roster_entry",
+        # Plugin-level hook capability (observers / filters) — not tied to
+        # a specific factory kind. Accepted so plugins declaring hook-only
+        # surfaces pass validation.
+        "hook",
+        # Legacy: pre-structured manifests used these bare-string values.
+        "roster",
+    }
+)
+
+
+def _parse_api_major(value: str) -> int:
+    """Parse a rail API version literal (e.g. ``"1"``, ``"2.3"``) to its
+    major integer. Non-numeric or empty values raise ``ValueError``.
+    """
+    if not value:
+        raise ValueError("empty API version")
+    token = value.strip()
+    # Accept bare integers ("1") and dotted forms ("1.0").
+    head = token.split(".", 1)[0]
+    return int(head)
+
+
+def check_requires_api(expression: str | None, current_api_version: str) -> bool:
+    """Return ``True`` if ``current_api_version`` satisfies ``expression``.
+
+    ``expression`` is a comma-separated list of simple constraints:
+
+        >=1   <2   ==1   !=2   >0   <=1
+
+    or a bare version ("1") which is treated as ``==1``. Missing /
+    ``None`` expressions always satisfy (returns ``True``).
+
+    Only the major-version integer is compared — this matches the rail's
+    compatibility model where the current API is a major number.
+    """
+    if expression is None:
+        return True
+    expr = expression.strip()
+    if not expr:
+        return True
+    current_major = _parse_api_major(current_api_version)
+
+    for raw_part in expr.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        op = "=="
+        rest = part
+        for candidate in (">=", "<=", "==", "!=", ">", "<"):
+            if part.startswith(candidate):
+                op = candidate
+                rest = part[len(candidate):].strip()
+                break
+        else:
+            # Bare "1" → "==1".
+            op = "=="
+            rest = part
+        try:
+            target_major = _parse_api_major(rest)
+        except ValueError:
+            raise ValueError(
+                f"Unparseable API version constraint '{part}' in '{expression}'"
+            ) from None
+        if op == ">=" and not (current_major >= target_major):
+            return False
+        if op == "<=" and not (current_major <= target_major):
+            return False
+        if op == "==" and not (current_major == target_major):
+            return False
+        if op == "!=" and not (current_major != target_major):
+            return False
+        if op == ">" and not (current_major > target_major):
+            return False
+        if op == "<" and not (current_major < target_major):
+            return False
+    return True
+
+
+@dataclass(slots=True, frozen=True)
+class Capability:
+    """A structured plugin capability declaration.
+
+    Each plugin advertises one ``Capability`` per surface it provides.
+    See docs/plugin-discovery-spec.md §4.
+
+    * ``kind`` — capability kind (see ``KNOWN_CAPABILITY_KINDS``).
+    * ``name`` — unique-within-(kind) identifier (e.g. ``"claude"`` for
+      a provider). Defaults to the plugin name when omitted.
+    * ``replaces`` — tuple of capability ``name`` values within the same
+      ``kind`` that this capability explicitly supersedes. Explicit
+      replacement wins over implicit last-write discovery order.
+    * ``requires_api`` — optional rail API version constraint (e.g.
+      ``">=1,<2"``). If the current rail API is outside the range the
+      capability is skipped. Missing means "any".
+    """
+
+    kind: str
+    name: str = ""
+    replaces: tuple[str, ...] = ()
+    requires_api: str | None = None
+
+
 class RosterAPI:
     """Stable façade plugins use to register recurring schedules.
 
@@ -147,13 +268,49 @@ class JobHandlerAPI:
         )
 
 
+def normalize_capabilities(
+    raw: "tuple[Capability | str, ...] | list[Capability | str]",
+    *,
+    plugin_name: str = "",
+) -> tuple[Capability, ...]:
+    """Coerce a tuple of ``Capability`` / bare-string entries into a
+    tuple of ``Capability``.
+
+    Bare-string form (legacy) is accepted for one release with a
+    deprecation warning. Each bare string is mapped to
+    ``Capability(kind=<string>, name=plugin_name or <string>)``.
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+    out: list[Capability] = []
+    for entry in raw:
+        if isinstance(entry, Capability):
+            out.append(entry)
+            continue
+        if isinstance(entry, str):
+            if plugin_name:
+                logger.warning(
+                    "Plugin '%s' uses legacy bare-string capability '%s'; "
+                    "migrate to structured [[capabilities]] blocks "
+                    "(kind=, name=) — deprecation target: next release.",
+                    plugin_name, entry,
+                )
+            out.append(Capability(kind=entry, name=plugin_name or entry))
+            continue
+        raise TypeError(
+            f"Capability entry must be Capability or str, got {type(entry).__name__}: {entry!r}"
+        )
+    return tuple(out)
+
+
 @dataclass(slots=True)
 class PollyPMPlugin:
     name: str
     api_version: str = "1"
     version: str = "0.1.0"
     description: str = ""
-    capabilities: tuple[str, ...] = ()
+    capabilities: tuple[Capability, ...] = ()
     providers: dict[str, ProviderFactory] = field(default_factory=dict)
     runtimes: dict[str, RuntimeFactory] = field(default_factory=dict)
     heartbeat_backends: dict[str, HeartbeatBackendFactory] = field(default_factory=dict)
@@ -165,3 +322,11 @@ class PollyPMPlugin:
     filters: dict[str, list[FilterHandler]] = field(default_factory=dict)
     register_roster: RosterRegistrar | None = None
     register_handlers: JobHandlerRegistrar | None = None
+
+    def __post_init__(self) -> None:
+        # Coerce legacy bare-string capabilities into structured form so
+        # older plugins (and in-tree builtins mid-migration) keep working.
+        if self.capabilities and any(not isinstance(c, Capability) for c in self.capabilities):
+            self.capabilities = normalize_capabilities(
+                self.capabilities, plugin_name=self.name,
+            )

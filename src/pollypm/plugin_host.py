@@ -9,11 +9,15 @@ import tomllib
 import types
 
 from pollypm.plugin_api.v1 import (
+    Capability,
     HookContext,
     HookFilterResult,
     JobHandlerAPI,
+    KNOWN_CAPABILITY_KINDS,
     PollyPMPlugin,
     RosterAPI,
+    check_requires_api,
+    normalize_capabilities,
 )
 
 logger = logging.getLogger(__name__)
@@ -29,10 +33,11 @@ class PluginManifest:
     version: str
     kind: str
     entrypoint: str
-    capabilities: tuple[str, ...]
+    capabilities: tuple[Capability, ...]
     description: str
     plugin_dir: Path
     source: str
+    requires_api: str | None = None
 
 
 class ExtensionHost:
@@ -162,12 +167,29 @@ class ExtensionHost:
     def _resolve_factory(self, name: str, registry_getter, kind: str, **kwargs: object) -> object:
         registry: dict[str, object] = {}
         sources: dict[str, str] = {}
+        # Build a (kind_hint, item_name) -> plugin name map for "explicit
+        # replaces" — a plugin whose capability declares replaces=[X] wins
+        # over any implicit last-write on X.
+        replacements: dict[str, str] = {}  # item_name -> replacing plugin name
+        for plugin in self.plugins().values():
+            for cap in plugin.capabilities:
+                for target in cap.replaces:
+                    replacements[target] = plugin.name
         for plugin in self.plugins().values():
             for item_name, factory in registry_getter(plugin).items():
-                if item_name in registry and sources.get(item_name) != plugin.name:
+                previous = sources.get(item_name)
+                if previous is not None and previous != plugin.name:
+                    # Skip the override if an explicit replacement was
+                    # already installed by another plugin.
+                    if replacements.get(item_name) == previous and replacements.get(item_name) != plugin.name:
+                        logger.debug(
+                            "%s '%s' from plugin '%s' preserved — explicit replace wins over implicit override from '%s'",
+                            kind, item_name, previous, plugin.name,
+                        )
+                        continue
                     logger.debug(
                         "%s '%s' from plugin '%s' overrides '%s' from plugin '%s'",
-                        kind, item_name, plugin.name, item_name, sources[item_name],
+                        kind, item_name, plugin.name, item_name, previous,
                     )
                 registry[item_name] = factory
                 sources[item_name] = plugin.name
@@ -262,17 +284,93 @@ class ExtensionHost:
 
     def _read_manifest(self, manifest_path: Path, source: str) -> PluginManifest:
         raw = tomllib.loads(manifest_path.read_text())
+        name = str(raw["name"])
+        capabilities = self._parse_capability_entries(raw.get("capabilities", []), plugin_name=name)
         return PluginManifest(
-            name=str(raw["name"]),
+            name=name,
             api_version=str(raw["api_version"]),
             version=str(raw.get("version", "0.1.0")),
             kind=str(raw.get("kind", "")),
             entrypoint=str(raw["entrypoint"]),
-            capabilities=tuple(str(item) for item in raw.get("capabilities", [])),
+            capabilities=capabilities,
             description=str(raw.get("description", "")),
             plugin_dir=manifest_path.parent,
             source=source,
+            requires_api=(str(raw["requires_api"]) if raw.get("requires_api") is not None else None),
         )
+
+    def _parse_capability_entries(
+        self, raw: object, *, plugin_name: str,
+    ) -> tuple[Capability, ...]:
+        """Parse the ``capabilities`` manifest field — structured blocks
+        (list-of-tables) or legacy bare strings. Bare strings are accepted
+        for one release and emit a deprecation warning."""
+        if raw is None:
+            return ()
+        if not isinstance(raw, list):
+            raise ValueError("capabilities must be a list")
+        structured: list[Capability] = []
+        legacy_strings: list[str] = []
+        for entry in raw:
+            if isinstance(entry, str):
+                legacy_strings.append(entry)
+                continue
+            if isinstance(entry, dict):
+                kind = entry.get("kind")
+                if not isinstance(kind, str) or not kind.strip():
+                    raise ValueError(
+                        f"capability block missing 'kind' in plugin '{plugin_name}'"
+                    )
+                name_field = entry.get("name")
+                if name_field is None:
+                    cap_name = plugin_name
+                else:
+                    cap_name = str(name_field)
+                replaces_raw = entry.get("replaces", ())
+                if isinstance(replaces_raw, (list, tuple)):
+                    replaces = tuple(str(item) for item in replaces_raw)
+                else:
+                    raise ValueError(
+                        f"capability 'replaces' must be a list in plugin '{plugin_name}'"
+                    )
+                requires_api = entry.get("requires_api")
+                if requires_api is not None and not isinstance(requires_api, str):
+                    raise ValueError(
+                        f"capability 'requires_api' must be a string in plugin '{plugin_name}'"
+                    )
+                if kind not in KNOWN_CAPABILITY_KINDS:
+                    logger.warning(
+                        "Plugin '%s' declares unknown capability kind '%s' — preserved but not a recognised rail capability.",
+                        plugin_name, kind,
+                    )
+                structured.append(
+                    Capability(
+                        kind=kind.strip(),
+                        name=cap_name,
+                        replaces=replaces,
+                        requires_api=requires_api,
+                    )
+                )
+                continue
+            raise ValueError(
+                f"capability entry must be a table or string in plugin '{plugin_name}', got {type(entry).__name__}"
+            )
+
+        if legacy_strings and structured:
+            logger.warning(
+                "Plugin '%s' mixes legacy bare-string capabilities with structured [[capabilities]] blocks; "
+                "migrate to fully structured form (kind=, name=).",
+                plugin_name,
+            )
+        if legacy_strings and not structured:
+            logger.warning(
+                "Plugin '%s' uses legacy bare-string capabilities %s; migrate to structured [[capabilities]] blocks "
+                "(kind=, name=) — deprecation target: next release.",
+                plugin_name, legacy_strings,
+            )
+        for raw_string in legacy_strings:
+            structured.append(Capability(kind=raw_string, name=plugin_name))
+        return tuple(structured)
 
     def _load_plugin_from_manifest(self, manifest: PluginManifest) -> PollyPMPlugin | None:
         if manifest.api_version != PLUGIN_API_VERSION:
@@ -280,6 +378,22 @@ class ExtensionHost:
                 f"Plugin {manifest.name} uses API version {manifest.api_version}; expected {PLUGIN_API_VERSION}"
             )
             return None
+        # Plugin-level requires_api (manifest top-level) must include the
+        # current rail API. Per-capability requires_api is enforced in
+        # _filter_capabilities below.
+        if manifest.requires_api:
+            try:
+                if not check_requires_api(manifest.requires_api, PLUGIN_API_VERSION):
+                    self.errors.append(
+                        f"Plugin {manifest.name} requires_api '{manifest.requires_api}' excludes current API "
+                        f"version {PLUGIN_API_VERSION}; skipped."
+                    )
+                    return None
+            except ValueError as exc:
+                self.errors.append(
+                    f"Plugin {manifest.name} has unparseable requires_api '{manifest.requires_api}': {exc}"
+                )
+                return None
         try:
             module = self._load_module(manifest)
             plugin_obj = self._resolve_entrypoint(module, manifest.entrypoint)
@@ -289,7 +403,35 @@ class ExtensionHost:
         if not isinstance(plugin_obj, PollyPMPlugin):
             self.errors.append(f"Plugin {manifest.name} entrypoint did not return PollyPMPlugin")
             return None
+        # If the manifest declared structured capabilities, prefer them
+        # over whatever the plugin module set — the manifest is canonical
+        # for discovery/doctor reporting.
+        if manifest.capabilities:
+            filtered = self._filter_capabilities(manifest.name, manifest.capabilities)
+            plugin_obj.capabilities = filtered
         return plugin_obj
+
+    def _filter_capabilities(
+        self, plugin_name: str, capabilities: tuple[Capability, ...],
+    ) -> tuple[Capability, ...]:
+        """Drop capabilities whose ``requires_api`` excludes the rail."""
+        kept: list[Capability] = []
+        for cap in capabilities:
+            try:
+                if not check_requires_api(cap.requires_api, PLUGIN_API_VERSION):
+                    self.errors.append(
+                        f"Plugin {plugin_name} capability {cap.kind}:{cap.name} requires_api "
+                        f"'{cap.requires_api}' excludes current API version {PLUGIN_API_VERSION}; dropped."
+                    )
+                    continue
+            except ValueError as exc:
+                self.errors.append(
+                    f"Plugin {plugin_name} capability {cap.kind}:{cap.name} has unparseable "
+                    f"requires_api '{cap.requires_api}': {exc}; dropped."
+                )
+                continue
+            kept.append(cap)
+        return tuple(kept)
 
     def _load_module(self, manifest: PluginManifest) -> types.ModuleType:
         module_ref, _attr = manifest.entrypoint.split(":", 1)

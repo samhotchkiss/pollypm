@@ -3,5 +3,9 @@ name = "claude"
 kind = "provider"
 version = "0.1.0"
 entrypoint = "plugin.py:plugin"
-capabilities = ["provider"]
 description = "Built-in Claude provider adapter."
+
+[[capabilities]]
+kind = "provider"
+name = "claude"
+requires_api = ">=1,<2"

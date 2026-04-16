@@ -3,5 +3,9 @@ name = "codex"
 kind = "provider"
 version = "0.1.0"
 entrypoint = "plugin.py:plugin"
-capabilities = ["provider"]
 description = "Built-in Codex provider adapter."
+
+[[capabilities]]
+kind = "provider"
+name = "codex"
+requires_api = ">=1,<2"

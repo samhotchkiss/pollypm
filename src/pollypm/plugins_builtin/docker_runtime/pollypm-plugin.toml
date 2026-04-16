@@ -3,5 +3,9 @@ name = "docker_runtime"
 kind = "runtime"
 version = "0.1.0"
 entrypoint = "plugin.py:plugin"
-capabilities = ["runtime"]
 description = "Built-in Docker runtime adapter."
+
+[[capabilities]]
+kind = "runtime"
+name = "docker"
+requires_api = ">=1,<2"

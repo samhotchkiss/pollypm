@@ -3,5 +3,42 @@ name = "itsalive"
 kind = "agent_profile"
 version = "0.3.0"
 entrypoint = "plugin.py:plugin"
-capabilities = ["agent_profile", "hook", "roster", "job_handler"]
 description = "Dedicated itsalive.co deployment integration with async verification, capability injection, and recurring deploy sweep."
+
+[[capabilities]]
+kind = "agent_profile"
+name = "itsalive"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "agent_profile"
+name = "polly"
+replaces = ["polly"]
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "agent_profile"
+name = "worker"
+replaces = ["worker"]
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "agent_profile"
+name = "heartbeat"
+replaces = ["heartbeat"]
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "hook"
+name = "session.after_launch"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "job_handler"
+name = "itsalive.deploy_sweep"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "roster_entry"
+name = "itsalive.deploy_sweep"
+requires_api = ">=1,<2"

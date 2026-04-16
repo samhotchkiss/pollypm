@@ -3,5 +3,9 @@ name = "local_runtime"
 kind = "runtime"
 version = "0.1.0"
 entrypoint = "plugin.py:plugin"
-capabilities = ["runtime"]
 description = "Built-in local runtime adapter."
+
+[[capabilities]]
+kind = "runtime"
+name = "local"
+requires_api = ">=1,<2"

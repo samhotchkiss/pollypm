@@ -3,5 +3,9 @@ name = "tmux_session_service"
 kind = "session_service"
 version = "0.1.0"
 entrypoint = "plugin.py:plugin"
-capabilities = ["session_service"]
 description = "Built-in tmux session service."
+
+[[capabilities]]
+kind = "session_service"
+name = "tmux"
+requires_api = ">=1,<2"

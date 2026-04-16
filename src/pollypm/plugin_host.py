@@ -37,6 +37,11 @@ class ExtensionHost:
             self._plugins = self._load_plugins()
         return dict(self._plugins)
 
+    def remove_plugin(self, name: str) -> None:
+        """Remove a plugin from the loaded registry (e.g. after validation failure)."""
+        if self._plugins is not None:
+            self._plugins.pop(name, None)
+
     def get_provider(self, name: str) -> object:
         return self._resolve_factory(name, lambda plugin: plugin.providers, "provider")
 

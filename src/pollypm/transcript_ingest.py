@@ -611,6 +611,10 @@ class TranscriptIngestor:
 def start_transcript_ingestion(config):
     key = config.project.base_dir.resolve()
     with _INGESTORS_LOCK:
+        # Evict stopped ingestors so the dict doesn't grow unbounded
+        stale = [k for k, v in _INGESTORS.items() if v._stop.is_set()]
+        for k in stale:
+            del _INGESTORS[k]
         ingestor = _INGESTORS.get(key)
         if ingestor is None:
             ingestor = TranscriptIngestor(config)

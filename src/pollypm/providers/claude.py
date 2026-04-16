@@ -9,7 +9,10 @@ from pollypm.models import AccountConfig, SessionConfig
 from pollypm.providers.base import LaunchCommand
 from pollypm.provider_sdk import ProviderAdapterBase, ProviderUsageSnapshot, TranscriptSource
 from pollypm.runtime_env import claude_config_dir
-from pollypm.tmux.client import TmuxClient
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from pollypm.tmux.client import TmuxClient
 
 
 class ClaudeAdapter(ProviderAdapterBase):

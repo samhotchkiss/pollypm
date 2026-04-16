@@ -92,7 +92,7 @@ class FileTaskBackend(TaskBackend):
         (self.issues_root() / ".latest_issue_number").write_text(f"{next_id}\n")
         return TaskRecord(task_id=task_id, title=title, state=state, path=path)
 
-    def move_task(self, task_id: str, to_state: str, *, strict: bool = False) -> TaskRecord:
+    def move_task(self, task_id: str, to_state: str) -> TaskRecord:
         for task in self.list_tasks():
             if task.task_id != task_id:
                 continue

@@ -331,9 +331,7 @@ def validate_all_plugins(host: ExtensionHost) -> ValidationReport:
 
         if not result.passed:
             report.disabled_plugins.append(name)
-            # Remove failing plugin from the host's loaded plugins
-            if host._plugins is not None and name in host._plugins:
-                del host._plugins[name]
+            host.remove_plugin(name)
             for error in result.errors:
                 logger.warning("Plugin '%s' validation failed: %s", name, error)
                 host.errors.append(f"Plugin '{name}' disabled: {error}")

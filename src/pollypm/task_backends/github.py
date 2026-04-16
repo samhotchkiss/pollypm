@@ -17,7 +17,7 @@ from pollypm.task_backends.base import TaskBackend, TaskRecord, TRACKER_STATES, 
 logger = logging.getLogger(__name__)
 
 # Maps internal state names to GitHub label names
-STATE_TO_LABEL: dict[str, str] = {
+_STATE_TO_LABEL: dict[str, str] = {
     "00-not-ready": "polly:not-ready",
     "01-ready": "polly:ready",
     "02-in-progress": "polly:in-progress",
@@ -26,9 +26,9 @@ STATE_TO_LABEL: dict[str, str] = {
     "05-completed": "polly:completed",
 }
 
-LABEL_TO_STATE: dict[str, str] = {v: k for k, v in STATE_TO_LABEL.items()}
+_LABEL_TO_STATE: dict[str, str] = {v: k for k, v in _STATE_TO_LABEL.items()}
 
-ALL_POLLY_LABELS = list(STATE_TO_LABEL.values())
+_ALL_POLLY_LABELS = list(_STATE_TO_LABEL.values())
 
 
 @dataclass(slots=True)
@@ -133,7 +133,7 @@ class GitHubTaskBackend(TaskBackend):
             existing = {name.strip() for name in result.stdout.strip().splitlines()}
         except RuntimeError:
             pass
-        for label in ALL_POLLY_LABELS:
+        for label in _ALL_POLLY_LABELS:
             if label not in existing:
                 try:
                     _gh("label", "create", label, "--repo", self.repo, "--force", check=False)
@@ -143,13 +143,13 @@ class GitHubTaskBackend(TaskBackend):
 
     def list_tasks(self, *, states: list[str] | None = None) -> list[TaskRecord]:
         wanted_states = states or TRACKER_STATES
-        wanted_labels = [STATE_TO_LABEL[s] for s in wanted_states if s in STATE_TO_LABEL]
+        wanted_labels = [_STATE_TO_LABEL[s] for s in wanted_states if s in _STATE_TO_LABEL]
         if not wanted_labels:
             return []
 
         tasks: list[TaskRecord] = []
         for label in wanted_labels:
-            state = LABEL_TO_STATE[label]
+            state = _LABEL_TO_STATE[label]
             try:
                 result = _gh(
                     "issue", "list",
@@ -181,8 +181,8 @@ class GitHubTaskBackend(TaskBackend):
         state = "01-ready"
         for label in issue.get("labels", []):
             name = label.get("name")
-            if isinstance(name, str) and name in LABEL_TO_STATE:
-                state = LABEL_TO_STATE[name]
+            if isinstance(name, str) and name in _LABEL_TO_STATE:
+                state = _LABEL_TO_STATE[name]
                 break
         issue_id = str(issue["number"])
         return TaskRecord(
@@ -195,7 +195,7 @@ class GitHubTaskBackend(TaskBackend):
     def next_available(self) -> TaskRecord | None:
         result = _gh(
             "issue", "list",
-            "--label", STATE_TO_LABEL["01-ready"],
+            "--label", _STATE_TO_LABEL["01-ready"],
             "--state", "all",
             "--json", "number,title,state,createdAt",
             "--repo", self.repo,
@@ -230,7 +230,7 @@ class GitHubTaskBackend(TaskBackend):
         return history
 
     def create_task(self, *, title: str, body: str = "", state: str = "01-ready") -> TaskRecord:
-        label = STATE_TO_LABEL.get(state, "polly:ready")
+        label = _STATE_TO_LABEL.get(state, "polly:ready")
         args = [
             "issue", "create",
             "--title", title,
@@ -252,7 +252,7 @@ class GitHubTaskBackend(TaskBackend):
             path=self.project_path / f"#{task_id}",
         )
 
-    def move_task(self, task_id: str, to_state: str, *, strict: bool = False) -> TaskRecord:
+    def move_task(self, task_id: str, to_state: str) -> TaskRecord:
         # Get current issue info
         result = _gh(
             "issue", "view", task_id,
@@ -266,15 +266,15 @@ class GitHubTaskBackend(TaskBackend):
         # Find current polly state
         current_state = None
         for lbl in current_labels:
-            if lbl in LABEL_TO_STATE:
-                current_state = LABEL_TO_STATE[lbl]
+            if lbl in _LABEL_TO_STATE:
+                current_state = _LABEL_TO_STATE[lbl]
                 break
 
         if current_state:
             validate_task_transition(current_state, to_state)
 
         # Remove all polly:* labels, add the new one
-        new_label = STATE_TO_LABEL.get(to_state)
+        new_label = _STATE_TO_LABEL.get(to_state)
         if not new_label:
             raise ValueError(f"Unknown state: {to_state}")
 
@@ -346,7 +346,7 @@ class GitHubTaskBackend(TaskBackend):
 
     def state_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
-        for state, label in STATE_TO_LABEL.items():
+        for state, label in _STATE_TO_LABEL.items():
             try:
                 result = _gh(
                     "issue", "list",

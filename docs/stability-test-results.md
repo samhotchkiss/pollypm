@@ -146,6 +146,7 @@ The system is demo-ready for the investor presentation with the following caveat
 - **Stability: 960+ hours (40 days) with zero intervention, 13 sessions running continuously, 1000+ monitoring iterations**
 - **Worktree code gap fix committed**: pm task done now syncs worker commits to task branch automatically
 - **Session identity swap FIXED**: Sequential initial input sending after parallel stabilization eliminates tmux routing races. All sessions now get correct prompts on every restart.
+- **Shortlink lifecycle test**: Task created → queued → claimed → implemented → reviewed → REJECTED (README missing CLI docs) → reworking v2. Full lifecycle verified with identity fix.
 - Account access valid until 11:35 AM (April 16)
 
 ## Bugs Found and Fixed

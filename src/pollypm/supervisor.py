@@ -795,6 +795,13 @@ class Supervisor:
         self.store.prune_sessions(
             {session.name for session in self.config.sessions.values() if session.enabled}
         )
+        # One-shot migration of any legacy inbox messages — safe to call on
+        # every boot; guarded by a durable marker so it only runs once.
+        try:
+            from pollypm.inbox_migration import run_inbox_migration_if_needed
+            run_inbox_migration_if_needed(self.config)
+        except Exception:  # noqa: BLE001 - never block startup on migration
+            pass
         return project.base_dir
 
     def console_window_name(self) -> str:

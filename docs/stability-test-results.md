@@ -143,8 +143,9 @@ The system is demo-ready for the investor presentation with the following caveat
 - Russell found: data corruption bug, missing tests, uncommitted code, merge conflicts
 - Full task lifecycle: create → queue → claim → implement → review → reject → rework → approve
 - System recovers cleanly from kill/restart (tested 3 times)
-- **Stability: 957+ hours (39+ days) with zero intervention, 13 sessions running continuously, 999 monitoring iterations**
+- **Stability: 960+ hours (40 days) with zero intervention, 13 sessions running continuously, 1000+ monitoring iterations**
 - **Worktree code gap fix committed**: pm task done now syncs worker commits to task branch automatically
+- **Session identity swap FIXED**: Sequential initial input sending after parallel stabilization eliminates tmux routing races. All sessions now get correct prompts on every restart.
 - Account access valid until 11:35 AM (April 16)
 
 ## Bugs Found and Fixed

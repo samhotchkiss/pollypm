@@ -217,6 +217,7 @@ class Task:
     # --- State ---
     work_status: WorkStatus = WorkStatus.DRAFT
     flow_template_id: str = ""
+    flow_template_version: int = 1
     current_node_id: str | None = None
     assignee: str | None = None
     priority: Priority = Priority.NORMAL

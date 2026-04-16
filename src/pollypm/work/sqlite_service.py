@@ -6,6 +6,7 @@ Flow templates are resolved via the flow engine and persisted on first use.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -138,16 +139,38 @@ class SQLiteWorkService:
     # Internal: flow template persistence
     # ------------------------------------------------------------------
 
-    def _ensure_flow_in_db(self, name: str) -> FlowTemplate:
-        """Load a flow via the engine, persist it if missing, and return it."""
-        template = resolve_flow(name, self._project_path)
-        row = self._conn.execute(
-            "SELECT 1 FROM work_flow_templates WHERE name = ? AND version = ?",
-            (template.name, template.version),
-        ).fetchone()
-        if row is not None:
-            return template
+    @staticmethod
+    def _flow_content_hash(template: FlowTemplate) -> str:
+        """Compute a stable content hash over the flow's structural fields.
 
+        Used to detect YAML changes. We intentionally ignore the ``version``
+        and ``is_current`` fields so that re-saving the same content with
+        a different version number doesn't count as a change.
+        """
+        payload = {
+            "description": template.description,
+            "roles": template.roles,
+            "start_node": template.start_node,
+            "nodes": {
+                nid: {
+                    "name": n.name,
+                    "type": n.type.value,
+                    "actor_type": n.actor_type.value if n.actor_type else None,
+                    "actor_role": n.actor_role,
+                    "next_node_id": n.next_node_id,
+                    "reject_node_id": n.reject_node_id,
+                    "gates": n.gates,
+                }
+                for nid, n in template.nodes.items()
+            },
+        }
+        serialised = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(serialised.encode("utf-8")).hexdigest()
+
+    def _insert_flow_version(
+        self, template: FlowTemplate, version: int,
+    ) -> None:
+        """Persist ``template`` at ``version`` in work_flow_templates/nodes."""
         now = _now()
         self._conn.execute(
             "INSERT INTO work_flow_templates "
@@ -155,7 +178,7 @@ class SQLiteWorkService:
             "VALUES (?, ?, ?, ?, ?, ?)",
             (
                 template.name,
-                template.version,
+                version,
                 template.description,
                 json.dumps(template.roles),
                 template.start_node,
@@ -170,7 +193,7 @@ class SQLiteWorkService:
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     template.name,
-                    template.version,
+                    version,
                     node_id,
                     node.name,
                     node.type.value,
@@ -181,8 +204,73 @@ class SQLiteWorkService:
                     json.dumps(node.gates),
                 ),
             )
+
+    def _ensure_flow_in_db(self, name: str) -> FlowTemplate:
+        """Load a flow via the engine and persist it, bumping version on change.
+
+        - If no row exists for this flow name, persist at version 1 (or the
+          template's stated version).
+        - If the latest stored row matches the current YAML content hash,
+          reuse that version.
+        - If the latest stored row differs from the current YAML, INSERT a
+          new row at max(version)+1, keeping older versions intact so
+          in-flight tasks that reference them still execute the old graph.
+
+        Returns a FlowTemplate whose ``version`` is the one new tasks
+        should be pinned to.
+        """
+        template = resolve_flow(name, self._project_path)
+        current_hash = self._flow_content_hash(template)
+
+        # Look up the latest stored version for this flow.
+        latest = self._conn.execute(
+            "SELECT version FROM work_flow_templates "
+            "WHERE name = ? ORDER BY version DESC LIMIT 1",
+            (template.name,),
+        ).fetchone()
+
+        if latest is None:
+            # First time we've seen this flow. Persist at the stated version.
+            self._insert_flow_version(template, template.version)
+            self._conn.commit()
+            return template
+
+        latest_version = int(latest["version"])
+
+        # Compare stored content hash at latest version to the current YAML.
+        stored = self._load_flow_from_db(template.name, latest_version)
+        stored_hash = self._flow_content_hash(stored)
+
+        if stored_hash == current_hash:
+            # Unchanged — reuse the latest version.
+            # Return a template object whose ``version`` reflects the stored
+            # row so new tasks get pinned correctly.
+            if template.version != latest_version:
+                template = FlowTemplate(
+                    name=template.name,
+                    description=template.description,
+                    roles=template.roles,
+                    nodes=template.nodes,
+                    start_node=template.start_node,
+                    version=latest_version,
+                    is_current=True,
+                )
+            return template
+
+        # YAML differs — bump to a new version row.
+        new_version = latest_version + 1
+        self._insert_flow_version(template, new_version)
         self._conn.commit()
-        return template
+
+        return FlowTemplate(
+            name=template.name,
+            description=template.description,
+            roles=template.roles,
+            nodes=template.nodes,
+            start_node=template.start_node,
+            version=new_version,
+            is_current=True,
+        )
 
     def _load_flow_from_db(self, name: str, version: int) -> FlowTemplate:
         """Load a flow template from the database."""
@@ -243,6 +331,7 @@ class SQLiteWorkService:
             labels=json.loads(row["labels"]),
             work_status=WorkStatus(row["work_status"]),
             flow_template_id=row["flow_template_id"],
+            flow_template_version=row["flow_template_version"],
             current_node_id=row["current_node_id"],
             assignee=row["assignee"],
             priority=Priority(row["priority"]),
@@ -439,7 +528,7 @@ class SQLiteWorkService:
         try:
             flow = self._load_flow_from_db(
                 task.flow_template_id,
-                1,  # version
+                task.flow_template_version,
             )
         except Exception:
             return task.assignee
@@ -741,7 +830,9 @@ class SQLiteWorkService:
         if task.blocked:
             raise InvalidTransitionError("Cannot claim a blocked task.")
 
-        flow = self._load_flow_from_db(task.flow_template_id, 1)
+        flow = self._load_flow_from_db(
+            task.flow_template_id, task.flow_template_version,
+        )
         start_node = flow.start_node
         now = _now()
 
@@ -1000,7 +1091,9 @@ class SQLiteWorkService:
         self, task: Task
     ) -> tuple[FlowTemplate, FlowNode]:
         """Load the flow and return the current node."""
-        flow = self._load_flow_from_db(task.flow_template_id, 1)
+        flow = self._load_flow_from_db(
+            task.flow_template_id, task.flow_template_version,
+        )
         if task.current_node_id is None:
             raise InvalidTransitionError("Task has no current flow node.")
         node = flow.nodes.get(task.current_node_id)

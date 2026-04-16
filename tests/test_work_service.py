@@ -512,3 +512,135 @@ class TestAvailableFlowsProjectArg:
 
         scoped = svc.get_flow("standard", project=str(other))
         assert scoped.description == "custom-for-other"
+
+
+# ---------------------------------------------------------------------------
+# Flow immutability (OQ-6) — tasks pin to their creation-time version
+# ---------------------------------------------------------------------------
+
+
+class TestFlowImmutability:
+    """Tasks execute on the flow template version they were created with.
+
+    Editing a flow YAML must not silently reroute in-flight tasks through
+    the new graph. New tasks pick up the latest version; existing tasks
+    stay on their pinned version (issue #134).
+    """
+
+    def _write_custom_standard(self, root, *, description):
+        """Write a project-local override of the 'standard' flow."""
+        import textwrap
+
+        flows_dir = root / ".pollypm" / "flows"
+        flows_dir.mkdir(parents=True, exist_ok=True)
+        (flows_dir / "standard.yaml").write_text(textwrap.dedent(f"""\
+            name: standard
+            description: {description}
+            roles:
+              worker:
+                description: Implements
+              reviewer:
+                description: Reviews
+            nodes:
+              implement:
+                type: work
+                actor_type: role
+                actor_role: worker
+                next_node: code_review
+                gates: [has_assignee]
+              code_review:
+                type: review
+                actor_type: role
+                actor_role: reviewer
+                next_node: done
+                reject_node: implement
+                gates: [has_work_output]
+              done:
+                type: terminal
+            start_node: implement
+        """))
+
+    def _make_task(self, svc):
+        return svc.create(
+            title="Task",
+            description="Do it",
+            type="task",
+            project="proj",
+            flow_template="standard",
+            roles={"worker": "pete", "reviewer": "polly"},
+            priority="normal",
+            created_by="tester",
+        )
+
+    def test_new_task_records_flow_template_version(self, tmp_path):
+        """A freshly-created task exposes its pinned flow_template_version."""
+        self._write_custom_standard(tmp_path, description="v1-body")
+        db = tmp_path / "work.db"
+        svc = SQLiteWorkService(db_path=db, project_path=tmp_path)
+
+        t = self._make_task(svc)
+        reloaded = svc.get(t.task_id)
+        assert reloaded.flow_template_version == 1
+
+    def test_yaml_change_bumps_version_for_new_tasks(self, tmp_path):
+        """Editing the YAML creates a new version; existing task stays on v1."""
+        self._write_custom_standard(tmp_path, description="v1-body")
+        db = tmp_path / "work.db"
+        svc = SQLiteWorkService(db_path=db, project_path=tmp_path)
+
+        old = self._make_task(svc)
+        assert svc.get(old.task_id).flow_template_version == 1
+
+        # Mutate the YAML — description differs, so content hash differs.
+        self._write_custom_standard(tmp_path, description="v2-body")
+
+        # Re-open the service so caches (if any) don't mask the test.
+        svc.close()
+        svc = SQLiteWorkService(db_path=db, project_path=tmp_path)
+
+        new = self._make_task(svc)
+        assert svc.get(new.task_id).flow_template_version == 2
+
+        # Old task still pinned to v1
+        still_old = svc.get(old.task_id)
+        assert still_old.flow_template_version == 1
+
+    def test_in_flight_task_uses_its_pinned_version(self, tmp_path):
+        """An in-flight task continues on the v1 graph after YAML is edited."""
+        self._write_custom_standard(tmp_path, description="v1-body")
+        db = tmp_path / "work.db"
+        svc = SQLiteWorkService(db_path=db, project_path=tmp_path)
+
+        old = self._make_task(svc)
+        svc.queue(old.task_id, "pm")
+        claimed = svc.claim(old.task_id, "pete")
+        assert claimed.current_node_id == "implement"
+
+        # Now mutate the YAML. Nothing about old's graph should change.
+        self._write_custom_standard(tmp_path, description="v2-body")
+        svc.close()
+        svc = SQLiteWorkService(db_path=db, project_path=tmp_path)
+
+        # _load_flow_from_db should return the v1 flow for the old task.
+        flow = svc._load_flow_from_db(
+            claimed.flow_template_id, claimed.flow_template_version,
+        )
+        assert flow.description == "v1-body"
+
+        # v2 is visible when we resolve via the engine directly (new tasks use it)
+        flow_v2 = svc._load_flow_from_db("standard", 2)
+        assert flow_v2.description == "v2-body"
+
+    def test_unchanged_yaml_does_not_bump_version(self, tmp_path):
+        """Re-opening the service without YAML changes keeps the same version."""
+        self._write_custom_standard(tmp_path, description="stable-body")
+        db = tmp_path / "work.db"
+        svc = SQLiteWorkService(db_path=db, project_path=tmp_path)
+
+        t1 = self._make_task(svc)
+        assert svc.get(t1.task_id).flow_template_version == 1
+
+        svc.close()
+        svc = SQLiteWorkService(db_path=db, project_path=tmp_path)
+        t2 = self._make_task(svc)
+        assert svc.get(t2.task_id).flow_template_version == 1

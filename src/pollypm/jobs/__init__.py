@@ -20,13 +20,25 @@ from pollypm.jobs.queue import (
     RetryPolicy,
     exponential_backoff,
 )
+from pollypm.jobs.workers import (
+    HandlerRegistryProtocol,
+    HandlerSpec,
+    JobWorkerPool,
+    PoolMetrics,
+    WorkerMetrics,
+)
 
 __all__ = [
+    "HandlerRegistryProtocol",
+    "HandlerSpec",
     "Job",
     "JobId",
     "JobQueue",
     "JobStatus",
+    "JobWorkerPool",
+    "PoolMetrics",
     "QueueStats",
     "RetryPolicy",
+    "WorkerMetrics",
     "exponential_backoff",
 ]

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from pollypm.atomic_io import atomic_write_json
 from pollypm.checkpoints import record_checkpoint, snapshot_hash, write_mechanical_checkpoint
 from pollypm.heartbeats.base import HeartbeatCursor, HeartbeatSessionContext, HeartbeatUnmanagedWindow
+from pollypm.heartbeats.types import Alert
 from pollypm.knowledge_extract import store_snapshot_learnings
 
 if TYPE_CHECKING:
@@ -120,8 +121,20 @@ class SupervisorHeartbeatAPI:
     def clear_alert(self, session_name: str, alert_type: str) -> None:
         self.supervisor.store.clear_alert(session_name, alert_type)
 
-    def open_alerts(self):
-        return self.supervisor.store.open_alerts()
+    def open_alerts(self) -> list[Alert]:
+        return [
+            Alert(
+                session_name=record.session_name,
+                alert_type=record.alert_type,
+                severity=record.severity,
+                message=record.message,
+                status=record.status,
+                created_at=record.created_at,
+                updated_at=record.updated_at,
+                alert_id=record.alert_id,
+            )
+            for record in self.supervisor.store.open_alerts()
+        ]
 
     def set_session_status(self, session_name: str, status: str, *, reason: str = "") -> None:
         self.supervisor.store.upsert_session_runtime(

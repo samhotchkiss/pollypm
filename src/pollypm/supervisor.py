@@ -299,6 +299,13 @@ class Supervisor:
             if homes_dir.is_dir():
                 for marker in homes_dir.glob("*/.pollypm-state/session-markers/*"):
                     marker.unlink(missing_ok=True)
+        # Also clear markers in account homes (e.g. ~/.pollypm/agent_homes/claude_1)
+        for account in self.config.accounts.values():
+            if account.home is not None:
+                markers_dir = account.home / ".pollypm-state" / "session-markers"
+                if markers_dir.is_dir():
+                    for marker in markers_dir.iterdir():
+                        marker.unlink(missing_ok=True)
 
     def _reconcile_existing(
         self,

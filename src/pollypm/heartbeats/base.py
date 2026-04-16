@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Protocol
 
-from pollypm.storage.state import AlertRecord
+from pollypm.heartbeats.types import Alert
 
 
 @dataclass(slots=True)
@@ -81,7 +80,7 @@ class HeartbeatAPI(Protocol):
 
     def clear_alert(self, session_name: str, alert_type: str) -> None: ...
 
-    def open_alerts(self) -> list[AlertRecord]: ...
+    def open_alerts(self) -> list[Alert]: ...
 
     def set_session_status(self, session_name: str, status: str, *, reason: str = "") -> None: ...
 
@@ -99,4 +98,4 @@ class HeartbeatAPI(Protocol):
 class HeartbeatBackend(Protocol):
     name: str
 
-    def run(self, api: HeartbeatAPI, *, snapshot_lines: int = 200) -> list[AlertRecord]: ...
+    def run(self, api: HeartbeatAPI, *, snapshot_lines: int = 200) -> list[Alert]: ...

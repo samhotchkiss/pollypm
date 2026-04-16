@@ -793,10 +793,14 @@ class SQLiteWorkService:
                 f"Task must be in 'draft' state."
             )
 
-        if task.requires_human_review:
+        if task.requires_human_review and not skip_gates:
+            # Full inbox-backed approval is a follow-up; for now, callers
+            # with an out-of-band approval signal must opt in explicitly
+            # via skip_gates=True so the feature is at least usable.
             raise InvalidTransitionError(
                 "Task requires human review before queueing. "
-                "Human approval integration is not yet available."
+                "Pass skip_gates=True to bypass this check once approval "
+                "has been obtained out-of-band (inbox integration pending)."
             )
 
         # Gate: has_description

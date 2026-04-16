@@ -243,6 +243,16 @@ class TestQueue:
         with pytest.raises(InvalidTransitionError, match="human review"):
             svc.queue(task.task_id, "pm")
 
+    def test_queue_requires_human_review_bypass_with_skip_gates(self, svc):
+        """skip_gates=True is a stopgap bypass until inbox integration
+        lands (issue #135) — otherwise requires_human_review tasks are
+        permanently stuck in draft."""
+        task = _create_standard_task(
+            svc, description="Needs approval", requires_human_review=True
+        )
+        queued = svc.queue(task.task_id, "pm", skip_gates=True)
+        assert queued.work_status == WorkStatus.QUEUED
+
 
 # ---------------------------------------------------------------------------
 # Claim

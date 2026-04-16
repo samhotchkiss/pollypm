@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
+from typing import Any
 
 from pollypm.plugins_builtin.core_agent_profiles.profiles import StaticPromptProfile, heartbeat_prompt, polly_prompt, worker_prompt
-from pollypm.itsalive import build_deploy_instructions
-from pollypm.plugin_api.v1 import HookContext, PollyPMPlugin
+from pollypm.itsalive import build_deploy_instructions, sweep_pending_deploys
+from pollypm.plugin_api.v1 import HookContext, JobHandlerAPI, PollyPMPlugin, RosterAPI
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +45,60 @@ def _on_session_after_launch(ctx: HookContext) -> None:
     logger.info("itsalive plugin active for %s", ctx.metadata.get("session_name", "session"))
 
 
+def _resolve_project_root(payload: dict[str, Any]) -> Path:
+    """Resolve the project root for a deploy sweep invocation.
+
+    Order of precedence: explicit payload hint → config's project.root_dir
+    → current working directory (best-effort fallback for unconfigured runs).
+    """
+    hint = payload.get("project_root") if isinstance(payload, dict) else None
+    if hint:
+        return Path(hint)
+    try:
+        from pollypm.config import DEFAULT_CONFIG_PATH, load_config, resolve_config_path
+
+        config_path = resolve_config_path(DEFAULT_CONFIG_PATH)
+        if config_path.exists():
+            return load_config(config_path).project.root_dir
+    except Exception:  # noqa: BLE001
+        pass
+    return Path.cwd()
+
+
+def itsalive_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
+    """Sweep pending itsalive deploys — migrated out of ``Supervisor.run_heartbeat``.
+
+    For each pending deploy, the handler checks the verification status,
+    completes deploys that are verified, and notifies the inbox on expiry.
+    Results are returned as a small summary for observability.
+    """
+    project_root = _resolve_project_root(payload)
+    outcomes = sweep_pending_deploys(project_root)
+    summary: dict[str, int] = {}
+    for outcome in outcomes:
+        summary[outcome.status] = summary.get(outcome.status, 0) + 1
+    return {"swept": len(outcomes), "by_status": summary}
+
+
+def _register_handlers(api: JobHandlerAPI) -> None:
+    api.register_handler(
+        "itsalive.deploy_sweep", itsalive_sweep_handler,
+        max_attempts=2, timeout_seconds=30.0,
+    )
+
+
+def _register_roster(api: RosterAPI) -> None:
+    # Matches the old cadence embedded in Supervisor.run_heartbeat (every
+    # tick, which was ~60s). Expressing it here inverts the direction —
+    # core no longer reaches into itsalive (see #118).
+    api.register_recurring("@every 60s", "itsalive.deploy_sweep", {})
+
+
 plugin = PollyPMPlugin(
     name="itsalive",
-    version="0.2.0",
+    version="0.3.0",
     description="itsalive.co deployment integration for PollyPM sessions.",
-    capabilities=("agent_profile", "hook"),
+    capabilities=("agent_profile", "hook", "roster", "job_handler"),
     agent_profiles={
         "itsalive": lambda: StaticPromptProfile(name="itsalive", prompt=build_deploy_instructions()),
         "polly": lambda: StaticPromptProfile(name="polly", prompt=_polly_prompt()),
@@ -57,4 +108,6 @@ plugin = PollyPMPlugin(
     observers={
         "session.after_launch": [_on_session_after_launch],
     },
+    register_handlers=_register_handlers,
+    register_roster=_register_roster,
 )

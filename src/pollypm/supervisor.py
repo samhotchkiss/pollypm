@@ -442,14 +442,24 @@ class Supervisor:
         self.tmux.set_window_option(console_target, "aggressive-resize", "on")
         self.focus_console()
 
-        # Phase 3: Stabilize all sessions in parallel background threads.
-        # Daemon threads so the CLI can attach to tmux immediately
-        # without waiting for stabilization to complete.
+        # Phase 3: Stabilize sessions and send initial input.
+        # Stabilization (dismissing prompts) runs in parallel threads.
+        # Initial input sending runs sequentially afterward to avoid
+        # tmux routing races that cause identity swaps.
+        stabilized: list[tuple[SessionLaunchSpec, str]] = []
+        lock = threading.Lock()
+
         def _stabilize_one(launch: SessionLaunchSpec, tgt: str) -> None:
             try:
-                self._stabilize_launch(launch, tgt)
+                # Only stabilize (dismiss trust/theme prompts), don't send input
+                name = launch.session.name
+                if launch.session.provider is ProviderKind.CLAUDE:
+                    self._stabilize_claude_launch(tgt)
+                elif launch.session.provider is ProviderKind.CODEX:
+                    self._stabilize_codex_launch(tgt)
+                with lock:
+                    stabilized.append((launch, tgt))
             except Exception as exc:  # noqa: BLE001
-                # Record the failure so the heartbeat can detect and recover.
                 try:
                     self.store.record_event(
                         launch.session.name,
@@ -463,10 +473,22 @@ class Supervisor:
                         f"Session {launch.session.name} failed to stabilize during bootstrap: {exc}",
                     )
                 except Exception:  # noqa: BLE001
-                    pass  # store itself may be unavailable
+                    pass
 
+        threads = []
         for launch, tgt in targets:
-            threading.Thread(target=_stabilize_one, args=(launch, tgt), daemon=True).start()
+            t = threading.Thread(target=_stabilize_one, args=(launch, tgt), daemon=True)
+            t.start()
+            threads.append(t)
+
+        # Wait for all stabilization to complete (with timeout)
+        for t in threads:
+            t.join(timeout=120)
+
+        # Phase 4: Send initial input SEQUENTIALLY to avoid tmux routing races
+        for launch, tgt in stabilized:
+            self._send_initial_input_if_fresh(launch, tgt)
+            self._mark_session_resume_ready(launch)
 
     def shutdown_tmux(self) -> None:
         for session_name in reversed(self._all_tmux_session_names()):

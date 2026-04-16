@@ -16,8 +16,138 @@ from pollypm.work.session_manager import (
     WorkerSession,
     TeardownResult,
     _parse_token_usage,
-    WORK_SESSIONS_SCHEMA,
 )
+from pollypm.work.models import WorkerSessionRecord
+
+
+# Mirror of the schema the sqlite work service maintains, used by the
+# minimal in-test work-service stub below.
+WORK_SESSIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS work_sessions (
+    task_project TEXT NOT NULL,
+    task_number INTEGER NOT NULL,
+    agent_name TEXT NOT NULL,
+    pane_id TEXT,
+    worktree_path TEXT,
+    branch_name TEXT,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    total_input_tokens INTEGER DEFAULT 0,
+    total_output_tokens INTEGER DEFAULT 0,
+    archive_path TEXT,
+    PRIMARY KEY (task_project, task_number),
+    FOREIGN KEY (task_project, task_number) REFERENCES work_tasks(project, task_number)
+);
+"""
+
+
+class _StubWorkService:
+    """Minimal work-service stand-in that backs the new worker-session
+    protocol methods with a real sqlite connection. Tests inspect the
+    connection via ``.conn`` to assert on persisted state."""
+
+    def __init__(self, conn):
+        self.conn = conn
+        # Back-compat alias — a few tests still reference _conn directly.
+        self._conn = conn
+
+    def ensure_worker_session_schema(self):
+        self.conn.executescript(WORK_SESSIONS_SCHEMA)
+
+    def _row_to_record(self, row):
+        if row is None:
+            return None
+        return WorkerSessionRecord(
+            task_project=row["task_project"],
+            task_number=int(row["task_number"]),
+            agent_name=row["agent_name"],
+            pane_id=row["pane_id"],
+            worktree_path=row["worktree_path"],
+            branch_name=row["branch_name"],
+            started_at=row["started_at"],
+            ended_at=row["ended_at"],
+            total_input_tokens=int(row["total_input_tokens"] or 0),
+            total_output_tokens=int(row["total_output_tokens"] or 0),
+            archive_path=row["archive_path"],
+        )
+
+    def upsert_worker_session(self, *, task_project, task_number, agent_name,
+                              pane_id, worktree_path, branch_name, started_at):
+        self.conn.execute(
+            "INSERT INTO work_sessions "
+            "(task_project, task_number, agent_name, pane_id, worktree_path, "
+            "branch_name, started_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (task_project, task_number) DO UPDATE SET "
+            "pane_id=excluded.pane_id, "
+            "worktree_path=excluded.worktree_path, "
+            "branch_name=excluded.branch_name, "
+            "started_at=excluded.started_at, "
+            "ended_at=NULL, "
+            "archive_path=NULL, "
+            "total_input_tokens=0, "
+            "total_output_tokens=0",
+            (task_project, task_number, agent_name, pane_id, worktree_path,
+             branch_name, started_at),
+        )
+        self.conn.commit()
+
+    def get_worker_session(self, *, task_project, task_number, active_only=False):
+        if active_only:
+            row = self.conn.execute(
+                "SELECT * FROM work_sessions "
+                "WHERE task_project = ? AND task_number = ? AND ended_at IS NULL",
+                (task_project, task_number),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT * FROM work_sessions "
+                "WHERE task_project = ? AND task_number = ?",
+                (task_project, task_number),
+            ).fetchone()
+        return self._row_to_record(row)
+
+    def list_worker_sessions(self, *, project=None, active_only=True):
+        clauses = []
+        params = []
+        if active_only:
+            clauses.append("ended_at IS NULL")
+        if project is not None:
+            clauses.append("task_project = ?")
+            params.append(project)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM work_sessions{where}", tuple(params),
+        ).fetchall()
+        return [self._row_to_record(r) for r in rows]
+
+    def end_worker_session(self, *, task_project, task_number, ended_at,
+                           total_input_tokens, total_output_tokens, archive_path):
+        self.conn.execute(
+            "UPDATE work_sessions SET ended_at = ?, total_input_tokens = ?, "
+            "total_output_tokens = ?, archive_path = ? "
+            "WHERE task_project = ? AND task_number = ?",
+            (ended_at, total_input_tokens, total_output_tokens, archive_path,
+             task_project, task_number),
+        )
+        self.conn.commit()
+
+    def update_worker_session_tokens(self, *, task_project, task_number,
+                                     total_input_tokens, total_output_tokens,
+                                     archive_path):
+        self.conn.execute(
+            "UPDATE work_sessions SET total_input_tokens = ?, "
+            "total_output_tokens = ?, archive_path = ? "
+            "WHERE task_project = ? AND task_number = ?",
+            (total_input_tokens, total_output_tokens, archive_path,
+             task_project, task_number),
+        )
+        self.conn.commit()
+
+    # Stub for _build_task_prompt which calls self._svc.get(task_id).
+    # Raise so the prompt builder falls through to its minimal fallback
+    # (the tests don't care about prompt content).
+    def get(self, task_id):
+        raise RuntimeError("no task lookups in these tests")
 
 
 # ---------------------------------------------------------------------------
@@ -89,10 +219,12 @@ def mock_tmux():
 
 @pytest.fixture
 def mock_svc(db_conn):
-    """A mock work service with a real SQLite connection."""
-    svc = MagicMock()
-    svc._conn = db_conn
-    return svc
+    """A minimal work service backed by a real SQLite connection.
+
+    Implements just the worker-session protocol methods SessionManager
+    uses. Tests that need to inspect DB state can use ``svc._conn``.
+    """
+    return _StubWorkService(db_conn)
 
 
 @pytest.fixture

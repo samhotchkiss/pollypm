@@ -48,29 +48,6 @@ class TeardownResult:
     worktree_removed: bool
 
 
-# ---------------------------------------------------------------------------
-# Schema extension
-# ---------------------------------------------------------------------------
-
-WORK_SESSIONS_SCHEMA = """
-CREATE TABLE IF NOT EXISTS work_sessions (
-    task_project TEXT NOT NULL,
-    task_number INTEGER NOT NULL,
-    agent_name TEXT NOT NULL,
-    pane_id TEXT,
-    worktree_path TEXT,
-    branch_name TEXT,
-    started_at TEXT NOT NULL,
-    ended_at TEXT,
-    total_input_tokens INTEGER DEFAULT 0,
-    total_output_tokens INTEGER DEFAULT 0,
-    archive_path TEXT,
-    PRIMARY KEY (task_project, task_number),
-    FOREIGN KEY (task_project, task_number) REFERENCES work_tasks(project, task_number)
-);
-"""
-
-
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -105,13 +82,10 @@ class SessionManager:
         self._svc = work_service
         self._project_path = project_path
         self._storage_closet_name = storage_closet_name
-        # Ensure the sessions table exists
-        conn = self._get_conn()
-        conn.executescript(WORK_SESSIONS_SCHEMA)
-
-    def _get_conn(self):
-        """Access the work service's SQLite connection."""
-        return self._svc._conn  # type: ignore[attr-access]
+        # Ensure the sessions table exists. The work service owns the
+        # persistence layer — previously we reached into ``_svc._conn``
+        # and executed DDL directly (#105).
+        self._svc.ensure_worker_session_schema()
 
     # ------------------------------------------------------------------
     # Provisioning
@@ -240,27 +214,18 @@ class SessionManager:
 
         now = _now_dt()
 
-        # Store binding in SQLite. Upsert so a re-claim after cancel
-        # reuses the row (teardown stamps ended_at but doesn't delete)
-        # instead of hitting the PK constraint.
-        conn = self._get_conn()
-        conn.execute(
-            "INSERT INTO work_sessions "
-            "(task_project, task_number, agent_name, pane_id, worktree_path, "
-            "branch_name, started_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT (task_project, task_number) DO UPDATE SET "
-            "pane_id=excluded.pane_id, "
-            "worktree_path=excluded.worktree_path, "
-            "branch_name=excluded.branch_name, "
-            "started_at=excluded.started_at, "
-            "ended_at=NULL, "
-            "archive_path=NULL, "
-            "total_input_tokens=0, "
-            "total_output_tokens=0",
-            (project, task_number, agent_name, pane_id, str(worktree_path),
-             branch_name, now.isoformat()),
+        # Store binding through the work service. Upsert so a re-claim
+        # after cancel reuses the row (teardown stamps ended_at but
+        # doesn't delete) instead of hitting the PK constraint.
+        self._svc.upsert_worker_session(
+            task_project=project,
+            task_number=task_number,
+            agent_name=agent_name,
+            pane_id=pane_id,
+            worktree_path=str(worktree_path),
+            branch_name=branch_name,
+            started_at=now.isoformat(),
         )
-        conn.commit()
 
         return WorkerSession(
             task_id=task_id,
@@ -401,13 +366,10 @@ class SessionManager:
         """
         project, task_number = _parse_task_id(task_id)
 
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT * FROM work_sessions WHERE task_project = ? AND task_number = ?",
-            (project, task_number),
-        ).fetchone()
-
-        if row is None or row["ended_at"] is not None:
+        record = self._svc.get_worker_session(
+            task_project=project, task_number=task_number,
+        )
+        if record is None or record.ended_at is not None:
             # Already torn down or never existed
             return TeardownResult(
                 task_id=task_id,
@@ -418,8 +380,8 @@ class SessionManager:
                 worktree_removed=False,
             )
 
-        pane_id = row["pane_id"]
-        worktree_path = Path(row["worktree_path"]) if row["worktree_path"] else None
+        pane_id = record.pane_id
+        worktree_path = Path(record.worktree_path) if record.worktree_path else None
 
         # Phase 1: Archive JSONL. Don't let a copy/parse failure block
         # the rest of teardown.
@@ -488,25 +450,24 @@ class SessionManager:
         # Only stamp ended_at when the pane was confirmed killed. If the
         # kill phase failed, leave ended_at=NULL so a future pass can
         # retry — but still record the archive results for observability.
+        archive_str = str(archive_path) if archive_path else None
         if pane_killed:
-            conn.execute(
-                "UPDATE work_sessions SET ended_at = ?, total_input_tokens = ?, "
-                "total_output_tokens = ?, archive_path = ? "
-                "WHERE task_project = ? AND task_number = ?",
-                (_now(), input_tokens, output_tokens,
-                 str(archive_path) if archive_path else None,
-                 project, task_number),
+            self._svc.end_worker_session(
+                task_project=project,
+                task_number=task_number,
+                ended_at=_now(),
+                total_input_tokens=input_tokens,
+                total_output_tokens=output_tokens,
+                archive_path=archive_str,
             )
         else:
-            conn.execute(
-                "UPDATE work_sessions SET total_input_tokens = ?, "
-                "total_output_tokens = ?, archive_path = ? "
-                "WHERE task_project = ? AND task_number = ?",
-                (input_tokens, output_tokens,
-                 str(archive_path) if archive_path else None,
-                 project, task_number),
+            self._svc.update_worker_session_tokens(
+                task_project=project,
+                task_number=task_number,
+                total_input_tokens=input_tokens,
+                total_output_tokens=output_tokens,
+                archive_path=archive_str,
             )
-        conn.commit()
 
         return TeardownResult(
             task_id=task_id,
@@ -571,31 +532,18 @@ class SessionManager:
 
     def active_sessions(self, project: str | None = None) -> list[WorkerSession]:
         """List all active worker sessions, optionally filtered by project."""
-        conn = self._get_conn()
-        if project is not None:
-            rows = conn.execute(
-                "SELECT * FROM work_sessions WHERE ended_at IS NULL AND task_project = ?",
-                (project,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM work_sessions WHERE ended_at IS NULL",
-            ).fetchall()
-
-        return [self._row_to_session(r) for r in rows]
+        records = self._svc.list_worker_sessions(project=project, active_only=True)
+        return [self._record_to_session(r) for r in records]
 
     def session_for_task(self, task_id: str) -> WorkerSession | None:
         """Get the worker session bound to a task, or None."""
         project, task_number = _parse_task_id(task_id)
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT * FROM work_sessions "
-            "WHERE task_project = ? AND task_number = ? AND ended_at IS NULL",
-            (project, task_number),
-        ).fetchone()
-        if row is None:
+        record = self._svc.get_worker_session(
+            task_project=project, task_number=task_number, active_only=True,
+        )
+        if record is None:
             return None
-        return self._row_to_session(row)
+        return self._record_to_session(record)
 
     # ------------------------------------------------------------------
     # JSONL archival
@@ -814,16 +762,14 @@ class SessionManager:
         )
 
     @staticmethod
-    def _row_to_session(row) -> WorkerSession:
-        project = row["task_project"]
-        number = row["task_number"]
+    def _record_to_session(record) -> WorkerSession:
         return WorkerSession(
-            task_id=f"{project}/{number}",
-            agent_name=row["agent_name"],
-            pane_id=row["pane_id"] or "",
-            worktree_path=Path(row["worktree_path"]) if row["worktree_path"] else Path(),
-            branch_name=row["branch_name"] or "",
-            started_at=datetime.fromisoformat(row["started_at"]),
+            task_id=f"{record.task_project}/{record.task_number}",
+            agent_name=record.agent_name,
+            pane_id=record.pane_id or "",
+            worktree_path=Path(record.worktree_path) if record.worktree_path else Path(),
+            branch_name=record.branch_name or "",
+            started_at=datetime.fromisoformat(record.started_at),
         )
 
 

@@ -29,6 +29,7 @@ from pollypm.work.models import (
     Task,
     TaskType,
     Transition,
+    WorkerSessionRecord,
     WorkOutput,
     WorkStatus,
     TERMINAL_STATUSES,
@@ -94,6 +95,9 @@ class MockWorkService:
         self._links: list[tuple[str, str, str]] = []  # (from_id, to_id, kind)
         self._project_path = project_path
         self._gate_registry = GateRegistry(project_path=project_path)
+        # Keyed by (project, task_number). Stored as plain dicts so tests
+        # can inspect / mutate the row shape directly.
+        self._worker_sessions: dict[tuple[str, int], dict] = {}
 
     # ------------------------------------------------------------------
     # Flow resolution
@@ -634,6 +638,124 @@ class MockWorkService:
                 if project is None or task.project == project:
                     result.append(deepcopy(task))
         return result
+
+    # ------------------------------------------------------------------
+    # Worker sessions
+    # ------------------------------------------------------------------
+
+    def ensure_worker_session_schema(self) -> None:
+        # Mock store is in-memory; nothing to prepare.
+        return None
+
+    def _row_to_record(self, row: dict) -> WorkerSessionRecord:
+        return WorkerSessionRecord(
+            task_project=row["task_project"],
+            task_number=int(row["task_number"]),
+            agent_name=row["agent_name"],
+            pane_id=row.get("pane_id"),
+            worktree_path=row.get("worktree_path"),
+            branch_name=row.get("branch_name"),
+            started_at=row["started_at"],
+            ended_at=row.get("ended_at"),
+            total_input_tokens=int(row.get("total_input_tokens", 0)),
+            total_output_tokens=int(row.get("total_output_tokens", 0)),
+            archive_path=row.get("archive_path"),
+        )
+
+    def upsert_worker_session(
+        self,
+        *,
+        task_project: str,
+        task_number: int,
+        agent_name: str,
+        pane_id: str,
+        worktree_path: str,
+        branch_name: str,
+        started_at: str,
+    ) -> None:
+        key = (task_project, task_number)
+        existing = self._worker_sessions.get(key, {})
+        existing.update(
+            {
+                "task_project": task_project,
+                "task_number": task_number,
+                "agent_name": agent_name,
+                "pane_id": pane_id,
+                "worktree_path": worktree_path,
+                "branch_name": branch_name,
+                "started_at": started_at,
+                "ended_at": None,
+                "archive_path": None,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+            }
+        )
+        self._worker_sessions[key] = existing
+
+    def get_worker_session(
+        self,
+        *,
+        task_project: str,
+        task_number: int,
+        active_only: bool = False,
+    ) -> WorkerSessionRecord | None:
+        row = self._worker_sessions.get((task_project, task_number))
+        if row is None:
+            return None
+        if active_only and row.get("ended_at") is not None:
+            return None
+        return self._row_to_record(row)
+
+    def list_worker_sessions(
+        self,
+        *,
+        project: str | None = None,
+        active_only: bool = True,
+    ) -> list[WorkerSessionRecord]:
+        out: list[WorkerSessionRecord] = []
+        for row in self._worker_sessions.values():
+            if active_only and row.get("ended_at") is not None:
+                continue
+            if project is not None and row["task_project"] != project:
+                continue
+            out.append(self._row_to_record(row))
+        return out
+
+    def end_worker_session(
+        self,
+        *,
+        task_project: str,
+        task_number: int,
+        ended_at: str,
+        total_input_tokens: int,
+        total_output_tokens: int,
+        archive_path: str | None,
+    ) -> None:
+        key = (task_project, task_number)
+        row = self._worker_sessions.get(key)
+        if row is None:
+            return
+        row["ended_at"] = ended_at
+        row["total_input_tokens"] = total_input_tokens
+        row["total_output_tokens"] = total_output_tokens
+        row["archive_path"] = archive_path
+
+    def update_worker_session_tokens(
+        self,
+        *,
+        task_project: str,
+        task_number: int,
+        total_input_tokens: int,
+        total_output_tokens: int,
+        archive_path: str | None,
+    ) -> None:
+        key = (task_project, task_number)
+        row = self._worker_sessions.get(key)
+        if row is None:
+            return
+        row["total_input_tokens"] = total_input_tokens
+        row["total_output_tokens"] = total_output_tokens
+        row["archive_path"] = archive_path
 
     # ------------------------------------------------------------------
     # Internal helpers

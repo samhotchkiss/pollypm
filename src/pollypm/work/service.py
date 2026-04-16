@@ -14,6 +14,7 @@ from pollypm.work.models import (
     FlowTemplate,
     GateResult,
     Task,
+    WorkerSessionRecord,
     WorkOutput,
 )
 
@@ -246,4 +247,86 @@ class WorkService(Protocol):
 
     def blocked_tasks(self, project: str | None = None) -> list[Task]:
         """All tasks in a non-terminal state with unresolved blockers."""
+        ...
+
+    # ------------------------------------------------------------------
+    # Worker sessions (binding tasks to tmux/worktree sessions)
+    # ------------------------------------------------------------------
+
+    def ensure_worker_session_schema(self) -> None:
+        """Idempotently create the persistence schema worker sessions need.
+
+        Invoked by :class:`pollypm.work.session_manager.SessionManager` at
+        construction. Implementations may no-op if the schema ships with the
+        main tables.
+        """
+        ...
+
+    def upsert_worker_session(
+        self,
+        *,
+        task_project: str,
+        task_number: int,
+        agent_name: str,
+        pane_id: str,
+        worktree_path: str,
+        branch_name: str,
+        started_at: str,
+    ) -> None:
+        """Record a new worker-session binding or resurrect an ended one.
+
+        Resurrecting clears ``ended_at``, ``archive_path`` and the token
+        counters so the row is reusable after cancel → re-claim.
+        """
+        ...
+
+    def get_worker_session(
+        self,
+        *,
+        task_project: str,
+        task_number: int,
+        active_only: bool = False,
+    ) -> WorkerSessionRecord | None:
+        """Return the binding row for a task, or ``None`` if absent.
+
+        When ``active_only`` is true, rows with a non-null ``ended_at`` are
+        filtered out.
+        """
+        ...
+
+    def list_worker_sessions(
+        self,
+        *,
+        project: str | None = None,
+        active_only: bool = True,
+    ) -> list[WorkerSessionRecord]:
+        """Return worker-session bindings, optionally filtered by project."""
+        ...
+
+    def end_worker_session(
+        self,
+        *,
+        task_project: str,
+        task_number: int,
+        ended_at: str,
+        total_input_tokens: int,
+        total_output_tokens: int,
+        archive_path: str | None,
+    ) -> None:
+        """Stamp ``ended_at`` and final accounting on a worker session."""
+        ...
+
+    def update_worker_session_tokens(
+        self,
+        *,
+        task_project: str,
+        task_number: int,
+        total_input_tokens: int,
+        total_output_tokens: int,
+        archive_path: str | None,
+    ) -> None:
+        """Record partial accounting when teardown could not kill the pane.
+
+        Leaves ``ended_at`` untouched so a future sweep can retry.
+        """
         ...

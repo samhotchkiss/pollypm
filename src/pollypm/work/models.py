@@ -297,3 +297,30 @@ class Task:
 
     def external_refs_json(self) -> str:
         return json.dumps(self.external_refs)
+
+
+# ---------------------------------------------------------------------------
+# Worker session record
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class WorkerSessionRecord:
+    """Persistent row for a worker-session binding.
+
+    Captures the full row shape used by ``SessionManager`` so the protocol
+    can describe session lookups without exposing SQL or requiring callers
+    to reach into ``SQLiteWorkService._conn`` (#105).
+    """
+
+    task_project: str
+    task_number: int
+    agent_name: str
+    pane_id: str | None
+    worktree_path: str | None
+    branch_name: str | None
+    started_at: str
+    ended_at: str | None = None
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    archive_path: str | None = None

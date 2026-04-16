@@ -43,8 +43,13 @@ from pollypm.projects import (
     scan_projects as scan_projects_registry,
 )
 from pollypm.providers import get_provider
+from pollypm.session_services import (
+    attach_existing_session,
+    current_session_name,
+    probe_session,
+    switch_client_to_session,
+)
 from pollypm.supervisor import Supervisor
-from pollypm.session_services.tmux import TmuxSessionService
 from pollypm.transcript_ingest import start_transcript_ingestion
 from pollypm.workers import create_worker_session, launch_worker_session
 from pollypm.worktrees import list_worktrees as list_project_worktrees
@@ -85,15 +90,15 @@ def _config_option_was_explicit() -> bool:
 
 
 def _attach_existing_session_without_config() -> bool:
-    current_tmux = TmuxSessionService.current_tmux_session()
+    current_tmux = current_session_name()
     for session_name in _session_name_candidates():
-        if not TmuxSessionService.probe_tmux_session(session_name):
+        if not probe_session(session_name):
             continue
         if current_tmux == session_name:
             return True
         if current_tmux:
-            raise typer.Exit(code=TmuxSessionService.switch_tmux_client(session_name))
-        raise typer.Exit(code=TmuxSessionService.attach_tmux_session(session_name))
+            raise typer.Exit(code=switch_client_to_session(session_name))
+        raise typer.Exit(code=attach_existing_session(session_name))
     return False
 
 

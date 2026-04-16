@@ -48,15 +48,60 @@ def fire_briefing(
     settings: BriefingSettings,
     now_local: datetime,
     state: BriefingState,
+    config=None,
 ) -> dict[str, Any]:
     """Execute the full gather → synthesize → emit path.
 
-    mb01 stub: no-op that returns a success sentinel. Later issues replace
-    the body of this function (or monkeypatch it via the module-level
-    attribute) with the real pipeline. The surrounding tick handler owns
-    timing + dedupe; this function owns *what* gets delivered.
+    mb02 wires the gather stage: we call
+    :func:`gather_yesterday` and :func:`identify_priorities` and
+    return a summary of their output. Synthesis (mb03) and inbox
+    emission (mb04) replace the body again.
+
+    ``config`` is the loaded ``PollyPMConfig`` — the tick handler has
+    already paid to load it, so we thread it through instead of
+    re-loading. When ``config`` is ``None`` (direct test invocation),
+    we load it from the default path.
     """
-    return {"fired": True, "stub": True}
+    from pollypm.plugins_builtin.morning_briefing.handlers.gather_yesterday import (
+        gather_yesterday,
+    )
+    from pollypm.plugins_builtin.morning_briefing.handlers.identify_priorities import (
+        identify_priorities,
+    )
+
+    if config is None:
+        from pollypm.config import DEFAULT_CONFIG_PATH, load_config, resolve_config_path
+
+        config_path = resolve_config_path(DEFAULT_CONFIG_PATH)
+        if config_path.exists():
+            config = load_config(config_path)
+
+    if config is None:
+        return {"fired": False, "reason": "no-config-for-gather"}
+
+    snapshot = gather_yesterday(config, now_local=now_local, project_root=project_root)
+    priorities = identify_priorities(
+        config,
+        now_local=now_local,
+        priorities_count=settings.priorities_count,
+        project_root=project_root,
+    )
+    return {
+        "fired": True,
+        "stub": False,
+        "yesterday": {
+            "date_local": snapshot.date_local,
+            "total_commits": snapshot.total_commits(),
+            "transitions": len(snapshot.task_transitions),
+            "advisor_insights": len(snapshot.advisor_insights),
+            "downtime_artifacts": len(snapshot.downtime_artifacts),
+        },
+        "priorities": {
+            "top_tasks": len(priorities.top_tasks),
+            "blockers": len(priorities.blockers),
+            "awaiting_approval": len(priorities.awaiting_approval),
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +221,7 @@ def briefing_tick_handler(payload: dict[str, Any]) -> dict[str, Any]:
             settings=settings,
             now_local=now_local,
             state=state,
+            config=config,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("briefing: fire_briefing failed")

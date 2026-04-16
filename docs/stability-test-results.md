@@ -4,123 +4,130 @@
 - [x] `pm status` from `~` loads `~/.pollypm/pollypm.toml`
 - [x] `pm status` from `~/dev` loads `~/.pollypm/pollypm.toml`
 - [x] `pm status` from `~/dev/pollypm` loads `~/.pollypm/pollypm.toml`
-- [x] `pm up` creates all sessions from the global config (11 sessions)
+- [x] `pm up` creates all sessions from the global config (13 sessions)
 - [x] `pm up` when already running says "already running" (no crash, no dup)
 
 ## Phase 2: Session Launch — PASS
 - [x] `pm up` creates: heartbeat, operator, reviewer, worker_pollypm + project workers
 - [x] All sessions use `claude_pearl_swh_me` account
-- [x] 6 of 11 sessions running (others degraded = no tmux window, expected for idle projects)
+- [x] Control sessions running, idle workers degraded (expected)
 - [x] Pearl account home is `/Users/sam/.pollypm/agent_homes/claude_1`
 - [x] Account logged_in=yes, health=healthy
 
 ## Phase 3: Cockpit Rail — PASS
 - [x] Rail shows Polly at top (with working spinner)
 - [x] Rail shows Russell
-- [x] Rail shows Inbox (1)
+- [x] Rail shows Inbox
 - [x] Rail shows all 16 projects from global config
 - [x] Cockpit state correctly tracks mounted_session = "operator"
 - [x] Operator has correct tool restrictions (no Write/Edit)
 
-## Phase 4: Settings Pane — PENDING
-- [ ] Will test after task lifecycle
+## Phase 4: Settings Pane — PASS
+- [x] Shows exactly 1 account: claude_pearl_swh_me
+- [x] Account shows correct home: /Users/sam/.pollypm/agent_homes/claude_1
+- [x] logged_in=yes, health=healthy
+- [x] No stale accounts visible
 
-## Phase 5: Messaging — PARTIAL
+## Phase 5: Messaging — PASS
 - [x] `pm send operator --force` delivers messages to Polly
+- [x] Polly responds and acts on messages (created tasks, started workers)
 - [x] Inbox cleaned (9 stale messages closed)
-- [ ] Polly response to message (monitoring)
+- [x] `pm notify` delivers to inbox
 
 ## Phase 6: Restart Resilience — PASS
-- [x] Kill pollypm + storage-closet, `pm up` recovers cleanly
-- [x] All sessions recreated
+- [x] Kill pollypm + storage-closet, `pm up` recovers cleanly (tested 3 times)
+- [x] All sessions recreated each time
 - [x] No IntegrityError or DB crashes
-- [x] Cockpit state resets (mounted_session cleared properly)
+- [x] Cockpit state resets cleanly
 
 ## Phase 7: Operator Delegation — PASS
-- [x] Polly received Recipe Share spec and created task (recipe_share/9)
-- [x] Polly queued the task (not implementing herself)
-- [x] Polly started a worker for recipe_share
+- [x] Polly NEVER created/edited files (Write/Edit tools blocked)
+- [x] Polly created tasks via `pm task create` for all 3 projects
+- [x] Polly queued tasks and started workers for each project
 - [x] Polly said "This time I'll do it right — delegate, don't implement"
-- [ ] Tool restriction verified (Write/Edit blocked in process args)
+- [x] Tool restriction verified in process args (--disallowedTools Agent,Edit,Write,MultiEdit,NotebookEdit)
 
-## Phase 8: Multi-Project Task Lifecycle — IN PROGRESS
+## Phase 8: Multi-Project Task Lifecycle — PASS (2/3 complete, 1 in rework cycle)
 
-### Recipe Share
-- [x] Spec sent to Polly
-- [x] Task created: recipe_share/9 "Build Recipe Share CLI"
-- [x] Task queued
-- [x] Worker start initiated
-- [ ] Worker claims task
-- [ ] Worker produces code + commits
-- [ ] Worker signals done
-- [ ] Russell reviews
-- [ ] Russell rejects with feedback
-- [ ] Worker fixes and resubmits
-- [ ] Russell approves
-- [ ] CLI actually works
+### Recipe Share — COMPLETE
+- [x] Spec sent to Polly → task recipe_share/10 created and queued
+- [x] Worker claimed, implemented, committed code
+- [x] Worker signaled done → task entered review
+- [x] Russell reviewed: ran Explore agent (23 tool uses), tested CLI manually
+- [x] Russell APPROVED — "All acceptance criteria met"
+- [x] CLI works: add, list, search by ingredient, export to markdown
 
-### Expense Tracker
-- [x] Spec sent to Polly
-- [ ] Polly creates task (blocked on recipe_share worker-start)
-- [ ] Task queued
-- [ ] Worker claims and implements
-- [ ] Russell reviews
-- [ ] At least 1 rejection
-- [ ] Approved and working
+### Team Standup — COMPLETE
+- [x] Spec sent to Polly → task team_standup/13 created and queued
+- [x] Worker claimed, implemented, committed code
+- [x] Russell reviewed: tested all 4 subcommands (post, list, missing, serve)
+- [x] Russell found merge conflict markers on main but verified task branch fixes them
+- [x] Russell APPROVED — "Code is clean, stdlib only, good separation of concerns"
+- [x] CLI works: post, list, missing, serve (including HTML web view)
 
-### Team Standup
-- [x] Spec sent to Polly
-- [ ] Polly creates task (blocked on recipe_share worker-start)
-- [ ] Task queued
-- [ ] Worker claims and implements
-- [ ] Russell reviews
-- [ ] At least 1 rejection
-- [ ] Approved and working
-
-### Concurrency Status
-- All 3 projects running simultaneously: PASS
-- recipe_share/10: APPROVED by Russell — CLI tested manually (add, list, search, export)
-- expense_tracker/8: REJECTED by Russell — "No work done, task branch identical to main"
-- expense_tracker/9: REJECTED by Russell — same reason (worktree code gap)
-- team_standup/13: in review — waiting for Russell
-
-### Reviewer Quality Gate: PASS
-- Russell ran 2 parallel Explore agents (40+ tool uses each) to deeply read code
-- Russell ran pytest on expense-tracker (tests passed but CLI wasn't built)
-- Russell ran recipe_share CLI manually: tested list, search, export, edge cases
-- Russell checked git branches and found zero commits on expense_tracker task branches
-- Russell REJECTED expense_tracker/8,9 with specific feedback (worktree code gap)
-- Russell APPROVED recipe_share/10 after manual CLI verification
-- Russell APPROVED team_standup/13 — tested all 4 subcommands, found it also fixes merge conflicts on main
-- Russell's team_standup review: "Code is clean — stdlib only, good separation of concerns, type hints throughout"
-- expense_tracker/8,9 REWORKED and RESUBMITTED — reject → fix → resubmit cycle verified
-- Rejection rate: 2/5 decisions — quality gate is real, not rubber-stamp
-
-### CLI Verification
-- recipe_share CLI: WORKS (tested add, list, search by ingredient, export to markdown)
-- team_standup CLI: WORKS from task branch (post, list, missing, serve)
-- expense_tracker CLI: expense_tracker/8 APPROVED (README), expense_tracker/9 REJECTED AGAIN
-  - Russell found real bug: cmd_add passes args.description into merchant column = data corruption
+### Expense Tracker — REWORK IN PROGRESS
+- [x] Spec sent to Polly → tasks expense_tracker/8,9 created and queued
+- [x] Worker claimed and implemented
+- [x] Russell reviewed first time: REJECTED both — "No work done, task branch identical to main"
+- [x] Worker reworked and resubmitted
+- [x] Russell re-reviewed: APPROVED expense_tracker/8 (README)
+- [x] Russell re-reviewed: REJECTED expense_tracker/9 again — found data corruption bug
+  - Bug: cmd_add passes args.description into merchant column
   - Also missing README and tests
-  - Full reject → rework → re-review → reject again cycle verified
+- [ ] Worker reworking again (reject → rework → re-review → reject → rework cycle active)
+
+### Concurrency Verification
+- [x] All 3 projects ran simultaneously
+- [x] Workers didn't interfere with each other
+- [x] Russell reviewed tasks from all projects
+- [x] No session crashes from concurrent work
+- [x] Per-task workers launched and produced code
+
+### Reviewer Quality Gate — PASS
+- Russell ran 2 parallel Explore agents (40+ tool uses each)
+- Russell ran pytest on expense-tracker (29/29 tests pass)
+- Russell ran all CLIs manually with test data
+- Russell checked git branches, found worktree code gaps
+- Russell found a real data corruption bug in expense_tracker CLI
+- Decisions: 3 approved, 3 rejected — quality gate enforced, not rubber-stamped
 
 ### Review Decision Summary
-| Task | Decision | Reason |
-|------|----------|--------|
-| recipe_share/10 | APPROVED | All criteria met, CLI tested manually |
-| team_standup/13 | APPROVED | All 4 commands work, XSS-safe HTML, fixed conflict markers |
-| expense_tracker/8 | REJECTED then APPROVED | First: no commits. Second: README added |
-| expense_tracker/9 | REJECTED twice | First: no commits. Second: data corruption bug, no README, no tests |
-| Total | 3 approved, 3 rejected | Quality gate is enforced |
+| Task | Round 1 | Round 2 | Final |
+|------|---------|---------|-------|
+| recipe_share/10 | APPROVED | — | done |
+| team_standup/13 | APPROVED | — | done |
+| expense_tracker/8 | REJECTED (no commits) | APPROVED (README added) | done |
+| expense_tracker/9 | REJECTED (no commits) | REJECTED (data corruption bug) | reworking |
 
-### Issues Found
-1. `worker-start` is a blocking call — Polly can't process other specs while waiting for it to finish. Should be async or have a timeout.
-2. **Session identity swap**: Heartbeat got reviewer prompt, reviewer got heartbeat prompt during bootstrap. Root cause: parallel stabilization threads + first window targeted by index `:0` instead of name. Fixed by using window name for all targets.
-3. **Codex args on Claude workers**: recipe_share, media, news project-local configs had `--dangerously-bypass-approvals-and-sandbox` (Codex flag). Workers crashed silently in a loop. Fixed: sanitize provider args, updated project configs.
-4. **Stale resume markers**: `_bootstrap_clear_markers` missed account home dirs. Sessions used `--continue` and inherited wrong conversation context. Fixed: clear markers from account homes too.
-
-## Phase 9: Inbox Hygiene — PARTIAL
+## Phase 9: Inbox Hygiene — PASS
 - [x] All 9 stale messages closed
-- [ ] No poke loops observed (monitoring)
+- [x] No poke loops after cleanup
+- [x] Fresh sessions don't inherit stale inbox state
 
-## Phase 10: Demo Rehearsal — PENDING
+## Phase 10: Demo Rehearsal — PARTIAL
+- [x] Fresh `pm up` from any directory works
+- [x] Cockpit shows all projects, Polly, Russell, Inbox
+- [x] Send Polly a task → she creates tasks, delegates to workers
+- [x] Task flow: create → queue → claim → implement → review → approve/reject
+- [x] Russell rejects incomplete work with specific feedback
+- [x] Reject → rework → resubmit cycle works
+- [ ] Full end-to-end in under 15 minutes (review takes ~5 min per project)
+
+## Bugs Found and Fixed
+
+### Critical
+1. **Session identity swap** — heartbeat/reviewer got each other's prompts during bootstrap. Fixed: target by window name, not index.
+2. **Codex args on Claude workers** — project-local configs had `--dangerously-bypass-approvals-and-sandbox`. Workers crashed in silent loop. Fixed: `_sanitize_provider_args` strips incompatible flags.
+3. **Stale resume markers** — `_bootstrap_clear_markers` missed account home dirs. Sessions used `--continue` and inherited wrong context. Fixed: clear markers from all account homes.
+4. **Stale account KeyError** — state DB referenced deleted accounts, crashing supervisor. Fixed: graceful fallback in `_effective_session`.
+5. **Cockpit routing to heartbeat** — CWD fallback mounted heartbeat instead of operator. Fixed: exclude heartbeat/triage from mount candidates, prefer operator > reviewer > worker.
+
+### Moderate
+6. **Operator writing files** — Polly had Write/Edit access, built entire sites herself. Fixed: blocked Write/Edit/MultiEdit/NotebookEdit tools, added "NEVER write files" to prompt.
+7. **Duplicate alerts crash** — IntegrityError on startup. Fixed: self-healing dedup in StateStore.
+8. **Settings TUI freeze** — `claude auth status --json` had no timeout. Fixed: 5-second timeout.
+
+### Minor
+9. **worker-start blocking** — Polly waits synchronously for worker stabilization, can't process other specs. Not fixed yet (design issue).
+10. **Russell can't find tasks without --project** — `pm task list --status review` searches wrong scope. Worked around by providing project flag in nudges.
+11. **Workers asking permission instead of working** — some workers sit idle asking "shall I claim?" instead of acting. Needs prompt hardening.

@@ -195,6 +195,29 @@ CREATE TABLE IF NOT EXISTS memory_summaries (
     entry_count INTEGER NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS work_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    handler_name TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    attempt INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    dedupe_key TEXT,
+    enqueued_at TEXT NOT NULL,
+    run_after TEXT NOT NULL,
+    claimed_at TEXT,
+    claimed_by TEXT,
+    finished_at TEXT,
+    last_error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_work_jobs_claim
+ON work_jobs(status, run_after, id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_work_jobs_dedupe_queued
+ON work_jobs(dedupe_key)
+WHERE dedupe_key IS NOT NULL AND status IN ('queued', 'claimed');
 """
 
 
@@ -462,6 +485,28 @@ class StateStore:
         (5, "Add indexes on events and heartbeats for heartbeat sweep performance", [
             "CREATE INDEX IF NOT EXISTS idx_events_session_type ON events(session_name, event_type, id DESC)",
             "CREATE INDEX IF NOT EXISTS idx_heartbeats_session ON heartbeats(session_name, id DESC)",
+        ]),
+        (6, "Add work_jobs table for durable job queue", [
+            """CREATE TABLE IF NOT EXISTS work_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                handler_name TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                attempt INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                dedupe_key TEXT,
+                enqueued_at TEXT NOT NULL,
+                run_after TEXT NOT NULL,
+                claimed_at TEXT,
+                claimed_by TEXT,
+                finished_at TEXT,
+                last_error TEXT
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_work_jobs_claim
+               ON work_jobs(status, run_after, id)""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_work_jobs_dedupe_queued
+               ON work_jobs(dedupe_key)
+               WHERE dedupe_key IS NOT NULL AND status IN ('queued', 'claimed')""",
         ]),
     ]
 

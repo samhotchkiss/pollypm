@@ -226,3 +226,30 @@ class TestBlockedTasks:
         blocked_ids = [t.task_id for t in blocked_alpha]
         assert target_alpha.task_id in blocked_ids
         assert target_beta.task_id not in blocked_ids
+
+    def test_blocked_tasks_shows_cancelled_blocker_case(self, svc):
+        """Per OQ-7: a task whose blocker was cancelled stays blocked until
+        the PM decides. blocked_tasks() must surface it so the operator
+        can act (#138)."""
+        from pollypm.work.models import WorkStatus
+
+        blocker = _create_task(svc, title="Will be cancelled")
+        target = _create_task(svc, title="Stuck target")
+
+        _queue_task(svc, target)
+        svc.link(blocker.task_id, target.task_id, "blocks")
+
+        # Task is now blocked
+        assert svc.get(target.task_id).work_status == WorkStatus.BLOCKED
+
+        # Cancel the blocker
+        svc.cancel(blocker.task_id, "pm", "not needed after all")
+
+        # Task must remain blocked (auto-unblock skipped — cancelled != done)
+        stuck = svc.get(target.task_id)
+        assert stuck.work_status == WorkStatus.BLOCKED
+
+        # And it must show up in blocked_tasks() — this is the whole point
+        # of the PM dashboard query.
+        blocked = svc.blocked_tasks()
+        assert target.task_id in [t.task_id for t in blocked]

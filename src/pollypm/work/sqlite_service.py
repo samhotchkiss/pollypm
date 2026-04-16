@@ -2071,52 +2071,26 @@ class SQLiteWorkService:
         return counts
 
     def blocked_tasks(self, project: str | None = None) -> list[Task]:
-        """All tasks in a non-terminal state that have unresolved blockers."""
-        terminal = tuple(s.value for s in TERMINAL_STATUSES)
-        placeholders = ", ".join("?" for _ in terminal)
+        """All tasks with ``work_status == blocked`` in a non-terminal state.
 
-        clauses = [f"t.work_status NOT IN ({placeholders})"]
-        params: list[object] = list(terminal)
+        Per spec (§5 + OQ-7): a task that is currently ``blocked`` must be
+        surfaced regardless of whether its blocker is still active, done,
+        or cancelled — the PM needs to see cancelled-blocker cases to
+        decide whether to unblock or cancel. Dependency-resolution gating
+        is internal to ``next()`` and auto-unblock.
+        """
+        clauses = ["work_status = ?"]
+        params: list[object] = [WorkStatus.BLOCKED.value]
 
         if project is not None:
-            clauses.append("t.project = ?")
+            clauses.append("project = ?")
             params.append(project)
 
         where = " AND ".join(clauses)
-        sql = (
-            "SELECT DISTINCT t.* FROM work_tasks t "
-            "JOIN work_task_dependencies d "
-            "  ON d.to_project = t.project AND d.to_task_number = t.task_number "
-            "  AND d.kind = ? "
-            f"WHERE {where}"
-        )
-        params.append(LinkKind.BLOCKS.value)
+        sql = f"SELECT * FROM work_tasks WHERE {where} ORDER BY project, task_number"
 
-        # Reorder: the JOIN param (kind) needs to be before WHERE params
-        # Actually, let's restructure to be clearer
-        join_params: list[object] = [LinkKind.BLOCKS.value]
-        where_params: list[object] = list(terminal)
-        if project is not None:
-            where_params.append(project)
-
-        sql = (
-            "SELECT DISTINCT t.* FROM work_tasks t "
-            "JOIN work_task_dependencies d "
-            "  ON d.to_project = t.project AND d.to_task_number = t.task_number "
-            "  AND d.kind = ? "
-            f"WHERE {where}"
-        )
-        all_params = join_params + where_params
-
-        rows = self._conn.execute(sql, all_params).fetchall()
-
-        # Filter in Python: only tasks where at least one blocker is not done
-        result: list[Task] = []
-        for row in rows:
-            task = self._row_to_task(row)
-            if self._has_unresolved_blockers(task.task_id):
-                result.append(task)
-        return result
+        rows = self._conn.execute(sql, params).fetchall()
+        return [self._row_to_task(row) for row in rows]
 
     # ------------------------------------------------------------------
     # Flows (public API)

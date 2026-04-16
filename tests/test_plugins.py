@@ -576,6 +576,110 @@ def test_entry_point_plugin_with_wrong_api_version_skipped(monkeypatch, tmp_path
     assert any("API version 99" in e for e in host.errors)
 
 
+# ---------------------------------------------------------------------------
+# Issue #172 — [plugins].disabled config key
+# ---------------------------------------------------------------------------
+
+
+def test_disabled_plugin_is_discovered_but_not_loaded(tmp_path: Path) -> None:
+    project_plugin = tmp_path / ".pollypm" / "plugins" / "noisy_plugin"
+    _write_structured_plugin(
+        project_plugin,
+        name="noisy_plugin",
+        manifest_extras='[[capabilities]]\nkind = "provider"\nname = "noisy"\n',
+        body=(
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "plugin = PollyPMPlugin(name='noisy_plugin')\n"
+        ),
+    )
+
+    host = ExtensionHost(tmp_path, disabled=("noisy_plugin",))
+    plugins = host.plugins()
+    assert "noisy_plugin" not in plugins
+    disabled = host.disabled_plugins
+    assert "noisy_plugin" in disabled
+    record = disabled["noisy_plugin"]
+    assert record.reason == "config"
+    assert record.source in {"project", "repo"}
+
+
+def test_disabled_builtin_plugin_records_reason(tmp_path: Path) -> None:
+    """Disabling a built-in plugin by name filters it out, even from the
+    builtin search path."""
+    host = ExtensionHost(tmp_path, disabled=("magic",))
+    plugins = host.plugins()
+    assert "magic" not in plugins
+    assert "magic" in host.disabled_plugins
+
+
+def test_unknown_disabled_plugin_name_is_ignored(tmp_path: Path) -> None:
+    """Disabling a plugin that doesn't exist does not crash."""
+    host = ExtensionHost(tmp_path, disabled=("nonexistent_plugin",))
+    # Smoke: plugin loading still works, no plugins crashed.
+    plugins = host.plugins()
+    assert "claude" in plugins  # builtin still loaded
+    # Nonexistent plugin is simply absent from both buckets.
+    assert "nonexistent_plugin" not in plugins
+    assert "nonexistent_plugin" not in host.disabled_plugins
+
+
+def test_plugin_settings_parsed_from_config(tmp_path: Path) -> None:
+    """The [plugins].disabled TOML section ends up in config.plugins."""
+    from pollypm.config import load_config
+
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        """[project]
+name = "sample"
+
+[pollypm]
+controller_account = ""
+
+[plugins]
+disabled = ["magic", "docker_runtime"]
+"""
+    )
+    cfg = load_config(config_path)
+    assert cfg.plugins.disabled == ("magic", "docker_runtime")
+
+
+def test_project_local_disabled_adds_to_user_disabled(tmp_path: Path, monkeypatch) -> None:
+    """A project-local [plugins].disabled can add to (but not remove from)
+    the user-global disabled set."""
+    from pollypm.config import load_config
+
+    # Set up a fake project at tmp_path / "my_project"
+    project_root = tmp_path / "my_project"
+    (project_root / ".pollypm" / "config").mkdir(parents=True)
+    (project_root / ".pollypm" / "config" / "project.toml").write_text(
+        """[project]
+display_name = "My Project"
+
+[plugins]
+disabled = ["extra_plugin"]
+"""
+    )
+
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"""[project]
+name = "sample"
+
+[pollypm]
+controller_account = ""
+
+[plugins]
+disabled = ["magic"]
+
+[projects.my_project]
+path = "{project_root}"
+"""
+    )
+    cfg = load_config(config_path)
+    assert "magic" in cfg.plugins.disabled
+    assert "extra_plugin" in cfg.plugins.disabled
+
+
 def test_user_plugin_can_override_builtin(monkeypatch, tmp_path: Path) -> None:
     """A plugin in the user-global directory with the same name as a
     built-in supersedes the built-in (later source wins)."""

@@ -8,6 +8,7 @@ from pollypm.models import (
     AccountConfig,
     MemorySettings,
     KnownProject,
+    PluginSettings,
     ProjectKind,
     ProjectSettings,
     PollyPMConfig,
@@ -226,6 +227,28 @@ def _parse_memory_settings(raw: dict[str, object]) -> MemorySettings:
     return MemorySettings(backend=str(memory_raw.get("backend", "file")))
 
 
+def _parse_plugin_settings(raw: dict[str, object]) -> PluginSettings:
+    """Parse the ``[plugins]`` TOML section.
+
+    Only ``disabled`` is recognised for now (per
+    docs/plugin-discovery-spec.md §8). Unknown keys are ignored with a
+    silent pass — future compat.
+    """
+    plugins_raw = raw.get("plugins", {})
+    if not isinstance(plugins_raw, dict):
+        return PluginSettings()
+    disabled_raw = plugins_raw.get("disabled", [])
+    if not isinstance(disabled_raw, list):
+        return PluginSettings()
+    disabled: list[str] = []
+    for entry in disabled_raw:
+        if isinstance(entry, str) and entry.strip():
+            disabled.append(entry.strip())
+    # Preserve declaration order but de-dupe.
+    deduped = tuple(dict.fromkeys(disabled))
+    return PluginSettings(disabled=deduped)
+
+
 def _parse_known_projects(raw: dict[str, object], *, base: Path) -> dict[str, KnownProject]:
     projects: dict[str, KnownProject] = {}
     projects_raw = raw.get("projects", {})
@@ -248,6 +271,7 @@ def _parse_known_projects(raw: dict[str, object], *, base: Path) -> dict[str, Kn
 def _merge_project_local_config(
     sessions: dict[str, SessionConfig],
     projects: dict[str, KnownProject],
+    plugins: PluginSettings | None = None,
 ) -> None:
     for project_key, project in projects.items():
         local_path = project_config_path(project.path)
@@ -268,6 +292,16 @@ def _merge_project_local_config(
                 continue  # Never allow project-local configs to override control sessions
             session.project = project_key
             sessions[session_name] = session
+        # Compose plugin-disabled lists: project can disable more, not
+        # re-enable user-disabled. See docs/plugin-discovery-spec.md §8.
+        if plugins is not None:
+            local_plugins = _parse_plugin_settings(raw)
+            if local_plugins.disabled:
+                merged = list(plugins.disabled)
+                for name in local_plugins.disabled:
+                    if name not in merged:
+                        merged.append(name)
+                plugins.disabled = tuple(merged)
 
 
 def _validate_cross_references(
@@ -314,8 +348,9 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
     sessions = _parse_sessions(raw, base=base, workspace_root=project.workspace_root)
     pollypm = _parse_pollypm_settings(raw, sessions)
     memory = _parse_memory_settings(raw)
+    plugins = _parse_plugin_settings(raw)
     projects = _parse_known_projects(raw, base=base)
-    _merge_project_local_config(sessions, projects)
+    _merge_project_local_config(sessions, projects, plugins)
     _validate_cross_references(accounts=accounts, sessions=sessions, pollypm=pollypm)
 
     config = PollyPMConfig(
@@ -325,6 +360,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
         sessions=sessions,
         projects=projects,
         memory=memory,
+        plugins=plugins,
     )
     try:
         _config_cache[config_path] = (config_path.stat().st_mtime, config)
@@ -367,6 +403,16 @@ def _render_global_config(config: PollyPMConfig) -> str:
             "",
         ]
     )
+
+    if config.plugins.disabled:
+        items = ", ".join(f'"{_toml_str(name)}"' for name in config.plugins.disabled)
+        lines.extend(
+            [
+                "[plugins]",
+                f"disabled = [{items}]",
+                "",
+            ]
+        )
 
     for account_name, account in config.accounts.items():
         lines.extend(

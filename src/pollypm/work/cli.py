@@ -208,6 +208,10 @@ def _task_to_dict(task) -> dict:
         "assignee": task.assignee,
         "current_node_id": task.current_node_id,
         "description": task.description,
+        "acceptance_criteria": task.acceptance_criteria,
+        "constraints": task.constraints,
+        "relevant_files": task.relevant_files,
+        "requires_human_review": task.requires_human_review,
         "roles": task.roles,
         "labels": task.labels,
         "created_at": str(task.created_at) if task.created_at else None,
@@ -385,6 +389,29 @@ def task_create(
     priority: str = typer.Option("normal", "--priority", help="Priority: critical, high, normal, low"),
     description: str = typer.Option("", "--description", "-d", help="Task description"),
     task_type: str = typer.Option("task", "--type", "-t", help="Task type: task, bug, spike, epic, subtask"),
+    label: Optional[list[str]] = typer.Option(
+        None, "--label", help="Label to attach (repeatable).",
+    ),
+    acceptance_criteria: Optional[list[str]] = typer.Option(
+        None,
+        "--acceptance-criteria",
+        help="Acceptance criteria line. Repeatable — multiple values are joined with newlines.",
+    ),
+    constraints: Optional[list[str]] = typer.Option(
+        None,
+        "--constraints",
+        help="Constraint line (what NOT to do). Repeatable — joined with newlines.",
+    ),
+    relevant_files: Optional[list[str]] = typer.Option(
+        None,
+        "--relevant-files",
+        help="Explicit file path / pattern the worker should touch (repeatable).",
+    ),
+    requires_human_review: bool = typer.Option(
+        False,
+        "--requires-human-review",
+        help="Gate queue() transition on human sign-off via inbox.",
+    ),
     db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
@@ -393,6 +420,9 @@ def task_create(
     for r in role or []:
         k, v = _parse_role(r)
         roles[k] = v
+
+    ac_text = "\n".join(acceptance_criteria) if acceptance_criteria else None
+    constraints_text = "\n".join(constraints) if constraints else None
 
     svc = _svc(db, project=project)
     task = svc.create(
@@ -403,6 +433,11 @@ def task_create(
         flow_template=flow,
         roles=roles,
         priority=priority,
+        acceptance_criteria=ac_text,
+        constraints=constraints_text,
+        relevant_files=list(relevant_files) if relevant_files else None,
+        labels=list(label) if label else None,
+        requires_human_review=requires_human_review,
     )
     if output_json:
         typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))

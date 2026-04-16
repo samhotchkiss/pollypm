@@ -144,7 +144,7 @@ def test_pm_up_bootstraps_worker_from_project_local_config(monkeypatch, tmp_path
     config_path, project_root = _write_split_config(tmp_path)
     fake_tmux = FakeTmux()
 
-    monkeypatch.setattr("pollypm.supervisor.TmuxClient", lambda: fake_tmux)
+    monkeypatch.setattr("pollypm.session_services.tmux.TmuxClient", lambda: fake_tmux)
     monkeypatch.setattr("pollypm.supervisor.Supervisor._stabilize_launch", lambda self, launch, target, on_status=None: None)
     monkeypatch.setattr("pollypm.supervisor.Supervisor.focus_console", lambda self: None)
 

@@ -125,11 +125,11 @@ def _svc(db: str, project: str | None = None) -> SQLiteWorkService:
 
     # Wire up the session manager for per-task worker lifecycle
     try:
-        from pollypm.tmux.client import TmuxClient
+        from pollypm.session_services import create_tmux_client
         from pollypm.work.session_manager import SessionManager
         if project_root.exists() and (project_root / ".git").exists():
             session_mgr = SessionManager(
-                tmux_client=TmuxClient(),
+                tmux_client=create_tmux_client(),
                 work_service=svc,
                 project_path=project_root,
             )

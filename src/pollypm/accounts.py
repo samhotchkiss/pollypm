@@ -29,7 +29,7 @@ from pollypm.providers import get_provider
 from pollypm.runtimes import get_runtime
 from pollypm.runtime_env import claude_config_dir, codex_home_dir, provider_profile_env
 from pollypm.storage.state import StateStore
-from pollypm.tmux.client import TmuxClient
+from pollypm.session_services import create_tmux_client
 
 
 @dataclass(slots=True)
@@ -274,7 +274,7 @@ def _build_probe_command(config, account: AccountConfig) -> str:
 def _run_usage_probe(config_path: Path, account_name: str) -> tuple[str, str, str]:
     config = load_config(config_path)
     account = config.accounts[account_name]
-    tmux = TmuxClient()
+    tmux = create_tmux_client()
     probe_session = f"pm-usage-{account_name}-{int(time.time())}"
     try:
         tmux.create_session(probe_session, "probe", _build_probe_command(config, account))
@@ -404,7 +404,7 @@ def list_account_statuses(config_path: Path) -> list[AccountStatus]:
 def add_account_via_login(config_path: Path, provider: ProviderKind) -> tuple[str, str]:
     config = load_config(config_path)
     root_dir = config.project.root_dir
-    tmux = TmuxClient()
+    tmux = create_tmux_client()
 
     existing = [account for account in config.accounts.values() if account.provider is provider]
     next_index = len(existing) + 1
@@ -466,7 +466,7 @@ def relogin_account(config_path: Path, identifier: str) -> tuple[str, str]:
     if account.home is None:
         raise typer.BadParameter(f"Account {account_name} does not have an isolated home configured.")
 
-    tmux = TmuxClient()
+    tmux = create_tmux_client()
     typer.echo(f"Re-launching login for {account.email or account_name} [{account.provider.value}]")
     _run_login_window(
         tmux,

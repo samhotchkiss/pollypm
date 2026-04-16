@@ -40,7 +40,12 @@ from pollypm.projects import (
     make_project_key,
 )
 from pollypm.runtime_env import provider_profile_env_for_provider
-from pollypm.tmux.client import TmuxClient
+from typing import TYPE_CHECKING
+
+from pollypm.session_services import create_tmux_client
+
+if TYPE_CHECKING:
+    from pollypm.tmux.client import TmuxClient
 
 
 @dataclass(slots=True)
@@ -941,7 +946,7 @@ def relogin_account(config_path: Path, identifier: str) -> tuple[str, str]:
     if account.home is None:
         raise typer.BadParameter(f"Account {account_name} does not have an isolated home configured.")
 
-    tmux = TmuxClient()
+    tmux = create_tmux_client()
     typer.echo(f"Re-launching login for {account.email or account_name} [{account.provider.value}]")
     pane_text = _run_login_window(
         tmux,

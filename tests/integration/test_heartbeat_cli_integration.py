@@ -85,7 +85,7 @@ class FakeTmux:
 
 def test_heartbeat_cli_commands_round_trip_state(monkeypatch, tmp_path: Path) -> None:
     config_path = _write_cli_config(tmp_path)
-    monkeypatch.setattr("pollypm.supervisor.TmuxClient", lambda: FakeTmux())
+    monkeypatch.setattr("pollypm.session_services.tmux.TmuxClient", lambda: FakeTmux())
     runner = CliRunner()
 
     result = runner.invoke(cli.app, ["status", "--config", str(config_path), "--json"])
@@ -170,7 +170,7 @@ def test_heartbeat_cli_commands_round_trip_state(monkeypatch, tmp_path: Path) ->
 def test_send_command_respects_human_lease(monkeypatch, tmp_path: Path) -> None:
     config_path = _write_cli_config(tmp_path)
     fake_tmux = FakeTmux()
-    monkeypatch.setattr("pollypm.supervisor.TmuxClient", lambda: fake_tmux)
+    monkeypatch.setattr("pollypm.session_services.tmux.TmuxClient", lambda: fake_tmux)
     store = StateStore((tmp_path / "workspace" / ".pollypm-state" / "state.db"))
     store.set_lease("worker_demo", "human", "busy")
     store.close()

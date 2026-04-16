@@ -89,7 +89,10 @@ def test_root_command_attaches_existing_session_when_default_config_missing(monk
     monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", fake_default)
     monkeypatch.setattr(cli, "_discover_config_path", lambda p: fake_default)
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli, "TmuxClient", lambda: FakeTmux())
+    from pollypm.session_services.tmux import TmuxSessionService
+    monkeypatch.setattr(TmuxSessionService, "current_tmux_session", staticmethod(lambda: None))
+    monkeypatch.setattr(TmuxSessionService, "probe_tmux_session", staticmethod(lambda name: name == "pollypm"))
+    monkeypatch.setattr(TmuxSessionService, "attach_tmux_session", staticmethod(lambda name: (called.update({"attached": name}) or 0)))
     monkeypatch.setattr(cli, "_first_run_setup_and_launch", lambda config_path: (_ for _ in ()).throw(AssertionError("should not onboard")))
 
     runner = CliRunner()

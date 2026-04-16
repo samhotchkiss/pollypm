@@ -188,8 +188,8 @@ def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
     sup.config = config
     sup.store = store
     sup.readonly_state = True
-    from pollypm.tmux.client import TmuxClient
-    sup.tmux = TmuxClient()
+    from pollypm.session_services import create_tmux_client
+    sup.tmux = create_tmux_client()
     sup._cached_launches = None
 
     active: list[SessionActivity] = []

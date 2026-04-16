@@ -16,7 +16,7 @@ from pollypm.runtimes import get_runtime
 from pollypm.service_api import PollyPMService
 from pollypm.supervisor import Supervisor
 from pollypm.task_backends import get_task_backend
-from pollypm.tmux.client import TmuxClient
+from pollypm.session_services import create_tmux_client
 from pollypm.worktrees import list_worktrees
 
 
@@ -182,7 +182,7 @@ class CockpitRouter:
     def __init__(self, config_path: Path) -> None:
         self.config_path = config_path
         self.service = PollyPMService(config_path)
-        self.tmux = TmuxClient()
+        self.tmux = create_tmux_client()
         self._supervisor: Supervisor | None = None
 
     def _load_supervisor(self, *, fresh: bool = False) -> Supervisor:

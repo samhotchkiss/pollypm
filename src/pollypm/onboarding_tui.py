@@ -30,7 +30,7 @@ from pollypm.onboarding import (
     build_onboarded_config,
 )
 from pollypm.projects import discover_recent_git_repositories, ensure_project_scaffold, make_project_key
-from pollypm.tmux.client import TmuxClient
+from pollypm.session_services import create_tmux_client
 
 
 def installed_provider_statuses(statuses: list[CliAvailability]) -> list[CliAvailability]:
@@ -330,7 +330,7 @@ class OnboardingApp(App[OnboardingResult | None]):
         self.config_path = config_path
         self.force = force
         self.root_dir = config_path.resolve().parent
-        self.tmux = TmuxClient()
+        self.tmux = create_tmux_client()
         self.step = "accounts"
 
         known_projects: dict[str, KnownProject] = {}

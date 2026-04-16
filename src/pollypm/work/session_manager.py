@@ -14,8 +14,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pollypm.tmux.client import TmuxClient
-
 logger = logging.getLogger(__name__)
 
 
@@ -93,7 +91,7 @@ class SessionManager:
 
     def __init__(
         self,
-        tmux_client: TmuxClient,
+        tmux_client: object,
         work_service: object,
         project_path: Path,
     ) -> None:

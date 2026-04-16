@@ -34,7 +34,10 @@ from pollypm.runtimes import get_runtime
 from pollypm.schedulers import ScheduledJob, get_scheduler_backend
 from pollypm.transcript_ledger import sync_token_ledger_for_config
 from pollypm.storage.state import AlertRecord, LeaseRecord, StateStore
-from pollypm.tmux.client import TmuxClient, TmuxWindow
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pollypm.tmux.client import TmuxWindow
 
 
 _OWNER_PREFIXES = {
@@ -118,7 +121,6 @@ class Supervisor:
     def __init__(self, config: PollyPMConfig, *, readonly_state: bool = False) -> None:
         self.config = config
         self.readonly_state = readonly_state
-        self.tmux = TmuxClient()
         self.store = StateStore(config.project.state_db, readonly=readonly_state)
         self._cached_launches: list[SessionLaunchSpec] | None = None
         # Lazy-init session service to avoid circular imports at construction
@@ -131,6 +133,21 @@ class Supervisor:
             from pollypm.session_services.tmux import TmuxSessionService
             self._session_service = TmuxSessionService(config=self.config, store=self.store)
         return self._session_service
+
+    @property
+    def tmux(self):
+        """Shortcut to the session service's TmuxClient.
+
+        External callers (cockpit, CLI, heartbeat, etc.) access
+        ``supervisor.tmux`` — this property keeps that working while
+        ensuring the single TmuxClient lives inside the session service.
+        """
+        return self.session_service.tmux
+
+    @tmux.setter
+    def tmux(self, value):
+        """Allow external code (e.g. dashboard_data) to inject a TmuxClient."""
+        self.session_service.tmux = value
 
     def _effective_session(self, session: SessionConfig, controller_account: str | None = None) -> SessionConfig:
         effective = session
@@ -311,7 +328,7 @@ class Supervisor:
         on_status: Callable[[str], None] | None = None,
     ) -> str:
         session_name = self.config.project.tmux_session
-        existing = [name for name in self._all_tmux_session_names() if self.tmux.has_session(name)]
+        existing = [name for name in self._all_tmux_session_names() if self.session_service.tmux.has_session(name)]
         if existing:
             # Sessions already running — reconcile instead of failing
             return self._reconcile_existing(session_name, on_status=on_status)
@@ -343,8 +360,8 @@ class Supervisor:
             except RuntimeError as exc:
                 failures.append(f"{controller_account}: {exc}")
                 for tmux_session in self._all_tmux_session_names():
-                    if self.tmux.has_session(tmux_session):
-                        self.tmux.kill_session(tmux_session)
+                    if self.session_service.tmux.has_session(tmux_session):
+                        self.session_service.tmux.kill_session(tmux_session)
 
         raise RuntimeError("PollyPM could not launch any controller account: " + "; ".join(failures))
 
@@ -372,8 +389,8 @@ class Supervisor:
         storage_session = self.storage_closet_session_name()
         launches = self.plan_launches()
         existing_windows: set[str] = set()
-        if self.tmux.has_session(storage_session):
-            for w in self.tmux.list_windows(storage_session):
+        if self.session_service.tmux.has_session(storage_session):
+            for w in self.session_service.tmux.list_windows(storage_session):
                 existing_windows.add(w.name)
 
         created = 0
@@ -381,19 +398,19 @@ class Supervisor:
             if launch.window_name in existing_windows:
                 continue
             _status(f"Recreating {launch.session.name}...")
-            if not self.tmux.has_session(storage_session):
-                self.tmux.create_session(storage_session, launch.window_name, launch.command)
+            if not self.session_service.tmux.has_session(storage_session):
+                self.session_service.tmux.create_session(storage_session, launch.window_name, launch.command)
             else:
-                self.tmux.create_window(storage_session, launch.window_name, launch.command, detached=True)
+                self.session_service.tmux.create_window(storage_session, launch.window_name, launch.command, detached=True)
             target = f"{storage_session}:{launch.window_name}"
-            self.tmux.set_window_option(target, "allow-passthrough", "on")
-            self.tmux.set_window_option(target, "focus-events", "on")
-            self.tmux.pipe_pane(target, launch.log_path)
+            self.session_service.tmux.set_window_option(target, "allow-passthrough", "on")
+            self.session_service.tmux.set_window_option(target, "focus-events", "on")
+            self.session_service.tmux.pipe_pane(target, launch.log_path)
             self._record_launch(launch)
             created += 1
 
-        if not self.tmux.has_session(session_name):
-            self.tmux.create_session(session_name, self._CONSOLE_WINDOW, self._console_command(), remain_on_exit=False)
+        if not self.session_service.tmux.has_session(session_name):
+            self.session_service.tmux.create_session(session_name, self._CONSOLE_WINDOW, self._console_command(), remain_on_exit=False)
 
         self.ensure_heartbeat_schedule()
         self.ensure_knowledge_extraction_schedule()
@@ -421,11 +438,11 @@ class Supervisor:
             first = launches[0]
             if on_status:
                 on_status(f"Creating {first.session.name}...")
-            first_pane_id = self.tmux.create_session(storage_session, first.window_name, first.command)
+            first_pane_id = self.session_service.tmux.create_session(storage_session, first.window_name, first.command)
             window_target = f"{storage_session}:{first.window_name}"
-            self.tmux.set_window_option(window_target, "allow-passthrough", "on")
-            self.tmux.set_window_option(window_target, "focus-events", "on")
-            self.tmux.pipe_pane(window_target, first.log_path)
+            self.session_service.tmux.set_window_option(window_target, "allow-passthrough", "on")
+            self.session_service.tmux.set_window_option(window_target, "focus-events", "on")
+            self.session_service.tmux.pipe_pane(window_target, first.log_path)
             self._record_launch(first)
             # Use pane ID from create_session for unambiguous targeting
             pane_target = first_pane_id or window_target
@@ -433,23 +450,23 @@ class Supervisor:
             for launch in launches[1:]:
                 if on_status:
                     on_status(f"Creating {launch.session.name}...")
-                pane_id = self.tmux.create_window(storage_session, launch.window_name, launch.command, detached=True)
+                pane_id = self.session_service.tmux.create_window(storage_session, launch.window_name, launch.command, detached=True)
                 window_target = f"{storage_session}:{launch.window_name}"
-                self.tmux.set_window_option(window_target, "allow-passthrough", "on")
-                self.tmux.set_window_option(window_target, "focus-events", "on")
-                self.tmux.pipe_pane(window_target, launch.log_path)
+                self.session_service.tmux.set_window_option(window_target, "allow-passthrough", "on")
+                self.session_service.tmux.set_window_option(window_target, "focus-events", "on")
+                self.session_service.tmux.pipe_pane(window_target, launch.log_path)
                 self._record_launch(launch)
                 # Use pane ID returned by create_window for unambiguous targeting
                 pane_target = pane_id or self._resolve_pane_id(storage_session, launch.window_name) or window_target
                 targets.append((launch, pane_target))
 
         # Phase 2: Create the cockpit session so the user can attach immediately.
-        self.tmux.create_session(session_name, self._CONSOLE_WINDOW, self._console_command(), remain_on_exit=False)
+        self.session_service.tmux.create_session(session_name, self._CONSOLE_WINDOW, self._console_command(), remain_on_exit=False)
         console_target = f"{session_name}:{self._CONSOLE_WINDOW}"
-        self.tmux.set_window_option(console_target, "allow-passthrough", "on")
-        self.tmux.set_window_option(console_target, "focus-events", "on")
-        self.tmux.set_window_option(console_target, "window-size", "latest")
-        self.tmux.set_window_option(console_target, "aggressive-resize", "on")
+        self.session_service.tmux.set_window_option(console_target, "allow-passthrough", "on")
+        self.session_service.tmux.set_window_option(console_target, "focus-events", "on")
+        self.session_service.tmux.set_window_option(console_target, "window-size", "latest")
+        self.session_service.tmux.set_window_option(console_target, "aggressive-resize", "on")
         self.focus_console()
 
         # Phase 3: Stabilize sessions and send initial input.
@@ -502,13 +519,13 @@ class Supervisor:
 
     def shutdown_tmux(self) -> None:
         for session_name in reversed(self._all_tmux_session_names()):
-            if self.tmux.has_session(session_name):
-                self.tmux.kill_session(session_name)
+            if self.session_service.tmux.has_session(session_name):
+                self.session_service.tmux.kill_session(session_name)
 
     def _resolve_pane_id(self, session_name: str, window_name: str) -> str | None:
         """Look up the pane ID for a window. Returns '%NNN' or None."""
         try:
-            windows = self.tmux.list_windows(session_name)
+            windows = self.session_service.tmux.list_windows(session_name)
             for w in windows:
                 if w.name == window_name:
                     return w.pane_id
@@ -549,7 +566,7 @@ class Supervisor:
     def _window_map(self) -> dict[str, TmuxWindow]:
         our_sessions = set(self._all_tmux_session_names())
         windows: dict[str, TmuxWindow] = {}
-        for window in self.tmux.list_all_windows():
+        for window in self.session_service.tmux.list_all_windows():
             if window.session in our_sessions:
                 windows[window.name] = window
         mounted = self._mounted_window_override()
@@ -576,7 +593,7 @@ class Supervisor:
             return None
         target = f"{self.config.project.tmux_session}:{self._CONSOLE_WINDOW}"
         try:
-            panes = self.tmux.list_panes(target)
+            panes = self.session_service.tmux.list_panes(target)
         except Exception:  # noqa: BLE001
             return None
         if len(panes) < 2:
@@ -609,7 +626,7 @@ class Supervisor:
 
         # Single subprocess call to get ALL windows across all sessions
         try:
-            all_windows = self.tmux.list_all_windows()
+            all_windows = self.session_service.tmux.list_all_windows()
             our_sessions = set(self._all_tmux_session_names())
             windows = [w for w in all_windows if w.session in our_sessions]
         except Exception as exc:  # noqa: BLE001
@@ -664,23 +681,23 @@ class Supervisor:
 
     def ensure_console_window(self) -> None:
         tmux_session = self.config.project.tmux_session
-        if not self.tmux.has_session(tmux_session):
+        if not self.session_service.tmux.has_session(tmux_session):
             return
         if self._CONSOLE_WINDOW in self._window_map():
             self._repair_console_if_broken(tmux_session)
             return
-        self.tmux.create_window(tmux_session, self._CONSOLE_WINDOW, self._console_command(), detached=True)
+        self.session_service.tmux.create_window(tmux_session, self._CONSOLE_WINDOW, self._console_command(), detached=True)
         target = f"{tmux_session}:{self._CONSOLE_WINDOW}"
-        self.tmux.set_window_option(target, "allow-passthrough", "on")
-        self.tmux.set_window_option(target, "window-size", "latest")
-        self.tmux.set_window_option(target, "aggressive-resize", "on")
-        self.tmux.set_pane_history_limit(target, 200)
+        self.session_service.tmux.set_window_option(target, "allow-passthrough", "on")
+        self.session_service.tmux.set_window_option(target, "window-size", "latest")
+        self.session_service.tmux.set_window_option(target, "aggressive-resize", "on")
+        self.session_service.tmux.set_pane_history_limit(target, 200)
 
     def _repair_console_if_broken(self, tmux_session: str) -> None:
         """Detect and repair a cockpit window where the rail pane died leaving only a worker."""
         target = f"{tmux_session}:{self._CONSOLE_WINDOW}"
         try:
-            panes = self.tmux.list_panes(target)
+            panes = self.session_service.tmux.list_panes(target)
         except Exception:  # noqa: BLE001
             return
         if len(panes) != 1:
@@ -704,9 +721,9 @@ class Supervisor:
                 None,
             )
             storage_session = self.storage_closet_session_name()
-            if launch is not None and self.tmux.has_session(storage_session):
+            if launch is not None and self.session_service.tmux.has_session(storage_session):
                 try:
-                    self.tmux.break_pane(pane.pane_id, storage_session, launch.window_name)
+                    self.session_service.tmux.break_pane(pane.pane_id, storage_session, launch.window_name)
                 except Exception:  # noqa: BLE001
                     pass
         # Clear stale cockpit state
@@ -719,31 +736,31 @@ class Supervisor:
                 pass
         # Recreate the cockpit.  If break_pane removed the last pane the
         # session itself is gone, so we need create_session instead of create_window.
-        if not self.tmux.has_session(tmux_session):
-            self.tmux.create_session(
+        if not self.session_service.tmux.has_session(tmux_session):
+            self.session_service.tmux.create_session(
                 tmux_session, self._CONSOLE_WINDOW, self._console_command(), remain_on_exit=False,
             )
         else:
             try:
-                remaining_panes = self.tmux.list_panes(target)
+                remaining_panes = self.session_service.tmux.list_panes(target)
             except Exception:  # noqa: BLE001
                 remaining_panes = []
             if len(remaining_panes) == 0:
-                self.tmux.create_window(
+                self.session_service.tmux.create_window(
                     tmux_session, self._CONSOLE_WINDOW, self._console_command(), detached=True,
                 )
             else:
-                self.tmux.respawn_pane(remaining_panes[0].pane_id, self._console_command())
-        self.tmux.set_window_option(f"{tmux_session}:{self._CONSOLE_WINDOW}", "allow-passthrough", "on")
-        self.tmux.set_window_option(f"{tmux_session}:{self._CONSOLE_WINDOW}", "window-size", "latest")
-        self.tmux.set_window_option(f"{tmux_session}:{self._CONSOLE_WINDOW}", "aggressive-resize", "on")
+                self.session_service.tmux.respawn_pane(remaining_panes[0].pane_id, self._console_command())
+        self.session_service.tmux.set_window_option(f"{tmux_session}:{self._CONSOLE_WINDOW}", "allow-passthrough", "on")
+        self.session_service.tmux.set_window_option(f"{tmux_session}:{self._CONSOLE_WINDOW}", "window-size", "latest")
+        self.session_service.tmux.set_window_option(f"{tmux_session}:{self._CONSOLE_WINDOW}", "aggressive-resize", "on")
 
     def focus_console(self) -> None:
         tmux_session = self.config.project.tmux_session
-        if not self.tmux.has_session(tmux_session):
+        if not self.session_service.tmux.has_session(tmux_session):
             return
         self.ensure_console_window()
-        self.tmux.select_window(f"{tmux_session}:{self._CONSOLE_WINDOW}")
+        self.session_service.tmux.select_window(f"{tmux_session}:{self._CONSOLE_WINDOW}")
 
     def run_heartbeat(self, snapshot_lines: int = 200) -> list[AlertRecord]:
         # Phase 0: Ingest provider transcripts into events.jsonl
@@ -1054,7 +1071,7 @@ class Supervisor:
 
     def _write_snapshot(self, window: TmuxWindow, snapshot_lines: int) -> tuple[Path, str]:
         target = window.pane_id or f"{window.session}:{window.name}"
-        content = self.tmux.capture_pane(target, lines=snapshot_lines)
+        content = self.session_service.tmux.capture_pane(target, lines=snapshot_lines)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         snapshot_path = self.config.project.snapshots_dir / f"{window.name}-{stamp}.txt"
         snapshot_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1350,8 +1367,8 @@ class Supervisor:
         storage = self.storage_closet_session_name()
         storage_target = f"{storage}:{launch.window_name}"
         # Check if the window exists in the storage closet
-        if self.tmux.has_session(storage):
-            windows = {w.name for w in self.tmux.list_windows(storage)}
+        if self.session_service.tmux.has_session(storage):
+            windows = {w.name for w in self.session_service.tmux.list_windows(storage)}
             if launch.window_name in windows:
                 return storage_target
         # Not in storage — check if it's mounted in the cockpit
@@ -1367,7 +1384,7 @@ class Supervisor:
                         # Validate the pane still exists in tmux
                         try:
                             cockpit_window = f"{cockpit_session}:{self._CONSOLE_WINDOW}"
-                            panes = self.tmux.list_panes(cockpit_window)
+                            panes = self.session_service.tmux.list_panes(cockpit_window)
                             if any(p.pane_id == right_pane for p in panes):
                                 return right_pane
                         except Exception:  # noqa: BLE001
@@ -1400,12 +1417,12 @@ class Supervisor:
 
         target = self._resolve_send_target(launch)
         prefixed = _prefix_for_owner(owner, text)
-        self.tmux.send_keys(target, prefixed, press_enter=press_enter)
+        self.session_service.tmux.send_keys(target, prefixed, press_enter=press_enter)
         # Codex CLI buffers input and requires a second Enter to submit.
         if press_enter and launch.session.provider is ProviderKind.CODEX:
             import time
             time.sleep(0.3)
-            self.tmux.send_keys(target, "", press_enter=True)
+            self.session_service.tmux.send_keys(target, "", press_enter=True)
         # Verify the message left the input bar.
         if press_enter:
             self._verify_input_submitted(target, text, launch)
@@ -1435,7 +1452,7 @@ class Supervisor:
         for attempt in range(max_retries):
             time.sleep(0.4)
             try:
-                snapshot = self.tmux.capture_pane(target, lines=5)
+                snapshot = self.session_service.tmux.capture_pane(target, lines=5)
             except Exception:
                 return  # Can't capture — skip verification
             lines = snapshot.strip().splitlines()
@@ -1447,7 +1464,7 @@ class Supervisor:
             if check_text in last_lines:
                 # Message is still in the input bar — press Enter again
                 try:
-                    self.tmux.send_keys(target, "", press_enter=True)
+                    self.session_service.tmux.send_keys(target, "", press_enter=True)
                 except Exception:
                     return
             else:
@@ -1717,10 +1734,10 @@ class Supervisor:
         )
         tmux_session = self._tmux_session_for_launch(launch)
         previous_runtime = self.store.get_session_runtime(session_name)
-        if self.tmux.has_session(tmux_session):
+        if self.session_service.tmux.has_session(tmux_session):
             window_map = self._window_map()
             if launch.window_name in window_map:
-                self.tmux.kill_window(f"{tmux_session}:{launch.window_name}")
+                self.session_service.tmux.kill_window(f"{tmux_session}:{launch.window_name}")
         account = self.config.accounts[account_name]
         self.store.upsert_session_runtime(
             session_name=session_name,
@@ -1766,7 +1783,7 @@ class Supervisor:
             rendered = recovery.render()
             if rendered.strip():
                 target = self._resolve_send_target(launch)
-                self.tmux.send_keys(target, rendered)
+                self.session_service.tmux.send_keys(target, rendered)
                 self.store.record_event(session_name, "recovery_prompt", "Injected recovery prompt with checkpoint context")
         except Exception:  # noqa: BLE001
             pass  # recovery prompt is best-effort
@@ -1842,17 +1859,17 @@ class Supervisor:
 
         if on_status:
             on_status(f"Creating tmux window for {session_name}...")
-        if not self.tmux.has_session(tmux_session):
-            self.tmux.create_session(tmux_session, launch.window_name, launch.command)
+        if not self.session_service.tmux.has_session(tmux_session):
+            self.session_service.tmux.create_session(tmux_session, launch.window_name, launch.command)
             target = f"{tmux_session}:0"
-            self.tmux.set_window_option(target, "allow-passthrough", "on")
+            self.session_service.tmux.set_window_option(target, "allow-passthrough", "on")
         else:
-            self.tmux.create_window(tmux_session, launch.window_name, launch.command, detached=True)
+            self.session_service.tmux.create_window(tmux_session, launch.window_name, launch.command, detached=True)
             target = f"{tmux_session}:{launch.window_name}"
-            self.tmux.set_window_option(target, "allow-passthrough", "on")
+            self.session_service.tmux.set_window_option(target, "allow-passthrough", "on")
         # Cap scrollback to prevent slow pane-switching in the cockpit
-        self.tmux.set_pane_history_limit(target, 200)
-        self.tmux.pipe_pane(target, launch.log_path)
+        self.session_service.tmux.set_pane_history_limit(target, 200)
+        self.session_service.tmux.pipe_pane(target, launch.log_path)
         self._record_launch(launch)
         return launch, target
 
@@ -1864,21 +1881,21 @@ class Supervisor:
             action="stop",
         )
         tmux_session = self._tmux_session_for_launch(launch)
-        if not self.tmux.has_session(tmux_session):
+        if not self.session_service.tmux.has_session(tmux_session):
             return
         window_map = self._window_map()
         if launch.window_name not in window_map:
             return
-        self.tmux.kill_window(f"{tmux_session}:{launch.window_name}")
+        self.session_service.tmux.kill_window(f"{tmux_session}:{launch.window_name}")
         self._release_session_locks(launch)
         self.store.record_event(session_name, "stop", f"Stopped tmux window {launch.window_name}")
 
     def focus_session(self, session_name: str) -> None:
         launch = self._launch_by_session(session_name)
         tmux_session = self._tmux_session_for_launch(launch)
-        if not self.tmux.has_session(tmux_session):
+        if not self.session_service.tmux.has_session(tmux_session):
             raise RuntimeError(f"tmux session does not exist: {tmux_session}")
-        self.tmux.select_window(f"{tmux_session}:{launch.window_name}")
+        self.session_service.tmux.select_window(f"{tmux_session}:{launch.window_name}")
 
     def switch_session_account(self, session_name: str, account_name: str) -> None:
         launch = self._launch_by_session(session_name)
@@ -1961,13 +1978,13 @@ class Supervisor:
         """Send the cockpit TUI command to the rail pane with a restart loop."""
         cockpit_cmd = self._cockpit_cmd()
         target = f"{session_name}:{self._CONSOLE_WINDOW}"
-        panes = self.tmux.list_panes(target)
+        panes = self.session_service.tmux.list_panes(target)
         rail_pane = min(panes, key=lambda p: int(getattr(p, "pane_left", 0)))
         loop_cmd = (
             f"while true; do {cockpit_cmd}; "
             f'echo "[Rail exited — restarting in 2s]"; sleep 2; done'
         )
-        self.tmux.send_keys(rail_pane.pane_id, loop_cmd)
+        self.session_service.tmux.send_keys(rail_pane.pane_id, loop_cmd)
 
     def _controller_candidates(self) -> list[str]:
         ordered = [self.config.pollypm.controller_account, *self.config.pollypm.failover_accounts]
@@ -2113,7 +2130,7 @@ class Supervisor:
         kickoff = self._prepare_initial_input(launch.session.name, initial_input)
         # Small delay to let Claude Code's input bar fully initialize
         time.sleep(0.5)
-        self.tmux.send_keys(target, kickoff)
+        self.session_service.tmux.send_keys(target, kickoff)
         self._verify_input_submitted(target, kickoff, launch)
         fresh_marker.unlink(missing_ok=True)
 
@@ -2156,7 +2173,7 @@ class Supervisor:
         while time.monotonic() < deadline:
             elapsed = int(time.monotonic() - start)
             try:
-                pane = self.tmux.capture_pane(target, lines=320)
+                pane = self.session_service.tmux.capture_pane(target, lines=320)
             except Exception:  # noqa: BLE001
                 _status(f"Waiting for Claude Code to start... ({elapsed}s)")
                 time.sleep(poll_interval)
@@ -2173,7 +2190,7 @@ class Supervisor:
             if "choose the text style that looks best with your terminal" in lowered:
                 if last_action != "theme":
                     _status(f"Dismissing theme picker... ({elapsed}s)")
-                    self.tmux.send_keys(target, "", press_enter=True)
+                    self.session_service.tmux.send_keys(target, "", press_enter=True)
                     last_action = "theme"
                     poll_interval = 0.5  # Wait a bit after sending keys
                 time.sleep(poll_interval)
@@ -2182,7 +2199,7 @@ class Supervisor:
             if "quick safety check" in lowered and "yes, i trust this folder" in lowered:
                 if last_action != "trust":
                     _status(f"Accepting trust prompt... ({elapsed}s)")
-                    self.tmux.send_keys(target, "", press_enter=True)
+                    self.session_service.tmux.send_keys(target, "", press_enter=True)
                     last_action = "trust"
                     poll_interval = 0.5
                 time.sleep(poll_interval)
@@ -2191,8 +2208,8 @@ class Supervisor:
             if "warning: claude code running in bypass permissions mode" in lowered:
                 if last_action != "bypass-confirm":
                     _status(f"Confirming bypass permissions mode... ({elapsed}s)")
-                    self.tmux.send_keys(target, "2", press_enter=False)
-                    self.tmux.send_keys(target, "", press_enter=True)
+                    self.session_service.tmux.send_keys(target, "2", press_enter=False)
+                    self.session_service.tmux.send_keys(target, "", press_enter=True)
                     last_action = "bypass-confirm"
                     poll_interval = 0.5
                 time.sleep(poll_interval)
@@ -2201,7 +2218,7 @@ class Supervisor:
             if "we recommend medium effort for opus" in lowered:
                 if last_action != "effort":
                     _status(f"Dismissing effort recommendation... ({elapsed}s)")
-                    self.tmux.send_keys(target, "", press_enter=True)
+                    self.session_service.tmux.send_keys(target, "", press_enter=True)
                     last_action = "effort"
                     poll_interval = 0.5
                 time.sleep(poll_interval)
@@ -2239,7 +2256,7 @@ class Supervisor:
         while time.monotonic() < deadline:
             elapsed = int(time.monotonic() - start)
             try:
-                pane = self.tmux.capture_pane(target, lines=260)
+                pane = self.session_service.tmux.capture_pane(target, lines=260)
             except Exception:  # noqa: BLE001
                 _status(f"Waiting for Codex to start... ({elapsed}s)")
                 time.sleep(poll_interval)
@@ -2249,7 +2266,7 @@ class Supervisor:
             if "approaching rate limits" in lowered and "switch to gpt-5.1-codex-mini" in lowered:
                 if last_action != "switch-mini":
                     _status(f"Switching to codex-mini due to rate limits... ({elapsed}s)")
-                    self.tmux.send_keys(target, "", press_enter=True)
+                    self.session_service.tmux.send_keys(target, "", press_enter=True)
                     last_action = "switch-mini"
                     poll_interval = 0.5
                 time.sleep(poll_interval)
@@ -2259,7 +2276,7 @@ class Supervisor:
             if "press enter to continue" in lowered:
                 if last_action != "continue":
                     _status(f"Dismissing continue prompt... ({elapsed}s)")
-                    self.tmux.send_keys(target, "", press_enter=True)
+                    self.session_service.tmux.send_keys(target, "", press_enter=True)
                     last_action = "continue"
                     poll_interval = 0.5
                 time.sleep(poll_interval)
@@ -2267,7 +2284,7 @@ class Supervisor:
             if "do you trust the contents of this directory" in lowered and "1. yes, continue" in lowered:
                 if last_action != "trust":
                     _status(f"Accepting trust prompt... ({elapsed}s)")
-                    self.tmux.send_keys(target, "", press_enter=True)
+                    self.session_service.tmux.send_keys(target, "", press_enter=True)
                     last_action = "trust"
                     poll_interval = 0.5
                 time.sleep(poll_interval)

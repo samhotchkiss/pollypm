@@ -35,6 +35,30 @@ class TmuxSessionService:
 
     name = "tmux"
 
+    # ------------------------------------------------------------------
+    # Static bootstrap methods — usable before a full service is created
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def probe_tmux_session(name: str) -> bool:
+        from pollypm.tmux.client import TmuxClient
+        return TmuxClient().has_session(name)
+
+    @staticmethod
+    def attach_tmux_session(name: str) -> int:
+        from pollypm.tmux.client import TmuxClient
+        return TmuxClient().attach_session(name)
+
+    @staticmethod
+    def switch_tmux_client(name: str) -> int:
+        from pollypm.tmux.client import TmuxClient
+        return TmuxClient().switch_client(name)
+
+    @staticmethod
+    def current_tmux_session() -> str | None:
+        from pollypm.tmux.client import TmuxClient
+        return TmuxClient().current_session_name()
+
     def __init__(self, *, config: object, store: object) -> None:
         # Accept config and store as opaque objects to avoid circular
         # imports at module level.  At runtime these are PollyPMConfig

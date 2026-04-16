@@ -180,13 +180,17 @@ class TestTeardownWorker:
             mock_sub.run.return_value = MagicMock(returncode=0, stderr="", stdout="")
             return manager.provision_worker(task_id, "agent-1")
 
-    def test_teardown_worker_archives_jsonl(self, manager, mock_tmux, tmp_project):
+    def test_teardown_worker_archives_jsonl(self, manager, mock_tmux, tmp_project, tmp_path, monkeypatch):
         session = self._provision(manager)
 
-        # Create a fake JSONL file in the worktree
-        claude_dir = session.worktree_path / ".claude"
-        claude_dir.mkdir(parents=True)
-        jsonl_file = claude_dir / "session.jsonl"
+        # Claude writes JSONL to $CLAUDE_CONFIG_DIR/projects/<encoded-cwd>/
+        claude_home = tmp_path / "claude-home"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+        from pollypm.work.session_manager import _encode_claude_cwd
+        encoded = _encode_claude_cwd(session.worktree_path.resolve())
+        proj_dir = claude_home / "projects" / encoded
+        proj_dir.mkdir(parents=True)
+        jsonl_file = proj_dir / "session.jsonl"
         jsonl_file.write_text('{"type": "token_usage", "input_tokens": 100, "output_tokens": 50}\n')
 
         with patch("pollypm.work.session_manager.subprocess") as mock_sub:
@@ -241,13 +245,17 @@ class TestTeardownWorker:
         assert r2.jsonl_archived is False
         assert r2.worktree_removed is False
 
-    def test_teardown_worker_records_tokens(self, manager, mock_tmux, tmp_project):
+    def test_teardown_worker_records_tokens(self, manager, mock_tmux, tmp_project, tmp_path, monkeypatch):
         session = self._provision(manager)
 
-        # Create JSONL with token events
-        claude_dir = session.worktree_path / ".claude"
-        claude_dir.mkdir(parents=True)
-        jsonl_file = claude_dir / "session.jsonl"
+        # Create JSONL with token events in the Claude config dir
+        claude_home = tmp_path / "claude-home"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+        from pollypm.work.session_manager import _encode_claude_cwd
+        encoded = _encode_claude_cwd(session.worktree_path.resolve())
+        proj_dir = claude_home / "projects" / encoded
+        proj_dir.mkdir(parents=True)
+        jsonl_file = proj_dir / "session.jsonl"
         lines = [
             json.dumps({"type": "token_usage", "input_tokens": 100, "output_tokens": 50}),
             json.dumps({"type": "token_usage", "input_tokens": 200, "output_tokens": 75}),
@@ -376,3 +384,16 @@ class TestTokenParsing:
         inp, out = _parse_token_usage(f)
         assert inp == 0
         assert out == 0
+
+
+# ---------------------------------------------------------------------------
+# Claude cwd encoding tests
+# ---------------------------------------------------------------------------
+
+
+class TestClaudeCwdEncoding:
+    def test_encode_cwd_replaces_slash_and_dot(self):
+        from pollypm.work.session_manager import _encode_claude_cwd
+
+        encoded = _encode_claude_cwd(Path("/Users/sam/dev/foo/.pollypm/worktrees/foo-1"))
+        assert encoded == "-Users-sam-dev-foo--pollypm-worktrees-foo-1"

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -470,19 +471,18 @@ class SessionManager:
     ) -> tuple[Path | None, int, int]:
         """Copy Claude JSONL to archive location. Parse token counts.
 
+        Claude Code writes transcripts to
+        ``$CLAUDE_CONFIG_DIR/projects/<encoded-cwd>/*.jsonl`` (default
+        ``~/.claude/projects/...``), not inside the worktree. The cwd
+        is encoded by replacing every ``/`` and ``.`` with ``-``.
+
         Returns (archive_path, input_tokens, output_tokens).
         """
-        # Look for .jsonl files in the worktree's .claude directory
-        claude_dir = worktree_path / ".claude"
-        if not claude_dir.exists():
-            return None, 0, 0
-
-        jsonl_files = list(claude_dir.rglob("*.jsonl"))
+        jsonl_files = _find_claude_jsonl_files(worktree_path)
         if not jsonl_files:
             return None, 0, 0
 
         # Create archive directory
-        project, task_number = _parse_task_id(task_id)
         archive_dir = (
             self._project_path / ".pollypm" / "transcripts" / "tasks" / task_id
         )
@@ -493,7 +493,11 @@ class SessionManager:
 
         for src in jsonl_files:
             dst = archive_dir / src.name
-            shutil.copy2(src, dst)
+            try:
+                shutil.copy2(src, dst)
+            except OSError as exc:
+                logger.warning("Failed to archive %s: %s", src, exc)
+                continue
 
             # Parse token counts
             input_t, output_t = _parse_token_usage(src)
@@ -671,6 +675,47 @@ def _shell_quote(s: str) -> str:
     """Shell-quote a string for embedding in a tmux command."""
     import shlex
     return shlex.quote(s)
+
+
+def _encode_claude_cwd(cwd: Path) -> str:
+    """Encode a cwd path the way Claude Code does for project JSONL dirs.
+
+    Claude replaces every ``/`` and ``.`` in the absolute cwd with ``-``,
+    e.g. ``/Users/sam/dev/foo/.pollypm/worktrees/foo-1`` becomes
+    ``-Users-sam-dev-foo--pollypm-worktrees-foo-1``.
+    """
+    s = str(cwd)
+    return s.replace("/", "-").replace(".", "-")
+
+
+def _claude_config_dir() -> Path:
+    """Resolve the Claude config directory.
+
+    Honors ``$CLAUDE_CONFIG_DIR`` (set per-account by the runtime) and
+    falls back to ``~/.claude``.
+    """
+    env_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if env_dir:
+        return Path(env_dir)
+    return Path.home() / ".claude"
+
+
+def _find_claude_jsonl_files(worktree_path: Path) -> list[Path]:
+    """Return JSONL files Claude wrote for a worktree cwd.
+
+    Looks in ``$CLAUDE_CONFIG_DIR/projects/<encoded-cwd>/*.jsonl``.
+    Returns an empty list if the directory doesn't exist.
+    """
+    projects_root = _claude_config_dir() / "projects"
+    if not projects_root.exists():
+        return []
+
+    encoded = _encode_claude_cwd(worktree_path.resolve())
+    project_dir = projects_root / encoded
+    if not project_dir.exists():
+        return []
+
+    return sorted(project_dir.glob("*.jsonl"))
 
 
 def _parse_token_usage(jsonl_path: Path) -> tuple[int, int]:

@@ -1,6 +1,6 @@
 """Wire the sealed heartbeat + job queue + worker pool from config.
 
-``CoreRail`` is the small orchestration object that constructs the three
+``HeartbeatRail`` is the small orchestration object that constructs the three
 moving parts of the Track 7 architecture and starts them together:
 
 * ``JobQueue`` — durable SQLite-backed queue (on ``config.project.state_db``).
@@ -10,7 +10,7 @@ moving parts of the Track 7 architecture and starts them together:
   enqueues jobs at their scheduled cadences.
 
 The heartbeat's tick cadence is driven by an external timer (the existing
-supervisor or a user-level loop). CoreRail only wires construction +
+supervisor or a user-level loop). HeartbeatRail only wires construction +
 lifecycle; callers call ``tick()`` themselves when they're ready.
 
 The worker concurrency is read from ``[heartbeat.workers]`` in the
@@ -31,7 +31,7 @@ from pollypm.heartbeat import Heartbeat, Roster
 from pollypm.jobs import JobQueue, JobWorkerPool
 
 
-__all__ = ["CoreRail", "WorkerSettings", "load_worker_settings"]
+__all__ = ["HeartbeatRail", "WorkerSettings", "load_worker_settings"]
 
 
 logger = logging.getLogger(__name__)
@@ -83,14 +83,14 @@ def load_worker_settings(config_path: Path) -> WorkerSettings:
     return WorkerSettings(concurrency=concurrency, poll_interval=poll_interval)
 
 
-class CoreRail:
+class HeartbeatRail:
     """Construct + start a JobQueue + JobWorkerPool + Heartbeat trio.
 
     Typical usage (e.g. from a supervisor or tests)::
 
-        from pollypm.heartbeat.boot import CoreRail
+        from pollypm.heartbeat.boot import HeartbeatRail
 
-        rail = CoreRail.from_config(config_path, plugin_host)
+        rail = HeartbeatRail.from_config(config_path, plugin_host)
         rail.start()
         try:
             while running:
@@ -133,8 +133,8 @@ class CoreRail:
         plugin_host: Any,
         config_path: Path | None = None,
         concurrency: int | None = None,
-    ) -> "CoreRail":
-        """Build a CoreRail from an already-resolved plugin host + DB path.
+    ) -> "HeartbeatRail":
+        """Build a HeartbeatRail from an already-resolved plugin host + DB path.
 
         The plugin host must expose ``build_roster()`` and
         ``job_handler_registry()`` (see :class:`pollypm.plugin_host.ExtensionHost`).
@@ -162,7 +162,7 @@ class CoreRail:
         )
 
     @classmethod
-    def from_config(cls, config_path: Path, plugin_host: Any) -> "CoreRail":
+    def from_config(cls, config_path: Path, plugin_host: Any) -> "HeartbeatRail":
         """Convenience: load the config, resolve the DB path, build from host."""
         from pollypm.config import load_config
 
@@ -195,7 +195,7 @@ class CoreRail:
         return self.heartbeat.tick(now or datetime.now(UTC))
 
     # Context manager sugar — mostly useful for tests.
-    def __enter__(self) -> "CoreRail":
+    def __enter__(self) -> "HeartbeatRail":
         self.start()
         return self
 

@@ -7,7 +7,7 @@ the roster + job queue. Verifies:
   schedules + handlers at the documented cadences.
 * The ``itsalive`` plugin registers its own ``deploy_sweep`` handler +
   schedule (plugin-owned, core no longer reaches into it).
-* A ``CoreRail`` wired from the plugin host enqueues roster entries on
+* A ``HeartbeatRail`` wired from the plugin host enqueues roster entries on
   tick and drains them via registered handlers.
 """
 
@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from pollypm.heartbeat import Heartbeat, Roster
-from pollypm.heartbeat.boot import CoreRail, WorkerSettings, load_worker_settings
+from pollypm.heartbeat.boot import HeartbeatRail, WorkerSettings, load_worker_settings
 from pollypm.jobs import JobHandlerRegistry, JobQueue, JobStatus, exponential_backoff
 from pollypm.plugin_api.v1 import JobHandlerAPI, RosterAPI
 from pollypm.plugins_builtin.core_recurring.plugin import plugin as core_plugin
@@ -114,12 +114,12 @@ class TestItsaliveRosterMigration:
 
 
 # ---------------------------------------------------------------------------
-# Boot wiring (CoreRail)
+# Boot wiring (HeartbeatRail)
 # ---------------------------------------------------------------------------
 
 
 class _FakeHost:
-    """Minimal plugin-host stand-in for CoreRail tests."""
+    """Minimal plugin-host stand-in for HeartbeatRail tests."""
 
     def __init__(self, roster: Roster, registry: JobHandlerRegistry) -> None:
         self._roster = roster
@@ -132,13 +132,13 @@ class _FakeHost:
         return self._registry
 
 
-class TestCoreRailBoot:
+class TestHeartbeatRailBoot:
     def test_from_plugin_host_wires_queue_pool_heartbeat(self, tmp_path: Path) -> None:
         roster = Roster()
         registry = JobHandlerRegistry()
         host = _FakeHost(roster, registry)
 
-        rail = CoreRail.from_plugin_host(
+        rail = HeartbeatRail.from_plugin_host(
             state_db=tmp_path / "state.db",
             plugin_host=host,
             concurrency=1,
@@ -172,7 +172,7 @@ class TestCoreRailBoot:
         )
 
         host = _FakeHost(roster, registry)
-        rail = CoreRail.from_plugin_host(
+        rail = HeartbeatRail.from_plugin_host(
             state_db=tmp_path / "state.db",
             plugin_host=host,
             concurrency=1,

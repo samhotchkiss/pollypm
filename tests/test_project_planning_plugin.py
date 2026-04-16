@@ -995,3 +995,227 @@ def test_user_approval_node_waits_indefinitely() -> None:
     assert node.budget_seconds is None
     assert node.next_node_id == "emit"
     assert node.reject_node_id == "synthesize"
+
+
+# ---------------------------------------------------------------------------
+# pp09 — pm project replan drift analysis + long-term planner memory
+# ---------------------------------------------------------------------------
+
+
+def test_planner_memory_round_trip(tmp_path: Path) -> None:
+    from pollypm.plugins_builtin.project_planning.memory import (
+        PlannerMemoryEntry, append_entry, read_entries,
+    )
+    memory_path = tmp_path / "planner.jsonl"
+    entry = PlannerMemoryEntry.new(
+        project="demo",
+        module_count=4,
+        selected_candidate="A",
+        top_risks=["Module Foo plugin boundary is premature"],
+        takeaways="Test gates were too permissive on Foo.",
+    )
+    append_entry(entry, path=memory_path)
+    loaded = read_entries(path=memory_path)
+    assert len(loaded) == 1
+    assert loaded[0].project == "demo"
+    assert loaded[0].module_count == 4
+    assert loaded[0].selected_candidate == "A"
+    assert "permissive" in loaded[0].takeaways
+
+
+def test_planner_memory_grows_one_entry_per_run(tmp_path: Path) -> None:
+    """Acceptance gate for pp09: every planning run appends one entry."""
+    from pollypm.plugins_builtin.project_planning.memory import (
+        PlannerMemoryEntry, append_entry, read_entries,
+    )
+    memory_path = tmp_path / "planner.jsonl"
+    for project in ("alpha", "beta", "gamma"):
+        append_entry(
+            PlannerMemoryEntry.new(
+                project=project,
+                module_count=3,
+                selected_candidate="B",
+            ),
+            path=memory_path,
+        )
+    loaded = read_entries(path=memory_path)
+    assert len(loaded) == 3
+    assert [e.project for e in loaded] == ["alpha", "beta", "gamma"]
+
+
+def test_planner_memory_filters_by_project(tmp_path: Path) -> None:
+    from pollypm.plugins_builtin.project_planning.memory import (
+        PlannerMemoryEntry, append_entry, read_entries,
+    )
+    memory_path = tmp_path / "planner.jsonl"
+    for project in ("alpha", "beta", "alpha"):
+        append_entry(
+            PlannerMemoryEntry.new(
+                project=project,
+                module_count=2,
+                selected_candidate="A",
+            ),
+            path=memory_path,
+        )
+    only_alpha = read_entries(project="alpha", path=memory_path)
+    assert len(only_alpha) == 2
+    assert all(e.project == "alpha" for e in only_alpha)
+
+
+def test_planner_memory_read_skips_malformed_lines(tmp_path: Path) -> None:
+    from pollypm.plugins_builtin.project_planning.memory import read_entries
+
+    memory_path = tmp_path / "planner.jsonl"
+    memory_path.write_text(
+        'not-json\n'
+        '{"project": "ok", "timestamp": "2026-04-16T00:00:00+00:00", '
+        '"module_count": 1, "selected_candidate": "A", "top_risks": [], '
+        '"shipped_modules": 0, "cancelled_modules": 0, "takeaways": ""}\n'
+        '[1,2,3]\n'  # JSON but not a dict
+    )
+    loaded = read_entries(path=memory_path)
+    assert len(loaded) == 1
+    assert loaded[0].project == "ok"
+
+
+def test_summarise_for_prompt_empty_memory() -> None:
+    from pollypm.plugins_builtin.project_planning.memory import (
+        summarise_for_prompt,
+    )
+    text = summarise_for_prompt([])
+    assert "<planner-memory>" in text
+    assert "No prior" in text
+
+
+def test_summarise_for_prompt_with_entries() -> None:
+    from pollypm.plugins_builtin.project_planning.memory import (
+        PlannerMemoryEntry, summarise_for_prompt,
+    )
+    entries = [
+        PlannerMemoryEntry.new(
+            project="alpha",
+            module_count=3,
+            selected_candidate="A",
+            takeaways="Strict test gates are required.",
+        )
+    ]
+    text = summarise_for_prompt(entries)
+    assert "alpha" in text
+    assert "Strict test gates" in text
+    assert "Weight your recommendations" in text
+
+
+def test_extract_plan_modules_reads_bold_list_items() -> None:
+    from pollypm.plugins_builtin.project_planning.replan import (
+        extract_plan_modules,
+    )
+    plan = """
+# Project Plan
+
+## Modules
+- **Foo Service** — does the foo
+- **Bar Worker** — handles bar events
+- **Baz Plugin** — ships the magic
+
+Other content.
+"""
+    modules = extract_plan_modules(plan)
+    assert modules == ["Foo Service", "Bar Worker", "Baz Plugin"]
+
+
+def test_analyse_drift_computes_gaps_and_drift() -> None:
+    from pollypm.plugins_builtin.project_planning.replan import (
+        CancelledRecord, ShippedRecord, analyse_drift,
+    )
+    plan = (
+        "## Modules\n"
+        "- **Foo Service** — does the foo\n"
+        "- **Bar Worker** — handles bar events\n"
+        "- **Baz Plugin** — ships the magic\n"
+    )
+    shipped = [
+        ShippedRecord(
+            task_id="demo/1", title="Implement Foo Service",
+            module="Foo Service", user_level_test_receipt=True,
+        ),
+        # Bar Worker shipped but without user-level test receipt ⇒ drift.
+        ShippedRecord(
+            task_id="demo/2", title="Implement Bar Worker",
+            module="Bar Worker", user_level_test_receipt=False,
+        ),
+    ]
+    cancelled = [
+        CancelledRecord(
+            task_id="demo/3", title="Implement Baz Plugin",
+            module="Baz Plugin", reason="Deferred to v2",
+        ),
+    ]
+    analysis = analyse_drift(
+        plan_text=plan,
+        shipped=shipped,
+        cancelled=cancelled,
+        ledger_risks=["Baz Plugin's interface is premature"],
+        materialized=["Baz Plugin's interface is premature"],
+    )
+    assert analysis.planned_modules == ["Foo Service", "Bar Worker", "Baz Plugin"]
+    assert "Foo Service" in analysis.shipped_modules
+    assert "Bar Worker" in analysis.drift_modules
+    assert analysis.cancelled_modules == ["Baz Plugin"]
+    assert analysis.gaps == []  # Baz was cancelled, not a gap
+    assert analysis.materialized_risks == ["Baz Plugin's interface is premature"]
+
+
+def test_analyse_drift_detects_plan_with_no_follow_through() -> None:
+    from pollypm.plugins_builtin.project_planning.replan import analyse_drift
+
+    plan = "- **Foo** — never shipped\n- **Bar** — also never shipped\n"
+    analysis = analyse_drift(plan_text=plan, shipped=[], cancelled=[])
+    assert set(analysis.gaps) == {"Foo", "Bar"}
+
+
+def test_render_drift_chat_contains_sections() -> None:
+    from pollypm.plugins_builtin.project_planning.replan import (
+        CancelledRecord, ShippedRecord, analyse_drift, render_drift_chat,
+    )
+    plan = (
+        "## Modules\n"
+        "- **Foo** — x\n"
+        "- **Bar** — y\n"
+    )
+    analysis = analyse_drift(
+        plan_text=plan,
+        shipped=[ShippedRecord(
+            task_id="p/1", title="Implement Bar", module="Bar",
+            user_level_test_receipt=False,
+        )],
+        cancelled=[],
+    )
+    text = render_drift_chat(analysis)
+    assert "# Drift analysis" in text
+    assert "## Gaps" in text
+    assert "Foo" in text
+    assert "## Drift" in text
+    assert "Bar" in text
+    assert "Decide what to act on" in text
+
+
+def test_replan_produces_chat_task_body(tmp_path: Path) -> None:
+    """pp09 acceptance: pm project replan produces a chat task body
+    with drift analysis for a project that has an existing plan."""
+    from pollypm.plugins_builtin.project_planning.replan import (
+        CancelledRecord, ShippedRecord, analyse_drift, render_drift_chat,
+    )
+    # Simulate what the CLI (pp10) will do when it reads disk.
+    plan = (
+        "# Plan\n\n## Modules\n"
+        "- **Foo Service** — does the thing\n"
+    )
+    analysis = analyse_drift(
+        plan_text=plan,
+        shipped=[],
+        cancelled=[],
+    )
+    body = render_drift_chat(analysis)
+    # The chat task has non-empty body and mentions the planned module.
+    assert "Foo Service" in body
+    assert "Decide what to act on" in body

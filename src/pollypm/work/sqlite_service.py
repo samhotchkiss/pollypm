@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from pollypm.work.flow_engine import resolve_flow
 from pollypm.work.gates import GateRegistry, evaluate_gates, has_hard_failure
@@ -895,8 +898,14 @@ class SQLiteWorkService:
         if self._session_mgr is not None:
             try:
                 self._session_mgr.provision_worker(task_id, actor)
-            except Exception:  # noqa: BLE001
-                pass  # Best-effort — task is claimed regardless
+            except Exception as exc:  # noqa: BLE001
+                # Best-effort — task is claimed regardless. Log at
+                # warning so the user has a breadcrumb when the worker
+                # fails to launch.
+                logger.warning(
+                    "provision_worker failed for %s (actor=%s): %s",
+                    task_id, actor, exc,
+                )
         return result
 
     def cancel(self, task_id: str, actor: str, reason: str) -> Task:

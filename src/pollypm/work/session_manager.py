@@ -169,12 +169,23 @@ class SessionManager:
 
         now = _now_dt()
 
-        # Store binding in SQLite
+        # Store binding in SQLite. Upsert so a re-claim after cancel
+        # reuses the row (teardown stamps ended_at but doesn't delete)
+        # instead of hitting the PK constraint.
         conn = self._get_conn()
         conn.execute(
             "INSERT INTO work_sessions "
             "(task_project, task_number, agent_name, pane_id, worktree_path, "
-            "branch_name, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "branch_name, started_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (task_project, task_number) DO UPDATE SET "
+            "pane_id=excluded.pane_id, "
+            "worktree_path=excluded.worktree_path, "
+            "branch_name=excluded.branch_name, "
+            "started_at=excluded.started_at, "
+            "ended_at=NULL, "
+            "archive_path=NULL, "
+            "total_input_tokens=0, "
+            "total_output_tokens=0",
             (project, task_number, agent_name, pane_id, str(worktree_path),
              branch_name, now.isoformat()),
         )

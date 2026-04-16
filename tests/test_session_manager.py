@@ -168,6 +168,25 @@ class TestProvisionWorker:
         # create_session called only once
         assert mock_tmux.create_session.call_count == 1
 
+    def test_provision_worker_reprovision_after_teardown(
+        self, manager, mock_tmux, tmp_project,
+    ):
+        """After teardown stamps ended_at, a re-claim must succeed (not
+        blow up on the primary-key constraint)."""
+        with patch("pollypm.work.session_manager.subprocess") as mock_sub:
+            mock_sub.run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+            manager.provision_worker("proj/1", "agent-1")
+            manager.teardown_worker("proj/1")
+            # Re-claim — previously hit PK constraint and was swallowed.
+            s2 = manager.provision_worker("proj/1", "agent-2")
+
+        assert s2.task_id == "proj/1"
+        # Row is reused with ended_at cleared; the active session query
+        # must return the freshly-upserted binding.
+        found = manager.session_for_task("proj/1")
+        assert found is not None
+        assert found.task_id == "proj/1"
+
 
 # ---------------------------------------------------------------------------
 # Teardown tests

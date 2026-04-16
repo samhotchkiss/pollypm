@@ -886,3 +886,112 @@ start_node: work
 """
     with pytest.raises(FlowValidationError):
         parse_flow_yaml(text)
+
+
+# ---------------------------------------------------------------------------
+# pp08 — present-plan-to-user approval gate
+# ---------------------------------------------------------------------------
+
+
+def _populate_plan_artifacts(root: Path, *, with_ledger_section: bool = True) -> None:
+    docs = root / "docs"
+    docs.mkdir(exist_ok=True)
+    plan_body = "# Project Plan\n\nModules: Foo, Bar, Baz.\n"
+    if with_ledger_section:
+        plan_body += "\n## Risk Ledger\n\n| risk | category | mitigation | raised-by | status |\n"
+    (docs / "project-plan.md").write_text(plan_body)
+    (docs / "planning-session-log.md").write_text(
+        "# Session log\n\nThe architect said..."
+    )
+
+
+def test_approval_readiness_detects_missing_plan(tmp_path: Path) -> None:
+    from pollypm.plugins_builtin.project_planning.approval import (
+        check_plan_ready_for_user,
+    )
+    result = check_plan_ready_for_user(tmp_path)
+    assert result.ready is False
+    assert any("project-plan.md" in item for item in result.missing)
+
+
+def test_approval_readiness_passes_with_all_artifacts(tmp_path: Path) -> None:
+    from pollypm.plugins_builtin.project_planning.approval import (
+        check_plan_ready_for_user,
+    )
+    _populate_plan_artifacts(tmp_path)
+    result = check_plan_ready_for_user(tmp_path)
+    assert result.ready is True
+    assert result.missing == []
+
+
+def test_approval_readiness_allows_sibling_risk_ledger(tmp_path: Path) -> None:
+    from pollypm.plugins_builtin.project_planning.approval import (
+        check_plan_ready_for_user,
+    )
+    _populate_plan_artifacts(tmp_path, with_ledger_section=False)
+    # Sibling Risk Ledger file is also accepted.
+    (tmp_path / "docs" / "project-plan-risk-ledger.md").write_text(
+        "| risk | mitigation |\n| --- | --- |\n| R1 | M1 |\n"
+    )
+    result = check_plan_ready_for_user(tmp_path)
+    assert result.ready is True
+
+
+def test_approval_readiness_missing_risk_ledger(tmp_path: Path) -> None:
+    from pollypm.plugins_builtin.project_planning.approval import (
+        check_plan_ready_for_user,
+    )
+    _populate_plan_artifacts(tmp_path, with_ledger_section=False)
+    result = check_plan_ready_for_user(tmp_path)
+    assert result.ready is False
+    assert any("Risk Ledger" in m for m in result.missing)
+
+
+def test_record_approval_appends_to_log(tmp_path: Path) -> None:
+    from pollypm.plugins_builtin.project_planning.approval import (
+        record_approval,
+    )
+    log_path = tmp_path / "docs" / "planning-session-log.md"
+    log_path.parent.mkdir()
+    log_path.write_text("# Session log\n\nPrior entries.\n")
+    record_approval(tmp_path, actor="alice", note="please ship Foo first")
+    text = log_path.read_text()
+    assert "Stage 7 approval received from alice" in text
+    assert "please ship Foo first" in text
+    # Prior content preserved.
+    assert "Prior entries." in text
+
+
+def test_record_rejection_captures_reason(tmp_path: Path) -> None:
+    from pollypm.plugins_builtin.project_planning.approval import (
+        record_rejection,
+    )
+    log_path = tmp_path / "docs" / "planning-session-log.md"
+    log_path.parent.mkdir()
+    log_path.write_text("# Session log\n")
+    record_rejection(tmp_path, actor="alice", reason="scope is too big")
+    text = log_path.read_text()
+    assert "Stage 7 rejection from alice" in text
+    assert "scope is too big" in text
+
+
+def test_record_rejection_handles_empty_reason(tmp_path: Path) -> None:
+    from pollypm.plugins_builtin.project_planning.approval import (
+        record_rejection,
+    )
+    log_path = tmp_path / "docs" / "planning-session-log.md"
+    log_path.parent.mkdir()
+    log_path.write_text("# Session log\n")
+    record_rejection(tmp_path, reason="   ")
+    text = log_path.read_text()
+    assert "no reason supplied" in text
+
+
+def test_user_approval_node_waits_indefinitely() -> None:
+    """pp08 acceptance: stage 7 has no budget (waits indefinitely)."""
+    template = resolve_flow("plan_project")
+    node = template.nodes["user_approval"]
+    assert node.actor_type == ActorType.HUMAN
+    assert node.budget_seconds is None
+    assert node.next_node_id == "emit"
+    assert node.reject_node_id == "synthesize"

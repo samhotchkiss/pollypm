@@ -68,6 +68,9 @@ from pollypm.work.cli import task_app, flow_app
 app.add_typer(task_app, name="task")
 app.add_typer(flow_app, name="flow")
 
+from pollypm.jobs.cli import jobs_app
+app.add_typer(jobs_app, name="jobs")
+
 
 def _session_name_candidates() -> list[str]:
     return ["pollypm", "pollypm-storage-closet"]

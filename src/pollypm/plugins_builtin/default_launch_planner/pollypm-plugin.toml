@@ -1,0 +1,7 @@
+api_version = "1"
+name = "default_launch_planner"
+kind = "launch_planner"
+version = "0.1.0"
+entrypoint = "plugin.py:plugin"
+capabilities = ["launch_planner"]
+description = "Built-in default launch planner — preserves historical Supervisor planning behavior."

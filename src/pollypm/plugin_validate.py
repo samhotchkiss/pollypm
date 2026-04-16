@@ -270,6 +270,21 @@ def _validate_recovery_policy_factory(name: str, factory: object) -> tuple[list[
     return checks, errors
 
 
+def _validate_launch_planner_factory(name: str, factory: object) -> tuple[list[str], list[str]]:
+    """Validate a launch_planner factory is callable. Planners take a context
+    kwarg at instantiation time, so we don't exercise the factory here —
+    we just confirm it's callable. The Supervisor exercises it on construction."""
+    checks: list[str] = []
+    errors: list[str] = []
+
+    if not callable(factory):
+        errors.append(f"Launch planner factory '{name}' is not callable")
+        return checks, errors
+
+    checks.append(f"Launch planner factory '{name}' is callable")
+    return checks, errors
+
+
 def _validate_observers(plugin: PollyPMPlugin) -> tuple[list[str], list[str]]:
     """Validate observer hooks are callable."""
     checks: list[str] = []
@@ -359,6 +374,11 @@ def validate_plugin(plugin: PollyPMPlugin) -> ValidationResult:
 
     for name, factory in plugin.recovery_policies.items():
         checks, errors = _validate_recovery_policy_factory(name, factory)
+        result.checks.extend(checks)
+        result.errors.extend(errors)
+
+    for name, factory in plugin.launch_planners.items():
+        checks, errors = _validate_launch_planner_factory(name, factory)
         result.checks.extend(checks)
         result.errors.extend(errors)
 

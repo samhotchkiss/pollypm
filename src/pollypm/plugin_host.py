@@ -98,6 +98,11 @@ class ExtensionHost:
             name, lambda plugin: plugin.transcript_sources, "transcript source", **kwargs,
         )
 
+    def get_launch_planner(self, name: str, **kwargs: object) -> object:
+        return self._resolve_factory(
+            name, lambda plugin: plugin.launch_planners, "launch planner", **kwargs,
+        )
+
     def iter_transcript_sources(self, **kwargs: object) -> list[tuple[str, object]]:
         """Return (name, instance) pairs for all registered transcript sources.
 

@@ -25,10 +25,9 @@ from pollypm.knowledge_extract import EXTRACTION_INTERVAL_SECONDS
 from pollypm.inbox_v2 import _inbox_root as _ensure_inbox_v2
 from pollypm.messaging import ensure_inbox
 from pollypm.models import AccountConfig, ProviderKind, SessionConfig, SessionLaunchSpec
-from pollypm.onboarding import _prime_claude_home, default_control_args, default_session_args
-from pollypm.providers import get_provider
+from pollypm.onboarding import _prime_claude_home
 from pollypm.providers.base import LaunchCommand
-from pollypm.projects import ensure_project_scaffold, ensure_session_lock
+from pollypm.projects import ensure_project_scaffold
 from pollypm.projects import project_checkpoints_dir, project_transcripts_dir, project_worktrees_dir, release_session_lock
 from pollypm.runtimes import get_runtime
 from pollypm.schedulers import ScheduledJob, get_scheduler_backend
@@ -141,16 +140,71 @@ class Supervisor:
             from pollypm.plugin_host import extension_host_for_root
             plugin_host = extension_host_for_root(str(config.project.root_dir.resolve()))
             self._core_rail = _CoreRail(config, self.store, plugin_host)
-        self._cached_launches: list[SessionLaunchSpec] | None = None
         # Lazy-init session service to avoid circular imports at construction
         self._session_service = None
         # Lazy-init recovery policy (resolved via plugin host)
         self._recovery_policy = None
+        # Lazy-init launch planner. The planner owns plan_launches /
+        # effective_session / tmux_session_for_launch / launch_by_session
+        # — Supervisor delegates to it. Kept lazy so alt constructions
+        # (``Supervisor.__new__`` in dashboard_data) can set the core
+        # rail up by hand before first access.
+        self._launch_planner_instance = None
         # Register ourselves as a subsystem so CoreRail.start()/stop() can
         # drive our lifecycle. Readonly supervisors (used by the cockpit
         # for passive inspection) don't register — they never drive boot.
         if not readonly_state:
             self._core_rail.register_subsystem(self)
+
+    def _build_launch_planner(self):
+        """Resolve the launch planner via the plugin host.
+
+        Today the default planner ships as a built-in plugin and is the
+        only registration under ``launch_planners`` — we request it by
+        name (``"default"``). Future work can thread a config-driven
+        planner name through here.
+        """
+        from pollypm.plugins_builtin.default_launch_planner.planner import (
+            DefaultLaunchPlannerContext,
+        )
+
+        ctx = DefaultLaunchPlannerContext(
+            config=self.config,
+            store=self.store,
+            readonly_state=self.readonly_state,
+            effective_account=self._effective_account,
+            apply_role_launch_restrictions=self._apply_role_launch_restrictions,
+            resolve_profile_prompt=self._resolve_profile_prompt,
+            storage_closet_session_name=self.storage_closet_session_name,
+        )
+        plugin_host = self._plugin_host_for_planner()
+        return plugin_host.get_launch_planner("default", context=ctx)
+
+    def _plugin_host_for_planner(self):
+        """Return the plugin host to resolve the planner through.
+
+        Prefers the core rail's host when present; falls back to the
+        project-root host for ``Supervisor.__new__`` code paths (e.g.
+        dashboard_data) that don't carry a rail.
+        """
+        rail = getattr(self, "_core_rail", None)
+        if rail is not None:
+            return rail.get_plugin_host()
+        from pollypm.plugin_host import extension_host_for_root
+
+        return extension_host_for_root(str(self.config.project.root_dir.resolve()))
+
+    @property
+    def launch_planner(self):
+        """The LaunchPlanner used to produce session launch plans.
+
+        Lazily constructed so Supervisor instances created via
+        ``__new__`` (dashboard_data's read-only view) can wire up the
+        bare minimum of state before first plan access.
+        """
+        if getattr(self, "_launch_planner_instance", None) is None:
+            self._launch_planner_instance = self._build_launch_planner()
+        return self._launch_planner_instance
 
     @property
     def core_rail(self) -> "CoreRail":
@@ -239,78 +293,10 @@ class Supervisor:
     def effective_session(self, session: SessionConfig, controller_account: str | None = None) -> SessionConfig:
         """Return ``session`` with runtime account overrides applied.
 
-        Inputs: the declared ``SessionConfig`` and an optional ``controller_account``
-        that overrides control-role sessions. Output: a (possibly new)
-        ``SessionConfig`` reflecting the effective account/provider/args/prompt.
+        Thin delegator to :meth:`LaunchPlanner.effective_session`. See
+        ``pollypm.launch_planner.base.LaunchPlanner`` for the contract.
         """
-        effective = session
-        try:
-            runtime = self.store.get_session_runtime(session.name)
-        except Exception:  # noqa: BLE001
-            runtime = None
-        override_account: str | None = None
-        override_applied = False
-        if controller_account is not None and session.role in self._CONTROL_ROLES:
-            override_account = controller_account
-            override_applied = True
-        elif runtime is not None and runtime.effective_account:
-            override_account = runtime.effective_account
-            override_applied = True
-        if override_account is not None:
-            if override_account in self.config.accounts:
-                account = self.config.accounts[override_account]
-                effective = replace(effective, provider=account.provider, account=override_account)
-            else:
-                # Stale account ref in state DB — clear it and fall back to config default
-                if runtime is not None and not override_applied:
-                    try:
-                        self.store.set_session_runtime(session.name, effective_account="")
-                    except Exception:  # noqa: BLE001
-                        pass
-        if self.readonly_state:
-            return effective
-        if effective.account not in self.config.accounts:
-            # Fall back to controller account if the session's account is missing
-            if controller_account and controller_account in self.config.accounts:
-                effective = replace(effective, account=controller_account)
-            else:
-                return effective
-        account = self.config.accounts[effective.account]
-        profile_prompt = self._resolve_profile_prompt(effective, account)
-        if effective.role in self._CONTROL_ROLES:
-            effective = replace(
-                effective,
-                prompt=profile_prompt or effective.prompt,
-                args=default_control_args(
-                    account.provider,
-                    open_permissions=self.config.pollypm.open_permissions_by_default,
-                    role=effective.role,
-                ),
-            )
-        else:
-            if profile_prompt and not effective.prompt:
-                effective = replace(effective, prompt=profile_prompt)
-            elif profile_prompt and effective.prompt:
-                # Worker has a custom prompt — append the profile's task
-                # management section so the worker knows how to use the
-                # task system regardless of what the custom prompt says.
-                effective = replace(
-                    effective,
-                    prompt=effective.prompt.rstrip() + "\n\n" + profile_prompt,
-                )
-            if not effective.args:
-                effective = replace(
-                    effective,
-                    args=default_session_args(
-                        account.provider,
-                        open_permissions=self.config.pollypm.open_permissions_by_default,
-                        role=effective.role,
-                    ),
-                )
-            else:
-                # Sanitize: strip provider-incompatible flags from project-local configs
-                effective = replace(effective, args=_sanitize_provider_args(effective.args, account.provider))
-        return effective
+        return self.launch_planner.effective_session(session, controller_account)
 
     def _effective_session(self, session: SessionConfig, controller_account: str | None = None) -> SessionConfig:
         return self.effective_session(session, controller_account)
@@ -351,10 +337,9 @@ class Supervisor:
     def tmux_session_for_launch(self, launch: SessionLaunchSpec) -> str:
         """Return the tmux session name that should host ``launch``.
 
-        Input: a ``SessionLaunchSpec``. Output: the tmux session name string
-        where the launch's window lives (typically the storage-closet session).
+        Thin delegator to :meth:`LaunchPlanner.tmux_session_for_launch`.
         """
-        return self._tmux_session_for_role(launch.session.role)
+        return self.launch_planner.tmux_session_for_launch(launch)
 
     def _tmux_session_for_launch(self, launch: SessionLaunchSpec) -> str:
         return self.tmux_session_for_launch(launch)
@@ -373,65 +358,16 @@ class Supervisor:
     def invalidate_launch_cache(self) -> None:
         """Drop the cached :meth:`plan_launches` result.
 
-        Inputs: none. Output: ``None`` — forces the next :meth:`plan_launches`
-        call (with no controller override) to recompute from config.
+        Thin delegator to :meth:`LaunchPlanner.invalidate_cache`.
         """
-        self._cached_launches = None
+        self.launch_planner.invalidate_cache()
 
     def plan_launches(self, *, controller_account: str | None = None) -> list[SessionLaunchSpec]:
-        # Cache launches for the default (no controller override) case.
-        # The launch plan only changes when config changes.
-        if controller_account is None and self._cached_launches is not None:
-            return self._cached_launches
-        launches: list[SessionLaunchSpec] = []
-        worker_projects: dict[str, str] = {}
-        for session in self.config.sessions.values():
-            effective = self._effective_session(session, controller_account)
-            if not effective.enabled:
-                continue
-            if effective.role == "worker":
-                existing = worker_projects.get(effective.project)
-                if existing is not None:
-                    raise ValueError(
-                        f"Project {effective.project} is assigned to more than one worker session: "
-                        f"{existing} and {effective.name}"
-                    )
-                worker_projects[effective.project] = effective.name
-            if effective.account not in self.config.accounts:
-                continue  # skip sessions with missing accounts
-            account = self._effective_account(effective, self.config.accounts[effective.account])
-            if account.provider is not effective.provider:
-                raise ValueError(
-                    f"Session {effective.name} uses provider {effective.provider.value} "
-                    f"but account {account.name} is configured for {account.provider.value}"
-                )
-            provider = get_provider(effective.provider, root_dir=self.config.project.root_dir)
-            launch = provider.build_launch_command(effective, account)
-            launch = self._apply_role_launch_restrictions(effective, launch)
-            if effective.provider is ProviderKind.CODEX and effective.role in self._CONTROL_ROLES and launch.initial_input:
-                env = dict(launch.env)
-                env["PM_CODEX_HOME_AGENTS_MD"] = launch.initial_input
-                launch = replace(launch, env=env, initial_input=None)
-            runtime = get_runtime(account.runtime, root_dir=self.config.project.root_dir)
-            window_name = effective.window_name or effective.name
-            log_dir = self.config.project.logs_dir / effective.name
-            ensure_session_lock(log_dir, effective.name)
-            log_path = log_dir / f"{window_name}.log"
-            launches.append(
-                SessionLaunchSpec(
-                    session=effective,
-                    account=account,
-                    window_name=window_name,
-                    log_path=log_path,
-                    command=runtime.wrap_command(launch, account, self.config.project),
-                    resume_marker=launch.resume_marker,
-                    initial_input=launch.initial_input,
-                    fresh_launch_marker=launch.fresh_launch_marker,
-                )
-            )
-        if controller_account is None:
-            self._cached_launches = launches
-        return launches
+        """Return the launch plan for every enabled session.
+
+        Thin delegator to :meth:`LaunchPlanner.plan_launches`.
+        """
+        return self.launch_planner.plan_launches(controller_account=controller_account)
 
     def bootstrap_tmux(
         self,
@@ -2115,14 +2051,9 @@ class Supervisor:
     def launch_by_session(self, session_name: str) -> SessionLaunchSpec:
         """Return the ``SessionLaunchSpec`` for ``session_name``.
 
-        Input: the declared session name. Output: the matching
-        ``SessionLaunchSpec`` from :meth:`plan_launches`. Raises ``KeyError``
-        if no session with that name exists.
+        Thin delegator to :meth:`LaunchPlanner.launch_by_session`.
         """
-        for launch in self.plan_launches():
-            if launch.session.name == session_name:
-                return launch
-        raise KeyError(f"Unknown session: {session_name}")
+        return self.launch_planner.launch_by_session(session_name)
 
     def _launch_by_session(self, session_name: str) -> SessionLaunchSpec:
         return self.launch_by_session(session_name)

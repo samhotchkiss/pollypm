@@ -3,7 +3,7 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
-from pollypm.agent_profiles.builtin import heartbeat_prompt, polly_prompt
+from pollypm.plugins_builtin.core_agent_profiles.profiles import heartbeat_prompt, polly_prompt
 from pollypm.models import (
     AccountConfig,
     MemorySettings,

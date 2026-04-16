@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from pollypm.agent_profiles.builtin import StaticPromptProfile, heartbeat_prompt, polly_prompt, worker_prompt
+from pollypm.plugins_builtin.core_agent_profiles.profiles import StaticPromptProfile, heartbeat_prompt, polly_prompt, worker_prompt
 from pollypm.itsalive import build_deploy_instructions
 from pollypm.plugin_api.v1 import HookContext, PollyPMPlugin
 

@@ -21,7 +21,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from pollypm.agent_profiles.builtin import heartbeat_prompt, polly_prompt
+from pollypm.plugins_builtin.core_agent_profiles.profiles import heartbeat_prompt, polly_prompt
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config, write_config
 from pollypm.models import (
     AccountConfig,

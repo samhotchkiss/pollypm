@@ -1,5 +1,12 @@
-from pollypm.agent_profiles.builtin import StaticPromptProfile, heartbeat_prompt, polly_prompt, reviewer_prompt, triage_prompt, worker_prompt
 from pollypm.plugin_api.v1 import PollyPMPlugin
+from pollypm.plugins_builtin.core_agent_profiles.profiles import (
+    StaticPromptProfile,
+    heartbeat_prompt,
+    polly_prompt,
+    reviewer_prompt,
+    triage_prompt,
+    worker_prompt,
+)
 
 plugin = PollyPMPlugin(
     name="core_agent_profiles",

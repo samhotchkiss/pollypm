@@ -13,7 +13,7 @@ from pathlib import Path
 
 import typer
 
-from pollypm.agent_profiles.builtin import heartbeat_prompt, polly_prompt
+from pollypm.plugins_builtin.core_agent_profiles.profiles import heartbeat_prompt, polly_prompt
 from pollypm.config import load_config, write_config
 from pollypm.models import AccountConfig, PollyPMConfig, ProviderKind, SessionConfig
 from pollypm.onboarding import (

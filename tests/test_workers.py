@@ -13,9 +13,9 @@ from pollypm.models import (
     KnownProject,
 )
 from pollypm.storage.state import StateStore
-from pollypm.agent_profiles.builtin import polly_prompt as operator_prompt
+from pollypm.plugins_builtin.core_agent_profiles.profiles import polly_prompt as operator_prompt
 from pollypm.workers import auto_select_worker_account, suggest_worker_prompt
-from pollypm.agent_profiles.builtin import worker_prompt
+from pollypm.plugins_builtin.core_agent_profiles.profiles import worker_prompt
 
 
 def _config(tmp_path: Path) -> tuple[PollyPMConfig, Path]:

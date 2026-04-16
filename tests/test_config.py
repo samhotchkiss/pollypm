@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pollypm.agent_profiles.builtin import heartbeat_prompt, polly_prompt
+from pollypm.plugins_builtin.core_agent_profiles.profiles import heartbeat_prompt, polly_prompt
 from pollypm.config import load_config, project_config_path, render_example_config, resolve_config_path, write_config
 from pollypm.models import (
     AccountConfig,

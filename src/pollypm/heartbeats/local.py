@@ -325,7 +325,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         with raw pasted text.
         """
         try:
-            from pollypm.agent_profiles.builtin import triage_prompt
+            from pollypm.plugins_builtin.core_agent_profiles.profiles import triage_prompt
             from pollypm.config import write_config
             from pollypm.inbox_v2 import create_message
             from pollypm.models import SessionConfig

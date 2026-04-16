@@ -1,0 +1,7 @@
+api_version = "1"
+name = "core_recurring"
+kind = "recurring"
+version = "0.1.0"
+entrypoint = "plugin.py:plugin"
+capabilities = ["roster", "job_handler"]
+description = "Built-in recurring handlers migrated from the old heartbeat loop (inbox sweep, session health sweep, capacity probe, transcript ingest, alerts GC)."

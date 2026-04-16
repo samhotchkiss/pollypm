@@ -32,6 +32,7 @@ from pollypm.plugins_builtin.core_agent_profiles.profiles import StaticPromptPro
 from pollypm.plugins_builtin.morning_briefing.handlers.briefing_tick import (
     briefing_tick_handler,
 )
+from pollypm.plugins_builtin.morning_briefing.inbox import briefing_sweep_handler
 
 
 _HERALD_PROFILE_PATH = Path(__file__).parent / "profiles" / "herald.md"
@@ -62,6 +63,12 @@ def _register_handlers(api: JobHandlerAPI) -> None:
         max_attempts=1,
         timeout_seconds=60.0,
     )
+    api.register_handler(
+        "briefing.sweep",
+        briefing_sweep_handler,
+        max_attempts=1,
+        timeout_seconds=30.0,
+    )
 
 
 def _register_roster(api: RosterAPI) -> None:
@@ -73,6 +80,15 @@ def _register_roster(api: RosterAPI) -> None:
         "briefing.tick",
         {},
         dedupe_key="briefing.tick",
+    )
+    # Sweep auto-closes un-pinned briefings older than 24h. Runs every
+    # 6 hours — the briefing itself fires once a day, so anything more
+    # frequent is wasted work.
+    api.register_recurring(
+        "@every 6h",
+        "briefing.sweep",
+        {},
+        dedupe_key="briefing.sweep",
     )
 
 
@@ -86,7 +102,9 @@ plugin = PollyPMPlugin(
     capabilities=(
         Capability(kind="agent_profile", name="herald"),
         Capability(kind="job_handler", name="briefing.tick"),
+        Capability(kind="job_handler", name="briefing.sweep"),
         Capability(kind="roster_entry", name="briefing.tick"),
+        Capability(kind="roster_entry", name="briefing.sweep"),
     ),
     agent_profiles={
         "herald": lambda: StaticPromptProfile(name="herald", prompt=_herald_prompt()),

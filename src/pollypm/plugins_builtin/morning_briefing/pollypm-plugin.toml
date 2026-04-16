@@ -16,6 +16,16 @@ name = "briefing.tick"
 requires_api = ">=1,<2"
 
 [[capabilities]]
+kind = "job_handler"
+name = "briefing.sweep"
+requires_api = ">=1,<2"
+
+[[capabilities]]
 kind = "roster_entry"
 name = "briefing.tick"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "roster_entry"
+name = "briefing.sweep"
 requires_api = ">=1,<2"

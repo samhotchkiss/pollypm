@@ -49,6 +49,7 @@ def fire_briefing(
     now_local: datetime,
     state: BriefingState,
     config=None,
+    emit_to_inbox: bool = True,
 ) -> dict[str, Any]:
     """Execute the full gather → synthesize → emit path.
 
@@ -61,6 +62,7 @@ def fire_briefing(
     from pollypm.plugins_builtin.morning_briefing.handlers import gather_yesterday as _gy
     from pollypm.plugins_builtin.morning_briefing.handlers import identify_priorities as _ip
     from pollypm.plugins_builtin.morning_briefing.handlers import synthesize as _synth
+    from pollypm.plugins_builtin.morning_briefing import inbox as _inbox
     from pollypm.plugins_builtin.morning_briefing.state import iso_date, save_state
 
     if config is None:
@@ -121,10 +123,19 @@ def fire_briefing(
             budget_seconds=300,
         )
 
+    inbox_entry = None
+    if emit_to_inbox:
+        try:
+            inbox_entry = _inbox.emit_briefing(base_dir, draft, now_utc=now_local)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("briefing: inbox emit failed: %s", exc)
+
     return {
         "fired": True,
         "stub": False,
         "quiet_mode": quiet_mode,
+        "emitted": inbox_entry is not None,
+        "inbox_date": inbox_entry.date_local if inbox_entry else None,
         "draft": {
             "date_local": draft.date_local,
             "mode": draft.mode,

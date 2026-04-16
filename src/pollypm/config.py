@@ -79,14 +79,15 @@ def project_config_path(project_root: Path) -> Path:
 
 
 def resolve_config_path(path: Path = DEFAULT_CONFIG_PATH) -> Path:
-    """Resolve the effective config path, preferring a local project config."""
+    """Resolve the effective config path.
+
+    Always uses the global config at ~/.pollypm/pollypm.toml.
+    Project-specific overrides are loaded separately via
+    _merge_project_local_config (reads .pollypm/config/project.toml
+    from each registered project directory).
+    """
     if path != DEFAULT_CONFIG_PATH:
         return path.resolve()
-    cwd = Path.cwd().resolve()
-    for candidate_dir in [cwd, *cwd.parents]:
-        candidate = candidate_dir / "pollypm.toml"
-        if candidate.exists():
-            return candidate.resolve()
     return DEFAULT_CONFIG_PATH.resolve()
 
 

@@ -99,10 +99,24 @@ class Supervisor:
             override_account = runtime.effective_account
             override_applied = True
         if override_account is not None:
-            account = self.config.accounts[override_account]
-            effective = replace(effective, provider=account.provider, account=override_account)
+            if override_account in self.config.accounts:
+                account = self.config.accounts[override_account]
+                effective = replace(effective, provider=account.provider, account=override_account)
+            else:
+                # Stale account ref in state DB — clear it and fall back to config default
+                if runtime is not None and not override_applied:
+                    try:
+                        self.store.set_session_runtime(session.name, effective_account="")
+                    except Exception:  # noqa: BLE001
+                        pass
         if self.readonly_state:
             return effective
+        if effective.account not in self.config.accounts:
+            # Fall back to controller account if the session's account is missing
+            if controller_account and controller_account in self.config.accounts:
+                effective = replace(effective, account=controller_account)
+            else:
+                return effective
         account = self.config.accounts[effective.account]
         profile_prompt = self._resolve_profile_prompt(effective, account)
         if effective.role in self._CONTROL_ROLES:
@@ -203,6 +217,8 @@ class Supervisor:
                         f"{existing} and {effective.name}"
                     )
                 worker_projects[effective.project] = effective.name
+            if effective.account not in self.config.accounts:
+                continue  # skip sessions with missing accounts
             account = self._effective_account(effective, self.config.accounts[effective.account])
             if account.provider is not effective.provider:
                 raise ValueError(

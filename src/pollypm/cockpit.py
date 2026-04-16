@@ -297,14 +297,11 @@ class CockpitRouter:
             return False
         if not self._is_live_provider_pane(pane):
             return False
-        pane_path = getattr(pane, "pane_current_path", "")
-        session_cwd = getattr(launch.session, "cwd", None)
-        if not pane_path or session_cwd is None:
-            return False
-        try:
-            return Path(pane_path).resolve() == Path(session_cwd).resolve()
-        except Exception:  # noqa: BLE001
-            return False
+        # A live provider pane is running — trust the state rather than
+        # trying to match CWD.  CWD matching is unreliable because the
+        # agent may cd elsewhere during its turn.  If state says this
+        # session is mounted and the pane is alive, believe it.
+        return True
 
     def _release_cockpit_lease(self, supervisor: Supervisor | None, session_name: str) -> None:
         if supervisor is None:
@@ -1018,6 +1015,15 @@ class CockpitRouter:
         self._write_state(state)
         self._release_cockpit_lease(supervisor, mounted_session)
 
+    # Roles that should NEVER be auto-detected as mounted via CWD fallback.
+    # These are background roles — if the user is looking at a pane, it's
+    # not the heartbeat.  Guessing wrong here causes cascading mis-parks.
+    _NEVER_MOUNT_ROLES = frozenset({"heartbeat-supervisor", "triage"})
+
+    # When CWD is ambiguous (multiple sessions share the same cwd), prefer
+    # the session the user is most likely interacting with.
+    _MOUNT_PRIORITY = {"operator-pm": 0, "reviewer": 1, "worker": 2}
+
     def _mounted_session_name(self, supervisor: Supervisor, window_target: str) -> str | None:
         state = self._load_state()
         mounted_session = state.get("mounted_session")
@@ -1034,14 +1040,25 @@ class CockpitRouter:
         right_pane = max(panes, key=self._pane_left)
         if not self._is_live_provider_pane(right_pane):
             return None
+        # CWD fallback: find the best matching session, but NEVER guess
+        # heartbeat or triage — those are background roles that should
+        # never be mounted in the cockpit.  When multiple sessions share
+        # a CWD, prefer operator > reviewer > worker.
+        pane_path = str(Path(right_pane.pane_current_path).resolve())
+        best_match: tuple[int, str] | None = None  # (priority, session_name)
         for launch in supervisor.plan_launches():
+            if launch.session.role in self._NEVER_MOUNT_ROLES:
+                continue
             session_cwd = str(Path(launch.session.cwd).resolve())
-            pane_path = str(Path(right_pane.pane_current_path).resolve())
             if pane_path == session_cwd:
-                state["mounted_session"] = launch.session.name
-                state["right_pane_id"] = right_pane.pane_id
-                self._write_state(state)
-                return launch.session.name
+                priority = self._MOUNT_PRIORITY.get(launch.session.role, 5)
+                if best_match is None or priority < best_match[0]:
+                    best_match = (priority, launch.session.name)
+        if best_match is not None:
+            state["mounted_session"] = best_match[1]
+            state["right_pane_id"] = right_pane.pane_id
+            self._write_state(state)
+            return best_match[1]
         return None
 
     def _is_live_provider_pane(self, pane) -> bool:

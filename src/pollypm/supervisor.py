@@ -423,13 +423,14 @@ class Supervisor:
             for launch in launches[1:]:
                 if on_status:
                     on_status(f"Creating {launch.session.name}...")
-                self.tmux.create_window(storage_session, launch.window_name, launch.command, detached=True)
+                pane_id = self.tmux.create_window(storage_session, launch.window_name, launch.command, detached=True)
                 window_target = f"{storage_session}:{launch.window_name}"
                 self.tmux.set_window_option(window_target, "allow-passthrough", "on")
                 self.tmux.set_window_option(window_target, "focus-events", "on")
                 self.tmux.pipe_pane(window_target, launch.log_path)
                 self._record_launch(launch)
-                pane_target = self._resolve_pane_id(storage_session, launch.window_name) or window_target
+                # Use pane ID returned by create_window for unambiguous targeting
+                pane_target = pane_id or self._resolve_pane_id(storage_session, launch.window_name) or window_target
                 targets.append((launch, pane_target))
 
         # Phase 2: Create the cockpit session so the user can attach immediately.

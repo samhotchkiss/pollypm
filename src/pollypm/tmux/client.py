@@ -134,8 +134,8 @@ class TmuxClient:
         )
         return result.returncode
 
-    def create_window(self, name: str, window_name: str, command: str, *, detached: bool = False) -> None:
-        """Create a window in a session. No-op if window already exists."""
+    def create_window(self, name: str, window_name: str, command: str, *, detached: bool = False) -> str | None:
+        """Create a window in a session. Returns pane ID or None if already exists."""
         self._validate_name(window_name, "window name")
         # Check if window already exists in this session
         if self.has_session(name):
@@ -143,14 +143,16 @@ class TmuxClient:
                 windows = self.list_windows(name)
                 if any(w.name == window_name for w in windows):
                     logger.debug("Window %r already exists in session %r, skipping create", window_name, name)
-                    return
+                    return None
             except subprocess.CalledProcessError:
                 pass  # Session may have vanished; proceed with creation attempt
-        args = ["new-window", "-t", self._exact_target(name), "-n", window_name]
+        args = ["new-window", "-P", "-F", "#{pane_id}", "-t", self._exact_target(name), "-n", window_name]
         if detached:
             args.append("-d")
         args.append(command)
-        self.run(*args)
+        result = self.run(*args)
+        pane_id = result.stdout.strip()
+        return pane_id if pane_id.startswith("%") else None
 
     def split_window(
         self,

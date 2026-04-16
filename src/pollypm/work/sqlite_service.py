@@ -1596,10 +1596,11 @@ class SQLiteWorkService:
     # ------------------------------------------------------------------
 
     def validate_advance(self, task_id: str, actor: str) -> list[GateResult]:
-        """Dry-run: would advancing the current node succeed?
+        """Dry-run: would advancing the current node succeed for this actor?
 
-        Evaluates all gates listed on the current flow node and returns
-        the results without modifying any state.
+        Evaluates all gates listed on the current flow node, plus an
+        actor-vs-role check matching what the real transition methods do.
+        Returns the combined results without modifying any state.
         """
         task = self.get(task_id)
         if task.current_node_id is None:
@@ -1610,13 +1611,31 @@ class SQLiteWorkService:
         except InvalidTransitionError:
             return []
 
-        if not node.gates:
-            return []
+        results: list[GateResult] = []
 
-        return evaluate_gates(
-            task, node.gates, self._gate_registry,
-            get_task=self.get,
-        )
+        # Actor-vs-role check: synthesised as a hard gate result so callers
+        # using validate_advance for permission preflight get a correct answer.
+        try:
+            self._validate_actor_role(task, node, actor)
+        except Exception as exc:  # noqa: BLE001
+            results.append(
+                GateResult(
+                    passed=False,
+                    reason=str(exc),
+                    gate_name="actor_role",
+                    gate_type="hard",
+                )
+            )
+
+        if node.gates:
+            results.extend(
+                evaluate_gates(
+                    task, node.gates, self._gate_registry,
+                    get_task=self.get,
+                )
+            )
+
+        return results
 
     # ------------------------------------------------------------------
     # Dependencies

@@ -414,3 +414,33 @@ class TestValidateAdvance:
         task = _create_standard_task(svc)
         results = svc.validate_advance(task.task_id, "pm")
         assert results == []
+
+    def test_actor_role_mismatch_returns_failure(self, svc):
+        """validate_advance must surface actor-vs-role violations as a hard
+        failure so permission preflight is accurate (#139)."""
+        task = _create_standard_task(svc)
+        svc.queue(task.task_id, "pm")
+        svc.claim(task.task_id, "agent-1")
+
+        # Wrong actor: node needs worker role (agent-1), but stranger is neither
+        # the role-holder nor "worker" nor a human synonym.
+        results = svc.validate_advance(task.task_id, "stranger")
+        actor_failures = [
+            r for r in results
+            if r.gate_name == "actor_role" and not r.passed
+        ]
+        assert len(actor_failures) == 1
+        assert actor_failures[0].gate_type == "hard"
+
+    def test_actor_role_correct_no_synthetic_failure(self, svc):
+        """When the actor matches the role, no actor_role failure appears."""
+        task = _create_standard_task(svc)
+        svc.queue(task.task_id, "pm")
+        svc.claim(task.task_id, "agent-1")
+
+        results = svc.validate_advance(task.task_id, "agent-1")
+        actor_failures = [
+            r for r in results
+            if r.gate_name == "actor_role" and not r.passed
+        ]
+        assert actor_failures == []

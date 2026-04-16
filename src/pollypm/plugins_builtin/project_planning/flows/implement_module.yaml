@@ -1,0 +1,51 @@
+name: implement_module
+description: >-
+  Module-implementation flow emitted tasks run through. A worker builds
+  the module, a user-level test (Playwright for web, tmux for CLI/TUI)
+  must pass before the reviewer sees it. The user_level_tests_pass gate
+  on the review node enforces the pass receipt — unit tests alone do
+  not count.
+
+roles:
+  worker:
+    description: Implements the module
+  reviewer:
+    description: Reviews the module, user-level tests, and magic
+  requester:
+    description: The architect who emitted this module task
+    optional: true
+
+nodes:
+  # Build — worker writes code, unit tests, and the user-level test
+  # harness (Playwright spec / tmux scenario). has_assignee enforces a
+  # concrete worker is attached before we consider the work started.
+  build:
+    type: work
+    actor_type: role
+    actor_role: worker
+    next_node: user_test
+    gates: [has_assignee]
+
+  # User-test — worker runs the user-level test and writes the pass
+  # receipt. The user_level_tests_pass gate blocks advance from review
+  # until that receipt is present and reads passed=true.
+  user_test:
+    type: work
+    actor_type: role
+    actor_role: worker
+    next_node: code_review
+
+  # Review — reviewer inspects code, test receipt, and magic. Rejects
+  # back to build if anything is missing.
+  code_review:
+    type: review
+    actor_type: role
+    actor_role: reviewer
+    next_node: done
+    reject_node: build
+    gates: [has_work_output, user_level_tests_pass]
+
+  done:
+    type: terminal
+
+start_node: build

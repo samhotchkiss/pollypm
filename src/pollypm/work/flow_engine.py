@@ -235,6 +235,47 @@ def _project_flows_dir(project_path: str | Path) -> Path:
     return Path(project_path) / ".pollypm" / "flows"
 
 
+def _plugin_flow_dirs(project_path: str | Path | None = None) -> list[Path]:
+    """Return every plugin-hosted ``flows/`` directory, in discovery order.
+
+    Scans each plugin search root (built-in, user-global, project-local)
+    for directory-style plugins and yields ``<plugin_dir>/flows/``. A
+    plugin opts in simply by shipping that directory — the same pattern
+    the manifest's ``[content].user_paths`` entry signals.
+
+    Precedence matches the plugin discovery chain (later wins):
+      1. src/pollypm/plugins_builtin/<plugin>/flows/
+      2. ~/.pollypm/plugins/<plugin>/flows/
+      3. <project>/.pollypm/plugins/<plugin>/flows/
+    """
+    dirs: list[Path] = []
+    # 1. Built-in plugins — adjacent to the pollypm package on disk.
+    try:
+        builtin_root = Path(str(importlib.resources.files("pollypm.plugins_builtin")))
+    except (ModuleNotFoundError, TypeError):
+        builtin_root = None
+    if builtin_root is not None and builtin_root.is_dir():
+        for plugin_dir in sorted(builtin_root.iterdir()):
+            if plugin_dir.is_dir() and (plugin_dir / "flows").is_dir():
+                dirs.append(plugin_dir / "flows")
+
+    # 2. User-global plugins.
+    user_plugin_root = Path.home() / ".pollypm" / "plugins"
+    if user_plugin_root.is_dir():
+        for plugin_dir in sorted(user_plugin_root.iterdir()):
+            if plugin_dir.is_dir() and (plugin_dir / "flows").is_dir():
+                dirs.append(plugin_dir / "flows")
+
+    # 3. Project-local plugins.
+    if project_path is not None:
+        proj_plugin_root = Path(project_path) / ".pollypm" / "plugins"
+        if proj_plugin_root.is_dir():
+            for plugin_dir in sorted(proj_plugin_root.iterdir()):
+                if plugin_dir.is_dir() and (plugin_dir / "flows").is_dir():
+                    dirs.append(plugin_dir / "flows")
+    return dirs
+
+
 def _load_flow_from_file(path: Path) -> FlowTemplate:
     """Load and validate a single flow YAML file."""
     text = path.read_text(encoding="utf-8")
@@ -258,12 +299,14 @@ def _list_flow_files(directory: Path) -> dict[str, Path]:
 
 
 def resolve_flow(name: str, project_path: str | Path | None = None) -> FlowTemplate:
-    """Resolve a flow by name through the three-tier override chain.
+    """Resolve a flow by name through the override chain.
 
     Precedence (highest first):
-    1. Project-local: <project>/.pollypm/flows/<name>.yaml
-    2. User-global:   ~/.pollypm/flows/<name>.yaml
-    3. Built-in:      pollypm/work/flows/<name>.yaml
+    1. Project-local user-flows: <project>/.pollypm/flows/<name>.yaml
+    2. User-global user-flows:   ~/.pollypm/flows/<name>.yaml
+    3. Built-in core flows:      pollypm/work/flows/<name>.yaml
+    4. Plugin-hosted flows:      <plugin>/flows/<name>.yaml
+       (scans built-in, user-global, and project-local plugin roots)
 
     Raises FlowValidationError if the flow is not found at any level,
     or if the found YAML is invalid.
@@ -276,6 +319,11 @@ def resolve_flow(name: str, project_path: str | Path | None = None) -> FlowTempl
 
     search_paths.append(_user_global_flows_dir())
     search_paths.append(_builtin_flows_dir())
+
+    # Plugin-hosted flows are searched last so user-override directories
+    # always win. A plugin that wants to ship a flow with the same name
+    # as a core built-in is not the common case and should be explicit.
+    search_paths.extend(_plugin_flow_dirs(project_path))
 
     for directory in search_paths:
         for suffix in (".yaml", ".yml"):
@@ -297,8 +345,12 @@ def available_flows(
     Returns a dict mapping flow name -> the path of the winning file
     (highest precedence). The dict is ordered by flow name.
     """
-    # Start with built-in (lowest precedence), then overlay higher levels.
+    # Start with plugin-hosted flows (lowest precedence), then overlay
+    # built-in core flows, user-global, and project-local. Later sources
+    # shadow earlier ones on flow-name collision.
     merged: dict[str, Path] = {}
+    for plugin_dir in _plugin_flow_dirs(project_path):
+        merged.update(_list_flow_files(plugin_dir))
     merged.update(_list_flow_files(_builtin_flows_dir()))
     merged.update(_list_flow_files(_user_global_flows_dir()))
     if project_path is not None:

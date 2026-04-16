@@ -1,0 +1,97 @@
+name: plan_project
+description: >-
+  Multi-stage project planning flow. Architect gathers context, generates
+  candidate decompositions, runs a 5-critic panel, synthesizes the best
+  candidate, then stops for user approval before emitting backlog tasks.
+  See docs/planner-plugin-spec.md §3 for stage semantics.
+
+roles:
+  architect:
+    description: The planner — owns research, decomposition, magic, and synthesis
+  requester:
+    description: The user who triggered the plan
+    optional: true
+
+nodes:
+  # Stage 0 — ReAct research (grep/read/list_files/web_search).
+  # Output artifact: context.md in the planning worktree.
+  research:
+    type: work
+    actor_type: role
+    actor_role: architect
+    next_node: discover
+
+  # Stage 1 — read spec + context, ask clarifying questions only if
+  # truly under-specified. Output: understanding artifact.
+  discover:
+    type: work
+    actor_type: role
+    actor_role: architect
+    next_node: decompose
+
+  # Stage 2 — tree-of-plans: architect emits 2-3 candidate decompositions,
+  # each saved as candidate_<letter>.md.
+  decompose:
+    type: work
+    actor_type: role
+    actor_role: architect
+    next_node: test_strategy
+
+  # Stage 3 — per-candidate test matrix. Playwright for web, tmux for CLI.
+  test_strategy:
+    type: work
+    actor_type: role
+    actor_role: architect
+    next_node: magic
+
+  # Stage 4 — magic pass per candidate. "How do we go 2x above vanilla?"
+  magic:
+    type: work
+    actor_type: role
+    actor_role: architect
+    next_node: critic_panel
+
+  # Stage 5 — critic panel. 5 short-lived worker sessions in parallel.
+  # The wait_for_children gate (pp03) holds us here until the children
+  # are in terminal states.
+  critic_panel:
+    type: work
+    actor_type: role
+    actor_role: architect
+    next_node: synthesize
+    gates: [wait_for_children]
+
+  # Stage 6 — architect picks the winning candidate, integrates objections
+  # into a Risk Ledger, writes docs/project-plan.md + docs/planning-session-log.md.
+  # log_present gate enforces the session log exists.
+  synthesize:
+    type: work
+    actor_type: role
+    actor_role: architect
+    next_node: user_approval
+    gates: [log_present]
+
+  # Stage 7 — single human touchpoint. Plan is presented with the Risk
+  # Ledger and the user approves/rejects. actor_type=human handles the
+  # waiting state. Rejection sends the architect back to synthesize to
+  # fold in user feedback before re-presenting.
+  user_approval:
+    type: review
+    actor_type: human
+    next_node: emit
+    reject_node: synthesize
+    gates: [has_work_output]
+
+  # Stage 8 — architect emits N backlog tasks, one per module, each
+  # using the implement_module flow with acceptance criteria and test
+  # spec attached.
+  emit:
+    type: work
+    actor_type: role
+    actor_role: architect
+    next_node: done
+
+  done:
+    type: terminal
+
+start_node: research

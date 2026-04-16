@@ -56,6 +56,7 @@ def _parse_node(name: str, data: dict) -> FlowNode:
         type=node_type,
         actor_type=actor_type,
         actor_role=data.get("actor_role"),
+        agent_name=data.get("agent_name"),
         next_node_id=data.get("next_node"),
         reject_node_id=data.get("reject_node"),
         gates=data.get("gates", []),
@@ -173,6 +174,12 @@ def validate_flow(template: FlowTemplate) -> None:
                     f"Node '{name}': actor_role '{node.actor_role}' not found in "
                     f"flow roles. Available roles: {sorted(template.roles.keys())}"
                 )
+
+        # Agent-typed nodes must specify an agent_name
+        if node.actor_type == ActorType.AGENT and not node.agent_name:
+            errors.append(
+                f"Node '{name}': actor_type is 'agent' but no agent_name specified."
+            )
 
     # No orphan nodes: every non-start node must be reachable from start
     if template.start_node and template.start_node in node_names:

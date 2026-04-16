@@ -644,3 +644,112 @@ class TestFlowImmutability:
         svc = SQLiteWorkService(db_path=db, project_path=tmp_path)
         t2 = self._make_task(svc)
         assert svc.get(t2.task_id).flow_template_version == 1
+
+
+# ---------------------------------------------------------------------------
+# actor_type=agent — named agent resolution (#140)
+# ---------------------------------------------------------------------------
+
+
+class TestActorTypeAgent:
+    """Flow nodes with actor_type=agent must resolve to the specific
+    named agent declared in the YAML (issue #140)."""
+
+    def _write_agent_flow(self, root, *, agent_name="polly"):
+        """Write a flow that uses actor_type=agent for the work node."""
+        import textwrap
+
+        flows_dir = root / ".pollypm" / "flows"
+        flows_dir.mkdir(parents=True, exist_ok=True)
+        (flows_dir / "pinned.yaml").write_text(textwrap.dedent(f"""\
+            name: pinned
+            description: Agent-pinned work node
+            roles:
+              reviewer:
+                description: Reviews
+            nodes:
+              do_it:
+                type: work
+                actor_type: agent
+                agent_name: {agent_name}
+                next_node: check
+              check:
+                type: review
+                actor_type: role
+                actor_role: reviewer
+                next_node: done
+                reject_node: do_it
+              done:
+                type: terminal
+            start_node: do_it
+        """))
+
+    def test_derive_owner_returns_named_agent(self, tmp_path):
+        self._write_agent_flow(tmp_path, agent_name="polly")
+        svc = SQLiteWorkService(
+            db_path=tmp_path / "w.db", project_path=tmp_path,
+        )
+        t = svc.create(
+            title="Pinned task",
+            description="Only polly can do this",
+            type="task",
+            project="proj",
+            flow_template="pinned",
+            roles={"reviewer": "rita"},
+            priority="normal",
+            created_by="tester",
+        )
+        svc.queue(t.task_id, "pm")
+        claimed = svc.claim(t.task_id, "polly")
+        owner = svc.derive_owner(claimed)
+        assert owner == "polly"
+
+    def test_validate_actor_role_agent_mismatch(self, tmp_path):
+        """An actor that is not the pinned agent must fail validation."""
+        self._write_agent_flow(tmp_path, agent_name="polly")
+        svc = SQLiteWorkService(
+            db_path=tmp_path / "w.db", project_path=tmp_path,
+        )
+        t = svc.create(
+            title="Pinned task",
+            description="desc",
+            type="task",
+            project="proj",
+            flow_template="pinned",
+            roles={"reviewer": "rita"},
+            priority="normal",
+            created_by="tester",
+        )
+        svc.queue(t.task_id, "pm")
+        svc.claim(t.task_id, "polly")
+
+        # Wrong actor for the pinned agent node must surface as a hard
+        # actor_role failure from validate_advance.
+        results = svc.validate_advance(t.task_id, "impostor")
+        actor_failures = [
+            r for r in results
+            if r.gate_name == "actor_role" and not r.passed
+        ]
+        assert len(actor_failures) == 1
+        assert "polly" in actor_failures[0].reason
+
+    def test_flow_validation_rejects_agent_without_name(self, tmp_path):
+        """YAML with actor_type=agent but no agent_name must fail validation."""
+        import textwrap
+        from pollypm.work.flow_engine import FlowValidationError, parse_flow_yaml
+
+        yaml_text = textwrap.dedent("""\
+            name: broken
+            description: missing agent_name
+            roles: {}
+            nodes:
+              do_it:
+                type: work
+                actor_type: agent
+                next_node: done
+              done:
+                type: terminal
+            start_node: do_it
+        """)
+        with pytest.raises(FlowValidationError, match="agent_name"):
+            parse_flow_yaml(yaml_text)

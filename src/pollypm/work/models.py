@@ -162,6 +162,7 @@ class FlowNode:
     type: NodeType
     actor_type: ActorType | None = None
     actor_role: str | None = None
+    agent_name: str | None = None
     next_node_id: str | None = None
     reject_node_id: str | None = None
     gates: list[str] = field(default_factory=list)

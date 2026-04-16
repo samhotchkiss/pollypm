@@ -438,3 +438,77 @@ class TestOwnerDerivation:
         queued = svc.queue(task.task_id, "pm")
         owner = svc.derive_owner(queued)
         assert owner is None
+
+
+# ---------------------------------------------------------------------------
+# available_flows() / get_flow() — project arg honored
+# ---------------------------------------------------------------------------
+
+
+class TestAvailableFlowsProjectArg:
+    def test_available_flows_uses_project_path_arg(self, tmp_path):
+        """Passing project= to available_flows should pick up that project's
+        project-local flows, not only the constructor-bound project (#146)."""
+        import textwrap
+
+        # Service is constructed with a project_path that has NO custom flows
+        svc_db = tmp_path / "svc.db"
+        svc = SQLiteWorkService(db_path=svc_db, project_path=tmp_path)
+
+        # Create a second project directory with a custom flow
+        other = tmp_path / "other_project"
+        (other / ".pollypm" / "flows").mkdir(parents=True)
+        (other / ".pollypm" / "flows" / "zebra.yaml").write_text(textwrap.dedent("""\
+            name: zebra
+            description: zebra flow
+            roles:
+              worker:
+                description: w
+            nodes:
+              step:
+                type: work
+                actor_type: role
+                actor_role: worker
+                next_node: done
+              done:
+                type: terminal
+            start_node: step
+        """))
+
+        # Without project arg: only the constructor's project, no zebra.
+        base = {t.name for t in svc.available_flows()}
+        assert "zebra" not in base
+
+        # With an explicit path-like project (falls through to candidate path):
+        scoped = {t.name for t in svc.available_flows(project=str(other))}
+        assert "zebra" in scoped
+
+    def test_get_flow_uses_project_path_arg(self, tmp_path):
+        """get_flow should resolve a project-local override when project= is
+        an explicit path, independent of the constructor-bound project."""
+        import textwrap
+
+        svc_db = tmp_path / "svc.db"
+        svc = SQLiteWorkService(db_path=svc_db, project_path=tmp_path)
+
+        other = tmp_path / "other_project"
+        (other / ".pollypm" / "flows").mkdir(parents=True)
+        (other / ".pollypm" / "flows" / "standard.yaml").write_text(textwrap.dedent("""\
+            name: standard
+            description: custom-for-other
+            roles:
+              worker:
+                description: w
+            nodes:
+              step:
+                type: work
+                actor_type: role
+                actor_role: worker
+                next_node: done
+              done:
+                type: terminal
+            start_node: step
+        """))
+
+        scoped = svc.get_flow("standard", project=str(other))
+        assert scoped.description == "custom-for-other"

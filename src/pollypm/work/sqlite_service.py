@@ -2103,20 +2103,61 @@ class SQLiteWorkService:
     # Flows (public API)
     # ------------------------------------------------------------------
 
+    def _resolve_project_path(self, project: str | None) -> Path | None:
+        """Resolve a project name to a filesystem path.
+
+        Falls back to the constructor-provided ``project_path`` when the
+        name can't be resolved via config. Returns ``None`` only when no
+        fallback is available.
+        """
+        if project is None:
+            return self._project_path
+
+        # Try the pollypm config for a matching project name.
+        try:
+            from pollypm.config import load_config
+            config = load_config()
+            normalized = project.replace("-", "_")
+            key = project if project in config.projects else (
+                normalized if normalized in config.projects else None
+            )
+            if key is not None:
+                return config.projects[key].path
+        except Exception:
+            pass
+
+        # Fallback: if it looks like a path, use it; otherwise stick with
+        # the service's bound project_path.
+        candidate = Path(project)
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+
+        return self._project_path
+
     def available_flows(self, project: str | None = None) -> list[FlowTemplate]:
-        """List all available flows after override resolution."""
+        """List all available flows after override resolution.
+
+        When ``project`` is supplied, resolves to that project's path (via
+        the pollypm config) and includes its project-local flows.
+        """
         from pollypm.work.flow_engine import available_flows as _available_flows
 
-        flow_map = _available_flows(self._project_path)
+        project_path = self._resolve_project_path(project)
+        flow_map = _available_flows(project_path)
         templates: list[FlowTemplate] = []
         for name, path in flow_map.items():
             try:
-                tmpl = resolve_flow(name, self._project_path)
+                tmpl = resolve_flow(name, project_path)
                 templates.append(tmpl)
             except Exception:
                 pass
         return templates
 
     def get_flow(self, name: str, project: str | None = None) -> FlowTemplate:
-        """Resolve a flow by name through the override chain."""
-        return resolve_flow(name, self._project_path)
+        """Resolve a flow by name through the override chain.
+
+        When ``project`` is supplied, resolves to that project's path (via
+        the pollypm config) so project-local overrides apply.
+        """
+        project_path = self._resolve_project_path(project)
+        return resolve_flow(name, project_path)

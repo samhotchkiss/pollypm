@@ -179,6 +179,18 @@ Visibility = Union[VisibilityLiteral, VisibilityPredicate]
 
 BadgeProvider = Callable[["RailContext"], "int | str | None"]
 RailHandler = Callable[["RailContext"], "PanelSpec | None"]
+# Dynamic state string (icon colour hint, e.g. "working" / "idle" / "!alert").
+# Cockpit-only extension — optional; defaults to "idle".
+StateProvider = Callable[["RailContext"], str]
+# Dynamic label — optional override so e.g. "Inbox (3)" can rebuild per tick
+# without going through badge_provider. Returns None to fall back to the
+# static label.
+LabelProvider = Callable[["RailContext"], "str | None"]
+# Dynamic multi-row expansion for sections that aren't 1:1 with the static
+# registration (e.g. `projects` — one registration, N rows). Returns a list
+# of (sub_key, label, state, selectable, indent_sub_rows) tuples; the rail
+# builder uses these to emit CockpitItem rows.
+RowsProvider = Callable[["RailContext"], "list[RailRow]"]
 
 
 @dataclass(slots=True)
@@ -200,6 +212,33 @@ class RailContext:
     user: str | None = None
     cockpit_state: dict[str, Any] = field(default_factory=dict)
     extras: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True, frozen=True)
+class RailRow:
+    """A concrete rail row produced by a ``rows_provider``.
+
+    This is a **Cockpit-internal** extension beyond the plugin-API spec
+    — the spec assumes one registration → one rail row. PollyPM's rail
+    contains the Projects section which fans out one row per project
+    (plus optional sub-items when expanded); those rows are generated
+    per-tick by a ``rows_provider`` callable.
+
+    Fields mirror :class:`pollypm.cockpit.CockpitItem` so the renderer
+    can consume them with minimal translation:
+
+    ``key`` — stable identifier used for selection (e.g. ``polly``,
+    ``project:demo:issues``). Must be unique within a rail build.
+    ``label`` — visible text. ``state`` — display-state hint consumed
+    by the renderer's indicator logic (``"live"``/``"working"``/
+    ``"idle"``/``"! reason"`` etc). ``selectable`` — whether the row
+    can take the cursor.
+    """
+
+    key: str
+    label: str
+    state: str = "idle"
+    selectable: bool = True
 
 
 @dataclass(slots=True)
@@ -236,6 +275,11 @@ class RailItemRegistration:
     visibility: Visibility = "always"
     feature_name: str | None = None  # for visibility="has_feature"
     key: str | None = None  # optional stable id; falls back to section.label
+    # Cockpit-internal extensions: dynamic label/state/multi-row. Optional —
+    # simple items pass the static label + default state and never set these.
+    state_provider: StateProvider | None = None
+    label_provider: LabelProvider | None = None
+    rows_provider: RowsProvider | None = None
 
     @property
     def item_key(self) -> str:
@@ -296,6 +340,9 @@ class RailAPI:
         visibility: Visibility = "always",
         feature_name: str | None = None,
         key: str | None = None,
+        state_provider: StateProvider | None = None,
+        label_provider: LabelProvider | None = None,
+        rows_provider: RowsProvider | None = None,
     ) -> RailItemRegistration:
         """Register a rail item.
 
@@ -342,6 +389,9 @@ class RailAPI:
             visibility=visibility,
             feature_name=feature_name,
             key=key,
+            state_provider=state_provider,
+            label_provider=label_provider,
+            rows_provider=rows_provider,
         )
         self._registry.add(reg)
         return reg

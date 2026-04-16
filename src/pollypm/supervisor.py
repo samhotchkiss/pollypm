@@ -2140,6 +2140,7 @@ class Supervisor:
         start = time.monotonic()
         deadline = start + timeout
         last_action = ""
+        poll_interval = 0.2  # Start fast, back off after actions
         _status = on_status or (lambda _msg: None)
         _status("Waiting for Claude Code to start...")
         while time.monotonic() < deadline:
@@ -2148,7 +2149,7 @@ class Supervisor:
                 pane = self.tmux.capture_pane(target, lines=320)
             except Exception:  # noqa: BLE001
                 _status(f"Waiting for Claude Code to start... ({elapsed}s)")
-                time.sleep(1)
+                time.sleep(poll_interval)
                 continue
             lowered = pane.lower()
 
@@ -2164,7 +2165,8 @@ class Supervisor:
                     _status(f"Dismissing theme picker... ({elapsed}s)")
                     self.tmux.send_keys(target, "", press_enter=True)
                     last_action = "theme"
-                time.sleep(1)
+                    poll_interval = 0.5  # Wait a bit after sending keys
+                time.sleep(poll_interval)
                 continue
 
             if "quick safety check" in lowered and "yes, i trust this folder" in lowered:
@@ -2172,7 +2174,8 @@ class Supervisor:
                     _status(f"Accepting trust prompt... ({elapsed}s)")
                     self.tmux.send_keys(target, "", press_enter=True)
                     last_action = "trust"
-                time.sleep(1)
+                    poll_interval = 0.5
+                time.sleep(poll_interval)
                 continue
 
             if "warning: claude code running in bypass permissions mode" in lowered:
@@ -2181,7 +2184,8 @@ class Supervisor:
                     self.tmux.send_keys(target, "2", press_enter=False)
                     self.tmux.send_keys(target, "", press_enter=True)
                     last_action = "bypass-confirm"
-                time.sleep(1)
+                    poll_interval = 0.5
+                time.sleep(poll_interval)
                 continue
 
             if "we recommend medium effort for opus" in lowered:
@@ -2189,7 +2193,8 @@ class Supervisor:
                     _status(f"Dismissing effort recommendation... ({elapsed}s)")
                     self.tmux.send_keys(target, "", press_enter=True)
                     last_action = "effort"
-                time.sleep(1)
+                    poll_interval = 0.5
+                time.sleep(poll_interval)
                 continue
 
             if "❯" in pane and (
@@ -2203,7 +2208,9 @@ class Supervisor:
                 return
 
             _status(f"Waiting for Claude Code to start... ({elapsed}s)")
-            time.sleep(1)
+            # Adaptive backoff: start at 0.2s, increase to max 1s
+            poll_interval = min(poll_interval + 0.1, 1.0)
+            time.sleep(poll_interval)
 
         _status("Timed out waiting for Claude Code")
         return
@@ -2216,6 +2223,7 @@ class Supervisor:
         deadline = start + timeout
         last_action = ""
         ready_streak = 0
+        poll_interval = 0.2
         _status = on_status or (lambda _msg: None)
         _status("Waiting for Codex to start...")
         while time.monotonic() < deadline:
@@ -2224,7 +2232,7 @@ class Supervisor:
                 pane = self.tmux.capture_pane(target, lines=260)
             except Exception:  # noqa: BLE001
                 _status(f"Waiting for Codex to start... ({elapsed}s)")
-                time.sleep(1)
+                time.sleep(poll_interval)
                 continue
             lowered = pane.lower()
 
@@ -2233,7 +2241,8 @@ class Supervisor:
                     _status(f"Switching to codex-mini due to rate limits... ({elapsed}s)")
                     self.tmux.send_keys(target, "", press_enter=True)
                     last_action = "switch-mini"
-                time.sleep(1)
+                    poll_interval = 0.5
+                time.sleep(poll_interval)
                 continue
             if "usage limit" in lowered:
                 raise RuntimeError("Codex account is out of credits")
@@ -2242,14 +2251,16 @@ class Supervisor:
                     _status(f"Dismissing continue prompt... ({elapsed}s)")
                     self.tmux.send_keys(target, "", press_enter=True)
                     last_action = "continue"
-                time.sleep(1)
+                    poll_interval = 0.5
+                time.sleep(poll_interval)
                 continue
             if "do you trust the contents of this directory" in lowered and "1. yes, continue" in lowered:
                 if last_action != "trust":
                     _status(f"Accepting trust prompt... ({elapsed}s)")
                     self.tmux.send_keys(target, "", press_enter=True)
                     last_action = "trust"
-                time.sleep(1)
+                    poll_interval = 0.5
+                time.sleep(poll_interval)
                 continue
             prompt_visible = "% left" in lowered or "›" in pane
             working = "working (" in lowered and "esc to interrupt" in lowered
@@ -2259,11 +2270,12 @@ class Supervisor:
                 if ready_streak >= 2:
                     _status("Codex ready")
                     return
-                time.sleep(1)
+                time.sleep(0.3)  # Quick recheck for streak confirmation
                 continue
             ready_streak = 0
             _status(f"Waiting for Codex to start... ({elapsed}s)")
-            time.sleep(1)
+            poll_interval = min(poll_interval + 0.1, 1.0)
+            time.sleep(poll_interval)
 
         _status("Timed out waiting for Codex")
         return

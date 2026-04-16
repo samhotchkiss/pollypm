@@ -361,7 +361,7 @@ class StateStore:
         self._lock = threading.RLock()
         use_readonly_uri = readonly and path.exists()
         db_target = f"file:{path}?mode=ro&immutable=1" if use_readonly_uri else str(path)
-        self.conn = sqlite3.connect(db_target, check_same_thread=False, uri=use_readonly_uri)
+        self._conn = sqlite3.connect(db_target, check_same_thread=False, uri=use_readonly_uri)
         with self._lock:
             self.execute("PRAGMA busy_timeout=30000")
             if not use_readonly_uri:
@@ -370,29 +370,29 @@ class StateStore:
                 # (when the file didn't exist before connect).
                 self.execute("PRAGMA journal_mode=WAL")
                 try:
-                    self.conn.executescript(SCHEMA)
+                    self._conn.executescript(SCHEMA)
                 except sqlite3.IntegrityError:
                     # Duplicates exist that conflict with a UNIQUE index.
                     # Deduplicate and retry.
                     self._deduplicate_alerts()
-                    self.conn.executescript(SCHEMA)
+                    self._conn.executescript(SCHEMA)
                 try:
                     self._migrate()
                 except Exception:
-                    self.conn.rollback()
+                    self._conn.rollback()
                     raise
                 self.commit()
 
     def _deduplicate_alerts(self) -> None:
         """Remove duplicate alerts, keeping the most recently updated row."""
         try:
-            self.conn.execute("""
+            self._conn.execute("""
                 DELETE FROM alerts WHERE rowid NOT IN (
                     SELECT MAX(rowid) FROM alerts
                     GROUP BY session_name, alert_type
                 )
             """)
-            self.conn.commit()
+            self._conn.commit()
         except Exception:  # noqa: BLE001
             pass
 
@@ -405,7 +405,7 @@ class StateStore:
     def close(self) -> None:
         with self._lock:
             try:
-                self.conn.close()
+                self._conn.close()
             except Exception:  # noqa: BLE001
                 import logging
                 logging.getLogger(__name__).debug("Error closing StateStore", exc_info=True)
@@ -413,12 +413,12 @@ class StateStore:
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         """Thread-safe execute."""
         with self._lock:
-            return self.conn.execute(sql, params)
+            return self._conn.execute(sql, params)
 
     def commit(self) -> None:
         """Thread-safe commit. Bumps the state epoch so subscribers know to refresh."""
         with self._lock:
-            self.conn.commit()
+            self._conn.commit()
         # Bump epoch outside the lock — commit is already durable and
         # the bump only touches a sentinel file's mtime.
         try:
@@ -489,7 +489,7 @@ class StateStore:
         return column in cols
 
     def _safe_add_column(self, table: str, column: str, typedef: str) -> None:
-        if not self._column_exists(self.conn, table, column):
+        if not self._column_exists(self._conn, table, column):
             self.execute(f"ALTER TABLE {table} ADD COLUMN {column} {typedef}")
 
     def upsert_session(
@@ -604,13 +604,13 @@ class StateStore:
         event_cutoff = (now - timedelta(days=event_days)).isoformat()
         heartbeat_cutoff = (now - timedelta(hours=heartbeat_hours)).isoformat()
         with self._lock:
-            e_cursor = self.conn.execute("DELETE FROM events WHERE created_at < ?", (event_cutoff,))
+            e_cursor = self._conn.execute("DELETE FROM events WHERE created_at < ?", (event_cutoff,))
             events_pruned = e_cursor.rowcount
-            h_cursor = self.conn.execute("DELETE FROM heartbeats WHERE created_at < ?", (heartbeat_cutoff,))
+            h_cursor = self._conn.execute("DELETE FROM heartbeats WHERE created_at < ?", (heartbeat_cutoff,))
             heartbeats_pruned = h_cursor.rowcount
             # WAL checkpoint to reclaim disk space
-            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            self.conn.commit()
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self._conn.commit()
         return {"events": events_pruned, "heartbeats": heartbeats_pruned}
 
     def record_heartbeat(
@@ -702,7 +702,7 @@ class StateStore:
         now = self._now()
         # Use INSERT OR IGNORE + UPDATE to avoid check-then-act race
         with self._lock:
-            existing = self.conn.execute(
+            existing = self._conn.execute(
                 """
                 SELECT id, message, severity
                 FROM alerts
@@ -712,7 +712,7 @@ class StateStore:
             ).fetchone()
             if existing is None:
                 try:
-                    self.conn.execute(
+                    self._conn.execute(
                         """
                         INSERT INTO alerts (session_name, alert_type, severity, message, status, created_at, updated_at)
                         VALUES (?, ?, ?, ?, 'open', ?, ?)
@@ -722,7 +722,7 @@ class StateStore:
                 except sqlite3.IntegrityError:
                     pass  # Another process inserted first — that's fine
             else:
-                self.conn.execute(
+                self._conn.execute(
                     """
                     UPDATE alerts
                     SET severity = ?, message = ?, updated_at = ?
@@ -730,7 +730,7 @@ class StateStore:
                     """,
                     (severity, message, now, existing[0]),
                 )
-            self.conn.commit()
+            self._conn.commit()
             try:
                 from pollypm.state_epoch import bump
                 bump()

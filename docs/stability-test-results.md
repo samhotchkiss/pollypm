@@ -92,12 +92,18 @@
 - Decisions: 3 approved, 3 rejected — quality gate enforced, not rubber-stamped
 
 ### Review Decision Summary
-| Task | Round 1 | Round 2 | Final |
-|------|---------|---------|-------|
-| recipe_share/10 | APPROVED | — | done |
-| team_standup/13 | APPROVED | — | done |
-| expense_tracker/8 | REJECTED (no commits) | APPROVED (README added) | done |
-| expense_tracker/9 | REJECTED (no commits) | REJECTED (data corruption bug) | reworking |
+| Task | Round 1 | Round 2 | Round 3 | Final |
+|------|---------|---------|---------|-------|
+| recipe_share/10 | APPROVED | — | — | done |
+| team_standup/13 | APPROVED | — | — | done |
+| expense_tracker/8 | REJECTED (no commits) | APPROVED (README) | — | done |
+| expense_tracker/9 | REJECTED (no commits) | REJECTED (data corruption) | REJECTED (tests not on branch) | reworking v4 |
+
+### Systemic Bug: Worktree Code Gap
+Workers produce code and tests in their persistent worktree (`pa/worker_*` branch) but
+don't commit all artifacts to the task branch (`task/project-N`). Russell catches this
+every time — tests exist in the worker worktree but are missing from the task branch.
+This is a session_manager/worktree issue, not a worker intelligence issue.
 
 ## Phase 9: Inbox Hygiene — PASS
 - [x] All 9 stale messages closed

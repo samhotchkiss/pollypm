@@ -70,6 +70,9 @@ app.add_typer(inbox_app, name="inbox")
 from pollypm.jobs.cli import jobs_app
 app.add_typer(jobs_app, name="jobs")
 
+from pollypm.plugin_cli import plugins_app
+app.add_typer(plugins_app, name="plugins")
+
 
 def _session_name_candidates() -> list[str]:
     return ["pollypm", "pollypm-storage-closet"]

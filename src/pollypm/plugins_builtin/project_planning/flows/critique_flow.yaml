@@ -1,0 +1,30 @@
+name: critique_flow
+description: >-
+  Single-node flow each critic persona runs. Reads plan artifact(s),
+  evaluates candidates, emits structured JSON via `pm task done --output`.
+  The output_present gate ensures the critic supplied non-empty
+  structured output before the task can move to terminal.
+
+roles:
+  critic:
+    description: >-
+      The evaluating persona. Any of critic_simplicity,
+      critic_maintainability, critic_user, critic_operational, or
+      critic_security — accepted generically as actor_type=role so the
+      critic panel provisioner can assign any of them.
+  requester:
+    description: The architect who spawned the critique
+    optional: true
+
+nodes:
+  critique:
+    type: work
+    actor_type: role
+    actor_role: critic
+    next_node: done
+    gates: [output_present]
+
+  done:
+    type: terminal
+
+start_node: critique

@@ -10,6 +10,12 @@ from pathlib import Path
 import pytest
 
 from pollypm.plugin_host import ExtensionHost
+from pollypm.work.flow_engine import (
+    available_flows,
+    resolve_flow,
+    validate_flow,
+)
+from pollypm.work.models import ActorType, NodeType
 
 
 # ---------------------------------------------------------------------------
@@ -80,3 +86,98 @@ def test_profile_file_exists_at_shipped_path(profile_name: str) -> None:
     # Frontmatter is YAML-ish and starts with ---
     assert text.startswith("---\n"), f"{profile_name} missing frontmatter"
     assert "preferred_providers" in text
+
+
+# ---------------------------------------------------------------------------
+# pp02 — flow templates: plan_project, critique_flow, implement_module
+# ---------------------------------------------------------------------------
+
+
+PLANNER_FLOWS = ("plan_project", "critique_flow", "implement_module")
+
+
+@pytest.mark.parametrize("flow_name", PLANNER_FLOWS)
+def test_planner_flow_resolves_and_validates(flow_name: str) -> None:
+    template = resolve_flow(flow_name)
+    # resolve_flow already calls validate_flow; an explicit re-check
+    # catches any regression where that contract changes.
+    validate_flow(template)
+    assert template.name == flow_name
+    assert template.start_node in template.nodes
+    # Every flow has at least one terminal node.
+    terminals = [n for n in template.nodes.values() if n.type == NodeType.TERMINAL]
+    assert terminals, f"{flow_name} has no terminal node"
+
+
+def test_planner_flows_listed_in_available() -> None:
+    flows = available_flows()
+    for flow_name in PLANNER_FLOWS:
+        assert flow_name in flows, f"{flow_name} missing from available_flows()"
+
+
+def test_plan_project_has_nine_active_stages() -> None:
+    """The plan_project flow follows the 9-stage spec (§3):
+    research, discover, decompose, test_strategy, magic, critic_panel,
+    synthesize, user_approval, emit, + done terminal = 10 nodes.
+    """
+    template = resolve_flow("plan_project")
+    expected_stage_names = {
+        "research", "discover", "decompose", "test_strategy", "magic",
+        "critic_panel", "synthesize", "user_approval", "emit", "done",
+    }
+    assert set(template.nodes.keys()) == expected_stage_names
+    assert template.start_node == "research"
+
+
+def test_plan_project_user_approval_is_human_review() -> None:
+    template = resolve_flow("plan_project")
+    node = template.nodes["user_approval"]
+    assert node.type == NodeType.REVIEW
+    assert node.actor_type == ActorType.HUMAN
+    # Rejection sends the architect back to synthesize (fold in user feedback).
+    assert node.reject_node_id == "synthesize"
+
+
+def test_plan_project_synthesize_requires_log_present() -> None:
+    template = resolve_flow("plan_project")
+    assert "log_present" in template.nodes["synthesize"].gates
+
+
+def test_plan_project_critic_panel_waits_for_children() -> None:
+    template = resolve_flow("plan_project")
+    assert "wait_for_children" in template.nodes["critic_panel"].gates
+
+
+def test_critique_flow_has_output_present_gate() -> None:
+    template = resolve_flow("critique_flow")
+    node = template.nodes["critique"]
+    assert node.actor_type == ActorType.ROLE
+    # actor_role=critic — generic so the panel can assign any critic persona.
+    assert node.actor_role == "critic"
+    assert "output_present" in node.gates
+
+
+def test_implement_module_review_enforces_user_level_tests() -> None:
+    template = resolve_flow("implement_module")
+    review = template.nodes["code_review"]
+    assert review.type == NodeType.REVIEW
+    assert "user_level_tests_pass" in review.gates
+
+
+def test_task_create_with_plan_project_flow_succeeds(tmp_path: Path) -> None:
+    """Acceptance gate for pp02: a task can be created with --flow plan_project."""
+    from pollypm.work.mock_service import MockWorkService
+
+    svc = MockWorkService(project_path=tmp_path)
+    task = svc.create(
+        title="Plan my new project",
+        description="Decompose the new project into modules.",
+        type="task",
+        project="demo",
+        flow_template="plan_project",
+        roles={"architect": "architect"},
+        priority="normal",
+    )
+    assert task.flow_template_id == "plan_project"
+    # Draft tasks do not yet set current_node_id (that's set on queue/claim);
+    # the create succeeding is itself the pp02 acceptance gate.

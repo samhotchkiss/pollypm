@@ -306,6 +306,10 @@ class Supervisor:
             # Sessions already running — reconcile instead of failing
             return self._reconcile_existing(session_name, on_status=on_status)
 
+        # Clear stale markers BEFORE plan_launches so launch commands don't
+        # use --continue from a previous run's resume markers.
+        self._bootstrap_clear_markers()
+
         failures: list[str] = []
         for controller_account in self._controller_candidates():
             launches = self.plan_launches(controller_account=controller_account)

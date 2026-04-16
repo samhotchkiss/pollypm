@@ -1,6 +1,19 @@
 from pathlib import Path
 
-from pollypm.memory_backends.base import MemoryBackend, MemoryEntry, MemorySummary
+from pollypm.memory_backends.base import (
+    EpisodicMemory,
+    FeedbackMemory,
+    MemoryBackend,
+    MemoryEntry,
+    MemorySummary,
+    MemoryType,
+    PatternMemory,
+    ProjectMemory,
+    ReferenceMemory,
+    TypedMemory,
+    UserMemory,
+    validate_typed_memory,
+)
 from pollypm.memory_backends.file import FileMemoryBackend
 
 
@@ -41,6 +54,15 @@ __all__ = [
     "MemoryBackend",
     "MemoryEntry",
     "MemorySummary",
+    "MemoryType",
+    "TypedMemory",
+    "UserMemory",
+    "FeedbackMemory",
+    "ProjectMemory",
+    "ReferenceMemory",
+    "PatternMemory",
+    "EpisodicMemory",
+    "validate_typed_memory",
     "FileMemoryBackend",
     "get_memory_backend",
 ]

@@ -1,11 +1,25 @@
 from __future__ import annotations
 
 import re
+import warnings
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
-from pollypm.memory_backends.base import MemoryBackend, MemoryEntry, MemorySummary
+from pollypm.memory_backends.base import (
+    EpisodicMemory,
+    FeedbackMemory,
+    MemoryBackend,
+    MemoryEntry,
+    MemorySummary,
+    MemoryType,
+    PatternMemory,
+    ProjectMemory,
+    ReferenceMemory,
+    TypedMemory,
+    UserMemory,
+    validate_typed_memory,
+)
 
 if TYPE_CHECKING:
     from pollypm.storage.state import StateStore
@@ -38,6 +52,16 @@ class _NullHook:
 
     def run_observers(self, hook_name, payload, *, metadata=None):
         return []
+
+
+_TYPED_MEMORY_CLASSES = (
+    UserMemory,
+    FeedbackMemory,
+    ProjectMemory,
+    ReferenceMemory,
+    PatternMemory,
+    EpisodicMemory,
+)
 
 
 class FileMemoryBackend(MemoryBackend):
@@ -111,7 +135,67 @@ class FileMemoryBackend(MemoryBackend):
         (self._artifacts_root / "memory").mkdir(parents=True, exist_ok=True)
         return self._memory_root
 
-    def write_entry(
+    def write_entry(self, memory: TypedMemory | None = None, /, **kwargs: Any) -> MemoryEntry:
+        """Persist a memory entry.
+
+        Preferred form — pass a typed memory dataclass as the first positional
+        argument::
+
+            backend.write_entry(ProjectMemory(fact=..., why=..., how_to_apply=...))
+
+        Legacy form (deprecated) — pass ``scope/title/body/kind/tags/source``
+        as keyword arguments. This path stays supported for one release and
+        maps to ``type=PROJECT`` for back-compat so existing writers
+        (``knowledge_extract``, ``checkpoints``) keep working unchanged.
+        """
+        if memory is not None and isinstance(memory, _TYPED_MEMORY_CLASSES):
+            return self._write_typed_entry(memory, **kwargs)
+        if memory is not None:
+            raise TypeError(
+                "write_entry positional argument must be a typed memory dataclass "
+                f"(got {type(memory).__name__})"
+            )
+        # Legacy keyword path — emit a DeprecationWarning and dispatch to a
+        # ProjectMemory under the hood for back-compat.
+        return self._write_legacy_entry(**kwargs)
+
+    # ------------------------------------------------------------------
+    # Typed write path
+    # ------------------------------------------------------------------
+
+    def _write_typed_entry(self, memory: TypedMemory, **overrides: Any) -> MemoryEntry:
+        validate_typed_memory(memory)
+
+        scope = str(overrides.get("scope") or memory.scope or "project")
+        importance = int(overrides.get("importance", memory.importance))
+        tags_value = overrides.get("tags", memory.tags)
+        tags = [str(tag) for tag in (tags_value or [])]
+        source = str(overrides.get("source", memory.source))
+        ttl_at = overrides.get("ttl_at", memory.ttl_at)
+        superseded_by = overrides.get("superseded_by", memory.superseded_by)
+
+        title, body = _render_typed_title_body(memory)
+        return self._persist_entry(
+            scope=scope,
+            title=title,
+            body=body,
+            type_value=memory.TYPE.value,
+            # Legacy ``kind`` column mirrors the type for back-compat with
+            # readers that still filter by ``kind``. New readers should use
+            # the ``type`` column.
+            kind=memory.TYPE.value,
+            tags=tags,
+            source=source,
+            importance=importance,
+            ttl_at=ttl_at,
+            superseded_by=superseded_by,
+        )
+
+    # ------------------------------------------------------------------
+    # Legacy keyword path
+    # ------------------------------------------------------------------
+
+    def _write_legacy_entry(
         self,
         *,
         scope: str,
@@ -120,16 +204,67 @@ class FileMemoryBackend(MemoryBackend):
         kind: str = "note",
         tags: list[str] | None = None,
         source: str = "manual",
+        importance: int = 3,
+        ttl_at: str | None = None,
+        superseded_by: int | None = None,
+    ) -> MemoryEntry:
+        warnings.warn(
+            "FileMemoryBackend.write_entry(scope=..., title=..., body=..., kind=...) "
+            "is deprecated; pass a typed memory dataclass "
+            "(UserMemory, FeedbackMemory, ProjectMemory, ReferenceMemory, "
+            "PatternMemory, EpisodicMemory) instead. Legacy calls are persisted "
+            "with type='project'.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return self._persist_entry(
+            scope=scope,
+            title=title,
+            body=body,
+            type_value=MemoryType.PROJECT.value,
+            kind=kind,
+            tags=[str(tag) for tag in (tags or [])],
+            source=source,
+            importance=int(importance),
+            ttl_at=ttl_at,
+            superseded_by=superseded_by,
+        )
+
+    # ------------------------------------------------------------------
+    # Shared persistence — runs plugin filters, writes to disk + SQLite
+    # ------------------------------------------------------------------
+
+    def _persist_entry(
+        self,
+        *,
+        scope: str,
+        title: str,
+        body: str,
+        type_value: str,
+        kind: str,
+        tags: list[str],
+        source: str,
+        importance: int,
+        ttl_at: str | None,
+        superseded_by: int | None,
     ) -> MemoryEntry:
         payload = {
             "scope": scope,
             "title": title,
             "body": body,
             "kind": kind,
-            "tags": list(tags or []),
+            "type": type_value,
+            "tags": list(tags),
             "source": source,
+            "importance": importance,
+            "ttl_at": ttl_at,
+            "superseded_by": superseded_by,
         }
-        result = self._plugins.run_filters("memory.before_write", payload, metadata={"scope": scope, "kind": kind})
+        result = self._plugins.run_filters(
+            "memory.before_write",
+            payload,
+            metadata={"scope": scope, "kind": kind, "type": type_value},
+        )
         action = getattr(result, "action", "allow")
         if action == "deny":
             raise PermissionError(getattr(result, "reason", None) or "Memory write denied by plugin")
@@ -140,8 +275,12 @@ class FileMemoryBackend(MemoryBackend):
         title = str(payload.get("title", title))
         body = str(payload.get("body", body))
         kind = str(payload.get("kind", kind))
-        tags = [str(tag) for tag in payload.get("tags", tags or [])]
+        type_value = str(payload.get("type", type_value))
+        tags = [str(tag) for tag in payload.get("tags", tags)]
         source = str(payload.get("source", source))
+        importance = int(payload.get("importance", importance))
+        ttl_at = payload.get("ttl_at", ttl_at)
+        superseded_by = payload.get("superseded_by", superseded_by)
 
         self.ensure_memory()
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -150,7 +289,17 @@ class FileMemoryBackend(MemoryBackend):
         scope_dir.mkdir(parents=True, exist_ok=True)
         file_path = scope_dir / f"{stamp}-{slug}.md"
         summary_path = file_path
-        content = _render_entry(scope=scope, title=title, body=body, kind=kind, tags=tags, source=source)
+        content = _render_entry(
+            scope=scope,
+            title=title,
+            body=body,
+            kind=kind,
+            type_value=type_value,
+            tags=tags,
+            source=source,
+            importance=importance,
+            ttl_at=ttl_at,
+        )
         file_path.write_text(content)
 
         record = self._state_store.record_memory_entry(
@@ -162,6 +311,10 @@ class FileMemoryBackend(MemoryBackend):
             source=source,
             file_path=str(file_path),
             summary_path=str(summary_path),
+            type=type_value,
+            importance=importance,
+            superseded_by=superseded_by,
+            ttl_at=ttl_at,
         )
         entry = MemoryEntry(
             entry_id=record.entry_id,
@@ -175,8 +328,16 @@ class FileMemoryBackend(MemoryBackend):
             summary_path=Path(record.summary_path),
             created_at=record.created_at,
             updated_at=record.updated_at,
+            type=record.type,
+            importance=record.importance,
+            superseded_by=record.superseded_by,
+            ttl_at=record.ttl_at,
         )
-        self._plugins.run_observers("memory.after_write", entry, metadata={"scope": scope, "kind": kind})
+        self._plugins.run_observers(
+            "memory.after_write",
+            entry,
+            metadata={"scope": scope, "kind": kind, "type": type_value},
+        )
         return entry
 
     def list_entries(
@@ -184,44 +345,24 @@ class FileMemoryBackend(MemoryBackend):
         *,
         scope: str | None = None,
         kind: str | None = None,
+        type: str | None = None,
         limit: int = 50,
     ) -> list[MemoryEntry]:
-        entries = self._state_store.list_memory_entries(scope=scope, kind=kind, limit=limit)
-        return [
-            MemoryEntry(
-                entry_id=item.entry_id,
-                scope=item.scope,
-                kind=item.kind,
-                title=item.title,
-                body=item.body,
-                tags=item.tags,
-                source=item.source,
-                file_path=Path(item.file_path),
-                summary_path=Path(item.summary_path),
-                created_at=item.created_at,
-                updated_at=item.updated_at,
-            )
-            for item in entries
-        ]
+        entries = self._state_store.list_memory_entries(
+            scope=scope, kind=kind, type=type, limit=limit
+        )
+        return [_record_to_entry(item) for item in entries]
 
     def read_entry(self, entry_id: int) -> MemoryEntry | None:
         entry = self._state_store.get_memory_entry(entry_id)
         if entry is None:
             return None
-        memory_entry = MemoryEntry(
-            entry_id=entry.entry_id,
-            scope=entry.scope,
-            kind=entry.kind,
-            title=entry.title,
-            body=entry.body,
-            tags=entry.tags,
-            source=entry.source,
-            file_path=Path(entry.file_path),
-            summary_path=Path(entry.summary_path),
-            created_at=entry.created_at,
-            updated_at=entry.updated_at,
+        memory_entry = _record_to_entry(entry)
+        self._plugins.run_observers(
+            "memory.after_read",
+            memory_entry,
+            metadata={"scope": entry.scope, "kind": entry.kind, "type": entry.type},
         )
-        self._plugins.run_observers("memory.after_read", memory_entry, metadata={"scope": entry.scope, "kind": entry.kind})
         return memory_entry
 
     def summarize(self, scope: str, *, limit: int = 20) -> str:
@@ -256,16 +397,111 @@ class FileMemoryBackend(MemoryBackend):
         return summary
 
 
-def _render_entry(*, scope: str, title: str, body: str, kind: str, tags: list[str], source: str) -> str:
+def _record_to_entry(record) -> MemoryEntry:
+    return MemoryEntry(
+        entry_id=record.entry_id,
+        scope=record.scope,
+        kind=record.kind,
+        title=record.title,
+        body=record.body,
+        tags=record.tags,
+        source=record.source,
+        file_path=Path(record.file_path),
+        summary_path=Path(record.summary_path),
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+        type=getattr(record, "type", "project"),
+        importance=getattr(record, "importance", 3),
+        superseded_by=getattr(record, "superseded_by", None),
+        ttl_at=getattr(record, "ttl_at", None),
+    )
+
+
+def _render_typed_title_body(memory: TypedMemory) -> tuple[str, str]:
+    """Convert a typed memory into a (title, body) pair for on-disk storage.
+
+    The body uses a simple key/value markdown format — readable by humans and
+    trivially parseable by future extractors. Title is the first salient
+    field of each type so the file-system name is informative.
+    """
+    if isinstance(memory, UserMemory):
+        return memory.name or memory.description[:80] or "user memory", "\n".join(
+            [
+                f"**Description:** {memory.description}",
+                "",
+                memory.body,
+            ]
+        )
+    if isinstance(memory, FeedbackMemory):
+        return memory.rule[:120] or "feedback", "\n".join(
+            [
+                f"**Rule:** {memory.rule}",
+                f"**Why:** {memory.why}",
+                f"**How to apply:** {memory.how_to_apply}",
+            ]
+        )
+    if isinstance(memory, ProjectMemory):
+        return memory.fact[:120] or "project fact", "\n".join(
+            [
+                f"**Fact:** {memory.fact}",
+                f"**Why:** {memory.why}",
+                f"**How to apply:** {memory.how_to_apply}",
+            ]
+        )
+    if isinstance(memory, ReferenceMemory):
+        return memory.description[:120] or memory.pointer[:120] or "reference", "\n".join(
+            [
+                f"**Pointer:** {memory.pointer}",
+                f"**Description:** {memory.description}",
+            ]
+        )
+    if isinstance(memory, PatternMemory):
+        return f"When: {memory.when}"[:120] or "pattern", "\n".join(
+            [
+                f"**When:** {memory.when}",
+                f"**Then:** {memory.then}",
+            ]
+        )
+    if isinstance(memory, EpisodicMemory):
+        title = memory.summary[:120] or f"session {memory.session_id}" or "episodic"
+        return title, "\n".join(
+            [
+                f"**Session:** {memory.session_id}",
+                f"**Started:** {memory.started_at}",
+                f"**Ended:** {memory.ended_at}",
+                "",
+                memory.summary,
+            ]
+        )
+    # Unreachable: validate_typed_memory has already rejected unknown types.
+    return "memory", ""
+
+
+def _render_entry(
+    *,
+    scope: str,
+    title: str,
+    body: str,
+    kind: str,
+    type_value: str,
+    tags: list[str],
+    source: str,
+    importance: int,
+    ttl_at: str | None,
+) -> str:
     tag_line = ", ".join(tags) if tags else "none"
+    ttl_line = ttl_at if ttl_at else "none"
     return "\n".join(
         [
             f"# {title}",
             "",
             f"- Scope: `{scope}`",
+            f"- Type: `{type_value}`",
             f"- Kind: `{kind}`",
+            f"- Importance: {importance}",
             f"- Source: `{source}`",
             f"- Tags: {tag_line}",
+            f"- TTL: {ttl_line}",
             "",
             body.rstrip(),
             "",

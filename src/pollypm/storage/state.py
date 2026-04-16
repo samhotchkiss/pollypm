@@ -181,11 +181,17 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     file_path TEXT NOT NULL,
     summary_path TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'project',
+    importance INTEGER NOT NULL DEFAULT 3,
+    superseded_by INTEGER,
+    ttl_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_entries_scope
 ON memory_entries(scope, id DESC);
+-- idx_memory_entries_type is created by migration 8 after the ``type``
+-- column is back-filled onto pre-M01 databases.
 
 CREATE TABLE IF NOT EXISTS memory_summaries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -373,6 +379,12 @@ class MemoryEntryRecord:
     summary_path: str
     created_at: str
     updated_at: str
+    # M01 typed-schema columns — defaults match the schema DEFAULTs so
+    # legacy construction paths remain valid.
+    type: str = "project"
+    importance: int = 3
+    superseded_by: int | None = None
+    ttl_at: str | None = None
 
 
 @dataclass(slots=True)
@@ -514,6 +526,11 @@ class StateStore:
         # cycle in case a rollback is needed. Nothing writes to it after
         # this point. A follow-up release will drop the table.
         (7, "Deprecate legacy inbox_messages table (iv04)", []),
+        (8, "Typed memory schema (type/importance/superseded_by/ttl_at)", [
+            # Pre-statements left empty — column additions happen in the
+            # dispatch block below (feature-detected via _safe_add_column),
+            # and the index is created afterwards, once the column exists.
+        ]),
     ]
 
     def _migrate(self) -> None:
@@ -540,6 +557,21 @@ class StateStore:
                 self._safe_add_column("heartbeats", "snapshot_hash", "TEXT NOT NULL DEFAULT ''")
             elif version == 4:
                 self._safe_add_column("token_usage_hourly", "cache_read_tokens", "INTEGER NOT NULL DEFAULT 0")
+            elif version == 8:
+                # Back-fill typed-schema columns on pre-existing memory_entries
+                # rows. Each _safe_add_column call is a no-op if the column
+                # already exists (fresh DBs already have them from SCHEMA).
+                # Existing rows get type='project', importance=3 via column
+                # DEFAULTs — the spec's migration contract (§3.2, #230).
+                self._safe_add_column("memory_entries", "type", "TEXT NOT NULL DEFAULT 'project'")
+                self._safe_add_column("memory_entries", "importance", "INTEGER NOT NULL DEFAULT 3")
+                self._safe_add_column("memory_entries", "superseded_by", "INTEGER")
+                self._safe_add_column("memory_entries", "ttl_at", "TEXT")
+                # Index created last, once the column is guaranteed to exist.
+                self.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memory_entries_type "
+                    "ON memory_entries(type, id DESC)"
+                )
             self.execute(
                 "INSERT INTO schema_version (version, description, applied_at) VALUES (?, ?, ?)",
                 (version, description, datetime.now(UTC).isoformat()),
@@ -1474,17 +1506,25 @@ class StateStore:
         source: str,
         file_path: str,
         summary_path: str,
+        type: str = "project",
+        importance: int = 3,
+        superseded_by: int | None = None,
+        ttl_at: str | None = None,
     ) -> MemoryEntryRecord:
         now = self._now()
         tags_json = json.dumps([str(tag) for tag in tags], ensure_ascii=True)
         cursor = self.execute(
             """
             INSERT INTO memory_entries (
-                scope, kind, title, body, tags, source, file_path, summary_path, created_at, updated_at
+                scope, kind, title, body, tags, source, file_path, summary_path, created_at, updated_at,
+                type, importance, superseded_by, ttl_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (scope, kind, title, body, tags_json, source, file_path, summary_path, now, now),
+            (
+                scope, kind, title, body, tags_json, source, file_path, summary_path, now, now,
+                type, int(importance), superseded_by, ttl_at,
+            ),
         )
         self.commit()
         return MemoryEntryRecord(
@@ -1499,12 +1539,17 @@ class StateStore:
             summary_path=summary_path,
             created_at=now,
             updated_at=now,
+            type=type,
+            importance=int(importance),
+            superseded_by=superseded_by,
+            ttl_at=ttl_at,
         )
 
     def get_memory_entry(self, entry_id: int) -> MemoryEntryRecord | None:
         row = self.execute(
             """
-            SELECT id, scope, kind, title, body, tags, source, file_path, summary_path, created_at, updated_at
+            SELECT id, scope, kind, title, body, tags, source, file_path, summary_path, created_at, updated_at,
+                   type, importance, superseded_by, ttl_at
             FROM memory_entries
             WHERE id = ?
             """,
@@ -1524,6 +1569,10 @@ class StateStore:
             summary_path=row[8],
             created_at=row[9],
             updated_at=row[10],
+            type=row[11] if row[11] is not None else "project",
+            importance=int(row[12]) if row[12] is not None else 3,
+            superseded_by=int(row[13]) if row[13] is not None else None,
+            ttl_at=row[14],
         )
 
     def list_memory_entries(
@@ -1531,6 +1580,7 @@ class StateStore:
         *,
         scope: str | None = None,
         kind: str | None = None,
+        type: str | None = None,
         limit: int = 50,
     ) -> list[MemoryEntryRecord]:
         clauses: list[str] = []
@@ -1541,10 +1591,14 @@ class StateStore:
         if kind is not None:
             clauses.append("kind = ?")
             params.append(kind)
+        if type is not None:
+            clauses.append("type = ?")
+            params.append(type)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self.execute(
             f"""
-            SELECT id, scope, kind, title, body, tags, source, file_path, summary_path, created_at, updated_at
+            SELECT id, scope, kind, title, body, tags, source, file_path, summary_path, created_at, updated_at,
+                   type, importance, superseded_by, ttl_at
             FROM memory_entries
             {where}
             ORDER BY id DESC
@@ -1565,6 +1619,10 @@ class StateStore:
                 summary_path=row[8],
                 created_at=row[9],
                 updated_at=row[10],
+                type=row[11] if row[11] is not None else "project",
+                importance=int(row[12]) if row[12] is not None else 3,
+                superseded_by=int(row[13]) if row[13] is not None else None,
+                ttl_at=row[14],
             )
             for row in rows
         ]

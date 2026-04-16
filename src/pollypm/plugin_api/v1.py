@@ -10,6 +10,7 @@ HeartbeatBackendFactory = Callable[[], object]
 SchedulerBackendFactory = Callable[[], object]
 AgentProfileFactory = Callable[[], object]
 SessionServiceFactory = Callable[..., object]
+TranscriptSourceFactory = Callable[..., object]
 ObserverHandler = Callable[["HookContext"], None]
 FilterHandler = Callable[["HookContext"], "HookFilterResult | None"]
 RosterRegistrar = Callable[["RosterAPI"], None]
@@ -159,6 +160,7 @@ class PollyPMPlugin:
     scheduler_backends: dict[str, SchedulerBackendFactory] = field(default_factory=dict)
     agent_profiles: dict[str, AgentProfileFactory] = field(default_factory=dict)
     session_services: dict[str, SessionServiceFactory] = field(default_factory=dict)
+    transcript_sources: dict[str, TranscriptSourceFactory] = field(default_factory=dict)
     observers: dict[str, list[ObserverHandler]] = field(default_factory=dict)
     filters: dict[str, list[FilterHandler]] = field(default_factory=dict)
     register_roster: RosterRegistrar | None = None

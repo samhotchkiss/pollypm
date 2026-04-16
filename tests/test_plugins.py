@@ -142,6 +142,43 @@ def test_get_provider_and_runtime_resolve_through_extension_host(tmp_path: Path)
     assert type(runtime).__name__ == "LocalRuntimeAdapter"
 
 
+def test_transcript_source_plugin_registers_and_resolves(monkeypatch, tmp_path: Path) -> None:
+    builtin_root = Path(__file__).resolve().parents[1] / "src" / "pollypm" / "plugins_builtin"
+    user_root = tmp_path / "user-plugins"
+    repo_root = tmp_path / ".pollypm-state" / "plugins"
+    repo_plugin = repo_root / "transcript_source_test"
+    monkeypatch.setattr(
+        ExtensionHost,
+        "_plugin_search_paths",
+        lambda self: [("builtin", builtin_root), ("user", user_root), ("repo", repo_root)],
+    )
+    try:
+        _write_plugin(
+            repo_plugin,
+            name="transcript_source_test",
+            kind="transcript_source",
+            capabilities=("transcript_source",),
+            body=(
+                "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+                "from pollypm.provider_sdk import TranscriptSource\n"
+                "from pathlib import Path\n"
+                "def make_source(**kwargs):\n"
+                "    return [TranscriptSource(root=Path('/tmp/does-not-exist'), pattern='*.jsonl')]\n"
+                "plugin = PollyPMPlugin(name='transcript_source_test', transcript_sources={'fake': make_source})\n"
+            ),
+        )
+
+        host = ExtensionHost(tmp_path)
+        produced = host.get_transcript_source("fake")
+        assert isinstance(produced, list) and len(produced) == 1
+
+        pairs = host.iter_transcript_sources()
+        assert any(name == "fake" for name, _ in pairs)
+    finally:
+        if repo_plugin.exists():
+            shutil.rmtree(repo_plugin)
+
+
 def test_repo_heartbeat_plugin_overrides_builtin_backend(monkeypatch, tmp_path: Path) -> None:
     builtin_root = Path(__file__).resolve().parents[1] / "src" / "pollypm" / "plugins_builtin"
     user_root = tmp_path / "user-plugins"

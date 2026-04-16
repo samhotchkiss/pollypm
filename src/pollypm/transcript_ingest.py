@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from pollypm.models import AccountConfig, ProviderKind
+from pollypm.plugin_host import extension_host_for_root
 from pollypm.providers import get_provider
 from pollypm.provider_sdk import TranscriptSource
 from pollypm.projects import project_transcripts_dir, session_scoped_dir
@@ -558,6 +559,40 @@ def _scan_source(config, account_name: str, account: AccountConfig, source: Tran
                     _append_event(config, event)
 
 
+def _iter_sources_for_account(config, account_name: str, account: AccountConfig):
+    """Yield (source, account_name, account) for every transcript source that
+    applies to this account, combining provider-supplied sources (legacy path)
+    with plugin-registered producers (plugin_host path)."""
+
+    # Provider-native sources (existing behavior)
+    provider = get_provider(account.provider, root_dir=config.project.root_dir)
+    for source in provider.transcript_sources(account, None):
+        yield source
+
+    # Plugin-registered transcript sources — producers receive the account
+    # and must return an iterable of TranscriptSource. They may also filter
+    # by provider themselves. Failures are logged, not fatal.
+    host = extension_host_for_root(str(config.project.root_dir.resolve()))
+    try:
+        producers = host.iter_transcript_sources(account=account, config=config)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("transcript_source plugin enumeration failed: %s", exc)
+        producers = []
+    for _name, produced in producers:
+        if produced is None:
+            continue
+        if isinstance(produced, TranscriptSource):
+            yield produced
+            continue
+        try:
+            for item in produced:
+                if isinstance(item, TranscriptSource):
+                    yield item
+        except TypeError:
+            # Not iterable — ignore silently; factory returned something else.
+            continue
+
+
 def sync_transcripts_once(config) -> None:
     # File lock prevents concurrent heartbeat cron processes from racing
     lock_path = _cursor_state_path(config).with_suffix(".lock")
@@ -569,8 +604,7 @@ def sync_transcripts_once(config) -> None:
             try:
                 state = _load_cursor_state(config)
                 for account_name, account in config.accounts.items():
-                    provider = get_provider(account.provider, root_dir=config.project.root_dir)
-                    for source in provider.transcript_sources(account, None):
+                    for source in _iter_sources_for_account(config, account_name, account):
                         _scan_source(config, account_name, account, source, state)
                 _save_cursor_state(config, state)
             finally:

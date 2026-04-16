@@ -73,6 +73,32 @@ class ExtensionHost:
             name, lambda plugin: plugin.session_services, "session service", **kwargs,
         )
 
+    def get_transcript_source(self, name: str, **kwargs: object) -> object:
+        return self._resolve_factory(
+            name, lambda plugin: plugin.transcript_sources, "transcript source", **kwargs,
+        )
+
+    def iter_transcript_sources(self, **kwargs: object) -> list[tuple[str, object]]:
+        """Return (name, instance) pairs for all registered transcript sources.
+
+        Kwargs are forwarded to each factory. Factories that raise are skipped
+        (the error is recorded on self.errors).
+        """
+        out: list[tuple[str, object]] = []
+        seen: set[str] = set()
+        for plugin in self.plugins().values():
+            for name, factory in plugin.transcript_sources.items():
+                if name in seen:
+                    continue
+                seen.add(name)
+                try:
+                    out.append((name, factory(**kwargs)))
+                except Exception as exc:  # noqa: BLE001
+                    self.errors.append(
+                        f"Plugin {plugin.name} transcript_source '{name}' factory failed: {exc}"
+                    )
+        return out
+
     def job_handler_registry(self) -> "JobHandlerRegistry":
         """Return the plugin host's ``JobHandlerRegistry`` singleton.
 

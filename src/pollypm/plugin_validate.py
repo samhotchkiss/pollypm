@@ -226,6 +226,20 @@ def _validate_agent_profile_factory(name: str, factory: object) -> tuple[list[st
     return checks, errors
 
 
+def _validate_transcript_source_factory(name: str, factory: object) -> tuple[list[str], list[str]]:
+    """Validate a transcript_source factory is callable. Factories may take
+    kwargs (e.g. account, config) so we don't try to instantiate them here."""
+    checks: list[str] = []
+    errors: list[str] = []
+
+    if not callable(factory):
+        errors.append(f"Transcript source factory '{name}' is not callable")
+        return checks, errors
+
+    checks.append(f"Transcript source factory '{name}' is callable")
+    return checks, errors
+
+
 def _validate_observers(plugin: PollyPMPlugin) -> tuple[list[str], list[str]]:
     """Validate observer hooks are callable."""
     checks: list[str] = []
@@ -305,6 +319,11 @@ def validate_plugin(plugin: PollyPMPlugin) -> ValidationResult:
 
     for name, factory in plugin.agent_profiles.items():
         checks, errors = _validate_agent_profile_factory(name, factory)
+        result.checks.extend(checks)
+        result.errors.extend(errors)
+
+    for name, factory in plugin.transcript_sources.items():
+        checks, errors = _validate_transcript_source_factory(name, factory)
         result.checks.extend(checks)
         result.errors.extend(errors)
 

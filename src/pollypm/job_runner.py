@@ -169,32 +169,6 @@ def _run_gc_maintenance(supervisor: Supervisor, payload: dict[str, Any]) -> None
         pass
 
 
-@register_job("inbox_escalation")
-def _run_inbox_escalation(supervisor: Supervisor, payload: dict[str, Any]) -> None:
-    """Escalate unattended waiting_on_user sessions to the inbox."""
-    from pollypm.inbox_escalation import escalate_waiting_sessions
-    escalate_waiting_sessions(supervisor.store, supervisor.config.project.root_dir)
-
-
-@register_job("inbox_processor")
-def _run_inbox_processor(supervisor: Supervisor, payload: dict[str, Any]) -> None:
-    """Process inbox items: triage, act, log decisions."""
-    from pollypm.inbox_processor import process_inbox
-    process_inbox(supervisor.config.project.root_dir, supervisor.store)
-
-
-@register_job("inbox_delivery")
-def _run_inbox_delivery(supervisor: Supervisor, payload: dict[str, Any]) -> None:
-    """Ensure every agent with open inbox items is actively working on them."""
-    from pollypm.inbox_delivery import ensure_inbox_progress
-    result = ensure_inbox_progress(supervisor.config)
-    if result["poked"]:
-        supervisor.store.record_event(
-            "inbox_delivery", "delivery",
-            f"Poked {result['poked']} idle agents, {result['active']} active, {result['skipped']} skipped",
-        )
-
-
 @register_job("prune_state")
 def _run_prune_state(supervisor: Supervisor, payload: dict[str, Any]) -> None:
     """Prune old events and heartbeat data to prevent unbounded growth."""

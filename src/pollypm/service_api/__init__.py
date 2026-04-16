@@ -11,7 +11,6 @@ import-boundary test in ``tests/test_import_boundary.py``.
 """
 
 from pollypm.service_api.v1 import (
-    InboxRouteDecision,
     PollyPMService,
     StatusSnapshot,
     plan_launches_readonly,
@@ -19,7 +18,6 @@ from pollypm.service_api.v1 import (
 )
 
 __all__ = [
-    "InboxRouteDecision",
     "PollyPMService",
     "StatusSnapshot",
     "plan_launches_readonly",

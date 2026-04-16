@@ -52,7 +52,7 @@ def test_cockpit_router_build_items_includes_core_entries(monkeypatch, tmp_path:
             windows = [FakeWindow("pm-operator"), FakeWindow("worker-demo")]
             return launches, windows, [], [], []
 
-    monkeypatch.setattr("pollypm.cockpit.list_v2_messages", lambda root_dir, **kw: [type("M", (), {"subject": "test", "id": "t1", "read": False, "owner": "user", "sender": "polly", "to": "user"})()])
+    monkeypatch.setattr("pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 1)
     (tmp_path / "pollypm.toml").write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm-state'}\"\n")
     router = CockpitRouter(tmp_path / "pollypm.toml")
     monkeypatch.setattr(router, "_load_supervisor", lambda: FakeSupervisor())
@@ -597,15 +597,7 @@ def test_build_cockpit_detail_dashboard_shows_activity_and_tokens(monkeypatch, t
 
     monkeypatch.setattr("pollypm.cockpit.load_config", lambda path: config)
     monkeypatch.setattr("pollypm.cockpit.PollyPMService.load_supervisor", lambda self: FakeSupervisor())
-    def _fake_v2_messages(root_dir, *, status="open", owner=None):
-        items = [
-            type("M", (), {"subject": "test1", "id": "t1", "sender": "polly", "owner": "user", "created_at": "2026-04-13T10:00:00+00:00"})(),
-            type("M", (), {"subject": "test2", "id": "t2", "sender": "user", "owner": "polly", "created_at": "2026-04-13T11:00:00+00:00"})(),
-        ]
-        if owner is not None:
-            items = [m for m in items if m.owner == owner]
-        return items
-    monkeypatch.setattr("pollypm.cockpit.list_v2_messages", _fake_v2_messages)
+    monkeypatch.setattr("pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 1)
 
     detail = build_cockpit_detail(config_path, "dashboard")
 

@@ -33,20 +33,6 @@ from pollypm.checkpoints import create_issue_completion_checkpoint, record_check
 from pollypm.config_patches import apply_preference_patch, detect_preference_patch, list_project_overrides
 from pollypm.config import load_config
 from pollypm.itsalive import deploy_site, pending_deploys, sweep_pending_deploys
-from pollypm.inbox_v2 import (
-    find_message,
-    read_message,
-)
-from pollypm.messaging import (
-    append_thread_message,
-    close_message,
-    create_message,
-    create_thread,
-    get_thread,
-    list_open_messages,
-    set_handoff,
-    transition_thread,
-)
 from pollypm.models import ProviderKind, SessionConfig, SessionLaunchSpec
 from pollypm.projects import (
     enable_tracked_project,
@@ -80,17 +66,6 @@ class StatusSnapshot:
     alerts: list[object]
     leases: list[object]
     errors: list[str]
-
-
-@dataclass(slots=True)
-class InboxRouteDecision:
-    """Outcome of the PM inbox-routing heuristic for a single thread."""
-
-    thread_id: str
-    owner: str
-    state: str
-    note: str
-    reason: str
 
 
 class PollyPMService:
@@ -670,117 +645,6 @@ class PollyPMService:
         """Stop and delete a worker session's config entry."""
         remove_worker_session(self.config_path, session_name)
 
-    def create_inbox_item(self, *, sender: str, subject: str, body: str):
-        """Create a new inbox message and return its persisted record."""
-        return create_message(self.config_path.parent, sender=sender, subject=subject, body=body)
-
-    def list_inbox_items(self) -> list[object]:
-        """List open inbox messages awaiting triage."""
-        return list_open_messages(self.config_path.parent)
-
-    def triage_inbox_item(self, item_name: str, *, actor: str, owner: str = "pm") -> object:
-        """Promote an inbox message into a thread owned by ``owner``."""
-        return create_thread(self.config_path.parent, item_name, actor=actor, owner=owner)
-
-    def route_inbox_thread(self, thread_id: str, *, actor: str = "pm") -> InboxRouteDecision:
-        """Decide whether PM keeps a thread or hands it off to PA; returns the decision."""
-        thread = get_thread(self.config_path.parent, thread_id)
-        body = self._get_thread_body(thread)
-        if self._message_needs_pm_ownership(thread.subject, body):
-            note = "PM kept ownership because the thread needs policy, scope, or priority judgment."
-            return InboxRouteDecision(
-                thread_id=thread.thread_id,
-                owner="pm",
-                state=thread.state,
-                note=note,
-                reason="policy",
-            )
-
-        note = "PM routed an execution-only task to PA."
-        updated = transition_thread(self.config_path.parent, thread.thread_id, "waiting-on-pa", actor=actor, note=note)
-        set_handoff(self.config_path.parent, thread.thread_id, owner="pa", actor=actor, note=note)
-        return InboxRouteDecision(
-            thread_id=thread.thread_id,
-            owner="pa",
-            state=updated.state,
-            note=note,
-            reason="execution",
-        )
-
-    def list_inbox_threads(self, *, include_closed: bool = False) -> list[object]:
-        """List inbox threads; ``include_closed`` selects open-only or all."""
-        config = load_config(self.config_path)
-        status = "all" if include_closed else "open"
-        return list_messages(config.project.root_dir, status=status)
-
-    def get_inbox_thread(self, thread_id: str) -> object:
-        """Fetch a single inbox thread by id."""
-        return get_thread(self.config_path.parent, thread_id)
-
-    def transition_inbox_thread(self, thread_id: str, state: str, *, actor: str, note: str = "") -> object:
-        """Transition an inbox thread to a new state and record the transition."""
-        return transition_thread(self.config_path.parent, thread_id, state, actor=actor, note=note)
-
-    def handoff_inbox_thread(self, thread_id: str, *, owner: str, actor: str, note: str = "") -> dict[str, object]:
-        """Set an inbox thread's handoff owner; returns the persisted handoff dict."""
-        path = set_handoff(self.config_path.parent, thread_id, owner=owner, actor=actor, note=note)
-        return json.loads(path.read_text())
-
-    def append_inbox_thread_message(self, thread_id: str, *, sender: str, subject: str, body: str) -> object:
-        """Append a new message to an inbox thread."""
-        return append_thread_message(self.config_path.parent, thread_id, sender=sender, subject=subject, body=body)
-
-    def record_worker_reply_via_pa(
-        self,
-        thread_id: str,
-        *,
-        worker_name: str,
-        subject: str,
-        body: str,
-        actor: str = "pa",
-    ) -> object:
-        """Record a worker-originated reply back through the PA → PM handoff."""
-        append_thread_message(self.config_path.parent, thread_id, sender=worker_name, subject=subject, body=body)
-        note = "PA surfaced a worker reply back to PM."
-        transition_thread(self.config_path.parent, thread_id, "waiting-on-pm", actor=actor, note=note)
-        set_handoff(self.config_path.parent, thread_id, owner="pm", actor=actor, note=note)
-        return get_thread(self.config_path.parent, thread_id)
-
-    def _get_message_body(self, project_root, msg_id: str) -> str:
-        try:
-            _ctx, _hist, entries = read_message(project_root, msg_id)
-            return entries[-1].body if entries else ""
-        except Exception:  # noqa: BLE001
-            return ""
-
-    def _get_thread_body(self, thread) -> str:
-        if not thread.message_paths:
-            return ""
-        try:
-            return thread.message_paths[-1].read_text()
-        except Exception:  # noqa: BLE001
-            return ""
-
-    def _message_needs_pm_ownership(self, subject: str, body: str) -> bool:
-        text = f"{subject}\n{body}".lower()
-        policy_markers = (
-            "should",
-            "scope",
-            "priority",
-            "plan",
-            "policy",
-            "approve",
-            "approval",
-            "decide",
-            "direction",
-            "strategy",
-        )
-        if any(marker in text for marker in policy_markers):
-            return True
-        if "?" not in text:
-            return False
-        return any(marker in text for marker in ("what", "which", "why", "should", "priority", "scope"))
-
     def _project_root(self, config, project_key: str) -> Path:
         project = config.projects.get(project_key)
         if project is not None:
@@ -829,7 +693,6 @@ def render_json(data: object) -> str:
 
 
 __all__ = [
-    "InboxRouteDecision",
     "PollyPMService",
     "StatusSnapshot",
     "render_json",

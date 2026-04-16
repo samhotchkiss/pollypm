@@ -4,8 +4,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from pollypm.agent_profiles.base import AgentProfile, AgentProfileContext
-from pollypm.inbox_v2 import list_messages as list_v2_messages
-from pollypm.messaging import list_open_messages
 from pollypm.rules import render_session_manifest
 from pollypm.storage.state import StateStore
 from pollypm.task_backends import get_task_backend
@@ -304,45 +302,39 @@ def reviewer_prompt() -> str:
 
 
 def _render_operator_inbox_brief(context: AgentProfileContext) -> str:
-    project_root = context.config.project.root_dir
+    """Brief the operator on what's waiting for the user, from the work service.
+
+    The legacy inbox subsystem is gone; the "inbox" is now a query over
+    ``inbox_tasks``. We aggregate across every tracked project, take the
+    top handful, and format them so Polly knows what to work through.
+    """
     lines = ["<inbox-state>"]
-
-    rendered: list[tuple[str, str, str]] = []  # (subject, sender, owner)
-    seen: set[tuple[str, str]] = set()
-
-    for root in (project_root.parent, project_root):
-        try:
-            for item in list_open_messages(root):
-                key = (item.subject, item.sender)
-                if key not in seen:
-                    seen.add(key)
-                    rendered.append((item.subject, item.sender, "user"))
-        except Exception:  # noqa: BLE001
-            pass
-
+    items: list[tuple[str, str, str]] = []  # (title, project_key, status)
     try:
-        for item in list_v2_messages(project_root, status="open"):
-            key = (item.subject, item.sender)
-            if key not in seen:
-                seen.add(key)
-                rendered.append((item.subject, item.sender, item.owner))
+        from pollypm.work.inbox_view import inbox_tasks
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        for project_key, project in getattr(context.config, "projects", {}).items():
+            db_path = project.path / ".pollypm" / "state.db"
+            if not db_path.exists():
+                continue
+            try:
+                with SQLiteWorkService(
+                    db_path=db_path, project_path=project.path,
+                ) as svc:
+                    for t in inbox_tasks(svc, project=project_key):
+                        items.append((t.title, project_key, t.work_status.value))
+            except Exception:  # noqa: BLE001
+                continue
     except Exception:  # noqa: BLE001
         pass
 
-    # Show Polly what she owns and what's waiting for the user
-    polly_items = [(s, f, o) for s, f, o in rendered if o == "polly"]
-    user_items = [(s, f, o) for s, f, o in rendered if o == "user"]
-    if not rendered:
-        lines.append("No open inbox items right now.")
+    if not items:
+        lines.append("No inbox tasks right now. Check with `pm inbox`.")
     else:
-        if polly_items:
-            lines.append(f"Items needing YOUR action ({len(polly_items)}):")
-            for subject, sender, _ in polly_items[:5]:
-                lines.append(f"- {subject} [{sender}]")
-        if user_items:
-            lines.append(f"Items waiting on the user ({len(user_items)}):")
-            for subject, sender, _ in user_items[:3]:
-                lines.append(f"- {subject} [{sender}]")
+        lines.append(f"You have {len(items)} inbox task(s). Check with `pm inbox`:")
+        for title, project_key, status in items[:8]:
+            lines.append(f"- [{project_key}] {title} ({status})")
     lines.append("</inbox-state>")
     return "\n".join(lines)
 

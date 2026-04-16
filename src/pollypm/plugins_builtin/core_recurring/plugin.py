@@ -59,32 +59,6 @@ def _load_config_and_store(payload: dict[str, Any]):
     return config, store
 
 
-def inbox_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
-    """Tier-1/2/3 inbox triage sweep — migrated from ``inbox_processor``."""
-    from pollypm.inbox_processor import process_inbox
-
-    # Allow the payload to target a specific project root; otherwise fall
-    # back to the config's project root for backwards compat.
-    project_root_hint = payload.get("project_root") if isinstance(payload, dict) else None
-    if project_root_hint:
-        project_root = Path(project_root_hint)
-        from pollypm.config import DEFAULT_CONFIG_PATH, load_config, resolve_config_path
-        from pollypm.storage.state import StateStore
-
-        config_path = resolve_config_path(DEFAULT_CONFIG_PATH)
-        if config_path.exists():
-            store = StateStore(load_config(config_path).project.state_db)
-        else:
-            # Fall back to a per-project store — better than crashing.
-            store = StateStore(project_root / ".pollypm" / "state.db")
-    else:
-        config, store = _load_config_and_store(payload)
-        project_root = config.project.root_dir
-
-    counts = process_inbox(project_root, store)
-    return dict(counts)
-
-
 def session_health_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Run one round of session health classification.
 
@@ -159,10 +133,6 @@ def alerts_gc_handler(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _register_handlers(api: JobHandlerAPI) -> None:
     api.register_handler(
-        "inbox.sweep", inbox_sweep_handler,
-        max_attempts=2, timeout_seconds=30.0,
-    )
-    api.register_handler(
         "session.health_sweep", session_health_sweep_handler,
         max_attempts=1, timeout_seconds=120.0,
     )
@@ -181,8 +151,8 @@ def _register_handlers(api: JobHandlerAPI) -> None:
 
 
 def _register_roster(api: RosterAPI) -> None:
-    # Cadences match the task spec for issue #164.
-    api.register_recurring("@every 15s", "inbox.sweep", {})
+    # Cadences match the task spec for issue #164. ``inbox.sweep`` was
+    # removed with the legacy inbox subsystem (see iv04).
     api.register_recurring("@every 10s", "session.health_sweep", {})
     api.register_recurring("@every 60s", "capacity.probe", {})
     api.register_recurring("@every 30s", "transcript.ingest", {})

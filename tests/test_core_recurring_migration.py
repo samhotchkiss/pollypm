@@ -40,13 +40,14 @@ class TestCoreRecurringPlugin:
         core_plugin.register_handlers(api)
 
         expected = {
-            "inbox.sweep",
             "session.health_sweep",
             "capacity.probe",
             "transcript.ingest",
             "alerts.gc",
         }
         assert expected.issubset(set(registry.names()))
+        # inbox.sweep was retired with the legacy inbox subsystem (iv04).
+        assert "inbox.sweep" not in registry.names()
 
     def test_roster_registrations_and_cadences(self) -> None:
         roster = Roster()
@@ -56,7 +57,6 @@ class TestCoreRecurringPlugin:
 
         entries = {entry.handler_name: entry for entry in roster.entries}
         assert set(entries.keys()) == {
-            "inbox.sweep",
             "session.health_sweep",
             "capacity.probe",
             "transcript.ingest",
@@ -64,7 +64,6 @@ class TestCoreRecurringPlugin:
         }
 
         # Cadences per issue #164.
-        assert _interval_seconds(entries["inbox.sweep"]) == 15
         assert _interval_seconds(entries["session.health_sweep"]) == 10
         assert _interval_seconds(entries["capacity.probe"]) == 60
         assert _interval_seconds(entries["transcript.ingest"]) == 30

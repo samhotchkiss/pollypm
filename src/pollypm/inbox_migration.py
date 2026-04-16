@@ -2,8 +2,8 @@
 
 Context
 -------
-The legacy inbox subsystem (``inbox_v2`` — folders under
-``<project_root>/.pollypm/inbox/messages/``) is being retired. Existing
+The legacy inbox subsystem — folders under
+``<project_root>/.pollypm/inbox/messages/`` — is being retired. Existing
 installs may have live messages in-flight on upgrade; this migration
 rescues them so nothing is silently lost.
 

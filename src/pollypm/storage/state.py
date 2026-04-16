@@ -508,6 +508,12 @@ class StateStore:
                ON work_jobs(dedupe_key)
                WHERE dedupe_key IS NOT NULL AND status IN ('queued', 'claimed')""",
         ]),
+        # --- Migration 7 -----------------------------------------------
+        # Inbox subsystem retired (iv04 / issue #191).
+        # The ``inbox_messages`` table is left in place for one release
+        # cycle in case a rollback is needed. Nothing writes to it after
+        # this point. A follow-up release will drop the table.
+        (7, "Deprecate legacy inbox_messages table (iv04)", []),
     ]
 
     def _migrate(self) -> None:

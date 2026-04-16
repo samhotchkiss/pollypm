@@ -71,7 +71,6 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     )
                 except Exception:  # noqa: BLE001
                     pass
-        # Inbox delivery is handled by the async inbox_delivery job in Phase 3
         api.record_event(
             "heartbeat",
             "heartbeat",
@@ -242,13 +241,6 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             reason=reason,
         )
 
-        # Detect worker completion — check on every sweep for workers showing
-        # identical snapshots (at a prompt, not actively working).
-        if not mechanical_only and context.role == "worker":
-            hashes = api.recent_snapshot_hashes(context.session_name, limit=2)
-            if len(hashes) >= 2 and hashes[0] == hashes[1]:
-                self._detect_worker_completion(api, context)
-
         # Use the structured classification engine for intervention decisions
         if not mechanical_only:
             try:
@@ -263,12 +255,12 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     # nudge, do nothing, or escalate.
                     self._triage_stalled_worker(api, context)
                 elif intervention and intervention.action == "escalate":
-                    self._escalate_to_inbox(api, context, intervention.reason)
+                    self._escalate(api, context, intervention.reason)
             except Exception:  # noqa: BLE001
                 pass
 
-    def _escalate_to_inbox(self, api, context: HeartbeatSessionContext, reason: str) -> None:
-        """Escalate a stuck session — activate the triage session if available, otherwise inbox."""
+    def _escalate(self, api, context: HeartbeatSessionContext, reason: str) -> None:
+        """Raise a durable alert so the user sees a stuck session in the cockpit."""
         # Dedup: don't re-escalate if we escalated this session within 10 minutes
         try:
             from datetime import UTC, datetime
@@ -280,128 +272,19 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         except Exception:  # noqa: BLE001
             pass
 
-        # Try triage session first
-        if self._activate_triage(api, context, reason):
-            return
-        # Fall back to inbox — send to Polly first, not the user.
         try:
-            from pollypm.inbox_v2 import create_message
-            snippet = (context.pane_text or "").strip()[-200:] if context.pane_text else "no snapshot available"
-            create_message(
-                api.supervisor.config.project.root_dir,
-                sender="heartbeat",
-                subject=f"[Escalation] {context.session_name} needs attention: {reason[:60]}",
-                to="polly",
-                owner="polly",
-                body=(
-                    f"Session '{context.session_name}' is stuck and automated intervention hasn't helped.\n"
-                    f"\n"
-                    f"Reason: {reason}\n"
-                    f"Role: {context.role}\n"
-                    f"Window: {context.window_name}\n"
-                    f"\n"
-                    f"Last snapshot:\n"
-                    f"```\n{snippet}\n```\n"
-                    f"\n"
-                    f"Try to resolve this yourself first:\n"
-                    f"  pm worker-start {context.session_name.replace('worker_', '', 1)}  (restart)\n"
-                    f"  Then create a task if the worker needs new work.\n"
-                    f"\n"
-                    f"Only escalate to the user with `pm notify` if you cannot resolve it.\n"
-                ),
+            api.raise_alert(
+                context.session_name,
+                "stuck_session",
+                "warn",
+                f"{context.session_name} needs attention: {reason[:160]}",
             )
             api.supervisor.store.record_event(
                 context.session_name, "escalated",
-                f"Escalated to inbox: {reason[:80]}",
+                f"Raised stuck_session alert: {reason[:80]}",
             )
         except Exception:  # noqa: BLE001
             pass
-
-    def _activate_triage(self, api, context: HeartbeatSessionContext, reason: str) -> bool:
-        """Activate a triage session to handle an issue.
-
-        Auto-creates and launches the triage session if needed. Delivers the
-        briefing via inbox so it's tracked and doesn't pollute the session
-        with raw pasted text.
-        """
-        try:
-            from pollypm.plugins_builtin.core_agent_profiles.profiles import triage_prompt
-            from pollypm.config import write_config
-            from pollypm.inbox_v2 import create_message
-            from pollypm.models import SessionConfig
-            from pollypm.onboarding import default_control_args
-
-            config = api.supervisor.config
-            session_cfg = config.sessions.get(context.session_name)
-            project_key = session_cfg.project if session_cfg else "pollypm"
-            triage_name = f"triage_{project_key}"
-
-            # Auto-create and launch the triage session if it doesn't exist
-            if triage_name not in config.sessions:
-                controller_name = config.pollypm.controller_account
-                controller = config.accounts.get(controller_name)
-                if controller is None:
-                    return False
-                project = config.projects.get(project_key)
-                cwd = project.path if project else config.project.root_dir
-                triage_session = SessionConfig(
-                    name=triage_name,
-                    role="triage",
-                    provider=controller.provider,
-                    account=controller_name,
-                    cwd=cwd,
-                    project=project_key,
-                    window_name=f"triage-{project_key}",
-                    prompt=triage_prompt(),
-                    agent_profile="triage",
-                    args=default_control_args(
-                        controller.provider,
-                        open_permissions=config.pollypm.open_permissions_by_default,
-                        role="triage",
-                    ),
-                )
-                config.sessions[triage_name] = triage_session
-                write_config(config, api.supervisor.config_path, force=True)
-                # Actually launch the tmux window
-                api.supervisor.launch_session(triage_name)
-
-            # Check if the tmux window exists — launch if not
-            storage = api.supervisor.storage_closet_session_name()
-            if api.supervisor.tmux.has_session(storage):
-                windows = {w.name for w in api.supervisor.tmux.list_windows(storage)}
-                if f"triage-{project_key}" not in windows:
-                    api.supervisor.launch_session(triage_name)
-
-            # Deliver briefing via inbox — tracked, audited, single-line delivery
-            snippet = (context.pane_text or "").strip()[-200:] if context.pane_text else "no snapshot"
-            create_message(
-                config.project.root_dir,
-                sender="heartbeat",
-                subject=f"Triage: {context.session_name} — {reason[:40]}",
-                to=triage_name,
-                owner=triage_name,
-                body=(
-                    f"Session '{context.session_name}' needs attention. "
-                    f"Reason: {reason}. "
-                    f"Recent output: {snippet}. "
-                    f"Check pm mail and pm status, then take action."
-                ),
-            )
-            # The inbox_delivery job will deliver it on the next heartbeat cycle,
-            # or we can trigger immediate delivery
-            try:
-                from pollypm.inbox_delivery import deliver_pending_messages
-                deliver_pending_messages(config)
-            except Exception:  # noqa: BLE001
-                pass  # Heartbeat cycle will pick it up
-
-            api.supervisor.store.record_event(
-                context.session_name, "triage_activated",
-                f"Activated triage session {triage_name}: {reason[:80]}",
-            )
-            return True
-        except Exception:  # noqa: BLE001
-            return False
 
     def _context_to_signals(self, context: HeartbeatSessionContext, api) -> SessionSignals:
         """Bridge HeartbeatSessionContext to SessionSignals for the classification engine."""
@@ -490,38 +373,8 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         except Exception:  # noqa: BLE001
             pass
 
-    def _detect_worker_completion(self, api, context: HeartbeatSessionContext) -> None:
-        """Ensure open task threads get responses from idle workers.
-
-        Only acts on workers that have an open inbox task thread they haven't
-        replied to. Re-pokes them to reply. Does NOT create new notifications
-        based on commits alone — that's noise. The task thread lifecycle
-        handles reporting back to Polly and the user.
-        """
-        try:
-            from pollypm.inbox_v2 import list_messages, mark_delivered
-
-            config = api.supervisor.config
-            root = config.project.root_dir
-
-            # Find open threads addressed to this worker
-            worker_threads = [
-                m for m in list_messages(root, status="open")
-                if m.to == context.session_name
-            ]
-
-            # Re-poke stale delivered threads where worker hasn't replied
-            stale = [
-                m for m in worker_threads
-                if m.delivery_state == "delivered" and m.message_count <= 1
-            ]
-            for m in stale:
-                mark_delivered(root, m.id, state="pending")
-        except Exception:  # noqa: BLE001
-            pass
-
     def _has_pending_work(self, api, context: HeartbeatSessionContext) -> bool:
-        """Check if a worker's project has ready or in-progress issues, or open inbox items."""
+        """Check if a worker's project has ready/in-progress tasks."""
         try:
             config = api.supervisor.config
             session = config.sessions.get(context.session_name)
@@ -537,14 +390,22 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 tasks = backend.list_tasks(states=["01-ready", "02-in-progress"])
                 if tasks:
                     return True
-            # Check inbox for messages addressed to this worker
-            from pollypm.inbox_v2 import list_messages
-            inbox_items = [
-                m for m in list_messages(config.project.root_dir, status="open")
-                if m.to == context.session_name
-            ]
-            if inbox_items:
-                return True
+            # Check the work service for non-terminal tasks assigned to this
+            # worker's project.
+            try:
+                from pollypm.work.sqlite_service import SQLiteWorkService
+
+                db_path = project.path / ".pollypm" / "state.db"
+                if db_path.exists():
+                    with SQLiteWorkService(
+                        db_path=db_path, project_path=project.path,
+                    ) as svc:
+                        tasks = svc.list_tasks(project=session.project)
+                    for t in tasks:
+                        if t.work_status.value not in ("done", "cancelled"):
+                            return True
+            except Exception:  # noqa: BLE001
+                pass
             return False
         except Exception:  # noqa: BLE001
             return True  # Assume work exists on error — don't falsely recover idle workers

@@ -174,9 +174,30 @@ def _session_description(status: str, role: str, snapshot_path: str | None) -> s
     return status
 
 
+def _count_inbox_tasks(config: PollyPMConfig) -> int:
+    """Total inbox tasks across all tracked projects (work-service backed)."""
+    try:
+        from pollypm.work.inbox_view import inbox_tasks
+        from pollypm.work.sqlite_service import SQLiteWorkService
+    except Exception:  # noqa: BLE001
+        return 0
+    total = 0
+    for project_key, project in getattr(config, "projects", {}).items():
+        db_path = project.path / ".pollypm" / "state.db"
+        if not db_path.exists():
+            continue
+        try:
+            with SQLiteWorkService(
+                db_path=db_path, project_path=project.path,
+            ) as svc:
+                total += len(inbox_tasks(svc, project=project_key))
+        except Exception:  # noqa: BLE001
+            continue
+    return total
+
+
 def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
     """Gather all dashboard data."""
-    from pollypm.inbox_v2 import list_messages as list_v2_messages
     from pollypm.service_api import plan_launches_readonly
 
     now = datetime.now(UTC)
@@ -224,7 +245,7 @@ def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
 
     commits = _recent_commits(config, hours=24)
     completed = _completed_issues(config, hours=72)
-    inbox_count = len(list_v2_messages(config.project.root_dir, status="open", owner="user"))
+    inbox_count = _count_inbox_tasks(config)
     sweeps = sum(1 for e in day_events if e.event_type == "heartbeat")
     recoveries = sum(1 for e in day_events if "recover" in e.event_type)
 

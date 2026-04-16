@@ -9,7 +9,11 @@ from typing import Any
 from urllib import error, request
 
 from pollypm.atomic_io import atomic_write_json
-from pollypm.inbox_v2 import create_message
+from pollypm.messaging import (
+    notify_deploy_complete,
+    notify_deploy_expired,
+    notify_deploy_verification_required,
+)
 
 
 ITSALIVE_API = "https://api.itsalive.co"
@@ -115,17 +119,11 @@ def deploy_site(
         expires_at=(datetime.now(UTC) + timedelta(hours=24)).isoformat(),
     )
     path = write_pending_deploy(root, pending)
-    create_message(
+    notify_deploy_verification_required(
         root,
-        sender="itsalive",
-        subject=f"itsalive verification required for {pending.subdomain}",
-        body=(
-            f"PollyPM started an itsalive deployment for `{pending.subdomain}.itsalive.co`.\n\n"
-            f"A verification email was sent to `{pending.email}`. The link remains valid until "
-            f"`{pending.expires_at}`.\n\n"
-            "No one needs to sit in the terminal waiting. Heartbeat will detect verification and "
-            "complete the deployment automatically."
-        ),
+        subdomain=pending.subdomain,
+        email=pending.email,
+        expires_at=pending.expires_at,
     )
     return DeployOutcome(
         status="pending_verification",
@@ -189,15 +187,10 @@ def sweep_pending_deploys(project_root: Path) -> list[DeployOutcome]:
         expires_at = _parse_timestamp(pending.expires_at)
         if expires_at is not None and expires_at <= datetime.now(UTC):
             delete_pending_deploy(root, pending.deploy_id)
-            create_message(
+            notify_deploy_expired(
                 root,
-                sender="itsalive",
-                subject=f"itsalive verification expired for {pending.subdomain}",
-                body=(
-                    f"The pending deployment for `{pending.subdomain}.itsalive.co` expired at "
-                    f"`{pending.expires_at}` before the verification link was clicked.\n\n"
-                    "Run `pm itsalive deploy` again to send a fresh email."
-                ),
+                subdomain=pending.subdomain,
+                expires_at=pending.expires_at,
             )
             outcomes.append(
                 DeployOutcome(
@@ -516,14 +509,8 @@ def _complete_pending(pending: PendingDeploy, *, notify: bool) -> DeployOutcome:
     write_itsalive_docs(root, domain, publish_dir=pending.publish_dir)
     delete_pending_deploy(root, pending.deploy_id)
     if notify:
-        create_message(
-            root,
-            sender="itsalive",
-            subject=f"itsalive deploy completed for {finalize['subdomain']}",
-            body=(
-                f"`https://{domain}` is live.\n\n"
-                "PollyPM detected that verification completed and finished the deploy automatically."
-            ),
+        notify_deploy_complete(
+            root, subdomain=str(finalize["subdomain"]), domain=domain,
         )
     return DeployOutcome(
         status="deployed",

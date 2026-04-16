@@ -210,20 +210,35 @@ def _build_from_checkpoint(
 
 
 def _pending_inbox_section(config: PollyPMConfig) -> RecoveryPromptSection | None:
-    """Build a section listing pending inbox items the agent should address."""
+    """Build a section listing tasks waiting on the user / agent.
+
+    Queries the work service for inbox tasks across all tracked projects
+    and summarises them. No legacy inbox.
+    """
     try:
-        from pollypm.inbox_v2 import list_messages as list_v2
-        messages = list_v2(config.project.root_dir, status="open")
-        if not messages:
+        from pollypm.work.inbox_view import inbox_tasks
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        summaries: list[str] = []
+        total = 0
+        for project_key, project in getattr(config, "projects", {}).items():
+            db_path = project.path / ".pollypm" / "state.db"
+            if not db_path.exists():
+                continue
+            try:
+                with SQLiteWorkService(
+                    db_path=db_path, project_path=project.path,
+                ) as svc:
+                    tasks = inbox_tasks(svc, project=project_key)
+            except Exception:  # noqa: BLE001
+                continue
+            for t in tasks[:5]:
+                summaries.append(f"  - [{project_key}] {t.title} ({t.work_status.value})")
+            total += len(tasks)
+        if total == 0:
             return None
-        parts: list[str] = []
-        parts.append(f"You have {len(messages)} pending inbox message(s):")
-        for msg in messages[:5]:
-            parts.append(f"  - {msg.subject} (from {msg.sender}, owner: {msg.owner})")
-        threaded = [m for m in messages if m.message_count > 1]
-        if threaded:
-            parts.append(f"{len(threaded)} of these have multiple messages (threads).")
-        parts.append("Check with: pm mail")
+        parts = [f"You have {total} task(s) waiting on the user:", *summaries[:10]]
+        parts.append("Check with: pm inbox")
         return RecoveryPromptSection(
             key="pending_inbox",
             heading="Pending Inbox Items",

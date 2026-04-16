@@ -907,29 +907,30 @@ def import_project_history(
         project_root, understanding, timestamp=timestamp,
     )
 
-    # Stage 5b: Send interview questions to inbox for async review
+    # Stage 5b: Persist interview questions alongside the generated docs
+    # for async review. The legacy inbox has been retired — the questions
+    # live on disk next to the generated docs so the user can read them
+    # without a running session.
     if result.interview_questions and not skip_interview:
         try:
-            from pollypm.inbox_v2 import create_message
-            body_lines = [
-                f"The history import for {project_name} generated {result.docs_generated} docs.",
-                f"Please review the generated docs in {project_root}/docs/ and answer these questions:",
+            questions_path = project_root / "docs" / "history-import-questions.md"
+            questions_path.parent.mkdir(parents=True, exist_ok=True)
+            lines = [
+                f"# Review: {project_name} history import",
+                "",
+                (
+                    f"The history import generated {result.docs_generated} docs. "
+                    f"Review them in `{project_root}/docs/` and answer the questions below."
+                ),
                 "",
             ]
             for i, question in enumerate(result.interview_questions, 1):
-                body_lines.append(f"{i}. {question}")
-            body_lines.extend([
-                "",
-                "Reply to Polly with corrections, or run `pm import --lock` to confirm.",
-            ])
-            create_message(
-                project_root,
-                sender="system",
-                subject=f"Review: {project_name} history import ({result.docs_generated} docs generated)",
-                body="\n".join(body_lines),
-            )
+                lines.append(f"{i}. {question}")
+            lines.append("")
+            lines.append("Run `pm import --lock` once you're satisfied.")
+            questions_path.write_text("\n".join(lines) + "\n")
         except Exception:  # noqa: BLE001
-            pass  # inbox delivery is best-effort
+            pass  # history-import review is best-effort
 
     # Stage 6: Lock (mark as complete)
     result.locked = skip_interview  # Only auto-lock if interview is skipped

@@ -27,17 +27,22 @@ def test_first_deploy_persists_pending_verification(tmp_path: Path, monkeypatch)
         return {"deploy_id": "dep_123", "pre_verified": False}
 
     monkeypatch.setattr(itsalive, "api_json", fake_api)
+
+    alerts: list[dict] = []
+
+    def _capture(project_root, *, subdomain, email, expires_at):
+        alerts.append({"subdomain": subdomain, "email": email, "expires_at": expires_at})
+
+    monkeypatch.setattr(itsalive, "notify_deploy_verification_required", _capture)
+
     outcome = itsalive.deploy_site(tmp_path, subdomain="demo", email="user@example.com", publish_dir="dist")
     assert outcome.status == "pending_verification"
     pending = itsalive.pending_deploys(tmp_path)
     assert len(pending) == 1
     assert pending[0].deploy_id == "dep_123"
-    inbox_msgs = tmp_path / ".pollypm" / "inbox" / "messages"
-    assert any(
-        "verification required" in path.read_text()
-        for msg_dir in inbox_msgs.iterdir() if msg_dir.is_dir()
-        for path in msg_dir.glob("0*.md")
-    )
+    assert len(alerts) == 1
+    assert alerts[0]["subdomain"] == "demo"
+    assert alerts[0]["email"] == "user@example.com"
 
 
 def test_verified_owner_skips_verification_and_completes(tmp_path: Path, monkeypatch) -> None:
@@ -114,17 +119,20 @@ def test_sweep_completes_verified_pending_deploy(tmp_path: Path, monkeypatch) ->
         "_upload_file",
         lambda path, base_url, relative_path, deploy_token: uploads.append(relative_path),
     )
+    complete_calls: list[dict] = []
+    monkeypatch.setattr(
+        itsalive,
+        "notify_deploy_complete",
+        lambda project_root, *, subdomain, domain: complete_calls.append(
+            {"subdomain": subdomain, "domain": domain}
+        ),
+    )
     outcomes = itsalive.sweep_pending_deploys(tmp_path)
     assert len(outcomes) == 1
     assert outcomes[0].status == "deployed"
     assert uploads == ["index.html"]
     assert not list((tmp_path / ".pollypm-state" / "itsalive" / "pending").glob("*.json"))
-    inbox_msgs = tmp_path / ".pollypm" / "inbox" / "messages"
-    assert any(
-        "deploy completed" in path.read_text()
-        for msg_dir in inbox_msgs.iterdir() if msg_dir.is_dir()
-        for path in msg_dir.glob("0*.md")
-    )
+    assert complete_calls == [{"subdomain": "demo", "domain": "demo.itsalive.co"}]
 
 
 def test_sweep_persists_owner_token_from_snake_case_finalize_response(tmp_path: Path, monkeypatch) -> None:

@@ -1,4 +1,4 @@
-"""Check for new PollyPM versions and notify the user via inbox."""
+"""Check for new PollyPM versions and notify the user via a durable alert."""
 from __future__ import annotations
 
 import importlib.metadata
@@ -8,11 +8,9 @@ import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
-from pollypm.inbox_v2 import create_message, list_messages
-
 logger = logging.getLogger(__name__)
 
-# Marker file to avoid spamming the inbox on every heartbeat
+# Marker file to avoid spamming the alert surface on every heartbeat
 _LAST_CHECK_FILENAME = "version_check.json"
 
 
@@ -77,7 +75,7 @@ def _too_soon_to_check(state_dir: Path) -> bool:
 
 
 def _already_notified(state_dir: Path, latest: str) -> bool:
-    """Check if we already sent an inbox notification for this version."""
+    """Check if we already sent a notification for this version."""
     marker = state_dir / _LAST_CHECK_FILENAME
     if not marker.exists():
         return False
@@ -111,22 +109,39 @@ def _record_notification(state_dir: Path, latest: str) -> None:
     }))
 
 
-def _inbox_already_has_upgrade_message(project_root: Path, latest: str) -> bool:
-    """Check if there's already an open inbox message about this version."""
+def _raise_upgrade_alert(project_root: Path, current: str, latest: str) -> None:
+    """Raise a durable alert advertising the new release."""
     try:
-        messages = list_messages(project_root, status="open")
-        needle = f"PollyPM {latest}"
-        return any(needle in msg.subject for msg in messages)
-    except Exception:  # noqa: BLE001
-        return False
+        from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+        from pollypm.storage.state import StateStore
+
+        config_path = project_root / "pollypm.toml"
+        if not config_path.exists():
+            config_path = DEFAULT_CONFIG_PATH
+        config = load_config(config_path)
+        store = StateStore(config.project.state_db)
+        try:
+            store.upsert_alert(
+                "pollypm",
+                "upgrade_available",
+                "info",
+                f"PollyPM {latest} is available (current: {current}). Run `pm upgrade`.",
+            )
+            store.record_event(
+                "pollypm", "upgrade_available",
+                f"New version detected: {latest} (current {current})",
+            )
+        finally:
+            store.close()
+    except Exception:  # noqa: BLE001 - version check must not fail the caller
+        logger.debug("Could not persist upgrade alert for %s", latest)
 
 
 def check_and_notify(project_root: Path, state_dir: Path) -> str | None:
-    """Check for a new version and send an inbox message if one is available.
+    """Check for a new version and raise an alert if one is available.
 
     Returns the new version string if a notification was sent, None otherwise.
-    Safe to call frequently — it deduplicates via a marker file and checks
-    the inbox for existing messages.
+    Safe to call frequently — it deduplicates via a marker file.
     """
     current = _current_version()
     if current == "dev":
@@ -149,32 +164,7 @@ def check_and_notify(project_root: Path, state_dir: Path) -> str | None:
     if _already_notified(state_dir, latest):
         return None
 
-    # Double-check: is there already an open inbox message?
-    if _inbox_already_has_upgrade_message(project_root, latest):
-        _record_notification(state_dir, latest)
-        return None
-
-    # Send the notification
-    create_message(
-        project_root,
-        sender="system",
-        subject=f"PollyPM {latest} available (current: {current})",
-        body=(
-            f"A new version of PollyPM is available.\n"
-            f"\n"
-            f"  Current: {current}\n"
-            f"  Latest:  {latest}\n"
-            f"\n"
-            f"To upgrade:\n"
-            f"  pm upgrade\n"
-            f"\n"
-            f"To see what changed:\n"
-            f"  pm upgrade --check\n"
-            f"\n"
-            f"Running sessions are not affected — restart with "
-            f"`pm reset && pm up` after upgrading."
-        ),
-    )
+    _raise_upgrade_alert(project_root, current, latest)
     _record_notification(state_dir, latest)
-    logger.info("Sent inbox notification for PollyPM %s (current: %s)", latest, current)
+    logger.info("Raised upgrade alert for PollyPM %s (current: %s)", latest, current)
     return latest

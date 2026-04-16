@@ -8,7 +8,6 @@ from pathlib import Path
 
 from pollypm.atomic_io import atomic_write_json
 from pollypm.config import load_config
-from pollypm.inbox_v2 import list_messages as list_v2_messages, read_message as read_v2_message
 from pollypm.tz import format_time as _fmt_time
 from pollypm.providers import get_provider
 from pollypm.projects import ensure_project_scaffold
@@ -82,6 +81,32 @@ def _render_work_service_issues(project: object) -> str:
         lines.append("No tasks found.")
 
     return "\n".join(lines)
+
+
+def _count_inbox_tasks_for_label(config) -> int:
+    """Sum of inbox tasks across all tracked projects.
+
+    Used by the cockpit rail label and the dashboard summary line; the
+    aggregate must match what :func:`_render_inbox_panel` would render.
+    """
+    try:
+        from pollypm.work.inbox_view import inbox_tasks
+        from pollypm.work.sqlite_service import SQLiteWorkService
+    except Exception:  # noqa: BLE001
+        return 0
+    total = 0
+    for project_key, project in getattr(config, "projects", {}).items():
+        db_path = project.path / ".pollypm" / "state.db"
+        if not db_path.exists():
+            continue
+        try:
+            with SQLiteWorkService(
+                db_path=db_path, project_path=project.path,
+            ) as svc:
+                total += len(inbox_tasks(svc, project=project_key))
+        except Exception:  # noqa: BLE001
+            continue
+    return total
 
 
 def render_inbox_panel(service, projects: list[object] | None = None) -> str:
@@ -507,13 +532,12 @@ class CockpitRouter:
         supervisor = self._load_supervisor()
         config = supervisor.config
         launches, windows, alerts, _leases, _errors = supervisor.status()
-        user_msgs = list_v2_messages(config.project.root_dir, status="open", owner="user")
-        unread = sum(1 for m in user_msgs if not m.read)
-        inbox_label = f"Inbox ({unread})" if unread else f"Inbox ({len(user_msgs)})" if user_msgs else "Inbox"
+        inbox_count = _count_inbox_tasks_for_label(config)
+        inbox_label = f"Inbox ({inbox_count})" if inbox_count else "Inbox"
         items = [
             CockpitItem("polly", "Polly", self._session_state("operator", launches, windows, alerts, spinner_index)),
             CockpitItem("russell", "Russell", self._session_state("reviewer", launches, windows, alerts, spinner_index)),
-            CockpitItem("inbox", inbox_label, "mail" if unread else ("clear" if not user_msgs else "read")),
+            CockpitItem("inbox", inbox_label, "mail" if inbox_count else "clear"),
         ]
 
         selected = self.selected_key()
@@ -1467,7 +1491,7 @@ def _build_dashboard(supervisor, config) -> str:
 
     # ── Gather system data ──
     open_alerts = supervisor.store.open_alerts()
-    user_inbox = len(list_v2_messages(config.project.root_dir, status="open", owner="user"))
+    user_inbox = _count_inbox_tasks_for_label(config)
     actionable_alerts = [a for a in open_alerts if a.alert_type not in (
         "suspected_loop", "stabilize_failed", "needs_followup",
     )]

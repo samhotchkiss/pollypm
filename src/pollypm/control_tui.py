@@ -27,7 +27,6 @@ from pollypm.accounts import (
     AccountStatus,
 )
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config
-from pollypm.inbox_v2 import list_messages as list_v2_messages
 from pollypm.models import ProviderKind
 from pollypm.projects import (
     discover_git_repositories,
@@ -40,6 +39,36 @@ from pollypm.projects import (
 from pollypm.service_api import PollyPMService
 from pollypm.task_backends import get_task_backend
 from pollypm.worktrees import list_worktrees
+
+
+def _inbox_tasks_for_tui(config):
+    """All inbox tasks aggregated across tracked projects.
+
+    Returns ``list[Task]`` — the TUI formats them itself. Empty list on
+    any error so the TUI still renders instead of blowing up mid-refresh.
+    """
+    try:
+        from pollypm.work.inbox_view import inbox_tasks
+        from pollypm.work.sqlite_service import SQLiteWorkService
+    except Exception:  # noqa: BLE001
+        return []
+    out: list = []
+    for project_key, project in getattr(config, "projects", {}).items():
+        db_path = project.path / ".pollypm" / "state.db"
+        if not db_path.exists():
+            continue
+        try:
+            with SQLiteWorkService(
+                db_path=db_path, project_path=project.path,
+            ) as svc:
+                out.extend(inbox_tasks(svc, project=project_key))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _count_inbox_tasks_for_tui(config) -> int:
+    return len(_inbox_tasks_for_tui(config))
 
 
 @dataclass(slots=True)
@@ -653,7 +682,7 @@ class PollyPMApp(App[None]):
     def _refresh_cockpit(self, supervisor, config, launches, windows, alerts, leases) -> None:
         rows: list[tuple[tuple[str, ...], str]] = []
         rows.append((("Polly", self._cockpit_state_for_session("operator", launches, windows, alerts)), "polly"))
-        inbox_count = len(list_v2_messages(config.project.root_dir, status="open"))
+        inbox_count = _count_inbox_tasks_for_tui(config)
         rows.append(((f"Inbox ({inbox_count})", "mail" if inbox_count else "clear"), "inbox"))
         rows.append((("Projects", "browse"), "section:projects"))
 
@@ -1145,17 +1174,16 @@ class PollyPMApp(App[None]):
         if key == "polly":
             return self._session_detail(supervisor, "operator")
         if key == "inbox":
-            messages = list_v2_messages(config.project.root_dir, status="open")
-            if not messages:
+            tasks = _inbox_tasks_for_tui(config)
+            if not tasks:
                 return "Inbox is clear."
-            lines = ["Open Inbox Messages:", ""]
-            for message in messages[:8]:
-                lines.append(f"- {message.subject} · from {message.sender}")
+            lines = ["Open Inbox Tasks:", ""]
+            for task in tasks[:8]:
+                lines.append(f"- {task.title} · {task.work_status.value}")
             lines.extend(
                 [
                     "",
-                    "Reply flow:",
-                    "Replies should go to Polly first. PM keeps the inbox thread, decides whether to resolve it, continue the conversation, or route a distilled action to a worker session.",
+                    "Work through these with `pm inbox` and `pm inbox show <task_id>`.",
                 ]
             )
             return "\n".join(lines)

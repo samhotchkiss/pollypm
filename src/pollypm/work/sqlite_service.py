@@ -157,6 +157,7 @@ class SQLiteWorkService:
                     "type": n.type.value,
                     "actor_type": n.actor_type.value if n.actor_type else None,
                     "actor_role": n.actor_role,
+                    "agent_name": n.agent_name,
                     "next_node_id": n.next_node_id,
                     "reject_node_id": n.reject_node_id,
                     "gates": n.gates,
@@ -189,8 +190,9 @@ class SQLiteWorkService:
             self._conn.execute(
                 "INSERT INTO work_flow_nodes "
                 "(flow_template_name, flow_template_version, node_id, name, "
-                "type, actor_type, actor_role, next_node_id, reject_node_id, gates) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "type, actor_type, actor_role, agent_name, "
+                "next_node_id, reject_node_id, gates) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     template.name,
                     version,
@@ -199,6 +201,7 @@ class SQLiteWorkService:
                     node.type.value,
                     node.actor_type.value if node.actor_type else None,
                     node.actor_role,
+                    node.agent_name,
                     node.next_node_id,
                     node.reject_node_id,
                     json.dumps(node.gates),
@@ -290,11 +293,18 @@ class SQLiteWorkService:
             (name, version),
         ).fetchall()
         for nr in node_rows:
+            # agent_name column may not exist on very old DBs — guard with
+            # a dict-style fallback.
+            try:
+                agent_name = nr["agent_name"]
+            except (IndexError, KeyError):
+                agent_name = None
             nodes[nr["node_id"]] = FlowNode(
                 name=nr["name"],
                 type=NodeType(nr["type"]),
                 actor_type=ActorType(nr["actor_type"]) if nr["actor_type"] else None,
                 actor_role=nr["actor_role"],
+                agent_name=agent_name,
                 next_node_id=nr["next_node_id"],
                 reject_node_id=nr["reject_node_id"],
                 gates=json.loads(nr["gates"]),
@@ -544,7 +554,10 @@ class SQLiteWorkService:
         elif node.actor_type == ActorType.PROJECT_MANAGER:
             return "project_manager"
         elif node.actor_type == ActorType.AGENT:
-            return "agent"
+            # Return the specific named agent from the flow YAML. Fall back
+            # to the assignee only if no agent_name was configured (which
+            # validate_flow now rejects, but guard anyway for legacy DBs).
+            return node.agent_name or task.assignee
         return task.assignee
 
     # ------------------------------------------------------------------
@@ -1133,6 +1146,12 @@ class SQLiteWorkService:
                         f"Actor '{actor}' does not match role "
                         f"'{node.actor_role}' (expected '{expected_actor}')."
                     )
+        elif node.actor_type == ActorType.AGENT and node.agent_name:
+            if actor != node.agent_name:
+                raise ValidationError(
+                    f"Node '{node.name}' is pinned to agent "
+                    f"'{node.agent_name}'. Actor '{actor}' is not authorized."
+                )
 
     def _next_visit(
         self, project: str, task_number: int, node_id: str

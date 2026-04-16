@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS work_flow_nodes (
     type TEXT NOT NULL,
     actor_type TEXT,
     actor_role TEXT,
+    agent_name TEXT,
     next_node_id TEXT,
     reject_node_id TEXT,
     gates TEXT NOT NULL DEFAULT '[]',
@@ -215,7 +216,23 @@ def create_work_tables(conn: sqlite3.Connection) -> None:
     are tracked in work_schema_version.
     """
     conn.executescript(WORK_SCHEMA)
+    _ensure_flow_node_columns(conn)
     _run_work_migrations(conn)
+
+
+def _ensure_flow_node_columns(conn: sqlite3.Connection) -> None:
+    """Backfill optional columns on work_flow_nodes for legacy DBs.
+
+    CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so rows
+    created before newer columns were added need an explicit
+    ALTER TABLE. SQLite lacks IF NOT EXISTS on ADD COLUMN, so we check
+    PRAGMA table_info first.
+    """
+    cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(work_flow_nodes)")
+    }
+    if "agent_name" not in cols:
+        conn.execute("ALTER TABLE work_flow_nodes ADD COLUMN agent_name TEXT")
 
 
 # ------------------------------------------------------------------

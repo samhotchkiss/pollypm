@@ -350,6 +350,142 @@ class CockpitItem:
     selectable: bool = True
 
 
+def _selected_project_key(selected: object) -> str | None:
+    """Extract the project key from the ``selected`` cockpit state."""
+    if not isinstance(selected, str) or not selected.startswith("project:"):
+        return None
+    parts = selected.split(":", 2)
+    if len(parts) < 2:
+        return None
+    return parts[1] or None
+
+
+def _hidden_rail_items(config: object) -> frozenset[str]:
+    """Return user-configured hidden rail item keys (``section.label``)."""
+    rail_cfg = getattr(config, "rail", None)
+    hidden = getattr(rail_cfg, "hidden_items", None) if rail_cfg is not None else None
+    if not hidden:
+        return frozenset()
+    return frozenset(str(item) for item in hidden)
+
+
+def _collapsed_rail_sections(config: object) -> frozenset[str]:
+    """Return user-configured collapsed section names."""
+    rail_cfg = getattr(config, "rail", None)
+    collapsed = (
+        getattr(rail_cfg, "collapsed_sections", None) if rail_cfg is not None else None
+    )
+    if not collapsed:
+        return frozenset()
+    return frozenset(str(item) for item in collapsed)
+
+
+def _visibility_passes(reg, ctx) -> bool:
+    """Evaluate the registration's visibility predicate.
+
+    * ``"always"`` — always visible.
+    * ``"has_feature"`` — visible only if ``ctx.extras["features"]``
+      (a set/frozenset of capability names) includes
+      ``reg.feature_name`` (or ``reg.item_key`` as fallback).
+    * ``Callable`` — invoked; exceptions treat as hidden-and-logged.
+    """
+    import logging
+
+    visibility = reg.visibility
+    if visibility == "always":
+        return True
+    if visibility == "has_feature":
+        features = ctx.extras.get("features") or frozenset()
+        if not isinstance(features, (set, frozenset)):
+            try:
+                features = frozenset(features)
+            except TypeError:
+                return False
+        target = reg.feature_name or reg.item_key
+        return target in features
+    if callable(visibility):
+        try:
+            return bool(visibility(ctx))
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).exception(
+                "Rail item %s visibility predicate raised — hiding item",
+                reg.item_key,
+            )
+            return False
+    return True
+
+
+def _rows_for_registration(reg, ctx) -> list:
+    """Produce the list of :class:`RailRow` a registration renders to.
+
+    Default: one row using the (possibly dynamic) label, icon, and
+    state. When ``rows_provider`` is set we defer to the plugin —
+    handy for sections like ``projects`` where one registration fans
+    out into N rows.
+    """
+    import logging
+    from pollypm.plugin_api.v1 import RailRow
+
+    logger = logging.getLogger(__name__)
+
+    if reg.rows_provider is not None:
+        try:
+            rows = reg.rows_provider(ctx)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Rail item %s rows_provider raised — skipping", reg.item_key,
+            )
+            return []
+        return [r for r in rows if isinstance(r, RailRow)]
+
+    label = reg.label
+    if reg.label_provider is not None:
+        try:
+            dynamic_label = reg.label_provider(ctx)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Rail item %s label_provider raised — falling back to static",
+                reg.item_key,
+            )
+            dynamic_label = None
+        if isinstance(dynamic_label, str) and dynamic_label:
+            label = dynamic_label
+
+    state = "idle"
+    if reg.state_provider is not None:
+        try:
+            dynamic_state = reg.state_provider(ctx)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Rail item %s state_provider raised — falling back to idle",
+                reg.item_key,
+            )
+            dynamic_state = None
+        if isinstance(dynamic_state, str) and dynamic_state:
+            state = dynamic_state
+
+    # Badge appended to label if provider returns a non-null value. The
+    # badge-rendering tick is cheap; provider exceptions fall back to no
+    # badge per er03 acceptance.
+    if reg.badge_provider is not None:
+        try:
+            badge = reg.badge_provider(ctx)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Rail item %s badge_provider raised — rendering without badge",
+                reg.item_key,
+            )
+            badge = None
+        if badge not in (None, 0, ""):
+            # Only append a badge when the label_provider hasn't already
+            # baked the count in (e.g. "Inbox (3)" from core_rail_items).
+            if f"({badge})" not in label:
+                label = f"{label} ({badge})"
+
+    key = reg.key or reg.item_key
+    return [RailRow(key=key, label=label, state=state, selectable=True)]
+
+
 class CockpitRouter:
     _STATE_FILE = "cockpit_state.json"
     _COCKPIT_WINDOW = "PollyPM"
@@ -529,147 +665,102 @@ class CockpitRouter:
         self._write_state(data)
 
     def build_items(self, *, spinner_index: int = 0) -> list[CockpitItem]:
+        """Build rail rows by walking the plugin-host rail registry.
+
+        Rows are gathered in section order (``top`` → ``projects`` →
+        ``workflows`` → ``tools`` → ``system``), then within each
+        section by ``(index, plugin_name)``. Items that declare a
+        ``rows_provider`` expand into N rows; others collapse into a
+        single :class:`CockpitItem` built from the static label plus
+        optional ``label_provider`` / ``state_provider`` callables.
+
+        Pre-er02 behaviour is preserved by the built-in
+        ``core_rail_items`` plugin, which registers every rail entry
+        that used to be hardcoded here.
+        """
+        from pollypm.plugin_api.v1 import RailContext, RAIL_SECTIONS
+
         supervisor = self._load_supervisor()
         config = supervisor.config
         launches, windows, alerts, _leases, _errors = supervisor.status()
-        inbox_count = _count_inbox_tasks_for_label(config)
-        inbox_label = f"Inbox ({inbox_count})" if inbox_count else "Inbox"
-        items = [
-            CockpitItem("polly", "Polly", self._session_state("operator", launches, windows, alerts, spinner_index)),
-            CockpitItem("russell", "Russell", self._session_state("reviewer", launches, windows, alerts, spinner_index)),
-            CockpitItem("inbox", inbox_label, "mail" if inbox_count else "clear"),
-        ]
 
-        selected = self.selected_key()
-        project_session_map = self._project_session_map(launches)
+        cockpit_state = self._load_state()
+        ctx = RailContext(
+            selected_project=_selected_project_key(cockpit_state.get("selected")),
+            cockpit_state=dict(cockpit_state),
+            extras={
+                "router": self,
+                "supervisor": supervisor,
+                "config": config,
+                "launches": launches,
+                "windows": windows,
+                "alerts": alerts,
+                "spinner_index": spinner_index,
+            },
+        )
 
-        # Classify projects as active (task activity in last 24h or newly created)
-        # vs inactive. SQLite opens are expensive at cockpit tick rate (0.8s) and
-        # most projects don't change between ticks — cache by (db_mtime, git_mtime)
-        # and only re-open on change. Uses a single SQL aggregation per project
-        # (count + max(updated_at)) instead of loading all Task rows into memory.
-        from datetime import UTC, datetime, timedelta
-        import sqlite3
-        now = datetime.now(UTC)
-        cutoff_iso = (now - timedelta(hours=24)).isoformat()
-        cutoff_ts = (now - timedelta(hours=24)).timestamp()
-        active_projects: list[tuple[str, object]] = []
-        inactive_projects: list[tuple[str, object]] = []
-        project_has_active_task: dict[str, bool] = {}
+        registry = self._rail_registry()
 
-        def _project_activity(
-            project_key: str, project: object,
-        ) -> tuple[bool, bool]:
-            db_path = project.path / ".pollypm" / "state.db"
-            git_dir = project.path / ".git"
-            try:
-                db_mtime = db_path.stat().st_mtime if db_path.exists() else 0.0
-            except OSError:
-                db_mtime = 0.0
-            try:
-                git_mtime = git_dir.stat().st_mtime if git_dir.exists() else 0.0
-            except OSError:
-                git_mtime = 0.0
-            cached = self._project_activity_cache.get(project_key)
-            if cached is not None and cached[0] == db_mtime and cached[1] == git_mtime:
-                return cached[2], cached[3]
+        # Hidden items + visibility predicates land in er03 / er04. The
+        # renderer here runs them every tick — badge providers likewise
+        # (a crash falls back to no-badge).
+        hidden_keys = _hidden_rail_items(config)
+        collapsed_sections = _collapsed_rail_sections(config)
 
-            is_active = False
-            has_working_task = False
-            if db_mtime > 0.0:
-                # Batched single-query classification: one count for working
-                # statuses, one max(updated_at) for recency. Avoids hydrating
-                # every Task row through the full service.
-                try:
-                    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-                    try:
-                        conn.row_factory = sqlite3.Row
-                        row = conn.execute(
-                            "SELECT "
-                            "  SUM(CASE WHEN work_status IN ('in_progress','review') "
-                            "           THEN 1 ELSE 0 END) AS working_count, "
-                            "  MAX(updated_at) AS max_updated "
-                            "FROM work_tasks WHERE project = ?",
-                            (project_key,),
-                        ).fetchone()
-                    finally:
-                        conn.close()
-                    if row is not None:
-                        working_count = row["working_count"] or 0
-                        max_updated = row["max_updated"] or ""
-                        if working_count > 0:
-                            has_working_task = True
-                            is_active = True
-                        if max_updated and max_updated >= cutoff_iso:
-                            is_active = True
-                except (sqlite3.Error, OSError):
-                    pass
-            if not is_active and git_mtime > cutoff_ts:
-                is_active = True
-            self._project_activity_cache[project_key] = (
-                db_mtime, git_mtime, is_active, has_working_task,
-            )
-            return is_active, has_working_task
+        grouped: dict[str, list[CockpitItem]] = {name: [] for name in RAIL_SECTIONS}
 
-        for project_key, project in config.projects.items():
-            is_active, has_working_task = _project_activity(project_key, project)
-            project_has_active_task[project_key] = has_working_task
-            if is_active:
-                active_projects.append((project_key, project))
-            else:
-                inactive_projects.append((project_key, project))
+        for reg in registry.items():
+            if reg.item_key in hidden_keys:
+                continue
+            if not _visibility_passes(reg, ctx):
+                continue
+            rows = _rows_for_registration(reg, ctx)
+            for row in rows:
+                item = CockpitItem(
+                    key=row.key,
+                    label=row.label,
+                    state=row.state,
+                    selectable=row.selectable,
+                )
+                grouped.setdefault(reg.section, []).append(item)
 
-        # Evict cache entries for projects no longer in config to bound memory.
-        live_keys = set(config.projects.keys())
-        for stale_key in list(self._project_activity_cache.keys()):
-            if stale_key not in live_keys:
-                self._project_activity_cache.pop(stale_key, None)
+        items: list[CockpitItem] = []
+        for section in RAIL_SECTIONS:
+            rows = grouped.get(section) or []
+            if not rows:
+                continue
+            if section in collapsed_sections:
+                # Collapsed sections render as a disabled header row so
+                # the user can still see the section exists. Expansion
+                # is a runtime concept tracked via set_selected_key.
+                items.append(
+                    CockpitItem(
+                        key=f"_section:{section}",
+                        label=f"{section.upper()} (collapsed)",
+                        state="separator",
+                        selectable=False,
+                    )
+                )
+                continue
+            items.extend(rows)
 
-        # Sort each group alphabetically by display label
-        active_projects.sort(key=lambda x: x[1].display_label().lower())
-        inactive_projects.sort(key=lambda x: x[1].display_label().lower())
-
-        def _add_project_items(project_key: str, project: object) -> None:
-            session_name = project_session_map.get(project_key)
-            # Determine state/color: yellow for active task, idle otherwise
-            if project_has_active_task.get(project_key):
-                state = "◆ working"  # yellow indicator
-            elif session_name is not None:
-                state = self._session_state(session_name, launches, windows, alerts, spinner_index)
-            else:
-                state = "idle"
-            items.append(CockpitItem(f"project:{project_key}", project.display_label(), state))
-            if selected.startswith(f"project:{project_key}"):
-                items.append(CockpitItem(f"project:{project_key}:dashboard", "  Dashboard", "sub"))
-                persona = project.persona_name or "Polly"
-                items.append(CockpitItem(f"project:{project_key}:session", f"  PM Chat ({persona})", "sub"))
-                items.append(CockpitItem(f"project:{project_key}:issues", "  Tasks", "sub"))
-                # Show active per-task worker sessions under the project
-                try:
-                    storage = supervisor.storage_closet_session_name()
-                    task_prefix = f"task-{project_key}-"
-                    for win in self.tmux.list_windows(storage):
-                        if win.name.startswith(task_prefix):
-                            task_num = win.name[len(task_prefix):]
-                            task_label = f"  ⟳ Task #{task_num}"
-                            items.append(CockpitItem(
-                                f"project:{project_key}:task:{task_num}",
-                                task_label,
-                                "sub",
-                            ))
-                except Exception:  # noqa: BLE001
-                    pass
-                items.append(CockpitItem(f"project:{project_key}:settings", "  Settings", "sub"))
-
-        for project_key, project in active_projects:
-            _add_project_items(project_key, project)
-        if active_projects and inactive_projects:
-            items.append(CockpitItem("_separator", "", "separator", selectable=False))
-        for project_key, project in inactive_projects:
-            _add_project_items(project_key, project)
-
-        items.append(CockpitItem("settings", "Settings", "config"))
         return items
+
+    def _rail_registry(self):
+        """Return the plugin-host rail registry for the active root dir."""
+        from pollypm.plugin_host import extension_host_for_root
+
+        config = load_config(self.config_path)
+        host = extension_host_for_root(str(config.project.root_dir.resolve()))
+        # Initialize plugins so the rail registry is populated. Safe to
+        # call repeatedly — it tracks which plugins have been init'd.
+        try:
+            host.initialize_plugins(config=config)
+        except Exception:  # noqa: BLE001
+            # Plugin init failures surface via degraded_plugins; don't
+            # block the rail rendering.
+            pass
+        return host.rail_registry()
 
     def _project_session_map(self, launches) -> dict[str, str]:
         project_session_map: dict[str, str] = {}

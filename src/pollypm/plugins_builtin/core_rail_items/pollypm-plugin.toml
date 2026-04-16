@@ -1,0 +1,10 @@
+api_version = "1"
+name = "core_rail_items"
+kind = "rail"
+version = "0.1.0"
+entrypoint = "plugin.py:plugin"
+description = "Built-in cockpit rail items — Polly, Russell, Inbox, Projects, Settings. Registers through the Rail API introduced in er01 so external plugins can slot alongside."
+# Core rail items populate the `top`, `projects`, and `system` reserved
+# sections (in addition to the open `workflows` section). The plugin
+# host uses this flag to permit those registrations silently.
+contributes_to_reserved_section = true

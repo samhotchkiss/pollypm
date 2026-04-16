@@ -524,12 +524,42 @@ class SessionManager:
     def _create_worktree(
         self, task_id: str, task_slug: str, project_path: Path
     ) -> Path:
-        """``git worktree add``. Returns the worktree path. Idempotent."""
+        """``git worktree add``. Returns the worktree path. Idempotent.
+
+        Verifies the path is actually registered with git before the
+        exists() fast-path returns — a crash on a previous run can leave
+        a dangling directory that isn't a real worktree. All subprocess
+        calls have timeouts so a hung git op can't wedge claim().
+        """
         worktree_path = project_path / ".pollypm" / "worktrees" / task_slug
         branch_name = f"task/{task_slug}"
 
         if worktree_path.exists():
-            return worktree_path
+            if _worktree_is_registered(project_path, worktree_path):
+                return worktree_path
+            # Dangling directory from a crashed run. Prune stale metadata
+            # and remove the directory so `git worktree add` can succeed.
+            logger.warning(
+                "Worktree path %s exists but is not registered; pruning "
+                "and re-adding",
+                worktree_path,
+            )
+            subprocess.run(
+                ["git", "-C", str(project_path), "worktree", "prune"],
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=60,
+            )
+            if worktree_path.exists():
+                # Directory is still there after prune — nuke it.
+                try:
+                    shutil.rmtree(worktree_path)
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"Could not remove dangling worktree dir "
+                        f"{worktree_path}: {exc}"
+                    ) from exc
 
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -543,6 +573,7 @@ class SessionManager:
             check=False,
             text=True,
             capture_output=True,
+            timeout=300,
         )
         if result.returncode != 0:
             # Branch may already exist; try without -b
@@ -556,6 +587,7 @@ class SessionManager:
                 check=False,
                 text=True,
                 capture_output=True,
+                timeout=300,
             )
             if result.returncode != 0:
                 raise RuntimeError(
@@ -578,6 +610,7 @@ class SessionManager:
             check=False,
             text=True,
             capture_output=True,
+            timeout=300,
         )
         if result.returncode != 0:
             logger.warning(
@@ -593,6 +626,7 @@ class SessionManager:
             check=False,
             text=True,
             capture_output=True,
+            timeout=60,
         )
         return True
 
@@ -686,6 +720,53 @@ def _shell_quote(s: str) -> str:
     """Shell-quote a string for embedding in a tmux command."""
     import shlex
     return shlex.quote(s)
+
+
+def _worktree_is_registered(project_path: Path, worktree_path: Path) -> bool:
+    """Return True if ``worktree_path`` is a registered git worktree of
+    ``project_path``.
+
+    Uses ``git worktree list --porcelain`` and compares resolved paths so
+    a directory left over from a crashed run (present but unregistered)
+    can be detected and cleaned up before we try to ``git worktree add``.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_path), "worktree", "list", "--porcelain"],
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=60,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        logger.debug(
+            "git worktree list failed for %s: %s", project_path, exc,
+        )
+        return False
+
+    if result.returncode != 0:
+        logger.debug(
+            "git worktree list exit %d: %s",
+            result.returncode, result.stderr.strip(),
+        )
+        return False
+
+    try:
+        target = worktree_path.resolve()
+    except OSError:
+        target = worktree_path
+
+    for line in result.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        registered = line[len("worktree "):].strip()
+        try:
+            registered_resolved = Path(registered).resolve()
+        except OSError:
+            registered_resolved = Path(registered)
+        if registered_resolved == target:
+            return True
+    return False
 
 
 def _encode_claude_cwd(cwd: Path) -> str:

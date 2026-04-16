@@ -168,6 +168,56 @@ class TestProvisionWorker:
         # create_session called only once
         assert mock_tmux.create_session.call_count == 1
 
+    def test_create_worktree_add_has_timeout(self, manager, mock_tmux, tmp_project):
+        """git worktree add must be called with a timeout so a hung git
+        op can't wedge claim()."""
+        with patch("pollypm.work.session_manager.subprocess") as mock_sub:
+            mock_sub.run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+            manager.provision_worker("proj/1", "agent-1")
+
+        add_calls = [
+            call for call in mock_sub.run.call_args_list
+            if "worktree" in str(call) and "add" in str(call)
+        ]
+        assert add_calls, "expected at least one git worktree add call"
+        for call in add_calls:
+            kwargs = call.kwargs
+            assert kwargs.get("timeout") == 300, (
+                f"git worktree add call missing timeout=300: {call}"
+            )
+
+    def test_create_worktree_removes_dangling_dir(self, manager, mock_tmux, tmp_project):
+        """If the worktree dir exists but isn't registered with git, the
+        fast-path must drop it before running `git worktree add`."""
+        # Create an unregistered directory at the target location.
+        slug = "proj-1"
+        dangling = tmp_project / ".pollypm" / "worktrees" / slug
+        dangling.mkdir(parents=True)
+        (dangling / "leftover.txt").write_text("junk")
+
+        calls_log = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls_log.append(cmd)
+            if "list" in cmd and "--porcelain" in cmd:
+                # Report a registered worktree that is NOT this one.
+                return MagicMock(
+                    returncode=0,
+                    stdout="worktree /somewhere/else\nHEAD abc\nbranch refs/heads/main\n\n",
+                    stderr="",
+                )
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("pollypm.work.session_manager.subprocess") as mock_sub:
+            mock_sub.run.side_effect = fake_run
+            mock_sub.TimeoutExpired = subprocess.TimeoutExpired
+            manager.provision_worker("proj/1", "agent-1")
+
+        # `git worktree add` should have been invoked (not short-circuited
+        # by the exists()-fast-path).
+        add_calls = [c for c in calls_log if "add" in c and "worktree" in c]
+        assert add_calls, "expected git worktree add to be called for the dangling dir case"
+
     def test_provision_worker_reprovision_after_teardown(
         self, manager, mock_tmux, tmp_project,
     ):

@@ -94,10 +94,15 @@ class SessionManager:
         tmux_client: object,
         work_service: object,
         project_path: Path,
+        *,
+        session_service: object | None = None,
+        storage_closet_name: str = "pollypm-storage-closet",
     ) -> None:
         self._tmux = tmux_client
+        self._session_service = session_service
         self._svc = work_service
         self._project_path = project_path
+        self._storage_closet_name = storage_closet_name
         # Ensure the sessions table exists
         conn = self._get_conn()
         conn.executescript(WORK_SESSIONS_SCHEMA)
@@ -111,7 +116,15 @@ class SessionManager:
     # ------------------------------------------------------------------
 
     def provision_worker(self, task_id: str, agent_name: str) -> WorkerSession:
-        """Create worktree + tmux pane for a task. Idempotent."""
+        """Create worktree + tmux window for a task. Idempotent.
+
+        Launches an *interactive* Claude session in the named tmux window
+        (via the ``SessionService`` when provided). The task prompt is
+        written to ``.pollypm-task-prompt.md`` inside the worktree and
+        a short kickoff string is fed as keystrokes so the worker reads
+        the file and gets to work. Relies on ``teardown_worker`` to kill
+        the window on approval/cancel.
+        """
         project, task_number = _parse_task_id(task_id)
 
         # Check for existing active session
@@ -135,34 +148,23 @@ class SessionManager:
         except OSError:
             logger.warning("Could not write task prompt to %s", prompt_path)
 
-        # Launch Claude in the worktree with the task prompt
         window_name = f"task-{task_slug}"
-        if prompt_path.exists():
-            claude_cmd = (
-                f"cd {_shell_quote(str(worktree_path))} && "
-                f"claude --dangerously-skip-permissions "
-                f"-p {_shell_quote(str(prompt_path))}"
-            )
-        else:
-            claude_cmd = (
-                f"cd {_shell_quote(str(worktree_path))} && "
-                f"claude --dangerously-skip-permissions"
-            )
+        session_name = self._storage_closet_name
 
-        # Use the storage closet session for task worker windows
-        session_name = "pollypm-storage-closet"
-        if not self._tmux.has_session(session_name):
-            self._tmux.create_session(session_name, window_name, claude_cmd)
-            windows = self._tmux.list_windows(session_name)
-            pane_id = windows[0].pane_id if windows else "%0"
-        else:
-            self._tmux.create_window(session_name, window_name, claude_cmd, detached=True)
-            windows = self._tmux.list_windows(session_name)
-            pane_id = "%0"
-            for w in windows:
-                if w.name == window_name:
-                    pane_id = w.pane_id
-                    break
+        # Kickoff string sent after stabilization so the worker reads the
+        # prompt file and signals done when finished.
+        kickoff = (
+            f"Read .pollypm-task-prompt.md, follow the instructions, "
+            f"commit your work, then run `pm task done {task_id}`."
+        )
+
+        pane_id = self._launch_worker_window(
+            session_name=session_name,
+            window_name=window_name,
+            worktree_path=worktree_path,
+            agent_name=agent_name,
+            kickoff=kickoff,
+        )
 
         now = _now_dt()
 
@@ -185,6 +187,74 @@ class SessionManager:
             branch_name=branch_name,
             started_at=now,
         )
+
+    # ------------------------------------------------------------------
+    # Worker launch helpers
+    # ------------------------------------------------------------------
+
+    def _launch_worker_window(
+        self,
+        *,
+        session_name: str,
+        window_name: str,
+        worktree_path: Path,
+        agent_name: str,
+        kickoff: str,
+    ) -> str:
+        """Launch an interactive Claude window and return its pane id.
+
+        When a ``SessionService`` is configured, route through it so the
+        window picks up stabilization, initial-input verification and
+        other robustness we already implemented there. Otherwise fall
+        back to raw tmux operations (used by unit tests that inject a
+        mock TmuxClient).
+        """
+        claude_cmd = (
+            f"cd {_shell_quote(str(worktree_path))} && "
+            f"claude --dangerously-skip-permissions"
+        )
+
+        if self._session_service is not None:
+            # Use a fresh_launch_marker so SessionService.create() knows
+            # to send the kickoff as initial input.
+            marker_dir = self._project_path / ".pollypm" / "worker-markers"
+            marker_dir.mkdir(parents=True, exist_ok=True)
+            marker_path = marker_dir / f"{window_name}.fresh"
+            try:
+                marker_path.write_text(_now())
+            except OSError:
+                logger.warning("Could not write fresh_launch_marker for %s", window_name)
+
+            handle = self._session_service.create(
+                name=window_name,
+                provider="claude",
+                account=agent_name,
+                cwd=worktree_path,
+                command=claude_cmd,
+                window_name=window_name,
+                tmux_session=session_name,
+                stabilize=True,
+                initial_input=kickoff,
+                fresh_launch_marker=marker_path,
+                session_role="worker",
+            )
+            return handle.pane_id or ""
+
+        # Fallback: raw tmux client path. Used by tests that construct
+        # SessionManager without a session_service.
+        if not self._tmux.has_session(session_name):
+            self._tmux.create_session(session_name, window_name, claude_cmd)
+            windows = self._tmux.list_windows(session_name)
+            pane_id = windows[0].pane_id if windows else "%0"
+        else:
+            self._tmux.create_window(session_name, window_name, claude_cmd, detached=True)
+            windows = self._tmux.list_windows(session_name)
+            pane_id = "%0"
+            for w in windows:
+                if w.name == window_name:
+                    pane_id = w.pane_id
+                    break
+        return pane_id
 
     # ------------------------------------------------------------------
     # Teardown
@@ -262,85 +332,47 @@ class SessionManager:
     # ------------------------------------------------------------------
 
     def notify_rejection(self, task_id: str, reason: str) -> bool:
-        """Send rejection feedback to the worker's session.
+        """Send rejection feedback to the worker's live pane.
 
-        If the session is alive, sends feedback directly. If the session
-        has exited (Claude -p mode exits after processing), spawns a new
-        worker session with the rejection context in its prompt.
+        With interactive-launch workers the pane is still alive after a
+        rejection, so we simply feed the feedback as keystrokes. No more
+        spawning a fresh ``claude -p`` session — that workaround existed
+        only because headless workers exited before we could talk to
+        them.
 
         Returns True if feedback was delivered.
         """
         session = self.session_for_task(task_id)
-
-        # Try to send to existing session
-        if session is not None and self._tmux.is_pane_alive(session.pane_id):
-            message = (
-                f"Your work on this task was rejected by the reviewer. "
-                f"Reason: {reason}. "
-                f"Please address the feedback and signal done when ready."
+        if session is None:
+            logger.warning(
+                "notify_rejection: no active worker session for %s", task_id,
             )
-            try:
-                self._tmux.send_keys(session.pane_id, message)
-                return True
-            except Exception:
-                logger.debug("Failed to send rejection to pane %s", session.pane_id)
-
-        # Session is dead or doesn't exist — spawn a new worker with rejection context
-        project, task_number = _parse_task_id(task_id)
-        task_slug = f"{project}-{task_number}"
-
-        # Reuse existing worktree if it still exists
-        worktree_path = self._project_path / ".pollypm" / "worktrees" / task_slug
-        if not worktree_path.exists():
-            try:
-                worktree_path = self._create_worktree(task_id, task_slug, self._project_path)
-            except Exception:
-                logger.warning("Could not create worktree for rework on %s", task_id)
-                return False
-
-        # Build rework prompt with rejection context
-        rework_prompt = self._build_rework_prompt(task_id, reason, worktree_path)
-        prompt_path = worktree_path / ".pollypm-task-prompt.md"
-        try:
-            prompt_path.parent.mkdir(parents=True, exist_ok=True)
-            prompt_path.write_text(rework_prompt)
-        except OSError:
-            logger.warning("Could not write rework prompt for %s", task_id)
             return False
 
-        # Launch new Claude session
-        window_name = f"task-{task_slug}"
-        claude_cmd = (
-            f"cd {_shell_quote(str(worktree_path))} && "
-            f"claude --dangerously-skip-permissions "
-            f"-p {_shell_quote(str(prompt_path))}"
-        )
-
-        session_name = "pollypm-storage-closet"
-        try:
-            # Kill old window if it exists
-            for win in self._tmux.list_windows(session_name):
-                if win.name == window_name:
-                    self._tmux.kill_window(f"{session_name}:{win.index}")
-                    break
-            self._tmux.create_window(session_name, window_name, claude_cmd, detached=True)
-            # Update session record
-            windows = self._tmux.list_windows(session_name)
-            pane_id = "%0"
-            for w in windows:
-                if w.name == window_name:
-                    pane_id = w.pane_id
-                    break
-            conn = self._get_conn()
-            conn.execute(
-                "UPDATE work_sessions SET pane_id = ?, ended_at = NULL "
-                "WHERE task_project = ? AND task_number = ?",
-                (pane_id, project, task_number),
+        if not self._tmux.is_pane_alive(session.pane_id):
+            logger.warning(
+                "notify_rejection: pane %s for task %s is not alive; "
+                "cannot deliver feedback",
+                session.pane_id,
+                task_id,
             )
-            conn.commit()
+            return False
+
+        message = (
+            f"Your work on this task was rejected by the reviewer. "
+            f"Reason: {reason}. "
+            f"Please address the feedback and signal done when ready."
+        )
+        try:
+            self._tmux.send_keys(session.pane_id, message)
             return True
-        except Exception:
-            logger.warning("Failed to spawn rework session for %s", task_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "notify_rejection: failed to send rejection to pane %s for %s: %s",
+                session.pane_id,
+                task_id,
+                exc,
+            )
             return False
 
     # ------------------------------------------------------------------
@@ -498,21 +530,6 @@ class SessionManager:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-
-    def _build_rework_prompt(self, task_id: str, reason: str, worktree_path: Path) -> str:
-        """Build a prompt for rework after rejection."""
-        base = self._build_task_prompt(task_id, worktree_path)
-        return (
-            f"{base}\n\n"
-            f"## REWORK REQUIRED\n\n"
-            f"Your previous submission was **rejected** by the reviewer.\n\n"
-            f"**Rejection reason:** {reason}\n\n"
-            f"Review the feedback carefully. Fix the specific issues mentioned. "
-            f"The reviewer will check that the issues are actually resolved — "
-            f"submitting without changes will be rejected again.\n\n"
-            f"Check the existing code in this worktree, fix the problems, "
-            f"commit your changes, then signal done.\n"
-        )
 
     def _build_task_prompt(self, task_id: str, worktree_path: Path) -> str:
         """Build a clear operating prompt for a per-task worker session."""

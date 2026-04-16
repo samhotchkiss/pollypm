@@ -145,7 +145,7 @@ class TmuxSessionService:
 
         # Send initial input if this is a fresh launch
         if initial_input and fresh_launch_marker and fresh_launch_marker.exists():
-            if session_role in {"heartbeat-supervisor", "operator-pm", "reviewer", "triage"}:
+            if session_role in {"heartbeat-supervisor", "operator-pm", "reviewer", "triage", "worker"}:
                 kickoff = self._prepare_initial_input(name, initial_input)
                 time.sleep(0.5)
                 self.tmux.send_keys(target, kickoff)

@@ -128,10 +128,30 @@ def _svc(db: str, project: str | None = None) -> SQLiteWorkService:
         from pollypm.session_services import create_tmux_client
         from pollypm.work.session_manager import SessionManager
         if project_root.exists() and (project_root / ".git").exists():
+            # Try to route through the configured SessionService so per-task
+            # workers pick up stabilization, initial_input handling, and
+            # storage-closet naming from config. Fall back to a raw
+            # TmuxClient if config/plugin resolution fails.
+            session_service = None
+            storage_closet_name = "pollypm-storage-closet"
+            try:
+                from pollypm.config import load_config
+                from pollypm.session_services.tmux import TmuxSessionService
+                from pollypm.storage.state import StateStore
+                config = load_config()
+                storage_closet_name = (
+                    f"{config.project.tmux_session}-storage-closet"
+                )
+                store = StateStore(config.project.state_db)
+                session_service = TmuxSessionService(config=config, store=store)
+            except Exception:  # noqa: BLE001
+                pass
             session_mgr = SessionManager(
                 tmux_client=create_tmux_client(),
                 work_service=svc,
                 project_path=project_root,
+                session_service=session_service,
+                storage_closet_name=storage_closet_name,
             )
             svc.set_session_manager(session_mgr)
     except Exception:  # noqa: BLE001

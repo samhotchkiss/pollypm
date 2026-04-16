@@ -444,16 +444,18 @@ class PollyCockpitApp(App[None]):
         self.set_interval(0.8, self._tick)
         self.set_interval(self.SCHEDULER_POLL_INTERVAL_SECONDS, self._tick_scheduler)
         self.nav.focus()
-        # Delay the cockpit layout split so Textual finishes its first render
-        # before the pane is resized.  An immediate split sends SIGWINCH before
-        # the alternate screen is active, which can leave the pane in copy mode.
-        self.set_timer(0.5, self._deferred_layout)
+        # Textual's first render after mount reflows panes and can stretch the
+        # rail past the persisted width. Re-enforce the rail width on a short
+        # one-shot timer (no split — pure resize, SIGWINCH-safe), instead of
+        # waiting ~30s for the periodic check to fix it. See issue #102.
+        self.set_timer(0.4, self._enforce_rail_width_once)
+        self.set_timer(1.5, self._enforce_rail_width_once)
 
-    def _deferred_layout(self) -> None:
-        # Layout is now handled by pm up / ensure_cockpit_layout at startup,
-        # NOT from inside the running TUI. Splitting panes while the TUI is
-        # rendering sends SIGWINCH that can crash the Textual event loop.
-        pass
+    def _enforce_rail_width_once(self) -> None:
+        try:
+            self._enforce_rail_width()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _focus_right_pane(self) -> None:
         focus_method = getattr(self.router, "focus_right_pane", None)
@@ -521,7 +523,8 @@ class PollyCockpitApp(App[None]):
                 self.router.ensure_cockpit_layout()
             elif len(panes) >= 2:
                 left_pane = min(panes, key=lambda p: p.pane_left)
-                if left_pane.pane_width != self.router._LEFT_PANE_WIDTH:
+                expected = self.router.rail_width()
+                if left_pane.pane_width != expected:
                     self.router._try_resize_rail(left_pane.pane_id)
         except Exception:  # noqa: BLE001
             pass

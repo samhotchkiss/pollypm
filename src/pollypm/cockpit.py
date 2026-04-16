@@ -177,7 +177,7 @@ class CockpitItem:
 class CockpitRouter:
     _STATE_FILE = "cockpit_state.json"
     _COCKPIT_WINDOW = "PollyPM"
-    _LEFT_PANE_WIDTH = 30
+    _LEFT_PANE_WIDTH = 30  # default; actual value persisted in cockpit state.
 
     def __init__(self, config_path: Path) -> None:
         self.config_path = config_path
@@ -245,6 +245,24 @@ class CockpitRouter:
 
     def _write_state(self, data: dict[str, object]) -> None:
         atomic_write_json(self._state_path(), data)
+
+    def rail_width(self) -> int:
+        """Return the persisted rail width, falling back to the default."""
+        data = self._load_state()
+        value = data.get("rail_width")
+        if isinstance(value, int) and 20 <= value <= 120:
+            return value
+        return self._LEFT_PANE_WIDTH
+
+    def set_rail_width(self, width: int) -> None:
+        """Persist the rail width so subsequent launches and layout checks use it."""
+        if not isinstance(width, int) or width < 20 or width > 120:
+            return
+        data = self._load_state()
+        if data.get("rail_width") == width:
+            return
+        data["rail_width"] = width
+        self._write_state(data)
 
     def _validate_state(self) -> None:
         """Clear stale entries from cockpit_state.json.
@@ -646,10 +664,10 @@ class CockpitRouter:
             right_pane_id = None
             right_pane_present = False
         if len(panes) < 2:
-            # Calculate right pane size so the rail starts at exactly _LEFT_PANE_WIDTH
+            # Calculate right pane size so the rail starts at exactly rail_width
             # columns — avoids the visible flash of a 50/50 split followed by resize.
             window_width = panes[0].pane_width if panes else 200
-            right_size = max(window_width - self._LEFT_PANE_WIDTH - 1, 40)
+            right_size = max(window_width - self.rail_width() - 1, 40)
             right_pane_id = self.tmux.split_window(
                 target,
                 self._right_pane_command("polly"),
@@ -686,17 +704,17 @@ class CockpitRouter:
     def _try_resize_rail(self, pane_id: str) -> None:
         """Best-effort resize of the rail pane. Never raises."""
         try:
-            self.tmux.resize_pane_width(pane_id, self._LEFT_PANE_WIDTH)
+            self.tmux.resize_pane_width(pane_id, self.rail_width())
         except Exception:  # noqa: BLE001
             pass
 
     def _right_pane_size(self, window_target: str) -> int | None:
-        """Calculate the exact right-pane size so the rail starts at _LEFT_PANE_WIDTH columns."""
+        """Calculate the exact right-pane size so the rail starts at rail_width columns."""
         try:
             panes = self.tmux.list_panes(window_target)
             if panes:
                 window_width = max(p.pane_width for p in panes)
-                return max(window_width - self._LEFT_PANE_WIDTH - 1, 40)
+                return max(window_width - self.rail_width() - 1, 40)
         except Exception:  # noqa: BLE001
             pass
         return None

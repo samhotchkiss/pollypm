@@ -537,11 +537,10 @@ class Supervisor:
         return assignments
 
     def _window_map(self) -> dict[str, TmuxWindow]:
+        our_sessions = set(self._all_tmux_session_names())
         windows: dict[str, TmuxWindow] = {}
-        for session_name in self._all_tmux_session_names():
-            if not self.tmux.has_session(session_name):
-                continue
-            for window in self.tmux.list_windows(session_name):
+        for window in self.tmux.list_all_windows():
+            if window.session in our_sessions:
                 windows[window.name] = window
         mounted = self._mounted_window_override()
         if mounted is not None:

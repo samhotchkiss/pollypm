@@ -110,6 +110,15 @@ class SQLiteWorkService:
         create_work_tables(self._conn)
         self._gate_registry = GateRegistry(project_path=project_path)
 
+    def set_session_manager(self, session_manager: object) -> None:
+        """Wire up the session manager after construction.
+
+        This supports two-phase init: the service is created first, then
+        the session manager (which needs a reference to the service) is
+        created and registered back.
+        """
+        self._session_mgr = session_manager
+
     def close(self) -> None:
         """Close the database connection."""
         self._conn.close()

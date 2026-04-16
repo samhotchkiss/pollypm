@@ -133,7 +133,7 @@ def _svc(db: str, project: str | None = None) -> SQLiteWorkService:
                 work_service=svc,
                 project_path=project_root,
             )
-            svc._session_mgr = session_mgr
+            svc.set_session_manager(session_mgr)
     except Exception:  # noqa: BLE001
         pass  # SessionManager is optional — CLI still works without it
 

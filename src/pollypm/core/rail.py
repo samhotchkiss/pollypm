@@ -104,30 +104,56 @@ class CoreRail:
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Start all registered subsystems in registration order.
+        """Drive the rail boot sequence.
 
-        At this step nothing is registered in the default path; this is
-        effectively a no-op for today's callers. When Step 2 lands
-        Supervisor will register itself and CoreRail will own the real
-        boot sequence.
+        Order is fixed and documented:
+          1. plugin host readiness (eager load — surfaces errors early)
+          2. state store readiness (already opened + migrated in its
+             constructor, but logged here so boot has a single narrative)
+          3. subsystem boot in registration order (Supervisor first,
+             heartbeat worker subsystems next as they get registered)
+
+        Idempotent: a second call while already started is a no-op.
         """
         if self._started:
             logger.debug("CoreRail.start() called while already started — skipping")
             return
-        logger.debug("CoreRail.start(): %d subsystem(s)", len(self._subsystems))
+        logger.info("CoreRail.start(): loading plugin host")
+        # Touch the plugin registry so any load errors surface here with
+        # a clear log line instead of at some deep accessor call later.
+        self._plugin_host.plugins()
+        logger.info("CoreRail.start(): state store ready at %s", self._state_store.path)
+        logger.info(
+            "CoreRail.start(): booting %d subsystem(s)", len(self._subsystems),
+        )
         for subsystem in self._subsystems:
             subsystem.start()
         self._started = True
+        logger.info("CoreRail.start(): boot complete")
 
     def stop(self) -> None:
-        """Stop all registered subsystems in reverse registration order."""
+        """Drive graceful shutdown in reverse order.
+
+        Subsystems stop first (reverse registration order), then the
+        state store is closed. Plugin host has no teardown today.
+        Idempotent: safe to call before start() or twice.
+        """
         if not self._started:
             logger.debug("CoreRail.stop() called while not started — skipping")
             return
-        logger.debug("CoreRail.stop(): %d subsystem(s)", len(self._subsystems))
+        logger.info(
+            "CoreRail.stop(): stopping %d subsystem(s)", len(self._subsystems),
+        )
         for subsystem in reversed(self._subsystems):
             try:
                 subsystem.stop()
             except Exception:  # noqa: BLE001
                 logger.exception("CoreRail subsystem stop raised; continuing shutdown")
+        # State store close is idempotent — Supervisor.stop may have
+        # already closed it, and that's fine. Double-close is swallowed.
+        try:
+            self._state_store.close()
+        except Exception:  # noqa: BLE001
+            logger.debug("CoreRail.stop(): state_store.close raised", exc_info=True)
         self._started = False
+        logger.info("CoreRail.stop(): shutdown complete")

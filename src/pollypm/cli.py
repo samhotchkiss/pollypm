@@ -1187,7 +1187,15 @@ def up(
         onboard(config_path=config_path, force=False)
         return
     supervisor = _load_supervisor(config_path)
-    supervisor.ensure_layout()
+    # CoreRail owns startup orchestration — it drives plugin host load,
+    # state store readiness, and Supervisor boot (which runs ensure_layout,
+    # ensure_heartbeat_schedule, and ensure_knowledge_extraction_schedule).
+    # Test harnesses that mock Supervisor without a core_rail fall back
+    # to the legacy per-call path below.
+    if hasattr(supervisor, "core_rail"):
+        supervisor.core_rail.start()
+    else:  # pragma: no cover - back-compat for mocked Supervisors in tests
+        supervisor.ensure_layout()
     if all(hasattr(supervisor.config, field) for field in ("project", "accounts", "projects")) and hasattr(
         supervisor.config.project, "base_dir"
     ):
@@ -1221,9 +1229,13 @@ def up(
     else:
         supervisor.ensure_console_window()
 
-    supervisor.ensure_heartbeat_schedule()
-    if hasattr(supervisor, "ensure_knowledge_extraction_schedule"):
-        supervisor.ensure_knowledge_extraction_schedule()
+    # Back-compat: when CoreRail wasn't available (mocked Supervisor),
+    # run the schedule ensures explicitly so test harnesses and any
+    # third-party Supervisor fakes still see the expected side effects.
+    if not hasattr(supervisor, "core_rail"):  # pragma: no cover
+        supervisor.ensure_heartbeat_schedule()
+        if hasattr(supervisor, "ensure_knowledge_extraction_schedule"):
+            supervisor.ensure_knowledge_extraction_schedule()
 
     # Set up the cockpit layout (split panes) BEFORE the TUI starts,
     # then launch the TUI into the rail pane.

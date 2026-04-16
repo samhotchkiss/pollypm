@@ -152,3 +152,143 @@ def test_supervisor_reuses_injected_corerail(tmp_path: Path) -> None:
 
     assert supervisor.core_rail is rail
     assert supervisor.store is store
+
+
+def test_supervisor_registers_itself_as_subsystem(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    assert supervisor in supervisor.core_rail.subsystems()
+
+
+def test_readonly_supervisor_does_not_register(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    # Pre-create the DB so readonly mode has something to open.
+    Supervisor(config).stop()
+    supervisor = Supervisor(config, readonly_state=True)
+    assert supervisor not in supervisor.core_rail.subsystems()
+
+
+def test_corerail_start_invokes_supervisor_lifecycle(tmp_path: Path) -> None:
+    """CoreRail.start() must run Supervisor.start() (ensure_layout etc.)."""
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+
+    calls: list[str] = []
+
+    def _ensure_layout() -> Path:
+        calls.append("layout")
+        return tmp_path
+
+    def _ensure_heartbeat() -> None:
+        calls.append("heartbeat")
+
+    def _ensure_knowledge() -> None:
+        calls.append("knowledge")
+
+    supervisor.ensure_layout = _ensure_layout  # type: ignore[assignment]
+    supervisor.ensure_heartbeat_schedule = _ensure_heartbeat  # type: ignore[assignment]
+    supervisor.ensure_knowledge_extraction_schedule = _ensure_knowledge  # type: ignore[assignment]
+
+    supervisor.core_rail.start()
+
+    assert calls == ["layout", "heartbeat", "knowledge"]
+
+
+def test_corerail_start_is_idempotent(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+
+    calls: list[str] = []
+    supervisor.ensure_layout = lambda: (calls.append("layout") or tmp_path)  # type: ignore[assignment]
+    supervisor.ensure_heartbeat_schedule = lambda: calls.append("hb")  # type: ignore[assignment]
+    supervisor.ensure_knowledge_extraction_schedule = lambda: calls.append("kn")  # type: ignore[assignment]
+
+    supervisor.core_rail.start()
+    supervisor.core_rail.start()
+
+    assert calls == ["layout", "hb", "kn"]
+
+
+def test_corerail_stop_reverse_order_with_subsystems(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    store = StateStore(config.project.state_db)
+    host = extension_host_for_root(str(config.project.root_dir.resolve()))
+    rail = CoreRail(config, store, host)
+
+    events: list[str] = []
+
+    class _Sub:
+        def __init__(self, tag: str) -> None:
+            self.tag = tag
+
+        def start(self) -> None:
+            events.append(f"start:{self.tag}")
+
+        def stop(self) -> None:
+            events.append(f"stop:{self.tag}")
+
+    rail.register_subsystem(_Sub("a"))
+    rail.register_subsystem(_Sub("b"))
+    rail.start()
+    rail.stop()
+
+    # subsystems stopped in reverse; state store close happens after
+    assert events == ["start:a", "start:b", "stop:b", "stop:a"]
+
+
+def test_corerail_stop_swallows_subsystem_errors(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    store = StateStore(config.project.state_db)
+    host = extension_host_for_root(str(config.project.root_dir.resolve()))
+    rail = CoreRail(config, store, host)
+
+    events: list[str] = []
+
+    class _Boom:
+        def start(self) -> None:
+            events.append("boom-start")
+
+        def stop(self) -> None:
+            events.append("boom-stop")
+            raise RuntimeError("boom")
+
+    class _Good:
+        def start(self) -> None:
+            events.append("good-start")
+
+        def stop(self) -> None:
+            events.append("good-stop")
+
+    rail.register_subsystem(_Good())
+    rail.register_subsystem(_Boom())
+    rail.start()
+    rail.stop()  # must not raise
+
+    # Boom stopped first (reverse order); _Good.stop still ran despite boom's error
+    assert events == ["good-start", "boom-start", "boom-stop", "good-stop"]
+
+
+def test_corerail_drives_plugin_host_load(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    store = StateStore(config.project.state_db)
+    host = extension_host_for_root(str(config.project.root_dir.resolve()))
+
+    calls: list[str] = []
+
+    class _HostProxy:
+        """Pass-through that records plugins() calls."""
+
+        def __init__(self, inner) -> None:
+            self._inner = inner
+
+        def plugins(self):
+            calls.append("plugins")
+            return self._inner.plugins()
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    rail = CoreRail(config, store, _HostProxy(host))
+    rail.start()
+
+    assert "plugins" in calls

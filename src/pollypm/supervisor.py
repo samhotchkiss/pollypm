@@ -144,11 +144,51 @@ class Supervisor:
         self._cached_launches: list[SessionLaunchSpec] | None = None
         # Lazy-init session service to avoid circular imports at construction
         self._session_service = None
+        # Register ourselves as a subsystem so CoreRail.start()/stop() can
+        # drive our lifecycle. Readonly supervisors (used by the cockpit
+        # for passive inspection) don't register — they never drive boot.
+        if not readonly_state:
+            self._core_rail.register_subsystem(self)
 
     @property
     def core_rail(self) -> "CoreRail":
         """Return the CoreRail this Supervisor is bound to."""
         return self._core_rail
+
+    # ── Startable lifecycle (driven by CoreRail.start()/stop()) ────────────
+
+    def start(self) -> None:
+        """Boot Supervisor-owned orchestration.
+
+        Called by :meth:`pollypm.core.CoreRail.start`. Idempotent and
+        safe to invoke directly for back-compat — callers that used to
+        drive ``ensure_layout`` / ``ensure_heartbeat_schedule`` /
+        ``ensure_knowledge_extraction_schedule`` manually can still do
+        so; this method just consolidates them.
+        """
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
+        _log.debug("Supervisor.start(): ensure_layout")
+        self.ensure_layout()
+        _log.debug("Supervisor.start(): ensure_heartbeat_schedule")
+        self.ensure_heartbeat_schedule()
+        if hasattr(self, "ensure_knowledge_extraction_schedule"):
+            _log.debug("Supervisor.start(): ensure_knowledge_extraction_schedule")
+            self.ensure_knowledge_extraction_schedule()
+
+    def stop(self) -> None:
+        """Gracefully release Supervisor-owned resources.
+
+        This is the paired teardown for :meth:`start`. It does NOT tear
+        down tmux sessions — that's ``pm reset`` territory. Today we
+        just close the state store connection if we opened it.
+        """
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
+        try:
+            self.store.close()
+        except Exception:  # noqa: BLE001
+            _log.debug("Supervisor.stop(): store.close raised", exc_info=True)
 
     @property
     def session_service(self):

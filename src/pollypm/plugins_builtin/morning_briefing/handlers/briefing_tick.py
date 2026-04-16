@@ -52,22 +52,16 @@ def fire_briefing(
 ) -> dict[str, Any]:
     """Execute the full gather → synthesize → emit path.
 
-    mb02 wires the gather stage: we call
-    :func:`gather_yesterday` and :func:`identify_priorities` and
-    return a summary of their output. Synthesis (mb03) and inbox
-    emission (mb04) replace the body again.
-
-    ``config`` is the loaded ``PollyPMConfig`` — the tick handler has
-    already paid to load it, so we thread it through instead of
-    re-loading. When ``config`` is ``None`` (direct test invocation),
-    we load it from the default path.
+    mb02 wired gather; mb03 wires synthesis + quiet-mode detection.
+    mb04 adds the inbox write on top. This function returns a summary
+    dict that the tick handler surfaces to the job-queue status; the
+    full :class:`BriefingDraft` is attached under ``"draft"`` so mb04's
+    emitter can pick it up.
     """
-    from pollypm.plugins_builtin.morning_briefing.handlers.gather_yesterday import (
-        gather_yesterday,
-    )
-    from pollypm.plugins_builtin.morning_briefing.handlers.identify_priorities import (
-        identify_priorities,
-    )
+    from pollypm.plugins_builtin.morning_briefing.handlers import gather_yesterday as _gy
+    from pollypm.plugins_builtin.morning_briefing.handlers import identify_priorities as _ip
+    from pollypm.plugins_builtin.morning_briefing.handlers import synthesize as _synth
+    from pollypm.plugins_builtin.morning_briefing.state import iso_date, save_state
 
     if config is None:
         from pollypm.config import DEFAULT_CONFIG_PATH, load_config, resolve_config_path
@@ -79,16 +73,70 @@ def fire_briefing(
     if config is None:
         return {"fired": False, "reason": "no-config-for-gather"}
 
-    snapshot = gather_yesterday(config, now_local=now_local, project_root=project_root)
-    priorities = identify_priorities(
+    snapshot = _gy.gather_yesterday(config, now_local=now_local, project_root=project_root)
+    priorities = _ip.identify_priorities(
         config,
         now_local=now_local,
         priorities_count=settings.priorities_count,
         project_root=project_root,
     )
+
+    # Quiet-mode detection — runs only when yesterday itself was empty
+    # (cheap fast-path; no need to scan the full 7-day window every day).
+    quiet_mode = False
+    if _synth._snapshot_is_quiet(snapshot):
+        try:
+            quiet_mode = _synth.detect_quiet_mode(
+                config,
+                now_local=now_local,
+                quiet_threshold_days=settings.quiet_mode_after_days,
+                project_root=project_root,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("briefing: quiet-mode probe failed: %s", exc)
+
+    if quiet_mode:
+        # In quiet mode we only actually fire on Sundays. Other days return
+        # "skipped-quiet" so the tick handler doesn't mark last_briefing_date
+        # (mb04 interprets this — for mb03 we still set the marker to avoid
+        # a thundering-hourly retry).
+        if not _synth.is_weekly_quiet_fire_day(now_local):
+            return {
+                "fired": False,
+                "reason": "quiet-mode",
+                "date_local": snapshot.date_local,
+                "quiet_mode": True,
+            }
+        draft = _synth.build_quiet_mode_draft(date_local=snapshot.date_local)
+        # Record the weekly-fire marker on the persisted state.
+        state.last_quiet_weekly_date = iso_date(now_local.date())
+        save_state(base_dir, state)
+    else:
+        draft = _synth.synthesize_briefing(
+            config=config,
+            snapshot=snapshot,
+            priorities=priorities,
+            base_dir=base_dir,
+            date_local=snapshot.date_local,
+            budget_seconds=300,
+        )
+
     return {
         "fired": True,
         "stub": False,
+        "quiet_mode": quiet_mode,
+        "draft": {
+            "date_local": draft.date_local,
+            "mode": draft.mode,
+            "yesterday": draft.yesterday,
+            "priorities": [
+                {"title": p.title, "project": p.project, "why": p.why}
+                for p in draft.priorities
+            ],
+            "watch": list(draft.watch),
+            "markdown": draft.markdown,
+            "meta": dict(draft.meta),
+        },
         "yesterday": {
             "date_local": snapshot.date_local,
             "total_commits": snapshot.total_commits(),
@@ -234,6 +282,26 @@ def briefing_tick_handler(payload: dict[str, Any]) -> dict[str, Any]:
         }
 
     today_iso = iso_date(now_local.date())
+
+    # fire_briefing may decline to fire (quiet mode on a non-Sunday, for
+    # example). Respect its verdict — don't mark the date done.
+    inner_fired = True
+    inner_reason = "ok"
+    if isinstance(result, dict) and result.get("fired") is False:
+        inner_fired = False
+        inner_reason = str(result.get("reason") or "declined")
+
+    if not inner_fired:
+        summary = {
+            "fired": False,
+            "reason": inner_reason,
+            "local_hour": now_local.hour,
+            "today_local": today_iso,
+        }
+        if isinstance(result, dict):
+            summary["result"] = result
+        return summary
+
     state.last_briefing_date = today_iso
     state.last_fire_at = now_local.astimezone().isoformat()
     save_state(base_dir, state)

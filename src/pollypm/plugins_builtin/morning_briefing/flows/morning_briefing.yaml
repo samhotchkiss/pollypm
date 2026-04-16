@@ -1,0 +1,34 @@
+# Morning Briefing flow — declarative description of the herald
+# synthesis invocation. Briefings are NOT work-service tasks, so this
+# file is a spec-of-intent, not a loaded FlowTemplate. The actual
+# herald session is spawned inline by handlers/synthesize.py.
+#
+# Kept here so operators can see the budget + single-node shape
+# alongside the rest of the plugin's behavior contract.
+
+name: morning_briefing
+description: |
+  Herald session synthesizes the gathered yesterday-snapshot +
+  today's-priorities into a single structured briefing JSON. Budget
+  5 minutes. On timeout or invalid JSON, the plugin falls back to a
+  non-narrative structured briefing assembled directly from the data.
+
+roles:
+  herald:
+    description: Morning-briefing synthesis persona
+    agent_profile: herald
+
+nodes:
+  synthesize:
+    type: work
+    actor_type: role
+    actor_role: herald
+    budget_seconds: 300
+    gates:
+      - output_present
+    next_node: done
+
+  done:
+    type: terminal
+
+start_node: synthesize

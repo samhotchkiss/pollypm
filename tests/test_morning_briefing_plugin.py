@@ -308,12 +308,16 @@ class TestTickHandler:
         assert result["fired"] is False
         assert result["reason"] == "disabled"
 
-    def test_timezone_override_path(self, tmp_path: Path) -> None:
+    def test_timezone_override_path(self, tmp_path: Path, monkeypatch) -> None:
         """[briefing].timezone should win over [pollypm].timezone."""
-        # pollypm says UTC, briefing says America/New_York.
-        # Without an explicit now_local override, the handler resolves
-        # timezone and computes now. We can't easily control wall-clock here,
-        # so instead we assert the gate uses the briefing-TZ date.
+        # pollypm says UTC, briefing says America/New_York. Short-circuit
+        # the gather → quiet-mode path since this test only exercises the
+        # gate logic — a busy fire_briefing keeps the tick handler on its
+        # happy path so we can assert fired=True.
+        monkeypatch.setattr(
+            briefing_tick, "fire_briefing",
+            lambda **kwargs: {"fired": True, "draft": {"mode": "stub"}},
+        )
         config_path = _minimal_config(
             tmp_path,
             briefing_section='\n[briefing]\ntimezone = "America/New_York"\nhour = 6\n',

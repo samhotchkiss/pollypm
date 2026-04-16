@@ -149,6 +149,19 @@ class HeartbeatRail:
         roster = plugin_host.build_roster()
         registry = plugin_host.job_handler_registry()
 
+        # Fire the PluginAPI initialize hook now that roster + handler
+        # registry are built — before the first heartbeat tick. Failures
+        # mark the plugin degraded but don't kill the rail. See
+        # docs/plugin-discovery-spec.md §6.
+        init_method = getattr(plugin_host, "initialize_plugins", None)
+        if callable(init_method):
+            try:
+                init_method(roster=roster, job_registry=registry)
+            except Exception:  # noqa: BLE001
+                # initialize_plugins already logs and tracks degraded
+                # state; defensive catch here so boot never aborts.
+                pass
+
         state_db = Path(state_db)
         state_db.parent.mkdir(parents=True, exist_ok=True)
         queue = JobQueue(db_path=state_db)

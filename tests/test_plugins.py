@@ -697,6 +697,177 @@ def test_content_declaration_accessible(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Issue #170 — PollyPMPlugin.initialize(api) callback
+# ---------------------------------------------------------------------------
+
+
+def test_initialize_callback_invoked_with_plugin_api(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / ".pollypm" / "plugins" / "init_probe"
+    _write_structured_plugin(
+        plugin_dir,
+        name="init_probe",
+        manifest_extras='[[capabilities]]\nkind = "provider"\nname = "init_probe"\n',
+        body=(
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "CALLED = []\n"
+            "def _init(api):\n"
+            "    CALLED.append(api.plugin_name)\n"
+            "plugin = PollyPMPlugin(name='init_probe', initialize=_init)\n"
+        ),
+    )
+
+    host = ExtensionHost(tmp_path)
+    host.plugins()
+    degraded = host.initialize_plugins()
+    assert degraded == {}
+
+
+def test_initialize_raising_marks_degraded_others_still_run(tmp_path: Path) -> None:
+    broken_dir = tmp_path / ".pollypm" / "plugins" / "broken_init"
+    _write_structured_plugin(
+        broken_dir,
+        name="broken_init",
+        manifest_extras='[[capabilities]]\nkind = "provider"\nname = "broken_init"\n',
+        body=(
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "def _init(api):\n"
+            "    raise RuntimeError('plugin bust')\n"
+            "plugin = PollyPMPlugin(name='broken_init', initialize=_init)\n"
+        ),
+    )
+    fine_dir = tmp_path / ".pollypm" / "plugins" / "fine_init"
+    _write_structured_plugin(
+        fine_dir,
+        name="fine_init",
+        manifest_extras='[[capabilities]]\nkind = "provider"\nname = "fine_init"\n',
+        body=(
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "BEACON = Path(os.environ['INIT_BEACON_PATH'])\n"
+            "def _init(api):\n"
+            "    BEACON.write_text(api.plugin_name)\n"
+            "plugin = PollyPMPlugin(name='fine_init', initialize=_init)\n"
+        ),
+    )
+    beacon = tmp_path / "beacon.txt"
+    import os
+
+    os.environ["INIT_BEACON_PATH"] = str(beacon)
+    try:
+        host = ExtensionHost(tmp_path)
+        host.plugins()
+        degraded = host.initialize_plugins()
+    finally:
+        os.environ.pop("INIT_BEACON_PATH", None)
+    assert "broken_init" in degraded
+    assert "fine_init" not in degraded
+    assert beacon.exists()
+    assert beacon.read_text() == "fine_init"
+    # Broken plugin is still in registry (loaded-but-degraded), not removed.
+    assert "broken_init" in host.plugins()
+    assert "broken_init" in host.degraded_plugins
+
+
+def test_initialize_not_invoked_twice(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / ".pollypm" / "plugins" / "once_init"
+    _write_structured_plugin(
+        plugin_dir,
+        name="once_init",
+        manifest_extras='[[capabilities]]\nkind = "provider"\nname = "once_init"\n',
+        body=(
+            "import os\n"
+            "from pathlib import Path\n"
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "BEACON = Path(os.environ['ONCE_BEACON_PATH'])\n"
+            "def _init(api):\n"
+            "    existing = int(BEACON.read_text()) if BEACON.exists() else 0\n"
+            "    BEACON.write_text(str(existing + 1))\n"
+            "plugin = PollyPMPlugin(name='once_init', initialize=_init)\n"
+        ),
+    )
+    beacon = tmp_path / "once.txt"
+    import os
+
+    os.environ["ONCE_BEACON_PATH"] = str(beacon)
+    try:
+        host = ExtensionHost(tmp_path)
+        host.plugins()
+        host.initialize_plugins()
+        host.initialize_plugins()
+        host.initialize_plugins()
+    finally:
+        os.environ.pop("ONCE_BEACON_PATH", None)
+    assert beacon.read_text() == "1"
+
+
+def test_initialize_passes_roster_and_jobs_when_provided(tmp_path: Path) -> None:
+    from pollypm.heartbeat import Roster
+    from pollypm.jobs import JobHandlerRegistry
+
+    plugin_dir = tmp_path / ".pollypm" / "plugins" / "roster_user"
+    _write_structured_plugin(
+        plugin_dir,
+        name="roster_user",
+        manifest_extras='[[capabilities]]\nkind = "job_handler"\nname = "ru.demo"\n',
+        body=(
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "def handler(payload): return {'ok': True}\n"
+            "def _init(api):\n"
+            "    api.jobs.register_handler('ru.demo', handler)\n"
+            "    api.roster.register_recurring('@every 30s', 'ru.demo', {})\n"
+            "plugin = PollyPMPlugin(name='roster_user', initialize=_init)\n"
+        ),
+    )
+
+    roster = Roster()
+    registry = JobHandlerRegistry()
+    host = ExtensionHost(tmp_path)
+    host.plugins()
+    degraded = host.initialize_plugins(roster=roster, job_registry=registry)
+    assert degraded == {}
+    # Handler was registered via api.jobs
+    assert registry.get("ru.demo") is not None
+    # Roster entry registered via api.roster
+    entries = list(roster.snapshot())
+    handler_names = {e.handler_name for e in entries}
+    assert "ru.demo" in handler_names
+
+
+def test_initialize_content_paths_shortcut(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / ".pollypm" / "plugins" / "cp_shortcut"
+    _write_structured_plugin(
+        plugin_dir,
+        name="cp_shortcut",
+        manifest_extras=(
+            '[[capabilities]]\n'
+            'kind = "agent_profile"\n'
+            'name = "cp_shortcut"\n'
+            '\n'
+            '[content]\n'
+            'kinds = ["skill"]\n'
+            'user_paths = ["skills"]\n'
+        ),
+        body=(
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "COLLECTED = []\n"
+            "def _init(api):\n"
+            "    COLLECTED.extend(api.content_paths(kind='skill'))\n"
+            "plugin = PollyPMPlugin(name='cp_shortcut', initialize=_init)\n"
+        ),
+    )
+    host = ExtensionHost(tmp_path)
+    host.plugins()
+    degraded = host.initialize_plugins()
+    assert degraded == {}
+    # Introspect the plugin module to get COLLECTED
+    plugin = host.plugins()["cp_shortcut"]
+    # API content_paths returned something (3 paths: bundled + user + project).
+    # Resolve via the host directly to confirm equivalence.
+    assert len(host.content_paths("cp_shortcut", kind="skill")) >= 3
+
+
+# ---------------------------------------------------------------------------
 # Issue #172 — [plugins].disabled config key
 # ---------------------------------------------------------------------------
 

@@ -14,6 +14,7 @@ from pollypm.plugin_api.v1 import (
     HookFilterResult,
     JobHandlerAPI,
     KNOWN_CAPABILITY_KINDS,
+    PluginAPI,
     PollyPMPlugin,
     RosterAPI,
     check_requires_api,
@@ -94,6 +95,11 @@ class ExtensionHost:
         self._plugin_dirs: dict[str, Path] = {}
         self._job_handler_registry = None
         self._job_handlers_loaded = False
+        # Plugins that loaded but whose initialize() callback raised —
+        # per docs/plugin-discovery-spec.md §6 these stay "loaded but
+        # degraded" and surface in pm plugins show.
+        self._degraded: dict[str, str] = {}  # plugin name -> reason
+        self._initialize_called: set[str] = set()
 
     @property
     def disabled_plugins(self) -> dict[str, DisabledPluginRecord]:
@@ -166,6 +172,82 @@ class ExtensionHost:
         if self._plugins is None:
             self.plugins()
         return self._content_declarations.get(plugin_name)
+
+    def initialize_plugins(
+        self,
+        *,
+        roster: Any = None,
+        job_registry: Any = None,
+        config: Any = None,
+        state_store: Any = None,
+    ) -> dict[str, str]:
+        """Invoke each loaded plugin's ``initialize(api)`` callback.
+
+        Called once per process — after all plugins are loaded and
+        validated, before the first heartbeat tick. Per
+        docs/plugin-discovery-spec.md §6, a failure in one plugin's
+        ``initialize`` marks it degraded (kept in the registry but
+        surfaced by ``pm plugins show``) and does **not** stop other
+        plugins from initialising.
+
+        Parameters let the caller pass the real ``Roster`` / job
+        registry / config / state store; missing ones are treated as
+        optional (the per-plugin accessor raises only when the plugin
+        touches them).
+
+        Returns a dict of ``{plugin_name: reason}`` for plugins that
+        degraded. An empty dict means everyone initialised cleanly.
+        """
+        degraded: dict[str, str] = {}
+
+        def _on_collision(plugin_name: str, handler_name: str, schedule: str) -> None:
+            logger.info(
+                "Plugin '%s' re-registered recurring handler '%s' "
+                "(schedule=%s) — collision deduped, keeping original",
+                plugin_name, handler_name, schedule,
+            )
+
+        for name, plugin in self.plugins().items():
+            if plugin.initialize is None:
+                continue
+            if name in self._initialize_called:
+                continue
+            self._initialize_called.add(name)
+
+            roster_api = (
+                RosterAPI(roster, plugin_name=name, on_collision=_on_collision)
+                if roster is not None
+                else None
+            )
+            jobs_api = (
+                JobHandlerAPI(job_registry, plugin_name=name)
+                if job_registry is not None
+                else None
+            )
+            api = PluginAPI(
+                plugin_name=name,
+                roster_api=roster_api,
+                jobs_api=jobs_api,
+                host=self,
+                config=config,
+                state_store=state_store,
+            )
+            try:
+                plugin.initialize(api)
+            except Exception as exc:  # noqa: BLE001
+                reason = f"initialize() raised: {exc}"
+                self.errors.append(f"Plugin {name} {reason}")
+                logger.exception("Plugin '%s' initialize() failed", name)
+                degraded[name] = reason
+                self._degraded[name] = reason
+        return degraded
+
+    @property
+    def degraded_plugins(self) -> dict[str, str]:
+        """Plugins that initialised with an error — kept loaded but
+        flagged for ``pm plugins show``.
+        """
+        return dict(self._degraded)
 
     def plugins(self) -> dict[str, PollyPMPlugin]:
         if self._plugins is None:

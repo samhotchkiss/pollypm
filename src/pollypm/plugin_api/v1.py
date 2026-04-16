@@ -18,6 +18,7 @@ FilterHandler = Callable[["HookContext"], "HookFilterResult | None"]
 RosterRegistrar = Callable[["RosterAPI"], None]
 JobHandlerRegistrar = Callable[["JobHandlerAPI"], None]
 JobHandlerCallable = Callable[[dict[str, Any]], Any]
+PluginInitializer = Callable[["PluginAPI"], None]
 
 
 @dataclass(slots=True)
@@ -308,6 +309,112 @@ def normalize_capabilities(
     return tuple(out)
 
 
+class PluginAPI:
+    """Read/write façade for PollyPMPlugin.initialize callbacks.
+
+    Plugins receive a ``PluginAPI`` in their ``initialize(api)`` hook,
+    invoked exactly once after all plugins have been loaded and
+    validated but before the first heartbeat tick. This hook replaces
+    ad-hoc import-time side effects and core-side plugin orchestration.
+
+    Exposed surface — per docs/plugin-discovery-spec.md §6:
+
+    * ``api.roster`` — ``RosterAPI`` for recurring-schedule registration.
+    * ``api.jobs`` — ``JobHandlerAPI`` for job-handler registration.
+    * ``api.content_paths(kind=...)`` — resolved content directories for
+      this plugin in spec precedence order.
+    * ``api.config`` — the loaded ``PollyPMConfig`` (may be ``None`` in
+      tests / unconfigured installs; callers should handle gracefully).
+    * ``api.state_store`` — ``StateStore`` (lazily opened on first read).
+    * ``api.emit_event(name, payload)`` — record an event into the state
+      store's ``events`` table. Safe no-op if no store is available.
+    """
+
+    __slots__ = (
+        "_plugin_name",
+        "_roster_api",
+        "_jobs_api",
+        "_host",
+        "_config",
+        "_state_store",
+    )
+
+    def __init__(
+        self,
+        *,
+        plugin_name: str,
+        roster_api: "RosterAPI | None",
+        jobs_api: "JobHandlerAPI | None",
+        host: Any = None,
+        config: Any = None,
+        state_store: Any = None,
+    ) -> None:
+        self._plugin_name = plugin_name
+        self._roster_api = roster_api
+        self._jobs_api = jobs_api
+        self._host = host
+        self._config = config
+        self._state_store = state_store
+
+    @property
+    def plugin_name(self) -> str:
+        return self._plugin_name
+
+    @property
+    def roster(self) -> "RosterAPI":
+        if self._roster_api is None:
+            raise RuntimeError(
+                "RosterAPI not available — plugin host was built without a roster. "
+                "This typically means the heartbeat rail is not initialised in this context."
+            )
+        return self._roster_api
+
+    @property
+    def jobs(self) -> "JobHandlerAPI":
+        if self._jobs_api is None:
+            raise RuntimeError(
+                "JobHandlerAPI not available — plugin host was built without a job registry."
+            )
+        return self._jobs_api
+
+    @property
+    def config(self) -> Any:
+        return self._config
+
+    @property
+    def state_store(self) -> Any:
+        return self._state_store
+
+    def content_paths(self, kind: str | None = None) -> list[Path]:
+        """Return the content search paths for this plugin, scoped to
+        ``kind`` if the plugin's manifest declares ``[content].kinds``.
+        """
+        if self._host is None:
+            return []
+        return list(self._host.content_paths(self._plugin_name, kind=kind))
+
+    def emit_event(self, name: str, payload: dict[str, Any] | None = None) -> None:
+        """Record a lightweight event tagged with this plugin name.
+
+        No-ops silently if no state store / events table is available —
+        initialize hooks should be idempotent to rail-less test
+        environments.
+        """
+        store = self._state_store
+        if store is None:
+            return
+        try:
+            record = getattr(store, "record_event", None)
+            if callable(record):
+                record(
+                    kind=f"plugin.{self._plugin_name}.{name}",
+                    payload=payload or {},
+                )
+        except Exception:  # noqa: BLE001
+            # Events are best-effort observability — swallow.
+            pass
+
+
 @dataclass(slots=True)
 class PollyPMPlugin:
     name: str
@@ -328,6 +435,7 @@ class PollyPMPlugin:
     filters: dict[str, list[FilterHandler]] = field(default_factory=dict)
     register_roster: RosterRegistrar | None = None
     register_handlers: JobHandlerRegistrar | None = None
+    initialize: PluginInitializer | None = None
 
     def __post_init__(self) -> None:
         # Coerce legacy bare-string capabilities into structured form so

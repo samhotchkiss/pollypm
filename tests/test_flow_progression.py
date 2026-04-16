@@ -282,6 +282,80 @@ class TestBlock:
         assert len(execs) == 1
         assert execs[0].status == ExecutionStatus.BLOCKED
 
+    def test_block_persists_dependency_row(self, svc):
+        """block() must INSERT a blocks row into work_task_dependencies so
+        auto-unblock can find it when the blocker reaches done (issue #133)."""
+        task = _create_task(svc)
+        _claim_task(svc, task)
+
+        blocker = _create_task(svc, title="Blocker task")
+
+        svc.block(task.task_id, "pm", blocker.task_id)
+
+        # The dependency row is on the task — blocked_by should reflect it
+        blocked = svc.get(task.task_id)
+        assert (blocker.project, blocker.task_number) in blocked.blocked_by
+
+        # dependents() from the blocker's side should list the blocked task
+        deps = svc.dependents(blocker.task_id)
+        assert any(d.task_id == task.task_id for d in deps)
+
+    def test_block_then_blocker_done_auto_unblocks(self, svc):
+        """After block(), marking the blocker done should auto-unblock the
+        task via _check_auto_unblock (issue #133)."""
+        task = _create_task(svc)
+        _claim_task(svc, task)
+
+        blocker = _create_task(svc, title="Blocker task")
+
+        svc.block(task.task_id, "pm", blocker.task_id)
+        assert svc.get(task.task_id).work_status == WorkStatus.BLOCKED
+
+        # Move blocker to done — auto-unblock should fire
+        svc.mark_done(blocker.task_id, "agent-1")
+
+        # Task was IN_PROGRESS before block; auto-unblock returns it to queued.
+        unblocked = svc.get(task.task_id)
+        assert unblocked.work_status == WorkStatus.QUEUED
+
+    def test_block_fires_sync_adapters(self, svc, tmp_path):
+        """block() must call _sync_transition so adapters see the blocked
+        state (issue #136)."""
+        from pollypm.work.sync import SyncManager
+
+        events: list[tuple[str, str, str]] = []
+
+        class RecordingAdapter:
+            name = "recorder"
+
+            def on_create(self, task):
+                events.append(("create", task.task_id, ""))
+
+            def on_transition(self, task, old_status, new_status):
+                events.append(("transition", old_status, new_status))
+
+            def on_update(self, task, changed_fields):
+                events.append(("update", task.task_id, ",".join(changed_fields)))
+
+        mgr = SyncManager()
+        mgr.register(RecordingAdapter())
+
+        db_path = tmp_path / "sync.db"
+        svc2 = SQLiteWorkService(db_path=db_path, sync_manager=mgr)
+
+        task = _create_task(svc2)
+        _claim_task(svc2, task)
+        blocker = _create_task(svc2, title="Blocker task")
+
+        events.clear()
+        svc2.block(task.task_id, "pm", blocker.task_id)
+
+        # Must have fired a transition event with new_status == 'blocked'
+        transition_events = [e for e in events if e[0] == "transition"]
+        assert any(
+            new == WorkStatus.BLOCKED.value for _, _, new in transition_events
+        ), f"Expected blocked transition in {transition_events}"
+
 
 # ---------------------------------------------------------------------------
 # spike flow (no review)

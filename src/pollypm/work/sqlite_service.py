@@ -1445,10 +1445,36 @@ class SQLiteWorkService:
         # Validate the blocker exists
         self.get(blocker_task_id)
 
+        # Parse the blocker id for the dependency INSERT below.
+        blocker_project, blocker_number = _parse_task_id(blocker_task_id)
+
+        # Cycle-check: would this blocks edge create a cycle?
+        if self._would_create_cycle(
+            blocker_project, blocker_number, task.project, task.task_number,
+        ):
+            raise ValidationError("circular dependency detected")
+
         now = _now()
         old_status = task.work_status
 
         try:
+            # Persist the blocks dependency row so auto-unblock /
+            # blocked_tasks() / dependents() can find it. Use INSERT OR
+            # IGNORE so a pre-existing link is a no-op.
+            self._conn.execute(
+                "INSERT OR IGNORE INTO work_task_dependencies "
+                "(from_project, from_task_number, to_project, to_task_number, "
+                "kind, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    blocker_project,
+                    blocker_number,
+                    task.project,
+                    task.task_number,
+                    LinkKind.BLOCKS.value,
+                    now,
+                ),
+            )
+
             self._conn.execute(
                 "UPDATE work_tasks SET work_status = ?, updated_at = ? "
                 "WHERE project = ? AND task_number = ?",
@@ -1488,7 +1514,9 @@ class SQLiteWorkService:
             self._conn.rollback()
             raise
 
-        return self.get(task_id)
+        result = self.get(task_id)
+        self._sync_transition(result, old_status.value, WorkStatus.BLOCKED.value)
+        return result
 
     def get_execution(
         self,

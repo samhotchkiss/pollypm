@@ -96,3 +96,64 @@ The `configure_work_plugins()` function reads this config and instantiates the a
 3. Custom sync adapters implementing `SyncAdapter` receive events via the `SyncManager`
 4. The `PluginRegistry` enforces that all required plugins are registered before use
 5. The `configure_work_plugins()` loader handles missing config by selecting built-in defaults
+
+## Rail Plugin Manifest (v1)
+
+Rail plugins (providers, runtimes, session services, agent profiles, etc.) live at a different boundary from the work-service plugins above — they extend the PollyPM *rail* and ship as directory bundles or `pollypm.plugins` entry points.
+
+The current manifest shape (`src/pollypm/plugins_builtin/<name>/pollypm-plugin.toml`) is defined in [`plugin-discovery-spec.md`](plugin-discovery-spec.md):
+
+```toml
+api_version = "1"
+name = "polly-github-sync"
+version = "0.4.1"
+entrypoint = "plugin.py:plugin"
+description = "Bidirectional sync of work-service tasks with GitHub Issues."
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "sync_adapter"      # one of provider, runtime, session_service,
+                            # heartbeat, scheduler, agent_profile,
+                            # task_backend, memory_backend, doc_backend,
+                            # sync_adapter, transcript_source,
+                            # recovery_policy, job_handler, roster_entry
+name = "github"
+replaces = []               # optional: which capability names this supersedes
+requires_api = ">=1,<2"     # optional: per-capability constraint
+
+[content]                   # optional — declared when the plugin hosts content
+kinds = ["sync_template"]
+user_paths = ["templates"]
+```
+
+Plugins with startup side effects implement an `initialize(api: PluginAPI)` callback on `PollyPMPlugin`; the host invokes it exactly once after all plugins load and before the first heartbeat tick:
+
+```python
+def initialize(api: PluginAPI) -> None:
+    api.jobs.register_handler("mine.sweep", _handler)
+    api.roster.register_recurring("@every 60s", "mine.sweep", {})
+```
+
+See [`plugin-authoring.md`](plugin-authoring.md) for a hello-world walkthrough.
+
+### Discovery sources (precedence low → high)
+
+| Source | Path |
+|---|---|
+| Built-in | `src/pollypm/plugins_builtin/` |
+| Python entry_points | `pollypm.plugins` group in installed packages |
+| User-global | `~/.pollypm/plugins/` |
+| Project-local | `<project>/.pollypm/plugins/` |
+
+Later sources override earlier ones on name collision. `pm plugins list` shows the effective source for each loaded plugin.
+
+### Disable knob
+
+Drop a plugin name into `~/.pollypm/pollypm.toml`:
+
+```toml
+[plugins]
+disabled = ["magic", "docker_runtime"]
+```
+
+Disabled plugins are discovered but not loaded; they still appear in `pm plugins list` with a `disabled` marker and reason. Project-local `[plugins].disabled` adds to the set — it cannot re-enable a user-disabled plugin.

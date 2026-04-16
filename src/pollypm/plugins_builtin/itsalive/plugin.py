@@ -8,7 +8,7 @@ from typing import Any
 
 from pollypm.plugins_builtin.core_agent_profiles.profiles import StaticPromptProfile, heartbeat_prompt, polly_prompt, worker_prompt
 from pollypm.itsalive import build_deploy_instructions, sweep_pending_deploys
-from pollypm.plugin_api.v1 import Capability, HookContext, JobHandlerAPI, PollyPMPlugin, RosterAPI
+from pollypm.plugin_api.v1 import Capability, HookContext, JobHandlerAPI, PluginAPI, PollyPMPlugin, RosterAPI
 
 logger = logging.getLogger(__name__)
 
@@ -88,10 +88,32 @@ def _register_handlers(api: JobHandlerAPI) -> None:
 
 
 def _register_roster(api: RosterAPI) -> None:
-    # Matches the old cadence embedded in Supervisor.run_heartbeat (every
-    # tick, which was ~60s). Expressing it here inverts the direction —
-    # core no longer reaches into itsalive (see #118).
+    # Legacy registration path — kept for rail versions that still call
+    # register_roster directly. The canonical registration now happens in
+    # ``_initialize`` below via the unified PluginAPI.
     api.register_recurring("@every 60s", "itsalive.deploy_sweep", {})
+
+
+def _initialize(api: PluginAPI) -> None:
+    """Register itsalive's recurring deploy sweep via the unified plugin
+    API (docs/plugin-discovery-spec.md §6).
+
+    Inverting the direction: core no longer needs to know about
+    sweep_pending_deploys — the plugin declares its own cadence. Matches
+    the old 60s tick embedded in ``Supervisor.run_heartbeat``. See #118.
+    """
+    # ``register_roster`` already wires the schedule; this hook is safe
+    # to call twice — the roster dedupes on (handler_name, payload). We
+    # keep it here so plugins using the new initialize() lifecycle stay
+    # readable and forward-compatible with rails that drop the older
+    # register_roster hook.
+    #
+    # Gracefully skip if no roster is available (initialize may be
+    # invoked in test harnesses that don't wire a heartbeat rail).
+    try:
+        api.roster.register_recurring("@every 60s", "itsalive.deploy_sweep", {})
+    except RuntimeError:
+        logger.debug("itsalive initialize skipped roster registration — no RosterAPI")
 
 
 plugin = PollyPMPlugin(
@@ -118,4 +140,5 @@ plugin = PollyPMPlugin(
     },
     register_handlers=_register_handlers,
     register_roster=_register_roster,
+    initialize=_initialize,
 )

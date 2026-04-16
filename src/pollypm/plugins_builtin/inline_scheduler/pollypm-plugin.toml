@@ -3,5 +3,9 @@ name = "inline_scheduler"
 kind = "scheduler"
 version = "0.1.0"
 entrypoint = "plugin.py:plugin"
-capabilities = ["scheduler"]
 description = "Built-in inline scheduler backend."
+
+[[capabilities]]
+kind = "scheduler"
+name = "inline"
+requires_api = ">=1,<2"

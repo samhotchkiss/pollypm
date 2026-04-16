@@ -3,5 +3,29 @@ name = "core_agent_profiles"
 kind = "agent_profile"
 version = "0.1.0"
 entrypoint = "plugin.py:plugin"
-capabilities = ["agent_profile"]
 description = "Built-in PollyPM agent profiles."
+
+[[capabilities]]
+kind = "agent_profile"
+name = "polly"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "agent_profile"
+name = "russell"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "agent_profile"
+name = "heartbeat"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "agent_profile"
+name = "worker"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "agent_profile"
+name = "triage"
+requires_api = ">=1,<2"

@@ -71,8 +71,9 @@ class TestCoreRecurringPlugin:
         assert _interval_seconds(entries["alerts.gc"]) == 300
 
     def test_plugin_declares_expected_capabilities(self) -> None:
-        assert "roster" in core_plugin.capabilities
-        assert "job_handler" in core_plugin.capabilities
+        kinds = {cap.kind for cap in core_plugin.capabilities}
+        assert "roster_entry" in kinds or "roster" in kinds  # legacy-compat
+        assert "job_handler" in kinds
 
 
 def _interval_seconds(entry) -> int:

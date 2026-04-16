@@ -3,5 +3,34 @@ name = "core_recurring"
 kind = "recurring"
 version = "0.1.0"
 entrypoint = "plugin.py:plugin"
-capabilities = ["roster", "job_handler"]
 description = "Built-in recurring handlers migrated from the old heartbeat loop (inbox sweep, session health sweep, capacity probe, transcript ingest, alerts GC)."
+
+[[capabilities]]
+kind = "job_handler"
+name = "inbox.sweep"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "job_handler"
+name = "session.health_sweep"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "job_handler"
+name = "capacity.probe"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "job_handler"
+name = "transcript.ingest"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "job_handler"
+name = "alerts.gc"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "roster_entry"
+name = "core_recurring"
+requires_api = ">=1,<2"

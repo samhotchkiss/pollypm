@@ -2,7 +2,7 @@ from pathlib import Path
 import shutil
 
 from pollypm.models import ProviderKind, RuntimeKind
-from pollypm.plugin_api.v1 import HookFilterResult
+from pollypm.plugin_api.v1 import Capability, HookFilterResult
 from pollypm.plugin_host import ExtensionHost
 from pollypm.providers import get_provider
 from pollypm.runtimes import get_runtime
@@ -212,3 +212,225 @@ def test_repo_heartbeat_plugin_overrides_builtin_backend(monkeypatch, tmp_path: 
     finally:
         if repo_plugin.exists():
             shutil.rmtree(repo_plugin)
+
+
+# ---------------------------------------------------------------------------
+# Issue #168 — structured [[capabilities]] manifest parsing.
+# ---------------------------------------------------------------------------
+
+
+def _write_structured_plugin(
+    plugin_dir: Path,
+    *,
+    name: str,
+    body: str,
+    manifest_extras: str = "",
+    requires_api: str | None = None,
+) -> None:
+    """Helper for writing a plugin with structured [[capabilities]]."""
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    top_requires = f'\nrequires_api = "{requires_api}"' if requires_api else ""
+    (plugin_dir / "pollypm-plugin.toml").write_text(
+        f'''api_version = "1"
+name = "{name}"
+version = "0.1.0"
+entrypoint = "plugin.py:plugin"{top_requires}
+{manifest_extras}
+'''
+    )
+    (plugin_dir / "plugin.py").write_text(body)
+
+
+def test_structured_capabilities_parse(monkeypatch, tmp_path: Path) -> None:
+    builtin_root = Path(__file__).resolve().parents[1] / "src" / "pollypm" / "plugins_builtin"
+    user_root = tmp_path / "user-plugins"
+    repo_root = tmp_path / ".pollypm-state" / "plugins"
+    repo_plugin = repo_root / "structured_caps_test"
+    monkeypatch.setattr(
+        ExtensionHost,
+        "_plugin_search_paths",
+        lambda self: [("builtin", builtin_root), ("user", user_root), ("repo", repo_root)],
+    )
+    _write_structured_plugin(
+        repo_plugin,
+        name="structured_caps_test",
+        manifest_extras=(
+            '[[capabilities]]\n'
+            'kind = "provider"\n'
+            'name = "my_provider"\n'
+            'requires_api = ">=1,<2"\n'
+            'replaces = ["old_provider"]\n'
+            '\n'
+            '[[capabilities]]\n'
+            'kind = "runtime"\n'
+            'name = "my_runtime"\n'
+        ),
+        body=(
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "plugin = PollyPMPlugin(name='structured_caps_test')\n"
+        ),
+    )
+
+    host = ExtensionHost(tmp_path)
+    plugins = host.plugins()
+    assert "structured_caps_test" in plugins
+    caps = plugins["structured_caps_test"].capabilities
+    assert len(caps) == 2
+    provider_cap = next(c for c in caps if c.kind == "provider")
+    runtime_cap = next(c for c in caps if c.kind == "runtime")
+    assert provider_cap.name == "my_provider"
+    assert provider_cap.replaces == ("old_provider",)
+    assert provider_cap.requires_api == ">=1,<2"
+    assert runtime_cap.name == "my_runtime"
+
+
+def test_legacy_bare_string_capabilities_still_parse(monkeypatch, tmp_path: Path, caplog) -> None:
+    import logging
+
+    builtin_root = Path(__file__).resolve().parents[1] / "src" / "pollypm" / "plugins_builtin"
+    user_root = tmp_path / "user-plugins"
+    repo_root = tmp_path / ".pollypm-state" / "plugins"
+    repo_plugin = repo_root / "legacy_caps_test"
+    monkeypatch.setattr(
+        ExtensionHost,
+        "_plugin_search_paths",
+        lambda self: [("builtin", builtin_root), ("user", user_root), ("repo", repo_root)],
+    )
+    _write_structured_plugin(
+        repo_plugin,
+        name="legacy_caps_test",
+        manifest_extras='capabilities = ["provider", "hook"]',
+        body=(
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "plugin = PollyPMPlugin(name='legacy_caps_test')\n"
+        ),
+    )
+    with caplog.at_level(logging.WARNING, logger="pollypm.plugin_host"):
+        host = ExtensionHost(tmp_path)
+        plugin = host.plugins()["legacy_caps_test"]
+    kinds = {c.kind for c in plugin.capabilities}
+    assert kinds == {"provider", "hook"}
+    assert any("legacy" in rec.message.lower() for rec in caplog.records)
+
+
+def test_requires_api_mismatch_skips_plugin(monkeypatch, tmp_path: Path) -> None:
+    builtin_root = Path(__file__).resolve().parents[1] / "src" / "pollypm" / "plugins_builtin"
+    user_root = tmp_path / "user-plugins"
+    repo_root = tmp_path / ".pollypm-state" / "plugins"
+    repo_plugin = repo_root / "bad_requires_api"
+    monkeypatch.setattr(
+        ExtensionHost,
+        "_plugin_search_paths",
+        lambda self: [("builtin", builtin_root), ("user", user_root), ("repo", repo_root)],
+    )
+    _write_structured_plugin(
+        repo_plugin,
+        name="bad_requires_api",
+        requires_api=">=2,<3",
+        manifest_extras='[[capabilities]]\nkind = "provider"\nname = "mine"\n',
+        body=(
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "plugin = PollyPMPlugin(name='bad_requires_api')\n"
+        ),
+    )
+    host = ExtensionHost(tmp_path)
+    assert "bad_requires_api" not in host.plugins()
+    assert any("requires_api" in err for err in host.errors)
+
+
+def test_per_capability_requires_api_drops_single_capability(monkeypatch, tmp_path: Path) -> None:
+    builtin_root = Path(__file__).resolve().parents[1] / "src" / "pollypm" / "plugins_builtin"
+    user_root = tmp_path / "user-plugins"
+    repo_root = tmp_path / ".pollypm-state" / "plugins"
+    repo_plugin = repo_root / "cap_requires_api"
+    monkeypatch.setattr(
+        ExtensionHost,
+        "_plugin_search_paths",
+        lambda self: [("builtin", builtin_root), ("user", user_root), ("repo", repo_root)],
+    )
+    _write_structured_plugin(
+        repo_plugin,
+        name="cap_requires_api",
+        manifest_extras=(
+            '[[capabilities]]\n'
+            'kind = "provider"\n'
+            'name = "fine"\n'
+            '\n'
+            '[[capabilities]]\n'
+            'kind = "runtime"\n'
+            'name = "future"\n'
+            'requires_api = ">=2"\n'
+        ),
+        body=(
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "plugin = PollyPMPlugin(name='cap_requires_api')\n"
+        ),
+    )
+    host = ExtensionHost(tmp_path)
+    plugin = host.plugins()["cap_requires_api"]
+    kept_kinds = {c.kind for c in plugin.capabilities}
+    assert "provider" in kept_kinds
+    assert "runtime" not in kept_kinds
+
+
+def test_explicit_replaces_preserves_earlier_provider(monkeypatch, tmp_path: Path) -> None:
+    """An explicit `replaces` capability wins over implicit last-write."""
+    builtin_root = Path(__file__).resolve().parents[1] / "src" / "pollypm" / "plugins_builtin"
+    user_root = tmp_path / "user-plugins"
+    repo_root = tmp_path / ".pollypm-state" / "plugins"
+    user_plugin = user_root / "explicit_replacer"
+    repo_plugin = repo_root / "late_override"
+    monkeypatch.setattr(
+        ExtensionHost,
+        "_plugin_search_paths",
+        lambda self: [("builtin", builtin_root), ("user", user_root), ("repo", repo_root)],
+    )
+    # user plugin: explicitly replaces "claude"
+    _write_structured_plugin(
+        user_plugin,
+        name="explicit_replacer",
+        manifest_extras=(
+            '[[capabilities]]\n'
+            'kind = "provider"\n'
+            'name = "claude"\n'
+            'replaces = ["claude"]\n'
+        ),
+        body=(
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "from pollypm.providers.codex import CodexAdapter\n"
+            "plugin = PollyPMPlugin(name='explicit_replacer', providers={'claude': CodexAdapter})\n"
+        ),
+    )
+    # repo plugin: tries implicit override (no `replaces`)
+    _write_structured_plugin(
+        repo_plugin,
+        name="late_override",
+        manifest_extras=(
+            '[[capabilities]]\n'
+            'kind = "provider"\n'
+            'name = "claude"\n'
+        ),
+        body=(
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "from pollypm.providers.claude import ClaudeAdapter\n"
+            "plugin = PollyPMPlugin(name='late_override', providers={'claude': ClaudeAdapter})\n"
+        ),
+    )
+
+    host = ExtensionHost(tmp_path)
+    provider = host.get_provider("claude")
+    # The explicit replacer (user plugin, loaded earlier) wins — its
+    # factory is CodexAdapter despite the later repo plugin trying to
+    # override.
+    assert provider.name == "codex"
+
+
+def test_plugin_post_init_normalizes_bare_strings() -> None:
+    from pollypm.plugin_api.v1 import PollyPMPlugin
+
+    plugin = PollyPMPlugin(name="sample", capabilities=("provider", "hook"))
+    assert all(isinstance(c, Capability) for c in plugin.capabilities)
+    kinds = {c.kind for c in plugin.capabilities}
+    assert kinds == {"provider", "hook"}
+    # name falls through to plugin name
+    assert all(c.name == "sample" for c in plugin.capabilities)

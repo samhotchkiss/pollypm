@@ -54,7 +54,7 @@ def test_validate_all_builtin_plugins_pass(tmp_path: Path) -> None:
 
 def test_validate_broken_plugin_is_disabled(tmp_path: Path) -> None:
     """A plugin with a broken provider factory should be disabled."""
-    plugin_dir = tmp_path / ".pollypm-state" / "plugins" / "broken_provider"
+    plugin_dir = tmp_path / ".pollypm" / "plugins" / "broken_provider"
     _write_plugin(
         plugin_dir,
         name="broken_provider",
@@ -87,7 +87,7 @@ def test_validate_broken_plugin_is_disabled(tmp_path: Path) -> None:
 
 def test_validate_plugin_missing_interface_methods(tmp_path: Path) -> None:
     """A plugin registering an incomplete provider should fail validation."""
-    plugin_dir = tmp_path / ".pollypm-state" / "plugins" / "incomplete"
+    plugin_dir = tmp_path / ".pollypm" / "plugins" / "incomplete"
     _write_plugin(
         plugin_dir,
         name="incomplete",
@@ -134,7 +134,7 @@ def test_validate_plugin_by_name_not_found(tmp_path: Path) -> None:
 
 def test_valid_plugin_remains_active_after_validation(tmp_path: Path) -> None:
     """A valid custom plugin should remain active after validation."""
-    plugin_dir = tmp_path / ".pollypm-state" / "plugins" / "good_plugin"
+    plugin_dir = tmp_path / ".pollypm" / "plugins" / "good_plugin"
     _write_plugin(
         plugin_dir,
         name="good_plugin",
@@ -167,8 +167,8 @@ def test_valid_plugin_remains_active_after_validation(tmp_path: Path) -> None:
 
 def test_mixed_valid_and_invalid_plugins(tmp_path: Path) -> None:
     """Only invalid plugins are disabled; valid ones remain."""
-    good_dir = tmp_path / ".pollypm-state" / "plugins" / "good_mix"
-    bad_dir = tmp_path / ".pollypm-state" / "plugins" / "bad_mix"
+    good_dir = tmp_path / ".pollypm" / "plugins" / "good_mix"
+    bad_dir = tmp_path / ".pollypm" / "plugins" / "bad_mix"
 
     _write_plugin(
         good_dir,

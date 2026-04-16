@@ -8,7 +8,7 @@ from typing import Any
 
 from pollypm.plugins_builtin.core_agent_profiles.profiles import StaticPromptProfile, heartbeat_prompt, polly_prompt, worker_prompt
 from pollypm.itsalive import build_deploy_instructions, sweep_pending_deploys
-from pollypm.plugin_api.v1 import HookContext, JobHandlerAPI, PollyPMPlugin, RosterAPI
+from pollypm.plugin_api.v1 import Capability, HookContext, JobHandlerAPI, PollyPMPlugin, RosterAPI
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +98,15 @@ plugin = PollyPMPlugin(
     name="itsalive",
     version="0.3.0",
     description="itsalive.co deployment integration for PollyPM sessions.",
-    capabilities=("agent_profile", "hook", "roster", "job_handler"),
+    capabilities=(
+        Capability(kind="agent_profile", name="itsalive"),
+        Capability(kind="agent_profile", name="polly", replaces=("polly",)),
+        Capability(kind="agent_profile", name="worker", replaces=("worker",)),
+        Capability(kind="agent_profile", name="heartbeat", replaces=("heartbeat",)),
+        Capability(kind="hook", name="session.after_launch"),
+        Capability(kind="job_handler", name="itsalive.deploy_sweep"),
+        Capability(kind="roster_entry", name="itsalive.deploy_sweep"),
+    ),
     agent_profiles={
         "itsalive": lambda: StaticPromptProfile(name="itsalive", prompt=build_deploy_instructions()),
         "polly": lambda: StaticPromptProfile(name="polly", prompt=_polly_prompt()),

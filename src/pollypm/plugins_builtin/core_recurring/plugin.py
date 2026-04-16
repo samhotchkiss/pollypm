@@ -21,7 +21,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from pollypm.plugin_api.v1 import JobHandlerAPI, PollyPMPlugin, RosterAPI
+from pollypm.plugin_api.v1 import Capability, JobHandlerAPI, PollyPMPlugin, RosterAPI
 
 
 logger = logging.getLogger(__name__)
@@ -197,7 +197,14 @@ plugin = PollyPMPlugin(
         "Registers inbox sweep, session health sweep, capacity probe, "
         "transcript ingest, and alerts GC on the roster + job queue."
     ),
-    capabilities=("roster", "job_handler"),
+    capabilities=(
+        Capability(kind="job_handler", name="inbox.sweep"),
+        Capability(kind="job_handler", name="session.health_sweep"),
+        Capability(kind="job_handler", name="capacity.probe"),
+        Capability(kind="job_handler", name="transcript.ingest"),
+        Capability(kind="job_handler", name="alerts.gc"),
+        Capability(kind="roster_entry", name="core_recurring"),
+    ),
     register_handlers=_register_handlers,
     register_roster=_register_roster,
 )

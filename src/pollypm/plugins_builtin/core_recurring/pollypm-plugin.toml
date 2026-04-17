@@ -31,6 +31,16 @@ name = "alerts.gc"
 requires_api = ">=1,<2"
 
 [[capabilities]]
+kind = "job_handler"
+name = "db.vacuum"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "job_handler"
+name = "memory.ttl_sweep"
+requires_api = ">=1,<2"
+
+[[capabilities]]
 kind = "roster_entry"
 name = "core_recurring"
 requires_api = ">=1,<2"

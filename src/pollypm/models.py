@@ -133,12 +133,24 @@ class PlannerSettings:
     opt-out is also available via ``--skip-plan`` on both
     ``pm add-project`` and ``pm project new``. See issue #255.
 
+    ``enforce_plan`` — when ``True`` (default), the ``task_assignment.sweep``
+    handler refuses to delegate implementation tasks for projects that
+    don't have an approved plan. Set to ``False`` to disable the gate
+    globally (tests / migration). See issue #273.
+
+    ``plan_dir`` — directory under each project root where the canonical
+    forward plan lives. Defaults to ``"docs/plan"`` — the gate looks for
+    ``<project>/<plan_dir>/plan.md``. Absolute paths are honoured as-is;
+    relative paths resolve against the project root. See issue #273.
+
     Note: this section is distinct from ``[planner.budgets]`` which is
     consumed directly out of raw TOML by ``budgets.py``; the two live
     under the same top-level key but serve different layers.
     """
 
     auto_on_project_created: bool = True
+    enforce_plan: bool = True
+    plan_dir: str = "docs/plan"
 
 
 @dataclass(slots=True)

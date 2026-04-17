@@ -25,6 +25,15 @@ closing the connection per tick. When a project has queued tasks for
 a role that has no live session, we emit a single deduped
 ``no_session`` alert per ``(project, role)`` — surfacing the blocked
 worker to the operator instead of silently dropping pings.
+
+#273: project-level plan-presence enforcement. Before emitting a ping
+for any non-planning task, the sweeper consults
+``has_acceptable_plan`` — a project without an approved, non-trivial
+``docs/plan/plan.md`` blocks delegation entirely. Blocked projects
+get a single deduped ``plan_missing`` alert per sweep cycle. Planning
+tasks (``plan_project`` / ``critique_flow``) and tasks labelled
+``bypass_plan_gate`` skate past the gate so the planner can always
+run and operators can force delegation when needed.
 """
 
 from __future__ import annotations
@@ -41,6 +50,10 @@ from pollypm.work.task_assignment import (
     role_candidate_names,
 )
 
+from pollypm.plugins_builtin.project_planning.plan_presence import (
+    has_acceptable_plan,
+    task_bypasses_plan_gate,
+)
 from pollypm.plugins_builtin.task_assignment_notify.resolver import (
     DEDUPE_WINDOW_SECONDS,
     SWEEPER_COOLDOWN_SECONDS,
@@ -207,6 +220,80 @@ def _emit_no_session_alert(
         )
 
 
+def _emit_plan_missing_alert(
+    services: Any,
+    *,
+    project: str,
+    example_task_id: str,
+) -> None:
+    """Raise (or refresh) a ``plan_missing`` alert for a project.
+
+    #273 sweep-level alert — fires once per project per sweep cycle
+    when the plan-presence gate blocks delegation. Keyed by
+    ``(project, 'plan_missing')`` so a project with many queued tasks
+    produces one row instead of N. Mirrors the ``_emit_no_session_alert``
+    dedupe semantics (``upsert_alert`` refreshes rather than duplicates).
+    """
+    store = services.state_store
+    if store is None:
+        return
+    # Alert row is keyed by the project identity — we use a synthetic
+    # session_name ``plan_gate-<project>`` so the cockpit's per-session
+    # alert view groups it alongside the project's worker alerts.
+    session_name = f"plan_gate-{project}"
+    message = (
+        f"Queued task {example_task_id} in project '{project}' cannot "
+        f"be delegated — no approved plan found at docs/plan/plan.md. "
+        f"Fix: pm project plan {project}"
+    )
+    try:
+        store.upsert_alert(session_name, "plan_missing", "warn", message)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "task_assignment sweep: upsert_alert(plan_missing) failed for %s",
+            session_name, exc_info=True,
+        )
+
+
+def _plan_gate_allows(
+    project_key: str,
+    project_path: Any,
+    work_service: Any,
+    services: Any,
+    plan_decisions: dict[str, bool],
+) -> bool:
+    """Return True when the plan gate allows delegation for ``project_key``.
+
+    Per-sweep-tick cache — the predicate reads ``plan.md`` from disk
+    and queries ``list_tasks``, so we amortise across the many-queued-
+    tasks case by memoising the decision keyed by project key alone.
+    Values: True = gate open (plan acceptable), False = gate closed.
+    """
+    cached = plan_decisions.get(project_key)
+    if cached is not None:
+        return cached
+    if project_path is None:
+        # Without a filesystem anchor we can't check ``docs/plan/plan.md``
+        # — treat the project as gated (fail closed).
+        plan_decisions[project_key] = False
+        return False
+    try:
+        allowed = has_acceptable_plan(
+            project_key,
+            Path(project_path),
+            work_service,
+            plan_dir=getattr(services, "plan_dir", "docs/plan"),
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "task_assignment sweep: plan gate evaluation failed for %s",
+            project_key, exc_info=True,
+        )
+        allowed = False
+    plan_decisions[project_key] = allowed
+    return allowed
+
+
 def _sweep_work_service(
     work: Any,
     services: Any,
@@ -214,6 +301,9 @@ def _sweep_work_service(
     throttle_override: int,
     totals: dict[str, Any],
     alerted_pairs: set[tuple[str, str]],
+    plan_missing_projects: set[str],
+    plan_decisions: dict[str, bool],
+    project_path: Any = None,
 ) -> None:
     """Run one sweep pass over a single work-service DB.
 
@@ -221,8 +311,16 @@ def _sweep_work_service(
     place so the caller can aggregate across per-project DBs. Tracks
     already-alerted ``(project, role)`` pairs in ``alerted_pairs`` so
     we emit at most one ``no_session`` alert per pair per sweep cycle.
+
+    ``plan_missing_projects`` — projects we've already emitted a
+    ``plan_missing`` alert for in this sweep cycle. ``plan_decisions``
+    — per-project plan-gate decision cache, one entry per project.
+    ``project_path`` — filesystem anchor for the plan-presence check;
+    None for the workspace-root pass (which has no single project
+    root and so auto-skips the gate).
     """
     by_outcome = totals["by_outcome"]
+    enforce_plan = bool(getattr(services, "enforce_plan", True))
     for status in _SWEEPABLE_STATUSES:
         try:
             tasks = work.list_tasks(work_status=status)
@@ -245,6 +343,36 @@ def _sweep_work_service(
                         by_outcome.get("skipped_active_turn", 0) + 1
                     )
                     continue
+
+            # #273: plan-presence gate. The planner's own tasks
+            # bypass; everyone else is blocked until the project has
+            # an approved plan. We only apply the gate for per-project
+            # sweeps (``project_path`` supplied) because workspace-root
+            # tasks have no single project path to anchor to.
+            if (
+                enforce_plan
+                and project_path is not None
+                and not task_bypasses_plan_gate(task)
+            ):
+                if not _plan_gate_allows(
+                    event.project,
+                    project_path,
+                    work,
+                    services,
+                    plan_decisions,
+                ):
+                    by_outcome["skipped_plan_missing"] = (
+                        by_outcome.get("skipped_plan_missing", 0) + 1
+                    )
+                    if event.project not in plan_missing_projects:
+                        plan_missing_projects.add(event.project)
+                        _emit_plan_missing_alert(
+                            services,
+                            project=event.project,
+                            example_task_id=event.task_id,
+                        )
+                    continue
+
             totals["considered"] += 1
             result = notify(
                 event, services=services, throttle_seconds=throttle_override,
@@ -327,12 +455,16 @@ def task_assignment_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
 
     totals: dict[str, Any] = {"considered": 0, "by_outcome": {}}
     alerted_pairs: set[tuple[str, str]] = set()
+    plan_missing_projects: set[str] = set()
+    plan_decisions: dict[str, bool] = {}
     projects_scanned = 0
     projects_skipped = 0
 
     # Pass 1: workspace-root DB (workspace-level tasks the pollypm repo
     # itself uses, or tests that point services.work_service at a
-    # tmpdir without registered projects).
+    # tmpdir without registered projects). Workspace-root tasks aren't
+    # anchored to a single project directory, so the plan-presence
+    # gate is intentionally skipped for this pass (``project_path=None``).
     workspace_work = services.work_service
     if workspace_work is not None:
         try:
@@ -341,6 +473,9 @@ def task_assignment_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 throttle_override=throttle_override,
                 totals=totals,
                 alerted_pairs=alerted_pairs,
+                plan_missing_projects=plan_missing_projects,
+                plan_decisions=plan_decisions,
+                project_path=None,
             )
         finally:
             _close_quietly(workspace_work)
@@ -364,6 +499,9 @@ def task_assignment_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 throttle_override=throttle_override,
                 totals=totals,
                 alerted_pairs=alerted_pairs,
+                plan_missing_projects=plan_missing_projects,
+                plan_decisions=plan_decisions,
+                project_path=getattr(project, "path", None),
             )
             projects_scanned += 1
         finally:
@@ -376,4 +514,5 @@ def task_assignment_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
         "projects_scanned": projects_scanned,
         "projects_skipped": projects_skipped,
         "no_session_alerts": len(alerted_pairs),
+        "plan_missing_alerts": len(plan_missing_projects),
     }

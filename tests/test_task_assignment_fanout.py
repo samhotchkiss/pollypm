@@ -138,6 +138,7 @@ class TestPerProjectFanout:
                     FakeKnownProject(key="alpha", path=proj_a),
                     FakeKnownProject(key="beta", path=proj_b),
                 ),
+                enforce_plan=False,  # #273: #259 tests pre-date the plan gate
             )
 
         _install_fake_loader(monkeypatch, _factory)
@@ -180,6 +181,7 @@ class TestPerProjectFanout:
                     FakeKnownProject(key="real", path=proj_real),
                     FakeKnownProject(key="missing", path=proj_missing),
                 ),
+                enforce_plan=False,  # #273: pre-dates plan gate
             )
 
         _install_fake_loader(monkeypatch, _factory)
@@ -224,6 +226,7 @@ class TestNoSessionAlerts:
                 work_service=None,
                 project_root=tmp_path,
                 known_projects=(FakeKnownProject(key="ghost", path=proj),),
+                enforce_plan=False,  # #273: pre-dates plan gate
             )
 
         _install_fake_loader(monkeypatch, _factory)
@@ -269,6 +272,7 @@ class TestNoSessionAlerts:
                 work_service=None,
                 project_root=tmp_path,
                 known_projects=(FakeKnownProject(key="ghost", path=proj),),
+                enforce_plan=False,  # #273: pre-dates plan gate
             )
 
         _install_fake_loader(monkeypatch, _factory)

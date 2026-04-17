@@ -259,7 +259,14 @@ def _parse_rail_settings(raw: dict[str, object]) -> "RailSettings":
 def _parse_planner_settings(raw: dict[str, object]) -> PlannerSettings:
     """Parse the ``[planner]`` TOML section.
 
-    Today only ``auto_on_project_created`` is recognised (see issue #255).
+    Recognised keys:
+
+    * ``auto_on_project_created`` — issue #255.
+    * ``enforce_plan`` — issue #273. Gate-wide kill switch for the
+      plan-presence sweep gate.
+    * ``plan_dir`` — issue #273. Per-project relative path to the
+      directory hosting ``plan.md``.
+
     Other nested tables under ``[planner]`` — for example
     ``[planner.budgets]`` — are consumed directly out of raw TOML by
     their own modules and ignored here. Unknown keys pass through
@@ -273,7 +280,17 @@ def _parse_planner_settings(raw: dict[str, object]) -> PlannerSettings:
     # a fat-fingered config never silently disables the planner.
     if not isinstance(auto, bool):
         auto = True
-    return PlannerSettings(auto_on_project_created=auto)
+    enforce = planner_raw.get("enforce_plan", True)
+    if not isinstance(enforce, bool):
+        enforce = True
+    plan_dir_raw = planner_raw.get("plan_dir", "docs/plan")
+    if not isinstance(plan_dir_raw, str) or not plan_dir_raw.strip():
+        plan_dir_raw = "docs/plan"
+    return PlannerSettings(
+        auto_on_project_created=auto,
+        enforce_plan=enforce,
+        plan_dir=plan_dir_raw.strip(),
+    )
 
 
 def _parse_plugin_settings(raw: dict[str, object]) -> PluginSettings:
@@ -468,16 +485,19 @@ def _render_global_config(config: PollyPMConfig) -> str:
         )
 
     # Emit [planner] only when the user has deviated from the default.
-    # Default (auto_on_project_created=True) round-trips as an absent
-    # section so existing configs don't churn on rewrite.
+    # Default (all fields at their factory values) round-trips as an
+    # absent section so existing configs don't churn on rewrite.
+    planner_overrides: list[str] = []
     if not config.planner.auto_on_project_created:
-        lines.extend(
-            [
-                "[planner]",
-                "auto_on_project_created = false",
-                "",
-            ]
-        )
+        planner_overrides.append("auto_on_project_created = false")
+    if not config.planner.enforce_plan:
+        planner_overrides.append("enforce_plan = false")
+    if config.planner.plan_dir != "docs/plan":
+        planner_overrides.append(f'plan_dir = "{_toml_str(config.planner.plan_dir)}"')
+    if planner_overrides:
+        lines.append("[planner]")
+        lines.extend(planner_overrides)
+        lines.append("")
 
     for account_name, account in config.accounts.items():
         lines.extend(

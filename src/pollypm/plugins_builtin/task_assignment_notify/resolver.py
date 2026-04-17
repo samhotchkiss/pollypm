@@ -39,6 +39,12 @@ class _RuntimeServices:
     config, used by the sweeper to fan out across per-project work-
     service DBs (#259). Empty tuple when no projects are registered or
     config didn't load; the sweep then only scans the workspace-root DB.
+
+    ``enforce_plan`` / ``plan_dir`` — ``[planner]`` config knobs read at
+    service-load time so the sweep handler can evaluate the plan-
+    presence gate (#273) without re-parsing config on every task.
+    ``enforce_plan`` defaults to True (gate active); ``plan_dir``
+    defaults to ``"docs/plan"``.
     """
 
     session_service: Any | None
@@ -46,6 +52,8 @@ class _RuntimeServices:
     work_service: Any | None
     project_root: Path
     known_projects: tuple[Any, ...] = field(default_factory=tuple)
+    enforce_plan: bool = True
+    plan_dir: str = "docs/plan"
 
 
 def load_runtime_services(
@@ -111,6 +119,8 @@ def load_runtime_services(
         work_service=work_service,
         project_root=config.project.root_dir,
         known_projects=known_projects,
+        enforce_plan=config.planner.enforce_plan,
+        plan_dir=config.planner.plan_dir,
     )
 
 

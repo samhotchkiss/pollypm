@@ -1,0 +1,21 @@
+api_version = "1"
+name = "task_assignment_notify"
+kind = "job_handler"
+version = "0.1.0"
+entrypoint = "plugin.py:plugin"
+description = "Event-driven + @every 30s sweeper that pings the right session when a task transitions to a non-user actor. Closes the idle-worker/idle-reviewer gap surfaced by issue #244."
+
+[[capabilities]]
+kind = "job_handler"
+name = "task_assignment.notify"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "job_handler"
+name = "task_assignment.sweep"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "roster_entry"
+name = "task_assignment.sweep"
+requires_api = ">=1,<2"

@@ -638,6 +638,26 @@ class StateStore:
             # _safe_add_column (idempotent on fresh DBs that already have
             # it from SCHEMA). The index is created afterwards.
         ]),
+        # --- Migration 11 ----------------------------------------------
+        # Task-assignment notification dedupe table (#244). Records
+        # every ping sent to a session about a given task so the notify
+        # handler can throttle re-sends to once per 30 minutes and the
+        # ``pm task pickup-log`` CLI can surface delivery history.
+        (11, "Task-assignment notifications dedupe table (#244)", [
+            """CREATE TABLE IF NOT EXISTS task_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_name TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                project TEXT NOT NULL DEFAULT '',
+                notified_at TEXT NOT NULL,
+                delivery_status TEXT NOT NULL DEFAULT 'sent',
+                message TEXT NOT NULL DEFAULT ''
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_task_notifications_recent
+               ON task_notifications(notified_at DESC)""",
+            """CREATE INDEX IF NOT EXISTS idx_task_notifications_session_task
+               ON task_notifications(session_name, task_id, notified_at DESC)""",
+        ]),
     ]
 
     def _migrate(self) -> None:
@@ -1068,6 +1088,103 @@ class StateStore:
         )
         self.commit()
         return self.get_alert(alert_id)
+
+    # ------------------------------------------------------------------
+    # Task-assignment notification dedupe (#244)
+    # ------------------------------------------------------------------
+
+    def record_notification(
+        self,
+        *,
+        session_name: str,
+        task_id: str,
+        project: str = "",
+        message: str = "",
+        delivery_status: str = "sent",
+    ) -> None:
+        """Record a task-assignment ping sent to ``session_name``.
+
+        The caller looks up ``was_notified_within`` beforehand to enforce
+        the 30-minute throttle; this method just appends a row.
+        """
+        self.execute(
+            """
+            INSERT INTO task_notifications
+                (session_name, task_id, project, notified_at, delivery_status, message)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (session_name, task_id, project, self._now(), delivery_status, message),
+        )
+        self.commit()
+
+    def was_notified_within(
+        self,
+        session_name: str,
+        task_id: str,
+        window_seconds: int,
+    ) -> bool:
+        """Return ``True`` if ``(session, task)`` was pinged inside the window.
+
+        ``window_seconds`` is the dedupe horizon — 30 min (``1800``) for
+        the primary throttle, 5 min (``300``) for the sweeper's
+        re-enqueue-avoidance cursor.
+        """
+        from datetime import timedelta
+        cutoff = (datetime.now(UTC) - timedelta(seconds=window_seconds)).isoformat()
+        row = self.execute(
+            """
+            SELECT 1 FROM task_notifications
+            WHERE session_name = ? AND task_id = ? AND notified_at >= ?
+            LIMIT 1
+            """,
+            (session_name, task_id, cutoff),
+        ).fetchone()
+        return row is not None
+
+    def recent_notifications(
+        self,
+        *,
+        since_seconds: int | None = None,
+        project: str | None = None,
+        task_id: str | None = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """Return a reverse-chronological slice of pickup notifications.
+
+        Backs ``pm task pickup-log``. Filters compose (AND).
+        """
+        clauses: list[str] = []
+        params: list[object] = []
+        if since_seconds is not None:
+            from datetime import timedelta
+            cutoff = (datetime.now(UTC) - timedelta(seconds=since_seconds)).isoformat()
+            clauses.append("notified_at >= ?")
+            params.append(cutoff)
+        if project is not None:
+            clauses.append("project = ?")
+            params.append(project)
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = (
+            "SELECT session_name, task_id, project, notified_at, "
+            "delivery_status, message FROM task_notifications"
+            f"{where} ORDER BY notified_at DESC LIMIT ?"
+        )
+        params.append(int(limit))
+        rows = self.execute(sql, tuple(params)).fetchall()
+        return [
+            {
+                "session_name": r[0],
+                "task_id": r[1],
+                "project": r[2],
+                "notified_at": r[3],
+                "delivery_status": r[4],
+                "message": r[5],
+            }
+            for r in rows
+        ]
 
     def set_lease(self, session_name: str, owner: str, note: str = "") -> None:
         now = self._now()

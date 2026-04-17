@@ -139,9 +139,62 @@ class SQLiteWorkService:
         self.close()
 
     def _sync_transition(self, task: Task, old_status: str, new_status: str) -> None:
-        """Fire sync adapter hooks for a state transition."""
+        """Fire sync adapter hooks + task-assignment bus for a state transition."""
         if self._sync:
             self._sync.on_transition(task, old_status, new_status)
+
+        # Emit a TaskAssignmentEvent whenever the task's new current node
+        # is waiting on a non-user actor. The event bus is consumed by
+        # the built-in ``task_assignment_notify`` plugin which resolves
+        # the target session by naming convention and sends a short
+        # imperative ping — see ``docs/`` and issue #244.
+        #
+        # Best-effort: bus dispatch never bubbles exceptions, and any
+        # lookup error here is swallowed so the transition always
+        # commits cleanly.
+        try:
+            if not task.flow_template_id:
+                return
+            flow = self._load_flow_from_db(
+                task.flow_template_id, task.flow_template_version,
+            )
+            # Task nodes don't live on the task until claim() wires
+            # ``current_node_id``. For a queued task (and similarly for
+            # a freshly-queued task with no active execution), the
+            # *implicit* current node is the flow's start node — that's
+            # where the next actor will pick up. The spec treats the
+            # queued→worker handoff as a first-class assignment event,
+            # so we fall back to ``flow.start_node`` when the task has
+            # no explicit current node set.
+            node_id = task.current_node_id or flow.start_node
+            if not node_id:
+                return
+            node = flow.nodes.get(node_id)
+            if node is None:
+                return
+            from pollypm.work.task_assignment import (
+                build_event_from_task,
+                dispatch as _dispatch_task_assignment,
+            )
+            # Inject the effective current_node so build_event sees it
+            # on tasks that haven't yet been claimed.
+            effective_task = task
+            if task.current_node_id is None:
+                # Shallow copy avoids mutating the caller's dataclass.
+                from dataclasses import replace
+                effective_task = replace(task, current_node_id=node_id)
+            event = build_event_from_task(
+                effective_task,
+                node,
+                transitioned_by=task.assignee or "system",
+            )
+            if event is not None:
+                _dispatch_task_assignment(event)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "task_assignment dispatch failed for %s", task.task_id,
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # Internal: flow template persistence

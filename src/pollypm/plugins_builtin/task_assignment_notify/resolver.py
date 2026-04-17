@@ -1,0 +1,263 @@
+"""Plugin-side helpers that wire the work-assignment bus to the rail's
+session service + state store.
+
+The real business logic (event shape, role → name convention, message
+text) lives in ``pollypm.work.task_assignment``. This module only
+glues the plugin to the runtime services — config loading, session
+service instantiation, dedupe / escalate decisions.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from pollypm.work.task_assignment import (
+    SessionRoleIndex,
+    TaskAssignmentEvent,
+    format_ping_for_role,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# 30-minute throttle on (session, task) pings — the spec's dedupe window.
+DEDUPE_WINDOW_SECONDS = 30 * 60
+
+# Sweeper's re-enqueue cooldown — we re-notify a stale sitter every 5 min
+# at most even when the sweep cadence is 30s.
+SWEEPER_COOLDOWN_SECONDS = 5 * 60
+
+
+@dataclass(slots=True)
+class _RuntimeServices:
+    """Container for the services a notify/sweep invocation needs."""
+
+    session_service: Any | None
+    state_store: Any | None
+    work_service: Any | None
+    project_root: Path
+
+
+def load_runtime_services(
+    *,
+    config_path: Path | None = None,
+) -> _RuntimeServices:
+    """Resolve the session service + state store + work service from config.
+
+    Returns a container with ``None`` slots when a particular piece can't
+    be built (e.g. tests running without a config). Callers should treat
+    missing services as a soft skip.
+    """
+    from pollypm.config import DEFAULT_CONFIG_PATH, load_config, resolve_config_path
+
+    resolved_path = config_path or resolve_config_path(DEFAULT_CONFIG_PATH)
+    if not resolved_path or not resolved_path.exists():
+        return _RuntimeServices(
+            session_service=None,
+            state_store=None,
+            work_service=None,
+            project_root=Path.cwd(),
+        )
+    config = load_config(resolved_path)
+
+    from pollypm.storage.state import StateStore
+
+    store = StateStore(config.project.state_db)
+
+    # Session service — try the tmux default; any failure means we have
+    # no way to ping, so the caller escalates to a user-inbox alert.
+    session_service: Any | None
+    try:
+        from pollypm.session_services.tmux import TmuxSessionService
+
+        session_service = TmuxSessionService(config=config, store=store)
+    except Exception:  # noqa: BLE001
+        logger.debug("task_assignment_notify: session service unavailable", exc_info=True)
+        session_service = None
+
+    # Work service — needed by the sweeper to enumerate queued/review
+    # tasks and by the resolver to count in-progress claims for
+    # disambiguation. Best-effort.
+    work_service: Any | None
+    try:
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        project_root = config.project.root_dir
+        db_path = project_root / ".pollypm" / "state.db"
+        work_service = SQLiteWorkService(db_path=db_path, project_path=project_root)
+    except Exception:  # noqa: BLE001
+        logger.debug("task_assignment_notify: work service unavailable", exc_info=True)
+        work_service = None
+
+    return _RuntimeServices(
+        session_service=session_service,
+        state_store=store,
+        work_service=work_service,
+        project_root=config.project.root_dir,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Notify primitive — used by both the event listener and the sweeper.
+# ---------------------------------------------------------------------------
+
+
+def notify(
+    event: TaskAssignmentEvent,
+    *,
+    services: _RuntimeServices,
+    throttle_seconds: int = DEDUPE_WINDOW_SECONDS,
+) -> dict[str, Any]:
+    """Resolve + dedupe + send a single assignment ping.
+
+    Returns a small dict describing the outcome so handlers can include
+    it in their job-result payload. Never raises — every error path is
+    classified (``"no_session"``, ``"deduped"``, ``"send_failed"``,
+    ``"no_session_service"``).
+    """
+    session_svc = services.session_service
+    store = services.state_store
+
+    if session_svc is None:
+        _escalate_no_session_service(event, store)
+        return {"outcome": "no_session_service", "task_id": event.task_id}
+
+    index = SessionRoleIndex(session_svc, work_service=services.work_service)
+    handle = index.resolve(event.actor_type, event.actor_name, event.project)
+
+    if handle is None:
+        _escalate_no_session(event, store)
+        return {
+            "outcome": "no_session",
+            "task_id": event.task_id,
+            "actor_type": event.actor_type.value,
+            "actor_name": event.actor_name,
+        }
+
+    target_name = getattr(handle, "name", "")
+
+    # Dedupe: don't re-ping the same session about the same task within
+    # the throttle window.
+    if store is not None and throttle_seconds > 0:
+        try:
+            if store.was_notified_within(target_name, event.task_id, throttle_seconds):
+                return {
+                    "outcome": "deduped",
+                    "task_id": event.task_id,
+                    "session": target_name,
+                }
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "task_assignment_notify: dedupe check failed for %s",
+                event.task_id, exc_info=True,
+            )
+
+    # Clear any prior "no session" alert for this task — the recipient
+    # is back online.
+    if store is not None:
+        try:
+            store.clear_alert("task_assignment", _alert_type_for(event))
+        except Exception:  # noqa: BLE001
+            pass
+
+    message = format_ping_for_role(event)
+
+    try:
+        session_svc.send(target_name, message)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "task_assignment_notify: send to %s failed: %s", target_name, exc,
+        )
+        if store is not None:
+            try:
+                store.record_notification(
+                    session_name=target_name,
+                    task_id=event.task_id,
+                    project=event.project,
+                    message=message,
+                    delivery_status=f"failed: {exc}"[:200],
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        return {
+            "outcome": "send_failed",
+            "task_id": event.task_id,
+            "session": target_name,
+            "error": str(exc),
+        }
+
+    if store is not None:
+        try:
+            store.record_notification(
+                session_name=target_name,
+                task_id=event.task_id,
+                project=event.project,
+                message=message,
+                delivery_status="sent",
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "task_assignment_notify: record_notification failed for %s",
+                event.task_id, exc_info=True,
+            )
+
+    return {
+        "outcome": "sent",
+        "task_id": event.task_id,
+        "session": target_name,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Escalation helpers
+# ---------------------------------------------------------------------------
+
+
+def _alert_type_for(event: TaskAssignmentEvent) -> str:
+    """Return the alert_type used to dedupe no-session alerts per task."""
+    return f"no_session_for_assignment:{event.task_id}"
+
+
+def _escalate_no_session(event: TaskAssignmentEvent, store: Any | None) -> None:
+    """Raise (or refresh) a user-inbox alert when no session matches."""
+    if store is None:
+        return
+    message = (
+        f"Task {event.task_id} queued for "
+        f"{event.actor_type.value}:{event.actor_name} but no session running. "
+        f"Fix: pm worker-start {event.project}"
+    )
+    try:
+        store.upsert_alert(
+            "task_assignment",
+            _alert_type_for(event),
+            "warning",
+            message,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "task_assignment_notify: failed to raise alert for %s",
+            event.task_id, exc_info=True,
+        )
+
+
+def _escalate_no_session_service(event: TaskAssignmentEvent, store: Any | None) -> None:
+    """No session service at all — dev/test mode or misconfig. Surface once."""
+    if store is None:
+        return
+    try:
+        store.upsert_alert(
+            "task_assignment",
+            "no_session_service",
+            "warning",
+            (
+                "Task-assignment notify cannot resolve a session service. "
+                "Check plugin host configuration — pings will not be delivered "
+                f"(example pending task: {event.task_id})."
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        pass

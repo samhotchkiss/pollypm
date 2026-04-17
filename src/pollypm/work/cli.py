@@ -1122,3 +1122,115 @@ def task_migrate(
             typer.echo(f"Errors:  {len(result.errors)}")
             for err in result.errors:
                 typer.echo(f"  - {err}")
+
+
+# ---------------------------------------------------------------------------
+# pm task pickup-log — inspect task-assignment notification history (#244)
+# ---------------------------------------------------------------------------
+
+
+def _parse_since(value: str | None) -> int | None:
+    """Parse a ``--since`` duration like ``24h`` / ``90m`` / ``7d``.
+
+    Returns ``None`` when ``value`` is ``None``. Raises ``typer.BadParameter``
+    for unparseable input so the CLI surfaces a clean error.
+    """
+    if value is None:
+        return None
+    raw = value.strip().lower()
+    if not raw:
+        return None
+    # Bare integer = seconds.
+    if raw.isdigit():
+        return int(raw)
+    unit = raw[-1]
+    try:
+        magnitude = int(raw[:-1])
+    except ValueError as exc:
+        raise typer.BadParameter(
+            f"--since must be an int, or a number followed by s/m/h/d (got {value!r})"
+        ) from exc
+    if unit == "s":
+        return magnitude
+    if unit == "m":
+        return magnitude * 60
+    if unit == "h":
+        return magnitude * 3600
+    if unit == "d":
+        return magnitude * 86400
+    raise typer.BadParameter(
+        f"--since unit must be one of s/m/h/d (got {unit!r})"
+    )
+
+
+@task_app.command("pickup-log")
+def task_pickup_log(
+    since: Optional[str] = typer.Option(
+        None, "--since",
+        help="Only show entries newer than this (e.g. 24h, 90m, 7d).",
+    ),
+    project: Optional[str] = typer.Option(
+        None, "--project", "-p", help="Filter by project key.",
+    ),
+    task_id: Optional[str] = typer.Option(
+        None, "--task-id", help="Filter by task id (project/number).",
+    ),
+    limit: int = typer.Option(
+        200, "--limit", help="Max rows to return.",
+    ),
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Show task-assignment notifications (who got pinged about what, when).
+
+    Reads the ``task_notifications`` dedupe table written by the
+    ``task_assignment_notify`` plugin. Helpful for auditing worker /
+    reviewer pickup after the E2E gap closed by issue #244.
+    """
+    since_seconds = _parse_since(since)
+
+    # Resolve state_db from config — same pattern as _svc.
+    try:
+        from pollypm.config import DEFAULT_CONFIG_PATH, load_config, resolve_config_path
+        from pollypm.storage.state import StateStore
+
+        config_path = resolve_config_path(DEFAULT_CONFIG_PATH)
+        if not config_path.exists():
+            typer.echo("No PollyPM config found; nothing to show.", err=True)
+            raise typer.Exit(code=1)
+        config = load_config(config_path)
+        store = StateStore(config.project.state_db)
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"Error loading state store: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    try:
+        rows = store.recent_notifications(
+            since_seconds=since_seconds,
+            project=project,
+            task_id=task_id,
+            limit=limit,
+        )
+    finally:
+        try:
+            store.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    if output_json:
+        typer.echo(json.dumps(rows, indent=2, default=str))
+        return
+
+    if not rows:
+        typer.echo("No pickup notifications recorded.")
+        return
+
+    typer.echo(
+        f"{'Notified At':<28} {'Session':<24} {'Task':<22} {'Status':<10} Project"
+    )
+    typer.echo("-" * 100)
+    for row in rows:
+        status = (row.get("delivery_status") or "")[:10]
+        typer.echo(
+            f"{row['notified_at']:<28} {row['session_name']:<24} "
+            f"{row['task_id']:<22} {status:<10} {row.get('project', '')}"
+        )

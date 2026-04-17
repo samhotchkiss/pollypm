@@ -33,7 +33,8 @@ SKILLS_DIR = (
 # Progress:
 #  - Architecture & Visualization (10): 10
 #  - Documents (8): 18
-EXPECTED_COUNT = 18
+#  - Code Quality & Review (10): 28
+EXPECTED_COUNT = 28
 
 
 REQUIRED_FIELDS = {"name", "description", "when_to_trigger", "kind"}

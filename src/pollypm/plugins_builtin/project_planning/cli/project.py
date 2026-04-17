@@ -16,12 +16,18 @@ Subcommands:
 Implementation detail: the ``pm project new`` flow delegates to the
 same ``_plan_project_task`` helper that the ``plan`` subcommand uses,
 so both exercises the same code path end-to-end.
+
+Issue #274: ``pm project new`` auto-classifies the target directory as
+``greenfield`` or ``existing`` and routes to the drift-aware replan
+flow in the ``existing`` case so cold-start decompositions don't fight
+against prior code. Use ``--force-cold-start`` to override.
 """
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import typer
 
@@ -108,6 +114,134 @@ def _resolve_project_key(
         err=True,
     )
     raise typer.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# Project-state classification (issue #274)
+# ---------------------------------------------------------------------------
+
+
+# Source-file suffixes we treat as "this directory already has code".
+# Conservative but covers the major languages users currently run
+# PollyPM against. A ``README`` alone is not enough — docs without code
+# or history usually land in the greenfield bucket.
+_SOURCE_SUFFIXES: frozenset[str] = frozenset(
+    {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".rb"}
+)
+
+
+def _git_commit_count(project_path: Path) -> int:
+    """Return the number of commits reachable from HEAD, or 0 on error.
+
+    Returns 0 for a non-git directory, a freshly-``git init``-ed
+    directory with no commits, or any other error (network, permissions,
+    git binary missing). Deliberately conservative — a read failure must
+    never force the existing-project branch on an actually-fresh dir.
+    """
+    if not (project_path / ".git").exists():
+        return 0
+    try:
+        result = subprocess.run(
+            ["git", "rev-list", "--count", "HEAD"],
+            cwd=str(project_path),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    if result.returncode != 0:
+        return 0
+    try:
+        return int(result.stdout.strip() or "0")
+    except ValueError:
+        return 0
+
+
+def _has_source_files(project_path: Path, *, max_scan: int = 2000) -> bool:
+    """Return True iff ``project_path`` contains at least one source file.
+
+    Walks the tree (skipping ``.git``, ``.pollypm``, and common venv /
+    node_modules dirs) and bails on the first match. Capped at
+    ``max_scan`` entries to keep the classifier fast on giant repos —
+    the ``rglob`` itself is cheap, but an uncooperative filesystem can
+    still stall us.
+    """
+    skip_dirs = {".git", ".pollypm", ".pollypm-state", "node_modules",
+                 "__pycache__", ".venv", "venv", "dist", "build", ".tox"}
+    count = 0
+    try:
+        for entry in project_path.rglob("*"):
+            # Cheap prune: any parent hit on the skip list → move on.
+            if any(part in skip_dirs for part in entry.parts):
+                continue
+            if not entry.is_file():
+                continue
+            if entry.suffix in _SOURCE_SUFFIXES:
+                return True
+            count += 1
+            if count >= max_scan:
+                break
+    except OSError:
+        return False
+    return False
+
+
+def _has_work_tasks(project_path: Path) -> bool:
+    """Return True iff the project's work-service DB has ≥1 work_tasks row.
+
+    Reads the sqlite table directly — ``SQLiteWorkService`` is a heavier
+    entrypoint and this path runs on the happy path for every
+    ``pm project new`` invocation, so we keep it lean. Fails closed:
+    any DB / IO error returns False so we don't accidentally flag a
+    greenfield project as existing on a transient error.
+    """
+    db_path = project_path / ".pollypm" / "state.db"
+    if not db_path.exists():
+        return False
+    try:
+        import sqlite3
+
+        with sqlite3.connect(str(db_path)) as conn:
+            cur = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='work_tasks' LIMIT 1"
+            )
+            if cur.fetchone() is None:
+                return False
+            cur = conn.execute("SELECT 1 FROM work_tasks LIMIT 1")
+            return cur.fetchone() is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _classify_project_state(
+    project_path: Path,
+) -> Literal["greenfield", "existing"]:
+    """Classify a project directory for the ``pm project new`` routing.
+
+    Returns ``"existing"`` if ANY of the following hold:
+
+    * ``git rev-list --count HEAD`` > 1 (i.e. more than just an initial
+      "init" commit).
+    * ``<path>/docs/plan/plan.md`` exists.
+    * Any source file (``.py``/``.ts``/``.js``/``.go``/``.rs``/
+      ``.java``/``.rb``/``.tsx``/``.jsx``) exists at any depth.
+    * The work-service DB already has ≥ 1 row in ``work_tasks``.
+
+    Otherwise ``"greenfield"``. The heuristic is intentionally loose —
+    the user can still override with ``--force-cold-start`` when the
+    auto-classification guesses wrong.
+    """
+    if _git_commit_count(project_path) > 1:
+        return "existing"
+    if (project_path / "docs" / "plan" / "plan.md").exists():
+        return "existing"
+    if _has_source_files(project_path):
+        return "existing"
+    if _has_work_tasks(project_path):
+        return "existing"
+    return "greenfield"
 
 
 def _plan_project_task(
@@ -287,6 +421,15 @@ def new_cmd(
             "`--skip-planner` prompt toggle."
         ),
     ),
+    force_cold_start: bool = typer.Option(
+        False, "--force-cold-start",
+        help=(
+            "Override the existing-project auto-detection (issue #274) "
+            "and run the cold-start planner even when the target "
+            "directory already has commits, a prior plan, source files, "
+            "or work-service rows."
+        ),
+    ),
     yes: bool = typer.Option(
         False, "--yes", "-y",
         help="Non-interactive: auto-accept the planner prompt.",
@@ -302,6 +445,12 @@ def new_cmd(
     ``--yes`` accepts the prompt non-interactively. ``--skip-plan``
     suppresses the project_planning plugin's auto-fire on the emitted
     ``project.created`` event (#255).
+
+    Issue #274: when the target directory already looks like an
+    existing project (commits, ``docs/plan/plan.md``, source files, or
+    prior work_tasks rows) the auto-fired planner task uses the
+    drift-aware replan description instead of cold-start decomposition.
+    Pass ``--force-cold-start`` to override.
     """
     from pollypm.projects import register_project, normalize_project_path
 
@@ -329,6 +478,25 @@ def new_cmd(
         f"Registered project {project.name or project.key} at {project.path}"
     )
 
+    # Issue #274: classify the project directory so we can choose
+    # between cold-start and drift-aware replan. Only meaningful when a
+    # planner task is actually going to fire — suppress the classifier
+    # echo when the user explicitly opted out.
+    suppress_all_planning = bool(skip_plan or skip_planner)
+    if suppress_all_planning:
+        mode: Literal["greenfield", "existing"] = "greenfield"
+    elif force_cold_start:
+        mode = "greenfield"
+        typer.echo("Fresh project — running cold-start planner.")
+    else:
+        mode = _classify_project_state(project.path)
+        if mode == "existing":
+            typer.echo(
+                "Detected existing project — running drift-aware replan."
+            )
+        else:
+            typer.echo("Fresh project — running cold-start planner.")
+
     # Fire the ``project.created`` observer chain so plugins (including
     # project_planning itself) can react. Best-effort — never block the
     # CLI on observer failures. Only fire on genuinely-new registrations
@@ -351,7 +519,14 @@ def new_cmd(
                     # interactive prompt + the explicit ``_plan_project_task``
                     # call below) also suppresses auto-fire so the combined
                     # UX stays "no planner task".
-                    "skip_plan": bool(skip_plan or skip_planner),
+                    "skip_plan": suppress_all_planning,
+                    # Issue #274: mode hint lets the observer pick
+                    # cold-start vs. drift-aware replan phrasing when
+                    # auto-firing the plan task. Defaults to
+                    # ``greenfield`` so observers from other plugins
+                    # that don't know about this payload key behave
+                    # identically to the pre-#274 world.
+                    "mode": mode,
                 },
                 metadata={
                     "source": "pm project new",
@@ -370,8 +545,9 @@ def new_cmd(
             pass
 
     if auto_fired:
+        mode_label = "replan" if mode == "existing" else "plan_project"
         typer.echo(
-            f"Auto-created plan_project task for '{project.key}' via "
+            f"Auto-created {mode_label} task for '{project.key}' via "
             "project.created hook (see `[planner] auto_on_project_created`)."
         )
         _auto_spawn_architect(path, project.key)
@@ -380,7 +556,7 @@ def new_cmd(
     # ``--skip-plan`` or ``--skip-planner`` both short-circuit the prompt +
     # legacy task-creation path. This keeps the CLI idempotent with the
     # event payload we sent to observers above.
-    if skip_plan or skip_planner:
+    if suppress_all_planning:
         typer.echo(
             "Skipped planner. Run `pm project plan "
             + project.key + "` later to start planning."
@@ -399,9 +575,22 @@ def new_cmd(
         )
         return
 
-    task = _plan_project_task(
-        project.key, project.path, title_prefix="Plan project",
-    )
+    # Issue #274: even on the legacy (auto-fire-disabled) path, route
+    # to the replan description when the directory looks existing.
+    if mode == "existing":
+        task = _plan_project_task(
+            project.key, project.path,
+            title_prefix="Replan project",
+            description=(
+                f"Re-run the architecture planner on {project.key}. Stage-0 "
+                "research should read the existing plan and produce a "
+                "drift analysis before proposing changes."
+            ),
+        )
+    else:
+        task = _plan_project_task(
+            project.key, project.path, title_prefix="Plan project",
+        )
     typer.echo(
         f"Created planning task {task.task_id} on project "
         f"'{project.key}' (flow={task.flow_template_id})."

@@ -79,6 +79,9 @@ app.add_typer(rail_app, name="rail")
 from pollypm.plugins_builtin.morning_briefing.cli import briefing_app
 app.add_typer(briefing_app, name="briefing")
 
+from pollypm.plugins_builtin.project_planning.cli import project_app
+app.add_typer(project_app, name="project")
+
 
 def _session_name_candidates() -> list[str]:
     return ["pollypm", "pollypm-storage-closet"]

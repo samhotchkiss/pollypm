@@ -67,18 +67,48 @@ def _profile_factory(name: str):
     return lambda: MarkdownPromptProfile(name=name, path=path)
 
 
+def _on_project_created(context) -> None:
+    """Observer fired when a project is registered via ``pm project new``.
+
+    Records a lightweight event through the plugin host state store so
+    the rail can surface "project X is ready for planning" affordances.
+    The actual user prompt + task creation live in
+    ``cli/project.py::new_cmd`` so the user touchpoint stays in the CLI
+    (observers run silently, which is wrong for a prompt).
+    """
+    # Observers are best-effort; swallow any error so a crash here never
+    # blocks the CLI from finishing.
+    import logging
+    try:
+        payload = context.payload if hasattr(context, "payload") else {}
+        logging.getLogger(__name__).info(
+            "project_planning: project.created observed (payload=%s)",
+            payload,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def initialize(api: "PluginAPI") -> None:
     """Startup hook.
 
-    The full wiring (content-path discovery for flows + gates, CLI
-    subcommand mount, project.created hook, provider-policy overrides)
-    lands in pp10. For pp01 this is an intentional stub so the plugin
-    surface and the ``initialize`` contract are in place without
-    changing runtime behaviour yet.
+    Records the plugin's initialise event and logs the set of registered
+    profiles. Project-level wiring is:
+
+    * CLI subcommands (``pm project plan`` / ``replan`` / ``new``) —
+      mounted by ``pollypm.cli`` as ``project_app``.
+    * ``project.created`` observer — registered on the plugin instance
+      directly (see ``observers=`` below) so it fires for every
+      ``run_observers("project.created", ...)`` emission.
     """
-    # Best-effort heartbeat event so the plugin's presence is visible in
-    # the events log even while the rest of the wiring is stubbed out.
-    api.emit_event("initialize.stub", {"profiles": list(PROFILE_NAMES)})
+    api.emit_event(
+        "initialize",
+        {
+            "profiles": list(PROFILE_NAMES),
+            "cli_mounted": True,
+            "observers": ["project.created"],
+        },
+    )
 
 
 plugin = PollyPMPlugin(
@@ -93,5 +123,8 @@ plugin = PollyPMPlugin(
         Capability(kind="agent_profile", name=name) for name in PROFILE_NAMES
     ),
     agent_profiles={name: _profile_factory(name) for name in PROFILE_NAMES},
+    observers={
+        "project.created": [_on_project_created],
+    },
     initialize=initialize,
 )

@@ -151,17 +151,35 @@ class FileMemoryBackend(MemoryBackend):
         as keyword arguments. This path stays supported for one release and
         maps to ``type=PROJECT`` for back-compat so existing writers
         (``knowledge_extract``, ``checkpoints``) keep working unchanged.
+
+        Supersession (M08): pass ``supersedes=<old_id>`` to chain a new
+        entry after an existing one. The old row's ``superseded_by`` is
+        set to the new entry's id so recall hides the old but audit
+        (``read_entry`` + ``pm memory show``) still sees both.
         """
+        supersedes = kwargs.pop("supersedes", None)
         if memory is not None and isinstance(memory, _TYPED_MEMORY_CLASSES):
-            return self._write_typed_entry(memory, **kwargs)
-        if memory is not None:
+            entry = self._write_typed_entry(memory, **kwargs)
+        elif memory is not None:
             raise TypeError(
                 "write_entry positional argument must be a typed memory dataclass "
                 f"(got {type(memory).__name__})"
             )
-        # Legacy keyword path — emit a DeprecationWarning and dispatch to a
-        # ProjectMemory under the hood for back-compat.
-        return self._write_legacy_entry(**kwargs)
+        else:
+            # Legacy keyword path — emit a DeprecationWarning and dispatch to a
+            # ProjectMemory under the hood for back-compat.
+            entry = self._write_legacy_entry(**kwargs)
+
+        if supersedes is not None:
+            try:
+                old_id = int(supersedes)
+            except (TypeError, ValueError):
+                old_id = None
+            if old_id is not None and old_id != entry.entry_id:
+                self._state_store.update_memory_entry(
+                    old_id, superseded_by=entry.entry_id
+                )
+        return entry
 
     # ------------------------------------------------------------------
     # Typed write path
@@ -425,6 +443,7 @@ class FileMemoryBackend(MemoryBackend):
         types: list[str] | None = None,
         limit: int = 10,
         importance_min: int = 1,
+        include_superseded: bool = False,
     ) -> list[RecallResult]:
         """Relevance-ranked retrieval over memory.
 
@@ -474,6 +493,7 @@ class FileMemoryBackend(MemoryBackend):
             limit=limit,
             scope_tiers=scope_tiers,
             tier_scope_pairs=tier_scope_pairs,
+            include_superseded=include_superseded,
         )
         now = datetime.now(UTC)
         scored: list[RecallResult] = []

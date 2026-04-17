@@ -1801,6 +1801,7 @@ class StateStore:
         candidate_multiplier: int = 5,
         scope_tiers: list[str] | None = None,
         tier_scope_pairs: list[tuple[str, str]] | None = None,
+        include_superseded: bool = False,
     ) -> list[tuple[MemoryEntryRecord, float | None]]:
         """Return (record, bm25_score_or_None) pairs ranked by FTS5.
 
@@ -1825,8 +1826,10 @@ class StateStore:
         # Filter superseded entries out of recall by default — they remain
         # readable by id but shouldn't surface in relevance search. Matches
         # the spec's "superseded entries preserved for audit but not returned
-        # by default" contract (§3.7).
-        clauses.append("me.superseded_by IS NULL")
+        # by default" contract (§3.7). Callers opt back in with
+        # ``include_superseded=True``.
+        if not include_superseded:
+            clauses.append("me.superseded_by IS NULL")
         # Filter expired entries (ttl_at in the past). ISO-8601 sorts
         # lexicographically so a string comparison works for UTC timestamps.
         now_iso = self._now()

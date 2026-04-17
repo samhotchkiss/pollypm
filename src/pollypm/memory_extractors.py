@@ -60,10 +60,16 @@ class MemoryCandidate:
     model's self-reported certainty in ``[0, 1]``. The coordinator
     filters on ``confidence >= CONFIDENCE_THRESHOLD`` and ignores the
     rest.
+
+    ``supersedes`` (M08 / #237) carries the id of an existing entry
+    that this candidate contradicts. Set by
+    :func:`flag_supersession_candidates` after a keyword-overlap pass;
+    the reviewer then decides whether the supersession is valid.
     """
 
     memory: TypedMemory
     confidence: float
+    supersedes: int | None = None
 
     def meets_threshold(self) -> bool:
         return float(self.confidence) >= CONFIDENCE_THRESHOLD
@@ -453,6 +459,8 @@ class ExtractionResult:
     duplicates_skipped: int = 0
     written: int = 0
     written_ids: list[int] = field(default_factory=list)
+    superseded: int = 0           # M08: entries displaced by a new write
+    supersession_rejected: int = 0  # M08: reviewer rejected candidate
 
 
 def run_extractors(
@@ -463,6 +471,7 @@ def run_extractors(
     user_scope: str = "operator",
     llm_runner: LLMRunner | None = None,
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    reviewer: "SupersessionReviewer | None" = None,
 ) -> ExtractionResult:
     """Run all five type-aware extractors, filter, dedupe, and write.
 
@@ -515,6 +524,13 @@ def run_extractors(
             }
         return existing_by_key[key]
 
+    # M08: flag potential supersession candidates before writing, then
+    # run the reviewer pass on each flagged candidate. Reviewer decides:
+    # accept (new entry supersedes old), reject (don't write), or
+    # side-by-side (write without supersession — both memories live).
+    _flag_supersession_candidates(backend, accepted)
+    active_reviewer = reviewer if reviewer is not None else _default_reviewer()
+
     for candidate in accepted:
         memory = candidate.memory
         scope = str(memory.scope or "project")
@@ -523,13 +539,25 @@ def run_extractors(
         if salient in _existing_set(scope, type_value):
             result.duplicates_skipped += 1
             continue
+
+        supersedes_id = candidate.supersedes
+        if supersedes_id is not None:
+            verdict = active_reviewer(backend, candidate)
+            if verdict == "reject":
+                result.supersession_rejected += 1
+                continue
+            if verdict == "side_by_side":
+                supersedes_id = None
+
         try:
-            entry = backend.write_entry(memory)
+            entry = backend.write_entry(memory, supersedes=supersedes_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to write %s memory: %s", type_value, exc)
             continue
         result.written += 1
         result.written_ids.append(entry.entry_id)
+        if supersedes_id is not None:
+            result.superseded += 1
         existing_by_key[(scope, type_value)].add(salient)
 
     return result
@@ -594,3 +622,164 @@ def _salient_field(title: str, body: str, type_value: str) -> str:
 def _normalize(text: str) -> str:
     """Case/whitespace-fold for duplicate detection."""
     return " ".join((text or "").lower().split())
+
+
+# ---------------------------------------------------------------------------
+# Supersession flagging + reviewer (M08 / #237)
+# ---------------------------------------------------------------------------
+
+
+# A reviewer returns one of three strings:
+#
+# * ``"accept"``        — write the new memory; mark the flagged old one
+#                         as superseded.
+# * ``"reject"``        — discard the new candidate entirely.
+# * ``"side_by_side"``  — write the new memory *without* supersession;
+#                         both coexist.
+SupersessionReviewer = Callable[[MemoryBackend, MemoryCandidate], str]
+
+
+# Keyword-overlap threshold for flagging potential supersessions.
+# Intentionally lower than the curator's dedup threshold — we want the
+# reviewer to see plausible contradictions, not guaranteed duplicates.
+SUPERSESSION_FLAG_SIMILARITY = 0.4
+
+
+def flag_supersession_candidates(
+    backend: MemoryBackend,
+    candidates: list[MemoryCandidate],
+) -> None:
+    """Stamp ``candidate.supersedes`` on candidates that look like contradictions.
+
+    "Contradict" here is a proxy: same type + same scope + Jaccard token
+    overlap with an existing entry >= ``SUPERSESSION_FLAG_SIMILARITY``.
+    The reviewer step then validates whether the overlap reflects a
+    real contradiction vs. an additive detail.
+    """
+    _flag_supersession_candidates(backend, candidates)
+
+
+def _flag_supersession_candidates(
+    backend: MemoryBackend,
+    candidates: list[MemoryCandidate],
+) -> None:
+    # Cache existing rows per (scope, type) so we hit the store once
+    # per bucket instead of once per candidate.
+    existing_cache: dict[tuple[str, str], list[tuple[int, set[str]]]] = {}
+
+    for candidate in candidates:
+        memory = candidate.memory
+        scope = str(memory.scope or "project")
+        type_value = memory.TYPE.value
+        key = (scope, type_value)
+        if key not in existing_cache:
+            rows = backend.list_entries(scope=scope, type=type_value, limit=500)
+            existing_cache[key] = [
+                (row.entry_id, _candidate_token_set_from_entry(row))
+                for row in rows
+            ]
+        tokens = _candidate_token_set(candidate)
+        best_id: int | None = None
+        best_score = 0.0
+        for entry_id, existing_tokens in existing_cache[key]:
+            score = _candidate_jaccard(tokens, existing_tokens)
+            if score >= SUPERSESSION_FLAG_SIMILARITY and score > best_score:
+                best_id = entry_id
+                best_score = score
+        if best_id is not None:
+            candidate.supersedes = best_id
+
+
+def _candidate_token_set(candidate: MemoryCandidate) -> set[str]:
+    memory = candidate.memory
+    parts: list[str] = []
+    for field_name in ("name", "rule", "fact", "pointer", "when", "summary"):
+        val = getattr(memory, field_name, "")
+        if val:
+            parts.append(str(val))
+    for field_name in ("description", "why", "how_to_apply", "then", "body"):
+        val = getattr(memory, field_name, "")
+        if val:
+            parts.append(str(val))
+    text = " ".join(parts).lower()
+    return {token for token in _CANDIDATE_TOKEN_RE.findall(text) if len(token) > 2}
+
+
+def _candidate_token_set_from_entry(entry) -> set[str]:
+    text = f"{entry.title} {entry.body}".lower()
+    return {token for token in _CANDIDATE_TOKEN_RE.findall(text) if len(token) > 2}
+
+
+def _candidate_jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    union = a | b
+    if not union:
+        return 0.0
+    return len(a & b) / len(union)
+
+
+import re as _re  # noqa: E402 — kept at bottom so prompt builders stay tidy
+
+_CANDIDATE_TOKEN_RE = _re.compile(r"[A-Za-z0-9]+")
+
+
+def _default_reviewer() -> SupersessionReviewer:
+    """Haiku-backed reviewer. Asks the model if the new candidate makes
+    the old entry obsolete.
+
+    Conservative default: when the LLM is unavailable or returns an
+    unparseable response, we fall through to ``"side_by_side"`` so the
+    new memory still lands without clobbering the old. That keeps the
+    store additive when the reviewer can't speak.
+    """
+
+    def _review(backend: MemoryBackend, candidate: MemoryCandidate) -> str:
+        if candidate.supersedes is None:
+            return "side_by_side"
+        old = backend.read_entry(int(candidate.supersedes))
+        if old is None:
+            return "side_by_side"
+        prompt = _review_prompt(old, candidate)
+        try:
+            response = run_haiku_json(prompt)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Supersession reviewer Haiku call failed: %s", exc)
+            return "side_by_side"
+        if not isinstance(response, dict):
+            return "side_by_side"
+        verdict = str(response.get("verdict", "")).strip().lower()
+        if verdict in {"accept", "reject", "side_by_side"}:
+            return verdict
+        return "side_by_side"
+
+    return _review
+
+
+def _review_prompt(old, candidate: MemoryCandidate) -> str:
+    new_memory = candidate.memory
+    return "\n".join(
+        [
+            "A memory extractor has produced a new candidate memory that",
+            "overlaps with an existing memory. Your job is to decide whether",
+            "the new memory should SUPERSEDE the old one, or whether they",
+            "should both stand side by side as additive details.",
+            "",
+            "Return ONLY valid JSON with shape:",
+            '  {"verdict": "accept" | "reject" | "side_by_side",',
+            '   "rationale": "<one short sentence>"}',
+            "",
+            '- "accept" — the new memory makes the old one obsolete.',
+            '- "reject" — the new memory is wrong or redundant, discard it.',
+            '- "side_by_side" — both are valid and complementary; keep both.',
+            "",
+            "EXISTING memory:",
+            f"type: {old.type}",
+            f"title: {old.title}",
+            f"body: {old.body}",
+            "",
+            "NEW candidate memory:",
+            f"type: {new_memory.TYPE.value}",
+            f"fields: { {f: getattr(new_memory, f, '') for f in ('name', 'rule', 'fact', 'pointer', 'when', 'body', 'description', 'why', 'how_to_apply', 'then')} }",
+        ]
+    )

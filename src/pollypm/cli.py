@@ -76,6 +76,9 @@ app.add_typer(plugins_app, name="plugins")
 from pollypm.rail_cli import rail_app
 app.add_typer(rail_app, name="rail")
 
+from pollypm.plugins_builtin.activity_feed.cli import activity_app
+app.add_typer(activity_app, name="activity")
+
 from pollypm.plugins_builtin.morning_briefing.cli import briefing_app
 app.add_typer(briefing_app, name="briefing")
 

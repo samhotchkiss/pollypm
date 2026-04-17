@@ -504,6 +504,13 @@ class StateStore:
                 # "readonly" mode we may have just created an empty DB
                 # (when the file didn't exist before connect).
                 self.execute("PRAGMA journal_mode=WAL")
+                # auto_vacuum=INCREMENTAL lets us reclaim freelist space on
+                # demand via ``PRAGMA incremental_vacuum``. This pragma must
+                # run BEFORE any tables are created to take effect on a
+                # fresh DB — on existing DBs it's a no-op and the one-shot
+                # VACUUM below (gated on the current mode) actually flips
+                # the page format.
+                self.execute("PRAGMA auto_vacuum=INCREMENTAL")
                 try:
                     self._conn.executescript(SCHEMA)
                 except sqlite3.IntegrityError:
@@ -517,6 +524,112 @@ class StateStore:
                     self._conn.rollback()
                     raise
                 self.commit()
+                # One-shot migration to flip existing NONE-mode DBs into
+                # INCREMENTAL mode. Must run OUTSIDE any transaction —
+                # VACUUM cannot run mid-tx, so we gate it behind a pragma
+                # read and skip if already in the right mode. New DBs hit
+                # this path with auto_vacuum already set, so the VACUUM is
+                # skipped for them (the initial pragma above sufficed).
+                self._ensure_incremental_auto_vacuum()
+
+    def _ensure_incremental_auto_vacuum(self) -> None:
+        """Flip pre-existing DBs into ``auto_vacuum=INCREMENTAL`` mode.
+
+        SQLite's ``auto_vacuum`` mode is baked into the page format, so the
+        only way to change it on an existing DB is to set the pragma and
+        then run a full ``VACUUM``. New DBs already pick up the setting
+        from the pragma issued before schema creation, so the VACUUM below
+        is skipped for them.
+
+        Must run outside any open transaction — callers are responsible
+        for committing first. ``PRAGMA auto_vacuum`` returns:
+            0 = NONE, 1 = FULL, 2 = INCREMENTAL.
+        """
+        try:
+            row = self._conn.execute("PRAGMA auto_vacuum").fetchone()
+        except sqlite3.DatabaseError:
+            return
+        mode = int(row[0]) if row else 0
+        if mode == 2:
+            return
+        # Fall back to a one-shot VACUUM to rewrite the page format. Use
+        # the raw connection so we bypass Python's implicit-tx layer; the
+        # connect path uses the default isolation_level ("") which
+        # auto-begins transactions on DML. For VACUUM we temporarily flip
+        # isolation_level to None so SQLite accepts the statement, then
+        # restore the original so downstream DML keeps its tx semantics.
+        previous = self._conn.isolation_level
+        try:
+            self._conn.isolation_level = None
+            self._conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+            self._conn.execute("VACUUM")
+        except sqlite3.DatabaseError:
+            # VACUUM can fail if another connection holds the DB — that's
+            # OK, we'll retry on the next StateStore open. Better to log
+            # and keep going than to block the cockpit boot on DB hygiene.
+            import logging
+            logging.getLogger(__name__).warning(
+                "StateStore: auto_vacuum=INCREMENTAL migration failed; will retry on next open",
+                exc_info=True,
+            )
+        finally:
+            self._conn.isolation_level = previous
+
+    def incremental_vacuum(self) -> int:
+        """Reclaim freelist pages via ``PRAGMA incremental_vacuum``.
+
+        Returns the number of bytes reclaimed (0 if no-op). Must run on
+        the shared connection so it coordinates with the existing write
+        lock — concurrent writers will block on the busy_timeout and pick
+        up once the vacuum is done. Safe to call any time after the
+        INCREMENTAL mode migration has run.
+        """
+        with self._lock:
+            try:
+                page_size_row = self._conn.execute("PRAGMA page_size").fetchone()
+                freelist_before_row = self._conn.execute("PRAGMA freelist_count").fetchone()
+            except sqlite3.DatabaseError:
+                return 0
+            page_size = int(page_size_row[0]) if page_size_row else 0
+            freelist_before = int(freelist_before_row[0]) if freelist_before_row else 0
+            if freelist_before == 0 or page_size == 0:
+                return 0
+            previous = self._conn.isolation_level
+            try:
+                # incremental_vacuum cannot run inside a transaction — use
+                # the same isolation_level=None trick as the one-shot
+                # migration above.
+                self._conn.isolation_level = None
+                self._conn.execute("PRAGMA incremental_vacuum")
+            finally:
+                self._conn.isolation_level = previous
+            freelist_after_row = self._conn.execute("PRAGMA freelist_count").fetchone()
+            freelist_after = int(freelist_after_row[0]) if freelist_after_row else 0
+            reclaimed_pages = max(freelist_before - freelist_after, 0)
+            return reclaimed_pages * page_size
+
+    def sweep_expired_memory_entries(self) -> int:
+        """Drop memory_entries whose ``ttl_at`` has elapsed.
+
+        Only touches entries that EXPLICITLY set a TTL — ``ttl_at IS NULL``
+        rows are left alone. Returns the number of rows deleted. Uses
+        ``datetime('now')`` so comparisons happen in SQL space against the
+        ISO-8601 strings already stored on the table.
+        """
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM memory_entries "
+                "WHERE ttl_at IS NOT NULL AND ttl_at < datetime('now')"
+            )
+            deleted = int(cursor.rowcount or 0)
+            self._conn.commit()
+        # Bump epoch outside the lock — matches commit()'s contract.
+        try:
+            from pollypm.state_epoch import bump
+            bump()
+        except Exception:  # noqa: BLE001
+            pass
+        return deleted
 
     def _deduplicate_alerts(self) -> None:
         """Remove duplicate alerts, keeping the most recently updated row."""

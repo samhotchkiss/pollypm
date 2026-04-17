@@ -46,6 +46,9 @@ class TestCoreRecurringPlugin:
             "alerts.gc",
             # #249 — work-service-aware progress sweeper.
             "work.progress_sweep",
+            # DB hygiene — incremental vacuum + TTL sweep for memory_entries.
+            "db.vacuum",
+            "memory.ttl_sweep",
         }
         assert expected.issubset(set(registry.names()))
         # inbox.sweep was retired with the legacy inbox subsystem (iv04).
@@ -65,6 +68,9 @@ class TestCoreRecurringPlugin:
             "alerts.gc",
             # #249 — work-service-aware progress sweeper.
             "work.progress_sweep",
+            # DB hygiene — daily cron at ~4am local.
+            "db.vacuum",
+            "memory.ttl_sweep",
         }
 
         # Cadences per issue #164 / #249.
@@ -73,6 +79,17 @@ class TestCoreRecurringPlugin:
         assert _interval_seconds(entries["transcript.ingest"]) == 30
         assert _interval_seconds(entries["alerts.gc"]) == 300
         assert _interval_seconds(entries["work.progress_sweep"]) == 300
+        # DB hygiene entries are 5-field cron, not @every — just verify
+        # they parse into a CronSchedule with the expected expression so
+        # the fleet doesn't sync on the hour.
+        from pollypm.heartbeat.roster import CronSchedule
+
+        db_vacuum = entries["db.vacuum"].schedule
+        assert isinstance(db_vacuum, CronSchedule)
+        assert db_vacuum.expression() == "7 4 * * *"
+        mem_sweep = entries["memory.ttl_sweep"].schedule
+        assert isinstance(mem_sweep, CronSchedule)
+        assert mem_sweep.expression() == "13 4 * * *"
 
     def test_plugin_declares_expected_capabilities(self) -> None:
         kinds = {cap.kind for cap in core_plugin.capabilities}

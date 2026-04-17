@@ -313,6 +313,44 @@ def alerts_gc_handler(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def db_vacuum_handler(payload: dict[str, Any]) -> dict[str, Any]:
+    """Run an incremental vacuum against StateStore to reclaim freelist pages.
+
+    Incremental vacuum is a low-cost operation that only touches pages on
+    the SQLite freelist — it does not rewrite the whole database the way
+    a full ``VACUUM`` would. Safe to call daily. The shared StateStore
+    connection coordinates with concurrent writers via busy_timeout, so
+    no external lock is needed beyond what StateStore already holds.
+    """
+    _config, store = _load_config_and_store(payload)
+    bytes_reclaimed = store.incremental_vacuum()
+    mb_reclaimed = bytes_reclaimed / (1024 * 1024)
+    store.record_event(
+        session_name="system",
+        event_type="db.vacuum",
+        message=f"reclaimed {mb_reclaimed:.1f}MB",
+    )
+    return {"bytes_reclaimed": bytes_reclaimed, "mb_reclaimed": mb_reclaimed}
+
+
+def memory_ttl_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
+    """Drop expired memory_entries (TTL in the past).
+
+    Only affects rows with ``ttl_at IS NOT NULL``. Rows without an
+    explicit TTL are left alone — retention policy for those is a
+    separate decision, this handler just enforces what's already on
+    the row.
+    """
+    _config, store = _load_config_and_store(payload)
+    deleted = store.sweep_expired_memory_entries()
+    store.record_event(
+        session_name="system",
+        event_type="memory.ttl_sweep",
+        message=f"dropped {deleted} expired entries",
+    )
+    return {"deleted": deleted}
+
+
 # ---------------------------------------------------------------------------
 # Plugin registration
 # ---------------------------------------------------------------------------
@@ -339,6 +377,16 @@ def _register_handlers(api: JobHandlerAPI) -> None:
         "work.progress_sweep", work_progress_sweep_handler,
         max_attempts=1, timeout_seconds=60.0,
     )
+    # DB hygiene — incremental vacuum + memory TTL sweep. Both are cheap
+    # daily sweeps that coordinate with the shared StateStore connection.
+    api.register_handler(
+        "db.vacuum", db_vacuum_handler,
+        max_attempts=1, timeout_seconds=120.0,
+    )
+    api.register_handler(
+        "memory.ttl_sweep", memory_ttl_sweep_handler,
+        max_attempts=1, timeout_seconds=60.0,
+    )
 
 
 def _register_roster(api: RosterAPI) -> None:
@@ -350,6 +398,14 @@ def _register_roster(api: RosterAPI) -> None:
     api.register_recurring("@every 5m", "alerts.gc", {})
     # #249 — work-service-aware stuck-task sweeper.
     api.register_recurring("@every 5m", "work.progress_sweep", {})
+    # DB hygiene — daily around 4am local. Off-minute (``7``) avoids
+    # fleet-wide sync if many cockpits run on the same host. Memory TTL
+    # sweep runs a few minutes later so its writes don't collide with
+    # the vacuum's page-reclaim pass.
+    api.register_recurring("7 4 * * *", "db.vacuum", {}, dedupe_key="db.vacuum")
+    api.register_recurring(
+        "13 4 * * *", "memory.ttl_sweep", {}, dedupe_key="memory.ttl_sweep",
+    )
 
 
 plugin = PollyPMPlugin(
@@ -368,6 +424,8 @@ plugin = PollyPMPlugin(
         Capability(kind="job_handler", name="transcript.ingest"),
         Capability(kind="job_handler", name="alerts.gc"),
         Capability(kind="job_handler", name="work.progress_sweep"),
+        Capability(kind="job_handler", name="db.vacuum"),
+        Capability(kind="job_handler", name="memory.ttl_sweep"),
         Capability(kind="roster_entry", name="core_recurring"),
     ),
     register_handlers=_register_handlers,

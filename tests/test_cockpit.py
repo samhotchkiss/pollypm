@@ -679,6 +679,122 @@ def test_cockpit_router_ensure_layout_resizes_existing_left_pane(tmp_path: Path)
     assert calls["resize"] == ("%1", router._LEFT_PANE_WIDTH)
 
 
+def test_cockpit_router_ensure_layout_steady_state_issues_one_list_panes(tmp_path: Path) -> None:
+    """Steady-state ``ensure_cockpit_layout`` must invoke ``list_panes`` once (#175).
+
+    Before the fix, the steady-state path (len==2, right_pane_id known, layout
+    already correct) issued two ``list_panes`` subprocesses — one baseline plus
+    one redundant re-fetch after a no-op ``_normalize_layout``. After the fix
+    the left/right pane is derived locally from the baseline.
+    """
+
+    class FakePane:
+        def __init__(self, pane_id: str, pane_left: int, command: str, pane_width: int = 100) -> None:
+            self.pane_id = pane_id
+            self.pane_left = pane_left
+            self.pane_current_command = command
+            self.pane_width = pane_width
+            self.active = True
+
+    list_pane_calls: list[str] = []
+
+    class FakeTmux:
+        def list_panes(self, target: str):
+            list_pane_calls.append(target)
+            return [
+                FakePane("%1", 0, "uv", pane_width=30),
+                FakePane("%2", 31, "bash", pane_width=170),
+            ]
+
+        def resize_pane_width(self, target: str, width: int):
+            pass
+
+        def run(self, *args, **kwargs):
+            pass
+
+        def swap_pane(self, source: str, target: str):
+            raise AssertionError("swap should not happen in steady state")
+
+        def list_windows(self, target: str):
+            return []
+
+    router = CockpitRouter(tmp_path / "pollypm.toml")
+    router.tmux = FakeTmux()  # type: ignore[assignment]
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm-state'}\"\n")
+    router._write_state({"right_pane_id": "%2"})
+
+    router.ensure_cockpit_layout()
+
+    # Exactly one list_panes call on the cockpit window. The old
+    # implementation ran up to 6 in this path (baseline + redundant refetch
+    # after each no-op branch).
+    cockpit_calls = [t for t in list_pane_calls if ":PollyPM" in t]
+    assert len(cockpit_calls) == 1, (
+        f"expected 1 list_panes call in steady state, got {len(cockpit_calls)}: "
+        f"{cockpit_calls}"
+    )
+
+
+def test_cockpit_router_ensure_layout_swap_preserves_pane_count(tmp_path: Path) -> None:
+    """When ``_normalize_layout`` swaps, we still issue just one ``list_panes``.
+
+    Pane IDs are stable across ``swap_pane``, so deriving the post-swap
+    left/right locally (#175) avoids the refetch.
+    """
+
+    class FakePane:
+        def __init__(self, pane_id: str, pane_left: int, command: str, pane_width: int = 100) -> None:
+            self.pane_id = pane_id
+            self.pane_left = pane_left
+            self.pane_current_command = command
+            self.pane_width = pane_width
+            self.active = True
+
+    list_pane_calls: list[str] = []
+    swaps: list[tuple[str, str]] = []
+
+    class FakeTmux:
+        def list_panes(self, target: str):
+            list_pane_calls.append(target)
+            # Left pane runs bash, right pane runs uv — so a swap is needed.
+            return [
+                FakePane("%1", 0, "bash", pane_width=30),
+                FakePane("%2", 31, "uv", pane_width=170),
+            ]
+
+        def resize_pane_width(self, target: str, width: int):
+            pass
+
+        def run(self, *args, **kwargs):
+            pass
+
+        def swap_pane(self, source: str, target: str):
+            swaps.append((source, target))
+
+        def list_windows(self, target: str):
+            return []
+
+    router = CockpitRouter(tmp_path / "pollypm.toml")
+    router.tmux = FakeTmux()  # type: ignore[assignment]
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm-state'}\"\n")
+    router._write_state({"right_pane_id": "%2"})
+
+    router.ensure_cockpit_layout()
+
+    cockpit_calls = [t for t in list_pane_calls if ":PollyPM" in t]
+    assert len(cockpit_calls) == 1, (
+        f"expected 1 list_panes call when only a swap happens, got {len(cockpit_calls)}"
+    )
+    # The swap actually happened — right_pane was "uv", so left↔right exchanged.
+    assert len(swaps) == 1
+    # Post-swap: %2 (was right, ran uv) is now the left pane and
+    # therefore the new ``right_pane_id`` in state is %1.
+    state = router._load_state()
+    assert state["right_pane_id"] == "%1"
+
+
 def test_cockpit_router_routes_idle_project_to_detail_pane(monkeypatch, tmp_path: Path) -> None:
     calls: dict[str, object] = {}
     (tmp_path / "pollypm.toml").write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm-state'}\"\n")

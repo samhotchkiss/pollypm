@@ -576,18 +576,23 @@ class CockpitRouter:
         data["rail_width"] = width
         self._write_state(data)
 
-    def _validate_state(self) -> None:
+    def _validate_state(self, *, panes: list | None = None, target: str | None = None) -> list:
         """Clear stale entries from cockpit_state.json.
 
         Checks that right_pane_id points to a real pane and that
         mounted_session is actually alive. Prevents stale state from
         blocking heartbeat recovery or causing wrong session mounts.
+
+        Returns the list of panes fetched (or the list passed in) so
+        callers can avoid re-issuing ``list_panes`` — see #175.
         """
         state = self._load_state()
         dirty = False
-        config = load_config(self.config_path)
-        target = f"{config.project.tmux_session}:{self._COCKPIT_WINDOW}"
-        panes = self._safe_list_panes(target)
+        if target is None:
+            config = load_config(self.config_path)
+            target = f"{config.project.tmux_session}:{self._COCKPIT_WINDOW}"
+        if panes is None:
+            panes = self._safe_list_panes(target)
 
         right_pane_id = state.get("right_pane_id")
         right_pane = None
@@ -619,6 +624,7 @@ class CockpitRouter:
 
         if dirty:
             self._write_state(state)
+        return panes
 
     def _safe_list_panes(self, target: str) -> list:
         try:
@@ -890,16 +896,20 @@ class CockpitRouter:
                 seen[window.name] = window.index
 
     def ensure_cockpit_layout(self) -> None:
-        self._validate_state()
         config = load_config(self.config_path)
+        target = f"{config.project.tmux_session}:{self._COCKPIT_WINDOW}"
+        # Single list-panes baseline shared with ``_validate_state``. See
+        # #175: subsequent list-panes calls only run after a mutation that
+        # invalidates the cached view (split/kill); pure swaps preserve
+        # pane IDs so we update order locally.
+        panes = self._safe_list_panes(target)
+        self._validate_state(panes=panes, target=target)
         # Clean up duplicate windows in the storage closet before layout setup
         try:
             supervisor = self._load_supervisor()
             self._cleanup_duplicate_windows(supervisor.storage_closet_session_name())
         except Exception:  # noqa: BLE001
             pass
-        target = f"{config.project.tmux_session}:{self._COCKPIT_WINDOW}"
-        panes = self.tmux.list_panes(target)
         state = self._load_state()
         right_pane_id = state.get("right_pane_id")
         right_pane_present = isinstance(right_pane_id, str) and any(pane.pane_id == right_pane_id for pane in panes)
@@ -924,7 +934,7 @@ class CockpitRouter:
             state.pop("mounted_session", None)
             self._write_state(state)
             try:
-                panes = self.tmux.list_panes(target)
+                panes = self.tmux.list_panes(target)  # structural change (break_pane)
             except Exception:  # noqa: BLE001
                 panes = []
             right_pane_id = None
@@ -943,7 +953,7 @@ class CockpitRouter:
             )
             state["right_pane_id"] = right_pane_id
             self._write_state(state)
-            panes = self.tmux.list_panes(target)
+            panes = self.tmux.list_panes(target)  # split added a pane
         elif len(panes) > 2:
             for pane in panes:
                 if pane.pane_id == panes[0].pane_id:
@@ -952,17 +962,39 @@ class CockpitRouter:
                     self.tmux.kill_pane(pane.pane_id)
                 except Exception:  # noqa: BLE001
                     pass
-            panes = self.tmux.list_panes(target)
-        if len(panes) >= 2 and (not right_pane_present or len(panes) != 2):
-            self._normalize_layout(target, panes)
-            panes = self.tmux.list_panes(target)
+            panes = self.tmux.list_panes(target)  # kill_pane removed panes
         if len(panes) >= 2:
+            # ``_normalize_layout`` may swap pane positions but never changes
+            # pane IDs or count — so we can reason about the post-swap left/
+            # right locally without another ``list-panes`` round-trip.
             self._normalize_layout(target, panes)
-            panes = self.tmux.list_panes(target)
-            left_pane = min(panes, key=self._pane_left)
-            state["right_pane_id"] = max(panes, key=self._pane_left).pane_id
+            left_pane, right_pane = self._post_normalize_lr(panes)
+            state["right_pane_id"] = right_pane.pane_id
             self._write_state(state)
             self._try_resize_rail(left_pane.pane_id)
+
+    def _post_normalize_lr(self, panes):
+        """Return ``(left, right)`` for the panes after ``_normalize_layout``.
+
+        ``_normalize_layout`` guarantees the ``uv`` (rail) pane ends up on
+        the left. When neither pane is ``uv`` (edge case), fall back to the
+        pre-swap ``pane_left`` ordering — the same answer the old code would
+        have computed via a second ``list-panes`` + ``min/max(pane_left)``.
+        """
+        if len(panes) != 2:
+            left = min(panes, key=self._pane_left)
+            right = max(panes, key=self._pane_left)
+            return left, right
+        a, b = panes
+        a_cmd = getattr(a, "pane_current_command", "")
+        b_cmd = getattr(b, "pane_current_command", "")
+        if a_cmd == "uv":
+            return a, b
+        if b_cmd == "uv":
+            return b, a
+        left = min(panes, key=self._pane_left)
+        right = max(panes, key=self._pane_left)
+        return left, right
 
     def _pane_left(self, pane) -> int:
         return int(getattr(pane, "pane_left", 0))

@@ -1961,6 +1961,135 @@ def _format_inbox_row(task, *, is_unread: bool, width: int = 38) -> Text:
     return text
 
 
+def _task_is_rollup(task) -> bool:
+    """True when a task was created by notification_staging.flush_milestone_digest.
+
+    Primary signal is the ``rollup`` label added by flush — the title
+    regex is a fallback for rollups created before the label landed.
+    """
+    labels = getattr(task, "labels", None) or []
+    if "rollup" in labels:
+        return True
+    title = (getattr(task, "title", "") or "").lower()
+    return "ready for review" in title and "updates" in title
+
+
+def _resolve_pm_target(config_path: Path, project_key: str | None) -> tuple[str, str]:
+    """Resolve the cockpit-router key + display name for a project's PM.
+
+    * Project has a ``persona_name`` configured → dispatch to its PM Chat
+      window (``project:<key>:session``) and surface the persona name.
+    * Otherwise (including ``project_key`` being empty or absent from
+      the config) → fall back to Polly (``polly`` → operator session).
+    """
+    fallback_key = "polly"
+    fallback_name = "Polly"
+    if not project_key:
+        return fallback_key, fallback_name
+    try:
+        config = load_config(config_path)
+    except Exception:  # noqa: BLE001 — config errors shouldn't crash the TUI
+        return fallback_key, fallback_name
+    projects = getattr(config, "projects", {}) or {}
+    project = projects.get(project_key)
+    if project is None:
+        return fallback_key, fallback_name
+    persona = getattr(project, "persona_name", None)
+    if isinstance(persona, str) and persona.strip():
+        return f"project:{project_key}:session", persona.strip()
+    return fallback_key, fallback_name
+
+
+def _build_pm_context_line(
+    task, *, item: dict | None = None, max_title: int = 64,
+) -> str:
+    """Compose the contextual first-line Sam sees in the PM input.
+
+    Shape matches the spec: ``re: inbox/<task_number> "<title>"``. When
+    ``item`` is provided (a rollup sub-item), include the sub-item
+    subject so the PM knows which constituent task Sam wants to discuss.
+    """
+    task_id = getattr(task, "task_id", None)
+    if not task_id:
+        # Derive from project + number if the helper was passed a fresh Task.
+        project = getattr(task, "project", "")
+        number = getattr(task, "task_number", "")
+        task_id = f"{project}/{number}" if project and number else "inbox/?"
+    if item is not None:
+        title = (item.get("subject") or task.title or "").strip()
+    else:
+        title = (getattr(task, "title", "") or "").strip()
+    if len(title) > max_title:
+        title = title[: max_title - 1] + "\u2026"
+    # Strip embedded quotes so the shell/tmux literal doesn't break.
+    title = title.replace('"', "'")
+    return f're: inbox/{task_id} "{title}"'
+
+
+class _RollupItem(ListItem):
+    """One sub-item in a rollup's expanded thread.
+
+    We inherit ListItem for consistent hover/click semantics, but the
+    widget lives inside a ``Vertical`` (not a ``ListView``), so it
+    behaves as a click target only — no cursor selection. Click emits a
+    ``Clicked`` message which the inbox app handles via ``on``.
+    """
+
+    def __init__(
+        self,
+        *,
+        index: int,
+        item: dict,
+        expanded: bool,
+        focused: bool,
+    ) -> None:
+        self.index = index
+        self.item = item
+        self.expanded = expanded
+        self._body = Static(self._build_text(), markup=True)
+        classes = ["rollup-item"]
+        if expanded:
+            classes.append("-expanded")
+        if focused:
+            classes.append("-focused")
+        super().__init__(self._body, classes=" ".join(classes))
+
+    def _build_text(self) -> str:
+        from pollypm.tz import format_relative
+        subject = self.item.get("subject") or "(no subject)"
+        created = self.item.get("created_at") or ""
+        age = format_relative(created) if created else ""
+        payload = self.item.get("payload") or {}
+        ref_bits: list[str] = []
+        for key in ("commit", "pr", "pull_request", "url"):
+            val = payload.get(key)
+            if val:
+                ref_bits.append(f"{key}={val}")
+        marker = "\u25bc" if self.expanded else "\u25b8"
+        header = f"[b]{marker} {_escape(subject)}[/b]"
+        if age:
+            header += f"  [dim]{_escape(age)}[/dim]"
+        lines = [header]
+        if ref_bits:
+            lines.append(f"[dim]{_escape(' \u00b7 '.join(ref_bits))}[/dim]")
+        if self.expanded:
+            body = (self.item.get("body") or "").strip()
+            if body:
+                lines.append("")
+                lines.append(_md_to_rich(_escape_body(body)))
+            actor = self.item.get("actor") or ""
+            source_project = self.item.get("source_project") or ""
+            meta_bits: list[str] = []
+            if actor:
+                meta_bits.append(actor)
+            if source_project:
+                meta_bits.append(source_project)
+            if meta_bits:
+                lines.append("")
+                lines.append(f"[dim]{_escape(' \u00b7 '.join(meta_bits))}[/dim]")
+        return "\n".join(lines)
+
+
 class _InboxListItem(ListItem):
     """One message in the inbox list — carries the task_id + unread flag."""
 
@@ -2081,6 +2210,31 @@ class PollyInboxApp(App[None]):
         border-left: thick #5b8aff;
         color: #d6dee5;
     }
+    #rollup-items {
+        height: auto;
+        padding: 0;
+    }
+    #rollup-items .rollup-item {
+        height: auto;
+        padding: 0 1;
+        margin: 1 0 0 0;
+        background: #111820;
+        border-left: thick #2a3340;
+        color: #d6dee5;
+    }
+    #rollup-items .rollup-item.-focused {
+        border-left: thick #5b8aff;
+        background: #14202c;
+    }
+    #rollup-items .rollup-item.-expanded {
+        border-left: thick #f0c45a;
+    }
+    #rollup-items .rollup-overflow {
+        height: auto;
+        padding: 0 1;
+        margin: 1 0 0 0;
+        color: #6b7a88;
+    }
     """
 
     BINDINGS = [
@@ -2091,29 +2245,49 @@ class PollyInboxApp(App[None]):
         Binding("enter,o", "open_selected", "Open", show=False),
         Binding("r", "start_reply", "Reply"),
         Binding("a", "archive_selected", "Archive"),
+        Binding("d", "jump_to_pm", "Discuss"),
+        Binding("e", "expand_all_rollup", "Expand all", show=False),
         Binding("u", "refresh", "Refresh"),
         Binding("q,escape", "back_or_cancel", "Back"),
     ]
 
     REFRESH_INTERVAL_SECONDS = 8
+    # Show the first ``ROLLUP_DEFAULT_VISIBLE`` items of a rollup, collapse
+    # the rest behind an expand keybind so a 40-item digest doesn't flood
+    # the detail pane.
+    ROLLUP_DEFAULT_VISIBLE = 10
 
     def __init__(self, config_path: Path) -> None:
         super().__init__()
         self.config_path = config_path
         self.list_view = ListView(id="inbox-list")
         self.detail = Static("", id="inbox-detail", markup=True)
+        # Rollup items are rendered as sibling widgets under the detail
+        # Static so each item is individually clickable. The container
+        # stays in the tree for every task; it's empty (display:none) on
+        # non-rollup selections.
+        self.rollup_items_box = Vertical(id="rollup-items")
         self.reply_input = Input(
             placeholder="Reply \u2026 (Enter to send, Esc back to list)",
             id="inbox-reply",
         )
         self.status = Static("", id="inbox-status")
         self.hint = Static(
-            "j/k move \u00b7 \u21b5 open \u00b7 r reply \u00b7 a archive \u00b7 u refresh \u00b7 q back",
+            "j/k move \u00b7 \u21b5 open \u00b7 r reply \u00b7 a archive "
+            "\u00b7 d discuss \u00b7 u refresh \u00b7 q back",
             id="inbox-hint",
         )
         self._tasks: list = []
         self._selected_task_id: str | None = None
         self._unread_ids: set[str] = set()
+        # Rollup state — populated on each rollup render. Index-keyed so
+        # the click handler can look up which item was expanded.
+        self._rollup_items: list[dict] = []
+        self._rollup_expanded: set[int] = set()
+        self._rollup_show_all: bool = False
+        # Focused rollup sub-item for ``d`` dispatch. None when the whole
+        # rollup is the jump target (or on a non-rollup task).
+        self._rollup_focused_index: int | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="inbox-layout"):
@@ -2121,6 +2295,7 @@ class PollyInboxApp(App[None]):
             with Vertical(id="inbox-detail-wrap"):
                 with VerticalScroll(id="inbox-detail-scroll"):
                     yield self.detail
+                    yield self.rollup_items_box
                 yield self.reply_input
         yield self.status
         yield self.hint
@@ -2261,12 +2436,18 @@ class PollyInboxApp(App[None]):
         svc = self._svc_for_task(task_id)
         if svc is None:
             self.detail.update("[red]Could not open project database for this task.[/red]")
+            self._clear_rollup_items()
             return
         try:
             task = svc.get(task_id)
             replies = svc.list_replies(task_id)
+            rollup_items_raw = (
+                svc.get_context(task_id, entry_type="rollup_item")
+                if _task_is_rollup(task) else []
+            )
         except Exception as exc:  # noqa: BLE001
             self.detail.update(f"[red]Error loading task: {exc}[/red]")
+            self._clear_rollup_items()
             svc.close()
             return
         finally:
@@ -2289,6 +2470,9 @@ class PollyInboxApp(App[None]):
         rel = format_relative(updated_iso or created_iso)
 
         sender = _format_sender(task)
+        # PM persona for the header — so the user knows which discussion
+        # pane the ``d`` key will reach out to.
+        _session, pm_label = _resolve_pm_target(self.config_path, task.project)
         sections: list[str] = []
         subject = task.title or "(no subject)"
         sections.append(f"[b #eef2f4]{_escape(subject)}[/b #eef2f4]")
@@ -2302,6 +2486,8 @@ class PollyInboxApp(App[None]):
         prio = getattr(task.priority, "value", str(task.priority))
         if prio and prio != "normal":
             meta_bits.append(f"[#f0c45a]\u25c6 {_escape(prio)}[/#f0c45a]")
+        # PM hint — dim, trailing, so it reads as metadata not a heading.
+        meta_bits.append(f"[dim #6b7a88]PM: {_escape(pm_label)}[/dim #6b7a88]")
         sections.append("  \u00b7  ".join(meta_bits))
         sections.append("")  # blank line before body
         body = task.description or "(no body)"
@@ -2324,6 +2510,8 @@ class PollyInboxApp(App[None]):
                 sections.append(_md_to_rich(_escape_body(entry.text)))
 
         self.detail.update("\n".join(sections))
+        # Rebuild the rollup item list (empty for non-rollups).
+        self._render_rollup_items(rollup_items_raw)
         # Auto-scroll to top of the new message so subject is visible.
         try:
             self.query_one("#inbox-detail-scroll", VerticalScroll).scroll_home(
@@ -2331,6 +2519,118 @@ class PollyInboxApp(App[None]):
             )
         except Exception:  # noqa: BLE001
             pass
+
+    # ------------------------------------------------------------------
+    # Rollup rendering / expansion
+    # ------------------------------------------------------------------
+
+    def _clear_rollup_items(self) -> None:
+        """Remove every child of the rollup-items box (safe on unmount).
+
+        ``Widget.remove_children`` is a batch-sync operation — individual
+        ``child.remove()`` calls are async and leave orphan widgets
+        around during the test pilot's pause window, which produces
+        duplicate-id collisions on the next mount.
+        """
+        self._rollup_items = []
+        self._rollup_expanded = set()
+        self._rollup_show_all = False
+        self._rollup_focused_index = None
+        try:
+            box = self.rollup_items_box
+            if box.children:
+                box.remove_children()
+            box.display = False
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _render_rollup_items(self, raw_entries) -> None:
+        """Parse ``rollup_item`` context rows and populate ``self._rollup_items``.
+
+        ``raw_entries`` are newest-first from ``get_context``; we reverse
+        so the UI reads chronologically (matches the markdown summary).
+        Resets expansion/focus state and delegates the actual widget
+        mounting to :meth:`_mount_rollup_widgets` so re-render after a
+        toggle reuses exactly the same mounting path.
+        """
+        import json as _json
+
+        self._clear_rollup_items()
+        if not raw_entries:
+            return
+        entries = list(reversed(raw_entries))
+        parsed: list[dict] = []
+        for e in entries:
+            try:
+                blob = _json.loads(e.text) if e.text else {}
+            except (TypeError, ValueError):
+                blob = {"subject": e.text or "(item)", "body": "", "payload": {}}
+            if not isinstance(blob, dict):
+                blob = {"subject": str(blob), "body": "", "payload": {}}
+            blob.setdefault("actor", e.actor or "polly")
+            blob.setdefault(
+                "created_at",
+                e.timestamp.isoformat()
+                if hasattr(e.timestamp, "isoformat") else str(e.timestamp),
+            )
+            parsed.append(blob)
+        self._rollup_items = parsed
+        self._mount_rollup_widgets()
+
+    def _mount_rollup_widgets(self) -> None:
+        """Idempotently refresh the rollup-items box for the current state."""
+        box = self.rollup_items_box
+        if box.children:
+            box.remove_children()
+        if not self._rollup_items:
+            box.display = False
+            return
+        box.display = True
+        total = len(self._rollup_items)
+        header = Static(
+            f"[dim]\u2500\u2500 items ({total}) \u2500\u2500[/dim]",
+            classes="rollup-items-header",
+            markup=True,
+        )
+        box.mount(header)
+        visible_count = (
+            total if self._rollup_show_all
+            else min(self.ROLLUP_DEFAULT_VISIBLE, total)
+        )
+        for idx in range(visible_count):
+            row = _RollupItem(
+                index=idx,
+                item=self._rollup_items[idx],
+                expanded=idx in self._rollup_expanded,
+                focused=self._rollup_focused_index == idx,
+            )
+            box.mount(row)
+        if visible_count < total:
+            remaining = total - visible_count
+            overflow = Static(
+                f"[dim]\u2026 {remaining} more \u2014 press [b]e[/b] to expand all[/dim]",
+                classes="rollup-overflow",
+                markup=True,
+            )
+            box.mount(overflow)
+
+    def toggle_rollup_item(self, index: int) -> None:
+        """Toggle expansion of the rollup item at ``index``."""
+        if not (0 <= index < len(self._rollup_items)):
+            return
+        if index in self._rollup_expanded:
+            self._rollup_expanded.discard(index)
+        else:
+            self._rollup_expanded.add(index)
+        self._rollup_focused_index = index
+        self._mount_rollup_widgets()
+
+    def action_expand_all_rollup(self) -> None:
+        """When the selected task is a rollup, reveal every item."""
+        if not self._rollup_items or self._rollup_show_all:
+            return
+        self._rollup_show_all = True
+        self._mount_rollup_widgets()
 
     # ------------------------------------------------------------------
     # Selection / navigation
@@ -2484,6 +2784,125 @@ class PollyInboxApp(App[None]):
         if task_id is None:
             return
         self.reply_input.focus()
+
+    # ------------------------------------------------------------------
+    # Jump to PM discussion (d)
+    # ------------------------------------------------------------------
+
+    def action_jump_to_pm(self) -> None:
+        """Navigate the cockpit right pane to this task's PM session.
+
+        * If focus is inside the reply Input, the action is a no-op —
+          Sam's mid-draft and `d` is just a character in his message.
+        * Resolves the PM persona via :func:`_resolve_pm_target`, routes
+          the cockpit to that window, and injects a context line via
+          ``tmux send-keys`` without pressing Enter — Sam finishes the
+          follow-up himself.
+        * When a rollup sub-item is currently focused, the context line
+          carries that sub-item's project + subject instead of the
+          rollup's own title so the discussion lands in the right PM.
+        """
+        if self.reply_input.has_focus:
+            return
+        task_id = self._selected_task_id
+        if task_id is None:
+            return
+        svc = self._svc_for_task(task_id)
+        if svc is None:
+            self.notify("Could not open project database.", severity="error")
+            return
+        try:
+            task = svc.get(task_id)
+        except Exception as exc:  # noqa: BLE001
+            self.notify(f"Could not load task: {exc}", severity="error")
+            svc.close()
+            return
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Determine which item (rollup sub-item vs the rollup itself)
+        # we're discussing, and derive the project the PM serves.
+        focus_item: dict | None = None
+        project_for_pm = task.project
+        if self._rollup_items and self._rollup_focused_index is not None:
+            idx = self._rollup_focused_index
+            if 0 <= idx < len(self._rollup_items):
+                focus_item = self._rollup_items[idx]
+                sub_project = (focus_item.get("source_project") or "").strip()
+                if sub_project:
+                    project_for_pm = sub_project
+
+        cockpit_key, pm_label = _resolve_pm_target(
+            self.config_path, project_for_pm,
+        )
+        context_line = _build_pm_context_line(task, item=focus_item)
+
+        # Do the cockpit navigation + tmux send-keys in a worker so a
+        # slow tmux call doesn't freeze the TUI. The actual work is
+        # pure subprocess invocations — safe off the UI thread.
+        self.run_worker(
+            lambda: self._dispatch_to_pm_sync(
+                cockpit_key, context_line, pm_label,
+            ),
+            thread=True,
+            exclusive=True,
+            group="jump_to_pm",
+        )
+
+    def _dispatch_to_pm_sync(
+        self, cockpit_key: str, context_line: str, pm_label: str,
+    ) -> None:
+        """Worker-thread body: route cockpit + inject the context line."""
+        try:
+            self._perform_pm_dispatch(cockpit_key, context_line)
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(
+                self.notify, f"Jump to PM failed: {exc}", severity="error",
+            )
+            return
+        self.call_from_thread(
+            self.notify,
+            f"Jumped to {pm_label} \u2014 finish your message and hit Enter.",
+            severity="information",
+            timeout=3.0,
+        )
+
+    def _perform_pm_dispatch(self, cockpit_key: str, context_line: str) -> None:
+        """Actually route to the PM pane and ``send-keys`` the context line.
+
+        Separated so tests can patch/record the call without spinning up
+        a real tmux server. See ``test_cockpit_inbox_ui.py`` for the
+        monkeypatch target.
+        """
+        router = CockpitRouter(self.config_path)
+        router.route_selected(cockpit_key)
+        supervisor = router._load_supervisor()
+        window_target = (
+            f"{supervisor.config.project.tmux_session}:{router._COCKPIT_WINDOW}"
+        )
+        right_pane = router._right_pane_id(window_target)
+        if right_pane is None:
+            # Fall back to the window target — tmux resolves to the
+            # active pane, which is almost always the right pane for
+            # cockpit flows post-route.
+            router.tmux.send_keys(window_target, context_line, press_enter=False)
+            return
+        router.tmux.send_keys(right_pane, context_line, press_enter=False)
+
+    @on(events.Click, ".rollup-item")
+    def _on_rollup_item_click(self, event: events.Click) -> None:
+        """Click on a rollup sub-item toggles expansion + focuses it."""
+        row = event.widget
+        # The click can land on the inner Static — walk up until we
+        # find the _RollupItem wrapper.
+        while row is not None and not isinstance(row, _RollupItem):
+            row = getattr(row, "parent", None)
+        if not isinstance(row, _RollupItem):
+            return
+        self.toggle_rollup_item(row.index)
 
     @on(Input.Submitted, "#inbox-reply")
     def _on_reply_submitted(self, event: Input.Submitted) -> None:

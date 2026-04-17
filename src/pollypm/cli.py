@@ -340,15 +340,38 @@ def onboard(
 
 
 @app.command()
-def doctor() -> None:
-    checks = {
-        "tmux": shutil.which("tmux"),
-        "claude": shutil.which("claude"),
-        "codex": shutil.which("codex"),
-        "docker": shutil.which("docker"),
-        "inside_tmux": bool(os.environ.get("TMUX")),
-    }
-    typer.echo(json.dumps(checks, indent=2))
+def doctor(
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead of the human checklist.",
+    ),
+    fix: bool = typer.Option(
+        False, "--fix", help="Auto-fix the safe subset (missing dirs, stale panes).",
+    ),
+) -> None:
+    """Validate a new-user environment end-to-end.
+
+    Runs a battery of fast checks (<5s on a healthy system) covering
+    system prerequisites, install state, plugins, migrations,
+    filesystem, tmux, and network reachability. Every failure is
+    reported with three pieces of information: what's wrong, why
+    PollyPM needs it, and the exact fix command.
+    """
+    from pollypm.doctor import apply_fixes, render_human, render_json, run_checks
+
+    report = run_checks()
+    if fix:
+        fix_results = apply_fixes(report)
+        if fix_results:
+            for name, success, message in fix_results:
+                glyph = "fixed" if success else "fix failed"
+                typer.echo(f"  [{glyph}] {name}: {message}")
+            # Re-run checks so the final output reflects the fixes.
+            report = run_checks()
+    if json_output:
+        typer.echo(render_json(report))
+    else:
+        typer.echo(render_human(report))
+    raise typer.Exit(code=0 if report.ok else 1)
 
 
 @app.command()

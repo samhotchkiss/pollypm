@@ -196,7 +196,20 @@ class SupervisorHeartbeatAPI:
                 ),
                 owner="heartbeat",
             )
-            self.supervisor.store.record_event(session_name, "polly_followup", reason)
+            from pollypm.plugins_builtin.activity_feed.summaries import (
+                activity_summary,
+            )
+
+            self.supervisor.store.record_event(
+                session_name,
+                "polly_followup",
+                activity_summary(
+                    summary=f"Nudged operator about {session_name}: {reason}",
+                    severity="recommendation",
+                    verb="nudged",
+                    subject=session_name,
+                ),
+            )
         except Exception:  # noqa: BLE001
             pass
 

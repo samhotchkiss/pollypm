@@ -29,6 +29,43 @@ PLUGIN_MANIFEST = "pollypm-plugin.toml"
 PLUGIN_API_VERSION = "1"
 
 
+def _emit_plugin_lifecycle_event(
+    state_store: object | None,
+    plugin_name: str,
+    *,
+    kind: str,
+    severity: str,
+    summary: str,
+) -> None:
+    """Record a plugin-lifecycle event on the state store (best-effort).
+
+    Used by :meth:`ExtensionHost.initialize_plugins` so the Activity
+    Feed (``plugins_builtin/activity_feed``) can surface plugin
+    load/error events alongside sessions and tasks. Tolerant of missing
+    state infrastructure — unit tests without a store silently skip.
+    """
+    if state_store is None:
+        return
+    record = getattr(state_store, "record_event", None)
+    if not callable(record):
+        return
+    try:
+        from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
+
+        record(
+            "plugin",
+            kind,
+            activity_summary(
+                summary=summary,
+                severity=severity,
+                verb=("loaded" if kind == "plugin_loaded" else "errored"),
+                subject=plugin_name,
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("plugin_host: lifecycle event emit failed", exc_info=True)
+
+
 @dataclass(slots=True, frozen=True)
 class ContentDeclaration:
     """A plugin's ``[content]`` manifest block.
@@ -259,6 +296,15 @@ class ExtensionHost:
                 logger.exception("Plugin '%s' initialize() failed", name)
                 degraded[name] = reason
                 self._degraded[name] = reason
+                _emit_plugin_lifecycle_event(
+                    state_store, name, kind="plugin_error", severity="critical",
+                    summary=f"Plugin {name} initialize() failed: {exc}",
+                )
+            else:
+                _emit_plugin_lifecycle_event(
+                    state_store, name, kind="plugin_loaded", severity="routine",
+                    summary=f"Plugin {name} initialized",
+                )
         return degraded
 
     def rail_registry(self) -> RailRegistry:

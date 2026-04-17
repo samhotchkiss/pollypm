@@ -32,6 +32,7 @@ from pollypm.accounts import (
 from pollypm.checkpoints import create_issue_completion_checkpoint, record_checkpoint
 from pollypm.config_patches import apply_preference_patch, detect_preference_patch, list_project_overrides
 from pollypm.config import load_config
+from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
 from pollypm.itsalive import deploy_site, pending_deploys, sweep_pending_deploys
 from pollypm.models import ProviderKind, SessionConfig, SessionLaunchSpec
 from pollypm.projects import (
@@ -201,7 +202,16 @@ class PollyPMService:
         )
         if alert is None:
             raise RuntimeError(f"Alert {alert_type} for {session_name} was not persisted")
-        supervisor.store.record_event(session_name, "alert", f"Raised {severity} alert {alert_type}: {message}")
+        supervisor.store.record_event(
+            session_name,
+            "alert",
+            activity_summary(
+                summary=f"Raised {severity} alert {alert_type}: {message}",
+                severity="critical" if severity == "critical" else "recommendation",
+                verb="alerted",
+                subject=alert_type,
+            ),
+        )
         return alert
 
     def list_alerts(self) -> list[object]:
@@ -217,7 +227,12 @@ class PollyPMService:
         supervisor.store.record_event(
             alert.session_name,
             "alert",
-            f"Cleared alert {alert.alert_type}#{alert_id}",
+            activity_summary(
+                summary=f"Cleared alert {alert.alert_type}#{alert_id}",
+                severity="routine",
+                verb="cleared",
+                subject=alert.alert_type,
+            ),
         )
         return alert
 
@@ -230,7 +245,18 @@ class PollyPMService:
             status=status,
             last_failure_message=reason or None,
         )
-        supervisor.store.record_event(session_name, "session_status", f"Set status to {status}: {reason}".rstrip(": "))
+        supervisor.store.record_event(
+            session_name,
+            "session_status",
+            activity_summary(
+                summary=f"Set status to {status}: {reason}".rstrip(": "),
+                severity="routine",
+                verb="status_changed",
+                subject=session_name,
+                status=status,
+                reason=reason or None,
+            ),
+        )
         runtime = supervisor.store.get_session_runtime(session_name)
         if runtime is None:
             raise RuntimeError(f"Session runtime for {session_name} was not updated")
@@ -251,6 +277,11 @@ class PollyPMService:
             snapshot_path=str(payload.get("snapshot_path", "")),
             snapshot_hash=str(payload.get("snapshot_hash", "")),
         )
+        # Heartbeat snapshots are the canonical "nothing changed" event;
+        # we keep the plain string so the projector's noise filter (see
+        # event_projector._is_noise) drops them from the feed. A
+        # structured payload here would make every heartbeat tick leak
+        # into the UI.
         supervisor.store.record_event(session_name, "heartbeat", "Recorded heartbeat snapshot")
         record = supervisor.store.latest_heartbeat(session_name)
         if record is None:
@@ -589,7 +620,17 @@ class PollyPMService:
         store.record_event(
             launch.session.name,
             "checkpoint",
-            f"Recorded Level 1 checkpoint for completed issue {task.task_id}: {checkpoint_data.checkpoint_id}",
+            activity_summary(
+                summary=(
+                    f"Recorded Level 1 checkpoint for completed issue "
+                    f"{task.task_id}: {checkpoint_data.checkpoint_id}"
+                ),
+                severity="routine",
+                verb="checkpointed",
+                subject=task.task_id,
+                project=project_key,
+                checkpoint_id=checkpoint_data.checkpoint_id,
+            ),
         )
 
     def _checkpoint_launch_for_project(self, config, project_key: str) -> SessionLaunchSpec:

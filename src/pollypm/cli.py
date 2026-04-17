@@ -1453,7 +1453,18 @@ def worker_stop(
     # Clear any open alerts
     for alert_type in ["missing_window", "pane_dead", "recovery_limit", "suspected_loop", "needs_followup"]:
         supervisor.store.clear_alert(session_name, alert_type)
-    supervisor.store.record_event(session_name, "decommissioned", f"Worker {session_name} stopped and disabled")
+    from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
+
+    supervisor.store.record_event(
+        session_name,
+        "decommissioned",
+        activity_summary(
+            summary=f"Worker {session_name} stopped and disabled",
+            severity="recommendation",
+            verb="decommissioned",
+            subject=session_name,
+        ),
+    )
     typer.echo(f"Marked {session_name} as disabled. Heartbeat will not recover it.")
 
 

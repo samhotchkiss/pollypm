@@ -326,7 +326,7 @@ uv run pm task list -p commit_validator --status blocked
 
 ## Bug Tracking
 
-Every bug found: fix it immediately. Run `uv run pytest tests/test_cockpit.py tests/test_work_service.py tests/test_work_cli.py tests/test_supervisor.py tests/test_heartbeat_loop.py -x -q` after each fix to verify no regressions.
+Every bug found: fix it immediately. Run `uv run pytest tests/test_cockpit.py tests/test_work_service.py tests/test_work_cli.py tests/test_supervisor.py tests/test_recovery_policy.py -x -q` after each fix to verify no regressions.
 
 When all phases pass, run the full test suite: `uv run pytest tests/ -x -q --ignore=tests/integration/test_knowledge_extract_integration.py --ignore=tests/integration/test_history_import_integration.py`
 

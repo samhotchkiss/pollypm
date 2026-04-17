@@ -144,8 +144,7 @@ Every major subsystem has a defined role, a fixed file path, and is independentl
 
 | Module | What it does | Path | Status |
 | --- | --- | --- | --- |
-| Heartbeat Loop | Current tick driver (legacy — being sealed) | `src/pollypm/heartbeat_loop.py` | refactor |
-| Heartbeat Plugins | Legacy plugin interface | `src/pollypm/heartbeats/` | refactor |
+| Heartbeat Backend | Mechanical session-health sweep (invoked by `core_recurring`'s `session.health_sweep` handler) | `src/pollypm/heartbeats/` | stable |
 | Scheduler Plugins | Cadence dispatcher | `src/pollypm/schedulers/` | refactor |
 | itsalive integration | Deploy-aware self-check | `src/pollypm/itsalive.py` | refactor |
 | Job Runner | Current placeholder job runner | `src/pollypm/job_runner.py` | partial |

@@ -1,15 +1,12 @@
 """Unit tests for the pluggable RecoveryPolicy.
 
-The default policy must match the historical ``heartbeat_loop``
-``classify_session_health`` / ``select_intervention`` behavior
-byte-for-byte. These tests pin that contract.
+The default policy is the sealed successor to the historical
+``heartbeat_loop`` ``classify_session_health`` / ``select_intervention``
+helpers (removed in issue #166). These tests pin the classification
+ladder contract.
 """
 
 from pollypm.capacity import CapacityState
-from pollypm.heartbeat_loop import (
-    classify_session_health as legacy_classify,
-    select_intervention as legacy_select,
-)
 from pollypm.recovery.base import (
     INTERVENTION_LADDER,
     InterventionAction,
@@ -25,41 +22,51 @@ from pollypm.recovery.default import DefaultRecoveryPolicy
 # ---------------------------------------------------------------------------
 
 
-REFERENCE_SIGNALS: list[SessionSignals] = [
-    SessionSignals(session_name="w"),  # healthy
-    SessionSignals(session_name="w", has_transcript_delta=True),  # active
-    SessionSignals(session_name="w", window_present=False),  # exited (no window)
-    SessionSignals(session_name="w", pane_dead=True),  # exited (dead pane)
-    SessionSignals(session_name="w", auth_failure=True),  # auth_broken
-    SessionSignals(
-        session_name="w", capacity_state=CapacityState.EXHAUSTED,
-    ),  # blocked_no_capacity
-    SessionSignals(
-        session_name="w", capacity_state=CapacityState.THROTTLED,
-    ),  # blocked_no_capacity
-    SessionSignals(session_name="w", last_verdict="blocked"),  # waiting_on_user
-    SessionSignals(session_name="w", snapshot_repeated=3),  # looping
-    SessionSignals(session_name="w", snapshot_repeated=2),  # not looping
-    SessionSignals(
-        session_name="w", output_stale=True, idle_cycles=3,
-    ),  # stuck
-    SessionSignals(
-        session_name="w", output_stale=True, idle_cycles=1,
-    ),  # idle
-    SessionSignals(
-        session_name="w",
-        output_stale=True, idle_cycles=5, last_verdict="blocked",
-    ),  # waiting_on_user takes precedence
-    SessionSignals(session_name="operator", output_stale=True, idle_cycles=1),
+REFERENCE_CLASSIFICATIONS: list[tuple[SessionSignals, SessionHealth]] = [
+    (SessionSignals(session_name="w"), SessionHealth.HEALTHY),
+    (SessionSignals(session_name="w", has_transcript_delta=True), SessionHealth.ACTIVE),
+    (SessionSignals(session_name="w", window_present=False), SessionHealth.EXITED),
+    (SessionSignals(session_name="w", pane_dead=True), SessionHealth.EXITED),
+    (SessionSignals(session_name="w", auth_failure=True), SessionHealth.AUTH_BROKEN),
+    (
+        SessionSignals(session_name="w", capacity_state=CapacityState.EXHAUSTED),
+        SessionHealth.BLOCKED_NO_CAPACITY,
+    ),
+    (
+        SessionSignals(session_name="w", capacity_state=CapacityState.THROTTLED),
+        SessionHealth.BLOCKED_NO_CAPACITY,
+    ),
+    (
+        SessionSignals(session_name="w", last_verdict="blocked"),
+        SessionHealth.WAITING_ON_USER,
+    ),
+    (SessionSignals(session_name="w", snapshot_repeated=3), SessionHealth.LOOPING),
+    (
+        SessionSignals(session_name="w", output_stale=True, idle_cycles=3),
+        SessionHealth.STUCK,
+    ),
+    (
+        SessionSignals(session_name="w", output_stale=True, idle_cycles=1),
+        SessionHealth.IDLE,
+    ),
+    (
+        SessionSignals(
+            session_name="w",
+            output_stale=True,
+            idle_cycles=5,
+            last_verdict="blocked",
+        ),
+        SessionHealth.WAITING_ON_USER,
+    ),
 ]
 
 
 class TestDefaultRecoveryPolicyClassify:
-    def test_matches_legacy_classify_for_reference_set(self) -> None:
+    def test_reference_classifications(self) -> None:
         policy = DefaultRecoveryPolicy()
-        for signals in REFERENCE_SIGNALS:
-            assert policy.classify(signals) == legacy_classify(signals), (
-                f"classify disagreement for {signals!r}"
+        for signals, expected in REFERENCE_CLASSIFICATIONS:
+            assert policy.classify(signals) == expected, (
+                f"classify disagreement for {signals!r}: expected {expected}"
             )
 
     def test_healthy_default(self) -> None:
@@ -177,35 +184,6 @@ class TestDefaultRecoveryPolicySelect:
         signals = SessionSignals(session_name="w")
         result = policy.select_intervention(SessionHealth.ERROR, signals, [])
         assert result is not None and result.action == "escalate"
-
-
-class TestLadderParityWithLegacy:
-    """Cross-check: policy.select_intervention and legacy select_intervention
-    produce identical actions across the full health x previous count grid."""
-
-    def test_policy_matches_legacy_across_grid(self) -> None:
-        policy = DefaultRecoveryPolicy()
-        session_names = ("worker_a", "operator")
-        healths = list(SessionHealth)
-        for name in session_names:
-            signals = SessionSignals(session_name=name)
-            for health in healths:
-                for prev in range(4):
-                    legacy = legacy_select(
-                        health, signals, previous_interventions=prev,
-                    )
-                    got = policy.select_intervention(
-                        health, signals, _history(prev),
-                    )
-                    assert (legacy is None) == (got is None), (
-                        f"legacy/policy None disagreement for "
-                        f"{name} {health} prev={prev}"
-                    )
-                    if legacy is not None and got is not None:
-                        assert legacy.action == got.action, (
-                            f"action disagreement {name} {health} prev={prev}: "
-                            f"legacy={legacy.action} policy={got.action}"
-                        )
 
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@ service instantiation, dedupe / escalate decisions.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -33,12 +33,19 @@ SWEEPER_COOLDOWN_SECONDS = 5 * 60
 
 @dataclass(slots=True)
 class _RuntimeServices:
-    """Container for the services a notify/sweep invocation needs."""
+    """Container for the services a notify/sweep invocation needs.
+
+    ``known_projects`` — the registered ``[projects.*]`` map from
+    config, used by the sweeper to fan out across per-project work-
+    service DBs (#259). Empty tuple when no projects are registered or
+    config didn't load; the sweep then only scans the workspace-root DB.
+    """
 
     session_service: Any | None
     state_store: Any | None
     work_service: Any | None
     project_root: Path
+    known_projects: tuple[Any, ...] = field(default_factory=tuple)
 
 
 def load_runtime_services(
@@ -60,6 +67,7 @@ def load_runtime_services(
             state_store=None,
             work_service=None,
             project_root=Path.cwd(),
+            known_projects=(),
         )
     config = load_config(resolved_path)
 
@@ -92,11 +100,17 @@ def load_runtime_services(
         logger.debug("task_assignment_notify: work service unavailable", exc_info=True)
         work_service = None
 
+    # #259: snapshot registered projects so the sweeper can open each
+    # per-project DB on its own tick. We store the KnownProject objects
+    # directly — the sweeper just needs ``.key`` and ``.path``.
+    known_projects = tuple(config.projects.values())
+
     return _RuntimeServices(
         session_service=session_service,
         state_store=store,
         work_service=work_service,
         project_root=config.project.root_dir,
+        known_projects=known_projects,
     )
 
 

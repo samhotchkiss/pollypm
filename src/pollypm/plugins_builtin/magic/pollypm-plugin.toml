@@ -9,3 +9,7 @@ description = "itsalive.co deployment integration with async verification and ag
 kind = "agent_profile"
 name = "magic"
 requires_api = ">=1,<2"
+
+[content]
+kinds = ["magic_skill"]
+user_paths = ["skills"]

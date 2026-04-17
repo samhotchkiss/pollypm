@@ -21,7 +21,9 @@ projection only runs when something changed.
 
 from __future__ import annotations
 
+import json
 import logging
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
@@ -33,6 +35,115 @@ from pollypm.plugins_builtin.activity_feed.handlers.event_projector import (
 from pollypm.plugins_builtin.activity_feed.plugin import build_projector
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Filter state (lf04) — composes with AND logic in ``apply_filter``.
+# ---------------------------------------------------------------------------
+
+
+_TIME_WINDOWS: dict[str, timedelta | None] = {
+    "all": None,
+    "hour": timedelta(hours=1),
+    "day": timedelta(days=1),
+    "week": timedelta(days=7),
+}
+
+
+@dataclass(slots=True, frozen=True)
+class FeedFilter:
+    """User-set filter state for the feed panel.
+
+    All fields are additive; ``apply_filter`` applies them with AND
+    semantics. The default-constructed instance is a no-op filter
+    (everything passes), so panels that don't expose filters behave
+    exactly as they did in lf03.
+    """
+
+    projects: tuple[str, ...] = ()
+    kinds: tuple[str, ...] = ()
+    actors: tuple[str, ...] = ()
+    time_window: str = "all"
+
+    def is_empty(self) -> bool:
+        return (
+            not self.projects
+            and not self.kinds
+            and not self.actors
+            and self.time_window in ("", "all")
+        )
+
+    def since(self) -> timedelta | None:
+        return _TIME_WINDOWS.get(self.time_window)
+
+    def with_project(self, project: str | None) -> "FeedFilter":
+        return replace(self, projects=(project,) if project else ())
+
+    def with_kind(self, kind: str | None) -> "FeedFilter":
+        return replace(self, kinds=(kind,) if kind else ())
+
+    def with_actor(self, actor: str | None) -> "FeedFilter":
+        return replace(self, actors=(actor,) if actor else ())
+
+    def with_time_window(self, window: str) -> "FeedFilter":
+        if window not in _TIME_WINDOWS:
+            window = "all"
+        return replace(self, time_window=window)
+
+    def describe(self) -> str:
+        """Short one-line summary for the panel header."""
+        if self.is_empty():
+            return "all activity"
+        bits: list[str] = []
+        if self.projects:
+            bits.append("project=" + ",".join(self.projects))
+        if self.kinds:
+            bits.append("kind=" + ",".join(self.kinds))
+        if self.actors:
+            bits.append("actor=" + ",".join(self.actors))
+        if self.time_window and self.time_window != "all":
+            bits.append("window=" + self.time_window)
+        return " | ".join(bits)
+
+
+def apply_filter(
+    entries: Iterable[FeedEntry], feed_filter: FeedFilter,
+) -> list[FeedEntry]:
+    """Apply a :class:`FeedFilter` to an entry iterable.
+
+    Used both by the Textual panel (to keep its in-memory window
+    coherent after a filter change) and by the tests. The projector
+    itself accepts the same filters in ``project()`` for efficient
+    server-side filtering — this helper exists so we can re-filter an
+    already-fetched list without another DB round-trip.
+    """
+    project_set = set(feed_filter.projects) if feed_filter.projects else None
+    kind_set = set(feed_filter.kinds) if feed_filter.kinds else None
+    actor_set = set(feed_filter.actors) if feed_filter.actors else None
+    cutoff: datetime | None = None
+    delta = feed_filter.since()
+    if delta is not None:
+        cutoff = datetime.now(UTC) - delta
+
+    out: list[FeedEntry] = []
+    for entry in entries:
+        if project_set is not None and entry.project not in project_set:
+            continue
+        if kind_set is not None and entry.kind not in kind_set:
+            continue
+        if actor_set is not None and entry.actor not in actor_set:
+            continue
+        if cutoff is not None:
+            try:
+                when = datetime.fromisoformat(entry.timestamp)
+            except ValueError:
+                continue
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=UTC)
+            if when < cutoff:
+                continue
+        out.append(entry)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +222,57 @@ def render_entries_as_text(entries: Iterable[FeedEntry]) -> str:
             "and heartbeats fire. Check back after the next sweep."
         )
     return "\n".join(rows)
+
+
+def render_entry_detail(entry: FeedEntry, *, now: datetime | None = None) -> str:
+    """Render the per-entry detail view as plain text (lf04).
+
+    Shows absolute + relative timestamps, project / actor / verb,
+    severity, a pretty-printed payload JSON, and suggested follow-up
+    navigation (task / session links) inferred from the payload.
+    """
+    lines: list[str] = []
+    abs_ts = entry.timestamp
+    rel_ts = format_relative_time(entry.timestamp, now=now)
+    lines.append(f"Activity entry · {entry.id}")
+    lines.append("")
+    lines.append(f"When: {abs_ts}  ({rel_ts})")
+    lines.append(f"Kind: {entry.kind}")
+    if entry.project:
+        lines.append(f"Project: {entry.project}")
+    lines.append(f"Actor: {entry.actor}")
+    if entry.subject:
+        lines.append(f"Subject: {entry.subject}")
+    lines.append(f"Verb: {entry.verb}")
+    lines.append(f"Severity: {entry.severity}")
+    lines.append("")
+    lines.append("Summary:")
+    lines.append(f"  {entry.summary}")
+    # Navigation hints — task / session links inferred from the payload.
+    task_project = entry.payload.get("task_project")
+    task_number = entry.payload.get("task_number")
+    if task_project and task_number is not None:
+        lines.append("")
+        lines.append(
+            f"Related task: project:{task_project}:task:{task_number}  "
+            f"(use the rail to open)"
+        )
+    elif entry.source == "work_transitions" and entry.subject:
+        lines.append("")
+        lines.append(f"Related task: {entry.subject}")
+    if entry.actor and entry.source == "events":
+        lines.append("")
+        lines.append(f"Related session: {entry.actor}")
+    # Payload dump (pretty-printed).
+    lines.append("")
+    lines.append("Payload:")
+    try:
+        rendered = json.dumps(entry.payload, indent=2, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        rendered = repr(entry.payload)
+    for line in rendered.splitlines():
+        lines.append(f"  {line}")
+    return "\n".join(lines)
 
 
 def render_activity_feed_text(config: Any, *, limit: int = 50) -> str:
@@ -230,17 +392,25 @@ def _build_widget_classes():
             self._projector = projector
             self._limit = limit
             self._state = _PanelState()
+            self._header = Static("", id="feed-header")
             self._body = Static("", id="feed-body")
             self._last_rendered_ids: set[str] = set()
+            # lf04 state — filter + detail-view flag.
+            self.feed_filter: FeedFilter = FeedFilter()
+            self._detail_entry: FeedEntry | None = None
+            self._selected_index: int = 0
 
         def compose(self) -> ComposeResult:  # pragma: no cover - Textual harness
+            yield self._header
             yield self._body
 
         def refresh_feed(self) -> list[FeedEntry]:
             """Fetch the latest projection and update the body.
 
             Returns the list of newly-arrived entries (for caller-side
-            badge math / notifications).
+            badge math / notifications). Applies the current filter
+            (lf04) both server-side (via the projector's filter args)
+            and client-side (so the in-memory window stays coherent).
             """
             if self._projector is None:
                 self._body.update(
@@ -248,15 +418,77 @@ def _build_widget_classes():
                     "Ensure `activity_feed` is loaded and the state DB exists."
                 )
                 return []
+            filt = self.feed_filter
             try:
-                fresh = self._projector.project(limit=self._limit)
+                fresh = self._projector.project(
+                    limit=self._limit,
+                    projects=filt.projects or None,
+                    kinds=filt.kinds or None,
+                    actors=filt.actors or None,
+                    since=filt.since(),
+                )
             except Exception:  # noqa: BLE001  # pragma: no cover
                 logger.exception("activity_feed: widget refresh failed")
                 return []
             newly = self._state.update_with(fresh)
-            self._body.update(self._render_markup(self._state.entries, newly))
+            # If detail view is active, keep it pinned; the list updates
+            # but the body shows the detail markup until the user dismisses.
+            if self._detail_entry is not None:
+                refreshed = next(
+                    (e for e in fresh if e.id == self._detail_entry.id), None,
+                )
+                if refreshed is not None:
+                    self._detail_entry = refreshed
+                self._body.update(self._render_detail_markup(self._detail_entry))
+            else:
+                self._body.update(self._render_markup(self._state.entries, newly))
+            self._header.update(self._render_header())
             self._last_rendered_ids = {e.id for e in self._state.entries}
             return newly
+
+        # ---- filter API ----------------------------------------------
+
+        def set_filter(self, feed_filter: FeedFilter) -> None:
+            """Replace the filter and refresh the feed."""
+            self.feed_filter = feed_filter
+            # Drop the cached window so rows that were filtered out
+            # don't linger until they age off.
+            self._state.entries = []
+            self.refresh_feed()
+
+        def clear_filter(self) -> None:
+            self.set_filter(FeedFilter())
+
+        # ---- detail-view API -----------------------------------------
+
+        def open_detail(self, entry: FeedEntry) -> None:
+            self._detail_entry = entry
+            self._body.update(self._render_detail_markup(entry))
+            self._header.update(self._render_header())
+
+        def close_detail(self) -> None:
+            self._detail_entry = None
+            self.refresh_feed()
+
+        @property
+        def detail_entry(self) -> FeedEntry | None:
+            return self._detail_entry
+
+        def entry_by_index(self, index: int) -> FeedEntry | None:
+            if 0 <= index < len(self._state.entries):
+                return self._state.entries[index]
+            return None
+
+        # ---- rendering ------------------------------------------------
+
+        def _render_header(self) -> str:
+            filter_desc = self.feed_filter.describe()
+            suffix = "  (detail)" if self._detail_entry is not None else ""
+            return (
+                f"[bold]Activity Feed[/] \u00b7 "
+                f"[cyan]{_rich_escape(filter_desc)}[/]"
+                f"{suffix}"
+            )
 
         def _render_markup(
             self, entries: list[FeedEntry], new_ids: list[FeedEntry],
@@ -290,16 +522,33 @@ def _build_widget_classes():
                 )
             return "\n".join(lines)
 
+        def _render_detail_markup(self, entry: FeedEntry) -> str:
+            """Rich-markup variant of ``render_entry_detail`` for the
+            Textual panel."""
+            text = render_entry_detail(entry)
+            # Escape brackets so Rich doesn't try to parse JSON braces.
+            return "[dim]" + _rich_escape(text) + "[/]"
+
     class ActivityFeedApp(App):
         TITLE = "PollyPM"
         SUB_TITLE = "Activity"
         CSS = """
         Screen { background: #10161b; color: #eef2f4; padding: 1; }
+        #feed-header { padding: 0 2 1 2; color: #98a7b5; }
         #feed-body { padding: 1 2; }
         """
         BINDINGS = [
             Binding("q", "quit", "Quit"),
             Binding("r", "refresh", "Refresh"),
+            # lf04 — cycle the time-window filter and clear filters.
+            Binding("t", "cycle_time_window", "Time window"),
+            Binding("c", "clear_filter", "Clear filter"),
+            Binding("enter", "open_detail", "Detail"),
+            Binding("escape", "close_detail", "Back"),
+            Binding("down", "cursor_down", "Down"),
+            Binding("up", "cursor_up", "Up"),
+            Binding("j", "cursor_down", "Down"),
+            Binding("k", "cursor_up", "Up"),
         ]
 
         def __init__(self, config_path: Path, *, limit: int = 50) -> None:
@@ -347,6 +596,47 @@ def _build_widget_classes():
         def action_refresh(self) -> None:  # pragma: no cover - Textual harness
             if self._panel is not None:
                 self._panel.refresh_feed()
+
+        def action_cycle_time_window(self) -> None:  # pragma: no cover
+            if self._panel is None:
+                return
+            order = ("all", "hour", "day", "week")
+            current = self._panel.feed_filter.time_window
+            try:
+                nxt = order[(order.index(current) + 1) % len(order)]
+            except ValueError:
+                nxt = "hour"
+            self._panel.set_filter(self._panel.feed_filter.with_time_window(nxt))
+
+        def action_clear_filter(self) -> None:  # pragma: no cover
+            if self._panel is not None:
+                self._panel.clear_filter()
+
+        def action_open_detail(self) -> None:  # pragma: no cover
+            if self._panel is None:
+                return
+            entry = self._panel.entry_by_index(self._panel._selected_index)
+            if entry is not None:
+                self._panel.open_detail(entry)
+
+        def action_close_detail(self) -> None:  # pragma: no cover
+            if self._panel is not None:
+                self._panel.close_detail()
+
+        def action_cursor_down(self) -> None:  # pragma: no cover
+            if self._panel is None:
+                return
+            total = len(self._panel._state.entries)
+            if total == 0:
+                return
+            self._panel._selected_index = min(
+                total - 1, self._panel._selected_index + 1,
+            )
+
+        def action_cursor_up(self) -> None:  # pragma: no cover
+            if self._panel is None:
+                return
+            self._panel._selected_index = max(0, self._panel._selected_index - 1)
 
     return ActivityFeedPanel, ActivityFeedApp
 
@@ -402,9 +692,12 @@ def new_event_count(
 __all__ = [
     "ActivityFeedApp",
     "ActivityFeedPanel",
+    "FeedFilter",
+    "apply_filter",
     "format_entry_row",
     "format_relative_time",
     "new_event_count",
     "render_activity_feed_text",
     "render_entries_as_text",
+    "render_entry_detail",
 ]

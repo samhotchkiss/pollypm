@@ -1,0 +1,9 @@
+api_version = "1"
+name = "activity_feed"
+kind = "observability"
+version = "0.1.0"
+entrypoint = "plugin.py:plugin"
+description = "Live Activity Feed — projects session/task/worker/inbox/heartbeat events into a unified feed. See docs/live-activity-feed-spec.md."
+# The activity-feed rail entry lives in the `tools` section, which is
+# NOT reserved, so this plugin does not need the reserved-section flag.
+contributes_to_reserved_section = false

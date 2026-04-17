@@ -382,6 +382,12 @@ def flush_milestone_digest(
     )
 
     # Mirror pm notify's inbox-visible shape: chat flow + requester=user.
+    # Tag the task with a ``rollup`` label so the cockpit inbox UI can
+    # detect it without parsing the title, plus the milestone_key label so
+    # consumers can filter by milestone without re-reading the body.
+    labels = ["rollup"]
+    if milestone_key:
+        labels.append(f"milestone:{milestone_key}")
     task = svc.create(
         title=title,
         description=body_md,
@@ -391,7 +397,37 @@ def flush_milestone_digest(
         roles={"requester": "user", "operator": actor},
         priority="normal",
         created_by=actor,
+        labels=labels,
     )
+
+    # Persist each staged row as a ``rollup_item`` context entry so the
+    # inbox detail view can expand the rollup back into its constituent
+    # items without re-parsing the markdown body. The entry text is a
+    # JSON blob carrying subject, actor, created_at, source project, and
+    # the full payload (commit/PR refs).
+    for r in rows:
+        payload: dict[str, Any] = {}
+        try:
+            payload = json.loads(r["payload_json"]) or {}
+        except (TypeError, ValueError):
+            payload = {}
+        item_blob = {
+            "subject": r["subject"],
+            "body": r["body"],
+            "actor": r["actor"],
+            "created_at": r["created_at"],
+            "source_project": payload.get("project", project),
+            "payload": payload,
+        }
+        try:
+            svc.add_context(
+                task.task_id,
+                actor,
+                json.dumps(item_blob, separators=(",", ":"), default=str),
+                entry_type="rollup_item",
+            )
+        except Exception:  # noqa: BLE001 — item persistence is best-effort
+            logger.debug("rollup_item persist failed", exc_info=True)
 
     now = _now_iso()
     ids = [int(r["id"]) for r in rows]

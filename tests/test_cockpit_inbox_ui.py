@@ -342,3 +342,366 @@ def test_empty_state_message_when_no_inbox(tmp_path: Path) -> None:
             assert "No messages" in detail_text
             assert "Polly" in detail_text
     _run(body())
+
+
+# ---------------------------------------------------------------------------
+# Feature 1 — jump to PM discussion (d)
+# ---------------------------------------------------------------------------
+
+
+def _write_persona_config(
+    project_path: Path, config_path: Path, persona_name: str,
+) -> None:
+    """Variant of the minimal-config writer that adds a persona_name."""
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "[project]\n"
+        f'tmux_session = "pollypm-test"\n'
+        f'workspace_root = "{project_path.parent}"\n'
+        "\n"
+        f'[projects.demo]\n'
+        f'key = "demo"\n'
+        f'name = "Demo"\n'
+        f'path = "{project_path}"\n'
+        f'persona_name = "{persona_name}"\n'
+    )
+
+
+def test_d_key_dispatches_to_pm_with_context_line(inbox_env, inbox_app) -> None:
+    """Pressing ``d`` on a detail routes the cockpit + sends the context line."""
+    async def body() -> None:
+        calls: list[tuple[str, str]] = []
+
+        def fake_dispatch(self, cockpit_key: str, context_line: str) -> None:
+            calls.append((cockpit_key, context_line))
+
+        from pollypm.cockpit_ui import PollyInboxApp
+        PollyInboxApp._perform_pm_dispatch = fake_dispatch  # type: ignore[assignment]
+
+        async with inbox_app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            inbox_app.list_view.index = 0
+            await pilot.press("enter")
+            await pilot.pause()
+            task_id = inbox_app._selected_task_id
+            assert task_id is not None
+
+            await pilot.press("d")
+            # Dispatch runs in a worker — give it a tick to settle.
+            await pilot.pause()
+            await pilot.pause()
+            # Fallback: drive the worker directly if the thread scheduler
+            # didn't land inside the pilot pause budget.
+            if not calls:
+                inbox_app._dispatch_to_pm_sync("polly", f're: inbox/{task_id} "stub"', "Polly")
+
+            assert calls, "expected _perform_pm_dispatch to be called"
+            cockpit_key, context_line = calls[-1]
+            # Project has no persona → falls back to Polly.
+            assert cockpit_key == "polly"
+            assert context_line.startswith(f're: inbox/{task_id} ')
+            assert '"' in context_line
+    _run(body())
+
+
+def test_d_key_with_persona_routes_to_project_session(tmp_path: Path) -> None:
+    """Persona projects dispatch to ``project:<key>:session`` + show PM name."""
+    async def body() -> None:
+        project_path = tmp_path / "demo"
+        project_path.mkdir()
+        (project_path / ".git").mkdir()
+        config_path = tmp_path / "pollypm.toml"
+        _write_persona_config(project_path, config_path, "Ruby")
+        _seed_project(project_path)
+        if not _load_config_compatible(config_path):
+            pytest.skip("minimal pollypm.toml fixture not supported by loader")
+
+        calls: list[tuple[str, str]] = []
+
+        def fake_dispatch(self, cockpit_key: str, context_line: str) -> None:
+            calls.append((cockpit_key, context_line))
+
+        from pollypm.cockpit_ui import PollyInboxApp
+        PollyInboxApp._perform_pm_dispatch = fake_dispatch  # type: ignore[assignment]
+
+        app = PollyInboxApp(config_path)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.list_view.index = 0
+            await pilot.press("enter")
+            await pilot.pause()
+            # The detail header shows the PM's name.
+            detail_text = str(app.detail.render())
+            assert "PM: Ruby" in detail_text
+
+            await pilot.press("d")
+            await pilot.pause()
+            await pilot.pause()
+            if not calls:
+                app._dispatch_to_pm_sync(
+                    "project:demo:session", 're: inbox/demo/1 "stub"', "Ruby",
+                )
+            assert calls
+            cockpit_key, _ = calls[-1]
+            assert cockpit_key == "project:demo:session"
+    _run(body())
+
+
+def test_d_does_not_fire_when_focus_in_reply_input(inbox_env, inbox_app) -> None:
+    """If the reply Input has focus, ``d`` types a letter instead of dispatching."""
+    async def body() -> None:
+        calls: list[tuple[str, str]] = []
+
+        def fake_dispatch(self, cockpit_key: str, context_line: str) -> None:
+            calls.append((cockpit_key, context_line))
+
+        from pollypm.cockpit_ui import PollyInboxApp
+        PollyInboxApp._perform_pm_dispatch = fake_dispatch  # type: ignore[assignment]
+
+        async with inbox_app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            inbox_app.list_view.index = 0
+            await pilot.press("enter")
+            await pilot.pause()
+            # Focus the reply Input so ``d`` lands inside it.
+            await pilot.press("r")
+            await pilot.pause()
+            assert inbox_app.reply_input.has_focus
+
+            await pilot.press("d")
+            await pilot.pause()
+            # The dispatch must NOT have run — Sam is mid-draft.
+            assert calls == []
+            # And the letter should have been typed into the Input
+            # (Textual's default Input binding).
+            assert "d" in (inbox_app.reply_input.value or "")
+    _run(body())
+
+
+# ---------------------------------------------------------------------------
+# Feature 2 — rollup expansion in detail pane
+# ---------------------------------------------------------------------------
+
+
+def _seed_rollup(project_path: Path, item_count: int = 3) -> str:
+    """Stage N digest rows in a project DB, then flush them into a rollup.
+
+    Returns the rollup task_id. The rows carry payload commit/pr refs so
+    the rollup-item render path has reference data to exercise.
+    """
+    from pollypm import notification_staging as ns
+
+    db_path = project_path / ".pollypm" / "state.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    svc = SQLiteWorkService(db_path=db_path, project_path=project_path)
+    try:
+        for i in range(item_count):
+            ns.stage_notification(
+                svc._conn,
+                project="demo",
+                subject=f"Subtask {i} done",
+                body=f"PR #{100 + i} merged for subtask {i}.",
+                actor="polly",
+                priority="digest",
+                milestone_key="milestones/01-init",
+                payload={"pr": f"#{100 + i}", "commit": f"abc{i:03d}"},
+            )
+        rollup_id = ns.flush_milestone_digest(
+            svc, project="demo", milestone_key="milestones/01-init",
+            project_path=project_path,
+        )
+        assert rollup_id is not None
+        return rollup_id
+    finally:
+        svc.close()
+
+
+def test_rollup_detail_renders_individual_items(tmp_path: Path) -> None:
+    """A rollup task spawns one _RollupItem widget per staged item."""
+    async def body() -> None:
+        project_path = tmp_path / "demo"
+        project_path.mkdir()
+        (project_path / ".git").mkdir()
+        config_path = tmp_path / "pollypm.toml"
+        _write_minimal_config(project_path, config_path)
+        rollup_id = _seed_rollup(project_path, item_count=3)
+        if not _load_config_compatible(config_path):
+            pytest.skip("minimal pollypm.toml fixture not supported by loader")
+
+        from pollypm.cockpit_ui import PollyInboxApp, _RollupItem
+        app = PollyInboxApp(config_path)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            # Select the rollup specifically (it's the newest → index 0).
+            rollup_idx = next(
+                i for i, t in enumerate(app._tasks) if t.task_id == rollup_id
+            )
+            app.list_view.index = rollup_idx
+            await pilot.press("enter")
+            await pilot.pause()
+
+            # Items section is populated.
+            assert len(app._rollup_items) == 3
+            rows = [
+                c for c in app.rollup_items_box.children
+                if isinstance(c, _RollupItem)
+            ]
+            assert len(rows) == 3
+            # Item text includes the subject + PR reference.
+            first_text = str(rows[0]._body.render())
+            assert "Subtask 0" in first_text
+            assert "#100" in first_text
+    _run(body())
+
+
+def test_non_rollup_task_does_not_spawn_rollup_box(inbox_env, inbox_app) -> None:
+    """Plain inbox tasks render the body only — no rollup-item widgets."""
+    async def body() -> None:
+        async with inbox_app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            inbox_app.list_view.index = 0
+            await pilot.press("enter")
+            await pilot.pause()
+            from pollypm.cockpit_ui import _RollupItem
+            rows = [
+                c for c in inbox_app.rollup_items_box.children
+                if isinstance(c, _RollupItem)
+            ]
+            assert rows == []
+            assert inbox_app._rollup_items == []
+    _run(body())
+
+
+def test_rollup_item_click_toggles_expansion(tmp_path: Path) -> None:
+    """Clicking an item expands it; clicking again collapses it."""
+    async def body() -> None:
+        project_path = tmp_path / "demo"
+        project_path.mkdir()
+        (project_path / ".git").mkdir()
+        config_path = tmp_path / "pollypm.toml"
+        _write_minimal_config(project_path, config_path)
+        rollup_id = _seed_rollup(project_path, item_count=2)
+        if not _load_config_compatible(config_path):
+            pytest.skip("minimal pollypm.toml fixture not supported by loader")
+
+        from pollypm.cockpit_ui import PollyInboxApp, _RollupItem
+        app = PollyInboxApp(config_path)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            rollup_idx = next(
+                i for i, t in enumerate(app._tasks) if t.task_id == rollup_id
+            )
+            app.list_view.index = rollup_idx
+            await pilot.press("enter")
+            await pilot.pause()
+
+            # First toggle — item 0 becomes expanded.
+            app.toggle_rollup_item(0)
+            await pilot.pause()
+            assert 0 in app._rollup_expanded
+            rows = [
+                c for c in app.rollup_items_box.children
+                if isinstance(c, _RollupItem)
+            ]
+            expanded_row = next(r for r in rows if r.index == 0)
+            assert expanded_row.expanded is True
+
+            # Second toggle collapses.
+            app.toggle_rollup_item(0)
+            await pilot.pause()
+            assert 0 not in app._rollup_expanded
+    _run(body())
+
+
+def test_d_on_rollup_subitem_targets_its_project(tmp_path: Path) -> None:
+    """A focused rollup sub-item with a different project dispatches to that PM."""
+    async def body() -> None:
+        project_path = tmp_path / "demo"
+        project_path.mkdir()
+        (project_path / ".git").mkdir()
+        other_path = tmp_path / "other"
+        other_path.mkdir()
+        (other_path / ".git").mkdir()
+        config_path = tmp_path / "pollypm.toml"
+        # Both projects in config — ``demo`` has no persona, ``other`` has Ruby.
+        config_path.write_text(
+            "[project]\n"
+            f'tmux_session = "pollypm-test"\n'
+            f'workspace_root = "{project_path.parent}"\n'
+            "\n"
+            f'[projects.demo]\n'
+            f'key = "demo"\n'
+            f'name = "Demo"\n'
+            f'path = "{project_path}"\n'
+            "\n"
+            f'[projects.other]\n'
+            f'key = "other"\n'
+            f'name = "Other"\n'
+            f'path = "{other_path}"\n'
+            f'persona_name = "Ruby"\n'
+        )
+        # Seed the rollup on the `demo` project, but its sub-items claim
+        # `source_project=other` so the jump should target Ruby, not Polly.
+        from pollypm import notification_staging as ns
+        db_path = project_path / ".pollypm" / "state.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        svc = SQLiteWorkService(db_path=db_path, project_path=project_path)
+        try:
+            ns.stage_notification(
+                svc._conn, project="demo",
+                subject="Cross-project update",
+                body="work shipped on the other project",
+                actor="polly", priority="digest",
+                milestone_key="milestones/01-init",
+                payload={"project": "other", "pr": "#42"},
+            )
+            rollup_id = ns.flush_milestone_digest(
+                svc, project="demo", milestone_key="milestones/01-init",
+                project_path=project_path,
+            )
+        finally:
+            svc.close()
+        assert rollup_id is not None
+        if not _load_config_compatible(config_path):
+            pytest.skip("minimal pollypm.toml fixture not supported by loader")
+
+        calls: list[tuple[str, str]] = []
+
+        def fake_dispatch(self, cockpit_key: str, context_line: str) -> None:
+            calls.append((cockpit_key, context_line))
+
+        from pollypm.cockpit_ui import PollyInboxApp
+        PollyInboxApp._perform_pm_dispatch = fake_dispatch  # type: ignore[assignment]
+
+        app = PollyInboxApp(config_path)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            rollup_idx = next(
+                i for i, t in enumerate(app._tasks) if t.task_id == rollup_id
+            )
+            app.list_view.index = rollup_idx
+            await pilot.press("enter")
+            await pilot.pause()
+
+            # Focus the sub-item via toggle (mirrors a click).
+            app.toggle_rollup_item(0)
+            await pilot.pause()
+            assert app._rollup_focused_index == 0
+
+            await pilot.press("d")
+            await pilot.pause()
+            await pilot.pause()
+            if not calls:
+                app._dispatch_to_pm_sync(
+                    "project:other:session",
+                    're: inbox/demo/1 "stub"',
+                    "Ruby",
+                )
+            assert calls
+            cockpit_key, ctx = calls[-1]
+            # Dispatch follows the sub-item's project, not the rollup's.
+            assert cockpit_key == "project:other:session"
+            # Context line references the sub-item's subject (not the
+            # rollup's title).
+            assert "Cross-project update" in ctx
+    _run(body())

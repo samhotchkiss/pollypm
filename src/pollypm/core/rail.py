@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from pollypm.config import PollyPMConfig
+    from pollypm.heartbeat.boot import HeartbeatRail
     from pollypm.plugin_host import ExtensionHost
     from pollypm.storage.state import StateStore
 
@@ -60,6 +61,10 @@ class CoreRail:
         self._plugin_host = plugin_host
         self._subsystems: list[Startable] = []
         self._started = False
+        # Lazily constructed in start() — the HeartbeatRail owns the
+        # sealed heartbeat + job queue + worker pool trio that drains
+        # roster-registered recurring handlers.
+        self._heartbeat_rail: "HeartbeatRail | None" = None
 
     # ── Accessors ──────────────────────────────────────────────────────────
 
@@ -112,6 +117,10 @@ class CoreRail:
              constructor, but logged here so boot has a single narrative)
           3. subsystem boot in registration order (Supervisor first,
              heartbeat worker subsystems next as they get registered)
+          4. HeartbeatRail boot — constructs the sealed JobQueue +
+             JobWorkerPool + Heartbeat trio from the plugin host so
+             roster-registered recurring handlers start draining on
+             the first tick.
 
         Idempotent: a second call while already started is a no-op.
         """
@@ -128,8 +137,44 @@ class CoreRail:
         )
         for subsystem in self._subsystems:
             subsystem.start()
+        self._start_heartbeat_rail()
         self._started = True
         logger.info("CoreRail.start(): boot complete")
+
+    def _start_heartbeat_rail(self) -> None:
+        """Construct and boot the HeartbeatRail.
+
+        Called from :meth:`start` after subsystem boot. Failures here are
+        logged but don't abort the rail — the rest of the process (CLI,
+        cockpit, supervisor tick) can still function without the job
+        queue; users will see degraded recurring handlers instead of a
+        hard boot failure.
+        """
+        if self._heartbeat_rail is not None:
+            return
+        try:
+            from pollypm.heartbeat.boot import HeartbeatRail
+
+            rail = HeartbeatRail.from_plugin_host(
+                state_db=self._config.project.state_db,
+                plugin_host=self._plugin_host,
+            )
+            rail.start()
+            self._heartbeat_rail = rail
+            logger.info(
+                "CoreRail.start(): HeartbeatRail booted "
+                "(%d roster entries, worker pool running)",
+                len(rail.roster.entries),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "CoreRail.start(): HeartbeatRail boot failed — "
+                "recurring handlers will not fire this process",
+            )
+
+    def get_heartbeat_rail(self) -> "HeartbeatRail | None":
+        """Return the process-wide :class:`HeartbeatRail` if started, else None."""
+        return self._heartbeat_rail
 
     def stop(self) -> None:
         """Drive graceful shutdown in reverse order.
@@ -144,6 +189,14 @@ class CoreRail:
         logger.info(
             "CoreRail.stop(): stopping %d subsystem(s)", len(self._subsystems),
         )
+        # HeartbeatRail was booted last; tear it down first so workers
+        # stop claiming jobs before subsystems release their resources.
+        if self._heartbeat_rail is not None:
+            try:
+                self._heartbeat_rail.stop()
+            except Exception:  # noqa: BLE001
+                logger.exception("CoreRail.stop(): HeartbeatRail stop raised")
+            self._heartbeat_rail = None
         for subsystem in reversed(self._subsystems):
             try:
                 subsystem.stop()

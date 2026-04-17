@@ -20,7 +20,6 @@ from pollypm.checkpoints import record_checkpoint, snapshot_hash, write_mechanic
 from pollypm.config import PollyPMConfig
 from pollypm.heartbeats import get_heartbeat_backend
 from pollypm.heartbeats.api import SupervisorHeartbeatAPI
-from pollypm.itsalive import sweep_pending_deploys
 from pollypm.knowledge_extract import EXTRACTION_INTERVAL_SECONDS
 from pollypm.models import AccountConfig, ProviderKind, SessionConfig, SessionLaunchSpec
 from pollypm.onboarding import _prime_claude_home
@@ -821,16 +820,23 @@ class Supervisor:
         self.session_service.tmux.select_window(f"{tmux_session}:{self._CONSOLE_WINDOW}")
 
     def run_heartbeat(self, snapshot_lines: int = 200) -> list[AlertRecord]:
-        # Phase 0: Ingest provider transcripts into events.jsonl
-        # This must run before everything else so Phase 2 snapshots and
-        # Phase 3 session_intelligence have fresh data to work with.
-        try:
-            from pollypm.transcript_ingest import sync_transcripts_once
-            sync_transcripts_once(self.config)
-        except Exception:  # noqa: BLE001
-            pass  # Ingest failure shouldn't block the heartbeat
+        """Run one session-health sweep.
 
-        # Phase 1: Fast synchronous pre-work (token sync uses SQLite, must stay on main thread)
+        Post-#184 this is the :class:`core_recurring` ``session.health_sweep``
+        handler's core: capture pane snapshots, classify session health,
+        record checkpoints, raise alerts. The formerly-inline "tick dispatch"
+        pieces (transcript ingest, itsalive deploy sweep, lease GC,
+        capacity probing, async job fanout) have all migrated to
+        roster-registered recurring handlers drained by the HeartbeatRail
+        worker pool — so this function does just the Phase 2 sweep now.
+
+        See ``src/pollypm/plugins_builtin/core_recurring/plugin.py`` and
+        ``src/pollypm/plugins_builtin/itsalive/plugin.py`` for the
+        replacement handlers.
+        """
+        # Phase 1 residual: token-ledger sync is still inline because it
+        # requires the main-thread SQLite connection and no equivalent
+        # handler exists yet (post-v1 migration target).
         transcript_samples = sync_token_ledger_for_config(self.config)
         if transcript_samples:
             self.store.record_event(
@@ -838,13 +844,6 @@ class Supervisor:
                 "token_ledger",
                 f"Synced {len(transcript_samples)} transcript token sample(s)",
             )
-        for outcome in sweep_pending_deploys(self.config.project.root_dir):
-            self.store.record_event(
-                "heartbeat",
-                "itsalive",
-                f"itsalive deploy sweep: {outcome.subdomain} -> {outcome.status}",
-            )
-        self.release_expired_leases()
 
         # Phase 2: Fast synchronous sweep — capture + classify + alert
         backend = get_heartbeat_backend(
@@ -853,17 +852,6 @@ class Supervisor:
         )
         api = SupervisorHeartbeatAPI(self, snapshot_lines=snapshot_lines)
         alerts = backend.run(api, snapshot_lines=snapshot_lines)
-
-        # Phase 3: Dispatch slow async jobs in parallel (fire-and-forget)
-        # These must NOT touch self.store (SQLite is single-threaded).
-        from pollypm.job_runner import submit_jobs_parallel
-        submit_jobs_parallel(self, [
-            ("version_check", {}),
-            ("session_intelligence_sweep", {}),
-            ("project_intelligence", {}),
-            ("gc_maintenance", {}),
-            ("prune_state", {}),
-        ])
 
         # Re-arm the heartbeat schedule so the next sweep is always queued.
         # Without this, the scheduler permanently stops if the heartbeat

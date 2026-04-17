@@ -292,3 +292,125 @@ def test_corerail_drives_plugin_host_load(tmp_path: Path) -> None:
     rail.start()
 
     assert "plugins" in calls
+
+
+# ---------------------------------------------------------------------------
+# CoreRail boots HeartbeatRail — #184
+# ---------------------------------------------------------------------------
+
+
+def test_corerail_start_boots_heartbeat_rail(tmp_path: Path) -> None:
+    """CoreRail.start() constructs + boots a HeartbeatRail so roster-
+    registered recurring handlers get drained by a running worker pool.
+    """
+    import threading
+
+    from pollypm.heartbeat import Roster
+    from pollypm.jobs import JobHandlerRegistry
+
+    # Minimal plugin-host stand-in exposing the two methods
+    # HeartbeatRail.from_plugin_host relies on.
+    registry = JobHandlerRegistry()
+    roster = Roster()
+    fired: set[str] = set()
+    fired_lock = threading.Lock()
+
+    def _mk_handler(name: str):
+        def _h(payload: dict) -> dict:
+            with fired_lock:
+                fired.add(name)
+            return {"ok": True}
+        return _h
+
+    handler_names = [
+        "session.health_sweep",
+        "capacity.probe",
+        "transcript.ingest",
+        "alerts.gc",
+        "itsalive.deploy_sweep",
+        "briefing.tick",
+    ]
+    for name in handler_names:
+        registry.register(
+            name=name, handler=_mk_handler(name),
+            plugin_name="test", timeout_seconds=2.0,
+        )
+        roster.register(schedule="@on_startup", handler_name=name, payload={})
+
+    class _FakeHost:
+        def plugins(self):
+            return {}
+
+        def build_roster(self):
+            return roster
+
+        def job_handler_registry(self):
+            return registry
+
+    config = _config(tmp_path)
+    store = StateStore(config.project.state_db)
+    rail = CoreRail(config, store, _FakeHost())
+
+    rail.start()
+    try:
+        hb = rail.get_heartbeat_rail()
+        assert hb is not None, "CoreRail.start() must boot a HeartbeatRail"
+        assert hb.pool.is_running, "HeartbeatRail worker pool must be running post-start"
+
+        # Tighten retry backoff + poll interval so the test doesn't linger
+        # on transient races; handlers above are all no-ops.
+        from pollypm.jobs import exponential_backoff
+        hb.queue.retry_policy = exponential_backoff(
+            base_seconds=0.01, factor=1.0, max_seconds=0.01, jitter=0,
+        )
+        hb.pool.poll_interval = 0.02
+
+        # Two ticks — first enqueues the @on_startup entries; second is a
+        # no-op (on_startup_fired is set). The worker pool drains asynchronously.
+        from datetime import UTC, datetime
+        result1 = hb.tick(datetime.now(UTC))
+        assert result1.enqueued_count == len(handler_names)
+        result2 = hb.tick(datetime.now(UTC))
+        assert result2.enqueued_count == 0  # on_startup already fired
+
+        import time
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            with fired_lock:
+                if len(fired) == len(handler_names):
+                    break
+            time.sleep(0.02)
+        with fired_lock:
+            missing = set(handler_names) - fired
+        assert not missing, f"Handlers that did not fire within 5s: {missing}"
+    finally:
+        rail.stop()
+        # After stop(), the HeartbeatRail reference is cleared.
+        assert rail.get_heartbeat_rail() is None
+
+
+def test_corerail_stop_tears_down_heartbeat_rail(tmp_path: Path) -> None:
+    """CoreRail.stop() must stop the HeartbeatRail's worker pool."""
+    from pollypm.heartbeat import Roster
+    from pollypm.jobs import JobHandlerRegistry
+
+    class _FakeHost:
+        def plugins(self):
+            return {}
+
+        def build_roster(self):
+            return Roster()
+
+        def job_handler_registry(self):
+            return JobHandlerRegistry()
+
+    config = _config(tmp_path)
+    store = StateStore(config.project.state_db)
+    rail = CoreRail(config, store, _FakeHost())
+    rail.start()
+    hb = rail.get_heartbeat_rail()
+    assert hb is not None
+    pool = hb.pool
+    assert pool.is_running
+    rail.stop()
+    assert not pool.is_running

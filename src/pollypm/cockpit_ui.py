@@ -1888,35 +1888,44 @@ def _format_sender(task) -> str:
     return "polly"
 
 
-def _format_inbox_row(task, *, is_unread: bool) -> Text:
-    """Render one inbox-list row as Rich text.
+def _format_inbox_row(task, *, is_unread: bool, width: int = 38) -> Text:
+    """Render one inbox-list row as two lines of Rich text.
 
     Matches the cockpit aesthetic from RailItem: yellow diamond for
-    unread, dim open circle for read. Subject truncates at ~38 chars so
-    age + indicator stay visible on a 60-col list pane.
+    unread, dim open circle for read.
+
+    Line 1 is the bold message title (truncated with an ellipsis if it
+    won't fit ``width`` chars after the unread-marker glyph — no wrap).
+    Line 2 is dim ``project · age`` metadata indented under the title.
     """
     from pollypm.tz import format_relative
 
-    text = Text()
+    text = Text(no_wrap=True, overflow="ellipsis")
     if is_unread:
         text.append("\u25c6 ", style="#f0c45a")  # yellow diamond
     else:
         text.append("\u25cb ", style="#4a5568")  # dim circle
-    sender = _format_sender(task)
-    text.append(f"{sender:<7}", style="#97a6b2")
-    text.append("  ")
     subject = task.title or "(no subject)"
-    max_subject = 38
+    # Account for the 2-char marker glyph prefix so the total row still
+    # fits the target list-pane width without wrapping.
+    max_subject = max(8, width - 2)
     if len(subject) > max_subject:
         subject = subject[: max_subject - 1] + "\u2026"
-    subject_style = "bold #eef2f4" if is_unread else "#b8c4cf"
+    subject_style = "bold #eef2f4" if is_unread else "bold #b8c4cf"
     text.append(subject, style=subject_style)
+
+    # Line 2: project · age, dim. Indent by 2 so it lines up under the
+    # subject text (past the marker glyph).
     updated = task.updated_at
     iso = updated.isoformat() if hasattr(updated, "isoformat") else str(updated or "")
     age = format_relative(iso) if iso else ""
+    project = (task.project or "").strip() or "\u2014"
+    meta_bits = [project]
     if age:
-        # Right-align age as a separate dim run so the subject can flex.
-        text.append(f"  · {age}", style="#4a5568")
+        meta_bits.append(age)
+    meta_line = "  " + "  \u00b7  ".join(meta_bits)
+    text.append("\n")
+    text.append(meta_line, style="#6b7a88")
     return text
 
 
@@ -1973,7 +1982,7 @@ class PollyInboxApp(App[None]):
         scrollbar-color: #2a3340;
     }
     #inbox-list > .inbox-row {
-        height: 2;
+        height: 3;
         padding: 0 1;
         color: #d6dee5;
         background: transparent;
@@ -2010,10 +2019,10 @@ class PollyInboxApp(App[None]):
         padding: 0 1;
         background: #111820;
         border: round #2a3340;
-        display: none;
+        color: #d6dee5;
     }
-    #inbox-reply.visible {
-        display: block;
+    #inbox-reply:focus {
+        border: round #5b8aff;
     }
     #inbox-status {
         height: 1;
@@ -2062,7 +2071,7 @@ class PollyInboxApp(App[None]):
         self.list_view = ListView(id="inbox-list")
         self.detail = Static("", id="inbox-detail", markup=True)
         self.reply_input = Input(
-            placeholder="Reply … (Enter to send, Esc to cancel)",
+            placeholder="Reply \u2026 (Enter to send, Esc back to list)",
             id="inbox-reply",
         )
         self.status = Static("", id="inbox-status")
@@ -2072,7 +2081,6 @@ class PollyInboxApp(App[None]):
         )
         self._tasks: list = []
         self._selected_task_id: str | None = None
-        self._reply_target_id: str | None = None
         self._unread_ids: set[str] = set()
 
     def compose(self) -> ComposeResult:
@@ -2304,6 +2312,10 @@ class PollyInboxApp(App[None]):
         if task.task_id == self._selected_task_id:
             return
         self._selected_task_id = task.task_id
+        # Clear any in-progress reply draft when the selection changes so
+        # a half-typed message doesn't get posted to a different task.
+        if self.reply_input.value:
+            self.reply_input.value = ""
         self._render_detail(task.task_id)
         self._mark_open_read(task.task_id, idx)
 
@@ -2336,9 +2348,11 @@ class PollyInboxApp(App[None]):
         self._refresh_list(select_first=False)
 
     def action_back_or_cancel(self) -> None:
-        """Esc/q cancels an open reply; otherwise returns to cockpit nav."""
-        if self.reply_input.has_class("visible"):
-            self._cancel_reply()
+        """Esc/q returns focus to the list from the reply box, else exits."""
+        if self.reply_input.has_focus:
+            # Return focus to the list so j/k works again. Don't exit the
+            # app — the reply input is always present on the detail pane.
+            self.list_view.focus()
             return
         self.exit()
 
@@ -2362,6 +2376,8 @@ class PollyInboxApp(App[None]):
         if self._selected_task_id == row.task_id:
             return
         self._selected_task_id = row.task_id
+        if self.reply_input.value:
+            self.reply_input.value = ""
         self._render_detail(row.task_id)
 
     # ------------------------------------------------------------------
@@ -2431,37 +2447,33 @@ class PollyInboxApp(App[None]):
         self._render_list(select_first=bool(self._tasks))
 
     def action_start_reply(self) -> None:
+        """Keyboard shortcut: focus the always-visible reply input."""
         task_id = self._selected_task_id
         if task_id is None:
             return
-        self._reply_target_id = task_id
-        self.reply_input.value = ""
-        self.reply_input.add_class("visible")
         self.reply_input.focus()
-
-    def _cancel_reply(self) -> None:
-        self._reply_target_id = None
-        self.reply_input.value = ""
-        self.reply_input.remove_class("visible")
-        self.list_view.focus()
 
     @on(Input.Submitted, "#inbox-reply")
     def _on_reply_submitted(self, event: Input.Submitted) -> None:
         body = (event.value or "").strip()
-        task_id = self._reply_target_id
+        task_id = self._selected_task_id
         if not body or not task_id:
-            self._cancel_reply()
+            # Empty submit — just hand focus back to the list.
+            self.reply_input.value = ""
+            self.list_view.focus()
             return
         svc = self._svc_for_task(task_id)
         if svc is None:
             self.notify("Could not open project database.", severity="error")
-            self._cancel_reply()
+            self.reply_input.value = ""
+            self.list_view.focus()
             return
         try:
             svc.add_reply(task_id, body, actor="user")
         except Exception as exc:  # noqa: BLE001
             self.notify(f"Reply failed: {exc}", severity="error")
-            self._cancel_reply()
+            self.reply_input.value = ""
+            self.list_view.focus()
             return
         finally:
             try:
@@ -2471,8 +2483,10 @@ class PollyInboxApp(App[None]):
         self._emit_event(
             task_id, "inbox.reply_received", f"user replied to {task_id}: {body[:60]}",
         )
-        self._cancel_reply()
-        # Re-render the detail pane so the new reply appears in-thread.
+        # Clear the input and re-render so the new reply appears in-thread.
+        # Keep focus on the list so j/k works without further keystrokes.
+        self.reply_input.value = ""
+        self.list_view.focus()
         self._render_detail(task_id)
 
     # ------------------------------------------------------------------

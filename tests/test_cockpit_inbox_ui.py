@@ -126,6 +126,43 @@ def test_inbox_lists_seeded_messages(inbox_env, inbox_app) -> None:
     _run(body())
 
 
+def test_list_row_renders_title_on_line1_and_project_age_on_line2(
+    inbox_env, inbox_app,
+) -> None:
+    """Each row is two lines: bold title, then dim ``project · age``.
+
+    The sender (always "polly") must NOT appear in the row; project key
+    is more useful across a multi-project workspace.
+    """
+    async def body() -> None:
+        async with inbox_app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            from pollypm.cockpit_ui import _InboxListItem, _format_inbox_row
+            rows = [
+                child for child in inbox_app.list_view.children
+                if isinstance(child, _InboxListItem)
+            ]
+            assert rows, "expected at least one inbox row"
+            first = rows[0]
+            # Re-derive the Rich Text from the public helper so we're not
+            # probing Textual's private Static internals.
+            rendered = _format_inbox_row(first.task_ref, is_unread=first.is_unread)
+            plain = rendered.plain
+            # Two lines — title then metadata.
+            lines = plain.split("\n")
+            assert len(lines) == 2, f"expected 2 lines, got: {lines!r}"
+            # Line 1 holds the subject (one of the seeded titles).
+            assert any(
+                s in lines[0] for s in ("Smoke", "Deploy", "Homepage")
+            ), f"expected a seeded title on line 1, got: {lines[0]!r}"
+            # Line 2 has the project key; never the sender "polly".
+            assert "demo" in lines[1]
+            assert "polly" not in lines[1].lower()
+            # Age is relative — "just now" is fine for a freshly-seeded row.
+            assert "\u00b7" in lines[1] or "ago" in lines[1] or "now" in lines[1]
+    _run(body())
+
+
 def test_selecting_a_row_renders_detail_and_clears_unread(inbox_env, inbox_app) -> None:
     """Keyboard navigation opens the message and records a read marker."""
     async def body() -> None:
@@ -152,8 +189,63 @@ def test_selecting_a_row_renders_detail_and_clears_unread(inbox_env, inbox_app) 
     _run(body())
 
 
+def test_reply_input_is_always_present_on_detail_open(inbox_env, inbox_app) -> None:
+    """Reply Input is visible from mount — not gated by pressing ``r``.
+
+    The list keeps focus on mount so j/k still works; the user must
+    explicitly press ``r`` (or Tab/click) to land in the reply box.
+    """
+    async def body() -> None:
+        async with inbox_app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            # Reply Input exists in the widget tree from first paint.
+            assert inbox_app.reply_input.is_mounted
+            # It is visually shown (always-visible design — no toggle class).
+            assert inbox_app.reply_input.display is not False
+            # The list, not the reply box, has focus on mount.
+            assert inbox_app.list_view.has_focus
+            assert not inbox_app.reply_input.has_focus
+    _run(body())
+
+
+def test_r_shortcut_focuses_reply_without_toggling_visibility(
+    inbox_env, inbox_app,
+) -> None:
+    """Pressing ``r`` focuses the already-visible reply box."""
+    async def body() -> None:
+        async with inbox_app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            inbox_app.list_view.index = 0
+            await pilot.press("enter")
+            await pilot.pause()
+            assert not inbox_app.reply_input.has_focus
+            await pilot.press("r")
+            await pilot.pause()
+            assert inbox_app.reply_input.has_focus
+    _run(body())
+
+
+def test_esc_from_reply_returns_focus_to_list(inbox_env, inbox_app) -> None:
+    """Esc inside the reply box hands focus back to the list (no exit)."""
+    async def body() -> None:
+        async with inbox_app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            inbox_app.list_view.index = 0
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("r")
+            await pilot.pause()
+            assert inbox_app.reply_input.has_focus
+            await pilot.press("escape")
+            await pilot.pause()
+            # Focus is back on the list and the app is still running.
+            assert inbox_app.list_view.has_focus
+            assert not inbox_app.reply_input.has_focus
+    _run(body())
+
+
 def test_reply_flow_persists_and_appears_in_thread(inbox_env, inbox_app) -> None:
-    """r opens the reply input; Enter posts; detail pane re-renders the thread."""
+    """Typing in the always-visible reply + Enter posts and clears the input."""
     async def body() -> None:
         async with inbox_app.run_test(size=(140, 40)) as pilot:
             await pilot.pause()
@@ -163,10 +255,9 @@ def test_reply_flow_persists_and_appears_in_thread(inbox_env, inbox_app) -> None
             task_id = inbox_app._selected_task_id
             assert task_id is not None
 
-            # Pressing r reveals the reply input.
+            # Focus the reply box via the keyboard shortcut.
             await pilot.press("r")
             await pilot.pause()
-            assert inbox_app.reply_input.has_class("visible")
             assert inbox_app.reply_input.has_focus
 
             # Type a reply and submit.
@@ -174,8 +265,9 @@ def test_reply_flow_persists_and_appears_in_thread(inbox_env, inbox_app) -> None
             await pilot.press("enter")
             await pilot.pause()
 
-            # Input closes, focus returns to the list.
-            assert not inbox_app.reply_input.has_class("visible")
+            # Input is cleared and focus returns to the list.
+            assert inbox_app.reply_input.value == ""
+            assert inbox_app.list_view.has_focus
 
             # The reply is persisted as a reply context row.
             svc = inbox_app._svc_for_task(task_id)

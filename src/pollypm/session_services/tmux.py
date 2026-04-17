@@ -13,7 +13,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable
 
-from pollypm.session_services.base import SessionHandle, SessionHealth, TranscriptStream
+from pollypm.session_services.base import (
+    SessionCreatedEvent,
+    SessionHandle,
+    SessionHealth,
+    TranscriptStream,
+    dispatch_session_event,
+)
 from pollypm.tmux.client import TmuxClient
 
 logger = logging.getLogger(__name__)
@@ -114,7 +120,7 @@ class TmuxSessionService:
         # Check if already exists
         existing = self._find_window(tsession, wname)
         if existing is not None:
-            return SessionHandle(
+            handle = SessionHandle(
                 name=name,
                 provider=provider,
                 account=account,
@@ -124,6 +130,16 @@ class TmuxSessionService:
                 cwd=str(cwd),
                 log_path=log_path,
             )
+            # #246: the session is already up, but re-fire the lifecycle
+            # event so subscribers (task-assignment resume pings, etc.)
+            # see the "session is ready now" signal after a supervisor
+            # restart that re-attaches to an existing window.
+            self._emit_session_created(
+                name=name,
+                provider=provider,
+                session_role=session_role,
+            )
+            return handle
 
         _status = on_status or (lambda _msg: None)
         _status(f"Creating tmux window for {name}...")
@@ -190,7 +206,7 @@ class TmuxSessionService:
                 datetime.now(UTC).isoformat().replace("+00:00", "Z") + "\n"
             )
 
-        return SessionHandle(
+        handle = SessionHandle(
             name=name,
             provider=provider,
             account=account,
@@ -200,6 +216,54 @@ class TmuxSessionService:
             cwd=str(cwd),
             log_path=log_path,
         )
+
+        # #246: notify subscribers that a new session is stable and ready
+        # to receive messages. Plugins use this to replay pings that would
+        # otherwise wait on the next sweeper cycle (e.g. resume-work pings
+        # for an in_progress task whose worker session just came back).
+        self._emit_session_created(
+            name=name,
+            provider=provider,
+            session_role=session_role,
+        )
+
+        return handle
+
+    # ------------------------------------------------------------------
+    # Internal: session lifecycle event dispatch (#246)
+    # ------------------------------------------------------------------
+
+    def _emit_session_created(
+        self,
+        *,
+        name: str,
+        provider: str,
+        session_role: str | None,
+    ) -> None:
+        """Emit a ``SessionCreatedEvent`` — best-effort, never raises.
+
+        The ``project`` field is resolved from the configured project
+        name; the ``role`` field is the caller's ``session_role`` kwarg
+        (empty string when unspecified — subscribers treat that as
+        "don't know the role, skip role-specific lookups").
+        """
+        try:
+            project = getattr(self._config.project, "name", "") or ""
+        except Exception:  # noqa: BLE001
+            project = ""
+        try:
+            dispatch_session_event(
+                SessionCreatedEvent(
+                    name=name,
+                    role=(session_role or "").strip(),
+                    project=str(project),
+                    provider=provider,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "tmux: session.created dispatch failed for %s", name, exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # Protocol: destroy

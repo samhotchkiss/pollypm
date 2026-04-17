@@ -3,13 +3,25 @@
 The SessionService is dumb infrastructure — it does what it's told.
 It owns session lifecycle mechanics (create, destroy, capture, send)
 but makes no policy decisions (when to recover, failover, or escalate).
+
+This module also exposes a lightweight in-process event bus for
+session lifecycle events (currently ``SessionCreatedEvent``). Plugins
+that want to react to session birth — e.g. the task-assignment
+notifier's immediate-resume-ping path for #246 — register a listener
+via :func:`register_session_listener`. Session service implementations
+dispatch via :func:`dispatch_session_event` once a new session is
+stable. No protocol change required; implementations that don't
+dispatch simply fall back to the sweeper cadence.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -137,3 +149,71 @@ class SessionService(Protocol):
         The supervisor decides WHEN to switch; this method executes it.
         """
         ...
+
+
+# ---------------------------------------------------------------------------
+# Session lifecycle event bus (#246)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True, frozen=True)
+class SessionCreatedEvent:
+    """Emitted by a SessionService after a new session is stable.
+
+    ``role`` and ``project`` are best-effort — callers pass through the
+    ``session_role`` kwarg and project name they know about. When the
+    caller doesn't have them (e.g. a cockpit-mounted session), they
+    default to empty strings and the subscriber treats that as "no
+    role-based lookup possible".
+    """
+
+    name: str
+    role: str
+    project: str
+    provider: str
+
+
+SessionCreatedListener = Callable[[SessionCreatedEvent], None]
+
+_session_created_listeners: list[SessionCreatedListener] = []
+
+
+def register_session_listener(listener: SessionCreatedListener) -> None:
+    """Register ``listener`` for ``SessionCreatedEvent`` delivery.
+
+    Idempotent — repeat registrations of the same callable are silently
+    de-duped so plugin re-initialization (test harnesses, reload paths)
+    doesn't stack subscribers.
+    """
+    if listener not in _session_created_listeners:
+        _session_created_listeners.append(listener)
+
+
+def unregister_session_listener(listener: SessionCreatedListener) -> None:
+    """Drop a previously-registered session listener. No-op if absent."""
+    try:
+        _session_created_listeners.remove(listener)
+    except ValueError:
+        pass
+
+
+def clear_session_listeners() -> None:
+    """Remove every session listener — test-only helper."""
+    _session_created_listeners.clear()
+
+
+def dispatch_session_event(event: SessionCreatedEvent) -> None:
+    """Deliver ``event`` to every registered subscriber.
+
+    Exceptions from one subscriber are logged and swallowed so a
+    misbehaving plugin can't break the session service's create() path.
+    """
+    for listener in list(_session_created_listeners):
+        try:
+            listener(event)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "session listener %r raised for %s",
+                getattr(listener, "__name__", listener),
+                getattr(event, "name", "?"),
+            )

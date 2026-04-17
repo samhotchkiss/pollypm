@@ -59,6 +59,10 @@ class FakeSessionService:
     handles: list[FakeHandle]
     sent: list[tuple[str, str]] = field(default_factory=list)
     send_failure: Exception | None = None
+    # #246: optional per-session busy map. A session appearing in this
+    # set reports ``is_turn_active -> True`` so the idle-gated sweeper
+    # branch skips it.
+    busy: set[str] = field(default_factory=set)
 
     def list(self) -> list[FakeHandle]:
         return list(self.handles)
@@ -67,6 +71,9 @@ class FakeSessionService:
         if self.send_failure is not None:
             raise self.send_failure
         self.sent.append((name, text))
+
+    def is_turn_active(self, name: str) -> bool:
+        return name in self.busy
 
 
 def _event(
@@ -550,3 +557,542 @@ def test_build_event_from_task_returns_none_for_human_node():
         actor_type=ActorType.HUMAN, actor_role="reviewer",
     )
     assert build_event_from_task(_Task(), human_node, transitioned_by="tester") is None
+
+
+# ---------------------------------------------------------------------------
+# #246 — sweeper in_progress branch
+# ---------------------------------------------------------------------------
+
+
+class TestSweeperInProgressBranch:
+    """The sweeper must now pick up in_progress tasks whose worker
+    session is idle, and skip those whose worker is actively turning."""
+
+    def _make_services(self, tmp_path, session_handles, busy=()):
+        db = tmp_path / "work.db"
+        state_db = tmp_path / "state.db"
+        work = SQLiteWorkService(db_path=db)
+        store = StateStore(state_db)
+        svc = FakeSessionService(
+            handles=list(session_handles), busy=set(busy),
+        )
+        return work, store, svc
+
+    def _queue_and_claim(self, work, project="proj", assignee="agent-1"):
+        bus.clear_listeners()
+        task = work.create(
+            title="In-flight work",
+            description="Already claimed before restart",
+            type="task",
+            project=project,
+            flow_template="standard",
+            roles={"worker": assignee, "reviewer": "agent-2"},
+            priority="normal",
+        )
+        work.queue(task.task_id, "pm")
+        work.claim(task.task_id, assignee)
+        return task
+
+    def test_sweeper_resume_pings_idle_in_progress_worker(
+        self, tmp_path, monkeypatch,
+    ):
+        """Task is claimed (in_progress), worker session is idle → resume ping."""
+        work, store, svc = self._make_services(
+            tmp_path, [FakeHandle("worker-proj")], busy=(),
+        )
+        task = self._queue_and_claim(work)
+        # Pretend the in-process listener already fired its original ping
+        # a long time ago — outside the 30-min dedupe window — by leaving
+        # the notifications table empty. The sweeper should emit fresh.
+
+        def _fake_loader(*, config_path=None):
+            return _RuntimeServices(
+                session_service=svc, state_store=store,
+                work_service=work, project_root=tmp_path,
+            )
+
+        monkeypatch.setattr(
+            "pollypm.plugins_builtin.task_assignment_notify.handlers.sweep.load_runtime_services",
+            _fake_loader,
+        )
+        result = task_assignment_sweep_handler({})
+        assert result["outcome"] == "swept"
+        assert result["by_outcome"].get("sent", 0) >= 1
+        resume_messages = [t for _n, t in svc.sent if "Resume work" in t]
+        assert resume_messages, f"expected a Resume ping, got {svc.sent!r}"
+        assert f"[{task.task_id}]" in resume_messages[0]
+
+    def test_sweeper_skips_in_progress_when_worker_is_busy(
+        self, tmp_path, monkeypatch,
+    ):
+        """A worker actively turning must not get re-pinged."""
+        work, store, svc = self._make_services(
+            tmp_path,
+            [FakeHandle("worker-proj")],
+            busy={"worker-proj"},
+        )
+        self._queue_and_claim(work)
+
+        def _fake_loader(*, config_path=None):
+            return _RuntimeServices(
+                session_service=svc, state_store=store,
+                work_service=work, project_root=tmp_path,
+            )
+
+        monkeypatch.setattr(
+            "pollypm.plugins_builtin.task_assignment_notify.handlers.sweep.load_runtime_services",
+            _fake_loader,
+        )
+        result = task_assignment_sweep_handler({})
+        # Busy-skip goes into a dedicated bucket, not "sent".
+        assert result["by_outcome"].get("skipped_active_turn", 0) >= 1
+        assert result["by_outcome"].get("sent", 0) == 0
+        assert not any("Resume work" in t for _n, t in svc.sent)
+
+    def test_sweeper_in_progress_respects_dedupe(
+        self, tmp_path, monkeypatch,
+    ):
+        """A fresh notification row within the cooldown → no re-ping."""
+        work, store, svc = self._make_services(
+            tmp_path, [FakeHandle("worker-proj")], busy=(),
+        )
+        task = self._queue_and_claim(work)
+        # Pre-populate a recent ping so the cooldown is hot.
+        store.record_notification(
+            session_name="worker-proj", task_id=task.task_id,
+            project="proj", message="previous ping", delivery_status="sent",
+        )
+
+        def _fake_loader(*, config_path=None):
+            return _RuntimeServices(
+                session_service=svc, state_store=store,
+                work_service=work, project_root=tmp_path,
+            )
+
+        monkeypatch.setattr(
+            "pollypm.plugins_builtin.task_assignment_notify.handlers.sweep.load_runtime_services",
+            _fake_loader,
+        )
+        result = task_assignment_sweep_handler({})
+        assert result["by_outcome"].get("deduped", 0) >= 1
+        assert len(svc.sent) == 0
+
+
+# ---------------------------------------------------------------------------
+# #246 — session.created listener (immediate resume ping path)
+# ---------------------------------------------------------------------------
+
+
+class TestSessionCreatedListener:
+    """Creating a fresh session targeting an in_progress task fires an
+    immediate resume ping — no sweeper wait."""
+
+    def _install_fake_loader(self, monkeypatch, services):
+        monkeypatch.setattr(
+            "pollypm.plugins_builtin.task_assignment_notify.plugin.load_runtime_services",
+            lambda *, config_path=None: services,
+        )
+
+    def test_session_created_fires_resume_ping_for_in_progress(
+        self, tmp_path, monkeypatch,
+    ):
+        from pollypm.plugins_builtin.task_assignment_notify.plugin import (
+            _session_created_listener,
+        )
+        from pollypm.session_services.base import SessionCreatedEvent
+
+        bus.clear_listeners()
+        db = tmp_path / "work.db"
+        state_db = tmp_path / "state.db"
+        work = SQLiteWorkService(db_path=db)
+        store = StateStore(state_db)
+        svc = FakeSessionService(handles=[FakeHandle("worker-proj")])
+
+        task = work.create(
+            title="Crash + restart",
+            description="Resume me",
+            type="task",
+            project="proj",
+            flow_template="standard",
+            roles={"worker": "agent-1", "reviewer": "agent-2"},
+            priority="normal",
+        )
+        work.queue(task.task_id, "pm")
+        work.claim(task.task_id, "agent-1")
+
+        services = _RuntimeServices(
+            session_service=svc, state_store=store,
+            work_service=work, project_root=tmp_path,
+        )
+        self._install_fake_loader(monkeypatch, services)
+
+        event = SessionCreatedEvent(
+            name="worker-proj", role="worker",
+            project="proj", provider="claude",
+        )
+        _session_created_listener(event)
+
+        assert svc.sent, "session.created listener should have fired a ping"
+        assert any(
+            "Resume work" in text and f"[{task.task_id}]" in text
+            for _name, text in svc.sent
+        )
+
+    def test_session_created_dedupe_prevents_double_ping(
+        self, tmp_path, monkeypatch,
+    ):
+        """A session.created event for an already-pinged session must
+        respect the 30-min (session, task) dedupe."""
+        from pollypm.plugins_builtin.task_assignment_notify.plugin import (
+            _session_created_listener,
+        )
+        from pollypm.session_services.base import SessionCreatedEvent
+
+        bus.clear_listeners()
+        db = tmp_path / "work.db"
+        state_db = tmp_path / "state.db"
+        work = SQLiteWorkService(db_path=db)
+        store = StateStore(state_db)
+        svc = FakeSessionService(handles=[FakeHandle("worker-proj")])
+
+        task = work.create(
+            title="Crash + restart",
+            description="Resume me",
+            type="task",
+            project="proj",
+            flow_template="standard",
+            roles={"worker": "agent-1", "reviewer": "agent-2"},
+            priority="normal",
+        )
+        work.queue(task.task_id, "pm")
+        work.claim(task.task_id, "agent-1")
+
+        # Pre-populate a notification that's inside the 30-min window.
+        store.record_notification(
+            session_name="worker-proj", task_id=task.task_id,
+            project="proj", message="original ping", delivery_status="sent",
+        )
+
+        services = _RuntimeServices(
+            session_service=svc, state_store=store,
+            work_service=work, project_root=tmp_path,
+        )
+        self._install_fake_loader(monkeypatch, services)
+
+        event = SessionCreatedEvent(
+            name="worker-proj", role="worker",
+            project="proj", provider="claude",
+        )
+        _session_created_listener(event)
+
+        # 30-min dedupe blocks the re-ping.
+        assert not svc.sent, (
+            "expected dedupe to suppress session.created re-ping, got %r" % svc.sent
+        )
+
+    def test_session_created_for_non_matching_session_is_noop(
+        self, tmp_path, monkeypatch,
+    ):
+        """A session.created for a name that resolves to a different
+        role's session (e.g. reviewer boot) shouldn't ping the worker
+        task targeting ``worker-proj``."""
+        from pollypm.plugins_builtin.task_assignment_notify.plugin import (
+            _session_created_listener,
+        )
+        from pollypm.session_services.base import SessionCreatedEvent
+
+        bus.clear_listeners()
+        db = tmp_path / "work.db"
+        state_db = tmp_path / "state.db"
+        work = SQLiteWorkService(db_path=db)
+        store = StateStore(state_db)
+        # The session service reports both sessions live, but the new
+        # session is the reviewer, not the worker.
+        svc = FakeSessionService(handles=[
+            FakeHandle("worker-proj"),
+            FakeHandle("pm-reviewer"),
+        ])
+
+        task = work.create(
+            title="Worker task",
+            description="Real description here",
+            type="task",
+            project="proj",
+            flow_template="standard",
+            roles={"worker": "agent-1", "reviewer": "agent-2"},
+            priority="normal",
+        )
+        work.queue(task.task_id, "pm")
+        work.claim(task.task_id, "agent-1")
+
+        services = _RuntimeServices(
+            session_service=svc, state_store=store,
+            work_service=work, project_root=tmp_path,
+        )
+        self._install_fake_loader(monkeypatch, services)
+
+        event = SessionCreatedEvent(
+            name="pm-reviewer", role="reviewer",
+            project="proj", provider="claude",
+        )
+        _session_created_listener(event)
+
+        # The worker task resolves to worker-proj, not pm-reviewer, so
+        # no ping should fire for this event.
+        assert not svc.sent
+
+
+# ---------------------------------------------------------------------------
+# #246 — session bus: register/dispatch plumbing
+# ---------------------------------------------------------------------------
+
+
+class TestTmuxServiceEmitsSessionCreated:
+    """The TmuxSessionService must dispatch a SessionCreatedEvent via
+    ``_emit_session_created``. We exercise the helper directly rather
+    than driving ``create()`` (which requires a live tmux)."""
+
+    def test_emit_publishes_to_session_bus(self, tmp_path):
+        from pollypm.session_services.base import (
+            SessionCreatedEvent,
+            clear_session_listeners,
+            register_session_listener,
+        )
+        from pollypm.session_services.tmux import TmuxSessionService
+
+        class _Project:
+            def __init__(self, root):
+                self.root_dir = root
+                self.name = "demo"
+
+        class _Config:
+            def __init__(self, root):
+                self.project = _Project(root)
+
+        clear_session_listeners()
+        received: list[SessionCreatedEvent] = []
+        register_session_listener(received.append)
+
+        svc = TmuxSessionService(config=_Config(tmp_path), store=object())
+        svc._emit_session_created(
+            name="worker-demo",
+            provider="claude",
+            session_role="worker",
+        )
+        assert len(received) == 1
+        ev = received[0]
+        assert ev.name == "worker-demo"
+        assert ev.role == "worker"
+        assert ev.project == "demo"
+        assert ev.provider == "claude"
+        clear_session_listeners()
+
+    def test_emit_tolerates_missing_project_name(self, tmp_path):
+        """When the config shape doesn't expose ``name``, emit still
+        fires with a best-effort empty string — we never raise out of
+        ``create()``."""
+        from pollypm.session_services.base import (
+            SessionCreatedEvent,
+            clear_session_listeners,
+            register_session_listener,
+        )
+        from pollypm.session_services.tmux import TmuxSessionService
+
+        class _Project:
+            def __init__(self, root):
+                self.root_dir = root
+
+        class _Config:
+            def __init__(self, root):
+                self.project = _Project(root)
+
+        clear_session_listeners()
+        received: list[SessionCreatedEvent] = []
+        register_session_listener(received.append)
+
+        svc = TmuxSessionService(config=_Config(tmp_path), store=object())
+        svc._emit_session_created(
+            name="worker-demo",
+            provider="claude",
+            session_role=None,
+        )
+        assert len(received) == 1
+        assert received[0].role == ""
+        assert received[0].project == ""
+        clear_session_listeners()
+
+
+class TestSupervisorRestartScenario:
+    """End-to-end #246: simulate the live russell/1 scenario.
+
+    1. A task is claimed (in_progress) — worker session is running.
+    2. Supervisor "restarts": the old session goes away and a fresh
+       worker-<project> session boots.
+    3. The new session's creation must trigger an immediate resume
+       ping (session.created path) — no sweeper wait required.
+    4. Separately, the sweeper must also catch this case for environments
+       where the session.created hook doesn't fire.
+    """
+
+    def test_session_created_path_resumes_in_progress_task(
+        self, tmp_path, monkeypatch,
+    ):
+        from pollypm.plugins_builtin.task_assignment_notify.plugin import (
+            _session_created_listener,
+        )
+        from pollypm.session_services.base import SessionCreatedEvent
+
+        bus.clear_listeners()
+        db = tmp_path / "work.db"
+        state_db = tmp_path / "state.db"
+        work = SQLiteWorkService(db_path=db)
+        store = StateStore(state_db)
+
+        # Step 1: worker claims a task — in_progress.
+        task = work.create(
+            title="Ship russell/1",
+            description="Implement the russell feature",
+            type="task",
+            project="russell",
+            flow_template="standard",
+            roles={"worker": "worker", "reviewer": "reviewer"},
+            priority="normal",
+        )
+        work.queue(task.task_id, "pm")
+        work.claim(task.task_id, "worker")
+
+        # Step 2: supervisor restarts, fresh session appears.
+        svc = FakeSessionService(handles=[FakeHandle("worker-russell")])
+        services = _RuntimeServices(
+            session_service=svc, state_store=store,
+            work_service=work, project_root=tmp_path,
+        )
+        monkeypatch.setattr(
+            "pollypm.plugins_builtin.task_assignment_notify.plugin.load_runtime_services",
+            lambda *, config_path=None: services,
+        )
+
+        # Step 3: session.created fires.
+        _session_created_listener(SessionCreatedEvent(
+            name="worker-russell", role="worker",
+            project="russell", provider="claude",
+        ))
+
+        # Assert the resume ping landed on the fresh session.
+        assert svc.sent, "session.created should have fired a resume ping"
+        name, text = svc.sent[-1]
+        assert name == "worker-russell"
+        assert "Resume work" in text
+        assert f"[{task.task_id}]" in text
+        assert "pm task get " in text
+
+    def test_sweeper_fallback_resumes_in_progress_task(
+        self, tmp_path, monkeypatch,
+    ):
+        """Covers the case where session.created didn't fire (older
+        session service implementation). The sweeper must pick it up
+        within one cycle."""
+        bus.clear_listeners()
+        db = tmp_path / "work.db"
+        state_db = tmp_path / "state.db"
+        work = SQLiteWorkService(db_path=db)
+        store = StateStore(state_db)
+
+        task = work.create(
+            title="Ship russell/1",
+            description="Implement the russell feature",
+            type="task",
+            project="russell",
+            flow_template="standard",
+            roles={"worker": "worker", "reviewer": "reviewer"},
+            priority="normal",
+        )
+        work.queue(task.task_id, "pm")
+        work.claim(task.task_id, "worker")
+
+        svc = FakeSessionService(handles=[FakeHandle("worker-russell")])
+
+        def _fake_loader(*, config_path=None):
+            return _RuntimeServices(
+                session_service=svc, state_store=store,
+                work_service=work, project_root=tmp_path,
+            )
+
+        monkeypatch.setattr(
+            "pollypm.plugins_builtin.task_assignment_notify.handlers.sweep.load_runtime_services",
+            _fake_loader,
+        )
+        result = task_assignment_sweep_handler({})
+        assert result["outcome"] == "swept"
+        resume = [t for _n, t in svc.sent if "Resume work" in t]
+        assert resume, f"sweeper missed the in_progress task — got {svc.sent!r}"
+        assert f"[{task.task_id}]" in resume[0]
+
+
+class TestSessionCreatedBus:
+    def test_register_and_dispatch_delivers_event(self):
+        from pollypm.session_services.base import (
+            SessionCreatedEvent,
+            clear_session_listeners,
+            dispatch_session_event,
+            register_session_listener,
+        )
+
+        clear_session_listeners()
+        received: list[SessionCreatedEvent] = []
+        register_session_listener(received.append)
+        event = SessionCreatedEvent(
+            name="worker-demo", role="worker",
+            project="demo", provider="claude",
+        )
+        dispatch_session_event(event)
+        assert received == [event]
+        clear_session_listeners()
+
+    def test_listener_exception_does_not_break_dispatch(self):
+        from pollypm.session_services.base import (
+            SessionCreatedEvent,
+            clear_session_listeners,
+            dispatch_session_event,
+            register_session_listener,
+        )
+
+        clear_session_listeners()
+        called: list[str] = []
+
+        def _boom(_ev):
+            raise RuntimeError("listener misbehaved")
+
+        def _good(ev):
+            called.append(ev.name)
+
+        register_session_listener(_boom)
+        register_session_listener(_good)
+        dispatch_session_event(SessionCreatedEvent(
+            name="x", role="worker", project="demo", provider="claude",
+        ))
+        assert called == ["x"]
+        clear_session_listeners()
+
+    def test_register_is_idempotent(self):
+        from pollypm.session_services.base import (
+            SessionCreatedEvent,
+            clear_session_listeners,
+            dispatch_session_event,
+            register_session_listener,
+        )
+
+        clear_session_listeners()
+        received: list[str] = []
+
+        def _one(ev):
+            received.append(ev.name)
+
+        register_session_listener(_one)
+        register_session_listener(_one)
+        register_session_listener(_one)
+        dispatch_session_event(SessionCreatedEvent(
+            name="x", role="worker", project="demo", provider="claude",
+        ))
+        assert received == ["x"]
+        clear_session_listeners()

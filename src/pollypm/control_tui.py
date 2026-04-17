@@ -31,7 +31,6 @@ from pollypm.models import ProviderKind
 from pollypm.projects import (
     discover_git_repositories,
     enable_tracked_project,
-    project_issues_dir,
     register_project,
     remove_project,
     set_workspace_root,

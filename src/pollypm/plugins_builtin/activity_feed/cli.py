@@ -30,7 +30,6 @@ import typer
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config
 from pollypm.plugins_builtin.activity_feed.cockpit.feed_panel import (
     FeedFilter,
-    apply_filter,
     format_entry_row,
 )
 from pollypm.plugins_builtin.activity_feed.handlers.event_projector import (

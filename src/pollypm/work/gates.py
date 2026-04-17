@@ -14,7 +14,6 @@ from typing import Any, Protocol, runtime_checkable
 
 from pollypm.work.models import (
     ArtifactKind,
-    ExecutionStatus,
     GateResult,
     Task,
     TERMINAL_STATUSES,

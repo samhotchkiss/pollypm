@@ -11,9 +11,6 @@ from pollypm.llm_runner import HAIKU_MODEL, run_haiku, run_haiku_json
 from pollypm.memory_backends import get_memory_backend
 from pollypm.memory_extractors import (
     CONFIDENCE_THRESHOLD,
-    ExtractionResult,
-    MemoryCandidate,
-    extract_episodic_memory,
     extract_feedback_memory,
     extract_pattern_memory,
     extract_project_memory,

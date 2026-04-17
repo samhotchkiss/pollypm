@@ -933,16 +933,13 @@ class TmuxSessionService:
         prompts_dir.mkdir(parents=True, exist_ok=True)
         prompt_path = prompts_dir / f"{session_name}.md"
         prompt_path.write_text(initial_input.rstrip() + "\n")
-        try:
-            display_path = prompt_path.relative_to(self._config.project.root_dir)
-        except ValueError:
-            display_path = prompt_path
+        # Use absolute paths so the kickoff resolves regardless of the
+        # worker's cwd (workers run from their worktree, not project root).
+        # See issue #263.
+        display_path = prompt_path
         instruct_path = self._config.project.root_dir / ".pollypm" / "docs" / "SYSTEM.md"
         if instruct_path.exists():
-            try:
-                instruct_display = instruct_path.relative_to(self._config.project.root_dir)
-            except ValueError:
-                instruct_display = instruct_path
+            instruct_display = instruct_path
             return (
                 f"Read {instruct_display} for system context, then read {display_path} for your role. "
                 f'Adopt both as your operating instructions, reply only "ready", then wait.'

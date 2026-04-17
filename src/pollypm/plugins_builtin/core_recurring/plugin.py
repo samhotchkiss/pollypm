@@ -351,6 +351,48 @@ def memory_ttl_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     return {"deleted": deleted}
 
 
+def notification_staging_prune_handler(payload: dict[str, Any]) -> dict[str, Any]:
+    """Drop flushed + silent notification_staging rows older than 30d.
+
+    Pending digest rows are never pruned — they belong to a milestone
+    that simply hasn't closed yet. Opens a short-lived work-service
+    connection so the staging table is guaranteed to exist (the
+    SQLiteWorkService init path runs the migration).
+    """
+    import sqlite3
+
+    from pollypm.notification_staging import prune_old_staging
+
+    _config, store = _load_config_and_store(payload)
+    retain_days = int(payload.get("retain_days") or 30)
+
+    # The staging table lives in the shared state.db alongside work_*
+    # tables; the work-service migration (v4) creates it. We open a
+    # direct connection here because the prune is a pure DML op and
+    # does not need the full service wrapper.
+    db_path = getattr(store, "path", None) or _config.project.state_db
+    conn = sqlite3.connect(str(db_path), timeout=30.0)
+    try:
+        conn.execute("PRAGMA busy_timeout=30000")
+        # Make sure the schema is present — safe no-op when the table
+        # already exists (e.g. SQLiteWorkService ran migration v4).
+        from pollypm.work.schema import create_work_tables
+        create_work_tables(conn)
+        summary = prune_old_staging(conn, retain_days=retain_days)
+    finally:
+        conn.close()
+
+    store.record_event(
+        session_name="system",
+        event_type="notification_staging.prune",
+        message=(
+            f"pruned {summary['flushed_pruned']} flushed + "
+            f"{summary['silent_pruned']} silent rows (>{retain_days}d)"
+        ),
+    )
+    return summary
+
+
 # ---------------------------------------------------------------------------
 # Plugin registration
 # ---------------------------------------------------------------------------
@@ -387,6 +429,10 @@ def _register_handlers(api: JobHandlerAPI) -> None:
         "memory.ttl_sweep", memory_ttl_sweep_handler,
         max_attempts=1, timeout_seconds=60.0,
     )
+    api.register_handler(
+        "notification_staging.prune", notification_staging_prune_handler,
+        max_attempts=1, timeout_seconds=60.0,
+    )
 
 
 def _register_roster(api: RosterAPI) -> None:
@@ -405,6 +451,13 @@ def _register_roster(api: RosterAPI) -> None:
     api.register_recurring("7 4 * * *", "db.vacuum", {}, dedupe_key="db.vacuum")
     api.register_recurring(
         "13 4 * * *", "memory.ttl_sweep", {}, dedupe_key="memory.ttl_sweep",
+    )
+    # Notification staging hygiene — flushed rollup rows and silent audit
+    # rows older than 30 days are dropped. Pending digest rows are left
+    # alone (they belong to a milestone that hasn't closed yet).
+    api.register_recurring(
+        "19 4 * * *", "notification_staging.prune", {},
+        dedupe_key="notification_staging.prune",
     )
 
 
@@ -426,6 +479,7 @@ plugin = PollyPMPlugin(
         Capability(kind="job_handler", name="work.progress_sweep"),
         Capability(kind="job_handler", name="db.vacuum"),
         Capability(kind="job_handler", name="memory.ttl_sweep"),
+        Capability(kind="job_handler", name="notification_staging.prune"),
         Capability(kind="roster_entry", name="core_recurring"),
     ),
     register_handlers=_register_handlers,

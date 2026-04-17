@@ -187,10 +187,24 @@ class SQLiteWorkService:
                 # Shallow copy avoids mutating the caller's dataclass.
                 from dataclasses import replace
                 effective_task = replace(task, current_node_id=node_id)
+            # #279: carry the current node's visit counter so the
+            # notifier's dedupe treats a reject-bounce (which opens a
+            # fresh execution row at a higher visit) as a new ping
+            # opportunity instead of suppressing it inside the 30-min
+            # window keyed on (session, task).
+            try:
+                execution_version = self.current_node_visit(
+                    effective_task.project,
+                    effective_task.task_number,
+                    node_id,
+                )
+            except Exception:  # noqa: BLE001
+                execution_version = 0
             event = build_event_from_task(
                 effective_task,
                 node,
                 transitioned_by=task.assignee or "system",
+                execution_version=execution_version,
             )
             if event is not None:
                 _dispatch_task_assignment(event)
@@ -1409,6 +1423,31 @@ class SQLiteWorkService:
         ).fetchone()
         return row["max_v"] + 1
 
+    def current_node_visit(
+        self, project: str, task_number: int, node_id: str
+    ) -> int:
+        """Return the visit number of the current execution at ``node_id``.
+
+        Used by the task-assignment notifier (#279) to key its dedupe on
+        ``(session, task, execution_version)`` so a reject-bounce back to
+        an earlier node unlocks the retry ping instead of being
+        suppressed by the 30-minute window that originally pinged the
+        worker at ``visit=1``.
+
+        Returns ``0`` when the task has no recorded execution for the
+        node yet — a queued task whose start node hasn't been entered
+        carries an implicit "zeroth visit", and downstream dedupe
+        treats that as one identity bucket (matching the pre-#279
+        column default).
+        """
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(visit), 0) AS max_v "
+            "FROM work_node_executions "
+            "WHERE task_project = ? AND task_number = ? AND node_id = ?",
+            (project, task_number, node_id),
+        ).fetchone()
+        return int(row["max_v"] or 0)
+
     def _advance_to_node(
         self,
         task: Task,
@@ -1591,6 +1630,7 @@ class SQLiteWorkService:
                         "teardown_worker on done failed for %s: %s",
                         task_id, exc,
                     )
+            self._on_task_done(task_id, actor)
         self._sync_transition(result, task.work_status.value, result.work_status.value)
         return result
 
@@ -1689,6 +1729,32 @@ class SQLiteWorkService:
                 ),
             )
 
+            # Plan-presence gate (#281): when the architect's user_approval
+            # node on a plan_project task is approved, stamp a dedicated
+            # ``plan_approved'' context entry. The gate in
+            # ``plan_presence.has_acceptable_plan`` reads this timestamp
+            # instead of relying on ``plan.md``'s mtime — file mtimes are
+            # perturbed by git checkouts, editor saves, and the planner's
+            # own stage-8 emit, so they make the gate unstable.
+            if (
+                task.flow_template_id == "plan_project"
+                and task.current_node_id == "user_approval"
+            ):
+                self._conn.execute(
+                    "INSERT INTO work_context_entries "
+                    "(task_project, task_number, actor, text, "
+                    "created_at, entry_type) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        task.project,
+                        task.task_number,
+                        actor,
+                        "plan approved",
+                        now,
+                        "plan_approved",
+                    ),
+                )
+
             # Advance to next node
             self._advance_to_node(
                 task,
@@ -1714,6 +1780,7 @@ class SQLiteWorkService:
                         "teardown_worker on approve failed for %s: %s",
                         task_id, exc,
                     )
+            self._on_task_done(task_id, actor)
         self._sync_transition(result, task.work_status.value, result.work_status.value)
         return result
 
@@ -2305,6 +2372,63 @@ class SQLiteWorkService:
                 f"— PM must decide whether to unblock or cancel this task.",
             )
 
+    def _on_task_done(self, task_id: str, actor: str) -> None:
+        """Post-commit hook — fire milestone/digest flush on done transitions.
+
+        Best-effort: failures are logged and swallowed so a broken
+        notification side-channel never blocks the primary transition.
+        Runs after ``_check_auto_unblock`` and ``teardown_worker`` so
+        the ordering matches the rest of the completion pipeline.
+        """
+        try:
+            from pollypm.notification_staging import check_and_flush_on_done
+
+            task = self.get(task_id)
+            check_and_flush_on_done(
+                self,
+                project=task.project,
+                completed_task=task,
+                actor=actor or "polly",
+                project_path=self._project_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "notification-digest flush skipped for %s: %s",
+                task_id, exc, exc_info=True,
+            )
+
+    def _on_task_transition(
+        self,
+        task_id: str,
+        from_state: str,
+        to_state: str,
+        actor: str,
+    ) -> None:
+        """Post-commit hook for any state transition.
+
+        Currently routes regression detection (away from ``done``). Safe
+        on every transition; cheap when not applicable.
+        """
+        if from_state == "done" and to_state != "done":
+            try:
+                from pollypm.notification_staging import check_regression_on_reopen
+
+                project = task_id.rsplit("/", 1)[0] if "/" in task_id else ""
+                if project:
+                    check_regression_on_reopen(
+                        self,
+                        project=project,
+                        task_id=task_id,
+                        from_state=from_state,
+                        to_state=to_state,
+                        actor=actor or "system",
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "regression notify skipped for %s (%s→%s): %s",
+                    task_id, from_state, to_state, exc, exc_info=True,
+                )
+
     def mark_done(self, task_id: str, actor: str) -> Task:
         """Move a task to done and trigger auto-unblock on dependents.
 
@@ -2318,10 +2442,11 @@ class SQLiteWorkService:
             )
 
         now = _now()
+        from_state = task.work_status.value
         self._record_transition(
             task.project,
             task.task_number,
-            task.work_status.value,
+            from_state,
             WorkStatus.DONE.value,
             actor,
         )
@@ -2332,6 +2457,7 @@ class SQLiteWorkService:
         )
         self._conn.commit()
         self._check_auto_unblock(task_id)
+        self._on_task_done(task_id, actor)
         return self.get(task_id)
 
     # ------------------------------------------------------------------

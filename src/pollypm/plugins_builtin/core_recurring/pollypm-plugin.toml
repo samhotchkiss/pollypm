@@ -41,6 +41,11 @@ name = "memory.ttl_sweep"
 requires_api = ">=1,<2"
 
 [[capabilities]]
+kind = "job_handler"
+name = "notification_staging.prune"
+requires_api = ">=1,<2"
+
+[[capabilities]]
 kind = "roster_entry"
 name = "core_recurring"
 requires_api = ">=1,<2"

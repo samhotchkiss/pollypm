@@ -300,6 +300,35 @@ _WORK_MIGRATIONS: list[tuple[int, str, list[str]]] = [
             # so the schema_version bump is recorded for fresh DBs too.
         ],
     ),
+    (
+        4,
+        "Add notification_staging table for pm notify priority tiering / digest rollups",
+        [
+            """
+            CREATE TABLE IF NOT EXISTS notification_staging (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                body TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                priority TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                milestone_key TEXT,
+                created_at TEXT NOT NULL,
+                flushed_at TEXT,
+                rollup_task_id TEXT
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_notification_staging_pending
+                ON notification_staging(project, milestone_key, flushed_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_notification_staging_created
+                ON notification_staging(created_at)
+            """,
+        ],
+    ),
 ]
 
 

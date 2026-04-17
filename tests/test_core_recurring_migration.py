@@ -71,6 +71,9 @@ class TestCoreRecurringPlugin:
             # DB hygiene — daily cron at ~4am local.
             "db.vacuum",
             "memory.ttl_sweep",
+            # Notification-staging 30-day prune — lands next to the
+            # other daily cron entries around 4am.
+            "notification_staging.prune",
         }
 
         # Cadences per issue #164 / #249.
@@ -90,6 +93,9 @@ class TestCoreRecurringPlugin:
         mem_sweep = entries["memory.ttl_sweep"].schedule
         assert isinstance(mem_sweep, CronSchedule)
         assert mem_sweep.expression() == "13 4 * * *"
+        ns_prune = entries["notification_staging.prune"].schedule
+        assert isinstance(ns_prune, CronSchedule)
+        assert ns_prune.expression() == "19 4 * * *"
 
     def test_plugin_declares_expected_capabilities(self) -> None:
         kinds = {cap.kind for cap in core_plugin.capabilities}

@@ -105,6 +105,15 @@ def _on_project_created(context) -> None:
             )
             return
         skip_plan_flag = bool(payload.get("skip_plan", False))
+        # Issue #274: cold-start vs. drift-aware replan.  ``mode`` is
+        # an opt-in payload field set by ``pm project new`` after
+        # classifying the project directory.  Any value other than
+        # the literal "existing" falls back to cold-start behaviour
+        # so callers from before #274 (or other plugins that raise
+        # ``project.created`` without this field) keep the same task
+        # wording.
+        mode_raw = payload.get("mode", "greenfield")
+        is_replan = mode_raw == "existing"
 
         # Config lookup: the observer doesn't get a PluginAPI, so we
         # re-read the global config here. Callers may pass an explicit
@@ -161,15 +170,26 @@ def _on_project_created(context) -> None:
         project_path = _Path(project_path_raw)
         db_path = project_path / ".pollypm" / "state.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
+        if is_replan:
+            title = f"Replan project {project_key}"
+            description = (
+                f"Auto-created on project.created for an existing project "
+                f"(#274). Re-run the architecture planner on {project_key}. "
+                "Stage-0 research should read the existing plan and produce "
+                "a drift analysis before proposing changes."
+            )
+        else:
+            title = f"Plan project {project_key}"
+            description = (
+                f"Auto-created on project.created. Run the architect "
+                f"+ 5-critic planning pipeline on {project_key}."
+            )
         with SQLiteWorkService(
             db_path=db_path, project_path=project_path,
         ) as svc:
             task = svc.create(
-                title=f"Plan project {project_key}",
-                description=(
-                    f"Auto-created on project.created. Run the architect "
-                    f"+ 5-critic planning pipeline on {project_key}."
-                ),
+                title=title,
+                description=description,
                 type="task",
                 project=project_key,
                 flow_template="plan_project",
@@ -177,8 +197,10 @@ def _on_project_created(context) -> None:
                 priority="high",
             )
         log.info(
-            "project_planning: auto-fired plan_project task %s for '%s'.",
+            "project_planning: auto-fired %s task %s for '%s' (mode=%s).",
+            "replan" if is_replan else "plan_project",
             task.task_id, project_key,
+            "existing" if is_replan else "greenfield",
         )
     except Exception as exc:  # noqa: BLE001
         # Observers are best-effort.

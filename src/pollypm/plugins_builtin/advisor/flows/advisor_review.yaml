@@ -1,0 +1,39 @@
+# Advisor review flow — single-node short session that produces a
+# structured JSON decision (emit or silent).
+#
+# Invoked by advisor_tick's enqueue path on a project with recent
+# activity. The session's context is packed by handlers/assess.py
+# (plan + delta + trajectory) into .pollypm-advisor-context.md in the
+# task worktree; the advisor persona reads that file and emits its
+# decision via `pm task done --output '{"emit":..., ...}'`.
+#
+# Budget: 300 seconds. On timeout or invalid JSON the tick handler
+# logs an error and treats the run as silent — the advisor's job is
+# to be rare, not to retry.
+
+name: advisor_review
+description: |
+  Advisor session reviews recent project activity against the plan
+  and emits a single structured JSON decision: emit an insight, or
+  stay silent. 5-minute budget. Output must be the JSON object
+  defined in docs/advisor-plugin-spec.md §5.
+
+roles:
+  advisor:
+    description: Senior-architect persona — silent by default
+    agent_profile: advisor
+
+nodes:
+  review:
+    type: work
+    actor_type: role
+    actor_role: advisor
+    budget_seconds: 300
+    gates:
+      - has_work_output
+    next_node: done
+
+  done:
+    type: terminal
+
+start_node: review

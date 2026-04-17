@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from pollypm.memory_backends.base import (
+    VALID_SCOPE_TIERS,
     EpisodicMemory,
     FeedbackMemory,
     MemoryBackend,
@@ -18,6 +19,7 @@ from pollypm.memory_backends.base import (
     ProjectMemory,
     RecallResult,
     ReferenceMemory,
+    ScopeTier,
     TypedMemory,
     UserMemory,
     validate_typed_memory,
@@ -175,6 +177,15 @@ class FileMemoryBackend(MemoryBackend):
         source = str(overrides.get("source", memory.source))
         ttl_at = overrides.get("ttl_at", memory.ttl_at)
         superseded_by = overrides.get("superseded_by", memory.superseded_by)
+        scope_tier = str(
+            overrides.get("scope_tier", memory.scope_tier)
+            or ScopeTier.PROJECT.value
+        )
+        if scope_tier not in VALID_SCOPE_TIERS:
+            raise ValueError(
+                f"scope_tier must be one of {sorted(VALID_SCOPE_TIERS)} "
+                f"(got {scope_tier!r})"
+            )
 
         title, body = _render_typed_title_body(memory)
         return self._persist_entry(
@@ -191,6 +202,7 @@ class FileMemoryBackend(MemoryBackend):
             importance=importance,
             ttl_at=ttl_at,
             superseded_by=superseded_by,
+            scope_tier=scope_tier,
         )
 
     # ------------------------------------------------------------------
@@ -209,6 +221,7 @@ class FileMemoryBackend(MemoryBackend):
         importance: int = 3,
         ttl_at: str | None = None,
         superseded_by: int | None = None,
+        scope_tier: str = ScopeTier.PROJECT.value,
     ) -> MemoryEntry:
         warnings.warn(
             "FileMemoryBackend.write_entry(scope=..., title=..., body=..., kind=...) "
@@ -219,6 +232,11 @@ class FileMemoryBackend(MemoryBackend):
             DeprecationWarning,
             stacklevel=3,
         )
+        if scope_tier not in VALID_SCOPE_TIERS:
+            raise ValueError(
+                f"scope_tier must be one of {sorted(VALID_SCOPE_TIERS)} "
+                f"(got {scope_tier!r})"
+            )
         return self._persist_entry(
             scope=scope,
             title=title,
@@ -230,6 +248,7 @@ class FileMemoryBackend(MemoryBackend):
             importance=int(importance),
             ttl_at=ttl_at,
             superseded_by=superseded_by,
+            scope_tier=scope_tier,
         )
 
     # ------------------------------------------------------------------
@@ -249,6 +268,7 @@ class FileMemoryBackend(MemoryBackend):
         importance: int,
         ttl_at: str | None,
         superseded_by: int | None,
+        scope_tier: str = ScopeTier.PROJECT.value,
     ) -> MemoryEntry:
         payload = {
             "scope": scope,
@@ -261,11 +281,12 @@ class FileMemoryBackend(MemoryBackend):
             "importance": importance,
             "ttl_at": ttl_at,
             "superseded_by": superseded_by,
+            "scope_tier": scope_tier,
         }
         result = self._plugins.run_filters(
             "memory.before_write",
             payload,
-            metadata={"scope": scope, "kind": kind, "type": type_value},
+            metadata={"scope": scope, "kind": kind, "type": type_value, "scope_tier": scope_tier},
         )
         action = getattr(result, "action", "allow")
         if action == "deny":
@@ -283,6 +304,7 @@ class FileMemoryBackend(MemoryBackend):
         importance = int(payload.get("importance", importance))
         ttl_at = payload.get("ttl_at", ttl_at)
         superseded_by = payload.get("superseded_by", superseded_by)
+        scope_tier = str(payload.get("scope_tier", scope_tier))
 
         self.ensure_memory()
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -301,6 +323,7 @@ class FileMemoryBackend(MemoryBackend):
             source=source,
             importance=importance,
             ttl_at=ttl_at,
+            scope_tier=scope_tier,
         )
         file_path.write_text(content)
 
@@ -317,6 +340,7 @@ class FileMemoryBackend(MemoryBackend):
             importance=importance,
             superseded_by=superseded_by,
             ttl_at=ttl_at,
+            scope_tier=scope_tier,
         )
         entry = MemoryEntry(
             entry_id=record.entry_id,
@@ -334,11 +358,12 @@ class FileMemoryBackend(MemoryBackend):
             importance=record.importance,
             superseded_by=record.superseded_by,
             ttl_at=record.ttl_at,
+            scope_tier=record.scope_tier,
         )
         self._plugins.run_observers(
             "memory.after_write",
             entry,
-            metadata={"scope": scope, "kind": kind, "type": type_value},
+            metadata={"scope": scope, "kind": kind, "type": type_value, "scope_tier": scope_tier},
         )
         return entry
 
@@ -348,6 +373,7 @@ class FileMemoryBackend(MemoryBackend):
         scope: str | None = None,
         kind: str | None = None,
         type: str | None = None,
+        scope_tier: str | None = None,
         limit: int = 50,
     ) -> list[MemoryEntry]:
         """List recent memory entries (back-compat wrapper over ``recall``).
@@ -366,13 +392,14 @@ class FileMemoryBackend(MemoryBackend):
             # pre-date the typed schema and overlap with types only
             # loosely), so we stay on the direct store query here.
             entries = self._state_store.list_memory_entries(
-                scope=scope, kind=kind, type=type, limit=limit
+                scope=scope, kind=kind, type=type, scope_tier=scope_tier, limit=limit
             )
             return [_record_to_entry(item) for item in entries]
         results = self.recall(
             "",
             scope=scope,
             types=[type] if type is not None else None,
+            scope_tier=scope_tier,
             limit=limit,
         )
         return [result.entry for result in results]
@@ -393,7 +420,8 @@ class FileMemoryBackend(MemoryBackend):
         self,
         query: str,
         *,
-        scope: str | list[str] | None = None,
+        scope: str | list[str] | list[tuple[str, str]] | None = None,
+        scope_tier: str | list[str] | None = None,
         types: list[str] | None = None,
         limit: int = 10,
         importance_min: int = 1,
@@ -421,17 +449,31 @@ class FileMemoryBackend(MemoryBackend):
         When ``query`` is empty, ``fts_score`` is 0 and results are
         ordered purely by importance + recency.
 
-        ``scope`` accepts a single string, a list, or None (all scopes).
+        ``scope`` accepts one of:
+
+        * ``None`` — don't filter by scope.
+        * a single ``str`` — match rows with ``scope == value``.
+        * a ``list[str]`` — match rows whose ``scope`` is in the list.
+        * a ``list[tuple[str, str]]`` — match rows whose
+          ``(scope_tier, scope)`` pair is in the list (M03 tiered
+          recall).
+
+        ``scope_tier`` filters to rows whose ``scope_tier`` is in the
+        given set (single string or list of strings). Combines with
+        ``scope`` when both are passed.
         ``types`` filters to the given MemoryType values (strings).
         Entries marked superseded or past their TTL are never returned.
         """
-        scopes = _coerce_scopes(scope)
+        scopes, tier_scope_pairs = _coerce_scope_argument(scope)
+        scope_tiers = _coerce_scope_tiers(scope_tier)
         raw_results = self._state_store.recall_memory_entries(
             query=query,
             scopes=scopes,
             types=types,
             importance_min=importance_min,
             limit=limit,
+            scope_tiers=scope_tiers,
+            tier_scope_pairs=tier_scope_pairs,
         )
         now = datetime.now(UTC)
         scored: list[RecallResult] = []
@@ -467,6 +509,8 @@ class FileMemoryBackend(MemoryBackend):
             metadata={
                 "query": query,
                 "scope": scopes,
+                "scope_tier": scope_tiers,
+                "tier_scope_pairs": tier_scope_pairs,
                 "types": types,
                 "limit": limit,
                 "result_count": len(top),
@@ -491,6 +535,60 @@ class FileMemoryBackend(MemoryBackend):
             metadata={"scope": scope, "entry_count": len(entries)},
         )
         return summary
+
+    # ------------------------------------------------------------------
+    # Tiered-scope lifecycle API (M03 / #232)
+    #
+    # These thin wrappers expose the state-store helpers via the backend
+    # so callers that hold a FileMemoryBackend instance — typically a
+    # plugin observer — don't need to reach into the store directly.
+    # The after-write observer hook can register these as handlers for
+    # ``memory.session.ended`` / ``memory.task.terminal`` and get the
+    # spec's per-tier lifecycle for free.
+    # ------------------------------------------------------------------
+
+    def purge_session_scope(self, session_id: str) -> int:
+        """Remove session-tier memory entries with ``scope == session_id``.
+
+        Returns the count of removed rows. Emits a
+        ``memory.after_session_purge`` observer so downstream plugins
+        (e.g. analytics, audit) can react. No-op (returns 0) when the
+        session has no session-tier memory, so it's safe to call from
+        any session-teardown path.
+        """
+        removed = self._state_store.purge_session_scope(session_id)
+        self._plugins.run_observers(
+            "memory.after_session_purge",
+            {"session_id": session_id, "removed": removed},
+            metadata={"session_id": session_id, "removed": removed},
+        )
+        return removed
+
+    def expire_task_scope(
+        self,
+        task_id: str,
+        *,
+        terminal_at: str | None = None,
+        ttl_days: int = 30,
+    ) -> int:
+        """Set TTL ``terminal_at + ttl_days`` on task-tier entries.
+
+        Returns the count of updated rows. Call this from the
+        task-terminal transition (``mark_done`` / ``mark_cancelled``)
+        wiring — the actual wire-up lives with the task service owner
+        (work service) and isn't installed here, but the helper is
+        kept backend-side so the same plugin-observer-shape that
+        handles session teardown can handle task teardown too.
+        """
+        updated = self._state_store.expire_task_scope(
+            task_id, terminal_at=terminal_at, ttl_days=ttl_days
+        )
+        self._plugins.run_observers(
+            "memory.after_task_expire",
+            {"task_id": task_id, "updated": updated, "ttl_days": ttl_days},
+            metadata={"task_id": task_id, "updated": updated},
+        )
+        return updated
 
     def compact(self, scope: str, *, limit: int = 50) -> MemorySummary:
         entries = self.list_entries(scope=scope, limit=limit)
@@ -535,6 +633,7 @@ def _record_to_entry(record) -> MemoryEntry:
         importance=getattr(record, "importance", 3),
         superseded_by=getattr(record, "superseded_by", None),
         ttl_at=getattr(record, "ttl_at", None),
+        scope_tier=getattr(record, "scope_tier", ScopeTier.PROJECT.value),
     )
 
 
@@ -609,6 +708,7 @@ def _render_entry(
     source: str,
     importance: int,
     ttl_at: str | None,
+    scope_tier: str = ScopeTier.PROJECT.value,
 ) -> str:
     tag_line = ", ".join(tags) if tags else "none"
     ttl_line = ttl_at if ttl_at else "none"
@@ -617,6 +717,7 @@ def _render_entry(
             f"# {title}",
             "",
             f"- Scope: `{scope}`",
+            f"- Scope tier: `{scope_tier}`",
             f"- Type: `{type_value}`",
             f"- Kind: `{kind}`",
             f"- Importance: {importance}",
@@ -661,6 +762,71 @@ def _coerce_scopes(scope: str | list[str] | None) -> list[str] | None:
     if isinstance(scope, str):
         return [scope]
     return list(scope)
+
+
+def _coerce_scope_argument(
+    scope: str | list[str] | list[tuple[str, str]] | None,
+) -> tuple[list[str] | None, list[tuple[str, str]] | None]:
+    """Split the polymorphic ``scope`` argument into (scopes, tier_scope_pairs).
+
+    Accepts the same three forms ``recall()`` documents:
+
+    * ``None`` → ``(None, None)``.
+    * ``str`` → ``(["s"], None)``.
+    * ``list[str]`` → ``(list, None)``.
+    * ``list[tuple[str, str]]`` → ``(None, list)`` — tiered recall.
+
+    Mixed lists (some strings, some tuples) raise ``TypeError`` so
+    callers catch the bug at the boundary rather than at SQL execution.
+    Empty list → ``(None, None)`` so "no scope filter" and "empty scope
+    list" share semantics.
+    """
+    if scope is None:
+        return None, None
+    if isinstance(scope, str):
+        return [scope], None
+    items = list(scope)
+    if not items:
+        return None, None
+    # Decide: are all strings, or all (tier, scope) tuples?
+    all_strings = all(isinstance(item, str) for item in items)
+    if all_strings:
+        return [str(item) for item in items], None
+    all_pairs = all(
+        isinstance(item, tuple) and len(item) == 2 for item in items
+    )
+    if all_pairs:
+        pairs: list[tuple[str, str]] = []
+        for tier, scope_id in items:
+            if tier not in VALID_SCOPE_TIERS:
+                raise ValueError(
+                    f"scope tuple tier must be one of "
+                    f"{sorted(VALID_SCOPE_TIERS)} (got {tier!r})"
+                )
+            pairs.append((str(tier), str(scope_id)))
+        return None, pairs
+    raise TypeError(
+        "scope must be None, a str, list[str], or list[tuple[tier, scope]] — "
+        "mixed lists are not supported"
+    )
+
+
+def _coerce_scope_tiers(
+    scope_tier: str | list[str] | None,
+) -> list[str] | None:
+    if scope_tier is None:
+        return None
+    if isinstance(scope_tier, str):
+        tiers = [scope_tier]
+    else:
+        tiers = list(scope_tier)
+    for tier in tiers:
+        if tier not in VALID_SCOPE_TIERS:
+            raise ValueError(
+                f"scope_tier must be one of {sorted(VALID_SCOPE_TIERS)} "
+                f"(got {tier!r})"
+            )
+    return tiers
 
 
 def _normalize_bm25(bm25_score: float | None) -> float:

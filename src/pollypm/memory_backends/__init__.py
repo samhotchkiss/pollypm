@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from pollypm.memory_backends.base import (
+    VALID_SCOPE_TIERS,
     EpisodicMemory,
     FeedbackMemory,
     MemoryBackend,
@@ -11,6 +12,7 @@ from pollypm.memory_backends.base import (
     ProjectMemory,
     RecallResult,
     ReferenceMemory,
+    ScopeTier,
     TypedMemory,
     UserMemory,
     validate_typed_memory,
@@ -57,6 +59,8 @@ __all__ = [
     "MemorySummary",
     "MemoryType",
     "RecallResult",
+    "ScopeTier",
+    "VALID_SCOPE_TIERS",
     "TypedMemory",
     "UserMemory",
     "FeedbackMemory",

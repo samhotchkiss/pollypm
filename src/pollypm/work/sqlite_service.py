@@ -108,10 +108,14 @@ class SQLiteWorkService:
         self._project_path = project_path
         self._sync = sync_manager
         self._session_mgr = session_manager
-        self._conn = sqlite3.connect(str(db_path))
+        self._conn = sqlite3.connect(str(db_path), timeout=30.0)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        # Wait up to 30s for busy locks before raising — prevents the
+        # Textual inbox UI from erroring when the heartbeat or other
+        # writers hold the DB briefly.
+        self._conn.execute("PRAGMA busy_timeout=30000")
         create_work_tables(self._conn)
         self._gate_registry = GateRegistry(project_path=project_path)
         # Last-provision-error breadcrumb — set by ``claim()`` when

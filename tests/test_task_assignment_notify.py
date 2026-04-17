@@ -658,10 +658,14 @@ class TestSweeperInProgressBranch:
             tmp_path, [FakeHandle("worker-proj")], busy=(),
         )
         task = self._queue_and_claim(work)
-        # Pre-populate a recent ping so the cooldown is hot.
+        # Pre-populate a recent ping so the cooldown is hot. The claim
+        # above puts the task at ``implement`` with visit=1, so the
+        # dedupe row must carry ``execution_version=1`` to match the
+        # event the sweeper will build for this state (#279).
         store.record_notification(
             session_name="worker-proj", task_id=task.task_id,
             project="proj", message="previous ping", delivery_status="sent",
+            execution_version=1,
         )
 
         def _fake_loader(*, config_path=None):
@@ -769,9 +773,13 @@ class TestSessionCreatedListener:
         work.claim(task.task_id, "agent-1")
 
         # Pre-populate a notification that's inside the 30-min window.
+        # The claim puts the task at ``implement`` with visit=1, so the
+        # dedupe row must carry ``execution_version=1`` to match the
+        # replay event's identity (#279).
         store.record_notification(
             session_name="worker-proj", task_id=task.task_id,
             project="proj", message="original ping", delivery_status="sent",
+            execution_version=1,
         )
 
         services = _RuntimeServices(
@@ -1097,3 +1105,370 @@ class TestSessionCreatedBus:
         ))
         assert received == ["x"]
         clear_session_listeners()
+
+
+# ---------------------------------------------------------------------------
+# #279 — reject-bounce unlocks retry ping via execution_version
+# ---------------------------------------------------------------------------
+
+
+class TestRejectBounceDedupe:
+    """The 30-minute dedupe was originally keyed on ``(session, task)``
+    only — a rejection that bounced the task back to ``implement`` v2
+    never got its retry ping because the dedupe still saw the stale
+    ``visit=1`` row as "already pinged". #279 keys the dedupe on
+    ``(session, task, execution_version)`` so a fresh visit counts as a
+    new ping opportunity."""
+
+    def _make_services(self, tmp_path, session_handles, busy=()):
+        db = tmp_path / "work.db"
+        state_db = tmp_path / "state.db"
+        work = SQLiteWorkService(db_path=db)
+        store = StateStore(state_db)
+        svc = FakeSessionService(
+            handles=list(session_handles), busy=set(busy),
+        )
+        return work, store, svc
+
+    def test_reject_bounce_unlocks_retry_ping(self, tmp_path):
+        """Ping → reject → ping: the retry ping at visit=2 gets through
+        even inside the 30-min window that throttled the visit=1 ping.
+
+        This is the headline fix: the live scenario (russell/1 on
+        e2e_auto_1776439172) where a rejected worker sat for 30 min
+        waiting for the dedupe to expire."""
+        from pollypm.work.models import (
+            Artifact, ArtifactKind, OutputType, WorkOutput,
+        )
+
+        bus.clear_listeners()
+        work, store, svc = self._make_services(
+            tmp_path, [FakeHandle("worker-proj")],
+        )
+        services = _RuntimeServices(
+            session_service=svc, state_store=store,
+            work_service=work, project_root=tmp_path,
+        )
+
+        task = work.create(
+            title="Build the thing",
+            description="Implement feature X",
+            type="task",
+            project="proj",
+            flow_template="standard",
+            roles={"worker": "agent-1", "reviewer": "agent-2"},
+            priority="normal",
+        )
+        # Claim puts the task at implement/visit=1.
+        work.queue(task.task_id, "pm")
+        work.claim(task.task_id, "agent-1")
+
+        # First ping: lands.
+        first_event = TaskAssignmentEvent(
+            task_id=task.task_id, project="proj",
+            task_number=task.task_number, title=task.title,
+            current_node="implement", current_node_kind="work",
+            actor_type=ActorType.ROLE, actor_name="worker",
+            work_status="in_progress", priority="normal",
+            transitioned_at=datetime.now(timezone.utc),
+            transitioned_by="tester",
+            execution_version=work.current_node_visit(
+                "proj", task.task_number, "implement",
+            ),
+        )
+        assert first_event.execution_version == 1
+        first = notify(first_event, services=services)
+        assert first["outcome"] == "sent"
+        assert first["execution_version"] == 1
+        assert len(svc.sent) == 1
+
+        # Worker finishes -> review (visit=1 at code_review).
+        out = WorkOutput(
+            type=OutputType.CODE_CHANGE,
+            summary="First attempt",
+            artifacts=[Artifact(
+                kind=ArtifactKind.COMMIT, description="impl", ref="abc",
+            )],
+        )
+        work.node_done(task.task_id, "agent-1", work_output=out)
+        # Reviewer rejects -> bounce to implement/visit=2.
+        work.reject(task.task_id, "agent-2", "try again")
+
+        second_visit = work.current_node_visit(
+            "proj", task.task_number, "implement",
+        )
+        assert second_visit == 2
+
+        # Second ping carries the new execution_version — dedupe must
+        # NOT suppress it even though we're well inside the 30-min
+        # window that throttled the first ping.
+        second_event = TaskAssignmentEvent(
+            task_id=task.task_id, project="proj",
+            task_number=task.task_number, title=task.title,
+            current_node="implement", current_node_kind="work",
+            actor_type=ActorType.ROLE, actor_name="worker",
+            work_status="in_progress", priority="normal",
+            transitioned_at=datetime.now(timezone.utc),
+            transitioned_by="tester",
+            execution_version=second_visit,
+        )
+        second = notify(second_event, services=services)
+        assert second["outcome"] == "sent", (
+            f"reject-bounce retry ping was suppressed: {second!r}"
+        )
+        assert second["execution_version"] == 2
+        assert len(svc.sent) == 2
+
+    def test_same_state_within_window_still_dedupes(self, state_store):
+        """Ping at visit=N → ping again at visit=N within the window →
+        suppressed. The version-aware dedupe must still catch pure
+        duplicates — we didn't just remove the throttle, we refined its
+        key."""
+        svc = FakeSessionService(handles=[FakeHandle("worker-demo")])
+        services = _RuntimeServices(
+            session_service=svc, state_store=state_store,
+            work_service=None, project_root=Path("."),
+        )
+        event = _event()
+        # _event() defaults to execution_version=0, matching the
+        # pre-#279 dedupe semantics for the "no work service" harness.
+        first = notify(event, services=services)
+        assert first["outcome"] == "sent"
+        second = notify(event, services=services)
+        assert second["outcome"] == "deduped"
+        assert second["execution_version"] == 0
+        assert len(svc.sent) == 1
+
+    def test_past_throttle_same_state_resends(self, state_store):
+        """Time-based dedupe still works for unchanged state. A ping at
+        version=0 that expires the window must re-send — we must not
+        have accidentally replaced the time window with a per-version
+        "ping exactly once" behaviour."""
+        svc = FakeSessionService(handles=[FakeHandle("worker-demo")])
+        services = _RuntimeServices(
+            session_service=svc, state_store=state_store,
+            work_service=None, project_root=Path("."),
+        )
+        notify(_event(), services=services)
+        # throttle_seconds=0 models "we're past the 30-min window".
+        outcome = notify(_event(), services=services, throttle_seconds=0)
+        assert outcome["outcome"] == "sent"
+        assert len(svc.sent) == 2
+
+    def test_sweeper_rebuilds_events_with_current_visit(
+        self, tmp_path, monkeypatch,
+    ):
+        """The sweeper's synthetic event must carry the current visit so
+        its dedupe lines up with the live work service state. This is
+        the path that runs on the @every 30s cadence and has to catch
+        the reject-bounce case when the in-process listener missed the
+        transition."""
+        from pollypm.work.models import (
+            Artifact, ArtifactKind, OutputType, WorkOutput,
+        )
+        from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
+            _build_event_for_task,
+        )
+
+        bus.clear_listeners()
+        work, store, svc = self._make_services(
+            tmp_path, [FakeHandle("worker-proj")],
+        )
+
+        task = work.create(
+            title="Build the thing",
+            description="Implement feature X",
+            type="task",
+            project="proj",
+            flow_template="standard",
+            roles={"worker": "agent-1", "reviewer": "agent-2"},
+            priority="normal",
+        )
+        work.queue(task.task_id, "pm")
+        work.claim(task.task_id, "agent-1")
+
+        # Visit 1 at implement.
+        t1 = work.get(task.task_id)
+        ev1 = _build_event_for_task(work, t1)
+        assert ev1 is not None
+        assert ev1.execution_version == 1
+
+        # Advance to review, then bounce back.
+        out = WorkOutput(
+            type=OutputType.CODE_CHANGE,
+            summary="First attempt",
+            artifacts=[Artifact(
+                kind=ArtifactKind.COMMIT, description="impl", ref="abc",
+            )],
+        )
+        work.node_done(task.task_id, "agent-1", work_output=out)
+        work.reject(task.task_id, "agent-2", "try again")
+
+        t2 = work.get(task.task_id)
+        ev2 = _build_event_for_task(work, t2)
+        assert ev2 is not None
+        assert ev2.execution_version == 2, (
+            f"sweeper rebuild missed the visit bump: {ev2.execution_version}"
+        )
+
+    def test_pre_migration_row_dedupes_default_version_event(self, state_store):
+        """An event rebuilt via a work service that can't compute a
+        visit (bare test double, failure path) emits ``version=0``. A
+        notification row created before #279 (column DEFAULT 0) must
+        still dedupe that event. This is the backward-compat contract
+        the spec called out."""
+        svc = FakeSessionService(handles=[FakeHandle("worker-demo")])
+        services = _RuntimeServices(
+            session_service=svc, state_store=state_store,
+            work_service=None, project_root=Path("."),
+        )
+        # Pre-populate a "pre-migration" row (execution_version omitted,
+        # so it lands as the column DEFAULT 0).
+        state_store.record_notification(
+            session_name="worker-demo", task_id="demo/1",
+            project="demo", message="legacy ping", delivery_status="sent",
+            # execution_version not passed — default 0, matching a row
+            # back-filled by migration 12.
+        )
+        outcome = notify(_event(), services=services)
+        assert outcome["outcome"] == "deduped", (
+            f"pre-migration dedupe compat broken: {outcome!r}"
+        )
+        assert len(svc.sent) == 0
+
+    def test_migration_adds_execution_version_column(self, tmp_path):
+        """Migration 12 adds ``execution_version`` with DEFAULT 0 and
+        creates the version-aware composite index. Fresh DBs get the
+        column from the migration runner; pre-#279 DBs back-fill
+        existing rows to ``0`` via the column DEFAULT."""
+        store = StateStore(tmp_path / "state.db")
+        try:
+            cols = {
+                r[1] for r in store.execute(
+                    "PRAGMA table_info(task_notifications)"
+                ).fetchall()
+            }
+            assert "execution_version" in cols
+            indexes = [
+                r[0] for r in store.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' "
+                    "AND tbl_name='task_notifications'"
+                ).fetchall()
+            ]
+            assert any("session_task_version" in i for i in indexes), (
+                f"version-aware dedupe index missing: {indexes!r}"
+            )
+            # Round-trip with + without the column: both forms work,
+            # and default rows dedupe at version=0.
+            store.record_notification(
+                session_name="worker-demo", task_id="demo/1",
+                project="demo", message="default", delivery_status="sent",
+            )
+            assert store.was_notified_within("worker-demo", "demo/1", 60)
+            # Explicit version round-trip.
+            store.record_notification(
+                session_name="worker-demo", task_id="demo/2",
+                project="demo", message="v3", delivery_status="sent",
+                execution_version=3,
+            )
+            assert store.was_notified_within(
+                "worker-demo", "demo/2", 60, execution_version=3,
+            )
+            # Different version is NOT matched by the dedupe query.
+            assert not store.was_notified_within(
+                "worker-demo", "demo/2", 60, execution_version=2,
+            )
+            # The recent_notifications readback surfaces the version so
+            # downstream tooling can display it.
+            rows = store.recent_notifications(task_id="demo/2")
+            assert rows and rows[0]["execution_version"] == 3
+        finally:
+            store.close()
+
+    def test_migration_upgrades_pre_existing_v11_database(self, tmp_path):
+        """A database that existed before #279 (schema v11) with
+        ``task_notifications`` rows must upgrade cleanly to v12 — the
+        new column appears, existing rows back-fill to 0, and the old
+        dedupe behaviour survives for any still-pending ping."""
+        import sqlite3
+        p = tmp_path / "legacy.db"
+        # Hand-build a v11-shaped DB (no execution_version column).
+        conn = sqlite3.connect(p)
+        conn.executescript(
+            """
+            CREATE TABLE schema_version (
+                version INTEGER NOT NULL,
+                description TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            );
+            CREATE TABLE task_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_name TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                project TEXT NOT NULL DEFAULT '',
+                notified_at TEXT NOT NULL,
+                delivery_status TEXT NOT NULL DEFAULT 'sent',
+                message TEXT NOT NULL DEFAULT ''
+            );
+            INSERT INTO schema_version VALUES
+                (11, 'v11 baseline', '2026-01-01T00:00:00+00:00');
+            INSERT INTO task_notifications
+                (session_name, task_id, project, notified_at,
+                 delivery_status, message)
+            VALUES
+                ('worker-legacy', 'legacy/1', 'legacy',
+                 '2026-04-17T00:00:00+00:00', 'sent', 'legacy ping');
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        # Open via StateStore — the migration runner must upgrade in
+        # place without losing data.
+        store = StateStore(p)
+        try:
+            cols = {
+                r[1] for r in store.execute(
+                    "PRAGMA table_info(task_notifications)"
+                ).fetchall()
+            }
+            assert "execution_version" in cols, (
+                f"migration 12 did not add column: {cols!r}"
+            )
+            rows = store.execute(
+                "SELECT session_name, task_id, execution_version "
+                "FROM task_notifications"
+            ).fetchall()
+            assert rows == [("worker-legacy", "legacy/1", 0)], (
+                f"legacy row did not back-fill to version=0: {rows!r}"
+            )
+            version = store.execute(
+                "SELECT MAX(version) FROM schema_version"
+            ).fetchone()[0]
+            assert version == 12
+        finally:
+            store.close()
+
+    def test_event_payload_round_trip_preserves_version(self):
+        """The notify job payload must round-trip the version so a
+        sweeper-enqueued job handed off to a worker runner dedupes on
+        the same key the in-process path uses."""
+        from pollypm.plugins_builtin.task_assignment_notify.handlers.notify import (
+            _event_from_payload, event_to_payload,
+        )
+        ev = TaskAssignmentEvent(
+            task_id="proj/5", project="proj", task_number=5,
+            title="x", current_node="implement", current_node_kind="work",
+            actor_type=ActorType.ROLE, actor_name="worker",
+            work_status="in_progress", priority="normal",
+            transitioned_at=datetime.now(timezone.utc),
+            transitioned_by="tester",
+            execution_version=4,
+        )
+        payload = event_to_payload(ev)
+        assert payload["execution_version"] == 4
+        # Serializer is JSON-compatible.
+        import json
+        round = json.loads(json.dumps(payload))
+        restored = _event_from_payload(round)
+        assert restored.execution_version == 4

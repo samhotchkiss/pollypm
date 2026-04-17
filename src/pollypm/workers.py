@@ -90,7 +90,17 @@ def create_worker_session(
     config = load_config(config_path)
     project = config.projects.get(project_key)
     if project is None:
-        raise typer.BadParameter(f"Unknown project: {project_key}")
+        registered = ", ".join(sorted(config.projects.keys())) or "<none>"
+        raise typer.BadParameter(
+            f"No project '{project_key}' registered.\n"
+            f"\n"
+            f"Why: `pm worker-start` needs a project key that's already "
+            f"tracked in the PollyPM config.\n"
+            f"\n"
+            f"Fix: run `pm projects` to see registered projects "
+            f"(currently: {registered}), or register a new one with\n"
+            f"    pm add-project <path> --name {project_key}"
+        )
 
     if account_name is None:
         account_name = auto_select_worker_account(config_path, provider=provider)
@@ -146,7 +156,13 @@ def suggest_worker_prompt(config_path: Path, *, project_key: str) -> str:
     config = load_config(config_path)
     project = config.projects.get(project_key)
     if project is None:
-        raise typer.BadParameter(f"Unknown project: {project_key}")
+        registered = ", ".join(sorted(config.projects.keys())) or "<none>"
+        raise typer.BadParameter(
+            f"No project '{project_key}' registered.\n"
+            f"Fix: `pm projects` lists registered projects "
+            f"(currently: {registered}); add with `pm add-project <path> "
+            f"--name {project_key}`."
+        )
     return ""
 
 

@@ -112,7 +112,9 @@ class TestNodeDone:
         task = _create_task(svc)
         _claim_task(svc, task)
 
-        with pytest.raises(ValidationError, match="Work output is required"):
+        # After wg03, the error message is longer (three-question rule)
+        # but still mentions --output, which is the actionable fix.
+        with pytest.raises(ValidationError, match="--output"):
             svc.node_done(task.task_id, "pete", None)
 
     def test_node_done_with_empty_artifacts_rejected(self, svc):

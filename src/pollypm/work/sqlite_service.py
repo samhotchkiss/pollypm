@@ -846,14 +846,47 @@ class SQLiteWorkService:
         task = self.get(task_id)
 
         if task.work_status != WorkStatus.QUEUED:
+            # Already-claimed is a distinct, common case — surface the
+            # current claimant and how to proceed.
+            if task.work_status == WorkStatus.IN_PROGRESS:
+                claimant = task.assignee or "another actor"
+                raise InvalidTransitionError(
+                    f"Task {task_id} is already claimed by '{claimant}'.\n"
+                    f"\n"
+                    f"Why: the task is in 'in_progress' and assigned. A "
+                    f"second claim would orphan the first worker's "
+                    f"session.\n"
+                    f"\n"
+                    f"Fix: use `pm task get {task_id}` to see the current "
+                    f"state. If the existing claim is stale (worker "
+                    f"session dead), hold and resume:\n"
+                    f"    pm task hold {task_id} --reason 'stale claim'\n"
+                    f"    pm task resume {task_id}\n"
+                    f"Otherwise, find an unclaimed task with `pm task next`."
+                )
             raise InvalidTransitionError(
-                f"Cannot claim task in '{task.work_status.value}' state. "
-                f"Task must be in 'queued' state."
+                f"Cannot claim task in '{task.work_status.value}' state.\n"
+                f"\n"
+                f"Why: only tasks in 'queued' state can be claimed.\n"
+                f"\n"
+                f"Fix: if the task is 'draft', run "
+                f"`pm task queue {task_id}` first. If it's 'done' or "
+                f"'cancelled', find another task with `pm task next`."
             )
 
         # blocked check (for now always False)
         if task.blocked:
-            raise InvalidTransitionError("Cannot claim a blocked task.")
+            raise InvalidTransitionError(
+                f"Cannot claim task {task_id}: it is blocked by another "
+                f"task.\n"
+                f"\n"
+                f"Why: blocking tasks must reach a terminal state before "
+                f"dependents can start.\n"
+                f"\n"
+                f"Fix: run `pm task get {task_id}` to see the blockers, "
+                f"then work on those first (or unblock with "
+                f"`pm task unlink`)."
+            )
 
         flow = self._load_flow_from_db(
             task.flow_template_id, task.flow_template_version,
@@ -1047,10 +1080,45 @@ class SQLiteWorkService:
                     f"Invalid output type '{output.type}'."
                 )
         if not output.summary or not output.summary.strip():
-            raise ValidationError("Work output must have a non-empty summary.")
+            raise ValidationError(
+                "Work output has an empty summary.\n"
+                "\n"
+                "Why: the reviewer needs a one-paragraph explanation of "
+                "what you built.\n"
+                "\n"
+                "Fix: include a non-empty \"summary\" in your --output "
+                "JSON, for example:\n"
+                "    pm task done <id> --output '{\n"
+                "      \"type\": \"code_change\",\n"
+                "      \"summary\": \"Implemented X; all tests green.\",\n"
+                "      \"artifacts\": [{\"kind\": \"commit\", \"description\": "
+                "\"impl\", \"ref\": \"HEAD\"}]\n"
+                "    }'"
+            )
         if not output.artifacts:
             raise ValidationError(
-                "Work output must have at least one artifact."
+                "Work output must have at least one artifact.\n"
+                "\n"
+                "Why: the reviewer needs concrete evidence of what you "
+                "built — a commit SHA, a changed file, or a recorded "
+                "action — before a task can advance to review.\n"
+                "\n"
+                "Fix: include an \"artifacts\" array in your --output "
+                "JSON. Common shapes:\n"
+                "    commit:      {\"kind\": \"commit\", \"description\": "
+                "\"impl\", \"ref\": \"HEAD\"}\n"
+                "    file change: {\"kind\": \"file_change\", \"description\": "
+                "\"docs\", \"path\": \"README.md\"}\n"
+                "    note:        {\"kind\": \"note\", \"description\": "
+                "\"investigated X; no code change needed\"}\n"
+                "\n"
+                "Full example:\n"
+                "    pm task done <id> --output '{\n"
+                "      \"type\": \"code_change\",\n"
+                "      \"summary\": \"...\",\n"
+                "      \"artifacts\": [{\"kind\": \"commit\", \"description\": "
+                "\"impl\", \"ref\": \"HEAD\"}]\n"
+                "    }'"
             )
         for i, art in enumerate(output.artifacts):
             if not isinstance(art.kind, ArtifactKind):
@@ -1058,12 +1126,17 @@ class SQLiteWorkService:
                     ArtifactKind(art.kind)
                 except (ValueError, KeyError):
                     raise ValidationError(
-                        f"Artifact {i}: invalid kind '{art.kind}'."
+                        f"Artifact {i}: invalid kind '{art.kind}'. "
+                        f"Expected one of: commit, file_change, action, note. "
+                        f"Fix: change \"kind\" in your --output JSON to one "
+                        f"of the four supported values."
                     )
             if not (art.description or art.ref or art.path):
                 raise ValidationError(
                     f"Artifact {i}: must have at least one of "
-                    f"description, ref, or path."
+                    f"description, ref, or path. "
+                    f"Fix: add a \"description\" field, or a \"ref\" (SHA) "
+                    f"for commits, or a \"path\" for file changes."
                 )
 
     @staticmethod
@@ -1311,7 +1384,21 @@ class SQLiteWorkService:
         # Coerce and validate work output
         work_output = self._coerce_work_output(work_output)
         if work_output is None:
-            raise ValidationError("Work output is required for node_done.")
+            raise ValidationError(
+                "pm task done requires a --output payload describing "
+                "what you built.\n"
+                "\n"
+                "Why: the reviewer cannot evaluate the handoff without "
+                "a summary and at least one artifact.\n"
+                "\n"
+                "Fix: pass --output with a JSON object, e.g.:\n"
+                "    pm task done <id> --output '{\n"
+                "      \"type\": \"code_change\",\n"
+                "      \"summary\": \"<what you built>\",\n"
+                "      \"artifacts\": [{\"kind\": \"commit\", \"description\": "
+                "\"impl\", \"ref\": \"HEAD\"}]\n"
+                "    }'"
+            )
         self._validate_work_output(work_output)
 
         now = _now()
@@ -1373,9 +1460,44 @@ class SQLiteWorkService:
         task = self.get(task_id)
 
         if task.work_status != WorkStatus.REVIEW:
+            current = task.work_status.value
+            # Tailor the fix hint to the specific state so workers who
+            # accidentally try to approve their own draft get routed to
+            # the right command.
+            if current == "draft":
+                hint = (
+                    f"Fix: drafts move through the queue, not straight "
+                    f"to review. Run `pm task queue {task_id}` to queue "
+                    f"it, then have a worker claim + build it."
+                )
+            elif current == "in_progress":
+                hint = (
+                    f"Fix: the worker hasn't handed this off yet. Wait "
+                    f"for `pm task done {task_id}` to run (which moves "
+                    f"the task to 'review'), or check in with the "
+                    f"claimant '{task.assignee or 'unknown'}'."
+                )
+            elif current == "queued":
+                hint = (
+                    f"Fix: this task is waiting for a worker. Approval "
+                    f"comes after a worker marks it done. Claim + build "
+                    f"first, or wait for a worker to pick it up."
+                )
+            else:
+                hint = (
+                    f"Fix: only tasks in 'review' can be approved. Run "
+                    f"`pm task get {task_id}` to inspect the current "
+                    f"state, or find a reviewable task with "
+                    f"`pm task list --status review`."
+                )
             raise InvalidTransitionError(
-                f"Cannot approve task in '{task.work_status.value}' state. "
-                f"Task must be in 'review' state."
+                f"Cannot approve task in '{current}' state.\n"
+                f"\n"
+                f"Why: only tasks whose current node is a review node "
+                f"(work_status = 'review') can be approved. Approving a "
+                f"non-review task would bypass the worker-build step.\n"
+                f"\n"
+                f"{hint}"
             )
 
         flow, node = self._get_current_flow_node(task)

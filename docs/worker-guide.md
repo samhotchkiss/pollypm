@@ -103,7 +103,7 @@ Minimal payload (commit-based):
 
 ```bash
 pm task done shortlink_gen/1 --output '{
-  "type": "build",
+  "type": "code_change",
   "summary": "Implemented shortlink generator + CLI + SQLite storage.",
   "artifacts": [
     {"kind": "commit", "description": "Initial implementation", "ref": "HEAD"}
@@ -122,7 +122,7 @@ Multiple artifacts in one output are fine and common:
 
 ```bash
 pm task done shortlink_gen/1 --output '{
-  "type": "build",
+  "type": "code_change",
   "summary": "Feature complete + playwright coverage.",
   "artifacts": [
     {"kind": "commit", "description": "impl", "ref": "237dfb0"},
@@ -272,7 +272,7 @@ pm task get <id>                         # read the spec
 pm task claim <id>                       # take it
 # ... code, test, commit ...
 pm task done <id> --output '{            # hand to review
-  "type": "build",
+  "type": "code_change",
   "summary": "...",
   "artifacts": [{"kind":"commit","description":"impl","ref":"HEAD"}]
 }'

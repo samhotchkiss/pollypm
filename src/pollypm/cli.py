@@ -566,10 +566,71 @@ def add_project(
     repo_path: Path = typer.Argument(..., help="Path to the project folder."),
     name: str | None = typer.Option(None, "--name", help="Optional display name."),
     skip_import: bool = typer.Option(False, "--skip-import", help="Skip history import."),
+    skip_plan: bool = typer.Option(
+        False, "--skip-plan",
+        help=(
+            "Suppress the project_planning auto-fire for this project. "
+            "See `[planner] auto_on_project_created` in pollypm.toml for "
+            "the global switch."
+        ),
+    ),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
+    # Detect whether this invocation is registering a *new* project
+    # versus re-touching an already-known path — only genuinely-new
+    # projects should fire the `project.created` observer chain (issue
+    # #255 part (a)). ``register_project`` silently returns the existing
+    # entry when the path matches, so we have to check the pre-state.
+    from pollypm.projects import normalize_project_path
+    was_preexisting = False
+    try:
+        normalized_new = normalize_project_path(repo_path)
+        existing = load_config(config_path)
+        for known in existing.projects.values():
+            if normalize_project_path(Path(known.path)) == normalized_new:
+                was_preexisting = True
+                break
+    except Exception:  # noqa: BLE001
+        # If the config can't be loaded (e.g. first-run), treat as new.
+        was_preexisting = False
+
     project = register_project(config_path, repo_path, name=name)
     typer.echo(f"Registered project {project.name or project.key} at {project.path}")
+
+    # Part (a): symmetrical `project.created` emission. ``pm project new``
+    # already emits this; ``pm add-project`` historically did not, which
+    # caused live-observed regressions where Polly used her native LLM
+    # planning instead of the architect plugin.
+    if not was_preexisting:
+        try:
+            from pollypm.plugin_host import extension_host_for_root
+
+            host = extension_host_for_root(str(project.path))
+            host.run_observers(
+                "project.created",
+                {
+                    "project_key": project.key,
+                    "path": str(project.path),
+                    # ``skip_plan`` travels through the event payload so
+                    # the project_planning observer can honour the
+                    # opt-out without the CLI needing to know about the
+                    # plugin. See plugin.py::_on_project_created.
+                    "skip_plan": bool(skip_plan),
+                },
+                metadata={
+                    "source": "pm add-project",
+                    # Forward the effective config path so observers
+                    # that need to read config (e.g. auto-fire gate)
+                    # don't have to guess at DEFAULT_CONFIG_PATH. Tests
+                    # rely on this to drive a non-default config.
+                    "config_path": str(config_path),
+                },
+            )
+        except Exception:  # noqa: BLE001
+            # Observers are best-effort — never block registration on a
+            # plugin crash. The same guard is in ``pm project new``.
+            pass
+
     if not skip_import:
         typer.echo("Importing project history (transcripts, git, files)...")
         from pollypm.history_import import import_project_history

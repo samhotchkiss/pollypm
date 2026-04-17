@@ -68,25 +68,126 @@ def _profile_factory(name: str):
 
 
 def _on_project_created(context) -> None:
-    """Observer fired when a project is registered via ``pm project new``.
+    """Observer fired when a project is registered.
 
-    Records a lightweight event through the plugin host state store so
-    the rail can surface "project X is ready for planning" affordances.
-    The actual user prompt + task creation live in
-    ``cli/project.py::new_cmd`` so the user touchpoint stays in the CLI
-    (observers run silently, which is wrong for a prompt).
+    Issue #255: auto-fires the ``plan_project`` flow for every new
+    project so users don't silently skip the architect + 5-critic +
+    Magic pipeline by using ``pm add-project`` instead of
+    ``pm project new``.
+
+    Precedence of suppression (any one suppresses):
+
+    * ``payload.skip_plan=True`` — the CLI was invoked with
+      ``--skip-plan``.
+    * ``config.planner.auto_on_project_created=False`` — user has
+      globally disabled auto-fire. A one-line inbox nudge is logged
+      in that case so the user can still find the project and run
+      ``pm project plan <name>`` manually.
+
+    Failures here are swallowed: the observer runs after
+    ``register_project`` has already succeeded, and a crash in task
+    creation must never undo the registration.
     """
-    # Observers are best-effort; swallow any error so a crash here never
-    # blocks the CLI from finishing.
     import logging
+
+    log = logging.getLogger(__name__)
+
     try:
         payload = context.payload if hasattr(context, "payload") else {}
-        logging.getLogger(__name__).info(
-            "project_planning: project.created observed (payload=%s)",
-            payload,
+        if not isinstance(payload, dict):
+            return
+        project_key = payload.get("project_key")
+        project_path_raw = payload.get("path")
+        if not project_key or not project_path_raw:
+            log.debug(
+                "project_planning: project.created missing project_key or path (%s)",
+                payload,
+            )
+            return
+        skip_plan_flag = bool(payload.get("skip_plan", False))
+
+        # Config lookup: the observer doesn't get a PluginAPI, so we
+        # re-read the global config here. Callers may pass an explicit
+        # ``config_path`` via the event metadata (test harnesses do);
+        # otherwise we fall through to ``DEFAULT_CONFIG_PATH``. Missing
+        # config (fresh install, or a test ExtensionHost with no
+        # pollypm.toml) means default ``auto_on_project_created=True``.
+        auto_fire = True
+        try:
+            from pathlib import Path as _Path2
+            from pollypm.config import DEFAULT_CONFIG_PATH, load_config, resolve_config_path
+
+            metadata = getattr(context, "metadata", None) or {}
+            override_cfg = metadata.get("config_path") if isinstance(metadata, dict) else None
+            if override_cfg:
+                cfg_path = _Path2(override_cfg)
+            else:
+                cfg_path = resolve_config_path(DEFAULT_CONFIG_PATH)
+            if cfg_path.exists():
+                cfg = load_config(cfg_path)
+                auto_fire = bool(cfg.planner.auto_on_project_created)
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "project_planning: config read failed, defaulting auto_fire=True (%s)",
+                exc,
+            )
+
+        if skip_plan_flag:
+            log.info(
+                "project_planning: project.created for '%s' — auto-fire "
+                "skipped via --skip-plan flag.", project_key,
+            )
+            return
+
+        if not auto_fire:
+            # Per spec, surface a one-line nudge so the user can still
+            # find the project and opt in manually. We emit a WARNING
+            # so it shows up in the default log handler; a future
+            # iteration can route this to the inbox service directly.
+            log.warning(
+                "project_planning: new project '%s' was registered but "
+                "auto-planning is disabled ([planner] auto_on_project_created=false). "
+                "Run `pm project plan %s` to design the architecture.",
+                project_key, project_key,
+            )
+            return
+
+        # Auto-fire: create a plan_project task on the project's work
+        # service. Local import to avoid pulling SQLite deps into code
+        # paths that don't need them.
+        from pathlib import Path as _Path
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        project_path = _Path(project_path_raw)
+        db_path = project_path / ".pollypm" / "state.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        with SQLiteWorkService(
+            db_path=db_path, project_path=project_path,
+        ) as svc:
+            task = svc.create(
+                title=f"Plan project {project_key}",
+                description=(
+                    f"Auto-created on project.created. Run the architect "
+                    f"+ 5-critic planning pipeline on {project_key}."
+                ),
+                type="task",
+                project=project_key,
+                flow_template="plan_project",
+                roles={"architect": "architect"},
+                priority="high",
+            )
+        log.info(
+            "project_planning: auto-fired plan_project task %s for '%s'.",
+            task.task_id, project_key,
         )
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        # Observers are best-effort.
+        try:
+            log.warning(
+                "project_planning: project.created observer failed: %s", exc,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def initialize(api: "PluginAPI") -> None:

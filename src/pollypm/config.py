@@ -8,6 +8,7 @@ from pollypm.models import (
     AccountConfig,
     MemorySettings,
     KnownProject,
+    PlannerSettings,
     PluginSettings,
     ProjectKind,
     ProjectSettings,
@@ -255,6 +256,26 @@ def _parse_rail_settings(raw: dict[str, object]) -> "RailSettings":
     )
 
 
+def _parse_planner_settings(raw: dict[str, object]) -> PlannerSettings:
+    """Parse the ``[planner]`` TOML section.
+
+    Today only ``auto_on_project_created`` is recognised (see issue #255).
+    Other nested tables under ``[planner]`` — for example
+    ``[planner.budgets]`` — are consumed directly out of raw TOML by
+    their own modules and ignored here. Unknown keys pass through
+    silently for forward-compat.
+    """
+    planner_raw = raw.get("planner", {})
+    if not isinstance(planner_raw, dict):
+        return PlannerSettings()
+    auto = planner_raw.get("auto_on_project_created", True)
+    # Accept only real bools — anything else falls back to the default so
+    # a fat-fingered config never silently disables the planner.
+    if not isinstance(auto, bool):
+        auto = True
+    return PlannerSettings(auto_on_project_created=auto)
+
+
 def _parse_plugin_settings(raw: dict[str, object]) -> PluginSettings:
     """Parse the ``[plugins]`` TOML section.
 
@@ -378,6 +399,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
     memory = _parse_memory_settings(raw)
     plugins = _parse_plugin_settings(raw)
     rail = _parse_rail_settings(raw)
+    planner = _parse_planner_settings(raw)
     projects = _parse_known_projects(raw, base=base)
     _merge_project_local_config(sessions, projects, plugins)
     _validate_cross_references(accounts=accounts, sessions=sessions, pollypm=pollypm)
@@ -391,6 +413,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
         memory=memory,
         plugins=plugins,
         rail=rail,
+        planner=planner,
     )
     try:
         _config_cache[config_path] = (config_path.stat().st_mtime, config)
@@ -440,6 +463,18 @@ def _render_global_config(config: PollyPMConfig) -> str:
             [
                 "[plugins]",
                 f"disabled = [{items}]",
+                "",
+            ]
+        )
+
+    # Emit [planner] only when the user has deviated from the default.
+    # Default (auto_on_project_created=True) round-trips as an absent
+    # section so existing configs don't churn on rewrite.
+    if not config.planner.auto_on_project_created:
+        lines.extend(
+            [
+                "[planner]",
+                "auto_on_project_created = false",
                 "",
             ]
         )

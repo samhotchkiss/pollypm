@@ -277,6 +277,16 @@ def new_cmd(
         False, "--skip-planner",
         help="Register the project without prompting for the planner.",
     ),
+    skip_plan: bool = typer.Option(
+        False, "--skip-plan",
+        help=(
+            "Suppress the project_planning auto-fire for this project "
+            "(issue #255). Equivalent to setting "
+            "`[planner] auto_on_project_created = false` globally, but "
+            "scoped to this invocation. Independent of the interactive "
+            "`--skip-planner` prompt toggle."
+        ),
+    ),
     yes: bool = typer.Option(
         False, "--yes", "-y",
         help="Non-interactive: auto-accept the planner prompt.",
@@ -289,11 +299,31 @@ def new_cmd(
 
     After registration, prompts "Run the planner now? (Y/n)" (default
     yes). ``--skip-planner`` registers the project without prompting;
-    ``--yes`` accepts the prompt non-interactively.
+    ``--yes`` accepts the prompt non-interactively. ``--skip-plan``
+    suppresses the project_planning plugin's auto-fire on the emitted
+    ``project.created`` event (#255).
     """
-    from pollypm.projects import register_project
+    from pollypm.projects import register_project, normalize_project_path
 
     path = _require_config(config_path)
+
+    # Determine whether the path is already registered before we call
+    # ``register_project`` — the function silently returns the existing
+    # entry on a re-register, and we must not re-fire ``project.created``
+    # for a project that already exists (issue #255 acceptance: "second
+    # add-project with same name doesn't double-fire").
+    was_preexisting = False
+    try:
+        from pollypm.config import load_config as _load_config
+        normalized_new = normalize_project_path(repo_path)
+        existing = _load_config(path)
+        for known in existing.projects.values():
+            if normalize_project_path(Path(known.path)) == normalized_new:
+                was_preexisting = True
+                break
+    except Exception:  # noqa: BLE001
+        was_preexisting = False
+
     project = register_project(path, repo_path, name=name)
     typer.echo(
         f"Registered project {project.name or project.key} at {project.path}"
@@ -301,20 +331,55 @@ def new_cmd(
 
     # Fire the ``project.created`` observer chain so plugins (including
     # project_planning itself) can react. Best-effort — never block the
-    # CLI on observer failures.
-    try:
-        from pollypm.plugin_host import extension_host_for_root
+    # CLI on observer failures. Only fire on genuinely-new registrations
+    # so a re-run of ``pm project new`` on the same path is idempotent.
+    auto_fired = False
+    if not was_preexisting:
+        try:
+            from pollypm.plugin_host import extension_host_for_root
 
-        host = extension_host_for_root(str(project.path))
-        host.run_observers(
-            "project.created",
-            {"project_key": project.key, "path": str(project.path)},
-            metadata={"source": "pm project new"},
+            host = extension_host_for_root(str(project.path))
+            host.run_observers(
+                "project.created",
+                {
+                    "project_key": project.key,
+                    "path": str(project.path),
+                    # ``skip_plan`` travels through the event payload so
+                    # the observer can suppress auto-fire without the
+                    # CLI having to reach into plugin internals.
+                    # ``--skip-planner`` (legacy flag that suppresses the
+                    # interactive prompt + the explicit ``_plan_project_task``
+                    # call below) also suppresses auto-fire so the combined
+                    # UX stays "no planner task".
+                    "skip_plan": bool(skip_plan or skip_planner),
+                },
+                metadata={
+                    "source": "pm project new",
+                    # Forward the effective config path so the observer
+                    # can honour `[planner] auto_on_project_created`
+                    # from a non-default config (notably in tests).
+                    "config_path": str(path),
+                },
+            )
+            # Detect whether the observer actually created a plan_project
+            # task on the project's work service. If it did, the
+            # interactive prompt below becomes redundant — auto-fire
+            # already satisfied the user's "plan this project" intent.
+            auto_fired = _plan_task_exists(project.path, project.key)
+        except Exception:  # noqa: BLE001
+            pass
+
+    if auto_fired:
+        typer.echo(
+            f"Auto-created plan_project task for '{project.key}' via "
+            "project.created hook (see `[planner] auto_on_project_created`)."
         )
-    except Exception:  # noqa: BLE001
-        pass
+        return
 
-    if skip_planner:
+    # ``--skip-plan`` or ``--skip-planner`` both short-circuit the prompt +
+    # legacy task-creation path. This keeps the CLI idempotent with the
+    # event payload we sent to observers above.
+    if skip_plan or skip_planner:
         typer.echo(
             "Skipped planner. Run `pm project plan "
             + project.key + "` later to start planning."
@@ -344,3 +409,29 @@ def new_cmd(
         "Next: `pm task queue " + task.task_id + "` to hand it off to the "
         "architect worker."
     )
+
+
+def _plan_task_exists(project_path: Path, project_key: str) -> bool:
+    """Return True if a ``plan_project`` task already exists on the
+    project's work service.
+
+    Used by ``new_cmd`` after emitting ``project.created`` to detect
+    whether the observer auto-fired a planning task — in which case the
+    interactive prompt becomes redundant. Safe to call on a project
+    that never opened its work DB (returns False without creating one).
+    """
+    db_path = project_path / ".pollypm" / "state.db"
+    if not db_path.exists():
+        return False
+    try:
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        with SQLiteWorkService(
+            db_path=db_path, project_path=project_path,
+        ) as svc:
+            for task in svc.list_tasks(project=project_key):
+                if task.flow_template_id == "plan_project":
+                    return True
+    except Exception:  # noqa: BLE001
+        return False
+    return False

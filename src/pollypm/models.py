@@ -121,6 +121,27 @@ class RailSettings:
 
 
 @dataclass(slots=True)
+class PlannerSettings:
+    """Project-planner plugin configuration from the ``[planner]`` TOML
+    section.
+
+    ``auto_on_project_created`` — when ``True`` (default), the
+    project_planning plugin's ``project.created`` observer auto-creates
+    a ``plan_project`` flow task for every newly-registered project.
+    Setting this to ``False`` suppresses auto-fire globally; the user
+    can still run ``pm project plan <name>`` manually. Per-invocation
+    opt-out is also available via ``--skip-plan`` on both
+    ``pm add-project`` and ``pm project new``. See issue #255.
+
+    Note: this section is distinct from ``[planner.budgets]`` which is
+    consumed directly out of raw TOML by ``budgets.py``; the two live
+    under the same top-level key but serve different layers.
+    """
+
+    auto_on_project_created: bool = True
+
+
+@dataclass(slots=True)
 class PollyPMConfig:
     project: ProjectSettings
     pollypm: PollyPMSettings
@@ -130,6 +151,7 @@ class PollyPMConfig:
     memory: MemorySettings = field(default_factory=MemorySettings)
     plugins: PluginSettings = field(default_factory=PluginSettings)
     rail: RailSettings = field(default_factory=RailSettings)
+    planner: PlannerSettings = field(default_factory=PlannerSettings)
 
 
 @dataclass(slots=True)

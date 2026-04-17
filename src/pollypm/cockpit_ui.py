@@ -17,7 +17,7 @@ from rich.text import Text
 from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, DataTable, Input, ListItem, ListView, Static
 
 from pollypm.models import ProviderKind
@@ -1814,3 +1814,710 @@ class PollySettingsPaneApp(App[None]):
     def on_account_selected(self, _event: DataTable.RowSelected) -> None:
         self._selected_account_key = self._current_selected_key()
         self._refresh()
+
+
+# ---------------------------------------------------------------------------
+# Inbox — interactive Textual screen
+#
+# Two-pane layout within the cockpit right pane:
+#   left  — scrollable list of inbox items (sender · subject · age · unread)
+#   right — focused message: subject, sender, timestamp, body (rich), thread
+#
+# Keybindings:
+#   j/k or arrows  move selection          r  reply
+#   enter / click  open (+ mark read)      a  archive
+#   q / escape     back to cockpit nav     esc (in reply)  cancel reply
+#
+# Backend: SQLiteWorkService.add_reply / archive_task / mark_read /
+# list_replies. Events (inbox.message.read / archived / reply) are emitted
+# via StateStore, matching the shape of ``pm notify``.
+# ---------------------------------------------------------------------------
+
+
+# Sort: most recent first (matches email-inbox affordance), then priority
+# as a secondary key so a newly arrived critical item outranks a slightly
+# older normal one. Falls back to title for a stable ordering when two
+# tasks share the same minute-resolution timestamp.
+_INBOX_PRIORITY_RANK = {
+    "critical": 0,
+    "high": 1,
+    "normal": 2,
+    "low": 3,
+}
+
+
+def _inbox_sort_key(task) -> tuple:
+    updated = task.updated_at
+    iso = updated.isoformat() if hasattr(updated, "isoformat") else str(updated or "")
+    prio = getattr(task.priority, "value", str(task.priority))
+    # Negate updated so newer comes first when sorted ascending; keep
+    # priority as a positive rank so critical (0) wins inside a same-age
+    # bucket.
+    return (-_iso_sort_weight(iso), _INBOX_PRIORITY_RANK.get(prio, 9), task.title)
+
+
+def _iso_sort_weight(iso: str) -> int:
+    """Coerce an ISO timestamp to a comparable integer key.
+
+    Lexicographic compare on ISO-8601 works for "same-offset" strings but
+    we want a real ordering regardless. Falling back to string length keeps
+    the sort stable for missing/invalid stamps without raising.
+    """
+    try:
+        from datetime import datetime as _dt
+        return int(_dt.fromisoformat(iso).timestamp())
+    except (ValueError, TypeError):
+        return 0
+
+
+def _format_sender(task) -> str:
+    """Best-effort human-friendly sender label for an inbox task.
+
+    Chat-flow tasks have ``roles.operator`` set to whichever agent posted
+    (``polly``, ``russell``, …). ``requester=user`` tasks that originate
+    from a worker's notify use ``operator`` too. When nothing resolves,
+    fall back to ``created_by``.
+    """
+    roles = getattr(task, "roles", {}) or {}
+    op = roles.get("operator")
+    if op and op != "user":
+        return op
+    if task.created_by and task.created_by != "user":
+        return task.created_by
+    # Last resort — unknown sender. Don't show blank.
+    return "polly"
+
+
+def _format_inbox_row(task, *, is_unread: bool) -> Text:
+    """Render one inbox-list row as Rich text.
+
+    Matches the cockpit aesthetic from RailItem: yellow diamond for
+    unread, dim open circle for read. Subject truncates at ~38 chars so
+    age + indicator stay visible on a 60-col list pane.
+    """
+    from pollypm.tz import format_relative
+
+    text = Text()
+    if is_unread:
+        text.append("\u25c6 ", style="#f0c45a")  # yellow diamond
+    else:
+        text.append("\u25cb ", style="#4a5568")  # dim circle
+    sender = _format_sender(task)
+    text.append(f"{sender:<7}", style="#97a6b2")
+    text.append("  ")
+    subject = task.title or "(no subject)"
+    max_subject = 38
+    if len(subject) > max_subject:
+        subject = subject[: max_subject - 1] + "\u2026"
+    subject_style = "bold #eef2f4" if is_unread else "#b8c4cf"
+    text.append(subject, style=subject_style)
+    updated = task.updated_at
+    iso = updated.isoformat() if hasattr(updated, "isoformat") else str(updated or "")
+    age = format_relative(iso) if iso else ""
+    if age:
+        # Right-align age as a separate dim run so the subject can flex.
+        text.append(f"  · {age}", style="#4a5568")
+    return text
+
+
+class _InboxListItem(ListItem):
+    """One message in the inbox list — carries the task_id + unread flag."""
+
+    def __init__(self, task, *, is_unread: bool) -> None:
+        self.task_id = task.task_id
+        self.task_ref = task
+        self.is_unread = is_unread
+        self._body = Static(_format_inbox_row(task, is_unread=is_unread), markup=False)
+        super().__init__(self._body, classes="inbox-row")
+        if is_unread:
+            self.add_class("unread")
+
+    def mark_read(self, task=None) -> None:
+        """Flip the row to read styling in place (no reflow of the list)."""
+        if self.is_unread is False:
+            return
+        self.is_unread = False
+        self.remove_class("unread")
+        if task is not None:
+            self.task_ref = task
+        self._body.update(_format_inbox_row(self.task_ref, is_unread=False))
+
+
+class PollyInboxApp(App[None]):
+    """Interactive cockpit inbox — two-pane list + detail with reply/archive.
+
+    Opened via ``pm cockpit-pane inbox``. Replaces the previous read-only
+    text dump so the user can drive the inbox entirely from the TUI
+    without falling back to the CLI.
+    """
+
+    TITLE = "PollyPM"
+    SUB_TITLE = "Inbox"
+    CSS = """
+    Screen {
+        background: #0f1317;
+        color: #eef2f4;
+        padding: 0;
+    }
+    #inbox-layout {
+        height: 1fr;
+    }
+    #inbox-list {
+        width: 42;
+        min-width: 32;
+        height: 1fr;
+        background: #0f1317;
+        border: round #1e2730;
+        padding: 0;
+        scrollbar-size: 1 1;
+        scrollbar-color: #2a3340;
+    }
+    #inbox-list > .inbox-row {
+        height: 2;
+        padding: 0 1;
+        color: #d6dee5;
+        background: transparent;
+    }
+    #inbox-list > .inbox-row.unread {
+        color: #eef2f4;
+    }
+    #inbox-list > .inbox-row.-highlight {
+        background: #1e2730;
+    }
+    #inbox-list:focus > .inbox-row.-highlight {
+        background: #253140;
+        color: #f2f6f8;
+    }
+    #inbox-detail-wrap {
+        height: 1fr;
+        border: round #1e2730;
+        background: #0f1317;
+        padding: 0;
+    }
+    #inbox-detail-scroll {
+        height: 1fr;
+        padding: 1 2;
+        scrollbar-size: 1 1;
+        scrollbar-color: #2a3340;
+    }
+    #inbox-detail {
+        width: 1fr;
+        height: auto;
+        color: #d6dee5;
+    }
+    #inbox-reply {
+        height: 3;
+        padding: 0 1;
+        background: #111820;
+        border: round #2a3340;
+        display: none;
+    }
+    #inbox-reply.visible {
+        display: block;
+    }
+    #inbox-status {
+        height: 1;
+        padding: 0 1;
+        color: #6b7a88;
+        background: #0c0f12;
+    }
+    #inbox-hint {
+        height: 1;
+        padding: 0 1;
+        color: #3e4c5a;
+        background: #0c0f12;
+    }
+    #inbox-empty {
+        width: 1fr;
+        height: 1fr;
+        content-align: center middle;
+        color: #6b7a88;
+    }
+    .reply-turn {
+        background: #111820;
+        padding: 1 2;
+        margin: 1 0 0 0;
+        border-left: thick #5b8aff;
+        color: #d6dee5;
+    }
+    """
+
+    BINDINGS = [
+        Binding("j,down", "cursor_down", "Down", show=False),
+        Binding("k,up", "cursor_up", "Up", show=False),
+        Binding("g,home", "cursor_first", "First", show=False),
+        Binding("G,end", "cursor_last", "Last", show=False),
+        Binding("enter,o", "open_selected", "Open", show=False),
+        Binding("r", "start_reply", "Reply"),
+        Binding("a", "archive_selected", "Archive"),
+        Binding("u", "refresh", "Refresh"),
+        Binding("q,escape", "back_or_cancel", "Back"),
+    ]
+
+    REFRESH_INTERVAL_SECONDS = 8
+
+    def __init__(self, config_path: Path) -> None:
+        super().__init__()
+        self.config_path = config_path
+        self.list_view = ListView(id="inbox-list")
+        self.detail = Static("", id="inbox-detail", markup=True)
+        self.reply_input = Input(
+            placeholder="Reply … (Enter to send, Esc to cancel)",
+            id="inbox-reply",
+        )
+        self.status = Static("", id="inbox-status")
+        self.hint = Static(
+            "j/k move \u00b7 \u21b5 open \u00b7 r reply \u00b7 a archive \u00b7 u refresh \u00b7 q back",
+            id="inbox-hint",
+        )
+        self._tasks: list = []
+        self._selected_task_id: str | None = None
+        self._reply_target_id: str | None = None
+        self._unread_ids: set[str] = set()
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="inbox-layout"):
+            yield self.list_view
+            with Vertical(id="inbox-detail-wrap"):
+                with VerticalScroll(id="inbox-detail-scroll"):
+                    yield self.detail
+                yield self.reply_input
+        yield self.status
+        yield self.hint
+
+    def on_mount(self) -> None:
+        self._refresh_list(select_first=True)
+        self.set_interval(self.REFRESH_INTERVAL_SECONDS, self._background_refresh)
+        self.list_view.focus()
+
+    # ------------------------------------------------------------------
+    # Data loading
+    # ------------------------------------------------------------------
+
+    def _load_inbox(self) -> tuple[list, set[str]]:
+        """Open each project's work-service DB, compute (tasks, unread_ids).
+
+        All services are closed before return — callers don't need to
+        manage lifecycle. Per-task operations open a fresh svc via
+        :meth:`_svc_for_task` so we never hold connections across ticks.
+        """
+        from pollypm.work.inbox_view import inbox_tasks
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        config = load_config(self.config_path)
+        tasks: list = []
+        unread: set[str] = set()
+        for project_key, project in getattr(config, "projects", {}).items():
+            db_path = project.path / ".pollypm" / "state.db"
+            if not db_path.exists():
+                continue
+            try:
+                svc = SQLiteWorkService(
+                    db_path=db_path, project_path=project.path,
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            try:
+                try:
+                    project_tasks = inbox_tasks(svc, project=project_key)
+                except Exception:  # noqa: BLE001
+                    project_tasks = []
+                for t in project_tasks:
+                    tasks.append(t)
+                    try:
+                        rows = svc.get_context(
+                            t.task_id, entry_type="read", limit=1,
+                        )
+                    except Exception:  # noqa: BLE001
+                        rows = []
+                    if not rows:
+                        unread.add(t.task_id)
+            finally:
+                try:
+                    svc.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        tasks.sort(key=_inbox_sort_key)
+        return tasks, unread
+
+    def _svc_for_task(self, task_id: str):
+        """Open a SQLiteWorkService rooted at the project owning ``task_id``.
+
+        The cockpit inbox spans every tracked project, so archive/reply
+        actions must target the project-specific DB. We resolve the
+        project from the task_id prefix and look up its path in config.
+        """
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        project_key = task_id.split("/", 1)[0]
+        config = load_config(self.config_path)
+        project = config.projects.get(project_key)
+        if project is None:
+            return None
+        db_path = project.path / ".pollypm" / "state.db"
+        if not db_path.exists():
+            return None
+        try:
+            return SQLiteWorkService(db_path=db_path, project_path=project.path)
+        except Exception:  # noqa: BLE001
+            return None
+
+    # ------------------------------------------------------------------
+    # List rendering
+    # ------------------------------------------------------------------
+
+    def _refresh_list(self, *, select_first: bool = False) -> None:
+        tasks, unread = self._load_inbox()
+        self._tasks = tasks
+        self._unread_ids = unread
+        self._render_list(select_first=select_first)
+
+    def _render_list(self, *, select_first: bool = False) -> None:
+        previous = self._selected_task_id
+        self.list_view.clear()
+        if not self._tasks:
+            self.list_view.append(
+                ListItem(Static("(empty)", classes="inbox-empty"), disabled=True)
+            )
+            self.detail.update(
+                "[dim]No messages.\n\n"
+                "Polly will notify you here when she has updates.[/dim]"
+            )
+            self.status.update("0 messages")
+            return
+        restore_index: int | None = 0 if select_first else None
+        for idx, task in enumerate(self._tasks):
+            is_unread = task.task_id in self._unread_ids
+            row = _InboxListItem(task, is_unread=is_unread)
+            self.list_view.append(row)
+            if previous and task.task_id == previous:
+                restore_index = idx
+        if restore_index is not None and self.list_view.index != restore_index:
+            self.list_view.index = restore_index
+            # Render detail for the restored selection so the right pane
+            # shows content immediately on refresh.
+            task = self._tasks[restore_index]
+            self._selected_task_id = task.task_id
+            self._render_detail(task.task_id)
+        unread_n = len(self._unread_ids)
+        total = len(self._tasks)
+        if unread_n:
+            self.status.update(f"{total} messages \u00b7 {unread_n} unread")
+        else:
+            self.status.update(f"{total} messages")
+
+    def _background_refresh(self) -> None:
+        """Periodic re-read; don't stomp the current cursor position."""
+        try:
+            self._refresh_list(select_first=False)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ------------------------------------------------------------------
+    # Detail rendering
+    # ------------------------------------------------------------------
+
+    def _render_detail(self, task_id: str) -> None:
+        svc = self._svc_for_task(task_id)
+        if svc is None:
+            self.detail.update("[red]Could not open project database for this task.[/red]")
+            return
+        try:
+            task = svc.get(task_id)
+            replies = svc.list_replies(task_id)
+        except Exception as exc:  # noqa: BLE001
+            self.detail.update(f"[red]Error loading task: {exc}[/red]")
+            svc.close()
+            return
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+        from pollypm.tz import format_relative
+
+        updated_iso = (
+            task.updated_at.isoformat()
+            if hasattr(task.updated_at, "isoformat") else str(task.updated_at or "")
+        )
+        created_iso = (
+            task.created_at.isoformat()
+            if hasattr(task.created_at, "isoformat") else str(task.created_at or "")
+        )
+        when = _fmt_time(updated_iso or created_iso)
+        rel = format_relative(updated_iso or created_iso)
+
+        sender = _format_sender(task)
+        sections: list[str] = []
+        subject = task.title or "(no subject)"
+        sections.append(f"[b #eef2f4]{_escape(subject)}[/b #eef2f4]")
+        meta_bits = [f"[#5b8aff]{_escape(sender)}[/#5b8aff]"]
+        if when:
+            meta_bits.append(f"[#97a6b2]{_escape(when)}[/#97a6b2]")
+        if rel:
+            meta_bits.append(f"[dim]{_escape(rel)}[/dim]")
+        if task.project and task.project != "inbox":
+            meta_bits.append(f"[dim]\u00b7 {_escape(task.project)}[/dim]")
+        prio = getattr(task.priority, "value", str(task.priority))
+        if prio and prio != "normal":
+            meta_bits.append(f"[#f0c45a]\u25c6 {_escape(prio)}[/#f0c45a]")
+        sections.append("  \u00b7  ".join(meta_bits))
+        sections.append("")  # blank line before body
+        body = task.description or "(no body)"
+        sections.append(_md_to_rich(_escape_body(body)))
+
+        if replies:
+            sections.append("")
+            sections.append(f"[dim]\u2500\u2500 thread ({len(replies)}) \u2500\u2500[/dim]")
+            for entry in replies:
+                e_iso = (
+                    entry.timestamp.isoformat()
+                    if hasattr(entry.timestamp, "isoformat") else str(entry.timestamp)
+                )
+                age = format_relative(e_iso)
+                who = entry.actor or "user"
+                sections.append("")
+                sections.append(
+                    f"[b #5b8aff]{_escape(who)}[/b #5b8aff]  [dim]{_escape(age)}[/dim]"
+                )
+                sections.append(_md_to_rich(_escape_body(entry.text)))
+
+        self.detail.update("\n".join(sections))
+        # Auto-scroll to top of the new message so subject is visible.
+        try:
+            self.query_one("#inbox-detail-scroll", VerticalScroll).scroll_home(
+                animate=False,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ------------------------------------------------------------------
+    # Selection / navigation
+    # ------------------------------------------------------------------
+
+    def _sync_selection_from_list(self) -> None:
+        idx = self.list_view.index
+        if idx is None or idx < 0 or idx >= len(self._tasks):
+            return
+        task = self._tasks[idx]
+        if task.task_id == self._selected_task_id:
+            return
+        self._selected_task_id = task.task_id
+        self._render_detail(task.task_id)
+        self._mark_open_read(task.task_id, idx)
+
+    def action_cursor_down(self) -> None:
+        if self.reply_input.has_focus:
+            return
+        self.list_view.action_cursor_down()
+        self._sync_selection_from_list()
+
+    def action_cursor_up(self) -> None:
+        if self.reply_input.has_focus:
+            return
+        self.list_view.action_cursor_up()
+        self._sync_selection_from_list()
+
+    def action_cursor_first(self) -> None:
+        if self._tasks:
+            self.list_view.index = 0
+            self._sync_selection_from_list()
+
+    def action_cursor_last(self) -> None:
+        if self._tasks:
+            self.list_view.index = len(self._tasks) - 1
+            self._sync_selection_from_list()
+
+    def action_open_selected(self) -> None:
+        self._sync_selection_from_list()
+
+    def action_refresh(self) -> None:
+        self._refresh_list(select_first=False)
+
+    def action_back_or_cancel(self) -> None:
+        """Esc/q cancels an open reply; otherwise returns to cockpit nav."""
+        if self.reply_input.has_class("visible"):
+            self._cancel_reply()
+            return
+        self.exit()
+
+    @on(ListView.Selected, "#inbox-list")
+    def _on_row_selected(self, event: ListView.Selected) -> None:
+        row = event.item
+        if not isinstance(row, _InboxListItem):
+            return
+        self._selected_task_id = row.task_id
+        self._render_detail(row.task_id)
+        idx = self.list_view.index or 0
+        self._mark_open_read(row.task_id, idx)
+
+    @on(ListView.Highlighted, "#inbox-list")
+    def _on_row_highlighted(self, event: ListView.Highlighted) -> None:
+        # Keyboard j/k emits Highlighted before any Selected; render eagerly
+        # so the right pane tracks the cursor without requiring Enter.
+        row = event.item
+        if not isinstance(row, _InboxListItem):
+            return
+        if self._selected_task_id == row.task_id:
+            return
+        self._selected_task_id = row.task_id
+        self._render_detail(row.task_id)
+
+    # ------------------------------------------------------------------
+    # Read / archive / reply actions
+    # ------------------------------------------------------------------
+
+    def _mark_open_read(self, task_id: str, row_index: int) -> None:
+        if task_id not in self._unread_ids:
+            return
+        svc = self._svc_for_task(task_id)
+        if svc is None:
+            return
+        wrote = False
+        try:
+            wrote = svc.mark_read(task_id, actor="user")
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+        if wrote:
+            self._emit_event(
+                task_id, "inbox.message.read", f"user opened {task_id}",
+            )
+        # Clear unread styling regardless — the row should update even if
+        # the underlying mark_read raced.
+        self._unread_ids.discard(task_id)
+        try:
+            children = list(self.list_view.children)
+            if 0 <= row_index < len(children):
+                row = children[row_index]
+                if isinstance(row, _InboxListItem):
+                    row.mark_read()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def action_archive_selected(self) -> None:
+        task_id = self._selected_task_id
+        if task_id is None:
+            return
+        svc = self._svc_for_task(task_id)
+        if svc is None:
+            self.notify("Could not open project database.", severity="error")
+            return
+        try:
+            svc.archive_task(task_id, actor="user")
+        except Exception as exc:  # noqa: BLE001
+            self.notify(f"Archive failed: {exc}", severity="error")
+            return
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._emit_event(
+            task_id, "inbox.message.archived", f"user archived {task_id}",
+        )
+        self.notify(f"Archived {task_id}", severity="information", timeout=2.0)
+        # Remove from local state + list so the row disappears immediately
+        # (the 8s background refresh would do it anyway, but snappy UX).
+        self._tasks = [t for t in self._tasks if t.task_id != task_id]
+        self._unread_ids.discard(task_id)
+        if self._selected_task_id == task_id:
+            self._selected_task_id = None
+        self._render_list(select_first=bool(self._tasks))
+
+    def action_start_reply(self) -> None:
+        task_id = self._selected_task_id
+        if task_id is None:
+            return
+        self._reply_target_id = task_id
+        self.reply_input.value = ""
+        self.reply_input.add_class("visible")
+        self.reply_input.focus()
+
+    def _cancel_reply(self) -> None:
+        self._reply_target_id = None
+        self.reply_input.value = ""
+        self.reply_input.remove_class("visible")
+        self.list_view.focus()
+
+    @on(Input.Submitted, "#inbox-reply")
+    def _on_reply_submitted(self, event: Input.Submitted) -> None:
+        body = (event.value or "").strip()
+        task_id = self._reply_target_id
+        if not body or not task_id:
+            self._cancel_reply()
+            return
+        svc = self._svc_for_task(task_id)
+        if svc is None:
+            self.notify("Could not open project database.", severity="error")
+            self._cancel_reply()
+            return
+        try:
+            svc.add_reply(task_id, body, actor="user")
+        except Exception as exc:  # noqa: BLE001
+            self.notify(f"Reply failed: {exc}", severity="error")
+            self._cancel_reply()
+            return
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._emit_event(
+            task_id, "inbox.reply_received", f"user replied to {task_id}: {body[:60]}",
+        )
+        self._cancel_reply()
+        # Re-render the detail pane so the new reply appears in-thread.
+        self._render_detail(task_id)
+
+    # ------------------------------------------------------------------
+    # Event emission
+    # ------------------------------------------------------------------
+
+    def _emit_event(self, task_id: str, event_type: str, message: str) -> None:
+        """Record an activity-feed event on the project-root state.db.
+
+        Matches the shape used by ``pm notify`` so the same consumers see
+        inbox.read / archived / reply alongside inbox.message.created.
+        Fire-and-forget — we never block the UI on event bookkeeping.
+        """
+        try:
+            from pollypm.storage.state import StateStore
+            project_key = task_id.split("/", 1)[0]
+            config = load_config(self.config_path)
+            project = config.projects.get(project_key)
+            if project is None:
+                return
+            db_path = project.path / ".pollypm" / "state.db"
+            if not db_path.exists():
+                return
+            store = StateStore(db_path)
+            try:
+                store.record_event("cockpit", event_type, message)
+            finally:
+                store.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _escape(s: str) -> str:
+    """Escape Rich markup brackets in a short span of text."""
+    if not s:
+        return ""
+    return str(s).replace("[", r"\[").replace("]", r"\]")
+
+
+def _escape_body(s: str) -> str:
+    """Escape Rich brackets for body text while preserving newlines.
+
+    ``_md_to_rich`` re-adds its own markup; we only need to neutralise
+    user-typed brackets so they render as literal characters.
+    """
+    if not s:
+        return ""
+    return str(s).replace("[", r"\[").replace("]", r"\]")

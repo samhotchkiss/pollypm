@@ -2334,8 +2334,20 @@ class SQLiteWorkService:
     # Context log
     # ------------------------------------------------------------------
 
-    def add_context(self, task_id: str, actor: str, text: str) -> ContextEntry:
-        """Append a context entry to a task's log."""
+    def add_context(
+        self,
+        task_id: str,
+        actor: str,
+        text: str,
+        *,
+        entry_type: str = "note",
+    ) -> ContextEntry:
+        """Append a context entry to a task's log.
+
+        ``entry_type`` classifies the row. ``"note"`` is the default (generic
+        context log, mirrors prior behaviour). Inbox callers use ``"reply"``
+        or ``"read"`` via :meth:`add_reply` and :meth:`mark_read` helpers.
+        """
         project, number = _parse_task_id(task_id)
         # Validate task exists
         row = self._conn.execute(
@@ -2348,15 +2360,16 @@ class SQLiteWorkService:
         now = _now()
         self._conn.execute(
             "INSERT INTO work_context_entries "
-            "(task_project, task_number, actor, text, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (project, number, actor, text, now),
+            "(task_project, task_number, actor, text, created_at, entry_type) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (project, number, actor, text, now, entry_type),
         )
         self._conn.commit()
         return ContextEntry(
             actor=actor,
             timestamp=datetime.fromisoformat(now),
             text=text,
+            entry_type=entry_type,
         )
 
     def get_context(
@@ -2364,8 +2377,14 @@ class SQLiteWorkService:
         task_id: str,
         limit: int | None = None,
         since: datetime | None = None,
+        entry_type: str | None = None,
     ) -> list[ContextEntry]:
-        """Query context entries for a task, most recent first."""
+        """Query context entries for a task, most recent first.
+
+        When ``entry_type`` is given, only rows matching that tag are
+        returned — pass ``"reply"`` for the inbox thread view,
+        ``"read"`` for read markers, or ``None`` for every row.
+        """
         project, number = _parse_task_id(task_id)
         clauses = ["task_project = ?", "task_number = ?"]
         params: list[object] = [project, number]
@@ -2374,6 +2393,10 @@ class SQLiteWorkService:
             clauses.append("created_at > ?")
             params.append(since.isoformat())
 
+        if entry_type is not None:
+            clauses.append("entry_type = ?")
+            params.append(entry_type)
+
         where = " AND ".join(clauses)
         sql = f"SELECT * FROM work_context_entries WHERE {where} ORDER BY id DESC"
 
@@ -2381,14 +2404,131 @@ class SQLiteWorkService:
             sql += f" LIMIT {int(limit)}"
 
         rows = self._conn.execute(sql, params).fetchall()
-        return [
-            ContextEntry(
-                actor=r["actor"],
-                timestamp=datetime.fromisoformat(r["created_at"]),
-                text=r["text"],
+        entries = []
+        for r in rows:
+            # entry_type may be absent on rows written before migration 3
+            # on a DB that was still being upgraded; coerce defensively.
+            try:
+                etype = r["entry_type"] or "note"
+            except (KeyError, IndexError):
+                etype = "note"
+            entries.append(
+                ContextEntry(
+                    actor=r["actor"],
+                    timestamp=datetime.fromisoformat(r["created_at"]),
+                    text=r["text"],
+                    entry_type=etype,
+                )
             )
-            for r in rows
-        ]
+        return entries
+
+    # ------------------------------------------------------------------
+    # Inbox actions — reply / archive / read-marker
+    #
+    # These three methods are the work-service backing for the cockpit's
+    # interactive inbox screen. Each wraps a primitive (add_context,
+    # mark_done) with the idempotency + event-emission shape the UI
+    # expects, so the Textual layer stays focused on interaction and
+    # doesn't reinvent state management.
+    # ------------------------------------------------------------------
+
+    def add_reply(
+        self, task_id: str, body: str, actor: str = "user",
+    ) -> ContextEntry:
+        """Record a user reply on an inbox task.
+
+        Stored as a ``work_context_entries`` row with ``entry_type='reply'``
+        so :meth:`list_replies` and the inbox thread view can render chat
+        turns without collision with system/notes context.
+
+        Raises :class:`ValidationError` when ``body`` is empty after strip.
+        """
+        if not body or not body.strip():
+            raise ValidationError("Reply body must not be empty.")
+        return self.add_context(
+            task_id, actor, body.strip(), entry_type="reply",
+        )
+
+    def archive_task(self, task_id: str, actor: str = "user") -> Task:
+        """Flip an inbox task to the chat-flow terminal state.
+
+        Idempotent: archiving an already-terminal task is a no-op and
+        returns the current record unchanged. Uses the same underlying
+        transition shape as :meth:`mark_done` so dashboard counts and
+        dependency unblocking stay consistent.
+        """
+        task = self.get(task_id)
+        if task.work_status in TERMINAL_STATUSES:
+            return task
+        now = _now()
+        self._record_transition(
+            task.project,
+            task.task_number,
+            task.work_status.value,
+            WorkStatus.DONE.value,
+            actor,
+            reason="inbox.archive",
+        )
+        self._conn.execute(
+            "UPDATE work_tasks SET work_status = ?, updated_at = ? "
+            "WHERE project = ? AND task_number = ?",
+            (WorkStatus.DONE.value, now, task.project, task.task_number),
+        )
+        self._conn.commit()
+        # Cascade: any dependents blocked on this task should unblock,
+        # same as mark_done. archive_task is effectively 'done' for the
+        # chat-flow, so we respect the same contract.
+        try:
+            self._check_auto_unblock(task_id)
+        except Exception:  # noqa: BLE001
+            # Unblock cascading is best-effort — never let it break archive.
+            logger.debug("auto_unblock after archive failed", exc_info=True)
+        return self.get(task_id)
+
+    def mark_read(self, task_id: str, actor: str = "user") -> bool:
+        """Record a read-marker on an inbox task if one isn't already present.
+
+        Returns ``True`` when a new marker row was written, ``False`` when
+        a read row already existed (idempotent repeat-open). Callers use
+        the return value to gate event emission so the activity feed only
+        sees the *first* open.
+        """
+        project, number = _parse_task_id(task_id)
+        row = self._conn.execute(
+            "SELECT 1 FROM work_tasks WHERE project = ? AND task_number = ?",
+            (project, number),
+        ).fetchone()
+        if row is None:
+            raise TaskNotFoundError(f"Task '{task_id}' not found.")
+        existing = self._conn.execute(
+            "SELECT 1 FROM work_context_entries "
+            "WHERE task_project = ? AND task_number = ? AND entry_type = 'read' "
+            "LIMIT 1",
+            (project, number),
+        ).fetchone()
+        if existing is not None:
+            return False
+        now = _now()
+        self._conn.execute(
+            "INSERT INTO work_context_entries "
+            "(task_project, task_number, actor, text, created_at, entry_type) "
+            "VALUES (?, ?, ?, ?, ?, 'read')",
+            (project, number, actor, "opened in cockpit inbox", now),
+        )
+        self._conn.commit()
+        return True
+
+    def list_replies(self, task_id: str) -> list[ContextEntry]:
+        """Return reply entries for a task in chronological (oldest first) order.
+
+        Thin wrapper over :meth:`get_context` so callers don't need to
+        remember the ``entry_type='reply'`` convention, and so the inbox
+        view can render the thread in natural reading order without the
+        reverse() gymnastics the general context log requires.
+        """
+        entries = self.get_context(task_id, entry_type="reply")
+        entries.reverse()  # get_context returns newest-first
+        return entries
 
     # ------------------------------------------------------------------
     # Queries

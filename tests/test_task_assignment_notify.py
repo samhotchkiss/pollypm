@@ -117,18 +117,19 @@ class TestRoleCandidates:
         ]
 
     def test_reviewer_pins_to_pm_reviewer(self):
-        assert role_candidate_names("reviewer", "ignored") == ["pm-reviewer"]
+        # Returns both session-config key and window name (#272).
+        assert role_candidate_names("reviewer", "ignored") == ["reviewer", "pm-reviewer"]
 
     def test_operator_pins_to_pm_operator(self):
-        assert role_candidate_names("operator", "x") == ["pm-operator"]
+        assert role_candidate_names("operator", "x") == ["operator", "pm-operator"]
 
     def test_heartbeat_supervisor_pins_to_pm_heartbeat(self):
-        assert role_candidate_names("heartbeat-supervisor", "x") == ["pm-heartbeat"]
+        assert role_candidate_names("heartbeat-supervisor", "x") == ["heartbeat", "pm-heartbeat"]
         # alias
-        assert role_candidate_names("heartbeat", "x") == ["pm-heartbeat"]
+        assert role_candidate_names("heartbeat", "x") == ["heartbeat", "pm-heartbeat"]
 
     def test_triage(self):
-        assert role_candidate_names("triage", "x") == ["pm-triage"]
+        assert role_candidate_names("triage", "x") == ["triage", "pm-triage"]
 
     def test_critic_passes_through(self):
         assert role_candidate_names("critic_simplicity", "x") == ["critic_simplicity"]

@@ -31,18 +31,22 @@ Supervisor-direct imports are confined to the allow-list.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 from pollypm.agent_profiles import get_agent_profile
 from pollypm.agent_profiles.base import AgentProfileContext
@@ -72,6 +76,20 @@ _OWNER_PREFIXES = {
     "polly": "P:",
     "pollypm": "[PollyPM]",
     "operator": "P:",
+}
+
+
+# Map a session role to a persona marker that should appear in the
+# pane after a successful kickoff. Used by the verify-after-kickoff
+# backstop (see ``Supervisor._schedule_persona_verify``) to catch
+# (launch, target) tuple crosses where one role's control prompt
+# lands in a different role's window. ``worker`` has no stable
+# persona and ``triage`` does not currently brand itself, so both
+# are intentionally omitted.
+_ROLE_PERSONA_MARKER: dict[str, str] = {
+    "operator-pm": "Polly",
+    "reviewer": "Russell",
+    "heartbeat-supervisor": "Heartbeat",
 }
 
 
@@ -548,8 +566,6 @@ class Supervisor:
         launches: list[SessionLaunchSpec],
         on_status: Callable[[str], None] | None = None,
     ) -> None:
-        import threading
-
         storage_session = self.storage_closet_session_name()
         (self.config.project.base_dir / "cockpit_state.json").unlink(missing_ok=True)
         self._bootstrap_clear_markers()
@@ -2429,8 +2445,89 @@ class Supervisor:
         self.session_service.tmux.send_keys(target, kickoff)
         self._verify_input_submitted(target, kickoff, launch)
         fresh_marker.unlink(missing_ok=True)
+        # Backup defense against (launch, target) crossed tuples: capture
+        # the pane a few seconds later and confirm the expected persona
+        # marker shows up. Non-blocking — fire-and-forget.
+        self._schedule_persona_verify(launch, target)
+
+    def _assert_session_launch_matches(
+        self, session_name: str, initial_input: str,
+    ) -> None:
+        """Fail loud if ``session_name`` doesn't resolve to a matching launch.
+
+        Two conditions are checked before we write a control-prompt file
+        or hand text to the pane:
+
+        1. ``launch.session.name == session_name`` — the planner returned
+           a launch for the name we were asked to prepare for.
+        2. ``launch.window_name`` matches the session's configured window
+           (``SessionConfig.window_name`` or, when unset, the session
+           name) — the (launch, target) tuple hasn't been crossed.
+
+        On mismatch we log loudly, record a ``persona_swap_detected``
+        event, and raise. A stuck pane is far easier to debug than a
+        reviewer masquerading as Polly, which is the failure mode we
+        observed overnight (2026-04-16: ``pm-operator`` window was
+        running Russell's prompt; root cause in the recovery/bootstrap
+        threading path is untraced).
+        """
+        try:
+            launch = self.launch_by_session(session_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "persona_swap_detected: no launch for session_name=%r: %s",
+                session_name, exc,
+            )
+            try:
+                self.store.record_event(
+                    session_name,
+                    "persona_swap_detected",
+                    f"no launch resolves for session_name={session_name!r}: {exc}",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            raise RuntimeError(
+                f"persona_swap_detected: no launch for session_name={session_name!r}"
+            ) from exc
+
+        cfg = self.config.sessions.get(session_name)
+        expected_window = None
+        if cfg is not None:
+            expected_window = cfg.window_name or cfg.name
+
+        mismatch_name = launch.session.name != session_name
+        mismatch_window = (
+            expected_window is not None and launch.window_name != expected_window
+        )
+        if mismatch_name or mismatch_window:
+            logger.error(
+                "persona_swap_detected: session_name=%r launch.session.name=%r "
+                "launch.window_name=%r expected_window=%r role=%r",
+                session_name,
+                launch.session.name,
+                launch.window_name,
+                expected_window,
+                launch.session.role,
+            )
+            details = (
+                f"session_name={session_name!r} "
+                f"launch.session.name={launch.session.name!r} "
+                f"launch.window_name={launch.window_name!r} "
+                f"expected_window={expected_window!r} "
+                f"role={launch.session.role!r}"
+            )
+            try:
+                self.store.record_event(
+                    session_name, "persona_swap_detected", details,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            raise RuntimeError(f"persona_swap_detected: {details}")
 
     def _prepare_initial_input(self, session_name: str, initial_input: str) -> str:
+        # Fail-loud persona-swap guard. Raises before we touch disk or
+        # the pane when the (launch, target) tuple looks wrong.
+        self._assert_session_launch_matches(session_name, initial_input)
         if len(initial_input) <= 280:
             return initial_input
         prompts_dir = self.config.project.base_dir / "control-prompts"
@@ -2455,6 +2552,93 @@ class Supervisor:
         return (
             f'Read {display_path}, adopt it as your operating instructions, reply only "ready", then wait.'
         )
+
+    def _schedule_persona_verify(self, launch: SessionLaunchSpec, target: str) -> None:
+        """Schedule a one-shot verify-after-kickoff on a background thread.
+
+        Backup defense against crossed ``(launch, target)`` tuples. The
+        strict assertion in :meth:`_prepare_initial_input` is the
+        primary line of defense; this runs 5 s after the kickoff send
+        and confirms the pane actually contains the expected persona
+        marker. If the pane instead shows a *different* persona, we
+        record ``persona_swap_verified`` and re-send the correct prompt
+        (which will itself fail-safe through the assertion if something
+        is still wrong).
+
+        Tolerant by design: one capture attempt, one retry send, then
+        log and give up. Never loops.
+        """
+        role = launch.session.role
+        expected = _ROLE_PERSONA_MARKER.get(role)
+        if expected is None:
+            # Worker / triage: no stable persona marker — nothing to verify.
+            return
+
+        def _run() -> None:
+            try:
+                time.sleep(5.0)
+                try:
+                    pane = self.session_service.tmux.capture_pane(target, lines=50)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "persona verify: capture_pane failed for %s: %s",
+                        launch.session.name, exc,
+                    )
+                    return
+                unexpected = [
+                    marker for other_role, marker in _ROLE_PERSONA_MARKER.items()
+                    if other_role != role and marker in pane
+                ]
+                if expected in pane and not unexpected:
+                    return  # All good.
+                if expected not in pane and unexpected:
+                    details = (
+                        f"session_name={launch.session.name!r} "
+                        f"role={role!r} expected={expected!r} "
+                        f"found_markers={unexpected!r} target={target!r}"
+                    )
+                    logger.error("persona_swap_verified: %s", details)
+                    try:
+                        self.store.record_event(
+                            launch.session.name,
+                            "persona_swap_verified",
+                            details,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    # Attempt one recovery resend. _prepare_initial_input
+                    # will re-run the strict assertion and raise if the
+                    # (launch, target) tuple is still crossed, which is
+                    # the fail-safe we want.
+                    initial_input = launch.initial_input
+                    if not initial_input:
+                        return
+                    try:
+                        kickoff = self._prepare_initial_input(
+                            launch.session.name, initial_input,
+                        )
+                        self.session_service.tmux.send_keys(target, kickoff)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error(
+                            "persona verify: resend failed for %s: %s",
+                            launch.session.name, exc,
+                        )
+                # Otherwise: marker not present yet (pane still
+                # rendering), or both expected and unexpected present
+                # (control prompt being read, mentions other persona).
+                # Don't overreact.
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "persona verify thread crashed for %s: %s",
+                    launch.session.name, exc,
+                )
+
+        t = threading.Thread(
+            target=_run,
+            name=f"persona-verify-{launch.session.name}",
+            daemon=True,
+        )
+        t.start()
 
     def _stabilize_claude_launch(
         self, target: str, on_status: Callable[[str], None] | None = None,

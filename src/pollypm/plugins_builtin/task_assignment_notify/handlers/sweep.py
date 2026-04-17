@@ -117,6 +117,21 @@ def _build_event_for_task(work_service: Any, task: Any) -> TaskAssignmentEvent |
     if not actor_name:
         return None
     priority = getattr(task.priority, "value", str(task.priority))
+    # #279: look up the current execution's visit number so the dedupe
+    # key includes ``(session, task, execution_version)``. A rejection
+    # that bounces the task back to an earlier node opens a fresh visit,
+    # which correctly lets the retry ping through even inside the 30-min
+    # window. Best-effort — missing helper / errors fall back to 0,
+    # matching the pre-migration default for existing dedupe rows.
+    execution_version = 0
+    visit_fn = getattr(work_service, "current_node_visit", None)
+    if callable(visit_fn):
+        try:
+            execution_version = int(
+                visit_fn(task.project, task.task_number, node_id) or 0
+            )
+        except Exception:  # noqa: BLE001
+            execution_version = 0
     return TaskAssignmentEvent(
         task_id=task.task_id,
         project=task.project,
@@ -131,6 +146,7 @@ def _build_event_for_task(work_service: Any, task: Any) -> TaskAssignmentEvent |
         transitioned_at=datetime.now(timezone.utc),
         transitioned_by="sweeper",
         commit_ref=None,
+        execution_version=execution_version,
     )
 
 

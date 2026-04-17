@@ -183,10 +183,24 @@ class SQLiteWorkService:
                 # Shallow copy avoids mutating the caller's dataclass.
                 from dataclasses import replace
                 effective_task = replace(task, current_node_id=node_id)
+            # #279: carry the current node's visit counter so the
+            # notifier's dedupe treats a reject-bounce (which opens a
+            # fresh execution row at a higher visit) as a new ping
+            # opportunity instead of suppressing it inside the 30-min
+            # window keyed on (session, task).
+            try:
+                execution_version = self.current_node_visit(
+                    effective_task.project,
+                    effective_task.task_number,
+                    node_id,
+                )
+            except Exception:  # noqa: BLE001
+                execution_version = 0
             event = build_event_from_task(
                 effective_task,
                 node,
                 transitioned_by=task.assignee or "system",
+                execution_version=execution_version,
             )
             if event is not None:
                 _dispatch_task_assignment(event)
@@ -1404,6 +1418,31 @@ class SQLiteWorkService:
             (project, task_number, node_id),
         ).fetchone()
         return row["max_v"] + 1
+
+    def current_node_visit(
+        self, project: str, task_number: int, node_id: str
+    ) -> int:
+        """Return the visit number of the current execution at ``node_id``.
+
+        Used by the task-assignment notifier (#279) to key its dedupe on
+        ``(session, task, execution_version)`` so a reject-bounce back to
+        an earlier node unlocks the retry ping instead of being
+        suppressed by the 30-minute window that originally pinged the
+        worker at ``visit=1``.
+
+        Returns ``0`` when the task has no recorded execution for the
+        node yet — a queued task whose start node hasn't been entered
+        carries an implicit "zeroth visit", and downstream dedupe
+        treats that as one identity bucket (matching the pre-#279
+        column default).
+        """
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(visit), 0) AS max_v "
+            "FROM work_node_executions "
+            "WHERE task_project = ? AND task_number = ? AND node_id = ?",
+            (project, task_number, node_id),
+        ).fetchone()
+        return int(row["max_v"] or 0)
 
     def _advance_to_node(
         self,

@@ -44,6 +44,15 @@ class TaskAssignmentEvent:
     * ``work_status`` — the task's current work status (``"queued"`` /
       ``"in_progress"`` / ``"review"`` / ...). The sweeper uses this to
       re-enqueue only tasks sitting in ``queued`` or ``review``.
+    * ``execution_version`` — the ``work_node_executions.visit`` counter
+      for ``(task, current_node)`` at event-build time (#279). A
+      reject-bounce that reopens an earlier node bumps the visit, which
+      lets the notify dedupe treat the retry ping as a meaningfully-new
+      event rather than suppressing it inside the 30-min window.
+      Defaults to ``0`` for environments that can't compute a visit
+      (bare test doubles, pre-#279 rehydrated events) — pre-migration
+      dedupe semantics survive the default because existing
+      ``task_notifications`` rows back-fill to ``0`` as well.
     """
 
     task_id: str
@@ -59,6 +68,7 @@ class TaskAssignmentEvent:
     transitioned_at: datetime
     transitioned_by: str
     commit_ref: str | None = None
+    execution_version: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -352,12 +362,19 @@ def build_event_from_task(
     *,
     transitioned_by: str,
     commit_ref: str | None = None,
+    execution_version: int = 0,
 ) -> TaskAssignmentEvent | None:
     """Build a :class:`TaskAssignmentEvent` from a task + its current node.
 
     Returns ``None`` if the node has no machine-actor binding (i.e. the
     node is a human-review node, a terminal node, or lacks the
     ``actor_type`` attribute).
+
+    ``execution_version`` (#279) should be the ``visit`` counter on the
+    current node's active execution row. Pass ``0`` when the work
+    service can't resolve it — the dedupe still behaves correctly for
+    pre-migration rows, and the notify path will simply treat
+    ``visit=0`` as one identity bucket.
     """
     actor_type = getattr(node, "actor_type", None)
     if actor_type is None:
@@ -397,4 +414,5 @@ def build_event_from_task(
         transitioned_at=datetime.now(timezone.utc),
         transitioned_by=transitioned_by,
         commit_ref=commit_ref,
+        execution_version=int(execution_version or 0),
     )

@@ -771,6 +771,27 @@ class StateStore:
             """CREATE INDEX IF NOT EXISTS idx_task_notifications_session_task
                ON task_notifications(session_name, task_id, notified_at DESC)""",
         ]),
+        # --- Migration 12 ----------------------------------------------
+        # Reject-bounce retry fix (#279). The dedupe for task-assignment
+        # pings was keyed on ``(session_name, task_id)`` only, which
+        # meant a rejected worker couldn't be re-pinged when the task
+        # bounced back to ``implement`` — the 30-minute dedupe window
+        # kept the retry ping suppressed. We add an ``execution_version``
+        # column (the ``work_node_executions.visit`` counter for the
+        # task's current node at ping time) so the dedupe key becomes
+        # ``(session_name, task_id, execution_version)``. A reject that
+        # opens a fresh ``(node, visit=N+1)`` execution counts as a new
+        # ping opportunity; identical-state pings within the window are
+        # still suppressed. Existing rows default to ``0`` (column
+        # DEFAULT) — the same default a freshly-built event carries when
+        # the work service can't compute a visit — so pre-migration
+        # dedupe semantics survive the upgrade.
+        (12, "Dedupe includes execution_version (#279)", [
+            # Column addition + index creation handled via the dispatch
+            # block below (_safe_add_column + explicit CREATE INDEX) so
+            # the column is guaranteed to exist before the index touches
+            # it, and a fresh DB re-running the migration is idempotent.
+        ]),
     ]
 
     def _migrate(self) -> None:
@@ -840,6 +861,32 @@ class StateStore:
                 self.execute(
                     "CREATE INDEX IF NOT EXISTS idx_memory_entries_tier "
                     "ON memory_entries(scope_tier, scope, id DESC)"
+                )
+            elif version == 12:
+                # Reject-bounce retry fix (#279). The dedupe key now
+                # includes the current node's execution version (the
+                # ``work_node_executions.visit`` counter at ping time).
+                # Existing rows back-fill to ``0`` via the column
+                # DEFAULT, which matches the default version emitted by
+                # freshly-rebuilt events whose work service can't
+                # compute a visit — so pre-migration dedupe semantics
+                # survive the upgrade intact.
+                self._safe_add_column(
+                    "task_notifications",
+                    "execution_version",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                # Composite index supports the new dedupe query path —
+                # ``WHERE session = ? AND task = ? AND version = ? AND
+                # notified_at >= ?``. The original per-session-task
+                # index (migration 11) stays in place for pickup-log
+                # filters that don't care about version.
+                self.execute(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "idx_task_notifications_session_task_version "
+                    "ON task_notifications("
+                    "session_name, task_id, execution_version, "
+                    "notified_at DESC)"
                 )
             self.execute(
                 "INSERT INTO schema_version (version, description, applied_at) VALUES (?, ?, ?)",
@@ -1214,19 +1261,36 @@ class StateStore:
         project: str = "",
         message: str = "",
         delivery_status: str = "sent",
+        execution_version: int = 0,
     ) -> None:
         """Record a task-assignment ping sent to ``session_name``.
 
         The caller looks up ``was_notified_within`` beforehand to enforce
         the 30-minute throttle; this method just appends a row.
+
+        ``execution_version`` (#279) captures the ``visit`` counter of
+        the task's current node execution at ping time. A rejection that
+        bounces the task back to an earlier node spawns a fresh
+        execution with a higher visit — which the dedupe query below
+        correctly treats as a new ping opportunity instead of a
+        duplicate within the 30-minute window.
         """
         self.execute(
             """
             INSERT INTO task_notifications
-                (session_name, task_id, project, notified_at, delivery_status, message)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (session_name, task_id, project, notified_at,
+                 delivery_status, message, execution_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (session_name, task_id, project, self._now(), delivery_status, message),
+            (
+                session_name,
+                task_id,
+                project,
+                self._now(),
+                delivery_status,
+                message,
+                int(execution_version),
+            ),
         )
         self.commit()
 
@@ -1235,22 +1299,35 @@ class StateStore:
         session_name: str,
         task_id: str,
         window_seconds: int,
+        execution_version: int = 0,
     ) -> bool:
-        """Return ``True`` if ``(session, task)`` was pinged inside the window.
+        """Return ``True`` if ``(session, task, version)`` was pinged inside the window.
 
         ``window_seconds`` is the dedupe horizon — 30 min (``1800``) for
         the primary throttle, 5 min (``300``) for the sweeper's
         re-enqueue-avoidance cursor.
+
+        ``execution_version`` (#279) is matched exactly. A reject-bounce
+        that advances the task's current node execution to a fresh
+        ``visit`` yields a different version, so the dedupe returns
+        ``False`` and the retry ping gets through. Pre-#279 notification
+        rows back-fill to ``0`` via the column DEFAULT; events built
+        when the work service can't compute a visit also emit ``0``, so
+        identical-state pings still dedupe correctly across the
+        migration boundary.
         """
         from datetime import timedelta
         cutoff = (datetime.now(UTC) - timedelta(seconds=window_seconds)).isoformat()
         row = self.execute(
             """
             SELECT 1 FROM task_notifications
-            WHERE session_name = ? AND task_id = ? AND notified_at >= ?
+            WHERE session_name = ?
+              AND task_id = ?
+              AND execution_version = ?
+              AND notified_at >= ?
             LIMIT 1
             """,
-            (session_name, task_id, cutoff),
+            (session_name, task_id, int(execution_version), cutoff),
         ).fetchone()
         return row is not None
 
@@ -1282,7 +1359,8 @@ class StateStore:
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         sql = (
             "SELECT session_name, task_id, project, notified_at, "
-            "delivery_status, message FROM task_notifications"
+            "delivery_status, message, execution_version "
+            "FROM task_notifications"
             f"{where} ORDER BY notified_at DESC LIMIT ?"
         )
         params.append(int(limit))
@@ -1295,6 +1373,7 @@ class StateStore:
                 "notified_at": r[3],
                 "delivery_status": r[4],
                 "message": r[5],
+                "execution_version": r[6] if len(r) > 6 else 0,
             }
             for r in rows
         ]

@@ -53,6 +53,7 @@ def _event_from_payload(payload: dict[str, Any]) -> TaskAssignmentEvent:
         transitioned_at=transitioned_at,
         transitioned_by=str(payload.get("transitioned_by", "system")),
         commit_ref=payload.get("commit_ref"),
+        execution_version=int(payload.get("execution_version", 0) or 0),
     )
 
 
@@ -72,6 +73,9 @@ def event_to_payload(event: TaskAssignmentEvent) -> dict[str, Any]:
         "transitioned_at": event.transitioned_at.isoformat(),
         "transitioned_by": event.transitioned_by,
         "commit_ref": event.commit_ref,
+        # #279: carry the node's execution visit so the dedupe key on
+        # the receiving side treats a reject-bounce as a fresh ping.
+        "execution_version": int(event.execution_version or 0),
     }
 
 

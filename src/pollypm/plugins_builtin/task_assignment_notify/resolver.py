@@ -163,15 +163,31 @@ def notify(
 
     target_name = getattr(handle, "name", "")
 
+    # #279: key the dedupe on ``(session, task, execution_version)``.
+    # A rejection that bounces the task back to an earlier node opens a
+    # fresh ``work_node_executions.visit`` — that shows up here as a new
+    # ``execution_version`` and correctly lets the retry ping through
+    # even inside the 30-minute window that originally throttled the
+    # first ping at ``visit=1``. Events with no version (``0``) still
+    # dedupe against pre-migration rows (column DEFAULT 0), preserving
+    # the original throttle semantics across the upgrade.
+    execution_version = int(getattr(event, "execution_version", 0) or 0)
+
     # Dedupe: don't re-ping the same session about the same task within
-    # the throttle window.
+    # the throttle window at the same execution_version.
     if store is not None and throttle_seconds > 0:
         try:
-            if store.was_notified_within(target_name, event.task_id, throttle_seconds):
+            if store.was_notified_within(
+                target_name,
+                event.task_id,
+                throttle_seconds,
+                execution_version,
+            ):
                 return {
                     "outcome": "deduped",
                     "task_id": event.task_id,
                     "session": target_name,
+                    "execution_version": execution_version,
                 }
         except Exception:  # noqa: BLE001
             logger.debug(
@@ -203,6 +219,7 @@ def notify(
                     project=event.project,
                     message=message,
                     delivery_status=f"failed: {exc}"[:200],
+                    execution_version=execution_version,
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -211,6 +228,7 @@ def notify(
             "task_id": event.task_id,
             "session": target_name,
             "error": str(exc),
+            "execution_version": execution_version,
         }
 
     if store is not None:
@@ -221,6 +239,7 @@ def notify(
                 project=event.project,
                 message=message,
                 delivery_status="sent",
+                execution_version=execution_version,
             )
         except Exception:  # noqa: BLE001
             logger.debug(
@@ -232,6 +251,7 @@ def notify(
         "outcome": "sent",
         "task_id": event.task_id,
         "session": target_name,
+        "execution_version": execution_version,
     }
 
 

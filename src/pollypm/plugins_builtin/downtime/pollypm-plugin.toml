@@ -1,0 +1,25 @@
+api_version = "1"
+name = "downtime"
+kind = "recurring"
+version = "0.1.0"
+entrypoint = "plugin.py:plugin"
+description = "Downtime management: use idle LLM budget for autonomous exploration (speccing, speculative builds, audits, alternative approaches). Every downtime task ends with an inbox message — nothing auto-deploys."
+
+[[capabilities]]
+kind = "agent_profile"
+name = "explorer"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "job_handler"
+name = "downtime.tick"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "roster_entry"
+name = "downtime.tick"
+requires_api = ">=1,<2"
+
+[content]
+kinds = ["flow_template", "gate"]
+user_paths = ["flows", "gates"]

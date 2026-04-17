@@ -335,7 +335,11 @@ def test_release_expired_leases_clears_stale_lease_and_records_event(tmp_path: P
     )
 
 
-def test_run_heartbeat_releases_expired_leases_before_backend(monkeypatch, tmp_path: Path) -> None:
+def test_release_expired_leases_is_available_for_alerts_gc_handler(monkeypatch, tmp_path: Path) -> None:
+    """Lease release is now the ``alerts.gc`` recurring handler's job
+    (migrated from inline Phase 1 dispatch by #184). Verify the
+    supervisor-side API is still intact so the handler can call it.
+    """
     config = _config(tmp_path)
     config.pollypm.lease_timeout_minutes = 30
     supervisor = Supervisor(config)
@@ -347,24 +351,10 @@ def test_run_heartbeat_releases_expired_leases_before_backend(monkeypatch, tmp_p
         (expired_at, "operator"),
     )
     supervisor.store.commit()
-    seen: dict[str, object] = {}
 
-    class FakeHeartbeatBackend:
-        name = "fake"
-
-        def run(self, _api, *, snapshot_lines=200):
-            seen["lease"] = supervisor.store.get_lease("operator")
-            return []
-
-    monkeypatch.setattr(
-        "pollypm.supervisor.get_heartbeat_backend",
-        lambda name, root_dir=None: FakeHeartbeatBackend(),
-    )
-    monkeypatch.setattr("pollypm.supervisor.sync_token_ledger_for_config", lambda config: [])
-
-    supervisor.run_heartbeat()
-
-    assert seen["lease"] is None
+    released = supervisor.release_expired_leases()
+    assert [lease.session_name for lease in released] == ["operator"]
+    assert supervisor.store.get_lease("operator") is None
 
 
 def test_heartbeat_uses_separate_tmux_session(monkeypatch, tmp_path: Path) -> None:

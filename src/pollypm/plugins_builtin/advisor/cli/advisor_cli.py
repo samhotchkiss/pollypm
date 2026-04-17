@@ -1,12 +1,17 @@
 """``pm advisor`` CLI — history, status, pause/resume, enable/disable.
 
-ad04 ships ``pm advisor history`` (the sole observability surface for
-tuning the persona — NOT a rate limit). ad06 will mount the rest of
-the commands in this Typer app (status / pause / resume / enable /
-disable / history-stats). We declare the full app skeleton here so
-ad06 only has to add subcommands — not re-wire the mount.
-
 Spec: docs/advisor-plugin-spec.md §8 (history), §9 (CLI / config).
+Shipped incrementally: ad04 added ``history``; ad06 adds the rest
+(``status``, ``pause``, ``resume``, ``enable``, ``disable``).
+
+``[advisor]`` config block in ``pollypm.toml``:
+
+    [advisor]
+    enabled = true             # master kill switch — default true
+    cadence = "@every 30m"     # override for lower-noise projects
+
+All config changes take effect on the next rail restart — the plugin
+reads cadence once at ``register_roster`` time (spec §9).
 """
 from __future__ import annotations
 
@@ -23,6 +28,17 @@ from pollypm.plugins_builtin.advisor.handlers.history_log import (
     HistoryEntry,
     entries_in_window,
     stats,
+)
+from pollypm.plugins_builtin.advisor.settings import (
+    DEFAULT_CADENCE,
+    load_advisor_settings,
+)
+from pollypm.plugins_builtin.advisor.state import (
+    AdvisorState,
+    ProjectAdvisorState,
+    is_paused,
+    load_state,
+    save_state,
 )
 
 
@@ -220,3 +236,316 @@ def history_cmd(
 
     for e in entries:
         typer.echo(_format_text(e))
+
+
+# ---------------------------------------------------------------------------
+# [advisor].enabled toggle — text-level edit of pollypm.toml.
+# ---------------------------------------------------------------------------
+#
+# Mirrors the morning_briefing cli pattern: locate the [advisor] section,
+# replace the enabled line, or append the section if missing. We avoid
+# tomli_w / dumping the whole config so comments and ordering survive.
+
+
+_ADVISOR_ENABLED_RE = re.compile(
+    r"^(?P<indent>\s*)enabled\s*=\s*(?P<val>true|false)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _set_advisor_enabled(config_path: Path, enabled: bool) -> bool:
+    """Rewrite ``pollypm.toml`` so ``[advisor].enabled = <bool>``.
+
+    Returns True when the file was modified, False when the value was
+    already correct. Creates the ``[advisor]`` section if missing.
+    """
+    text = config_path.read_text()
+    target = "true" if enabled else "false"
+
+    lines = text.splitlines()
+    section_start: int | None = None
+    section_end: int | None = None
+    for idx, raw in enumerate(lines):
+        stripped = raw.strip()
+        if stripped == "[advisor]":
+            section_start = idx + 1
+            continue
+        if section_start is not None and stripped.startswith("[") and stripped.endswith("]"):
+            section_end = idx
+            break
+    if section_start is not None and section_end is None:
+        section_end = len(lines)
+
+    if section_start is not None:
+        found_at: int | None = None
+        for i in range(section_start, section_end or len(lines)):
+            m = _ADVISOR_ENABLED_RE.match(lines[i])
+            if m:
+                found_at = i
+                break
+        if found_at is not None:
+            if lines[found_at].split("=", 1)[1].strip().lower() == target:
+                return False
+            indent = _ADVISOR_ENABLED_RE.match(lines[found_at]).group("indent")  # type: ignore[union-attr]
+            lines[found_at] = f"{indent}enabled = {target}"
+        else:
+            lines.insert(section_start, f"enabled = {target}")
+    else:
+        if lines and lines[-1].strip() != "":
+            lines.append("")
+        lines.append("[advisor]")
+        lines.append(f"enabled = {target}")
+
+    new_text = "\n".join(lines)
+    if not new_text.endswith("\n"):
+        new_text += "\n"
+    if new_text == text:
+        return False
+    config_path.write_text(new_text)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# pm advisor enable / disable — config-level toggle.
+# ---------------------------------------------------------------------------
+
+
+@advisor_app.command("enable")
+def enable_cmd(
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path.",
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable output."),
+) -> None:
+    """Enable the advisor for this install."""
+    path = _require_config(config_path)
+    changed = _set_advisor_enabled(path, True)
+    payload = {"enabled": True, "changed": changed, "config_path": str(path)}
+    if as_json:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    typer.echo("advisor: enabled" if changed else "advisor: already enabled")
+
+
+@advisor_app.command("disable")
+def disable_cmd(
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path.",
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable output."),
+) -> None:
+    """Disable the advisor (until re-enabled)."""
+    path = _require_config(config_path)
+    changed = _set_advisor_enabled(path, False)
+    payload = {"enabled": False, "changed": changed, "config_path": str(path)}
+    if as_json:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    typer.echo("advisor: disabled" if changed else "advisor: already disabled")
+
+
+# ---------------------------------------------------------------------------
+# pm advisor pause / resume — per-project pause_until marker.
+# ---------------------------------------------------------------------------
+
+
+def _parse_pause_until(
+    *, hours: int | None, until: str | None,
+) -> datetime:
+    """Resolve a pause_until datetime from CLI flags.
+
+    Priority: ``--until YYYY-MM-DD`` > ``--hours N`` > default 24h.
+    Returns a tz-aware UTC datetime.
+    """
+    if until:
+        value = until.strip()
+        try:
+            # Accept bare dates (YYYY-MM-DD) and full ISO-8601 strings.
+            if "T" in value:
+                dt = datetime.fromisoformat(value)
+            else:
+                dt = datetime.fromisoformat(f"{value}T23:59:59+00:00")
+        except ValueError as exc:
+            raise typer.BadParameter(
+                f"--until must be YYYY-MM-DD or ISO-8601; got {until!r}"
+            ) from exc
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt
+    delta_hours = hours if (hours and hours > 0) else 24
+    return datetime.now(UTC) + timedelta(hours=delta_hours)
+
+
+def _resolve_project_key(
+    *, config, project_hint: str | None,
+) -> str:
+    """Pick a project key from CLI input, falling back to the ambient project."""
+    if project_hint:
+        return project_hint
+    ambient_name = (
+        getattr(getattr(config, "project", None), "name", None) or None
+    )
+    # Fall through to the ambient project name if known, otherwise the
+    # single tracked project, otherwise a fallback string.
+    if ambient_name:
+        return ambient_name
+    projects = getattr(config, "projects", {}) or {}
+    tracked = [k for k, v in projects.items() if getattr(v, "tracked", False)]
+    if len(tracked) == 1:
+        return tracked[0]
+    return "project"
+
+
+@advisor_app.command("pause")
+def pause_cmd(
+    hours: int = typer.Option(
+        24, "--hours", help="Pause duration in hours (ignored if --until set).",
+    ),
+    until: str | None = typer.Option(
+        None, "--until", help="Explicit YYYY-MM-DD or ISO-8601 resume time.",
+    ),
+    project: str | None = typer.Option(
+        None, "--project", help="Project key (defaults to the ambient project).",
+    ),
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path.",
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable output."),
+) -> None:
+    """Skip advisor ticks for a project until the given moment (default +24h)."""
+    path = _require_config(config_path)
+    cfg = load_config(path)
+    base_dir = _resolve_base_dir(path)
+    project_key = _resolve_project_key(config=cfg, project_hint=project)
+
+    pause_until = _parse_pause_until(hours=hours, until=until)
+    state = load_state(base_dir)
+    proj_state = state.get(project_key)
+    proj_state.pause_until = pause_until.isoformat()
+    save_state(base_dir, state)
+
+    payload = {
+        "project": project_key,
+        "pause_until": proj_state.pause_until,
+    }
+    if as_json:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    typer.echo(f"advisor: paused {project_key} until {proj_state.pause_until}")
+
+
+@advisor_app.command("resume")
+def resume_cmd(
+    project: str | None = typer.Option(
+        None, "--project", help="Project key (defaults to the ambient project).",
+    ),
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path.",
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable output."),
+) -> None:
+    """Clear a pause marker so the advisor resumes normal cadence."""
+    path = _require_config(config_path)
+    cfg = load_config(path)
+    base_dir = _resolve_base_dir(path)
+    project_key = _resolve_project_key(config=cfg, project_hint=project)
+
+    state = load_state(base_dir)
+    proj_state = state.get(project_key)
+    was_paused = bool(proj_state.pause_until)
+    proj_state.pause_until = ""
+    save_state(base_dir, state)
+
+    payload = {"project": project_key, "was_paused": was_paused}
+    if as_json:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    if was_paused:
+        typer.echo(f"advisor: resumed {project_key}")
+    else:
+        typer.echo(f"advisor: {project_key} was not paused")
+
+
+# ---------------------------------------------------------------------------
+# pm advisor status — current state + next-tick projection + 24h emit count.
+# ---------------------------------------------------------------------------
+
+
+def _next_scheduled(cadence: str, *, now_utc: datetime) -> str:
+    """Best-effort "next tick" projection for display only.
+
+    For ``@every <dur>`` cadences we project ``now + duration``; other
+    shapes (cron, @hourly, etc) emit the cadence string as-is. The
+    advisor's actual dispatch is driven by the roster — this field is
+    a human-readable cue, not a load-bearing schedule.
+    """
+    cadence = (cadence or DEFAULT_CADENCE).strip()
+    if cadence.startswith("@every"):
+        rest = cadence[len("@every"):].strip()
+        match = re.match(r"^(?P<n>\d+)\s*(?P<u>[smhd])$", rest, re.IGNORECASE)
+        if match:
+            n = int(match.group("n"))
+            unit = match.group("u").lower()
+            per_unit = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+            return (now_utc + timedelta(seconds=n * per_unit[unit])).isoformat()
+    return cadence
+
+
+@advisor_app.command("status")
+def status_cmd(
+    project: str | None = typer.Option(
+        None, "--project", help="Project key (defaults to the ambient project).",
+    ),
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path.",
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable output."),
+) -> None:
+    """Print advisor status: enabled? paused? last tick? emits-in-24h?"""
+    path = _require_config(config_path)
+    cfg = load_config(path)
+    settings = load_advisor_settings(path)
+    base_dir = _resolve_base_dir(path)
+    project_key = _resolve_project_key(config=cfg, project_hint=project)
+
+    state = load_state(base_dir)
+    proj_state: ProjectAdvisorState = state.get(project_key)
+
+    now_utc = datetime.now(UTC)
+    paused = is_paused(proj_state, now_utc=now_utc)
+
+    # 24-hour emit count for the project, via the history log.
+    since = now_utc - timedelta(hours=24)
+    emit_window = entries_in_window(
+        base_dir, since=since, project=project_key, decision="emit",
+    )
+
+    payload: dict[str, Any] = {
+        "project": project_key,
+        "plugin_enabled": settings.enabled,
+        "project_enabled": proj_state.enabled,
+        "cadence": settings.cadence,
+        "paused": paused,
+        "pause_until": proj_state.pause_until or None,
+        "last_run": proj_state.last_run or None,
+        "last_tick_at": proj_state.last_tick_at or None,
+        "next_tick": _next_scheduled(settings.cadence, now_utc=now_utc),
+        "emits_24h": len(emit_window),
+        "now_utc": now_utc.isoformat(),
+    }
+
+    if as_json:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return
+
+    typer.echo(f"project:          {payload['project']}")
+    typer.echo(f"plugin enabled:   {'yes' if payload['plugin_enabled'] else 'no'}")
+    typer.echo(f"project enabled:  {'yes' if payload['project_enabled'] else 'no'}")
+    typer.echo(f"cadence:          {payload['cadence']}")
+    typer.echo(f"paused:           {'yes' if payload['paused'] else 'no'}")
+    if payload["pause_until"]:
+        typer.echo(f"pause until:      {payload['pause_until']}")
+    typer.echo(f"last run:         {payload['last_run'] or '(never)'}")
+    typer.echo(f"last tick:        {payload['last_tick_at'] or '(never)'}")
+    typer.echo(f"next tick:        {payload['next_tick']}")
+    typer.echo(f"emits in last 24h: {payload['emits_24h']}")

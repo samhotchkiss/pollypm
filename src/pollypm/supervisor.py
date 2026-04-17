@@ -642,6 +642,35 @@ class Supervisor:
             self._send_initial_input_if_fresh(launch, tgt)
             self._mark_session_resume_ready(launch)
 
+        # Phase 5: Dispatch SessionCreatedEvent so #246's task-assignment
+        # listener can resume-ping any in-progress task owned by the new
+        # session. The bootstrap path uses tmux.create_* directly (not
+        # SessionService.create()), so the emitter baked into create()
+        # doesn't fire for these launches. Emit explicitly here.
+        try:
+            from pollypm.session_services.base import (
+                SessionCreatedEvent,
+                dispatch_session_event,
+            )
+            for launch, _tgt in stabilized:
+                try:
+                    dispatch_session_event(
+                        SessionCreatedEvent(
+                            name=launch.session.name,
+                            role=launch.session.role or "",
+                            project=launch.session.project or "",
+                            provider=launch.session.provider.value,
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    self.store.record_event(
+                        launch.session.name,
+                        "session_created_dispatch_failed",
+                        "bootstrap session.created dispatch failed",
+                    )
+        except ImportError:
+            pass  # session_services.base missing dispatcher — no-op (pre-#246 build)
+
     def shutdown_tmux(self) -> None:
         for session_name in reversed(self._all_tmux_session_names()):
             if self.session_service.tmux.has_session(session_name):

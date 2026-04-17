@@ -1,4 +1,4 @@
-"""Plan-presence gate — issue #273.
+"""Plan-presence gate — issues #273, #281.
 
 The sweeper refuses to delegate implementation tasks for a project
 until that project has a non-trivial, user-approved plan on disk.
@@ -30,10 +30,15 @@ A plan is "acceptable" iff ALL of the following hold:
 3. That done task's ``user_approval`` flow-node execution carries a
    ``decision='approved'`` — a ``rejected`` decision disqualifies the
    plan even if the file looks complete.
-4. ``plan.md``'s mtime is greater than or equal to the most recent
-   non-planning task's ``created_at`` timestamp in the project. Projects
-   with no non-planning tasks (fresh planner run, nothing emitted yet)
-   auto-pass this check.
+4. The plan's approval timestamp is greater than or equal to the most
+   recent non-planning task's ``created_at`` timestamp in the project.
+   Projects with no non-planning tasks auto-pass this staleness check.
+   (#281) The approval timestamp comes from a ``plan_approved`` context
+   entry written when the user approves the user_approval node. For
+   plans approved before this change shipped, the timestamp falls back
+   to the ``user_approval`` execution's ``completed_at``. File mtime
+   is **not** used — git operations, editor saves, and the planner's
+   own stage-8 emit all perturb it, making the gate unstable.
 
 A separate helper — ``task_bypasses_plan_gate`` — returns True when a
 task should skip the gate entirely. Two cases:
@@ -148,6 +153,57 @@ def _find_approved_plan_task(work_service: Any, project_key: str) -> Any | None:
     return None
 
 
+def _plan_approved_at(work_service: Any, plan_task: Any) -> float | None:
+    """Return the approval timestamp (epoch seconds) for ``plan_task``.
+
+    Preferred source: a ``work_context_entries`` row with
+    ``entry_type='plan_approved'`` — written inside the work-service
+    ``approve()`` call when a ``plan_project`` task's ``user_approval``
+    node is approved (issue #281).
+
+    Fallback for plans approved before #281 shipped: derive the
+    timestamp from the ``user_approval`` execution's ``completed_at``.
+    The fallback is critical — without it, every project that planned
+    pre-fix would be stuck behind the gate forever.
+
+    Returns None only when the plan is malformed (approved but no
+    completion timestamp anywhere) — which is vanishingly rare and
+    fails closed on the staleness check.
+    """
+    task_id = getattr(plan_task, "task_id", None)
+    if task_id:
+        try:
+            entries = work_service.get_context(
+                task_id, entry_type="plan_approved",
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "plan_presence: get_context failed for %s", task_id,
+                exc_info=True,
+            )
+            entries = []
+        if entries:
+            # get_context returns newest-first; take the most recent.
+            ts = entries[0].timestamp
+            if ts is not None:
+                return ts.timestamp()
+
+    # Fallback: the user_approval execution's completed_at. Walk
+    # backwards to find the latest APPROVED execution, matching the
+    # scan in _find_approved_plan_task.
+    for execution in reversed(getattr(plan_task, "executions", []) or []):
+        if execution.node_id != _APPROVAL_NODE:
+            continue
+        if execution.status is not ExecutionStatus.COMPLETED:
+            continue
+        if execution.decision is Decision.APPROVED:
+            completed = execution.completed_at
+            if completed is not None:
+                return completed.timestamp()
+            return None
+    return None
+
+
 def _latest_backlog_created_at(work_service: Any, project_key: str) -> float | None:
     """Return the most recent ``created_at`` timestamp across non-planning tasks.
 
@@ -189,9 +245,8 @@ def has_acceptable_plan(
     """Return True iff the project has a non-trivial, approved, fresh plan.
 
     See module docstring for the precise four-part contract. Fails
-    closed on any error — if we can't read the plan file, we can't
-    resolve the work service, or the plan mtime can't be stat'd, the
-    gate denies.
+    closed on any error — if we can't read the plan file, or we can't
+    derive the plan's approval timestamp, the gate denies.
 
     Callers should cache results per ``(project_key, sweep_tick)`` to
     avoid repeated disk reads across the many-queued-tasks case.
@@ -201,18 +256,23 @@ def has_acceptable_plan(
     plan_path = _resolve_plan_path(project_path, plan_dir)
     if not _plan_file_non_trivial(plan_path):
         return False
-    if _find_approved_plan_task(work_service, project_key) is None:
+    plan_task = _find_approved_plan_task(work_service, project_key)
+    if plan_task is None:
         return False
-    # Staleness check: plan.md must be at least as new as the newest
-    # non-planning task. If there's no backlog yet, nothing to be
-    # stale against.
+    # Staleness check (#281): the plan_approved timestamp must be at
+    # least as recent as the newest non-planning task. Timestamp comes
+    # from the ``plan_approved`` context entry written at approve()
+    # time; falls back to the user_approval execution's completed_at
+    # for plans approved pre-#281. If there's no backlog yet, nothing
+    # to be stale against. File mtime is intentionally NOT used —
+    # it's perturbed by git checkouts, editor saves, and the
+    # planner's own stage-8 emit.
     latest_backlog = _latest_backlog_created_at(work_service, project_key)
     if latest_backlog is not None:
-        try:
-            plan_mtime = plan_path.stat().st_mtime
-        except OSError:
+        plan_approved_ts = _plan_approved_at(work_service, plan_task)
+        if plan_approved_ts is None:
             return False
-        if plan_mtime < latest_backlog:
+        if plan_approved_ts < latest_backlog:
             return False
     return True
 

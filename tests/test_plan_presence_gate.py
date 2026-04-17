@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from pollypm.plugins_builtin.project_planning.plan_presence import (
@@ -130,7 +130,12 @@ def _create_queued_impl_task(
 
 
 def _create_done_approved_plan_task(
-    project_path: Path, *, project_key: str, decision: Decision = Decision.APPROVED,
+    project_path: Path,
+    *,
+    project_key: str,
+    decision: Decision = Decision.APPROVED,
+    approved_at: datetime | None = None,
+    write_plan_approved_entry: bool = True,
 ) -> None:
     """Stamp a plan_project task as done + approved via direct SQL.
 
@@ -141,6 +146,16 @@ def _create_done_approved_plan_task(
 
     ``decision`` lets the caller simulate a rejected outcome for the
     ``rejected`` test case.
+
+    ``approved_at`` overrides the timestamp stamped on both the
+    ``user_approval`` execution and the ``plan_approved`` context
+    entry. Pass a past ``datetime`` to simulate a stale approval.
+    Defaults to "now".
+
+    ``write_plan_approved_entry`` gates whether the explicit
+    ``plan_approved`` context entry is written. Pass ``False`` to
+    simulate a project that was approved *before* issue #281 shipped,
+    so the gate must fall back to the execution's ``completed_at``.
     """
     db_path = project_path / ".pollypm" / "state.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -164,7 +179,8 @@ def _create_done_approved_plan_task(
             (WorkStatus.DONE.value, project_key, task.task_number),
         )
         # Insert a user_approval execution row carrying the decision.
-        now = datetime.now(timezone.utc).isoformat()
+        stamp = approved_at or datetime.now(timezone.utc)
+        stamp_iso = stamp.isoformat()
         work._conn.execute(
             "INSERT INTO work_node_executions "
             "(task_project, task_number, node_id, visit, status, "
@@ -177,10 +193,31 @@ def _create_done_approved_plan_task(
                 1,
                 ExecutionStatus.COMPLETED.value,
                 decision.value,
-                now,
-                now,
+                stamp_iso,
+                stamp_iso,
             ),
         )
+        # Mirror the work-service behaviour (#281): on approve(), a
+        # plan_approved context entry is written. Tests can opt out
+        # to simulate pre-fix projects.
+        if (
+            decision is Decision.APPROVED
+            and write_plan_approved_entry
+        ):
+            work._conn.execute(
+                "INSERT INTO work_context_entries "
+                "(task_project, task_number, actor, text, "
+                "created_at, entry_type) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    project_key,
+                    task.task_number,
+                    "user",
+                    "plan approved",
+                    stamp_iso,
+                    "plan_approved",
+                ),
+            )
         work._conn.commit()
     finally:
         work.close()
@@ -307,6 +344,168 @@ class TestPredicate:
 
 
 # ---------------------------------------------------------------------------
+# #281 — plan_approved_at timestamp gate
+# ---------------------------------------------------------------------------
+
+
+class TestPlanApprovedAtTimestamp:
+    """Unit tests for the #281 timestamp-based freshness check.
+
+    These pin the fix that replaces file mtime with a work-service
+    timestamp. Each test drives the predicate directly via
+    ``has_acceptable_plan``; the sweep-handler layer is covered by
+    ``TestSweepHandlerGateIntegration``.
+    """
+
+    def test_gate_accepts_when_plan_approved_at_is_recent(self, tmp_path):
+        """plan_approved entry written → gate accepts, even with old file mtime."""
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        plan_path = _write_plan(proj)
+        # Force plan.md mtime into the past. Under the old mtime-based
+        # gate this would block; under #281 it is irrelevant because
+        # the gate reads the context-entry timestamp.
+        old = time.time() - 3600
+        os.utime(plan_path, (old, old))
+        # Queue the impl task first, then approve the plan — so the
+        # approval timestamp is strictly ≥ the impl task's created_at.
+        _create_queued_impl_task(proj, project_key="proj")
+        approved_at = datetime.now(timezone.utc) + timedelta(seconds=1)
+        _create_done_approved_plan_task(
+            proj, project_key="proj", approved_at=approved_at,
+        )
+
+        db_path = proj / ".pollypm" / "state.db"
+        work = SQLiteWorkService(db_path=db_path, project_path=proj)
+        try:
+            assert has_acceptable_plan("proj", proj, work) is True
+        finally:
+            work.close()
+
+    def test_gate_rejects_when_plan_not_yet_approved(self, tmp_path):
+        """No approved plan_project task → gate rejects."""
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        _write_plan(proj)
+        # A draft plan task — never approved.
+        _create_draft_plan_task(proj, project_key="proj")
+        _create_queued_impl_task(proj, project_key="proj")
+
+        db_path = proj / ".pollypm" / "state.db"
+        work = SQLiteWorkService(db_path=db_path, project_path=proj)
+        try:
+            assert has_acceptable_plan("proj", proj, work) is False
+        finally:
+            work.close()
+
+    def test_gate_rejects_when_plan_approved_at_predates_backlog(self, tmp_path):
+        """plan_approved_at < latest backlog task created_at → stale → reject."""
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        _write_plan(proj)
+        # Approval stamped an hour ago; the impl task below is created
+        # "now" so the approval is stale against it.
+        stale = datetime.now(timezone.utc) - timedelta(hours=1)
+        _create_done_approved_plan_task(
+            proj, project_key="proj", approved_at=stale,
+        )
+        _create_queued_impl_task(proj, project_key="proj")
+
+        db_path = proj / ".pollypm" / "state.db"
+        work = SQLiteWorkService(db_path=db_path, project_path=proj)
+        try:
+            assert has_acceptable_plan("proj", proj, work) is False
+        finally:
+            work.close()
+
+    def test_gate_falls_back_to_execution_completed_at_for_prefix_projects(
+        self, tmp_path,
+    ):
+        """Pre-#281 project (no plan_approved entry) → fallback accepts.
+
+        A project approved before #281 shipped won't have a
+        ``plan_approved`` context entry. The gate falls back to the
+        ``user_approval`` execution's ``completed_at`` — otherwise every
+        pre-fix project would be stuck behind the gate forever.
+        """
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        _write_plan(proj)
+        # Queue the impl task first so the approval (stamped after)
+        # is strictly ≥ its created_at — the fallback path is what we
+        # want to exercise here.
+        _create_queued_impl_task(proj, project_key="proj")
+        # write_plan_approved_entry=False simulates a pre-#281 task:
+        # execution row exists with decision=APPROVED + completed_at,
+        # but no plan_approved context entry.
+        approved_at = datetime.now(timezone.utc) + timedelta(seconds=1)
+        _create_done_approved_plan_task(
+            proj,
+            project_key="proj",
+            approved_at=approved_at,
+            write_plan_approved_entry=False,
+        )
+
+        db_path = proj / ".pollypm" / "state.db"
+        work = SQLiteWorkService(db_path=db_path, project_path=proj)
+        try:
+            # Sanity: no plan_approved entry exists — we're really
+            # testing the fallback.
+            task_rows = work._conn.execute(
+                "SELECT task_number FROM work_tasks "
+                "WHERE project = ? AND flow_template_id = 'plan_project'",
+                ("proj",),
+            ).fetchall()
+            assert len(task_rows) == 1
+            number = task_rows[0]["task_number"]
+            pae = work._conn.execute(
+                "SELECT COUNT(*) AS c FROM work_context_entries "
+                "WHERE task_project = ? AND task_number = ? "
+                "AND entry_type = 'plan_approved'",
+                ("proj", number),
+            ).fetchone()
+            assert pae["c"] == 0
+            assert has_acceptable_plan("proj", proj, work) is True
+        finally:
+            work.close()
+
+    def test_gate_ignores_file_mtime(self, tmp_path):
+        """File mtime is NOT consulted — backdating or future-dating is a no-op.
+
+        Pins the #281 invariant: git operations, editor saves, and the
+        planner's own stage-8 emit all perturb mtime. The gate must
+        ignore it entirely.
+        """
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        plan_path = _write_plan(proj)
+        # Queue the impl task first so the plan's approval timestamp
+        # is strictly newer than the backlog's created_at.
+        _create_queued_impl_task(proj, project_key="proj")
+        approved_at = datetime.now(timezone.utc) + timedelta(seconds=1)
+        _create_done_approved_plan_task(
+            proj, project_key="proj", approved_at=approved_at,
+        )
+
+        db_path = proj / ".pollypm" / "state.db"
+        work = SQLiteWorkService(db_path=db_path, project_path=proj)
+        try:
+            # Baseline: default mtime, gate accepts.
+            assert has_acceptable_plan("proj", proj, work) is True
+            # Future-dated mtime: still accepts.
+            future = time.time() + 3600
+            os.utime(plan_path, (future, future))
+            assert has_acceptable_plan("proj", proj, work) is True
+            # Backdated mtime: still accepts (decision is driven by
+            # the plan_approved context entry, not the file).
+            old = time.time() - 7200
+            os.utime(plan_path, (old, old))
+            assert has_acceptable_plan("proj", proj, work) is True
+        finally:
+            work.close()
+
+
+# ---------------------------------------------------------------------------
 # Sweep-handler integration tests
 # ---------------------------------------------------------------------------
 
@@ -319,13 +518,14 @@ class TestSweepHandlerGateIntegration:
         proj = tmp_path / "proj"
         proj.mkdir()
         _write_plan(proj)
-        _create_done_approved_plan_task(proj, project_key="proj")
+        # Queue the impl task first; approval timestamp sits strictly
+        # after its created_at, so the #281 staleness check passes.
         _create_queued_impl_task(proj, project_key="proj")
-        # The real pipeline touches plan.md during stage 8 so its mtime
-        # sits ≥ the emitted backlog's created_at. Simulate that here.
-        plan_path = proj / "docs" / "plan" / "plan.md"
-        future = time.time() + 1
-        os.utime(plan_path, (future, future))
+        _create_done_approved_plan_task(
+            proj,
+            project_key="proj",
+            approved_at=datetime.now(timezone.utc) + timedelta(seconds=1),
+        )
 
         store = StateStore(tmp_path / "workspace_state.db")
         session_svc = FakeSessionService(handles=[FakeHandle("worker-proj")])
@@ -431,18 +631,20 @@ class TestSweepHandlerGateIntegration:
         store.close()
 
     def test_stale_plan_blocks_delegation(self, tmp_path, monkeypatch):
-        """plan.md mtime older than latest backlog task → blocks."""
+        """plan_approved_at older than latest backlog task → blocks.
+
+        (#281) Freshness is keyed off the approval timestamp, not the
+        plan.md mtime. Stamp an approval from an hour ago; the queued
+        impl task's ``created_at`` is "now", so the plan is stale.
+        """
         proj = tmp_path / "proj"
         proj.mkdir()
-        # 1. Write the plan first.
-        plan_path = _write_plan(proj)
-        # 2. Backdate the plan's mtime to well before the queued task.
-        old = time.time() - 3600
-        os.utime(plan_path, (old, old))
-        # 3. Create the approved plan task + queued impl task — the
-        #    queued task's created_at timestamp is ``now``, so the
-        #    plan is stale by ~1h.
-        _create_done_approved_plan_task(proj, project_key="proj")
+        _write_plan(proj)
+        # Approval timestamp well before any backlog task is created.
+        stale = datetime.now(timezone.utc) - timedelta(hours=1)
+        _create_done_approved_plan_task(
+            proj, project_key="proj", approved_at=stale,
+        )
         _create_queued_impl_task(proj, project_key="proj")
 
         store = StateStore(tmp_path / "workspace_state.db")
@@ -578,12 +780,14 @@ class TestSweepHandlerGateIntegration:
         proj_a = tmp_path / "proj_a"
         proj_a.mkdir()
         _write_plan(proj_a)
-        _create_done_approved_plan_task(proj_a, project_key="alpha")
+        # Queue impl task first so the approval timestamp is strictly
+        # newer than the backlog's created_at (#281 staleness check).
         _create_queued_impl_task(proj_a, project_key="alpha")
-        # Touch plan.md so its mtime ≥ the impl task (see staleness rule).
-        plan_a = proj_a / "docs" / "plan" / "plan.md"
-        future = time.time() + 1
-        os.utime(plan_a, (future, future))
+        _create_done_approved_plan_task(
+            proj_a,
+            project_key="alpha",
+            approved_at=datetime.now(timezone.utc) + timedelta(seconds=1),
+        )
 
         # Project B: no plan, has impl task → plan_missing
         proj_b = tmp_path / "proj_b"

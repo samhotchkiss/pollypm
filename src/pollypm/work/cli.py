@@ -555,10 +555,34 @@ def task_claim(
     """Claim a queued task and start the flow."""
     svc = _svc(db, project=_project_from_task_id(task_id))
     task = _run(svc.claim, task_id, actor, skip_gates=skip_gates)
+    # Surface provisioning trouble instead of silently reporting success
+    # (#243). The DB claim is authoritative — the worker can proceed
+    # from an existing session — but the user needs to know the
+    # dedicated session didn't spin up.
+    provision_error = getattr(svc, "last_provision_error", None)
     if output_json:
-        typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
+        payload = _task_to_dict(task)
+        if provision_error:
+            payload["_provision_warning"] = provision_error
+        typer.echo(json.dumps(payload, indent=2, default=str))
     else:
         typer.echo(f"Claimed {task.task_id}")
+        if provision_error:
+            typer.echo(
+                f"\nWARNING: task claim recorded, but worker session "
+                f"provisioning failed:\n"
+                f"  {provision_error}\n"
+                f"\n"
+                f"What to do:\n"
+                f"  (a) If you're already inside a worker session for this project "
+                f"(e.g. started via `pm worker-start`), just continue working — "
+                f"the DB claim is in effect.\n"
+                f"  (b) Otherwise, put the task on hold and retry after fixing the "
+                f"underlying provisioning issue:\n"
+                f"      pm task hold {task.task_id} --reason 'provision failed'\n"
+                f"      pm task resume {task.task_id}",
+                err=True,
+            )
 
 
 @task_app.command("done")

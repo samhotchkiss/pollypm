@@ -393,6 +393,90 @@ class TestProvisionWorker:
         add_calls = [c for c in calls_log if "add" in c and "worktree" in c]
         assert add_calls, "expected git worktree add to be called for the dangling dir case"
 
+    def test_provision_worker_falls_back_to_new_window_when_session_exists(
+        self, manager, mock_tmux, tmp_project,
+    ):
+        """#243: claim against an existing storage-closet session must
+        succeed by routing through ``create_window`` rather than raising
+        from a failed ``new-session``.
+
+        Mirrors the E2E failure:
+          has_session() → True
+          → path should take the create_window branch.
+        """
+        # Storage-closet session already exists.
+        mock_tmux.has_session.return_value = True
+
+        with patch("pollypm.work.session_manager.subprocess") as mock_sub:
+            mock_sub.run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+            session = manager.provision_worker("proj/1", "agent-1")
+
+        # Should NOT have called create_session (would fail with "session
+        # already exists" in real tmux).
+        assert mock_tmux.create_session.call_count == 0
+        # Should have gone through create_window instead.
+        assert mock_tmux.create_window.call_count == 1
+        # Task still bound.
+        assert session.task_id == "proj/1"
+
+    def test_provision_worker_falls_back_on_new_session_race(
+        self, manager, mock_tmux, tmp_project,
+    ):
+        """#243: if ``has_session`` reports False but ``create_session``
+        then fails (race/inconsistency) AND the session now exists,
+        provision should swallow the error and use ``create_window``."""
+        # has_session returns False the first time (decision point), then
+        # True after create_session fails (race resolution).
+        mock_tmux.has_session.side_effect = [False, True, True, True, True, True]
+
+        def create_session_raises(*args, **kwargs):
+            raise subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["tmux", "new-session", "-d", "-s", "pollypm-storage-closet"],
+                stderr="duplicate session: pollypm-storage-closet",
+            )
+
+        mock_tmux.create_session.side_effect = create_session_raises
+
+        with patch("pollypm.work.session_manager.subprocess") as mock_sub:
+            mock_sub.run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+            session = manager.provision_worker("proj/1", "agent-1")
+
+        # Fallback path kicked in.
+        assert mock_tmux.create_window.call_count == 1
+        assert session.task_id == "proj/1"
+
+    def test_provision_worker_raises_provision_error_on_true_failure(
+        self, manager, mock_tmux, tmp_project,
+    ):
+        """#243: if tmux is actually broken (new-session fails AND
+        has_session still reports False), surface a ProvisionError so
+        ``pm task claim`` can show an actionable message instead of
+        silently continuing."""
+        from pollypm.work.session_manager import ProvisionError
+
+        mock_tmux.has_session.return_value = False
+
+        def create_session_raises(*args, **kwargs):
+            raise subprocess.CalledProcessError(
+                returncode=1,
+                cmd=["tmux", "new-session"],
+                stderr="server exited unexpectedly",
+            )
+
+        mock_tmux.create_session.side_effect = create_session_raises
+
+        with patch("pollypm.work.session_manager.subprocess") as mock_sub:
+            mock_sub.run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+            with pytest.raises(ProvisionError) as excinfo:
+                manager.provision_worker("proj/1", "agent-1")
+
+        # Error guidance should reference a recovery command (three-
+        # question rule).
+        msg = str(excinfo.value)
+        assert "tmux" in msg
+        assert "pm task release" in msg or "retry" in msg
+
     def test_provision_worker_reprovision_after_teardown(
         self, manager, mock_tmux, tmp_project,
     ):

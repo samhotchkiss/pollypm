@@ -294,6 +294,55 @@ class TestClaim:
         assert reloaded.work_status == WorkStatus.DRAFT
         assert reloaded.assignee is None
 
+    def test_claim_records_provision_error_breadcrumb(self, svc):
+        """#243: when a session manager raises during provisioning,
+        the error must be stashed on the service so the CLI can show
+        an actionable warning instead of a silent success."""
+
+        class _FailingSessionMgr:
+            def provision_worker(self, task_id, actor):
+                raise RuntimeError("tmux server unreachable")
+
+        svc.set_session_manager(_FailingSessionMgr())
+
+        task = _create_standard_task(svc, description="Work to do")
+        svc.queue(task.task_id, "pm")
+
+        assert svc.last_provision_error is None
+        claimed = svc.claim(task.task_id, "agent-1")
+
+        # Claim succeeded at the DB level...
+        assert claimed.work_status == WorkStatus.IN_PROGRESS
+        # ...but the error is surfaced so the CLI can flag it.
+        assert svc.last_provision_error is not None
+        assert "tmux server unreachable" in svc.last_provision_error
+
+    def test_claim_clears_stale_provision_error(self, svc):
+        """A successful provision after a previous failure must clear
+        the breadcrumb so a follow-up claim doesn't show a stale
+        warning."""
+        calls = {"n": 0}
+
+        class _FlakeySessionMgr:
+            def provision_worker(self, task_id, actor):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise RuntimeError("first attempt fails")
+                return object()  # succeeds on retry
+
+        svc.set_session_manager(_FlakeySessionMgr())
+
+        t1 = _create_standard_task(svc, description="first")
+        svc.queue(t1.task_id, "pm")
+        svc.claim(t1.task_id, "agent-1")
+        assert svc.last_provision_error is not None
+
+        t2 = _create_standard_task(svc, description="second")
+        svc.queue(t2.task_id, "pm")
+        svc.claim(t2.task_id, "agent-1")
+        # Breadcrumb cleared because the second provision succeeded.
+        assert svc.last_provision_error is None
+
 
 # ---------------------------------------------------------------------------
 # Cancel

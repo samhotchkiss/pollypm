@@ -128,8 +128,23 @@ class TmuxSessionService:
         _status = on_status or (lambda _msg: None)
         _status(f"Creating tmux window for {name}...")
 
+        # #243: new-session → new-window fallback. If has_session
+        # reports False but new-session then fails (TOCTOU race, exotic
+        # tmux state), check again and fall through to new-window
+        # rather than raising — same end state either way.
+        import subprocess as _subprocess
         if not self.tmux.has_session(tsession):
-            self.tmux.create_session(tsession, wname, cmd)
+            try:
+                self.tmux.create_session(tsession, wname, cmd)
+            except _subprocess.CalledProcessError:
+                if self.tmux.has_session(tsession):
+                    logger.info(
+                        "create: new-session raced for %r; using new-window",
+                        tsession,
+                    )
+                    self.tmux.create_window(tsession, wname, cmd, detached=True)
+                else:
+                    raise
             target = f"{tsession}:{wname}"
         else:
             self.tmux.create_window(tsession, wname, cmd, detached=True)

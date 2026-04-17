@@ -114,6 +114,10 @@ class SQLiteWorkService:
         self._conn.execute("PRAGMA foreign_keys=ON")
         create_work_tables(self._conn)
         self._gate_registry = GateRegistry(project_path=project_path)
+        # Last-provision-error breadcrumb — set by ``claim()`` when
+        # ``provision_worker`` fails so the CLI can surface it instead
+        # of reporting a silent success (#243).
+        self.last_provision_error: str | None = None
 
     def set_session_manager(self, session_manager: object) -> None:
         """Wire up the session manager after construction.
@@ -899,14 +903,19 @@ class SQLiteWorkService:
 
         result = self.get(task_id)
         self._sync_transition(result, WorkStatus.QUEUED.value, result.work_status.value)
+        # Reset any stale provision-error breadcrumb before attempting
+        # provisioning for this claim.
+        self.last_provision_error = None
         # Provision a per-task worker session with worktree
         if self._session_mgr is not None:
             try:
                 self._session_mgr.provision_worker(task_id, actor)
             except Exception as exc:  # noqa: BLE001
-                # Best-effort — task is claimed regardless. Log at
-                # warning so the user has a breadcrumb when the worker
-                # fails to launch.
+                # Best-effort — task is claimed regardless. Record the
+                # reason on the service so ``pm task claim`` can surface
+                # it (instead of a silent success, which was the #243
+                # E2E blocker).
+                self.last_provision_error = str(exc)
                 logger.warning(
                     "provision_worker failed for %s (actor=%s): %s",
                     task_id, actor, exc,

@@ -20,6 +20,21 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+
+class ProvisionError(RuntimeError):
+    """Raised when worker provisioning truly fails.
+
+    Surfaced to ``pm task claim`` so the user sees an actionable message
+    ("claim recorded, but session provisioning failed — run ``pm task
+    release`` and retry") rather than a silent log warning that leaves
+    the task stuck ``in_progress`` with no session. See #243.
+    """
+
+
+# ---------------------------------------------------------------------------
 # Data models
 # ---------------------------------------------------------------------------
 
@@ -295,10 +310,48 @@ class SessionManager:
 
         # Fallback: raw tmux client path. Used by tests that construct
         # SessionManager without a session_service.
+        #
+        # Robustness: if the storage-closet session doesn't appear to
+        # exist, try ``create_session`` first — but if that fails because
+        # the session was in fact already present (race, inconsistent
+        # ``has_session`` result, or exotic tmux state), fall back to
+        # ``create_window`` rather than raising. This is the #243 fix:
+        # ``pm task claim`` was hard-erroring on a benign "session
+        # already exists" condition.
         if not self._tmux.has_session(session_name):
-            self._tmux.create_session(session_name, window_name, claude_cmd)
+            try:
+                self._tmux.create_session(session_name, window_name, claude_cmd)
+            except _CalledProcessError as exc:
+                # Most common reason: someone else just created the
+                # session. Verify and fall back to new-window.
+                if self._tmux.has_session(session_name):
+                    logger.info(
+                        "provision_worker: new-session raced for %r; "
+                        "falling back to new-window",
+                        session_name,
+                    )
+                    self._tmux.create_window(
+                        session_name, window_name, claude_cmd, detached=True,
+                    )
+                else:
+                    # Genuinely couldn't create the session. Re-raise
+                    # with a more actionable error — caller (sqlite
+                    # service's claim() path) will surface this to the
+                    # user instead of silently logging.
+                    raise ProvisionError(
+                        f"Could not create tmux session '{session_name}': "
+                        f"{exc}. "
+                        f"Check that tmux is installed and running, then "
+                        f"run `pm task release <id>` and retry."
+                    ) from exc
             windows = self._tmux.list_windows(session_name)
-            pane_id = windows[0].pane_id if windows else "%0"
+            pane_id = "%0"
+            for w in windows:
+                if w.name == window_name:
+                    pane_id = w.pane_id
+                    break
+            if pane_id == "%0" and windows:
+                pane_id = windows[0].pane_id
         else:
             self._tmux.create_window(session_name, window_name, claude_cmd, detached=True)
             windows = self._tmux.list_windows(session_name)

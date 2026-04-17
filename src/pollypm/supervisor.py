@@ -1,3 +1,33 @@
+"""PollyPM Supervisor — session orchestration over tmux.
+
+Status: **late-stage decomposition** (see issues #179, #186). The
+Supervisor used to own every moving part of PollyPM's runtime; steps
+0–8 of the split extracted the durable pieces into dedicated modules:
+
+* ``pollypm.core.CoreRail`` — process-wide startup/shutdown rail.
+* ``pollypm.launch_planner`` / ``default_launch_planner`` — plan_launches
+  + effective_session + tmux_session_for_launch + launch_by_session.
+* ``pollypm.recovery`` / ``DefaultRecoveryPolicy`` — health classification
+  and intervention-ladder policy.
+* ``pollypm.session_services`` — tmux mechanics, session lifecycle.
+* ``pollypm.heartbeat`` / ``HeartbeatRail`` — sealed tick + job queue
+  + worker pool.
+* ``pollypm.core.console_window`` — cockpit console window manager (#186).
+
+What's left on this class is what hasn't been teased apart yet:
+tmux bootstrap + layout, session stabilization, recovery interventions,
+and the send_input surface. Removing Supervisor outright (or renaming it
+to ``LegacySupervisor``) was considered in #186 and deferred — the
+remaining surface is big enough that a single rename would ripple
+through every internal caller with zero architectural benefit. Instead,
+Supervisor stays as the orchestrator of those remaining responsibilities
+while future issues peel off one subsystem at a time.
+
+External callers **must** route through ``pollypm.service_api`` — the
+import-boundary test (``tests/test_import_boundary.py``) enforces that
+Supervisor-direct imports are confined to the allow-list.
+"""
+
 from __future__ import annotations
 
 import json
@@ -147,6 +177,9 @@ class Supervisor:
         # (``Supervisor.__new__`` in dashboard_data) can set the core
         # rail up by hand before first access.
         self._launch_planner_instance = None
+        # Lazy-init console window manager — ConsoleWindowManager owns
+        # the cockpit window create/repair/focus lifecycle.
+        self._console_window_manager = None
         # Register ourselves as a subsystem so CoreRail.start()/stop() can
         # drive our lifecycle. Readonly supervisors (used by the cockpit
         # for passive inspection) don't register — they never drive boot.
@@ -733,91 +766,40 @@ class Supervisor:
             pass
         return project.base_dir
 
+    @property
+    def console_window(self):
+        """The :class:`ConsoleWindowManager` that owns the cockpit window lifecycle."""
+        if getattr(self, "_console_window_manager", None) is None:
+            from pollypm.core.console_window import ConsoleWindowManager
+            self._console_window_manager = ConsoleWindowManager(
+                config=self.config,
+                session_service=self.session_service,
+                storage_closet_session_name=self.storage_closet_session_name,
+                plan_launches=self.plan_launches,
+            )
+        return self._console_window_manager
+
     def console_window_name(self) -> str:
-        return self._CONSOLE_WINDOW
+        """Return the tmux window name used for the PollyPM cockpit."""
+        return self.CONSOLE_WINDOW
 
     def ensure_console_window(self) -> None:
-        tmux_session = self.config.project.tmux_session
-        if not self.session_service.tmux.has_session(tmux_session):
-            return
-        if self._CONSOLE_WINDOW in self._window_map():
-            self._repair_console_if_broken(tmux_session)
-            return
-        self.session_service.tmux.create_window(tmux_session, self._CONSOLE_WINDOW, self._console_command(), detached=True)
-        target = f"{tmux_session}:{self._CONSOLE_WINDOW}"
-        self.session_service.tmux.set_window_option(target, "allow-passthrough", "on")
-        self.session_service.tmux.set_window_option(target, "window-size", "latest")
-        self.session_service.tmux.set_window_option(target, "aggressive-resize", "on")
-        self.session_service.tmux.set_pane_history_limit(target, 200)
+        """Ensure the cockpit window exists in the PollyPM tmux session.
+
+        Thin delegator to :meth:`ConsoleWindowManager.ensure`.
+        """
+        self.console_window.ensure()
 
     def _repair_console_if_broken(self, tmux_session: str) -> None:
-        """Detect and repair a cockpit window where the rail pane died leaving only a worker."""
-        target = f"{tmux_session}:{self._CONSOLE_WINDOW}"
-        try:
-            panes = self.session_service.tmux.list_panes(target)
-        except Exception:  # noqa: BLE001
-            return
-        if len(panes) != 1:
-            return
-        pane = panes[0]
-        # Check if the surviving pane is the right (worker) pane from cockpit state.
-        # If so, the rail (left) pane died and we need to repair.
-        state_path = self.config.project.base_dir / "cockpit_state.json"
-        try:
-            state_data = json.loads(state_path.read_text()) if state_path.exists() else {}
-        except (json.JSONDecodeError, OSError):
-            state_data = {}
-        saved_right_id = state_data.get("right_pane_id") if isinstance(state_data, dict) else None
-        if not isinstance(saved_right_id, str) or saved_right_id != pane.pane_id:
-            return
-        # Try to park the worker pane back to storage-closet
-        mounted_session = state_data.get("mounted_session") if isinstance(state_data, dict) else None
-        if isinstance(mounted_session, str) and mounted_session:
-            launch = next(
-                (item for item in self.plan_launches() if item.session.name == mounted_session),
-                None,
-            )
-            storage_session = self.storage_closet_session_name()
-            if launch is not None and self.session_service.tmux.has_session(storage_session):
-                try:
-                    self.session_service.tmux.break_pane(pane.pane_id, storage_session, launch.window_name)
-                except Exception:  # noqa: BLE001
-                    pass
-        # Clear stale cockpit state
-        if isinstance(state_data, dict):
-            state_data.pop("right_pane_id", None)
-            state_data.pop("mounted_session", None)
-            try:
-                state_path.write_text(json.dumps(state_data, indent=2) + "\n")
-            except OSError:
-                pass
-        # Recreate the cockpit.  If break_pane removed the last pane the
-        # session itself is gone, so we need create_session instead of create_window.
-        if not self.session_service.tmux.has_session(tmux_session):
-            self.session_service.tmux.create_session(
-                tmux_session, self._CONSOLE_WINDOW, self._console_command(), remain_on_exit=False,
-            )
-        else:
-            try:
-                remaining_panes = self.session_service.tmux.list_panes(target)
-            except Exception:  # noqa: BLE001
-                remaining_panes = []
-            if len(remaining_panes) == 0:
-                self.session_service.tmux.create_window(
-                    tmux_session, self._CONSOLE_WINDOW, self._console_command(), detached=True,
-                )
-            else:
-                self.session_service.tmux.respawn_pane(remaining_panes[0].pane_id, self._console_command())
-        self.session_service.tmux.set_window_option(f"{tmux_session}:{self._CONSOLE_WINDOW}", "allow-passthrough", "on")
-        self.session_service.tmux.set_window_option(f"{tmux_session}:{self._CONSOLE_WINDOW}", "window-size", "latest")
-        self.session_service.tmux.set_window_option(f"{tmux_session}:{self._CONSOLE_WINDOW}", "aggressive-resize", "on")
+        """Repair a cockpit window whose rail pane died (delegator)."""
+        self.console_window.repair_if_broken(tmux_session)
 
     def focus_console(self) -> None:
-        tmux_session = self.config.project.tmux_session
-        if not self.session_service.tmux.has_session(tmux_session):
-            return
-        self.ensure_console_window()
-        self.session_service.tmux.select_window(f"{tmux_session}:{self._CONSOLE_WINDOW}")
+        """Select the cockpit window, creating it if missing.
+
+        Thin delegator to :meth:`ConsoleWindowManager.focus`.
+        """
+        self.console_window.focus()
 
     def run_heartbeat(self, snapshot_lines: int = 200) -> list[AlertRecord]:
         """Run one session-health sweep.
@@ -2186,11 +2168,9 @@ class Supervisor:
     def console_command(self) -> str:
         """Return the shell command for the cockpit rail pane.
 
-        Inputs: none. Output: a shell command string (currently ``"bash -l"``)
-        used as the initial rail-pane process. The TUI is launched separately
-        after the layout split to avoid SIGWINCH crashes.
+        Thin delegator to :meth:`ConsoleWindowManager.console_command`.
         """
-        return "bash -l"
+        return self.console_window.console_command()
 
     def _console_command(self) -> str:
         return self.console_command()

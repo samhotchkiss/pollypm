@@ -1398,11 +1398,13 @@ def send(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
     supervisor = _load_supervisor(config_path)
-    # Block pm send to workers at the CLI level. The operator must use inbox
-    # (pm notify --to) so tasks are tracked with audit trail and reply path.
-    # The delivery system bypasses this by calling supervisor.send_input() directly.
+    # Block pm send to workers at the CLI level UNLESS --force is set.
+    # The default nudges the operator to use the task system (audit trail
+    # + reply path). --force is the escape hatch for when the auto-pickup
+    # path is broken and a human operator needs to push a command through
+    # directly — e.g., nudging a stuck worker. #261.
     session_cfg = supervisor.config.sessions.get(session_name)
-    if session_cfg and session_cfg.role == "worker":
+    if session_cfg and session_cfg.role == "worker" and not force:
         project = session_cfg.project or session_name.replace("worker_", "", 1)
         typer.echo(
             f"Blocked: dispatch work through the task system.\n"
@@ -1410,7 +1412,9 @@ def send(
             f"-f standard -r worker=worker -r reviewer=polly\n"
             f"  pm task queue {project}/<number>\n"
             f"\n"
-            f"The worker picks up queued tasks automatically."
+            f"The worker picks up queued tasks automatically.\n"
+            f"If the auto-pickup path is broken and you need to nudge "
+            f"this worker directly, re-run with --force."
         )
         raise typer.Exit(code=1)
     try:

@@ -38,7 +38,8 @@ SKILLS_DIR = (
 #  - Frontend / UI (8): 42
 #  - Backend & Database (8): 50
 #  - Deploy / Infrastructure (6): 56
-EXPECTED_COUNT = 56
+#  - Workflow & Process (8): 64
+EXPECTED_COUNT = 64
 
 
 REQUIRED_FIELDS = {"name", "description", "when_to_trigger", "kind"}

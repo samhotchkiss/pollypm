@@ -35,7 +35,8 @@ SKILLS_DIR = (
 #  - Documents (8): 18
 #  - Code Quality & Review (10): 28
 #  - Testing & QA (6): 34
-EXPECTED_COUNT = 34
+#  - Frontend / UI (8): 42
+EXPECTED_COUNT = 42
 
 
 REQUIRED_FIELDS = {"name", "description", "when_to_trigger", "kind"}

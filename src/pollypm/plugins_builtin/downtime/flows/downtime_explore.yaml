@@ -1,0 +1,69 @@
+# Downtime exploration flow. Runs autonomous exploration between two
+# human-controlled points:
+#
+#   explore (role=explorer)  →  awaiting_approval (human)  →  apply (role=explorer)  →  done
+#
+# Load-bearing contract — see docs/downtime-plugin-spec.md §5 / §10:
+#
+#   * `awaiting_approval` is a review node with actor_type=human. The flow
+#     engine blocks at this node waiting for `pm task approve/reject`. No
+#     other edge reaches `apply`; the architecture forbids an auto-deploy
+#     bypass.
+#   * `apply` reads the approval state from the inbox entry and either
+#     commits/archives per category (spec §6). Code for the apply logic
+#     lives in dt06.
+#
+# A secondary flow validator (registered by plugin.py:initialize) re-
+# asserts this shape at load time so a hand-written malicious flow that
+# skips the human node is rejected at plugin load.
+
+name: downtime_explore
+description: >-
+  Autonomous exploration during idle LLM budget. The explorer produces an
+  artifact (spec / branch / report), the human reviews via the inbox, and
+  the apply node commits or archives based on the verdict. Nothing ever
+  auto-deploys.
+
+roles:
+  explorer:
+    description: The autonomous exploration persona (see profiles/explorer.md).
+
+nodes:
+  # Stage 1 — explorer runs the actual exploration. 30-minute cap per
+  # spec §5; the session runtime may impose a tighter budget.
+  explore:
+    type: work
+    actor_type: role
+    actor_role: explorer
+    budget_seconds: 1800
+    next_node: awaiting_approval
+
+  # Stage 2 — the single human touchpoint. `actor_type: human` parks the
+  # task in the inbox; `inbox_notification_sent` is a hard gate so the
+  # flow cannot advance past explore until the notification has actually
+  # been dispatched (belt-and-suspenders for the never-auto-deploy rule).
+  # Rejection routes back to `explore` so the explorer can fold in the
+  # human's feedback on a second pass.
+  awaiting_approval:
+    type: review
+    actor_type: human
+    gates:
+      - inbox_notification_sent
+    next_node: apply
+    reject_node: apply
+
+  # Stage 3 — the explorer (as the persona best equipped to handle the
+  # artifact) runs the apply routine. On approval it commits/merges per
+  # spec §6; on rejection it archives. The handler reads approval state
+  # from the inbox entry; even if this node were reached without human
+  # input, the handler archives by default.
+  apply:
+    type: work
+    actor_type: role
+    actor_role: explorer
+    next_node: done
+
+  done:
+    type: terminal
+
+start_node: explore

@@ -28,6 +28,10 @@ from pollypm.plugin_api.v1 import (
     PollyPMPlugin,
     RosterAPI,
 )
+from pollypm.plugins_builtin.downtime.flow_validator import (
+    DowntimeFlowValidationError,
+    assert_downtime_flow_shape,
+)
 from pollypm.plugins_builtin.downtime.handlers.downtime_tick import (
     downtime_tick_handler,
 )
@@ -119,12 +123,40 @@ def _register_roster(api: RosterAPI) -> None:
     )
 
 
+def _validate_bundled_flow() -> tuple[bool, str]:
+    """Re-validate the bundled downtime_explore flow at plugin init.
+
+    The flow-engine's own parser only checks generic graph shape; the
+    never-auto-deploy rule (spec §10) is the downtime plugin's
+    responsibility. Running the stricter validator here fails loudly if
+    a bad edit slips into the shipped YAML.
+
+    Returns ``(ok, detail)``. ``ok=False`` is reported via ``emit_event``
+    so the plugin host's diagnostic surfaces pick it up; the plugin
+    itself still loads — the tick handler refuses to schedule when the
+    flow fails to resolve.
+    """
+    try:
+        from pollypm.work.flow_engine import resolve_flow
+
+        flow = resolve_flow("downtime_explore")
+    except Exception as exc:  # noqa: BLE001
+        return False, f"resolve_flow failed: {exc}"
+
+    try:
+        assert_downtime_flow_shape(flow)
+    except DowntimeFlowValidationError as exc:
+        return False, str(exc)
+    return True, "ok"
+
+
 def initialize(api: "PluginAPI") -> None:
     """Record the plugin's initialisation event.
 
     Keeps a lightweight marker in the state store so operators can see
-    the downtime plugin loaded (and under which cadence). Flow/gate
-    validators wired in dt02 attach here too.
+    the downtime plugin loaded (and under which cadence). Also
+    re-validates the bundled ``downtime_explore`` flow under the
+    stricter never-auto-deploy rules (dt02 §10 — belt-and-suspenders).
     """
     try:
         from pollypm.config import DEFAULT_CONFIG_PATH, resolve_config_path
@@ -136,12 +168,16 @@ def initialize(api: "PluginAPI") -> None:
     except Exception:
         cadence = DEFAULT_CADENCE
 
+    flow_ok, flow_detail = _validate_bundled_flow()
+
     api.emit_event(
         "initialize",
         {
             "cadence": cadence,
             "handlers": ["downtime.tick"],
             "profile": "explorer",
+            "flow_validator_ok": flow_ok,
+            "flow_validator_detail": flow_detail,
         },
     )
 

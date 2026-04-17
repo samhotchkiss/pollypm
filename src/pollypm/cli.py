@@ -535,6 +535,12 @@ def cockpit_pane(
 
         ActivityFeedApp(config_path).run(mouse=True)
         return
+    if kind == "project" and target:
+        # Per-project dashboard — beautiful Textual screen, replaces the
+        # read-only Static text dump. See issue #245.
+        from pollypm.cockpit_ui import PollyProjectDashboardApp
+        PollyProjectDashboardApp(config_path, target).run(mouse=True)
+        return
     from pollypm.cockpit_ui import PollyCockpitPaneApp
     PollyCockpitPaneApp(config_path, kind, target).run(mouse=True)
 

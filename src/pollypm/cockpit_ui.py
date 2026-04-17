@@ -3293,3 +3293,948 @@ def _escape_body(s: str) -> str:
     if not s:
         return ""
     return str(s).replace("[", r"\[").replace("]", r"\]")
+
+
+# ---------------------------------------------------------------------------
+# Per-project dashboard (Textual screen) — #245 follow-up, replaces the
+# read-only Static text dump that ``kind == "project"`` used to render
+# via ``PollyCockpitPaneApp``.
+# ---------------------------------------------------------------------------
+
+
+_PLAN_FILE_CANDIDATES: tuple[str, ...] = (
+    "docs/plan/plan.md",
+    "docs/project-plan.md",
+)
+
+# Candidate locations for the plan-review HTML explainer; first hit wins.
+_PLAN_EXPLAINER_CANDIDATES_FMT: tuple[str, ...] = (
+    "reports/plan-review.html",
+    "reports/{key}-plan-review.html",
+)
+
+
+def _dashboard_plan_path(project_path: Path) -> Path | None:
+    for rel in _PLAN_FILE_CANDIDATES:
+        p = project_path / rel
+        if p.is_file():
+            return p
+    return None
+
+
+def _dashboard_plan_explainer(project_path: Path, project_key: str) -> Path | None:
+    for rel in _PLAN_EXPLAINER_CANDIDATES_FMT:
+        p = project_path / rel.format(key=project_key)
+        if p.is_file():
+            return p
+    return None
+
+
+def _extract_h2_sections(md_text: str, *, limit: int = 12) -> list[str]:
+    """Extract level-2 markdown headers (``## Title``) from plan text."""
+    out: list[str] = []
+    for line in md_text.splitlines():
+        if line.startswith("## ") and not line.startswith("### "):
+            title = line[3:].strip()
+            if title:
+                out.append(title)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def _format_relative_age(value) -> str:
+    """Relative-age formatting that tolerates missing / malformed inputs.
+
+    Accepts either an ISO-8601 string or a :class:`datetime` instance
+    (the work service surfaces both shapes depending on the call site).
+    """
+    if not value:
+        return ""
+    from datetime import datetime as _dt
+    iso_str: str
+    if isinstance(value, _dt):
+        iso_str = value.isoformat()
+    else:
+        iso_str = str(value)
+    try:
+        from pollypm.tz import format_relative
+        return format_relative(iso_str)
+    except Exception:  # noqa: BLE001
+        return iso_str[:16]
+
+
+def _dashboard_status(
+    active_worker: dict | None,
+    inbox_count: int,
+    alert_count: int,
+    idle_minutes: float | None,
+) -> tuple[str, str, str]:
+    """Return (dot, colour, label) for the top-bar project status light.
+
+    * Green — a worker is heartbeat-alive on this project right now.
+    * Yellow — the user has inbox items or actionable alerts on this
+      project (nothing in flight but attention is required).
+    * Dim — idle / no activity.
+    """
+    if active_worker is not None:
+        return ("\u25cf", "#3ddc84", "active")
+    if inbox_count or alert_count:
+        return ("\u25c6", "#f0c45a", "needs attention")
+    return ("\u25cb", "#4a5568", "idle")
+
+
+class ProjectDashboardData:
+    """Snapshot of everything the dashboard renders — cached per tick.
+
+    Constructed off the UI thread via :func:`_gather_project_dashboard`;
+    the dashboard app holds the resulting object and reads fields for
+    each section. Keep this *data-only* — no rendering — so tests can
+    poke individual attributes without mounting a Textual screen.
+    """
+
+    __slots__ = (
+        "project_key",
+        "project_name",
+        "project_path",
+        "persona_name",
+        "pm_label",
+        "exists_on_disk",
+        "status_dot",
+        "status_color",
+        "status_label",
+        "active_worker",
+        "architect",
+        "task_counts",
+        "task_buckets",
+        "plan_path",
+        "plan_sections",
+        "plan_explainer",
+        "activity_entries",
+        "inbox_count",
+        "inbox_top",
+        "alert_count",
+    )
+
+    def __init__(
+        self,
+        *,
+        project_key: str,
+        project_name: str,
+        project_path: Path | None,
+        persona_name: str | None,
+        pm_label: str,
+        exists_on_disk: bool,
+        status_dot: str,
+        status_color: str,
+        status_label: str,
+        active_worker: dict | None,
+        architect: dict | None,
+        task_counts: dict[str, int],
+        task_buckets: dict[str, list[dict]],
+        plan_path: Path | None,
+        plan_sections: list[str],
+        plan_explainer: Path | None,
+        activity_entries: list[dict],
+        inbox_count: int,
+        inbox_top: list[dict],
+        alert_count: int,
+    ) -> None:
+        self.project_key = project_key
+        self.project_name = project_name
+        self.project_path = project_path
+        self.persona_name = persona_name
+        self.pm_label = pm_label
+        self.exists_on_disk = exists_on_disk
+        self.status_dot = status_dot
+        self.status_color = status_color
+        self.status_label = status_label
+        self.active_worker = active_worker
+        self.architect = architect
+        self.task_counts = task_counts
+        self.task_buckets = task_buckets
+        self.plan_path = plan_path
+        self.plan_sections = plan_sections
+        self.plan_explainer = plan_explainer
+        self.activity_entries = activity_entries
+        self.inbox_count = inbox_count
+        self.inbox_top = inbox_top
+        self.alert_count = alert_count
+
+
+# Module-level cache keyed by (project_key, db_mtime) so a rapidly-
+# rerendering dashboard doesn't hammer SQLite for the same data. The
+# dashboard refreshes every 10s by default; stale-cache hits are a net
+# win there too.
+_PROJECT_DASHBOARD_TASK_CACHE: dict[str, tuple[float, dict[str, int], dict[str, list[dict]]]] = {}
+
+
+def _dashboard_gather_tasks(
+    project_key: str, project_path: Path,
+) -> tuple[dict[str, int], dict[str, list[dict]]]:
+    """Fetch task counts + top-N titles per status bucket for a project.
+
+    Uses the same mtime-cache trick as ``_dashboard_project_tasks`` so
+    the overall dashboard tick stays cheap when the work service has
+    no new writes. Only small dict views of each task are cached (never
+    full ``Task`` objects) to keep the cache footprint bounded.
+    """
+    db_path = project_path / ".pollypm" / "state.db"
+    if not db_path.exists():
+        return {}, {}
+    try:
+        db_mtime = db_path.stat().st_mtime
+    except OSError:
+        return {}, {}
+    cached = _PROJECT_DASHBOARD_TASK_CACHE.get(project_key)
+    if cached is not None and cached[0] == db_mtime:
+        return cached[1], cached[2]
+
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    buckets: dict[str, list[dict]] = {
+        "queued": [],
+        "in_progress": [],
+        "review": [],
+        "blocked": [],
+        "done": [],
+    }
+    counts: dict[str, int] = {}
+    try:
+        with SQLiteWorkService(db_path=db_path, project_path=project_path) as svc:
+            counts = svc.state_counts(project=project_key)
+            tasks = svc.list_tasks(project=project_key)
+            for t in tasks:
+                status = getattr(t.work_status, "value", "")
+                if status not in buckets:
+                    continue
+                updated_at = getattr(t, "updated_at", "") or ""
+                # Normalise to ISO-8601 string — task.updated_at comes
+                # back as datetime from the work-service hydrator.
+                if hasattr(updated_at, "isoformat"):
+                    updated_at = updated_at.isoformat()
+                buckets[status].append(
+                    {
+                        "task_id": t.task_id,
+                        "task_number": getattr(t, "task_number", None),
+                        "title": getattr(t, "title", "") or "(untitled)",
+                        "updated_at": updated_at,
+                        "assignee": getattr(t, "assignee", None),
+                        "current_node_id": getattr(t, "current_node_id", None),
+                    }
+                )
+    except Exception:  # noqa: BLE001
+        return {}, {}
+
+    for status, items in buckets.items():
+        items.sort(key=lambda d: d["updated_at"] or "", reverse=True)
+
+    _PROJECT_DASHBOARD_TASK_CACHE[project_key] = (db_mtime, counts, buckets)
+    return counts, buckets
+
+
+def _dashboard_active_worker(
+    config_path: Path, project_key: str,
+) -> tuple[dict | None, int]:
+    """Inspect supervisor state for a live worker on this project.
+
+    Returns ``(worker_info, alert_count)`` where ``worker_info`` is
+    ``None`` when no worker is currently heartbeat-alive. ``alert_count``
+    counts actionable alerts scoped to this project's sessions so the
+    top bar can render the yellow "needs attention" light even when the
+    worker is idle.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    worker_info: dict | None = None
+    alert_count = 0
+    try:
+        supervisor = PollyPMService(config_path).load_supervisor()
+    except Exception:  # noqa: BLE001
+        return None, 0
+    try:
+        try:
+            launches = list(supervisor.plan_launches())
+        except Exception:  # noqa: BLE001
+            launches = []
+        project_sessions = [
+            l.session for l in launches
+            if getattr(l.session, "project", None) == project_key
+            and getattr(l.session, "role", "") != "operator-pm"
+        ]
+        alive_cutoff = datetime.now(UTC) - timedelta(minutes=5)
+        for sess in project_sessions:
+            try:
+                hb = supervisor.store.latest_heartbeat(sess.name)
+            except Exception:  # noqa: BLE001
+                continue
+            if hb is None:
+                continue
+            try:
+                dt = datetime.fromisoformat(hb.created_at)
+            except (ValueError, TypeError):
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            if dt > alive_cutoff and not getattr(hb, "pane_dead", False):
+                worker_info = {
+                    "session_name": sess.name,
+                    "role": getattr(sess, "role", "worker"),
+                    "last_heartbeat": hb.created_at,
+                }
+                break
+        # Actionable alerts for this project's sessions.
+        try:
+            project_session_names = {s.name for s in project_sessions}
+            open_alerts = supervisor.store.open_alerts()
+            alert_count = sum(
+                1 for a in open_alerts
+                if getattr(a, "session_name", None) in project_session_names
+                and getattr(a, "alert_type", "") not in (
+                    "suspected_loop", "stabilize_failed", "needs_followup",
+                )
+            )
+        except Exception:  # noqa: BLE001
+            alert_count = 0
+    finally:
+        try:
+            supervisor.store.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return worker_info, alert_count
+
+
+def _dashboard_inbox(
+    config_path: Path, project_key: str, project_path: Path,
+) -> tuple[int, list[dict]]:
+    """Count inbox tasks for this project and return a top-3 preview."""
+    db_path = project_path / ".pollypm" / "state.db"
+    if not db_path.exists():
+        return 0, []
+    try:
+        from pollypm.work.inbox_view import inbox_tasks
+        from pollypm.work.sqlite_service import SQLiteWorkService
+    except Exception:  # noqa: BLE001
+        return 0, []
+    try:
+        with SQLiteWorkService(
+            db_path=db_path, project_path=project_path,
+        ) as svc:
+            tasks = inbox_tasks(svc, project=project_key)
+    except Exception:  # noqa: BLE001
+        return 0, []
+    top: list[dict] = []
+    for t in tasks[:3]:
+        updated_at = getattr(t, "updated_at", "") or ""
+        if hasattr(updated_at, "isoformat"):
+            updated_at = updated_at.isoformat()
+        top.append(
+            {
+                "task_id": t.task_id,
+                "title": getattr(t, "title", "") or "(untitled)",
+                "updated_at": updated_at,
+            }
+        )
+    return len(tasks), top
+
+
+def _dashboard_activity(
+    config_path: Path, project_key: str, *, limit: int = 10,
+) -> list[dict]:
+    """Fetch the last ``limit`` activity-feed entries for this project.
+
+    Returns lightweight dicts (not ``FeedEntry``) so the dashboard's
+    cache + tests can reason about shape without pulling in the
+    projector's import graph.
+    """
+    try:
+        from pollypm.plugins_builtin.activity_feed.plugin import build_projector
+    except Exception:  # noqa: BLE001
+        return []
+    try:
+        config = load_config(config_path)
+    except Exception:  # noqa: BLE001
+        return []
+    projector = build_projector(config)
+    if projector is None:
+        return []
+    try:
+        entries = projector.project(projects=[project_key], limit=limit)
+    except Exception:  # noqa: BLE001
+        return []
+    return [
+        {
+            "timestamp": e.timestamp,
+            "actor": e.actor or "",
+            "verb": e.verb or "",
+            "summary": e.summary or "",
+            "kind": e.kind or "",
+        }
+        for e in entries
+    ]
+
+
+def _gather_project_dashboard(
+    config_path: Path, project_key: str,
+) -> ProjectDashboardData | None:
+    """Build the full ``ProjectDashboardData`` snapshot for one project."""
+    try:
+        config = load_config(config_path)
+    except Exception:  # noqa: BLE001
+        return None
+    projects = getattr(config, "projects", {}) or {}
+    project = projects.get(project_key)
+    if project is None:
+        return None
+
+    project_path = getattr(project, "path", None)
+    name = (
+        project.display_label() if hasattr(project, "display_label")
+        else (getattr(project, "name", None) or project_key)
+    )
+    persona = getattr(project, "persona_name", None)
+    pm_label = f"PM: {persona}" if (isinstance(persona, str) and persona.strip()) else "PM: Polly"
+
+    exists_on_disk = bool(
+        project_path is not None
+        and isinstance(project_path, Path)
+        and project_path.exists()
+    )
+
+    if exists_on_disk:
+        counts, buckets = _dashboard_gather_tasks(project_key, project_path)
+        inbox_count, inbox_top = _dashboard_inbox(
+            config_path, project_key, project_path,
+        )
+        plan_path = _dashboard_plan_path(project_path)
+        if plan_path is not None:
+            try:
+                plan_sections = _extract_h2_sections(
+                    plan_path.read_text(encoding="utf-8"),
+                )
+            except OSError:
+                plan_sections = []
+        else:
+            plan_sections = []
+        plan_explainer = _dashboard_plan_explainer(project_path, project_key)
+        activity_entries = _dashboard_activity(config_path, project_key)
+    else:
+        counts = {}
+        buckets = {}
+        inbox_count = 0
+        inbox_top = []
+        plan_path = None
+        plan_sections = []
+        plan_explainer = None
+        activity_entries = []
+
+    active_worker, alert_count = _dashboard_active_worker(
+        config_path, project_key,
+    )
+
+    status_dot, status_color, status_label = _dashboard_status(
+        active_worker, inbox_count, alert_count, None,
+    )
+
+    return ProjectDashboardData(
+        project_key=project_key,
+        project_name=name,
+        project_path=project_path if exists_on_disk else None,
+        persona_name=persona if isinstance(persona, str) else None,
+        pm_label=pm_label,
+        exists_on_disk=exists_on_disk,
+        status_dot=status_dot,
+        status_color=status_color,
+        status_label=status_label,
+        active_worker=active_worker,
+        architect=None,  # stage info not yet wired — reserved for future
+        task_counts=counts,
+        task_buckets=buckets,
+        plan_path=plan_path,
+        plan_sections=plan_sections,
+        plan_explainer=plan_explainer,
+        activity_entries=activity_entries,
+        inbox_count=inbox_count,
+        inbox_top=inbox_top,
+        alert_count=alert_count,
+    )
+
+
+class PollyProjectDashboardApp(App[None]):
+    """Information-dense per-project dashboard — replaces the legacy
+    text dump rendered when the user selects a project in the rail.
+
+    Opened via ``pm cockpit-pane project <project_key>``. See issue #245
+    for the design intent.
+    """
+
+    TITLE = "PollyPM"
+    SUB_TITLE = "Project"
+    REFRESH_INTERVAL_SECONDS = 10
+
+    CSS = """
+    Screen {
+        background: #0f1317;
+        color: #eef2f4;
+        padding: 0;
+    }
+    #proj-outer {
+        height: 1fr;
+        padding: 1 2;
+    }
+    #proj-topbar {
+        height: 3;
+        padding: 0 0 1 0;
+        border-bottom: solid #1e2730;
+    }
+    #proj-status {
+        color: #97a6b2;
+        padding-top: 0;
+    }
+    #proj-body {
+        height: 1fr;
+        padding: 1 0 0 0;
+        scrollbar-size: 1 1;
+        scrollbar-color: #2a3340;
+    }
+    .proj-section {
+        margin-bottom: 1;
+        padding: 1 2;
+        background: #111820;
+        border: round #1e2730;
+    }
+    .proj-section-title {
+        color: #5b8aff;
+        text-style: bold;
+        padding-bottom: 1;
+    }
+    .proj-section-body {
+        color: #d6dee5;
+    }
+    .proj-empty {
+        color: #6b7a88;
+    }
+    #proj-hint {
+        height: 1;
+        padding: 0 2;
+        color: #3e4c5a;
+        background: #0c0f12;
+    }
+    """
+
+    BINDINGS = [
+        Binding("c", "chat_pm", "Chat PM"),
+        Binding("p", "open_plan", "Plan"),
+        Binding("i", "jump_inbox", "Inbox"),
+        Binding("l", "jump_activity", "Log"),
+        Binding("u,r", "refresh", "Refresh", show=False),
+        Binding("q,escape", "back", "Back"),
+    ]
+
+    _DEFAULT_HINT = (
+        "c chat \u00b7 p plan \u00b7 i inbox \u00b7 l log \u00b7 q back"
+    )
+
+    def __init__(self, config_path: Path, project_key: str) -> None:
+        super().__init__()
+        self.config_path = config_path
+        self.project_key = project_key
+        self.topbar = Static("", id="proj-topbar", markup=True)
+        self.status_line = Static("", id="proj-status", markup=True)
+        self.now_title = Static(
+            "[b]Current activity[/b]",
+            classes="proj-section-title",
+            markup=True,
+        )
+        self.now_body = Static(
+            "", classes="proj-section-body", markup=True,
+        )
+        self.pipeline_title = Static(
+            "[b]Task pipeline[/b]",
+            classes="proj-section-title",
+            markup=True,
+        )
+        self.pipeline_body = Static(
+            "", classes="proj-section-body", markup=True,
+        )
+        self.plan_title = Static(
+            "[b]Plan[/b]", classes="proj-section-title", markup=True,
+        )
+        self.plan_body = Static(
+            "", classes="proj-section-body", markup=True,
+        )
+        self.activity_title = Static(
+            "[b]Recent activity[/b]",
+            classes="proj-section-title",
+            markup=True,
+        )
+        self.activity_body = Static(
+            "", classes="proj-section-body", markup=True,
+        )
+        self.inbox_title = Static(
+            "[b]Inbox[/b]", classes="proj-section-title", markup=True,
+        )
+        self.inbox_body = Static(
+            "", classes="proj-section-body", markup=True,
+        )
+        self.hint = Static(
+            self._DEFAULT_HINT, id="proj-hint", markup=True,
+        )
+        self.data: ProjectDashboardData | None = None
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="proj-outer"):
+            yield self.topbar
+            yield self.status_line
+            with VerticalScroll(id="proj-body"):
+                with Vertical(classes="proj-section"):
+                    yield self.now_title
+                    yield self.now_body
+                with Vertical(classes="proj-section"):
+                    yield self.pipeline_title
+                    yield self.pipeline_body
+                with Vertical(classes="proj-section"):
+                    yield self.plan_title
+                    yield self.plan_body
+                with Vertical(classes="proj-section"):
+                    yield self.activity_title
+                    yield self.activity_body
+                with Vertical(classes="proj-section"):
+                    yield self.inbox_title
+                    yield self.inbox_body
+        yield self.hint
+
+    def on_mount(self) -> None:
+        self._refresh()
+        self.set_interval(self.REFRESH_INTERVAL_SECONDS, self._refresh)
+
+    # ------------------------------------------------------------------
+    # Data
+    # ------------------------------------------------------------------
+
+    def _refresh(self) -> None:
+        try:
+            self.data = _gather_project_dashboard(
+                self.config_path, self.project_key,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.topbar.update(
+                f"[#ff5f6d]Error loading project:[/#ff5f6d] {_escape(str(exc))}"
+            )
+            return
+        self._render()
+
+    def _render(self) -> None:
+        data = self.data
+        if data is None:
+            self.topbar.update(
+                f"[b]{_escape(self.project_key)}[/b]  "
+                f"[dim]not found in config[/dim]"
+            )
+            return
+
+        # ── Top bar ──
+        title = f"[#eef6ff][b]{_escape(data.project_name)}[/b][/#eef6ff]"
+        meta = f"[#97a6b2]{_escape(data.pm_label)}[/#97a6b2]"
+        self.topbar.update(f"{title}   {meta}")
+
+        status_markup = (
+            f"[{data.status_color}]{data.status_dot}[/] "
+            f"[#97a6b2]{_escape(data.status_label)}[/]"
+        )
+        self.status_line.update(status_markup)
+
+        # ── Current activity ──
+        self.now_body.update(self._render_now_body(data))
+
+        # ── Task pipeline ──
+        self.pipeline_body.update(self._render_pipeline_body(data))
+
+        # ── Plan summary ──
+        self.plan_body.update(self._render_plan_body(data))
+
+        # ── Recent activity ──
+        self.activity_body.update(self._render_activity_body(data))
+
+        # ── Inbox ──
+        self.inbox_body.update(self._render_inbox_body(data))
+
+        self.hint.update(self._DEFAULT_HINT)
+
+    # ------------------------------------------------------------------
+    # Section renderers — all return Rich-markup strings, all handle
+    # missing-data gracefully with friendly empty-state copy.
+    # ------------------------------------------------------------------
+
+    def _render_now_body(self, data: ProjectDashboardData) -> str:
+        w = data.active_worker
+        if w:
+            sess = _escape(w.get("session_name") or "")
+            role = _escape(w.get("role") or "worker")
+            hb = w.get("last_heartbeat") or ""
+            age = _format_relative_age(hb) if hb else ""
+            age_part = f"  [dim]{_escape(age)}[/dim]" if age else ""
+            lines = [
+                f"[#3ddc84]\u25cf[/#3ddc84] "
+                f"[b]{sess}[/b]  [dim]{role}[/dim]{age_part}",
+            ]
+            # Surface the top-most in-flight task as context.
+            in_flight = data.task_buckets.get("in_progress", [])
+            if in_flight:
+                t = in_flight[0]
+                num = t.get("task_number")
+                num_part = f"#{num} " if num is not None else ""
+                title = _escape(t.get("title") or "")
+                node = t.get("current_node_id")
+                node_part = (
+                    f"  [dim]@ {_escape(str(node))}[/dim]" if node else ""
+                )
+                lines.append(f"  {num_part}{title}{node_part}")
+            return "\n".join(lines)
+        return "[dim]Idle. No tasks in flight.[/dim]"
+
+    def _render_pipeline_body(self, data: ProjectDashboardData) -> str:
+        if not data.exists_on_disk:
+            return "[dim]No project path on disk.[/dim]"
+        counts = data.task_counts
+        buckets = data.task_buckets
+        if not counts and not any(buckets.values()):
+            return "[dim]No tasks yet. Press N on the rail to start a lane.[/dim]"
+
+        # Compact count strip
+        strip_order = [
+            ("queued", "#6b7a88", "\u25cb"),
+            ("in_progress", "#f0c45a", "\u25c6"),
+            ("review", "#5b8aff", "\u25c9"),
+            ("done", "#3ddc84", "\u2713"),
+        ]
+        strip_parts: list[str] = []
+        for status, colour, icon in strip_order:
+            n = counts.get(status, 0)
+            label = status.replace("_", " ")
+            strip_parts.append(
+                f"[{colour}]{icon}[/] [b]{n}[/b] [dim]{label}[/dim]"
+            )
+        out = ["  \u00b7  ".join(strip_parts), ""]
+
+        for status, _colour, _icon in strip_order:
+            items = buckets.get(status, [])[:3]
+            if not items:
+                continue
+            header = status.replace("_", " ").title()
+            out.append(f"[dim]{header}[/dim]")
+            for t in items:
+                num = t.get("task_number")
+                num_part = f"[dim]#{num}[/dim] " if num is not None else ""
+                title = _escape(t.get("title") or "")
+                age = _format_relative_age(t.get("updated_at") or "")
+                age_part = f"  [dim]{_escape(age)}[/dim]" if age else ""
+                out.append(f"  {num_part}{title}{age_part}")
+            out.append("")
+        # Drop trailing blank for tidy spacing
+        while out and out[-1] == "":
+            out.pop()
+        return "\n".join(out)
+
+    def _render_plan_body(self, data: ProjectDashboardData) -> str:
+        if not data.exists_on_disk:
+            return "[dim]Virtual project — no plan on disk.[/dim]"
+        if data.plan_path is None:
+            return (
+                "[dim]No plan yet. Run [b]pm project plan[/b] "
+                "or let it auto-fire.[/dim]"
+            )
+        lines: list[str] = []
+        rel_path = ""
+        try:
+            rel_path = str(data.plan_path.relative_to(data.project_path))
+        except (ValueError, TypeError):
+            rel_path = str(data.plan_path.name)
+        lines.append(f"[dim]{_escape(rel_path)}[/dim]")
+        if data.plan_sections:
+            for title in data.plan_sections:
+                lines.append(f"  \u25aa {_escape(title)}")
+        else:
+            lines.append("  [dim](no H2 sections found)[/dim]")
+        if data.plan_explainer is not None:
+            lines.append("")
+            lines.append("[dim]Press [b]v[/b] to open the visual explainer[/dim]")
+        return "\n".join(lines)
+
+    def _render_activity_body(self, data: ProjectDashboardData) -> str:
+        if not data.activity_entries:
+            return "[dim]No recent activity for this project.[/dim]"
+        lines: list[str] = []
+        for e in data.activity_entries[:10]:
+            ts = _format_relative_age(e.get("timestamp") or "")
+            actor = _escape(e.get("actor") or "-")
+            verb = _escape(e.get("verb") or "")
+            summary = _escape(e.get("summary") or "")
+            ts_part = f"[dim]{ts:>8}[/dim]" if ts else ""
+            line = (
+                f"{ts_part}  [#97a6b2]{actor}[/#97a6b2]  "
+                f"[b]{verb}[/b] {summary}"
+            )
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _render_inbox_body(self, data: ProjectDashboardData) -> str:
+        count = data.inbox_count
+        if count == 0:
+            return "[dim]Inbox is clear for this project.[/dim]"
+        attention_mark = (
+            "[#f0c45a]\u25c6[/#f0c45a] " if count else ""
+        )
+        lines = [
+            f"{attention_mark}[b]{count}[/b] "
+            f"[dim]open item{'s' if count != 1 else ''}[/dim]"
+        ]
+        for item in data.inbox_top:
+            title = _escape(item.get("title") or "")
+            age = _format_relative_age(item.get("updated_at") or "")
+            age_part = f"  [dim]{_escape(age)}[/dim]" if age else ""
+            lines.append(f"  \u00b7 {title}{age_part}")
+        lines.append("")
+        lines.append("[dim]Press [b]i[/b] to jump to the inbox[/dim]")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Actions — keybindings
+    # ------------------------------------------------------------------
+
+    def action_refresh(self) -> None:
+        self._refresh()
+
+    def action_back(self) -> None:
+        self.exit()
+
+    def action_chat_pm(self) -> None:
+        """Route the cockpit right-pane to this project's PM session.
+
+        Mirrors :meth:`PollyInboxApp.action_jump_to_pm` — resolves the
+        persona via :func:`_resolve_pm_target` and uses the same worker
+        dispatch so tests can monkeypatch the same hook.
+        """
+        cockpit_key, pm_label = _resolve_pm_target(
+            self.config_path, self.project_key,
+        )
+        context_line = f're: project/{self.project_key} "dashboard discussion"'
+        self.run_worker(
+            lambda: self._dispatch_to_pm_sync(
+                cockpit_key, context_line, pm_label,
+            ),
+            thread=True,
+            exclusive=True,
+            group="proj_jump_to_pm",
+        )
+
+    def _dispatch_to_pm_sync(
+        self, cockpit_key: str, context_line: str, pm_label: str,
+    ) -> None:
+        try:
+            self._perform_pm_dispatch(cockpit_key, context_line)
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(
+                self.notify, f"Jump to PM failed: {exc}", severity="error",
+            )
+            return
+        self.call_from_thread(
+            self.notify,
+            f"Jumped to {pm_label} \u2014 finish your message and hit Enter.",
+            severity="information",
+            timeout=3.0,
+        )
+
+    def _perform_pm_dispatch(self, cockpit_key: str, context_line: str) -> None:
+        """Route the cockpit to the PM pane and inject a context line.
+
+        Split out exactly like the inbox path so the same
+        ``monkeypatch`` strategy works for the dashboard's chat keybind.
+        """
+        router = CockpitRouter(self.config_path)
+        router.route_selected(cockpit_key)
+        supervisor = router._load_supervisor()
+        window_target = (
+            f"{supervisor.config.project.tmux_session}:{router._COCKPIT_WINDOW}"
+        )
+        right_pane = router._right_pane_id(window_target)
+        if right_pane is None:
+            router.tmux.send_keys(window_target, context_line, press_enter=False)
+            return
+        router.tmux.send_keys(right_pane, context_line, press_enter=False)
+
+    def action_jump_inbox(self) -> None:
+        """Route the cockpit right-pane to the inbox.
+
+        The inbox app itself doesn't expose a project-filter yet, but
+        routing still lands Sam where he can act. A lightweight test
+        seam (``_route_to_inbox``) keeps this mockable.
+        """
+        self.run_worker(
+            lambda: self._route_to_inbox_sync(),
+            thread=True,
+            exclusive=True,
+            group="proj_inbox",
+        )
+
+    def _route_to_inbox_sync(self) -> None:
+        try:
+            self._route_to_inbox()
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(
+                self.notify, f"Jump to inbox failed: {exc}", severity="error",
+            )
+
+    def _route_to_inbox(self) -> None:
+        router = CockpitRouter(self.config_path)
+        router.route_selected("inbox")
+
+    def action_jump_activity(self) -> None:
+        """Route to the activity log / feed for the whole workspace."""
+        self.run_worker(
+            lambda: self._route_to_activity_sync(),
+            thread=True,
+            exclusive=True,
+            group="proj_activity",
+        )
+
+    def _route_to_activity_sync(self) -> None:
+        try:
+            self._route_to_activity()
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(
+                self.notify, f"Jump to activity failed: {exc}", severity="error",
+            )
+
+    def _route_to_activity(self) -> None:
+        router = CockpitRouter(self.config_path)
+        router.route_selected("tools:activity")
+
+    def action_open_plan(self) -> None:
+        """Surface the plan file path + section list inline (no shell out).
+
+        The body is already rendered in the plan section — pressing ``p``
+        scrolls the body into focus and flashes a hint so Sam knows
+        where to look. When no plan exists, friendly notify.
+        """
+        data = self.data
+        if data is None or data.plan_path is None:
+            self.notify(
+                "No plan file yet for this project.",
+                severity="warning", timeout=2.0,
+            )
+            return
+        # Scroll the plan section into view (best-effort).
+        try:
+            self.plan_title.scroll_visible()
+        except Exception:  # noqa: BLE001
+            pass
+        self.notify(
+            f"Plan: {data.plan_path}",
+            severity="information",
+            timeout=3.0,
+        )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -8,6 +9,8 @@ import sys
 from pathlib import Path
 
 import typer
+
+logger = logging.getLogger(__name__)
 
 from pollypm.accounts import (
     add_account_via_login,
@@ -1226,12 +1229,44 @@ def heartbeat(
         return
     supervisor = _load_supervisor(config_path)
     alerts = supervisor.run_heartbeat(snapshot_lines=snapshot_lines)
+    # Fallback rail driver ("suspenders" to the cockpit ticker's "belt"):
+    # when no persistent host is running, the every-minute cron still
+    # advances recurring roster handlers (task_assignment.sweep,
+    # transcript.ingest, work.progress_sweep, etc.). If the cockpit is
+    # running, the CoreRail's HeartbeatRail is already booted and this
+    # is just one extra tick — no harm. See issue #268 Gap A.
+    _tick_core_rail_if_available(supervisor)
     if json_output:
         _emit_json({"alerts": alerts})
         return
     typer.echo(f"Heartbeat completed. Open alerts: {len(alerts)}")
     for alert in alerts:
         typer.echo(f"- {alert.severity} {alert.session_name}/{alert.alert_type}#{alert.alert_id}: {alert.message}")
+
+
+def _tick_core_rail_if_available(supervisor) -> None:
+    """Tick the process-wide HeartbeatRail if the supervisor exposes one.
+
+    No-ops silently when the rail isn't available (legacy supervisors,
+    mocked test harnesses, boot failures). Swallows tick exceptions so
+    a bad roster entry can't break the session-health heartbeat that
+    already ran above.
+    """
+    rail_getter = getattr(supervisor, "core_rail", None)
+    if rail_getter is None:
+        return
+    try:
+        # CoreRail.start() is idempotent and ensures the HeartbeatRail
+        # is booted. This is a transient driver — the worker pool drains
+        # anything we enqueue synchronously over the next few seconds.
+        rail_getter.start()
+        heartbeat_rail = rail_getter.get_heartbeat_rail()
+        if heartbeat_rail is None:
+            return
+        heartbeat_rail.tick()
+    except Exception:  # noqa: BLE001
+        # Non-fatal — session-health sweep already succeeded above.
+        logger.debug("pm heartbeat: core rail tick failed", exc_info=True)
 
 
 @app.command()

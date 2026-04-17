@@ -21,6 +21,7 @@ the knob in config avoids plumbing it through every construction call.
 from __future__ import annotations
 
 import logging
+import threading
 import tomllib
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -38,6 +39,10 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_WORKER_CONCURRENCY = 4
+
+# Default ticker cadence. 15s gives two ticks per 30s roster entry so
+# any ``@every 30s`` handler fires with at most 15s latency.
+DEFAULT_TICK_INTERVAL_SECONDS = 15.0
 
 
 @dataclass(slots=True)
@@ -102,9 +107,18 @@ class HeartbeatRail:
     The roster is built from the plugin host at construction. The handler
     registry is also resolved via the plugin host so newly-registered
     handlers fire on the next tick without a restart.
+
+    ``start()`` also spawns a daemon ticker thread that calls ``tick()``
+    on a fixed interval so any long-lived process that calls
+    ``rail.start()`` gets periodic ticks for free. The ticker exits when
+    ``stop()`` sets the stop event. For tests, use ``tick()`` directly —
+    the ticker is a deployment-time convenience, not a test dependency.
     """
 
-    __slots__ = ("queue", "pool", "heartbeat", "roster", "_concurrency")
+    __slots__ = (
+        "queue", "pool", "heartbeat", "roster", "_concurrency",
+        "_tick_interval", "_tick_thread", "_tick_stop",
+    )
 
     def __init__(
         self,
@@ -114,12 +128,20 @@ class HeartbeatRail:
         heartbeat: Heartbeat,
         roster: Roster,
         concurrency: int = DEFAULT_WORKER_CONCURRENCY,
+        tick_interval_seconds: float = DEFAULT_TICK_INTERVAL_SECONDS,
     ) -> None:
         self.queue = queue
         self.pool = pool
         self.heartbeat = heartbeat
         self.roster = roster
         self._concurrency = concurrency
+        self._tick_interval = (
+            float(tick_interval_seconds)
+            if tick_interval_seconds and tick_interval_seconds > 0
+            else DEFAULT_TICK_INTERVAL_SECONDS
+        )
+        self._tick_thread: threading.Thread | None = None
+        self._tick_stop = threading.Event()
 
     # ------------------------------------------------------------------
     # Construction
@@ -133,6 +155,7 @@ class HeartbeatRail:
         plugin_host: Any,
         config_path: Path | None = None,
         concurrency: int | None = None,
+        tick_interval_seconds: float = DEFAULT_TICK_INTERVAL_SECONDS,
     ) -> "HeartbeatRail":
         """Build a HeartbeatRail from an already-resolved plugin host + DB path.
 
@@ -172,6 +195,7 @@ class HeartbeatRail:
         return cls(
             queue=queue, pool=pool, heartbeat=heartbeat,
             roster=roster, concurrency=effective_concurrency,
+            tick_interval_seconds=tick_interval_seconds,
         )
 
     @classmethod
@@ -191,13 +215,57 @@ class HeartbeatRail:
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Start the worker pool. Idempotent — no-op if already started."""
+        """Start the worker pool and the background ticker. Idempotent.
+
+        Spawns a daemon thread that calls :meth:`tick` every
+        ``tick_interval_seconds`` seconds so recurring roster handlers
+        actually fire in long-lived processes (cockpit TUI, future
+        daemons) without requiring callers to wire their own clock.
+        Calling ``start()`` again while already running is a silent
+        no-op — a second ticker thread is never spawned.
+        """
         if self.pool.is_running:
             return
         self.pool.start(concurrency=self._concurrency)
+        # Reset the stop event in case ``stop()`` + ``start()`` is called
+        # on the same rail (the pool is re-startable).
+        self._tick_stop.clear()
+        thread = self._tick_thread
+        if thread is not None and thread.is_alive():
+            # Defensive: should be unreachable because pool.is_running
+            # gates entry, but belt-and-suspenders if a caller manually
+            # pokes the pool.
+            return
+        self._tick_thread = threading.Thread(
+            target=self._tick_loop,
+            daemon=True,
+            name="HeartbeatRail-ticker",
+        )
+        self._tick_thread.start()
+
+    def _tick_loop(self) -> None:
+        """Background loop: ``tick()`` every ``_tick_interval`` seconds.
+
+        Exits as soon as ``_tick_stop`` is set. Exceptions from ``tick``
+        are logged and swallowed so one bad tick can't kill the thread —
+        the next iteration will try again.
+        """
+        # ``Event.wait(timeout)`` returns True when the event is set,
+        # False when the timeout elapses. Looping "while not wait()"
+        # gives us a clean interval-plus-fast-shutdown pattern.
+        while not self._tick_stop.wait(self._tick_interval):
+            try:
+                self.tick()
+            except Exception:  # noqa: BLE001
+                logger.exception("HeartbeatRail tick failed; continuing")
 
     def stop(self, *, timeout: float = 10.0) -> None:
-        """Stop the worker pool and close the queue connection."""
+        """Stop the ticker, the worker pool, and close the queue."""
+        self._tick_stop.set()
+        thread = self._tick_thread
+        if thread is not None:
+            thread.join(timeout=timeout)
+            self._tick_thread = None
         try:
             self.pool.stop(timeout=timeout)
         finally:

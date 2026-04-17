@@ -449,6 +449,29 @@ class PollyCockpitApp(App[None]):
         # waiting ~30s for the periodic check to fix it. See issue #102.
         self.set_timer(0.4, self._enforce_rail_width_once)
         self.set_timer(1.5, self._enforce_rail_width_once)
+        # Boot the HeartbeatRail so recurring roster handlers
+        # (task_assignment.sweep, transcript.ingest, work.progress_sweep,
+        # etc.) actually fire while the cockpit is open. The cockpit is
+        # the only long-lived Python process in production; short-lived
+        # CLIs like `pm up` exit before the rail can do useful work.
+        # Failures here are non-fatal — the TUI still works, just
+        # without autonomous sweeps. See issue #268 Gap A.
+        self._start_core_rail()
+
+    def _start_core_rail(self) -> None:
+        """Start the process-wide HeartbeatRail via the supervisor, best-effort."""
+        try:
+            supervisor = self.router._load_supervisor()
+        except Exception:  # noqa: BLE001
+            return
+        rail = getattr(supervisor, "core_rail", None)
+        if rail is None:
+            return
+        try:
+            rail.start()
+        except Exception:  # noqa: BLE001
+            # Already logged by CoreRail; swallow so the TUI still mounts.
+            pass
 
     def _enforce_rail_width_once(self) -> None:
         try:
@@ -773,6 +796,15 @@ class PollyCockpitApp(App[None]):
         try:
             sup = self.router._supervisor
             if sup is not None:
+                # Stop the CoreRail (and its HeartbeatRail ticker thread)
+                # before closing the store so the ticker isn't racing
+                # shutdown. CoreRail.stop() is idempotent.
+                rail = getattr(sup, "core_rail", None)
+                if rail is not None:
+                    try:
+                        rail.stop()
+                    except Exception:  # noqa: BLE001
+                        pass
                 # Release any cockpit-held leases
                 for lease in sup.store.list_leases():
                     if lease.owner == "cockpit":

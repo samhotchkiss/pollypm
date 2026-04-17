@@ -103,9 +103,9 @@ def format_ping_for_role(event: TaskAssignmentEvent) -> str:
 # ---------------------------------------------------------------------------
 
 
-# Role → session naming conventions. ``role:worker`` is project-scoped
-# (one worker session per project); the other roles are process-wide
-# singletons.
+# Role → session naming conventions. ``role:worker`` and
+# ``role:architect`` are project-scoped (one session per project); the
+# other roles listed here are process-wide singletons.
 _ROLE_STATIC_NAMES: dict[str, tuple[str, ...]] = {
     # Each role lists both the session-config key (what ``sessions`` table
     # stores as ``name``) and the window name (legacy convention). #272.
@@ -117,17 +117,27 @@ _ROLE_STATIC_NAMES: dict[str, tuple[str, ...]] = {
 }
 
 
+# Project-scoped roles expand to both hyphen- and underscore-separated
+# session names (``<role>-<project>`` and ``<role>_<project>``). The
+# worker shipping convention is underscore (``workers.py``), but the
+# resolver is tolerant of either so naming drift between operators,
+# tests, and docs doesn't break lookup.
+_PROJECT_SCOPED_ROLES: frozenset[str] = frozenset({"worker", "architect"})
+
+
 def role_candidate_names(role: str, project: str) -> list[str]:
     """Return the ordered list of session names a role *could* map to.
 
     Callers match the first candidate that actually has a live session.
-    ``role:worker`` expands to ``worker-<project>`` and ``worker_<project>``
-    (we accept both conventions — ``workers.py`` ships underscore but
-    operators/tests and docs use both interchangeably).
+    Project-scoped roles (``worker``, ``architect``) expand to both
+    ``<role>-<project>`` and ``<role>_<project>`` — we accept either
+    convention so drift between docs and shipping code doesn't break
+    lookup. Process-wide singletons (reviewer / operator / heartbeat /
+    triage) map to their fixed session names via ``_ROLE_STATIC_NAMES``.
     """
     key = role.strip().lower()
-    if key == "worker":
-        return [f"worker-{project}", f"worker_{project}"]
+    if key in _PROJECT_SCOPED_ROLES:
+        return [f"{key}-{project}", f"{key}_{project}"]
     if key.startswith("critic_") or key.startswith("critic-"):
         # Planner-spawned per-task critic sessions carry the role name
         # verbatim. Pass through so exact-name lookup picks them up.

@@ -86,6 +86,8 @@ def create_worker_session(
     account_name: str | None = None,
     provider: ProviderKind | None = None,
     session_name: str | None = None,
+    role: str = "worker",
+    agent_profile: str | None = None,
 ) -> SessionConfig:
     config = load_config(config_path)
     project = config.projects.get(project_key)
@@ -102,6 +104,8 @@ def create_worker_session(
             f"    pm add-project <path> --name {project_key}"
         )
 
+    role = (role or "worker").strip() or "worker"
+
     if account_name is None:
         account_name = auto_select_worker_account(config_path, provider=provider)
     if account_name not in config.accounts:
@@ -115,28 +119,35 @@ def create_worker_session(
         prompt = suggest_worker_prompt(config_path, project_key=project_key)
 
     for existing in config.sessions.values():
-        if existing.role == "worker" and existing.project == project_key and existing.enabled:
+        if existing.role == role and existing.project == project_key and existing.enabled:
             raise typer.BadParameter(
-                f"Project {project_key} already has worker session {existing.name}"
+                f"Project {project_key} already has {role} session {existing.name}"
             )
 
-    session_key = session_name or _make_worker_session_name(project_key, set(config.sessions))
+    session_key = session_name or _make_role_session_name(
+        role, project_key, set(config.sessions)
+    )
+    # Workers use a ``pa`` worktree lane; non-worker roles (e.g. architect)
+    # take a lane named after the role so they don't collide with workers.
+    lane_kind = "pa" if role == "worker" else role
     worktree = ensure_worktree(
         config_path,
         project_key=project_key,
-        lane_kind="pa",
+        lane_kind=lane_kind,
         lane_key=session_key,
         session_name=session_key,
     )
+    window_prefix = "worker" if role == "worker" else role
     worker = SessionConfig(
         name=session_key,
-        role="worker",
+        role=role,
         provider=account.provider,
         account=account_name,
         cwd=Path(worktree.path) if worktree is not None else project.path,
         project=project_key,
-        window_name=f"worker-{project_key}",
+        window_name=f"{window_prefix}-{project_key}",
         prompt=prompt,
+        agent_profile=agent_profile,
         args=default_session_args(account.provider, open_permissions=config.pollypm.open_permissions_by_default),
     )
     config.sessions[session_key] = worker
@@ -210,7 +221,19 @@ def remove_worker_session(config_path: Path, session_name: str) -> None:
 
 
 def _make_worker_session_name(project_key: str, existing: set[str]) -> str:
-    base = f"worker_{project_key}"
+    return _make_role_session_name("worker", project_key, existing)
+
+
+def _make_role_session_name(role: str, project_key: str, existing: set[str]) -> str:
+    """Return an unused ``<role>_<project>`` session name.
+
+    Workers retain the historical ``worker_<project>`` convention. Other
+    roles (e.g. ``architect``) follow the same ``<role>_<project>`` layout
+    so the :func:`role_candidate_names` resolver (which probes both
+    hyphen- and underscore-separated forms) can find them without
+    bespoke per-role naming logic.
+    """
+    base = f"{role}_{project_key}"
     candidate = base
     index = 2
     while candidate in existing:

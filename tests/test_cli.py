@@ -219,7 +219,7 @@ def test_worker_start_creates_and_launches_managed_worker(monkeypatch, tmp_path:
     monkeypatch.setattr(
         cli,
         "create_worker_session",
-        lambda path, project_key, prompt=None: (
+        lambda path, project_key, prompt=None, role="worker", agent_profile=None: (
             created.append((path, project_key, prompt))
             or type("Session", (), {"name": "worker_pollypm"})()
         ),

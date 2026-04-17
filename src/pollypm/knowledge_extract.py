@@ -9,6 +9,18 @@ from typing import Any
 
 from pollypm.llm_runner import HAIKU_MODEL, run_haiku, run_haiku_json
 from pollypm.memory_backends import get_memory_backend
+from pollypm.memory_extractors import (
+    CONFIDENCE_THRESHOLD,
+    ExtractionResult,
+    MemoryCandidate,
+    extract_episodic_memory,
+    extract_feedback_memory,
+    extract_pattern_memory,
+    extract_project_memory,
+    extract_reference_memory,
+    extract_user_memory,
+    run_extractors,
+)
 
 EXTRACTION_INTERVAL_SECONDS = 15 * 60
 SUMMARY_HEADER = "## Summary"
@@ -185,6 +197,62 @@ def _store_memory_entries(config, project_root: Path, delta: "KnowledgeDelta") -
             count += 1
     store.close()
     return count
+
+
+def extract_typed_memories_once(
+    config,
+    *,
+    memory_backend_name: str = "file",
+    user_scope: str = "operator",
+    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+) -> dict[str, Any]:
+    """Type-aware extraction pass (M04 / #233).
+
+    Walks every project root, reads new transcript events since the
+    last checkpoint, and runs the five non-episodic extractors
+    (:func:`extract_user_memory`, :func:`extract_feedback_memory`,
+    :func:`extract_project_memory`, :func:`extract_reference_memory`,
+    :func:`extract_pattern_memory`). Low-confidence candidates and
+    duplicates are filtered; survivors are written to the per-project
+    memory backend.
+
+    Returns aggregate counts:
+
+    * ``processed_events`` — total events read.
+    * ``candidates`` — extractor output count before filtering.
+    * ``filtered_low_confidence`` — candidates dropped by threshold.
+    * ``duplicates_skipped`` — candidates matching existing entries.
+    * ``memory_entries`` — count actually written.
+    """
+    totals: dict[str, int] = {
+        "processed_events": 0,
+        "candidates": 0,
+        "filtered_low_confidence": 0,
+        "duplicates_skipped": 0,
+        "memory_entries": 0,
+    }
+    for project_root in _all_project_roots(config):
+        events, checkpoint = _read_new_events(project_root)
+        if not events:
+            continue
+        try:
+            backend = get_memory_backend(project_root, memory_backend_name)
+        except Exception:  # noqa: BLE001
+            continue
+        result = run_extractors(
+            events,
+            backend,
+            project_scope=project_root.name,
+            user_scope=user_scope,
+            confidence_threshold=confidence_threshold,
+        )
+        totals["processed_events"] += len(events)
+        totals["candidates"] += result.attempted
+        totals["filtered_low_confidence"] += result.filtered_low_confidence
+        totals["duplicates_skipped"] += result.duplicates_skipped
+        totals["memory_entries"] += result.written
+        _save_checkpoint(project_root, checkpoint)
+    return totals
 
 
 def _all_project_roots(config) -> list[Path]:

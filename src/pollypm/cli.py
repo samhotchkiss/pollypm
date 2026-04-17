@@ -85,6 +85,9 @@ app.add_typer(project_app, name="project")
 from pollypm.plugins_builtin.advisor.cli.advisor_cli import advisor_app
 app.add_typer(advisor_app, name="advisor")
 
+from pollypm.plugins_builtin.downtime.cli import downtime_app
+app.add_typer(downtime_app, name="downtime")
+
 
 def _session_name_candidates() -> list[str]:
     return ["pollypm", "pollypm-storage-closet"]

@@ -88,6 +88,46 @@ def decompose_stage_prompt() -> str:
     )
 
 
+def synthesis_stage_prompt() -> str:
+    """Instruction block appended to the architect persona at stage 6.
+
+    Ensures the architect knows to emit ``docs/downtime-backlog.md`` as
+    part of synthesis output — the downtime plugin reads this file to
+    source exploration candidates (see docs/downtime-plugin-spec.md §4
+    / §8). The architect may also invoke the programmatic helper
+    :func:`pollypm.plugins_builtin.project_planning.downtime_backlog.write_backlog`
+    from a post-synthesis hook; this prompt is the persona-facing
+    contract.
+    """
+    return (
+        "<synthesis-stage>\n"
+        "You are in Stage 6 (Synthesis) of the PollyPM planning flow. In "
+        "addition to `docs/project-plan.md`, the Risk Ledger, and "
+        "`docs/planning-session-log.md`, you must emit **one more** "
+        "artifact:\n\n"
+        "## `docs/downtime-backlog.md`\n"
+        "A markdown table the downtime plugin reads during idle LLM "
+        "budget windows. Columns — keep the header exact:\n\n"
+        "    | title | kind | source | priority | description | why_deprioritized |\n\n"
+        "What to include:\n"
+        "- Every non-winning tree-of-plans candidate (kind=try_alt_approach).\n"
+        "- Every magic-stage idea critics deprioritized but didn't reject "
+        "outright (kind=spec_feature or build_speculative, per the "
+        "idea's concreteness).\n"
+        "- Any 'explore later' note you logged during the session.\n\n"
+        "Rules:\n"
+        "- `kind` must be one of: spec_feature, build_speculative, "
+        "audit_docs, security_scan, try_alt_approach.\n"
+        "- `source` is always `planner` for entries you write.\n"
+        "- `priority` is 1–5 (5 highest).\n"
+        "- Merge, don't overwrite: if a previous planner run already "
+        "populated the file, preserve existing rows and append new ones "
+        "dedup'd by title. The downtime plugin tolerates a missing "
+        "file, so first-run writes are fine.\n"
+        "</synthesis-stage>"
+    )
+
+
 def critic_panel_prompt() -> str:
     """Instruction block appended to the critic persona on stage 5.
 

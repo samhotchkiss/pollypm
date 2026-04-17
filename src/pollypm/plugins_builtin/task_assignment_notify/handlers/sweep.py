@@ -14,6 +14,17 @@ The ``in_progress`` branch (#246) is gated on session idleness — a
 worker that's actively turning shouldn't be pinged mid-work. When the
 target session is busy (active turn indicator visible in the pane),
 we skip the ping and let the sweeper re-check on its next cadence.
+
+#259: the sweeper now fans out across per-project work-service DBs.
+``pm project new`` creates tasks in ``<project_path>/.pollypm/state.db``
+— those are invisible to a sweep that only reads the workspace-root
+DB, so pickup pings never fire for operator-created projects. We
+enumerate ``config.projects`` (exposed as ``services.known_projects``)
+and run the same sweep body against each per-project DB, opening and
+closing the connection per tick. When a project has queued tasks for
+a role that has no live session, we emit a single deduped
+``no_session`` alert per ``(project, role)`` — surfacing the blocked
+worker to the operator instead of silently dropping pings.
 """
 
 from __future__ import annotations
@@ -24,7 +35,11 @@ from pathlib import Path
 from typing import Any
 
 from pollypm.work.models import ActorType, WorkStatus
-from pollypm.work.task_assignment import SessionRoleIndex, TaskAssignmentEvent
+from pollypm.work.task_assignment import (
+    SessionRoleIndex,
+    TaskAssignmentEvent,
+    role_candidate_names,
+)
 
 from pollypm.plugins_builtin.task_assignment_notify.resolver import (
     DEDUPE_WINDOW_SECONDS,
@@ -153,15 +168,155 @@ def _target_session_is_idle(
         return True
 
 
+def _emit_no_session_alert(
+    services: Any,
+    *,
+    project: str,
+    role: str,
+    actor_type: ActorType,
+    example_task_id: str,
+) -> None:
+    """Raise (or refresh) a ``no_session`` alert for a ``(project, role)``.
+
+    Sweep-level alert — complements the per-task ``no_session_for_assignment:<id>``
+    alerts from ``_escalate_no_session`` with a single human-readable row
+    per blocked role. The underlying ``upsert_alert`` already dedupes on
+    ``(session_name, alert_type, status='open')`` so repeat emissions
+    within a sweep cycle (or across sweep cycles) just refresh the row.
+    """
+    store = services.state_store
+    if store is None:
+        return
+    # Candidate session name we would *expect* if the worker were running —
+    # keeps the alert's session_name column aligned with the missing
+    # session's identity, which is what the cockpit's "alerts for session X"
+    # queries filter on.
+    candidates = role_candidate_names(role, project) if actor_type is ActorType.ROLE else [role]
+    expected_name = candidates[0] if candidates else f"{role}-{project}"
+    message = (
+        f"Queued task {example_task_id} has no live session for "
+        f"{actor_type.value}:{role} in project '{project}'. "
+        f"Fix: pm worker-start {project}"
+    )
+    try:
+        store.upsert_alert(expected_name, "no_session", "warn", message)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "task_assignment sweep: upsert_alert(no_session) failed for %s",
+            expected_name, exc_info=True,
+        )
+
+
+def _sweep_work_service(
+    work: Any,
+    services: Any,
+    *,
+    throttle_override: int,
+    totals: dict[str, Any],
+    alerted_pairs: set[tuple[str, str]],
+) -> None:
+    """Run one sweep pass over a single work-service DB.
+
+    Mutates ``totals`` (``considered`` count + ``by_outcome`` tally) in
+    place so the caller can aggregate across per-project DBs. Tracks
+    already-alerted ``(project, role)`` pairs in ``alerted_pairs`` so
+    we emit at most one ``no_session`` alert per pair per sweep cycle.
+    """
+    by_outcome = totals["by_outcome"]
+    for status in _SWEEPABLE_STATUSES:
+        try:
+            tasks = work.list_tasks(work_status=status)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "task_assignment sweep: list_tasks failed for %s", status,
+                exc_info=True,
+            )
+            continue
+        for task in tasks:
+            event = _build_event_for_task(work, task)
+            if event is None:
+                continue
+            # #246: for in_progress tasks, only ping if the worker
+            # session is idle. An active turn means they're working;
+            # resume pings are for the restart / crash-recovery case.
+            if status in _IDLE_GATED_STATUSES:
+                if not _target_session_is_idle(event, services):
+                    by_outcome["skipped_active_turn"] = (
+                        by_outcome.get("skipped_active_turn", 0) + 1
+                    )
+                    continue
+            totals["considered"] += 1
+            result = notify(
+                event, services=services, throttle_seconds=throttle_override,
+            )
+            outcome = str(result.get("outcome", "unknown"))
+            by_outcome[outcome] = by_outcome.get(outcome, 0) + 1
+
+            # #259: when the task can't be routed, also raise a
+            # sweep-level ``no_session`` alert keyed by (project, role)
+            # so the operator sees one row per blocked role instead of
+            # N per-task alerts. Dedupe within a cycle via the visited
+            # set; upsert_alert dedupes across cycles.
+            if outcome == "no_session":
+                pair = (event.project, event.actor_name)
+                if pair not in alerted_pairs:
+                    alerted_pairs.add(pair)
+                    _emit_no_session_alert(
+                        services,
+                        project=event.project,
+                        role=event.actor_name,
+                        actor_type=event.actor_type,
+                        example_task_id=event.task_id,
+                    )
+
+
+def _open_project_work_service(project: Any) -> Any | None:
+    """Open a per-project ``SQLiteWorkService`` if its state.db exists.
+
+    Returns ``None`` when the project path has no state.db yet (fresh
+    registration, never-touched project) or when any open-time error
+    prevents connecting. Never raises — the sweeper skips silently and
+    moves on to the next project.
+    """
+    project_path = getattr(project, "path", None)
+    if project_path is None:
+        return None
+    db_path = Path(project_path) / ".pollypm" / "state.db"
+    if not db_path.exists():
+        return None
+    try:
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        return SQLiteWorkService(db_path=db_path, project_path=Path(project_path))
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "task_assignment sweep: failed to open per-project DB at %s",
+            db_path, exc_info=True,
+        )
+        return None
+
+
+def _close_quietly(svc: Any) -> None:
+    closer = getattr(svc, "close", None)
+    if callable(closer):
+        try:
+            closer()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def task_assignment_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
-    """Re-notify machine-actor tasks in queued/review/in_progress states."""
+    """Re-notify machine-actor tasks in queued/review/in_progress states.
+
+    Fans out across the workspace-root DB *and* every registered
+    per-project DB (``config.projects``) so tasks created via
+    ``pm project new`` are picked up. Each per-project connection is
+    opened, read, and closed within the sweep tick — we don't hold
+    20+ connections open permanently.
+    """
     config_path_hint = payload.get("config_path")
     config_path = Path(config_path_hint) if config_path_hint else None
     services = load_runtime_services(config_path=config_path)
-
-    work = services.work_service
-    if work is None:
-        return {"outcome": "skipped", "reason": "no_work_service"}
 
     # The sweeper uses a shorter throttle so pre-existing queued tasks
     # get re-pinged every 5 min if they stay unclaimed — that's the
@@ -170,47 +325,55 @@ def task_assignment_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     if throttle_override < 1:
         throttle_override = SWEEPER_COOLDOWN_SECONDS
 
-    total = 0
-    by_outcome: dict[str, int] = {}
-    try:
-        for status in _SWEEPABLE_STATUSES:
-            try:
-                tasks = work.list_tasks(work_status=status)
-            except Exception:  # noqa: BLE001
-                logger.debug(
-                    "task_assignment sweep: list_tasks failed for %s", status,
-                    exc_info=True,
-                )
-                continue
-            for task in tasks:
-                event = _build_event_for_task(work, task)
-                if event is None:
-                    continue
-                # #246: for in_progress tasks, only ping if the worker
-                # session is idle. An active turn means they're working;
-                # resume pings are for the restart / crash-recovery case.
-                if status in _IDLE_GATED_STATUSES:
-                    if not _target_session_is_idle(event, services):
-                        by_outcome["skipped_active_turn"] = (
-                            by_outcome.get("skipped_active_turn", 0) + 1
-                        )
-                        continue
-                total += 1
-                result = notify(
-                    event, services=services, throttle_seconds=throttle_override,
-                )
-                outcome = str(result.get("outcome", "unknown"))
-                by_outcome[outcome] = by_outcome.get(outcome, 0) + 1
-    finally:
-        closer = getattr(work, "close", None)
-        if callable(closer):
-            try:
-                closer()
-            except Exception:  # noqa: BLE001
-                pass
+    totals: dict[str, Any] = {"considered": 0, "by_outcome": {}}
+    alerted_pairs: set[tuple[str, str]] = set()
+    projects_scanned = 0
+    projects_skipped = 0
+
+    # Pass 1: workspace-root DB (workspace-level tasks the pollypm repo
+    # itself uses, or tests that point services.work_service at a
+    # tmpdir without registered projects).
+    workspace_work = services.work_service
+    if workspace_work is not None:
+        try:
+            _sweep_work_service(
+                workspace_work, services,
+                throttle_override=throttle_override,
+                totals=totals,
+                alerted_pairs=alerted_pairs,
+            )
+        finally:
+            _close_quietly(workspace_work)
+    elif not services.known_projects:
+        # No workspace work service AND no registered projects → nothing
+        # to sweep. Keep the legacy "no_work_service" outcome for
+        # observability / existing callers.
+        return {"outcome": "skipped", "reason": "no_work_service"}
+
+    # Pass 2: per-project DBs. Each gets its own connection, opened and
+    # closed within the sweep tick so we don't pile up file handles
+    # when many projects are registered.
+    for project in services.known_projects:
+        project_work = _open_project_work_service(project)
+        if project_work is None:
+            projects_skipped += 1
+            continue
+        try:
+            _sweep_work_service(
+                project_work, services,
+                throttle_override=throttle_override,
+                totals=totals,
+                alerted_pairs=alerted_pairs,
+            )
+            projects_scanned += 1
+        finally:
+            _close_quietly(project_work)
 
     return {
         "outcome": "swept",
-        "considered": total,
-        "by_outcome": by_outcome,
+        "considered": totals["considered"],
+        "by_outcome": totals["by_outcome"],
+        "projects_scanned": projects_scanned,
+        "projects_skipped": projects_skipped,
+        "no_session_alerts": len(alerted_pairs),
     }

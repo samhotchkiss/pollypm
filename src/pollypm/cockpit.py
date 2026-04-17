@@ -8,7 +8,6 @@ from pathlib import Path
 
 from pollypm.atomic_io import atomic_write_json
 from pollypm.config import load_config
-from pollypm.tz import format_time as _fmt_time
 from pollypm.providers import get_provider
 from pollypm.projects import ensure_project_scaffold
 from pollypm.runtimes import get_runtime

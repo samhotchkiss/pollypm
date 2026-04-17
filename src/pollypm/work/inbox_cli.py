@@ -16,7 +16,6 @@ from pollypm.work.cli import (
     _DB_OPTION,
     _JSON_OPTION,
     _PROJECT_OPTION,
-    _print_task,
     _project_from_task_id,
     _svc,
     _task_to_dict,

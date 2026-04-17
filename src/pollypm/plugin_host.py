@@ -20,7 +20,6 @@ from pollypm.plugin_api.v1 import (
     RailRegistry,
     RosterAPI,
     check_requires_api,
-    normalize_capabilities,
 )
 
 logger = logging.getLogger(__name__)

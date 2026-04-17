@@ -27,10 +27,6 @@ from __future__ import annotations
 from dataclasses import asdict, is_dataclass
 from typing import Any, Protocol
 
-from pollypm.plugins_builtin.downtime.handlers.audit_docs import AuditDocsResult
-from pollypm.plugins_builtin.downtime.handlers.build_speculative import (
-    BuildSpeculativeResult,
-)
 from pollypm.plugins_builtin.downtime.handlers.security_scan import (
     SecurityScanResult,
 )

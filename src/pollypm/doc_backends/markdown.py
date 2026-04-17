@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from pollypm.doc_backends.base import DocBackend, DocEntry
+from pollypm.doc_backends.base import DocEntry
 
 
 class MarkdownDocBackend:

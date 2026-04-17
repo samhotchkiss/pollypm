@@ -17,11 +17,7 @@ from textual.message import Message
 from textual.widgets import Static
 
 from pollypm.work.models import (
-    Decision,
-    ExecutionStatus,
     FlowNodeExecution,
-    OutputType,
-    Priority,
     Task,
     WorkOutput,
     WorkStatus,

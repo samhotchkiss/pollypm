@@ -11,7 +11,6 @@ from pollypm.onboarding import default_session_args
 from pollypm.models import ProviderKind, SessionConfig
 from pollypm.supervisor import Supervisor
 from pollypm.storage.state import StateStore
-from pollypm.task_backends import get_task_backend
 from pollypm.worktrees import ensure_worktree
 
 

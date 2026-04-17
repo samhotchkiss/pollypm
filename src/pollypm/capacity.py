@@ -14,7 +14,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pollypm.models import AccountConfig, PollyPMConfig, ProviderKind
+from pollypm.models import PollyPMConfig, ProviderKind
 from pollypm.storage.state import StateStore
 
 logger = logging.getLogger(__name__)

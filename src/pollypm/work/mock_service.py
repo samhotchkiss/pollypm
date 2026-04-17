@@ -18,7 +18,6 @@ from pollypm.work.models import (
     ContextEntry,
     Decision,
     ExecutionStatus,
-    FlowNode,
     FlowNodeExecution,
     FlowTemplate,
     GateResult,

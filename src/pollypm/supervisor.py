@@ -165,6 +165,11 @@ def _review_tasks_for_project(project_key: str, db_path: Path) -> list[str]:
 
 class Supervisor:
     _CONTROL_ROLES = {"heartbeat-supervisor", "operator-pm", "triage", "reviewer"}
+    # Roles that should receive an initial-input prompt on fresh launch.
+    # Workers are NOT control-plane sessions (not in _CONTROL_ROLES), but
+    # they DO need their profile prompt delivered on launch — same as the
+    # reviewer / operator / heartbeat / triage sessions.
+    _INITIAL_INPUT_ROLES = _CONTROL_ROLES | {"worker"}
     #: Name of the PollyPM console/cockpit window inside a tmux session.
     CONSOLE_WINDOW = "PollyPM"
     _CONSOLE_WINDOW = CONSOLE_WINDOW  # deprecated alias — use CONSOLE_WINDOW
@@ -2417,7 +2422,7 @@ class Supervisor:
         marker.write_text(datetime.now(UTC).isoformat().replace("+00:00", "Z") + "\n")
 
     def _send_initial_input_if_fresh(self, launch: SessionLaunchSpec, target: str) -> None:
-        if launch.session.role not in self._CONTROL_ROLES:
+        if launch.session.role not in self._INITIAL_INPUT_ROLES:
             return
         initial_input = launch.initial_input
         fresh_marker = launch.fresh_launch_marker

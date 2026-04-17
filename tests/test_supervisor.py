@@ -25,6 +25,7 @@ from pollypm.models import (
     PollyPMSettings,
     ProviderKind,
     SessionConfig,
+    SessionLaunchSpec,
 )
 from pollypm.supervisor import (
     Supervisor,
@@ -1149,3 +1150,113 @@ def test_build_review_nudge_evicts_dropped_projects(monkeypatch, tmp_path: Path)
     assert "proj_1" not in _supervisor_module._REVIEW_NUDGE_CACHE
     assert "proj_0" in _supervisor_module._REVIEW_NUDGE_CACHE
     assert "proj_2" in _supervisor_module._REVIEW_NUDGE_CACHE
+
+
+# ---------------------------------------------------------------------------
+# _send_initial_input_if_fresh — role gating (Issue #260)
+# ---------------------------------------------------------------------------
+
+
+def _make_launch_for_role(
+    config: PollyPMConfig, tmp_path: Path, role: str, *, initial_input: str = "hello worker"
+) -> SessionLaunchSpec:
+    """Build a SessionLaunchSpec with a real fresh-launch marker on disk."""
+    session = SessionConfig(
+        name=f"{role}-session",
+        role=role,
+        provider=ProviderKind.CLAUDE,
+        account="claude_controller",
+        cwd=tmp_path,
+        project="pollypm",
+        window_name=f"pm-{role}",
+    )
+    marker_dir = tmp_path / ".pollypm-state" / "fresh-markers"
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker = marker_dir / f"{role}-session.marker"
+    marker.write_text("fresh\n")
+    return SessionLaunchSpec(
+        session=session,
+        account=config.accounts["claude_controller"],
+        window_name=f"pm-{role}",
+        log_path=tmp_path / "logs" / f"{role}.log",
+        command="claude",
+        initial_input=initial_input,
+        fresh_launch_marker=marker,
+    )
+
+
+def test_send_initial_input_delivers_prompt_for_worker_role(monkeypatch, tmp_path: Path) -> None:
+    """Regression for Issue #260: workers on fresh launch must receive initial prompt."""
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+
+    launch = _make_launch_for_role(config, tmp_path, "worker", initial_input="worker kickoff")
+    assert launch.fresh_launch_marker is not None
+    assert launch.fresh_launch_marker.exists()
+
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "send_keys",
+        lambda target, text, **kw: sent.append((target, text)),
+    )
+    monkeypatch.setattr(supervisor, "_verify_input_submitted", lambda *a, **kw: None)
+    # Skip the 0.5s sleep in the method.
+    monkeypatch.setattr("pollypm.supervisor.time.sleep", lambda *_: None)
+
+    supervisor._send_initial_input_if_fresh(launch, "pollypm:pm-worker")
+
+    assert len(sent) == 1, "worker role should receive one send_keys call"
+    assert sent[0][0] == "pollypm:pm-worker"
+    assert sent[0][1] == "worker kickoff"
+    assert not launch.fresh_launch_marker.exists(), "fresh-launch marker must be consumed"
+
+
+def test_send_initial_input_still_delivers_for_reviewer_role(monkeypatch, tmp_path: Path) -> None:
+    """Sanity: pre-existing control roles (reviewer) keep working — no regression."""
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+
+    launch = _make_launch_for_role(config, tmp_path, "reviewer", initial_input="reviewer kickoff")
+    assert launch.fresh_launch_marker is not None
+
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "send_keys",
+        lambda target, text, **kw: sent.append((target, text)),
+    )
+    monkeypatch.setattr(supervisor, "_verify_input_submitted", lambda *a, **kw: None)
+    monkeypatch.setattr("pollypm.supervisor.time.sleep", lambda *_: None)
+
+    supervisor._send_initial_input_if_fresh(launch, "pollypm:pm-reviewer")
+
+    assert len(sent) == 1
+    assert sent[0][1] == "reviewer kickoff"
+    assert not launch.fresh_launch_marker.exists()
+
+
+def test_send_initial_input_skips_unknown_role(monkeypatch, tmp_path: Path) -> None:
+    """Unknown / non-opted-in roles (e.g. cockpit) must NOT receive the prompt."""
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+
+    launch = _make_launch_for_role(config, tmp_path, "cockpit", initial_input="should not send")
+    assert launch.fresh_launch_marker is not None
+    marker_before = launch.fresh_launch_marker.exists()
+
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "send_keys",
+        lambda target, text, **kw: sent.append((target, text)),
+    )
+    monkeypatch.setattr(supervisor, "_verify_input_submitted", lambda *a, **kw: None)
+    monkeypatch.setattr("pollypm.supervisor.time.sleep", lambda *_: None)
+
+    supervisor._send_initial_input_if_fresh(launch, "pollypm:pm-cockpit")
+
+    assert sent == [], "non-opted-in role must not receive send_keys"
+    # Marker is NOT consumed when role gate rejects.
+    assert marker_before is True
+    assert launch.fresh_launch_marker.exists()

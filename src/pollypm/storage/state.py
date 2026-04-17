@@ -228,13 +228,16 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     type TEXT NOT NULL DEFAULT 'project',
     importance INTEGER NOT NULL DEFAULT 3,
     superseded_by INTEGER,
-    ttl_at TEXT
+    ttl_at TEXT,
+    scope_tier TEXT NOT NULL DEFAULT 'project'
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_entries_scope
 ON memory_entries(scope, id DESC);
 -- idx_memory_entries_type is created by migration 8 after the ``type``
 -- column is back-filled onto pre-M01 databases.
+-- idx_memory_entries_tier is created by migration 10 after the
+-- ``scope_tier`` column is back-filled onto pre-M03 databases.
 
 -- FTS5 keyword index over memory_entries.{title, body, tags}. The entries
 -- table is the source of truth; this contentless-FTS mirror (content=…) is
@@ -468,6 +471,9 @@ class MemoryEntryRecord:
     importance: int = 3
     superseded_by: int | None = None
     ttl_at: str | None = None
+    # M03 tiered-scope column. Default matches the schema DEFAULT so
+    # pre-M03 records and tests that predate the column keep working.
+    scope_tier: str = "project"
 
 
 @dataclass(slots=True)
@@ -621,6 +627,17 @@ class StateStore:
             # back-fill the FTS rows for entries that existed before the
             # triggers landed (dispatch block below handles that).
         ]),
+        # --- Migration 10 ----------------------------------------------
+        # Tiered scope model (#232 / M03). Adds ``scope_tier`` to
+        # memory_entries — one of session/task/project/user. Pre-M03
+        # rows back-fill to ``'project'`` via the column DEFAULT so
+        # existing behaviour is preserved. The index supports the common
+        # "recall across tier X" and "purge tier=session scope=S" paths.
+        (10, "Tiered scope model (scope_tier column + index)", [
+            # Column addition handled in the dispatch block below via
+            # _safe_add_column (idempotent on fresh DBs that already have
+            # it from SCHEMA). The index is created afterwards.
+        ]),
     ]
 
     def _migrate(self) -> None:
@@ -671,6 +688,25 @@ class StateStore:
                 # (the table is empty) and idempotent otherwise.
                 self.execute(
                     "INSERT INTO memory_entries_fts(memory_entries_fts) VALUES('rebuild')"
+                )
+            elif version == 10:
+                # Tiered scope model. Add ``scope_tier`` as NOT NULL with
+                # DEFAULT 'project' so any pre-M03 row is treated as
+                # project-tier memory — matching the acceptance contract
+                # that existing entries survive the upgrade with the
+                # "never auto-expire" lifecycle. Fresh DBs already have
+                # the column from SCHEMA; _safe_add_column is a no-op.
+                self._safe_add_column(
+                    "memory_entries",
+                    "scope_tier",
+                    "TEXT NOT NULL DEFAULT 'project'",
+                )
+                # Composite (tier, scope) index supports the two hot
+                # paths introduced by M03: "recall across tier X" and
+                # "purge session-tier entries with scope=S".
+                self.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memory_entries_tier "
+                    "ON memory_entries(scope_tier, scope, id DESC)"
                 )
             self.execute(
                 "INSERT INTO schema_version (version, description, applied_at) VALUES (?, ?, ?)",
@@ -746,6 +782,21 @@ class StateStore:
                 """,
                 (now, *sorted(valid_session_names)),
             )
+            # M03 (#232): session-tier memory entries auto-purge when
+            # their session ends. The supervisor's session-reconciliation
+            # path calls ``prune_sessions`` whenever it rebuilds the set
+            # of live sessions, so piggy-backing here gives us the
+            # "session ended → session memory gone" contract without
+            # needing a new observer. Only session-tier rows are touched;
+            # project/user/task memory is untouched.
+            self.execute(
+                f"""
+                DELETE FROM memory_entries
+                WHERE scope_tier = 'session'
+                  AND scope NOT IN ({placeholders})
+                """,
+                params,
+            )
         else:
             self.execute("DELETE FROM sessions")
             self.execute("DELETE FROM leases")
@@ -756,6 +807,10 @@ class StateStore:
                 WHERE status = 'open'
                 """,
                 (now,),
+            )
+            # No live sessions ⇒ all session-tier memory is orphaned.
+            self.execute(
+                "DELETE FROM memory_entries WHERE scope_tier = 'session'"
             )
         self.commit()
 
@@ -1610,6 +1665,7 @@ class StateStore:
         importance: int = 3,
         superseded_by: int | None = None,
         ttl_at: str | None = None,
+        scope_tier: str = "project",
     ) -> MemoryEntryRecord:
         now = self._now()
         tags_json = json.dumps([str(tag) for tag in tags], ensure_ascii=True)
@@ -1617,13 +1673,13 @@ class StateStore:
             """
             INSERT INTO memory_entries (
                 scope, kind, title, body, tags, source, file_path, summary_path, created_at, updated_at,
-                type, importance, superseded_by, ttl_at
+                type, importance, superseded_by, ttl_at, scope_tier
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 scope, kind, title, body, tags_json, source, file_path, summary_path, now, now,
-                type, int(importance), superseded_by, ttl_at,
+                type, int(importance), superseded_by, ttl_at, scope_tier,
             ),
         )
         self.commit()
@@ -1643,13 +1699,14 @@ class StateStore:
             importance=int(importance),
             superseded_by=superseded_by,
             ttl_at=ttl_at,
+            scope_tier=scope_tier,
         )
 
     def get_memory_entry(self, entry_id: int) -> MemoryEntryRecord | None:
         row = self.execute(
             """
             SELECT id, scope, kind, title, body, tags, source, file_path, summary_path, created_at, updated_at,
-                   type, importance, superseded_by, ttl_at
+                   type, importance, superseded_by, ttl_at, scope_tier
             FROM memory_entries
             WHERE id = ?
             """,
@@ -1673,6 +1730,7 @@ class StateStore:
             importance=int(row[12]) if row[12] is not None else 3,
             superseded_by=int(row[13]) if row[13] is not None else None,
             ttl_at=row[14],
+            scope_tier=row[15] if row[15] is not None else "project",
         )
 
     def list_memory_entries(
@@ -1681,6 +1739,7 @@ class StateStore:
         scope: str | None = None,
         kind: str | None = None,
         type: str | None = None,
+        scope_tier: str | None = None,
         limit: int = 50,
     ) -> list[MemoryEntryRecord]:
         clauses: list[str] = []
@@ -1694,11 +1753,14 @@ class StateStore:
         if type is not None:
             clauses.append("type = ?")
             params.append(type)
+        if scope_tier is not None:
+            clauses.append("scope_tier = ?")
+            params.append(scope_tier)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self.execute(
             f"""
             SELECT id, scope, kind, title, body, tags, source, file_path, summary_path, created_at, updated_at,
-                   type, importance, superseded_by, ttl_at
+                   type, importance, superseded_by, ttl_at, scope_tier
             FROM memory_entries
             {where}
             ORDER BY id DESC
@@ -1723,6 +1785,7 @@ class StateStore:
                 importance=int(row[12]) if row[12] is not None else 3,
                 superseded_by=int(row[13]) if row[13] is not None else None,
                 ttl_at=row[14],
+                scope_tier=row[15] if row[15] is not None else "project",
             )
             for row in rows
         ]
@@ -1736,6 +1799,8 @@ class StateStore:
         importance_min: int = 1,
         limit: int = 10,
         candidate_multiplier: int = 5,
+        scope_tiers: list[str] | None = None,
+        tier_scope_pairs: list[tuple[str, str]] | None = None,
     ) -> list[tuple[MemoryEntryRecord, float | None]]:
         """Return (record, bm25_score_or_None) pairs ranked by FTS5.
 
@@ -1748,6 +1813,12 @@ class StateStore:
         headroom to apply the importance/recency weighting without the
         top-K being clipped by SQL's bm25-only ordering. Defaults to 5×
         which is generous but bounded (still O(limit)).
+
+        ``scope_tiers`` restricts to rows whose ``scope_tier`` is in the
+        list. ``tier_scope_pairs`` matches rows whose
+        ``(scope_tier, scope)`` pair is in the list — this lets callers
+        compose cross-tier recall ("task=T123 AND project=foo") in one
+        query without a Python-side merge (M03 / #232).
         """
         clauses: list[str] = []
         params: list[object] = []
@@ -1769,6 +1840,21 @@ class StateStore:
             placeholders = ", ".join("?" for _ in types)
             clauses.append(f"me.type IN ({placeholders})")
             params.extend(types)
+        if scope_tiers:
+            placeholders = ", ".join("?" for _ in scope_tiers)
+            clauses.append(f"me.scope_tier IN ({placeholders})")
+            params.extend(scope_tiers)
+        if tier_scope_pairs:
+            # Match ``(scope_tier, scope)`` pairs via OR-of-equalities —
+            # SQLite handles small OR sets efficiently with the
+            # idx_memory_entries_tier index, and this keeps the plan
+            # deterministic without needing a VALUES() clause.
+            pair_clauses: list[str] = []
+            for tier, scope_id in tier_scope_pairs:
+                pair_clauses.append("(me.scope_tier = ? AND me.scope = ?)")
+                params.extend([tier, scope_id])
+            if pair_clauses:
+                clauses.append("(" + " OR ".join(pair_clauses) + ")")
         if importance_min > 1:
             clauses.append("me.importance >= ?")
             params.append(int(importance_min))
@@ -1784,7 +1870,7 @@ class StateStore:
             sql = f"""
             SELECT me.id, me.scope, me.kind, me.title, me.body, me.tags, me.source,
                    me.file_path, me.summary_path, me.created_at, me.updated_at,
-                   me.type, me.importance, me.superseded_by, me.ttl_at,
+                   me.type, me.importance, me.superseded_by, me.ttl_at, me.scope_tier,
                    bm25(memory_entries_fts) AS bm25_score
             FROM memory_entries_fts
             JOIN memory_entries me ON me.id = memory_entries_fts.rowid
@@ -1800,7 +1886,7 @@ class StateStore:
             sql = f"""
             SELECT me.id, me.scope, me.kind, me.title, me.body, me.tags, me.source,
                    me.file_path, me.summary_path, me.created_at, me.updated_at,
-                   me.type, me.importance, me.superseded_by, me.ttl_at,
+                   me.type, me.importance, me.superseded_by, me.ttl_at, me.scope_tier,
                    NULL AS bm25_score
             FROM memory_entries me
             WHERE {where}
@@ -1827,10 +1913,88 @@ class StateStore:
                 importance=int(row[12]) if row[12] is not None else 3,
                 superseded_by=int(row[13]) if row[13] is not None else None,
                 ttl_at=row[14],
+                scope_tier=row[15] if row[15] is not None else "project",
             )
-            bm25_score = float(row[15]) if row[15] is not None else None
+            bm25_score = float(row[16]) if row[16] is not None else None
             results.append((record, bm25_score))
         return results
+
+    # ------------------------------------------------------------------
+    # Tiered-scope lifecycle helpers (M03 / #232)
+    #
+    # These methods implement the per-tier lifecycle contract from
+    # docs/memory-system-review.md §3.1:
+    #
+    #   * session  — auto-purge on session end (purge_session_scope)
+    #   * task     — auto-TTL 30 days after terminal (expire_task_scope)
+    #   * project  — never auto-expire
+    #   * user     — never auto-expire
+    #
+    # They operate on the state store alone — on-disk memory files are
+    # left behind by ``purge_session_scope`` (cheap "tombstones" for
+    # post-mortem inspection) since the recall path filters rows out of
+    # the SQLite view the moment they're deleted from memory_entries.
+    # The file-backend-owned artifact directory cleanup is a later
+    # enhancement; the DB is the source of truth for what ``recall``
+    # sees.
+    # ------------------------------------------------------------------
+
+    def purge_session_scope(self, session_id: str) -> int:
+        """Delete all session-tier memory entries with scope=``session_id``.
+
+        Returns the number of rows removed. Idempotent — calling twice
+        removes zero on the second call. FTS triggers keep the FTS
+        virtual table in sync automatically (see memory_entries_fts_ad).
+        """
+        cursor = self.execute(
+            "DELETE FROM memory_entries WHERE scope_tier = 'session' AND scope = ?",
+            (session_id,),
+        )
+        removed = int(cursor.rowcount) if cursor.rowcount is not None else 0
+        if removed:
+            self.commit()
+        return removed
+
+    def expire_task_scope(
+        self,
+        task_id: str,
+        *,
+        terminal_at: str | None = None,
+        ttl_days: int = 30,
+    ) -> int:
+        """Set a ttl_at 30 days out for task-tier entries with scope=``task_id``.
+
+        ``terminal_at`` defaults to ``now`` in UTC; tests pass an explicit
+        value. ``ttl_days`` is the lifetime after terminal transition —
+        30 per the spec, exposed as an argument for tests. Entries that
+        already carry a ``ttl_at`` keep the earlier of the two so a
+        caller-set TTL is never extended.
+        """
+        from datetime import datetime as _dt, timedelta as _td, UTC as _UTC
+        if terminal_at is None:
+            now = _dt.now(_UTC)
+        else:
+            now = _dt.fromisoformat(terminal_at)
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=_UTC)
+        ttl_at = (now + _td(days=int(ttl_days))).isoformat()
+        # Use MIN() so an explicit earlier ttl (e.g. an author pinned a
+        # 7-day experiment note) isn't extended by the terminal-transition
+        # update. ``COALESCE`` fills the null side so MIN() works when
+        # ttl_at was previously NULL.
+        cursor = self.execute(
+            """
+            UPDATE memory_entries
+            SET ttl_at = MIN(COALESCE(ttl_at, ?), ?),
+                updated_at = ?
+            WHERE scope_tier = 'task' AND scope = ?
+            """,
+            (ttl_at, ttl_at, now.isoformat(), task_id),
+        )
+        updated = int(cursor.rowcount) if cursor.rowcount is not None else 0
+        if updated:
+            self.commit()
+        return updated
 
     def record_memory_summary(
         self,

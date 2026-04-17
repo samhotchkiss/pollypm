@@ -6,6 +6,39 @@ from pathlib import Path
 from typing import Protocol, Union
 
 
+class ScopeTier(str, Enum):
+    """Tiered scope model (M03 / #232).
+
+    Each tier carries a distinct lifecycle:
+
+    * ``SESSION`` — auto-purge when the session ends. ``scope`` is the
+      session UUID / name. Intended for transient working memory that
+      shouldn't leak across sessions.
+    * ``TASK`` — auto-TTL 30 days after the task reaches a terminal
+      state (``done`` or ``cancelled``). ``scope`` is the task id.
+    * ``PROJECT`` — never auto-expire. ``scope`` is the project name.
+      This is the historical default and what legacy callers got before
+      M03.
+    * ``USER`` — never auto-expire, persists across projects. ``scope``
+      is the user id.
+
+    Values are the strings written to the ``memory_entries.scope_tier``
+    column and accepted on the ``scope_tier`` argument to ``write_entry``
+    / ``recall``.
+    """
+
+    SESSION = "session"
+    TASK = "task"
+    PROJECT = "project"
+    USER = "user"
+
+
+# Public set used by validators — kept in a module-level constant so
+# callers that want to check "is this a valid tier?" don't import the
+# enum directly.
+VALID_SCOPE_TIERS: frozenset[str] = frozenset(t.value for t in ScopeTier)
+
+
 class MemoryType(str, Enum):
     """Typed memory kinds (M01 schema).
 
@@ -40,6 +73,10 @@ class _TypedMemoryBase:
     FileMemoryBackend conventions. ``ttl_at`` is an ISO-8601 timestamp string
     (null = no expiry), and ``superseded_by`` is reserved for future writers
     that flag contradictions (set lazily; no FK enforcement in v1).
+
+    ``scope_tier`` (M03 / #232) selects the per-tier lifecycle. It
+    defaults to ``"project"`` so pre-M03 callers get the never-expire
+    behaviour they had before the column existed.
     """
 
     scope: str | None = None
@@ -48,6 +85,7 @@ class _TypedMemoryBase:
     source: str = "manual"
     ttl_at: str | None = None
     superseded_by: int | None = None
+    scope_tier: str = ScopeTier.PROJECT.value
 
     # Subclasses override this with their MemoryType.
     TYPE: MemoryType = MemoryType.PROJECT
@@ -150,6 +188,12 @@ def validate_typed_memory(memory: TypedMemory) -> None:
             f"{memory.TYPE.value} memory importance must be between 1 and 5 "
             f"(got {memory.importance})"
         )
+    tier = getattr(memory, "scope_tier", ScopeTier.PROJECT.value)
+    if tier not in VALID_SCOPE_TIERS:
+        raise ValueError(
+            f"{memory.TYPE.value} memory scope_tier must be one of "
+            f"{sorted(VALID_SCOPE_TIERS)} (got {tier!r})"
+        )
 
 
 @dataclass(slots=True)
@@ -171,6 +215,9 @@ class MemoryEntry:
     importance: int = 3
     superseded_by: int | None = None
     ttl_at: str | None = None
+    # M03 tiered-scope field. Default mirrors the schema DEFAULT so
+    # existing callers see a project-tier lifecycle unless they opt in.
+    scope_tier: str = ScopeTier.PROJECT.value
 
 
 @dataclass(slots=True)
@@ -230,7 +277,8 @@ class MemoryBackend(Protocol):
         self,
         query: str,
         *,
-        scope: str | list[str] | None = None,
+        scope: str | list[str] | list[tuple[str, str]] | None = None,
+        scope_tier: str | list[str] | None = None,
         types: list[str] | None = None,
         limit: int = 10,
         importance_min: int = 1,

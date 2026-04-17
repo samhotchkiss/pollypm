@@ -27,6 +27,7 @@ from pathlib import Path
 
 MEMORY_DIR = Path.home() / ".pollypm" / "memory"
 MEMORY_FILE = MEMORY_DIR / "planner.jsonl"
+REJECTIONS_FILE = MEMORY_DIR / "planner_rejections.jsonl"
 
 
 @dataclass(slots=True)
@@ -183,3 +184,85 @@ def summarise_for_prompt(entries: list[PlannerMemoryEntry]) -> str:
     )
     lines.append("</planner-memory>")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Improvement-proposal rejection memory (issue #275)
+#
+# A separate JSONL so it doesn't collide with ``PlannerMemoryEntry`` reads
+# in :func:`read_entries`. One line per rejection, append-only. We never
+# need to enumerate rejections, only predicate-check them, so this file is
+# kept dead simple.
+# ---------------------------------------------------------------------------
+
+
+def _rejections_path(override: Path | None = None) -> Path:
+    """Return the active rejections file path (defaults to REJECTIONS_FILE)."""
+    return override if override is not None else REJECTIONS_FILE
+
+
+def record_proposal_rejection(
+    *,
+    project_key: str,
+    planner_memory_key: str,
+    rationale: str = "",
+    path: Path | None = None,
+) -> Path:
+    """Append a rejection record. Idempotent — duplicate rejections are a no-op.
+
+    The file layout is append-only JSONL; each line carries the project
+    key, the memkey, the optional free-form rationale, and a timestamp
+    for future analytics. The predicate :func:`is_proposal_rejected`
+    matches on (project_key, planner_memory_key) only, so re-adding the
+    same pair is harmless but wastes a byte or two.
+    """
+    target = _rejections_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "project": project_key,
+        "planner_memory_key": planner_memory_key,
+        "rationale": (rationale or "").strip(),
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "entry_type": "proposal_rejected",
+    }
+    with target.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, ensure_ascii=False))
+        fh.write("\n")
+    return target
+
+
+def is_proposal_rejected(
+    *,
+    project_key: str,
+    planner_memory_key: str,
+    path: Path | None = None,
+) -> bool:
+    """Predicate: has this (project, memkey) pair been rejected before?
+
+    Returns False when the rejections file doesn't exist yet (fresh
+    install). Malformed lines are skipped — the predicate degrades to
+    "no rejection found" rather than crashing the planner.
+    """
+    target = _rejections_path(path)
+    if not target.is_file():
+        return False
+    try:
+        content = target.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if (
+            obj.get("project") == project_key
+            and obj.get("planner_memory_key") == planner_memory_key
+        ):
+            return True
+    return False

@@ -2026,6 +2026,55 @@ def _build_pm_context_line(
     return f're: inbox/{task_id} "{title}"'
 
 
+def _extract_proposal_spec(task, *, labels: list[str] | None = None) -> dict:
+    """Recover a proposal's ``proposed_task_spec`` from an inbox row.
+
+    The body was rendered at emit time by ``render_proposal_body`` which
+    intersperses the rationale with a ``## Proposed task`` markdown
+    block. Rather than parse that back, we fall back to title +
+    description: the accepted follow-on task uses the proposal title
+    and rationale as its description. Tests that care about the exact
+    spec shape can stub :meth:`PollyInboxApp._proposal_specs` directly.
+    """
+    spec: dict[str, object] = {}
+    subject = (getattr(task, "title", "") or "").strip()
+    if subject:
+        spec["title"] = subject
+    body = (getattr(task, "description", "") or "").strip()
+    # Split at the preview marker so the accepted follow-on task only
+    # carries the rationale, not the spec scaffold.
+    marker = "## Proposed task"
+    if marker in body:
+        rationale, _, tail = body.partition(marker)
+        spec["description"] = rationale.strip()
+        # Recover acceptance criteria from the preview, when present.
+        for line in tail.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("- **acceptance criteria**"):
+                # Subsequent indented lines form the AC block.
+                continue
+        # Heuristic AC extractor: grab the block after ``acceptance criteria:``.
+        ac_lines: list[str] = []
+        capturing = False
+        for line in tail.splitlines():
+            low = line.lstrip().lower()
+            if low.startswith("- **acceptance criteria**"):
+                capturing = True
+                continue
+            if capturing:
+                if line.startswith("- **") and not line.lstrip().startswith(
+                    "- **acceptance"
+                ):
+                    break
+                if line.strip():
+                    ac_lines.append(line.strip())
+        if ac_lines:
+            spec["acceptance_criteria"] = "\n".join(ac_lines)
+    else:
+        spec["description"] = body
+    return spec
+
+
 class _RollupItem(ListItem):
     """One sub-item in a rollup's expanded thread.
 
@@ -2246,6 +2295,11 @@ class PollyInboxApp(App[None]):
         Binding("r", "start_reply", "Reply"),
         Binding("a", "archive_selected", "Archive"),
         Binding("d", "jump_to_pm", "Discuss"),
+        # Improvement proposals (#275): capital A/X so plain lowercase
+        # ``a`` (archive) stays distinct. Accepting / rejecting IS
+        # archiving, but with a decision trail.
+        Binding("A", "accept_proposal", "Accept", show=False),
+        Binding("X", "reject_proposal", "Reject", show=False),
         Binding("e", "expand_all_rollup", "Expand all", show=False),
         Binding("u", "refresh", "Refresh"),
         Binding("q,escape", "back_or_cancel", "Back"),
@@ -2273,8 +2327,7 @@ class PollyInboxApp(App[None]):
         )
         self.status = Static("", id="inbox-status")
         self.hint = Static(
-            "j/k move \u00b7 \u21b5 open \u00b7 r reply \u00b7 a archive "
-            "\u00b7 d discuss \u00b7 u refresh \u00b7 q back",
+            PollyInboxApp._DEFAULT_HINT,
             id="inbox-hint",
         )
         self._tasks: list = []
@@ -2288,6 +2341,15 @@ class PollyInboxApp(App[None]):
         # Focused rollup sub-item for ``d`` dispatch. None when the whole
         # rollup is the jump target (or on a non-rollup task).
         self._rollup_focused_index: int | None = None
+        # Improvement-proposal state (#275). When the user presses ``X``
+        # on a proposal item, the shared reply_input becomes a rationale
+        # prompt. We flag it here so the Input.Submitted handler routes
+        # to record_proposal_rejection instead of add_reply.
+        self._awaiting_rejection_task_id: str | None = None
+        # Cache of parsed proposal_task_spec per inbox task_id, populated
+        # on _render_detail. Accept uses it to seed the follow-on task
+        # without re-reading the DB.
+        self._proposal_specs: dict[str, dict] = {}
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="inbox-layout"):
@@ -2508,6 +2570,22 @@ class PollyInboxApp(App[None]):
                     f"[b #5b8aff]{_escape(who)}[/b #5b8aff]  [dim]{_escape(age)}[/dim]"
                 )
                 sections.append(_md_to_rich(_escape_body(entry.text)))
+
+        # Improvement-proposal detection (#275). Proposal items carry a
+        # ``proposal`` label; when present, swap the hint bar for the
+        # accept/reject keybindings. The body itself already embeds the
+        # proposed-task-spec preview (written at emit time via
+        # ``render_proposal_body``), so we don't double-render it here.
+        _labels = list(getattr(task, "labels", []) or [])
+        _is_proposal = "proposal" in _labels
+        if _is_proposal:
+            self._proposal_specs[task_id] = _extract_proposal_spec(
+                task, labels=_labels,
+            )
+            self._update_hint_for_proposal()
+        else:
+            self._proposal_specs.pop(task_id, None)
+            self._restore_default_hint()
 
         self.detail.update("\n".join(sections))
         # Rebuild the rollup item list (empty for non-rollups).
@@ -2752,6 +2830,17 @@ class PollyInboxApp(App[None]):
         task_id = self._selected_task_id
         if task_id is None:
             return
+        # Improvement proposals force an explicit Accept (A) or Reject
+        # (X). Plain ``a`` must not silently archive them — the user
+        # gets a visible warning instead so they don't accidentally
+        # drop a suggestion without recording the decision.
+        task, _labels = self._selected_proposal_task()
+        if task is not None:
+            self.notify(
+                "This is an improvement proposal \u2014 press A to accept or X to reject.",
+                severity="warning", timeout=3.0,
+            )
+            return
         svc = self._svc_for_task(task_id)
         if svc is None:
             self.notify("Could not open project database.", severity="error")
@@ -2908,6 +2997,24 @@ class PollyInboxApp(App[None]):
     def _on_reply_submitted(self, event: Input.Submitted) -> None:
         body = (event.value or "").strip()
         task_id = self._selected_task_id
+        # Rejection path: when the user pressed ``X`` on a proposal, the
+        # shared reply input was repurposed to collect a rationale. Route
+        # submission through the rejection flow instead of add_reply so
+        # the bytes land in planner memory + the task archives with the
+        # ``proposal_rejected`` entry_type.
+        if self._awaiting_rejection_task_id is not None:
+            pending = self._awaiting_rejection_task_id
+            self._awaiting_rejection_task_id = None
+            self.reply_input.placeholder = (
+                "Reply \u2026 (Enter to send, Esc back to list)"
+            )
+            if not task_id or task_id != pending:
+                # Selection moved while typing — abandon the rejection.
+                self.reply_input.value = ""
+                self.list_view.focus()
+                return
+            self._finish_reject_proposal(task_id, body)
+            return
         if not body or not task_id:
             # Empty submit — just hand focus back to the list.
             self.reply_input.value = ""
@@ -2939,6 +3046,206 @@ class PollyInboxApp(App[None]):
         self.reply_input.value = ""
         self.list_view.focus()
         self._render_detail(task_id)
+
+    # ------------------------------------------------------------------
+    # Improvement proposals (#275) — Accept / Reject
+    # ------------------------------------------------------------------
+
+    _DEFAULT_HINT = (
+        "j/k move \u00b7 \u21b5 open \u00b7 r reply \u00b7 a archive "
+        "\u00b7 d discuss \u00b7 u refresh \u00b7 q back"
+    )
+    _PROPOSAL_HINT = (
+        "A accept \u00b7 X reject \u00b7 r reply \u00b7 q back"
+    )
+
+    def _update_hint_for_proposal(self) -> None:
+        try:
+            self.hint.update(self._PROPOSAL_HINT)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _restore_default_hint(self) -> None:
+        try:
+            self.hint.update(self._DEFAULT_HINT)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _selected_proposal_task(self):
+        """Return (task, labels) for the current selection if it's a proposal."""
+        task_id = self._selected_task_id
+        if task_id is None:
+            return None, []
+        svc = self._svc_for_task(task_id)
+        if svc is None:
+            return None, []
+        try:
+            task = svc.get(task_id)
+        except Exception:  # noqa: BLE001
+            return None, []
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+        labels = list(getattr(task, "labels", []) or [])
+        if "proposal" not in labels:
+            return None, labels
+        return task, labels
+
+    def action_accept_proposal(self) -> None:
+        """Accept the selected proposal — create a follow-on task + archive."""
+        if self.reply_input.has_focus:
+            return
+        task_id = self._selected_task_id
+        if task_id is None:
+            return
+        task, labels = self._selected_proposal_task()
+        if task is None:
+            self.notify(
+                "Accept/Reject only applies to proposal items.",
+                severity="warning", timeout=2.0,
+            )
+            return
+        spec = self._proposal_specs.get(task_id) or _extract_proposal_spec(
+            task, labels=labels,
+        )
+        project_key = task.project
+        from pollypm.plugins_builtin.project_planning.proposals import (
+            accept_proposal as _accept_helper,
+        )
+        svc = self._svc_for_task(task_id)
+        if svc is None:
+            self.notify("Could not open project database.", severity="error")
+            return
+        try:
+            new_task = _accept_helper(
+                svc,
+                task_id=task_id,
+                proposal_spec=spec,
+                project_key=project_key,
+                actor="user",
+            )
+            svc.add_context(
+                task_id,
+                actor="user",
+                text=f"Proposal accepted \u2192 {new_task.task_id}",
+                entry_type="proposal_accepted",
+            )
+            svc.archive_task(task_id, actor="user")
+        except Exception as exc:  # noqa: BLE001
+            self.notify(f"Accept failed: {exc}", severity="error")
+            return
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._emit_event(
+            task_id, "inbox.proposal.accepted",
+            f"user accepted proposal {task_id} \u2192 {new_task.task_id}",
+        )
+        self.notify(
+            f"Accepted \u2014 created {new_task.task_id}",
+            severity="information", timeout=3.0,
+        )
+        # Drop the archived row locally so it disappears without waiting
+        # for the next background refresh.
+        self._tasks = [t for t in self._tasks if t.task_id != task_id]
+        self._unread_ids.discard(task_id)
+        self._proposal_specs.pop(task_id, None)
+        if self._selected_task_id == task_id:
+            self._selected_task_id = None
+        self._render_list(select_first=bool(self._tasks))
+        self._restore_default_hint()
+
+    def action_reject_proposal(self) -> None:
+        """Reject the selected proposal — prompt for a rationale first."""
+        if self.reply_input.has_focus:
+            return
+        task_id = self._selected_task_id
+        if task_id is None:
+            return
+        task, _labels = self._selected_proposal_task()
+        if task is None:
+            self.notify(
+                "Accept/Reject only applies to proposal items.",
+                severity="warning", timeout=2.0,
+            )
+            return
+        self._awaiting_rejection_task_id = task_id
+        self.reply_input.value = ""
+        self.reply_input.placeholder = (
+            "Why reject? (Enter to confirm, Esc to cancel)"
+        )
+        self.reply_input.focus()
+
+    def _finish_reject_proposal(self, task_id: str, rationale: str) -> None:
+        """Persist rejection in planner memory + archive the inbox row."""
+        task, labels = self._selected_proposal_task()
+        if task is None:
+            # Selection moved to a non-proposal item mid-typing.
+            self.reply_input.value = ""
+            self.list_view.focus()
+            return
+        from pollypm.plugins_builtin.project_planning.memory import (
+            record_proposal_rejection,
+        )
+        from pollypm.plugins_builtin.project_planning.proposals import (
+            memkey_from_labels,
+        )
+        memkey = memkey_from_labels(labels) or ""
+        project_key = task.project
+        try:
+            record_proposal_rejection(
+                project_key=project_key,
+                planner_memory_key=memkey,
+                rationale=rationale,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.notify(f"Reject memory failed: {exc}", severity="error")
+            # Still try to archive so the user isn't stuck looking at
+            # the rejected proposal.
+        svc = self._svc_for_task(task_id)
+        if svc is None:
+            self.notify("Could not open project database.", severity="error")
+            self.reply_input.value = ""
+            self.list_view.focus()
+            return
+        try:
+            svc.add_context(
+                task_id,
+                actor="user",
+                text=f"Proposal rejected: {rationale[:200]}" if rationale else
+                     "Proposal rejected (no rationale given).",
+                entry_type="proposal_rejected",
+            )
+            svc.archive_task(task_id, actor="user")
+        except Exception as exc:  # noqa: BLE001
+            self.notify(f"Archive after reject failed: {exc}", severity="error")
+            self.reply_input.value = ""
+            self.list_view.focus()
+            return
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._emit_event(
+            task_id, "inbox.proposal.rejected",
+            f"user rejected proposal {task_id}",
+        )
+        self.notify("Rejected \u2014 planner will skip this next time.",
+                    severity="information", timeout=3.0)
+        self._tasks = [t for t in self._tasks if t.task_id != task_id]
+        self._unread_ids.discard(task_id)
+        self._proposal_specs.pop(task_id, None)
+        if self._selected_task_id == task_id:
+            self._selected_task_id = None
+        self.reply_input.value = ""
+        self.list_view.focus()
+        self._render_list(select_first=bool(self._tasks))
+        self._restore_default_hint()
 
     # ------------------------------------------------------------------
     # Event emission

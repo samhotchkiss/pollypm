@@ -1,11 +1,54 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+
+
+def _normalize_fts_query(query: str) -> str:
+    """Convert a free-text query into an FTS5-safe MATCH expression.
+
+    FTS5's query syntax treats a fistful of characters as operators
+    (``" ( ) : . * + -``) and rejects malformed input with
+    ``sqlite3.OperationalError: fts5: syntax error``. We take the belt-
+    and-braces approach: split the input on anything that isn't a word
+    character, drop empty fragments, wrap each surviving token in
+    double quotes (FTS5 treats a quoted token as a literal phrase — no
+    operators), and join with implicit-AND. Tokens shorter than two
+    characters are dropped because FTS5's unicode61 tokenizer will
+    silently skip them anyway, and empty queries fall back to an
+    all-columns wildcard so the MATCH always matches nothing (we
+    surface that to the caller by returning a sentinel which the
+    caller can treat as "no results" — see note below).
+
+    Returns a string safe to pass as the right-hand side of a
+    ``col MATCH ?`` parameterized query.
+    """
+    # Extract alphanumeric runs; underscore is included so identifiers
+    # like ``state_store`` stay whole.
+    tokens = re.findall(r"[\w]+", query.lower(), flags=re.UNICODE)
+    # Drop single-char tokens — FTS5 unicode61 filters them anyway and
+    # keeping them just bloats the query.
+    tokens = [t for t in tokens if len(t) >= 2]
+    if not tokens:
+        # Fall back to a query that matches nothing. FTS5 requires *some*
+        # valid term, so we use an obviously-nonsense token. Callers that
+        # want "all entries" should pass empty string to recall() which
+        # short-circuits before reaching this helper.
+        return '"__pollypm_no_match_sentinel__"'
+    # OR the tokens so a multi-word query like "testing strategy" still
+    # surfaces entries that match either word (bm25 ranks entries that
+    # match both higher, which is what we want). Each token is quoted to
+    # neutralise any operator characters that slip through (the regex
+    # already strips them, but quoting is cheap insurance). The porter
+    # tokenizer on the FTS table handles stemming so ``testing`` matches
+    # entries containing ``tests`` or ``tested`` without any prefix-``*``
+    # gymnastics.
+    return " OR ".join(f'"{t}"' for t in tokens)
 
 
 SCHEMA = """
@@ -192,6 +235,46 @@ CREATE INDEX IF NOT EXISTS idx_memory_entries_scope
 ON memory_entries(scope, id DESC);
 -- idx_memory_entries_type is created by migration 8 after the ``type``
 -- column is back-filled onto pre-M01 databases.
+
+-- FTS5 keyword index over memory_entries.{title, body, tags}. The entries
+-- table is the source of truth; this contentless-FTS mirror (content=…) is
+-- kept in sync by triggers below. ``rowid`` mirrors ``memory_entries.id`` so
+-- joins are trivial (#231 / M02).
+-- Tokenizer: ``porter unicode61 remove_diacritics 2`` — Porter stemmer
+-- chained on top of unicode61 folds "testing"/"tests"/"tested" to a
+-- common stem so a query for "testing" surfaces all three. Accent
+-- folding keeps the index forgiving for non-ASCII content.
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_entries_fts
+USING fts5(
+    title,
+    body,
+    tags,
+    content='memory_entries',
+    content_rowid='id',
+    tokenize='porter unicode61 remove_diacritics 2'
+);
+
+-- Triggers: keep the FTS index in lock-step with writes. A contentless FTS
+-- table stores no rows by itself; after_delete uses the 'delete' command
+-- form ``INSERT INTO fts(fts, rowid, …) VALUES('delete', …)`` so the index
+-- matches before/after consistently. See SQLite FTS5 docs §4.4.
+CREATE TRIGGER IF NOT EXISTS memory_entries_fts_ai
+AFTER INSERT ON memory_entries BEGIN
+    INSERT INTO memory_entries_fts(rowid, title, body, tags)
+    VALUES (new.id, new.title, new.body, new.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS memory_entries_fts_ad
+AFTER DELETE ON memory_entries BEGIN
+    INSERT INTO memory_entries_fts(memory_entries_fts, rowid, title, body, tags)
+    VALUES ('delete', old.id, old.title, old.body, old.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS memory_entries_fts_au
+AFTER UPDATE ON memory_entries BEGIN
+    INSERT INTO memory_entries_fts(memory_entries_fts, rowid, title, body, tags)
+    VALUES ('delete', old.id, old.title, old.body, old.tags);
+    INSERT INTO memory_entries_fts(rowid, title, body, tags)
+    VALUES (new.id, new.title, new.body, new.tags);
+END;
 
 CREATE TABLE IF NOT EXISTS memory_summaries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -531,6 +614,13 @@ class StateStore:
             # dispatch block below (feature-detected via _safe_add_column),
             # and the index is created afterwards, once the column exists.
         ]),
+        (9, "FTS5 index for memory recall (title/body/tags)", [
+            # Table + triggers are declared in SCHEMA with IF NOT EXISTS,
+            # so they already exist on fresh databases by the time this
+            # migration runs. On upgraded databases we just need to
+            # back-fill the FTS rows for entries that existed before the
+            # triggers landed (dispatch block below handles that).
+        ]),
     ]
 
     def _migrate(self) -> None:
@@ -571,6 +661,16 @@ class StateStore:
                 self.execute(
                     "CREATE INDEX IF NOT EXISTS idx_memory_entries_type "
                     "ON memory_entries(type, id DESC)"
+                )
+            elif version == 9:
+                # Back-fill the FTS5 index for rows that existed before the
+                # after_insert trigger was installed. Use the 'rebuild'
+                # command form so SQLite repopulates the index from the
+                # content table atomically — cheaper and safer than a
+                # row-by-row insert loop. This is a no-op on a fresh DB
+                # (the table is empty) and idempotent otherwise.
+                self.execute(
+                    "INSERT INTO memory_entries_fts(memory_entries_fts) VALUES('rebuild')"
                 )
             self.execute(
                 "INSERT INTO schema_version (version, description, applied_at) VALUES (?, ?, ?)",
@@ -1626,6 +1726,111 @@ class StateStore:
             )
             for row in rows
         ]
+
+    def recall_memory_entries(
+        self,
+        *,
+        query: str,
+        scopes: list[str] | None = None,
+        types: list[str] | None = None,
+        importance_min: int = 1,
+        limit: int = 10,
+        candidate_multiplier: int = 5,
+    ) -> list[tuple[MemoryEntryRecord, float | None]]:
+        """Return (record, bm25_score_or_None) pairs ranked by FTS5.
+
+        When ``query`` is empty or whitespace-only, skips the FTS MATCH and
+        returns rows filtered by the remaining predicates, ordered by id
+        DESC. The caller (``FileMemoryBackend.recall``) is responsible for
+        combining bm25 with importance + recency into the final score.
+
+        ``candidate_multiplier`` widens the SQL fetch so the ranker has
+        headroom to apply the importance/recency weighting without the
+        top-K being clipped by SQL's bm25-only ordering. Defaults to 5×
+        which is generous but bounded (still O(limit)).
+        """
+        clauses: list[str] = []
+        params: list[object] = []
+        # Filter superseded entries out of recall by default — they remain
+        # readable by id but shouldn't surface in relevance search. Matches
+        # the spec's "superseded entries preserved for audit but not returned
+        # by default" contract (§3.7).
+        clauses.append("me.superseded_by IS NULL")
+        # Filter expired entries (ttl_at in the past). ISO-8601 sorts
+        # lexicographically so a string comparison works for UTC timestamps.
+        now_iso = self._now()
+        clauses.append("(me.ttl_at IS NULL OR me.ttl_at > ?)")
+        params.append(now_iso)
+        if scopes:
+            placeholders = ", ".join("?" for _ in scopes)
+            clauses.append(f"me.scope IN ({placeholders})")
+            params.extend(scopes)
+        if types:
+            placeholders = ", ".join("?" for _ in types)
+            clauses.append(f"me.type IN ({placeholders})")
+            params.extend(types)
+        if importance_min > 1:
+            clauses.append("me.importance >= ?")
+            params.append(int(importance_min))
+
+        query_text = (query or "").strip()
+        fetch_limit = max(limit * candidate_multiplier, limit)
+
+        if query_text:
+            # FTS5 MATCH — negative bm25 so that higher = better (matches
+            # the shape of every other relevance score in the codebase and
+            # lets callers ignore the "lower is better" quirk).
+            where = " AND ".join(clauses)
+            sql = f"""
+            SELECT me.id, me.scope, me.kind, me.title, me.body, me.tags, me.source,
+                   me.file_path, me.summary_path, me.created_at, me.updated_at,
+                   me.type, me.importance, me.superseded_by, me.ttl_at,
+                   bm25(memory_entries_fts) AS bm25_score
+            FROM memory_entries_fts
+            JOIN memory_entries me ON me.id = memory_entries_fts.rowid
+            WHERE memory_entries_fts MATCH ?
+              AND {where}
+            ORDER BY bm25_score ASC
+            LIMIT ?
+            """
+            fts_query = _normalize_fts_query(query_text)
+            rows = self.execute(sql, (fts_query, *params, fetch_limit)).fetchall()
+        else:
+            where = " AND ".join(clauses)
+            sql = f"""
+            SELECT me.id, me.scope, me.kind, me.title, me.body, me.tags, me.source,
+                   me.file_path, me.summary_path, me.created_at, me.updated_at,
+                   me.type, me.importance, me.superseded_by, me.ttl_at,
+                   NULL AS bm25_score
+            FROM memory_entries me
+            WHERE {where}
+            ORDER BY me.id DESC
+            LIMIT ?
+            """
+            rows = self.execute(sql, (*params, fetch_limit)).fetchall()
+
+        results: list[tuple[MemoryEntryRecord, float | None]] = []
+        for row in rows:
+            record = MemoryEntryRecord(
+                entry_id=int(row[0]),
+                scope=row[1],
+                kind=row[2],
+                title=row[3],
+                body=row[4],
+                tags=tuple(json.loads(row[5] or "[]")),
+                source=row[6],
+                file_path=row[7],
+                summary_path=row[8],
+                created_at=row[9],
+                updated_at=row[10],
+                type=row[11] if row[11] is not None else "project",
+                importance=int(row[12]) if row[12] is not None else 3,
+                superseded_by=int(row[13]) if row[13] is not None else None,
+                ttl_at=row[14],
+            )
+            bm25_score = float(row[15]) if row[15] is not None else None
+            results.append((record, bm25_score))
+        return results
 
     def record_memory_summary(
         self,

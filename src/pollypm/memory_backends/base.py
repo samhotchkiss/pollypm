@@ -183,6 +183,26 @@ class MemorySummary:
     created_at: str
 
 
+@dataclass(slots=True)
+class RecallResult:
+    """A single hit from :meth:`MemoryBackend.recall`.
+
+    - ``entry`` — the matched :class:`MemoryEntry`.
+    - ``score`` — combined relevance in ``[0, 1]`` (higher = better). The
+      scoring formula is defined in ``FileMemoryBackend.recall`` so
+      callers can compare scores *within* one call but should not rely on
+      scores being comparable across different recall queries.
+    - ``match_rationale`` — short human-readable string describing *why*
+      this entry ranked where it did (e.g. ``"fts=0.82 importance=0.80
+      recency=0.91"``). Intended for debugging and the ``pm memory``
+      CLI's verbose output; not a stable API contract.
+    """
+
+    entry: "MemoryEntry"
+    score: float
+    match_rationale: str
+
+
 class MemoryBackend(Protocol):
     def root(self) -> Path: ...
 
@@ -205,3 +225,13 @@ class MemoryBackend(Protocol):
     def summarize(self, scope: str, *, limit: int = 20) -> str: ...
 
     def compact(self, scope: str, *, limit: int = 50) -> MemorySummary: ...
+
+    def recall(
+        self,
+        query: str,
+        *,
+        scope: str | list[str] | None = None,
+        types: list[str] | None = None,
+        limit: int = 10,
+        importance_min: int = 1,
+    ) -> list["RecallResult"]: ...

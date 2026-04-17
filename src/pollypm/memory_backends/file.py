@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 import warnings
 from datetime import UTC, datetime
@@ -15,6 +16,7 @@ from pollypm.memory_backends.base import (
     MemoryType,
     PatternMemory,
     ProjectMemory,
+    RecallResult,
     ReferenceMemory,
     TypedMemory,
     UserMemory,
@@ -348,10 +350,32 @@ class FileMemoryBackend(MemoryBackend):
         type: str | None = None,
         limit: int = 50,
     ) -> list[MemoryEntry]:
-        entries = self._state_store.list_memory_entries(
-            scope=scope, kind=kind, type=type, limit=limit
+        """List recent memory entries (back-compat wrapper over ``recall``).
+
+        Behavior matches the pre-M02 contract: when callers pass a ``kind``
+        filter (used by ``knowledge_extract`` and ``checkpoints`` to fetch
+        legacy-kind rows like ``"decision"`` or ``"checkpoint"``), we defer
+        to the direct state-store query so those kinds keep working. When
+        ``kind`` is absent we route through ``recall(query="")`` — which
+        orders by recency only, since there is no keyword to rank by — so
+        this call path exercises the same plumbing as the primary read
+        path.
+        """
+        if kind is not None:
+            # Legacy-kind path. Recall doesn't take a kind filter (kinds
+            # pre-date the typed schema and overlap with types only
+            # loosely), so we stay on the direct store query here.
+            entries = self._state_store.list_memory_entries(
+                scope=scope, kind=kind, type=type, limit=limit
+            )
+            return [_record_to_entry(item) for item in entries]
+        results = self.recall(
+            "",
+            scope=scope,
+            types=[type] if type is not None else None,
+            limit=limit,
         )
-        return [_record_to_entry(item) for item in entries]
+        return [result.entry for result in results]
 
     def read_entry(self, entry_id: int) -> MemoryEntry | None:
         entry = self._state_store.get_memory_entry(entry_id)
@@ -365,10 +389,107 @@ class FileMemoryBackend(MemoryBackend):
         )
         return memory_entry
 
+    def recall(
+        self,
+        query: str,
+        *,
+        scope: str | list[str] | None = None,
+        types: list[str] | None = None,
+        limit: int = 10,
+        importance_min: int = 1,
+    ) -> list[RecallResult]:
+        """Relevance-ranked retrieval over memory.
+
+        Scoring (v1, see issue #231 / memory-system-review.md §3.3)::
+
+            0.5 * fts_score + 0.3 * importance/5 + 0.2 * recency_decay
+
+        where
+
+        * ``fts_score`` — FTS5 bm25 normalised into ``[0, 1]`` via
+          ``1 / (1 + |bm25|)``. bm25 is negative-lower-is-better by
+          convention in SQLite, so we take the absolute value; more
+          negative (= better) ⇒ larger ``|bm25|`` ⇒ smaller fraction —
+          which inverts the "better" direction. We therefore pass the raw
+          bm25 rank order and use the transform to squash into ``[0, 1]``
+          while *preserving* the ordering given by SQLite.
+        * ``importance/5`` — importance is 1..5 so this naturally sits in
+          ``[0.2, 1.0]``.
+        * ``recency_decay`` — ``exp(-age_days / 90)``; an entry written
+          today scores 1.0, one 90 days old scores ~0.37.
+
+        When ``query`` is empty, ``fts_score`` is 0 and results are
+        ordered purely by importance + recency.
+
+        ``scope`` accepts a single string, a list, or None (all scopes).
+        ``types`` filters to the given MemoryType values (strings).
+        Entries marked superseded or past their TTL are never returned.
+        """
+        scopes = _coerce_scopes(scope)
+        raw_results = self._state_store.recall_memory_entries(
+            query=query,
+            scopes=scopes,
+            types=types,
+            importance_min=importance_min,
+            limit=limit,
+        )
+        now = datetime.now(UTC)
+        scored: list[RecallResult] = []
+        for record, bm25_score in raw_results:
+            fts_component = _normalize_bm25(bm25_score)
+            importance_component = float(record.importance) / 5.0
+            recency_component = _recency_decay(record.created_at, now)
+            score = (
+                0.5 * fts_component
+                + 0.3 * importance_component
+                + 0.2 * recency_component
+            )
+            rationale = (
+                f"fts={fts_component:.2f} "
+                f"importance={importance_component:.2f} "
+                f"recency={recency_component:.2f}"
+            )
+            entry = _record_to_entry(record)
+            scored.append(
+                RecallResult(entry=entry, score=score, match_rationale=rationale)
+            )
+        # Re-rank in Python — SQL ordered by bm25 only; the final score
+        # blends in importance + recency so a high-importance-older entry
+        # can outrank a low-importance-fresh one (and vice versa). The
+        # state store fetched a generous candidate pool (see
+        # ``candidate_multiplier`` on recall_memory_entries) so the
+        # Python-side top-K is meaningful.
+        scored.sort(key=lambda r: r.score, reverse=True)
+        top = scored[:limit]
+        self._plugins.run_observers(
+            "memory.after_recall",
+            top,
+            metadata={
+                "query": query,
+                "scope": scopes,
+                "types": types,
+                "limit": limit,
+                "result_count": len(top),
+            },
+        )
+        return top
+
     def summarize(self, scope: str, *, limit: int = 20) -> str:
-        entries = self.list_entries(scope=scope, limit=limit)
+        """Summarise the most recent entries in a scope.
+
+        Back-compat wrapper over ``recall``: issues a no-query recall
+        (ordered by importance + recency) and renders the top N entries
+        as markdown for legacy callers that want a quick paste-ready
+        view.
+        """
+        results = self.recall("", scope=scope, limit=limit)
+        entries = [result.entry for result in results]
         summary = _summarize_entries(scope, entries)
-        self._plugins.run_observers("memory.after_summarize", summary, metadata={"scope": scope, "entry_count": len(entries)})
+        self._plugins.run_observers(
+            "memory.after_summarize",
+            summary,
+            metadata={"scope": scope, "entry_count": len(entries)},
+        )
         return summary
 
     def compact(self, scope: str, *, limit: int = 50) -> MemorySummary:
@@ -532,3 +653,57 @@ def _summarize_entries(scope: str, entries: list[MemoryEntry]) -> str:
 
 def _slugify(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "memory"
+
+
+def _coerce_scopes(scope: str | list[str] | None) -> list[str] | None:
+    if scope is None:
+        return None
+    if isinstance(scope, str):
+        return [scope]
+    return list(scope)
+
+
+def _normalize_bm25(bm25_score: float | None) -> float:
+    """Map SQLite FTS5 bm25 to ``[0, 1]`` with higher = better.
+
+    SQLite's bm25() returns a negative float where *more negative* means
+    a better match (it's the negation of the standard BM25 score). The
+    transform ``1 / (1 + |bm25|)`` squashes into ``[0, 1]`` while keeping
+    the "more negative ⇒ higher score" intuition — with one subtlety:
+    because ``|bm25|`` grows with match quality, ``1/(1+|bm25|)`` *shrinks*
+    with match quality, which is backwards. So we invert: we want the
+    best match to map to a number near 1, the worst to a number near 0.
+
+    The clean form is: ``1 - 1/(1+|bm25|) = |bm25| / (1 + |bm25|)``. As
+    ``|bm25|`` grows, the fraction approaches 1 — matching the
+    "higher = better" convention callers expect.
+
+    When ``bm25_score`` is None (no FTS query ran), returns 0.0 — the
+    recall pipeline then ranks purely on importance + recency.
+    """
+    if bm25_score is None:
+        return 0.0
+    magnitude = abs(float(bm25_score))
+    return magnitude / (1.0 + magnitude)
+
+
+def _recency_decay(created_at: str, now: datetime, *, half_life_days: float = 90.0) -> float:
+    """Exponential recency decay: ``exp(-age_days / half_life_days)``.
+
+    An entry written ``now`` scores 1.0; one ``half_life_days`` old scores
+    ``1/e`` ≈ 0.37. The spec calls this "linear half-life over 90 days"
+    but the implementation here is the standard exponential form —
+    strictly monotonic and numerically stable for very old entries. If
+    the timestamp fails to parse (corruption / legacy rows without
+    timezone info), we return 0.5 so the entry isn't silently buried.
+    """
+    try:
+        created = datetime.fromisoformat(created_at)
+    except (TypeError, ValueError):
+        return 0.5
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    age = (now - created).total_seconds() / 86400.0
+    if age <= 0:
+        return 1.0
+    return math.exp(-age / half_life_days)

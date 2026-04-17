@@ -1005,3 +1005,147 @@ def test_recovery_hard_limit_stops_after_many_failures(tmp_path: Path) -> None:
     assert len(recovery_alerts) == 1
     assert "STOPPED" in recovery_alerts[0].message
     assert "manual intervention" in recovery_alerts[0].message
+
+
+# ---------------------------------------------------------------------------
+# _build_review_nudge mtime cache (#174)
+# ---------------------------------------------------------------------------
+
+
+def _configure_review_nudge_projects(tmp_path: Path, n_projects: int) -> PollyPMConfig:
+    """Build a config with *n_projects* project-scoped SQLite work dbs,
+    each seeded with one in-review task. Used by the #174 cache tests.
+    """
+    from pollypm.work.models import (
+        Artifact as _Artifact,
+        ArtifactKind as _ArtifactKind,
+        OutputType as _OutputType,
+        WorkOutput as _WorkOutput,
+    )
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    config = _config(tmp_path)
+    for i in range(n_projects):
+        key = f"proj_{i}"
+        proj_root = tmp_path / key
+        (proj_root / ".pollypm").mkdir(parents=True, exist_ok=True)
+        config.projects[key] = KnownProject(
+            key=key, path=proj_root, name=key, kind=ProjectKind.FOLDER,
+        )
+        db_path = proj_root / ".pollypm" / "state.db"
+        with SQLiteWorkService(db_path=db_path) as svc:
+            task = svc.create(
+                title=f"review task {i}",
+                description="d",
+                type="task",
+                project=key,
+                flow_template="standard",
+                roles={"worker": "pete", "reviewer": "polly"},
+                priority="normal",
+                created_by="tester",
+            )
+            svc.queue(task.task_id, "pm")
+            svc.claim(task.task_id, "pete")
+            svc.node_done(
+                task.task_id,
+                "pete",
+                _WorkOutput(
+                    type=_OutputType.CODE_CHANGE,
+                    summary="done",
+                    artifacts=[
+                        _Artifact(
+                            kind=_ArtifactKind.COMMIT,
+                            description="feat",
+                            ref="abc",
+                        ),
+                    ],
+                ),
+            )
+    return config
+
+
+def _pin_load_config(monkeypatch, config: PollyPMConfig) -> None:
+    """Route ``_resolve_db_path`` through *config* instead of the user's real
+    on-disk config. ``work.cli._resolve_db_path`` imports ``load_config``
+    lazily and calls it with no arg.
+    """
+    import pollypm.config as _config_mod
+    monkeypatch.setattr(_config_mod, "load_config", lambda path=None: config)
+
+
+def test_build_review_nudge_caches_by_db_mtime(monkeypatch, tmp_path: Path) -> None:
+    """Repeated nudge builds on unchanged dbs must not re-open SQLite (#174)."""
+    from pollypm import supervisor as _supervisor_module
+
+    config = _configure_review_nudge_projects(tmp_path, n_projects=4)
+    _pin_load_config(monkeypatch, config)
+    sup = Supervisor(config)
+
+    # Reset cache to a clean slate before measuring.
+    _supervisor_module._REVIEW_NUDGE_CACHE.clear()
+
+    # Count SQLiteWorkService instantiations. Each instantiation is one
+    # sqlite3.connect + schema check — the exact hotspot flagged by #174.
+    opens: list[Path] = []
+    from pollypm.work.sqlite_service import SQLiteWorkService as _RealSvc
+    orig_init = _RealSvc.__init__
+
+    def counting_init(self, *args, **kwargs):
+        opens.append(kwargs.get("db_path", args[0] if args else None))
+        return orig_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(_RealSvc, "__init__", counting_init)
+
+    # First call: cache is cold, must open one connection per project (4).
+    nudge1 = sup._build_review_nudge()
+    assert nudge1 is not None
+    assert "4 task(s) waiting" in nudge1
+    first_opens = len(opens)
+    assert first_opens == 4, f"cold pass opened {first_opens} connections (want 4)"
+
+    # Second call: nothing changed — cache must serve every project with
+    # zero new SQLite opens.
+    opens.clear()
+    nudge2 = sup._build_review_nudge()
+    assert nudge2 == nudge1
+    second_opens = len(opens)
+    assert second_opens == 0, (
+        f"warm pass opened {second_opens} connections (want 0) — "
+        f"mtime cache is not short-circuiting"
+    )
+
+    # Mutate one project's db (touch mtime). Only that project should reopen.
+    touched_db = config.projects["proj_1"].path / ".pollypm" / "state.db"
+    import os as _os
+    import time as _time
+    new_mtime = touched_db.stat().st_mtime + 5.0
+    _os.utime(touched_db, (new_mtime, new_mtime))
+    # Give the filesystem a cycle to settle (macOS APFS can coalesce mtime).
+    _time.sleep(0.01)
+
+    opens.clear()
+    sup._build_review_nudge()
+    third_opens = len(opens)
+    assert third_opens == 1, (
+        f"one-project-changed pass opened {third_opens} connections (want 1)"
+    )
+
+
+def test_build_review_nudge_evicts_dropped_projects(monkeypatch, tmp_path: Path) -> None:
+    """Projects removed from config must be evicted from the cache (#174)."""
+    from pollypm import supervisor as _supervisor_module
+
+    config = _configure_review_nudge_projects(tmp_path, n_projects=3)
+    _pin_load_config(monkeypatch, config)
+    sup = Supervisor(config)
+
+    _supervisor_module._REVIEW_NUDGE_CACHE.clear()
+    sup._build_review_nudge()
+    assert set(_supervisor_module._REVIEW_NUDGE_CACHE) >= {"proj_0", "proj_1", "proj_2"}
+
+    # Drop proj_1 from config, rebuild — it must be evicted.
+    del config.projects["proj_1"]
+    sup._build_review_nudge()
+    assert "proj_1" not in _supervisor_module._REVIEW_NUDGE_CACHE
+    assert "proj_0" in _supervisor_module._REVIEW_NUDGE_CACHE
+    assert "proj_2" in _supervisor_module._REVIEW_NUDGE_CACHE

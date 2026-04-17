@@ -121,6 +121,48 @@ def _sanitize_provider_args(args: list[str], provider: ProviderKind) -> list[str
     return cleaned
 
 
+# Per-project cache of review-task nudge lines keyed by ``state.db`` mtime.
+# Populated by ``_review_tasks_for_project`` (called from
+# ``Supervisor._build_review_nudge``). Unchanged projects skip SQLite entirely
+# — mirrors ``_DASHBOARD_PROJECT_CACHE`` in cockpit.py and keeps the heartbeat
+# tick from scaling linearly with project count (see #174).
+_REVIEW_NUDGE_CACHE: dict[str, tuple[float, list[str]]] = {}
+
+
+def _review_tasks_for_project(project_key: str, db_path: Path) -> list[str]:
+    """Return nudge lines for a project's review-queue tasks.
+
+    Opens SQLite only when ``state.db`` mtime differs from the cached entry;
+    otherwise returns the cached lines. Mirrors ``_dashboard_project_tasks``.
+    """
+    try:
+        db_mtime = db_path.stat().st_mtime
+    except OSError:
+        _REVIEW_NUDGE_CACHE.pop(project_key, None)
+        return []
+    cached = _REVIEW_NUDGE_CACHE.get(project_key)
+    if cached is not None and cached[0] == db_mtime:
+        return cached[1]
+
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    entries: list[str] = []
+    try:
+        with SQLiteWorkService(db_path=db_path) as svc:
+            tasks = svc.list_tasks(work_status="review", project=project_key)
+            for task in tasks:
+                # Skip human-review tasks — those need user approval.
+                if task.current_node_id and "human" in task.current_node_id:
+                    continue
+                entries.append(f"  - {task.task_id}: {task.title}")
+    except Exception:  # noqa: BLE001
+        # Don't poison the cache on transient errors; just return empty.
+        return []
+
+    _REVIEW_NUDGE_CACHE[project_key] = (db_mtime, entries)
+    return entries
+
+
 class Supervisor:
     _CONTROL_ROLES = {"heartbeat-supervisor", "operator-pm", "triage", "reviewer"}
     #: Name of the PollyPM console/cockpit window inside a tmux session.
@@ -1289,25 +1331,29 @@ class Supervisor:
             pass
 
     def _build_review_nudge(self) -> str | None:
-        """Check all projects for tasks in review state."""
+        """Check all projects for tasks in review state.
+
+        Per-project review-task lists are cached in ``_REVIEW_NUDGE_CACHE``
+        keyed by ``state.db`` mtime — unchanged projects skip SQLite entirely.
+        Mirrors the pattern used by ``_dashboard_project_tasks`` (cockpit.py)
+        so the heartbeat cost scales with changed projects, not total projects.
+        """
         try:
             from pollypm.work.cli import _resolve_db_path
-            from pollypm.work.sqlite_service import SQLiteWorkService
 
             review_tasks: list[str] = []
+            live_keys: set[str] = set()
             for project_key in self.config.projects:
+                live_keys.add(project_key)
                 db_path = _resolve_db_path(".pollypm/state.db", project=project_key)
                 if not db_path.exists():
+                    _REVIEW_NUDGE_CACHE.pop(project_key, None)
                     continue
-                with SQLiteWorkService(db_path=db_path) as svc:
-                    tasks = svc.list_tasks(work_status="review", project=project_key)
-                    for task in tasks:
-                        # Skip human-review tasks — those need user approval
-                        if task.current_node_id and "human" in task.current_node_id:
-                            continue
-                        review_tasks.append(
-                            f"  - {task.task_id}: {task.title}"
-                        )
+                entries = _review_tasks_for_project(project_key, db_path)
+                review_tasks.extend(entries)
+            # Evict cache entries for projects no longer in config.
+            for stale in set(_REVIEW_NUDGE_CACHE) - live_keys:
+                _REVIEW_NUDGE_CACHE.pop(stale, None)
             if not review_tasks:
                 return None
             lines = [

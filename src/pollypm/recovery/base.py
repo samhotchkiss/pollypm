@@ -39,6 +39,9 @@ class SessionHealth(StrEnum):
     AUTH_BROKEN = "auth_broken"
     WAITING_ON_USER = "waiting_on_user"
     HEALTHY = "healthy"
+    # #249 — work-service-aware classifications
+    STUCK_ON_TASK = "stuck_on_task"
+    SILENT_WORKER = "silent_worker"
 
 
 # Intervention escalation ladder
@@ -48,6 +51,14 @@ INTERVENTION_LADDER = (
     "relaunch",    # Kill and relaunch the session
     "failover",    # Switch to a different account
     "escalate",    # Alert the operator for manual intervention
+)
+
+# Extended interventions — work-service-aware actions (#249). These are
+# not part of the sequential ladder above; they're action kinds emitted
+# by the work-aware classifications and handled by the apply side.
+EXTENDED_INTERVENTIONS = (
+    "resume_ping",          # Re-emit a task_assignment notify event
+    "prompt_pm_task_next",  # Send `pm task next` to the session
 )
 
 
@@ -70,6 +81,21 @@ class SessionSignals:
     capacity_state: CapacityState = CapacityState.UNKNOWN
     last_verdict: str = ""
     idle_cycles: int = 0
+    # ── #249 work-service-aware signals ────────────────────────────────
+    # These are optional — absent when the caller is a pure-mechanical
+    # path (e.g. supervisor policy lookup from a failure type). Populated
+    # by the session-health-sweep handler for each live session.
+    active_claim_task_id: str | None = None
+    claim_age_seconds: int | None = None
+    last_event_seconds_ago: int | None = None
+    last_commit_seconds_ago: int | None = None
+    # Role hint — "worker", "operator", "reviewer", "pm-heartbeat", ...
+    # Optional, defaults to "" for back-compat with older callers.
+    session_role: str = ""
+    # Whether an active turn indicator is visible in the pane. When True,
+    # the session is currently processing — we should NOT classify as
+    # stuck even if other timers have rolled over.
+    turn_active: bool = False
 
 
 @dataclass(slots=True)

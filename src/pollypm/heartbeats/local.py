@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import logging
 import re
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
 from pollypm.heartbeats.base import HeartbeatBackend, HeartbeatSessionContext
 from pollypm.recovery.base import (
@@ -9,6 +14,143 @@ from pollypm.recovery.base import (
     SessionSignals,
 )
 from pollypm.recovery.default import DefaultRecoveryPolicy
+
+logger = logging.getLogger(__name__)
+
+
+def _collect_work_service_signals(
+    api: Any, context: HeartbeatSessionContext,
+) -> dict[str, Any]:
+    """Populate work-service-aware signal fields for ``context``.
+
+    Queries (#249):
+      * ``work_sessions`` — active claim (task_id + claim timestamp).
+      * ``events`` — last event tied to this session.
+      * ``git log -1 --format=%ct`` — last commit on the worktree.
+
+    Returns a dict with ``active_claim_task_id``, ``claim_age_seconds``,
+    ``last_event_seconds_ago``, ``last_commit_seconds_ago`` — any key may
+    be absent (or value ``None``) when the underlying probe fails.
+    Exceptions are swallowed — the classifier degrades to mechanical mode.
+    """
+    out: dict[str, Any] = {
+        "active_claim_task_id": None,
+        "claim_age_seconds": None,
+        "last_event_seconds_ago": None,
+        "last_commit_seconds_ago": None,
+    }
+
+    now = datetime.now(timezone.utc)
+
+    # -- last event tied to this session from the state store -----------
+    try:
+        store = api.supervisor.store
+        # Use a broad "any event for this session" probe — the previous
+        # event in the ledger tells us the session has been doing
+        # something. Filter by session_name only, no event_type filter.
+        row = store.execute(
+            "SELECT created_at FROM events WHERE session_name = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (context.session_name,),
+        ).fetchone()
+        if row and row[0]:
+            ts = datetime.fromisoformat(row[0])
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            out["last_event_seconds_ago"] = int((now - ts).total_seconds())
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "work-signal: last_event probe failed for %s",
+            context.session_name, exc_info=True,
+        )
+
+    # -- active claim + commit age via the work service -----------------
+    # The work service lives in ``<project_path>/.pollypm/state.db``.
+    # Not every session maps to a project with a work DB; tests and
+    # non-work-service setups skip through cleanly.
+    try:
+        config = api.supervisor.config
+        session_cfg = config.sessions.get(context.session_name)
+        if session_cfg is None:
+            return out
+        project_cfg = config.projects.get(session_cfg.project)
+        if project_cfg is None:
+            return out
+        project_path: Path = project_cfg.path
+        work_db = project_path / ".pollypm" / "state.db"
+        if not work_db.exists():
+            return out
+
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        worktree_path: str | None = None
+        claim_started_at: str | None = None
+        claim_task_id: str | None = None
+        try:
+            with SQLiteWorkService(
+                db_path=work_db, project_path=project_path,
+            ) as svc:
+                sessions = svc.list_worker_sessions(
+                    project=session_cfg.project, active_only=True,
+                )
+                # The caller's session name may be ``worker-<proj>`` while
+                # ``agent_name`` is typically ``worker``. The simplest
+                # reliable correlation is: an in-progress task whose
+                # ``work_sessions`` row has the most recent started_at
+                # wins. In practice worker sessions are per-task (see
+                # #239-ish) so there's usually only one active row.
+                best = None
+                for row in sessions:
+                    if best is None or (row.started_at or "") > (best.started_at or ""):
+                        best = row
+                if best is not None:
+                    claim_started_at = best.started_at
+                    claim_task_id = f"{best.task_project}/{best.task_number}"
+                    worktree_path = best.worktree_path
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "work-signal: work service query failed for %s",
+                context.session_name, exc_info=True,
+            )
+
+        if claim_started_at and claim_task_id:
+            try:
+                ts = datetime.fromisoformat(claim_started_at)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                out["active_claim_task_id"] = claim_task_id
+                out["claim_age_seconds"] = int((now - ts).total_seconds())
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Git commit timestamp on the claimed task's worktree.
+        if worktree_path:
+            try:
+                result = subprocess.run(
+                    ["git", "log", "-1", "--format=%ct"],
+                    cwd=worktree_path,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    ct = int(result.stdout.strip())
+                    out["last_commit_seconds_ago"] = int(
+                        now.timestamp() - ct,
+                    )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "work-signal: git log failed for %s",
+                    worktree_path, exc_info=True,
+                )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "work-signal: outer probe failed for %s",
+            context.session_name, exc_info=True,
+        )
+
+    return out
 
 _DEFAULT_POLICY = DefaultRecoveryPolicy()
 
@@ -298,7 +440,14 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 runtime = api.supervisor.store.get_session_runtime(context.session_name)
                 prev = runtime.recovery_attempts if runtime else 0
                 intervention = _select_intervention(health, signals, previous_interventions=prev)
-                if intervention and context.role == "worker":
+                # #249 — work-aware interventions. These dispatch before
+                # the generic worker-triage path so the policy-chosen
+                # action actually runs.
+                if intervention and intervention.action == "resume_ping":
+                    self._apply_resume_ping(api, context, signals, intervention)
+                elif intervention and intervention.action == "prompt_pm_task_next":
+                    self._apply_prompt_pm_task_next(api, context)
+                elif intervention and context.role == "worker":
                     # Use Haiku to decide the right action for idle workers.
                     # The LLM reads the snapshot and classifies: push forward,
                     # nudge, do nothing, or escalate.
@@ -307,6 +456,127 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     self._escalate(api, context, intervention.reason)
             except Exception:  # noqa: BLE001
                 pass
+
+    def _apply_resume_ping(
+        self, api, context: HeartbeatSessionContext, signals: SessionSignals,
+        intervention,
+    ) -> None:
+        """Emit a resume ping via task_assignment_notify (#249).
+
+        Reuses the existing 30-min dedupe via ``notify()``. Best-effort —
+        all failures are logged and swallowed so the sweep never aborts
+        on an apply hiccup.
+        """
+        try:
+            from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
+                _build_event_for_task,
+            )
+            from pollypm.plugins_builtin.task_assignment_notify.resolver import (
+                DEDUPE_WINDOW_SECONDS,
+                load_runtime_services,
+                notify as _notify,
+            )
+            from pollypm.work.sqlite_service import SQLiteWorkService
+
+            task_id = signals.active_claim_task_id
+            if not task_id or "/" not in task_id:
+                return
+            project, number_s = task_id.rsplit("/", 1)
+            try:
+                task_number = int(number_s)
+            except ValueError:
+                return
+
+            config = api.supervisor.config
+            project_cfg = config.projects.get(project)
+            if project_cfg is None:
+                return
+            work_db = project_cfg.path / ".pollypm" / "state.db"
+            if not work_db.exists():
+                return
+
+            services = load_runtime_services()
+            try:
+                with SQLiteWorkService(
+                    db_path=work_db, project_path=project_cfg.path,
+                ) as svc:
+                    tasks = svc.list_tasks(project=project)
+                    task = next(
+                        (
+                            t for t in tasks
+                            if t.task_number == task_number
+                        ),
+                        None,
+                    )
+                    if task is None:
+                        return
+                    event = _build_event_for_task(svc, task)
+                if event is None:
+                    return
+                _notify(
+                    event, services=services,
+                    throttle_seconds=DEDUPE_WINDOW_SECONDS,
+                )
+            finally:
+                closer = getattr(services.work_service, "close", None)
+                if callable(closer):
+                    try:
+                        closer()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            # Raise a low-severity alert so the cockpit surfaces it.
+            try:
+                api.supervisor.store.upsert_alert(
+                    context.session_name,
+                    f"stuck_on_task:{task_id}",
+                    "warning",
+                    f"Stuck on {task_id}: {intervention.reason[:140]}",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "resume_ping apply failed for %s",
+                context.session_name, exc_info=True,
+            )
+
+    def _apply_prompt_pm_task_next(
+        self, api, context: HeartbeatSessionContext,
+    ) -> None:
+        """Send `pm task next` into a silent worker session (#249).
+
+        The send is routed through the same rate-limit path used for
+        ordinary nudges so we don't spam a worker that's slow to pick up.
+        """
+        try:
+            api.send_session_message(
+                context.session_name,
+                "pm task next",
+                owner="heartbeat",
+            )
+            try:
+                from pollypm.plugins_builtin.activity_feed.summaries import (
+                    activity_summary,
+                )
+
+                api.supervisor.store.record_event(
+                    context.session_name,
+                    "silent_worker_prompt",
+                    activity_summary(
+                        summary="Sent 'pm task next' to silent worker",
+                        severity="recommendation",
+                        verb="prompted",
+                        subject=context.session_name,
+                    ),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "prompt_pm_task_next apply failed for %s",
+                context.session_name, exc_info=True,
+            )
 
     def _escalate(self, api, context: HeartbeatSessionContext, reason: str) -> None:
         """Raise a durable alert so the user sees a stuck session in the cockpit."""
@@ -354,6 +624,13 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     repeated += 1
                 else:
                     break
+
+        # Work-service-aware signals (#249). Populate best-effort — if
+        # the work service can't be reached (tests, missing DB, etc.)
+        # these stay None and the classifier falls through to the
+        # pre-existing mechanical ladder.
+        work_signals = _collect_work_service_signals(api, context)
+
         return SessionSignals(
             session_name=context.session_name,
             window_present=context.window_present,
@@ -367,6 +644,12 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             has_transcript_delta=bool(context.transcript_delta),
             last_verdict=context.cursor.last_verdict if context.cursor else "",
             idle_cycles=repeated,
+            session_role=context.role or "",
+            turn_active=bool(context.transcript_delta),
+            active_claim_task_id=work_signals.get("active_claim_task_id"),
+            claim_age_seconds=work_signals.get("claim_age_seconds"),
+            last_event_seconds_ago=work_signals.get("last_event_seconds_ago"),
+            last_commit_seconds_ago=work_signals.get("last_commit_seconds_ago"),
         )
 
     # Rate limit nudges: max once per session per 10 minutes

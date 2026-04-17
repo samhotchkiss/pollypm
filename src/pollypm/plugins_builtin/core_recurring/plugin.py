@@ -102,6 +102,193 @@ def transcript_ingest_handler(payload: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True}
 
 
+def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
+    """Scan in_progress tasks for staleness and emit resume pings (#249).
+
+    Complements the 10s ``session.health_sweep`` — at a lower 5-min
+    cadence we iterate every ``in_progress`` task whose current actor is
+    a machine (``actor_type != user``) and check:
+
+      * The claimant session exists.
+      * The claimant session is idle (``is_turn_active == False``).
+      * The session hasn't recorded an event in the last 30 minutes.
+
+    When all three hold we re-emit the assignment event through
+    ``task_assignment_notify``'s ``notify()`` helper — the plugin's
+    existing 30-min dedupe table (``task_notifications``) guarantees at
+    most one ping per (session, task) per 30 minutes.
+
+    Returns a small summary so the job runner records useful output.
+    Never raises on a per-task failure — the sweep continues.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
+        _build_event_for_task,
+    )
+    from pollypm.plugins_builtin.task_assignment_notify.resolver import (
+        DEDUPE_WINDOW_SECONDS,
+        load_runtime_services,
+    )
+    from pollypm.plugins_builtin.task_assignment_notify.resolver import (
+        notify as _notify,
+    )
+    from pollypm.work.models import ActorType
+    from pollypm.work.task_assignment import SessionRoleIndex
+
+    # 30 min — mirrors the stuck_on_task threshold + dedupe window.
+    STALE_THRESHOLD_SECONDS = int(
+        payload.get("stale_threshold_seconds") or 1800,
+    )
+
+    config_path_hint = payload.get("config_path")
+    config_path = Path(config_path_hint) if config_path_hint else None
+    services = load_runtime_services(config_path=config_path)
+    work = services.work_service
+    state_store = services.state_store
+    session_svc = services.session_service
+
+    if work is None:
+        return {"outcome": "skipped", "reason": "no_work_service"}
+
+    considered = 0
+    pinged = 0
+    skipped_active_turn = 0
+    skipped_recent_event = 0
+    skipped_no_session = 0
+    deduped = 0
+
+    try:
+        try:
+            tasks = work.list_tasks(work_status="in_progress")
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "work.progress_sweep: list_tasks(in_progress) failed",
+                exc_info=True,
+            )
+            return {"outcome": "failed", "reason": "list_tasks_error"}
+
+        # Index: resolve each event's target session handle.
+        index = (
+            SessionRoleIndex(session_svc, work_service=work)
+            if session_svc is not None else None
+        )
+
+        now = datetime.now(UTC)
+        for task in tasks:
+            try:
+                event = _build_event_for_task(work, task)
+            except Exception:  # noqa: BLE001
+                continue
+            if event is None:
+                continue
+            # Only machine actors — we don't ping humans.
+            if event.actor_type is ActorType.HUMAN:
+                continue
+            considered += 1
+
+            # Resolve the target session.
+            handle = None
+            if index is not None:
+                try:
+                    handle = index.resolve(
+                        event.actor_type, event.actor_name, event.project,
+                    )
+                except Exception:  # noqa: BLE001
+                    handle = None
+            if handle is None:
+                skipped_no_session += 1
+                continue
+            target_name = getattr(handle, "name", "")
+            if not target_name:
+                skipped_no_session += 1
+                continue
+
+            # Skip actively-turning sessions — we don't ping mid-work.
+            if session_svc is not None:
+                checker = getattr(session_svc, "is_turn_active", None)
+                if callable(checker):
+                    try:
+                        if bool(checker(target_name)):
+                            skipped_active_turn += 1
+                            continue
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            # Skip sessions that have recorded ANY event recently — the
+            # session is clearly still doing something; a stale task
+            # here is orthogonal to session liveness.
+            if state_store is not None:
+                try:
+                    row = state_store.execute(
+                        "SELECT created_at FROM events WHERE session_name = ? "
+                        "ORDER BY id DESC LIMIT 1",
+                        (target_name,),
+                    ).fetchone()
+                    if row and row[0]:
+                        last_ts = datetime.fromisoformat(row[0])
+                        if last_ts.tzinfo is None:
+                            last_ts = last_ts.replace(tzinfo=UTC)
+                        if (now - last_ts) < timedelta(
+                            seconds=STALE_THRESHOLD_SECONDS,
+                        ):
+                            skipped_recent_event += 1
+                            continue
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # Fire the ping — notify() enforces the 30-min dedupe.
+            try:
+                outcome = _notify(
+                    event,
+                    services=services,
+                    throttle_seconds=DEDUPE_WINDOW_SECONDS,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "work.progress_sweep: notify failed for %s",
+                    event.task_id, exc_info=True,
+                )
+                continue
+            result = str(outcome.get("outcome", ""))
+            if result == "deduped":
+                deduped += 1
+            elif result == "sent":
+                pinged += 1
+                # Raise a low-severity stuck_on_task alert so the
+                # cockpit surfaces the event to the operator.
+                if state_store is not None:
+                    try:
+                        state_store.upsert_alert(
+                            target_name,
+                            f"stuck_on_task:{event.task_id}",
+                            "warning",
+                            (
+                                f"Session {target_name} stuck on "
+                                f"{event.task_id} — resume ping sent"
+                            ),
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+    finally:
+        closer = getattr(work, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:  # noqa: BLE001
+                pass
+
+    return {
+        "outcome": "swept",
+        "considered": considered,
+        "pinged": pinged,
+        "deduped": deduped,
+        "skipped_active_turn": skipped_active_turn,
+        "skipped_recent_event": skipped_recent_event,
+        "skipped_no_session": skipped_no_session,
+    }
+
+
 def alerts_gc_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Release expired leases and prune old events/heartbeat rows.
 
@@ -148,6 +335,10 @@ def _register_handlers(api: JobHandlerAPI) -> None:
         "alerts.gc", alerts_gc_handler,
         max_attempts=1, timeout_seconds=60.0,
     )
+    api.register_handler(
+        "work.progress_sweep", work_progress_sweep_handler,
+        max_attempts=1, timeout_seconds=60.0,
+    )
 
 
 def _register_roster(api: RosterAPI) -> None:
@@ -157,6 +348,8 @@ def _register_roster(api: RosterAPI) -> None:
     api.register_recurring("@every 60s", "capacity.probe", {})
     api.register_recurring("@every 30s", "transcript.ingest", {})
     api.register_recurring("@every 5m", "alerts.gc", {})
+    # #249 — work-service-aware stuck-task sweeper.
+    api.register_recurring("@every 5m", "work.progress_sweep", {})
 
 
 plugin = PollyPMPlugin(
@@ -165,7 +358,8 @@ plugin = PollyPMPlugin(
     description=(
         "Built-in recurring handlers — migrated from the old heartbeat loop. "
         "Registers inbox sweep, session health sweep, capacity probe, "
-        "transcript ingest, and alerts GC on the roster + job queue."
+        "transcript ingest, alerts GC, and work-service progress sweep on "
+        "the roster + job queue."
     ),
     capabilities=(
         Capability(kind="job_handler", name="inbox.sweep"),
@@ -173,6 +367,7 @@ plugin = PollyPMPlugin(
         Capability(kind="job_handler", name="capacity.probe"),
         Capability(kind="job_handler", name="transcript.ingest"),
         Capability(kind="job_handler", name="alerts.gc"),
+        Capability(kind="job_handler", name="work.progress_sweep"),
         Capability(kind="roster_entry", name="core_recurring"),
     ),
     register_handlers=_register_handlers,

@@ -32,6 +32,12 @@ class DefaultRecoveryPolicy(RecoveryPolicy):
 
     name = "default"
 
+    # Time thresholds for work-service-aware classifications (#249).
+    # 1800s (30min) mirrors the task_assignment notify dedupe window
+    # so a stuck_on_task classification never out-races a resume ping.
+    STUCK_ON_TASK_SECONDS = 1800
+    SILENT_WORKER_SECONDS = 1800
+
     # ── Classification ────────────────────────────────────────────────────
 
     def classify(self, signals: SessionSignals) -> SessionHealth:
@@ -51,6 +57,35 @@ class DefaultRecoveryPolicy(RecoveryPolicy):
         # session is waiting on a human and should not be bumped.
         if signals.last_verdict == "blocked":
             return SessionHealth.WAITING_ON_USER
+
+        # Work-service-aware: the session is alive but hasn't made
+        # progress on its claimed task for too long. Gate on turn_active
+        # so a session actively generating output doesn't get flagged.
+        # The pane being alive (not dead) is our liveness signal here.
+        if (
+            not signals.pane_dead
+            and not signals.turn_active
+            and signals.active_claim_task_id
+            and signals.claim_age_seconds is not None
+            and signals.claim_age_seconds > self.STUCK_ON_TASK_SECONDS
+            and signals.last_event_seconds_ago is not None
+            and signals.last_event_seconds_ago > self.STUCK_ON_TASK_SECONDS
+        ):
+            return SessionHealth.STUCK_ON_TASK
+
+        # Worker session is up but has no active claim and hasn't done
+        # anything for 30min — it likely missed a queue event. Only
+        # applies to "worker" role to avoid flagging operator/reviewer
+        # sessions that legitimately idle.
+        if (
+            not signals.pane_dead
+            and not signals.turn_active
+            and signals.active_claim_task_id is None
+            and signals.session_role == "worker"
+            and signals.last_event_seconds_ago is not None
+            and signals.last_event_seconds_ago > self.SILENT_WORKER_SECONDS
+        ):
+            return SessionHealth.SILENT_WORKER
 
         if signals.snapshot_repeated >= 3:
             return SessionHealth.LOOPING
@@ -167,6 +202,42 @@ class DefaultRecoveryPolicy(RecoveryPolicy):
                 session_name=signals.session_name,
                 action="escalate",
                 reason="Session in error state",
+            )
+
+        # ── #249 work-service-aware interventions ────────────────────────
+        if health == SessionHealth.STUCK_ON_TASK:
+            # Resume-ping via the task_assignment_notify plugin. The apply
+            # side emits a TaskAssignmentEvent so the existing dedupe
+            # table prevents double-firing, and raises a low-severity
+            # stuck_on_task alert for operator visibility.
+            return InterventionAction(
+                session_name=signals.session_name,
+                action="resume_ping",
+                reason=(
+                    f"Session idle on task {signals.active_claim_task_id} — "
+                    f"claim age {signals.claim_age_seconds}s, "
+                    f"last event {signals.last_event_seconds_ago}s ago"
+                ),
+                details={
+                    "task_id": signals.active_claim_task_id,
+                    "claim_age_seconds": signals.claim_age_seconds,
+                    "last_event_seconds_ago": signals.last_event_seconds_ago,
+                },
+            )
+
+        if health == SessionHealth.SILENT_WORKER:
+            # Worker is up with no claim — send `pm task next` to kick
+            # it into picking up the queue.
+            return InterventionAction(
+                session_name=signals.session_name,
+                action="prompt_pm_task_next",
+                reason=(
+                    f"Worker idle without a claim — "
+                    f"last event {signals.last_event_seconds_ago}s ago"
+                ),
+                details={
+                    "last_event_seconds_ago": signals.last_event_seconds_ago,
+                },
             )
 
         return None

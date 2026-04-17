@@ -193,7 +193,12 @@ class TmuxSessionService:
                     task_description=task_description,
                     user_id=user_id,
                 )
-                kickoff = self._prepare_initial_input(name, injected_input)
+                kickoff = self._prepare_initial_input(
+                    name,
+                    injected_input,
+                    expected_window=wname,
+                    session_role=session_role,
+                )
                 time.sleep(0.5)
                 self.tmux.send_keys(target, kickoff)
                 self._verify_input_submitted(target, kickoff, provider)
@@ -857,7 +862,71 @@ class TmuxSessionService:
     # Internal: initial input preparation
     # ------------------------------------------------------------------
 
-    def _prepare_initial_input(self, session_name: str, initial_input: str) -> str:
+    def _assert_session_launch_matches(
+        self,
+        session_name: str,
+        *,
+        expected_window: str | None,
+        session_role: str | None,
+    ) -> None:
+        """Fail loud when a (session_name, target-window) tuple is crossed.
+
+        Mirrors :meth:`pollypm.supervisor.Supervisor._assert_session_launch_matches`
+        but operates on :class:`pollypm.config.PollyPMConfig.sessions` — the
+        session service layer doesn't have a launch planner handle.
+
+        Worker sessions are transient (per-task window names under a
+        dynamic tmux session), so they are never registered in the
+        static ``sessions`` config. Skip the check for those; the
+        supervisor-layer assertion covers the static control roles.
+        """
+        if session_role == "worker":
+            return
+        sessions = getattr(self._config, "sessions", None) or {}
+        cfg = sessions.get(session_name) if isinstance(sessions, dict) else None
+        if cfg is None:
+            # Session not in static config — likely an ad-hoc / worker
+            # session. Nothing to cross-check against.
+            return
+        configured_window = cfg.window_name or cfg.name
+        mismatch_window = (
+            expected_window is not None and configured_window != expected_window
+        )
+        if mismatch_window:
+            details = (
+                f"session_name={session_name!r} "
+                f"expected_window={expected_window!r} "
+                f"configured_window={configured_window!r} "
+                f"role={session_role!r}"
+            )
+            logger.error("persona_swap_detected (session_service): %s", details)
+            try:
+                self._store.record_event(
+                    session_name, "persona_swap_detected", details,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            raise RuntimeError(f"persona_swap_detected: {details}")
+
+    def _prepare_initial_input(
+        self,
+        session_name: str,
+        initial_input: str,
+        *,
+        expected_window: str | None = None,
+        session_role: str | None = None,
+    ) -> str:
+        # Fail-loud persona-swap guard. The parallel path in
+        # ``pollypm.supervisor.Supervisor._prepare_initial_input`` has
+        # the same check against ``launch_by_session``; here we use the
+        # config-level session map because the session service layer
+        # has no launch planner handle. See 2026-04-16 commit that
+        # added this check for the overnight-E2E context.
+        self._assert_session_launch_matches(
+            session_name,
+            expected_window=expected_window,
+            session_role=session_role,
+        )
         if len(initial_input) <= 280:
             return initial_input
         prompts_dir = self._config.project.base_dir / "control-prompts"

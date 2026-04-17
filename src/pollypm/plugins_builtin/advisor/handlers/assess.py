@@ -574,3 +574,61 @@ def parse_decision(output: str | None) -> AdvisorDecision:
             invalid_output_reason="silent-no-rationale",
         )
     return AdvisorDecision(emit=False, rationale_if_silent=rationale)
+
+
+# ---------------------------------------------------------------------------
+# Post-session wiring — history append + optional inbox emit.
+# ---------------------------------------------------------------------------
+
+
+def record_decision(
+    *,
+    base_dir: Path,
+    project: str,
+    decision: AdvisorDecision,
+    task_id: str = "",
+    commits_reviewed: list[str] | None = None,
+    now_utc: datetime | None = None,
+) -> dict[str, Any]:
+    """Persist the session's decision: history log (always) + inbox (if emit).
+
+    Returns a dict with ``history_entry`` (the HistoryEntry that was
+    appended) and ``inbox_entry`` (the ``AdvisorInsight`` written, or
+    None on silent / invalid-output decisions).
+
+    Called by the assess path on session completion — the tick handler
+    enqueues; ad03 runs the session; this wires the terminal handling
+    for ad04 (log) + ad05 (inbox). Kept in assess.py so the emit path
+    is one unit the operator can reason about.
+    """
+    from pollypm.plugins_builtin.advisor.handlers.history_log import (
+        append_decision,
+    )
+
+    ts = (now_utc or datetime.now(UTC)).isoformat()
+    history_entry = append_decision(
+        base_dir,
+        project=project,
+        decision_json=decision.to_dict(),
+        task_id=task_id,
+        commits_reviewed=commits_reviewed or [],
+        timestamp=ts,
+    )
+
+    inbox_entry = None
+    if decision.emit and not decision.invalid_output_reason:
+        from pollypm.plugins_builtin.advisor.inbox import emit_insight
+
+        try:
+            inbox_entry = emit_insight(
+                base_dir,
+                project=project,
+                decision=decision,
+                task_id=task_id,
+                commits_reviewed=commits_reviewed or [],
+                now_utc=now_utc,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("advisor: inbox emit failed: %s", exc)
+
+    return {"history_entry": history_entry, "inbox_entry": inbox_entry}

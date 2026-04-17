@@ -1,0 +1,16 @@
+api_version = "1"
+name = "memory_curator"
+kind = "recurring"
+version = "0.1.0"
+entrypoint = "plugin.py:plugin"
+description = "Memory curator: daily TTL sweep, dedup, episodic-to-pattern promotion candidates, importance decay."
+
+[[capabilities]]
+kind = "job_handler"
+name = "memory.curate"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "roster_entry"
+name = "memory.curate"
+requires_api = ">=1,<2"

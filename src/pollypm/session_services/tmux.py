@@ -103,6 +103,9 @@ class TmuxSessionService:
         fresh_launch_marker: Path | None = None,
         resume_marker: Path | None = None,
         session_role: str | None = None,
+        task_title: str | None = None,
+        task_description: str | None = None,
+        user_id: str = "operator",
     ) -> SessionHandle:
         wname = window_name or f"session-{name}"
         tsession = tmux_session or self.storage_closet_session_name()
@@ -146,7 +149,20 @@ class TmuxSessionService:
         # Send initial input if this is a fresh launch
         if initial_input and fresh_launch_marker and fresh_launch_marker.exists():
             if session_role in {"heartbeat-supervisor", "operator-pm", "reviewer", "triage", "worker"}:
-                kickoff = self._prepare_initial_input(name, initial_input)
+                # M05: prepend a "What you should know" section with
+                # recalled memories before the persona prompt is written
+                # to disk. When the memory backend isn't available (or
+                # no relevant memories surface), the helper returns the
+                # prompt unchanged — so a brand-new project boots with
+                # exactly today's behavior.
+                injected_input = self._inject_memory_into_prompt(
+                    initial_input=initial_input,
+                    session_role=session_role,
+                    task_title=task_title,
+                    task_description=task_description,
+                    user_id=user_id,
+                )
+                kickoff = self._prepare_initial_input(name, injected_input)
                 time.sleep(0.5)
                 self.tmux.send_keys(target, kickoff)
                 self._verify_input_submitted(target, kickoff, provider)
@@ -674,6 +690,59 @@ class TmuxSessionService:
             time.sleep(poll_interval)
 
         _status("Timed out waiting for Codex")
+
+    # ------------------------------------------------------------------
+    # Internal: memory injection (M05 / #234)
+    # ------------------------------------------------------------------
+
+    def _inject_memory_into_prompt(
+        self,
+        *,
+        initial_input: str,
+        session_role: str | None,
+        task_title: str | None,
+        task_description: str | None,
+        user_id: str,
+    ) -> str:
+        """Prepend a "What you should know" section to the persona prompt.
+
+        The hook is narrow: it computes a task-context query, calls
+        ``memory.recall`` against the project's memory backend, and
+        prepends the rendered section to ``initial_input``. Errors on
+        any of those steps fall through to the unchanged input so a
+        broken memory store never takes down a session launch.
+        """
+        try:
+            project_root = Path(self._config.project.root_dir)
+            project_name = getattr(self._config.project, "name", project_root.name)
+        except Exception:  # noqa: BLE001
+            return initial_input
+        try:
+            from pollypm.memory_backends import get_memory_backend
+            from pollypm.memory_prompts import (
+                build_memory_injection,
+                compute_task_context_summary,
+                prepend_memory_injection,
+            )
+        except Exception:  # noqa: BLE001
+            return initial_input
+        try:
+            backend = get_memory_backend(project_root, "file")
+        except Exception:  # noqa: BLE001
+            return initial_input
+        summary = compute_task_context_summary(
+            task_title=task_title,
+            task_description=task_description,
+            session_role=session_role,
+            project=project_name,
+        )
+        injection = build_memory_injection(
+            backend,
+            user_id=user_id,
+            project_name=project_name,
+            task_context_summary=summary,
+        )
+        return prepend_memory_injection(initial_input, injection)
 
     # ------------------------------------------------------------------
     # Internal: initial input preparation

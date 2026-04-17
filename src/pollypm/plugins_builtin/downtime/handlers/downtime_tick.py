@@ -44,33 +44,16 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Candidate shape — duplicated here so dt01 compiles without dt03. dt03's
-# ``pick_candidate`` replaces this with the real structure; both dataclasses
-# are intentionally field-compatible.
+# Candidate + candidate sourcing — dt03 ships the real implementation; we
+# re-export from pick_candidate so existing tests and downstream handlers
+# that imported ``Candidate`` from this module keep working.
 # ---------------------------------------------------------------------------
 
 
-@dataclass(slots=True, frozen=True)
-class Candidate:
-    """A pickable downtime task candidate.
-
-    Replaced with a richer implementation in dt03; we keep the type here
-    so the tick handler is importable without depending on the candidate
-    sourcing module.
-    """
-
-    title: str
-    kind: str
-    description: str
-    priority: int = 3
-    source: str = "stub"
-    metadata: dict[str, Any] | None = None
+from pollypm.plugins_builtin.downtime.handlers import pick_candidate as _pick_candidate
 
 
-# ---------------------------------------------------------------------------
-# Hook points — overridden by dt03 (pick_candidate) and dt01 wiring (task
-# create). Tests monkeypatch these module attributes.
-# ---------------------------------------------------------------------------
+Candidate = _pick_candidate.Candidate
 
 
 def pick_candidate(
@@ -80,14 +63,19 @@ def pick_candidate(
     state: DowntimeState,
     project_root: Path,
 ) -> Candidate | None:
-    """Default candidate sourcer — returns ``None``.
+    """Delegate to dt03's real candidate sourcer.
 
-    dt03 swaps in a real implementation that reads the planner's
-    ``docs/downtime-backlog.md``, the user queue, and auto-discovery
-    scaffolding. For dt01 the stub unconditionally returns ``None`` so
-    the tick handler cleanly returns ``"no-candidates"``.
+    Kept as a thin wrapper so tests can monkeypatch
+    ``downtime_tick.pick_candidate`` without reaching into the sourcing
+    module. This preserves the dt01 test contract while dt03 lands the
+    actual implementation.
     """
-    return None
+    return _pick_candidate.pick_candidate(
+        config=config,
+        settings=settings,
+        state=state,
+        project_root=project_root,
+    )
 
 
 def schedule_downtime_task(

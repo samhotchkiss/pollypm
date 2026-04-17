@@ -102,7 +102,6 @@ tests/
     test_queue.py
   integration/
     test_session_launch.py
-    test_heartbeat_loop.py
     test_failover.py
     test_inbox_routing.py
     test_checkpoint_lifecycle.py

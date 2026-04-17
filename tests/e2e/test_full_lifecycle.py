@@ -25,16 +25,15 @@ from pollypm.checkpoints import (
 )
 from pollypm.config import write_config
 from pollypm.doc_backends import get_doc_backend
-from pollypm.heartbeat_loop import (
-    SessionHealth,
-    SessionSignals,
-    classify_session_health,
-    run_heartbeat_cycle,
-)
 from pollypm.history_import import import_project_history
 from pollypm.knowledge_extract import extract_knowledge_once
 from pollypm.plugin_validate import validate_all_plugins
 from pollypm.plugin_host import ExtensionHost
+from pollypm.recovery.base import (
+    SessionHealth,
+    SessionSignals,
+)
+from pollypm.recovery.default import DefaultRecoveryPolicy
 from pollypm.recovery_prompt import build_recovery_prompt
 from pollypm.storage.state import StateStore
 
@@ -133,17 +132,22 @@ def test_full_project_lifecycle(tmp_path: Path) -> None:
     assert "resuming" in rendered.lower()
     assert "LifecycleProject" in rendered
 
-    # 9. Heartbeat cycle
+    # 9. Heartbeat classification (sealed recovery policy)
     store = StateStore(config.project.state_db)
+    policy = DefaultRecoveryPolicy()
     signals = [
         SessionSignals(session_name="heartbeat", has_transcript_delta=True),
         SessionSignals(session_name="operator", has_transcript_delta=True),
         SessionSignals(session_name="worker", has_transcript_delta=True),
     ]
-    heartbeat_result = run_heartbeat_cycle(config, store, session_signals=signals)
-    assert heartbeat_result.sessions_checked == 3
-    assert len(heartbeat_result.interventions) == 0
-    assert all(h == SessionHealth.ACTIVE for h in heartbeat_result.classifications.values())
+    classifications = {s.session_name: policy.classify(s) for s in signals}
+    interventions = [
+        policy.select_intervention(classifications[s.session_name], s, [])
+        for s in signals
+    ]
+    assert len(classifications) == 3
+    assert all(intervention is None for intervention in interventions)
+    assert all(h == SessionHealth.ACTIVE for h in classifications.values())
 
     # 10. Capacity probes
     probes = probe_all_accounts(config, store)
@@ -205,16 +209,21 @@ def test_failure_and_recovery_lifecycle(tmp_path: Path) -> None:
     rendered = recovery.render()
     assert "resuming" in rendered.lower()
 
-    # Heartbeat detects the issue
+    # Heartbeat classifies the capacity issue and selects failover
+    policy = DefaultRecoveryPolicy()
     signals = [
         SessionSignals(
             session_name="worker",
             capacity_state=CapacityState.EXHAUSTED,
         ),
     ]
-    result = run_heartbeat_cycle(config, store, session_signals=signals)
-    assert result.classifications["worker"] == SessionHealth.BLOCKED_NO_CAPACITY
-    assert any(i.action == "failover" for i in result.interventions)
+    classifications = {s.session_name: policy.classify(s) for s in signals}
+    interventions = [
+        policy.select_intervention(classifications[s.session_name], s, [])
+        for s in signals
+    ]
+    assert classifications["worker"] == SessionHealth.BLOCKED_NO_CAPACITY
+    assert any(i is not None and i.action == "failover" for i in interventions)
 
 
 def test_isolated_state_no_production_interference(tmp_path: Path) -> None:

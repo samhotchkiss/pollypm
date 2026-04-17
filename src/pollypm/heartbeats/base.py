@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
-
-from pollypm.heartbeats.types import Alert
+from typing import Any, Protocol
 
 
 @dataclass(slots=True)
@@ -52,50 +50,16 @@ class HeartbeatUnmanagedWindow:
     pane_path: str
 
 
-class HeartbeatAPI(Protocol):
-    def list_sessions(self) -> list[HeartbeatSessionContext]: ...
-
-    def list_unmanaged_windows(self) -> list[HeartbeatUnmanagedWindow]: ...
-
-    def get_cursor(self, session_name: str) -> HeartbeatCursor | None: ...
-
-    def update_cursor(
-        self,
-        session_name: str,
-        *,
-        source_path: str,
-        last_offset: int,
-        snapshot_hash: str = "",
-        verdict: str = "",
-        reason: str = "",
-    ) -> None: ...
-
-    def record_observation(self, context: HeartbeatSessionContext) -> None: ...
-
-    def record_checkpoint(self, context: HeartbeatSessionContext, *, alerts: list[str]) -> None: ...
-
-    def record_event(self, session_name: str, event_type: str, message: str) -> None: ...
-
-    def raise_alert(self, session_name: str, alert_type: str, severity: str, message: str) -> None: ...
-
-    def clear_alert(self, session_name: str, alert_type: str) -> None: ...
-
-    def open_alerts(self) -> list[Alert]: ...
-
-    def set_session_status(self, session_name: str, status: str, *, reason: str = "") -> None: ...
-
-    def mark_account_auth_broken(self, account_name: str, provider: str, *, reason: str) -> None: ...
-
-    def recent_snapshot_hashes(self, session_name: str, *, limit: int = 3) -> list[str]: ...
-
-    def recover_session(self, session_name: str, *, failure_type: str, message: str) -> None: ...
-
-    def send_session_message(self, session_name: str, text: str, *, owner: str = "heartbeat") -> None: ...
-
-    def queue_polly_followup(self, session_name: str, reason: str) -> None: ...
-
-
 class HeartbeatBackend(Protocol):
+    """Mechanical session-health sweep (runs inside a roster-scheduled job).
+
+    The ``api`` argument is duck-typed — today it's a
+    :class:`pollypm.heartbeats.api.SupervisorHeartbeatAPI`. A stable Protocol
+    for the API surface was removed with the legacy heartbeat dispatch
+    (issue #166) because only one caller exists; re-add a Protocol here if
+    a second backend implementation lands.
+    """
+
     name: str
 
-    def run(self, api: HeartbeatAPI, *, snapshot_lines: int = 200) -> list[Alert]: ...
+    def run(self, api: Any, *, snapshot_lines: int = 200) -> list[Any]: ...

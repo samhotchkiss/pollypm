@@ -2,13 +2,31 @@ from __future__ import annotations
 
 import re
 
-from pollypm.heartbeat_loop import (
+from pollypm.heartbeats.base import HeartbeatBackend, HeartbeatSessionContext
+from pollypm.recovery.base import (
+    InterventionHistoryEntry,
     SessionHealth,
     SessionSignals,
-    classify_session_health,
-    select_intervention,
 )
-from pollypm.heartbeats.base import HeartbeatBackend, HeartbeatSessionContext
+from pollypm.recovery.default import DefaultRecoveryPolicy
+
+_DEFAULT_POLICY = DefaultRecoveryPolicy()
+
+
+def _classify_session_health(signals: SessionSignals) -> SessionHealth:
+    return _DEFAULT_POLICY.classify(signals)
+
+
+def _select_intervention(
+    health: SessionHealth,
+    signals: SessionSignals,
+    *,
+    previous_interventions: int = 0,
+):
+    history = [
+        InterventionHistoryEntry(action="") for _ in range(previous_interventions)
+    ]
+    return _DEFAULT_POLICY.select_intervention(health, signals, history)
 
 
 class LocalHeartbeatBackend(HeartbeatBackend):
@@ -276,10 +294,10 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         if not mechanical_only:
             try:
                 signals = self._context_to_signals(context, api)
-                health = classify_session_health(signals)
+                health = _classify_session_health(signals)
                 runtime = api.supervisor.store.get_session_runtime(context.session_name)
                 prev = runtime.recovery_attempts if runtime else 0
-                intervention = select_intervention(health, signals, previous_interventions=prev)
+                intervention = _select_intervention(health, signals, previous_interventions=prev)
                 if intervention and context.role == "worker":
                     # Use Haiku to decide the right action for idle workers.
                     # The LLM reads the snapshot and classifies: push forward,

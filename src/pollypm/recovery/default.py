@@ -1,10 +1,9 @@
 """Built-in default recovery policy.
 
-This is the historical behavior that used to live in
-``pollypm.heartbeat_loop.classify_session_health`` /
-``pollypm.heartbeat_loop.select_intervention``. Preserving that behavior
-byte-for-byte is a hard constraint — see ``tests/test_heartbeat_loop.py``
-and ``tests/test_recovery_policy.py`` for the reference behavior.
+This is the sealed classification + escalation ladder; its historical
+ancestor lived in ``pollypm.heartbeat_loop.classify_session_health`` /
+``select_intervention`` before issue #166 removed the legacy dispatch.
+See ``tests/test_recovery_policy.py`` for the pinned contract.
 
 The policy is stateless. Instance state (name, future knobs) is set in
 ``__init__`` only.

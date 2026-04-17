@@ -32,7 +32,8 @@ SKILLS_DIR = (
 # The final number locks at 71 when Meta is committed.
 # Progress:
 #  - Architecture & Visualization (10): 10
-EXPECTED_COUNT = 10
+#  - Documents (8): 18
+EXPECTED_COUNT = 18
 
 
 REQUIRED_FIELDS = {"name", "description", "when_to_trigger", "kind"}

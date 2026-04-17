@@ -81,17 +81,25 @@ def _run(fn, *args, **kwargs):
 def _resolve_db_path(db: str, project: str | None = None) -> Path:
     """Resolve the database path, trying the pollypm config for project root.
 
-    When *project* is given and the default ``--db`` wasn't overridden,
-    resolve to that project's ``.pollypm/state.db``.
+    When *project* is given and resolves to a registered project (and the
+    default ``--db`` wasn't overridden), resolve to that project's
+    ``.pollypm/state.db``.
 
-    When the default relative ``--db .pollypm/state.db`` doesn't exist in the
-    cwd, fall back to the pollypm config's known project paths so that agents
-    running in workspace-root (e.g. the operator in ``/Users/sam/dev``) find
-    the project-level database.
+    When the default ``--db .pollypm/state.db`` is used with no (or an
+    unregistered) project, prefer the canonical workspace-root DB at
+    ``<workspace_root>/.pollypm/state.db`` so ``pm notify`` and ``pm inbox``
+    land in the same place regardless of cwd (#271). The cockpit inbox
+    aggregator also scans workspace-root alongside per-project DBs, so
+    notifications stay visible.
+
+    A caller that explicitly passes ``--db`` always wins; that escape hatch
+    keeps tests and CI paths that stage their own DB working unchanged.
     """
     is_default = db == ".pollypm/state.db"
 
-    # If a specific project is requested, always use that project's db
+    # If a specific, registered project is requested, always use that
+    # project's db. Unknown project names (e.g. the sentinel "inbox" used
+    # by `pm notify`) fall through to the workspace-root default below.
     if project and is_default:
         try:
             from pollypm.config import load_config
@@ -109,21 +117,24 @@ def _resolve_db_path(db: str, project: str | None = None) -> Path:
         except Exception:
             pass
 
-    db_path = Path(db)
-    if db_path.exists():
-        return db_path
-
-    # Fall back to any project with an existing db
+    # Default resolution: workspace-root DB. Every `pm notify`/`pm inbox`
+    # call without an explicit --db lands here, so items are always visible
+    # regardless of which worktree or directory the caller invoked from.
     if is_default:
         try:
             from pollypm.config import load_config
             config = load_config()
-            for proj in config.projects.values():
-                candidate = proj.path / ".pollypm" / "state.db"
-                if candidate.exists():
-                    return candidate
+            workspace_root = getattr(config.project, "workspace_root", None)
+            if workspace_root is not None:
+                candidate = Path(workspace_root) / ".pollypm" / "state.db"
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                return candidate
         except Exception:
             pass
+
+    db_path = Path(db)
+    if db_path.exists():
+        return db_path
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return db_path

@@ -83,30 +83,66 @@ def _render_work_service_issues(project: object) -> str:
     return "\n".join(lines)
 
 
+def _inbox_db_sources(config) -> list[tuple[str | None, Path, Path]]:
+    """Return ``(project_key, db_path, project_path)`` for every inbox source.
+
+    Includes the per-project ``.pollypm/state.db`` for every registered
+    project **and** the workspace-root ``<workspace_root>/.pollypm/state.db``
+    — the latter is where ``pm notify`` (with defaults) lands items that
+    don't belong to any one project (#271). Duplicates are dropped so a
+    project whose path happens to equal the workspace root is scanned once.
+
+    ``project_key`` is ``None`` for the workspace-root source; callers that
+    need a project filter treat ``None`` as "no filter".
+    """
+    sources: list[tuple[str | None, Path, Path]] = []
+    seen: set[Path] = set()
+    for project_key, project in getattr(config, "projects", {}).items():
+        project_path = Path(project.path)
+        db_path = project_path / ".pollypm" / "state.db"
+        resolved = db_path.resolve() if db_path.exists() else db_path
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        sources.append((project_key, db_path, project_path))
+
+    workspace_root = getattr(getattr(config, "project", None), "workspace_root", None)
+    if workspace_root is not None:
+        ws_path = Path(workspace_root)
+        ws_db = ws_path / ".pollypm" / "state.db"
+        resolved = ws_db.resolve() if ws_db.exists() else ws_db
+        if resolved not in seen:
+            seen.add(resolved)
+            sources.append((None, ws_db, ws_path))
+    return sources
+
+
 def _count_inbox_tasks_for_label(config) -> int:
-    """Sum of inbox tasks across all tracked projects.
+    """Sum of inbox tasks across all tracked projects + workspace-root.
 
     Used by the cockpit rail label and the dashboard summary line; the
     aggregate must match what :func:`_render_inbox_panel` would render.
+    Dedupes tasks by ``task_id`` so a task that somehow appears in more
+    than one DB counts exactly once.
     """
     try:
         from pollypm.work.inbox_view import inbox_tasks
         from pollypm.work.sqlite_service import SQLiteWorkService
     except Exception:  # noqa: BLE001
         return 0
-    total = 0
-    for project_key, project in getattr(config, "projects", {}).items():
-        db_path = project.path / ".pollypm" / "state.db"
+    seen_task_ids: set[str] = set()
+    for project_key, db_path, project_path in _inbox_db_sources(config):
         if not db_path.exists():
             continue
         try:
             with SQLiteWorkService(
-                db_path=db_path, project_path=project.path,
+                db_path=db_path, project_path=project_path,
             ) as svc:
-                total += len(inbox_tasks(svc, project=project_key))
+                for task in inbox_tasks(svc, project=project_key):
+                    seen_task_ids.add(task.task_id)
         except Exception:  # noqa: BLE001
             continue
-    return total
+    return len(seen_task_ids)
 
 
 def render_inbox_panel(service, projects: list[object] | None = None) -> str:
@@ -233,21 +269,25 @@ def _render_inbox_panel(config) -> str:
 
     agg = _AggregateService()
     opened: list[SQLiteWorkService] = []
+    seen_task_ids: set[str] = set()
     try:
-        for project_key, project in getattr(config, "projects", {}).items():
-            db_path = project.path / ".pollypm" / "state.db"
+        for project_key, db_path, project_path in _inbox_db_sources(config):
             if not db_path.exists():
                 continue
             try:
                 svc = SQLiteWorkService(
-                    db_path=db_path, project_path=project.path,
+                    db_path=db_path, project_path=project_path,
                 )
             except Exception:  # noqa: BLE001
                 continue
             opened.append(svc)
             agg._flows_by_svc.append(svc)
             try:
-                agg._tasks.extend(svc.list_tasks(project=project_key))
+                for task in svc.list_tasks(project=project_key):
+                    if task.task_id in seen_task_ids:
+                        continue
+                    seen_task_ids.add(task.task_id)
+                    agg._tasks.append(task)
             except Exception:  # noqa: BLE001
                 pass
 

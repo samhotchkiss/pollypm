@@ -263,6 +263,14 @@ class Task:
     # --- Flow execution (loaded separately, not always populated) ---
     executions: list[FlowNodeExecution] = field(default_factory=list)
 
+    # --- Token usage (derived SUM over work_sessions; #86) ---
+    # Populated by the service layer from the ``work_sessions`` table.
+    # Not stored on ``work_tasks`` — recomputed on read. ``session_count``
+    # is the number of worker-session rows bound to this task.
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    session_count: int = 0
+
     # --- Derived properties ---
 
     @property

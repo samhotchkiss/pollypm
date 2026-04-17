@@ -1342,6 +1342,15 @@ class PollyTasksApp(App[None]):
             lines.append(f"  Roles     {roles}")
         if task.assignee:
             lines.append(f"  Assignee  {task.assignee}")
+        # Per-task token usage aggregated across worker sessions (#86).
+        tokens_in = getattr(task, "total_input_tokens", 0) or 0
+        tokens_out = getattr(task, "total_output_tokens", 0) or 0
+        sess_count = getattr(task, "session_count", 0) or 0
+        if tokens_in or tokens_out or sess_count:
+            lines.append(
+                f"  Tokens    in={tokens_in}  out={tokens_out}  "
+                f"sessions={sess_count}"
+            )
 
         if task.description:
             lines.extend(["", "── Description ──────────────────────────", "", task.description])

@@ -196,7 +196,28 @@ class MockWorkService:
         t.blocks = [(p, n) for fid, tid, k in self._links if k == "blocks" and fid == task_id for p, n in [_parse_task_id(tid)]]
         t.blocked_by = [(p, n) for fid, tid, k in self._links if k == "blocks" and tid == task_id for p, n in [_parse_task_id(fid)]]
         t.relates_to = [(p, n) for fid, tid, k in self._links if k == "relates_to" and (fid == task_id or tid == task_id) for p, n in [_parse_task_id(tid if fid == task_id else fid)]]
+        # Aggregate per-task token usage from worker-session rows (#86)
+        tin, tout, cnt = self._sum_tokens_for_task(t.project, t.task_number)
+        t.total_input_tokens = tin
+        t.total_output_tokens = tout
+        t.session_count = cnt
         return t
+
+    def _sum_tokens_for_task(
+        self, project: str, task_number: int
+    ) -> tuple[int, int, int]:
+        """Sum (tokens_in, tokens_out, session_count) for one task."""
+        tin = 0
+        tout = 0
+        cnt = 0
+        for row in self._worker_sessions.values():
+            if row.get("task_project") == project and int(
+                row.get("task_number")
+            ) == task_number:
+                tin += int(row.get("total_input_tokens", 0) or 0)
+                tout += int(row.get("total_output_tokens", 0) or 0)
+                cnt += 1
+        return tin, tout, cnt
 
     def list_tasks(
         self,
@@ -227,7 +248,15 @@ class MockWorkService:
             tasks = tasks[offset:]
         if limit:
             tasks = tasks[:limit]
-        return [deepcopy(t) for t in tasks]
+        out: list[Task] = []
+        for t in tasks:
+            copy = deepcopy(t)
+            tin, tout, cnt = self._sum_tokens_for_task(copy.project, copy.task_number)
+            copy.total_input_tokens = tin
+            copy.total_output_tokens = tout
+            copy.session_count = cnt
+            out.append(copy)
+        return out
 
     def queue(self, task_id: str, actor: str, skip_gates: bool = False) -> Task:
         task = self._tasks.get(task_id)

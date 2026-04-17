@@ -209,6 +209,12 @@ def _print_task(task, as_json: bool = False) -> None:
             typer.echo(f"Desc:     {task.description}")
         if task.roles:
             typer.echo(f"Roles:    {json.dumps(task.roles)}")
+        # Per-task token usage aggregated across worker sessions (#86)
+        typer.echo(
+            f"Tokens:   in={task.total_input_tokens} "
+            f"out={task.total_output_tokens} "
+            f"sessions={task.session_count}"
+        )
         if task.executions:
             typer.echo("Executions:")
             for ex in task.executions:
@@ -245,6 +251,10 @@ def _task_to_dict(task) -> dict:
         "labels": task.labels,
         "created_at": str(task.created_at) if task.created_at else None,
         "updated_at": str(task.updated_at) if task.updated_at else None,
+        # Per-task token aggregates (#86)
+        "tokens_in": task.total_input_tokens,
+        "tokens_out": task.total_output_tokens,
+        "session_count": task.session_count,
         "executions": [
             {
                 "node_id": ex.node_id,
@@ -258,14 +268,39 @@ def _task_to_dict(task) -> dict:
     }
 
 
-def _print_task_table(tasks, as_json: bool = False) -> None:
-    """Print a list of tasks as a table or JSON."""
+def _print_task_table(
+    tasks,
+    as_json: bool = False,
+    with_tokens: bool = False,
+) -> None:
+    """Print a list of tasks as a table or JSON.
+
+    When ``with_tokens`` is set, three extra columns (tokens in, tokens
+    out, session count) are appended to the text table. The JSON mode
+    always includes these fields via ``_task_to_dict``.
+    """
     if as_json:
         typer.echo(json.dumps([_task_to_dict(t) for t in tasks], indent=2, default=str))
         return
 
     if not tasks:
         typer.echo("No tasks found.")
+        return
+
+    if with_tokens:
+        header = (
+            f"{'ID':<20} {'Status':<14} {'Priority':<10} "
+            f"{'TokIn':>8} {'TokOut':>8} {'Sess':>5}  Title"
+        )
+        typer.echo(header)
+        typer.echo("-" * max(90, len(header)))
+        for t in tasks:
+            typer.echo(
+                f"{t.task_id:<20} {t.work_status.value:<14} "
+                f"{t.priority.value:<10} "
+                f"{t.total_input_tokens:>8} {t.total_output_tokens:>8} "
+                f"{t.session_count:>5}  {t.title}"
+            )
         return
 
     # Simple table
@@ -493,13 +528,18 @@ def task_list(
     status: Optional[str] = typer.Option(None, "--status", "-s", help="Filter by work_status"),
     project: Optional[str] = _PROJECT_OPTION,
     assignee: Optional[str] = typer.Option(None, "--assignee", "-a", help="Filter by assignee"),
+    with_tokens: bool = typer.Option(
+        False,
+        "--with-tokens",
+        help="Include per-task token usage columns (in/out/sessions). #86",
+    ),
     db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """List tasks with optional filters."""
     svc = _svc(db, project=project)
     tasks = svc.list_tasks(work_status=status, project=project, assignee=assignee)
-    _print_task_table(tasks, as_json=output_json)
+    _print_task_table(tasks, as_json=output_json, with_tokens=with_tokens)
 
 
 @task_app.command("update")

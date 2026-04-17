@@ -385,14 +385,35 @@ class SQLiteWorkService:
     # Internal: task reconstruction
     # ------------------------------------------------------------------
 
-    def _row_to_task(self, row: sqlite3.Row) -> Task:
-        """Build a Task dataclass from a database row."""
+    def _row_to_task(
+        self,
+        row: sqlite3.Row,
+        token_sums: dict[tuple[str, int], tuple[int, int, int]] | None = None,
+    ) -> Task:
+        """Build a Task dataclass from a database row.
+
+        ``token_sums`` is an optional pre-computed map keyed by
+        ``(project, task_number)`` holding
+        ``(total_input_tokens, total_output_tokens, session_count)`` so
+        callers issuing batch reads (e.g. ``list_tasks``) can avoid the
+        N+1 query hit. When ``None``, a single per-task aggregate query
+        is issued against ``work_sessions`` (#86).
+        """
         project = row["project"]
         task_number = row["task_number"]
 
         transitions = self._load_transitions(project, task_number)
         executions = self._load_executions(project, task_number)
         rels = self._load_relationships(project, task_number)
+
+        if token_sums is not None:
+            tokens_in, tokens_out, sess_count = token_sums.get(
+                (project, task_number), (0, 0, 0)
+            )
+        else:
+            tokens_in, tokens_out, sess_count = self._load_task_token_sum(
+                project, task_number
+            )
 
         task = Task(
             project=project,
@@ -428,8 +449,74 @@ class SQLiteWorkService:
             updated_at=datetime.fromisoformat(row["updated_at"]),
             transitions=transitions,
             executions=executions,
+            total_input_tokens=tokens_in,
+            total_output_tokens=tokens_out,
+            session_count=sess_count,
         )
         return task
+
+    # ------------------------------------------------------------------
+    # Per-task token aggregation (#86)
+    # ------------------------------------------------------------------
+    #
+    # Token counts live on the ``work_sessions`` rows (populated by the
+    # session teardown path — see #150). Per-task visibility is a SUM
+    # over every session row bound to the task. The single-row helper is
+    # cheap enough for ``get()`` / ``_row_to_task`` lookups; the batch
+    # helper avoids N+1 in ``list_tasks`` when large result sets are
+    # involved.
+
+    def _load_task_token_sum(
+        self, project: str, task_number: int
+    ) -> tuple[int, int, int]:
+        """Return ``(tokens_in, tokens_out, session_count)`` for one task."""
+        row = self._conn.execute(
+            "SELECT "
+            "COALESCE(SUM(total_input_tokens), 0) AS tin, "
+            "COALESCE(SUM(total_output_tokens), 0) AS tout, "
+            "COUNT(*) AS cnt "
+            "FROM work_sessions "
+            "WHERE task_project = ? AND task_number = ?",
+            (project, task_number),
+        ).fetchone()
+        if row is None:
+            return (0, 0, 0)
+        return (int(row["tin"] or 0), int(row["tout"] or 0), int(row["cnt"] or 0))
+
+    def _load_task_token_sums_bulk(
+        self,
+        project: str | None = None,
+    ) -> dict[tuple[str, int], tuple[int, int, int]]:
+        """Return aggregated tokens for every task, optionally filtered.
+
+        Keyed by ``(project, task_number)``. Returns zero-sum tuples
+        only for tasks that have at least one session row — callers
+        should default to ``(0, 0, 0)`` for misses.
+        """
+        clauses: list[str] = []
+        params: list[object] = []
+        if project is not None:
+            clauses.append("task_project = ?")
+            params.append(project)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = (
+            "SELECT task_project, task_number, "
+            "COALESCE(SUM(total_input_tokens), 0) AS tin, "
+            "COALESCE(SUM(total_output_tokens), 0) AS tout, "
+            "COUNT(*) AS cnt "
+            f"FROM work_sessions{where} "
+            "GROUP BY task_project, task_number"
+        )
+        rows = self._conn.execute(sql, tuple(params)).fetchall()
+        out: dict[tuple[str, int], tuple[int, int, int]] = {}
+        for r in rows:
+            key = (r["task_project"], int(r["task_number"]))
+            out[key] = (
+                int(r["tin"] or 0),
+                int(r["tout"] or 0),
+                int(r["cnt"] or 0),
+            )
+        return out
 
     def _load_relationships(
         self, project: str, task_number: int
@@ -764,7 +851,8 @@ class SQLiteWorkService:
             sql += f" OFFSET {int(offset)}"
 
         rows = self._conn.execute(sql, params).fetchall()
-        tasks = [self._row_to_task(r) for r in rows]
+        token_sums = self._load_task_token_sums_bulk(project=project)
+        tasks = [self._row_to_task(r, token_sums=token_sums) for r in rows]
 
         # Post-query filters that require derived data
         if owner is not None:

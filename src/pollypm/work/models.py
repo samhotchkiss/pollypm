@@ -111,11 +111,18 @@ class GateResult:
 
 @dataclass(slots=True)
 class ContextEntry:
-    """Append-only log entry attached to a task."""
+    """Append-only log entry attached to a task.
+
+    ``entry_type`` classifies the row so inbox/chat consumers can filter
+    without touching the text: ``"note"`` (default, generic context),
+    ``"reply"`` (user chat reply in the inbox thread view), or ``"read"``
+    (read-marker so repeat opens don't re-emit the read event).
+    """
 
     actor: str
     timestamp: datetime
     text: str
+    entry_type: str = "note"
 
 
 @dataclass(slots=True)

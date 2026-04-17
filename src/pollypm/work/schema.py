@@ -160,12 +160,15 @@ CREATE TABLE IF NOT EXISTS work_context_entries (
     actor TEXT NOT NULL,
     text TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    entry_type TEXT NOT NULL DEFAULT 'note',
     FOREIGN KEY (task_project, task_number)
         REFERENCES work_tasks(project, task_number)
 );
 
 CREATE INDEX IF NOT EXISTS idx_work_context_task
     ON work_context_entries(task_project, task_number, id DESC);
+-- idx_work_context_entry_type is created by _ensure_context_entry_columns
+-- after the entry_type column is backfilled (migration 3).
 
 -- -------------------------------------------------------------------
 -- Transitions (status change history)
@@ -217,6 +220,7 @@ def create_work_tables(conn: sqlite3.Connection) -> None:
     """
     conn.executescript(WORK_SCHEMA)
     _ensure_flow_node_columns(conn)
+    _ensure_context_entry_columns(conn)
     _run_work_migrations(conn)
 
 
@@ -233,6 +237,30 @@ def _ensure_flow_node_columns(conn: sqlite3.Connection) -> None:
     }
     if "agent_name" not in cols:
         conn.execute("ALTER TABLE work_flow_nodes ADD COLUMN agent_name TEXT")
+
+
+def _ensure_context_entry_columns(conn: sqlite3.Connection) -> None:
+    """Backfill optional ``entry_type`` column on work_context_entries.
+
+    The column classifies each row (``note`` default, ``reply`` for user
+    chat replies, ``read`` for inbox read-markers). Legacy rows keep the
+    default ``note`` tag so existing context-log consumers don't change
+    shape. The entry_type index is created here too — not in WORK_SCHEMA —
+    because SQLite won't parse an index that references a column the
+    (pre-migration) legacy table doesn't have.
+    """
+    cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(work_context_entries)")
+    }
+    if "entry_type" not in cols:
+        conn.execute(
+            "ALTER TABLE work_context_entries "
+            "ADD COLUMN entry_type TEXT NOT NULL DEFAULT 'note'"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_work_context_entry_type "
+        "ON work_context_entries(task_project, task_number, entry_type)"
+    )
 
 
 # ------------------------------------------------------------------
@@ -261,6 +289,15 @@ _WORK_MIGRATIONS: list[tuple[int, str, list[str]]] = [
             CREATE INDEX IF NOT EXISTS idx_work_sync_state_adapter
                 ON work_sync_state(adapter_name)
             """,
+        ],
+    ),
+    (
+        3,
+        "Add entry_type column to work_context_entries for inbox reply/read markers",
+        [
+            # SQLite lacks IF NOT EXISTS on ADD COLUMN — guarded separately in
+            # _ensure_context_entry_columns below. This migration row exists
+            # so the schema_version bump is recorded for fresh DBs too.
         ],
     ),
 ]

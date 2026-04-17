@@ -15,10 +15,17 @@ non-determinism.
 Budget: 4K tokens, approximated as 16K UTF-8 chars (≈4 chars/token).
 If the rendered section would exceed the budget, the lowest-score
 entries drop out first.
+
+wg02 / #239 extension: :func:`build_worker_protocol_injection` prepends
+the canonical worker guide under a "Worker Protocol" heading when the
+session role is ``worker``. This sits *above* the memory injection so
+every worker session boots knowing the task lifecycle before any
+recall-based context.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
 
 from pollypm.memory_backends import MemoryBackend, MemoryEntry, MemoryType, RecallResult
@@ -256,6 +263,93 @@ def prepend_memory_injection(prompt: str, injection: str) -> str:
     The injection string renders with a trailing newline already, so
     we add a single additional newline to produce a blank-line gap
     between the injection and the caller's prompt.
+    """
+    if not injection:
+        return prompt
+    if not prompt:
+        return injection
+    separator = "\n" if injection.endswith("\n") else "\n\n"
+    return f"{injection}{separator}{prompt}"
+
+
+# ---------------------------------------------------------------------------
+# Worker protocol injection (wg02 / #239)
+# ---------------------------------------------------------------------------
+
+WORKER_PROTOCOL_HEADING = "## Worker Protocol"
+
+# Relative path from the pollypm package to the canonical worker guide
+# inside the repo. At runtime we walk up from ``__file__`` to find it.
+_WORKER_GUIDE_RELATIVE = "docs/worker-guide.md"
+
+
+def _locate_worker_guide() -> Path | None:
+    """Find docs/worker-guide.md in the enclosing repo.
+
+    We walk up from this file's directory looking for a sibling
+    ``docs/worker-guide.md``. In an editable install this resolves to
+    the repo's real doc; in a packaged install where the doc isn't
+    shipped, the search returns ``None`` and the caller falls through
+    to an empty injection (so session startup isn't blocked).
+    """
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / _WORKER_GUIDE_RELATIVE
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def load_worker_guide_text() -> str:
+    """Read the worker guide from disk.
+
+    Returns ``""`` if the doc can't be located so callers never hard-
+    fail a session launch on a missing guide. The caller must be
+    resilient to an empty return.
+    """
+    path = _locate_worker_guide()
+    if path is None:
+        return ""
+    try:
+        return path.read_text()
+    except OSError:  # noqa: BLE001
+        return ""
+
+
+def build_worker_protocol_injection(
+    *,
+    session_role: str | None,
+    guide_text: str | None = None,
+) -> str:
+    """Render a ``## Worker Protocol`` section containing the worker guide.
+
+    Returns an empty string when ``session_role`` is not exactly
+    ``"worker"``. Non-worker roles (PM, reviewer, operator, supervisor)
+    get nothing — this is intentional, so adding the injection to the
+    existing memory-injection path is a no-op for those sessions.
+
+    ``guide_text`` overrides the on-disk lookup; tests use it to avoid
+    a filesystem dependency.
+    """
+    if session_role != "worker":
+        return ""
+    text = guide_text if guide_text is not None else load_worker_guide_text()
+    if not text.strip():
+        return ""
+    # The guide starts with its own "# Worker Guide" H1. We wrap it in
+    # an H2 section so the persona prompt keeps a consistent hierarchy
+    # (the memory section is also H2). Strip a trailing newline before
+    # re-wrapping so the final render has exactly one trailing newline.
+    body = text.rstrip("\n")
+    return f"{WORKER_PROTOCOL_HEADING}\n\n{body}\n"
+
+
+def prepend_worker_protocol(prompt: str, injection: str) -> str:
+    """Prepend a worker-protocol injection to ``prompt``.
+
+    Mirror of :func:`prepend_memory_injection`; kept as a separate
+    function so callers can compose the two injections in either order
+    and tests can pin the concatenation semantics.
     """
     if not injection:
         return prompt

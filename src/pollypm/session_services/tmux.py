@@ -719,13 +719,25 @@ class TmuxSessionService:
         task_description: str | None,
         user_id: str,
     ) -> str:
-        """Prepend a "What you should know" section to the persona prompt.
+        """Prepend memory recall + (for workers) the worker guide.
 
-        The hook is narrow: it computes a task-context query, calls
-        ``memory.recall`` against the project's memory backend, and
-        prepends the rendered section to ``initial_input``. Errors on
-        any of those steps fall through to the unchanged input so a
-        broken memory store never takes down a session launch.
+        Two injections compose here:
+
+        1. The "## What you should know" memory recall section (M05).
+        2. The "## Worker Protocol" worker-guide section (wg02 / #239),
+           only when ``session_role == "worker"``.
+
+        Order in the final prompt (top → bottom):
+            ## Worker Protocol       (workers only)
+            ## What you should know  (role-scoped recall)
+            <persona prompt>
+
+        This means the worker reads the lifecycle protocol first, then
+        context-specific memories, then their persona. Non-worker roles
+        get exactly today's behavior (worker protocol is empty).
+
+        All failure paths fall through to the unchanged ``initial_input``
+        so a broken memory store or missing guide never blocks a launch.
         """
         try:
             project_root = Path(self._config.project.root_dir)
@@ -736,28 +748,46 @@ class TmuxSessionService:
             from pollypm.memory_backends import get_memory_backend
             from pollypm.memory_prompts import (
                 build_memory_injection,
+                build_worker_protocol_injection,
                 compute_task_context_summary,
                 prepend_memory_injection,
+                prepend_worker_protocol,
             )
         except Exception:  # noqa: BLE001
             return initial_input
+
+        # Memory injection (may fail if backend is unavailable).
+        memory_injection = ""
         try:
             backend = get_memory_backend(project_root, "file")
+            summary = compute_task_context_summary(
+                task_title=task_title,
+                task_description=task_description,
+                session_role=session_role,
+                project=project_name,
+            )
+            memory_injection = build_memory_injection(
+                backend,
+                user_id=user_id,
+                project_name=project_name,
+                task_context_summary=summary,
+            )
         except Exception:  # noqa: BLE001
-            return initial_input
-        summary = compute_task_context_summary(
-            task_title=task_title,
-            task_description=task_description,
-            session_role=session_role,
-            project=project_name,
-        )
-        injection = build_memory_injection(
-            backend,
-            user_id=user_id,
-            project_name=project_name,
-            task_context_summary=summary,
-        )
-        return prepend_memory_injection(initial_input, injection)
+            memory_injection = ""
+
+        with_memory = prepend_memory_injection(initial_input, memory_injection)
+
+        # Worker protocol injection — only for role=worker. Empty for
+        # every other role, so the composition is a no-op for PM /
+        # reviewer / supervisor / triage sessions.
+        try:
+            worker_injection = build_worker_protocol_injection(
+                session_role=session_role,
+            )
+        except Exception:  # noqa: BLE001
+            worker_injection = ""
+
+        return prepend_worker_protocol(with_memory, worker_injection)
 
     # ------------------------------------------------------------------
     # Internal: initial input preparation

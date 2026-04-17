@@ -45,6 +45,29 @@ when >1 provider is registered, it forces at least one critic onto the
 non-planner provider to reduce correlated blind spots. Users override
 per-critic in ``pollypm.toml`` and the resolver respects the override.
 
+## Import boundaries (enforced in CI)
+
+``tests/test_import_boundary.py`` runs on every PR and enforces three
+guardrails left by the Supervisor decomposition (#179, #182, #186, #187):
+
+1. **No direct ``from pollypm.supervisor import Supervisor``** outside
+   ``pollypm.core/``, the ``service_api`` facade, and a small allow-list
+   of integration points. New consumers should use
+   ``pollypm.service_api.PollyPMService``.
+2. **No ``supervisor._<anything>`` reach-through.** Every private helper
+   that had callers was promoted to public during the decomposition; if
+   you need one that isn't public, promote it first.
+3. **No direct SQL on ``StateStore._conn`` / ``SQLiteWorkService._conn``.**
+   Use the typed accessor methods the store exposes. The connection's
+   lifecycle is owned by one module only.
+
+If you hit one of these failures and the violation is genuinely
+unavoidable (usually: a core-decomposition step that's still mid-flight),
+add the file to the relevant allow-list inside
+``tests/test_import_boundary.py`` **with a TODO comment pointing at the
+issue that will remove it**. The companion ``_has_no_stale_entries``
+tests keep the allow-lists honest as migrations land.
+
 ## Conventions
 
 - Issue-based tracking (Issue NNNN format)

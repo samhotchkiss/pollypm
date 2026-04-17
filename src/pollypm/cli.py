@@ -1331,6 +1331,99 @@ def send(
     typer.echo(f"Sent input to {session_name}")
 
 
+@app.command()
+def notify(
+    subject: str = typer.Argument(..., help="Short title for the inbox item."),
+    body: str = typer.Argument(..., help="Message body. Pass '-' to read from stdin."),
+    actor: str = typer.Option("polly", "--actor", help="Who is posting the notification."),
+    project: str = typer.Option(
+        "inbox", "--project", "-p",
+        help="Project namespace for the notification task (default: 'inbox').",
+    ),
+    db: str = typer.Option(
+        ".pollypm/state.db", "--db",
+        help="Path to SQLite database (default: same resolution as `pm inbox`).",
+    ),
+) -> None:
+    """Create a work-service inbox item for the human user.
+
+    This is the canonical escalation channel referenced by the operator
+    runbook and control prompts. Polly (or any agent) uses ``pm notify``
+    to reach the user when something needs attention — a blocker, a
+    completed deliverable, a status update.
+
+    The notification is stored as a work-service task on the ``chat``
+    flow with ``roles.requester=user``, so it appears in ``pm inbox``
+    immediately.
+
+    Examples:
+
+    • pm notify "Deploy blocked" "Needs verification email click."
+    • pm notify "Done: homepage rewrite" "Review at https://…"
+    • echo "long body" | pm notify "Subject" -
+    """
+    if not subject.strip():
+        typer.echo("Error: subject must not be empty.", err=True)
+        raise typer.Exit(code=1)
+
+    if body == "-":
+        body = sys.stdin.read()
+    if not body.strip():
+        typer.echo(
+            "Error: body must not be empty (pass '-' to read from stdin).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # Use the same work-service entry point pm inbox reads through, so
+    # the notification lands in the identical DB and surfaces immediately.
+    from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
+    from pollypm.storage.state import StateStore
+    from pollypm.work.cli import _resolve_db_path, _svc
+
+    svc = _svc(db, project=project)
+    try:
+        task = svc.create(
+            title=subject,
+            description=body,
+            type="task",
+            project=project,
+            flow_template="chat",
+            # requester=user makes _roles_match_user() trip in the
+            # inbox_view filter — the canonical mark for "user must
+            # look at this".
+            roles={"requester": "user", "operator": actor},
+            priority="normal",
+            created_by=actor,
+        )
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"Failed to create inbox task: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    # Audit event — mirrors the legacy inbox_message_created shape so the
+    # activity feed projector/consumers see the notification.
+    db_path = _resolve_db_path(db, project=project)
+    store = StateStore(db_path)
+    try:
+        store.record_event(
+            actor,
+            "inbox.message.created",
+            activity_summary(
+                summary=f"{actor} -> user: {subject}",
+                severity="recommendation",
+                verb="notified",
+                subject=subject,
+                project=project,
+                task_id=task.task_id,
+                body=body,
+            ),
+        )
+    finally:
+        store.close()
+
+    typer.echo(task.task_id)
+
+
 @alert_app.command("raise")
 def alert_raise(
     alert_type: str = typer.Argument(..., help="Alert type."),

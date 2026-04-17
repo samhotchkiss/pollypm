@@ -31,7 +31,6 @@ import typer
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config, resolve_config_path
 from pollypm.plugins_builtin.morning_briefing.handlers import briefing_tick as _tick
 from pollypm.plugins_builtin.morning_briefing.inbox import (
-    BriefingEntry,
     list_briefings,
     pin_briefing as _pin_briefing,
 )
@@ -44,7 +43,6 @@ from pollypm.plugins_builtin.morning_briefing.state import (
     iso_date,
     load_state,
 )
-from pollypm.tz import get_timezone
 
 
 briefing_app = typer.Typer(

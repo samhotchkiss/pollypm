@@ -10,7 +10,6 @@ from pollypm.atomic_io import atomic_write_json
 from pollypm.checkpoints import record_checkpoint, snapshot_hash, write_mechanical_checkpoint
 from pollypm.heartbeats.base import HeartbeatCursor, HeartbeatSessionContext, HeartbeatUnmanagedWindow
 from pollypm.heartbeats.types import Alert
-from pollypm.knowledge_extract import store_snapshot_learnings
 
 if TYPE_CHECKING:
     from pollypm.supervisor import Supervisor

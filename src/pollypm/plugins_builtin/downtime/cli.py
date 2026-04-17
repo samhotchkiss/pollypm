@@ -32,11 +32,9 @@ from pollypm.plugins_builtin.downtime.handlers.pick_candidate import (
 )
 from pollypm.plugins_builtin.downtime.settings import (
     KNOWN_CATEGORIES,
-    DowntimeSettings,
     load_downtime_settings,
 )
 from pollypm.plugins_builtin.downtime.state import (
-    DowntimeState,
     load_state,
     save_state,
 )

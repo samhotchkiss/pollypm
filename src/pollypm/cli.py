@@ -27,8 +27,7 @@ from pollypm.config import (
     render_example_config,
     write_example_config,
 )
-from pollypm.doc_scaffold import repair_docs, scaffold_docs, verify_docs
-from pollypm.tz import format_time as _fmt_time
+from pollypm.doc_scaffold import repair_docs, verify_docs
 from pollypm.models import ProviderKind
 from pollypm.service_api import PollyPMService
 from pollypm.service_api import render_json
@@ -37,7 +36,6 @@ from pollypm.projects import (
     register_project,
     scan_projects as scan_projects_registry,
 )
-from pollypm.providers import get_provider
 from pollypm.session_services import (
     attach_existing_session,
     current_session_name,

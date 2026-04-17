@@ -278,8 +278,13 @@ class Supervisor:
 
     @property
     def session_service(self):
-        """The session service handles all tmux session mechanics."""
-        if self._session_service is None:
+        """The session service handles all tmux session mechanics.
+
+        Uses getattr to tolerate ``Supervisor.__new__(Supervisor)``
+        construction from dashboard_data / service_api readonly paths
+        where ``__init__`` never ran.
+        """
+        if getattr(self, "_session_service", None) is None:
             from pollypm.session_services.tmux import TmuxSessionService
             self._session_service = TmuxSessionService(config=self.config, store=self.store)
         return self._session_service
@@ -292,7 +297,7 @@ class Supervisor:
         tmux / state mutations) stays on the Supervisor — the policy is
         a pure decision maker.
         """
-        if self._recovery_policy is None:
+        if getattr(self, "_recovery_policy", None) is None:
             try:
                 from pollypm.recovery import get_recovery_policy
                 self._recovery_policy = get_recovery_policy(

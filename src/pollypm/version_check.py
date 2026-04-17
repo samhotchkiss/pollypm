@@ -127,9 +127,20 @@ def _raise_upgrade_alert(project_root: Path, current: str, latest: str) -> None:
                 "info",
                 f"PollyPM {latest} is available (current: {current}). Run `pm upgrade`.",
             )
+            from pollypm.plugins_builtin.activity_feed.summaries import (
+                activity_summary,
+            )
+
             store.record_event(
                 "pollypm", "upgrade_available",
-                f"New version detected: {latest} (current {current})",
+                activity_summary(
+                    summary=f"New version detected: {latest} (current {current})",
+                    severity="recommendation",
+                    verb="upgrade_available",
+                    subject="pollypm",
+                    latest=latest,
+                    current=current,
+                ),
             )
         finally:
             store.close()

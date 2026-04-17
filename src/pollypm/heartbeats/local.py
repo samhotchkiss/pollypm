@@ -64,19 +64,37 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             except Exception as exc:  # noqa: BLE001
                 # Log and continue — don't let one session abort the entire sweep
                 try:
+                    from pollypm.plugins_builtin.activity_feed.summaries import (
+                        activity_summary,
+                    )
+
                     api.record_event(
                         context.session_name,
                         "heartbeat_error",
-                        f"Error processing session: {exc}",
+                        activity_summary(
+                            summary=f"Error processing session: {exc}",
+                            severity="critical",
+                            verb="errored",
+                            subject=context.session_name,
+                        ),
                     )
                 except Exception:  # noqa: BLE001
                     pass
+        from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
+
+        open_alerts = api.open_alerts()
         api.record_event(
             "heartbeat",
             "heartbeat",
-            f"Heartbeat sweep completed with {len(api.open_alerts())} open alerts",
+            activity_summary(
+                summary=f"Heartbeat sweep completed with {len(open_alerts)} open alerts",
+                severity="recommendation" if open_alerts else "routine",
+                verb="swept",
+                subject="heartbeat",
+                open_alerts=len(open_alerts),
+            ),
         )
-        return api.open_alerts()
+        return open_alerts
 
     def _process_unmanaged_windows(self, api) -> None:
         current_alert_types: set[str] = set()
@@ -94,7 +112,20 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             )
             api.raise_alert("heartbeat", alert_type, "warn", message)
             if alert_type not in existing_alert_types:
-                api.record_event("heartbeat", "unmanaged_window", message)
+                from pollypm.plugins_builtin.activity_feed.summaries import (
+                    activity_summary,
+                )
+
+                api.record_event(
+                    "heartbeat",
+                    "unmanaged_window",
+                    activity_summary(
+                        summary=message,
+                        severity="recommendation",
+                        verb="unmanaged",
+                        subject=window.window_name,
+                    ),
+                )
         for alert_type in existing_alert_types - current_alert_types:
             api.clear_alert("heartbeat", alert_type)
 
@@ -279,9 +310,18 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 "warn",
                 f"{context.session_name} needs attention: {reason[:160]}",
             )
+            from pollypm.plugins_builtin.activity_feed.summaries import (
+                activity_summary,
+            )
+
             api.supervisor.store.record_event(
                 context.session_name, "escalated",
-                f"Raised stuck_session alert: {reason[:80]}",
+                activity_summary(
+                    summary=f"Raised stuck_session alert: {reason[:80]}",
+                    severity="critical",
+                    verb="escalated",
+                    subject=context.session_name,
+                ),
             )
         except Exception:  # noqa: BLE001
             pass
@@ -369,7 +409,20 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             message = "State the remaining task in one sentence, execute the next step, and report."
         api.send_session_message(context.session_name, message, owner="heartbeat")
         try:
-            api.supervisor.store.record_event(context.session_name, "nudge", f"Sent nudge: {message[:80]}")
+            from pollypm.plugins_builtin.activity_feed.summaries import (
+                activity_summary,
+            )
+
+            api.supervisor.store.record_event(
+                context.session_name,
+                "nudge",
+                activity_summary(
+                    summary=f"Sent nudge: {message[:80]}",
+                    severity="recommendation",
+                    verb="nudged",
+                    subject=context.session_name,
+                ),
+            )
         except Exception:  # noqa: BLE001
             pass
 
@@ -430,8 +483,18 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 "Yes, proceed. Do the next step you outlined.",
                 owner="heartbeat",
             )
+            from pollypm.plugins_builtin.activity_feed.summaries import (
+                activity_summary,
+            )
+
             api.supervisor.store.record_event(
-                context.session_name, "heuristic_triage", "Pushed forward: proceed signal detected",
+                context.session_name, "heuristic_triage",
+                activity_summary(
+                    summary="Pushed forward: proceed signal detected",
+                    severity="routine",
+                    verb="triaged",
+                    subject=context.session_name,
+                ),
             )
             return
 

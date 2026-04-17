@@ -225,9 +225,18 @@ def _raise_alert(config: Any, alert_type: str, message: str) -> None:
             store.upsert_alert(
                 "inbox_migration", alert_type, "warn", message,
             )
+            from pollypm.plugins_builtin.activity_feed.summaries import (
+                activity_summary,
+            )
+
             store.record_event(
                 "inbox_migration", "alert",
-                f"Raised migration alert {alert_type}: {message[:160]}",
+                activity_summary(
+                    summary=f"Raised migration alert {alert_type}: {message[:160]}",
+                    severity="recommendation",
+                    verb="alerted",
+                    subject=alert_type,
+                ),
             )
         finally:
             store.close()
@@ -241,7 +250,20 @@ def _record_event(config: Any, message: str) -> None:
 
         store = StateStore(config.project.state_db)
         try:
-            store.record_event("inbox_migration", "migration", message)
+            from pollypm.plugins_builtin.activity_feed.summaries import (
+                activity_summary,
+            )
+
+            store.record_event(
+                "inbox_migration",
+                "migration",
+                activity_summary(
+                    summary=message,
+                    severity="routine",
+                    verb="migrated",
+                    subject="inbox",
+                ),
+            )
         finally:
             store.close()
     except Exception:  # noqa: BLE001

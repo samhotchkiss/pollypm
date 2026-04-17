@@ -98,11 +98,23 @@ def _run_session_intelligence_sweep(supervisor: Supervisor, payload: dict[str, A
     from pollypm.session_intelligence import sweep_all_sessions
     result = sweep_all_sessions(supervisor.config)
     if result["sessions_processed"]:
+        from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
+
         supervisor.store.record_event(
             "session_intelligence", "sweep_completed",
-            f"Processed {result['sessions_processed']} sessions, "
-            f"{result['knowledge_entries']} knowledge entries, "
-            f"{result['summaries']} summaries",
+            activity_summary(
+                summary=(
+                    f"Processed {result['sessions_processed']} sessions, "
+                    f"{result['knowledge_entries']} knowledge entries, "
+                    f"{result['summaries']} summaries"
+                ),
+                severity="routine",
+                verb="swept",
+                subject="session_intelligence",
+                sessions_processed=result["sessions_processed"],
+                knowledge_entries=result["knowledge_entries"],
+                summaries=result["summaries"],
+            ),
         )
 
 
@@ -125,9 +137,17 @@ def _run_project_intelligence(supervisor: Supervisor, payload: dict[str, Any]) -
         if run_project_intelligence(supervisor.config, project_root):
             updated += 1
     if updated:
+        from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
+
         supervisor.store.record_event(
             "project_intelligence", "completed",
-            f"Updated docs for {updated} project(s)",
+            activity_summary(
+                summary=f"Updated docs for {updated} project(s)",
+                severity="routine",
+                verb="updated",
+                subject="project_intelligence",
+                projects_updated=updated,
+            ),
         )
 
 
@@ -142,10 +162,18 @@ def _run_token_ledger_sync(supervisor: Supervisor, payload: dict[str, Any]) -> N
     from pollypm.transcript_ledger import sync_token_ledger_for_config
     samples = sync_token_ledger_for_config(supervisor.config)
     if samples:
+        from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
+
         supervisor.store.record_event(
             "heartbeat",
             "token_ledger",
-            f"Synced {len(samples)} transcript token sample(s)",
+            activity_summary(
+                summary=f"Synced {len(samples)} transcript token sample(s)",
+                severity="routine",
+                verb="synced",
+                subject="token_ledger",
+                samples=len(samples),
+            ),
         )
 
 
@@ -175,10 +203,22 @@ def _run_prune_state(supervisor: Supervisor, payload: dict[str, Any]) -> None:
     result = supervisor.store.prune_old_data()
     total = sum(result.values())
     if total > 0:
+        from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
+
         supervisor.store.record_event(
             "maintenance",
             "prune",
-            f"Pruned {result['events']} events, {result['heartbeats']} heartbeat records",
+            activity_summary(
+                summary=(
+                    f"Pruned {result['events']} events, "
+                    f"{result['heartbeats']} heartbeat records"
+                ),
+                severity="routine",
+                verb="pruned",
+                subject="maintenance",
+                events=result["events"],
+                heartbeats=result["heartbeats"],
+            ),
         )
 
 

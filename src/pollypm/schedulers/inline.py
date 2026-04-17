@@ -34,10 +34,19 @@ class InlineSchedulerBackend(SchedulerBackend):
         jobs = self._load_jobs(supervisor)
         jobs.append(job)
         self._save_jobs(supervisor, jobs)
+        from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
+
         supervisor.store.record_event(
             "scheduler",
             "scheduled",
-            f"Scheduled job {job.kind} at {job.run_at.isoformat()}",
+            activity_summary(
+                summary=f"Scheduled job {job.kind} at {job.run_at.isoformat()}",
+                severity="routine",
+                verb="scheduled",
+                subject=job.kind,
+                job_id=job.job_id,
+                run_at=job.run_at.isoformat(),
+            ),
         )
         return job
 
@@ -64,10 +73,20 @@ class InlineSchedulerBackend(SchedulerBackend):
                     job.status = "pending"
                 else:
                     job.status = "failed"
+                from pollypm.plugins_builtin.activity_feed.summaries import (
+                    activity_summary,
+                )
+
                 supervisor.store.record_event(
                     "scheduler",
                     "failed",
-                    f"Scheduled job {job.kind} failed: {exc}",
+                    activity_summary(
+                        summary=f"Scheduled job {job.kind} failed: {exc}",
+                        severity="critical",
+                        verb="failed",
+                        subject=job.kind,
+                        job_id=job.job_id,
+                    ),
                 )
             else:
                 executed.append(job)
@@ -77,10 +96,20 @@ class InlineSchedulerBackend(SchedulerBackend):
                     job.last_error = None
                 else:
                     job.status = "done"
+                from pollypm.plugins_builtin.activity_feed.summaries import (
+                    activity_summary,
+                )
+
                 supervisor.store.record_event(
                     "scheduler",
                     "ran",
-                    f"Ran scheduled job {job.kind}",
+                    activity_summary(
+                        summary=f"Ran scheduled job {job.kind}",
+                        severity="routine",
+                        verb="ran",
+                        subject=job.kind,
+                        job_id=job.job_id,
+                    ),
                 )
         if dirty:
             self._save_jobs(supervisor, jobs)

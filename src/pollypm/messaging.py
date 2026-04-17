@@ -47,7 +47,24 @@ def _alert(
         try:
             store.upsert_alert(_SESSION, alert_type, severity, message)
             if event:
-                store.record_event(_SESSION, event, message)
+                from pollypm.plugins_builtin.activity_feed.summaries import (
+                    activity_summary,
+                )
+
+                store.record_event(
+                    _SESSION,
+                    event,
+                    activity_summary(
+                        summary=message,
+                        severity=(
+                            "critical" if severity in {"critical", "error"}
+                            else "recommendation" if severity in {"warn", "warning"}
+                            else "routine"
+                        ),
+                        verb=event,
+                        subject=alert_type,
+                    ),
+                )
         finally:
             store.close()
     except Exception:  # noqa: BLE001 - notification must not break callers

@@ -107,11 +107,13 @@ def format_ping_for_role(event: TaskAssignmentEvent) -> str:
 # (one worker session per project); the other roles are process-wide
 # singletons.
 _ROLE_STATIC_NAMES: dict[str, tuple[str, ...]] = {
-    "reviewer": ("pm-reviewer",),
-    "operator": ("pm-operator",),
-    "heartbeat-supervisor": ("pm-heartbeat",),
-    "heartbeat": ("pm-heartbeat",),  # common alias
-    "triage": ("pm-triage",),
+    # Each role lists both the session-config key (what ``sessions`` table
+    # stores as ``name``) and the window name (legacy convention). #272.
+    "reviewer": ("reviewer", "pm-reviewer"),
+    "operator": ("operator", "pm-operator"),
+    "heartbeat-supervisor": ("heartbeat", "pm-heartbeat"),
+    "heartbeat": ("heartbeat", "pm-heartbeat"),  # common alias
+    "triage": ("triage", "pm-triage"),
 }
 
 

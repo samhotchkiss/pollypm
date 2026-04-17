@@ -42,6 +42,10 @@ class SessionHealth(StrEnum):
     # #249 — work-service-aware classifications
     STUCK_ON_TASK = "stuck_on_task"
     SILENT_WORKER = "silent_worker"
+    # #296 — observable-deliverables drift: the agent ended its turn
+    # with plan/artefacts already on disk but the task's flow node
+    # didn't advance. Alert + event only; no auto-advance in v1.
+    STATE_DRIFT = "state_drift"
 
 
 # Intervention escalation ladder
@@ -57,8 +61,9 @@ INTERVENTION_LADDER = (
 # not part of the sequential ladder above; they're action kinds emitted
 # by the work-aware classifications and handled by the apply side.
 EXTENDED_INTERVENTIONS = (
-    "resume_ping",          # Re-emit a task_assignment notify event
-    "prompt_pm_task_next",  # Send `pm task next` to the session
+    "resume_ping",            # Re-emit a task_assignment notify event
+    "prompt_pm_task_next",    # Send `pm task next` to the session
+    "reconcile_flow_state",   # Log + alert observable flow drift (#296)
 )
 
 
@@ -96,6 +101,13 @@ class SessionSignals:
     # the session is currently processing — we should NOT classify as
     # stuck even if other timers have rolled over.
     turn_active: bool = False
+    # #296 — precomputed drift-reconciliation action. When populated, the
+    # classifier promotes the session to ``STATE_DRIFT`` instead of the
+    # generic ``IDLE`` ladder. Carries the inferred target node + reason
+    # so the intervention layer can log + alert without re-running the
+    # heuristics. Type is ``ReconciliationAction | None`` — typed as
+    # ``Any`` here to avoid a cycle with ``state_reconciliation``.
+    drift_action: Any | None = None
 
 
 @dataclass(slots=True)

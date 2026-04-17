@@ -73,6 +73,19 @@ class DefaultRecoveryPolicy(RecoveryPolicy):
         ):
             return SessionHealth.STUCK_ON_TASK
 
+        # #296 — flow-state drift. Agent ended its turn, holds an active
+        # claim, and the precomputed reconciliation action says the task
+        # has observable deliverables past its current flow node. Evaluate
+        # AFTER turn_active (a live turn shouldn't be flagged) and BEFORE
+        # the generic IDLE classification so the drift alert takes
+        # priority over routine-idle nudges.
+        if (
+            not signals.turn_active
+            and signals.active_claim_task_id
+            and signals.drift_action is not None
+        ):
+            return SessionHealth.STATE_DRIFT
+
         # Worker session is up but has no active claim and hasn't done
         # anything for 30min — it likely missed a queue event. Only
         # applies to "worker" role to avoid flagging operator/reviewer
@@ -237,6 +250,28 @@ class DefaultRecoveryPolicy(RecoveryPolicy):
                 ),
                 details={
                     "last_event_seconds_ago": signals.last_event_seconds_ago,
+                },
+            )
+
+        # #296 — observable flow-state drift. V1 policy: log + alert only.
+        # We deliberately do NOT auto-advance the task node in v1; better
+        # to flag than silently mutate state. The apply side owns the
+        # event + alert writes (see ``work.progress_sweep``).
+        if health == SessionHealth.STATE_DRIFT:
+            action = signals.drift_action
+            target = getattr(action, "advance_to_node", "") if action else ""
+            reason = getattr(action, "reason", "") if action else ""
+            return InterventionAction(
+                session_name=signals.session_name,
+                action="reconcile_flow_state",
+                reason=(
+                    f"Observable drift on task {signals.active_claim_task_id}: "
+                    f"{reason}"
+                ),
+                details={
+                    "task_id": signals.active_claim_task_id,
+                    "advance_to_node": target,
+                    "drift_reason": reason,
                 },
             )
 

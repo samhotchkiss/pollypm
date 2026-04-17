@@ -133,6 +133,9 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     from pollypm.plugins_builtin.task_assignment_notify.resolver import (
         notify as _notify,
     )
+    from pollypm.recovery.state_reconciliation import (
+        reconcile_expected_advance,
+    )
     from pollypm.work.models import ActorType
     from pollypm.work.task_assignment import SessionRoleIndex
 
@@ -157,6 +160,13 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     skipped_recent_event = 0
     skipped_no_session = 0
     deduped = 0
+    # #296 — state-drift counters. ``drift_detected`` is the number of
+    # tasks whose observable deliverables outpace their flow node on
+    # this sweep; ``drift_alerted`` is the subset where we actually
+    # raised a fresh alert (the rest were deduped by upsert_alert's
+    # per-type uniqueness guard).
+    drift_detected = 0
+    drift_alerted = 0
 
     try:
         try:
@@ -212,6 +222,81 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
                         if bool(checker(target_name)):
                             skipped_active_turn += 1
                             continue
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            # #296 — observable flow-state drift. Check BEFORE the
+            # recent-event skip: a session that just fired a ``pm
+            # notify`` has a very fresh event on the ledger (the
+            # notify itself), which would otherwise suppress the
+            # stuck_on_task path AND mask the drift. Drift detection
+            # has its own dedupe via ``upsert_alert`` — the
+            # ``state_drift:<task_id>`` alert type is unique per task
+            # per open alert, so repeated sweeps don't spam.
+            try:
+                resolver = getattr(work, "_resolve_project_path", None)
+                project_path = None
+                if callable(resolver):
+                    try:
+                        project_path = resolver(task.project)
+                    except Exception:  # noqa: BLE001
+                        project_path = None
+                if project_path is None:
+                    project_path = services.project_root
+                drift = reconcile_expected_advance(
+                    task,
+                    Path(project_path),
+                    work,
+                    state_store=state_store,
+                    now=now,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "work.progress_sweep: drift reconcile failed for %s",
+                    task.task_id, exc_info=True,
+                )
+                drift = None
+            if drift is not None:
+                drift_detected += 1
+                current_node = getattr(task, "current_node_id", "") or ""
+                message = (
+                    f"task {task.task_id}: observed "
+                    f"{drift.advance_to_node} deliverables, advancing "
+                    f"from {current_node} to {drift.advance_to_node} — "
+                    f"{drift.reason}"
+                )
+                if state_store is not None:
+                    # Event — permanent record of the drift detection.
+                    # Keyed to the session so operators can scope.
+                    try:
+                        state_store.record_event(
+                            target_name, "state_drift", message,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    # Alert — visible warning for Polly / the cockpit.
+                    # Alert type carries the task id so drift on two
+                    # different tasks surfaces as two distinct alerts.
+                    alert_type = f"state_drift:{task.task_id}"
+                    try:
+                        # Detect whether the alert is new so our counter
+                        # reflects real user-visible notifications.
+                        existing = state_store.execute(
+                            "SELECT id FROM alerts WHERE session_name = ? "
+                            "AND alert_type = ? AND status = 'open'",
+                            (target_name, alert_type),
+                        ).fetchone()
+                        state_store.upsert_alert(
+                            target_name,
+                            alert_type,
+                            "warn",
+                            (
+                                f"{target_name} drift on {task.task_id}: "
+                                f"{drift.reason}"
+                            ),
+                        )
+                        if existing is None:
+                            drift_alerted += 1
                     except Exception:  # noqa: BLE001
                         pass
 
@@ -286,6 +371,8 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
         "skipped_active_turn": skipped_active_turn,
         "skipped_recent_event": skipped_recent_event,
         "skipped_no_session": skipped_no_session,
+        "drift_detected": drift_detected,
+        "drift_alerted": drift_alerted,
     }
 
 

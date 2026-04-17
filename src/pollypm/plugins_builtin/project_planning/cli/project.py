@@ -374,6 +374,7 @@ def new_cmd(
             f"Auto-created plan_project task for '{project.key}' via "
             "project.created hook (see `[planner] auto_on_project_created`)."
         )
+        _auto_spawn_architect(path, project.key)
         return
 
     # ``--skip-plan`` or ``--skip-planner`` both short-circuit the prompt +
@@ -409,6 +410,83 @@ def new_cmd(
         "Next: `pm task queue " + task.task_id + "` to hand it off to the "
         "architect worker."
     )
+    _auto_spawn_architect(path, project.key)
+
+
+def _auto_spawn_architect(config_path: Path, project_key: str) -> None:
+    """Best-effort: spawn a project-scoped architect session for ``project_key``.
+
+    The planner's ``plan_project`` flow parks every stage on
+    ``actor_role: architect``. Without a live session named
+    ``architect_<project>`` the task-assignment sweeper (see
+    ``pollypm.work.task_assignment``) cannot resolve a recipient and the
+    pipeline stalls silently at the ``research`` node.
+
+    Called from ``pm project new`` after a plan_project task has been
+    created (either via the ``project.created`` observer or the legacy
+    interactive prompt). Honours the ``--skip-planner`` / ``--skip-plan``
+    flags at the callsite — this helper assumes a planner task was
+    actually created and the user wants the flow to run.
+
+    Failures here are swallowed: the task is already parked in queued
+    state, the user can always spawn the architect manually with
+    ``pm worker-start --role architect --profile architect <project>``.
+    """
+    import logging
+
+    log = logging.getLogger(__name__)
+    try:
+        # Local import — keeps the planner CLI importable in environments
+        # that haven't wired the full session/supervisor stack (tests
+        # running against ``pm project new`` with a minimal config).
+        from pollypm.config import load_config
+        from pollypm.workers import create_worker_session, launch_worker_session
+
+        config = load_config(config_path)
+        # Don't double-spawn if the caller (or an earlier invocation)
+        # already registered an architect session for this project.
+        for existing in config.sessions.values():
+            if (
+                existing.role == "architect"
+                and existing.project == project_key
+                and existing.enabled
+            ):
+                log.info(
+                    "project_planning: architect session %s already "
+                    "registered for '%s' — skipping auto-spawn.",
+                    existing.name, project_key,
+                )
+                return
+
+        session = create_worker_session(
+            config_path,
+            project_key=project_key,
+            prompt=None,
+            role="architect",
+            agent_profile="architect",
+        )
+        typer.echo(
+            f"Spawned architect session {session.name} for "
+            f"project '{project_key}'."
+        )
+        try:
+            launch_worker_session(config_path, session.name)
+        except Exception as exc:  # noqa: BLE001
+            log.info(
+                "project_planning: architect session %s registered but "
+                "not launched (%s). Start it manually with "
+                "`pm worker-start --role architect --profile architect %s`.",
+                session.name, exc, project_key,
+            )
+    except Exception as exc:  # noqa: BLE001
+        # Most common failure is no accounts configured yet (fresh
+        # install running ``pm project new`` before ``pm onboard``).
+        log.info(
+            "project_planning: architect auto-spawn skipped (%s). "
+            "Start it manually with "
+            "`pm worker-start --role architect --profile architect %s`.",
+            exc, project_key,
+        )
 
 
 def _plan_task_exists(project_path: Path, project_key: str) -> bool:

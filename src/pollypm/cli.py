@@ -1630,6 +1630,24 @@ def heartbeat_record(
 def worker_start(
     project_key: str = typer.Argument(..., help="Tracked project key."),
     prompt: str | None = typer.Option(None, "--prompt", help="Optional initial worker prompt."),
+    role: str = typer.Option(
+        "worker",
+        "--role",
+        help=(
+            "Session role. Defaults to 'worker'. Pass e.g. '--role architect' "
+            "to spawn a non-worker project-scoped session that the task "
+            "sweeper can find via the role-candidate-names resolver."
+        ),
+    ),
+    agent_profile: str | None = typer.Option(
+        None,
+        "--profile",
+        help=(
+            "Agent profile to pin on the new session (e.g. 'architect'). "
+            "When omitted, the supervisor falls back to the role's default "
+            "profile if one exists."
+        ),
+    ),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
     supervisor = _load_supervisor(config_path)
@@ -1638,16 +1656,23 @@ def worker_start(
         (
             session
             for session in supervisor.config.sessions.values()
-            if session.role == "worker" and session.project == project_key and session.enabled
+            if session.role == role and session.project == project_key and session.enabled
         ),
         None,
     )
-    session = existing or create_worker_session(config_path, project_key=project_key, prompt=prompt)
+    session = existing or create_worker_session(
+        config_path,
+        project_key=project_key,
+        prompt=prompt,
+        role=role,
+        agent_profile=agent_profile,
+    )
     launch_worker_session(config_path, session.name)
     refreshed = _load_supervisor(config_path)
     launch = next(item for item in refreshed.plan_launches() if item.session.name == session.name)
+    label = "Managed worker" if role == "worker" else f"Managed {role}"
     typer.echo(
-        f"Managed worker {session.name} ready for project {project_key} "
+        f"{label} {session.name} ready for project {project_key} "
         f"in {refreshed.tmux_session_for_launch(launch)}:{launch.window_name}"
     )
 

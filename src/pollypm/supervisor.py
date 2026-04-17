@@ -184,10 +184,10 @@ def _review_tasks_for_project(project_key: str, db_path: Path) -> list[str]:
 class Supervisor:
     _CONTROL_ROLES = {"heartbeat-supervisor", "operator-pm", "triage", "reviewer"}
     # Roles that should receive an initial-input prompt on fresh launch.
-    # Workers are NOT control-plane sessions (not in _CONTROL_ROLES), but
-    # they DO need their profile prompt delivered on launch — same as the
-    # reviewer / operator / heartbeat / triage sessions.
-    _INITIAL_INPUT_ROLES = _CONTROL_ROLES | {"worker"}
+    # Workers + architects are NOT control-plane sessions (not in
+    # _CONTROL_ROLES — they're project-scoped), but they DO need their
+    # profile prompt delivered on launch so the agent knows its persona.
+    _INITIAL_INPUT_ROLES = _CONTROL_ROLES | {"worker", "architect"}
     #: Name of the PollyPM console/cockpit window inside a tmux session.
     CONSOLE_WINDOW = "PollyPM"
     _CONSOLE_WINDOW = CONSOLE_WINDOW  # deprecated alias — use CONSOLE_WINDOW
@@ -421,6 +421,8 @@ class Supervisor:
             return "worker"
         if session.role == "reviewer":
             return "russell"
+        if session.role == "architect":
+            return "architect"
         return None
 
     def _resolve_profile_prompt(self, session: SessionConfig, account: AccountConfig) -> str | None:

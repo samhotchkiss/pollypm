@@ -503,7 +503,7 @@ def cockpit(
 
 @app.command("cockpit-pane")
 def cockpit_pane(
-    kind: str = typer.Argument(..., help="Pane type: inbox, settings, or project."),
+    kind: str = typer.Argument(..., help="Pane type: inbox, settings, workers, metrics, activity, or project."),
     target: str | None = typer.Argument(None, help="Optional project key for project panes."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     project: str | None = typer.Option(
@@ -533,6 +533,11 @@ def cockpit_pane(
     if kind == "workers":
         from pollypm.cockpit_ui import PollyWorkerRosterApp
         PollyWorkerRosterApp(config_path).run(mouse=True)
+        return
+    if kind == "metrics":
+        # Observability metrics — fifth cockpit surface (#322 etc.).
+        from pollypm.cockpit_ui import PollyMetricsApp
+        PollyMetricsApp(config_path).run(mouse=True)
         return
     if kind == "issues" and target:
         from pollypm.cockpit_ui import PollyTasksApp

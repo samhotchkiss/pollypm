@@ -17,6 +17,8 @@ Two test surfaces:
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import os
 import subprocess
 import time
@@ -30,6 +32,14 @@ from pollypm.worktree_audit import (
     WorktreeState,
     classify_worktree_state,
 )
+
+
+def _fake_load_cm(config, store):
+    """Context-manager mock matching the real @contextmanager _load_config_and_store."""
+    @contextmanager
+    def _cm(payload):
+        yield config, store
+    return _cm
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +303,7 @@ def _invoke_handler_with_fakes(
 
     monkeypatch.setattr(
         plugin_module, "_load_config_and_store",
-        lambda payload: (cfg, fake_store),
+        _fake_load_cm(cfg, fake_store),
     )
     # Patch SQLiteWorkService to return our fake regardless of args.
     import pollypm.work.sqlite_service as sqlite_service_mod
@@ -448,7 +458,7 @@ class TestHandler:
         cfg = _FakeConfig(project=_FakeProject(root_dir=repo))
         monkeypatch.setattr(
             plugin_module, "_load_config_and_store",
-            lambda payload: (cfg, fake_store),
+            _fake_load_cm(cfg, fake_store),
         )
         import pollypm.work.sqlite_service as sqlite_service_mod
 

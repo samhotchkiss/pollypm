@@ -541,8 +541,17 @@ def new_cmd(
             # interactive prompt below becomes redundant — auto-fire
             # already satisfied the user's "plan this project" intent.
             auto_fired = _plan_task_exists(project.path, project.key)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # Auto-fire is best-effort, but a silent swallow meant users
+            # couldn't tell when the planner failed to boot. Emit a
+            # stderr breadcrumb so the interactive prompt below is still
+            # reached and the user at least knows why it wasn't skipped.
+            typer.echo(
+                f"Warning: project.created hook failed ({exc}). The project "
+                f"is registered, but the planner auto-fire did not run. Run "
+                f"`pm project plan {project.key}` to start planning manually.",
+                err=True,
+            )
 
     if auto_fired:
         mode_label = "replan" if mode == "existing" else "plan_project"

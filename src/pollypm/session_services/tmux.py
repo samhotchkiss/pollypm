@@ -175,7 +175,13 @@ class TmuxSessionService:
 
         # Stabilize (dismiss provider prompts, detect ready state)
         if stabilize:
-            self._stabilize(provider, target, name, on_status=on_status)
+            self._stabilize(
+                provider,
+                target,
+                name,
+                on_status=on_status,
+                account_name=account,
+            )
 
         # Send initial input if this is a fresh launch
         if initial_input and fresh_launch_marker and fresh_launch_marker.exists():
@@ -621,6 +627,7 @@ class TmuxSessionService:
         target: str,
         name: str,
         on_status: Callable[[str], None] | None = None,
+        account_name: str | None = None,
     ) -> None:
         def _prefixed(msg: str) -> None:
             if on_status:
@@ -629,7 +636,9 @@ class TmuxSessionService:
         if provider == "claude":
             self._stabilize_claude_launch(target, on_status=_prefixed)
         elif provider == "codex":
-            self._stabilize_codex_launch(target, on_status=_prefixed)
+            self._stabilize_codex_launch(
+                target, on_status=_prefixed, account_name=account_name,
+            )
 
     def _stabilize_claude_launch(
         self, target: str, on_status: Callable[[str], None] | None = None,
@@ -712,7 +721,10 @@ class TmuxSessionService:
         _status("Timed out waiting for Claude Code")
 
     def _stabilize_codex_launch(
-        self, target: str, on_status: Callable[[str], None] | None = None,
+        self,
+        target: str,
+        on_status: Callable[[str], None] | None = None,
+        account_name: str | None = None,
     ) -> None:
         timeout = 60
         start = time.monotonic()
@@ -741,7 +753,22 @@ class TmuxSessionService:
                 time.sleep(poll_interval)
                 continue
             if "usage limit" in lowered:
-                raise RuntimeError("Codex account is out of credits")
+                from pollypm.errors import _last_lines, format_probe_failure
+                who = account_name or "<controller>"
+                raise RuntimeError(
+                    format_probe_failure(
+                        provider="Codex",
+                        account_name=who,
+                        account_email=None,
+                        reason="the account is out of credits",
+                        pane_tail=_last_lines(pane, n=5),
+                        fix=(
+                            f"switch the controller to a different account "
+                            f"with `pm failover` (see `pm accounts`), or top "
+                            f"up '{who}' and rerun `pm up`."
+                        ),
+                    )
+                )
             if "press enter to continue" in lowered:
                 if last_action != "continue":
                     _status(f"Dismissing continue prompt... ({elapsed}s)")

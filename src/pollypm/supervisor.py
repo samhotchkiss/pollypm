@@ -52,6 +52,7 @@ from pollypm.agent_profiles import get_agent_profile
 from pollypm.agent_profiles.base import AgentProfileContext
 from pollypm.checkpoints import record_checkpoint, snapshot_hash, write_mechanical_checkpoint
 from pollypm.config import PollyPMConfig
+from pollypm.errors import _last_lines, format_probe_failure
 from pollypm.heartbeats import get_heartbeat_backend
 from pollypm.heartbeats.api import SupervisorHeartbeatAPI
 from pollypm.knowledge_extract import EXTRACTION_INTERVAL_SECONDS
@@ -2374,17 +2375,75 @@ class Supervisor:
         account = self._effective_account(operator_session, self.config.accounts[operator_session.account])
         output = self._run_probe(account)
         lowered = output.lower()
+        pane_tail = _last_lines(output, n=5)
         if account.provider is ProviderKind.CLAUDE:
             if "ok" in lowered and "authentication" not in lowered:
                 return
-            raise RuntimeError("Claude probe failed")
+            raise RuntimeError(
+                format_probe_failure(
+                    provider="Claude",
+                    account_name=account_name,
+                    account_email=account.email,
+                    reason=(
+                        "the `claude -p 'Reply with ok'` probe did not "
+                        "return 'ok' within the probe window"
+                    ),
+                    pane_tail=pane_tail,
+                    fix=(
+                        f"run `pm accounts` to check login state, then "
+                        f"`pm relogin {account_name}` if the session expired."
+                    ),
+                )
+            )
         if account.provider is ProviderKind.CODEX:
             if "usage limit" in lowered:
-                raise RuntimeError("Codex account is out of credits")
+                raise RuntimeError(
+                    format_probe_failure(
+                        provider="Codex",
+                        account_name=account_name,
+                        account_email=account.email,
+                        reason="the account is out of credits",
+                        pane_tail=pane_tail,
+                        fix=(
+                            f"switch the controller to a different account "
+                            f"with `pm failover` (see `pm accounts` for "
+                            f"current state), or top up '{account_name}' "
+                            f"and rerun `pm up`."
+                        ),
+                    )
+                )
             if "not logged" in lowered or "login" in lowered:
-                raise RuntimeError("Codex account is not authenticated")
+                raise RuntimeError(
+                    format_probe_failure(
+                        provider="Codex",
+                        account_name=account_name,
+                        account_email=account.email,
+                        reason="the account is not authenticated",
+                        pane_tail=pane_tail,
+                        fix=(
+                            f"run `pm relogin {account_name}` and retry "
+                            f"`pm up`."
+                        ),
+                    )
+                )
             if "error:" in lowered:
-                raise RuntimeError("Codex probe failed")
+                raise RuntimeError(
+                    format_probe_failure(
+                        provider="Codex",
+                        account_name=account_name,
+                        account_email=account.email,
+                        reason=(
+                            "the `codex exec 'Reply with ok'` probe "
+                            "returned an unexpected response"
+                        ),
+                        pane_tail=pane_tail,
+                        fix=(
+                            f"`pm relogin {account_name}` usually clears "
+                            f"this. If it persists, run the probe command "
+                            f"manually to see the raw output."
+                        ),
+                    )
+                )
             return
         raise RuntimeError(f"Unsupported controller provider: {account.provider.value}")
 
@@ -2494,7 +2553,9 @@ class Supervisor:
         if launch.session.provider is ProviderKind.CLAUDE:
             self._stabilize_claude_launch(target, on_status=_prefixed_status)
         elif launch.session.provider is ProviderKind.CODEX:
-            self._stabilize_codex_launch(target, on_status=_prefixed_status)
+            self._stabilize_codex_launch(
+                target, on_status=_prefixed_status, account=launch.account,
+            )
         _prefixed_status("Sending initial input...")
         self._send_initial_input_if_fresh(launch, target)
         self._mark_session_resume_ready(launch)
@@ -2794,7 +2855,10 @@ class Supervisor:
         return
 
     def _stabilize_codex_launch(
-        self, target: str, on_status: Callable[[str], None] | None = None,
+        self,
+        target: str,
+        on_status: Callable[[str], None] | None = None,
+        account: AccountConfig | None = None,
     ) -> None:
         timeout = 60
         start = time.monotonic()
@@ -2823,7 +2887,22 @@ class Supervisor:
                 time.sleep(poll_interval)
                 continue
             if "usage limit" in lowered:
-                raise RuntimeError("Codex account is out of credits")
+                account_name = account.name if account else "<controller>"
+                account_email = account.email if account else None
+                raise RuntimeError(
+                    format_probe_failure(
+                        provider="Codex",
+                        account_name=account_name,
+                        account_email=account_email,
+                        reason="the account is out of credits",
+                        pane_tail=_last_lines(pane, n=5),
+                        fix=(
+                            f"switch the controller to a different account "
+                            f"with `pm failover` (see `pm accounts`), or top "
+                            f"up '{account_name}' and rerun `pm up`."
+                        ),
+                    )
+                )
             if "press enter to continue" in lowered:
                 if last_action != "continue":
                     _status(f"Dismissing continue prompt... ({elapsed}s)")

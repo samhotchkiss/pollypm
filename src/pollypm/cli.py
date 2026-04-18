@@ -28,6 +28,7 @@ from pollypm.config import (
     write_example_config,
 )
 from pollypm.doc_scaffold import repair_docs, verify_docs
+from pollypm.errors import format_config_not_found_error
 from pollypm.models import ProviderKind
 from pollypm.service_api import PollyPMService
 from pollypm.service_api import render_json
@@ -637,10 +638,20 @@ def add_project(
                     "config_path": str(config_path),
                 },
             )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             # Observers are best-effort — never block registration on a
-            # plugin crash. The same guard is in ``pm project new``.
-            pass
+            # plugin crash. Surface a stderr breadcrumb so the user knows
+            # the planner auto-fire did not run (the project IS still
+            # registered). Mirror of the guard in ``pm project new``.
+            logger.warning(
+                "project.created observer failed for %s: %s", project.key, exc,
+            )
+            typer.echo(
+                f"Warning: project.created hook failed ({exc}). The project "
+                f"is registered, but the planner auto-fire did not run. Run "
+                f"`pm project plan {project.key}` to start planning manually.",
+                err=True,
+            )
 
     if not skip_import:
         typer.echo("Importing project history (transcripts, git, files)...")
@@ -654,7 +665,18 @@ def add_project(
                 f"{result.timeline_events} events, {result.docs_generated} docs generated"
             )
         except Exception as exc:  # noqa: BLE001
-            typer.echo(f"History import failed (project still registered): {exc}")
+            # Route to stderr so scripted callers can see the failure
+            # without grepping stdout. The project is registered — make
+            # that explicit and offer a retry command.
+            logger.warning(
+                "history_import failed for %s: %s", project.key, exc,
+            )
+            typer.echo(
+                f"Failed: history import for {project.key}: {exc}\n"
+                f"The project is registered — rerun `pm import {project.key}` "
+                f"to retry.",
+                err=True,
+            )
 
 
 @app.command("import")
@@ -773,7 +795,10 @@ def issue_transition(
     try:
         task = service.move_task(project, task_id, to_state=to_state)
     except ValueError as exc:
-        typer.echo(str(exc))
+        # Route to stderr with a prefix that names the subject. The raw
+        # ValueError used to leak to stdout (see
+        # reports/error-message-audit.md §1 item 2).
+        typer.echo(f"Cannot transition {task_id}: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"Moved issue {task.task_id} to {task.state}")
 
@@ -830,7 +855,7 @@ def issue_approve(
             verification=verification,
         )
     except ValueError as exc:
-        typer.echo(str(exc))
+        typer.echo(f"Cannot approve {task_id}: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"Approved issue {task.task_id} to {task.state}")
 
@@ -855,7 +880,7 @@ def issue_request_changes(
             changes_requested=changes,
         )
     except ValueError as exc:
-        typer.echo(str(exc))
+        typer.echo(f"Cannot request changes on {task_id}: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"Returned issue {task.task_id} to {task.state}")
 
@@ -1146,7 +1171,7 @@ def reset(
     """Kill all PollyPM tmux sessions (cockpit + storage closet). Use `pm up` to restart."""
     config_path = _discover_config_path(config_path)
     if not config_path.exists():
-        typer.echo(f"Config not found at {config_path}.")
+        typer.echo(format_config_not_found_error(config_path), err=True)
         raise typer.Exit(code=1)
     supervisor = _load_supervisor(config_path)
     session_name = supervisor.config.project.tmux_session
@@ -2006,7 +2031,7 @@ def repair(
     """Check and repair PollyPM project scaffolding, docs, and state."""
     config_path = _discover_config_path(config_path)
     if not config_path.exists():
-        typer.echo(f"Config not found at {config_path}.")
+        typer.echo(format_config_not_found_error(config_path), err=True)
         raise typer.Exit(code=1)
     config = load_config(config_path)
     all_problems: list[str] = []

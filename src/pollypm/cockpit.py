@@ -1364,7 +1364,22 @@ class CockpitRouter:
             # Plugin init failures surface via degraded_plugins; don't
             # block the rail rendering.
             pass
-        return host.rail_registry()
+        registry = host.rail_registry()
+        # Worker roster top-rail entry. Registered here (not in
+        # ``core_rail_items``) so the cockpit router + roster Textual
+        # app land in one feature drop — the rail row, the route handler
+        # (``route_selected("workers")``), and the panel renderer all
+        # live alongside each other. The registration is gated on
+        # ``core_rail_items`` being active so disabling the core plugin
+        # still yields an empty rail (see
+        # ``test_removing_core_rail_items_yields_empty_rail``).
+        try:
+            core_enabled = "core_rail_items" in host.plugins()
+        except Exception:  # noqa: BLE001
+            core_enabled = True
+        if core_enabled:
+            _register_worker_roster_rail_item(registry, self)
+        return registry
 
     def _project_session_map(self, launches) -> dict[str, str]:
         project_session_map: dict[str, str] = {}
@@ -1684,6 +1699,9 @@ class CockpitRouter:
             return
         if key == "inbox":
             self._show_static_view(supervisor, window_target, "inbox")
+            return
+        if key == "workers":
+            self._show_static_view(supervisor, window_target, "workers")
             return
         if key == "settings":
             self._show_static_view(supervisor, window_target, "settings")
@@ -2374,6 +2392,9 @@ def _build_cockpit_detail_dispatch(supervisor, config_path: Path, kind: str, tar
     if kind == "inbox":
         return _render_inbox_panel(config)
 
+    if kind == "workers":
+        return _render_worker_roster_panel(config_path)
+
     if kind == "activity":
         from pollypm.plugins_builtin.activity_feed.cockpit.feed_panel import (
             render_activity_feed_text,
@@ -2480,3 +2501,429 @@ def _build_cockpit_detail_dispatch(supervisor, config_path: Path, kind: str, tar
         return "\n".join(lines)
 
     return "PollyPM\n\nSelect Polly, Inbox, a project, or Settings from the left rail."
+
+
+# ---------------------------------------------------------------------------
+# Worker roster — a live mission-control view that spans every project.
+# ``_gather_worker_roster`` walks the config, opens each project's
+# ``.pollypm/state.db`` to find active task assignments, cross-references
+# tmux windows + supervisor state, and produces one ``WorkerRosterRow``
+# per worker session. The row is the stable shape every renderer + test
+# consumes — keep it data-only (no Textual imports).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class WorkerRosterRow:
+    """One worker session, flattened for the roster table.
+
+    The row carries both display-ready bits (``status``, ``turn_label``)
+    and the raw data the cockpit needs to route a jump (``tmux_window``,
+    ``session_name``). ``status`` is one of ``working``/``idle``/``stuck``/
+    ``offline`` so the renderer can pick the dot colour + sort bucket
+    without re-inspecting the underlying signals.
+    """
+
+    project_key: str
+    project_name: str
+    session_name: str
+    status: str  # "working" | "idle" | "stuck" | "offline"
+    task_id: str | None
+    task_number: int | None
+    task_title: str
+    current_node: str | None
+    turn_label: str
+    last_commit_label: str
+    tmux_window: str | None  # e.g. "task-<project>-<number>"
+    last_heartbeat: str | None
+    worktree_path: str | None
+    branch_name: str | None
+
+
+# Order used by the renderer + sort helpers. Lower = earlier in the table.
+_WORKER_ROSTER_STATUS_ORDER: dict[str, int] = {
+    "stuck": 0,
+    "working": 1,
+    "idle": 2,
+    "offline": 3,
+}
+
+
+def _worker_roster_sort_key(row: "WorkerRosterRow") -> tuple[int, str]:
+    return (
+        _WORKER_ROSTER_STATUS_ORDER.get(row.status, 9),
+        (row.project_name or row.project_key or "").lower(),
+    )
+
+
+def _format_worker_turn_label(
+    *, last_heartbeat_iso: str | None, is_turn_active: bool,
+) -> str:
+    """Return ``active 2m`` / ``idle 12m`` / ``—`` from heartbeat state."""
+    if not last_heartbeat_iso:
+        return "\u2014"
+    from datetime import UTC, datetime
+    try:
+        dt = datetime.fromisoformat(last_heartbeat_iso)
+    except (TypeError, ValueError):
+        return "\u2014"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    delta = datetime.now(UTC) - dt
+    total_s = max(0, int(delta.total_seconds()))
+    mins = total_s // 60 if total_s >= 60 else 0
+    if mins < 1:
+        unit = "now"
+    elif mins < 60:
+        unit = f"{mins}m"
+    elif mins < 60 * 24:
+        unit = f"{mins // 60}h"
+    else:
+        unit = f"{mins // (60 * 24)}d"
+    prefix = "active" if is_turn_active else "idle"
+    if unit == "now":
+        return f"{prefix} now"
+    return f"{prefix} {unit}"
+
+
+def _last_commit_age(project_path: Path, branch_name: str | None) -> str:
+    """Return a short relative-age string for the worker's branch tip.
+
+    Best-effort: we only run ``git log -1 --format=%ct`` so a missing
+    branch / non-repo path falls through to the empty-age dash.
+    """
+    if not branch_name:
+        return "\u2014"
+    try:
+        import subprocess as _sp
+        result = _sp.run(
+            ["git", "-C", str(project_path), "log", "-1", "--format=%ct", branch_name],
+            capture_output=True, text=True, check=False, timeout=2,
+        )
+    except Exception:  # noqa: BLE001
+        return "\u2014"
+    if result.returncode != 0:
+        return "\u2014"
+    ts_raw = (result.stdout or "").strip()
+    if not ts_raw:
+        return "\u2014"
+    try:
+        ts = int(ts_raw)
+    except ValueError:
+        return "\u2014"
+    from datetime import UTC, datetime
+    dt = datetime.fromtimestamp(ts, tz=UTC)
+    delta = datetime.now(UTC) - dt
+    total_s = max(0, int(delta.total_seconds()))
+    if total_s < 60:
+        return "just now"
+    if total_s < 3600:
+        return f"{total_s // 60}m ago"
+    if total_s < 3600 * 24:
+        return f"{total_s // 3600}h ago"
+    return f"{total_s // (3600 * 24)}d ago"
+
+
+def _gather_worker_roster(config) -> list[WorkerRosterRow]:
+    """Walk every tracked project's work-service + tmux state.
+
+    Returns one ``WorkerRosterRow`` per active worker session. Offline
+    sessions (worker record exists but tmux window is gone) are included
+    so Sam can see workers that have crashed.
+
+    Always best-effort: a bad DB or missing tmux session degrades one
+    project's worth of rows, never the whole roster.
+    """
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    projects = getattr(config, "projects", {}) or {}
+    if not projects:
+        return []
+
+    # Supervisor state is optional — the roster is valuable even without
+    # a running tmux server (e.g. headless CI / tests). We degrade to
+    # offline + empty turn labels when either one is unavailable.
+    supervisor = _try_load_supervisor_for_config(config)
+
+    tmux = None
+    storage_windows: dict[str, object] = {}
+    try:
+        from pollypm.session_services import create_tmux_client
+        tmux = create_tmux_client()
+        storage_session = f"{config.project.tmux_session}-storage-closet"
+        try:
+            storage_window_list = tmux.list_windows(storage_session)
+        except Exception:  # noqa: BLE001
+            storage_window_list = []
+        storage_windows = {w.name: w for w in storage_window_list}
+    except Exception:  # noqa: BLE001
+        tmux = None
+        storage_windows = {}
+
+    rows: list[WorkerRosterRow] = []
+
+    for project_key, project in projects.items():
+        project_path = getattr(project, "path", None)
+        project_name = (
+            project.display_label() if hasattr(project, "display_label")
+            else (getattr(project, "name", None) or project_key)
+        )
+        if project_path is None or not isinstance(project_path, Path):
+            continue
+        db_path = project_path / ".pollypm" / "state.db"
+        if not db_path.exists():
+            continue
+        try:
+            svc = SQLiteWorkService(db_path=db_path, project_path=project_path)
+        except Exception:  # noqa: BLE001
+            continue
+        try:
+            try:
+                worker_sessions = svc.list_worker_sessions(
+                    project=project_key, active_only=True,
+                )
+            except Exception:  # noqa: BLE001
+                worker_sessions = []
+            task_lookup: dict[int, object] = {}
+            try:
+                for t in svc.list_tasks(project=project_key):
+                    tn = getattr(t, "task_number", None)
+                    if isinstance(tn, int):
+                        task_lookup[tn] = t
+            except Exception:  # noqa: BLE001
+                task_lookup = {}
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+        for ws in worker_sessions:
+            task = task_lookup.get(ws.task_number)
+            task_title_full = (
+                getattr(task, "title", "") or "" if task is not None else ""
+            )
+            task_title = task_title_full[:40]
+            task_id = getattr(task, "task_id", None) if task is not None else None
+            current_node = (
+                getattr(task, "current_node_id", None)
+                if task is not None else None
+            )
+            window_name = f"task-{project_key}-{ws.task_number}"
+            window = storage_windows.get(window_name)
+            has_window = window is not None and not getattr(
+                window, "pane_dead", False,
+            )
+            session_name = ws.agent_name or window_name
+
+            last_heartbeat_iso: str | None = None
+            is_turn_active = False
+            if has_window and tmux is not None:
+                try:
+                    pane_text = tmux.capture_pane(window.pane_id, lines=15)
+                except Exception:  # noqa: BLE001
+                    pane_text = ""
+                lowered = pane_text.lower()
+                if "\u23fa" in pane_text or "working" in lowered:
+                    is_turn_active = True
+                if (
+                    "working (" in lowered
+                    and "esc to interrupt" in lowered
+                ):
+                    is_turn_active = True
+
+            stuck = False
+            if supervisor is not None:
+                try:
+                    drift_at = supervisor.store.last_event_at(
+                        session_name, "state_drift",
+                    )
+                except Exception:  # noqa: BLE001
+                    drift_at = None
+                if drift_at:
+                    from datetime import UTC, datetime, timedelta
+                    try:
+                        drift_dt = datetime.fromisoformat(drift_at)
+                    except (TypeError, ValueError):
+                        drift_dt = None
+                    if drift_dt is not None:
+                        if drift_dt.tzinfo is None:
+                            drift_dt = drift_dt.replace(tzinfo=UTC)
+                        if drift_dt >= datetime.now(UTC) - timedelta(minutes=30):
+                            stuck = True
+                try:
+                    hb = supervisor.store.latest_heartbeat(session_name)
+                except Exception:  # noqa: BLE001
+                    hb = None
+                if hb is not None:
+                    last_heartbeat_iso = getattr(hb, "created_at", None)
+
+            if not has_window:
+                status = "offline"
+            elif stuck:
+                status = "stuck"
+            elif is_turn_active:
+                status = "working"
+            else:
+                status = "idle"
+
+            turn_label = _format_worker_turn_label(
+                last_heartbeat_iso=last_heartbeat_iso,
+                is_turn_active=is_turn_active,
+            )
+            last_commit_label = _last_commit_age(project_path, ws.branch_name)
+
+            rows.append(
+                WorkerRosterRow(
+                    project_key=project_key,
+                    project_name=str(project_name),
+                    session_name=session_name,
+                    status=status,
+                    task_id=task_id,
+                    task_number=ws.task_number,
+                    task_title=task_title,
+                    current_node=current_node,
+                    turn_label=turn_label,
+                    last_commit_label=last_commit_label,
+                    tmux_window=window_name,
+                    last_heartbeat=last_heartbeat_iso,
+                    worktree_path=ws.worktree_path,
+                    branch_name=ws.branch_name,
+                )
+            )
+
+    if supervisor is not None:
+        try:
+            supervisor.store.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    rows.sort(key=_worker_roster_sort_key)
+    return rows
+
+
+def _try_load_supervisor_for_config(config):
+    """Best-effort supervisor load from a ``PollyPMConfig`` — returns
+    ``None`` if we can't find a canonical config file path to feed into
+    :class:`PollyPMService`. The roster still renders useful data without
+    a supervisor (no drift detection, no heartbeat ages), so this is not
+    fatal.
+    """
+    try:
+        cfg_path = getattr(config.project, "config_file", None) or getattr(
+            config.project, "config_path", None,
+        )
+    except Exception:  # noqa: BLE001
+        cfg_path = None
+    if cfg_path is None:
+        try:
+            root = getattr(config.project, "root_dir", None)
+            if root is not None:
+                candidate = root / "pollypm.toml"
+                cfg_path = candidate if candidate.exists() else None
+        except Exception:  # noqa: BLE001
+            cfg_path = None
+    if cfg_path is None:
+        return None
+    try:
+        from pollypm.service_api import PollyPMService
+        return PollyPMService(cfg_path).load_supervisor()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _render_worker_roster_panel(config_path: Path) -> str:
+    """Fallback text-only roster — used by ``build_cockpit_detail`` when
+    the right pane hasn't launched the Textual app yet (e.g. in
+    automated tests that poke the static-view plumbing).
+
+    The production path is the ``PollyWorkerRosterApp`` Textual screen
+    launched via ``pm cockpit-pane workers``.
+    """
+    try:
+        config = load_config(config_path)
+    except Exception as exc:  # noqa: BLE001
+        return f"Workers\n\nError loading config: {exc}"
+    rows = _gather_worker_roster(config)
+    if not rows:
+        return (
+            "Workers\n\n"
+            "No active worker sessions.\n\n"
+            "Start one with `pm cockpit-pane project <key>` and press `w`."
+        )
+    lines = ["Workers", ""]
+    dot_for = {
+        "working": "\u25cf", "idle": "\u25cb",
+        "stuck": "\u25b2", "offline": "\u25cf",
+    }
+    for row in rows:
+        dot = dot_for.get(row.status, "\u25cb")
+        task_part = (
+            f"#{row.task_number} {row.task_title}"
+            if row.task_number is not None else "(none)"
+        )
+        lines.append(
+            f"  {dot} {row.status:<7}  {row.project_name:<18}  "
+            f"{row.session_name:<22}  {task_part}  @{row.current_node or '-'}  "
+            f"{row.turn_label}  {row.last_commit_label}"
+        )
+    return "\n".join(lines)
+
+
+def _register_worker_roster_rail_item(registry, router) -> None:
+    """Add the ``top.Workers`` rail row if not already registered.
+
+    Kept out of ``core_rail_items`` so the roster's rail row, its route
+    dispatch (``route_selected("workers")``) and its Textual app land in
+    one patch rather than being spread across the plugin boundary. The
+    registry dedupes on ``(plugin_name, section, label)``, so calling
+    this every tick is safe.
+    """
+    try:
+        from pollypm.plugin_api.v1 import RailItemRegistration, PanelSpec
+    except Exception:  # noqa: BLE001
+        return
+
+    def _label(ctx) -> str:
+        extras = getattr(ctx, "extras", {}) or {}
+        cfg = extras.get("config")
+        try:
+            count = len(_gather_worker_roster(cfg)) if cfg is not None else 0
+        except Exception:  # noqa: BLE001
+            count = 0
+        return f"Workers ({count})" if count else "Workers"
+
+    def _state(ctx) -> str:
+        extras = getattr(ctx, "extras", {}) or {}
+        cfg = extras.get("config")
+        try:
+            rows = _gather_worker_roster(cfg) if cfg is not None else []
+        except Exception:  # noqa: BLE001
+            rows = []
+        if any(r.status == "stuck" for r in rows):
+            return "! stuck"
+        if any(r.status == "working" for r in rows):
+            return "\u25c6 working"
+        return "idle"
+
+    def _handler(ctx):
+        try:
+            router.route_selected("workers")
+        except Exception:  # noqa: BLE001
+            pass
+        return PanelSpec(widget=None, focus_hint="workers")
+
+    reg = RailItemRegistration(
+        plugin_name="cockpit_worker_roster",
+        section="top",
+        index=25,  # after Inbox (20), before Projects
+        label="Workers",
+        handler=_handler,
+        key="workers",
+        state_provider=_state,
+        label_provider=_label,
+    )
+    try:
+        registry.add(reg)
+    except Exception:  # noqa: BLE001
+        pass

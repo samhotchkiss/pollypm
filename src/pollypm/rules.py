@@ -21,16 +21,33 @@ def _parse_catalog_metadata(
     *,
     default_description: str,
     default_trigger: str,
+    name_override: str | None = None,
 ) -> CatalogFile:
-    name = path.stem
+    name = name_override if name_override is not None else path.stem
     description = ""
     trigger = ""
-    for line in content.splitlines()[:20]:
+    # Strip a YAML frontmatter block if present so that directory-style skills
+    # (SKILL.md) can use ``description:`` inside the front matter.
+    body_lines = content.splitlines()
+    scan_lines: list[str]
+    if body_lines and body_lines[0].strip() == "---":
+        fm_end = None
+        for idx in range(1, min(len(body_lines), 40)):
+            if body_lines[idx].strip() == "---":
+                fm_end = idx
+                break
+        if fm_end is not None:
+            scan_lines = body_lines[1:fm_end] + body_lines[fm_end + 1 : fm_end + 21]
+        else:
+            scan_lines = body_lines[:20]
+    else:
+        scan_lines = body_lines[:20]
+    for line in scan_lines:
         stripped = line.strip()
         lowered = stripped.casefold()
-        if lowered.startswith("description:"):
+        if not description and lowered.startswith("description:"):
             description = stripped.split(":", 1)[1].strip()
-        elif lowered.startswith("trigger:"):
+        elif not trigger and lowered.startswith("trigger:"):
             trigger = stripped.split(":", 1)[1].strip()
     if not description:
         description = default_description.format(name=name)
@@ -72,7 +89,10 @@ def _scan_catalog_dir(
     if not directory.exists():
         return {}
     merged: dict[str, CatalogFile] = {}
+    # Single-file skills/rules: any top-level ``*.md`` (excluding private ones).
     for path in sorted(directory.glob("*.md")):
+        if path.name.startswith("_"):
+            continue
         content = path.read_text()
         rule = _parse_catalog_metadata(
             path,
@@ -82,6 +102,28 @@ def _scan_catalog_dir(
         )
         if display_base is not None:
             rule.display_path = f"{display_base}/{path.name}"
+        merged[rule.name] = rule
+    # Directory-style skills: any subdirectory that contains a ``SKILL.md``.
+    # The directory name becomes the skill name (not ``SKILL``), so that a
+    # layout like ``visual-explainer/SKILL.md`` registers as ``visual-explainer``.
+    for child in sorted(directory.iterdir()):
+        if not child.is_dir():
+            continue
+        if child.name.startswith(("_", ".")):
+            continue
+        skill_md = child / "SKILL.md"
+        if not skill_md.is_file():
+            continue
+        content = skill_md.read_text()
+        rule = _parse_catalog_metadata(
+            skill_md,
+            content,
+            default_description=default_description,
+            default_trigger=default_trigger,
+            name_override=child.name,
+        )
+        if display_base is not None:
+            rule.display_path = f"{display_base}/{child.name}/SKILL.md"
         merged[rule.name] = rule
     return merged
 

@@ -87,6 +87,36 @@ def format_probe_failure(
     return "\n".join(parts)
 
 
+class StoreBackendNotFound(LookupError):
+    """No ``pollypm.store_backend`` entry point matches the configured name.
+
+    Raised by :func:`pollypm.store.registry.get_store` when
+    ``config.storage.backend`` names a backend that is not currently
+    installed. The message follows the three-question rule (#240): what
+    happened, why it matters, how to fix it — including the list of
+    backends that *are* available so the user can eyeball a typo.
+    """
+
+    def __init__(self, backend: str, *, available: list[str]) -> None:
+        self.backend = backend
+        self.available = list(available)
+        available_list = ", ".join(available) if available else "none"
+        message = (
+            f"Storage backend '{backend}' is not installed.\n\n"
+            f"PollyPM loads its persistent-state backend via the "
+            f"'pollypm.store_backend' entry-point group, and no installed "
+            f"package registered a backend with that name — so the CLI "
+            f"cannot open the state DB and every subsystem that persists "
+            f"state will fail.\n\n"
+            f"Available backends: {available_list}.\n\n"
+            f"Fix: set ``[storage] backend`` in ~/.pollypm/pollypm.toml to "
+            f"one of the available names, or install the package that "
+            f"ships '{backend}' (e.g. `uv tool install "
+            f"pollypm-store-postgres` for the Postgres backend)."
+        )
+        super().__init__(message)
+
+
 def _last_lines(text: str, n: int = 5) -> str:
     """Return the last ``n`` non-empty lines of ``text``.
 

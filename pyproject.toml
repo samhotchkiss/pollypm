@@ -20,6 +20,9 @@ dev = [
 pm = "pollypm.cli:app"
 pollypm = "pollypm.cli:app"
 
+[project.entry-points."pollypm.store_backend"]
+sqlite = "pollypm.store.sqlalchemy_store:SQLAlchemyStore"
+
 [build-system]
 requires = ["setuptools>=80", "wheel"]
 build-backend = "setuptools.build_meta"

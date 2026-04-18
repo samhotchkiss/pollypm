@@ -624,6 +624,89 @@ def check_provider_account_configured() -> CheckResult:
     )
 
 
+def check_storage_backend() -> CheckResult:
+    """Resolve the configured storage backend via entry points (issue #343).
+
+    Calls :func:`pollypm.store.registry.get_store` and reports which
+    backend is active plus its URL. A missing config skips. A
+    :class:`~pollypm.errors.StoreBackendNotFound` surfaces the
+    three-question-rule message verbatim so the user sees what, why,
+    and how to fix.
+    """
+    from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+    from pollypm.errors import StoreBackendNotFound
+    from pollypm.store.registry import get_store
+
+    if not DEFAULT_CONFIG_PATH.exists():
+        return _skip("storage backend check skipped (no config)")
+    try:
+        config = load_config(DEFAULT_CONFIG_PATH)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(
+            f"config failed to parse ({exc})",
+            why=(
+                "Doctor cannot resolve the storage backend without a "
+                "parseable ~/.pollypm/pollypm.toml."
+            ),
+            fix=(
+                "Inspect and fix the config —\n"
+                "  pm example-config   # reference template\n"
+                "  edit ~/.pollypm/pollypm.toml\n"
+                "Recheck: pm doctor"
+            ),
+            data={"error": str(exc)},
+        )
+    backend_name = config.storage.backend
+    try:
+        store = get_store(config)
+    except StoreBackendNotFound as exc:
+        return _fail(
+            f"storage backend '{backend_name}' not installed",
+            why=(
+                "PollyPM resolves its persistent-state backend via the "
+                "'pollypm.store_backend' entry-point group; no installed "
+                "package registered that name. Every subsystem that writes "
+                "state will fail until this is fixed."
+            ),
+            fix=(
+                "Set [storage].backend in ~/.pollypm/pollypm.toml to an "
+                "installed backend, or install the package that ships the "
+                f"'{backend_name}' backend.\n"
+                f"Available: {', '.join(exc.available) or 'none'}\n"
+                "Recheck: pm doctor"
+            ),
+            data={"backend": backend_name, "available": exc.available},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _fail(
+            f"storage backend '{backend_name}' failed to initialise ({exc})",
+            why=(
+                "The entry point loaded but construction raised — the "
+                "backend is registered but not usable in this environment."
+            ),
+            fix=(
+                "Inspect the error above, check [storage].url in "
+                "~/.pollypm/pollypm.toml, and verify the backend package's "
+                "own dependencies.\n"
+                "Recheck: pm doctor"
+            ),
+            data={"backend": backend_name, "error": str(exc)},
+        )
+    # Grab the URL for reporting, then release the resources the store
+    # just opened. Doctor must not leave connection pools dangling.
+    url = getattr(store, "url", "<unknown>")
+    try:
+        dispose = getattr(store, "dispose", None)
+        if callable(dispose):
+            dispose()
+    except Exception:  # noqa: BLE001
+        pass
+    return _ok(
+        f"storage backend '{backend_name}' active at {url}",
+        data={"backend": backend_name, "url": url},
+    )
+
+
 # --------------------------------------------------------------------- #
 # Plugin health
 # --------------------------------------------------------------------- #
@@ -2394,6 +2477,7 @@ def _registered_checks() -> list[Check]:
         Check("pollypm-version-matches", check_installed_version_matches_pyproject, "install", severity="warning"),
         Check("config-file", check_config_file, "install"),
         Check("provider-account", check_provider_account_configured, "install"),
+        Check("storage-backend", check_storage_backend, "install"),
         # Plugins
         Check("builtin-plugin-manifests", check_builtin_plugin_manifests, "plugins"),
         Check("critical-plugins-enabled", check_no_critical_plugin_disabled, "plugins"),

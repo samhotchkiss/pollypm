@@ -19,6 +19,7 @@ from pollypm.models import (
     ProviderKind,
     RuntimeKind,
     SessionConfig,
+    StorageSettings,
 )
 
 
@@ -374,6 +375,46 @@ def _parse_events_retention_settings(
     )
 
 
+def _parse_storage_settings(
+    raw: dict[str, object],
+    *,
+    project: ProjectSettings,
+) -> StorageSettings:
+    """Parse the ``[storage]`` TOML section (issue #343).
+
+    Recognised keys:
+
+    * ``backend`` — entry-point name under ``pollypm.store_backend``.
+      Defaults to ``"sqlite"`` (registered by this package).
+    * ``url`` — SQLAlchemy URL. When empty/missing, the resolver derives
+      ``sqlite:///<project.state_db>`` so first-run users don't have to
+      think about connection strings.
+
+    Missing section yields defaults. Fat-fingered value types (non-str)
+    silently fall back to defaults — a broken ``[storage]`` block must
+    never brick the CLI on a config the user can fix with ``pm repair``.
+    """
+    storage_raw = raw.get("storage", {})
+    if not isinstance(storage_raw, dict):
+        storage_raw = {}
+    backend_raw = storage_raw.get("backend", "sqlite")
+    if not isinstance(backend_raw, str) or not backend_raw.strip():
+        backend_raw = "sqlite"
+    url_raw = storage_raw.get("url", "")
+    if not isinstance(url_raw, str):
+        url_raw = ""
+    url_stripped = url_raw.strip()
+    if not url_stripped:
+        # Default-derive from the already-resolved state_db path. The
+        # resolver downstream uses this URL verbatim, so emit an absolute
+        # path that survives chdir.
+        url_stripped = f"sqlite:///{project.state_db.resolve()}"
+    return StorageSettings(
+        backend=backend_raw.strip(),
+        url=url_stripped,
+    )
+
+
 def _parse_plugin_settings(raw: dict[str, object]) -> PluginSettings:
     """Parse the ``[plugins]`` TOML section.
 
@@ -500,6 +541,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
     planner = _parse_planner_settings(raw)
     logging_settings = _parse_logging_settings(raw)
     events = _parse_events_retention_settings(raw)
+    storage = _parse_storage_settings(raw, project=project)
     projects = _parse_known_projects(raw, base=base)
     _merge_project_local_config(sessions, projects, plugins)
     _validate_cross_references(accounts=accounts, sessions=sessions, pollypm=pollypm)
@@ -516,6 +558,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
         planner=planner,
         logging=logging_settings,
         events=events,
+        storage=storage,
     )
     try:
         _config_cache[config_path] = (config_path.stat().st_mtime, config)

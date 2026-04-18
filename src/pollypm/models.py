@@ -193,6 +193,27 @@ class EventsRetentionSettings:
 
 
 @dataclass(slots=True)
+class StorageSettings:
+    """Storage-backend selection from the ``[storage]`` TOML section.
+
+    PollyPM loads its persistent-state backend via the
+    ``pollypm.store_backend`` entry-point group (issue #343). This
+    dataclass holds the config values the resolver feeds into
+    :func:`pollypm.store.registry.get_store`.
+
+    ``backend`` — entry-point name. ``"sqlite"`` is the built-in default
+    registered by this package; third-party packages (e.g. the future
+    ``pollypm-store-postgres``) can register additional names.
+    ``url`` — SQLAlchemy URL passed to the backend constructor. Empty
+    string means "derive from ``config.project.state_db``" —
+    ``sqlite:///<resolved-state-db-path>``.
+    """
+
+    backend: str = "sqlite"
+    url: str = ""
+
+
+@dataclass(slots=True)
 class PollyPMConfig:
     project: ProjectSettings
     pollypm: PollyPMSettings
@@ -207,6 +228,7 @@ class PollyPMConfig:
     events: EventsRetentionSettings = field(
         default_factory=EventsRetentionSettings,
     )
+    storage: StorageSettings = field(default_factory=StorageSettings)
 
 
 @dataclass(slots=True)

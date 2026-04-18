@@ -15,6 +15,8 @@ Run with::
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -25,6 +27,14 @@ from pollypm.plugins_builtin.core_recurring.plugin import (
     is_ephemeral_session_name,
     sweep_ephemeral_sessions,
 )
+
+
+def _fake_load_cm(config, store):
+    """Context-manager mock matching the real @contextmanager _load_config_and_store."""
+    @contextmanager
+    def _cm(payload):
+        yield config, store
+    return _cm
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +413,7 @@ class TestHandlerSurfacesEphemeralCounts:
         # so the test stays hermetic.
         monkeypatch.setattr(
             mod, "_load_config_and_store",
-            lambda payload: (object(), store),
+            _fake_load_cm(object(), store),
         )
         monkeypatch.setattr(mod, "Supervisor", StubSupervisor, raising=False)
         # The handler imports Supervisor inside the function body. Patch

@@ -18,6 +18,7 @@ may carry per-invocation hints (e.g. ``project_root`` overrides).
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -32,16 +33,16 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _load_config_and_store(payload: dict[str, Any]):
-    """Open the config + state store for a handler invocation.
+def _load_config(payload: dict[str, Any]):
+    """Resolve + load the PollyPM config for a handler invocation.
 
     Handlers accept an optional ``config_path`` override in ``payload`` so
     tests (and alt installations) can target a non-default config. Falls
     back to the global default discovery.
 
-    Returns ``(config, store)``; the store is closed by caller via
-    ``finally: store.close()`` — but for our handlers we use short-lived
-    stores that exit with the function so garbage collection handles it.
+    Use this helper when the handler does NOT need a ``StateStore`` — it
+    avoids opening a SQLite file descriptor that would then leak on the
+    recurring schedule (the heartbeat fires some handlers every ~10s).
     """
     from pollypm.config import DEFAULT_CONFIG_PATH, load_config, resolve_config_path
 
@@ -51,12 +52,30 @@ def _load_config_and_store(payload: dict[str, Any]):
         raise RuntimeError(
             f"PollyPM config not found at {config_path}; cannot run recurring handler"
         )
-    config = load_config(config_path)
+    return load_config(config_path)
 
+
+@contextmanager
+def _load_config_and_store(payload: dict[str, Any]):
+    """Context-managed config + state store for handler invocations.
+
+    Yields ``(config, store)``. The store is closed deterministically on
+    exit — callers MUST use
+    ``with _load_config_and_store(payload) as (config, store): ...``.
+
+    Recurring handlers fire every 10-60s, so relying on garbage collection
+    to close the underlying SQLite connection leaks file descriptors over
+    hours and eventually trips ``OSError: [Errno 24] Too many open
+    files``. The explicit ``finally: store.close()`` below is the fix.
+    """
     from pollypm.storage.state import StateStore
 
+    config = _load_config(payload)
     store = StateStore(config.project.state_db)
-    return config, store
+    try:
+        yield config, store
+    finally:
+        store.close()
 
 
 # Ephemeral session name prefixes (#252). Sessions whose name starts with
@@ -109,33 +128,32 @@ def session_health_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     raising an alert tied to the parent task; we never auto-restart an
     ephemeral session because its lifecycle is owned by whoever spawned it.
     """
-    config, store = _load_config_and_store(payload)
+    with _load_config_and_store(payload) as (config, store):
+        # Late import to avoid a supervisor import cycle at plugin load.
+        from pollypm.supervisor import Supervisor
 
-    # Late import to avoid a supervisor import cycle at plugin load.
-    from pollypm.supervisor import Supervisor
+        supervisor = Supervisor(config)
+        alerts = supervisor.run_heartbeat(snapshot_lines=int(payload.get("snapshot_lines", 200) or 200))
 
-    supervisor = Supervisor(config)
-    alerts = supervisor.run_heartbeat(snapshot_lines=int(payload.get("snapshot_lines", 200) or 200))
+        # #252 — ephemeral session sweep. Best-effort: any failure is logged
+        # but never fails the planned-session sweep result, which is the
+        # caller's primary contract.
+        ephemeral_summary = {
+            "considered": 0, "alerts_raised": 0, "skipped_planned": 0,
+        }
+        try:
+            ephemeral_summary = sweep_ephemeral_sessions(supervisor, store)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "session.health_sweep: ephemeral pass failed", exc_info=True,
+            )
 
-    # #252 — ephemeral session sweep. Best-effort: any failure is logged
-    # but never fails the planned-session sweep result, which is the
-    # caller's primary contract.
-    ephemeral_summary = {
-        "considered": 0, "alerts_raised": 0, "skipped_planned": 0,
-    }
-    try:
-        ephemeral_summary = sweep_ephemeral_sessions(supervisor, store)
-    except Exception:  # noqa: BLE001
-        logger.debug(
-            "session.health_sweep: ephemeral pass failed", exc_info=True,
-        )
-
-    return {
-        "alerts_raised": len(alerts),
-        "ephemeral_considered": ephemeral_summary["considered"],
-        "ephemeral_alerts_raised": ephemeral_summary["alerts_raised"],
-        "ephemeral_skipped_planned": ephemeral_summary["skipped_planned"],
-    }
+        return {
+            "alerts_raised": len(alerts),
+            "ephemeral_considered": ephemeral_summary["considered"],
+            "ephemeral_alerts_raised": ephemeral_summary["alerts_raised"],
+            "ephemeral_skipped_planned": ephemeral_summary["skipped_planned"],
+        }
 
 
 def sweep_ephemeral_sessions(supervisor: Any, store: Any) -> dict[str, int]:
@@ -281,18 +299,17 @@ def _ephemeral_alert_type(session_name: str, failure_kind: str) -> str:
 
 def capacity_probe_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Probe capacity for every configured account."""
-    config, store = _load_config_and_store(payload)
+    with _load_config_and_store(payload) as (config, store):
+        from pollypm.capacity import probe_all_accounts
 
-    from pollypm.capacity import probe_all_accounts
-
-    probes = probe_all_accounts(config, store)
-    summary = {probe.account_name: probe.state.value for probe in probes}
-    return {"probes": summary}
+        probes = probe_all_accounts(config, store)
+        summary = {probe.account_name: probe.state.value for probe in probes}
+        return {"probes": summary}
 
 
 def transcript_ingest_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Tail provider transcripts into the shared events ledger."""
-    config, _store = _load_config_and_store(payload)
+    config = _load_config(payload)
 
     from pollypm.transcript_ingest import sync_transcripts_once
 
@@ -958,24 +975,23 @@ def alerts_gc_handler(payload: dict[str, Any]) -> dict[str, Any]:
     high-volume noise still gets swept at 7 days, but explicitly via
     tier rather than blunt cutoff.
     """
-    config, store = _load_config_and_store(payload)
+    with _load_config_and_store(payload) as (config, store):
+        # Lease GC lives on the supervisor because it records events with
+        # owner context; use a transient supervisor here.
+        from pollypm.supervisor import Supervisor
 
-    # Lease GC lives on the supervisor because it records events with
-    # owner context; use a transient supervisor here.
-    from pollypm.supervisor import Supervisor
+        supervisor = Supervisor(config)
+        released = supervisor.release_expired_leases()
 
-    supervisor = Supervisor(config)
-    released = supervisor.release_expired_leases()
-
-    # event_days=10**6 effectively no-ops events pruning while keeping
-    # the heartbeat cutoff at the existing 24h. The events.retention_sweep
-    # handler is now authoritative for the events table.
-    pruned = store.prune_old_data(event_days=10**6)
-    return {
-        "leases_released": len(released),
-        "events_pruned": int(pruned.get("events", 0)),
-        "heartbeats_pruned": int(pruned.get("heartbeats", 0)),
-    }
+        # event_days=10**6 effectively no-ops events pruning while keeping
+        # the heartbeat cutoff at the existing 24h. The events.retention_sweep
+        # handler is now authoritative for the events table.
+        pruned = store.prune_old_data(event_days=10**6)
+        return {
+            "leases_released": len(released),
+            "events_pruned": int(pruned.get("events", 0)),
+            "heartbeats_pruned": int(pruned.get("heartbeats", 0)),
+        }
 
 
 def db_vacuum_handler(payload: dict[str, Any]) -> dict[str, Any]:
@@ -987,15 +1003,15 @@ def db_vacuum_handler(payload: dict[str, Any]) -> dict[str, Any]:
     connection coordinates with concurrent writers via busy_timeout, so
     no external lock is needed beyond what StateStore already holds.
     """
-    _config, store = _load_config_and_store(payload)
-    bytes_reclaimed = store.incremental_vacuum()
-    mb_reclaimed = bytes_reclaimed / (1024 * 1024)
-    store.record_event(
-        session_name="system",
-        event_type="db.vacuum",
-        message=f"reclaimed {mb_reclaimed:.1f}MB",
-    )
-    return {"bytes_reclaimed": bytes_reclaimed, "mb_reclaimed": mb_reclaimed}
+    with _load_config_and_store(payload) as (_config, store):
+        bytes_reclaimed = store.incremental_vacuum()
+        mb_reclaimed = bytes_reclaimed / (1024 * 1024)
+        store.record_event(
+            session_name="system",
+            event_type="db.vacuum",
+            message=f"reclaimed {mb_reclaimed:.1f}MB",
+        )
+        return {"bytes_reclaimed": bytes_reclaimed, "mb_reclaimed": mb_reclaimed}
 
 
 def events_retention_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1028,47 +1044,46 @@ def events_retention_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
         sweep_events,
     )
 
-    config, store = _load_config_and_store(payload)
-
-    settings = config.events
-    policy = RetentionPolicy(
-        audit_days=settings.audit_retention_days,
-        operational_days=settings.operational_retention_days,
-        high_volume_days=settings.high_volume_retention_days,
-        default_days=settings.default_retention_days,
-    )
-
-    # Serialize against the StateStore's own lock so we don't race with
-    # writers on the shared connection. ``sweep_events`` issues a
-    # commit, so the rowcounts are durable before we return.
-    with store._lock:  # noqa: SLF001 — StateStore exposes no public wrapper
-        result = sweep_events(store._conn, policy)  # noqa: SLF001
-
-    counts = {
-        "deleted_audit": result.deleted_audit,
-        "deleted_operational": result.deleted_operational,
-        "deleted_high_volume": result.deleted_high_volume,
-        "deleted_default": result.deleted_default,
-        "total": result.total,
-    }
-
-    # Only log when something actually happened — otherwise every hourly
-    # sweep would itself become a ``high_volume`` event and grow the
-    # table we're trying to shrink.
-    if result.total > 0:
-        store.record_event(
-            session_name="system",
-            event_type="events.retention_sweep",
-            message=(
-                f"deleted {result.total} events "
-                f"(audit={result.deleted_audit}, "
-                f"operational={result.deleted_operational}, "
-                f"high_volume={result.deleted_high_volume}, "
-                f"default={result.deleted_default})"
-            ),
+    with _load_config_and_store(payload) as (config, store):
+        settings = config.events
+        policy = RetentionPolicy(
+            audit_days=settings.audit_retention_days,
+            operational_days=settings.operational_retention_days,
+            high_volume_days=settings.high_volume_retention_days,
+            default_days=settings.default_retention_days,
         )
 
-    return counts
+        # Serialize against the StateStore's own lock so we don't race
+        # with writers on the shared connection. ``sweep_events`` issues
+        # a commit, so the rowcounts are durable before we return.
+        with store._lock:  # noqa: SLF001 — StateStore exposes no public wrapper
+            result = sweep_events(store._conn, policy)  # noqa: SLF001
+
+        counts = {
+            "deleted_audit": result.deleted_audit,
+            "deleted_operational": result.deleted_operational,
+            "deleted_high_volume": result.deleted_high_volume,
+            "deleted_default": result.deleted_default,
+            "total": result.total,
+        }
+
+        # Only log when something actually happened — otherwise every
+        # hourly sweep would itself become a ``high_volume`` event and
+        # grow the table we're trying to shrink.
+        if result.total > 0:
+            store.record_event(
+                session_name="system",
+                event_type="events.retention_sweep",
+                message=(
+                    f"deleted {result.total} events "
+                    f"(audit={result.deleted_audit}, "
+                    f"operational={result.deleted_operational}, "
+                    f"high_volume={result.deleted_high_volume}, "
+                    f"default={result.deleted_default})"
+                ),
+            )
+
+        return counts
 
 
 def memory_ttl_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1079,14 +1094,14 @@ def memory_ttl_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     separate decision, this handler just enforces what's already on
     the row.
     """
-    _config, store = _load_config_and_store(payload)
-    deleted = store.sweep_expired_memory_entries()
-    store.record_event(
-        session_name="system",
-        event_type="memory.ttl_sweep",
-        message=f"dropped {deleted} expired entries",
-    )
-    return {"deleted": deleted}
+    with _load_config_and_store(payload) as (_config, store):
+        deleted = store.sweep_expired_memory_entries()
+        store.record_event(
+            session_name="system",
+            event_type="memory.ttl_sweep",
+            message=f"dropped {deleted} expired entries",
+        )
+        return {"deleted": deleted}
 
 
 def agent_worktree_prune_handler(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1116,7 +1131,7 @@ def agent_worktree_prune_handler(payload: dict[str, Any]) -> dict[str, Any]:
     if hint:
         repo_root = Path(hint)
     else:
-        config, _store = _load_config_and_store(payload)
+        config = _load_config(payload)
         repo_root = config.project.root_dir
 
     worktrees_dir = repo_root / ".claude" / "worktrees"
@@ -1257,242 +1272,242 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
         classify_worktree_state,
     )
 
-    config, store = _load_config_and_store(payload)
+    with _load_config_and_store(payload) as (config, store):
 
-    # Work service — required to list active work_sessions. Open via
-    # the same path ``work.progress_sweep`` uses so we honour the
-    # workspace-root DB convention.
-    try:
-        from pollypm.work.sqlite_service import SQLiteWorkService
-
-        project_root = config.project.root_dir
-        db_path = project_root / ".pollypm" / "state.db"
-        work = SQLiteWorkService(db_path=db_path, project_path=project_root)
-    except Exception:  # noqa: BLE001
-        logger.debug(
-            "worktree.state_audit: work service unavailable", exc_info=True,
-        )
-        return {"outcome": "skipped", "reason": "no_work_service"}
-
-    # All alert types this handler owns — used to clear stale alerts
-    # when we transition into ``CLEAN``. Keep in sync with the
-    # branches below.
-    STATE_ALERT_TYPES: tuple[str, ...] = (
-        "merge_conflict", "lock_file", "detached_head",
-        "dirty_stale", "orphan_branch",
-    )
-
-    considered = 0
-    classified: dict[str, int] = {}
-    alerts_raised = 0
-    alerts_cleared = 0
-    inbox_emitted = 0
-
-    # Thresholds — kept local (no config knob yet) so they're explicit
-    # in the handler body for reviewers.
-    LOCK_ESCALATE_SECONDS = 5 * 60       # lock >5min → severity error
-    DIRTY_STALE_SECONDS = 60 * 60        # dirty + mtime > 60min → alert
-
-    now_epoch = _time.time()
-
-    try:
+        # Work service — required to list active work_sessions. Open via
+        # the same path ``work.progress_sweep`` uses so we honour the
+        # workspace-root DB convention.
         try:
-            sessions = work.list_worker_sessions(active_only=True)
+            from pollypm.work.sqlite_service import SQLiteWorkService
+
+            project_root = config.project.root_dir
+            db_path = project_root / ".pollypm" / "state.db"
+            work = SQLiteWorkService(db_path=db_path, project_path=project_root)
         except Exception:  # noqa: BLE001
             logger.debug(
-                "worktree.state_audit: list_worker_sessions failed",
-                exc_info=True,
+                "worktree.state_audit: work service unavailable", exc_info=True,
             )
-            return {"outcome": "failed", "reason": "list_sessions_error"}
+            return {"outcome": "skipped", "reason": "no_work_service"}
 
-        for sess in sessions:
-            wt_path_raw = getattr(sess, "worktree_path", None)
-            if not wt_path_raw:
-                continue
-            considered += 1
-            wt_path = Path(wt_path_raw)
-            task_id = f"{sess.task_project}/{sess.task_number}"
-            agent = sess.agent_name or "worker"
-            # The alert namespace is the agent session name so the
-            # cockpit's per-session view shows the blocker alongside
-            # other heartbeat-raised alerts.
-            session_key = agent
+        # All alert types this handler owns — used to clear stale alerts
+        # when we transition into ``CLEAN``. Keep in sync with the
+        # branches below.
+        STATE_ALERT_TYPES: tuple[str, ...] = (
+            "merge_conflict", "lock_file", "detached_head",
+            "dirty_stale", "orphan_branch",
+        )
 
+        considered = 0
+        classified: dict[str, int] = {}
+        alerts_raised = 0
+        alerts_cleared = 0
+        inbox_emitted = 0
+
+        # Thresholds — kept local (no config knob yet) so they're explicit
+        # in the handler body for reviewers.
+        LOCK_ESCALATE_SECONDS = 5 * 60       # lock >5min → severity error
+        DIRTY_STALE_SECONDS = 60 * 60        # dirty + mtime > 60min → alert
+
+        now_epoch = _time.time()
+
+        try:
             try:
-                classification = classify_worktree_state(wt_path)
+                sessions = work.list_worker_sessions(active_only=True)
             except Exception:  # noqa: BLE001
                 logger.debug(
-                    "worktree.state_audit: classify failed for %s",
-                    wt_path, exc_info=True,
+                    "worktree.state_audit: list_worker_sessions failed",
+                    exc_info=True,
                 )
-                continue
-            state = classification.state
-            classified[state.value] = classified.get(state.value, 0) + 1
+                return {"outcome": "failed", "reason": "list_sessions_error"}
 
-            # Resolve the all-clear path for CLEAN / MISSING so any
-            # prior alerts auto-close.
-            if state in (WorktreeState.CLEAN, WorktreeState.MISSING):
-                for kind in STATE_ALERT_TYPES:
-                    alert_type = f"worktree_state:{task_id}:{kind}"
-                    try:
-                        existing = store.execute(
-                            "SELECT id FROM alerts WHERE session_name = ? "
-                            "AND alert_type = ? AND status = 'open'",
-                            (session_key, alert_type),
-                        ).fetchone()
-                    except Exception:  # noqa: BLE001
-                        existing = None
-                    if existing is None:
-                        continue
-                    try:
-                        store.clear_alert(session_key, alert_type)
-                        alerts_cleared += 1
-                    except Exception:  # noqa: BLE001
-                        pass
-                continue
+            for sess in sessions:
+                wt_path_raw = getattr(sess, "worktree_path", None)
+                if not wt_path_raw:
+                    continue
+                considered += 1
+                wt_path = Path(wt_path_raw)
+                task_id = f"{sess.task_project}/{sess.task_number}"
+                agent = sess.agent_name or "worker"
+                # The alert namespace is the agent session name so the
+                # cockpit's per-session view shows the blocker alongside
+                # other heartbeat-raised alerts.
+                session_key = agent
 
-            # --- non-clean branches ---
-            if state is WorktreeState.MERGE_CONFLICT:
-                alert_type = f"worktree_state:{task_id}:merge_conflict"
-                files = classification.metadata.get("conflict_files", [])
-                file_blurb = (
-                    f" ({len(files)} file{'s' if len(files) != 1 else ''})"
-                    if files else ""
-                )
-                message = (
-                    f"{agent}: merge conflict in {wt_path}{file_blurb} on task "
-                    f"{task_id}. Worker is blocked until the conflict resolves."
-                )
-                _raise_alert(store, session_key, alert_type, "error", message)
-                alerts_raised += 1
-                # Inbox — the user needs to either resolve or reassign.
-                fix_hint = (
-                    f"Run `git -C {wt_path} status` to inspect the conflict, "
-                    f"then resolve and `git commit` or reassign the task."
-                )
-                body = (
-                    f"Worker {agent} hit a merge conflict in {wt_path} while "
-                    f"working on task {task_id}.\n\n"
-                    f"{len(files)} conflicted file(s) detected.\n\n"
-                    f"Fix: {fix_hint}"
-                )
-                if _emit_inbox_task(
-                    work,
-                    subject=f"Merge conflict: {task_id}",
-                    body=body,
-                    actor=agent,
-                    dedupe_label=f"worktree_audit:{task_id}:merge_conflict",
-                    project=sess.task_project,
-                ):
-                    inbox_emitted += 1
-
-            elif state is WorktreeState.LOCK_FILE:
-                lock_age = float(
-                    classification.metadata.get("lock_age_seconds", 0.0),
-                )
-                severity = "error" if lock_age >= LOCK_ESCALATE_SECONDS else "warn"
-                minutes = max(1, int(lock_age // 60))
-                alert_type = f"worktree_state:{task_id}:lock_file"
-                lock_path = classification.metadata.get("lock_path", "")
-                message = (
-                    f"{agent}: git lock held on {wt_path} for ~{minutes}min "
-                    f"(task {task_id}). If no git process is running, remove "
-                    f"{lock_path or '<gitdir>/index.lock'}."
-                )
-                _raise_alert(store, session_key, alert_type, severity, message)
-                alerts_raised += 1
-
-            elif state is WorktreeState.DETACHED_HEAD:
-                alert_type = f"worktree_state:{task_id}:detached_head"
-                sha = classification.metadata.get("head_sha", "")
-                message = (
-                    f"{agent}: worktree {wt_path} on detached HEAD "
-                    f"{sha or '(unknown)'} (task {task_id}). "
-                    f"Fix: checkout the task branch before the worker "
-                    f"can push."
-                )
-                _raise_alert(store, session_key, alert_type, "warn", message)
-                alerts_raised += 1
-
-            elif state is WorktreeState.DIRTY_EXPECTED:
                 try:
-                    mtime = wt_path.stat().st_mtime
-                except OSError:
-                    mtime = now_epoch
-                age_s = now_epoch - mtime
-                alert_type = f"worktree_state:{task_id}:dirty_stale"
-                if age_s >= DIRTY_STALE_SECONDS:
-                    message = (
-                        f"{agent}: {wt_path} has uncommitted changes and "
-                        f"hasn't been touched in ~{int(age_s // 60)}min "
-                        f"(task {task_id}). Fix: check in on the worker — "
-                        f"likely stuck or idle."
+                    classification = classify_worktree_state(wt_path)
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "worktree.state_audit: classify failed for %s",
+                        wt_path, exc_info=True,
                     )
-                    _raise_alert(store, session_key, alert_type, "warn", message)
-                    alerts_raised += 1
-                else:
-                    # Fresh dirt — clear any prior stale alert.
-                    try:
-                        existing = store.execute(
-                            "SELECT id FROM alerts WHERE session_name = ? "
-                            "AND alert_type = ? AND status = 'open'",
-                            (session_key, alert_type),
-                        ).fetchone()
-                    except Exception:  # noqa: BLE001
-                        existing = None
-                    if existing is not None:
+                    continue
+                state = classification.state
+                classified[state.value] = classified.get(state.value, 0) + 1
+
+                # Resolve the all-clear path for CLEAN / MISSING so any
+                # prior alerts auto-close.
+                if state in (WorktreeState.CLEAN, WorktreeState.MISSING):
+                    for kind in STATE_ALERT_TYPES:
+                        alert_type = f"worktree_state:{task_id}:{kind}"
+                        try:
+                            existing = store.execute(
+                                "SELECT id FROM alerts WHERE session_name = ? "
+                                "AND alert_type = ? AND status = 'open'",
+                                (session_key, alert_type),
+                            ).fetchone()
+                        except Exception:  # noqa: BLE001
+                            existing = None
+                        if existing is None:
+                            continue
                         try:
                             store.clear_alert(session_key, alert_type)
                             alerts_cleared += 1
                         except Exception:  # noqa: BLE001
                             pass
+                    continue
 
-            elif state is WorktreeState.ORPHAN_BRANCH:
-                age_days = float(classification.metadata.get("age_days", 0.0))
-                alert_type = f"worktree_state:{task_id}:orphan_branch"
-                message = (
-                    f"{agent}: {wt_path} on local-only branch "
-                    f"{classification.branch or '(unknown)'} with no upstream "
-                    f"and no commit in ~{age_days:.1f}d (task {task_id}). "
-                    f"Fix: push or archive the branch before the prune "
-                    f"handler GCs it."
-                )
-                _raise_alert(store, session_key, alert_type, "info", message)
-                alerts_raised += 1
-                # Low-severity inbox nudge.
-                body = (
-                    f"Worker {agent}'s worktree for task {task_id} is on a "
-                    f"local-only branch with no upstream and ~{age_days:.1f} "
-                    f"days of inactivity.\n\n"
-                    f"Path: {wt_path}\n\n"
-                    f"Fix: push the branch, merge/abandon the task, or let "
-                    f"the hourly `agent_worktree.prune` handler decide."
-                )
-                if _emit_inbox_task(
-                    work,
-                    subject=f"Orphan worktree branch: {task_id}",
-                    body=body,
-                    actor=agent,
-                    dedupe_label=f"worktree_audit:{task_id}:orphan_branch",
-                    project=sess.task_project,
-                ):
-                    inbox_emitted += 1
-    finally:
-        closer = getattr(work, "close", None)
-        if callable(closer):
-            try:
-                closer()
-            except Exception:  # noqa: BLE001
-                pass
+                # --- non-clean branches ---
+                if state is WorktreeState.MERGE_CONFLICT:
+                    alert_type = f"worktree_state:{task_id}:merge_conflict"
+                    files = classification.metadata.get("conflict_files", [])
+                    file_blurb = (
+                        f" ({len(files)} file{'s' if len(files) != 1 else ''})"
+                        if files else ""
+                    )
+                    message = (
+                        f"{agent}: merge conflict in {wt_path}{file_blurb} on task "
+                        f"{task_id}. Worker is blocked until the conflict resolves."
+                    )
+                    _raise_alert(store, session_key, alert_type, "error", message)
+                    alerts_raised += 1
+                    # Inbox — the user needs to either resolve or reassign.
+                    fix_hint = (
+                        f"Run `git -C {wt_path} status` to inspect the conflict, "
+                        f"then resolve and `git commit` or reassign the task."
+                    )
+                    body = (
+                        f"Worker {agent} hit a merge conflict in {wt_path} while "
+                        f"working on task {task_id}.\n\n"
+                        f"{len(files)} conflicted file(s) detected.\n\n"
+                        f"Fix: {fix_hint}"
+                    )
+                    if _emit_inbox_task(
+                        work,
+                        subject=f"Merge conflict: {task_id}",
+                        body=body,
+                        actor=agent,
+                        dedupe_label=f"worktree_audit:{task_id}:merge_conflict",
+                        project=sess.task_project,
+                    ):
+                        inbox_emitted += 1
 
-    return {
-        "outcome": "swept",
-        "considered": considered,
-        "classified": classified,
-        "alerts_raised": alerts_raised,
-        "alerts_cleared": alerts_cleared,
-        "inbox_emitted": inbox_emitted,
-    }
+                elif state is WorktreeState.LOCK_FILE:
+                    lock_age = float(
+                        classification.metadata.get("lock_age_seconds", 0.0),
+                    )
+                    severity = "error" if lock_age >= LOCK_ESCALATE_SECONDS else "warn"
+                    minutes = max(1, int(lock_age // 60))
+                    alert_type = f"worktree_state:{task_id}:lock_file"
+                    lock_path = classification.metadata.get("lock_path", "")
+                    message = (
+                        f"{agent}: git lock held on {wt_path} for ~{minutes}min "
+                        f"(task {task_id}). If no git process is running, remove "
+                        f"{lock_path or '<gitdir>/index.lock'}."
+                    )
+                    _raise_alert(store, session_key, alert_type, severity, message)
+                    alerts_raised += 1
+
+                elif state is WorktreeState.DETACHED_HEAD:
+                    alert_type = f"worktree_state:{task_id}:detached_head"
+                    sha = classification.metadata.get("head_sha", "")
+                    message = (
+                        f"{agent}: worktree {wt_path} on detached HEAD "
+                        f"{sha or '(unknown)'} (task {task_id}). "
+                        f"Fix: checkout the task branch before the worker "
+                        f"can push."
+                    )
+                    _raise_alert(store, session_key, alert_type, "warn", message)
+                    alerts_raised += 1
+
+                elif state is WorktreeState.DIRTY_EXPECTED:
+                    try:
+                        mtime = wt_path.stat().st_mtime
+                    except OSError:
+                        mtime = now_epoch
+                    age_s = now_epoch - mtime
+                    alert_type = f"worktree_state:{task_id}:dirty_stale"
+                    if age_s >= DIRTY_STALE_SECONDS:
+                        message = (
+                            f"{agent}: {wt_path} has uncommitted changes and "
+                            f"hasn't been touched in ~{int(age_s // 60)}min "
+                            f"(task {task_id}). Fix: check in on the worker — "
+                            f"likely stuck or idle."
+                        )
+                        _raise_alert(store, session_key, alert_type, "warn", message)
+                        alerts_raised += 1
+                    else:
+                        # Fresh dirt — clear any prior stale alert.
+                        try:
+                            existing = store.execute(
+                                "SELECT id FROM alerts WHERE session_name = ? "
+                                "AND alert_type = ? AND status = 'open'",
+                                (session_key, alert_type),
+                            ).fetchone()
+                        except Exception:  # noqa: BLE001
+                            existing = None
+                        if existing is not None:
+                            try:
+                                store.clear_alert(session_key, alert_type)
+                                alerts_cleared += 1
+                            except Exception:  # noqa: BLE001
+                                pass
+
+                elif state is WorktreeState.ORPHAN_BRANCH:
+                    age_days = float(classification.metadata.get("age_days", 0.0))
+                    alert_type = f"worktree_state:{task_id}:orphan_branch"
+                    message = (
+                        f"{agent}: {wt_path} on local-only branch "
+                        f"{classification.branch or '(unknown)'} with no upstream "
+                        f"and no commit in ~{age_days:.1f}d (task {task_id}). "
+                        f"Fix: push or archive the branch before the prune "
+                        f"handler GCs it."
+                    )
+                    _raise_alert(store, session_key, alert_type, "info", message)
+                    alerts_raised += 1
+                    # Low-severity inbox nudge.
+                    body = (
+                        f"Worker {agent}'s worktree for task {task_id} is on a "
+                        f"local-only branch with no upstream and ~{age_days:.1f} "
+                        f"days of inactivity.\n\n"
+                        f"Path: {wt_path}\n\n"
+                        f"Fix: push the branch, merge/abandon the task, or let "
+                        f"the hourly `agent_worktree.prune` handler decide."
+                    )
+                    if _emit_inbox_task(
+                        work,
+                        subject=f"Orphan worktree branch: {task_id}",
+                        body=body,
+                        actor=agent,
+                        dedupe_label=f"worktree_audit:{task_id}:orphan_branch",
+                        project=sess.task_project,
+                    ):
+                        inbox_emitted += 1
+        finally:
+            closer = getattr(work, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        return {
+            "outcome": "swept",
+            "considered": considered,
+            "classified": classified,
+            "alerts_raised": alerts_raised,
+            "alerts_cleared": alerts_cleared,
+            "inbox_emitted": inbox_emitted,
+        }
 
 
 def _raise_alert(
@@ -1623,7 +1638,7 @@ def log_rotate_handler(payload: dict[str, Any]) -> dict[str, Any]:
         rotate_size_mb = int(size_override) if size_override is not None else 20
         rotate_keep = int(keep_override) if keep_override is not None else 3
     else:
-        config, _store = _load_config_and_store(payload)
+        config = _load_config(payload)
         logs_dir = config.project.logs_dir
         rotate_size_mb = (
             int(size_override) if size_override is not None
@@ -1736,34 +1751,34 @@ def notification_staging_prune_handler(payload: dict[str, Any]) -> dict[str, Any
 
     from pollypm.notification_staging import prune_old_staging
 
-    _config, store = _load_config_and_store(payload)
-    retain_days = int(payload.get("retain_days") or 30)
+    with _load_config_and_store(payload) as (_config, store):
+        retain_days = int(payload.get("retain_days") or 30)
 
-    # The staging table lives in the shared state.db alongside work_*
-    # tables; the work-service migration (v4) creates it. We open a
-    # direct connection here because the prune is a pure DML op and
-    # does not need the full service wrapper.
-    db_path = getattr(store, "path", None) or _config.project.state_db
-    conn = sqlite3.connect(str(db_path), timeout=30.0)
-    try:
-        conn.execute("PRAGMA busy_timeout=30000")
-        # Make sure the schema is present — safe no-op when the table
-        # already exists (e.g. SQLiteWorkService ran migration v4).
-        from pollypm.work.schema import create_work_tables
-        create_work_tables(conn)
-        summary = prune_old_staging(conn, retain_days=retain_days)
-    finally:
-        conn.close()
+        # The staging table lives in the shared state.db alongside work_*
+        # tables; the work-service migration (v4) creates it. We open a
+        # direct connection here because the prune is a pure DML op and
+        # does not need the full service wrapper.
+        db_path = getattr(store, "path", None) or _config.project.state_db
+        conn = sqlite3.connect(str(db_path), timeout=30.0)
+        try:
+            conn.execute("PRAGMA busy_timeout=30000")
+            # Make sure the schema is present — safe no-op when the table
+            # already exists (e.g. SQLiteWorkService ran migration v4).
+            from pollypm.work.schema import create_work_tables
+            create_work_tables(conn)
+            summary = prune_old_staging(conn, retain_days=retain_days)
+        finally:
+            conn.close()
 
-    store.record_event(
-        session_name="system",
-        event_type="notification_staging.prune",
-        message=(
-            f"pruned {summary['flushed_pruned']} flushed + "
-            f"{summary['silent_pruned']} silent rows (>{retain_days}d)"
-        ),
-    )
-    return summary
+        store.record_event(
+            session_name="system",
+            event_type="notification_staging.prune",
+            message=(
+                f"pruned {summary['flushed_pruned']} flushed + "
+                f"{summary['silent_pruned']} silent rows (>{retain_days}d)"
+            ),
+        )
+        return summary
 
 
 # ---------------------------------------------------------------------------

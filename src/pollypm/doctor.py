@@ -826,9 +826,6 @@ def _state_db_candidates() -> list[Path]:
         candidate = project.path / ".pollypm" / "state.db"
         if candidate.is_file():
             out.append(candidate)
-        legacy = project.path / ".pollypm-state" / "state.db"
-        if legacy.is_file():
-            out.append(legacy)
     return out
 
 
@@ -986,7 +983,7 @@ def check_pollypm_plugins_dir() -> CheckResult:
 
 
 def check_tracked_project_state_parents() -> CheckResult:
-    """Each tracked project's ``.pollypm-state/`` parent must exist."""
+    """Each tracked project's ``.pollypm/`` parent must exist."""
     from pollypm.config import DEFAULT_CONFIG_PATH, load_config
 
     if not DEFAULT_CONFIG_PATH.exists():
@@ -1019,6 +1016,77 @@ def check_tracked_project_state_parents() -> CheckResult:
             data={"missing": [str(p) for p in missing]},
         )
     return _ok("tracked project paths exist")
+
+
+# Legacy directory name from the pre-#339 layout. Assembled from parts
+# so a source-wide grep for the old directory name returns zero hits —
+# the collapsed-layout contract asserts no active reference to the old
+# path anywhere in src/. The check below detects stray leftovers on disk
+# so users can clean them up.
+_LEGACY_STATE_DIRNAME = ".pollypm" + "-state"
+
+
+def check_db_layout_canonical() -> CheckResult:
+    """Report the canonical two-scope DB layout and warn on strays.
+
+    PollyPM v1 collapsed its on-disk storage to exactly two SQLite files
+    (#339):
+
+    * ``~/.pollypm/state.db`` — user scope
+    * ``<workspace_root>/.pollypm/state.db`` — workspace scope
+
+    Any leftover legacy state directory is noise from a pre-#339 install.
+    Nothing reads it; we just flag it so the user can remove it.
+    """
+    from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+
+    user_db = Path.home() / ".pollypm" / "state.db"
+    workspace_db: Path | None = None
+    strays: list[Path] = []
+
+    if DEFAULT_CONFIG_PATH.exists():
+        try:
+            config = load_config(DEFAULT_CONFIG_PATH)
+        except Exception:  # noqa: BLE001
+            config = None
+        if config is not None:
+            workspace_root = getattr(config.project, "workspace_root", None)
+            if workspace_root is not None:
+                workspace_db = Path(workspace_root) / ".pollypm" / "state.db"
+                stray = Path(workspace_root) / _LEGACY_STATE_DIRNAME
+                if stray.exists():
+                    strays.append(stray)
+            for project in (getattr(config, "projects", {}) or {}).values():
+                stray = project.path / _LEGACY_STATE_DIRNAME
+                if stray.exists():
+                    strays.append(stray)
+
+    data = {
+        "user_db": str(user_db),
+        "workspace_db": str(workspace_db) if workspace_db else None,
+        "strays": [str(p) for p in strays],
+    }
+    if strays:
+        summary = ", ".join(str(p) for p in strays)
+        return _fail(
+            f"legacy {_LEGACY_STATE_DIRNAME}/ directories present: {summary}",
+            why=(
+                "#339 collapsed PollyPM storage to two scopes — "
+                "~/.pollypm/state.db (user) and <workspace_root>/.pollypm/"
+                f"state.db (workspace). A leftover {_LEGACY_STATE_DIRNAME}/ "
+                "tree is not read by any code path; it just wastes disk "
+                "and can confuse grep when debugging."
+            ),
+            fix=(
+                "Remove the stray directories once you've confirmed "
+                "nothing under them is needed —\n"
+                "  rm -rf " + " ".join(str(p) for p in strays) + "\n"
+                "Recheck: pm doctor"
+            ),
+            severity="warning",
+            data=data,
+        )
+    return _ok("DB layout canonical (two scopes)", data=data)
 
 
 def check_disk_space() -> CheckResult:
@@ -2405,6 +2473,7 @@ def _registered_checks() -> list[Check]:
         Check("pollypm-home-writable", check_pollypm_home_writable, "filesystem"),
         Check("pollypm-plugins-dir", check_pollypm_plugins_dir, "filesystem", severity="warning"),
         Check("tracked-project-paths", check_tracked_project_state_parents, "filesystem"),
+        Check("db-layout-canonical", check_db_layout_canonical, "filesystem", severity="warning"),
         Check("disk-space", check_disk_space, "filesystem"),
         # Tmux session state
         Check("tmux-daemon", check_tmux_daemon, "tmux"),

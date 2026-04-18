@@ -41,7 +41,7 @@ def get_memory_backend(project_path: Path, backend_name: str = "file") -> Memory
         # Scaffold the project up-front so the backend can assume memory
         # roots exist (it used to call ensure_project_scaffold itself).
         ensure_project_scaffold(resolved)
-        state_db = resolved / ".pollypm-state" / "state.db"
+        state_db = resolved / ".pollypm" / "state.db"
         return FileMemoryBackend(
             resolved,
             state_store=StateStore(state_db),

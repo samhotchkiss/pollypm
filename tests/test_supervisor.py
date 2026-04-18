@@ -40,10 +40,10 @@ def _config(tmp_path: Path) -> PollyPMConfig:
     return PollyPMConfig(
         project=ProjectSettings(
             root_dir=tmp_path,
-            base_dir=tmp_path / ".pollypm-state",
-            logs_dir=tmp_path / ".pollypm-state/logs",
-            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
-            state_db=tmp_path / ".pollypm-state/state.db",
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
         ),
         pollypm=PollyPMSettings(
             controller_account="claude_controller",
@@ -55,13 +55,13 @@ def _config(tmp_path: Path) -> PollyPMConfig:
                 name="claude_controller",
                 provider=ProviderKind.CLAUDE,
                 email="claude@example.com",
-                home=tmp_path / ".pollypm-state/homes/claude_controller",
+                home=tmp_path / ".pollypm/homes/claude_controller",
             ),
             "codex_backup": AccountConfig(
                 name="codex_backup",
                 provider=ProviderKind.CODEX,
                 email="codex@example.com",
-                home=tmp_path / ".pollypm-state/homes/codex_backup",
+                home=tmp_path / ".pollypm/homes/codex_backup",
             ),
         },
         sessions={
@@ -508,7 +508,7 @@ def test_codex_control_home_syncs_global_state(tmp_path: Path) -> None:
         name="codex_backup",
         provider=ProviderKind.CODEX,
         email="codex@example.com",
-        home=tmp_path / ".pollypm-state" / "homes" / "codex_backup",
+        home=tmp_path / ".pollypm" / "homes" / "codex_backup",
     )
     config.sessions["operator"] = SessionConfig(
         name="operator",
@@ -1014,8 +1014,11 @@ def test_recovery_hard_limit_stops_after_many_failures(tmp_path: Path) -> None:
 
 
 def _configure_review_nudge_projects(tmp_path: Path, n_projects: int) -> PollyPMConfig:
-    """Build a config with *n_projects* project-scoped SQLite work dbs,
-    each seeded with one in-review task. Used by the #174 cache tests.
+    """Build a config with *n_projects* projects, all sharing the collapsed
+    workspace-scope DB (#339). Each project gets one in-review task seeded
+    into that single DB. Used by the #174 cache tests — even though the
+    DB is shared, ``_review_tasks_for_project`` still caches per-project by
+    db_path mtime, and ``_build_review_nudge`` still iterates projects.
     """
     from pollypm.work.models import (
         Artifact as _Artifact,
@@ -1026,6 +1029,17 @@ def _configure_review_nudge_projects(tmp_path: Path, n_projects: int) -> PollyPM
     from pollypm.work.sqlite_service import SQLiteWorkService
 
     config = _config(tmp_path)
+    # Pin workspace_root so _resolve_db_path lands inside tmp_path rather
+    # than the real ~/dev — the test runs with a pytest-isolated HOME but
+    # workspace_root defaults to Path.home() / "dev".
+    config.project.workspace_root = tmp_path
+    # Drop the boilerplate ``pollypm`` project from _config so the only
+    # projects the nudge scans are the ones we seed here — the assertions
+    # count opens per registered project.
+    config.projects.clear()
+    workspace_db = tmp_path / ".pollypm" / "state.db"
+    workspace_db.parent.mkdir(parents=True, exist_ok=True)
+
     for i in range(n_projects):
         key = f"proj_{i}"
         proj_root = tmp_path / key
@@ -1033,8 +1047,9 @@ def _configure_review_nudge_projects(tmp_path: Path, n_projects: int) -> PollyPM
         config.projects[key] = KnownProject(
             key=key, path=proj_root, name=key, kind=ProjectKind.FOLDER,
         )
-        db_path = proj_root / ".pollypm" / "state.db"
-        with SQLiteWorkService(db_path=db_path) as svc:
+        # All tasks land in the single workspace-scope DB; the ``project``
+        # column is what isolates them (row-level scoping, post-#339).
+        with SQLiteWorkService(db_path=workspace_db) as svc:
             task = svc.create(
                 title=f"review task {i}",
                 description="d",
@@ -1115,8 +1130,10 @@ def test_build_review_nudge_caches_by_db_mtime(monkeypatch, tmp_path: Path) -> N
         f"mtime cache is not short-circuiting"
     )
 
-    # Mutate one project's db (touch mtime). Only that project should reopen.
-    touched_db = config.projects["proj_1"].path / ".pollypm" / "state.db"
+    # Mutate the workspace-scope db (touch mtime). All cached entries
+    # share the same db_path post-#339, so every project cache row is
+    # invalidated at once — the warm pass reopens once per project.
+    touched_db = tmp_path / ".pollypm" / "state.db"
     import os as _os
     import time as _time
     new_mtime = touched_db.stat().st_mtime + 5.0
@@ -1127,8 +1144,9 @@ def test_build_review_nudge_caches_by_db_mtime(monkeypatch, tmp_path: Path) -> N
     opens.clear()
     sup._build_review_nudge()
     third_opens = len(opens)
-    assert third_opens == 1, (
-        f"one-project-changed pass opened {third_opens} connections (want 1)"
+    assert third_opens == 4, (
+        f"db-changed pass opened {third_opens} connections "
+        f"(want 4 — one reopen per project after mtime bump)"
     )
 
 
@@ -1180,7 +1198,7 @@ def _make_launch_for_role(
     # Register the session so the planner can resolve it and the
     # persona-swap guard finds a matching launch (#266).
     config.sessions[session.name] = session
-    marker_dir = tmp_path / ".pollypm-state" / "fresh-markers"
+    marker_dir = tmp_path / ".pollypm" / "fresh-markers"
     marker_dir.mkdir(parents=True, exist_ok=True)
     marker = marker_dir / f"{role}-session.marker"
     marker.write_text("fresh\n")

@@ -263,7 +263,7 @@ def advisor_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Build a minimal pollypm.toml + FakeConfig under ``tmp_path``."""
     project_root = tmp_path / "proj"
     project_root.mkdir()
-    base_dir = project_root / ".pollypm-state"
+    base_dir = project_root / ".pollypm"
     base_dir.mkdir()
 
     config_path = tmp_path / "pollypm.toml"
@@ -412,7 +412,7 @@ class TestTickHandler:
     ) -> None:
         project_root = tmp_path / "single"
         project_root.mkdir()
-        base_dir = project_root / ".pollypm-state"
+        base_dir = project_root / ".pollypm"
         base_dir.mkdir()
         config_path = tmp_path / "pollypm.toml"
         config_path.write_text("[advisor]\nenabled = true\n")

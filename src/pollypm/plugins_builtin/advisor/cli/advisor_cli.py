@@ -82,7 +82,7 @@ def _require_config(config_path: Path) -> Path:
 
 
 def _resolve_base_dir(config_path: Path) -> Path:
-    """Resolve the ``.pollypm-state`` directory for the current install."""
+    """Resolve the ``.pollypm`` directory for the current install."""
     cfg = load_config(config_path)
     base_dir: Path = Path(cfg.project.base_dir)
     base_dir.mkdir(parents=True, exist_ok=True)

@@ -92,7 +92,7 @@ def list_project_overrides(project_root: Path) -> list[Path]:
         ".pollypm/rules",
         ".pollypm/magic",
         ".pollypm/config",
-        ".pollypm-state/plugins",
+        ".pollypm/plugins",
     ):
         root = project_root / relative
         if not root.exists():
@@ -129,7 +129,7 @@ def _write_magic_override(project_root: Path, magic_name: str, preference: str) 
 
 def write_plugin_override(project_root: Path, plugin_name: str, body: str) -> Path:
     ensure_project_scaffold(project_root)
-    plugin_dir = project_root / ".pollypm-state" / "plugins" / plugin_name
+    plugin_dir = project_root / ".pollypm" / "plugins" / plugin_name
     plugin_dir.mkdir(parents=True, exist_ok=True)
     (plugin_dir / PLUGIN_MANIFEST).write_text(
         "\n".join(
@@ -157,7 +157,7 @@ def remove_project_override(project_root: Path, kind: str, target_name: str) -> 
         ("magic", target_name): project_root / ".pollypm" / "magic" / f"{target_name}.md",
         ("project_setting", target_name): project_config_path(project_root),
         ("plugin_selection", target_name): project_root / ".pollypm" / "config" / "plugins.toml",
-        ("plugin", target_name): project_root / ".pollypm-state" / "plugins" / target_name,
+        ("plugin", target_name): project_root / ".pollypm" / "plugins" / target_name,
     }
     path = candidates.get((kind, target_name))
     if path is None:

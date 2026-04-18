@@ -222,8 +222,8 @@ class TestPlanSecurityScan:
     def test_approve_stamps_reviewed(self) -> None:
         plan = plan_security_scan(
             approved=True,
-            result={"report_path": ".pollypm-state/security-reports/x.md"},
-            changed_paths=[".pollypm-state/security-reports/x.md"],
+            result={"report_path": ".pollypm/security-reports/x.md"},
+            changed_paths=[".pollypm/security-reports/x.md"],
         )
         assert plan.refused is False
         assert plan.actions[0].verb == "stamp_report"
@@ -232,8 +232,8 @@ class TestPlanSecurityScan:
     def test_reject_stamps_dismissed(self) -> None:
         plan = plan_security_scan(
             approved=False,
-            result={"report_path": ".pollypm-state/security-reports/x.md"},
-            changed_paths=[".pollypm-state/security-reports/x.md"],
+            result={"report_path": ".pollypm/security-reports/x.md"},
+            changed_paths=[".pollypm/security-reports/x.md"],
         )
         assert plan.actions[0].verb == "stamp_report"
         assert "dismissed" in plan.actions[0].detail.lower()
@@ -241,9 +241,9 @@ class TestPlanSecurityScan:
     def test_refuses_when_non_report_file_changed(self) -> None:
         plan = plan_security_scan(
             approved=True,
-            result={"report_path": ".pollypm-state/security-reports/x.md"},
+            result={"report_path": ".pollypm/security-reports/x.md"},
             changed_paths=[
-                ".pollypm-state/security-reports/x.md",
+                ".pollypm/security-reports/x.md",
                 "src/pollypm/cli.py",
             ],
         )
@@ -279,7 +279,7 @@ class TestBuildApplyPlan:
         plan = build_apply_plan(
             kind="security_scan",
             approved=True,
-            result={"report_path": ".pollypm-state/security-reports/x.md"},
+            result={"report_path": ".pollypm/security-reports/x.md"},
             changed_paths=["unrelated/file.py"],
         )
         assert plan.refused is True
@@ -322,16 +322,16 @@ class TestExecutePlan:
                     verb="archive_file",
                     detail="archive",
                     src="docs/ideas/x.md",
-                    dst=".pollypm-state/archive/specs/x.md",
+                    dst=".pollypm/archive/specs/x.md",
                 ),
             ),
         )
         summaries = execute_plan(plan, project_root=tmp_path)
-        assert (tmp_path / ".pollypm-state/archive/specs/x.md").exists()
+        assert (tmp_path / ".pollypm/archive/specs/x.md").exists()
         assert summaries[0].startswith("ok:")
 
     def test_stamp_report_action(self, tmp_path: Path) -> None:
-        rpt = tmp_path / ".pollypm-state" / "security-reports" / "r.md"
+        rpt = tmp_path / ".pollypm" / "security-reports" / "r.md"
         rpt.parent.mkdir(parents=True)
         rpt.write_text("# Findings\n")
         plan = ApplyPlan(
@@ -340,7 +340,7 @@ class TestExecutePlan:
                 ApplyAction(
                     verb="stamp_report",
                     detail="stamp",
-                    src=".pollypm-state/security-reports/r.md",
+                    src=".pollypm/security-reports/r.md",
                     extras={"stamp_text": "\n> Reviewed on 2026-04-16\n"},
                 ),
             ),
@@ -401,5 +401,5 @@ class TestRunApply:
         )
         assert plan.approved is False
         # File archived.
-        assert (tmp_path / ".pollypm-state" / "archive" / "specs" / "x.md").exists()
+        assert (tmp_path / ".pollypm" / "archive" / "specs" / "x.md").exists()
         assert any("archived" in s for s in summaries)

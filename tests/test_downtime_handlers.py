@@ -161,7 +161,7 @@ class TestBuildSpeculative:
         )
         assert isinstance(result, BuildSpeculativeResult)
         assert result.branch_name == "downtime/proto-x"
-        scratch = tmp_path / ".pollypm-state" / "downtime-scratch" / "proto-x.md"
+        scratch = tmp_path / ".pollypm" / "downtime-scratch" / "proto-x.md"
         assert scratch.exists()
 
     @pytest.mark.skipif(not GIT_AVAILABLE, reason="git not on PATH")
@@ -211,7 +211,7 @@ class TestSecurityScan:
             today=date(2026, 4, 16),
         )
         assert isinstance(result, SecurityScanResult)
-        # Path shape: .pollypm-state/security-reports/2026-04-16-subprocess-hardening.md
+        # Path shape: .pollypm/security-reports/2026-04-16-subprocess-hardening.md
         expected_rel = REPORT_DIR / "2026-04-16-subprocess-hardening.md"
         assert result.report_path == str(expected_rel)
         assert (tmp_path / expected_rel).exists()
@@ -244,8 +244,8 @@ class TestSecurityScan:
     def test_validate_no_source_changes_ok(self) -> None:
         ok, offenders = validate_no_source_changes(
             changed_paths=[
-                ".pollypm-state/security-reports/2026-04-16-x.md",
-                ".pollypm-state/security-reports/2026-04-17-y.md",
+                ".pollypm/security-reports/2026-04-16-x.md",
+                ".pollypm/security-reports/2026-04-17-y.md",
             ]
         )
         assert ok is True
@@ -254,7 +254,7 @@ class TestSecurityScan:
     def test_validate_no_source_changes_rejects_other_paths(self) -> None:
         ok, offenders = validate_no_source_changes(
             changed_paths=[
-                ".pollypm-state/security-reports/ok.md",
+                ".pollypm/security-reports/ok.md",
                 "src/pollypm/cli.py",
                 "docs/cli.md",
             ]
@@ -265,10 +265,10 @@ class TestSecurityScan:
 
     def test_validate_rejects_paths_outside_dir_even_by_prefix_collision(self) -> None:
         ok, offenders = validate_no_source_changes(
-            changed_paths=[".pollypm-state/security-reports-evil/sneaky.md"],
+            changed_paths=[".pollypm/security-reports-evil/sneaky.md"],
         )
         assert ok is False
-        assert offenders == [".pollypm-state/security-reports-evil/sneaky.md"]
+        assert offenders == [".pollypm/security-reports-evil/sneaky.md"]
 
 
 # ---------------------------------------------------------------------------

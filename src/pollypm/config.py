@@ -724,7 +724,7 @@ def render_example_config() -> str:
 
 
 def _build_example_config(root: Path) -> PollyPMConfig:
-    base_dir = root / ".pollypm-state"
+    base_dir = root / ".pollypm"
     return PollyPMConfig(
         project=ProjectSettings(
             name="PollyPM",

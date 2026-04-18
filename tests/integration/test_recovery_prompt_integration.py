@@ -23,17 +23,17 @@ def _config(tmp_path: Path) -> PollyPMConfig:
     return PollyPMConfig(
         project=ProjectSettings(
             root_dir=project_root,
-            base_dir=project_root / ".pollypm-state",
-            logs_dir=project_root / ".pollypm-state/logs",
-            snapshots_dir=project_root / ".pollypm-state/snapshots",
-            state_db=project_root / ".pollypm-state/state.db",
+            base_dir=project_root / ".pollypm",
+            logs_dir=project_root / ".pollypm/logs",
+            snapshots_dir=project_root / ".pollypm/snapshots",
+            state_db=project_root / ".pollypm/state.db",
         ),
         pollypm=PollyPMSettings(controller_account="claude_main"),
         accounts={
             "claude_main": AccountConfig(
                 name="claude_main",
                 provider=ProviderKind.CLAUDE,
-                home=project_root / ".pollypm-state" / "homes" / "claude_main",
+                home=project_root / ".pollypm" / "homes" / "claude_main",
             )
         },
         sessions={

@@ -265,7 +265,7 @@ def test_audit_log_appends_one_line_per_action(tmp_path: Path) -> None:
     now = datetime.now(UTC)
     _set_ttl(backend, entry.entry_id, ttl_at=now - timedelta(hours=1))
 
-    log_path = tmp_path / ".pollypm-state" / "memory-curator.jsonl"
+    log_path = tmp_path / ".pollypm" / "memory-curator.jsonl"
     result = curate_memory(backend, log_path=log_path, now=now)
     assert result.ttl_deleted == 1
     assert log_path.exists()
@@ -282,7 +282,7 @@ def test_audit_log_quiet_run_writes_nothing(tmp_path: Path) -> None:
     backend.write_entry(
         ProjectMemory(fact="fine", why="w", how_to_apply="h", scope="pollypm")
     )
-    log_path = tmp_path / ".pollypm-state" / "memory-curator.jsonl"
+    log_path = tmp_path / ".pollypm" / "memory-curator.jsonl"
     result = curate_memory(backend, log_path=log_path, now=datetime.now(UTC))
     assert result.total_changes() == 0
     assert not log_path.exists()
@@ -442,7 +442,7 @@ def test_integration_curator_shrinks_seeded_store(tmp_path: Path) -> None:
     before = _raw_count()
     assert before == 100
 
-    log_path = tmp_path / ".pollypm-state" / "memory-curator.jsonl"
+    log_path = tmp_path / ".pollypm" / "memory-curator.jsonl"
     result = curate_memory(backend, log_path=log_path, now=now)
 
     after = _raw_count()

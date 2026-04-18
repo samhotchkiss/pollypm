@@ -19,7 +19,7 @@ from pollypm.messaging import (
 ITSALIVE_API = "https://api.itsalive.co"
 CONFIG_FILE = ".itsalive"
 GLOBAL_CONFIG_FILE = Path.home() / ".itsalive"
-PENDING_DIR = ".pollypm-state/itsalive/pending"
+PENDING_DIR = ".pollypm/itsalive/pending"
 _IGNORE_NAMES = {".DS_Store", ".itsalive", "ITSALIVE.md", "CLAUDE.md"}
 _IGNORE_PARTS = {".git", "node_modules"}
 
@@ -317,7 +317,7 @@ Use PollyPM's built-in wrapper instead of a raw `npx itsalive` polling loop when
 - Force a sweep now: `pm itsalive sweep --project <project_key>`
 
 Important behavior:
-- PollyPM writes first-deploy state under `.pollypm-state/itsalive/pending/`.
+- PollyPM writes first-deploy state under `.pollypm/itsalive/pending/`.
 - Verification links remain valid for 24 hours.
 - Heartbeat checks pending deploys and completes them automatically after the user clicks the email link.
 - Existing `.itsalive` deploy tokens trigger the fast push flow with no verification prompt.

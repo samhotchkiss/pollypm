@@ -43,7 +43,7 @@ class _Config:
 
 def _make_config(tmp_path: Path, *, projects: dict[str, Path] | None = None) -> _Config:
     root = tmp_path / "root"
-    base = root / ".pollypm-state"
+    base = root / ".pollypm"
     root.mkdir(parents=True, exist_ok=True)
     base.mkdir(parents=True, exist_ok=True)
     projects_dict: dict[str, _Project] = {}

@@ -42,10 +42,10 @@ def _config(tmp_path: Path) -> PollyPMConfig:
         project=ProjectSettings(
             name="TestProject",
             root_dir=project_root,
-            base_dir=project_root / ".pollypm-state",
-            logs_dir=project_root / ".pollypm-state/logs",
-            snapshots_dir=project_root / ".pollypm-state/snapshots",
-            state_db=project_root / ".pollypm-state/state.db",
+            base_dir=project_root / ".pollypm",
+            logs_dir=project_root / ".pollypm/logs",
+            snapshots_dir=project_root / ".pollypm/snapshots",
+            state_db=project_root / ".pollypm/state.db",
         ),
         pollypm=PollyPMSettings(
             controller_account="claude_main",
@@ -56,17 +56,17 @@ def _config(tmp_path: Path) -> PollyPMConfig:
             "claude_main": AccountConfig(
                 name="claude_main",
                 provider=ProviderKind.CLAUDE,
-                home=project_root / ".pollypm-state" / "homes" / "claude_main",
+                home=project_root / ".pollypm" / "homes" / "claude_main",
             ),
             "claude_backup": AccountConfig(
                 name="claude_backup",
                 provider=ProviderKind.CLAUDE,
-                home=project_root / ".pollypm-state" / "homes" / "claude_backup",
+                home=project_root / ".pollypm" / "homes" / "claude_backup",
             ),
             "codex_main": AccountConfig(
                 name="codex_main",
                 provider=ProviderKind.CODEX,
-                home=project_root / ".pollypm-state" / "homes" / "codex_main",
+                home=project_root / ".pollypm" / "homes" / "codex_main",
             ),
         },
         sessions={

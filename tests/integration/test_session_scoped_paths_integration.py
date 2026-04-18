@@ -29,17 +29,17 @@ def _config(tmp_path: Path) -> tuple[PollyPMConfig, Path]:
         project=ProjectSettings(
             name="pollypm",
             root_dir=tmp_path,
-            base_dir=tmp_path / ".pollypm-state",
-            logs_dir=tmp_path / ".pollypm-state/logs",
-            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
-            state_db=tmp_path / ".pollypm-state/state.db",
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
         ),
         pollypm=PollyPMSettings(controller_account="claude_main"),
         accounts={
             "claude_main": AccountConfig(
                 name="claude_main",
                 provider=ProviderKind.CLAUDE,
-                home=tmp_path / ".pollypm-state" / "homes" / "claude_main",
+                home=tmp_path / ".pollypm" / "homes" / "claude_main",
             )
         },
         sessions={
@@ -81,16 +81,16 @@ def test_session_scoped_paths_do_not_collide_and_locks_are_respected(tmp_path: P
     supervisor = Supervisor(config)
     launches = {launch.session.name: launch for launch in supervisor.plan_launches()}
 
-    assert launches["worker_demo"].log_path == tmp_path / ".pollypm-state/logs/worker_demo/worker-demo.log"
-    assert launches["review_demo"].log_path == tmp_path / ".pollypm-state/logs/review_demo/review-demo.log"
+    assert launches["worker_demo"].log_path == tmp_path / ".pollypm/logs/worker_demo/worker-demo.log"
+    assert launches["review_demo"].log_path == tmp_path / ".pollypm/logs/review_demo/review-demo.log"
     assert launches["worker_demo"].log_path != launches["review_demo"].log_path
-    assert (tmp_path / ".pollypm-state/logs/worker_demo/.session.lock").exists()
-    assert (tmp_path / ".pollypm-state/logs/review_demo/.session.lock").exists()
+    assert (tmp_path / ".pollypm/logs/worker_demo/.session.lock").exists()
+    assert (tmp_path / ".pollypm/logs/review_demo/.session.lock").exists()
 
     worker_checkpoint = write_mechanical_checkpoint(
         config,
         launches["worker_demo"],
-        snapshot_path=tmp_path / ".pollypm-state/snapshots/worker.txt",
+        snapshot_path=tmp_path / ".pollypm/snapshots/worker.txt",
         snapshot_content="one\n",
         log_bytes=1,
         alerts=[],
@@ -98,7 +98,7 @@ def test_session_scoped_paths_do_not_collide_and_locks_are_respected(tmp_path: P
     review_checkpoint = write_mechanical_checkpoint(
         config,
         launches["review_demo"],
-        snapshot_path=tmp_path / ".pollypm-state/snapshots/review.txt",
+        snapshot_path=tmp_path / ".pollypm/snapshots/review.txt",
         snapshot_content="two\n",
         log_bytes=2,
         alerts=[],

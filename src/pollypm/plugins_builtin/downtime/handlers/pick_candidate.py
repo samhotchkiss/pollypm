@@ -6,7 +6,7 @@ a scored selection loop with variety-preserving tie-breaks (spec §4):
 1. **Planner output** — ``docs/downtime-backlog.md`` in the project
    root. Markdown-table format (see ``parse_backlog``). Planner writes
    it during Synthesis (dt04).
-2. **User-queued** — ``.pollypm-state/downtime-queue.jsonl``. One
+2. **User-queued** — ``.pollypm/downtime-queue.jsonl``. One
    ``Candidate`` per line as JSON; ``pm downtime add`` appends.
 3. **Auto-discovered** — hooks for doc-drift / security rotation /
    dep-audit scanners. The scanner bodies live alongside the dt05
@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 
 BACKLOG_RELATIVE_PATH = Path("docs") / "downtime-backlog.md"
-USER_QUEUE_RELATIVE_PATH = Path(".pollypm-state") / "downtime-queue.jsonl"
+USER_QUEUE_RELATIVE_PATH = Path(".pollypm") / "downtime-queue.jsonl"
 
 
 # ---------------------------------------------------------------------------

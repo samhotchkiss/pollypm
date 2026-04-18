@@ -2101,25 +2101,15 @@ def repair(
             all_problems.append(f"[{key}] project path does not exist: {project_root}")
             continue
 
-        # Check .pollypm-state scaffold dirs
-        state_dir = project_root / ".pollypm-state"
-        for subdir in ["dossier", "logs", "artifacts", "checkpoints", "worktrees"]:
+        # Check .pollypm/ scaffold dirs (collapsed layout #339)
+        state_dir = project_root / ".pollypm"
+        for subdir in ["dossier", "logs", "artifacts", "checkpoints", "worktrees", "rules", "magic"]:
             d = state_dir / subdir
             if not d.exists():
                 all_problems.append(f"[{key}] missing {d.relative_to(project_root)}")
                 if not check_only:
                     d.mkdir(parents=True, exist_ok=True)
                     all_actions.append(f"[{key}] created {d.relative_to(project_root)}")
-
-        # Check instruction dir
-        instruction_dir = project_root / ".pollypm"
-        for subdir in ["rules", "magic"]:
-            d = instruction_dir / subdir
-            if not d.exists():
-                all_problems.append(f"[{key}] missing .pollypm/{subdir}")
-                if not check_only:
-                    d.mkdir(parents=True, exist_ok=True)
-                    all_actions.append(f"[{key}] created .pollypm/{subdir}")
 
         # Check docs
         doc_problems = verify_docs(project_root)
@@ -2134,14 +2124,14 @@ def repair(
         gitignore = project_root / ".gitignore"
         if gitignore.exists():
             content = gitignore.read_text()
-            if ".pollypm-state/" not in content:
-                all_problems.append(f"[{key}] .gitignore missing .pollypm-state/ entry")
+            if ".pollypm/" not in content:
+                all_problems.append(f"[{key}] .gitignore missing .pollypm/ entry")
                 if not check_only:
                     with gitignore.open("a") as f:
                         if not content.endswith("\n"):
                             f.write("\n")
-                        f.write(".pollypm-state/\n")
-                    all_actions.append(f"[{key}] added .pollypm-state/ to .gitignore")
+                        f.write(".pollypm/\n")
+                    all_actions.append(f"[{key}] added .pollypm/ to .gitignore")
 
     # -- Report --
     if not all_problems:

@@ -2,10 +2,10 @@
 name = "PollyPM"
 tmux_session = "pollypm"
 workspace_root = "/Users/sam/dev"
-base_dir = ".pollypm-state"
-logs_dir = ".pollypm-state/logs"
-snapshots_dir = ".pollypm-state/snapshots"
-state_db = ".pollypm-state/state.db"
+base_dir = ".pollypm"
+logs_dir = ".pollypm/logs"
+snapshots_dir = ".pollypm/snapshots"
+state_db = ".pollypm/state.db"
 
 [pollypm]
 controller_account = "claude_pearl_swh_me"
@@ -45,7 +45,7 @@ args = ["--dangerously-skip-permissions"]
 role = "worker"
 provider = "claude"
 account = "claude_pearl_swh_me"
-cwd = ".pollypm-state/worktrees/pollypm-pa-worker_pollypm"
+cwd = ".pollypm/worktrees/pollypm-pa-worker_pollypm"
 window_name = "worker-pollypm"
 prompt = "Read the PollyPM issue queue, start with the highest-leverage open issue, and move the project forward in small verified chunks."
 

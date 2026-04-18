@@ -46,8 +46,8 @@ Asked worker to check gitignore and docs tracking:
 ```
 • Ran grep pollypm .gitignore && echo "---" && git ls-files docs/ | wc -l
   └ .pollypm/
-    .pollypm-state/
+    .pollypm/
     ---
           22
 ```
-`.pollypm/` and `.pollypm-state/` are gitignored. 22 files under docs/ are tracked. ✅
+`.pollypm/` and `.pollypm/` are gitignored. 22 files under docs/ are tracked. ✅

@@ -45,10 +45,10 @@ prompt = "Implement issue #1."
 name = "PollyPM"
 tmux_session = "pollypm"
 workspace_root = "{tmp_path / 'workspace'}"
-base_dir = "{tmp_path / '.pollypm-state'}"
-logs_dir = "{tmp_path / '.pollypm-state' / 'logs'}"
-snapshots_dir = "{tmp_path / '.pollypm-state' / 'snapshots'}"
-state_db = "{tmp_path / '.pollypm-state' / 'state.db'}"
+base_dir = "{tmp_path / '.pollypm'}"
+logs_dir = "{tmp_path / '.pollypm' / 'logs'}"
+snapshots_dir = "{tmp_path / '.pollypm' / 'snapshots'}"
+state_db = "{tmp_path / '.pollypm' / 'state.db'}"
 
 [pollypm]
 controller_account = "claude_controller"
@@ -57,12 +57,12 @@ failover_enabled = false
 [accounts.claude_controller]
 provider = "claude"
 email = "controller@example.com"
-home = "{tmp_path / '.pollypm-state' / 'homes' / 'claude_controller'}"
+home = "{tmp_path / '.pollypm' / 'homes' / 'claude_controller'}"
 
 [accounts.claude_worker]
 provider = "claude"
 email = "worker@example.com"
-home = "{tmp_path / '.pollypm-state' / 'homes' / 'claude_worker'}"
+home = "{tmp_path / '.pollypm' / 'homes' / 'claude_worker'}"
 
 [sessions.heartbeat]
 role = "heartbeat-supervisor"

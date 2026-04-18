@@ -41,7 +41,7 @@ class BuildSpeculativeResult:
     slug: str
 
 
-_SCRATCH_REL = Path(".pollypm-state") / "downtime-scratch"
+_SCRATCH_REL = Path(".pollypm") / "downtime-scratch"
 
 
 def render_scratch_readme(*, title: str, description: str) -> str:

@@ -74,7 +74,7 @@ def _write_minimal_config(tmp_path: Path) -> Path:
     touch accounts / sessions.
     """
     config_path = tmp_path / "pollypm.toml"
-    base_dir = tmp_path / ".pollypm-state"
+    base_dir = tmp_path / ".pollypm"
     state_db = base_dir / "state.db"
     config_path.write_text(
         "[project]\n"
@@ -101,7 +101,7 @@ def _seed(state_db: Path, records: list[tuple[str, str, str]]) -> None:
 
 def test_activity_cli_prints_entries(tmp_path: Path) -> None:
     config_path = _write_minimal_config(tmp_path)
-    state_db = tmp_path / ".pollypm-state" / "state.db"
+    state_db = tmp_path / ".pollypm" / "state.db"
     _seed(state_db, [
         ("operator", "alert", activity_summary(summary="Pane died", severity="critical", verb="alerted")),
         ("worker", "commit", activity_summary(summary="Shipped lf01", severity="routine", verb="committed")),
@@ -119,7 +119,7 @@ def test_activity_cli_prints_entries(tmp_path: Path) -> None:
 
 def test_activity_cli_json_is_ndjson(tmp_path: Path) -> None:
     config_path = _write_minimal_config(tmp_path)
-    state_db = tmp_path / ".pollypm-state" / "state.db"
+    state_db = tmp_path / ".pollypm" / "state.db"
     _seed(state_db, [
         ("a", "k", activity_summary(summary="one")),
         ("a", "k", activity_summary(summary="two")),
@@ -141,7 +141,7 @@ def test_activity_cli_json_is_ndjson(tmp_path: Path) -> None:
 
 def test_activity_cli_filter_by_kind(tmp_path: Path) -> None:
     config_path = _write_minimal_config(tmp_path)
-    state_db = tmp_path / ".pollypm-state" / "state.db"
+    state_db = tmp_path / ".pollypm" / "state.db"
     _seed(state_db, [
         ("a", "alert", activity_summary(summary="alert A")),
         ("a", "nudge", activity_summary(summary="nudge B")),
@@ -158,7 +158,7 @@ def test_activity_cli_filter_by_kind(tmp_path: Path) -> None:
 
 def test_activity_cli_limit_cap(tmp_path: Path) -> None:
     config_path = _write_minimal_config(tmp_path)
-    state_db = tmp_path / ".pollypm-state" / "state.db"
+    state_db = tmp_path / ".pollypm" / "state.db"
     _seed(state_db, [
         ("a", "k", activity_summary(summary=f"row {i}")) for i in range(10)
     ])
@@ -180,7 +180,7 @@ def test_activity_cli_follow_picks_up_new_events(monkeypatch, tmp_path: Path) ->
     KeyboardInterrupt on the second to exit.
     """
     config_path = _write_minimal_config(tmp_path)
-    state_db = tmp_path / ".pollypm-state" / "state.db"
+    state_db = tmp_path / ".pollypm" / "state.db"
     _seed(state_db, [("a", "k", activity_summary(summary="first"))])
 
     call_count = {"n": 0}

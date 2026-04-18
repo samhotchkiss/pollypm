@@ -103,7 +103,7 @@ class FileMemoryBackend(MemoryBackend):
         if state_store is None:
             from pollypm.storage.state import StateStore
 
-            self._state_db = state_db or (self._project_path / ".pollypm-state" / "state.db")
+            self._state_db = state_db or (self._project_path / ".pollypm" / "state.db")
             self._state_store = StateStore(self._state_db)
         else:
             self._state_db = state_db

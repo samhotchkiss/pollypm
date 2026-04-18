@@ -79,7 +79,7 @@ def memory_curate_handler(payload: dict[str, Any]) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             logger.warning("memory.curate[%s]: backend unavailable (%s)", project_root, exc)
             continue
-        log_path = project_root / ".pollypm-state" / CURATOR_LOG_FILENAME
+        log_path = project_root / ".pollypm" / CURATOR_LOG_FILENAME
         try:
             result = curate_memory(backend, log_path=log_path, now=datetime.now(UTC))
         except Exception as exc:  # noqa: BLE001
@@ -99,14 +99,14 @@ def memory_curate_handler(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _emit_inbox_summary(project_root: Path, summary: str) -> None:
-    """Write today's summary under ``.pollypm-state/curator/<date>.md``.
+    """Write today's summary under ``.pollypm/curator/<date>.md``.
 
     The inbox surfaces this via directory scan — keeping the curator's
     output self-contained means it doesn't depend on a specific inbox
     implementation (the work-service inbox, morning briefing inbox, or
     a future unified inbox all see the same file).
     """
-    inbox_dir = project_root / ".pollypm-state" / CURATOR_INBOX_DIRNAME
+    inbox_dir = project_root / ".pollypm" / CURATOR_INBOX_DIRNAME
     inbox_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y-%m-%d")
     path = inbox_dir / f"{stamp}.md"

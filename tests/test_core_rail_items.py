@@ -25,7 +25,7 @@ def _write_config(tmp_path: Path) -> Path:
         "name = \"PollyPM\"\n"
         f"root_dir = \"{tmp_path}\"\n"
         "tmux_session = \"pollypm\"\n"
-        f"base_dir = \"{tmp_path / '.pollypm-state'}\"\n"
+        f"base_dir = \"{tmp_path / '.pollypm'}\"\n"
     )
     return config_path
 
@@ -34,7 +34,7 @@ class _FakeConfig:
     def __init__(self, tmp_path: Path) -> None:
         class Project:
             root_dir = tmp_path
-            base_dir = tmp_path / ".pollypm-state"
+            base_dir = tmp_path / ".pollypm"
             tmux_session = "pollypm"
 
         self.project = Project()

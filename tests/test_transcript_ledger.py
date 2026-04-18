@@ -14,22 +14,22 @@ def _config(tmp_path: Path) -> Path:
         project=ProjectSettings(
             name="pollypm",
             root_dir=root,
-            base_dir=root / ".pollypm-state",
-            logs_dir=root / ".pollypm-state/logs",
-            snapshots_dir=root / ".pollypm-state/snapshots",
-            state_db=root / ".pollypm-state/state.db",
+            base_dir=root / ".pollypm",
+            logs_dir=root / ".pollypm/logs",
+            snapshots_dir=root / ".pollypm/snapshots",
+            state_db=root / ".pollypm/state.db",
         ),
         pollypm=PollyPMSettings(controller_account="claude_main"),
         accounts={
             "claude_main": AccountConfig(
                 name="claude_main",
                 provider=ProviderKind.CLAUDE,
-                home=root / ".pollypm-state/homes/claude_main",
+                home=root / ".pollypm/homes/claude_main",
             ),
             "codex_main": AccountConfig(
                 name="codex_main",
                 provider=ProviderKind.CODEX,
-                home=root / ".pollypm-state/homes/codex_main",
+                home=root / ".pollypm/homes/codex_main",
             ),
         },
         sessions={},
@@ -51,7 +51,7 @@ def test_sync_token_ledger_reads_claude_and_codex_jsonl(tmp_path: Path) -> None:
     config_path = _config(tmp_path)
     root = config_path.parent
 
-    claude_home = root / ".pollypm-state/homes/claude_main"
+    claude_home = root / ".pollypm/homes/claude_main"
     claude_file = claude_home / ".claude/projects/-Users-sam-dev-pollypm/session-a.jsonl"
     claude_file.parent.mkdir(parents=True, exist_ok=True)
     claude_file.write_text(
@@ -96,7 +96,7 @@ def test_sync_token_ledger_reads_claude_and_codex_jsonl(tmp_path: Path) -> None:
         + "\n"
     )
 
-    codex_home = root / ".pollypm-state/homes/codex_main"
+    codex_home = root / ".pollypm/homes/codex_main"
     codex_file = codex_home / ".codex/sessions/2026/04/08/rollout-test.jsonl"
     codex_file.parent.mkdir(parents=True, exist_ok=True)
     codex_file.write_text(
@@ -161,7 +161,7 @@ def test_sync_token_ledger_reads_claude_and_codex_jsonl(tmp_path: Path) -> None:
     )
 
     samples = sync_token_ledger(config_path)
-    store = StateStore(root / ".pollypm-state/state.db")
+    store = StateStore(root / ".pollypm/state.db")
     usage = store.recent_token_usage(limit=10)
 
     assert len(samples) == 2

@@ -247,17 +247,17 @@ def test_project_detail_shows_github_backend_state_counts(monkeypatch, tmp_path:
     config = PollyPMConfig(
         project=ProjectSettings(
             root_dir=control_root,
-            base_dir=control_root / ".pollypm-state",
-            logs_dir=control_root / ".pollypm-state/logs",
-            snapshots_dir=control_root / ".pollypm-state/snapshots",
-            state_db=control_root / ".pollypm-state/state.db",
+            base_dir=control_root / ".pollypm",
+            logs_dir=control_root / ".pollypm/logs",
+            snapshots_dir=control_root / ".pollypm/snapshots",
+            state_db=control_root / ".pollypm/state.db",
         ),
         pollypm=PollyPMSettings(controller_account="claude_main"),
         accounts={
             "claude_main": AccountConfig(
                 name="claude_main",
                 provider=ProviderKind.CLAUDE,
-                home=control_root / ".pollypm-state" / "homes" / "claude_main",
+                home=control_root / ".pollypm" / "homes" / "claude_main",
             )
         },
         sessions={},

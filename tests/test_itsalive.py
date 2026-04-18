@@ -131,7 +131,7 @@ def test_sweep_completes_verified_pending_deploy(tmp_path: Path, monkeypatch) ->
     assert len(outcomes) == 1
     assert outcomes[0].status == "deployed"
     assert uploads == ["index.html"]
-    assert not list((tmp_path / ".pollypm-state" / "itsalive" / "pending").glob("*.json"))
+    assert not list((tmp_path / ".pollypm" / "itsalive" / "pending").glob("*.json"))
     assert complete_calls == [{"subdomain": "demo", "domain": "demo.itsalive.co"}]
 
 

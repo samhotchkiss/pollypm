@@ -6,7 +6,7 @@ Returns a :class:`YesterdaySnapshot` summarizing:
   calendar day preceding ``now_local``.
 * ``task_transitions`` — work-service state transitions that occurred in
   the same window.
-* ``advisor_insights`` — entries from ``.pollypm-state/advisor-log.jsonl``
+* ``advisor_insights`` — entries from ``.pollypm/advisor-log.jsonl``
   emitted in the window (only rows with ``emit=true``).
 * ``downtime_artifacts`` — downtime tasks that reached
   ``awaiting_approval`` yesterday.
@@ -324,7 +324,7 @@ def _gather_advisor_insights(
     since_iso: str,
     until_iso: str,
 ) -> list[AdvisorInsightSummary]:
-    """Read ``.pollypm-state/advisor-log.jsonl`` within the window.
+    """Read ``.pollypm/advisor-log.jsonl`` within the window.
 
     Schema (best-effort — missing fields degrade gracefully):
     each line is a JSON object with keys: ``timestamp`` (UTC ISO),
@@ -333,7 +333,7 @@ def _gather_advisor_insights(
 
     Missing file / corrupt lines / wrong type → ignored.
     """
-    log_path = project_root / ".pollypm-state" / "advisor-log.jsonl"
+    log_path = project_root / ".pollypm" / "advisor-log.jsonl"
     if not log_path.exists():
         return []
     out: list[AdvisorInsightSummary] = []

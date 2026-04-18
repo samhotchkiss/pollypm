@@ -33,7 +33,7 @@ def _config(tmp_path: Path) -> PollyPMConfig:
             name="Test",
             root_dir=tmp_path,
             tmux_session="test-pm",
-            base_dir=tmp_path / ".pollypm-state",
+            base_dir=tmp_path / ".pollypm",
         ),
         pollypm=PollyPMSettings(controller_account="claude_test", failover_accounts=[]),
         accounts={
@@ -41,7 +41,7 @@ def _config(tmp_path: Path) -> PollyPMConfig:
                 name="claude_test",
                 provider=ProviderKind.CLAUDE,
                 email="test@example.com",
-                home=tmp_path / ".pollypm-state" / "homes" / "claude_test",
+                home=tmp_path / ".pollypm" / "homes" / "claude_test",
             ),
         },
         sessions={
@@ -77,7 +77,7 @@ def test_prime_claude_home_writes_state_inside_config_dir(tmp_path: Path) -> Non
 
 def test_launch_command_wraps_in_login_shell(tmp_path: Path) -> None:
     config = _config(tmp_path)
-    config.project.state_db = tmp_path / ".pollypm-state" / "state.db"
+    config.project.state_db = tmp_path / ".pollypm" / "state.db"
     config.accounts["claude_test"].home.mkdir(parents=True)
     _prime_claude_home(config.accounts["claude_test"].home)
     supervisor = Supervisor(config)
@@ -96,7 +96,7 @@ def test_bootstrap_clears_session_markers(tmp_path: Path) -> None:
     _prime_claude_home(home)
 
     # Create fake session markers
-    markers_dir = home / ".pollypm-state" / "session-markers"
+    markers_dir = home / ".pollypm" / "session-markers"
     markers_dir.mkdir(parents=True)
     (markers_dir / "heartbeat.resume").write_text("stale")
     (markers_dir / "heartbeat.fresh").write_text("stale")
@@ -112,7 +112,7 @@ def test_bootstrap_clears_session_markers(tmp_path: Path) -> None:
 
 def test_claude_control_sessions_keep_original_account_home(tmp_path: Path) -> None:
     config = _config(tmp_path)
-    config.project.state_db = tmp_path / ".pollypm-state" / "state.db"
+    config.project.state_db = tmp_path / ".pollypm" / "state.db"
     home = config.accounts["claude_test"].home
     home.mkdir(parents=True)
     _prime_claude_home(home)

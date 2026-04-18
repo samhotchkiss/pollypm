@@ -61,10 +61,10 @@ def _write_minimal_config(
     config = PollyPMConfig(
         project=ProjectSettings(
             root_dir=tmp_path,
-            base_dir=tmp_path / ".pollypm-state",
-            logs_dir=tmp_path / ".pollypm-state/logs",
-            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
-            state_db=tmp_path / ".pollypm-state/state.db",
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
         ),
         pollypm=PollyPMSettings(controller_account=""),
         accounts={},
@@ -323,10 +323,10 @@ def _supervisor_with_architect(tmp_path: Path):
     config = PollyPMConfig(
         project=ProjectSettings(
             root_dir=tmp_path,
-            base_dir=tmp_path / ".pollypm-state",
-            logs_dir=tmp_path / ".pollypm-state/logs",
-            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
-            state_db=tmp_path / ".pollypm-state/state.db",
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
         ),
         pollypm=PollyPMSettings(controller_account="claude_1"),
         accounts={
@@ -334,7 +334,7 @@ def _supervisor_with_architect(tmp_path: Path):
                 name="claude_1",
                 provider=ProviderKind.CLAUDE,
                 email="c@example.com",
-                home=tmp_path / ".pollypm-state/homes/claude_1",
+                home=tmp_path / ".pollypm/homes/claude_1",
             ),
         },
         sessions={

@@ -874,7 +874,7 @@ def build_onboarded_config(
         raise ValueError(f"Unknown controller account: {controller_account}")
 
     controller = accounts[controller_account]
-    base_dir = root_dir / ".pollypm-state"
+    base_dir = root_dir / ".pollypm"
 
     config_accounts = {
         name: AccountConfig(

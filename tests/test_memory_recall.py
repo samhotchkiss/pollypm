@@ -460,7 +460,7 @@ def test_migration_backfills_fts_index_on_upgrade(tmp_path: Path) -> None:
     import sqlite3 as _sqlite3
     from pollypm.storage.state import StateStore
 
-    db_path = tmp_path / ".pollypm-state" / "state.db"
+    db_path = tmp_path / ".pollypm" / "state.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = _sqlite3.connect(db_path)
     conn.executescript(

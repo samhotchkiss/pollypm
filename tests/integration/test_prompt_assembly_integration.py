@@ -33,17 +33,17 @@ def test_worker_prompt_assembles_overview_manifest_issue_and_checkpoint(tmp_path
         project=ProjectSettings(
             name="pollypm",
             root_dir=control_root,
-            base_dir=control_root / ".pollypm-state",
-            logs_dir=control_root / ".pollypm-state/logs",
-            snapshots_dir=control_root / ".pollypm-state/snapshots",
-            state_db=control_root / ".pollypm-state/state.db",
+            base_dir=control_root / ".pollypm",
+            logs_dir=control_root / ".pollypm/logs",
+            snapshots_dir=control_root / ".pollypm/snapshots",
+            state_db=control_root / ".pollypm/state.db",
         ),
         pollypm=PollyPMSettings(controller_account="claude_main"),
         accounts={
             "claude_main": AccountConfig(
                 name="claude_main",
                 provider=ProviderKind.CLAUDE,
-                home=control_root / ".pollypm-state" / "homes" / "claude_main",
+                home=control_root / ".pollypm" / "homes" / "claude_main",
             )
         },
         sessions={
@@ -122,17 +122,17 @@ def test_worker_prompt_reads_active_issue_from_github_backend(monkeypatch, tmp_p
         project=ProjectSettings(
             name="pollypm",
             root_dir=control_root,
-            base_dir=control_root / ".pollypm-state",
-            logs_dir=control_root / ".pollypm-state/logs",
-            snapshots_dir=control_root / ".pollypm-state/snapshots",
-            state_db=control_root / ".pollypm-state/state.db",
+            base_dir=control_root / ".pollypm",
+            logs_dir=control_root / ".pollypm/logs",
+            snapshots_dir=control_root / ".pollypm/snapshots",
+            state_db=control_root / ".pollypm/state.db",
         ),
         pollypm=PollyPMSettings(controller_account="claude_main"),
         accounts={
             "claude_main": AccountConfig(
                 name="claude_main",
                 provider=ProviderKind.CLAUDE,
-                home=control_root / ".pollypm-state" / "homes" / "claude_main",
+                home=control_root / ".pollypm" / "homes" / "claude_main",
             )
         },
         sessions={

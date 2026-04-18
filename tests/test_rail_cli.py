@@ -32,7 +32,7 @@ def test_rail_config_parsed_from_toml(tmp_path: Path) -> None:
         "name = \"PollyPM\"\n"
         f"root_dir = \"{tmp_path}\"\n"
         "tmux_session = \"pollypm\"\n"
-        f"base_dir = \"{tmp_path / '.pollypm-state'}\"\n"
+        f"base_dir = \"{tmp_path / '.pollypm'}\"\n"
         "\n"
         "[rail]\n"
         'hidden_items = ["tools.activity", "workflows.queue"]\n'
@@ -50,7 +50,7 @@ def test_rail_config_defaults_when_section_missing(tmp_path: Path) -> None:
         "name = \"PollyPM\"\n"
         f"root_dir = \"{tmp_path}\"\n"
         "tmux_session = \"pollypm\"\n"
-        f"base_dir = \"{tmp_path / '.pollypm-state'}\"\n"
+        f"base_dir = \"{tmp_path / '.pollypm'}\"\n"
     )
     config = load_config(config_path)
     assert config.rail == RailSettings()
@@ -63,7 +63,7 @@ def test_rail_config_tolerates_bad_types(tmp_path: Path) -> None:
         "name = \"PollyPM\"\n"
         f"root_dir = \"{tmp_path}\"\n"
         "tmux_session = \"pollypm\"\n"
-        f"base_dir = \"{tmp_path / '.pollypm-state'}\"\n"
+        f"base_dir = \"{tmp_path / '.pollypm'}\"\n"
         "\n"
         "[rail]\n"
         'hidden_items = "not-a-list"\n'
@@ -85,7 +85,7 @@ def test_build_items_skips_hidden_items(monkeypatch, tmp_path: Path) -> None:
         def __init__(self, tmp_path: Path) -> None:
             class Project:
                 root_dir = tmp_path
-                base_dir = tmp_path / ".pollypm-state"
+                base_dir = tmp_path / ".pollypm"
                 tmux_session = "pollypm"
 
             self.project = Project()
@@ -127,7 +127,7 @@ def test_build_items_collapses_sections(monkeypatch, tmp_path: Path) -> None:
         def __init__(self, tmp_path: Path) -> None:
             class Project:
                 root_dir = tmp_path
-                base_dir = tmp_path / ".pollypm-state"
+                base_dir = tmp_path / ".pollypm"
                 tmux_session = "pollypm"
 
             self.project = Project()

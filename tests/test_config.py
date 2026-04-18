@@ -66,7 +66,7 @@ controller_account = "claude_primary"
 
 [accounts.claude_primary]
 provider = "claude"
-home = ".pollypm-state/homes/claude_primary"
+home = ".pollypm/homes/claude_primary"
 
 [sessions.heartbeat]
 role = "heartbeat-supervisor"
@@ -120,7 +120,7 @@ controller_account = "claude_primary"
 
 [accounts.claude_primary]
 provider = "claude"
-home = ".pollypm-state/homes/claude_primary"
+home = ".pollypm/homes/claude_primary"
 
 [sessions.heartbeat]
 role = "heartbeat-supervisor"
@@ -163,7 +163,7 @@ lease_timeout_minutes = 5
 
 [accounts.claude_primary]
 provider = "claude"
-home = ".pollypm-state/homes/claude_primary"
+home = ".pollypm/homes/claude_primary"
 
 [sessions.operator]
 role = "operator-pm"
@@ -212,7 +212,7 @@ controller_account = "claude_primary"
 
 [accounts.claude_primary]
 provider = "claude"
-home = ".pollypm-state/homes/claude_primary"
+home = ".pollypm/homes/claude_primary"
 
 [sessions.heartbeat]
 role = "heartbeat-supervisor"
@@ -245,17 +245,17 @@ def test_write_config_splits_worker_sessions_into_project_local_files(tmp_path: 
     config = PollyPMConfig(
         project=ProjectSettings(
             root_dir=tmp_path,
-            base_dir=tmp_path / ".pollypm-state",
-            logs_dir=tmp_path / ".pollypm-state/logs",
-            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
-            state_db=tmp_path / ".pollypm-state/state.db",
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
         ),
         pollypm=PollyPMSettings(controller_account="claude_primary"),
         accounts={
             "claude_primary": AccountConfig(
                 name="claude_primary",
                 provider=ProviderKind.CLAUDE,
-                home=tmp_path / ".pollypm-state" / "homes" / "claude_primary",
+                home=tmp_path / ".pollypm" / "homes" / "claude_primary",
             )
         },
         sessions={

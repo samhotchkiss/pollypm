@@ -37,38 +37,72 @@ class Store(Protocol):
     # Event log (append-only journal)
     # ------------------------------------------------------------------
 
-    def append_event(self, *, kind: str, payload: dict[str, Any]) -> None:
-        """Append an event to the journal. Fire-and-forget; no return value."""
+    def append_event(
+        self,
+        scope: str,
+        sender: str,
+        subject: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Fire-and-forget event append. No return value; see #338."""
         ...
 
     def record_event(
-        self, session_name: str, event_type: str, message: str
-    ) -> None:
-        """Record a session-scoped event (heartbeat / supervisor audit trail)."""
+        self,
+        scope: str,
+        sender: str,
+        subject: str,
+        payload: dict[str, Any] | None = None,
+    ) -> int:
+        """Synchronous event insert — returns the new row id."""
         ...
 
     # ------------------------------------------------------------------
     # Inbox messages
     # ------------------------------------------------------------------
 
-    def enqueue_message(self, message: dict[str, Any]) -> int:
-        """Insert a new inbox message. Returns the assigned row id."""
+    def enqueue_message(
+        self,
+        type: str,
+        tier: str,
+        recipient: str,
+        sender: str,
+        subject: str,
+        body: str,
+        scope: str,
+        **extra: Any,
+    ) -> int:
+        """Insert a new message row. Returns the assigned row id."""
         ...
 
-    def update_message(self, message_id: int, **fields: Any) -> None:
-        """Patch fields on an existing inbox message."""
+    def upsert_message(
+        self,
+        type: str,
+        tier: str,
+        recipient: str,
+        sender: str,
+        subject: str,
+        body: str,
+        scope: str,
+        **extra: Any,
+    ) -> int:
+        """Insert-if-no-open-match-for-dedupe-key-else-update. Returns row id."""
         ...
 
-    def close_message(self, message_id: int, *, reason: str | None = None) -> None:
-        """Mark an inbox message as closed/resolved."""
+    def update_message(self, id: int, **fields: Any) -> None:
+        """Patch fields on an existing message row."""
+        ...
+
+    def close_message(self, id: int) -> None:
+        """Mark a message as closed/resolved."""
         ...
 
     def query_messages(self, **filters: Any) -> list[dict[str, Any]]:
-        """Return inbox messages matching ``filters`` (ordered by recency)."""
+        """Return messages matching ``filters`` (ordered by recency)."""
         ...
 
     # ------------------------------------------------------------------
-    # Alerts
+    # Alerts — thin wrappers over upsert_message / close_message.
     # ------------------------------------------------------------------
 
     def upsert_alert(
@@ -86,7 +120,7 @@ class Store(Protocol):
         ...
 
     # ------------------------------------------------------------------
-    # Transaction scope
+    # Transaction scope + escape hatch
     # ------------------------------------------------------------------
 
     def transaction(self) -> AbstractContextManager[Any]:
@@ -96,5 +130,14 @@ class Store(Protocol):
         return a SQLAlchemy :class:`~sqlalchemy.engine.Connection`; test
         doubles may yield a lighter-weight handle as long as it supports
         ``execute(...)``.
+        """
+        ...
+
+    def execute(self, stmt: Any) -> Any:
+        """Execute a SQLAlchemy Core statement inside a write transaction.
+
+        Escape hatch for callers writing to tables the Store does not
+        own (e.g. ``work_tasks``). Returns a cursor-shaped result with
+        ``rowcount`` / ``inserted_primary_key``.
         """
         ...

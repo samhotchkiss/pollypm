@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+import sqlalchemy
 from typer.testing import CliRunner
 
 from pollypm import notification_staging as ns
@@ -258,24 +259,47 @@ class TestClassifyPriority:
 
 
 class TestNotifyCLITiers:
-    def test_default_priority_creates_inbox_item(self, db_path):
+    """After issue #340, ``pm notify`` writes to the unified ``messages``
+    table (via :meth:`Store.enqueue_message`) instead of splitting across
+    ``work_tasks`` / ``notification_staging`` / ``events``.
+
+    The classifier behaviour is unchanged — these tests verify the tier
+    still drives the stored row's ``tier`` + ``state`` and the CLI's
+    stdout shape (``digest:<id>`` / ``silent`` / bare id).
+    """
+
+    def _messages(self, db_path):
+        from pollypm.store import SQLAlchemyStore
+        store = SQLAlchemyStore(f"sqlite:///{db_path}")
+        try:
+            with store.read_engine.connect() as conn:
+                rows = conn.execute(
+                    sqlalchemy.text(
+                        "SELECT type, tier, state, subject, body "
+                        "FROM messages ORDER BY id ASC"
+                    )
+                ).mappings().all()
+            return [dict(r) for r in rows]
+        finally:
+            store.close()
+
+    def test_default_priority_creates_immediate_message(self, db_path):
         result = _invoke_notify(
             str(db_path), "Deploy blocked", "Needs verification email click.",
         )
         assert result.exit_code == 0, result.output
-        # Legacy shape: task_id printed, project/number form.
-        task_id = result.output.strip().splitlines()[-1]
-        assert "/" in task_id
-        # Still creates a work-service task (backwards compat).
-        svc = SQLiteWorkService(db_path=db_path)
-        try:
-            task = svc.get(task_id)
-            assert task.title == "Deploy blocked"
-            assert task.roles.get("requester") == "user"
-        finally:
-            svc.close()
+        row_id = result.output.strip().splitlines()[-1]
+        assert row_id.isdigit(), row_id
 
-    def test_digest_priority_does_not_create_inbox_item(self, db_path):
+        rows = self._messages(db_path)
+        assert len(rows) == 1
+        assert rows[0]["type"] == "notify"
+        assert rows[0]["tier"] == "immediate"
+        assert rows[0]["state"] == "open"
+        assert "Deploy blocked" in rows[0]["subject"]
+        assert rows[0]["subject"].startswith("[Action]")
+
+    def test_digest_priority_lands_staged(self, db_path):
         result = _invoke_notify(
             str(db_path),
             "Done: homepage rewrite",
@@ -286,21 +310,13 @@ class TestNotifyCLITiers:
         out = result.output.strip().splitlines()[-1]
         assert out.startswith("digest:"), out
 
-        # No inbox task; one staging row with priority=digest.
-        svc = SQLiteWorkService(db_path=db_path)
-        try:
-            tasks = svc.list_tasks()
-            assert tasks == []
-        finally:
-            svc.close()
-
-        rows = _staging_rows(db_path)
+        rows = self._messages(db_path)
         assert len(rows) == 1
-        assert rows[0]["priority"] == "digest"
-        assert rows[0]["subject"] == "Done: homepage rewrite"
-        assert rows[0]["flushed_at"] is None
+        assert rows[0]["tier"] == "digest"
+        assert rows[0]["state"] == "staged"
+        assert rows[0]["subject"].startswith("[FYI]")
 
-    def test_silent_priority_creates_neither(self, db_path):
+    def test_silent_priority_lands_closed(self, db_path):
         result = _invoke_notify(
             str(db_path),
             "Test pass",
@@ -308,29 +324,13 @@ class TestNotifyCLITiers:
             "--priority", "silent",
         )
         assert result.exit_code == 0, result.output
-        out = result.output.strip().splitlines()[-1]
-        assert out == "silent"
+        assert result.output.strip().splitlines()[-1] == "silent"
 
-        svc = SQLiteWorkService(db_path=db_path)
-        try:
-            assert svc.list_tasks() == []
-        finally:
-            svc.close()
-
-        # No staging rows for silent — the audit event is the whole record.
-        assert _staging_rows(db_path) == []
-
-        # Silent must still emit an activity event so the feed projector
-        # sees the audit entry.
-        conn = sqlite3.connect(str(db_path))
-        try:
-            rows = conn.execute(
-                "SELECT event_type, message FROM events "
-                "WHERE event_type = 'inbox.message.silent'"
-            ).fetchall()
-        finally:
-            conn.close()
+        rows = self._messages(db_path)
         assert len(rows) == 1
+        assert rows[0]["tier"] == "silent"
+        assert rows[0]["state"] == "closed"
+        assert rows[0]["subject"].startswith("[Audit]")
 
     def test_auto_priority_infers_digest(self, db_path):
         # --priority omitted → classify_priority picks "digest" from "done".
@@ -343,12 +343,9 @@ class TestNotifyCLITiers:
         out = result.output.strip().splitlines()[-1]
         assert out.startswith("digest:"), out
 
-        # No inbox task — auto-classified as digest.
-        svc = SQLiteWorkService(db_path=db_path)
-        try:
-            assert svc.list_tasks() == []
-        finally:
-            svc.close()
+        rows = self._messages(db_path)
+        assert len(rows) == 1
+        assert rows[0]["tier"] == "digest"
 
     def test_auto_priority_infers_silent(self, db_path):
         result = _invoke_notify(

@@ -42,7 +42,7 @@ from pollypm.projects import (
     set_workspace_root,
 )
 from pollypm.schedulers.base import ScheduledJob
-from pollypm.storage.state import StateStore
+from pollypm.storage.state import AlertRecord, StateStore
 from pollypm.supervisor import Supervisor
 from pollypm.task_backends import FileTaskBackend, get_task_backend
 from pollypm.task_backends.base import TaskRecord
@@ -191,48 +191,108 @@ class PollyPMService:
         """Raise a session alert; persists to state store and records an event."""
         supervisor = self.load_supervisor()
         supervisor.require_session(session_name)
-        supervisor.store.upsert_alert(session_name, alert_type, severity, message)
+        # #349: writer on ``messages`` via the unified Store.
+        supervisor.msg_store.upsert_alert(session_name, alert_type, severity, message)
         alert = next(
             (
                 item
-                for item in supervisor.store.open_alerts()
+                for item in supervisor.open_alerts()
                 if item.session_name == session_name and item.alert_type == alert_type
             ),
             None,
         )
         if alert is None:
             raise RuntimeError(f"Alert {alert_type} for {session_name} was not persisted")
-        supervisor.store.record_event(
-            session_name,
-            "alert",
-            activity_summary(
-                summary=f"Raised {severity} alert {alert_type}: {message}",
-                severity="critical" if severity == "critical" else "recommendation",
-                verb="alerted",
-                subject=alert_type,
-            ),
+        supervisor.msg_store.append_event(
+            scope=session_name,
+            sender=session_name,
+            subject="alert",
+            payload={
+                "message": activity_summary(
+                    summary=f"Raised {severity} alert {alert_type}: {message}",
+                    severity=(
+                        "critical" if severity == "critical" else "recommendation"
+                    ),
+                    verb="alerted",
+                    subject=alert_type,
+                ),
+                "alert_type": alert_type,
+                "severity": severity,
+            },
         )
         return alert
 
     def list_alerts(self) -> list[object]:
         """Return all currently open alerts across sessions."""
-        return self.load_supervisor().store.open_alerts()
+        # #349: route through ``Supervisor.open_alerts`` so the read matches
+        # the writer flip onto ``messages``.
+        return self.load_supervisor().open_alerts()
 
     def clear_alert(self, alert_id: int) -> object:
-        """Clear a single open alert by its id and record the clearance event."""
+        """Clear a single open alert by its id and record the clearance event.
+
+        #349: alert rows live on the unified ``messages`` table now, so we
+        resolve ``alert_id`` against ``messages`` first (its row id is the
+        alert id callers see). Falls back to the legacy
+        :meth:`StateStore.clear_alert_by_id` path for any alert created
+        before the writer flip, so pre-migration rows still clear cleanly.
+        """
         supervisor = self.load_supervisor()
-        alert = supervisor.store.clear_alert_by_id(alert_id)
-        if alert is None:
-            raise KeyError(f"Unknown alert id: {alert_id}")
-        supervisor.store.record_event(
-            alert.session_name,
-            "alert",
-            activity_summary(
-                summary=f"Cleared alert {alert.alert_type}#{alert_id}",
-                severity="routine",
-                verb="cleared",
-                subject=alert.alert_type,
-            ),
+        # Try the unified Store first — if the alert row lives in
+        # ``messages``, close it via the Store and reshape the returned
+        # row into an ``AlertRecord`` for the caller.
+        try:
+            rows = supervisor.msg_store.query_messages(
+                type="alert",
+                state="open",
+                limit=200,
+            )
+        except Exception:  # noqa: BLE001
+            rows = []
+        target = next((row for row in rows if int(row.get("id", 0)) == alert_id), None)
+        if target is not None:
+            try:
+                supervisor.msg_store.close_message(alert_id)
+            except Exception:  # noqa: BLE001
+                pass
+            payload = target.get("payload") or {}
+            subject = str(target.get("subject") or "")
+            message_text = (
+                subject[len("[Alert] "):] if subject.startswith("[Alert] ")
+                else subject
+            )
+            alert = AlertRecord(
+                session_name=str(target.get("scope") or ""),
+                alert_type=str(target.get("sender") or ""),
+                severity=str(payload.get("severity") or ""),
+                message=message_text,
+                status="cleared",
+                created_at=str(target.get("created_at") or ""),
+                updated_at=str(target.get("updated_at") or ""),
+                alert_id=alert_id,
+            )
+        else:
+            # TODO(#342-F): fallback for pre-migration rows still in the
+            # legacy ``alerts`` table. Remove when StateStore is retired.
+            legacy = supervisor.store.clear_alert_by_id(alert_id)
+            if legacy is None:
+                raise KeyError(f"Unknown alert id: {alert_id}")
+            alert = legacy
+
+        supervisor.msg_store.append_event(
+            scope=alert.session_name,
+            sender=alert.session_name,
+            subject="alert",
+            payload={
+                "message": activity_summary(
+                    summary=f"Cleared alert {alert.alert_type}#{alert_id}",
+                    severity="routine",
+                    verb="cleared",
+                    subject=alert.alert_type,
+                ),
+                "alert_type": alert.alert_type,
+                "alert_id": alert_id,
+            },
         )
         return alert
 
@@ -245,17 +305,22 @@ class PollyPMService:
             status=status,
             last_failure_message=reason or None,
         )
-        supervisor.store.record_event(
-            session_name,
-            "session_status",
-            activity_summary(
-                summary=f"Set status to {status}: {reason}".rstrip(": "),
-                severity="routine",
-                verb="status_changed",
-                subject=session_name,
-                status=status,
-                reason=reason or None,
-            ),
+        supervisor.msg_store.append_event(
+            scope=session_name,
+            sender=session_name,
+            subject="session_status",
+            payload={
+                "message": activity_summary(
+                    summary=f"Set status to {status}: {reason}".rstrip(": "),
+                    severity="routine",
+                    verb="status_changed",
+                    subject=session_name,
+                    status=status,
+                    reason=reason or None,
+                ),
+                "status": status,
+                "reason": reason or None,
+            },
         )
         runtime = supervisor.store.get_session_runtime(session_name)
         if runtime is None:
@@ -282,7 +347,12 @@ class PollyPMService:
         # event_projector._is_noise) drops them from the feed. A
         # structured payload here would make every heartbeat tick leak
         # into the UI.
-        supervisor.store.record_event(session_name, "heartbeat", "Recorded heartbeat snapshot")
+        supervisor.msg_store.append_event(
+            scope=session_name,
+            sender=session_name,
+            subject="heartbeat",
+            payload={"message": "Recorded heartbeat snapshot"},
+        )
         record = supervisor.store.latest_heartbeat(session_name)
         if record is None:
             raise RuntimeError(f"Heartbeat for {session_name} was not recorded")
@@ -608,6 +678,8 @@ class PollyPMService:
             verification=verification,
         )
         store = StateStore(config.project.state_db)
+        # TODO(#342-F): ``record_checkpoint`` still writes the checkpoints
+        # table through StateStore; migrate when the checkpoint surface moves.
         record_checkpoint(
             store,
             launch,
@@ -617,21 +689,36 @@ class PollyPMService:
             snapshot_path=moved.path,
             memory_backend_name=config.memory.backend,
         )
-        store.record_event(
-            launch.session.name,
-            "checkpoint",
-            activity_summary(
-                summary=(
-                    f"Recorded Level 1 checkpoint for completed issue "
-                    f"{task.task_id}: {checkpoint_data.checkpoint_id}"
-                ),
-                severity="routine",
-                verb="checkpointed",
-                subject=task.task_id,
-                project=project_key,
-                checkpoint_id=checkpoint_data.checkpoint_id,
-            ),
-        )
+        # #349: audit event lands on the unified ``messages`` table via Store.
+        from pollypm.store.registry import get_store
+
+        msg_store = get_store(config)
+        try:
+            msg_store.append_event(
+                scope=launch.session.name,
+                sender=launch.session.name,
+                subject="checkpoint",
+                payload={
+                    "message": activity_summary(
+                        summary=(
+                            f"Recorded Level 1 checkpoint for completed issue "
+                            f"{task.task_id}: {checkpoint_data.checkpoint_id}"
+                        ),
+                        severity="routine",
+                        verb="checkpointed",
+                        subject=task.task_id,
+                        project=project_key,
+                        checkpoint_id=checkpoint_data.checkpoint_id,
+                    ),
+                    "task_id": task.task_id,
+                    "project": project_key,
+                    "checkpoint_id": checkpoint_data.checkpoint_id,
+                },
+            )
+        finally:
+            close = getattr(msg_store, "close", None)
+            if callable(close):
+                close()
 
     def _checkpoint_launch_for_project(self, config, project_key: str) -> SessionLaunchSpec:
         project = config.projects[project_key]

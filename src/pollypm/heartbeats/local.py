@@ -527,7 +527,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
 
             # Raise a low-severity alert so the cockpit surfaces it.
             try:
-                api.supervisor.store.upsert_alert(
+                api.supervisor.msg_store.upsert_alert(
                     context.session_name,
                     f"stuck_on_task:{task_id}",
                     "warning",
@@ -560,15 +560,18 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     activity_summary,
                 )
 
-                api.supervisor.store.record_event(
-                    context.session_name,
-                    "silent_worker_prompt",
-                    activity_summary(
-                        summary="Sent 'pm task next' to silent worker",
-                        severity="recommendation",
-                        verb="prompted",
-                        subject=context.session_name,
-                    ),
+                api.supervisor.msg_store.append_event(
+                    scope=context.session_name,
+                    sender=context.session_name,
+                    subject="silent_worker_prompt",
+                    payload={
+                        "message": activity_summary(
+                            summary="Sent 'pm task next' to silent worker",
+                            severity="recommendation",
+                            verb="prompted",
+                            subject=context.session_name,
+                        ),
+                    },
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -580,14 +583,37 @@ class LocalHeartbeatBackend(HeartbeatBackend):
 
     def _escalate(self, api, context: HeartbeatSessionContext, reason: str) -> None:
         """Raise a durable alert so the user sees a stuck session in the cockpit."""
-        # Dedup: don't re-escalate if we escalated this session within 10 minutes
+        # Dedup: don't re-escalate if we escalated this session within 10 minutes.
+        # #349: escalation events now live on the unified ``messages`` table.
         try:
             from datetime import UTC, datetime
-            last = api.supervisor.store.last_event_at(context.session_name, "escalated")
-            if last:
-                age = (datetime.now(UTC) - datetime.fromisoformat(last)).total_seconds()
+            recent = api.supervisor.msg_store.query_messages(
+                type="event",
+                scope=context.session_name,
+                limit=20,
+            )
+            now = datetime.now(UTC)
+            for event in recent:
+                if event.get("subject") != "escalated":
+                    continue
+                created_at = event.get("created_at")
+                if created_at is None:
+                    continue
+                stamp = (
+                    created_at.isoformat()
+                    if hasattr(created_at, "isoformat")
+                    else str(created_at)
+                )
+                try:
+                    parsed = datetime.fromisoformat(stamp)
+                except ValueError:
+                    continue
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=UTC)
+                age = (now - parsed).total_seconds()
                 if age < 600:
                     return
+                break
         except Exception:  # noqa: BLE001
             pass
 
@@ -602,14 +628,19 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 activity_summary,
             )
 
-            api.supervisor.store.record_event(
-                context.session_name, "escalated",
-                activity_summary(
-                    summary=f"Raised stuck_session alert: {reason[:80]}",
-                    severity="critical",
-                    verb="escalated",
-                    subject=context.session_name,
-                ),
+            api.supervisor.msg_store.append_event(
+                scope=context.session_name,
+                sender=context.session_name,
+                subject="escalated",
+                payload={
+                    "message": activity_summary(
+                        summary=f"Raised stuck_session alert: {reason[:80]}",
+                        severity="critical",
+                        verb="escalated",
+                        subject=context.session_name,
+                    ),
+                    "reason": reason,
+                },
             )
         except Exception:  # noqa: BLE001
             pass
@@ -666,28 +697,52 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             return
         try:
             from datetime import UTC, datetime
-            recent = api.supervisor.store.recent_events(limit=200)
+            # #349: events migrated to the unified ``messages`` table.
+            recent = api.supervisor.msg_store.query_messages(
+                type="event",
+                scope=context.session_name,
+                limit=200,
+            )
             now = datetime.now(UTC)
-            # Debounce: skip if worker received input recently
+
+            def _age_seconds(event: dict) -> float | None:
+                created_at = event.get("created_at")
+                if created_at is None:
+                    return None
+                stamp = (
+                    created_at.isoformat()
+                    if hasattr(created_at, "isoformat")
+                    else str(created_at)
+                )
+                try:
+                    parsed = datetime.fromisoformat(stamp)
+                except ValueError:
+                    return None
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=UTC)
+                return (now - parsed).total_seconds()
+
+            # Debounce: skip if worker received input recently.
             for event in recent:
-                if (
-                    event.session_name == context.session_name
-                    and event.event_type == "send_input"
-                    and (now - datetime.fromisoformat(event.created_at)).total_seconds() < 120
-                ):
-                    return
-            # Rate limit + circuit breaker
-            nudge_count = 0
-            most_recent_age = None
-            for event in recent:
-                if event.session_name != context.session_name or event.event_type != "nudge":
+                if event.get("subject") != "send_input":
                     continue
-                age = (now - datetime.fromisoformat(event.created_at)).total_seconds()
+                age = _age_seconds(event)
+                if age is not None and age < 120:
+                    return
+            # Rate limit + circuit breaker.
+            nudge_count = 0
+            most_recent_age: float | None = None
+            for event in recent:
+                if event.get("subject") != "nudge":
+                    continue
+                age = _age_seconds(event)
+                if age is None:
+                    continue
                 if age < 3600:
                     nudge_count += 1
                 if most_recent_age is None:
                     most_recent_age = age
-            # Circuit breaker: too many nudges → recover the worker
+            # Circuit breaker: too many nudges → recover the worker.
             if nudge_count >= self._MAX_NUDGES_BEFORE_RECOVERY:
                 api.recover_session(
                     context.session_name,
@@ -695,7 +750,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     message=f"Worker unresponsive after {nudge_count} nudges — restarting",
                 )
                 return
-            # Rate limit
+            # Rate limit.
             if most_recent_age is not None and most_recent_age < self._NUDGE_COOLDOWN_SECONDS:
                 return
         except Exception:  # noqa: BLE001
@@ -714,15 +769,18 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 activity_summary,
             )
 
-            api.supervisor.store.record_event(
-                context.session_name,
-                "nudge",
-                activity_summary(
-                    summary=f"Sent nudge: {message[:80]}",
-                    severity="recommendation",
-                    verb="nudged",
-                    subject=context.session_name,
-                ),
+            api.supervisor.msg_store.append_event(
+                scope=context.session_name,
+                sender=context.session_name,
+                subject="nudge",
+                payload={
+                    "message": activity_summary(
+                        summary=f"Sent nudge: {message[:80]}",
+                        severity="recommendation",
+                        verb="nudged",
+                        subject=context.session_name,
+                    ),
+                },
             )
         except Exception:  # noqa: BLE001
             pass
@@ -788,14 +846,18 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 activity_summary,
             )
 
-            api.supervisor.store.record_event(
-                context.session_name, "heuristic_triage",
-                activity_summary(
-                    summary="Pushed forward: proceed signal detected",
-                    severity="routine",
-                    verb="triaged",
-                    subject=context.session_name,
-                ),
+            api.supervisor.msg_store.append_event(
+                scope=context.session_name,
+                sender=context.session_name,
+                subject="heuristic_triage",
+                payload={
+                    "message": activity_summary(
+                        summary="Pushed forward: proceed signal detected",
+                        severity="routine",
+                        verb="triaged",
+                        subject=context.session_name,
+                    ),
+                },
             )
             return
 

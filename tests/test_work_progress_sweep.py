@@ -115,7 +115,9 @@ class TestWorkProgressSweep:
     claimant session via the task_assignment_notify path, respecting the
     existing 30-min dedupe table."""
 
-    def _patch_resolver_with_factory(self, monkeypatch, tmp_path, svc, store):
+    def _patch_resolver_with_factory(
+        self, monkeypatch, tmp_path, svc, store, msg_store=None,
+    ):
         """Patch the resolver so each sweep call gets a freshly-opened work
         service — matching the production loader's behaviour (the handler
         closes the service after each sweep)."""
@@ -127,6 +129,7 @@ class TestWorkProgressSweep:
                 state_store=store,
                 work_service=work,
                 project_root=tmp_path,
+                msg_store=msg_store,
             )
 
         monkeypatch.setattr(
@@ -190,10 +193,20 @@ class TestWorkProgressSweep:
         seed.close()
 
         store = StateStore(tmp_path / "state.db")
+        # #349: the sweep's "recent event" probe reads from the unified
+        # Store. Seed the worker's latest event on ``messages``.
+        from pollypm.store import SQLAlchemyStore
+        msg_store = SQLAlchemyStore(f"sqlite:///{tmp_path / 'state.db'}")
         svc = FakeSessionService(handles=[FakeHandle("worker-demo")])
-        # Record a fresh event for the worker — sweep must skip.
-        store.record_event("worker-demo", "turn_complete", "did some work")
-        self._patch_resolver_with_factory(monkeypatch, tmp_path, svc, store)
+        msg_store.record_event(
+            scope="worker-demo",
+            sender="worker-demo",
+            subject="turn_complete",
+            payload={"message": "did some work"},
+        )
+        self._patch_resolver_with_factory(
+            monkeypatch, tmp_path, svc, store, msg_store=msg_store,
+        )
 
         result = work_progress_sweep_handler({})
         assert result["skipped_recent_event"] == 1
@@ -208,16 +221,37 @@ class TestWorkProgressSweep:
         seed.close()
 
         store = StateStore(tmp_path / "state.db")
+        # #349: back-date an event on the unified ``messages`` table so
+        # the sweep's recency probe sees it as stale.
+        from datetime import timezone as _tz
+        from pollypm.store import SQLAlchemyStore
+        from pollypm.store.schema import messages as _messages
+        from sqlalchemy import insert as _insert
+        import json as _json
+        msg_store = SQLAlchemyStore(f"sqlite:///{tmp_path / 'state.db'}")
         svc = FakeSessionService(handles=[FakeHandle("worker-demo")])
-        # Back-date a historical event past the threshold.
-        cutoff = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
-        store.execute(
-            "INSERT INTO events (session_name, event_type, message, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            ("worker-demo", "turn_complete", "old work", cutoff),
+        stale_ts = datetime.now(UTC) - timedelta(hours=2)
+        with msg_store.transaction() as conn:
+            conn.execute(
+                _insert(_messages),
+                {
+                    "scope": "worker-demo",
+                    "type": "event",
+                    "tier": "immediate",
+                    "recipient": "*",
+                    "sender": "worker-demo",
+                    "state": "open",
+                    "subject": "turn_complete",
+                    "body": "",
+                    "payload_json": _json.dumps({"message": "old work"}),
+                    "labels": "[]",
+                    "created_at": stale_ts,
+                    "updated_at": stale_ts,
+                },
+            )
+        self._patch_resolver_with_factory(
+            monkeypatch, tmp_path, svc, store, msg_store=msg_store,
         )
-        store.commit()
-        self._patch_resolver_with_factory(monkeypatch, tmp_path, svc, store)
 
         result = work_progress_sweep_handler({})
         assert result["pinged"] == 1

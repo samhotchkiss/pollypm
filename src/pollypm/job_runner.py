@@ -51,6 +51,45 @@ def register_job(kind: str):
     return decorator
 
 
+def _last_event_ts(
+    supervisor: Supervisor, scope: str, subject: str,
+) -> datetime | None:
+    """Return the timestamp of the most recent ``(scope, subject)`` event.
+
+    #349: replaces the legacy :meth:`StateStore.last_event_at` lookup so the
+    rate-limit gate reads from the same table writers now emit to
+    (``messages`` via the unified Store). Returns ``None`` when no matching
+    event has been recorded yet.
+    """
+    try:
+        rows = supervisor.msg_store.query_messages(
+            type="event",
+            scope=scope,
+            limit=20,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    for row in rows:
+        if row.get("subject") != subject:
+            continue
+        created_at = row.get("created_at")
+        if created_at is None:
+            continue
+        stamp = (
+            created_at.isoformat()
+            if hasattr(created_at, "isoformat")
+            else str(created_at)
+        )
+        try:
+            parsed = datetime.fromisoformat(stamp)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed
+    return None
+
+
 # -- Built-in jobs ----------------------------------------------------------
 
 @register_job("heartbeat")
@@ -90,9 +129,10 @@ def _run_session_intelligence_sweep(supervisor: Supervisor, payload: dict[str, A
     Extracts knowledge entries and activity summaries.
     """
     from datetime import UTC, datetime
-    last = supervisor.store.last_event_at("session_intelligence", "sweep_completed")
-    if last:
-        age = (datetime.now(UTC) - datetime.fromisoformat(last)).total_seconds()
+    # #349: rate-limit check reads events from the unified ``messages`` table.
+    last = _last_event_ts(supervisor, "session_intelligence", "sweep_completed")
+    if last is not None:
+        age = (datetime.now(UTC) - last).total_seconds()
         if age < 300:  # 5 minutes
             return
     from pollypm.session_intelligence import sweep_all_sessions
@@ -100,21 +140,28 @@ def _run_session_intelligence_sweep(supervisor: Supervisor, payload: dict[str, A
     if result["sessions_processed"]:
         from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
 
-        supervisor.store.record_event(
-            "session_intelligence", "sweep_completed",
-            activity_summary(
-                summary=(
-                    f"Processed {result['sessions_processed']} sessions, "
-                    f"{result['knowledge_entries']} knowledge entries, "
-                    f"{result['summaries']} summaries"
+        supervisor.msg_store.append_event(
+            scope="session_intelligence",
+            sender="session_intelligence",
+            subject="sweep_completed",
+            payload={
+                "message": activity_summary(
+                    summary=(
+                        f"Processed {result['sessions_processed']} sessions, "
+                        f"{result['knowledge_entries']} knowledge entries, "
+                        f"{result['summaries']} summaries"
+                    ),
+                    severity="routine",
+                    verb="swept",
+                    subject="session_intelligence",
+                    sessions_processed=result["sessions_processed"],
+                    knowledge_entries=result["knowledge_entries"],
+                    summaries=result["summaries"],
                 ),
-                severity="routine",
-                verb="swept",
-                subject="session_intelligence",
-                sessions_processed=result["sessions_processed"],
-                knowledge_entries=result["knowledge_entries"],
-                summaries=result["summaries"],
-            ),
+                "sessions_processed": result["sessions_processed"],
+                "knowledge_entries": result["knowledge_entries"],
+                "summaries": result["summaries"],
+            },
         )
 
 
@@ -125,9 +172,10 @@ def _run_project_intelligence(supervisor: Supervisor, payload: dict[str, Any]) -
     Runs at most every 60 minutes. Only fires if pending knowledge exists.
     """
     from datetime import UTC, datetime
-    last = supervisor.store.last_event_at("project_intelligence", "completed")
-    if last:
-        age = (datetime.now(UTC) - datetime.fromisoformat(last)).total_seconds()
+    # #349: rate-limit check reads from the unified ``messages`` table.
+    last = _last_event_ts(supervisor, "project_intelligence", "completed")
+    if last is not None:
+        age = (datetime.now(UTC) - last).total_seconds()
         if age < 3600:  # 1 hour
             return
     from pollypm.knowledge_extract import _all_project_roots
@@ -139,15 +187,20 @@ def _run_project_intelligence(supervisor: Supervisor, payload: dict[str, Any]) -
     if updated:
         from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
 
-        supervisor.store.record_event(
-            "project_intelligence", "completed",
-            activity_summary(
-                summary=f"Updated docs for {updated} project(s)",
-                severity="routine",
-                verb="updated",
-                subject="project_intelligence",
-                projects_updated=updated,
-            ),
+        supervisor.msg_store.append_event(
+            scope="project_intelligence",
+            sender="project_intelligence",
+            subject="completed",
+            payload={
+                "message": activity_summary(
+                    summary=f"Updated docs for {updated} project(s)",
+                    severity="routine",
+                    verb="updated",
+                    subject="project_intelligence",
+                    projects_updated=updated,
+                ),
+                "projects_updated": updated,
+            },
         )
 
 
@@ -164,16 +217,22 @@ def _run_token_ledger_sync(supervisor: Supervisor, payload: dict[str, Any]) -> N
     if samples:
         from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
 
-        supervisor.store.record_event(
-            "heartbeat",
-            "token_ledger",
-            activity_summary(
-                summary=f"Synced {len(samples)} transcript token sample(s)",
-                severity="routine",
-                verb="synced",
-                subject="token_ledger",
-                samples=len(samples),
-            ),
+        supervisor.msg_store.append_event(
+            scope="heartbeat",
+            sender="heartbeat",
+            subject="token_ledger",
+            payload={
+                "message": activity_summary(
+                    summary=(
+                        f"Synced {len(samples)} transcript token sample(s)"
+                    ),
+                    severity="routine",
+                    verb="synced",
+                    subject="token_ledger",
+                    samples=len(samples),
+                ),
+                "samples": len(samples),
+            },
         )
 
 
@@ -205,20 +264,25 @@ def _run_prune_state(supervisor: Supervisor, payload: dict[str, Any]) -> None:
     if total > 0:
         from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
 
-        supervisor.store.record_event(
-            "maintenance",
-            "prune",
-            activity_summary(
-                summary=(
-                    f"Pruned {result['events']} events, "
-                    f"{result['heartbeats']} heartbeat records"
+        supervisor.msg_store.append_event(
+            scope="maintenance",
+            sender="maintenance",
+            subject="prune",
+            payload={
+                "message": activity_summary(
+                    summary=(
+                        f"Pruned {result['events']} events, "
+                        f"{result['heartbeats']} heartbeat records"
+                    ),
+                    severity="routine",
+                    verb="pruned",
+                    subject="maintenance",
+                    events=result["events"],
+                    heartbeats=result["heartbeats"],
                 ),
-                severity="routine",
-                verb="pruned",
-                subject="maintenance",
-                events=result["events"],
-                heartbeats=result["heartbeats"],
-            ),
+                "events": result["events"],
+                "heartbeats": result["heartbeats"],
+            },
         )
 
 

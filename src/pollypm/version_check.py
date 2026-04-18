@@ -113,13 +113,14 @@ def _raise_upgrade_alert(project_root: Path, current: str, latest: str) -> None:
     """Raise a durable alert advertising the new release."""
     try:
         from pollypm.config import DEFAULT_CONFIG_PATH, load_config
-        from pollypm.storage.state import StateStore
+        from pollypm.store.registry import get_store
 
         config_path = project_root / "pollypm.toml"
         if not config_path.exists():
             config_path = DEFAULT_CONFIG_PATH
         config = load_config(config_path)
-        store = StateStore(config.project.state_db)
+        # #349: writers land on the unified ``messages`` table via Store.
+        store = get_store(config)
         try:
             store.upsert_alert(
                 "pollypm",
@@ -131,19 +132,30 @@ def _raise_upgrade_alert(project_root: Path, current: str, latest: str) -> None:
                 activity_summary,
             )
 
-            store.record_event(
-                "pollypm", "upgrade_available",
-                activity_summary(
-                    summary=f"New version detected: {latest} (current {current})",
-                    severity="recommendation",
-                    verb="upgrade_available",
-                    subject="pollypm",
-                    latest=latest,
-                    current=current,
-                ),
+            store.append_event(
+                scope="pollypm",
+                sender="pollypm",
+                subject="upgrade_available",
+                payload={
+                    "message": activity_summary(
+                        summary=(
+                            f"New version detected: {latest} "
+                            f"(current {current})"
+                        ),
+                        severity="recommendation",
+                        verb="upgrade_available",
+                        subject="pollypm",
+                        latest=latest,
+                        current=current,
+                    ),
+                    "latest": latest,
+                    "current": current,
+                },
             )
         finally:
-            store.close()
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
     except Exception:  # noqa: BLE001 - version check must not fail the caller
         logger.debug("Could not persist upgrade alert for %s", latest)
 

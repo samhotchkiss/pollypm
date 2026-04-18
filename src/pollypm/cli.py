@@ -1992,20 +1992,23 @@ def worker_stop(
         session_name=session_name,
         status="disabled",
     )
-    # Clear any open alerts
+    # Clear any open alerts. #349: writers go through the unified Store.
     for alert_type in ["missing_window", "pane_dead", "recovery_limit", "suspected_loop", "needs_followup"]:
-        supervisor.store.clear_alert(session_name, alert_type)
+        supervisor.msg_store.clear_alert(session_name, alert_type)
     from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
 
-    supervisor.store.record_event(
-        session_name,
-        "decommissioned",
-        activity_summary(
-            summary=f"Worker {session_name} stopped and disabled",
-            severity="recommendation",
-            verb="decommissioned",
-            subject=session_name,
-        ),
+    supervisor.msg_store.append_event(
+        scope=session_name,
+        sender=session_name,
+        subject="decommissioned",
+        payload={
+            "message": activity_summary(
+                summary=f"Worker {session_name} stopped and disabled",
+                severity="recommendation",
+                verb="decommissioned",
+                subject=session_name,
+            ),
+        },
     )
     typer.echo(f"Marked {session_name} as disabled. Heartbeat will not recover it.")
 

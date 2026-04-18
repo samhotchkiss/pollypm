@@ -160,13 +160,16 @@ def test_prepare_initial_input_records_event_on_mismatch(
     with pytest.raises(RuntimeError):
         supervisor._prepare_initial_input("operator", "kickoff")
 
-    rows = supervisor.store.execute(
-        "SELECT event_type, message FROM events "
-        "WHERE session_name = ? AND event_type = ?",
-        ("operator", "persona_swap_detected"),
-    ).fetchall()
-    assert len(rows) == 1
-    _event_type, message = rows[0]
+    # #349: persona-swap events now land in the unified ``messages``
+    # table via the Store. Query through ``_msg_store`` directly.
+    rows = supervisor.msg_store.query_messages(
+        type="event",
+        scope="operator",
+        limit=10,
+    )
+    matches = [r for r in rows if r.get("subject") == "persona_swap_detected"]
+    assert len(matches) == 1
+    message = (matches[0].get("payload") or {}).get("message") or ""
     assert "pm-operator" in message
     assert "pm-reviewer" in message
 
@@ -301,10 +304,15 @@ def test_verify_after_kickoff_noop_when_marker_matches(
     # Happy path: no resend.
     assert sends == []
 
-    events = supervisor.store.execute(
-        "SELECT event_type FROM events WHERE session_name = 'operator'",
-    ).fetchall()
-    assert not any(row[0] == "persona_swap_verified" for row in events)
+    # #349: events live in the unified ``messages`` table.
+    events = supervisor.msg_store.query_messages(
+        type="event",
+        scope="operator",
+        limit=20,
+    )
+    assert not any(
+        event.get("subject") == "persona_swap_verified" for event in events
+    )
 
 
 def test_verify_after_kickoff_resends_on_wrong_persona(
@@ -345,12 +353,19 @@ def test_verify_after_kickoff_resends_on_wrong_persona(
     assert sends[0][0] == "pollypm-storage-closet:pm-operator"
 
     # And a persona_swap_verified event recorded.
-    events = supervisor.store.execute(
-        "SELECT event_type, message FROM events "
-        "WHERE session_name = 'operator' AND event_type = 'persona_swap_verified'",
-    ).fetchall()
-    assert len(events) == 1
-    assert "Russell" in events[0][1]
+    # #349: events land in the unified ``messages`` table via the Store.
+    events = supervisor.msg_store.query_messages(
+        type="event",
+        scope="operator",
+        limit=20,
+    )
+    matches = [
+        event for event in events
+        if event.get("subject") == "persona_swap_verified"
+    ]
+    assert len(matches) == 1
+    message_text = (matches[0].get("payload") or {}).get("message") or ""
+    assert "Russell" in message_text
 
 
 def test_verify_after_kickoff_skips_for_worker_role(

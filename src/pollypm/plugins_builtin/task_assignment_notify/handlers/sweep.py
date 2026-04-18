@@ -213,7 +213,8 @@ def _emit_no_session_alert(
     ``(session_name, alert_type, status='open')`` so repeat emissions
     within a sweep cycle (or across sweep cycles) just refresh the row.
     """
-    store = services.state_store
+    # #349: alerts now live on the unified ``messages`` table via the Store.
+    store = services.msg_store or services.state_store
     if store is None:
         return
     # Candidate session name we would *expect* if the worker were running —
@@ -250,7 +251,8 @@ def _emit_plan_missing_alert(
     produces one row instead of N. Mirrors the ``_emit_no_session_alert``
     dedupe semantics (``upsert_alert`` refreshes rather than duplicates).
     """
-    store = services.state_store
+    # #349: alerts now live on the unified ``messages`` table via the Store.
+    store = services.msg_store or services.state_store
     if store is None:
         return
     # Alert row is keyed by the project identity — we use a synthetic

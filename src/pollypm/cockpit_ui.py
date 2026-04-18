@@ -6673,9 +6673,10 @@ class PollyInboxApp(App[None]):
         Matches the shape used by ``pm notify`` so the same consumers see
         inbox.read / archived / reply alongside inbox.message.created.
         Fire-and-forget — we never block the UI on event bookkeeping.
+        #349: routes through the unified ``messages`` table via Store.
         """
         try:
-            from pollypm.storage.state import StateStore
+            from pollypm.store import SQLAlchemyStore
             project_key = task_id.split("/", 1)[0]
             config = load_config(self.config_path)
             project = config.projects.get(project_key)
@@ -6684,11 +6685,18 @@ class PollyInboxApp(App[None]):
             db_path = project.path / ".pollypm" / "state.db"
             if not db_path.exists():
                 return
-            store = StateStore(db_path)
+            store = SQLAlchemyStore(f"sqlite:///{db_path}")
             try:
-                store.record_event("cockpit", event_type, message)
+                store.append_event(
+                    scope="cockpit",
+                    sender="cockpit",
+                    subject=event_type,
+                    payload={"message": message},
+                )
             finally:
-                store.close()
+                close = getattr(store, "close", None)
+                if callable(close):
+                    close()
         except Exception:  # noqa: BLE001
             pass
 

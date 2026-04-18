@@ -78,6 +78,40 @@ def _load_config_and_store(payload: dict[str, Any]):
         store.close()
 
 
+def _open_msg_store(config: Any) -> Any:
+    """Open the unified-messages Store for a handler invocation (#349).
+
+    Returns ``None`` when the backend can't be resolved — callers treat
+    that as a soft skip so a misconfigured entry-point never crashes a
+    recurring handler.
+    """
+    try:
+        from pollypm.store.registry import get_store
+
+        return get_store(config)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "core_recurring: unified Store unavailable", exc_info=True,
+        )
+        return None
+
+
+def _close_msg_store(store: Any) -> None:
+    """Close a Store handle opened by :func:`_open_msg_store`.
+
+    Tolerant of ``None`` (no-op) and missing ``close`` (some test doubles
+    don't implement it).
+    """
+    if store is None:
+        return
+    close = getattr(store, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # noqa: BLE001
+            logger.debug("core_recurring: msg_store close raised", exc_info=True)
+
+
 # Ephemeral session name prefixes (#252). Sessions whose name starts with
 # any of these are NOT in the supervisor's launch plan — they're spawned
 # on-demand for a specific task / critic pass / downtime exploration. The
@@ -142,7 +176,13 @@ def session_health_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
             "considered": 0, "alerts_raised": 0, "skipped_planned": 0,
         }
         try:
-            ephemeral_summary = sweep_ephemeral_sessions(supervisor, store)
+            # #349: the ephemeral sweep emits alerts through the unified
+            # Store. Route through the supervisor's ``_msg_store`` so the
+            # writer lands on ``messages`` rather than the legacy table.
+            msg_store = getattr(supervisor, "_msg_store", None)
+            ephemeral_summary = sweep_ephemeral_sessions(
+                supervisor, msg_store or store,
+            )
         except Exception:  # noqa: BLE001
             logger.debug(
                 "session.health_sweep: ephemeral pass failed", exc_info=True,
@@ -368,6 +408,10 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     services = load_runtime_services(config_path=config_path)
     work = services.work_service
     state_store = services.state_store
+    # #349: unified Store handle for writer sites (record_event, upsert_alert,
+    # clear_alert). Raw-SQL readers on ``state_store`` (``.execute``) stay
+    # on the legacy StateStore until Issue F (#342) retires it.
+    msg_store = services.msg_store
     session_svc = services.session_service
 
     if work is None:
@@ -505,13 +549,30 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
                     f"from {current_node} to {drift.advance_to_node} — "
                     f"{drift.reason}"
                 )
-                if state_store is not None:
+                # #349: writers prefer the unified ``messages`` Store; the
+                # fallback to ``state_store`` keeps older test harnesses
+                # (and the handful of callers that don't yet carry a Store)
+                # working.
+                audit_store = msg_store or state_store
+                if audit_store is not None:
                     # Event — permanent record of the drift detection.
                     # Keyed to the session so operators can scope.
                     try:
-                        state_store.record_event(
-                            target_name, "state_drift", message,
-                        )
+                        if msg_store is not None:
+                            msg_store.append_event(
+                                scope=target_name,
+                                sender=target_name,
+                                subject="state_drift",
+                                payload={
+                                    "message": message,
+                                    "task_id": task.task_id,
+                                    "reason": drift.reason,
+                                },
+                            )
+                        else:
+                            state_store.record_event(
+                                target_name, "state_drift", message,
+                            )
                     except Exception:  # noqa: BLE001
                         pass
                     # Alert — visible warning for Polly / the cockpit.
@@ -519,23 +580,44 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
                     # different tasks surfaces as two distinct alerts.
                     alert_type = f"state_drift:{task.task_id}"
                     try:
-                        # Detect whether the alert is new so our counter
-                        # reflects real user-visible notifications.
-                        existing = state_store.execute(
-                            "SELECT id FROM alerts WHERE session_name = ? "
-                            "AND alert_type = ? AND status = 'open'",
-                            (target_name, alert_type),
-                        ).fetchone()
-                        state_store.upsert_alert(
-                            target_name,
-                            alert_type,
-                            "warn",
-                            (
-                                f"{target_name} drift on {task.task_id}: "
-                                f"{drift.reason}"
-                            ),
-                        )
-                        if existing is None:
+                        if msg_store is not None:
+                            # Read through the Store so the "is this new?"
+                            # check observes the same table the upsert
+                            # writes to.
+                            existing_rows = msg_store.query_messages(
+                                type="alert",
+                                scope=target_name,
+                                sender=alert_type,
+                                state="open",
+                                limit=1,
+                            )
+                            is_new = not existing_rows
+                            msg_store.upsert_alert(
+                                target_name,
+                                alert_type,
+                                "warn",
+                                (
+                                    f"{target_name} drift on {task.task_id}: "
+                                    f"{drift.reason}"
+                                ),
+                            )
+                        else:
+                            existing_row = state_store.execute(
+                                "SELECT id FROM alerts WHERE session_name = ? "
+                                "AND alert_type = ? AND status = 'open'",
+                                (target_name, alert_type),
+                            ).fetchone()
+                            is_new = existing_row is None
+                            state_store.upsert_alert(
+                                target_name,
+                                alert_type,
+                                "warn",
+                                (
+                                    f"{target_name} drift on {task.task_id}: "
+                                    f"{drift.reason}"
+                                ),
+                            )
+                        if is_new:
                             drift_alerted += 1
                     except Exception:  # noqa: BLE001
                         pass
@@ -556,6 +638,7 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
                             session_service=session_svc,
                             state_store=state_store,
                             config=sweep_config,
+                            msg_store=msg_store,
                         )
                     except Exception:  # noqa: BLE001
                         logger.debug(
@@ -571,7 +654,28 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
             # Skip sessions that have recorded ANY event recently — the
             # session is clearly still doing something; a stale task
             # here is orthogonal to session liveness.
-            if state_store is not None:
+            # #349: events moved to the unified ``messages`` table; query
+            # via the Store when available, fall back to the legacy
+            # ``events`` table otherwise so older callers still see their
+            # own writes.
+            recent_ts: str | None = None
+            if msg_store is not None:
+                try:
+                    events = msg_store.query_messages(
+                        type="event",
+                        scope=target_name,
+                        limit=1,
+                    )
+                    last_ts_stamp = events[0].get("created_at") if events else None
+                    if last_ts_stamp is not None:
+                        recent_ts = (
+                            last_ts_stamp.isoformat()
+                            if hasattr(last_ts_stamp, "isoformat")
+                            else str(last_ts_stamp)
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
+            if recent_ts is None and state_store is not None:
                 try:
                     row = state_store.execute(
                         "SELECT created_at FROM events WHERE session_name = ? "
@@ -579,15 +683,20 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
                         (target_name,),
                     ).fetchone()
                     if row and row[0]:
-                        last_ts = datetime.fromisoformat(row[0])
-                        if last_ts.tzinfo is None:
-                            last_ts = last_ts.replace(tzinfo=UTC)
-                        if (now - last_ts) < timedelta(
-                            seconds=STALE_THRESHOLD_SECONDS,
-                        ):
-                            skipped_recent_event += 1
-                            continue
+                        recent_ts = str(row[0])
                 except Exception:  # noqa: BLE001
+                    pass
+            if recent_ts is not None:
+                try:
+                    last_ts = datetime.fromisoformat(recent_ts)
+                    if last_ts.tzinfo is None:
+                        last_ts = last_ts.replace(tzinfo=UTC)
+                    if (now - last_ts) < timedelta(
+                        seconds=STALE_THRESHOLD_SECONDS,
+                    ):
+                        skipped_recent_event += 1
+                        continue
+                except ValueError:
                     pass
 
             # Fire the ping — notify() enforces the 30-min dedupe.
@@ -610,9 +719,10 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 pinged += 1
                 # Raise a low-severity stuck_on_task alert so the
                 # cockpit surfaces the event to the operator.
-                if state_store is not None:
+                # #349: writers land on the unified ``messages`` table.
+                if msg_store is not None:
                     try:
-                        state_store.upsert_alert(
+                        msg_store.upsert_alert(
                             target_name,
                             f"stuck_on_task:{event.task_id}",
                             "warning",
@@ -685,6 +795,9 @@ def pane_text_classify_handler(payload: dict[str, Any]) -> dict[str, Any]:
 
     session_svc = services.session_service
     state_store = services.state_store
+    # #349: unified Store for writer sites; StateStore stays for the raw
+    # ``.execute`` paths below which target tables the Store does not own.
+    msg_store = services.msg_store
     work_service = services.work_service
 
     if session_svc is None or state_store is None:
@@ -752,26 +865,48 @@ def pane_text_classify_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 try:
                     # Detect first-fire so the counter reflects real
                     # new notifications rather than idempotent upserts.
-                    existing = state_store.execute(
-                        "SELECT id FROM alerts WHERE session_name = ? "
-                        "AND alert_type = ? AND status = 'open'",
-                        (session_name, alert_type),
-                    ).fetchone()
-                    state_store.upsert_alert(
-                        session_name, alert_type, severity, message,
-                    )
-                    if existing is None:
+                    # #349: read + write through the unified Store.
+                    if msg_store is not None:
+                        existing = msg_store.query_messages(
+                            type="alert",
+                            scope=session_name,
+                            sender=alert_type,
+                            state="open",
+                            limit=1,
+                        )
+                        msg_store.upsert_alert(
+                            session_name, alert_type, severity, message,
+                        )
+                        is_new = not existing
+                    else:  # pragma: no cover — Store fallback path.
+                        existing_row = state_store.execute(
+                            "SELECT id FROM alerts WHERE session_name = ? "
+                            "AND alert_type = ? AND status = 'open'",
+                            (session_name, alert_type),
+                        ).fetchone()
+                        state_store.upsert_alert(
+                            session_name, alert_type, severity, message,
+                        )
+                        is_new = existing_row is None
+                    if is_new:
                         alerts_raised += 1
                         match_counts[rule_name] += 1
                         # Ledger event so the activity feed carries a
                         # permanent record of the detection regardless
                         # of how long the alert stays open.
                         try:
-                            state_store.record_event(
-                                session_name,
-                                "pane.classify.match",
-                                f"matched rule '{rule_name}'",
-                            )
+                            if msg_store is not None:
+                                msg_store.append_event(
+                                    scope=session_name,
+                                    sender=session_name,
+                                    subject="pane.classify.match",
+                                    payload={
+                                        "message": (
+                                            f"matched rule '{rule_name}'"
+                                        ),
+                                        "rule": rule_name,
+                                    },
+                                )
                         except Exception:  # noqa: BLE001
                             pass
                 except Exception:  # noqa: BLE001
@@ -796,21 +931,35 @@ def pane_text_classify_handler(payload: dict[str, Any]) -> dict[str, Any]:
                         rule_name=rule_name,
                         pane_text=pane_text,
                         state_store=state_store,
+                        msg_store=msg_store,
                     )
                     if emitted:
                         inbox_items_emitted += 1
             else:
                 # Rule doesn't match anymore — clear any open alert.
                 # ``clear_alert`` is a no-op when no open alert exists.
+                # #349: read + clear via the unified Store.
                 try:
-                    existing = state_store.execute(
-                        "SELECT id FROM alerts WHERE session_name = ? "
-                        "AND alert_type = ? AND status = 'open'",
-                        (session_name, alert_type),
-                    ).fetchone()
-                    if existing is not None:
-                        state_store.clear_alert(session_name, alert_type)
-                        alerts_cleared += 1
+                    if msg_store is not None:
+                        existing = msg_store.query_messages(
+                            type="alert",
+                            scope=session_name,
+                            sender=alert_type,
+                            state="open",
+                            limit=1,
+                        )
+                        if existing:
+                            msg_store.clear_alert(session_name, alert_type)
+                            alerts_cleared += 1
+                    else:  # pragma: no cover — Store fallback path.
+                        existing_row = state_store.execute(
+                            "SELECT id FROM alerts WHERE session_name = ? "
+                            "AND alert_type = ? AND status = 'open'",
+                            (session_name, alert_type),
+                        ).fetchone()
+                        if existing_row is not None:
+                            state_store.clear_alert(session_name, alert_type)
+                            alerts_cleared += 1
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -832,6 +981,7 @@ def _emit_pane_pattern_inbox_item(
     rule_name: str,
     pane_text: str,
     state_store: Any = None,
+    msg_store: Any = None,
 ) -> bool:
     """Create a user-visible inbox task for a matched pane pattern.
 
@@ -944,16 +1094,24 @@ def _emit_pane_pattern_inbox_item(
         )
         return False
 
-    if state_store is not None:
+    # #349: audit event lands on the unified ``messages`` table via the
+    # Store. Falls back to the legacy StateStore when no Store is wired
+    # through (older call paths / tests).
+    if msg_store is not None:
         task_id = getattr(inbox_task, "task_id", "") or ""
         try:
-            state_store.record_event(
-                session_name,
-                "pane.classify.inbox_emitted",
-                (
-                    f"emitted inbox task {task_id} for "
-                    f"rule '{rule_name}'"
-                ),
+            msg_store.append_event(
+                scope=session_name,
+                sender=session_name,
+                subject="pane.classify.inbox_emitted",
+                payload={
+                    "message": (
+                        f"emitted inbox task {task_id} for "
+                        f"rule '{rule_name}'"
+                    ),
+                    "task_id": task_id,
+                    "rule": rule_name,
+                },
             )
         except Exception:  # noqa: BLE001
             pass
@@ -1006,11 +1164,21 @@ def db_vacuum_handler(payload: dict[str, Any]) -> dict[str, Any]:
     with _load_config_and_store(payload) as (_config, store):
         bytes_reclaimed = store.incremental_vacuum()
         mb_reclaimed = bytes_reclaimed / (1024 * 1024)
-        store.record_event(
-            session_name="system",
-            event_type="db.vacuum",
-            message=f"reclaimed {mb_reclaimed:.1f}MB",
-        )
+        # #349: audit lands on ``messages`` via the unified Store.
+        msg_store = _open_msg_store(_config)
+        try:
+            if msg_store is not None:
+                msg_store.append_event(
+                    scope="system",
+                    sender="system",
+                    subject="db.vacuum",
+                    payload={
+                        "message": f"reclaimed {mb_reclaimed:.1f}MB",
+                        "bytes_reclaimed": bytes_reclaimed,
+                    },
+                )
+        finally:
+            _close_msg_store(msg_store)
         return {"bytes_reclaimed": bytes_reclaimed, "mb_reclaimed": mb_reclaimed}
 
 
@@ -1070,18 +1238,28 @@ def events_retention_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
         # Only log when something actually happened — otherwise every
         # hourly sweep would itself become a ``high_volume`` event and
         # grow the table we're trying to shrink.
+        # #349: audit lands on ``messages`` via the unified Store.
         if result.total > 0:
-            store.record_event(
-                session_name="system",
-                event_type="events.retention_sweep",
-                message=(
-                    f"deleted {result.total} events "
-                    f"(audit={result.deleted_audit}, "
-                    f"operational={result.deleted_operational}, "
-                    f"high_volume={result.deleted_high_volume}, "
-                    f"default={result.deleted_default})"
-                ),
-            )
+            msg_store = _open_msg_store(config)
+            try:
+                if msg_store is not None:
+                    msg_store.append_event(
+                        scope="system",
+                        sender="system",
+                        subject="events.retention_sweep",
+                        payload={
+                            "message": (
+                                f"deleted {result.total} events "
+                                f"(audit={result.deleted_audit}, "
+                                f"operational={result.deleted_operational}, "
+                                f"high_volume={result.deleted_high_volume}, "
+                                f"default={result.deleted_default})"
+                            ),
+                            **counts,
+                        },
+                    )
+            finally:
+                _close_msg_store(msg_store)
 
         return counts
 
@@ -1096,11 +1274,21 @@ def memory_ttl_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """
     with _load_config_and_store(payload) as (_config, store):
         deleted = store.sweep_expired_memory_entries()
-        store.record_event(
-            session_name="system",
-            event_type="memory.ttl_sweep",
-            message=f"dropped {deleted} expired entries",
-        )
+        # #349: audit lands on ``messages`` via the unified Store.
+        msg_store = _open_msg_store(_config)
+        try:
+            if msg_store is not None:
+                msg_store.append_event(
+                    scope="system",
+                    sender="system",
+                    subject="memory.ttl_sweep",
+                    payload={
+                        "message": f"dropped {deleted} expired entries",
+                        "deleted": deleted,
+                    },
+                )
+        finally:
+            _close_msg_store(msg_store)
         return {"deleted": deleted}
 
 
@@ -1273,6 +1461,14 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
     with _load_config_and_store(payload) as (config, store):
+        # #349: writers flip onto the unified ``messages`` table via Store.
+        # ``store`` (StateStore) stays for raw ``.execute`` reads on the
+        # legacy ``alerts`` table below — those reads run in parallel with
+        # the Store-backed writes so the alert-exists check + the new
+        # upsert still observe the same table during the rollout.
+        # TODO(#342-F): once StateStore is retired, flip the read to
+        # ``msg_store.query_messages(type='alert', scope=..., sender=...)``.
+        msg_store = _open_msg_store(config)
 
         # Work service — required to list active work_sessions. Open via
         # the same path ``work.progress_sweep`` uses so we honour the
@@ -1287,6 +1483,7 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
             logger.debug(
                 "worktree.state_audit: work service unavailable", exc_info=True,
             )
+            _close_msg_store(msg_store)
             return {"outcome": "skipped", "reason": "no_work_service"}
 
         # All alert types this handler owns — used to clear stale alerts
@@ -1360,7 +1557,7 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
                         if existing is None:
                             continue
                         try:
-                            store.clear_alert(session_key, alert_type)
+                            (msg_store or store).clear_alert(session_key, alert_type)
                             alerts_cleared += 1
                         except Exception:  # noqa: BLE001
                             pass
@@ -1378,7 +1575,7 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
                         f"{agent}: merge conflict in {wt_path}{file_blurb} on task "
                         f"{task_id}. Worker is blocked until the conflict resolves."
                     )
-                    _raise_alert(store, session_key, alert_type, "error", message)
+                    _raise_alert(msg_store or store, session_key,alert_type, "error", message)
                     alerts_raised += 1
                     # Inbox — the user needs to either resolve or reassign.
                     fix_hint = (
@@ -1414,7 +1611,7 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
                         f"(task {task_id}). If no git process is running, remove "
                         f"{lock_path or '<gitdir>/index.lock'}."
                     )
-                    _raise_alert(store, session_key, alert_type, severity, message)
+                    _raise_alert(msg_store or store, session_key,alert_type, severity, message)
                     alerts_raised += 1
 
                 elif state is WorktreeState.DETACHED_HEAD:
@@ -1426,7 +1623,7 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
                         f"Fix: checkout the task branch before the worker "
                         f"can push."
                     )
-                    _raise_alert(store, session_key, alert_type, "warn", message)
+                    _raise_alert(msg_store or store, session_key,alert_type, "warn", message)
                     alerts_raised += 1
 
                 elif state is WorktreeState.DIRTY_EXPECTED:
@@ -1443,7 +1640,7 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
                             f"(task {task_id}). Fix: check in on the worker — "
                             f"likely stuck or idle."
                         )
-                        _raise_alert(store, session_key, alert_type, "warn", message)
+                        _raise_alert(msg_store or store, session_key,alert_type, "warn", message)
                         alerts_raised += 1
                     else:
                         # Fresh dirt — clear any prior stale alert.
@@ -1457,7 +1654,7 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
                             existing = None
                         if existing is not None:
                             try:
-                                store.clear_alert(session_key, alert_type)
+                                (msg_store or store).clear_alert(session_key, alert_type)
                                 alerts_cleared += 1
                             except Exception:  # noqa: BLE001
                                 pass
@@ -1472,7 +1669,7 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
                         f"Fix: push or archive the branch before the prune "
                         f"handler GCs it."
                     )
-                    _raise_alert(store, session_key, alert_type, "info", message)
+                    _raise_alert(msg_store or store, session_key,alert_type, "info", message)
                     alerts_raised += 1
                     # Low-severity inbox nudge.
                     body = (
@@ -1499,6 +1696,7 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
                     closer()
                 except Exception:  # noqa: BLE001
                     pass
+            _close_msg_store(msg_store)
 
         return {
             "outcome": "swept",
@@ -1770,14 +1968,25 @@ def notification_staging_prune_handler(payload: dict[str, Any]) -> dict[str, Any
         finally:
             conn.close()
 
-        store.record_event(
-            session_name="system",
-            event_type="notification_staging.prune",
-            message=(
-                f"pruned {summary['flushed_pruned']} flushed + "
-                f"{summary['silent_pruned']} silent rows (>{retain_days}d)"
-            ),
-        )
+        # #349: audit lands on ``messages`` via the unified Store.
+        msg_store = _open_msg_store(_config)
+        try:
+            if msg_store is not None:
+                msg_store.append_event(
+                    scope="system",
+                    sender="system",
+                    subject="notification_staging.prune",
+                    payload={
+                        "message": (
+                            f"pruned {summary['flushed_pruned']} flushed + "
+                            f"{summary['silent_pruned']} silent rows "
+                            f"(>{retain_days}d)"
+                        ),
+                        **summary,
+                    },
+                )
+        finally:
+            _close_msg_store(msg_store)
         return summary
 
 

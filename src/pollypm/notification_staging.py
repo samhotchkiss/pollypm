@@ -67,12 +67,70 @@ _DIGEST_KEYWORDS: tuple[str, ...] = (
     "merged",
     "approved",
     "completed",
+    "complete",
 )
 
 _SILENT_KEYWORDS: tuple[str, ...] = (
     "test pass",
     "audit",
     "recorded",
+)
+
+# Action-requiring phrases — when one of these co-occurs with a completion
+# keyword ("done", "shipped", "clear", etc.), the message is a
+# completion-with-implication that the user must see NOW, not in a rollup.
+# Matched as case-insensitive substrings (whitespace-normalised) against
+# the combined subject+body text.
+_ACTION_REQUIRING_PHRASES: tuple[str, ...] = (
+    "ready for testing",
+    "ready for review",
+    "ready for approval",
+    "ready for account",
+    "needs your attention",
+    "needs your review",
+    "needs your input",
+    "needs your approval",
+    "awaiting your",
+    "awaiting approval",
+    "awaiting review",
+    "safe to",
+    "time to",
+    "please verify",
+    "please review",
+    "please approve",
+    "clear — ready",
+    "clear - ready",
+    "clear, ready",
+    "done — ready",
+    "done - ready",
+    "done, ready",
+    "shipped — ready",
+    "shipped - ready",
+    "shipped, ready",
+)
+
+# Extra "completion" markers used ONLY for the action-requiring upgrade
+# path. These aren't in ``_DIGEST_KEYWORDS`` on their own (too ambiguous
+# — "clear" shows up in plenty of non-completion contexts) but when
+# paired with an action-requiring phrase they confirm the completion
+# shape so we can safely bump the whole message to immediate.
+_COMPLETION_MARKERS: tuple[str, ...] = (
+    "done",
+    "shipped",
+    "merged",
+    "approved",
+    "completed",
+    "clear",
+    "complete",
+    "finished",
+    "ready",
+    "passed",
+    # Multi-word audit/test markers — these normally classify silent,
+    # but paired with an action-requiring phrase they're completions
+    # with implication ("Test pass: please verify" → immediate).
+    "test pass",
+    "tests pass",
+    "suite pass",
 )
 
 _VALID_PRIORITIES: frozenset[str] = frozenset({"immediate", "digest", "silent"})
@@ -104,15 +162,36 @@ def _has_keyword(text: str, keywords: Iterable[str]) -> bool:
 def classify_priority(subject: str, body: str) -> str:
     """Infer notify priority from subject + body keywords.
 
-    Precedence: immediate > silent > digest > default(immediate). The
-    "silent" tier beats "digest" because audit-trail markers ("test
-    pass", "recorded") commonly coexist with outcome words ("done")
-    and the operator's intent is the quieter tier in that case.
+    Precedence:
+
+    1. **immediate** — explicit urgency keywords (blocker, question, etc.)
+    2. **immediate (action-requiring completion)** — a completion marker
+       (done, shipped, clear, ready, passed, …) co-occurring with an
+       action-requiring phrase (``ready for testing``, ``safe to``,
+       ``please verify``, …). This catches "all subagents clear —
+       ready for account switch" style updates that were previously
+       swallowed as digest.
+    3. **silent** — routine audit-trail markers (``test pass``,
+       ``audit``, ``recorded``). Skipped if action-requiring phrase
+       present so "Test pass: please verify" correctly upgrades.
+    4. **digest** — completion-only updates (``done``, ``shipped``,
+       ``merged``, …) with no action-requiring phrase.
+    5. **default: immediate** — ambiguous input over-notifies rather
+       than silently dropping.
 
     Returns one of ``'immediate'`` / ``'digest'`` / ``'silent'``.
     """
     text = f"{subject}\n{body}"
     if _has_keyword(text, _IMMEDIATE_KEYWORDS):
+        return "immediate"
+    # Action-requiring completion — a completion marker + an
+    # action-requiring phrase both present → the user has to see this
+    # now, not in a milestone rollup. Evaluated before both silent and
+    # digest so "Test pass: please verify" and "All subagents clear —
+    # ready for account switch" both land in the inbox.
+    if _has_keyword(text, _ACTION_REQUIRING_PHRASES) and _has_keyword(
+        text, _COMPLETION_MARKERS,
+    ):
         return "immediate"
     if _has_keyword(text, _SILENT_KEYWORDS):
         return "silent"

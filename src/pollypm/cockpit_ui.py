@@ -4809,6 +4809,121 @@ def _extract_h2_sections(md_text: str, *, limit: int = 12) -> list[str]:
     return out
 
 
+# Plan-viewer staleness threshold — see the task brief. 30 days of no
+# edits to ``plan.md`` (or the plan being older than any backlog task)
+# flips the UI's warning badge on.
+_PLAN_STALE_DAYS = 30
+
+
+def _dashboard_plan_aux_files(project_path: Path) -> list[Path]:
+    """Return auxiliary files under ``docs/plan/`` (excluding ``plan.md``).
+
+    Surfaces ``architecture.md``, ``risks.md``, ``milestones/*.md`` etc.
+    so the dashboard can offer one-press jumps. Only top-level entries
+    plus files one level deep in ``milestones/`` are returned — we don't
+    walk arbitrarily deep, keeping the UI list bounded.
+    """
+    plan_dir = project_path / "docs" / "plan"
+    if not plan_dir.is_dir():
+        return []
+    out: list[Path] = []
+    try:
+        for entry in sorted(plan_dir.iterdir()):
+            if entry.name == "plan.md":
+                continue
+            if entry.is_file() and entry.suffix.lower() in (".md", ".txt"):
+                out.append(entry)
+            elif entry.is_dir() and entry.name == "milestones":
+                try:
+                    for sub in sorted(entry.iterdir()):
+                        if sub.is_file() and sub.suffix.lower() in (".md", ".txt"):
+                            out.append(sub)
+                except OSError:
+                    continue
+    except OSError:
+        return []
+    # Bound the list so a runaway milestones folder doesn't drown the UI.
+    return out[:12]
+
+
+def _dashboard_plan_staleness(
+    plan_path: Path | None,
+    plan_mtime: float | None,
+    project_path: Path | None,
+    project_key: str,
+) -> str | None:
+    """Return a human-readable stale reason, or ``None`` when fresh.
+
+    Two checks — either fires:
+
+    * File mtime older than ``_PLAN_STALE_DAYS`` days.
+    * The most recent approved ``plan_project`` task's approval
+      timestamp is older than the newest non-planning (backlog) task's
+      ``created_at``. Mirrors the plan-presence gate's staleness rule
+      so the UI warning agrees with the sweeper.
+
+    Both checks fail-open (return None) on any SQLite or datetime
+    parse error — the warning is informational, not load-bearing.
+    """
+    if plan_path is None:
+        return None
+    from datetime import datetime as _dt, timezone as _tz
+
+    now = _dt.now(_tz.utc).timestamp()
+    if plan_mtime is not None:
+        age_days = (now - plan_mtime) / 86400.0
+        if age_days > _PLAN_STALE_DAYS:
+            return f"plan.md last touched {int(age_days)} days ago"
+
+    if project_path is None:
+        return None
+    db_path = project_path / ".pollypm" / "state.db"
+    if not db_path.exists():
+        return None
+    try:
+        from pollypm.plugins_builtin.project_planning.plan_presence import (
+            _find_approved_plan_task,
+            _plan_approved_at,
+        )
+        from pollypm.work.sqlite_service import SQLiteWorkService
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        with SQLiteWorkService(
+            db_path=db_path, project_path=project_path,
+        ) as svc:
+            plan_task = _find_approved_plan_task(svc, project_key)
+            if plan_task is None:
+                return None
+            approved_at = _plan_approved_at(svc, plan_task)
+            if approved_at is None:
+                return None
+            # Find latest non-planning task's created_at.
+            tasks = svc.list_tasks(project=project_key)
+            latest_backlog: float | None = None
+            for t in tasks:
+                flow = getattr(t, "flow_template_id", "") or ""
+                if flow in ("plan_project", "critique_flow"):
+                    continue
+                created = getattr(t, "created_at", None)
+                if created is None:
+                    continue
+                try:
+                    if hasattr(created, "timestamp"):
+                        ts = created.timestamp()
+                    else:
+                        ts = _dt.fromisoformat(str(created)).timestamp()
+                except (ValueError, TypeError):
+                    continue
+                if latest_backlog is None or ts > latest_backlog:
+                    latest_backlog = ts
+            if latest_backlog is not None and approved_at < latest_backlog:
+                return "plan approved before latest backlog task"
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 def _format_relative_age(value) -> str:
     """Relative-age formatting that tolerates missing / malformed inputs.
 
@@ -4876,6 +4991,10 @@ class ProjectDashboardData:
         "plan_path",
         "plan_sections",
         "plan_explainer",
+        "plan_text",
+        "plan_aux_files",
+        "plan_mtime",
+        "plan_stale_reason",
         "activity_entries",
         "inbox_count",
         "inbox_top",
@@ -4901,6 +5020,10 @@ class ProjectDashboardData:
         plan_path: Path | None,
         plan_sections: list[str],
         plan_explainer: Path | None,
+        plan_text: str | None,
+        plan_aux_files: list[Path],
+        plan_mtime: float | None,
+        plan_stale_reason: str | None,
         activity_entries: list[dict],
         inbox_count: int,
         inbox_top: list[dict],
@@ -4922,6 +5045,10 @@ class ProjectDashboardData:
         self.plan_path = plan_path
         self.plan_sections = plan_sections
         self.plan_explainer = plan_explainer
+        self.plan_text = plan_text
+        self.plan_aux_files = plan_aux_files
+        self.plan_mtime = plan_mtime
+        self.plan_stale_reason = plan_stale_reason
         self.activity_entries = activity_entries
         self.inbox_count = inbox_count
         self.inbox_top = inbox_top
@@ -5173,16 +5300,26 @@ def _gather_project_dashboard(
             config_path, project_key, project_path,
         )
         plan_path = _dashboard_plan_path(project_path)
+        plan_text: str | None = None
+        plan_mtime: float | None = None
         if plan_path is not None:
             try:
-                plan_sections = _extract_h2_sections(
-                    plan_path.read_text(encoding="utf-8"),
-                )
+                plan_text = plan_path.read_text(encoding="utf-8")
+                plan_sections = _extract_h2_sections(plan_text)
             except OSError:
                 plan_sections = []
+                plan_text = None
+            try:
+                plan_mtime = plan_path.stat().st_mtime
+            except OSError:
+                plan_mtime = None
         else:
             plan_sections = []
         plan_explainer = _dashboard_plan_explainer(project_path, project_key)
+        plan_aux_files = _dashboard_plan_aux_files(project_path)
+        plan_stale_reason = _dashboard_plan_staleness(
+            plan_path, plan_mtime, project_path, project_key,
+        )
         activity_entries = _dashboard_activity(config_path, project_key)
     else:
         counts = {}
@@ -5192,6 +5329,10 @@ def _gather_project_dashboard(
         plan_path = None
         plan_sections = []
         plan_explainer = None
+        plan_text = None
+        plan_aux_files = []
+        plan_mtime = None
+        plan_stale_reason = None
         activity_entries = []
 
     active_worker, alert_count = _dashboard_active_worker(
@@ -5219,6 +5360,10 @@ def _gather_project_dashboard(
         plan_path=plan_path,
         plan_sections=plan_sections,
         plan_explainer=plan_explainer,
+        plan_text=plan_text,
+        plan_aux_files=plan_aux_files,
+        plan_mtime=plan_mtime,
+        plan_stale_reason=plan_stale_reason,
         activity_entries=activity_entries,
         inbox_count=inbox_count,
         inbox_top=inbox_top,
@@ -5280,6 +5425,28 @@ class PollyProjectDashboardApp(App[None]):
     .proj-empty {
         color: #6b7a88;
     }
+    #proj-plan-scroll {
+        height: auto;
+        max-height: 30;
+        background: #0c1116;
+        padding: 0 1 0 1;
+        scrollbar-size: 1 1;
+        scrollbar-color: #2a3340;
+    }
+    #proj-plan-scroll.-plan-focus {
+        max-height: 100vh;
+        height: 1fr;
+    }
+    #proj-plan-content {
+        color: #d6dee5;
+    }
+    #proj-plan-stale {
+        color: #6b7a88;
+        padding-top: 0;
+    }
+    .proj-section.-hidden {
+        display: none;
+    }
     #proj-hint {
         height: 1;
         padding: 0 2;
@@ -5293,12 +5460,22 @@ class PollyProjectDashboardApp(App[None]):
         Binding("p", "open_plan", "Plan"),
         Binding("i", "jump_inbox", "Inbox"),
         Binding("l", "jump_activity", "Log"),
+        Binding("v", "open_explainer", "Explainer", show=False),
+        Binding("o", "open_editor", "Editor", show=False),
+        Binding("j", "plan_scroll_down", "Scroll down", show=False),
+        Binding("k", "plan_scroll_up", "Scroll up", show=False),
+        Binding("g", "plan_scroll_top", "Top", show=False),
+        Binding("G", "plan_scroll_bottom", "Bottom", show=False),
         Binding("u,r", "refresh", "Refresh", show=False),
         Binding("q,escape", "back", "Back"),
     ]
 
     _DEFAULT_HINT = (
         "c chat \u00b7 p plan \u00b7 i inbox \u00b7 l log \u00b7 q back"
+    )
+    _PLAN_VIEW_HINT = (
+        "j/k scroll \u00b7 g/G top/bottom \u00b7 v explainer "
+        "\u00b7 o editor \u00b7 p back \u00b7 q exit"
     )
 
     def __init__(self, config_path: Path, project_key: str) -> None:
@@ -5329,6 +5506,15 @@ class PollyProjectDashboardApp(App[None]):
         self.plan_body = Static(
             "", classes="proj-section-body", markup=True,
         )
+        self.plan_stale = Static(
+            "", id="proj-plan-stale", markup=True,
+        )
+        self.plan_content = Static(
+            "", id="proj-plan-content", markup=True,
+        )
+        self.plan_scroll = VerticalScroll(
+            self.plan_content, id="proj-plan-scroll",
+        )
         self.activity_title = Static(
             "[b]Recent activity[/b]",
             classes="proj-section-title",
@@ -5347,6 +5533,9 @@ class PollyProjectDashboardApp(App[None]):
             self._DEFAULT_HINT, id="proj-hint", markup=True,
         )
         self.data: ProjectDashboardData | None = None
+        # When True, the plan section takes over the whole body — other
+        # sections are hidden via the ``proj-plan-focus`` screen class.
+        self._plan_view_mode: bool = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -5357,19 +5546,21 @@ class PollyProjectDashboardApp(App[None]):
             yield self.topbar
             yield self.status_line
             with VerticalScroll(id="proj-body"):
-                with Vertical(classes="proj-section"):
+                with Vertical(classes="proj-section", id="proj-now-section"):
                     yield self.now_title
                     yield self.now_body
-                with Vertical(classes="proj-section"):
+                with Vertical(classes="proj-section", id="proj-pipeline-section"):
                     yield self.pipeline_title
                     yield self.pipeline_body
-                with Vertical(classes="proj-section"):
+                with Vertical(classes="proj-section", id="proj-plan-section"):
                     yield self.plan_title
                     yield self.plan_body
-                with Vertical(classes="proj-section"):
+                    yield self.plan_stale
+                    yield self.plan_scroll
+                with Vertical(classes="proj-section", id="proj-activity-section"):
                     yield self.activity_title
                     yield self.activity_body
-                with Vertical(classes="proj-section"):
+                with Vertical(classes="proj-section", id="proj-inbox-section"):
                     yield self.inbox_title
                     yield self.inbox_body
         yield self.hint
@@ -5422,6 +5613,8 @@ class PollyProjectDashboardApp(App[None]):
 
         # ── Plan summary ──
         self.plan_body.update(self._render_plan_body(data))
+        self.plan_stale.update(self._render_plan_stale(data))
+        self.plan_content.update(self._render_plan_content(data))
 
         # ── Recent activity ──
         self.activity_body.update(self._render_activity_body(data))
@@ -5526,10 +5719,41 @@ class PollyProjectDashboardApp(App[None]):
                 lines.append(f"  \u25aa {_escape(title)}")
         else:
             lines.append("  [dim](no H2 sections found)[/dim]")
+        if data.plan_aux_files:
+            lines.append("")
+            lines.append("[dim]Also in docs/plan/:[/dim]")
+            for aux in data.plan_aux_files:
+                try:
+                    aux_rel = str(aux.relative_to(data.project_path))
+                except (ValueError, TypeError):
+                    aux_rel = aux.name
+                lines.append(f"  \u00b7 {_escape(aux_rel)}")
         if data.plan_explainer is not None:
             lines.append("")
             lines.append("[dim]Press [b]v[/b] to open the visual explainer[/dim]")
         return "\n".join(lines)
+
+    def _render_plan_stale(self, data: ProjectDashboardData) -> str:
+        """Return the staleness warning line, or empty string when fresh."""
+        if data.plan_stale_reason:
+            return f"[dim]\u26a0 plan may be stale \u2014 {_escape(data.plan_stale_reason)}[/dim]"
+        return ""
+
+    def _render_plan_content(self, data: ProjectDashboardData) -> str:
+        """Render ``plan.md`` inline via the existing ``_md_to_rich`` helper.
+
+        Returns an empty string when there's no plan — the VerticalScroll
+        container is still present but renders nothing, so the plan
+        section simply stays compact.
+        """
+        text = data.plan_text
+        if not text:
+            return ""
+        try:
+            return _md_to_rich(_escape_body(text))
+        except Exception:  # noqa: BLE001
+            # Defensive — never let a malformed plan crash the dashboard.
+            return _escape_body(text)
 
     def _render_activity_body(self, data: ProjectDashboardData) -> str:
         if not data.activity_entries:
@@ -5681,11 +5905,10 @@ class PollyProjectDashboardApp(App[None]):
         router.route_selected("tools:activity")
 
     def action_open_plan(self) -> None:
-        """Surface the plan file path + section list inline (no shell out).
+        """Toggle plan-view mode — plan.md takes over the body.
 
-        The body is already rendered in the plan section — pressing ``p``
-        scrolls the body into focus and flashes a hint so Sam knows
-        where to look. When no plan exists, friendly notify.
+        When no plan exists, friendly-notify instead of flipping a mode
+        with nothing to show.
         """
         data = self.data
         if data is None or data.plan_path is None:
@@ -5694,16 +5917,135 @@ class PollyProjectDashboardApp(App[None]):
                 severity="warning", timeout=2.0,
             )
             return
-        # Scroll the plan section into view (best-effort).
+        self._plan_view_mode = not self._plan_view_mode
+        other_section_ids = (
+            "#proj-now-section",
+            "#proj-pipeline-section",
+            "#proj-activity-section",
+            "#proj-inbox-section",
+        )
         try:
-            self.plan_title.scroll_visible()
+            if self._plan_view_mode:
+                for sid in other_section_ids:
+                    try:
+                        self.query_one(sid).add_class("-hidden")
+                    except Exception:  # noqa: BLE001
+                        pass
+                try:
+                    self.plan_scroll.add_class("-plan-focus")
+                except Exception:  # noqa: BLE001
+                    pass
+                self.hint.update(self._PLAN_VIEW_HINT)
+                # Scroll the plan content to the top so every toggle
+                # starts from a predictable position.
+                try:
+                    self.plan_scroll.scroll_home(animate=False)
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                for sid in other_section_ids:
+                    try:
+                        self.query_one(sid).remove_class("-hidden")
+                    except Exception:  # noqa: BLE001
+                        pass
+                try:
+                    self.plan_scroll.remove_class("-plan-focus")
+                except Exception:  # noqa: BLE001
+                    pass
+                self.hint.update(self._DEFAULT_HINT)
         except Exception:  # noqa: BLE001
             pass
+
+    def action_open_explainer(self) -> None:
+        """Open the plan-review HTML explainer in the system browser.
+
+        No-op with a friendly notify when the explainer artifact is
+        absent — shipping ``v`` is cheap even without an explainer on
+        disk because we just warn and move on.
+        """
+        data = self.data
+        if data is None or data.plan_explainer is None:
+            self.notify(
+                "No plan-review explainer found (reports/plan-review.html).",
+                severity="warning", timeout=2.0,
+            )
+            return
+        try:
+            self._open_external(data.plan_explainer)
+        except Exception as exc:  # noqa: BLE001
+            self.notify(
+                f"Open failed: {exc}", severity="error", timeout=3.0,
+            )
+            return
         self.notify(
-            f"Plan: {data.plan_path}",
-            severity="information",
-            timeout=3.0,
+            f"Opened {data.plan_explainer.name}",
+            severity="information", timeout=2.0,
         )
+
+    def action_open_editor(self) -> None:
+        """Open ``plan.md`` in the user's preferred viewer (``open`` on mac).
+
+        Best-effort — on platforms where ``open``/``xdg-open`` is absent
+        we notify instead of crashing the dashboard.
+        """
+        data = self.data
+        if data is None or data.plan_path is None:
+            self.notify(
+                "No plan file to open.",
+                severity="warning", timeout=2.0,
+            )
+            return
+        try:
+            self._open_external(data.plan_path)
+        except Exception as exc:  # noqa: BLE001
+            self.notify(
+                f"Open failed: {exc}", severity="error", timeout=3.0,
+            )
+            return
+        self.notify(
+            f"Opened {data.plan_path.name}",
+            severity="information", timeout=2.0,
+        )
+
+    def _open_external(self, path: Path) -> None:
+        """Shell out to the platform opener. Test seam — monkeypatch this."""
+        import platform
+        cmd = "open" if platform.system() == "Darwin" else "xdg-open"
+        subprocess.run([cmd, str(path)], check=False)
+
+    # ── Plan-view scroll helpers (active when ``_plan_view_mode`` is on) ──
+
+    def action_plan_scroll_down(self) -> None:
+        if not self._plan_view_mode:
+            return
+        try:
+            self.plan_scroll.scroll_down(animate=False)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def action_plan_scroll_up(self) -> None:
+        if not self._plan_view_mode:
+            return
+        try:
+            self.plan_scroll.scroll_up(animate=False)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def action_plan_scroll_top(self) -> None:
+        if not self._plan_view_mode:
+            return
+        try:
+            self.plan_scroll.scroll_home(animate=False)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def action_plan_scroll_bottom(self) -> None:
+        if not self._plan_view_mode:
+            return
+        try:
+            self.plan_scroll.scroll_end(animate=False)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ---------------------------------------------------------------------------

@@ -51,6 +51,11 @@ name = "agent_worktree.prune"
 requires_api = ">=1,<2"
 
 [[capabilities]]
+kind = "job_handler"
+name = "log.rotate"
+requires_api = ">=1,<2"
+
+[[capabilities]]
 kind = "roster_entry"
 name = "core_recurring"
 requires_api = ">=1,<2"

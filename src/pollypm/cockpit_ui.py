@@ -1525,327 +1525,1213 @@ class PollyTasksApp(App[None]):
             svc.close()
 
 
+# ---------------------------------------------------------------------------
+# Settings — interactive Textual screen (rebuild)
+# ---------------------------------------------------------------------------
+
+_SETTINGS_SECTIONS: tuple[tuple[str, str], ...] = (
+    ("accounts", "Accounts"),
+    ("projects", "Projects"),
+    ("heartbeat", "Heartbeat & Recovery"),
+    ("plugins", "Plugins"),
+    ("planner", "Planner"),
+    ("inbox", "Inbox & Notifications"),
+    ("about", "About"),
+)
+
+
+def _settings_status_dot(health: str, logged_in: bool) -> tuple[str, str]:
+    if not logged_in:
+        return ("\u25cf", "#ff5f6d")
+    h = (health or "").lower()
+    if h in ("capacity-exhausted", "auth-broken", "signed-out"):
+        return ("\u25cf", "#ff5f6d")
+    if h in ("capacity-low", "warning", "degraded"):
+        return ("\u25cf", "#f0c45a")
+    if h == "healthy":
+        return ("\u25cf", "#3ddc84")
+    return ("\u25cf", "#6b7a88")
+
+
+def _settings_dir_size(path: Path) -> int:
+    total = 0
+    try:
+        for p in path.rglob("*"):
+            try:
+                if p.is_file():
+                    total += p.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    return total
+
+
+def _humanize_bytes(n: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(n)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{n} B"
+
+
+class SettingsData:
+    """Snapshot of everything the settings screen renders — gathered once."""
+
+    __slots__ = (
+        "accounts",
+        "projects",
+        "heartbeat",
+        "plugins",
+        "planner",
+        "inbox",
+        "about",
+        "errors",
+    )
+
+    def __init__(
+        self,
+        *,
+        accounts: list[dict],
+        projects: list[dict],
+        heartbeat: list[tuple[str, str]],
+        plugins: list[dict],
+        planner: list[tuple[str, str]],
+        inbox: list[tuple[str, str]],
+        about: list[tuple[str, str]],
+        errors: list[str],
+    ) -> None:
+        self.accounts = accounts
+        self.projects = projects
+        self.heartbeat = heartbeat
+        self.plugins = plugins
+        self.planner = planner
+        self.inbox = inbox
+        self.about = about
+        self.errors = errors
+
+
+def _gather_settings_data(
+    config_path: Path,
+    *,
+    service: PollyPMService | None = None,
+    account_statuses: list | None = None,
+) -> SettingsData:
+    """Build a :class:`SettingsData` snapshot in a single pass.
+
+    All fields are loaded once so the cockpit settings pane can render
+    instantly without firing per-tick subprocesses (the source of the
+    legacy lag). ``service`` and ``account_statuses`` are injection
+    hooks for tests.
+    """
+    errors: list[str] = []
+    try:
+        config = load_config(config_path)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"Config load failed: {exc}")
+        config = None
+
+    accounts: list[dict] = []
+    if account_statuses is None:
+        if service is None:
+            service = PollyPMService(config_path)
+        try:
+            account_statuses = list(service.list_account_statuses())
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"Accounts unavailable: {exc}")
+            account_statuses = []
+    pp = getattr(config, "pollypm", None) if config is not None else None
+    ctrl = getattr(pp, "controller_account", "") if pp is not None else ""
+    fo_list = (
+        list(getattr(pp, "failover_accounts", []) or [])
+        if pp is not None else []
+    )
+    for idx, status in enumerate(account_statuses):
+        provider = getattr(status, "provider", None)
+        provider_name = (
+            getattr(provider, "value", "") if provider is not None else ""
+        )
+        home = getattr(status, "home", None)
+        failover_pos = (
+            (fo_list.index(status.key) + 1) if status.key in fo_list else None
+        )
+        accounts.append(
+            {
+                "key": status.key,
+                "email": getattr(status, "email", "") or "-",
+                "provider": provider_name,
+                "home": str(home) if home else "",
+                "is_controller": status.key == ctrl,
+                "failover_pos": failover_pos,
+                "logged_in": bool(getattr(status, "logged_in", False)),
+                "health": getattr(status, "health", "") or "",
+                "plan": getattr(status, "plan", "") or "",
+                "usage_summary": getattr(status, "usage_summary", "") or "",
+                "usage_raw_text": getattr(status, "usage_raw_text", "") or "",
+                "reason": getattr(status, "reason", "") or "",
+                "available_at": getattr(status, "available_at", "") or "",
+                "access_expires_at": getattr(status, "access_expires_at", "") or "",
+                "isolation_status": getattr(status, "isolation_status", "") or "",
+                "auth_storage": getattr(status, "auth_storage", "") or "",
+                "status_obj": status,
+                "index": idx,
+            }
+        )
+
+    projects: list[dict] = []
+    if config is not None:
+        from datetime import datetime as _dt
+        for key, project in (getattr(config, "projects", {}) or {}).items():
+            path = getattr(project, "path", None)
+            persona = getattr(project, "persona_name", None)
+            path_str = str(path) if path else ""
+            tracked = bool(getattr(project, "tracked", False))
+            path_exists = False
+            task_total = 0
+            last_activity = ""
+            try:
+                if path is not None and path.exists():
+                    path_exists = True
+                    db_path = path / ".pollypm" / "state.db"
+                    if db_path.exists():
+                        try:
+                            mtime = db_path.stat().st_mtime
+                            last_activity = _format_relative_age(
+                                _dt.fromtimestamp(mtime).isoformat()
+                            )
+                        except OSError:
+                            last_activity = ""
+                        try:
+                            from pollypm.work.sqlite_service import SQLiteWorkService
+                            with SQLiteWorkService(
+                                db_path=db_path, project_path=path,
+                            ) as svc:
+                                counts = svc.state_counts(project=key)
+                                task_total = sum(counts.values())
+                        except Exception:  # noqa: BLE001
+                            task_total = 0
+            except OSError:
+                path_exists = False
+            projects.append(
+                {
+                    "key": key,
+                    "name": getattr(project, "name", None) or key,
+                    "persona": (
+                        persona
+                        if isinstance(persona, str) and persona.strip()
+                        else "Polly"
+                    ),
+                    "path": path_str,
+                    "path_exists": path_exists,
+                    "tracked": tracked,
+                    "task_total": task_total,
+                    "last_activity": last_activity,
+                    "project_obj": project,
+                }
+            )
+
+    heartbeat: list[tuple[str, str]] = []
+    if pp is not None:
+        failover_accounts = getattr(pp, "failover_accounts", []) or []
+        heartbeat = [
+            ("Controller account", getattr(pp, "controller_account", "") or "-"),
+            ("Failover enabled", "yes" if getattr(pp, "failover_enabled", False) else "no"),
+            (
+                "Failover order",
+                ", ".join(failover_accounts) if failover_accounts else "none",
+            ),
+            ("Lease timeout", f"{getattr(pp, 'lease_timeout_minutes', 30)} min"),
+            ("Heartbeat backend", getattr(pp, "heartbeat_backend", "") or "-"),
+            ("Scheduler backend", getattr(pp, "scheduler_backend", "") or "-"),
+            (
+                "Open permissions",
+                "on" if getattr(pp, "open_permissions_by_default", False) else "off",
+            ),
+            ("Timezone", getattr(pp, "timezone", "") or "(auto-detect)"),
+        ]
+
+    plugins: list[dict] = []
+    try:
+        from pollypm.plugin_host import ExtensionHost
+        host = ExtensionHost(
+            config_path.parent,
+            disabled=tuple(
+                getattr(getattr(config, "plugins", None), "disabled", ()) or ()
+            ),
+        )
+        loaded = host.plugins()
+        degraded = host.degraded_plugins
+        for name, plugin in sorted(loaded.items()):
+            source = host.plugin_source(name) or "-"
+            status = "degraded" if name in degraded else "loaded"
+            plugins.append(
+                {
+                    "name": name,
+                    "version": getattr(plugin, "version", ""),
+                    "description": getattr(plugin, "description", "") or "",
+                    "source": source,
+                    "status": status,
+                    "degraded_reason": degraded.get(name, ""),
+                }
+            )
+        for name, record in sorted(host.disabled_plugins.items()):
+            plugins.append(
+                {
+                    "name": name,
+                    "version": "",
+                    "description": "",
+                    "source": getattr(record, "source", "-") or "-",
+                    "status": "disabled",
+                    "degraded_reason": getattr(record, "reason", "") or "",
+                }
+            )
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"Plugin host unavailable: {exc}")
+
+    planner: list[tuple[str, str]] = []
+    pl = getattr(config, "planner", None) if config is not None else None
+    if pl is not None:
+        planner = [
+            (
+                "Auto-fire on project created",
+                "yes" if getattr(pl, "auto_on_project_created", False) else "no",
+            ),
+            ("Enforce plan gate", "yes" if getattr(pl, "enforce_plan", False) else "no"),
+            ("Plan directory", getattr(pl, "plan_dir", "") or "docs/plan"),
+        ]
+
+    inbox_section: list[tuple[str, str]] = []
+    project_settings = (
+        getattr(config, "project", None) if config is not None else None
+    )
+    if project_settings is not None:
+        ws = getattr(project_settings, "workspace_root", None)
+        if ws is not None:
+            inbox_section.append(("Workspace root", str(ws)))
+        sdb = getattr(project_settings, "state_db", None)
+        if sdb is not None:
+            inbox_section.append(("Global state DB", str(sdb)))
+        logs = getattr(project_settings, "logs_dir", None)
+        if logs is not None:
+            inbox_section.append(("Logs directory", str(logs)))
+
+    about_section: list[tuple[str, str]] = []
+    try:
+        from pollypm import __version__ as _pp_version
+    except Exception:  # noqa: BLE001
+        _pp_version = "unknown"
+    import sys as _sys
+    about_section.append(("PollyPM version", _pp_version))
+    about_section.append(("Python", _sys.version.split()[0]))
+    about_section.append(("Config path", str(config_path)))
+    if project_settings is not None:
+        sdb = getattr(project_settings, "state_db", None)
+        if sdb is not None:
+            about_section.append(("State DB", str(sdb)))
+    pollypm_dir = config_path.parent
+    disk = _settings_dir_size(pollypm_dir) if pollypm_dir.exists() else 0
+    about_section.append(
+        (f"Disk usage ({pollypm_dir.name}/)", _humanize_bytes(disk))
+    )
+
+    return SettingsData(
+        accounts=accounts,
+        projects=projects,
+        heartbeat=heartbeat,
+        plugins=plugins,
+        planner=planner,
+        inbox=inbox_section,
+        about=about_section,
+        errors=errors,
+    )
+
+
 class PollySettingsPaneApp(App[None]):
+    """Interactive settings cockpit — fast, sections-based, searchable.
+
+    Layout:
+      * Top: status line (controller / permissions / counts).
+      * Left: section nav.
+      * Right: a DataTable for rowed sections (accounts, projects,
+        plugins) or a key/value Static for configuration sections.
+        Detail Static under the table shows the selected row's full
+        metadata.
+      * Bottom: search input (hidden until ``/``) + keybind hint.
+
+    Backwards compatibility: ``self.accounts`` is still the DataTable
+    of accounts; ``self.detail`` is the per-account info Static; ``b``
+    still toggles permissions; ``self.service`` stays swappable. The
+    legacy ``test_settings_pane_renders_accounts_and_toggles_permissions``
+    regression test continues to pass.
+    """
+
     TITLE = "PollyPM"
     SUB_TITLE = "Settings"
+
     CSS = """
     Screen {
-        background: #0c0f12;
-        color: #eef2f4;
-        padding: 1;
-        layout: vertical;
-    }
-    #status {
-        height: 1;
-        color: #a8b8c4;
-        background: #111820;
-        padding: 0 1;
-    }
-    #message {
-        height: 1;
-        color: #7ee8a4;
-        background: #111820;
-        padding: 0 1;
-    }
-    #actions {
-        height: auto;
-        padding: 1 0;
-    }
-    #actions Button {
-        margin-right: 1;
-        min-width: 10;
-    }
-    #layout {
-        height: 1fr;
-    }
-    #accounts {
-        width: 58;
-        min-width: 42;
-        height: 1fr;
-        border: round #1a2230;
         background: #0f1317;
+        color: #eef2f4;
+        padding: 0;
     }
-    #detail-pane {
+    #settings-outer {
         height: 1fr;
-        border: round #1a2230;
+        padding: 1 2 0 2;
+    }
+    #settings-topbar {
+        height: 1;
+        color: #97a6b2;
+        padding: 0 0 1 0;
+    }
+    #settings-body {
+        height: 1fr;
+    }
+    #settings-nav {
+        width: 28;
+        min-width: 22;
+        height: 1fr;
+        background: #111820;
+        border: round #1e2730;
+        padding: 1 1;
+        margin-right: 1;
+    }
+    #settings-nav > .nav-item {
+        height: 1;
+        padding: 0 1;
+        color: #b8c4cf;
+    }
+    #settings-nav > .nav-item.-selected {
+        background: #1e2730;
+        color: #eef2f4;
+        text-style: bold;
+    }
+    #settings-nav > .nav-item.-section-active {
+        background: #253140;
+        color: #f2f6f8;
+    }
+    #settings-right {
+        height: 1fr;
+        border: round #1e2730;
         background: #0f1317;
         padding: 1 2;
     }
-    .section-title {
+    #settings-section-title {
         color: #5b8aff;
         text-style: bold;
         padding-bottom: 1;
+        height: 1;
+    }
+    #settings-table-wrap {
+        height: 1fr;
+    }
+    #accounts, #projects-table, #plugins-table {
+        height: 1fr;
+        background: #0f1317;
     }
     #detail {
-        height: 1fr;
+        height: auto;
         color: #b8c4cf;
+        padding-top: 1;
     }
-    #help {
-        height: 2;
+    #settings-kv {
+        height: 1fr;
+        color: #d6dee5;
+    }
+    #settings-search {
+        height: 3;
+        padding: 0 1;
+        margin-top: 1;
+        background: #111820;
+        border: round #2a3340;
+        color: #d6dee5;
+        display: none;
+    }
+    #settings-search.-active {
+        display: block;
+    }
+    #settings-search:focus {
+        border: round #5b8aff;
+    }
+    #settings-hint {
+        height: 1;
+        padding: 0 2;
         color: #3e4c5a;
         background: #0c0f12;
-        padding-top: 1;
     }
     """
 
     BINDINGS = [
-        Binding("r", "relogin_selected", "Relogin"),
-        Binding("y", "refresh_usage", "Usage"),
-        Binding("j", "switch_operator", "Operator"),
-        Binding("m", "make_controller", "Controller"),
-        Binding("v", "toggle_failover", "Failover"),
+        Binding("j,down", "nav_down", "Down", show=False),
+        Binding("k,up", "nav_up", "Up", show=False),
+        Binding("tab", "section_next", "Next section", show=False, priority=True),
+        Binding("shift+tab", "section_prev", "Prev section", show=False, priority=True),
+        Binding("]", "section_next", "Next section", show=False),
+        Binding("[", "section_prev", "Prev section", show=False),
+        Binding("enter", "activate_row", "Open", show=False),
+        Binding("slash", "start_search", "Search", show=False),
+        Binding("r,u", "refresh", "Refresh"),
         Binding("b", "toggle_permissions", "Permissions"),
-        Binding("c", "add_codex", "Add Codex"),
-        Binding("l", "add_claude", "Add Claude"),
-        Binding("d", "remove_selected", "Remove"),
-        Binding("u", "refresh", "Refresh"),
+        Binding("t", "toggle_project_tracked", "Toggle project", show=False),
+        Binding("m", "make_controller", "Controller", show=False),
+        Binding("v", "toggle_failover", "Failover", show=False),
+        Binding("q,escape", "back_or_cancel", "Back"),
     ]
+
+    _DEFAULT_HINT = (
+        "j/k move \u00b7 Tab section \u00b7 / search \u00b7 R refresh \u00b7 "
+        "b permissions \u00b7 t toggle project \u00b7 q back"
+    )
 
     def __init__(self, config_path: Path) -> None:
         super().__init__()
         self.config_path = config_path
         self.service = PollyPMService(config_path)
-        self.status_bar = Static("", id="status")
-        self.message_bar = Static("", id="message")
-        self.accounts = DataTable(id="accounts")
-        self.detail = Static("", id="detail")
-        self.help = Static(
-            "C add Codex · L add Claude · Y usage · R relogin · D remove · J operator · M controller · V failover · B permissions · U refresh",
-            id="help",
+        # Widgets
+        self.topbar = Static("", id="settings-topbar", markup=True)
+        self.nav = Vertical(id="settings-nav")
+        self.section_title = Static(
+            "", id="settings-section-title", markup=True,
         )
+        self.accounts = DataTable(id="accounts")  # backwards-compat name
+        self.projects_table = DataTable(id="projects-table")
+        self.plugins_table = DataTable(id="plugins-table")
+        self.kv_static = Static("", id="settings-kv", markup=True)
+        self.detail = Static("", id="detail", markup=True)
+        self.search_input = Input(
+            placeholder="Filter \u2026 (Enter to apply, Esc to clear)",
+            id="settings-search",
+        )
+        self.hint = Static(self._DEFAULT_HINT, id="settings-hint", markup=True)
+        # State
+        self.data: SettingsData | None = None
+        self._active_section: str = _SETTINGS_SECTIONS[0][0]
+        self._search_query: str = ""
+        self._nav_widgets: dict[str, Static] = {}
         self._selected_account_key: str | None = None
+        self._selected_project_key: str | None = None
+        self._nav_cursor: int = 0
+        self._focus_target: str = "nav"  # nav | table
+
+    # ------------------------------------------------------------------
+    # Layout
+    # ------------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        yield self.status_bar
-        yield self.message_bar
-        with Horizontal(id="actions"):
-            yield Button("Add Codex", id="add-codex")
-            yield Button("Add Claude", id="add-claude")
-            yield Button("Usage", id="usage")
-            yield Button("Relogin", id="relogin")
-            yield Button("Operator", id="operator")
-            yield Button("Controller", id="controller")
-            yield Button("Failover", id="failover")
-            yield Button("Permissions", id="permissions")
-            yield Button("Remove", id="remove", variant="error")
-            yield Button("Refresh", id="refresh")
-        with Horizontal(id="layout"):
-            yield self.accounts
-            with Vertical(id="detail-pane"):
-                yield Static("Settings", classes="section-title")
-                yield self.detail
-        yield self.help
+        with Vertical(id="settings-outer"):
+            yield self.topbar
+            with Horizontal(id="settings-body"):
+                yield self.nav
+                with Vertical(id="settings-right"):
+                    yield self.section_title
+                    with Vertical(id="settings-table-wrap"):
+                        yield self.accounts
+                        yield self.projects_table
+                        yield self.plugins_table
+                        yield self.kv_static
+                    yield self.detail
+                    yield self.search_input
+        yield self.hint
 
     def on_mount(self) -> None:
+        # Prepare DataTables once — add_columns fails if called twice.
         self.accounts.cursor_type = "row"
         self.accounts.zebra_stripes = True
-        self.accounts.add_columns("Key", "Email", "Provider", "Login", "Ctrl", "FO", "Usage")
-        self._refresh()
-        self.set_interval(8, self._refresh)
-        self.accounts.focus()
+        self.accounts.add_columns(
+            "", "Key", "Email", "Provider", "Ctrl", "FO", "Usage",
+        )
+        self.projects_table.cursor_type = "row"
+        self.projects_table.zebra_stripes = True
+        self.projects_table.add_columns(
+            "", "Key", "Name", "PM", "Path", "Tasks", "Last activity",
+        )
+        self.plugins_table.cursor_type = "row"
+        self.plugins_table.zebra_stripes = True
+        self.plugins_table.add_columns(
+            "Name", "Version", "Source", "Status",
+        )
 
-    def _notify(self, message: str) -> None:
-        self.message_bar.update(message)
+        for key, label in _SETTINGS_SECTIONS:
+            item = Static(
+                self._nav_label(key, label, count=None),
+                classes="nav-item",
+                markup=True,
+            )
+            self._nav_widgets[key] = item
+            self.nav.mount(item)
+
+        self._refresh()
+        self._show_section(self._active_section)
+
+    # ------------------------------------------------------------------
+    # Data refresh
+    # ------------------------------------------------------------------
 
     def _refresh(self) -> None:
         try:
-            config = load_config(self.config_path)
-            statuses = self.service.list_account_statuses()
-        except Exception:  # noqa: BLE001
-            return  # Don't crash the TUI on transient errors
-        selected = self._selected_account_key or self._current_selected_key()
-        rows: list[tuple[tuple[str, ...], str]] = []
-        for status in statuses:
-            rows.append(
-                (
-                    (
-                        status.key,
-                        status.email or "-",
-                        status.provider.value,
-                        "yes" if status.logged_in else "no",
-                        "yes" if config.pollypm.controller_account == status.key else "",
-                        "yes" if status.key in config.pollypm.failover_accounts else "",
-                        status.usage_summary,
-                    ),
-                    status.key,
-                )
+            self.data = _gather_settings_data(
+                self.config_path, service=self.service,
             )
-        self._replace_rows(rows, selected)
-        current_key = self._current_selected_key()
-        self._selected_account_key = current_key
-        controller = config.pollypm.controller_account
-        self.status_bar.update(
-            f"Controller: {controller} · Open permissions: {'on' if config.pollypm.open_permissions_by_default else 'off'} · Accounts: {len(statuses)}"
-        )
-        self._refresh_detail(statuses, config)
-
-    def _replace_rows(self, rows: list[tuple[tuple[str, ...], str]], selected: str | None) -> None:
-        self.accounts.clear()
-        new_order = [key for _row, key in rows]
-        for row, key in rows:
-            self.accounts.add_row(*row, key=key)
-        if self.accounts.row_count == 0:
+        except Exception as exc:  # noqa: BLE001
+            self.topbar.update(
+                f"[#ff5f6d]Settings load failed:[/] {_escape(str(exc))}"
+            )
             return
-        if selected and selected in new_order:
-            self.accounts.move_cursor(row=new_order.index(selected))
-        elif self.accounts.cursor_row < 0:
-            self.accounts.move_cursor(row=0)
+        self._render_topbar()
+        self._render_nav()
+        self._render_section(self._active_section)
 
-    def _current_selected_key(self) -> str | None:
+    def _render_topbar(self) -> None:
+        data = self.data
+        if data is None:
+            self.topbar.update("")
+            return
+        try:
+            config = load_config(self.config_path)
+            pp = config.pollypm
+            controller = getattr(pp, "controller_account", "") or "-"
+            perms = "on" if getattr(pp, "open_permissions_by_default", False) else "off"
+        except Exception:  # noqa: BLE001
+            controller = "-"
+            perms = "?"
+        bits = [
+            "[b]Settings[/b]",
+            f"[dim]controller:[/dim] {_escape(controller)}",
+            f"[dim]permissions:[/dim] {perms}",
+            f"[dim]accounts:[/dim] {len(data.accounts)}",
+            f"[dim]projects:[/dim] {len(data.projects)}",
+        ]
+        if data.errors:
+            bits.append(f"[#ff5f6d]\u25cf {len(data.errors)} error(s)[/]")
+        self.topbar.update("   ".join(bits))
+
+    def _render_nav(self) -> None:
+        data = self.data
+        counts = {
+            "accounts": len(data.accounts) if data else 0,
+            "projects": len(data.projects) if data else 0,
+            "heartbeat": len(data.heartbeat) if data else 0,
+            "plugins": len(data.plugins) if data else 0,
+            "planner": len(data.planner) if data else 0,
+            "inbox": len(data.inbox) if data else 0,
+            "about": len(data.about) if data else 0,
+        }
+        for i, (key, label) in enumerate(_SETTINGS_SECTIONS):
+            widget = self._nav_widgets.get(key)
+            if widget is None:
+                continue
+            widget.update(self._nav_label(key, label, count=counts.get(key)))
+            widget.remove_class("-selected")
+            widget.remove_class("-section-active")
+            if i == self._nav_cursor:
+                widget.add_class("-selected")
+            if key == self._active_section:
+                widget.add_class("-section-active")
+
+    def _nav_label(self, key: str, label: str, *, count: int | None) -> str:
+        marker = "\u25b8" if key == self._active_section else " "
+        cnt = f"  [dim]{count}[/dim]" if count is not None else ""
+        return f"{marker} {_escape(label)}{cnt}"
+
+    # ------------------------------------------------------------------
+    # Section switching / rendering
+    # ------------------------------------------------------------------
+
+    def _show_section(self, key: str) -> None:
+        self._active_section = key
+        self._search_query = ""
+        self.search_input.remove_class("-active")
+        self.search_input.value = ""
+        self._render_nav()
+        self._render_section(key)
+
+    def _render_section(self, key: str) -> None:
+        self.accounts.display = key == "accounts"
+        self.projects_table.display = key == "projects"
+        self.plugins_table.display = key == "plugins"
+        self.kv_static.display = key in {"heartbeat", "planner", "inbox", "about"}
+        self.detail.display = key in {"accounts", "projects", "plugins"}
+
+        title_map = dict(_SETTINGS_SECTIONS)
+        self.section_title.update(
+            f"[b]{_escape(title_map.get(key, key))}[/b]"
+        )
+
+        data = self.data
+        if data is None:
+            return
+
+        if key == "accounts":
+            self._render_accounts(data)
+        elif key == "projects":
+            self._render_projects(data)
+        elif key == "plugins":
+            self._render_plugins(data)
+        elif key == "heartbeat":
+            self._render_kv("Heartbeat & recovery", data.heartbeat)
+        elif key == "planner":
+            self._render_kv("Planner", data.planner)
+        elif key == "inbox":
+            self._render_kv("Inbox & notifications", data.inbox)
+        elif key == "about":
+            self._render_kv("About", data.about)
+
+    # ── Accounts ───────────────────────────────────────────────────
+
+    def _filtered_accounts(self, data: SettingsData) -> list[dict]:
+        q = self._search_query.strip().lower()
+        if not q:
+            return data.accounts
+        return [
+            a for a in data.accounts
+            if q in a["key"].lower()
+            or q in a["email"].lower()
+            or q in a["provider"].lower()
+            or q in a["plan"].lower()
+        ]
+
+    def _render_accounts(self, data: SettingsData) -> None:
+        self.accounts.clear()
+        rows = self._filtered_accounts(data)
+        for a in rows:
+            dot, colour = _settings_status_dot(a["health"], a["logged_in"])
+            fo_mark = f"#{a['failover_pos']}" if a["failover_pos"] else ""
+            ctrl_mark = "\u2713" if a["is_controller"] else ""
+            self.accounts.add_row(
+                Text(dot, style=colour),
+                a["key"],
+                a["email"],
+                a["provider"],
+                ctrl_mark,
+                fo_mark,
+                a["usage_summary"] or "-",
+                key=a["key"],
+            )
+        if self.accounts.row_count and self._selected_account_key:
+            try:
+                keys = [a["key"] for a in rows]
+                if self._selected_account_key in keys:
+                    self.accounts.move_cursor(
+                        row=keys.index(self._selected_account_key),
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+        elif self.accounts.row_count and self.accounts.cursor_row < 0:
+            self.accounts.move_cursor(row=0)
+        self._render_account_detail(data)
+
+    def _render_account_detail(self, data: SettingsData) -> None:
+        rows = self._filtered_accounts(data)
+        if not rows:
+            self.detail.update(
+                "[dim]No accounts match the current filter.[/dim]\n\n"
+                "Press [b]Esc[/b] to clear the search."
+            )
+            return
+        key = (
+            self._selected_account_key
+            or self._current_accounts_key()
+            or rows[0]["key"]
+        )
+        selected = next((a for a in rows if a["key"] == key), rows[0])
+        sep = "[dim]" + "\u2500" * 40 + "[/dim]"
+        dot, colour = _settings_status_dot(
+            selected["health"], selected["logged_in"],
+        )
+        lines = [
+            f"[{colour}]{dot}[/{colour}] [b]{_escape(selected['key'])}[/b]"
+            f"  [dim]({_escape(selected['provider'])})[/dim]",
+            sep,
+            f"[dim]Email:[/dim]      {_escape(selected['email'])}",
+            f"[dim]Logged in:[/dim]  {'yes' if selected['logged_in'] else 'no'}",
+            f"[dim]Health:[/dim]     {_escape(selected['health']) or '-'}",
+            f"[dim]Plan:[/dim]       {_escape(selected['plan']) or '-'}",
+            f"[dim]Usage:[/dim]      {_escape(selected['usage_summary']) or '-'}",
+            f"[dim]Controller:[/dim] {'yes' if selected['is_controller'] else 'no'}",
+            f"[dim]Failover:[/dim]   "
+            f"{'#' + str(selected['failover_pos']) if selected['failover_pos'] else 'no'}",
+            f"[dim]Home:[/dim]       {_escape(selected['home']) or '-'}",
+            f"[dim]Isolation:[/dim]  {_escape(selected['isolation_status']) or '-'}",
+            f"[dim]Storage:[/dim]    {_escape(selected['auth_storage']) or '-'}",
+        ]
+        if selected["available_at"]:
+            lines.append(
+                f"[dim]Available:[/dim]  {_escape(selected['available_at'])}"
+            )
+        if selected["access_expires_at"]:
+            lines.append(
+                f"[dim]Expires:[/dim]    {_escape(selected['access_expires_at'])}"
+            )
+        if selected["reason"]:
+            lines.extend(
+                [sep, f"[dim]Reason:[/dim]     {_escape(selected['reason'])}"]
+            )
+        if selected["usage_raw_text"]:
+            snippet = selected["usage_raw_text"].strip().splitlines()[:6]
+            if snippet:
+                lines.append(sep)
+                lines.append("[dim]Latest usage snapshot:[/dim]")
+                lines.extend(f"  {_escape(line)}" for line in snippet)
+        self.detail.update("\n".join(lines))
+
+    def _current_accounts_key(self) -> str | None:
         if self.accounts.row_count == 0 or self.accounts.cursor_row < 0:
             return None
         try:
-            row_key = self.accounts.coordinate_to_cell_key((self.accounts.cursor_row, 0)).row_key
-        except Exception:
+            row_key = self.accounts.coordinate_to_cell_key(
+                (self.accounts.cursor_row, 0),
+            ).row_key
+        except Exception:  # noqa: BLE001
             return None
         return str(row_key.value) if row_key is not None else None
 
-    def _selected_status(self, statuses) -> object | None:
-        key = self._current_selected_key()
-        if key is None:
-            return None
-        for status in statuses:
-            if status.key == key:
-                return status
-        return None
+    # ── Projects ───────────────────────────────────────────────────
 
-    def _refresh_detail(self, statuses, config) -> None:
-        status = self._selected_status(statuses)
-        if status is None:
-            self.detail.update("No connected accounts.\n\nUse Add Codex or Add Claude to connect one.")
-            return
-        sep = "[dim]" + "\u2500" * 40 + "[/dim]"
-        is_ctrl = config.pollypm.controller_account == status.key
-        is_fo = status.key in config.pollypm.failover_accounts
-        detail_lines = [
-            f"[bold]Account: {status.key}[/bold]",
-            sep,
-            f"[dim]Email:[/dim]      {status.email or '-'}",
-            f"[dim]Provider:[/dim]   {status.provider.value}",
-            f"[dim]Logged in:[/dim]  {'yes' if status.logged_in else 'no'}",
-            f"[dim]Health:[/dim]     {status.health}",
-            f"[dim]Plan:[/dim]       {status.plan}",
-            f"[dim]Usage:[/dim]      {status.usage_summary}",
-            sep,
-            f"[dim]Controller:[/dim] {'yes' if is_ctrl else 'no'}",
-            f"[dim]Failover:[/dim]   {'yes' if is_fo else 'no'}",
-            f"[dim]Home:[/dim]       {status.home or '-'}",
-            sep,
-            f"[dim]Isolation:[/dim]  {status.isolation_status}",
-            f"[dim]Storage:[/dim]    {status.auth_storage}",
+    def _filtered_projects(self, data: SettingsData) -> list[dict]:
+        q = self._search_query.strip().lower()
+        if not q:
+            return data.projects
+        return [
+            p for p in data.projects
+            if q in p["key"].lower()
+            or q in p["name"].lower()
+            or q in p["persona"].lower()
+            or q in p["path"].lower()
         ]
-        if status.available_at:
-            detail_lines.append(f"[dim]Available:[/dim]  {status.available_at}")
-        if status.access_expires_at:
-            detail_lines.append(f"[dim]Expires:[/dim]    {status.access_expires_at}")
-        if status.reason:
-            detail_lines.extend([sep, f"[dim]Reason:[/dim]     {status.reason}"])
-        if status.usage_raw_text:
-            snippet = status.usage_raw_text.strip().splitlines()[:8]
-            if snippet:
-                detail_lines.extend([sep, "[dim]Latest usage snapshot:[/dim]"])
-                detail_lines.extend(f"  {line}" for line in snippet)
-        self.detail.update("\n".join(detail_lines))
 
-    def _run_action(self, label: str, callback) -> None:
-        try:
-            callback()
-        except Exception as exc:  # noqa: BLE001
-            self._notify(f"{label} failed: {exc}")
+    def _render_projects(self, data: SettingsData) -> None:
+        self.projects_table.clear()
+        rows = self._filtered_projects(data)
+        for p in rows:
+            dot_colour = "#3ddc84" if p["tracked"] else "#4a5568"
+            dot = Text("\u25cf", style=dot_colour)
+            name_style = "" if p["tracked"] else "dim"
+            name_cell = Text(p["name"] or p["key"], style=name_style)
+            path = p["path"] or "-"
+            path_disp = path if len(path) <= 42 else ("\u2026" + path[-41:])
+            path_cell = Text(path_disp, style="dim")
+            tasks_cell = Text(str(p["task_total"]))
+            last_cell = Text(p["last_activity"] or "-", style="dim")
+            key_cell = Text(p["key"], style=name_style)
+            persona_cell = Text(p["persona"], style="dim")
+            self.projects_table.add_row(
+                dot, key_cell, name_cell, persona_cell,
+                path_cell, tasks_cell, last_cell,
+                key=p["key"],
+            )
+        if self.projects_table.row_count and self._selected_project_key:
+            keys = [p["key"] for p in rows]
+            if self._selected_project_key in keys:
+                try:
+                    self.projects_table.move_cursor(
+                        row=keys.index(self._selected_project_key),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+        elif (
+            self.projects_table.row_count
+            and self.projects_table.cursor_row < 0
+        ):
+            self.projects_table.move_cursor(row=0)
+        self._render_project_detail(data)
+
+    def _render_project_detail(self, data: SettingsData) -> None:
+        rows = self._filtered_projects(data)
+        if not rows:
+            self.detail.update(
+                "[dim]No projects match the current filter.[/dim]"
+            )
             return
-        self._notify(f"{label} completed.")
-        self._refresh()
+        key = (
+            self._selected_project_key
+            or self._current_projects_key()
+            or rows[0]["key"]
+        )
+        selected = next((p for p in rows if p["key"] == key), rows[0])
+        tracked_line = (
+            "[#3ddc84]tracked[/#3ddc84]"
+            if selected["tracked"]
+            else "[dim]paused (press [b]t[/b] to enable)[/dim]"
+        )
+        lines = [
+            f"[b]{_escape(selected['name'])}[/b]  "
+            f"[dim]({_escape(selected['key'])})[/dim]",
+            f"[dim]PM:[/dim]     {_escape(selected['persona'])}",
+            f"[dim]Path:[/dim]   {_escape(selected['path']) or '-'}  "
+            f"{'' if selected['path_exists'] else '[#ff5f6d](missing)[/]'}",
+            f"[dim]Status:[/dim] {tracked_line}",
+            f"[dim]Tasks:[/dim]  {selected['task_total']}",
+            f"[dim]Last:[/dim]   {_escape(selected['last_activity']) or '-'}",
+        ]
+        self.detail.update("\n".join(lines))
 
-    def _selected_key_or_notice(self) -> str | None:
-        key = self._current_selected_key()
-        if key is None:
-            self._notify("No account selected.")
-        return key
+    def _current_projects_key(self) -> str | None:
+        if (
+            self.projects_table.row_count == 0
+            or self.projects_table.cursor_row < 0
+        ):
+            return None
+        try:
+            row_key = self.projects_table.coordinate_to_cell_key(
+                (self.projects_table.cursor_row, 0),
+            ).row_key
+        except Exception:  # noqa: BLE001
+            return None
+        return str(row_key.value) if row_key is not None else None
+
+    # ── Plugins ────────────────────────────────────────────────────
+
+    def _filtered_plugins(self, data: SettingsData) -> list[dict]:
+        q = self._search_query.strip().lower()
+        if not q:
+            return data.plugins
+        return [
+            p for p in data.plugins
+            if q in p["name"].lower()
+            or q in p["description"].lower()
+            or q in p["source"].lower()
+            or q in p["status"].lower()
+        ]
+
+    def _render_plugins(self, data: SettingsData) -> None:
+        self.plugins_table.clear()
+        rows = self._filtered_plugins(data)
+        for p in rows:
+            status = p["status"]
+            if status == "loaded":
+                status_text = Text("\u25cf loaded", style="#3ddc84")
+            elif status == "degraded":
+                status_text = Text("\u25cf degraded", style="#f0c45a")
+            else:
+                status_text = Text("\u25cf disabled", style="#6b7a88")
+            name_style = "" if status == "loaded" else "dim"
+            self.plugins_table.add_row(
+                Text(p["name"], style=name_style),
+                Text(p["version"] or "-", style="dim"),
+                Text(p["source"] or "-", style="dim"),
+                status_text,
+                key=p["name"],
+            )
+        if (
+            self.plugins_table.row_count
+            and self.plugins_table.cursor_row < 0
+        ):
+            self.plugins_table.move_cursor(row=0)
+        self._render_plugin_detail(data)
+
+    def _render_plugin_detail(self, data: SettingsData) -> None:
+        rows = self._filtered_plugins(data)
+        if not rows:
+            self.detail.update(
+                "[dim]No plugins match the current filter.[/dim]"
+            )
+            return
+        idx = 0
+        if (
+            self.plugins_table.row_count
+            and self.plugins_table.cursor_row >= 0
+        ):
+            idx = min(self.plugins_table.cursor_row, len(rows) - 1)
+        selected = rows[idx]
+        lines = [
+            f"[b]{_escape(selected['name'])}[/b]  "
+            f"[dim]v{_escape(selected['version'] or '?')}[/dim]",
+            f"[dim]Source:[/dim] {_escape(selected['source'])}",
+            f"[dim]Status:[/dim] {_escape(selected['status'])}",
+        ]
+        if selected["description"]:
+            lines.append("")
+            lines.append(_escape(selected["description"]))
+        if selected["degraded_reason"]:
+            lines.append("")
+            lines.append(
+                f"[#f0c45a]Reason:[/] {_escape(selected['degraded_reason'])}"
+            )
+        self.detail.update("\n".join(lines))
+
+    # ── Key/value sections ─────────────────────────────────────────
+
+    def _render_kv(self, _title: str, pairs: list[tuple[str, str]]) -> None:
+        q = self._search_query.strip().lower()
+        if q:
+            pairs = [
+                (k, v) for k, v in pairs
+                if q in k.lower() or q in v.lower()
+            ]
+        if not pairs:
+            self.kv_static.update(
+                "[dim]No entries match the current filter.[/dim]"
+            )
+            return
+        key_width = max((len(k) for k, _ in pairs), default=10)
+        lines = []
+        for k, v in pairs:
+            lines.append(
+                f"[dim]{_escape(k.ljust(key_width))}[/dim]  {_escape(v)}"
+            )
+        self.kv_static.update("\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # Keybindings — nav, search, actions
+    # ------------------------------------------------------------------
+
+    def action_nav_down(self) -> None:
+        if self._focus_target == "nav":
+            self._nav_cursor = (
+                self._nav_cursor + 1
+            ) % len(_SETTINGS_SECTIONS)
+            self._render_nav()
+        else:
+            table = self._active_table()
+            if table is not None and table.row_count:
+                new = min(table.cursor_row + 1, table.row_count - 1)
+                table.move_cursor(row=new)
+                self._sync_selection()
+
+    def action_nav_up(self) -> None:
+        if self._focus_target == "nav":
+            self._nav_cursor = (
+                self._nav_cursor - 1
+            ) % len(_SETTINGS_SECTIONS)
+            self._render_nav()
+        else:
+            table = self._active_table()
+            if table is not None and table.row_count:
+                new = max(table.cursor_row - 1, 0)
+                table.move_cursor(row=new)
+                self._sync_selection()
+
+    def action_section_next(self) -> None:
+        idx = next(
+            (
+                i for i, (k, _l) in enumerate(_SETTINGS_SECTIONS)
+                if k == self._active_section
+            ),
+            0,
+        )
+        idx = (idx + 1) % len(_SETTINGS_SECTIONS)
+        self._nav_cursor = idx
+        self._show_section(_SETTINGS_SECTIONS[idx][0])
+
+    def action_section_prev(self) -> None:
+        idx = next(
+            (
+                i for i, (k, _l) in enumerate(_SETTINGS_SECTIONS)
+                if k == self._active_section
+            ),
+            0,
+        )
+        idx = (idx - 1) % len(_SETTINGS_SECTIONS)
+        self._nav_cursor = idx
+        self._show_section(_SETTINGS_SECTIONS[idx][0])
+
+    def action_activate_row(self) -> None:
+        if self._focus_target == "nav":
+            key = _SETTINGS_SECTIONS[self._nav_cursor][0]
+            self._show_section(key)
+            table = self._active_table()
+            if table is not None and table.row_count:
+                self._focus_target = "table"
+                try:
+                    table.focus()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def action_start_search(self) -> None:
+        self.search_input.add_class("-active")
+        self.search_input.value = ""
+        self.search_input.focus()
 
     def action_refresh(self) -> None:
         self._refresh()
-
-    def action_add_codex(self) -> None:
-        self._run_action("Add Codex account", lambda: self.service.add_account(ProviderKind.CODEX))
-
-    def action_add_claude(self) -> None:
-        self._run_action("Add Claude account", lambda: self.service.add_account(ProviderKind.CLAUDE))
-
-    def action_relogin_selected(self) -> None:
-        key = self._selected_key_or_notice()
-        if key is None:
-            return
-        self._run_action("Re-authenticate account", lambda: self.service.relogin_account(key))
-
-    def action_refresh_usage(self) -> None:
-        key = self._selected_key_or_notice()
-        if key is None:
-            return
         try:
-            subprocess.run(
-                ["uv", "run", "pm", "refresh-usage", key],
-                cwd=self.config_path.parent,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self._notify(f"Usage refresh failed: {exc}")
-            return
-        self._notify(f"Usage refreshed for {key}.")
-        self._refresh()
-
-    def action_switch_operator(self) -> None:
-        key = self._selected_key_or_notice()
-        if key is None:
-            return
-        self._run_action("Switch operator", lambda: self.service.switch_session_account("operator", key))
-
-    def action_make_controller(self) -> None:
-        key = self._selected_key_or_notice()
-        if key is None:
-            return
-        self._run_action("Set controller account", lambda: self.service.set_controller_account(key))
-
-    def action_toggle_failover(self) -> None:
-        key = self._selected_key_or_notice()
-        if key is None:
-            return
-        self._run_action("Toggle failover", lambda: self.service.toggle_failover_account(key))
+            self.notify("Settings refreshed.", timeout=1.5)
+        except Exception:  # noqa: BLE001
+            pass
 
     def action_toggle_permissions(self) -> None:
-        config = load_config(self.config_path)
-        enabled = not config.pollypm.open_permissions_by_default
-        self._run_action("Toggle open permissions", lambda: self.service.set_open_permissions_default(enabled))
+        try:
+            config = load_config(self.config_path)
+            enabled = not config.pollypm.open_permissions_by_default
+            self.service.set_open_permissions_default(enabled)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.notify(
+                    f"Toggle permissions failed: {exc}", severity="error",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        try:
+            self.notify(
+                f"Open permissions {'enabled' if enabled else 'disabled'}.",
+                timeout=1.5,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        self._refresh()
 
-    def action_remove_selected(self) -> None:
-        key = self._selected_key_or_notice()
+    def action_toggle_project_tracked(self) -> None:
+        if self._active_section != "projects":
+            return
+        key = self._current_projects_key()
         if key is None:
             return
-        self._run_action("Remove account", lambda: self.service.remove_account(key))
+        setter = getattr(self.service, "set_project_tracked", None)
+        if setter is None:
+            return
+        try:
+            data = self.data
+            current = next(
+                (
+                    p for p in (data.projects if data else [])
+                    if p["key"] == key
+                ),
+                None,
+            )
+            if current is None:
+                return
+            setter(key, not current["tracked"])
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.notify(f"Toggle failed: {exc}", severity="error")
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        self._refresh()
 
-    @on(Button.Pressed)
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        actions = {
-            "add-codex": self.action_add_codex,
-            "add-claude": self.action_add_claude,
-            "usage": self.action_refresh_usage,
-            "relogin": self.action_relogin_selected,
-            "remove": self.action_remove_selected,
-            "operator": self.action_switch_operator,
-            "controller": self.action_make_controller,
-            "failover": self.action_toggle_failover,
-            "permissions": self.action_toggle_permissions,
-            "refresh": self.action_refresh,
-        }
-        action = actions.get(event.button.id or "")
-        if action is not None:
-            action()
+    def action_make_controller(self) -> None:
+        if self._active_section != "accounts":
+            return
+        key = self._current_accounts_key()
+        if not key:
+            return
+        setter = getattr(self.service, "set_controller_account", None)
+        if setter is None:
+            return
+        try:
+            setter(key)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.notify(
+                    f"Controller change failed: {exc}", severity="error",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        self._refresh()
+
+    def action_toggle_failover(self) -> None:
+        if self._active_section != "accounts":
+            return
+        key = self._current_accounts_key()
+        if not key:
+            return
+        setter = getattr(self.service, "toggle_failover_account", None)
+        if setter is None:
+            return
+        try:
+            setter(key)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.notify(
+                    f"Failover toggle failed: {exc}", severity="error",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        self._refresh()
+
+    def action_back_or_cancel(self) -> None:
+        if self.search_input.has_class("-active"):
+            self.search_input.remove_class("-active")
+            self._search_query = ""
+            self.search_input.value = ""
+            self._render_section(self._active_section)
+            try:
+                self.nav.focus()
+            except Exception:  # noqa: BLE001
+                pass
+            self._focus_target = "nav"
+            return
+        if self._focus_target == "table":
+            self._focus_target = "nav"
+            try:
+                self.nav.focus()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        self.exit()
+
+    # ------------------------------------------------------------------
+    # Search input handlers
+    # ------------------------------------------------------------------
+
+    @on(Input.Changed, "#settings-search")
+    def on_search_changed(self, event: Input.Changed) -> None:
+        self._search_query = event.value or ""
+        self._render_section(self._active_section)
+
+    @on(Input.Submitted, "#settings-search")
+    def on_search_submitted(self, _event: Input.Submitted) -> None:
+        table = self._active_table()
+        if table is not None:
+            try:
+                table.focus()
+                self._focus_target = "table"
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _active_table(self) -> DataTable | None:
+        if self._active_section == "accounts":
+            return self.accounts
+        if self._active_section == "projects":
+            return self.projects_table
+        if self._active_section == "plugins":
+            return self.plugins_table
+        return None
+
+    def _sync_selection(self) -> None:
+        data = self.data
+        if data is None:
+            return
+        if self._active_section == "accounts":
+            self._selected_account_key = self._current_accounts_key()
+            self._render_account_detail(data)
+        elif self._active_section == "projects":
+            self._selected_project_key = self._current_projects_key()
+            self._render_project_detail(data)
+        elif self._active_section == "plugins":
+            self._render_plugin_detail(data)
+
+    @on(DataTable.RowHighlighted, "#accounts")
+    def on_account_highlighted(
+        self, _event: DataTable.RowHighlighted,
+    ) -> None:
+        self._sync_selection()
+
+    @on(DataTable.RowHighlighted, "#projects-table")
+    def on_project_highlighted(
+        self, _event: DataTable.RowHighlighted,
+    ) -> None:
+        self._sync_selection()
+
+    @on(DataTable.RowHighlighted, "#plugins-table")
+    def on_plugin_highlighted(
+        self, _event: DataTable.RowHighlighted,
+    ) -> None:
+        self._sync_selection()
 
     @on(DataTable.RowSelected, "#accounts")
     def on_account_selected(self, _event: DataTable.RowSelected) -> None:
-        self._selected_account_key = self._current_selected_key()
-        self._refresh()
+        self._selected_account_key = self._current_accounts_key()
+        if self.data is not None:
+            self._render_account_detail(self.data)
 
 
 # ---------------------------------------------------------------------------

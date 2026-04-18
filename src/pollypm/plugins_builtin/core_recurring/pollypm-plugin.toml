@@ -42,6 +42,11 @@ requires_api = ">=1,<2"
 
 [[capabilities]]
 kind = "job_handler"
+name = "events.retention_sweep"
+requires_api = ">=1,<2"
+
+[[capabilities]]
+kind = "job_handler"
 name = "notification_staging.prune"
 requires_api = ">=1,<2"
 

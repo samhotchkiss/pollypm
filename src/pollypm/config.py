@@ -6,6 +6,7 @@ from pathlib import Path
 from pollypm.plugins_builtin.core_agent_profiles.profiles import heartbeat_prompt, polly_prompt
 from pollypm.models import (
     AccountConfig,
+    EventsRetentionSettings,
     LoggingSettings,
     MemorySettings,
     KnownProject,
@@ -322,6 +323,57 @@ def _parse_logging_settings(raw: dict[str, object]) -> LoggingSettings:
     return LoggingSettings(rotate_size_mb=size_mb, rotate_keep=keep)
 
 
+def _parse_events_retention_settings(
+    raw: dict[str, object],
+) -> EventsRetentionSettings:
+    """Parse the ``[events]`` TOML section.
+
+    Recognised keys (all ints, measured in days):
+
+    * ``audit_retention_days`` — default 365.
+    * ``operational_retention_days`` — default 30.
+    * ``high_volume_retention_days`` — default 7.
+    * ``default_retention_days`` — default 30.
+
+    Non-positive values or non-int types are silently coerced to the
+    defaults — a fat-fingered config must never accidentally delete
+    everything. See ``pollypm.storage.events_retention`` for tier
+    membership and the ``events.retention_sweep`` handler for cadence.
+    """
+    events_raw = raw.get("events", {})
+    if not isinstance(events_raw, dict):
+        return EventsRetentionSettings()
+
+    defaults = EventsRetentionSettings()
+
+    def _as_positive_int(value: object, fallback: int) -> int:
+        if isinstance(value, bool):
+            # ``bool`` is a subclass of ``int`` — reject explicitly.
+            return fallback
+        if isinstance(value, int) and value > 0:
+            return value
+        return fallback
+
+    return EventsRetentionSettings(
+        audit_retention_days=_as_positive_int(
+            events_raw.get("audit_retention_days"),
+            defaults.audit_retention_days,
+        ),
+        operational_retention_days=_as_positive_int(
+            events_raw.get("operational_retention_days"),
+            defaults.operational_retention_days,
+        ),
+        high_volume_retention_days=_as_positive_int(
+            events_raw.get("high_volume_retention_days"),
+            defaults.high_volume_retention_days,
+        ),
+        default_retention_days=_as_positive_int(
+            events_raw.get("default_retention_days"),
+            defaults.default_retention_days,
+        ),
+    )
+
+
 def _parse_plugin_settings(raw: dict[str, object]) -> PluginSettings:
     """Parse the ``[plugins]`` TOML section.
 
@@ -447,6 +499,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
     rail = _parse_rail_settings(raw)
     planner = _parse_planner_settings(raw)
     logging_settings = _parse_logging_settings(raw)
+    events = _parse_events_retention_settings(raw)
     projects = _parse_known_projects(raw, base=base)
     _merge_project_local_config(sessions, projects, plugins)
     _validate_cross_references(accounts=accounts, sessions=sessions, pollypm=pollypm)
@@ -462,6 +515,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
         rail=rail,
         planner=planner,
         logging=logging_settings,
+        events=events,
     )
     try:
         _config_cache[config_path] = (config_path.stat().st_mtime, config)

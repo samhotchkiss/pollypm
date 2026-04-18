@@ -78,6 +78,8 @@ class TestCoreRecurringPlugin:
             "agent_worktree.prune",
             # Log-file hygiene — hourly at minute :31.
             "log.rotate",
+            # Events-table tiered retention — hourly at minute :37.
+            "events.retention_sweep",
         }
 
         # Cadences per issue #164 / #249.
@@ -106,6 +108,9 @@ class TestCoreRecurringPlugin:
         log_rotate = entries["log.rotate"].schedule
         assert isinstance(log_rotate, CronSchedule)
         assert log_rotate.expression() == "31 * * * *"
+        events_retention = entries["events.retention_sweep"].schedule
+        assert isinstance(events_retention, CronSchedule)
+        assert events_retention.expression() == "37 * * * *"
 
     def test_plugin_declares_expected_capabilities(self) -> None:
         kinds = {cap.kind for cap in core_plugin.capabilities}

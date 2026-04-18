@@ -176,6 +176,23 @@ class PlannerSettings:
 
 
 @dataclass(slots=True)
+class EventsRetentionSettings:
+    """Tiered retention windows for the ``events`` table.
+
+    Each tier's retention window is measured in days. The actual
+    event_type → tier mapping lives in
+    ``pollypm.storage.events_retention`` and is authoritative — this
+    dataclass only tunes the windows. See issue context in
+    ``core_recurring/plugin.py::events_retention_sweep_handler``.
+    """
+
+    audit_retention_days: int = 365
+    operational_retention_days: int = 30
+    high_volume_retention_days: int = 7
+    default_retention_days: int = 30
+
+
+@dataclass(slots=True)
 class PollyPMConfig:
     project: ProjectSettings
     pollypm: PollyPMSettings
@@ -187,6 +204,9 @@ class PollyPMConfig:
     rail: RailSettings = field(default_factory=RailSettings)
     planner: PlannerSettings = field(default_factory=PlannerSettings)
     logging: LoggingSettings = field(default_factory=LoggingSettings)
+    events: EventsRetentionSettings = field(
+        default_factory=EventsRetentionSettings,
+    )
 
 
 @dataclass(slots=True)

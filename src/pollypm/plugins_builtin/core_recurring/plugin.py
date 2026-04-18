@@ -475,6 +475,79 @@ def db_vacuum_handler(payload: dict[str, Any]) -> dict[str, Any]:
     return {"bytes_reclaimed": bytes_reclaimed, "mb_reclaimed": mb_reclaimed}
 
 
+def events_retention_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
+    """Apply tiered retention to the ``events`` table (issue-tracked as #267 follow-up).
+
+    The events ledger is written to on every heartbeat, token-ledger
+    bump, and task transition — unbounded growth is the single biggest
+    contributor to ``state.db`` bloat on long-running installations.
+    This handler walks four tiers (``audit`` / ``operational`` /
+    ``high_volume`` / ``default``) and DELETEs rows older than each
+    tier's retention window. One parameterized DELETE per tier — no
+    row-by-row work.
+
+    Runs hourly (``37 * * * *`` — off-pattern from the 4am DB hygiene
+    window) so the freelist stays small; the daily ``db.vacuum``
+    ``PRAGMA incremental_vacuum`` then reclaims the pages. No explicit
+    code dependency between the two — purely a cadence contract.
+
+    Tier membership is data, defined in
+    ``pollypm.storage.events_retention``. Retention *windows* are
+    configurable via the ``[events]`` TOML section; the handler honours
+    whatever ``config.events`` resolves to.
+
+    Emits a single ``events.retention_sweep`` event only when rows were
+    deleted — a no-op sweep stays silent to avoid the handler logging
+    its own cadence and defeating the purpose.
+    """
+    from pollypm.storage.events_retention import (
+        RetentionPolicy,
+        sweep_events,
+    )
+
+    config, store = _load_config_and_store(payload)
+
+    settings = config.events
+    policy = RetentionPolicy(
+        audit_days=settings.audit_retention_days,
+        operational_days=settings.operational_retention_days,
+        high_volume_days=settings.high_volume_retention_days,
+        default_days=settings.default_retention_days,
+    )
+
+    # Serialize against the StateStore's own lock so we don't race with
+    # writers on the shared connection. ``sweep_events`` issues a
+    # commit, so the rowcounts are durable before we return.
+    with store._lock:  # noqa: SLF001 — StateStore exposes no public wrapper
+        result = sweep_events(store._conn, policy)  # noqa: SLF001
+
+    counts = {
+        "deleted_audit": result.deleted_audit,
+        "deleted_operational": result.deleted_operational,
+        "deleted_high_volume": result.deleted_high_volume,
+        "deleted_default": result.deleted_default,
+        "total": result.total,
+    }
+
+    # Only log when something actually happened — otherwise every hourly
+    # sweep would itself become a ``high_volume`` event and grow the
+    # table we're trying to shrink.
+    if result.total > 0:
+        store.record_event(
+            session_name="system",
+            event_type="events.retention_sweep",
+            message=(
+                f"deleted {result.total} events "
+                f"(audit={result.deleted_audit}, "
+                f"operational={result.deleted_operational}, "
+                f"high_volume={result.deleted_high_volume}, "
+                f"default={result.deleted_default})"
+            ),
+        )
+
+    return counts
+
+
 def memory_ttl_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Drop expired memory_entries (TTL in the past).
 
@@ -848,6 +921,10 @@ def _register_handlers(api: JobHandlerAPI) -> None:
         max_attempts=1, timeout_seconds=60.0,
     )
     api.register_handler(
+        "events.retention_sweep", events_retention_sweep_handler,
+        max_attempts=1, timeout_seconds=60.0,
+    )
+    api.register_handler(
         "notification_staging.prune", notification_staging_prune_handler,
         max_attempts=1, timeout_seconds=60.0,
     )
@@ -880,6 +957,14 @@ def _register_roster(api: RosterAPI) -> None:
     api.register_recurring("7 4 * * *", "db.vacuum", {}, dedupe_key="db.vacuum")
     api.register_recurring(
         "13 4 * * *", "memory.ttl_sweep", {}, dedupe_key="memory.ttl_sweep",
+    )
+    # Events-table retention — hourly at :37, off-pattern from the 4am
+    # hygiene window and from the ``23``/``23 * * * *`` agent-worktree
+    # prune. Tiered policy (audit 365d / operational 30d / high_volume
+    # 7d / default 30d) lives in pollypm.storage.events_retention.
+    api.register_recurring(
+        "37 * * * *", "events.retention_sweep", {},
+        dedupe_key="events.retention_sweep",
     )
     # Notification staging hygiene — flushed rollup rows and silent audit
     # rows older than 30 days are dropped. Pending digest rows are left
@@ -923,6 +1008,7 @@ plugin = PollyPMPlugin(
         Capability(kind="job_handler", name="work.progress_sweep"),
         Capability(kind="job_handler", name="db.vacuum"),
         Capability(kind="job_handler", name="memory.ttl_sweep"),
+        Capability(kind="job_handler", name="events.retention_sweep"),
         Capability(kind="job_handler", name="notification_staging.prune"),
         Capability(kind="job_handler", name="agent_worktree.prune"),
         Capability(kind="job_handler", name="log.rotate"),

@@ -92,7 +92,7 @@ One `pm task done` call per stage. No chaining.
    Then: `pm task done ...` (after children are all done/approved).
    Advances: critic_panel → synthesize.
 
-6. **synthesize** — pick the winning candidate; write `docs/project-plan.md` AND `docs/planning-session-log.md` (the `log_present` gate will block you if the session log is missing or empty).
+6. **synthesize** — pick the winning candidate; write `docs/project-plan.md` AND `docs/planning-session-log.md` (the `log_present` gate will block you if the session log is missing or empty). Before you call `pm task done`, invoke the `visual-explainer` magic skill (see `<visual_plan_review>`) so the user approves against a rendered HTML page, not a wall of markdown.
    Then: `pm task done <task_id> --actor architect --output '{"type":"code_change","summary":"Plan synthesized; Risk Ledger folded in","artifacts":[{"kind":"file_change","description":"project plan","path":"docs/project-plan.md"},{"kind":"file_change","description":"session log","path":"docs/planning-session-log.md"}]}'`
    Advances: synthesize → user_approval.
 
@@ -113,3 +113,26 @@ Before you end your turn at ANY stage other than `user_approval`, confirm:
 
 If any of those three is false, you are not done. Fix it before yielding. A stuck node is the #1 failure mode of the planner — don't be the architect who writes excellent artifacts and then leaves the task frozen on `research`.
 </stage_transitions>
+
+<visual_plan_review>
+When the markdown plan is ready at stage 6 (synthesize), you MUST invoke the
+`visual-explainer` magic skill to produce a rendered HTML companion for the
+user. This is not optional — the user reviews the HTML page, not the raw
+markdown, because that is how approval at stage 7 is designed to work.
+
+- Skill name: `visual-explainer` (directory-style skill at
+  `pollypm/defaults/magic/visual-explainer/SKILL.md`).
+- Preferred command: `plan-review` when comparing the plan against the
+  existing codebase (risk assessment + architecture diff). Use
+  `generate-visual-plan` when the project is greenfield and there is no
+  codebase yet to compare against.
+- Output: defer to the skill's own conventions for filename and location;
+  do not invent a path format. When the skill finishes, note the rendered
+  file path in the session log and reference it in the `pm notify`
+  plan-ready message at stage 7 so the user opens the HTML, not the raw
+  markdown.
+- Do not write HTML from scratch. Do not paste a CSS block into
+  `docs/project-plan.md`. The skill owns the rendering; your job is to
+  invoke it with the right inputs (the synthesized plan + the codebase
+  context).
+</visual_plan_review>

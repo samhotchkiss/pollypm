@@ -466,7 +466,11 @@ def test_issue_cli_rejects_skipped_transition(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 1
-    assert "Invalid transition 01-ready -> 03-needs-review" in result.stdout
+    # Error text is now routed to stderr with a "Cannot transition ..." prefix
+    # (reports/error-message-audit.md P3 fix). Accept stderr or combined output.
+    combined = (result.stdout or "") + (result.stderr or "")
+    assert "Cannot transition 0001" in combined
+    assert "Invalid transition 01-ready -> 03-needs-review" in combined
 
 
 def test_issue_cli_rejects_direct_completion_without_review(tmp_path: Path) -> None:
@@ -487,4 +491,7 @@ def test_issue_cli_rejects_direct_completion_without_review(tmp_path: Path) -> N
     )
 
     assert result.exit_code == 1
-    assert "must pass through 04-in-review before completion" in result.stdout
+    # Error now routed to stderr with prefix (audit P3).
+    combined = (result.stdout or "") + (result.stderr or "")
+    assert "Cannot transition 0001" in combined
+    assert "must pass through 04-in-review before completion" in combined

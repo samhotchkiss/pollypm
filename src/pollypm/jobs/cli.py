@@ -66,9 +66,9 @@ def build_queue_for_config(config_path: Path) -> JobQueue:
     """Default factory: open a ``JobQueue`` against the project's state DB."""
     resolved = resolve_config_path(config_path)
     if not resolved.exists():
-        raise typer.BadParameter(
-            f"Config not found at {resolved}. Run `pm init` or pass --config.",
-        )
+        from pollypm.errors import format_config_not_found_error
+
+        raise typer.BadParameter(format_config_not_found_error(resolved))
     config = load_config(resolved)
     db_path = config.project.state_db
     db_path.parent.mkdir(parents=True, exist_ok=True)

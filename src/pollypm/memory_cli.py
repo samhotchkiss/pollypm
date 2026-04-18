@@ -57,9 +57,9 @@ def build_backend_for_config(config_path: Path) -> FileMemoryBackend:
     """Default factory: resolve the config, open a backend against the project."""
     resolved = resolve_config_path(config_path)
     if not resolved.exists():
-        raise typer.BadParameter(
-            f"Config not found at {resolved}. Run `pm init` or pass --config."
-        )
+        from pollypm.errors import format_config_not_found_error
+
+        raise typer.BadParameter(format_config_not_found_error(resolved))
     config = load_config(resolved)
     project_root = config.project.root_dir
     return get_memory_backend(project_root, "file")  # type: ignore[return-value]

@@ -64,9 +64,9 @@ def _resolve(config_path: Path) -> Path:
 def _require_config(config_path: Path) -> Path:
     path = _resolve(config_path)
     if not path.exists():
-        typer.echo(
-            f"No PollyPM config at {path}. Run `pm init` first.", err=True,
-        )
+        from pollypm.errors import format_config_not_found_error
+
+        typer.echo(format_config_not_found_error(path), err=True)
         raise typer.Exit(code=1)
     return path
 

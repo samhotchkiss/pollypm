@@ -146,6 +146,30 @@ def test_pm_up_bootstraps_worker_from_project_local_config(monkeypatch, tmp_path
 
     monkeypatch.setattr("pollypm.session_services.tmux.TmuxClient", lambda: fake_tmux)
     monkeypatch.setattr("pollypm.supervisor.Supervisor._stabilize_launch", lambda self, launch, target, on_status=None: None)
+    # ``_bootstrap_launches`` calls ``_stabilize_claude_launch`` directly from
+    # worker threads (not through ``_stabilize_launch``). Without stubbing it
+    # the per-thread poll loop runs to its 90s deadline against FakeTmux
+    # (which has no ``capture_pane``), dominating the test wall time.
+    monkeypatch.setattr(
+        "pollypm.supervisor.Supervisor._stabilize_claude_launch",
+        lambda self, target, on_status=None: None,
+    )
+    monkeypatch.setattr(
+        "pollypm.supervisor.Supervisor._stabilize_codex_launch",
+        lambda self, target, on_status=None, account=None: None,
+    )
+    # ``_send_initial_input_if_fresh`` does a 0.5s sleep before send_keys;
+    # skip it — the test doesn't assert on initial input delivery.
+    monkeypatch.setattr(
+        "pollypm.supervisor.Supervisor._send_initial_input_if_fresh",
+        lambda self, launch, target: None,
+    )
+    # ``cli.up`` sleeps 0.3s after the cockpit layout split. That sleep
+    # lives in an inline ``import time`` so monkey-patching ``time.sleep``
+    # on the module object is the simplest way to reach it. Scope is
+    # auto-restored by ``monkeypatch`` at teardown.
+    import time as _time
+    monkeypatch.setattr(_time, "sleep", lambda _s: None)
     monkeypatch.setattr("pollypm.supervisor.Supervisor.focus_console", lambda self: None)
 
     runner = CliRunner()

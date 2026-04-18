@@ -1595,97 +1595,20 @@ def notify(
         )
         raise typer.Exit(code=1)
 
-    # Resolve priority. 'auto' means "classify by keyword".
-    from pollypm import notification_staging as _ns
+    # Resolve priority. 'auto' means "classify by keyword" (see #340 —
+    # the classifier moved to :mod:`pollypm.store.classifier`).
+    from pollypm.store.classifier import classify_priority, validate_priority
 
     requested = (priority or "auto").strip().lower()
     if requested == "auto":
-        resolved_priority = _ns.classify_priority(subject, body)
+        resolved_priority = classify_priority(subject, body)
     else:
         try:
-            resolved_priority = _ns.validate_priority(requested)
+            resolved_priority = validate_priority(requested)
         except ValueError as exc:
             typer.echo(f"Error: {exc}", err=True)
             raise typer.Exit(code=1) from exc
 
-    # Use the same work-service entry point pm inbox reads through, so
-    # the notification lands in the identical DB and surfaces immediately.
-    from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
-    from pollypm.storage.state import StateStore
-    from pollypm.work.cli import _resolve_db_path, _svc
-
-    milestone_key = milestone.strip() or None
-
-    # Silent tier: audit only, no inbox task, no staging row.
-    if resolved_priority == "silent":
-        db_path = _resolve_db_path(db, project=project)
-        store = StateStore(db_path)
-        try:
-            store.record_event(
-                actor,
-                "inbox.message.silent",
-                activity_summary(
-                    summary=f"{actor} (silent): {subject}",
-                    severity="routine",
-                    verb="recorded",
-                    subject=subject,
-                    project=project,
-                    body=body,
-                ),
-            )
-        finally:
-            store.close()
-        typer.echo("silent")
-        return
-
-    # Digest tier: stage the row, no inbox task.
-    if resolved_priority == "digest":
-        svc = _svc(db, project=project)
-        try:
-            payload = {
-                "subject": subject,
-                "body": body,
-                "actor": actor,
-                "project": project,
-            }
-            staging_id = _ns.stage_notification(
-                svc._conn,  # type: ignore[attr-defined]
-                project=project,
-                subject=subject,
-                body=body,
-                actor=actor,
-                priority="digest",
-                milestone_key=milestone_key,
-                payload=payload,
-            )
-        except Exception as exc:  # noqa: BLE001
-            typer.echo(f"Failed to stage digest notification: {exc}", err=True)
-            raise typer.Exit(code=1) from exc
-
-        db_path = _resolve_db_path(db, project=project)
-        store = StateStore(db_path)
-        try:
-            store.record_event(
-                actor,
-                "inbox.message.staged",
-                activity_summary(
-                    summary=f"{actor} (digest): {subject}",
-                    severity="routine",
-                    verb="staged",
-                    subject=subject,
-                    project=project,
-                    staging_id=staging_id,
-                    milestone_key=milestone_key,
-                    body=body,
-                ),
-            )
-        finally:
-            store.close()
-        typer.echo(f"digest:{staging_id}")
-        return
-
-    # Immediate tier (default) — create an inbox task as before.
-    svc = _svc(db, project=project)
     # Normalise the requester role. ``user`` → normal inbox (default).
     # ``polly`` → fast-track plan_review: lands in Polly's inbox instead
     # of the user's. Anything else is rejected so we don't silently
@@ -1697,49 +1620,67 @@ def notify(
             err=True,
         )
         raise typer.Exit(code=1)
+
     label_list = [label for label in (labels or []) if label and label.strip()]
+    milestone_key = milestone.strip() or None
+
+    # Route every tier through the unified :class:`Store` messages table.
+    # ``tier=silent`` lands with ``state='closed'`` so it stays log-only;
+    # ``tier=digest`` inserts at ``state='staged'`` so rollup sweeps can
+    # promote; ``tier=immediate`` lands open and shows up in the inbox.
+    # The :func:`apply_title_contract` shim inside
+    # :meth:`Store.enqueue_message` stamps ``[Action]`` / ``[FYI]`` /
+    # ``[Audit]`` prefixes — see :mod:`pollypm.store.title_contract`.
+    from pollypm.store import SQLAlchemyStore
+    from pollypm.work.cli import _resolve_db_path
+
+    db_path = _resolve_db_path(db, project=project)
+    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+
+    # Tier → (state, retained_label) mapping:
+    #   immediate → state='open'    (surfaces in inbox immediately)
+    #   digest    → state='staged'  (rollup promotes at flush time)
+    #   silent    → state='closed'  (audit trail only, never surfaces)
+    tier_state = {
+        "immediate": "open",
+        "digest": "staged",
+        "silent": "closed",
+    }[resolved_priority]
+
+    payload = {
+        "actor": actor,
+        "project": project,
+        "milestone_key": milestone_key,
+        "requester": requester_role,
+    }
+
     try:
-        task = svc.create(
-            title=subject,
-            description=body,
-            type="task",
-            project=project,
-            flow_template="chat",
-            # requester=user makes _roles_match_user() trip in the
-            # inbox_view filter — the canonical mark for "user must
-            # look at this". requester=polly routes to Polly's inbox
-            # (see #297 fast-track plan review).
-            roles={"requester": requester_role, "operator": actor},
-            priority="normal",
-            created_by=actor,
+        message_id = store.enqueue_message(
+            type="notify",
+            tier=resolved_priority,
+            # recipient routes the row to a reader surface: 'user' →
+            # normal inbox, 'polly' → fast-track plan review (see #297).
+            recipient=requester_role,
+            sender=actor,
+            subject=subject,
+            body=body,
+            scope=project,
             labels=label_list or None,
+            payload=payload,
+            state=tier_state,
         )
     except Exception as exc:  # noqa: BLE001
-        typer.echo(f"Failed to create inbox task: {exc}", err=True)
+        typer.echo(f"Failed to enqueue notify message: {exc}", err=True)
         raise typer.Exit(code=1) from exc
-
-    # Audit event — mirrors the legacy inbox_message_created shape so the
-    # activity feed projector/consumers see the notification.
-    db_path = _resolve_db_path(db, project=project)
-    store = StateStore(db_path)
-    try:
-        store.record_event(
-            actor,
-            "inbox.message.created",
-            activity_summary(
-                summary=f"{actor} -> user: {subject}",
-                severity="recommendation",
-                verb="notified",
-                subject=subject,
-                project=project,
-                task_id=task.task_id,
-                body=body,
-            ),
-        )
     finally:
         store.close()
 
-    typer.echo(task.task_id)
+    if resolved_priority == "silent":
+        typer.echo("silent")
+    elif resolved_priority == "digest":
+        typer.echo(f"digest:{message_id}")
+    else:
+        typer.echo(str(message_id))
 
 
 @alert_app.command("raise")

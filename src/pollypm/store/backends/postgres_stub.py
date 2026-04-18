@@ -58,23 +58,34 @@ class PostgresStore:
     # Store protocol — every method raises NotImplementedError.
     # ------------------------------------------------------------------
 
-    def append_event(self, *, kind: str, payload: dict[str, Any]) -> None:
+    def append_event(
+        self,
+        scope: str,
+        sender: str,
+        subject: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
         raise NotImplementedError(_NOT_YET_IMPLEMENTED)
 
     def record_event(
-        self, session_name: str, event_type: str, message: str
-    ) -> None:
+        self,
+        scope: str,
+        sender: str,
+        subject: str,
+        payload: dict[str, Any] | None = None,
+    ) -> int:
         raise NotImplementedError(_NOT_YET_IMPLEMENTED)
 
-    def enqueue_message(self, message: dict[str, Any]) -> int:
+    def enqueue_message(self, **kwargs: Any) -> int:
         raise NotImplementedError(_NOT_YET_IMPLEMENTED)
 
-    def update_message(self, message_id: int, **fields: Any) -> None:
+    def upsert_message(self, **kwargs: Any) -> int:
         raise NotImplementedError(_NOT_YET_IMPLEMENTED)
 
-    def close_message(
-        self, message_id: int, *, reason: str | None = None
-    ) -> None:
+    def update_message(self, id: int, **fields: Any) -> None:
+        raise NotImplementedError(_NOT_YET_IMPLEMENTED)
+
+    def close_message(self, id: int) -> None:
         raise NotImplementedError(_NOT_YET_IMPLEMENTED)
 
     def query_messages(self, **filters: Any) -> list[dict[str, Any]]:
@@ -93,6 +104,9 @@ class PostgresStore:
         raise NotImplementedError(_NOT_YET_IMPLEMENTED)
 
     def transaction(self) -> AbstractContextManager[Any]:
+        raise NotImplementedError(_NOT_YET_IMPLEMENTED)
+
+    def execute(self, stmt: Any) -> Any:
         raise NotImplementedError(_NOT_YET_IMPLEMENTED)
 
 

@@ -219,27 +219,22 @@ def test_store_transaction_rolls_back_on_exception(tmp_path: Path) -> None:
         store.dispose()
 
 
-def test_store_stub_methods_raise_with_guidance(tmp_path: Path) -> None:
-    """Remaining unimplemented methods must honor the three-question rule.
-
-    #338 implemented the messages + event-log surface. The alert methods
-    are still awaiting their dedicated issue, and their
-    ``NotImplementedError`` messages must still follow the what/why/fix
-    shape so a caller who trips on them gets an actionable pointer.
+def test_alert_methods_wired_to_messages_table(tmp_path: Path) -> None:
+    """Issue #340 wired ``upsert_alert`` / ``clear_alert`` onto the unified
+    ``messages`` table. The previous version of this test asserted these
+    were still stubbed; now the same methods round-trip through the real
+    writer surface.
     """
     store = SQLAlchemyStore(_db_url(tmp_path))
     try:
-        stubs = [
-            lambda: store.upsert_alert("s", "a", "warn", "m"),
-            lambda: store.clear_alert("s", "a"),
-        ]
-        for call in stubs:
-            with pytest.raises(NotImplementedError) as excinfo:
-                call()
-            msg = str(excinfo.value)
-            # Three-question rule: what / why / fix.
-            assert "not implemented" in msg.lower()
-            assert "#338" in msg or "#340" in msg
-            assert "Fix:" in msg
+        store.upsert_alert(
+            session_name="s", alert_type="a", severity="warn", message="m",
+        )
+        rows = store.query_messages(type="alert", scope="s")
+        assert len(rows) == 1
+        assert rows[0]["state"] == "open"
+        store.clear_alert("s", "a")
+        rows = store.query_messages(type="alert", scope="s")
+        assert rows[0]["state"] == "closed"
     finally:
         store.close()

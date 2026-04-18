@@ -39,192 +39,22 @@ import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Priority classification
+# Priority classification — moved to :mod:`pollypm.store.classifier` in #340.
 # ---------------------------------------------------------------------------
+#
+# The keyword-driven classifier used to live in this module; issue #340
+# moved it next to the new :class:`Store` writers. We re-export the public
+# helpers here so the existing importers (tests, legacy callers) keep
+# working until Issue F retires :mod:`pollypm.notification_staging`
+# entirely.
 
-# Tier-keyword mapping. Match is case-insensitive, word-boundary where the
-# token is plain-ASCII so "done" doesn't match "condone". Multi-word
-# phrases are matched as a literal substring with whitespace collapsed.
-_IMMEDIATE_KEYWORDS: tuple[str, ...] = (
-    "blocker",
-    "question",
-    "rejected",
-    "needs decision",
-    "stuck",
-    "failed",
-    "persona swap",
-    # Bug-report shape — operator (Polly) flagged that "dogfood
-    # finding" / "Archie skips per-stage pm task done" / "Gap A
-    # fallback doesn't fire" notifications were silently classified as
-    # digest because they happened to contain a completion keyword
-    # ("done"). Bug reports must surface immediately so the user can
-    # triage before a milestone flush. Single-word tokens are matched
-    # on word boundary so "bug" doesn't hit "debug" / "bugged" and
-    # "gap" doesn't hit "stopgap".
-    "bug",
-    "gap",
-    "finding",
-    "regression",
-    "broken",
-    "misclassification",
-    "skips",
-)
-
-_DIGEST_KEYWORDS: tuple[str, ...] = (
-    "done",
-    "shipped",
-    "merged",
-    "approved",
-    "completed",
-    "complete",
-)
-
-_SILENT_KEYWORDS: tuple[str, ...] = (
-    "test pass",
-    "audit",
-    "recorded",
-)
-
-# Action-requiring phrases — when one of these co-occurs with a completion
-# keyword ("done", "shipped", "clear", etc.), the message is a
-# completion-with-implication that the user must see NOW, not in a rollup.
-# Matched as case-insensitive substrings (whitespace-normalised) against
-# the combined subject+body text.
-_ACTION_REQUIRING_PHRASES: tuple[str, ...] = (
-    "ready for testing",
-    "ready for review",
-    "ready for approval",
-    "ready for account",
-    "needs your attention",
-    "needs your review",
-    "needs your input",
-    "needs your approval",
-    "awaiting your",
-    "awaiting approval",
-    "awaiting review",
-    "safe to",
-    "time to",
-    "please verify",
-    "please review",
-    "please approve",
-    "clear — ready",
-    "clear - ready",
-    "clear, ready",
-    "done — ready",
-    "done - ready",
-    "done, ready",
-    "shipped — ready",
-    "shipped - ready",
-    "shipped, ready",
-)
-
-# Extra "completion" markers used ONLY for the action-requiring upgrade
-# path. These aren't in ``_DIGEST_KEYWORDS`` on their own (too ambiguous
-# — "clear" shows up in plenty of non-completion contexts) but when
-# paired with an action-requiring phrase they confirm the completion
-# shape so we can safely bump the whole message to immediate.
-_COMPLETION_MARKERS: tuple[str, ...] = (
-    "done",
-    "shipped",
-    "merged",
-    "approved",
-    "completed",
-    "clear",
-    "complete",
-    "finished",
-    "ready",
-    "passed",
-    # Multi-word audit/test markers — these normally classify silent,
-    # but paired with an action-requiring phrase they're completions
-    # with implication ("Test pass: please verify" → immediate).
-    "test pass",
-    "tests pass",
-    "suite pass",
-)
-
-_VALID_PRIORITIES: frozenset[str] = frozenset({"immediate", "digest", "silent"})
-
-
-def _has_keyword(text: str, keywords: Iterable[str]) -> bool:
-    """Case-insensitive substring match with whitespace normalisation.
-
-    Single-word tokens must match on a word boundary (so "done" hits
-    "Done: deploy" but not "condone"). Multi-word phrases match as
-    literal substrings after collapsing runs of whitespace.
-    """
-    haystack = re.sub(r"\s+", " ", text.lower())
-    for raw in keywords:
-        kw = raw.lower().strip()
-        if not kw:
-            continue
-        if " " in kw:
-            if kw in haystack:
-                return True
-        else:
-            # \b on both sides — catches word-boundary single tokens.
-            pattern = rf"\b{re.escape(kw)}\b"
-            if re.search(pattern, haystack):
-                return True
-    return False
-
-
-def classify_priority(subject: str, body: str) -> str:
-    """Infer notify priority from subject + body keywords.
-
-    Precedence:
-
-    1. **immediate** — explicit urgency keywords (blocker, question, etc.)
-    2. **immediate (action-requiring completion)** — a completion marker
-       (done, shipped, clear, ready, passed, …) co-occurring with an
-       action-requiring phrase (``ready for testing``, ``safe to``,
-       ``please verify``, …). This catches "all subagents clear —
-       ready for account switch" style updates that were previously
-       swallowed as digest.
-    3. **silent** — routine audit-trail markers (``test pass``,
-       ``audit``, ``recorded``). Skipped if action-requiring phrase
-       present so "Test pass: please verify" correctly upgrades.
-    4. **digest** — completion-only updates (``done``, ``shipped``,
-       ``merged``, …) with no action-requiring phrase.
-    5. **default: immediate** — ambiguous input over-notifies rather
-       than silently dropping.
-
-    Returns one of ``'immediate'`` / ``'digest'`` / ``'silent'``.
-    """
-    text = f"{subject}\n{body}"
-    if _has_keyword(text, _IMMEDIATE_KEYWORDS):
-        return "immediate"
-    # Action-requiring completion — a completion marker + an
-    # action-requiring phrase both present → the user has to see this
-    # now, not in a milestone rollup. Evaluated before both silent and
-    # digest so "Test pass: please verify" and "All subagents clear —
-    # ready for account switch" both land in the inbox.
-    if _has_keyword(text, _ACTION_REQUIRING_PHRASES) and _has_keyword(
-        text, _COMPLETION_MARKERS,
-    ):
-        return "immediate"
-    if _has_keyword(text, _SILENT_KEYWORDS):
-        return "silent"
-    if _has_keyword(text, _DIGEST_KEYWORDS):
-        return "digest"
-    # Ambiguous — over-notify is safer than under-notify.
-    return "immediate"
-
-
-def validate_priority(priority: str) -> str:
-    """Normalise and validate a priority string. Raises ValueError on bad input."""
-    p = (priority or "").strip().lower()
-    if p not in _VALID_PRIORITIES:
-        raise ValueError(
-            f"Invalid priority '{priority}'. Expected one of: "
-            f"{sorted(_VALID_PRIORITIES)}"
-        )
-    return p
+from pollypm.store.classifier import classify_priority, validate_priority  # noqa: E402,F401
 
 
 # ---------------------------------------------------------------------------

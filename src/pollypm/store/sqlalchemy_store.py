@@ -28,21 +28,13 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
-from sqlalchemy import MetaData, and_, delete, insert, select, text, update
-from sqlalchemy.engine import Connection, Engine
+from sqlalchemy import Executable, MetaData, and_, delete, insert, select, text, update
+from sqlalchemy.engine import Connection, CursorResult, Engine
 
 from pollypm.store.engine import make_engines
 from pollypm.store.event_buffer import EventBuffer
 from pollypm.store.schema import FTS_DDL_STATEMENTS, messages, metadata
-
-
-_NOT_YET_IMPLEMENTED = (
-    "SQLAlchemyStore.{method}() is not implemented yet. "
-    "The storage rewrite lands in phases — alert methods arrive in a "
-    "follow-up issue to #338. "
-    "Fix: wait for the unified-alerts issue to merge, or track progress "
-    "in the #337 epic."
-)
+from pollypm.store.title_contract import apply_title_contract
 
 
 class SQLAlchemyStore:
@@ -246,22 +238,31 @@ class SQLAlchemyStore:
         labels: list[str] | None = None,
         parent_id: int | None = None,
         payload: dict[str, Any] | None = None,
+        state: str = "open",
     ) -> int:
         """Insert a single message row. Returns the new row id.
 
         Keyword arguments map directly onto columns; JSON fields
         (``labels`` / ``payload``) are serialized here so callers pass
-        native Python values.
+        native Python values. ``subject`` is routed through
+        :func:`apply_title_contract` so every stored row starts with a
+        bracket tag (``[Action]`` / ``[FYI]`` / ``[Audit]`` / …) — see
+        :mod:`pollypm.store.title_contract` for the full tag table.
+
+        ``state`` defaults to ``'open'``; pass ``'staged'`` to insert a
+        digest-tier row that shouldn't surface until a flush sweep
+        promotes it.
         """
+        stamped_subject = apply_title_contract(subject, tier=tier, type=type)
         row = {
             "scope": scope,
             "type": type,
             "tier": tier,
             "recipient": recipient,
             "sender": sender,
-            "state": "open",
+            "state": state,
             "parent_id": parent_id,
-            "subject": subject,
+            "subject": stamped_subject,
             "body": body,
             "payload_json": json.dumps(payload if payload is not None else {}),
             "labels": json.dumps(labels if labels is not None else []),
@@ -270,6 +271,128 @@ class SQLAlchemyStore:
             result = conn.execute(insert(messages), row)
             inserted = result.inserted_primary_key
         return int(inserted[0]) if inserted else 0
+
+    def upsert_message(
+        self,
+        type: str,
+        tier: str,
+        recipient: str,
+        sender: str,
+        subject: str,
+        body: str,
+        scope: str,
+        dedupe_key: tuple[str, ...] = ("scope", "recipient", "type", "sender"),
+        labels: list[str] | None = None,
+        parent_id: int | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> int:
+        """Insert-if-no-open-match-else-update. Returns the row id.
+
+        The dedupe contract: at most one ``state='open'`` row exists for
+        the tuple named by ``dedupe_key`` (default: ``scope`` + ``recipient``
+        + ``type`` + ``sender``). If such a row exists, its ``body`` /
+        ``subject`` / ``payload`` / ``labels`` / ``tier`` are refreshed
+        and the existing row id is returned. Otherwise a fresh row is
+        inserted via :meth:`enqueue_message`.
+
+        Enforcement lives in application code — we query for a matching
+        open row inside the same writer transaction that performs the
+        update/insert, so a check-then-act race is impossible for a
+        single-pool writer. Callers from multiple processes are
+        serialized by SQLite's file lock + the ``busy_timeout`` in
+        :mod:`pollypm.store.engine`.
+
+        The default dedupe key matches the pre-migration alert semantics
+        — one open alert per ``(session_name, alert_type)`` — by mapping
+        ``scope=session_name`` and ``sender=alert_type``. Alert callers
+        typically leave ``dedupe_key`` at its default.
+        """
+        stamped_subject = apply_title_contract(subject, tier=tier, type=type)
+        supported = {"scope", "recipient", "type", "sender"}
+        unknown = set(dedupe_key) - supported
+        if unknown:
+            raise ValueError(
+                f"upsert_message received unsupported dedupe_key field(s) "
+                f"{sorted(unknown)!r}. "
+                f"Only {sorted(supported)} are valid because those are the "
+                f"columns the indexed open-row lookup can match on. "
+                f"Fix: remove the field or, if a new dedupe axis is "
+                f"genuinely needed, extend the schema + widen this "
+                f"allowlist in SQLAlchemyStore.upsert_message."
+            )
+        # Dedupe tuple — the values we match an existing open row against.
+        local_vars = {
+            "scope": scope,
+            "recipient": recipient,
+            "type": type,
+            "sender": sender,
+        }
+        now = datetime.now(timezone.utc)
+        payload_json = json.dumps(payload if payload is not None else {})
+        labels_json = json.dumps(labels if labels is not None else [])
+        with self.transaction() as conn:
+            conditions = [messages.c.state == "open"]
+            for field in dedupe_key:
+                conditions.append(messages.c[field] == local_vars[field])
+            existing = conn.execute(
+                select(messages.c.id)
+                .where(and_(*conditions))
+                .order_by(messages.c.id.desc())
+                .limit(1)
+            ).fetchone()
+            if existing is not None:
+                row_id = int(existing[0])
+                conn.execute(
+                    update(messages)
+                    .where(messages.c.id == row_id)
+                    .values(
+                        tier=tier,
+                        subject=stamped_subject,
+                        body=body,
+                        payload_json=payload_json,
+                        labels=labels_json,
+                        parent_id=parent_id,
+                        updated_at=now,
+                    )
+                )
+                return row_id
+            result = conn.execute(
+                insert(messages),
+                {
+                    "scope": scope,
+                    "type": type,
+                    "tier": tier,
+                    "recipient": recipient,
+                    "sender": sender,
+                    "state": "open",
+                    "parent_id": parent_id,
+                    "subject": stamped_subject,
+                    "body": body,
+                    "payload_json": payload_json,
+                    "labels": labels_json,
+                },
+            )
+            inserted = result.inserted_primary_key
+        return int(inserted[0]) if inserted else 0
+
+    def execute(self, stmt: Executable) -> CursorResult[Any]:
+        """Execute an arbitrary SQLAlchemy Core statement in a write tx.
+
+        Escape hatch for callers that need to write to tables the Store
+        doesn't own — most notably ``work_tasks`` (flow-engine state)
+        and its siblings. Tasks are not messages, so the Store should
+        not grow a bespoke method for every table, but every writer
+        still needs to share the single-connection writer pool or two
+        processes will contend for SQLite's file lock.
+
+        Returns the :class:`~sqlalchemy.engine.CursorResult` so callers
+        can inspect ``rowcount`` / ``inserted_primary_key``. Commits on
+        clean exit, rolls back on exception — the semantics are the
+        same as :meth:`transaction`, this is just the single-statement
+        convenience form.
+        """
+        with self.transaction() as conn:
+            return conn.execute(stmt)
 
     def update_message(self, id: int, **fields: Any) -> None:
         """Patch ``fields`` onto the message with the given ``id``.
@@ -381,7 +504,7 @@ class SQLAlchemyStore:
         return rows
 
     # ------------------------------------------------------------------
-    # Alerts — still stubbed; follow-up issue to #338.
+    # Alerts — thin wrappers over upsert_message / close_message.
     # ------------------------------------------------------------------
 
     def upsert_alert(
@@ -391,14 +514,52 @@ class SQLAlchemyStore:
         severity: str,
         message: str,
     ) -> None:
-        raise NotImplementedError(
-            _NOT_YET_IMPLEMENTED.format(method="upsert_alert")
+        """Create-or-refresh an alert row in the unified messages table.
+
+        Maps the legacy ``(session_name, alert_type)`` dedupe key onto
+        the ``(scope, sender)`` columns of ``messages`` and routes
+        through :meth:`upsert_message`, so at most one open alert exists
+        per ``(session_name, alert_type)`` at a time — matching the
+        pre-migration contract from :class:`StateStore.upsert_alert`.
+
+        The ``severity`` column used to be first-class; under the
+        unified schema it rides along in ``payload['severity']`` so the
+        cockpit/alert readers can still filter by severity without a
+        dedicated column. The subject is auto-tagged ``[Alert]`` by
+        :func:`apply_title_contract`.
+        """
+        self.upsert_message(
+            type="alert",
+            tier="immediate",
+            recipient="user",
+            sender=alert_type,
+            subject=message,
+            body="",
+            scope=session_name,
+            payload={"severity": severity, "session_name": session_name},
         )
 
     def clear_alert(self, session_name: str, alert_type: str) -> None:
-        raise NotImplementedError(
-            _NOT_YET_IMPLEMENTED.format(method="clear_alert")
-        )
+        """Close any open alert matching ``(session_name, alert_type)``.
+
+        Mirrors the legacy :meth:`StateStore.clear_alert` — if no open
+        row exists, the call is a no-op (we don't raise on "already
+        cleared" because the heartbeat drives this on every sweep).
+        """
+        now = datetime.now(timezone.utc)
+        with self.transaction() as conn:
+            conn.execute(
+                update(messages)
+                .where(
+                    and_(
+                        messages.c.type == "alert",
+                        messages.c.scope == session_name,
+                        messages.c.sender == alert_type,
+                        messages.c.state == "open",
+                    )
+                )
+                .values(state="closed", closed_at=now, updated_at=now)
+            )
 
     # ------------------------------------------------------------------
     # Test-only conveniences — do NOT call from production code paths.

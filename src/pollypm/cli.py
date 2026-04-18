@@ -522,6 +522,10 @@ def cockpit_pane(
         from pollypm.cockpit_ui import PollyInboxApp
         PollyInboxApp(config_path).run(mouse=True)
         return
+    if kind == "workers":
+        from pollypm.cockpit_ui import PollyWorkerRosterApp
+        PollyWorkerRosterApp(config_path).run(mouse=True)
+        return
     if kind == "issues" and target:
         from pollypm.cockpit_ui import PollyTasksApp
         PollyTasksApp(config_path, target).run(mouse=True)

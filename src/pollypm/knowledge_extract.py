@@ -370,35 +370,109 @@ def _heuristic_extract(events: list[dict[str, Any]]) -> KnowledgeDelta:
                 delta.risks.append(sentence)
             if any(token in lowered for token in ("idea", "maybe", "consider", "future", "could")):
                 delta.ideas.append(sentence)
-    delta.goals = _dedupe(delta.goals)
-    delta.architecture_changes = _dedupe(delta.architecture_changes)
-    delta.convention_shifts = _dedupe(delta.convention_shifts)
-    delta.decisions = _dedupe(delta.decisions)
-    delta.risks = _dedupe(delta.risks)
-    delta.ideas = _dedupe(delta.ideas)
+    # Route every field through the same sanitizer the Haiku path uses so
+    # heuristic-produced entries cannot blow past the title/body caps or
+    # smuggle in exponentially-escaped JSON garbage (root cause of the
+    # 83k memory_entries bloat; largest row was a 2.44 MB title).
+    delta.goals = _sanitize_items(delta.goals)
+    delta.architecture_changes = _sanitize_items(delta.architecture_changes)
+    delta.convention_shifts = _sanitize_items(delta.convention_shifts)
+    delta.decisions = _sanitize_items(delta.decisions)
+    delta.risks = _sanitize_items(delta.risks)
+    delta.ideas = _sanitize_items(delta.ideas)
     return delta
 
 
+# Shared caps — enforced identically by the Haiku path (_sanitize_items) and
+# the heuristic fallback (_heuristic_extract) via _apply_item_caps.
+MAX_TITLE_LEN = 500
+MAX_BODY_LEN = 4000
+# Reject anything with more than this many consecutive backslashes — a
+# reliable signal of JSON-escape doubling feedback loops that previously
+# produced multi-megabyte "titles" in the memory_entries table.
+MAX_CONSECUTIVE_BACKSLASHES = 10
+_BACKSLASH_RUN_RE = re.compile(r"\\{" + str(MAX_CONSECUTIVE_BACKSLASHES + 1) + r",}")
+_TITLE_ELLIPSIS = "…"
+
+
+def _apply_item_caps(item: object, *, body: str | None = None) -> tuple[str, str] | None:
+    """Apply the shared title/body caps and rejection rules.
+
+    Returns ``(title, body)`` with the enforced caps applied, or ``None`` if
+    the whole item should be dropped. ``body`` defaults to the title when
+    not supplied (matching the historical ``body=title`` storage pattern
+    used by :func:`store_snapshot_learnings`).
+
+    Rules (applied identically to both extraction paths):
+
+    * Reject empty / whitespace-only titles.
+    * Reject raw JSON / fenced-code / transcript-payload noise.
+    * Reject titles or bodies that contain any run of more than
+      :data:`MAX_CONSECUTIVE_BACKSLASHES` backslashes (escape-doubling).
+    * Reject the entry when ``body == title`` **and** the title is already
+      being carried elsewhere — see :func:`_sanitize_items` which keeps the
+      legacy body=title behavior for callers that don't pass an explicit
+      body.
+    * Truncate title to :data:`MAX_TITLE_LEN` characters (with ellipsis).
+    * Truncate body to :data:`MAX_BODY_LEN` characters.
+    """
+    if item is None:
+        return None
+    text = _sanitize_text(str(item)).strip()
+    if not text:
+        return None
+    # Reject items that are raw JSON, escaped strings, or transcript noise.
+    if text.startswith("{") or text.startswith("[") or text.startswith("```"):
+        return None
+    if "\\\\" in text or "\\n" in text:
+        return None
+    if '"timestamp"' in text or '"event_type"' in text or '"payload"' in text:
+        return None
+    if text.startswith("I'm ready to extract") or text.startswith("For example"):
+        return None
+    # Pathological escape-doubling check: a run of >10 backslashes anywhere
+    # in the title means someone has re-JSON-encoded a JSON string, which
+    # was the root cause of the 2.44 MB title observed in the memory audit.
+    if _BACKSLASH_RUN_RE.search(text):
+        return None
+    # Title length cap with ellipsis — final length stays <= MAX_TITLE_LEN.
+    if len(text) > MAX_TITLE_LEN:
+        text = text[: MAX_TITLE_LEN - 1].rstrip() + _TITLE_ELLIPSIS
+
+    if body is None:
+        capped_body = text
+    else:
+        body_text = _sanitize_text(str(body)).strip()
+        if _BACKSLASH_RUN_RE.search(body_text):
+            return None
+        if len(body_text) > MAX_BODY_LEN:
+            body_text = body_text[: MAX_BODY_LEN - 1].rstrip() + _TITLE_ELLIPSIS
+        # Reject no-info entries where the body adds nothing beyond the title.
+        if body_text == text:
+            return None
+        capped_body = body_text
+    return text, capped_body
+
+
 def _sanitize_items(value: object) -> list[str]:
+    """Sanitize a list of title-only items (Haiku path + heuristic path).
+
+    Items are routed through :func:`_apply_item_caps`. Because callers of
+    this helper historically store ``body=title`` (or an empty body), we
+    only return the capped title string here and rely on the caller to
+    mirror it into the body field as before. The body-equality rejection
+    in :func:`_apply_item_caps` is therefore skipped by passing
+    ``body=None``.
+    """
     if not isinstance(value, list):
         return []
-    cleaned = []
+    cleaned: list[str] = []
     for item in value:
-        text = _sanitize_text(str(item)).strip()
-        if not text:
+        capped = _apply_item_caps(item, body=None)
+        if capped is None:
             continue
-        # Reject items that are raw JSON, escaped strings, or transcript noise
-        if text.startswith("{") or text.startswith("[") or text.startswith("```"):
-            continue
-        if "\\\\" in text or "\\n" in text:
-            continue
-        if '"timestamp"' in text or '"event_type"' in text or '"payload"' in text:
-            continue
-        if text.startswith("I'm ready to extract") or text.startswith("For example"):
-            continue
-        if len(text) > 500:
-            text = text[:500]
-        cleaned.append(text)
+        title, _body = capped
+        cleaned.append(title)
     return _dedupe(cleaned)
 
 

@@ -70,6 +70,8 @@ class TestCoreRecurringPlugin:
             "alerts.gc",
             # #249 — work-service-aware progress sweeper.
             "work.progress_sweep",
+            # #250 — pane-text semantic classifier.
+            "pane.classify",
             # DB hygiene — daily cron at ~4am local.
             "db.vacuum",
             "memory.ttl_sweep",
@@ -92,6 +94,8 @@ class TestCoreRecurringPlugin:
         assert _interval_seconds(entries["transcript.ingest"]) == 30
         assert _interval_seconds(entries["alerts.gc"]) == 300
         assert _interval_seconds(entries["work.progress_sweep"]) == 300
+        # #250 — pane-text classifier runs every 30s.
+        assert _interval_seconds(entries["pane.classify"]) == 30
         # DB hygiene entries are 5-field cron, not @every — just verify
         # they parse into a CronSchedule with the expected expression so
         # the fleet doesn't sync on the hour.

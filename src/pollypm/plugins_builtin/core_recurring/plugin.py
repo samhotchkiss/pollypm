@@ -629,6 +629,320 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def pane_text_classify_handler(payload: dict[str, Any]) -> dict[str, Any]:
+    """Semantic pane-text classifier sweep — issue #250.
+
+    Runs the :mod:`pollypm.recovery.pane_patterns` rule set against
+    every live session's captured pane text. For each rule that
+    matches, raises a ``pane:<rule_name>:<session_name>`` alert via
+    ``StateStore.upsert_alert`` (the alert's per-(session, type) open
+    uniqueness guarantees dedupe across sweeps). Rules in
+    :data:`pane_patterns.USER_VISIBLE_RULES` additionally emit a
+    best-effort inbox task so Sam sees a pushable notification.
+
+    DETECTION + ALERTS ONLY (scope constraint — Polly is live in a
+    dogfood session on 2026-04-17). Any send-keys intervention (
+    ``/compact``, ``Esc``, auto-accept of permission prompts, theme
+    modal dismissal) is deferred to the follow-up PR and marked
+    ``TODO(#250-followup)`` below.
+
+    Clears alerts for rules that no longer match — the handler owns
+    the full lifecycle so the cockpit doesn't accumulate stale
+    warnings.
+
+    Returns a small summary dict for job-result introspection.
+    """
+    from pollypm.plugins_builtin.task_assignment_notify.resolver import (
+        load_runtime_services,
+    )
+    from pollypm.recovery.pane_patterns import (
+        RULES,
+        USER_VISIBLE_RULES,
+        classify_pane,
+        rule_by_name,
+    )
+
+    config_path_hint = payload.get("config_path")
+    config_path = Path(config_path_hint) if config_path_hint else None
+    services = load_runtime_services(config_path=config_path)
+
+    session_svc = services.session_service
+    state_store = services.state_store
+    work_service = services.work_service
+
+    if session_svc is None or state_store is None:
+        return {"outcome": "skipped", "reason": "services_unavailable"}
+
+    capture_lines = int(payload.get("capture_lines", 200) or 200)
+
+    # Pre-resolve the full rule-name set so we can clear alerts for
+    # rules that no longer match on this session.
+    all_rule_names = [rule.name for rule in RULES]
+
+    sessions_scanned = 0
+    alerts_raised = 0
+    alerts_cleared = 0
+    inbox_items_emitted = 0
+    capture_failures = 0
+    match_counts: dict[str, int] = {name: 0 for name in all_rule_names}
+
+    try:
+        handles = session_svc.list()
+    except Exception:  # noqa: BLE001
+        logger.debug("pane_text_classify: session list failed", exc_info=True)
+        return {"outcome": "failed", "reason": "session_list_error"}
+
+    for handle in handles:
+        session_name = getattr(handle, "name", "") or ""
+        if not session_name:
+            continue
+        sessions_scanned += 1
+
+        capture_fn = getattr(session_svc, "capture", None)
+        if not callable(capture_fn):
+            capture_failures += 1
+            continue
+        try:
+            pane_text = capture_fn(session_name, lines=capture_lines)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "pane_text_classify: capture failed for %s",
+                session_name, exc_info=True,
+            )
+            capture_failures += 1
+            continue
+        if not isinstance(pane_text, str):
+            pane_text = ""
+
+        try:
+            matched = set(classify_pane(pane_text))
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "pane_text_classify: classify failed for %s",
+                session_name, exc_info=True,
+            )
+            continue
+
+        for rule_name in all_rule_names:
+            alert_type = f"pane:{rule_name}"
+            if rule_name in matched:
+                rule = rule_by_name(rule_name)
+                severity = rule.severity if rule else "warn"
+                message = (
+                    f"{session_name}: pane-text pattern "
+                    f"'{rule_name}' matched"
+                )
+                try:
+                    # Detect first-fire so the counter reflects real
+                    # new notifications rather than idempotent upserts.
+                    existing = state_store.execute(
+                        "SELECT id FROM alerts WHERE session_name = ? "
+                        "AND alert_type = ? AND status = 'open'",
+                        (session_name, alert_type),
+                    ).fetchone()
+                    state_store.upsert_alert(
+                        session_name, alert_type, severity, message,
+                    )
+                    if existing is None:
+                        alerts_raised += 1
+                        match_counts[rule_name] += 1
+                        # Ledger event so the activity feed carries a
+                        # permanent record of the detection regardless
+                        # of how long the alert stays open.
+                        try:
+                            state_store.record_event(
+                                session_name,
+                                "pane.classify.match",
+                                f"matched rule '{rule_name}'",
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "pane_text_classify: upsert_alert failed "
+                        "for %s/%s", session_name, rule_name,
+                        exc_info=True,
+                    )
+
+                # TODO(#250-followup): wire send-keys intervention
+                # after Sam reviews. For context_full → send '/compact';
+                # for permission_prompt → optional auto-accept via
+                # `pm send <session> 1`; for theme_trust_modal →
+                # dismiss via Enter. All deferred — Polly is live in a
+                # dogfood session and any stray send_keys would clobber
+                # her turn.
+
+                if rule_name in USER_VISIBLE_RULES and work_service is not None:
+                    emitted = _emit_pane_pattern_inbox_item(
+                        work_service=work_service,
+                        session_name=session_name,
+                        rule_name=rule_name,
+                        pane_text=pane_text,
+                        state_store=state_store,
+                    )
+                    if emitted:
+                        inbox_items_emitted += 1
+            else:
+                # Rule doesn't match anymore — clear any open alert.
+                # ``clear_alert`` is a no-op when no open alert exists.
+                try:
+                    existing = state_store.execute(
+                        "SELECT id FROM alerts WHERE session_name = ? "
+                        "AND alert_type = ? AND status = 'open'",
+                        (session_name, alert_type),
+                    ).fetchone()
+                    if existing is not None:
+                        state_store.clear_alert(session_name, alert_type)
+                        alerts_cleared += 1
+                except Exception:  # noqa: BLE001
+                    pass
+
+    return {
+        "outcome": "swept",
+        "sessions_scanned": sessions_scanned,
+        "alerts_raised": alerts_raised,
+        "alerts_cleared": alerts_cleared,
+        "inbox_items_emitted": inbox_items_emitted,
+        "capture_failures": capture_failures,
+        "match_counts": match_counts,
+    }
+
+
+def _emit_pane_pattern_inbox_item(
+    *,
+    work_service: Any,
+    session_name: str,
+    rule_name: str,
+    pane_text: str,
+    state_store: Any = None,
+) -> bool:
+    """Create a user-visible inbox task for a matched pane pattern.
+
+    Dedupes via a stable ``labels`` tag — callers scan by label before
+    creating. Returns ``True`` when a new inbox task was created,
+    ``False`` when one already existed or creation failed (best-effort
+    so a flaky work service never crashes the sweep).
+    """
+    dedupe_label = f"pane_pattern:{rule_name}:{session_name}"
+
+    # Best-effort dedupe: scan the inbox project's open/in_progress
+    # tasks for one carrying our sidecar label. The work_service API
+    # doesn't filter on labels server-side, so we filter in Python —
+    # acceptable because the inbox project's open task count is small
+    # (single-digit at steady state).
+    try:
+        list_fn = getattr(work_service, "list_tasks", None)
+        if callable(list_fn):
+            for status in ("queued", "in_progress", "draft", "review"):
+                try:
+                    tasks = list_fn(work_status=status, project="inbox")
+                except TypeError:
+                    # Older fakes may not accept ``project`` — fall
+                    # back to status-only.
+                    tasks = list_fn(work_status=status)
+                for task in tasks or []:
+                    labels = getattr(task, "labels", None) or []
+                    if dedupe_label in labels:
+                        return False
+    except Exception:  # noqa: BLE001
+        # A list failure isn't fatal — worst case we duplicate, which
+        # is visible + fixable rather than silent drops.
+        pass
+
+    title_map = {
+        "context_full": (
+            f"Session '{session_name}' approaching context limit — "
+            f"consider /compact"
+        ),
+        "permission_prompt": (
+            f"Session '{session_name}' is waiting on a permission "
+            f"prompt — approval needed"
+        ),
+    }
+    title = title_map.get(
+        rule_name,
+        f"Session '{session_name}' matched pane pattern '{rule_name}'",
+    )
+
+    # Short excerpt for the inbox body — keep tight so the UI list
+    # stays readable. We take the tail of the capture because the
+    # relevant prompt / warning is almost always the most recent thing
+    # rendered.
+    excerpt_source = pane_text[-600:] if pane_text else ""
+    body_parts = [
+        f"Session **{session_name}** matched pane-text rule "
+        f"**{rule_name}**.",
+        "",
+        "## Recent pane text",
+        "",
+        "```",
+        excerpt_source.strip() or "(empty capture)",
+        "```",
+        "",
+        "## How to resolve",
+        "",
+    ]
+    if rule_name == "context_full":
+        body_parts.extend([
+            f"- Attach (`tmux attach -t {session_name}`) and run "
+            "`/compact` to summarize, or",
+            f"- Send from the cockpit: `pm send {session_name} /compact`.",
+        ])
+    elif rule_name == "permission_prompt":
+        body_parts.extend([
+            f"- Attach (`tmux attach -t {session_name}`) and approve "
+            "the prompt, or",
+            f"- Auto-accept: `pm send {session_name} 1`.",
+        ])
+    body_parts.extend([
+        "",
+        f"Alert type: `pane:{rule_name}`. This inbox item was emitted "
+        "by the pane-text classifier (issue #250).",
+    ])
+    body = "\n".join(body_parts)
+
+    labels = [
+        "pane_pattern",
+        f"rule:{rule_name}",
+        f"session:{session_name}",
+        dedupe_label,
+    ]
+
+    try:
+        inbox_task = work_service.create(
+            title=title,
+            description=body,
+            type="task",
+            project="inbox",
+            flow_template="chat",
+            roles={"requester": session_name, "operator": "polly"},
+            priority="normal",
+            created_by=session_name,
+            labels=labels,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "pane_text_classify: inbox create failed for %s/%s",
+            session_name, rule_name, exc_info=True,
+        )
+        return False
+
+    if state_store is not None:
+        task_id = getattr(inbox_task, "task_id", "") or ""
+        try:
+            state_store.record_event(
+                session_name,
+                "pane.classify.inbox_emitted",
+                (
+                    f"emitted inbox task {task_id} for "
+                    f"rule '{rule_name}'"
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    return True
+
+
 def alerts_gc_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Release expired leases and prune old heartbeat rows.
 
@@ -1478,6 +1792,12 @@ def _register_handlers(api: JobHandlerAPI) -> None:
         "work.progress_sweep", work_progress_sweep_handler,
         max_attempts=1, timeout_seconds=60.0,
     )
+    # #250 — semantic pane-text classifier. Detection + alerts only in
+    # v1; send-keys interventions are deferred to a follow-up PR.
+    api.register_handler(
+        "pane.classify", pane_text_classify_handler,
+        max_attempts=1, timeout_seconds=60.0,
+    )
     # DB hygiene — incremental vacuum + memory TTL sweep. Both are cheap
     # daily sweeps that coordinate with the shared StateStore connection.
     api.register_handler(
@@ -1525,6 +1845,12 @@ def _register_roster(api: RosterAPI) -> None:
     api.register_recurring("@every 5m", "alerts.gc", {})
     # #249 — work-service-aware stuck-task sweeper.
     api.register_recurring("@every 5m", "work.progress_sweep", {})
+    # #250 — semantic pane-text classifier. 30s cadence is a balance
+    # between operator latency (alerts within ~half a minute) and the
+    # cost of capturing every active pane. The handler itself is cheap
+    # (regex match per session) — the dominant cost is the tmux
+    # capture-pane round trip.
+    api.register_recurring("@every 30s", "pane.classify", {})
     # DB hygiene — daily around 4am local. Off-minute (``7``) avoids
     # fleet-wide sync if many cockpits run on the same host. Memory TTL
     # sweep runs a few minutes later so its writes don't collide with
@@ -1587,6 +1913,7 @@ plugin = PollyPMPlugin(
         Capability(kind="job_handler", name="transcript.ingest"),
         Capability(kind="job_handler", name="alerts.gc"),
         Capability(kind="job_handler", name="work.progress_sweep"),
+        Capability(kind="job_handler", name="pane.classify"),
         Capability(kind="job_handler", name="db.vacuum"),
         Capability(kind="job_handler", name="memory.ttl_sweep"),
         Capability(kind="job_handler", name="events.retention_sweep"),

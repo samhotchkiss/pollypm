@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import resource
+from collections import deque
 from pathlib import Path
 import subprocess
 
@@ -17,7 +18,7 @@ from rich.text import Text
 from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, ListItem, ListView, Static
 
@@ -215,6 +216,23 @@ class _PaletteListItem(ListItem):
         return f"{title}\n  {line2}"
 
 
+class _PaletteSectionHeader(ListItem):
+    """Non-selectable header row that labels a group in the palette.
+
+    Used to separate the "Recent" group from the full "All commands"
+    list on empty-query open. Marked ``disabled`` so Textual skips it
+    during arrow-key navigation and so Enter cannot fire on it.
+    """
+
+    def __init__(self, label: str) -> None:
+        body = Static(
+            f"[#6b7a88]\u2500\u2500 {label} \u2500\u2500[/#6b7a88]",
+            markup=True,
+        )
+        super().__init__(body, classes="palette-section-header")
+        self.disabled = True
+
+
 class CommandPaletteModal(ModalScreen[str | None]):
     """Global ``:`` command palette — fuzzy-searchable command list.
 
@@ -274,6 +292,12 @@ class CommandPaletteModal(ModalScreen[str | None]):
         background: #253140;
         color: #f2f6f8;
     }
+    #palette-list > .palette-section-header {
+        height: 1;
+        padding: 0 1;
+        color: #6b7a88;
+        background: transparent;
+    }
     #palette-empty {
         height: 3;
         padding: 1;
@@ -293,10 +317,33 @@ class CommandPaletteModal(ModalScreen[str | None]):
         Binding("enter", "run_selected", "Run", show=False),
     ]
 
-    def __init__(self, commands: list[PaletteCommand]) -> None:
+    def __init__(
+        self,
+        commands: list[PaletteCommand],
+        *,
+        recent_tags: list[str] | None = None,
+    ) -> None:
         super().__init__()
         self._all_commands: list[PaletteCommand] = list(commands)
+        # Most-recent-first list of recently-run PaletteCommands, deduped
+        # and capped to 5 entries for empty-query rendering. Each tag is
+        # resolved back to its PaletteCommand so the row renders with
+        # the same title/subtitle/category as the main list. Tags that
+        # no longer exist in ``commands`` are dropped silently.
+        self._recent_commands: list[PaletteCommand] = _resolve_recent_commands(
+            commands, recent_tags or [], limit=5,
+        )
+        # ``_visible`` is the flat list of *selectable* PaletteCommands
+        # currently on screen (recent + all when empty query; filtered
+        # only otherwise). It mirrors the ListView index 1:1 after
+        # accounting for header rows, so ``action_run_selected`` can map
+        # the cursor row back to a tag.
         self._visible: list[PaletteCommand] = list(commands)
+        # ``_row_kinds`` mirrors ListView children 1:1 with "header" or
+        # "item" so keyboard navigation (``action_run_selected``) can
+        # resolve a ListView index to the right ``_visible`` slot without
+        # assuming header positions.
+        self._row_kinds: list[str] = []
         self.input = Input(placeholder="Type a command\u2026", id="palette-input")
         self.list_view = ListView(id="palette-list")
         self.empty = Static(
@@ -321,29 +368,71 @@ class CommandPaletteModal(ModalScreen[str | None]):
             yield self.hint
 
     def on_mount(self) -> None:
-        self._populate(self._all_commands)
+        # Empty query on open → render the Recent section (if any) above
+        # the full command list. ``_filter("")`` routes through the
+        # shared rendering path so repeat-opens land on the same layout.
+        self._filter("")
         self.input.focus()
 
     # ------------------------------------------------------------------
     # Population / filtering
     # ------------------------------------------------------------------
 
-    def _populate(self, commands: list[PaletteCommand]) -> None:
-        self._visible = list(commands)
+    def _populate(
+        self,
+        commands: list[PaletteCommand],
+        *,
+        recent: list[PaletteCommand] | None = None,
+    ) -> None:
+        """Render the palette list.
+
+        When ``recent`` is non-empty we prepend a ``-- Recent --`` header
+        and the recent rows, then a ``-- All commands --`` header and
+        the full ``commands`` list. When ``recent`` is empty/None we fall
+        back to the original single-section layout — callers get the
+        existing behaviour for free.
+        """
+        recent = recent or []
+        self._visible = list(recent) + list(commands)
+        self._row_kinds = []
         self.list_view.clear()
-        if not commands:
+        if not self._visible:
             self.empty.display = True
             self.list_view.display = False
             return
         self.empty.display = False
         self.list_view.display = True
-        items = [_PaletteListItem(cmd) for cmd in commands]
-        self.list_view.extend(items)
-        # Always cursor the top match so Enter runs the most relevant
-        # command without needing to arrow.
-        self.list_view.index = 0
+
+        first_item_index: int | None = None
+        if recent:
+            self.list_view.append(_PaletteSectionHeader("Recent"))
+            self._row_kinds.append("header")
+            for cmd in recent:
+                if first_item_index is None:
+                    first_item_index = len(self._row_kinds)
+                self.list_view.append(_PaletteListItem(cmd))
+                self._row_kinds.append("item")
+            self.list_view.append(_PaletteSectionHeader("All commands"))
+            self._row_kinds.append("header")
+        for cmd in commands:
+            if first_item_index is None:
+                first_item_index = len(self._row_kinds)
+            self.list_view.append(_PaletteListItem(cmd))
+            self._row_kinds.append("item")
+
+        # Cursor the first selectable row — Enter should re-run the
+        # most recent command when Recent is present, else the top of
+        # the full list.
+        self.list_view.index = first_item_index if first_item_index is not None else 0
 
     def _filter(self, query: str) -> None:
+        # Empty query reveals the Recent section above the full list;
+        # any non-empty query suppresses Recent so search results aren't
+        # polluted by history.
+        stripped = (query or "").strip()
+        if not stripped:
+            self._populate(self._all_commands, recent=self._recent_commands)
+            return
         matches = filter_palette_commands(self._all_commands, query)
         self._populate(matches)
 
@@ -362,6 +451,8 @@ class CommandPaletteModal(ModalScreen[str | None]):
     @on(ListView.Selected, "#palette-list")
     def _on_row_selected(self, event: ListView.Selected) -> None:
         row = event.item
+        # Section headers are ``ListItem``s but not ``_PaletteListItem``;
+        # ignore clicks on them so Enter-on-header doesn't dispatch.
         if isinstance(row, _PaletteListItem):
             self.dismiss(row.command.tag)
 
@@ -379,12 +470,40 @@ class CommandPaletteModal(ModalScreen[str | None]):
         self.list_view.action_cursor_up()
 
     def action_run_selected(self) -> None:
-        idx = self.list_view.index or 0
         if not self._visible:
             return
-        if idx < 0 or idx >= len(self._visible):
-            idx = 0
-        self.dismiss(self._visible[idx].tag)
+        # ListView index addresses every row including headers; translate
+        # it to a ``_visible`` slot by counting non-header rows up to the
+        # cursor. Falling through a header (shouldn't normally happen
+        # since headers are disabled) lands on the next selectable row.
+        raw_idx = self.list_view.index or 0
+        item_idx = self._resolve_item_index(raw_idx)
+        if item_idx is None:
+            return
+        self.dismiss(self._visible[item_idx].tag)
+
+    def _resolve_item_index(self, list_view_index: int) -> int | None:
+        """Map a ListView row index to the matching ``_visible`` slot.
+
+        Returns ``None`` if ``list_view_index`` points past the end, is
+        negative, or lands on a header with no selectable row after it.
+        If the cursor is on a header we walk forward to the next item so
+        Enter always dispatches something reasonable.
+        """
+        if not self._row_kinds:
+            return 0 if self._visible else None
+        if list_view_index < 0:
+            list_view_index = 0
+        # Count item rows strictly before the cursor — that's the
+        # _visible index of the next item we encounter at or after the
+        # cursor, since headers don't consume a _visible slot.
+        items_before = sum(
+            1 for kind in self._row_kinds[:list_view_index] if kind == "item"
+        )
+        for kind in self._row_kinds[list_view_index:]:
+            if kind == "item":
+                return items_before
+        return None
 
 
 def _current_project_for_palette(app: App) -> str | None:
@@ -579,17 +698,90 @@ def _palette_show_shortcuts(app: App) -> None:
     _palette_notify(app, body)
 
 
+# Session-scoped history cap — 10 entries total (we display the last 5 on
+# empty query, the extra headroom lets short-lived repeats bubble back up
+# without evicting older distinct commands prematurely). Bump cautiously;
+# a deeper history is cheap but clutters the "Recent" section when the
+# user only wants the last few.
+_PALETTE_HISTORY_MAX = 10
+_PALETTE_RECENT_DISPLAY = 5
+
+
+def _palette_history(app: App) -> deque[str]:
+    """Return the per-App command history deque, initialising lazily.
+
+    Session-scoped: nothing persists across cockpit restarts (by design —
+    see the TODO below for the follow-up plan). The deque is ordered
+    oldest-first; callers reverse it when rendering "Recent". We dedup
+    before pushing so a repeat-run moves the tag to the most-recent slot
+    without inflating the list.
+
+    TODO(v1.1): persist to ``~/.pollypm/.palette_history.json`` (last 20)
+    so opening a fresh cockpit keeps the last session's "Recent" row.
+    """
+    history = getattr(app, "_palette_recent_history", None)
+    if not isinstance(history, deque):
+        history = deque(maxlen=_PALETTE_HISTORY_MAX)
+        setattr(app, "_palette_recent_history", history)
+    return history
+
+
+def _record_palette_command(app: App, tag: str) -> None:
+    """Record a dispatched command tag on the host App's history.
+
+    Deduplicates by tag (repeat runs move the tag to the most-recent end
+    rather than pushing a new entry) and caps via the deque ``maxlen``.
+    """
+    if not tag:
+        return
+    history = _palette_history(app)
+    try:
+        history.remove(tag)
+    except ValueError:
+        pass
+    history.append(tag)
+
+
+def _resolve_recent_commands(
+    all_commands: list[PaletteCommand],
+    recent_tags: list[str],
+    *,
+    limit: int,
+) -> list[PaletteCommand]:
+    """Resolve a most-recent-first list of tags back to ``PaletteCommand``s.
+
+    Tags that aren't in ``all_commands`` are dropped silently — this can
+    happen if the config changes between cockpit runs (project removed,
+    etc.) or, more commonly, because the command doesn't live in the
+    current palette scope. Result length is capped at ``limit``.
+    """
+    by_tag = {cmd.tag: cmd for cmd in all_commands}
+    resolved: list[PaletteCommand] = []
+    for tag in recent_tags:
+        cmd = by_tag.get(tag)
+        if cmd is None:
+            continue
+        resolved.append(cmd)
+        if len(resolved) >= limit:
+            break
+    return resolved
+
+
 def _open_command_palette(app: App) -> None:
     """Push :class:`CommandPaletteModal` onto ``app`` with the full command set.
 
     Builds the command registry from the App's config + current-project
     hint, then dispatches the selected tag once the modal dismisses.
+    Also passes the session-scoped command history so empty-query opens
+    render a "Recent" section above the full list.
     """
     config_path = getattr(app, "config_path", None)
     if config_path is None:
         return
 
     def _on_dismiss(tag: str | None) -> None:
+        if tag:
+            _record_palette_command(app, tag)
         _dispatch_palette_tag(app, tag)
 
     try:
@@ -598,7 +790,11 @@ def _open_command_palette(app: App) -> None:
         )
     except Exception:  # noqa: BLE001
         commands = []
-    app.push_screen(CommandPaletteModal(commands), _on_dismiss)
+    # Most-recent-first snapshot — the modal dedupes + caps internally.
+    recent_tags = list(reversed(_palette_history(app)))
+    app.push_screen(
+        CommandPaletteModal(commands, recent_tags=recent_tags), _on_dismiss,
+    )
 
 
 # ---------------------------------------------------------------------------

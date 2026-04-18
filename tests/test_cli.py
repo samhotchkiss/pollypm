@@ -48,7 +48,10 @@ def test_discover_config_path_returns_global_default(monkeypatch, tmp_path: Path
 
     resolved = cli._discover_config_path(DEFAULT_CONFIG_PATH)
 
-    assert resolved == DEFAULT_CONFIG_PATH
+    # Compare via .resolve() to handle macOS /tmp -> /private/tmp symlink
+    # when HOME is under /tmp (agent-run isolated HOME); _discover_config_path
+    # resolves symlinks whereas DEFAULT_CONFIG_PATH is built from the raw HOME.
+    assert resolved.resolve() == DEFAULT_CONFIG_PATH.resolve()
 
 
 def test_discover_config_path_returns_global_config(monkeypatch, tmp_path: Path) -> None:

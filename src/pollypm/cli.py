@@ -2255,3 +2255,164 @@ def upgrade(
             if actions:
                 typer.echo(f"  [{key}] {len(actions)} doc(s) updated")
     typer.echo(f"Upgrade to {latest} complete. Running sessions are unaffected — restart with `pm reset && pm up` when ready.")
+
+
+# --------------------------------------------------------------------- #
+# pm backup / pm restore — disaster-recovery helpers.
+#
+# The CLI layer stays thin: it resolves paths from config, formats
+# output, and handles Typer exits. All IO + safety logic lives in
+# :mod:`pollypm.backup`.
+# --------------------------------------------------------------------- #
+
+
+@app.command("backup")
+def backup_cmd(
+    output: Path | None = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Custom destination path for the snapshot. Default: ~/.pollypm/backups/state-db-<ts>.db.gz",
+    ),
+    full: bool = typer.Option(
+        False,
+        "--full",
+        help="Bundle state.db + ~/.pollypm/ tree into a single .tar.gz. Not subject to retention.",
+    ),
+    keep: int = typer.Option(
+        None,
+        "--keep",
+        help="Keep N most recent DB snapshots; prune the rest. Ignored with --full.",
+    ),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    """Snapshot ~/.pollypm/state.db using SQLite's online backup API.
+
+    Safe to run while the cockpit + heartbeat are live. Default output
+    is a gzipped DB snapshot; pass ``--full`` to also bundle config /
+    logs / agent homes.
+    """
+    from pollypm import backup as backup_mod
+
+    try:
+        config = load_config(config_path)
+    except FileNotFoundError:
+        typer.echo(f"Config not found at {config_path}. Run `pm` to onboard first.", err=True)
+        raise typer.Exit(code=1)
+
+    state_db = config.project.state_db
+    base_dir = config.project.base_dir
+    keep_value = backup_mod.DEFAULT_KEEP if keep is None else keep
+
+    try:
+        result = backup_mod.backup_state_db(
+            state_db,
+            base_dir=base_dir,
+            output=output,
+            full=full,
+            keep=keep_value,
+        )
+    except FileNotFoundError as exc:
+        typer.echo(f"Backup failed: {exc}", err=True)
+        raise typer.Exit(code=1)
+    except Exception as exc:
+        typer.echo(f"Backup failed: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    before = backup_mod.humanize_bytes(result.db_size_before)
+    after = backup_mod.humanize_bytes(result.archive_size)
+    typer.echo(f"Backed up to {result.path}. DB size before: {before}. Archive size: {after}.")
+    if result.pruned:
+        typer.echo(f"Pruned {len(result.pruned)} older snapshot(s) (keep={keep_value}).")
+
+
+@app.command("restore")
+def restore_cmd(
+    snapshot_path: Path = typer.Argument(..., help="Path to a .db.gz DB snapshot or --full .tar.gz archive."),
+    confirm: bool = typer.Option(
+        False,
+        "--confirm",
+        help="Required to actually replace the live DB. Without this flag, restore refuses.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Describe what would happen without touching any files.",
+    ),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    """Restore state.db from a snapshot produced by ``pm backup``.
+
+    Creates a ``.before-restore-<ts>`` sibling copy of the live DB
+    before replacing it — even with ``--confirm``. You must stop the
+    cockpit first (``pm reset`` / detach the tmux session); this
+    command will not do it for you.
+    """
+    from pollypm import backup as backup_mod
+
+    try:
+        config = load_config(config_path)
+    except FileNotFoundError:
+        typer.echo(f"Config not found at {config_path}. Run `pm` to onboard first.", err=True)
+        raise typer.Exit(code=1)
+
+    live_db = config.project.state_db
+
+    try:
+        plan = backup_mod.plan_restore(snapshot_path, live_db)
+    except FileNotFoundError as exc:
+        typer.echo(f"Restore failed: {exc}", err=True)
+        raise typer.Exit(code=1)
+    except ValueError as exc:
+        typer.echo(f"Restore failed: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    if dry_run:
+        typer.echo("Dry run — no files will be touched.")
+        typer.echo(f"  snapshot:      {plan.snapshot_path}")
+        typer.echo(f"  live DB:       {plan.live_db_path}")
+        typer.echo(f"  safety copy:   {plan.safety_path}")
+        typer.echo(f"  snapshot kind: {'full tar.gz' if plan.is_tar else 'db snapshot'}")
+        return
+
+    if not confirm:
+        session_name = config.project.tmux_session
+        typer.echo("Restore refused — this replaces the live state.db.")
+        typer.echo("")
+        typer.echo("Before you proceed:")
+        typer.echo(f"  1. Stop the cockpit: `tmux kill-session -t {session_name}` (or `pm reset`).")
+        typer.echo(f"  2. Re-run with `--confirm`:")
+        typer.echo(f"       pm restore {snapshot_path} --confirm")
+        typer.echo("")
+        typer.echo(
+            "A safety copy of the live DB will be written to "
+            f"{plan.safety_path} before anything is replaced."
+        )
+        raise typer.Exit(code=1)
+
+    # Soft warning if the cockpit session is visibly running. We don't
+    # refuse — operators sometimes want to stomp in a recovery
+    # scenario — but we do surface the state so it's an informed
+    # choice.
+    try:
+        if probe_session(config.project.tmux_session):
+            typer.echo(
+                f"WARNING: tmux session '{config.project.tmux_session}' appears to still be running. "
+                "Stop it first or the restored DB may be overwritten by the live cockpit."
+            )
+    except Exception:
+        # probe_session failures are non-fatal for the restore itself.
+        pass
+
+    try:
+        result = backup_mod.execute_restore(plan)
+    except Exception as exc:
+        typer.echo(f"Restore failed mid-flight: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    typer.echo(f"Restored {result.live_db_path} from {result.snapshot_path}.")
+    typer.echo(f"Safety copy of the previous live DB: {result.safety_path}")
+    typer.echo("")
+    typer.echo("Next steps:")
+    typer.echo("  pm up                  # relaunch the cockpit")
+    typer.echo("  pm doctor              # verify the restored state")

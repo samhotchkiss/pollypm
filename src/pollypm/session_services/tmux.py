@@ -927,10 +927,24 @@ class TmuxSessionService:
                 f"role={session_role!r}"
             )
             logger.error("persona_swap_detected (session_service): %s", details)
+            # #349: emit via the unified Store when one is available; fall
+            # back to the legacy ``record_event`` on StateStore to preserve
+            # behavior in test doubles that don't carry ``append_event``.
             try:
-                self._store.record_event(
-                    session_name, "persona_swap_detected", details,
-                )
+                append = getattr(self._store, "append_event", None)
+                if callable(append):
+                    append(
+                        scope=session_name,
+                        sender=session_name,
+                        subject="persona_swap_detected",
+                        payload={"message": details},
+                    )
+                else:
+                    # TODO(#342-F): remove this fallback when StateStore
+                    # is retired; all callers will carry a Store.
+                    self._store.record_event(
+                        session_name, "persona_swap_detected", details,
+                    )
             except Exception:  # noqa: BLE001
                 pass
             raise RuntimeError(f"persona_swap_detected: {details}")

@@ -51,6 +51,12 @@ class _RuntimeServices:
     state_store: Any | None
     work_service: Any | None
     project_root: Path
+    # #349: unified-messages Store handle alongside the legacy
+    # ``state_store`` so writer sites (upsert_alert / record_event /
+    # clear_alert) can flip onto ``messages`` while readers that still
+    # need StateStore-specific APIs (raw ``execute``, ``was_notified_within``,
+    # ``record_notification``) keep working.
+    msg_store: Any | None = None
     known_projects: tuple[Any, ...] = field(default_factory=tuple)
     enforce_plan: bool = True
     plan_dir: str = "docs/plan"
@@ -76,12 +82,28 @@ def load_runtime_services(
             work_service=None,
             project_root=Path.cwd(),
             known_projects=(),
+            msg_store=None,
         )
     config = load_config(resolved_path)
 
     from pollypm.storage.state import StateStore
 
     store = StateStore(config.project.state_db)
+
+    # #349: unified-messages Store handle. Falls back to ``None`` if the
+    # backend can't be resolved so the caller still has ``state_store``
+    # to fall back on for the legacy tables.
+    msg_store: Any | None
+    try:
+        from pollypm.store.registry import get_store
+
+        msg_store = get_store(config)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "task_assignment_notify: unified Store unavailable",
+            exc_info=True,
+        )
+        msg_store = None
 
     # Session service — try the tmux default; any failure means we have
     # no way to ping, so the caller escalates to a user-inbox alert.
@@ -121,6 +143,7 @@ def load_runtime_services(
         known_projects=known_projects,
         enforce_plan=config.planner.enforce_plan,
         plan_dir=config.planner.plan_dir,
+        msg_store=msg_store,
     )
 
 
@@ -144,16 +167,17 @@ def notify(
     """
     session_svc = services.session_service
     store = services.state_store
+    msg_store = services.msg_store
 
     if session_svc is None:
-        _escalate_no_session_service(event, store)
+        _escalate_no_session_service(event, msg_store or store)
         return {"outcome": "no_session_service", "task_id": event.task_id}
 
     index = SessionRoleIndex(session_svc, work_service=services.work_service)
     handle = index.resolve(event.actor_type, event.actor_name, event.project)
 
     if handle is None:
-        _escalate_no_session(event, store)
+        _escalate_no_session(event, msg_store or store)
         return {
             "outcome": "no_session",
             "task_id": event.task_id,
@@ -196,10 +220,10 @@ def notify(
             )
 
     # Clear any prior "no session" alert for this task — the recipient
-    # is back online.
-    if store is not None:
+    # is back online. #349: writers land in ``messages`` via the Store.
+    if msg_store is not None:
         try:
-            store.clear_alert("task_assignment", _alert_type_for(event))
+            msg_store.clear_alert("task_assignment", _alert_type_for(event))
         except Exception:  # noqa: BLE001
             pass
 

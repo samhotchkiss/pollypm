@@ -412,15 +412,24 @@ class TestRetentionSweepHandler:
         assert out["deleted_audit"] == 1
 
         # The handler must have recorded a single retention-sweep event.
-        verify = StateStore(state_db)
+        # #349: audit rows now live on the unified ``messages`` table.
+        from pollypm.store import SQLAlchemyStore
+        msg_store = SQLAlchemyStore(f"sqlite:///{state_db}")
         try:
-            row = verify._conn.execute(
-                "SELECT COUNT(*) FROM events "
-                "WHERE event_type = 'events.retention_sweep'",
-            ).fetchone()
-            assert int(row[0]) == 1
+            rows = msg_store.query_messages(
+                type="event",
+                scope="system",
+                limit=20,
+            )
+            matches = [
+                row for row in rows
+                if row.get("subject") == "events.retention_sweep"
+            ]
+            assert len(matches) == 1
         finally:
-            verify.close()
+            close = getattr(msg_store, "close", None)
+            if callable(close):
+                close()
 
     def test_handler_silent_on_no_op_sweep(self, tmp_path: Path) -> None:
         """No deletions → no ``events.retention_sweep`` log row emitted."""

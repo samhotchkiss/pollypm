@@ -349,7 +349,7 @@ class TestSweepDriftIntegration:
     Dedupe comes from ``upsert_alert``'s per-type uniqueness guard."""
 
     def _patch_resolver_with_factory(
-        self, monkeypatch, tmp_path, svc, store,
+        self, monkeypatch, tmp_path, svc, store, msg_store=None,
     ):
         def _fake_loader(*, config_path=None):
             work = SQLiteWorkService(
@@ -361,6 +361,7 @@ class TestSweepDriftIntegration:
                 state_store=store,
                 work_service=work,
                 project_root=tmp_path,
+                msg_store=msg_store,
             )
 
         monkeypatch.setattr(
@@ -383,10 +384,15 @@ class TestSweepDriftIntegration:
         # Write the deliverables + fire the notify.
         _write_plan(tmp_path / "docs" / "plan" / "plan.md")
         store = StateStore(tmp_path / "state.db")
+        # #349: drift sweep writes events + alerts via the unified Store.
+        from pollypm.store import SQLAlchemyStore
+        msg_store = SQLAlchemyStore(f"sqlite:///{tmp_path / 'state.db'}")
         _record_plan_ready_notify(store, project="demo")
 
         svc = FakeSessionService(handles=[FakeHandle("architect-demo")])
-        self._patch_resolver_with_factory(monkeypatch, tmp_path, svc, store)
+        self._patch_resolver_with_factory(
+            monkeypatch, tmp_path, svc, store, msg_store=msg_store,
+        )
 
         result = work_progress_sweep_handler({})
         assert result["outcome"] == "swept"
@@ -397,28 +403,29 @@ class TestSweepDriftIntegration:
 
         # The state_drift event landed on the architect session.
         events = [
-            e for e in store.recent_events(limit=50)
-            if e.event_type == "state_drift"
+            e for e in msg_store.query_messages(
+                type="event", scope="architect-demo", limit=50,
+            )
+            if e.get("subject") == "state_drift"
         ]
         assert len(events) == 1
-        assert events[0].session_name == "architect-demo"
+        assert events[0]["scope"] == "architect-demo"
         # The event message narrates the node transition so an operator
         # can see the drift without chasing the alert.
-        assert task_id in events[0].message
-        assert "research" in events[0].message
-        assert "user_approval" in events[0].message
+        message = (events[0].get("payload") or {}).get("message") or ""
+        assert task_id in message
+        assert "research" in message
+        assert "user_approval" in message
 
         # The alert is keyed to the task and is open.
-        with store._lock:  # noqa: SLF001
-            rows = store._conn.execute(  # noqa: SLF001
-                "SELECT alert_type, severity, status FROM alerts WHERE "
-                "session_name = ?", ("architect-demo",),
-            ).fetchall()
-        alert_types = [r[0] for r in rows]
-        assert f"state_drift:{task_id}" in alert_types
-        row = next(r for r in rows if r[0] == f"state_drift:{task_id}")
-        assert row[1] == "warn"
-        assert row[2] == "open"
+        alerts = msg_store.query_messages(
+            type="alert", scope="architect-demo", state="open", limit=50,
+        )
+        senders = [a.get("sender") for a in alerts]
+        assert f"state_drift:{task_id}" in senders
+        alert_row = next(a for a in alerts if a.get("sender") == f"state_drift:{task_id}")
+        assert (alert_row.get("payload") or {}).get("severity") == "warn"
+        assert alert_row.get("state") == "open"
 
     def test_repeated_sweep_dedupes_alert(
         self, tmp_path: Path, monkeypatch,
@@ -435,10 +442,14 @@ class TestSweepDriftIntegration:
 
         _write_plan(tmp_path / "docs" / "plan" / "plan.md")
         store = StateStore(tmp_path / "state.db")
+        from pollypm.store import SQLAlchemyStore
+        msg_store = SQLAlchemyStore(f"sqlite:///{tmp_path / 'state.db'}")
         _record_plan_ready_notify(store, project="demo")
 
         svc = FakeSessionService(handles=[FakeHandle("architect-demo")])
-        self._patch_resolver_with_factory(monkeypatch, tmp_path, svc, store)
+        self._patch_resolver_with_factory(
+            monkeypatch, tmp_path, svc, store, msg_store=msg_store,
+        )
 
         result1 = work_progress_sweep_handler({})
         assert result1["drift_alerted"] == 1
@@ -448,14 +459,16 @@ class TestSweepDriftIntegration:
         # because the alert row already exists.
         assert result2["drift_alerted"] == 0
 
-        # Only one alert row for the task.
-        with store._lock:  # noqa: SLF001
-            rows = store._conn.execute(  # noqa: SLF001
-                "SELECT COUNT(*) FROM alerts WHERE session_name = ? AND "
-                "alert_type LIKE 'state_drift:%' AND status = 'open'",
-                ("architect-demo",),
-            ).fetchone()
-        assert rows[0] == 1
+        # Only one open alert row for the task.
+        # #349: alerts live in ``messages`` now.
+        alerts = msg_store.query_messages(
+            type="alert", scope="architect-demo", state="open", limit=50,
+        )
+        drift_alerts = [
+            a for a in alerts
+            if str(a.get("sender") or "").startswith("state_drift:")
+        ]
+        assert len(drift_alerts) == 1
 
     def test_no_drift_when_no_deliverables(
         self, tmp_path: Path, monkeypatch,

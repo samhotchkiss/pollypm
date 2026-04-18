@@ -288,11 +288,16 @@ def test_release_lease_clears_active_lease_and_records_event(tmp_path: Path) -> 
     supervisor.release_lease("operator", expected_owner="human")
 
     assert supervisor.store.get_lease("operator") is None
-    events = supervisor.store.recent_events(limit=5)
+    # #349: record_event now writes the audit row to the unified
+    # ``messages`` table. Lease transitions use the synchronous Store
+    # path so this query sees the row immediately.
+    events = supervisor.msg_store.query_messages(
+        type="event", scope="operator", limit=5,
+    )
     assert any(
-        event.session_name == "operator"
-        and event.event_type == "lease"
-        and event.message == "Lease released"
+        event["scope"] == "operator"
+        and event["subject"] == "lease"
+        and event.get("payload", {}).get("message") == "Lease released"
         for event in events
     )
 
@@ -327,11 +332,16 @@ def test_release_expired_leases_clears_stale_lease_and_records_event(tmp_path: P
 
     assert [lease.session_name for lease in released] == ["operator"]
     assert supervisor.store.get_lease("operator") is None
-    events = supervisor.store.recent_events(limit=5)
+    # #349: lease transitions land in ``messages`` via the sync Store path.
+    events = supervisor.msg_store.query_messages(
+        type="event", scope="operator", limit=5,
+    )
     assert any(
-        event.session_name == "operator"
-        and event.event_type == "lease"
-        and "Auto-released expired lease held by human" in event.message
+        event["scope"] == "operator"
+        and event["subject"] == "lease"
+        and "Auto-released expired lease held by human" in (
+            event.get("payload", {}).get("message") or ""
+        )
         for event in events
     )
 
@@ -967,11 +977,15 @@ def test_stalled_worker_nudge_skips_when_human_holds_lease(monkeypatch, tmp_path
     )
 
     assert "suspected_loop" in alerts
-    events = supervisor.store.recent_events(limit=5)
+    # #349: the nudge-skip audit event lands in ``messages`` via the
+    # sync Store path so this assertion sees it immediately.
+    events = supervisor.msg_store.query_messages(
+        type="event", scope="worker", limit=5,
+    )
     assert any(
-        event.session_name == "worker"
-        and event.event_type == "heartbeat_nudge_skipped"
-        and "leased to human" in event.message
+        event["scope"] == "worker"
+        and event["subject"] == "heartbeat_nudge_skipped"
+        and "leased to human" in (event.get("payload", {}).get("message") or "")
         for event in events
     )
 

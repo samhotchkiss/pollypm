@@ -41,9 +41,10 @@ def _alert(
         if not config_path.exists():
             config_path = DEFAULT_CONFIG_PATH
         config = load_config(config_path)
-        from pollypm.storage.state import StateStore
+        # #349: writers land on the unified ``messages`` table via Store.
+        from pollypm.store.registry import get_store
 
-        store = StateStore(config.project.state_db)
+        store = get_store(config)
         try:
             store.upsert_alert(_SESSION, alert_type, severity, message)
             if event:
@@ -51,22 +52,29 @@ def _alert(
                     activity_summary,
                 )
 
-                store.record_event(
-                    _SESSION,
-                    event,
-                    activity_summary(
-                        summary=message,
-                        severity=(
-                            "critical" if severity in {"critical", "error"}
-                            else "recommendation" if severity in {"warn", "warning"}
-                            else "routine"
+                store.append_event(
+                    scope=_SESSION,
+                    sender=_SESSION,
+                    subject=event,
+                    payload={
+                        "message": activity_summary(
+                            summary=message,
+                            severity=(
+                                "critical" if severity in {"critical", "error"}
+                                else "recommendation" if severity in {"warn", "warning"}
+                                else "routine"
+                            ),
+                            verb=event,
+                            subject=alert_type,
                         ),
-                        verb=event,
-                        subject=alert_type,
-                    ),
+                        "alert_type": alert_type,
+                        "severity": severity,
+                    },
                 )
         finally:
-            store.close()
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
     except Exception:  # noqa: BLE001 - notification must not break callers
         pass
 

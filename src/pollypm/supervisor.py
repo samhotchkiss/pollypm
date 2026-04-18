@@ -63,6 +63,7 @@ from pollypm.projects import ensure_project_scaffold
 from pollypm.projects import project_checkpoints_dir, project_transcripts_dir, project_worktrees_dir, release_session_lock
 from pollypm.runtimes import get_runtime
 from pollypm.schedulers import ScheduledJob, get_scheduler_backend
+from pollypm.store.registry import get_store
 from pollypm.transcript_ledger import sync_token_ledger_for_config
 from pollypm.storage.state import AlertRecord, LeaseRecord, StateStore
 from pollypm.tmux.client import TmuxWindow
@@ -70,6 +71,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from pollypm.core import CoreRail
+    from pollypm.store.protocol import Store
 
 
 _OWNER_PREFIXES = {
@@ -233,6 +235,15 @@ class Supervisor:
             from pollypm.plugin_host import extension_host_for_root
             plugin_host = extension_host_for_root(str(config.project.root_dir.resolve()))
             self._core_rail = _CoreRail(config, self.store, plugin_host)
+        # Unified-messages Store for record_event/upsert_alert/clear_alert
+        # (#349). Lives alongside ``self.store`` because StateStore exposes
+        # many methods that aren't on the Store protocol (record_heartbeat,
+        # upsert_session, list_leases, etc.); those call sites stay on
+        # StateStore until Issue F (#342) retires it entirely.
+        # TODO(#342-F): remaining StateStore-specific access (heartbeats,
+        # leases, session runtimes, checkpoints, token ledger) migrates
+        # when StateStore is deleted.
+        self._msg_store: "Store" = get_store(config)
         # Lazy-init session service to avoid circular imports at construction
         self._session_service = None
         # Lazy-init recovery policy (resolved via plugin host)
@@ -307,6 +318,22 @@ class Supervisor:
         """Return the CoreRail this Supervisor is bound to."""
         return self._core_rail
 
+    @property
+    def msg_store(self) -> "Store":
+        """Public accessor for the unified-messages :class:`Store`.
+
+        Introduced in #349 so the writer-migration call sites in
+        :mod:`pollypm.job_runner`, :mod:`pollypm.schedulers.inline`, the
+        service-api, and the heartbeat rail can reach the Store without
+        violating the import-boundary "no private reach-through" rule.
+
+        The underlying attribute (``_msg_store``) stays private so
+        Supervisor owns its lifecycle (opened in ``__init__``, closed in
+        ``stop``) — callers use this accessor and never poke the private
+        slot directly.
+        """
+        return self._msg_store
+
     # ── Startable lifecycle (driven by CoreRail.start()/stop()) ────────────
 
     def start(self) -> None:
@@ -344,7 +371,8 @@ class Supervisor:
 
         This is the paired teardown for :meth:`start`. It does NOT tear
         down tmux sessions — that's ``pm reset`` territory. Today we
-        just close the state store connection if we opened it.
+        close the legacy state store and the unified-messages Store (the
+        latter flushes the event buffer before disposing its engine pool).
         """
         import logging as _logging
         _log = _logging.getLogger(__name__)
@@ -352,6 +380,12 @@ class Supervisor:
             self.store.close()
         except Exception:  # noqa: BLE001
             _log.debug("Supervisor.stop(): store.close raised", exc_info=True)
+        try:
+            close = getattr(self._msg_store, "close", None)
+            if callable(close):
+                close()
+        except Exception:  # noqa: BLE001
+            _log.debug("Supervisor.stop(): _msg_store.close raised", exc_info=True)
 
     @property
     def session_service(self):
@@ -513,10 +547,13 @@ class Supervisor:
                 self._bootstrap_launches(session_name, launches, on_status=on_status)
                 self.ensure_heartbeat_schedule()
                 self.ensure_knowledge_extraction_schedule()
-                self.store.record_event(
-                    "pollypm",
-                    "controller_selected",
-                    f"Selected controller account {controller_account}",
+                self._msg_store.append_event(
+                    scope="pollypm",
+                    sender="pollypm",
+                    subject="controller_selected",
+                    payload={
+                        "message": f"Selected controller account {controller_account}",
+                    },
                 )
                 return controller_account
             except RuntimeError as exc:
@@ -704,12 +741,15 @@ class Supervisor:
                     stabilized.append((launch, tgt))
             except Exception as exc:  # noqa: BLE001
                 try:
-                    self.store.record_event(
-                        launch.session.name,
-                        "stabilize_failed",
-                        f"Bootstrap stabilization failed: {exc}",
+                    self._msg_store.append_event(
+                        scope=launch.session.name,
+                        sender=launch.session.name,
+                        subject="stabilize_failed",
+                        payload={
+                            "message": f"Bootstrap stabilization failed: {exc}",
+                        },
                     )
-                    self.store.upsert_alert(
+                    self._msg_store.upsert_alert(
                         launch.session.name,
                         "stabilize_failed",
                         "warn",
@@ -754,10 +794,13 @@ class Supervisor:
                         )
                     )
                 except Exception:  # noqa: BLE001
-                    self.store.record_event(
-                        launch.session.name,
-                        "session_created_dispatch_failed",
-                        "bootstrap session.created dispatch failed",
+                    self._msg_store.append_event(
+                        scope=launch.session.name,
+                        sender=launch.session.name,
+                        subject="session_created_dispatch_failed",
+                        payload={
+                            "message": "bootstrap session.created dispatch failed",
+                        },
                     )
         except ImportError:
             pass  # session_services.base missing dispatcher — no-op (pre-#246 build)
@@ -788,11 +831,17 @@ class Supervisor:
             cwd=str(launch.session.cwd),
             window_name=launch.window_name,
         )
-        self.store.clear_alert(launch.session.name, "missing_window")
-        self.store.record_event(
-            launch.session.name,
-            "launch",
-            f"Created tmux window {launch.window_name} with provider {launch.session.provider.value}",
+        self._msg_store.clear_alert(launch.session.name, "missing_window")
+        self._msg_store.append_event(
+            scope=launch.session.name,
+            sender=launch.session.name,
+            subject="launch",
+            payload={
+                "message": (
+                    f"Created tmux window {launch.window_name} with "
+                    f"provider {launch.session.provider.value}"
+                ),
+            },
         )
 
     def _session_name_by_window(self) -> dict[str, str]:
@@ -988,10 +1037,17 @@ class Supervisor:
         # handler exists yet (post-v1 migration target).
         transcript_samples = sync_token_ledger_for_config(self.config)
         if transcript_samples:
-            self.store.record_event(
-                "heartbeat",
-                "token_ledger",
-                f"Synced {len(transcript_samples)} transcript token sample(s)",
+            self._msg_store.append_event(
+                scope="heartbeat",
+                sender="heartbeat",
+                subject="token_ledger",
+                payload={
+                    "message": (
+                        f"Synced {len(transcript_samples)} transcript token "
+                        f"sample(s)"
+                    ),
+                    "samples": len(transcript_samples),
+                },
             )
 
         # Phase 2: Fast synchronous sweep — capture + classify + alert
@@ -1087,7 +1143,7 @@ class Supervisor:
             session_key = launch.session.name
             tmux_session = self._tmux_session_for_launch(launch)
             if window is None:
-                self.store.upsert_alert(
+                self._msg_store.upsert_alert(
                     session_key,
                     "missing_window",
                     "error",
@@ -1125,13 +1181,24 @@ class Supervisor:
                     cumulative_tokens=token_metrics[1],
                 )
                 if delta > 0:
-                    self.store.record_event(
-                        session_key,
-                        "token_usage",
-                        f"Recorded {delta} tokens for {launch.session.project} on {launch.account.name} ({token_metrics[0]})",
+                    self._msg_store.append_event(
+                        scope=session_key,
+                        sender=session_key,
+                        subject="token_usage",
+                        payload={
+                            "message": (
+                                f"Recorded {delta} tokens for "
+                                f"{launch.session.project} on "
+                                f"{launch.account.name} ({token_metrics[0]})"
+                            ),
+                            "delta": delta,
+                            "project": launch.session.project,
+                            "account": launch.account.name,
+                            "model": token_metrics[0],
+                        },
                     )
 
-            self.store.clear_alert(session_key, "missing_window")
+            self._msg_store.clear_alert(session_key, "missing_window")
             active_alerts = self._update_alerts(
                 launch,
                 window,
@@ -1170,7 +1237,7 @@ class Supervisor:
         for window_name, session_key in name_by_window.items():
             if window_name in window_map:
                 continue
-            self.store.upsert_alert(
+            self._msg_store.upsert_alert(
                 session_key,
                 "missing_window",
                 "error",
@@ -1178,10 +1245,17 @@ class Supervisor:
             )
 
         current_alerts = self.store.open_alerts()
-        self.store.record_event(
-            "heartbeat",
-            "heartbeat",
-            f"Heartbeat sweep completed with {len(current_alerts)} open alerts",
+        self._msg_store.append_event(
+            scope="heartbeat",
+            sender="heartbeat",
+            subject="heartbeat",
+            payload={
+                "message": (
+                    f"Heartbeat sweep completed with {len(current_alerts)} "
+                    f"open alerts"
+                ),
+                "open_alerts": len(current_alerts),
+            },
         )
         return current_alerts
 
@@ -1300,7 +1374,7 @@ class Supervisor:
         active_alerts: list[str] = []
 
         if window.pane_dead:
-            self.store.upsert_alert(
+            self._msg_store.upsert_alert(
                 session_name,
                 "pane_dead",
                 "error",
@@ -1308,10 +1382,10 @@ class Supervisor:
             )
             active_alerts.append("pane_dead")
         else:
-            self.store.clear_alert(session_name, "pane_dead")
+            self._msg_store.clear_alert(session_name, "pane_dead")
 
         if window.pane_current_command in shell_commands:
-            self.store.upsert_alert(
+            self._msg_store.upsert_alert(
                 session_name,
                 "shell_returned",
                 "warn",
@@ -1319,10 +1393,10 @@ class Supervisor:
             )
             active_alerts.append("shell_returned")
         else:
-            self.store.clear_alert(session_name, "shell_returned")
+            self._msg_store.clear_alert(session_name, "shell_returned")
 
         if previous_log_bytes is not None and current_log_bytes <= previous_log_bytes:
-            self.store.upsert_alert(
+            self._msg_store.upsert_alert(
                 session_name,
                 "idle_output",
                 "warn",
@@ -1330,13 +1404,13 @@ class Supervisor:
             )
             active_alerts.append("idle_output")
         else:
-            self.store.clear_alert(session_name, "idle_output")
+            self._msg_store.clear_alert(session_name, "idle_output")
 
         if previous_snapshot_hash and previous_snapshot_hash == current_snapshot_hash:
             history = self.store.recent_heartbeats(session_name, limit=3)
             recent_hashes = [item.snapshot_hash for item in history[:3]]
             if len(recent_hashes) == 3 and len(set(recent_hashes)) == 1:
-                self.store.upsert_alert(
+                self._msg_store.upsert_alert(
                     session_name,
                     "suspected_loop",
                     "warn",
@@ -1348,13 +1422,13 @@ class Supervisor:
                 if len(longer_hashes) == 5 and len(set(longer_hashes)) == 1:
                     self._maybe_nudge_stalled_session(launch)
             else:
-                self.store.clear_alert(session_name, "suspected_loop")
+                self._msg_store.clear_alert(session_name, "suspected_loop")
         else:
-            self.store.clear_alert(session_name, "suspected_loop")
+            self._msg_store.clear_alert(session_name, "suspected_loop")
 
         lower_pane = pane_text.lower()
         if self._pane_has_auth_failure(lower_pane):
-            self.store.upsert_alert(
+            self._msg_store.upsert_alert(
                 session_name,
                 "auth_broken",
                 "error",
@@ -1368,10 +1442,10 @@ class Supervisor:
             )
             active_alerts.append("auth_broken")
         else:
-            self.store.clear_alert(session_name, "auth_broken")
+            self._msg_store.clear_alert(session_name, "auth_broken")
 
         if self._pane_has_capacity_failure(lower_pane):
-            self.store.upsert_alert(
+            self._msg_store.upsert_alert(
                 session_name,
                 "capacity_exhausted",
                 "error",
@@ -1385,10 +1459,10 @@ class Supervisor:
             )
             active_alerts.append("capacity_exhausted")
         else:
-            self.store.clear_alert(session_name, "capacity_exhausted")
+            self._msg_store.clear_alert(session_name, "capacity_exhausted")
 
         if self._pane_has_provider_outage(lower_pane):
-            self.store.upsert_alert(
+            self._msg_store.upsert_alert(
                 session_name,
                 "provider_outage",
                 "warn",
@@ -1403,7 +1477,7 @@ class Supervisor:
             )
             active_alerts.append("provider_outage")
         else:
-            self.store.clear_alert(session_name, "provider_outage")
+            self._msg_store.clear_alert(session_name, "provider_outage")
 
         return active_alerts
 
@@ -1417,10 +1491,18 @@ class Supervisor:
             return
         lease = self.store.get_lease(launch.session.name)
         if lease is not None and lease.owner == "human":
-            self.store.record_event(
-                launch.session.name,
-                "heartbeat_nudge_skipped",
-                "Skipped stalled-worker nudge because session is leased to human",
+            # Sync path — operator-visible audit event tied to the
+            # nudge-skip decision (tested synchronously below).
+            self._msg_store.record_event(
+                scope=launch.session.name,
+                sender=launch.session.name,
+                subject="heartbeat_nudge_skipped",
+                payload={
+                    "message": (
+                        "Skipped stalled-worker nudge because session is "
+                        "leased to human"
+                    ),
+                },
             )
             return
         # Check if there's a queued task the worker could pick up
@@ -1525,13 +1607,18 @@ class Supervisor:
             if age < self._lease_timeout():
                 continue
             self.store.clear_lease(lease.session_name)
-            self.store.record_event(
-                lease.session_name,
-                "lease",
-                (
-                    f"Auto-released expired lease held by {lease.owner} "
-                    f"after {self.config.pollypm.lease_timeout_minutes} minutes"
-                ),
+            # Sync — lease state transitions are transactional audit events.
+            self._msg_store.record_event(
+                scope=lease.session_name,
+                sender=lease.session_name,
+                subject="lease",
+                payload={
+                    "message": (
+                        f"Auto-released expired lease held by {lease.owner} "
+                        f"after {self.config.pollypm.lease_timeout_minutes} "
+                        f"minutes"
+                    ),
+                },
             )
             released.append(lease)
         return released
@@ -1547,7 +1634,13 @@ class Supervisor:
         message = f"Lease claimed by {owner}"
         if note:
             message = f"{message}: {note}"
-        self.store.record_event(session_name, "lease", message)
+        # Sync — lease state transitions are transactional audit events.
+        self._msg_store.record_event(
+            scope=session_name,
+            sender=session_name,
+            subject="lease",
+            payload={"message": message},
+        )
         # Schedule auto-release after timeout
         try:
             backend = get_scheduler_backend(
@@ -1570,7 +1663,13 @@ class Supervisor:
             if current is None or current.owner != expected_owner:
                 return  # Lease was already released or reclaimed by someone else
         self.store.clear_lease(session_name)
-        self.store.record_event(session_name, "lease", "Lease released")
+        # Sync — lease state transitions are transactional audit events.
+        self._msg_store.record_event(
+            scope=session_name,
+            sender=session_name,
+            subject="lease",
+            payload={"message": "Lease released"},
+        )
 
     def _resolve_send_target(self, launch: SessionLaunchSpec) -> str:
         """Find the actual tmux target for a session, checking both storage closet and cockpit mount."""
@@ -1638,7 +1737,12 @@ class Supervisor:
             self._verify_input_submitted(target, text, launch)
         if owner == "human":
             self.store.set_lease(session_name, "human", "automatic lease from direct human input")
-        self.store.record_event(session_name, "send_input", f"{owner} sent input: {text}")
+        self._msg_store.append_event(
+            scope=session_name,
+            sender=owner,
+            subject="send_input",
+            payload={"message": f"{owner} sent input: {text}", "owner": owner},
+        )
 
     def _verify_input_submitted(
         self,
@@ -1681,7 +1785,47 @@ class Supervisor:
                 return  # Message was submitted
 
     def open_alerts(self) -> list[AlertRecord]:
-        return self.store.open_alerts()
+        """Return every open alert, read from the unified ``messages`` table.
+
+        #349 flipped the writer side so ``self.store.upsert_alert`` now
+        lands in ``messages`` via ``self._msg_store``. Reading through the
+        Store here keeps the (writer, reader) pair on the same table; the
+        legacy ``alerts`` view drains naturally as old rows age out.
+
+        The subject in ``messages`` is stamped with an ``[Alert]`` tag by
+        :func:`apply_title_contract`; we strip it here so callers that
+        display ``AlertRecord.message`` see the same text the writer
+        supplied — preserving the pre-migration contract.
+        """
+        rows = self._msg_store.query_messages(
+            type="alert",
+            state="open",
+        )
+        out: list[AlertRecord] = []
+        for row in rows:
+            payload = row.get("payload") or {}
+            subject = str(row.get("subject") or "")
+            # Strip the leading ``[Alert] `` tag added by the title contract
+            # so downstream display matches the legacy alert message text.
+            if subject.startswith("[Alert] "):
+                message = subject[len("[Alert] "):]
+            elif subject.startswith("[Alert]"):
+                message = subject[len("[Alert]"):].lstrip()
+            else:
+                message = subject
+            out.append(
+                AlertRecord(
+                    session_name=str(row.get("scope") or ""),
+                    alert_type=str(row.get("sender") or ""),
+                    severity=str(payload.get("severity") or ""),
+                    message=message,
+                    status="open",
+                    created_at=str(row.get("created_at") or ""),
+                    updated_at=str(row.get("updated_at") or ""),
+                    alert_id=int(row.get("id") or 0),
+                )
+            )
+        return out
 
     def leases(self) -> list[LeaseRecord]:
         return self.store.list_leases()
@@ -1757,7 +1901,7 @@ class Supervisor:
         except Exception:  # noqa: BLE001
             return
         if not needs_roll:
-            self.store.clear_alert(launch.session.name, "capacity_low")
+            self._msg_store.clear_alert(launch.session.name, "capacity_low")
             return
         # Skip if we already rolled this session for low capacity in the
         # current recovery window — avoids oscillating between accounts.
@@ -1765,16 +1909,24 @@ class Supervisor:
         if runtime and runtime.last_failure_type == "capacity_low" and runtime.status == "recovering":
             return
         pct = probe.remaining_pct if probe.remaining_pct is not None else -1
-        self.store.upsert_alert(
+        self._msg_store.upsert_alert(
             launch.session.name,
             "capacity_low",
             "warn",
             f"Account {launch.account.name} at {pct}% left — proactively rolling over",
         )
-        self.store.record_event(
-            launch.session.name,
-            "proactive_rollover",
-            f"Account {launch.account.name} at {pct}% left; triggering failover",
+        self._msg_store.append_event(
+            scope=launch.session.name,
+            sender=launch.session.name,
+            subject="proactive_rollover",
+            payload={
+                "message": (
+                    f"Account {launch.account.name} at {pct}% left; "
+                    f"triggering failover"
+                ),
+                "account": launch.account.name,
+                "remaining_pct": pct,
+            },
         )
         active_alerts.append("capacity_low")
 
@@ -1947,11 +2099,19 @@ class Supervisor:
         # carry the policy-selected action kind.
         recommendation = self._policy_recommendation(launch, failure_type)
         if recommendation is not None:
-            self.store.record_event(
-                launch.session.name,
-                "recovery_recommendation",
-                f"policy={self.recovery_policy.name} action={recommendation.action} "
-                f"reason={recommendation.reason[:120]}",
+            self._msg_store.append_event(
+                scope=launch.session.name,
+                sender=launch.session.name,
+                subject="recovery_recommendation",
+                payload={
+                    "message": (
+                        f"policy={self.recovery_policy.name} "
+                        f"action={recommendation.action} "
+                        f"reason={recommendation.reason[:120]}"
+                    ),
+                    "policy": self.recovery_policy.name,
+                    "action": recommendation.action,
+                },
             )
 
         lease = self.store.get_lease(launch.session.name)
@@ -1960,14 +2120,22 @@ class Supervisor:
                 # Session is dead — the lease is protecting nothing.  Release it
                 # so recovery can proceed immediately.
                 self.store.clear_lease(launch.session.name)
-                self.store.clear_alert(launch.session.name, "recovery_waiting_on_human")
-                self.store.record_event(
-                    launch.session.name,
-                    "lease_override",
-                    f"Auto-released stale lease (owner={lease.owner}) — session is {failure_type}",
+                self._msg_store.clear_alert(launch.session.name, "recovery_waiting_on_human")
+                self._msg_store.append_event(
+                    scope=launch.session.name,
+                    sender=launch.session.name,
+                    subject="lease_override",
+                    payload={
+                        "message": (
+                            f"Auto-released stale lease (owner={lease.owner}) "
+                            f"— session is {failure_type}"
+                        ),
+                        "owner": lease.owner,
+                        "failure_type": failure_type,
+                    },
                 )
             else:
-                self.store.upsert_alert(
+                self._msg_store.upsert_alert(
                     launch.session.name,
                     "recovery_waiting_on_human",
                     "warn",
@@ -1999,7 +2167,7 @@ class Supervisor:
                     f"Automatic recovery STOPPED after {attempts} total failures. "
                     f"Session requires manual intervention (pm up or account re-auth)."
                 )
-            self.store.upsert_alert(
+            self._msg_store.upsert_alert(
                 launch.session.name,
                 "recovery_limit",
                 "error",
@@ -2021,7 +2189,7 @@ class Supervisor:
         allow_same = failure_type not in {"capacity_exhausted", "capacity_low"}
         candidates = self._candidate_accounts(launch, allow_same=allow_same)
         if not candidates:
-            self.store.upsert_alert(
+            self._msg_store.upsert_alert(
                 launch.session.name,
                 "blocked_no_capacity",
                 "error",
@@ -2052,13 +2220,21 @@ class Supervisor:
                     reason=f"startup recovery failed: {last_error}",
                     available_at=(datetime.now(UTC) + timedelta(minutes=10)).isoformat() if status == "provider_outage" else None,
                 )
-                self.store.record_event(
-                    launch.session.name,
-                    "recovery_candidate_failed",
-                    f"Recovery candidate {selected} failed: {last_error}",
+                self._msg_store.append_event(
+                    scope=launch.session.name,
+                    sender=launch.session.name,
+                    subject="recovery_candidate_failed",
+                    payload={
+                        "message": (
+                            f"Recovery candidate {selected} failed: "
+                            f"{last_error}"
+                        ),
+                        "candidate": selected,
+                        "error": last_error,
+                    },
                 )
 
-        self.store.upsert_alert(
+        self._msg_store.upsert_alert(
             launch.session.name,
             "blocked_no_capacity",
             "error",
@@ -2141,14 +2317,30 @@ class Supervisor:
             if rendered.strip():
                 target = self._resolve_send_target(launch)
                 self.session_service.tmux.send_keys(target, rendered)
-                self.store.record_event(session_name, "recovery_prompt", "Injected recovery prompt with checkpoint context")
+                self._msg_store.append_event(
+                    scope=session_name,
+                    sender=session_name,
+                    subject="recovery_prompt",
+                    payload={
+                        "message": (
+                            "Injected recovery prompt with checkpoint context"
+                        ),
+                    },
+                )
         except Exception:  # noqa: BLE001
             pass  # recovery prompt is best-effort
 
-        self.store.record_event(
-            session_name,
-            "recovered",
-            f"Recovered {launch.window_name} in place using {account_name}",
+        self._msg_store.append_event(
+            scope=session_name,
+            sender=session_name,
+            subject="recovered",
+            payload={
+                "message": (
+                    f"Recovered {launch.window_name} in place using "
+                    f"{account_name}"
+                ),
+                "account": account_name,
+            },
         )
         # If recovered on the config-default account, clear the override
         # so the session doesn't carry a stale effective_account that blocks
@@ -2178,7 +2370,7 @@ class Supervisor:
             "recovery_waiting_on_human",
             "blocked_no_capacity",
         ]:
-            self.store.clear_alert(session_name, alert_type)
+            self._msg_store.clear_alert(session_name, alert_type)
 
     def launch_by_session(self, session_name: str) -> SessionLaunchSpec:
         """Return the ``SessionLaunchSpec`` for ``session_name``.
@@ -2258,7 +2450,12 @@ class Supervisor:
             return
         self.session_service.tmux.kill_window(f"{tmux_session}:{launch.window_name}")
         self._release_session_locks(launch)
-        self.store.record_event(session_name, "stop", f"Stopped tmux window {launch.window_name}")
+        self._msg_store.append_event(
+            scope=session_name,
+            sender=session_name,
+            subject="stop",
+            payload={"message": f"Stopped tmux window {launch.window_name}"},
+        )
 
     def focus_session(self, session_name: str) -> None:
         launch = self._launch_by_session(session_name)
@@ -2286,10 +2483,14 @@ class Supervisor:
             last_failure_message=f"manually switched to {account_name}",
         )
         self._restart_session(session_name, account_name, failure_type="manual_switch")
-        self.store.record_event(
-            session_name,
-            "manual_switch",
-            f"Switched {launch.window_name} to {account_name}",
+        self._msg_store.append_event(
+            scope=session_name,
+            sender=session_name,
+            subject="manual_switch",
+            payload={
+                "message": f"Switched {launch.window_name} to {account_name}",
+                "account": account_name,
+            },
         )
 
     def _assert_lease_available(
@@ -2614,10 +2815,18 @@ class Supervisor:
                 session_name, exc,
             )
             try:
-                self.store.record_event(
-                    session_name,
-                    "persona_swap_detected",
-                    f"no launch resolves for session_name={session_name!r}: {exc}",
+                # Sync — the diagnostic event must be readable by the time
+                # the raise propagates to callers / tests.
+                self._msg_store.record_event(
+                    scope=session_name,
+                    sender=session_name,
+                    subject="persona_swap_detected",
+                    payload={
+                        "message": (
+                            f"no launch resolves for "
+                            f"session_name={session_name!r}: {exc}"
+                        ),
+                    },
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -2652,8 +2861,13 @@ class Supervisor:
                 f"role={launch.session.role!r}"
             )
             try:
-                self.store.record_event(
-                    session_name, "persona_swap_detected", details,
+                # Sync — the diagnostic event must be readable by the time
+                # the raise propagates to callers / tests.
+                self._msg_store.record_event(
+                    scope=session_name,
+                    sender=session_name,
+                    subject="persona_swap_detected",
+                    payload={"message": details},
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -2731,10 +2945,14 @@ class Supervisor:
                     )
                     logger.error("persona_swap_verified: %s", details)
                     try:
-                        self.store.record_event(
-                            launch.session.name,
-                            "persona_swap_verified",
-                            details,
+                        # Sync — the operator-visible diagnostic row must
+                        # be durable by the time we return so tests / ops
+                        # can read it back immediately after the verify.
+                        self._msg_store.record_event(
+                            scope=launch.session.name,
+                            sender=launch.session.name,
+                            subject="persona_swap_verified",
+                            payload={"message": details},
                         )
                     except Exception:  # noqa: BLE001
                         pass

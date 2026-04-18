@@ -36,17 +36,24 @@ class InlineSchedulerBackend(SchedulerBackend):
         self._save_jobs(supervisor, jobs)
         from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
 
-        supervisor.store.record_event(
-            "scheduler",
-            "scheduled",
-            activity_summary(
-                summary=f"Scheduled job {job.kind} at {job.run_at.isoformat()}",
-                severity="routine",
-                verb="scheduled",
-                subject=job.kind,
-                job_id=job.job_id,
-                run_at=job.run_at.isoformat(),
-            ),
+        supervisor.msg_store.append_event(
+            scope="scheduler",
+            sender="scheduler",
+            subject="scheduled",
+            payload={
+                "message": activity_summary(
+                    summary=(
+                        f"Scheduled job {job.kind} at {job.run_at.isoformat()}"
+                    ),
+                    severity="routine",
+                    verb="scheduled",
+                    subject=job.kind,
+                    job_id=job.job_id,
+                    run_at=job.run_at.isoformat(),
+                ),
+                "job_id": job.job_id,
+                "job_kind": job.kind,
+            },
         )
         return job
 
@@ -77,16 +84,22 @@ class InlineSchedulerBackend(SchedulerBackend):
                     activity_summary,
                 )
 
-                supervisor.store.record_event(
-                    "scheduler",
-                    "failed",
-                    activity_summary(
-                        summary=f"Scheduled job {job.kind} failed: {exc}",
-                        severity="critical",
-                        verb="failed",
-                        subject=job.kind,
-                        job_id=job.job_id,
-                    ),
+                supervisor.msg_store.append_event(
+                    scope="scheduler",
+                    sender="scheduler",
+                    subject="failed",
+                    payload={
+                        "message": activity_summary(
+                            summary=f"Scheduled job {job.kind} failed: {exc}",
+                            severity="critical",
+                            verb="failed",
+                            subject=job.kind,
+                            job_id=job.job_id,
+                        ),
+                        "job_id": job.job_id,
+                        "job_kind": job.kind,
+                        "error": str(exc),
+                    },
                 )
             else:
                 executed.append(job)
@@ -100,16 +113,21 @@ class InlineSchedulerBackend(SchedulerBackend):
                     activity_summary,
                 )
 
-                supervisor.store.record_event(
-                    "scheduler",
-                    "ran",
-                    activity_summary(
-                        summary=f"Ran scheduled job {job.kind}",
-                        severity="routine",
-                        verb="ran",
-                        subject=job.kind,
-                        job_id=job.job_id,
-                    ),
+                supervisor.msg_store.append_event(
+                    scope="scheduler",
+                    sender="scheduler",
+                    subject="ran",
+                    payload={
+                        "message": activity_summary(
+                            summary=f"Ran scheduled job {job.kind}",
+                            severity="routine",
+                            verb="ran",
+                            subject=job.kind,
+                            job_id=job.job_id,
+                        ),
+                        "job_id": job.job_id,
+                        "job_kind": job.kind,
+                    },
                 )
         if dirty:
             self._save_jobs(supervisor, jobs)

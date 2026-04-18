@@ -218,9 +218,10 @@ def _raise_alert(config: Any, alert_type: str, message: str) -> None:
     a ``state.db`` present).
     """
     try:
-        from pollypm.storage.state import StateStore
+        from pollypm.store.registry import get_store
 
-        store = StateStore(config.project.state_db)
+        # #349: writers land on the unified ``messages`` table via Store.
+        store = get_store(config)
         try:
             store.upsert_alert(
                 "inbox_migration", alert_type, "warn", message,
@@ -229,43 +230,59 @@ def _raise_alert(config: Any, alert_type: str, message: str) -> None:
                 activity_summary,
             )
 
-            store.record_event(
-                "inbox_migration", "alert",
-                activity_summary(
-                    summary=f"Raised migration alert {alert_type}: {message[:160]}",
-                    severity="recommendation",
-                    verb="alerted",
-                    subject=alert_type,
-                ),
+            store.append_event(
+                scope="inbox_migration",
+                sender="inbox_migration",
+                subject="alert",
+                payload={
+                    "message": activity_summary(
+                        summary=(
+                            f"Raised migration alert {alert_type}: "
+                            f"{message[:160]}"
+                        ),
+                        severity="recommendation",
+                        verb="alerted",
+                        subject=alert_type,
+                    ),
+                    "alert_type": alert_type,
+                },
             )
         finally:
-            store.close()
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
     except Exception:  # noqa: BLE001
         logger.warning("inbox-migration alert could not be persisted: %s", message)
 
 
 def _record_event(config: Any, message: str) -> None:
+    # #349: events land on the unified ``messages`` table via the Store.
     try:
-        from pollypm.storage.state import StateStore
+        from pollypm.store.registry import get_store
 
-        store = StateStore(config.project.state_db)
+        store = get_store(config)
         try:
             from pollypm.plugins_builtin.activity_feed.summaries import (
                 activity_summary,
             )
 
-            store.record_event(
-                "inbox_migration",
-                "migration",
-                activity_summary(
-                    summary=message,
-                    severity="routine",
-                    verb="migrated",
-                    subject="inbox",
-                ),
+            store.append_event(
+                scope="inbox_migration",
+                sender="inbox_migration",
+                subject="migration",
+                payload={
+                    "message": activity_summary(
+                        summary=message,
+                        severity="routine",
+                        verb="migrated",
+                        subject="inbox",
+                    ),
+                },
             )
         finally:
-            store.close()
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
     except Exception:  # noqa: BLE001
         logger.info("inbox-migration event could not be persisted: %s", message)
 

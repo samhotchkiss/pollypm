@@ -231,6 +231,9 @@ class TestCreateBlockingQuestionInboxItem:
         )
         task = FakeTask(project="demo", task_number=7)
         store = StateStore(tmp_path / "state.db")
+        # #349: audit event lands on ``messages`` via the unified Store.
+        from pollypm.store import SQLAlchemyStore
+        msg_store = SQLAlchemyStore(f"sqlite:///{tmp_path / 'state.db'}")
         config = FakeConfig(projects={
             "demo": FakeProject(path=tmp_path, persona_name="Archie"),
         })
@@ -242,6 +245,7 @@ class TestCreateBlockingQuestionInboxItem:
             work,
             config=config,
             state_store=store,
+            msg_store=msg_store,
         )
         assert inbox_task is not None
         labels = list(inbox_task.labels or [])
@@ -257,13 +261,15 @@ class TestCreateBlockingQuestionInboxItem:
         # Title surfaces the truncated excerpt alongside the task id.
         assert "demo/7" in inbox_task.title
 
-        # Event landed on the ledger.
+        # Event landed on the ledger (``messages`` table now).
         events = [
-            e for e in store.recent_events(limit=10)
-            if e.event_type == "inbox.blocking_question.created"
+            e for e in msg_store.query_messages(
+                type="event", scope="worker-demo", limit=10,
+            )
+            if e.get("subject") == "inbox.blocking_question.created"
         ]
         assert len(events) == 1
-        assert events[0].session_name == "worker-demo"
+        assert events[0]["scope"] == "worker-demo"
         work.close()
 
     def test_falls_back_to_polly_when_no_persona(
@@ -317,16 +323,22 @@ class TestSendStandardReprompt:
     def test_records_event_on_state_store(self, tmp_path: Path) -> None:
         svc = FakeSessionService(handles=[FakeHandle("worker-demo")])
         store = StateStore(tmp_path / "state.db")
+        from pollypm.store import SQLAlchemyStore
+        msg_store = SQLAlchemyStore(f"sqlite:///{tmp_path / 'state.db'}")
         task = FakeTask(project="demo", task_number=2)
         assert send_standard_reprompt(
-            "worker-demo", task, svc, state_store=store,
+            "worker-demo", task, svc, state_store=store, msg_store=msg_store,
         ) is True
+        # #349: audit event lands on ``messages`` via the unified Store.
         events = [
-            e for e in store.recent_events(limit=10)
-            if e.event_type == "inbox.worker_reprompted"
+            e for e in msg_store.query_messages(
+                type="event", scope="worker-demo", limit=10,
+            )
+            if e.get("subject") == "inbox.worker_reprompted"
         ]
         assert len(events) == 1
-        assert "demo/2" in events[0].message
+        message = (events[0].get("payload") or {}).get("message") or ""
+        assert "demo/2" in message
 
     def test_soft_fail_on_none_session(self) -> None:
         task = FakeTask(project="demo", task_number=2)
@@ -471,7 +483,7 @@ class TestHandleWorkerTurnEnd:
 
 
 class TestSweepRoutesWorkerDrift:
-    def _patch_resolver(self, monkeypatch, tmp_path, svc, store):
+    def _patch_resolver(self, monkeypatch, tmp_path, svc, store, msg_store=None):
         from pollypm.plugins_builtin.task_assignment_notify.resolver import (
             _RuntimeServices,
         )
@@ -486,6 +498,7 @@ class TestSweepRoutesWorkerDrift:
                 state_store=store,
                 work_service=work,
                 project_root=tmp_path,
+                msg_store=msg_store,
             )
 
         monkeypatch.setattr(

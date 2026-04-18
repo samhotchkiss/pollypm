@@ -112,15 +112,25 @@ class SupervisorHeartbeatAPI:
         # instead of per-checkpoint snapshot learning.
 
     def record_event(self, session_name: str, event_type: str, message: str) -> None:
-        self.supervisor.store.record_event(session_name, event_type, message)
+        # #349: events now land in the unified ``messages`` table via the
+        # Store's fire-and-forget buffer. ``session_name`` maps to both
+        # scope and sender for parity with legacy ``events`` rows.
+        self.supervisor.msg_store.append_event(
+            scope=session_name,
+            sender=session_name,
+            subject=event_type,
+            payload={"message": message},
+        )
 
     def raise_alert(self, session_name: str, alert_type: str, severity: str, message: str) -> None:
-        self.supervisor.store.upsert_alert(session_name, alert_type, severity, message)
+        self.supervisor.msg_store.upsert_alert(session_name, alert_type, severity, message)
 
     def clear_alert(self, session_name: str, alert_type: str) -> None:
-        self.supervisor.store.clear_alert(session_name, alert_type)
+        self.supervisor.msg_store.clear_alert(session_name, alert_type)
 
     def open_alerts(self) -> list[Alert]:
+        # #349: route through ``Supervisor.open_alerts`` so we read from
+        # the unified ``messages`` table (matching the writer flip).
         return [
             Alert(
                 session_name=record.session_name,
@@ -132,7 +142,7 @@ class SupervisorHeartbeatAPI:
                 updated_at=record.updated_at,
                 alert_id=record.alert_id,
             )
-            for record in self.supervisor.store.open_alerts()
+            for record in self.supervisor.open_alerts()
         ]
 
     def set_session_status(self, session_name: str, status: str, *, reason: str = "") -> None:
@@ -168,16 +178,33 @@ class SupervisorHeartbeatAPI:
     _FOLLOWUP_COOLDOWN_SECONDS = 600
 
     def queue_polly_followup(self, session_name: str, reason: str) -> None:
-        # Rate-limit: check recent events for a followup already sent
+        # Rate-limit: check recent events for a followup already sent.
+        # #349: events now live on the unified ``messages`` table; query
+        # the Store instead of the legacy ``events`` table.
         try:
-            recent = self.supervisor.store.recent_events(limit=50)
+            recent = self.supervisor.msg_store.query_messages(
+                type="event",
+                scope=session_name,
+                limit=50,
+            )
             now = datetime.now(UTC)
             for event in recent:
-                if (
-                    event.session_name == session_name
-                    and event.event_type == "polly_followup"
-                ):
-                    age = (now - datetime.fromisoformat(event.created_at)).total_seconds()
+                if event.get("subject") == "polly_followup":
+                    created_at = event.get("created_at")
+                    if created_at is None:
+                        continue
+                    stamp = (
+                        created_at.isoformat()
+                        if hasattr(created_at, "isoformat")
+                        else str(created_at)
+                    )
+                    try:
+                        parsed = datetime.fromisoformat(stamp)
+                    except ValueError:
+                        continue
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=UTC)
+                    age = (now - parsed).total_seconds()
                     if age < self._FOLLOWUP_COOLDOWN_SECONDS:
                         return  # already notified recently
                     break  # found the most recent one but it's old enough
@@ -199,15 +226,19 @@ class SupervisorHeartbeatAPI:
                 activity_summary,
             )
 
-            self.supervisor.store.record_event(
-                session_name,
-                "polly_followup",
-                activity_summary(
-                    summary=f"Nudged operator about {session_name}: {reason}",
-                    severity="recommendation",
-                    verb="nudged",
-                    subject=session_name,
-                ),
+            self.supervisor.msg_store.append_event(
+                scope=session_name,
+                sender=session_name,
+                subject="polly_followup",
+                payload={
+                    "message": activity_summary(
+                        summary=f"Nudged operator about {session_name}: {reason}",
+                        severity="recommendation",
+                        verb="nudged",
+                        subject=session_name,
+                    ),
+                    "reason": reason,
+                },
             )
         except Exception:  # noqa: BLE001
             pass

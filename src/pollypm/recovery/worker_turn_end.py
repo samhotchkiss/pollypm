@@ -259,6 +259,7 @@ def create_blocking_question_inbox_item(
     *,
     config: Any = None,
     state_store: Any = None,
+    msg_store: Any = None,
 ) -> Any:
     """Create a ``blocking_question`` inbox task addressed at the PM.
 
@@ -333,16 +334,35 @@ def create_blocking_question_inbox_item(
 
     # Emit a ledger event so the activity feed / audit trail sees the
     # blocking_question creation even if the inbox UI doesn't render
-    # it right away.
-    if state_store is not None:
+    # it right away. #349: the audit row lives on the unified ``messages``
+    # table when a Store is threaded through; fall back to the legacy
+    # ``StateStore.record_event`` for callers that haven't migrated yet.
+    message = (
+        f"worker {session_name} blocked on {task_id} — "
+        f"created inbox item {inbox_task.task_id} for "
+        f"{pm_actor}"
+    )
+    if msg_store is not None:
+        try:
+            msg_store.append_event(
+                scope=session_name,
+                sender=session_name,
+                subject="inbox.blocking_question.created",
+                payload={
+                    "message": message,
+                    "task_id": task_id,
+                    "inbox_task_id": getattr(inbox_task, "task_id", ""),
+                    "pm_actor": pm_actor,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    elif state_store is not None:
         try:
             state_store.record_event(
                 session_name,
                 "inbox.blocking_question.created",
-                (
-                    f"worker {session_name} blocked on {task_id} — "
-                    f"created inbox item {inbox_task.task_id} for {pm_actor}"
-                ),
+                message,
             )
         except Exception:  # noqa: BLE001
             pass
@@ -355,6 +375,7 @@ def send_standard_reprompt(
     session_service: Any,
     *,
     state_store: Any = None,
+    msg_store: Any = None,
 ) -> bool:
     """Nudge the worker with the canonical turn-end reprompt.
 
@@ -373,16 +394,28 @@ def send_standard_reprompt(
             "worker_turn_end: reprompt send to %s failed", session_name,
         )
         return False
-    if state_store is not None:
-        task_id = getattr(task, "task_id", "") or ""
+    # #349: audit event moves to the unified ``messages`` table via Store;
+    # fall back to the legacy StateStore.record_event when a Store isn't
+    # wired through (older callers / test fixtures).
+    task_id = getattr(task, "task_id", "") or ""
+    message = (
+        f"worker {session_name} reprompted on {task_id} "
+        f"(turn ended without transition)"
+    )
+    if msg_store is not None:
+        try:
+            msg_store.append_event(
+                scope=session_name,
+                sender=session_name,
+                subject="inbox.worker_reprompted",
+                payload={"message": message, "task_id": task_id},
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    elif state_store is not None:
         try:
             state_store.record_event(
-                session_name,
-                "inbox.worker_reprompted",
-                (
-                    f"worker {session_name} reprompted on {task_id} "
-                    f"(turn ended without transition)"
-                ),
+                session_name, "inbox.worker_reprompted", message,
             )
         except Exception:  # noqa: BLE001
             pass
@@ -452,6 +485,7 @@ def handle_worker_turn_end(
     session_service: Any,
     state_store: Any,
     config: Any = None,
+    msg_store: Any = None,
 ) -> str:
     """Top-level entry point invoked from the drift sweep.
 
@@ -459,6 +493,11 @@ def handle_worker_turn_end(
     the chosen action, and returns the action name (``"blocking_question"``
     / ``"reprompt"`` / ``"skipped"``). Never raises — the sweep is a
     best-effort loop.
+
+    ``msg_store`` (optional) is the #349 unified-messages Store. When
+    provided, audit events land on ``messages`` instead of the legacy
+    ``events`` table so the writer migration flips in lockstep with
+    :mod:`pollypm.plugins_builtin.core_recurring.plugin`.
     """
     if not is_worker_session_name(session_name):
         return "skipped"
@@ -474,9 +513,12 @@ def handle_worker_turn_end(
             work_service,
             config=config,
             state_store=state_store,
+            msg_store=msg_store,
         )
         return "blocking_question"
     send_standard_reprompt(
-        session_name, task, session_service, state_store=state_store,
+        session_name, task, session_service,
+        state_store=state_store,
+        msg_store=msg_store,
     )
     return "reprompt"

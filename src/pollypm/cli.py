@@ -349,6 +349,10 @@ def doctor(
     fix: bool = typer.Option(
         False, "--fix", help="Auto-fix the safe subset (missing dirs, stale panes).",
     ),
+    fix_dry_run: bool = typer.Option(
+        False, "--fix-dry-run",
+        help="Show what --fix WOULD do, without mutating anything.",
+    ),
 ) -> None:
     """Validate a new-user environment end-to-end.
 
@@ -358,22 +362,44 @@ def doctor(
     reported with three pieces of information: what's wrong, why
     PollyPM needs it, and the exact fix command.
     """
-    from pollypm.doctor import apply_fixes, render_human, render_json, run_checks
+    from pollypm.doctor import (
+        apply_fixes,
+        manual_fixes,
+        planned_fixes,
+        render_fix_dry_run,
+        render_fix_summary,
+        render_human,
+        render_json,
+        run_checks,
+    )
 
     report = run_checks()
+    if fix_dry_run:
+        planned = planned_fixes(report)
+        manual = manual_fixes(report)
+        typer.echo(render_fix_dry_run(planned, manual))
+        raise typer.Exit(code=0 if report.ok else 1)
+    fix_summary: str | None = None
     if fix:
         fix_results = apply_fixes(report)
         if fix_results:
             for name, success, message in fix_results:
                 glyph = "fixed" if success else "fix failed"
                 typer.echo(f"  [{glyph}] {name}: {message}")
+        manual_before_rerun = manual_fixes(report)
+        fix_summary = render_fix_summary(fix_results, manual_before_rerun)
+        if fix_results:
             # Re-run checks so the final output reflects the fixes.
             report = run_checks()
     if json_output:
         typer.echo(render_json(report))
     else:
         typer.echo(render_human(report))
+    if fix_summary:
+        typer.echo("")
+        typer.echo(fix_summary)
     raise typer.Exit(code=0 if report.ok else 1)
+
 
 
 @app.command()

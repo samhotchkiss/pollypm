@@ -639,3 +639,303 @@ def test_fix_runs_registered_fixers(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.exit_code == 0
     assert invoked["count"] == 1
     assert "fixed" in result.stdout
+
+
+# --------------------------------------------------------------------- #
+# Expanded --fix coverage (PR: doctor --fix autonomy)
+# --------------------------------------------------------------------- #
+
+
+def test_agent_worktree_count_fix_invokes_prune(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """--fix on an over-threshold worktree dir calls the prune handler."""
+    fake_dirs = [tmp_path / f"agent-{i}" for i in range(60)]
+    for d in fake_dirs:
+        d.mkdir()
+    monkeypatch.setattr(doctor, "_agent_worktree_dirs", lambda: fake_dirs)
+    result = doctor.check_agent_worktree_count()
+    assert not result.passed
+    assert result.fixable
+    assert callable(result.fix_fn)
+
+    called = {"n": 0}
+
+    def _fake_handler(payload: dict) -> dict:
+        called["n"] += 1
+        return {"pruned": 3, "skipped_active": 0, "warned_stale": 0, "errors": 0}
+
+    import pollypm.plugins_builtin.core_recurring.plugin as rec_plugin
+    monkeypatch.setattr(rec_plugin, "agent_worktree_prune_handler", _fake_handler)
+    success, message = result.fix_fn()
+    assert success
+    assert called["n"] == 1
+    assert "pruned 3" in message
+
+
+def test_logs_dir_size_fix_invokes_rotate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """--fix on an over-threshold logs dir calls the log.rotate handler."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "big.log").write_bytes(b"\0" * (600 * 1024 * 1024))
+    monkeypatch.setattr(doctor, "_logs_dir_candidates", lambda: [logs])
+    result = doctor.check_logs_dir_size()
+    assert not result.passed
+    assert result.fixable
+    assert callable(result.fix_fn)
+
+    called = {"payload": None}
+
+    def _fake_handler(payload: dict) -> dict:
+        called["payload"] = payload
+        return {"rotated": 1, "deleted": 0, "errors": 0}
+
+    import pollypm.plugins_builtin.core_recurring.plugin as rec_plugin
+    monkeypatch.setattr(rec_plugin, "log_rotate_handler", _fake_handler)
+    success, message = result.fix_fn()
+    assert success
+    # The fix passes the resolved logs_dir in the payload so the handler
+    # doesn't have to re-load config.
+    assert called["payload"] == {"logs_dir": str(logs)}
+    assert "rotated 1" in message
+
+
+def test_plan_gate_fix_rewrites_config_with_backup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """--fix on disabled plan gate writes a new config + .bak backup."""
+    cfg_path = tmp_path / "pollypm.toml"
+    cfg_path.write_text(
+        "[project]\nname = 'x'\n\n[planner]\nenforce_plan = false\nplan_dir = 'docs/plan'\n"
+    )
+
+    fake_planner = type("P", (), {"enforce_plan": False, "plan_dir": "docs/plan"})
+    fake_config = type("C", (), {"planner": fake_planner})
+    monkeypatch.setattr(doctor, "_safe_load_config", lambda: (cfg_path, fake_config))
+    result = doctor.check_plan_presence_gate()
+    assert not result.passed
+    assert result.fixable
+    assert callable(result.fix_fn)
+
+    success, message = result.fix_fn()
+    assert success, message
+    # Backup file exists with the original contents.
+    bak = cfg_path.with_suffix(cfg_path.suffix + ".bak")
+    assert bak.is_file()
+    assert "enforce_plan = false" in bak.read_text()
+    # New config has the flipped key.
+    new_text = cfg_path.read_text()
+    assert "enforce_plan = true" in new_text
+    assert "enforce_plan = false" not in new_text
+
+
+def test_plan_gate_fix_inserts_section_when_missing(tmp_path: Path) -> None:
+    """The rewriter appends [planner] when no section exists yet."""
+    cfg_path = tmp_path / "pollypm.toml"
+    cfg_path.write_text("[project]\nname = 'x'\n")
+    ok, _message = doctor._rewrite_planner_enforce_plan(cfg_path)
+    assert ok
+    text = cfg_path.read_text()
+    assert "[planner]" in text
+    assert "enforce_plan = true" in text
+
+
+def test_task_assignment_sweeper_fix_initializes_state_dbs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """--fix creates state.db files for known-but-missing projects."""
+    proj_a = tmp_path / "proj-a"
+    proj_a.mkdir()
+    proj_b = tmp_path / "proj-b"
+    proj_b.mkdir()
+    fake_projects = {
+        "proj-a": type("P", (), {"path": proj_a, "tracked": True}),
+        "proj-b": type("P", (), {"path": proj_b, "tracked": True}),
+    }
+    fake_config = type("C", (), {"projects": fake_projects})
+    monkeypatch.setattr(doctor, "_safe_load_config", lambda: (Path("/tmp/x"), fake_config))
+    result = doctor.check_task_assignment_sweeper_dbs()
+    assert not result.passed
+    assert result.fixable
+    success, message = result.fix_fn()
+    assert success, message
+    assert (proj_a / ".pollypm" / "state.db").is_file()
+    assert (proj_b / ".pollypm" / "state.db").is_file()
+
+
+def test_session_drift_fix_invokes_repair(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """--fix on session drift calls Supervisor.repair_sessions_table()."""
+    db = _make_state_db(tmp_path / "state.db")
+    monkeypatch.setattr(doctor, "_primary_state_db", lambda: db)
+    monkeypatch.setattr(doctor, "_tool_path", lambda name: "/usr/bin/tmux" if name == "tmux" else None)
+    monkeypatch.setattr(doctor, "_run_cmd", lambda cmd, **kw: (0, "polly:worker-rogue"))
+    result = doctor.check_sessions_table_vs_tmux()
+    assert not result.passed
+    assert result.fixable
+    assert callable(result.fix_fn)
+
+
+# --------------------------------------------------------------------- #
+# --fix-dry-run
+# --------------------------------------------------------------------- #
+
+
+def test_fix_dry_run_lists_planned_fixes_without_mutating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--fix-dry-run enumerates fixable checks but never invokes fix_fn."""
+    invoked = {"count": 0}
+
+    def _fixer() -> tuple[bool, str]:
+        invoked["count"] += 1
+        return (True, "fixed")
+
+    def _check() -> doctor.CheckResult:
+        return doctor._fail(
+            "broken", why="w",
+            fix="Trigger a one-off prune\nOr run:  pm doctor --fix",
+            fixable=True, fix_fn=_fixer, severity="warning",
+        )
+
+    monkeypatch.setattr(
+        doctor, "_registered_checks",
+        lambda: [doctor.Check("fixme", _check, "resources", severity="warning")],
+    )
+    import pollypm.cli as cli_mod
+
+    runner = CliRunner()
+    result = runner.invoke(cli_mod.app, ["doctor", "--fix-dry-run"])
+    assert result.exit_code == 0
+    assert "Would apply 1 fix" in result.stdout
+    assert "fixme" in result.stdout
+    # The most important invariant: dry-run never runs the fixer.
+    assert invoked["count"] == 0
+
+
+def test_fix_dry_run_lists_manual_issues(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Non-fixable failures appear under the manual-intervention list."""
+    def _manual() -> doctor.CheckResult:
+        return doctor._fail(
+            "cant auto-fix", why="w",
+            fix="Install Python manually",
+            severity="error",
+        )
+
+    monkeypatch.setattr(
+        doctor, "_registered_checks",
+        lambda: [doctor.Check("needs-hands", _manual, "system")],
+    )
+    import pollypm.cli as cli_mod
+
+    runner = CliRunner()
+    result = runner.invoke(cli_mod.app, ["doctor", "--fix-dry-run"])
+    # Error-severity failures flip exit to 1.
+    assert result.exit_code == 1
+    assert "1 issue(s) require manual intervention" in result.stdout
+    assert "needs-hands" in result.stdout
+
+
+def test_fix_dry_run_helpers_do_not_invoke_fixers() -> None:
+    """Direct module-level helper test — the helpers never call fix_fn."""
+    invoked = {"count": 0}
+
+    def _never() -> tuple[bool, str]:
+        invoked["count"] += 1
+        return (True, "nope")
+
+    def _check() -> doctor.CheckResult:
+        return doctor._fail(
+            "x", why="w", fix="f1\nf2",
+            fixable=True, fix_fn=_never, severity="warning",
+        )
+
+    report = doctor.run_checks([doctor.Check("c", _check, "pipeline", severity="warning")])
+    planned = doctor.planned_fixes(report)
+    manual = doctor.manual_fixes(report)
+    assert planned == [("c", "f1")]
+    assert manual == []
+    assert invoked["count"] == 0
+
+
+# --------------------------------------------------------------------- #
+# Summary footer
+# --------------------------------------------------------------------- #
+
+
+def test_fix_summary_footer_counts_applied_and_remaining() -> None:
+    """render_fix_summary reports N applied + K manual issues."""
+    manual = [("needs-hands", "edit config manually"), ("another", "restart")]
+    fix_results = [
+        ("worktrees", True, "pruned 3"),
+        ("logs", True, "rotated 1"),
+        ("plan-gate", False, "write failed: permission denied"),
+    ]
+    summary = doctor.render_fix_summary(fix_results, manual)
+    assert "Applied 2 fix(es)" in summary
+    assert "worktrees" in summary and "logs" in summary
+    assert "1 fix(es) failed" in summary
+    assert "plan-gate" in summary
+    assert "2 issue(s) remain" in summary
+    assert "needs-hands" in summary
+
+
+def test_fix_cli_prints_summary_footer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CLI emits the summary footer after --fix completes."""
+    def _fixable() -> doctor.CheckResult:
+        return doctor._fail(
+            "bad", why="w", fix="run a thing",
+            fixable=True, fix_fn=lambda: (True, "done"),
+            severity="warning",
+        )
+
+    def _manual() -> doctor.CheckResult:
+        return doctor._fail(
+            "stuck", why="w", fix="do it by hand", severity="warning",
+        )
+
+    monkeypatch.setattr(
+        doctor, "_registered_checks",
+        lambda: [
+            doctor.Check("auto", _fixable, "resources", severity="warning"),
+            doctor.Check("byhand", _manual, "resources", severity="warning"),
+        ],
+    )
+    import pollypm.cli as cli_mod
+
+    runner = CliRunner()
+    result = runner.invoke(cli_mod.app, ["doctor", "--fix"])
+    assert result.exit_code == 0
+    # Summary line appears; it names the applied fix and the remaining item.
+    assert "Applied 1 fix(es)" in result.stdout
+    assert "auto" in result.stdout
+    assert "1 issue(s) remain" in result.stdout
+    assert "byhand" in result.stdout
+
+
+def test_manual_fixes_excludes_skipped_and_passing() -> None:
+    """manual_fixes only lists failures that cannot auto-run."""
+    def _pass() -> doctor.CheckResult:
+        return doctor._ok("fine")
+
+    def _skip_c() -> doctor.CheckResult:
+        return doctor._skip("n/a")
+
+    def _fixable() -> doctor.CheckResult:
+        return doctor._fail("x", why="w", fix="f", fixable=True, fix_fn=lambda: (True, "ok"))
+
+    def _manual_c() -> doctor.CheckResult:
+        return doctor._fail("y", why="w", fix="do by hand")
+
+    report = doctor.run_checks([
+        doctor.Check("a", _pass, "pipeline"),
+        doctor.Check("b", _skip_c, "pipeline"),
+        doctor.Check("c", _fixable, "pipeline"),
+        doctor.Check("d", _manual_c, "pipeline"),
+    ])
+    manual = doctor.manual_fixes(report)
+    names = [n for n, _ in manual]
+    assert names == ["d"]

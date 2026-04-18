@@ -1291,6 +1291,73 @@ def _safe_load_config():
     return DEFAULT_CONFIG_PATH, config
 
 
+def _rewrite_planner_enforce_plan(config_path: Path) -> tuple[bool, str]:
+    """Flip ``[planner].enforce_plan`` to true in ``config_path``.
+
+    Preserves all other keys. Creates a ``<path>.bak`` sibling before
+    writing. Idempotent — calling on a config that already has the key
+    true is a no-op that returns success.
+    """
+    try:
+        original = config_path.read_text()
+    except OSError as exc:
+        return (False, f"read failed: {exc}")
+    # Backup first — safety net for manual rollback if the rewrite is
+    # surprising. Overwrite any stale prior .bak from an earlier fix so
+    # the backup always reflects the pre-fix content.
+    try:
+        (config_path.with_suffix(config_path.suffix + ".bak")).write_text(original)
+    except OSError as exc:
+        return (False, f"backup failed: {exc}")
+
+    # Find an existing [planner] section; update or insert the key.
+    lines = original.splitlines(keepends=True)
+    planner_start: int | None = None
+    planner_end: int | None = None
+    for idx, raw in enumerate(lines):
+        stripped = raw.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped.strip("[]").strip()
+            if section == "planner":
+                planner_start = idx
+                planner_end = len(lines)
+            elif planner_start is not None and planner_end == len(lines):
+                planner_end = idx
+    if planner_start is None:
+        # Append a new section at the end. Match the blank-line style
+        # of the rest of the file.
+        suffix = "" if original.endswith("\n") else "\n"
+        new_text = (
+            original
+            + suffix
+            + "\n[planner]\nenforce_plan = true\n"
+        )
+    else:
+        assert planner_end is not None
+        new_section_lines: list[str] = []
+        replaced = False
+        for raw in lines[planner_start:planner_end]:
+            stripped = raw.strip()
+            if stripped.startswith("enforce_plan"):
+                # Rewrite in place, preserving indentation.
+                prefix = raw[: len(raw) - len(raw.lstrip())]
+                new_section_lines.append(f"{prefix}enforce_plan = true\n")
+                replaced = True
+            else:
+                new_section_lines.append(raw)
+        if not replaced:
+            # Insert right after the [planner] header.
+            new_section_lines.insert(1, "enforce_plan = true\n")
+        new_text = "".join(
+            lines[:planner_start] + new_section_lines + lines[planner_end:]
+        )
+    try:
+        config_path.write_text(new_text)
+    except OSError as exc:
+        return (False, f"write failed: {exc}")
+    return (True, f"enabled plan-presence gate in {config_path} (backup: {config_path}.bak)")
+
+
 def check_plan_presence_gate() -> CheckResult:
     """``[planner].enforce_plan`` should be true unless explicitly opted out.
 
@@ -1298,13 +1365,18 @@ def check_plan_presence_gate() -> CheckResult:
     gate for migrations or hotfixes — but call it out so a forgotten
     override doesn't leak into production.
     """
-    _path, config = _safe_load_config()
+    path, config = _safe_load_config()
     if config is None:
         return _skip("plan-gate check skipped (no config)")
     planner = getattr(config, "planner", None)
     enforce = bool(getattr(planner, "enforce_plan", True)) if planner else True
     plan_dir = getattr(planner, "plan_dir", "docs/plan") if planner else "docs/plan"
     if not enforce:
+        def _fix() -> tuple[bool, str]:
+            if path is None:
+                return (False, "no config path resolved")
+            return _rewrite_planner_enforce_plan(path)
+
         return _fail(
             "[planner].enforce_plan = false (plan-presence gate disabled)",
             why=(
@@ -1317,9 +1389,12 @@ def check_plan_presence_gate() -> CheckResult:
                 "Re-enable the gate in ~/.pollypm/pollypm.toml —\n"
                 "  [planner]\n"
                 "  enforce_plan = true\n"
+                "Or run:  pm doctor --fix   # writes the key with a .bak backup\n"
                 "Recheck: pm doctor"
             ),
             severity="warning",
+            fixable=True,
+            fix_fn=_fix,
             data={"enforce_plan": False, "plan_dir": plan_dir},
         )
     return _ok(
@@ -1393,6 +1468,31 @@ def check_visual_explainer_skill() -> CheckResult:
     )
 
 
+def _initialize_project_state_db(db_path: Path) -> tuple[bool, str]:
+    """Create an initialized ``state.db`` at ``db_path`` via StateStore.
+
+    Running StateStore's constructor creates the parent directory,
+    applies the full schema, and runs every pending migration, so the
+    resulting file is the same shape the sweeper expects. Safe to call
+    on a path whose DB already exists — the open is a no-op for schema
+    creation (CREATE TABLE IF NOT EXISTS) and a re-run of pending
+    migrations.
+    """
+    try:
+        from pollypm.storage.state import StateStore
+    except Exception as exc:  # noqa: BLE001
+        return (False, f"import failed: {exc}")
+    try:
+        store = StateStore(db_path)
+        try:
+            pass
+        finally:
+            store.close()
+        return (True, f"created {db_path}")
+    except Exception as exc:  # noqa: BLE001
+        return (False, f"StateStore init failed: {exc}")
+
+
 def check_task_assignment_sweeper_dbs() -> CheckResult:
     """Each tracked project must expose a state.db the sweeper can find."""
     _path, config = _safe_load_config()
@@ -1402,6 +1502,7 @@ def check_task_assignment_sweeper_dbs() -> CheckResult:
     if not projects:
         return _skip("task-assignment sweeper check skipped (no projects)")
     missing: list[str] = []
+    missing_paths: list[Path] = []
     found = 0
     for key, project in projects.items():
         if not getattr(project, "tracked", False):
@@ -1411,6 +1512,24 @@ def check_task_assignment_sweeper_dbs() -> CheckResult:
             found += 1
         else:
             missing.append(f"{key} ({db_path})")
+            if project.path.exists():
+                missing_paths.append(db_path)
+
+    def _fix() -> tuple[bool, str]:
+        if not missing_paths:
+            return (False, "no writable project paths to initialize")
+        initialized = 0
+        errors: list[str] = []
+        for db_path in missing_paths:
+            ok, msg = _initialize_project_state_db(db_path)
+            if ok:
+                initialized += 1
+            else:
+                errors.append(f"{db_path}: {msg}")
+        if errors:
+            return (initialized > 0, f"initialized {initialized}; errors: {'; '.join(errors[:3])}")
+        return (True, f"initialized {initialized} project state.db file(s)")
+
     if missing and not found:
         return _fail(
             f"no tracked project has a state.db on disk ({len(missing)} missing)",
@@ -1423,9 +1542,12 @@ def check_task_assignment_sweeper_dbs() -> CheckResult:
             fix=(
                 "Boot at least one project to materialize its state.db —\n"
                 "  cd <project> && pm up\n"
+                "Or run:  pm doctor --fix   # initializes empty state.db for each\n"
                 "Recheck: pm doctor"
             ),
             severity="warning",
+            fixable=bool(missing_paths),
+            fix_fn=_fix if missing_paths else None,
             data={"missing": missing},
         )
     if missing:
@@ -1439,10 +1561,13 @@ def check_task_assignment_sweeper_dbs() -> CheckResult:
             fix=(
                 "Boot each project once to create its state.db —\n"
                 "  cd <project> && pm up\n"
+                "Or run:  pm doctor --fix   # initializes empty state.db for each\n"
                 "Or remove the [projects.*] entry from ~/.pollypm/pollypm.toml.\n"
                 "Recheck: pm doctor"
             ),
             severity="warning",
+            fixable=bool(missing_paths),
+            fix_fn=_fix if missing_paths else None,
             data={"found": found, "missing": missing},
         )
     return _ok(
@@ -1801,6 +1926,32 @@ def _agent_worktree_dirs() -> list[Path]:
     return [p for p in candidates if p.is_dir()]
 
 
+def _invoke_prune_handler() -> tuple[bool, str]:
+    """Invoke the ``agent_worktree.prune`` handler directly.
+
+    Bypasses the scheduler so the prune runs immediately rather than
+    waiting for the next hourly tick. The handler is idempotent —
+    calling it when nothing is prunable is a cheap no-op.
+    """
+    try:
+        from pollypm.plugins_builtin.core_recurring.plugin import (
+            agent_worktree_prune_handler,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return (False, f"import failed: {exc}")
+    try:
+        result = agent_worktree_prune_handler({})
+    except Exception as exc:  # noqa: BLE001
+        return (False, f"prune handler failed: {exc}")
+    pruned = int(result.get("pruned", 0)) if isinstance(result, dict) else 0
+    errors = int(result.get("errors", 0)) if isinstance(result, dict) else 0
+    warned = int(result.get("warned_stale", 0)) if isinstance(result, dict) else 0
+    return (
+        errors == 0,
+        f"pruned {pruned} merged worktree(s), {warned} stale unmerged retained, {errors} error(s)",
+    )
+
+
 def check_agent_worktree_count() -> CheckResult:
     """Warn when the harness's agent worktree dir has accumulated >50 entries."""
     worktrees = _agent_worktree_dirs()
@@ -1816,10 +1967,13 @@ def check_agent_worktree_count() -> CheckResult:
             fix=(
                 "Trigger a one-off prune —\n"
                 "  pm rail tick   # forces the next scheduled tick\n"
+                "Or run:  pm doctor --fix   # runs the prune handler immediately\n"
                 "Or manually:  git worktree prune && git worktree list\n"
                 "Recheck: pm doctor"
             ),
             severity="warning",
+            fixable=True,
+            fix_fn=_invoke_prune_handler,
             data={"count": count},
         )
     return _ok(
@@ -1855,6 +2009,32 @@ def _dir_size_bytes(path: Path) -> int:
     return total
 
 
+def _invoke_log_rotate_handler(logs_dir: Path) -> tuple[bool, str]:
+    """Invoke ``log.rotate`` against ``logs_dir`` directly.
+
+    We pass ``logs_dir`` as a payload override so the handler skips the
+    config-load path — we already know the directory. The handler
+    rotates files past the threshold and prunes retention-exceeded
+    siblings; calling it when nothing is over-threshold is a cheap
+    no-op.
+    """
+    try:
+        from pollypm.plugins_builtin.core_recurring.plugin import log_rotate_handler
+    except Exception as exc:  # noqa: BLE001
+        return (False, f"import failed: {exc}")
+    try:
+        result = log_rotate_handler({"logs_dir": str(logs_dir)})
+    except Exception as exc:  # noqa: BLE001
+        return (False, f"log.rotate handler failed: {exc}")
+    rotated = int(result.get("rotated", 0)) if isinstance(result, dict) else 0
+    deleted = int(result.get("deleted", 0)) if isinstance(result, dict) else 0
+    errors = int(result.get("errors", 0)) if isinstance(result, dict) else 0
+    return (
+        errors == 0,
+        f"rotated {rotated} log(s), deleted {deleted} old archive(s), {errors} error(s)",
+    )
+
+
 def check_logs_dir_size() -> CheckResult:
     """Warn when the logs dir exceeds 500 MB."""
     dirs = _logs_dir_candidates()
@@ -1869,6 +2049,9 @@ def check_logs_dir_size() -> CheckResult:
             biggest_size = size
     mb = biggest_size / (1024 * 1024)
     if biggest_size > _LOGS_WARN_BYTES:
+        def _fix() -> tuple[bool, str]:
+            return _invoke_log_rotate_handler(biggest_dir)
+
         return _fail(
             f"logs dir {biggest_dir} is {mb:.0f} MB (warn at {_LOGS_WARN_BYTES // (1024 * 1024)} MB)",
             why=(
@@ -1880,10 +2063,13 @@ def check_logs_dir_size() -> CheckResult:
             fix=(
                 "Trigger a one-off rotation —\n"
                 "  pm rail tick\n"
+                "Or run:  pm doctor --fix   # runs log.rotate handler immediately\n"
                 f"Path: {biggest_dir}\n"
                 "Recheck: pm doctor"
             ),
             severity="warning",
+            fixable=True,
+            fix_fn=_fix,
             data={"path": str(biggest_dir), "bytes": biggest_size, "mb": round(mb, 1)},
         )
     return _ok(
@@ -2100,6 +2286,22 @@ def check_sessions_table_vs_tmux() -> CheckResult:
     }
     drift = sorted(pollypm_windows - db_windows)
     if drift:
+        def _fix() -> tuple[bool, str]:
+            try:
+                from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+                from pollypm.supervisor import Supervisor
+            except Exception as exc:  # noqa: BLE001
+                return (False, f"import failed: {exc}")
+            if not DEFAULT_CONFIG_PATH.exists():
+                return (False, "no config to load")
+            try:
+                cfg = load_config(DEFAULT_CONFIG_PATH)
+                sup = Supervisor(cfg)
+                repaired = sup.repair_sessions_table()
+                return (True, f"repaired {repaired} session(s)")
+            except Exception as exc:  # noqa: BLE001
+                return (False, f"repair failed: {exc}")
+
         return _fail(
             f"{len(drift)} tmux window(s) without a sessions row: {', '.join(drift[:5])}",
             why=(
@@ -2115,6 +2317,8 @@ def check_sessions_table_vs_tmux() -> CheckResult:
                 "Recheck: pm doctor"
             ),
             severity="warning",
+            fixable=True,
+            fix_fn=_fix,
             data={
                 "drift": drift,
                 "tmux_count": len(tmux_windows),
@@ -2426,3 +2630,98 @@ def apply_fixes(report: DoctorReport) -> list[tuple[str, bool, str]]:
             continue
         results.append((check.name, success, message))
     return results
+
+
+def planned_fixes(report: DoctorReport) -> list[tuple[str, str]]:
+    """List the fixes that ``apply_fixes`` *would* run, without running them.
+
+    Returns ``(check_name, intention)`` tuples. ``intention`` is a short
+    human-readable summary derived from the check's ``fix`` text — we
+    use the first non-empty line so the output stays concise.
+    """
+    planned: list[tuple[str, str]] = []
+    for check, result in report.results:
+        if result.passed or result.skipped:
+            continue
+        if not result.fixable or result.fix_fn is None:
+            continue
+        # First non-blank line of the fix block makes a readable
+        # intention summary for dry-run output.
+        intention = ""
+        for line in (result.fix or "").splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.lower().startswith("or"):
+                intention = stripped
+                break
+        if not intention:
+            intention = result.status or check.name
+        planned.append((check.name, intention))
+    return planned
+
+
+def manual_fixes(report: DoctorReport) -> list[tuple[str, str]]:
+    """List failures that ``--fix`` cannot auto-resolve.
+
+    Returns ``(check_name, fix_hint)`` tuples where ``fix_hint`` is the
+    check's ``fix`` text (manual instructions). Warnings and errors both
+    count; skipped checks never do.
+    """
+    manual: list[tuple[str, str]] = []
+    for check, result in report.results:
+        if result.passed or result.skipped:
+            continue
+        if result.fixable and result.fix_fn is not None:
+            continue
+        manual.append((check.name, result.fix or result.status))
+    return manual
+
+
+def render_fix_summary(
+    fix_results: list[tuple[str, bool, str]],
+    manual: list[tuple[str, str]],
+) -> str:
+    """Render the post-``--fix`` summary footer.
+
+    Format:
+        Applied N fix(es): [name, name, ...]. K issue(s) remain (require manual intervention).
+
+    When every fix succeeds and nothing manual is pending, the footer
+    collapses to a single "Applied N fix(es)" line.
+    """
+    applied = [name for name, ok, _ in fix_results if ok]
+    failed = [name for name, ok, _ in fix_results if not ok]
+    parts: list[str] = []
+    if applied:
+        parts.append(f"Applied {len(applied)} fix(es): [{', '.join(applied)}]")
+    else:
+        parts.append("Applied 0 fixes")
+    if failed:
+        parts.append(f"{len(failed)} fix(es) failed: [{', '.join(failed)}]")
+    if manual:
+        names = [n for n, _ in manual]
+        parts.append(
+            f"{len(manual)} issue(s) remain (require manual intervention): [{', '.join(names)}]"
+        )
+    return ". ".join(parts) + "."
+
+
+def render_fix_dry_run(planned: list[tuple[str, str]], manual: list[tuple[str, str]]) -> str:
+    """Render ``--fix-dry-run`` output.
+
+    Lists the fixes that would run, then the issues that can't be
+    auto-fixed. Mirrors the shape of :func:`render_fix_summary` so
+    scripts can diff the two outputs.
+    """
+    lines: list[str] = []
+    lines.append(f"Would apply {len(planned)} fix(es):")
+    for name, intention in planned:
+        lines.append(f"  [would fix] {name}: {intention}")
+    if manual:
+        lines.append("")
+        lines.append(
+            f"{len(manual)} issue(s) require manual intervention (not auto-fixable):"
+        )
+        for name, hint in manual:
+            first = (hint or "").splitlines()[0] if hint else ""
+            lines.append(f"  [manual] {name}: {first.strip()}")
+    return "\n".join(lines)

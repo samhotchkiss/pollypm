@@ -183,6 +183,74 @@ class TestClassifyPriority:
         # — the existing audit-trail behaviour must not regress.
         assert ns.classify_priority("Test pass", "") == "silent"
 
+    # ---- Bug-report shape upgrades (operator-surfaced regression:
+    # dogfood findings #3 and #4 were auto-classified as digest because
+    # the literal "done" keyword in "Archie skips per-stage pm task
+    # done" hit ``_DIGEST_KEYWORDS``. Bug-report-shape keywords must
+    # take precedence so findings reach the inbox immediately rather
+    # than waiting for the next milestone flush.
+    def test_bug_finding_classifies_immediate(self):
+        # Polly's literal repro string — co-occurring "done" must NOT
+        # downgrade this to digest because "skips" flags a bug shape.
+        assert (
+            ns.classify_priority(
+                "#4: Archie skips per-stage pm task done", "",
+            )
+            == "immediate"
+        )
+
+    def test_gap_finding_classifies_immediate(self):
+        assert (
+            ns.classify_priority(
+                "Gap A fallback doesn't fire from cron pm heartbeat", "",
+            )
+            == "immediate"
+        )
+
+    def test_dogfood_finding_classifies_immediate(self):
+        assert (
+            ns.classify_priority(
+                "dogfood finding: replan misclassification", "",
+            )
+            == "immediate"
+        )
+
+    def test_regression_classifies_immediate(self):
+        assert ns.classify_priority("regression in foo bar", "") == "immediate"
+
+    def test_bug_keyword_classifies_immediate(self):
+        # Even when paired with a digest keyword, "bug" wins.
+        assert (
+            ns.classify_priority("Bug: deploy completed but page 500s", "")
+            == "immediate"
+        )
+
+    def test_broken_keyword_classifies_immediate(self):
+        assert (
+            ns.classify_priority("Broken: heartbeat skipped a tick", "")
+            == "immediate"
+        )
+
+    def test_misclassification_keyword_classifies_immediate(self):
+        assert (
+            ns.classify_priority("replan misclassification shipped", "")
+            == "immediate"
+        )
+
+    def test_non_bug_done_remains_digest(self):
+        # The new bug-shape keywords must NOT swallow routine
+        # completions. "Build done." has no bug keyword and should
+        # still classify as digest so milestone rollups keep working.
+        assert ns.classify_priority("Build done.", "") == "digest"
+
+    def test_debug_does_not_trigger_bug(self):
+        # Word-boundary safety: "debug" / "bugfix" must not match the
+        # bare "bug" token (otherwise routine "debug logs shipped"
+        # status updates would over-notify).
+        assert (
+            ns.classify_priority("debug logs shipped", "") == "digest"
+        )
+
 
 # ---------------------------------------------------------------------------
 # pm notify CLI — tier routing

@@ -59,6 +59,21 @@ _IMMEDIATE_KEYWORDS: tuple[str, ...] = (
     "stuck",
     "failed",
     "persona swap",
+    # Bug-report shape — operator (Polly) flagged that "dogfood
+    # finding" / "Archie skips per-stage pm task done" / "Gap A
+    # fallback doesn't fire" notifications were silently classified as
+    # digest because they happened to contain a completion keyword
+    # ("done"). Bug reports must surface immediately so the user can
+    # triage before a milestone flush. Single-word tokens are matched
+    # on word boundary so "bug" doesn't hit "debug" / "bugged" and
+    # "gap" doesn't hit "stopgap".
+    "bug",
+    "gap",
+    "finding",
+    "regression",
+    "broken",
+    "misclassification",
+    "skips",
 )
 
 _DIGEST_KEYWORDS: tuple[str, ...] = (

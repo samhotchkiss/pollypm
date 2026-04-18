@@ -59,6 +59,37 @@ def _load_config_and_store(payload: dict[str, Any]):
     return config, store
 
 
+# Ephemeral session name prefixes (#252). Sessions whose name starts with
+# any of these are NOT in the supervisor's launch plan — they're spawned
+# on-demand for a specific task / critic pass / downtime exploration. The
+# health sweep classifies them with ``is_ephemeral=True`` so interventions
+# differ: we surface failure to the parent task instead of restarting.
+_EPHEMERAL_SESSION_PREFIXES: tuple[str, ...] = (
+    "task-",
+    "critic_",
+    "downtime_",
+)
+
+
+def is_ephemeral_session_name(name: str) -> bool:
+    """Return True if ``name`` matches an ephemeral session naming convention.
+
+    Ephemeral sessions are spawned on-demand by the work service / planners
+    rather than declared in the supervisor's launch plan. Examples:
+
+    * ``task-<project>-<number>`` — per-task worker session.
+    * ``critic_<flavor>`` — per-task critic pass (security, simplicity, …).
+    * ``downtime_<slug>`` — speculative downtime exploration session.
+
+    A name with no prefix match returns False — planned sessions
+    (``operator``, ``architect-<project>``, ``worker-<project>``, etc.)
+    are never classified as ephemeral.
+    """
+    if not name:
+        return False
+    return any(name.startswith(prefix) for prefix in _EPHEMERAL_SESSION_PREFIXES)
+
+
 def session_health_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Run one round of session health classification.
 
@@ -70,15 +101,182 @@ def session_health_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     instantiates a transient ``Supervisor`` bound to the current config.
     Works for the co-located single-process setup; plugin overlays can
     replace this with a network-aware implementation.
+
+    After the planned-session sweep we run a second pass over *ephemeral*
+    sessions — ``task-*``, ``critic_*``, ``downtime_*`` — that the
+    launch planner doesn't know about (#252). Their classification carries
+    ``is_ephemeral=True`` and the intervention dispatch is restricted to
+    raising an alert tied to the parent task; we never auto-restart an
+    ephemeral session because its lifecycle is owned by whoever spawned it.
     """
-    config, _store = _load_config_and_store(payload)
+    config, store = _load_config_and_store(payload)
 
     # Late import to avoid a supervisor import cycle at plugin load.
     from pollypm.supervisor import Supervisor
 
     supervisor = Supervisor(config)
     alerts = supervisor.run_heartbeat(snapshot_lines=int(payload.get("snapshot_lines", 200) or 200))
-    return {"alerts_raised": len(alerts)}
+
+    # #252 — ephemeral session sweep. Best-effort: any failure is logged
+    # but never fails the planned-session sweep result, which is the
+    # caller's primary contract.
+    ephemeral_summary = {
+        "considered": 0, "alerts_raised": 0, "skipped_planned": 0,
+    }
+    try:
+        ephemeral_summary = sweep_ephemeral_sessions(supervisor, store)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "session.health_sweep: ephemeral pass failed", exc_info=True,
+        )
+
+    return {
+        "alerts_raised": len(alerts),
+        "ephemeral_considered": ephemeral_summary["considered"],
+        "ephemeral_alerts_raised": ephemeral_summary["alerts_raised"],
+        "ephemeral_skipped_planned": ephemeral_summary["skipped_planned"],
+    }
+
+
+def sweep_ephemeral_sessions(supervisor: Any, store: Any) -> dict[str, int]:
+    """Mechanical health pass over ephemeral (non-planned) sessions (#252).
+
+    Iterates ``SessionService.list()`` filtered to ephemeral name prefixes
+    (see :func:`is_ephemeral_session_name`) and excludes any name already
+    covered by ``supervisor.plan_launches()`` so a session can never be
+    classified twice.
+
+    For each ephemeral session we ask the SessionService for raw health
+    signals (``health(name)``). When the window is missing or the pane is
+    dead we raise a session-scoped alert keyed by the ephemeral name —
+    ``critic_failed:<task>`` for critic sessions, ``downtime_failed:<task>``
+    for downtime sessions, ``ephemeral_session_dead:<task>`` for task
+    workers — and skip the planned-session ``recover_session`` path
+    entirely. The parent task is resolved via the work service when
+    possible; when it can't be resolved, the alert falls back to keying
+    on the session name itself.
+
+    Returns a small summary suitable for the handler's job-result row.
+    """
+    summary = {"considered": 0, "alerts_raised": 0, "skipped_planned": 0}
+
+    # Build the planned-session name set so we never double-classify a
+    # session that already went through the supervisor sweep.
+    try:
+        planned_names = {
+            launch.session.name for launch in supervisor.plan_launches()
+        }
+    except Exception:  # noqa: BLE001
+        planned_names = set()
+
+    session_service = getattr(supervisor, "session_service", None)
+    if session_service is None:
+        return summary
+
+    try:
+        handles = session_service.list()
+    except Exception:  # noqa: BLE001
+        logger.debug("ephemeral_sweep: session_service.list() failed", exc_info=True)
+        return summary
+
+    for handle in handles:
+        name = getattr(handle, "name", "") or ""
+        if not is_ephemeral_session_name(name):
+            continue
+        if name in planned_names:
+            # Defensive — an ephemeral name that overlaps a planned
+            # launch (shouldn't happen in production) was already
+            # classified by the supervisor sweep. Skip to avoid double
+            # alerts.
+            summary["skipped_planned"] += 1
+            continue
+
+        summary["considered"] += 1
+        try:
+            health = session_service.health(name)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "ephemeral_sweep: health(%s) failed", name, exc_info=True,
+            )
+            continue
+
+        # Mechanical failure modes — window missing or pane dead. Other
+        # signals (auth failure, stuck loops, etc.) belong to the
+        # planned-session classifier; for ephemerals we only act on the
+        # hard failures the planner can't recover from.
+        failure: tuple[str, str] | None = None
+        if not getattr(health, "window_present", False):
+            failure = (
+                "missing_window",
+                f"Ephemeral session {name} has no tmux window",
+            )
+        elif getattr(health, "pane_dead", False):
+            failure = (
+                "pane_dead",
+                f"Ephemeral session {name} pane has exited",
+            )
+
+        if failure is None:
+            continue
+
+        failure_kind, failure_message = failure
+        alert_type = _ephemeral_alert_type(name, failure_kind)
+        try:
+            store.upsert_alert(
+                name,
+                alert_type,
+                "warn",
+                # Three-question rule (#240): what / why / fix.
+                f"{failure_message}. "
+                f"Why it matters: parent task is blocked because the "
+                f"ephemeral session that was driving it is gone. "
+                f"Fix: inspect the parent task's status and re-spawn the "
+                f"session via the originating handler "
+                f"(critic / downtime / `pm worker-start`).",
+            )
+            summary["alerts_raised"] += 1
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "ephemeral_sweep: upsert_alert failed for %s", name,
+                exc_info=True,
+            )
+        # Deliberately do NOT call ``supervisor.maybe_recover_session`` —
+        # ephemeral sessions are owned by the spawning subsystem (work
+        # service for task workers, planner for critics, downtime
+        # explorer for downtime sessions). Surfacing the alert is the
+        # contract; the spawner decides whether to relaunch.
+
+    return summary
+
+
+def _ephemeral_alert_type(session_name: str, failure_kind: str) -> str:
+    """Pick a stable, parent-task-keyed alert type for an ephemeral failure.
+
+    Naming convention:
+
+    * ``task-<project>-<number>`` → ``ephemeral_session_dead:<project>/<number>``
+    * ``critic_<flavor>`` → ``critic_failed:<session_name>``
+    * ``downtime_<slug>`` → ``downtime_failed:<session_name>``
+
+    For ``task-*`` we attempt to extract the parent ``<project>/<number>``
+    so the cockpit can correlate the alert with the task row directly. If
+    the name doesn't fit the expected pattern we fall back to the raw
+    session name.
+    """
+    if session_name.startswith("task-"):
+        suffix = session_name[len("task-"):]
+        # ``task-<project>-<number>`` — split from the right so projects
+        # containing hyphens are handled correctly.
+        if "-" in suffix:
+            project, _, number = suffix.rpartition("-")
+            if project and number.isdigit():
+                return f"ephemeral_session_dead:{project}/{number}"
+        return f"ephemeral_session_dead:{session_name}"
+    if session_name.startswith("critic_"):
+        return f"critic_failed:{session_name}"
+    if session_name.startswith("downtime_"):
+        return f"downtime_failed:{session_name}"
+    return f"ephemeral_session_dead:{session_name}"
 
 
 def capacity_probe_handler(payload: dict[str, Any]) -> dict[str, Any]:

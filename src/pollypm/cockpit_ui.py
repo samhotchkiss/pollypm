@@ -3267,6 +3267,166 @@ def _task_is_rollup(task) -> bool:
     return "ready for review" in title and "updates" in title
 
 
+def _fuzzy_subseq_match(query: str, hay: str) -> bool:
+    """Subsequence fuzzy match: every char in ``query`` appears in ``hay`` in order.
+
+    ``"shp"`` matches ``"shipped"`` (s, h, p land in order). Substring
+    matches are a subset, so a plain ``"deploy"`` query against
+    ``"deploy blocked"`` still matches via the same algorithm.
+    Empty query matches everything; case is folded before compare so
+    the call site doesn't have to.
+    """
+    if not query:
+        return True
+    if not hay:
+        return False
+    qi = 0
+    q = query
+    for ch in hay:
+        if ch == q[qi]:
+            qi += 1
+            if qi == len(q):
+                return True
+    return False
+
+
+def _task_recent_timestamp(task) -> float | None:
+    """Return the most-recent updated/created stamp as a unix timestamp.
+
+    Prefers ``updated_at`` (newer thread activity wins), falls back to
+    ``created_at``. Returns ``None`` for unparseable values so the
+    "recent 24h" filter simply drops them rather than including weirdly
+    dated tasks by accident.
+    """
+    from datetime import datetime as _dt
+
+    for attr in ("updated_at", "created_at"):
+        value = getattr(task, attr, None)
+        if value is None:
+            continue
+        try:
+            if hasattr(value, "timestamp"):
+                return float(value.timestamp())
+            return _dt.fromisoformat(str(value)).timestamp()
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+class _InboxProjectPickerModal(ModalScreen[str | None]):
+    """Tiny modal listing project keys for the ``p`` filter chip.
+
+    Returns the selected key (string) or ``None`` when dismissed via
+    Esc. Selecting the currently-active project clears the chip.
+    """
+
+    CSS = """
+    _InboxProjectPickerModal {
+        align: center middle;
+        background: rgba(0, 0, 0, 0.45);
+    }
+    #ipp-dialog {
+        width: 48;
+        max-width: 90%;
+        height: auto;
+        max-height: 18;
+        padding: 1 1 0 1;
+        background: #141a20;
+        border: round #2a3340;
+    }
+    #ipp-title {
+        height: 1;
+        padding: 0 1;
+        color: #97a6b2;
+    }
+    #ipp-list {
+        height: auto;
+        max-height: 14;
+        background: #141a20;
+        border: none;
+        margin-top: 1;
+        padding: 0;
+    }
+    #ipp-list > .ipp-row {
+        height: 1;
+        padding: 0 1;
+        color: #d6dee5;
+        background: transparent;
+    }
+    #ipp-list > .ipp-row.-highlight {
+        background: #1e2730;
+    }
+    #ipp-hint {
+        height: 1;
+        padding: 0 1;
+        color: #3e4c5a;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close"),
+        Binding("down,j", "cursor_down", "Down", show=False),
+        Binding("up,k", "cursor_up", "Up", show=False),
+        Binding("enter", "select", "Pick", show=False),
+    ]
+
+    def __init__(self, keys: list[str], current: str | None) -> None:
+        super().__init__()
+        self._keys = list(keys)
+        self._current = current
+        self.list_view = ListView(id="ipp-list")
+        self.title_bar = Static(
+            "[b]Filter by project[/b]", id="ipp-title", markup=True,
+        )
+        self.hint = Static(
+            "[dim]\u21b5 select  \u00b7  esc cancel  \u00b7  pick the active "
+            "project to clear[/dim]",
+            id="ipp-hint", markup=True,
+        )
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ipp-dialog"):
+            yield self.title_bar
+            yield self.list_view
+            yield self.hint
+
+    def on_mount(self) -> None:
+        for key in self._keys:
+            label = key
+            if key == self._current:
+                label = f"\u25cf {key}"
+            self.list_view.append(
+                ListItem(Static(label, markup=False), classes="ipp-row")
+            )
+        self.list_view.index = 0
+        self.list_view.focus()
+
+    def action_cursor_down(self) -> None:
+        self.list_view.action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        self.list_view.action_cursor_up()
+
+    def action_select(self) -> None:
+        idx = self.list_view.index or 0
+        if 0 <= idx < len(self._keys):
+            picked = self._keys[idx]
+            # Picking the current chip again is a "clear" gesture.
+            if picked == self._current:
+                self.dismiss("")
+            else:
+                self.dismiss(picked)
+        else:
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(ListView.Selected, "#ipp-list")
+    def _on_row_selected(self, _event: ListView.Selected) -> None:
+        self.action_select()
+
+
 def _resolve_pm_target(config_path: Path, project_key: str | None) -> tuple[str, str]:
     """Resolve the cockpit-router key + display name for a project's PM.
 
@@ -3718,8 +3878,40 @@ class PollyInboxApp(App[None]):
         margin: 1 0 0 0;
         color: #6b7a88;
     }
+    #inbox-filter-bar {
+        height: auto;
+        padding: 0 1;
+        background: #0c0f12;
+    }
+    #inbox-filter-input {
+        height: 3;
+        padding: 0 1;
+        background: #111820;
+        border: round #2a3340;
+        color: #d6dee5;
+    }
+    #inbox-filter-input:focus {
+        border: round #5b8aff;
+    }
+    #inbox-filter-chips {
+        height: 1;
+        padding: 0 1;
+        color: #97a6b2;
+    }
+    #inbox-empty-state {
+        height: 1fr;
+        content-align: center middle;
+        color: #6b7a88;
+        background: #0f1317;
+    }
     """
 
+    # Filter keybindings (inbox-search #NEW): `/` opens a fuzzy text
+    # filter, chip-toggle keys flip AND-combined filter chips, ``c``
+    # clears all. Conflicts with existing bindings resolved as:
+    #   * ``r`` stays as reply → capital ``R`` opens recent-24h.
+    #   * ``u`` was refresh → promoted filter (unread-only); refresh
+    #     remains available via ``ctrl+r`` and the ``:`` palette.
     BINDINGS = [
         Binding("j,down", "cursor_down", "Down", show=False),
         Binding("k,up", "cursor_up", "Up", show=False),
@@ -3741,7 +3933,17 @@ class PollyInboxApp(App[None]):
         # so no separate keybinding is needed here for approve.
         Binding("v", "open_plan_explainer", "Explainer", show=False),
         Binding("e", "expand_all_rollup", "Expand all", show=False),
-        Binding("u", "refresh", "Refresh"),
+        # Filter / search bar (#NEW).
+        Binding("slash", "start_filter", "Filter", show=False),
+        Binding("u", "toggle_filter_unread", "Unread", show=False),
+        Binding("p", "pick_filter_project", "Project", show=False),
+        Binding("R", "toggle_filter_recent", "Recent", show=False),
+        Binding("l", "toggle_filter_plan_review", "Plan review", show=False),
+        Binding("b", "toggle_filter_blocking", "Blocking", show=False),
+        Binding("c", "clear_filters", "Clear filters", show=False),
+        # Refresh: ``u`` re-bound to filter, so refresh moves to ``ctrl+r``
+        # (palette 'session.refresh' still works from any screen).
+        Binding("ctrl+r", "refresh", "Refresh", show=False),
         Binding("colon", "open_command_palette", "Palette", priority=True),
         Binding("q,escape", "back_or_cancel", "Back"),
     ]
@@ -3769,6 +3971,18 @@ class PollyInboxApp(App[None]):
             placeholder="Reply \u2026 (Enter to send, Esc back to list)",
             id="inbox-reply",
         )
+        # Filter bar (#NEW). Hidden until `/` mounts the Input. The
+        # chips Static is always part of the tree so toggles can update
+        # it without an explicit mount; it renders an empty string when
+        # no filters are active.
+        self.filter_input = Input(
+            placeholder="filter \u2026  (Esc clears + closes)",
+            id="inbox-filter-input",
+        )
+        self.filter_chips = Static("", id="inbox-filter-chips", markup=True)
+        self.filter_bar = Vertical(
+            self.filter_input, self.filter_chips, id="inbox-filter-bar",
+        )
         self.status = Static("", id="inbox-status")
         self.hint = Static(
             PollyInboxApp._DEFAULT_HINT,
@@ -3777,6 +3991,15 @@ class PollyInboxApp(App[None]):
         self._tasks: list = []
         self._selected_task_id: str | None = None
         self._unread_ids: set[str] = set()
+        # Filter state (#NEW). Session-scoped — cleared on each mount
+        # via :meth:`on_mount`. All filters AND-combine.
+        self._filter_text: str = ""
+        self._filter_unread_only: bool = False
+        self._filter_project: str | None = None
+        self._filter_recent: bool = False
+        self._filter_plan_review: bool = False
+        self._filter_blocking: bool = False
+        self._filter_bar_visible: bool = False
         # Rollup state — populated on each rollup render. Index-keyed so
         # the click handler can look up which item was expanded.
         self._rollup_items: list[dict] = []
@@ -3809,6 +4032,7 @@ class PollyInboxApp(App[None]):
         self._blocking_question_meta: dict[str, dict] = {}
 
     def compose(self) -> ComposeResult:
+        yield self.filter_bar
         with Horizontal(id="inbox-layout"):
             yield self.list_view
             with Vertical(id="inbox-detail-wrap"):
@@ -3820,6 +4044,12 @@ class PollyInboxApp(App[None]):
         yield self.hint
 
     def on_mount(self) -> None:
+        # Session-scoped filters: clear on each mount so restarts of the
+        # cockpit land on a pristine full-list view.
+        self._reset_filter_state()
+        self.filter_input.display = False
+        self.filter_bar.display = False
+        self.filter_chips.display = False
         self._refresh_list(select_first=True)
         self.set_interval(self.REFRESH_INTERVAL_SECONDS, self._background_refresh)
         self.list_view.focus()
@@ -3909,6 +4139,9 @@ class PollyInboxApp(App[None]):
     def _render_list(self, *, select_first: bool = False) -> None:
         previous = self._selected_task_id
         self.list_view.clear()
+        # Refresh chip line on every render so toggles + project changes
+        # land in the UI even when the list itself didn't shrink.
+        self._update_filter_chips()
         if not self._tasks:
             self.list_view.append(
                 ListItem(Static("(empty)", classes="inbox-empty"), disabled=True)
@@ -3919,8 +4152,30 @@ class PollyInboxApp(App[None]):
             )
             self.status.update("0 messages")
             return
+        # Apply filter stack — fuzzy text + chip toggles AND-combine.
+        visible = self._filtered_tasks(self._tasks)
+        total = len(self._tasks)
+        if not visible:
+            # Friendly empty-match copy so a fully-filtered list isn't a
+            # blank pane. The list stays in the tree (one disabled row)
+            # so cursor focus has somewhere to land without crashing.
+            self.list_view.append(
+                ListItem(
+                    Static(
+                        "No matches. Press c to clear filters.",
+                        classes="inbox-empty",
+                    ),
+                    disabled=True,
+                )
+            )
+            self.detail.update(
+                "[dim]No matches for the current filter set.\n\n"
+                "Press [b]c[/b] to clear filters and see every message.[/dim]"
+            )
+            self._update_status(total=total, shown=0)
+            return
         restore_index: int | None = 0 if select_first else None
-        for idx, task in enumerate(self._tasks):
+        for idx, task in enumerate(visible):
             is_unread = task.task_id in self._unread_ids
             row = _InboxListItem(task, is_unread=is_unread)
             self.list_view.append(row)
@@ -3930,15 +4185,29 @@ class PollyInboxApp(App[None]):
             self.list_view.index = restore_index
             # Render detail for the restored selection so the right pane
             # shows content immediately on refresh.
-            task = self._tasks[restore_index]
+            task = visible[restore_index]
             self._selected_task_id = task.task_id
             self._render_detail(task.task_id)
+        self._update_status(total=total, shown=len(visible))
+
+    def _update_status(self, *, total: int, shown: int) -> None:
+        """Render the bottom counter strip — folds in active filters.
+
+        ``shown`` may equal ``total`` when no filter narrows the list;
+        in that case we omit the "N of M" framing for visual calm.
+        """
         unread_n = len(self._unread_ids)
-        total = len(self._tasks)
-        if unread_n:
-            self.status.update(f"{total} messages \u00b7 {unread_n} unread")
+        bits: list[str] = []
+        if self._has_active_filters() and shown != total:
+            bits.append(f"{shown} of {total} shown")
         else:
-            self.status.update(f"{total} messages")
+            bits.append(f"{total} messages")
+        if unread_n:
+            bits.append(f"{unread_n} unread")
+        desc = self._describe_filters()
+        if desc:
+            bits.append(f"filters: {desc}")
+        self.status.update(" \u00b7 ".join(bits))
 
     def _background_refresh(self) -> None:
         """Periodic re-read; don't stomp the current cursor position."""
@@ -3946,6 +4215,210 @@ class PollyInboxApp(App[None]):
             self._refresh_list(select_first=False)
         except Exception:  # noqa: BLE001
             pass
+
+    # ------------------------------------------------------------------
+    # Filter / search (#NEW)
+    # ------------------------------------------------------------------
+
+    def _reset_filter_state(self) -> None:
+        """Clear every filter back to the "show everything" baseline."""
+        self._filter_text = ""
+        self._filter_unread_only = False
+        self._filter_project = None
+        self._filter_recent = False
+        self._filter_plan_review = False
+        self._filter_blocking = False
+        self._filter_bar_visible = False
+
+    def _has_active_filters(self) -> bool:
+        return any(
+            (
+                self._filter_text,
+                self._filter_unread_only,
+                self._filter_project,
+                self._filter_recent,
+                self._filter_plan_review,
+                self._filter_blocking,
+            )
+        )
+
+    def _filtered_tasks(self, tasks: list) -> list:
+        """Apply the AND-combined filter stack to ``tasks``.
+
+        Cheap O(N * filters) — the inbox is at most a few hundred rows
+        and the chips short-circuit, so we don't need anything fancier.
+        """
+        if not self._has_active_filters():
+            return list(tasks)
+        text_q = self._filter_text.strip().lower()
+        proj = self._filter_project
+        out: list = []
+        recent_cutoff_ts = self._recent_cutoff_timestamp() if self._filter_recent else None
+        for t in tasks:
+            if self._filter_unread_only and t.task_id not in self._unread_ids:
+                continue
+            if proj and (t.project or "") != proj:
+                continue
+            labels = list(getattr(t, "labels", []) or [])
+            if self._filter_plan_review and "plan_review" not in labels:
+                continue
+            if self._filter_blocking and "blocking_question" not in labels:
+                continue
+            if recent_cutoff_ts is not None:
+                ts = _task_recent_timestamp(t)
+                if ts is None or ts < recent_cutoff_ts:
+                    continue
+            if text_q:
+                hay = self._task_haystack(t).lower()
+                if not _fuzzy_subseq_match(text_q, hay):
+                    continue
+            out.append(t)
+        return out
+
+    def _task_haystack(self, task) -> str:
+        """Concatenate searchable fields for fuzzy matching."""
+        return " ".join(
+            [
+                task.title or "",
+                task.project or "",
+                _format_sender(task),
+            ]
+        )
+
+    def _recent_cutoff_timestamp(self) -> float:
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        return (_dt.now(_tz.utc) - _td(hours=24)).timestamp()
+
+    def _describe_filters(self) -> str:
+        bits: list[str] = []
+        if self._filter_unread_only:
+            bits.append("unread")
+        if self._filter_project:
+            bits.append(f"project:{self._filter_project}")
+        if self._filter_recent:
+            bits.append("recent")
+        if self._filter_plan_review:
+            bits.append("plan_review")
+        if self._filter_blocking:
+            bits.append("blocking_question")
+        if self._filter_text:
+            bits.append(f'"{self._filter_text}"')
+        return " \u00b7 ".join(bits)
+
+    def _update_filter_chips(self) -> None:
+        """Re-render the chip strip + drive bar visibility.
+
+        The filter bar (Input + chips) hides entirely when there are no
+        active filters AND the user hasn't pressed `/` to open the
+        Input. Otherwise it shows: the Input is gated by
+        ``_filter_bar_visible``, the chips render whenever any chip is
+        on (so toggling without `/` still surfaces feedback).
+        """
+        chip_bits: list[str] = []
+        if self._filter_unread_only:
+            chip_bits.append("[on #1e2730] unread [/on #1e2730]")
+        if self._filter_project:
+            chip_bits.append(
+                f"[on #1e2730] project:{_escape(self._filter_project)} [/on #1e2730]"
+            )
+        if self._filter_recent:
+            chip_bits.append("[on #1e2730] recent 24h [/on #1e2730]")
+        if self._filter_plan_review:
+            chip_bits.append("[on #1e2730] plan_review [/on #1e2730]")
+        if self._filter_blocking:
+            chip_bits.append("[on #1e2730] blocking_question [/on #1e2730]")
+        if self._filter_text:
+            chip_bits.append(
+                f'[on #1e2730] "{_escape(self._filter_text)}" [/on #1e2730]'
+            )
+        if chip_bits:
+            self.filter_chips.update("  ".join(chip_bits))
+            self.filter_chips.display = True
+        else:
+            self.filter_chips.update("")
+            self.filter_chips.display = False
+        # Bar visibility tracks either the explicit Input toggle OR any
+        # active chip (so the user sees the chip rendered without
+        # needing to keep `/` open).
+        self.filter_input.display = self._filter_bar_visible
+        self.filter_bar.display = self._filter_bar_visible or bool(chip_bits)
+
+    # --- filter actions ------------------------------------------------
+
+    def action_start_filter(self) -> None:
+        """`/` — mount + focus the fuzzy filter Input."""
+        self._filter_bar_visible = True
+        self.filter_input.value = self._filter_text
+        self._update_filter_chips()
+        self.filter_input.focus()
+
+    def action_toggle_filter_unread(self) -> None:
+        if self.reply_input.has_focus or self.filter_input.has_focus:
+            return
+        self._filter_unread_only = not self._filter_unread_only
+        self._render_list(select_first=True)
+
+    def action_toggle_filter_recent(self) -> None:
+        if self.reply_input.has_focus or self.filter_input.has_focus:
+            return
+        self._filter_recent = not self._filter_recent
+        self._render_list(select_first=True)
+
+    def action_toggle_filter_plan_review(self) -> None:
+        if self.reply_input.has_focus or self.filter_input.has_focus:
+            return
+        self._filter_plan_review = not self._filter_plan_review
+        self._render_list(select_first=True)
+
+    def action_toggle_filter_blocking(self) -> None:
+        if self.reply_input.has_focus or self.filter_input.has_focus:
+            return
+        self._filter_blocking = not self._filter_blocking
+        self._render_list(select_first=True)
+
+    def action_clear_filters(self) -> None:
+        if self.reply_input.has_focus or self.filter_input.has_focus:
+            return
+        self._reset_filter_state()
+        self.filter_input.value = ""
+        self._render_list(select_first=True)
+
+    def action_pick_filter_project(self) -> None:
+        """`p` — open a small modal listing project keys for selection."""
+        if self.reply_input.has_focus or self.filter_input.has_focus:
+            return
+        keys = sorted({(t.project or "").strip() for t in self._tasks if t.project})
+        if not keys:
+            self.notify("No projects in the current inbox.", severity="warning")
+            return
+        # If only one project is in scope, just toggle it instead of
+        # bothering the user with a modal.
+        if len(keys) == 1:
+            self._filter_project = (
+                None if self._filter_project == keys[0] else keys[0]
+            )
+            self._render_list(select_first=True)
+            return
+
+        def _on_pick(value: str | None) -> None:
+            if value is None:
+                return
+            self._filter_project = value or None
+            self._render_list(select_first=True)
+
+        self.push_screen(_InboxProjectPickerModal(keys, self._filter_project), _on_pick)
+
+    @on(Input.Changed, "#inbox-filter-input")
+    def _on_filter_changed(self, event: Input.Changed) -> None:
+        # Live-filter as the user types — cheap enough on inbox-sized data.
+        self._filter_text = event.value or ""
+        self._render_list(select_first=True)
+
+    @on(Input.Submitted, "#inbox-filter-input")
+    def _on_filter_submitted(self, _event: Input.Submitted) -> None:
+        # Enter inside the filter Input applies + returns focus to the
+        # list so j/k works without an extra Esc.
+        self.list_view.focus()
 
     # ------------------------------------------------------------------
     # Detail rendering
@@ -4254,7 +4727,19 @@ class PollyInboxApp(App[None]):
         self._refresh_list(select_first=False)
 
     def action_back_or_cancel(self) -> None:
-        """Esc/q returns focus to the list from the reply box, else exits."""
+        """Esc/q returns focus to the list from inputs, else exits.
+
+        From the filter Input: clears the typed query + closes the bar
+        (per the brief — "Esc clears + closes"). Chip toggles aren't
+        cleared here; ``c`` is the explicit "wipe everything" key.
+        """
+        if self.filter_input.has_focus:
+            self._filter_text = ""
+            self.filter_input.value = ""
+            self._filter_bar_visible = False
+            self._render_list(select_first=False)
+            self.list_view.focus()
+            return
         if self.reply_input.has_focus:
             # Return focus to the list so j/k works again. Don't exit the
             # app — the reply input is always present on the detail pane.
@@ -4692,7 +5177,7 @@ class PollyInboxApp(App[None]):
 
     _DEFAULT_HINT = (
         "j/k move \u00b7 \u21b5 open \u00b7 r reply \u00b7 a archive "
-        "\u00b7 d discuss \u00b7 u refresh \u00b7 q back"
+        "\u00b7 d discuss \u00b7 / filter \u00b7 c clear \u00b7 q back"
     )
     _PROPOSAL_HINT = (
         "A accept \u00b7 X reject \u00b7 r reply \u00b7 q back"

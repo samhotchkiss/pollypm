@@ -2026,6 +2026,116 @@ def _build_pm_context_line(
     return f're: inbox/{task_id} "{title}"'
 
 
+def _extract_plan_review_meta(labels: list[str] | None) -> dict:
+    """Parse plan_review sidecar labels into a structured dict.
+
+    The architect emits a plan_review item with labels that encode the
+    plan task id, the explainer HTML path, and the fast-track flag:
+
+        plan_review
+        project:<key>
+        plan_task:<project/number>
+        explainer:<abs path to plan-review.html>
+        fast_track             (optional; present only for fast-track)
+
+    Returns ``{plan_task_id, explainer_path, fast_track, project}``;
+    keys are present only when the source label was present.
+    """
+    meta: dict[str, object] = {"fast_track": False}
+    for raw in labels or []:
+        if not isinstance(raw, str):
+            continue
+        label = raw.strip()
+        if label == "fast_track":
+            meta["fast_track"] = True
+            continue
+        if label.startswith("plan_task:"):
+            meta["plan_task_id"] = label[len("plan_task:"):].strip()
+        elif label.startswith("explainer:"):
+            path_str = label[len("explainer:"):].strip()
+            if path_str:
+                meta["explainer_path"] = path_str
+        elif label.startswith("project:"):
+            meta["project"] = label[len("project:"):].strip()
+    return meta
+
+
+def _plan_review_has_round_trip(
+    replies, *, requester: str = "user",
+) -> bool:
+    """True if the thread shows both the reviewer and the PM have spoken.
+
+    "Round-trip" means at least one reply entry from the reviewer
+    (the requester role — normally ``user``, or ``polly`` for
+    fast-tracked items) AND at least one reply entry from the PM side
+    (architect / polly / project persona — any non-reviewer actor).
+
+    The gate is intentionally lenient: we don't care about ordering,
+    we just need evidence of a conversation before Accept unlocks.
+    """
+    reviewer = (requester or "user").strip().lower() or "user"
+    saw_reviewer = False
+    saw_other = False
+    for entry in replies or []:
+        actor = (getattr(entry, "actor", "") or "").strip().lower()
+        if not actor:
+            continue
+        if actor == reviewer:
+            saw_reviewer = True
+        else:
+            saw_other = True
+        if saw_reviewer and saw_other:
+            return True
+    return False
+
+
+def _build_plan_review_primer(
+    *,
+    project_key: str,
+    plan_path: str,
+    explainer_path: str,
+    plan_task_id: str,
+    reviewer_name: str = "Sam",
+) -> str:
+    """Build the PM input primer injected on ``d`` for a plan_review item.
+
+    Distinct from the generic ``re: inbox/N ...`` shape — this primer
+    hands the PM a short brief plus the canonical co-refinement job
+    description so the conversation starts on-topic without Sam (or
+    Polly, when fast-tracked) having to type the frame themselves.
+    """
+    person = reviewer_name.strip() or "Sam"
+    pronoun_subject = "Sam" if person == "Sam" else person
+    return (
+        f"{pronoun_subject} has opened plan review for project: {project_key}.\n"
+        f"Plan: {plan_path}\n"
+        f"Explainer: {explainer_path}\n"
+        "\n"
+        "Your job in this conversation:\n"
+        f"- Co-refine the plan with {pronoun_subject}\n"
+        "- Push hard for decomposition into the smallest reasonable tasks\n"
+        "- Each task should ship a small module with clean interfaces\n"
+        "- Challenge large lumps: a 500-LoC module with 3 concerns should "
+        "become 3 modules with 1 concern each\n"
+        "- Surface cross-cutting risks that span modules \u2014 integration "
+        "bugs live there\n"
+        "- Propose rewrites of any decision that's load-bearing without "
+        "clear justification\n"
+        f"- If {pronoun_subject} pings without a specific concern, your "
+        "default opener is to walk through the plan's riskiest decisions + "
+        "decomposition and ask where to dig in \u2014 don't just wait for "
+        "a question\n"
+        "\n"
+        f"When {pronoun_subject} signs off (says 'approved' or equivalent): "
+        f"call `pm task approve {plan_task_id} --actor "
+        f"{'user' if person == 'Sam' else 'polly'}`\n"
+        "Don't create backlog tasks yourself \u2014 emit_backlog fires "
+        "after approval.\n"
+        "This small-tasks / small-modules bias matters because it's much "
+        "more maintainable for agentic development."
+    )
+
+
 def _extract_proposal_spec(task, *, labels: list[str] | None = None) -> dict:
     """Recover a proposal's ``proposed_task_spec`` from an inbox row.
 
@@ -2300,6 +2410,12 @@ class PollyInboxApp(App[None]):
         # archiving, but with a decision trail.
         Binding("A", "accept_proposal", "Accept", show=False),
         Binding("X", "reject_proposal", "Reject", show=False),
+        # Plan review (#297). ``v`` opens the rendered HTML explainer in
+        # the user's browser — reviewing against the visual page is the
+        # whole point of the plan-review flow. Accept (capital A) routes
+        # through ``action_accept_proposal`` which branches on label,
+        # so no separate keybinding is needed here for approve.
+        Binding("v", "open_plan_explainer", "Explainer", show=False),
         Binding("e", "expand_all_rollup", "Expand all", show=False),
         Binding("u", "refresh", "Refresh"),
         Binding("q,escape", "back_or_cancel", "Back"),
@@ -2350,6 +2466,14 @@ class PollyInboxApp(App[None]):
         # on _render_detail. Accept uses it to seed the follow-on task
         # without re-reading the DB.
         self._proposal_specs: dict[str, dict] = {}
+        # Plan-review state (#297). Keyed by inbox task_id:
+        # * _plan_review_meta — parsed sidecar labels (plan_task id,
+        #   explainer path, fast_track flag) so the approve/open
+        #   handlers don't re-parse on every keystroke.
+        # * _plan_review_round_trip — whether the thread already has the
+        #   user-plus-PM exchange that unlocks Accept (gating rule).
+        self._plan_review_meta: dict[str, dict] = {}
+        self._plan_review_round_trip: dict[str, bool] = {}
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="inbox-layout"):
@@ -2578,11 +2702,35 @@ class PollyInboxApp(App[None]):
         # ``render_proposal_body``), so we don't double-render it here.
         _labels = list(getattr(task, "labels", []) or [])
         _is_proposal = "proposal" in _labels
+        # Plan-review detection (#297). Plan-review items carry a
+        # ``plan_review`` label and a ``plan_task:<id>`` sidecar that
+        # points at the plan_project task the inbox item is reviewing.
+        # A separate hint bar + gating state tracks whether the user has
+        # conversed with the PM at least once (round-trip) before the
+        # Accept key is surfaced. Fast-tracked items (``fast_track``
+        # label) skip gating entirely.
+        _is_plan_review = "plan_review" in _labels
+        if _is_plan_review:
+            meta = _extract_plan_review_meta(_labels)
+            self._plan_review_meta[task_id] = meta
+            round_trip = _plan_review_has_round_trip(
+                replies, requester=(task.roles or {}).get("requester", "user"),
+            )
+            self._plan_review_round_trip[task_id] = round_trip
+            self._update_hint_for_plan_review(
+                fast_track=meta.get("fast_track", False),
+                round_trip=round_trip,
+            )
+        else:
+            self._plan_review_meta.pop(task_id, None)
+            self._plan_review_round_trip.pop(task_id, None)
         if _is_proposal:
             self._proposal_specs[task_id] = _extract_proposal_spec(
                 task, labels=_labels,
             )
             self._update_hint_for_proposal()
+        elif _is_plan_review:
+            self._proposal_specs.pop(task_id, None)
         else:
             self._proposal_specs.pop(task_id, None)
             self._restore_default_hint()
@@ -2927,7 +3075,44 @@ class PollyInboxApp(App[None]):
         cockpit_key, pm_label = _resolve_pm_target(
             self.config_path, project_for_pm,
         )
-        context_line = _build_pm_context_line(task, item=focus_item)
+        # Plan-review items (#297) inject a richer primer instead of the
+        # generic ``re: inbox/N ...`` line so the PM lands in the
+        # conversation with the co-refinement brief already framed.
+        task_labels = list(getattr(task, "labels", []) or [])
+        if "plan_review" in task_labels and focus_item is None:
+            meta = _extract_plan_review_meta(task_labels)
+            explainer_path = str(meta.get("explainer_path") or "")
+            plan_task_id = str(meta.get("plan_task_id") or task_id or "")
+            project_key = str(meta.get("project") or task.project or "")
+            # Derive the plan file location alongside the explainer — the
+            # architect writes ``docs/plan/plan.md`` via the planning
+            # skill by convention; fall back to the canonical relative
+            # path when we can't resolve the absolute one.
+            plan_path = ""
+            try:
+                config = load_config(self.config_path)
+                project = config.projects.get(project_key)
+                if project is not None:
+                    for candidate in _PLAN_FILE_CANDIDATES:
+                        p = project.path / candidate
+                        if p.is_file():
+                            plan_path = str(p)
+                            break
+            except Exception:  # noqa: BLE001
+                plan_path = ""
+            if not plan_path:
+                plan_path = "docs/plan/plan.md"
+            reviewer_requester = (task.roles or {}).get("requester", "user")
+            reviewer_name = "Polly" if reviewer_requester == "polly" else "Sam"
+            context_line = _build_plan_review_primer(
+                project_key=project_key or task.project or "",
+                plan_path=plan_path,
+                explainer_path=explainer_path,
+                plan_task_id=plan_task_id,
+                reviewer_name=reviewer_name,
+            )
+        else:
+            context_line = _build_pm_context_line(task, item=focus_item)
 
         # Do the cockpit navigation + tmux send-keys in a worker so a
         # slow tmux call doesn't freeze the TUI. The actual work is
@@ -3058,10 +3243,41 @@ class PollyInboxApp(App[None]):
     _PROPOSAL_HINT = (
         "A accept \u00b7 X reject \u00b7 r reply \u00b7 q back"
     )
+    # Plan-review hint bars (#297). The gated variant hides ``A`` until
+    # the thread has a round-trip; the ungated variant surfaces it.
+    _PLAN_REVIEW_HINT_GATED = (
+        "v open explainer \u00b7 d discuss with PM \u00b7 q back"
+    )
+    _PLAN_REVIEW_HINT_OPEN = (
+        "v open explainer \u00b7 d discuss \u00b7 A approve \u00b7 q back"
+    )
+    _PLAN_REVIEW_HINT_FAST_TRACK = (
+        "v open explainer \u00b7 d discuss \u00b7 A approve \u00b7 q back"
+    )
 
     def _update_hint_for_proposal(self) -> None:
         try:
             self.hint.update(self._PROPOSAL_HINT)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _update_hint_for_plan_review(
+        self, *, fast_track: bool, round_trip: bool,
+    ) -> None:
+        """Render the plan-review hint bar based on state.
+
+        Fast-tracked items (Polly's inbox) never gate — Accept is live
+        from the first render. User-inbox items are gated until the
+        thread has at least one exchange with the PM.
+        """
+        if fast_track:
+            text = self._PLAN_REVIEW_HINT_FAST_TRACK
+        elif round_trip:
+            text = self._PLAN_REVIEW_HINT_OPEN
+        else:
+            text = self._PLAN_REVIEW_HINT_GATED
+        try:
+            self.hint.update(text)
         except Exception:  # noqa: BLE001
             pass
 
@@ -3094,11 +3310,19 @@ class PollyInboxApp(App[None]):
         return task, labels
 
     def action_accept_proposal(self) -> None:
-        """Accept the selected proposal — create a follow-on task + archive."""
+        """Accept the selected proposal or plan_review — branch on label."""
         if self.reply_input.has_focus:
             return
         task_id = self._selected_task_id
         if task_id is None:
+            return
+        # Plan-review items (#297) reuse the capital-A keybinding for
+        # approve, but the action is different: we call
+        # ``pm task approve`` against the referenced plan_task, not the
+        # inbox item, and we don't create a follow-on task. Branch here
+        # before the proposal-only guard below.
+        if self._is_plan_review_selected():
+            self._approve_plan_review()
             return
         task, labels = self._selected_proposal_task()
         if task is None:
@@ -3244,6 +3468,191 @@ class PollyInboxApp(App[None]):
             self._selected_task_id = None
         self.reply_input.value = ""
         self.list_view.focus()
+        self._render_list(select_first=bool(self._tasks))
+        self._restore_default_hint()
+
+    # ------------------------------------------------------------------
+    # Plan review (#297) — approve / open-explainer / PM primer
+    # ------------------------------------------------------------------
+
+    def _selected_plan_review_task(self):
+        """Return (task, labels) for the current selection if it's plan_review.
+
+        Mirrors :meth:`_selected_proposal_task` shape so callers can
+        branch without awkward sentinel checks.
+        """
+        task_id = self._selected_task_id
+        if task_id is None:
+            return None, []
+        svc = self._svc_for_task(task_id)
+        if svc is None:
+            return None, []
+        try:
+            task = svc.get(task_id)
+        except Exception:  # noqa: BLE001
+            return None, []
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+        labels = list(getattr(task, "labels", []) or [])
+        if "plan_review" not in labels:
+            return None, labels
+        return task, labels
+
+    def _is_plan_review_selected(self) -> bool:
+        """Fast check for branching inside action handlers."""
+        task_id = self._selected_task_id
+        if task_id is None:
+            return False
+        # Prefer the cached meta so we don't hit the DB for a keystroke
+        # when the render path just populated it.
+        if task_id in self._plan_review_meta:
+            return True
+        task, _labels = self._selected_plan_review_task()
+        return task is not None
+
+    def action_open_plan_explainer(self) -> None:
+        """``v`` — open the plan-review HTML file for the selected item.
+
+        No-op when focus is in the reply Input (so ``v`` types a letter),
+        or when the selected item isn't a plan_review (the explainer
+        concept doesn't apply to generic inbox items).
+        """
+        if self.reply_input.has_focus:
+            return
+        task_id = self._selected_task_id
+        if task_id is None:
+            return
+        meta = self._plan_review_meta.get(task_id)
+        if meta is None:
+            task, labels = self._selected_plan_review_task()
+            if task is None:
+                self.notify(
+                    "Open explainer only applies to plan_review items.",
+                    severity="warning", timeout=2.0,
+                )
+                return
+            meta = _extract_plan_review_meta(labels)
+            self._plan_review_meta[task_id] = meta
+        path = meta.get("explainer_path")
+        if not path:
+            self.notify(
+                "No explainer path recorded on this plan_review item.",
+                severity="warning", timeout=2.0,
+            )
+            return
+        try:
+            self._open_explainer(str(path))
+        except Exception as exc:  # noqa: BLE001
+            self.notify(f"Open explainer failed: {exc}", severity="error")
+            return
+        self._emit_event(
+            task_id, "inbox.plan_review.explainer_opened",
+            f"user opened explainer for {task_id} \u2192 {path}",
+        )
+
+    def _open_explainer(self, path: str) -> None:
+        """Shell out to ``open`` (macOS) or ``xdg-open`` (linux).
+
+        Separated so tests patch one method instead of mocking the
+        subprocess module directly.
+        """
+        import platform
+        cmd = "open" if platform.system() == "Darwin" else "xdg-open"
+        subprocess.run([cmd, path], check=False)
+
+    def _approve_plan_review(self) -> None:
+        """Call ``pm task approve`` against the plan_task, then archive.
+
+        Gating (user-inbox only): when ``fast_track`` is NOT set, the
+        approve keybinding should have been hidden by the hint bar
+        until the thread has a round-trip. We still enforce the gate
+        here — belt-and-braces against stale state — and warn the user
+        if they somehow triggered Accept before the conversation.
+        """
+        task_id = self._selected_task_id
+        if task_id is None:
+            return
+        task, labels = self._selected_plan_review_task()
+        if task is None:
+            self.notify(
+                "Approve only applies to plan_review items.",
+                severity="warning", timeout=2.0,
+            )
+            return
+        meta = self._plan_review_meta.get(task_id) or _extract_plan_review_meta(
+            labels,
+        )
+        plan_task_id = meta.get("plan_task_id")
+        if not plan_task_id:
+            self.notify(
+                "Missing plan_task label; cannot approve.",
+                severity="error", timeout=3.0,
+            )
+            return
+        fast_track = bool(meta.get("fast_track", False))
+        actor_name = "polly" if fast_track else "user"
+        if not fast_track and not self._plan_review_round_trip.get(task_id, False):
+            self.notify(
+                "Discuss the plan with your PM first (press d). "
+                "Approve unlocks after the first round-trip.",
+                severity="warning", timeout=4.0,
+            )
+            return
+        # Route through the work-service approve path directly — the
+        # CLI entry point is just sugar over ``svc.approve``, and we
+        # already hold the project context.
+        svc = self._svc_for_task(plan_task_id)
+        if svc is None:
+            self.notify(
+                "Could not open project database for plan task.",
+                severity="error",
+            )
+            return
+        try:
+            svc.approve(plan_task_id, actor_name, None)
+        except Exception as exc:  # noqa: BLE001
+            self.notify(f"Approve failed: {exc}", severity="error")
+            return
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+        # Archive the inbox row so it drops out of the list.
+        svc = self._svc_for_task(task_id)
+        if svc is not None:
+            try:
+                svc.add_context(
+                    task_id,
+                    actor=actor_name,
+                    text=f"Plan approved \u2192 {plan_task_id}",
+                    entry_type="plan_review_approved",
+                )
+                svc.archive_task(task_id, actor=actor_name)
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                try:
+                    svc.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        self._emit_event(
+            task_id, "inbox.plan_review.approved",
+            f"{actor_name} approved plan {plan_task_id} via {task_id}",
+        )
+        self.notify(
+            f"Plan approved \u2014 {plan_task_id}",
+            severity="information", timeout=3.0,
+        )
+        self._tasks = [t for t in self._tasks if t.task_id != task_id]
+        self._unread_ids.discard(task_id)
+        self._plan_review_meta.pop(task_id, None)
+        self._plan_review_round_trip.pop(task_id, None)
+        if self._selected_task_id == task_id:
+            self._selected_task_id = None
         self._render_list(select_first=bool(self._tasks))
         self._restore_default_hint()
 

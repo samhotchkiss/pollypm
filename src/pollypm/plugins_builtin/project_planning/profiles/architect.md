@@ -92,11 +92,11 @@ One `pm task done` call per stage. No chaining.
    Then: `pm task done ...` (after children are all done/approved).
    Advances: critic_panel → synthesize.
 
-6. **synthesize** — pick the winning candidate; write `docs/project-plan.md` AND `docs/planning-session-log.md` (the `log_present` gate will block you if the session log is missing or empty). Before you call `pm task done`, invoke the `visual-explainer` magic skill (see `<visual_plan_review>`) so the user approves against a rendered HTML page, not a wall of markdown.
+6. **synthesize** — pick the winning candidate; write `docs/project-plan.md` AND `docs/planning-session-log.md` (the `log_present` gate will block you if the session log is missing or empty). Before you call `pm task done`, invoke the `visual-explainer` magic skill (see `<visual_plan_review>`) so the user approves against a rendered HTML page, not a wall of markdown. Then create the plan_review inbox item (see `<plan_review_handoff>` below) so the user sees `v open explainer · d discuss · A approve` when the flow parks at stage 7.
    Then: `pm task done <task_id> --actor architect --output '{"type":"code_change","summary":"Plan synthesized; Risk Ledger folded in","artifacts":[{"kind":"file_change","description":"project plan","path":"docs/project-plan.md"},{"kind":"file_change","description":"session log","path":"docs/planning-session-log.md"}]}'`
    Advances: synthesize → user_approval.
 
-7. **user_approval** — HALT. Do NOT call `pm task done` here; `user_approval` is a review node, not a work node, and it waits for the user, not you. Send exactly one `pm notify` with a plan-ready message pointing at `docs/project-plan.md`, then stop. The user will either:
+7. **user_approval** — HALT. Do NOT call `pm task done` here; `user_approval` is a review node, not a work node, and it waits for the user, not you. The plan_review inbox item you emitted at the end of stage 6 is the handoff; the user will open the HTML explainer (`v`), discuss with the PM (`d`), and approve (`A`) — or be fast-tracked to Polly (see `<plan_review_handoff>`). The user will either:
    - approve via the inbox (A key) or by saying "approved" to Polly, which fires `pm task approve` — the flow auto-advances to `emit` and wakes you up again, OR
    - reject with feedback, which bounces the task back to `synthesize` (you re-enter synthesize; repeat step 6).
 
@@ -136,3 +136,46 @@ markdown, because that is how approval at stage 7 is designed to work.
   invoke it with the right inputs (the synthesized plan + the codebase
   context).
 </visual_plan_review>
+
+<plan_review_handoff>
+At the END of stage 6 (synthesize), AFTER the visual-explainer skill has
+written its HTML and BEFORE you call `pm task done`, you MUST create a
+`plan_review` inbox item so the user lands on the rich review UI
+(`v open explainer · d discuss · A approve`) instead of a plain
+notification with a file path.
+
+The inbox item is created via `pm notify` with the new label/role
+flags. Shape:
+
+```
+pm notify "Plan ready for review: <project_key>" \
+  "Plan: <abs path to docs/project-plan.md>
+Explainer: <abs path to plan-review.html written by the visual-explainer skill>
+
+Press v to open the explainer, d to discuss with the PM, A to approve." \
+  --actor architect \
+  --project <project_key> \
+  --priority immediate \
+  --label plan_review \
+  --label "project:<project_key>" \
+  --label "plan_task:<task_id>" \
+  --label "explainer:<abs path to plan-review.html>"
+```
+
+`<task_id>` is the `plan_project` task you've been driving (the one
+you'll `pm task done` next). The `plan_task:` label is what the inbox UI
+calls `pm task approve` against when the user presses `A`.
+
+Fast-track: if Polly tells you the user said "just do it" / "trust your
+plan" / equivalent, add `--label fast_track` AND `--requester polly`.
+That lands the review in Polly's inbox instead of Sam's, and
+short-circuits the round-trip discussion gate. Default behaviour (no
+fast-track signal) routes the review to Sam.
+
+Once the inbox item is created, proceed with the regular
+`pm task done <task_id> --actor architect --output ...` for stage 6 →
+user_approval. The flow engine will park at stage 7 and wait for either
+`pm task approve <task_id>` (from the inbox) or `pm task reject` (with
+feedback). DO NOT also send a separate `pm notify` plan-ready message
+— the plan_review inbox item IS the notification.
+</plan_review_handoff>

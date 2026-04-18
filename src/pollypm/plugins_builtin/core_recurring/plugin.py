@@ -432,11 +432,19 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def alerts_gc_handler(payload: dict[str, Any]) -> dict[str, Any]:
-    """Release expired leases and prune old events/heartbeat rows.
+    """Release expired leases and prune old heartbeat rows.
 
     Leases are auto-released via ``Supervisor.release_expired_leases``;
-    stale rows are pruned via ``StateStore.prune_old_data``. Both are
-    cheap, idempotent, and safe to run from any worker thread.
+    heartbeat rows older than 24h are pruned via
+    ``StateStore.prune_old_data``. Both are cheap, idempotent, and safe
+    to run from any worker thread.
+
+    Events pruning was previously done here with a blanket 7-day cutoff,
+    which contradicted the tiered ``[events]`` retention policy
+    (``events.retention_sweep`` handler). Events are now exclusively
+    managed by that policy — audit events keep their 365-day floor and
+    high-volume noise still gets swept at 7 days, but explicitly via
+    tier rather than blunt cutoff.
     """
     config, store = _load_config_and_store(payload)
 
@@ -447,7 +455,10 @@ def alerts_gc_handler(payload: dict[str, Any]) -> dict[str, Any]:
     supervisor = Supervisor(config)
     released = supervisor.release_expired_leases()
 
-    pruned = store.prune_old_data()
+    # event_days=10**6 effectively no-ops events pruning while keeping
+    # the heartbeat cutoff at the existing 24h. The events.retention_sweep
+    # handler is now authoritative for the events table.
+    pruned = store.prune_old_data(event_days=10**6)
     return {
         "leases_released": len(released),
         "events_pruned": int(pruned.get("events", 0)),

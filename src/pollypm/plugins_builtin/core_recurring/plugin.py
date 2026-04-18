@@ -701,6 +701,365 @@ def agent_worktree_prune_handler(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
+    """Classify every active worker-session worktree + surface blockers (#251).
+
+    Complements the hourly ``agent_worktree.prune`` handler (which GCs
+    orphans) with a 10-minute *state* sweep over the
+    ``work_sessions`` rows the session-manager owns. For each row with
+    a ``worktree_path`` we classify the worktree via
+    ``pollypm.worktree_audit.classify_worktree_state`` and act:
+
+    * ``merge_conflict`` → open ``worktree_state:<task>:merge_conflict``
+      alert (severity ``error``) AND, if the task is claimed, emit a
+      blocking inbox task via the same work-service path ``pm notify``
+      uses so the user sees it immediately.
+    * ``lock_file`` → alert ``worktree_state:<task>:lock_file``. Age
+      <5min → ``warn``; ≥5min → ``error`` (escalated).
+    * ``detached_head`` → alert ``worktree_state:<task>:detached_head``
+      (``warn``). No inbox — the heartbeat reprompt path handles
+      recovery.
+    * ``dirty_expected`` → tracked but silent *unless* the worktree's
+      mtime is >60 min old, in which case a low-severity
+      ``worktree_state:<task>:dirty_stale`` alert fires. The
+      staleness test uses the directory mtime because git operations
+      bump it — we stay silent while the worker is still typing.
+    * ``orphan_branch`` → inbox nudge (``routine`` priority) once per
+      task per sweep-dedup window. Alert also raised for cockpit
+      visibility.
+    * ``clean`` → any open ``worktree_state:<task>:*`` alerts are
+      cleared.
+
+    All alerts are keyed by ``(session_name, worktree_state:<task>:<st>)``
+    so the ``upsert_alert`` uniqueness guard auto-dedupes repeat
+    observations and ``clear_alert`` can resolve them when the state
+    flips back to ``clean``.
+
+    Returns a summary of counts for the job-result ledger — no per-
+    worktree detail to keep the event row small.
+    """
+    import time as _time
+
+    from pollypm.worktree_audit import (
+        WorktreeState,
+        classify_worktree_state,
+    )
+
+    config, store = _load_config_and_store(payload)
+
+    # Work service — required to list active work_sessions. Open via
+    # the same path ``work.progress_sweep`` uses so we honour the
+    # workspace-root DB convention.
+    try:
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        project_root = config.project.root_dir
+        db_path = project_root / ".pollypm" / "state.db"
+        work = SQLiteWorkService(db_path=db_path, project_path=project_root)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "worktree.state_audit: work service unavailable", exc_info=True,
+        )
+        return {"outcome": "skipped", "reason": "no_work_service"}
+
+    # All alert types this handler owns — used to clear stale alerts
+    # when we transition into ``CLEAN``. Keep in sync with the
+    # branches below.
+    STATE_ALERT_TYPES: tuple[str, ...] = (
+        "merge_conflict", "lock_file", "detached_head",
+        "dirty_stale", "orphan_branch",
+    )
+
+    considered = 0
+    classified: dict[str, int] = {}
+    alerts_raised = 0
+    alerts_cleared = 0
+    inbox_emitted = 0
+
+    # Thresholds — kept local (no config knob yet) so they're explicit
+    # in the handler body for reviewers.
+    LOCK_ESCALATE_SECONDS = 5 * 60       # lock >5min → severity error
+    DIRTY_STALE_SECONDS = 60 * 60        # dirty + mtime > 60min → alert
+
+    now_epoch = _time.time()
+
+    try:
+        try:
+            sessions = work.list_worker_sessions(active_only=True)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "worktree.state_audit: list_worker_sessions failed",
+                exc_info=True,
+            )
+            return {"outcome": "failed", "reason": "list_sessions_error"}
+
+        for sess in sessions:
+            wt_path_raw = getattr(sess, "worktree_path", None)
+            if not wt_path_raw:
+                continue
+            considered += 1
+            wt_path = Path(wt_path_raw)
+            task_id = f"{sess.task_project}/{sess.task_number}"
+            agent = sess.agent_name or "worker"
+            # The alert namespace is the agent session name so the
+            # cockpit's per-session view shows the blocker alongside
+            # other heartbeat-raised alerts.
+            session_key = agent
+
+            try:
+                classification = classify_worktree_state(wt_path)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "worktree.state_audit: classify failed for %s",
+                    wt_path, exc_info=True,
+                )
+                continue
+            state = classification.state
+            classified[state.value] = classified.get(state.value, 0) + 1
+
+            # Resolve the all-clear path for CLEAN / MISSING so any
+            # prior alerts auto-close.
+            if state in (WorktreeState.CLEAN, WorktreeState.MISSING):
+                for kind in STATE_ALERT_TYPES:
+                    alert_type = f"worktree_state:{task_id}:{kind}"
+                    try:
+                        existing = store.execute(
+                            "SELECT id FROM alerts WHERE session_name = ? "
+                            "AND alert_type = ? AND status = 'open'",
+                            (session_key, alert_type),
+                        ).fetchone()
+                    except Exception:  # noqa: BLE001
+                        existing = None
+                    if existing is None:
+                        continue
+                    try:
+                        store.clear_alert(session_key, alert_type)
+                        alerts_cleared += 1
+                    except Exception:  # noqa: BLE001
+                        pass
+                continue
+
+            # --- non-clean branches ---
+            if state is WorktreeState.MERGE_CONFLICT:
+                alert_type = f"worktree_state:{task_id}:merge_conflict"
+                files = classification.metadata.get("conflict_files", [])
+                file_blurb = (
+                    f" ({len(files)} file{'s' if len(files) != 1 else ''})"
+                    if files else ""
+                )
+                message = (
+                    f"{agent}: merge conflict in {wt_path}{file_blurb} on task "
+                    f"{task_id}. Worker is blocked until the conflict resolves."
+                )
+                _raise_alert(store, session_key, alert_type, "error", message)
+                alerts_raised += 1
+                # Inbox — the user needs to either resolve or reassign.
+                fix_hint = (
+                    f"Run `git -C {wt_path} status` to inspect the conflict, "
+                    f"then resolve and `git commit` or reassign the task."
+                )
+                body = (
+                    f"Worker {agent} hit a merge conflict in {wt_path} while "
+                    f"working on task {task_id}.\n\n"
+                    f"{len(files)} conflicted file(s) detected.\n\n"
+                    f"Fix: {fix_hint}"
+                )
+                if _emit_inbox_task(
+                    work,
+                    subject=f"Merge conflict: {task_id}",
+                    body=body,
+                    actor=agent,
+                    dedupe_label=f"worktree_audit:{task_id}:merge_conflict",
+                    project=sess.task_project,
+                ):
+                    inbox_emitted += 1
+
+            elif state is WorktreeState.LOCK_FILE:
+                lock_age = float(
+                    classification.metadata.get("lock_age_seconds", 0.0),
+                )
+                severity = "error" if lock_age >= LOCK_ESCALATE_SECONDS else "warn"
+                minutes = max(1, int(lock_age // 60))
+                alert_type = f"worktree_state:{task_id}:lock_file"
+                lock_path = classification.metadata.get("lock_path", "")
+                message = (
+                    f"{agent}: git lock held on {wt_path} for ~{minutes}min "
+                    f"(task {task_id}). If no git process is running, remove "
+                    f"{lock_path or '<gitdir>/index.lock'}."
+                )
+                _raise_alert(store, session_key, alert_type, severity, message)
+                alerts_raised += 1
+
+            elif state is WorktreeState.DETACHED_HEAD:
+                alert_type = f"worktree_state:{task_id}:detached_head"
+                sha = classification.metadata.get("head_sha", "")
+                message = (
+                    f"{agent}: worktree {wt_path} on detached HEAD "
+                    f"{sha or '(unknown)'} (task {task_id}). "
+                    f"Fix: checkout the task branch before the worker "
+                    f"can push."
+                )
+                _raise_alert(store, session_key, alert_type, "warn", message)
+                alerts_raised += 1
+
+            elif state is WorktreeState.DIRTY_EXPECTED:
+                try:
+                    mtime = wt_path.stat().st_mtime
+                except OSError:
+                    mtime = now_epoch
+                age_s = now_epoch - mtime
+                alert_type = f"worktree_state:{task_id}:dirty_stale"
+                if age_s >= DIRTY_STALE_SECONDS:
+                    message = (
+                        f"{agent}: {wt_path} has uncommitted changes and "
+                        f"hasn't been touched in ~{int(age_s // 60)}min "
+                        f"(task {task_id}). Fix: check in on the worker — "
+                        f"likely stuck or idle."
+                    )
+                    _raise_alert(store, session_key, alert_type, "warn", message)
+                    alerts_raised += 1
+                else:
+                    # Fresh dirt — clear any prior stale alert.
+                    try:
+                        existing = store.execute(
+                            "SELECT id FROM alerts WHERE session_name = ? "
+                            "AND alert_type = ? AND status = 'open'",
+                            (session_key, alert_type),
+                        ).fetchone()
+                    except Exception:  # noqa: BLE001
+                        existing = None
+                    if existing is not None:
+                        try:
+                            store.clear_alert(session_key, alert_type)
+                            alerts_cleared += 1
+                        except Exception:  # noqa: BLE001
+                            pass
+
+            elif state is WorktreeState.ORPHAN_BRANCH:
+                age_days = float(classification.metadata.get("age_days", 0.0))
+                alert_type = f"worktree_state:{task_id}:orphan_branch"
+                message = (
+                    f"{agent}: {wt_path} on local-only branch "
+                    f"{classification.branch or '(unknown)'} with no upstream "
+                    f"and no commit in ~{age_days:.1f}d (task {task_id}). "
+                    f"Fix: push or archive the branch before the prune "
+                    f"handler GCs it."
+                )
+                _raise_alert(store, session_key, alert_type, "info", message)
+                alerts_raised += 1
+                # Low-severity inbox nudge.
+                body = (
+                    f"Worker {agent}'s worktree for task {task_id} is on a "
+                    f"local-only branch with no upstream and ~{age_days:.1f} "
+                    f"days of inactivity.\n\n"
+                    f"Path: {wt_path}\n\n"
+                    f"Fix: push the branch, merge/abandon the task, or let "
+                    f"the hourly `agent_worktree.prune` handler decide."
+                )
+                if _emit_inbox_task(
+                    work,
+                    subject=f"Orphan worktree branch: {task_id}",
+                    body=body,
+                    actor=agent,
+                    dedupe_label=f"worktree_audit:{task_id}:orphan_branch",
+                    project=sess.task_project,
+                ):
+                    inbox_emitted += 1
+    finally:
+        closer = getattr(work, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:  # noqa: BLE001
+                pass
+
+    return {
+        "outcome": "swept",
+        "considered": considered,
+        "classified": classified,
+        "alerts_raised": alerts_raised,
+        "alerts_cleared": alerts_cleared,
+        "inbox_emitted": inbox_emitted,
+    }
+
+
+def _raise_alert(
+    store: Any, session_name: str, alert_type: str, severity: str, message: str,
+) -> None:
+    """Thin wrapper that swallows a failing alert write.
+
+    Matches the ``try/except Exception`` pattern used by ``work.
+    progress_sweep`` — a single alert failure must not abort the rest
+    of the sweep.
+    """
+    try:
+        store.upsert_alert(session_name, alert_type, severity, message)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "worktree.state_audit: upsert_alert failed for %s/%s",
+            session_name, alert_type, exc_info=True,
+        )
+
+
+def _emit_inbox_task(
+    work: Any,
+    *,
+    subject: str,
+    body: str,
+    actor: str,
+    dedupe_label: str,
+    project: str,
+) -> bool:
+    """Create a user-routed inbox task on the chat flow.
+
+    Mirrors the ``pm notify`` immediate-tier path in ``cli.py`` — a
+    work-service task on the ``chat`` flow with ``roles.requester=user``
+    is what the inbox_view filter picks up. We attach
+    ``audit:worktree_state`` + the dedupe label so repeated sweeps of
+    the same blocker don't mint duplicate inbox items (the label-based
+    dedupe is done by the list-tasks query below).
+
+    Returns True when a fresh task was created, False on skip (dedup
+    or failure).
+    """
+    try:
+        # Dedupe: if any task on this project already carries our
+        # ``audit:<label>`` label and is still open, skip. The label
+        # namespace is distinct enough that a second ``startswith``
+        # scan stays cheap.
+        existing = work.list_tasks(project=project, work_status="queued")
+        existing += work.list_tasks(project=project, work_status="in_progress")
+        for task in existing:
+            labels = getattr(task, "labels", None) or ()
+            if dedupe_label in labels:
+                return False
+    except Exception:  # noqa: BLE001
+        # Listing failed — proceed to create. A duplicate is better
+        # than a missing blocker notification.
+        pass
+
+    try:
+        work.create(
+            title=subject,
+            description=body,
+            type="task",
+            project=project,
+            flow_template="chat",
+            labels=[
+                "audit:worktree_state",
+                dedupe_label,
+            ],
+            roles={"requester": "user", "actor": actor},
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "worktree.state_audit: create inbox task failed for %s",
+            dedupe_label, exc_info=True,
+        )
+        return False
+
+
 def log_rotate_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Rotate + prune oversized log files under ``config.project.logs_dir``.
 
@@ -950,6 +1309,13 @@ def _register_handlers(api: JobHandlerAPI) -> None:
         "log.rotate", log_rotate_handler,
         max_attempts=1, timeout_seconds=120.0,
     )
+    # Worker-worktree state audit — 10-minute classification of live
+    # work_sessions worktrees (merge conflicts, lock files, orphans).
+    # Issue #251.
+    api.register_handler(
+        "worktree.state_audit", worktree_state_audit_handler,
+        max_attempts=1, timeout_seconds=120.0,
+    )
 
 
 def _register_roster(api: RosterAPI) -> None:
@@ -999,6 +1365,12 @@ def _register_roster(api: RosterAPI) -> None:
         "31 * * * *", "log.rotate", {},
         dedupe_key="log.rotate",
     )
+    # Worker-worktree *state* audit — every 10 minutes. Complements the
+    # hourly ``agent_worktree.prune`` (which GCs orphan worktrees) by
+    # classifying live ``work_sessions`` worktrees into
+    # clean/dirty/conflict/lock/detached/orphan and surfacing blockers
+    # as alerts + inbox items. Issue #251.
+    api.register_recurring("@every 10m", "worktree.state_audit", {})
 
 
 plugin = PollyPMPlugin(
@@ -1023,6 +1395,7 @@ plugin = PollyPMPlugin(
         Capability(kind="job_handler", name="notification_staging.prune"),
         Capability(kind="job_handler", name="agent_worktree.prune"),
         Capability(kind="job_handler", name="log.rotate"),
+        Capability(kind="job_handler", name="worktree.state_audit"),
         Capability(kind="roster_entry", name="core_recurring"),
     ),
     register_handlers=_register_handlers,

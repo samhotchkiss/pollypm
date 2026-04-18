@@ -49,6 +49,8 @@ class TestCoreRecurringPlugin:
             # DB hygiene — incremental vacuum + TTL sweep for memory_entries.
             "db.vacuum",
             "memory.ttl_sweep",
+            # #251 — worker-worktree state audit.
+            "worktree.state_audit",
         }
         assert expected.issubset(set(registry.names()))
         # inbox.sweep was retired with the legacy inbox subsystem (iv04).
@@ -80,6 +82,8 @@ class TestCoreRecurringPlugin:
             "log.rotate",
             # Events-table tiered retention — hourly at minute :37.
             "events.retention_sweep",
+            # #251 — worker-worktree state audit, @every 10m.
+            "worktree.state_audit",
         }
 
         # Cadences per issue #164 / #249.
@@ -111,6 +115,8 @@ class TestCoreRecurringPlugin:
         events_retention = entries["events.retention_sweep"].schedule
         assert isinstance(events_retention, CronSchedule)
         assert events_retention.expression() == "37 * * * *"
+        # #251 — worktree state audit uses EverySchedule(10m).
+        assert _interval_seconds(entries["worktree.state_audit"]) == 600
 
     def test_plugin_declares_expected_capabilities(self) -> None:
         kinds = {cap.kind for cap in core_plugin.capabilities}

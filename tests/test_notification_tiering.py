@@ -141,6 +141,48 @@ class TestClassifyPriority:
             == "silent"
         )
 
+    # ---- Action-requiring completion upgrades (issue: Sam's "all
+    # subagents clear — ready for account switch" was silently staged
+    # as digest because the classifier only saw "clear" and missed the
+    # action-requiring "ready for …" phrase). Completion messages that
+    # imply the user must do something NOW must land in the inbox.
+    @pytest.mark.parametrize(
+        "subject, body",
+        [
+            # Regression: the exact subject that was swallowed.
+            ("All subagents clear — ready for account switch", ""),
+            # Plain "ready for testing" completion.
+            ("Ready for testing: dashboard + stage transitions live", ""),
+            # "MERGED" + "safe to test" — both completion and action.
+            ("#271 MERGED — safe to test", ""),
+            # Action phrase hiding in the body, completion in subject.
+            ("Task done", "please verify the new flow"),
+            # Awaiting-approval variant.
+            ("Shipped v2", "awaiting your approval to cut the tag"),
+            # Even an otherwise-silent "test pass" must upgrade when
+            # the body explicitly requests action.
+            ("Test pass", "please verify the rollout"),
+        ],
+    )
+    def test_action_requiring_completion_upgrades_to_immediate(
+        self, subject, body,
+    ):
+        assert ns.classify_priority(subject, body) == "immediate"
+
+    def test_routine_completion_still_digest(self):
+        # No action-requiring phrase → classic digest path unchanged.
+        assert (
+            ns.classify_priority(
+                "Routine progress: 3 tasks complete", "nothing to action",
+            )
+            == "digest"
+        )
+
+    def test_test_pass_subject_alone_still_silent(self):
+        # Bare "Test pass" subject with a no-action body stays silent
+        # — the existing audit-trail behaviour must not regress.
+        assert ns.classify_priority("Test pass", "") == "silent"
+
 
 # ---------------------------------------------------------------------------
 # pm notify CLI — tier routing

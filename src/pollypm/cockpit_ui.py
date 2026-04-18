@@ -544,7 +544,15 @@ def _palette_notify(app: App, message: str) -> None:
 
 
 def _palette_show_shortcuts(app: App) -> None:
-    """Render the host App's registered keybindings via :meth:`notify`."""
+    """Render the host App's registered keybindings.
+
+    Prefers the rich :class:`KeyboardHelpModal` when the host App
+    exposes ``action_show_keyboard_help`` (every cockpit App does). The
+    notify fallback + ``_palette_last_shortcuts`` payload remain so
+    integration tests and pre-modal callers keep working unchanged.
+    """
+    # Always stash a flat text payload — tests/integrators may inspect
+    # it even when the modal layer is unavailable (e.g. headless toasts).
     lines: list[str] = []
     bindings = getattr(app, "BINDINGS", None) or []
     for binding in bindings:
@@ -554,9 +562,17 @@ def _palette_show_shortcuts(app: App) -> None:
             continue
         lines.append(f"{key}  \u2014  {desc}" if desc else key)
     body = "\n".join(lines) if lines else "No keybindings registered."
-    # Stash so tests / integrators can find the payload even when the
-    # toast system isn't initialised.
     setattr(app, "_palette_last_shortcuts", body)
+
+    # Prefer the polished modal — this is the post-#NEW path. Falling
+    # back to ``notify`` keeps every prior caller working.
+    show_help = getattr(app, "action_show_keyboard_help", None)
+    if callable(show_help):
+        try:
+            show_help()
+            return
+        except Exception:  # noqa: BLE001
+            pass
     _palette_notify(app, body)
 
 
@@ -580,6 +596,288 @@ def _open_command_palette(app: App) -> None:
     except Exception:  # noqa: BLE001
         commands = []
     app.push_screen(CommandPaletteModal(commands), _on_dismiss)
+
+
+# ---------------------------------------------------------------------------
+# Keyboard help overlay (``?``)
+# ---------------------------------------------------------------------------
+#
+# Discoverability of the cockpit's keyboard surface lives behind a single
+# global keybinding: pressing ``?`` from any cockpit App opens the
+# :class:`KeyboardHelpModal` with three categorised sections:
+#
+#   1. **This screen** — the host App's own ``BINDINGS``, including
+#      ``show=False`` entries (we want to surface every key the App
+#      reacts to, not just the visible footer).
+#   2. **Inbox label-specific** — extra keys that only apply when the
+#      currently-selected inbox item carries a particular label
+#      (``plan_review``, ``proposal``, ``blocking_question``).
+#   3. **Global** — bindings that work from every cockpit App (``:``
+#      palette, ``?`` this help, navigation jumps).
+#
+# The modal is intentionally inert — Esc dismisses, nothing dispatches.
+# It exists so a new user can learn the surface in 5 seconds.
+
+# Global bindings advertised on every cockpit screen. Source-of-truth:
+# every cockpit App registers ``:`` (palette) and ``?`` (this help).
+# Navigation jumps live in the palette and project-dashboard surface,
+# but we surface the palette + help here so the user always knows the
+# two universal keys.
+_GLOBAL_HELP_BINDINGS: list[tuple[str, str]] = [
+    (":", "command palette"),
+    ("?", "this help"),
+    ("ctrl+q", "quit"),
+    ("ctrl+w", "detach"),
+]
+
+# Inbox label-specific keybinds. These are *additive* — the inbox App's
+# BINDINGS already lists v / A / X, but the keys are conditional on the
+# selected item's labels. We re-render them in their own section so the
+# user sees *why* the key works (label gating), not just that it exists.
+_INBOX_LABEL_HELP: dict[str, list[tuple[str, str]]] = {
+    "plan_review": [
+        ("v", "open visual explainer"),
+        ("A", "approve plan"),
+    ],
+    "proposal": [
+        ("A", "accept proposal"),
+        ("X", "reject proposal"),
+    ],
+    "blocking_question": [
+        ("r", "reply to worker"),
+        ("d", "jump to worker pane"),
+    ],
+}
+
+
+def _format_binding_keys(key_field: str) -> str:
+    """Render a comma-separated Binding.key into a friendly label.
+
+    Textual stores aliases as ``"j,down"``; we surface them as
+    ``"j / \u2193"`` so the modal reads naturally.
+    """
+    pretty: list[str] = []
+    for raw in (key_field or "").split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        # Friendly aliases for common Textual key names.
+        replacements = {
+            "down": "\u2193",
+            "up": "\u2191",
+            "left": "\u2190",
+            "right": "\u2192",
+            "escape": "Esc",
+            "enter": "Enter",
+            "home": "Home",
+            "end": "End",
+            "tab": "Tab",
+            "shift+tab": "Shift+Tab",
+            "colon": ":",
+            "slash": "/",
+            "question_mark": "?",
+            "space": "Space",
+        }
+        pretty.append(replacements.get(raw, raw))
+    return " / ".join(pretty) if pretty else key_field
+
+
+def _selected_inbox_labels(app: App) -> list[str]:
+    """Return labels on the currently-selected inbox item, if any.
+
+    Returns ``[]`` for non-inbox Apps or when nothing is selected. The
+    helper is best-effort — failures fall back to an empty list so the
+    help modal never crashes.
+    """
+    selected_id = getattr(app, "_selected_task_id", None)
+    if not selected_id:
+        return []
+    tasks = getattr(app, "_tasks", None) or []
+    for task in tasks:
+        if getattr(task, "task_id", None) == selected_id:
+            return list(getattr(task, "labels", []) or [])
+    return []
+
+
+def _collect_keybindings_for_screen(app: App) -> list[tuple[str, list[tuple[str, str]]]]:
+    """Return ordered ``(category, [(key, description), ...])`` sections.
+
+    Categories are ordered the way the user reads them: this screen's
+    bindings first, then any label-specific subsections, finally the
+    globals that always apply. Hidden bindings (``show=False``) are
+    included — the help overlay is the canonical place to learn the
+    full surface, not a subset of it.
+    """
+    sections: list[tuple[str, list[tuple[str, str]]]] = []
+
+    # 1. This screen.
+    screen_rows: list[tuple[str, str]] = []
+    for binding in getattr(app, "BINDINGS", None) or []:
+        key_field = getattr(binding, "key", "") or ""
+        desc = getattr(binding, "description", "") or ""
+        if not key_field:
+            continue
+        # Skip the global ``?`` / ``:`` so they're not double-listed.
+        # The Globals section always covers them.
+        norm_keys = {k.strip() for k in key_field.split(",")}
+        if norm_keys & {"question_mark", "colon"}:
+            continue
+        screen_rows.append((_format_binding_keys(key_field), desc or "(no description)"))
+    if screen_rows:
+        sections.append(("This screen", screen_rows))
+
+    # 2. Inbox label-specific (only when relevant context exists).
+    labels = _selected_inbox_labels(app)
+    for label_name, rows in _INBOX_LABEL_HELP.items():
+        if label_name in labels:
+            sections.append(
+                (f"Selected item: {label_name}", list(rows)),
+            )
+
+    # 3. Globals — always last so the user's eye lands on screen-specific
+    #    keys first.
+    sections.append(("Global (anywhere in cockpit)", list(_GLOBAL_HELP_BINDINGS)))
+
+    return sections
+
+
+def _screen_title_for_help(app: App) -> str:
+    """Best-effort human label for the host App in the modal title."""
+    cls_name = type(app).__name__
+    mapping = {
+        "PollyCockpitApp": "Cockpit",
+        "PollyInboxApp": "Inbox",
+        "PollyProjectDashboardApp": "Project dashboard",
+        "PollyWorkerRosterApp": "Workers",
+        "PollyActivityFeedApp": "Activity feed",
+        "PollySettingsPaneApp": "Settings",
+    }
+    return mapping.get(cls_name, cls_name)
+
+
+class KeyboardHelpModal(ModalScreen[None]):
+    """``?`` keyboard help overlay — categorised, scrollable.
+
+    Dismisses on Esc. Inert: never dispatches commands, never mutates
+    state. The modal is constructed from a flat ``sections`` list so
+    tests can drive it without a live host App.
+    """
+
+    CSS = """
+    KeyboardHelpModal {
+        align: center middle;
+        background: rgba(0, 0, 0, 0.45);
+    }
+    #kh-dialog {
+        width: 64;
+        max-width: 90%;
+        height: auto;
+        max-height: 28;
+        padding: 1 1 0 1;
+        background: #141a20;
+        border: round #2a3340;
+    }
+    #kh-title {
+        height: 1;
+        padding: 0 1;
+        color: #eef6ff;
+    }
+    #kh-scroll {
+        height: auto;
+        max-height: 22;
+        background: #141a20;
+        border: none;
+        margin-top: 1;
+        padding: 0 1;
+        scrollbar-size: 1 1;
+        scrollbar-color: #2a3340;
+    }
+    #kh-body {
+        height: auto;
+        color: #d6dee5;
+    }
+    #kh-hint {
+        height: 1;
+        padding: 0 1;
+        color: #3e4c5a;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape,q,question_mark", "cancel", "Close"),
+    ]
+
+    def __init__(
+        self,
+        sections: list[tuple[str, list[tuple[str, str]]]],
+        *,
+        screen_title: str = "",
+    ) -> None:
+        super().__init__()
+        self._sections = list(sections)
+        self._screen_title = screen_title or "Cockpit"
+        self.title_bar = Static(
+            f"[b]Keyboard shortcuts[/b]  [dim]\u2014  {self._screen_title}[/dim]",
+            id="kh-title",
+            markup=True,
+        )
+        self.body = Static(self._render_body(), id="kh-body", markup=True)
+        self.hint = Static(
+            "[dim]Esc / q / ? to close[/dim]",
+            id="kh-hint",
+            markup=True,
+        )
+
+    def _render_body(self) -> str:
+        """Render the categorised key list as Rich markup.
+
+        Each section gets a bold header, then key/description rows with
+        the key bolded and the description dimmed for visual contrast.
+        Padding keeps columns roughly aligned without depending on a
+        DataTable (the overlay must stay narrow + scrollable).
+        """
+        if not self._sections:
+            return "[dim]No keybindings registered.[/dim]"
+        lines: list[str] = []
+        for idx, (category, rows) in enumerate(self._sections):
+            if idx > 0:
+                lines.append("")  # blank line between sections
+            lines.append(f"[b #5b8aff]{category}[/b #5b8aff]")
+            if not rows:
+                lines.append("  [dim](none)[/dim]")
+                continue
+            # Column-align key labels so descriptions line up vertically.
+            max_key_len = max((len(k) for k, _ in rows), default=0)
+            for key, desc in rows:
+                pad = " " * max(0, max_key_len - len(key))
+                lines.append(
+                    f"  [b]{key}[/b]{pad}   [dim]{desc}[/dim]"
+                )
+        return "\n".join(lines)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="kh-dialog"):
+            yield self.title_bar
+            with VerticalScroll(id="kh-scroll"):
+                yield self.body
+            yield self.hint
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+def _open_keyboard_help(app: App) -> None:
+    """Push :class:`KeyboardHelpModal` onto ``app``.
+
+    Computes the section list at call time so label-specific keys
+    reflect the App's *current* selection, not its mount-time state.
+    """
+    try:
+        sections = _collect_keybindings_for_screen(app)
+    except Exception:  # noqa: BLE001
+        sections = []
+    title = _screen_title_for_help(app)
+    app.push_screen(KeyboardHelpModal(sections, screen_title=title))
 
 
 class RailItem(ListItem):
@@ -795,6 +1093,7 @@ class PollyCockpitApp(App[None]):
         Binding("r", "refresh", "Refresh"),
         Binding("s", "open_settings", "Settings"),
         Binding("colon", "open_command_palette", "Palette", priority=True),
+        Binding("question_mark", "show_keyboard_help", "Help", priority=True),
         Binding("j,down", "cursor_down", "Down", show=False),
         Binding("k,up", "cursor_up", "Up", show=False),
         Binding("g,home", "cursor_first", "First", show=False),
@@ -805,6 +1104,9 @@ class PollyCockpitApp(App[None]):
 
     def action_open_command_palette(self) -> None:
         _open_command_palette(self)
+
+    def action_show_keyboard_help(self) -> None:
+        _open_keyboard_help(self)
 
     def __init__(self, config_path: Path) -> None:
         super().__init__()
@@ -2383,8 +2685,12 @@ class PollySettingsPaneApp(App[None]):
         Binding("t", "toggle_project_tracked", "Toggle project", show=False),
         Binding("m", "make_controller", "Controller", show=False),
         Binding("v", "toggle_failover", "Failover", show=False),
+        Binding("question_mark", "show_keyboard_help", "Help", priority=True),
         Binding("q,escape", "back_or_cancel", "Back"),
     ]
+
+    def action_show_keyboard_help(self) -> None:
+        _open_keyboard_help(self)
 
     _DEFAULT_HINT = (
         "j/k move \u00b7 Tab section \u00b7 / search \u00b7 R refresh \u00b7 "
@@ -3743,11 +4049,15 @@ class PollyInboxApp(App[None]):
         Binding("e", "expand_all_rollup", "Expand all", show=False),
         Binding("u", "refresh", "Refresh"),
         Binding("colon", "open_command_palette", "Palette", priority=True),
+        Binding("question_mark", "show_keyboard_help", "Help", priority=True),
         Binding("q,escape", "back_or_cancel", "Back"),
     ]
 
     def action_open_command_palette(self) -> None:
         _open_command_palette(self)
+
+    def action_show_keyboard_help(self) -> None:
+        _open_keyboard_help(self)
 
     REFRESH_INTERVAL_SECONDS = 8
     # Show the first ``ROLLUP_DEFAULT_VISIBLE`` items of a rollup, collapse
@@ -5879,11 +6189,15 @@ class PollyProjectDashboardApp(App[None]):
         Binding("G", "plan_scroll_bottom", "Bottom", show=False),
         Binding("u,r", "refresh", "Refresh", show=False),
         Binding("colon", "open_command_palette", "Palette", priority=True),
+        Binding("question_mark", "show_keyboard_help", "Help", priority=True),
         Binding("q,escape", "back", "Back"),
     ]
 
     def action_open_command_palette(self) -> None:
         _open_command_palette(self)
+
+    def action_show_keyboard_help(self) -> None:
+        _open_keyboard_help(self)
 
     _DEFAULT_HINT = (
         "c chat \u00b7 p plan \u00b7 i inbox \u00b7 l log \u00b7 q back"
@@ -6557,11 +6871,15 @@ class PollyWorkerRosterApp(App[None]):
         Binding("enter", "jump_to_project", "Open"),
         Binding("d", "jump_to_worker", "Discuss"),
         Binding("colon", "open_command_palette", "Palette", priority=True),
+        Binding("question_mark", "show_keyboard_help", "Help", priority=True),
         Binding("q,escape", "back", "Back"),
     ]
 
     def action_open_command_palette(self) -> None:
         _open_command_palette(self)
+
+    def action_show_keyboard_help(self) -> None:
+        _open_keyboard_help(self)
 
     AUTO_REFRESH_SECONDS = 5.0
 
@@ -7034,8 +7352,12 @@ class PollyActivityFeedApp(App[None]):
         Binding("c", "clear_filters", "Clear"),
         Binding("R,u", "refresh", "Refresh", show=False),
         Binding("enter", "open_detail", "Open"),
+        Binding("question_mark", "show_keyboard_help", "Help", priority=True),
         Binding("q,escape", "back_or_cancel", "Back"),
     ]
+
+    def action_show_keyboard_help(self) -> None:
+        _open_keyboard_help(self)
 
     _DEFAULT_HINT = (
         "j/k move \u00b7 / fuzzy \u00b7 p project \u00b7 t type "

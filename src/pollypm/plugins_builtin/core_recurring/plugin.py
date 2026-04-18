@@ -438,6 +438,130 @@ def memory_ttl_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     return {"deleted": deleted}
 
 
+def agent_worktree_prune_handler(payload: dict[str, Any]) -> dict[str, Any]:
+    """Prune stale Claude Code harness agent worktrees under ``.claude/worktrees/``.
+
+    These are NOT PollyPM task worktrees (those live under ``<project>/.pollypm/
+    worktrees/...`` and are owned by ``teardown_worker``). They are harness
+    worktrees spawned by background ``Agent()`` calls with
+    ``isolation: "worktree"``. The harness doesn't always clean up after
+    itself — on Sam's machine the directory bloated to 6.6 GB across 59
+    worktrees. This handler performs conservative cleanup:
+
+    * Merged-to-main branches: prune via ``git worktree remove --force`` and
+      drop the local branch.
+    * Unmerged + mtime > 7 days: log a warning but do not delete (may be
+      in-progress uncommitted work).
+    * mtime < 1 hour: skip (still actively in use).
+
+    Only directories matching ``<repo_root>/.claude/worktrees/agent-*`` are
+    considered. The repo root is taken from ``payload['project_root']`` if
+    provided, otherwise from config's ``project.root_dir``.
+    """
+    import subprocess
+    import time
+
+    hint = payload.get("project_root") if isinstance(payload, dict) else None
+    if hint:
+        repo_root = Path(hint)
+    else:
+        config, _store = _load_config_and_store(payload)
+        repo_root = config.project.root_dir
+
+    worktrees_dir = repo_root / ".claude" / "worktrees"
+    if not worktrees_dir.is_dir():
+        return {"pruned": 0, "skipped_active": 0, "warned_stale": 0, "errors": 0}
+
+    now = time.time()
+    one_hour = 3600.0
+    seven_days = 7 * 86400.0
+
+    def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            capture_output=True, text=True, check=False,
+        )
+
+    # Pre-compute the merged-branch set once via two cheap calls — cheaper
+    # than spawning two git processes per worktree.
+    merged_local = _git(repo_root, "branch", "--merged", "main")
+    merged_remote = _git(repo_root, "branch", "-r", "--merged", "origin/main")
+    merged_names: set[str] = set()
+    for proc in (merged_local, merged_remote):
+        if proc.returncode != 0:
+            continue
+        for raw in proc.stdout.splitlines():
+            # ``git branch`` prefixes lines with ``* `` (current),
+            # ``+ `` (checked out in another worktree), or spaces.
+            name = raw.strip().lstrip("*+").strip()
+            if not name or name.startswith("("):
+                continue
+            # Normalize ``origin/foo`` → ``foo`` so local+remote merge into
+            # one name set.
+            if name.startswith("origin/"):
+                name = name[len("origin/"):]
+            merged_names.add(name)
+
+    pruned = 0
+    skipped_active = 0
+    warned_stale = 0
+    errors = 0
+
+    for wt in sorted(worktrees_dir.glob("agent-*")):
+        if not wt.is_dir():
+            continue
+        try:
+            mtime = wt.stat().st_mtime
+            age = now - mtime
+            if age < one_hour:
+                skipped_active += 1
+                continue
+
+            branch_proc = _git(wt, "branch", "--show-current")
+            if branch_proc.returncode != 0:
+                errors += 1
+                continue
+            branch = branch_proc.stdout.strip()
+            if not branch:
+                errors += 1
+                continue
+
+            if branch in merged_names:
+                remove_proc = _git(
+                    repo_root, "worktree", "remove", "--force", str(wt),
+                )
+                if remove_proc.returncode != 0:
+                    errors += 1
+                    continue
+                # Best-effort local branch delete — don't fail the prune
+                # if the branch was already gone.
+                _git(repo_root, "branch", "-D", branch)
+                pruned += 1
+            elif age > seven_days:
+                logger.warning(
+                    "agent_worktree.prune: stale unmerged worktree %s "
+                    "(branch=%s, age_days=%.1f) — leaving in place",
+                    wt, branch, age / 86400.0,
+                )
+                warned_stale += 1
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "agent_worktree.prune: error processing %s", wt, exc_info=True,
+            )
+            errors += 1
+
+    # Clean up any dangling worktree admin entries (e.g. directories that
+    # were removed on disk but still registered in ``.git/worktrees``).
+    _git(repo_root, "worktree", "prune")
+
+    return {
+        "pruned": pruned,
+        "skipped_active": skipped_active,
+        "warned_stale": warned_stale,
+        "errors": errors,
+    }
+
+
 def notification_staging_prune_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Drop flushed + silent notification_staging rows older than 30d.
 
@@ -520,6 +644,12 @@ def _register_handlers(api: JobHandlerAPI) -> None:
         "notification_staging.prune", notification_staging_prune_handler,
         max_attempts=1, timeout_seconds=60.0,
     )
+    # Harness agent-worktree hygiene — hourly prune of merged/stale
+    # worktrees under ``<repo_root>/.claude/worktrees/agent-*``.
+    api.register_handler(
+        "agent_worktree.prune", agent_worktree_prune_handler,
+        max_attempts=1, timeout_seconds=120.0,
+    )
 
 
 def _register_roster(api: RosterAPI) -> None:
@@ -546,6 +676,13 @@ def _register_roster(api: RosterAPI) -> None:
         "19 4 * * *", "notification_staging.prune", {},
         dedupe_key="notification_staging.prune",
     )
+    # Harness agent-worktree hygiene — every hour at minute 23, off-pattern
+    # from the 4am DB hygiene window. Only prunes merged branches; stale
+    # unmerged trees are logged but left intact.
+    api.register_recurring(
+        "23 * * * *", "agent_worktree.prune", {},
+        dedupe_key="agent_worktree.prune",
+    )
 
 
 plugin = PollyPMPlugin(
@@ -567,6 +704,7 @@ plugin = PollyPMPlugin(
         Capability(kind="job_handler", name="db.vacuum"),
         Capability(kind="job_handler", name="memory.ttl_sweep"),
         Capability(kind="job_handler", name="notification_staging.prune"),
+        Capability(kind="job_handler", name="agent_worktree.prune"),
         Capability(kind="roster_entry", name="core_recurring"),
     ),
     register_handlers=_register_handlers,

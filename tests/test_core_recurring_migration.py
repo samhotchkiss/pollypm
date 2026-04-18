@@ -74,6 +74,8 @@ class TestCoreRecurringPlugin:
             # Notification-staging 30-day prune — lands next to the
             # other daily cron entries around 4am.
             "notification_staging.prune",
+            # Harness agent-worktree hygiene — hourly at minute :23.
+            "agent_worktree.prune",
         }
 
         # Cadences per issue #164 / #249.
@@ -96,6 +98,9 @@ class TestCoreRecurringPlugin:
         ns_prune = entries["notification_staging.prune"].schedule
         assert isinstance(ns_prune, CronSchedule)
         assert ns_prune.expression() == "19 4 * * *"
+        agent_prune = entries["agent_worktree.prune"].schedule
+        assert isinstance(agent_prune, CronSchedule)
+        assert agent_prune.expression() == "23 * * * *"
 
     def test_plugin_declares_expected_capabilities(self) -> None:
         kinds = {cap.kind for cap in core_plugin.capabilities}

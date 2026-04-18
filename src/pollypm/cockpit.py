@@ -2967,3 +2967,241 @@ def _register_worker_roster_rail_item(registry, router) -> None:
         registry.add(reg)
     except Exception:  # noqa: BLE001
         pass
+
+
+# ---------------------------------------------------------------------------
+# Command palette (``:``) — see issue brief 2026-04-17.
+#
+# A thin data layer that the Textual ``CommandPaletteModal`` in
+# :mod:`pollypm.cockpit_ui` renders. Keeping the registry out of the UI
+# layer lets tests exercise the command list (filtering, fuzzy search,
+# per-project commands) without having to spin up a full Textual Pilot.
+# Every entry is a plain dataclass — the dispatch happens via a ``tag``
+# string the host App interprets. This avoids coupling the registry to
+# any particular App class.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True, frozen=True)
+class PaletteCommand:
+    """A single row in the ``:`` command palette.
+
+    ``tag`` is a dotted string the host :class:`App` interprets in
+    :meth:`dispatch_palette_command`. Commands are kept as inert data
+    here so the registry can be built+filtered in tests without
+    requiring a running Textual app.
+    """
+
+    title: str
+    subtitle: str
+    category: str
+    keybind: str | None
+    tag: str
+
+    def haystack(self) -> str:
+        """Lowercased search string covering title + subtitle + category."""
+        return f"{self.title} {self.subtitle} {self.category}".lower()
+
+
+def _fuzzy_subsequence_score(needle: str, haystack: str) -> int | None:
+    """Return a match score if ``needle`` is a subsequence of ``haystack``.
+
+    Lower score is a tighter match. Adjacent characters score better than
+    scattered ones — this mirrors VS Code / Raycast's "close letters
+    win" feel without any real dependency on a fuzzy library. Returns
+    ``None`` when ``needle`` isn't a subsequence at all.
+    """
+    if not needle:
+        return 0
+    needle = needle.lower()
+    haystack = haystack.lower()
+    # Substring match always wins — the earliest exact substring gets
+    # the best (lowest) score.
+    idx = haystack.find(needle)
+    if idx != -1:
+        return idx  # closer to start = better
+    # Fall back to subsequence: walk both strings in lockstep.
+    score = 0
+    last_pos = -1
+    h_i = 0
+    for ch in needle:
+        while h_i < len(haystack) and haystack[h_i] != ch:
+            h_i += 1
+        if h_i >= len(haystack):
+            return None
+        gap = h_i - last_pos - 1
+        score += 1000 + gap  # subsequence baseline > any substring score
+        last_pos = h_i
+        h_i += 1
+    return score
+
+
+def filter_palette_commands(
+    commands: list[PaletteCommand], query: str,
+) -> list[PaletteCommand]:
+    """Return matching commands ordered by fuzzy score, then title."""
+    query = (query or "").strip()
+    if not query:
+        return list(commands)
+    scored: list[tuple[int, str, PaletteCommand]] = []
+    for cmd in commands:
+        score = _fuzzy_subsequence_score(query, cmd.haystack())
+        if score is None:
+            continue
+        scored.append((score, cmd.title.lower(), cmd))
+    scored.sort(key=lambda item: (item[0], item[1]))
+    return [cmd for _score, _title, cmd in scored]
+
+
+def build_palette_commands(
+    config_path: Path,
+    *,
+    current_project: str | None = None,
+) -> list[PaletteCommand]:
+    """Return the default global command set for the cockpit palette.
+
+    ``current_project`` is the project key the caller is currently
+    viewing (if any) — used to prefill project-scoped commands like
+    "Create task". Projects are read from the loaded config; if the
+    config can't be loaded we still return the static commands so the
+    palette never shows an empty list.
+    """
+    commands: list[PaletteCommand] = []
+
+    # Navigation — the six top-level cockpit views.
+    commands.append(PaletteCommand(
+        title="Go to Inbox",
+        subtitle="Open the cockpit inbox",
+        category="Navigation",
+        keybind=None,
+        tag="nav.inbox",
+    ))
+    commands.append(PaletteCommand(
+        title="Go to Workers",
+        subtitle="Open the worker roster",
+        category="Navigation",
+        keybind=None,
+        tag="nav.workers",
+    ))
+    commands.append(PaletteCommand(
+        title="Go to Activity",
+        subtitle="Open the activity feed",
+        category="Navigation",
+        keybind=None,
+        tag="nav.activity",
+    ))
+    commands.append(PaletteCommand(
+        title="Go to Settings",
+        subtitle="Open cockpit settings",
+        category="Navigation",
+        keybind="s",
+        tag="nav.settings",
+    ))
+    commands.append(PaletteCommand(
+        title="Go to Dashboard",
+        subtitle="Jump to the main cockpit rail",
+        category="Navigation",
+        keybind=None,
+        tag="nav.dashboard",
+    ))
+
+    # Per-project navigation + task commands.
+    try:
+        config = load_config(config_path)
+        projects = getattr(config, "projects", {}) or {}
+    except Exception:  # noqa: BLE001
+        projects = {}
+    for project_key, project in projects.items():
+        name = getattr(project, "name", None) or project_key
+        commands.append(PaletteCommand(
+            title=f"Go to project: {name}",
+            subtitle=f"Open the {name} dashboard",
+            category="Navigation",
+            keybind=None,
+            tag=f"nav.project:{project_key}",
+        ))
+        commands.append(PaletteCommand(
+            title=f"Create task in {name}",
+            subtitle="Draft a new task in this project",
+            category="Task",
+            keybind=None,
+            tag=f"task.create:{project_key}",
+        ))
+        commands.append(PaletteCommand(
+            title=f"Queue next task in {name}",
+            subtitle=f"Run pm task next --project {project_key}",
+            category="Task",
+            keybind=None,
+            tag=f"task.queue_next:{project_key}",
+        ))
+
+    # Inbox commands.
+    commands.append(PaletteCommand(
+        title="Run pm notify",
+        subtitle="Send a notification into the inbox",
+        category="Inbox",
+        keybind=None,
+        tag="inbox.notify",
+    ))
+    commands.append(PaletteCommand(
+        title="Archive all read inbox items",
+        subtitle="Mark every already-read message done",
+        category="Inbox",
+        keybind=None,
+        tag="inbox.archive_read",
+    ))
+
+    # Session / app-level.
+    commands.append(PaletteCommand(
+        title="Refresh data",
+        subtitle="Re-read state and repaint the current screen",
+        category="Session",
+        keybind="r",
+        tag="session.refresh",
+    ))
+    commands.append(PaletteCommand(
+        title="Restart cockpit",
+        subtitle="Exit and reload the cockpit app",
+        category="Session",
+        keybind=None,
+        tag="session.restart",
+    ))
+    commands.append(PaletteCommand(
+        title="Show keyboard shortcuts",
+        subtitle="Display the current screen's keybindings",
+        category="Session",
+        keybind="?",
+        tag="session.shortcuts",
+    ))
+
+    # System.
+    commands.append(PaletteCommand(
+        title="Run pm doctor",
+        subtitle="Stream doctor checks into the palette",
+        category="System",
+        keybind=None,
+        tag="system.doctor",
+    ))
+    commands.append(PaletteCommand(
+        title="Open pollypm.toml in editor",
+        subtitle=str(config_path),
+        category="System",
+        keybind=None,
+        tag="system.edit_config",
+    ))
+
+    # Let the caller prioritise current-project commands visually. We
+    # keep the list stable (no re-ordering mid-render); a current-project
+    # hint just means the "Create task in <current>" entry sits above
+    # its siblings.
+    if current_project is not None:
+        preferred: list[PaletteCommand] = []
+        rest: list[PaletteCommand] = []
+        for cmd in commands:
+            if cmd.tag.endswith(f":{current_project}"):
+                preferred.append(cmd)
+            else:
+                rest.append(cmd)
+        commands = preferred + rest
+
+    return commands

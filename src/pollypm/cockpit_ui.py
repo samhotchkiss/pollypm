@@ -18,13 +18,21 @@ from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, ListItem, ListView, Static
 
 from pollypm.models import ProviderKind
 from pollypm.tz import format_time as _fmt_time
 from pollypm.config import load_config
 from pollypm.service_api import PollyPMService
-from pollypm.cockpit import CockpitItem, CockpitRouter, build_cockpit_detail
+from pollypm.cockpit import (
+    CockpitItem,
+    CockpitRouter,
+    PaletteCommand,
+    build_cockpit_detail,
+    build_palette_commands,
+    filter_palette_commands,
+)
 
 
 import re as _re
@@ -177,6 +185,401 @@ POLLY_SLOGANS = [
     "Fewer surprises.\nBetter launches.",
     "Guide the chaos.\nShip the value.",
 ]
+
+
+class _PaletteListItem(ListItem):
+    """A single row inside the ``:`` command palette.
+
+    Holds onto the underlying :class:`PaletteCommand` so the modal can
+    resolve the selection back to a dispatchable tag without parsing
+    the rendered label.
+    """
+
+    def __init__(self, command: PaletteCommand) -> None:
+        self.command = command
+        self.body = Static(self._render_body(command), markup=True)
+        super().__init__(self.body, classes="palette-row")
+
+    @staticmethod
+    def _render_body(command: PaletteCommand) -> str:
+        # Two-line layout: title + hint row that carries category and an
+        # optional keybind pill. Rich markup keeps the muted palette
+        # consistent with other cockpit panels.
+        title = f"[b]{command.title}[/b]"
+        if command.keybind:
+            title = f"{title}  [dim]\\[{command.keybind}][/dim]"
+        subtitle = command.subtitle or ""
+        line2 = f"[#6b7a88]{command.category}[/#6b7a88]"
+        if subtitle:
+            line2 = f"{line2}  [dim]\u00b7[/dim]  [dim]{subtitle}[/dim]"
+        return f"{title}\n  {line2}"
+
+
+class CommandPaletteModal(ModalScreen[str | None]):
+    """Global ``:`` command palette — fuzzy-searchable command list.
+
+    Opened from any cockpit App that registers the ``:`` keybinding.
+    Dismissing via Esc returns ``None``; selecting an entry (Enter or
+    click) returns the command's ``tag`` so the host App can dispatch.
+    The palette itself is inert: it does not know how to route "nav.inbox"
+    or "inbox.archive_read" — the hosting App interprets the tag via
+    :func:`_dispatch_palette_tag` (see ``PollyCockpitApp``/``PollyInboxApp``
+    etc.).
+    """
+
+    CSS = """
+    CommandPaletteModal {
+        align: center middle;
+        background: rgba(0, 0, 0, 0.45);
+    }
+    #palette-dialog {
+        width: 72;
+        max-width: 90%;
+        height: auto;
+        max-height: 22;
+        padding: 1 1 0 1;
+        background: #141a20;
+        border: round #2a3340;
+    }
+    #palette-input {
+        height: 3;
+        padding: 0 1;
+        background: #0f1317;
+        border: round #2a3340;
+        color: #eef2f4;
+    }
+    #palette-input:focus {
+        border: round #5b8aff;
+    }
+    #palette-list {
+        height: auto;
+        max-height: 15;
+        background: #141a20;
+        border: none;
+        margin-top: 1;
+        padding: 0;
+        scrollbar-size: 1 1;
+        scrollbar-color: #2a3340;
+    }
+    #palette-list > .palette-row {
+        height: 3;
+        padding: 0 1;
+        color: #d6dee5;
+        background: transparent;
+    }
+    #palette-list > .palette-row.-highlight {
+        background: #1e2730;
+    }
+    #palette-list:focus-within > .palette-row.-highlight {
+        background: #253140;
+        color: #f2f6f8;
+    }
+    #palette-empty {
+        height: 3;
+        padding: 1;
+        color: #6b7a88;
+    }
+    #palette-hint {
+        height: 1;
+        padding: 0 1;
+        color: #3e4c5a;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close"),
+        Binding("down", "cursor_down", "Down", show=False),
+        Binding("up", "cursor_up", "Up", show=False),
+        Binding("enter", "run_selected", "Run", show=False),
+    ]
+
+    def __init__(self, commands: list[PaletteCommand]) -> None:
+        super().__init__()
+        self._all_commands: list[PaletteCommand] = list(commands)
+        self._visible: list[PaletteCommand] = list(commands)
+        self.input = Input(placeholder="Type a command\u2026", id="palette-input")
+        self.list_view = ListView(id="palette-list")
+        self.empty = Static(
+            "[dim]No commands match[/dim]", id="palette-empty", markup=True,
+        )
+        self.empty.display = False
+        self.hint = Static(
+            "[dim]\u21b5 run  \u00b7  \u2191\u2193 move  \u00b7  esc close[/dim]",
+            id="palette-hint",
+            markup=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="palette-dialog"):
+            yield self.input
+            yield self.empty
+            yield self.list_view
+            yield self.hint
+
+    def on_mount(self) -> None:
+        self._populate(self._all_commands)
+        self.input.focus()
+
+    # ------------------------------------------------------------------
+    # Population / filtering
+    # ------------------------------------------------------------------
+
+    def _populate(self, commands: list[PaletteCommand]) -> None:
+        self._visible = list(commands)
+        self.list_view.clear()
+        if not commands:
+            self.empty.display = True
+            self.list_view.display = False
+            return
+        self.empty.display = False
+        self.list_view.display = True
+        items = [_PaletteListItem(cmd) for cmd in commands]
+        self.list_view.extend(items)
+        # Always cursor the top match so Enter runs the most relevant
+        # command without needing to arrow.
+        self.list_view.index = 0
+
+    def _filter(self, query: str) -> None:
+        matches = filter_palette_commands(self._all_commands, query)
+        self._populate(matches)
+
+    # ------------------------------------------------------------------
+    # Event handlers
+    # ------------------------------------------------------------------
+
+    @on(Input.Changed, "#palette-input")
+    def _on_query_changed(self, event: Input.Changed) -> None:
+        self._filter(event.value)
+
+    @on(Input.Submitted, "#palette-input")
+    def _on_query_submitted(self, _event: Input.Submitted) -> None:
+        self.action_run_selected()
+
+    @on(ListView.Selected, "#palette-list")
+    def _on_row_selected(self, event: ListView.Selected) -> None:
+        row = event.item
+        if isinstance(row, _PaletteListItem):
+            self.dismiss(row.command.tag)
+
+    # ------------------------------------------------------------------
+    # Actions
+    # ------------------------------------------------------------------
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_cursor_down(self) -> None:
+        self.list_view.action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        self.list_view.action_cursor_up()
+
+    def action_run_selected(self) -> None:
+        idx = self.list_view.index or 0
+        if not self._visible:
+            return
+        if idx < 0 or idx >= len(self._visible):
+            idx = 0
+        self.dismiss(self._visible[idx].tag)
+
+
+def _current_project_for_palette(app: App) -> str | None:
+    """Best-effort current-project hint for :func:`build_palette_commands`.
+
+    Each host App exposes a ``project_key`` (dashboard), a
+    ``selected_key`` that may start with ``project:`` (cockpit rail), or
+    nothing at all. This helper normalises those shapes into a single
+    optional string so the palette can prefer current-project commands.
+    """
+    project_key = getattr(app, "project_key", None)
+    if isinstance(project_key, str) and project_key:
+        return project_key
+    selected = getattr(app, "selected_key", None)
+    if isinstance(selected, str) and selected.startswith("project:"):
+        parts = selected.split(":", 2)
+        if len(parts) >= 2 and parts[1]:
+            return parts[1]
+    return None
+
+
+def _dispatch_palette_tag(app: App, tag: str | None) -> None:
+    """Interpret a palette ``tag`` inside the host App.
+
+    Keeps dispatch centralised so every cockpit App gets the same
+    behaviour for free. Unknown tags fall through silently — nothing
+    should crash the host App mid-palette.
+    """
+    if not tag:
+        return
+    try:
+        # Navigation — either leave this App (so the router takes over)
+        # or jump directly when the current App already knows how.
+        if tag == "nav.inbox":
+            _palette_nav(app, "inbox")
+            return
+        if tag == "nav.workers":
+            _palette_nav(app, "workers")
+            return
+        if tag == "nav.activity":
+            _palette_nav(app, "activity")
+            return
+        if tag == "nav.settings":
+            _palette_nav(app, "settings")
+            return
+        if tag == "nav.dashboard":
+            _palette_nav(app, "dashboard")
+            return
+        if tag.startswith("nav.project:"):
+            _palette_nav(app, tag.split(":", 1)[1], is_project=True)
+            return
+
+        # Session commands — every App exposes the same surface.
+        if tag == "session.refresh":
+            refresh = getattr(app, "action_refresh", None)
+            if callable(refresh):
+                refresh()
+            else:
+                _palette_notify(app, "This screen has no refresh action.")
+            return
+        if tag == "session.restart":
+            _palette_notify(app, "Restarting cockpit\u2026")
+            app.exit()
+            return
+        if tag == "session.shortcuts":
+            _palette_show_shortcuts(app)
+            return
+
+        # Inbox / system / task — all deferred to a single notice so we
+        # never silently break cockpit state. ``pm notify`` and ``pm
+        # doctor`` need their own prompt flows; those are wired in a
+        # follow-up. The palette advertises them so Sam can discover them.
+        if tag == "inbox.notify":
+            _palette_notify(
+                app, "Run `pm notify` from a shell \u2014 palette prompt landing in a follow-up.",
+            )
+            return
+        if tag == "inbox.archive_read":
+            _palette_notify(
+                app, "Bulk-archive not wired yet \u2014 press 'a' on an open inbox item.",
+            )
+            return
+        if tag == "system.doctor":
+            _palette_notify(app, "Run `pm doctor` from a shell for now.")
+            return
+        if tag == "system.edit_config":
+            _palette_notify(
+                app, "Open pollypm.toml in your editor \u2014 palette shortcut landing in a follow-up.",
+            )
+            return
+        if tag.startswith("task.create:"):
+            project_key = tag.split(":", 1)[1]
+            _palette_notify(
+                app, f"Create task in {project_key}: run `pm task create --project {project_key}`.",
+            )
+            return
+        if tag.startswith("task.queue_next:"):
+            project_key = tag.split(":", 1)[1]
+            _palette_notify(
+                app, f"Queue next: run `pm task next --project {project_key}`.",
+            )
+            return
+    except Exception as exc:  # noqa: BLE001
+        _palette_notify(app, f"Command failed: {exc}")
+
+
+def _palette_nav(app: App, target: str, *, is_project: bool = False) -> None:
+    """Route to a top-level cockpit view from any host App.
+
+    If the App *is* the cockpit rail we drive the router directly.
+    Otherwise we exit the current App and return the target as an
+    annotation on the exit payload; the caller (typically the tmux
+    wrapper in ``pm cockpit-pane``) decides what to do next. The simple
+    exit+notify flow is enough for Sam's "jump anywhere" need — the
+    rail regains focus and he can press the usual key to land on the
+    view. Calling ``app.notify`` is best-effort.
+    """
+    router = getattr(app, "router", None)
+    if router is not None and hasattr(router, "route_selected"):
+        try:
+            if is_project:
+                router.route_selected(f"project:{target}")
+            else:
+                router.route_selected(target)
+            app.selected_key = router.selected_key()  # type: ignore[attr-defined]
+            refresh = getattr(app, "_refresh_rows", None)
+            if callable(refresh):
+                refresh()
+            return
+        except Exception as exc:  # noqa: BLE001
+            _palette_notify(app, f"Route failed: {exc}")
+            return
+    # Non-rail apps: surface the request so the user knows where to
+    # land, then exit. The cockpit wrapper re-mounts the rail.
+    if is_project:
+        _palette_notify(app, f"Jump to project: {target} \u2014 exiting this pane.")
+    else:
+        _palette_notify(app, f"Jump to {target} \u2014 exiting this pane.")
+    app.exit()
+
+
+def _palette_notify(app: App, message: str) -> None:
+    """Thin wrapper around :meth:`App.notify` that never raises.
+
+    Some Textual Apps override ``notify`` and some tests stub it; catch
+    everything so a missing toast layer doesn't break the palette.
+    """
+    notify = getattr(app, "notify", None)
+    if callable(notify):
+        try:
+            notify(message, timeout=3.0)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    # Fallback: stash the last message on the app so tests can assert.
+    setattr(app, "_palette_last_message", message)
+
+
+def _palette_show_shortcuts(app: App) -> None:
+    """Render the host App's registered keybindings via :meth:`notify`."""
+    lines: list[str] = []
+    bindings = getattr(app, "BINDINGS", None) or []
+    for binding in bindings:
+        key = getattr(binding, "key", None) or str(binding)
+        desc = getattr(binding, "description", "") or ""
+        if not key:
+            continue
+        lines.append(f"{key}  \u2014  {desc}" if desc else key)
+    body = "\n".join(lines) if lines else "No keybindings registered."
+    # Stash so tests / integrators can find the payload even when the
+    # toast system isn't initialised.
+    setattr(app, "_palette_last_shortcuts", body)
+    _palette_notify(app, body)
+
+
+def _open_command_palette(app: App) -> None:
+    """Push :class:`CommandPaletteModal` onto ``app`` with the full command set.
+
+    Builds the command registry from the App's config + current-project
+    hint, then dispatches the selected tag once the modal dismisses.
+    """
+    config_path = getattr(app, "config_path", None)
+    if config_path is None:
+        return
+
+    def _on_dismiss(tag: str | None) -> None:
+        _dispatch_palette_tag(app, tag)
+
+    try:
+        commands = build_palette_commands(
+            config_path, current_project=_current_project_for_palette(app),
+        )
+    except Exception:  # noqa: BLE001
+        commands = []
+    app.push_screen(CommandPaletteModal(commands), _on_dismiss)
 
 
 class RailItem(ListItem):
@@ -391,6 +794,7 @@ class PollyCockpitApp(App[None]):
         Binding("n", "new_worker", "New Worker"),
         Binding("r", "refresh", "Refresh"),
         Binding("s", "open_settings", "Settings"),
+        Binding("colon", "open_command_palette", "Palette", priority=True),
         Binding("j,down", "cursor_down", "Down", show=False),
         Binding("k,up", "cursor_up", "Up", show=False),
         Binding("g,home", "cursor_first", "First", show=False),
@@ -398,6 +802,9 @@ class PollyCockpitApp(App[None]):
         Binding("ctrl+q", "request_quit", "Quit", priority=True),
         Binding("ctrl+w", "detach", "Detach", priority=True),
     ]
+
+    def action_open_command_palette(self) -> None:
+        _open_command_palette(self)
 
     def __init__(self, config_path: Path) -> None:
         super().__init__()
@@ -3335,8 +3742,12 @@ class PollyInboxApp(App[None]):
         Binding("v", "open_plan_explainer", "Explainer", show=False),
         Binding("e", "expand_all_rollup", "Expand all", show=False),
         Binding("u", "refresh", "Refresh"),
+        Binding("colon", "open_command_palette", "Palette", priority=True),
         Binding("q,escape", "back_or_cancel", "Back"),
     ]
+
+    def action_open_command_palette(self) -> None:
+        _open_command_palette(self)
 
     REFRESH_INTERVAL_SECONDS = 8
     # Show the first ``ROLLUP_DEFAULT_VISIBLE`` items of a rollup, collapse
@@ -5467,8 +5878,12 @@ class PollyProjectDashboardApp(App[None]):
         Binding("g", "plan_scroll_top", "Top", show=False),
         Binding("G", "plan_scroll_bottom", "Bottom", show=False),
         Binding("u,r", "refresh", "Refresh", show=False),
+        Binding("colon", "open_command_palette", "Palette", priority=True),
         Binding("q,escape", "back", "Back"),
     ]
+
+    def action_open_command_palette(self) -> None:
+        _open_command_palette(self)
 
     _DEFAULT_HINT = (
         "c chat \u00b7 p plan \u00b7 i inbox \u00b7 l log \u00b7 q back"
@@ -6141,8 +6556,12 @@ class PollyWorkerRosterApp(App[None]):
         Binding("a,A", "toggle_auto", "Auto-refresh"),
         Binding("enter", "jump_to_project", "Open"),
         Binding("d", "jump_to_worker", "Discuss"),
+        Binding("colon", "open_command_palette", "Palette", priority=True),
         Binding("q,escape", "back", "Back"),
     ]
+
+    def action_open_command_palette(self) -> None:
+        _open_command_palette(self)
 
     AUTO_REFRESH_SECONDS = 5.0
 

@@ -220,16 +220,16 @@ def test_store_transaction_rolls_back_on_exception(tmp_path: Path) -> None:
 
 
 def test_store_stub_methods_raise_with_guidance(tmp_path: Path) -> None:
-    """Every unimplemented method must honor the three-question rule."""
+    """Remaining unimplemented methods must honor the three-question rule.
+
+    #338 implemented the messages + event-log surface. The alert methods
+    are still awaiting their dedicated issue, and their
+    ``NotImplementedError`` messages must still follow the what/why/fix
+    shape so a caller who trips on them gets an actionable pointer.
+    """
     store = SQLAlchemyStore(_db_url(tmp_path))
     try:
         stubs = [
-            lambda: store.append_event(kind="x", payload={}),
-            lambda: store.record_event("s", "e", "m"),
-            lambda: store.enqueue_message({}),
-            lambda: store.update_message(1),
-            lambda: store.close_message(1),
-            lambda: store.query_messages(),
             lambda: store.upsert_alert("s", "a", "warn", "m"),
             lambda: store.clear_alert("s", "a"),
         ]
@@ -242,4 +242,4 @@ def test_store_stub_methods_raise_with_guidance(tmp_path: Path) -> None:
             assert "#338" in msg or "#340" in msg
             assert "Fix:" in msg
     finally:
-        store.dispose()
+        store.close()

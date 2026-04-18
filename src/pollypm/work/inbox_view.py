@@ -103,6 +103,19 @@ def _current_node_is_human(
     return node.actor_type == ActorType.HUMAN
 
 
+def _is_plan_review_label(task: Task) -> bool:
+    """True when the task carries the ``plan_review`` label.
+
+    Plan-review items (#297) may ship with ``requester=polly`` when
+    fast-tracked, so the generic ``roles contains user`` membership
+    test above would drop them. They still need to appear in the
+    shared cockpit inbox (reviewed by Sam or by Polly on Sam's
+    behalf), so we accept the label itself as a membership signal.
+    """
+    labels = task.labels or []
+    return any(label == "plan_review" for label in labels)
+
+
 def is_inbox_task(
     task: Task,
     service: _FlowLookup,
@@ -113,6 +126,8 @@ def is_inbox_task(
     if task.work_status in TERMINAL_STATUSES:
         return False
     if _roles_match_user(task):
+        return True
+    if _is_plan_review_label(task):
         return True
     cache = flow_cache if flow_cache is not None else {}
     return _current_node_is_human(task, service, flow_cache=cache)

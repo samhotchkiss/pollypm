@@ -1467,6 +1467,25 @@ def notify(
             "milestone detection classify at flush time."
         ),
     ),
+    labels: list[str] = typer.Option(
+        None,
+        "--label",
+        help=(
+            "Attach a label to the created inbox task. Repeatable. "
+            "Used by typed flows like plan_review "
+            "(e.g. --label plan_review --label 'plan_task:key/1' "
+            "--label 'explainer:/abs/path/plan-review.html')."
+        ),
+    ),
+    requester: str = typer.Option(
+        "user",
+        "--requester",
+        help=(
+            "Role assigned as the task's requester. Defaults to 'user' "
+            "(normal user inbox). Pass 'polly' to route to Polly's "
+            "inbox instead (fast-track plan_review)."
+        ),
+    ),
     db: str = typer.Option(
         ".pollypm/state.db", "--db",
         help="Path to SQLite database (default: same resolution as `pm inbox`).",
@@ -1488,6 +1507,9 @@ def notify(
     • pm notify "Deploy blocked" "Needs verification email click."
     • pm notify "Done: homepage rewrite" "Review at https://…"
     • echo "long body" | pm notify "Subject" -
+    • pm notify "Plan ready" "Review the plan" --priority immediate \\
+          --label plan_review --label "plan_task:demo/5" \\
+          --label "explainer:/abs/path/reports/plan-review.html"
     """
     if not subject.strip():
         typer.echo("Error: subject must not be empty.", err=True)
@@ -1593,6 +1615,18 @@ def notify(
 
     # Immediate tier (default) — create an inbox task as before.
     svc = _svc(db, project=project)
+    # Normalise the requester role. ``user`` → normal inbox (default).
+    # ``polly`` → fast-track plan_review: lands in Polly's inbox instead
+    # of the user's. Anything else is rejected so we don't silently
+    # mis-route escalations.
+    requester_role = (requester or "user").strip().lower()
+    if requester_role not in ("user", "polly"):
+        typer.echo(
+            f"Error: --requester must be 'user' or 'polly' (got {requester!r}).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    label_list = [label for label in (labels or []) if label and label.strip()]
     try:
         task = svc.create(
             title=subject,
@@ -1602,10 +1636,12 @@ def notify(
             flow_template="chat",
             # requester=user makes _roles_match_user() trip in the
             # inbox_view filter — the canonical mark for "user must
-            # look at this".
-            roles={"requester": "user", "operator": actor},
+            # look at this". requester=polly routes to Polly's inbox
+            # (see #297 fast-track plan review).
+            roles={"requester": requester_role, "operator": actor},
             priority="normal",
             created_by=actor,
+            labels=label_list or None,
         )
     except Exception as exc:  # noqa: BLE001
         typer.echo(f"Failed to create inbox task: {exc}", err=True)

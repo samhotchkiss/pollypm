@@ -17,22 +17,22 @@ def _config(tmp_path: Path) -> tuple[PollyPMConfig, Path]:
         project=ProjectSettings(
             name="pollypm",
             root_dir=project_root,
-            base_dir=project_root / ".pollypm-state",
-            logs_dir=project_root / ".pollypm-state/logs",
-            snapshots_dir=project_root / ".pollypm-state/snapshots",
-            state_db=project_root / ".pollypm-state/state.db",
+            base_dir=project_root / ".pollypm",
+            logs_dir=project_root / ".pollypm/logs",
+            snapshots_dir=project_root / ".pollypm/snapshots",
+            state_db=project_root / ".pollypm/state.db",
         ),
         pollypm=PollyPMSettings(controller_account="claude_main"),
         accounts={
             "claude_main": AccountConfig(
                 name="claude_main",
                 provider=ProviderKind.CLAUDE,
-                home=project_root / ".pollypm-state/homes/claude_main",
+                home=project_root / ".pollypm/homes/claude_main",
             ),
             "codex_main": AccountConfig(
                 name="codex_main",
                 provider=ProviderKind.CODEX,
-                home=project_root / ".pollypm-state/homes/codex_main",
+                home=project_root / ".pollypm/homes/codex_main",
             ),
         },
         sessions={
@@ -219,7 +219,7 @@ def test_up_starts_transcript_ingestion(monkeypatch, tmp_path: Path) -> None:
                 "Config",
                 (),
                 {
-                    "project": type("Project", (), {"tmux_session": "pollypm", "base_dir": config_path.parent / ".pollypm-state"})(),
+                    "project": type("Project", (), {"tmux_session": "pollypm", "base_dir": config_path.parent / ".pollypm"})(),
                     "accounts": {},
                     "projects": {},
                 },
@@ -247,4 +247,4 @@ def test_up_starts_transcript_ingestion(monkeypatch, tmp_path: Path) -> None:
     result = runner.invoke(cli.app, ["up", "--config", str(config_path)])
 
     assert result.exit_code == 0
-    assert calls == [str(config_path.parent / ".pollypm-state")]
+    assert calls == [str(config_path.parent / ".pollypm")]

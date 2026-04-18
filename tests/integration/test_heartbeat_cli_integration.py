@@ -35,17 +35,17 @@ agent_profile = "worker"
 name = "PollyPM"
 tmux_session = "pollypm"
 workspace_root = "{workspace_root}"
-base_dir = "{workspace_root / '.pollypm-state'}"
-logs_dir = "{workspace_root / '.pollypm-state' / 'logs'}"
-snapshots_dir = "{workspace_root / '.pollypm-state' / 'snapshots'}"
-state_db = "{workspace_root / '.pollypm-state' / 'state.db'}"
+base_dir = "{workspace_root / '.pollypm'}"
+logs_dir = "{workspace_root / '.pollypm' / 'logs'}"
+snapshots_dir = "{workspace_root / '.pollypm' / 'snapshots'}"
+state_db = "{workspace_root / '.pollypm' / 'state.db'}"
 
 [pollypm]
 controller_account = "claude_main"
 
 [accounts.claude_main]
 provider = "claude"
-home = "{workspace_root / '.pollypm-state' / 'homes' / 'claude_main'}"
+home = "{workspace_root / '.pollypm' / 'homes' / 'claude_main'}"
 
 [sessions.heartbeat]
 role = "heartbeat-supervisor"
@@ -160,7 +160,7 @@ def test_heartbeat_cli_commands_round_trip_state(monkeypatch, tmp_path: Path) ->
     cleared = json.loads(result.output)["alert"]
     assert cleared["status"] == "cleared"
 
-    store = StateStore((tmp_path / "workspace" / ".pollypm-state" / "state.db"))
+    store = StateStore((tmp_path / "workspace" / ".pollypm" / "state.db"))
     assert store.latest_heartbeat("worker_demo").snapshot_hash == "abc123"
     assert store.get_session_runtime("worker_demo").status == "needs_followup"
     assert store.open_alerts() == []
@@ -171,7 +171,7 @@ def test_send_command_respects_human_lease(monkeypatch, tmp_path: Path) -> None:
     config_path = _write_cli_config(tmp_path)
     fake_tmux = FakeTmux()
     monkeypatch.setattr("pollypm.session_services.tmux.TmuxClient", lambda: fake_tmux)
-    store = StateStore((tmp_path / "workspace" / ".pollypm-state" / "state.db"))
+    store = StateStore((tmp_path / "workspace" / ".pollypm" / "state.db"))
     store.set_lease("worker_demo", "human", "busy")
     store.close()
 

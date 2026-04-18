@@ -22,10 +22,10 @@ def _config(tmp_path: Path) -> tuple[PollyPMConfig, Path]:
     config = PollyPMConfig(
         project=ProjectSettings(
             root_dir=tmp_path,
-            base_dir=tmp_path / ".pollypm-state",
-            logs_dir=tmp_path / ".pollypm-state/logs",
-            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
-            state_db=tmp_path / ".pollypm-state/state.db",
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
         ),
         pollypm=PollyPMSettings(
             controller_account="claude_controller",
@@ -38,21 +38,21 @@ def _config(tmp_path: Path) -> tuple[PollyPMConfig, Path]:
                 provider=ProviderKind.CLAUDE,
                 email="claude@example.com",
                 runtime=RuntimeKind.LOCAL,
-                home=tmp_path / ".pollypm-state/homes/claude_controller",
+                home=tmp_path / ".pollypm/homes/claude_controller",
             ),
             "codex_backup": AccountConfig(
                 name="codex_backup",
                 provider=ProviderKind.CODEX,
                 email="codex@example.com",
                 runtime=RuntimeKind.LOCAL,
-                home=tmp_path / ".pollypm-state/homes/codex_backup",
+                home=tmp_path / ".pollypm/homes/codex_backup",
             ),
             "claude_worker": AccountConfig(
                 name="claude_worker",
                 provider=ProviderKind.CLAUDE,
                 email="worker@example.com",
                 runtime=RuntimeKind.LOCAL,
-                home=tmp_path / ".pollypm-state/homes/claude_worker",
+                home=tmp_path / ".pollypm/homes/claude_worker",
             ),
         },
         sessions={

@@ -119,10 +119,10 @@ def test_probe_account_usage_records_claude_refresh_failure(monkeypatch, tmp_pat
     config = PollyPMConfig(
         project=ProjectSettings(
             root_dir=tmp_path,
-            base_dir=tmp_path / ".pollypm-state",
-            logs_dir=tmp_path / ".pollypm-state/logs",
-            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
-            state_db=tmp_path / ".pollypm-state/state.db",
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
         ),
         pollypm=PollyPMSettings(controller_account="claude_primary"),
         accounts={
@@ -131,7 +131,7 @@ def test_probe_account_usage_records_claude_refresh_failure(monkeypatch, tmp_pat
                 provider=ProviderKind.CLAUDE,
                 email="claude@example.com",
                 runtime=RuntimeKind.LOCAL,
-                home=tmp_path / ".pollypm-state/homes/claude_primary",
+                home=tmp_path / ".pollypm/homes/claude_primary",
             )
         },
         sessions={},

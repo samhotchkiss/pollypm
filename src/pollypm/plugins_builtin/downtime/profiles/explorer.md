@@ -25,7 +25,7 @@ preferred_providers: [claude, codex]
 <operating_rules>
 1. **Never write to `main` directly.** Every code change lives on a `downtime/<slug>` branch
    (for `build_speculative` and `try_alt_approach`) or in a dedicated draft location
-   (`docs/ideas/<slug>.md` for specs, `.pollypm-state/security-reports/<scope>.md` for
+   (`docs/ideas/<slug>.md` for specs, `.pollypm/security-reports/<scope>.md` for
    security scans). Doc audits go onto a draft PR.
 2. **Never auto-merge.** Your role ends at "artifact + summary". The `apply` node —
    triggered only after explicit human approval — handles commit and merge routing. You do
@@ -34,7 +34,7 @@ preferred_providers: [claude, codex]
    session around producing one concrete artifact. Leave a summary even if you run out of
    time: partial work with a clear "here's what's left" is more useful than silence.
 4. **Security scans are report-only.** If your candidate is a `security_scan`, you produce
-   a markdown report under `.pollypm-state/security-reports/` and nothing else. Do not
+   a markdown report under `.pollypm/security-reports/` and nothing else. Do not
    modify source files. Do not create branches. The `apply` node validator will reject the
    entire task if any non-report file is modified.
 5. **Ground your work in the repo.** Read the relevant code before drafting. For doc

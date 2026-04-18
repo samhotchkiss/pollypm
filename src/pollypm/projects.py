@@ -27,7 +27,7 @@ SKIP_DIR_NAMES = {
     ".local",
     ".npm",
     ".pnpm-store",
-    ".pollypm-state",
+    ".pollypm",
     ".rustup",
     ".Trash",
     ".venv",
@@ -92,7 +92,7 @@ def detect_project_kind(path: Path) -> ProjectKind:
 
 
 def project_pollypm_dir(project_path: Path) -> Path:
-    return normalize_project_path(project_path) / ".pollypm-state"
+    return normalize_project_path(project_path) / ".pollypm"
 
 
 def project_instruction_dir(project_path: Path) -> Path:
@@ -213,7 +213,7 @@ def ensure_project_scaffold(project_path: Path) -> Path:
         shutil.copyfile(PROJECT_INSTRUCTIONS_TEMPLATE, instructions_target)
     # Generate system reference docs for agent consumption
     scaffold_docs(normalize_project_path(project_path))
-    _ensure_gitignore_entry(normalize_project_path(project_path), ".pollypm-state/")
+    _ensure_gitignore_entry(normalize_project_path(project_path), ".pollypm/")
     return pollypm_dir
 
 

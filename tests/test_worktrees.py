@@ -29,14 +29,14 @@ def _git_project(tmp_path: Path) -> Path:
 def test_worktree_lifecycle(tmp_path: Path) -> None:
     repo = _git_project(tmp_path)
     config = PollyPMConfig(
-        project=ProjectSettings(root_dir=tmp_path, base_dir=tmp_path / ".pollypm-state", logs_dir=tmp_path / ".pollypm-state/logs", snapshots_dir=tmp_path / ".pollypm-state/snapshots", state_db=tmp_path / ".pollypm-state/state.db"),
+        project=ProjectSettings(root_dir=tmp_path, base_dir=tmp_path / ".pollypm", logs_dir=tmp_path / ".pollypm/logs", snapshots_dir=tmp_path / ".pollypm/snapshots", state_db=tmp_path / ".pollypm/state.db"),
         pollypm=PollyPMSettings(controller_account="codex_primary"),
         accounts={
             "codex_primary": AccountConfig(
                 name="codex_primary",
                 provider=ProviderKind.CODEX,
                 email="codex@example.com",
-                home=tmp_path / ".pollypm-state/homes/codex_primary",
+                home=tmp_path / ".pollypm/homes/codex_primary",
             )
         },
         sessions={},

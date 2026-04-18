@@ -32,15 +32,15 @@ def test_worker_launches_use_project_or_worktree_cwd_while_auth_stays_in_account
     worktree_root = project_root / ".pollypm" / "worktrees" / "review_demo" / "demo-pa-review_demo"
     project_root.mkdir()
     worktree_root.mkdir(parents=True)
-    account_home = tmp_path / ".pollypm-state" / "homes" / "codex_worker"
+    account_home = tmp_path / ".pollypm" / "homes" / "codex_worker"
     config = PollyPMConfig(
         project=ProjectSettings(
             name="pollypm",
             root_dir=tmp_path,
-            base_dir=tmp_path / ".pollypm-state",
-            logs_dir=tmp_path / ".pollypm-state/logs",
-            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
-            state_db=tmp_path / ".pollypm-state/state.db",
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
         ),
         pollypm=PollyPMSettings(controller_account="codex_worker"),
         accounts={

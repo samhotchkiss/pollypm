@@ -7,7 +7,7 @@ a separate downtime task or a scheduled planning item.
 
 Enforcement (spec §10):
 
-* The handler writes exclusively under ``.pollypm-state/security-reports/``.
+* The handler writes exclusively under ``.pollypm/security-reports/``.
 * :func:`validate_no_source_changes` checks that no tracked file
   outside the report dir was modified during the exploration. dt06's
   apply path calls this before stamping the report as reviewed — if
@@ -28,7 +28,7 @@ from pollypm.plugins_builtin.downtime.handlers.spec_feature import slugify
 logger = logging.getLogger(__name__)
 
 
-REPORT_DIR = Path(".pollypm-state") / "security-reports"
+REPORT_DIR = Path(".pollypm") / "security-reports"
 # Files under this prefix are the only ones the handler is allowed to
 # write. Anything else means the explorer tried to write code — which
 # is a hard refusal for this category.

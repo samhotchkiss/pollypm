@@ -76,7 +76,7 @@ class FakeConfig:
 def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     project_root = tmp_path / "proj"
     project_root.mkdir()
-    base_dir = tmp_path / ".pollypm-state"
+    base_dir = tmp_path / ".pollypm"
     base_dir.mkdir()
     config_path = tmp_path / "pollypm.toml"
     config_path.write_text("[advisor]\nenabled = true\n")

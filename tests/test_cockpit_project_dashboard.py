@@ -328,7 +328,7 @@ class TestSectionInsights:
         assert any("no advisor insights" in l for l in lines)
 
     def test_recent_emit_entry_rendered(self, tmp_path: Path):
-        state_dir = tmp_path / ".pollypm-state"
+        state_dir = tmp_path / ".pollypm"
         state_dir.mkdir()
         log = state_dir / "advisor-log.jsonl"
         log.write_text(
@@ -347,7 +347,7 @@ class TestSectionInsights:
         assert "[recommendation]" in joined
 
     def test_silent_entries_are_skipped(self, tmp_path: Path):
-        state_dir = tmp_path / ".pollypm-state"
+        state_dir = tmp_path / ".pollypm"
         state_dir.mkdir()
         log = state_dir / "advisor-log.jsonl"
         log.write_text(
@@ -362,7 +362,7 @@ class TestSectionInsights:
         assert any("no advisor insights" in l for l in lines)
 
     def test_wrong_project_entries_filtered_out(self, tmp_path: Path):
-        state_dir = tmp_path / ".pollypm-state"
+        state_dir = tmp_path / ".pollypm"
         state_dir.mkdir()
         log = state_dir / "advisor-log.jsonl"
         log.write_text(
@@ -654,7 +654,7 @@ def test_render_project_dashboard_integration(tmp_path: Path):
     proj_path, project_key = _seed_project(tmp_path)
 
     # Advisor log with an emit entry.
-    state_dir = proj_path / ".pollypm-state"
+    state_dir = proj_path / ".pollypm"
     state_dir.mkdir(exist_ok=True)
     (state_dir / "advisor-log.jsonl").write_text(
         json.dumps({

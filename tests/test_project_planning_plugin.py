@@ -359,7 +359,7 @@ def test_user_level_tests_pass_blocks_with_failing_receipt(tmp_path: Path) -> No
     from pollypm.work.gates import GateRegistry
 
     gate = GateRegistry().get("user_level_tests_pass")
-    receipts = tmp_path / ".pollypm-state" / "test-receipts"
+    receipts = tmp_path / ".pollypm" / "test-receipts"
     receipts.mkdir(parents=True)
     receipts.joinpath("demo-1.json").write_text(
         _json.dumps({"passed": False, "details": "3/5 scenarios failed"})
@@ -375,7 +375,7 @@ def test_user_level_tests_pass_passes_with_receipt(tmp_path: Path) -> None:
     from pollypm.work.gates import GateRegistry
 
     gate = GateRegistry().get("user_level_tests_pass")
-    receipts = tmp_path / ".pollypm-state" / "test-receipts"
+    receipts = tmp_path / ".pollypm" / "test-receipts"
     receipts.mkdir(parents=True)
     receipts.joinpath("demo-1.json").write_text(
         _json.dumps({"passed": True, "details": "Playwright 5/5"})

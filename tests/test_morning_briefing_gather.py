@@ -47,10 +47,10 @@ def _make_empty_config(project_root: Path) -> PollyPMConfig:
         project=ProjectSettings(
             name="Fixture",
             root_dir=project_root,
-            base_dir=project_root / ".pollypm-state",
-            logs_dir=project_root / ".pollypm-state" / "logs",
-            snapshots_dir=project_root / ".pollypm-state" / "snapshots",
-            state_db=project_root / ".pollypm-state" / "state.db",
+            base_dir=project_root / ".pollypm",
+            logs_dir=project_root / ".pollypm" / "logs",
+            snapshots_dir=project_root / ".pollypm" / "snapshots",
+            state_db=project_root / ".pollypm" / "state.db",
         ),
         pollypm=PollyPMSettings(controller_account=""),
         accounts={},
@@ -386,7 +386,7 @@ class TestGatherDowntimeArtifacts:
 
 class TestGatherAdvisorInsights:
     def test_reads_emitted_entries(self, tmp_path: Path) -> None:
-        log_path = tmp_path / ".pollypm-state" / "advisor-log.jsonl"
+        log_path = tmp_path / ".pollypm" / "advisor-log.jsonl"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(
             json.dumps({
@@ -527,7 +527,7 @@ class TestGatherYesterdayIntegration:
             from_state="draft", to_state="queued", created_at=yesterday_ts,
         )
 
-        advisor_log = ambient / ".pollypm-state" / "advisor-log.jsonl"
+        advisor_log = ambient / ".pollypm" / "advisor-log.jsonl"
         advisor_log.parent.mkdir(parents=True, exist_ok=True)
         advisor_log.write_text(
             json.dumps({

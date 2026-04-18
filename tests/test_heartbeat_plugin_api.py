@@ -25,10 +25,10 @@ def _config(tmp_path: Path) -> PollyPMConfig:
     return PollyPMConfig(
         project=ProjectSettings(
             root_dir=tmp_path,
-            base_dir=tmp_path / ".pollypm-state",
-            logs_dir=tmp_path / ".pollypm-state/logs",
-            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
-            state_db=tmp_path / ".pollypm-state/state.db",
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
         ),
         pollypm=PollyPMSettings(
             controller_account="claude_controller",
@@ -40,7 +40,7 @@ def _config(tmp_path: Path) -> PollyPMConfig:
                 name="claude_controller",
                 provider=ProviderKind.CLAUDE,
                 email="claude@example.com",
-                home=tmp_path / ".pollypm-state/homes/claude_controller",
+                home=tmp_path / ".pollypm/homes/claude_controller",
             ),
         },
         sessions={
@@ -288,7 +288,7 @@ def test_supervisor_heartbeat_api_records_snapshot_learnings_into_memory(tmp_pat
         project_key="pollypm",
         cwd=str(tmp_path),
         window_name="pm-operator",
-        source_path=str(tmp_path / ".pollypm-state" / "logs" / "operator.log"),
+        source_path=str(tmp_path / ".pollypm" / "logs" / "operator.log"),
         snapshot_path=str(snapshot_path),
         pane_text=(
             "Decision: use the heartbeat snapshot as a memory source. "
@@ -324,7 +324,7 @@ def test_supervisor_heartbeat_api_deduplicates_snapshot_learnings(tmp_path: Path
         project_key="pollypm",
         cwd=str(tmp_path),
         window_name="pm-operator",
-        source_path=str(tmp_path / ".pollypm-state" / "logs" / "operator.log"),
+        source_path=str(tmp_path / ".pollypm" / "logs" / "operator.log"),
         snapshot_path=str(snapshot_path),
         pane_text="Decision: keep heartbeat learnings deduplicated.",
         pane_command="claude",

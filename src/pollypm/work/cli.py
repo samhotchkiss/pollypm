@@ -69,63 +69,62 @@ def _run(fn, *args, **kwargs):
 
 
 def _resolve_db_path(db: str, project: str | None = None) -> Path:
-    """Resolve the database path, trying the pollypm config for project root.
+    """Resolve the work-service database path.
 
-    When *project* is given and resolves to a registered project (and the
-    default ``--db`` wasn't overridden), resolve to that project's
-    ``.pollypm/state.db``.
+    Issue #339 collapsed PollyPM's on-disk layout to exactly two scopes.
+    This resolver only ever returns one of three things:
 
-    When the default ``--db .pollypm/state.db`` is used with no (or an
-    unregistered) project, prefer the canonical workspace-root DB at
-    ``<workspace_root>/.pollypm/state.db`` so ``pm notify`` and ``pm inbox``
-    land in the same place regardless of cwd (#271). The cockpit inbox
-    aggregator also scans workspace-root alongside per-project DBs, so
-    notifications stay visible.
+    1. An explicit ``--db`` override — a caller passing anything other
+       than the default path gets that path back unchanged. This is the
+       escape hatch tests and CI paths rely on to stage their own DB.
+    2. ``<workspace_root>/.pollypm/state.db`` — the canonical default
+       for ``pm notify``, ``pm inbox``, and every workspace-scoped task
+       command. Resolved from the loaded PollyPM config so the same DB
+       is returned regardless of cwd (#271). The cockpit inbox
+       aggregator scans this same file, so notifications stay visible.
+    3. The literal default path resolved against cwd, as a last-resort
+       fallback when the config can't be loaded (fresh install, or the
+       config file is missing / malformed).
 
-    A caller that explicitly passes ``--db`` always wins; that escape hatch
-    keeps tests and CI paths that stage their own DB working unchanged.
+    The old project-registered-lookup branch (which redirected to
+    ``<project>/.pollypm/work/work.db``) is gone — project isolation is
+    row-level now via the ``scope`` column on the workspace-scope DB,
+    not per-file.
     """
     is_default = db == ".pollypm/state.db"
 
-    # If a specific, registered project is requested, always use that
-    # project's db. Unknown project names (e.g. the sentinel "inbox" used
-    # by `pm notify`) fall through to the workspace-root default below.
-    if project and is_default:
-        try:
-            from pollypm.config import load_config
-            config = load_config()
-            # Normalize hyphens to underscores for flexible matching
-            normalized = project.replace("-", "_")
-            if project in config.projects:
-                pass  # exact match
-            elif normalized in config.projects:
-                project = normalized
-            if project in config.projects:
-                candidate = config.projects[project].path / ".pollypm" / "state.db"
-                candidate.parent.mkdir(parents=True, exist_ok=True)
-                return candidate
-        except Exception:
-            pass
+    # Explicit override wins — return the caller's path unchanged.
+    if not is_default:
+        db_path = Path(db)
+        if db_path.exists():
+            return db_path
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        return db_path
+
+    # The *project* argument used to route to a per-project DB. Post-#339
+    # it's purely a filter passed into the service layer; it no longer
+    # affects which DB file we open.
+    _ = project
 
     # Default resolution: workspace-root DB. Every `pm notify`/`pm inbox`
-    # call without an explicit --db lands here, so items are always visible
-    # regardless of which worktree or directory the caller invoked from.
-    if is_default:
-        try:
-            from pollypm.config import load_config
-            config = load_config()
-            workspace_root = getattr(config.project, "workspace_root", None)
-            if workspace_root is not None:
-                candidate = Path(workspace_root) / ".pollypm" / "state.db"
-                candidate.parent.mkdir(parents=True, exist_ok=True)
-                return candidate
-        except Exception:
-            pass
+    # call without an explicit --db lands here, so items are always
+    # visible regardless of which worktree or directory the caller
+    # invoked from.
+    try:
+        from pollypm.config import load_config
+        config = load_config()
+        workspace_root = getattr(config.project, "workspace_root", None)
+        if workspace_root is not None:
+            candidate = Path(workspace_root) / ".pollypm" / "state.db"
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            return candidate
+    except Exception:
+        pass
 
+    # Fallback: cwd-relative default when no config is loadable.
     db_path = Path(db)
     if db_path.exists():
         return db_path
-
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return db_path
 

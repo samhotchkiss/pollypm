@@ -15,7 +15,7 @@ no LLM calls, no per-type policy. Just four local rules:
 4. **Importance decay** — entries older than 90 days that haven't been
    recalled in 30 days drop importance by 1 (floor 1).
 
-Every action is appended to ``.pollypm-state/memory-curator.jsonl`` as
+Every action is appended to ``.pollypm/memory-curator.jsonl`` as
 one JSON record per line so the user can audit what the curator did.
 
 Observability: a single daily inbox entry summarizes the run. If

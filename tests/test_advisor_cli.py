@@ -74,7 +74,7 @@ class FakeConfig:
 
 @pytest.fixture
 def cli_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    base_dir = tmp_path / ".pollypm-state"
+    base_dir = tmp_path / ".pollypm"
     base_dir.mkdir()
     config_path = tmp_path / "pollypm.toml"
     config_path.write_text("")

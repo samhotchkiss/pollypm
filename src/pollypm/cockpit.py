@@ -754,7 +754,7 @@ def _section_insights(project_path: Path, project_key: str) -> list[str]:
     from datetime import UTC, datetime, timedelta
 
     lines = [_dashboard_divider("Insights"), ""]
-    log_path = project_path / ".pollypm-state" / "advisor-log.jsonl"
+    log_path = project_path / ".pollypm" / "advisor-log.jsonl"
     if not log_path.exists():
         lines.extend(
             [f"{_DASHBOARD_BULLET}(no advisor insights in last 7 days)", ""]

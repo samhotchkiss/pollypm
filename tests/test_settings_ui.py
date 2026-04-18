@@ -91,8 +91,8 @@ class _FakePollyPM:
 class _FakeProjectSettings:
     def __init__(self, tmp_path: Path) -> None:
         self.workspace_root = tmp_path
-        self.state_db = tmp_path / ".pollypm-state" / "state.db"
-        self.logs_dir = tmp_path / ".pollypm-state" / "logs"
+        self.state_db = tmp_path / ".pollypm" / "state.db"
+        self.logs_dir = tmp_path / ".pollypm" / "logs"
 
 
 class _FakePlanner:

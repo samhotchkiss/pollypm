@@ -49,9 +49,9 @@ def test_extension_host_loads_builtin_provider_and_runtime(tmp_path: Path) -> No
 def test_repo_local_plugin_overrides_user_plugin(monkeypatch, tmp_path: Path) -> None:
     builtin_root = Path(__file__).resolve().parents[1] / "src" / "pollypm" / "plugins_builtin"
     user_root = tmp_path / "user-plugins"
-    repo_root = tmp_path / ".pollypm-state" / "plugins"
+    repo_root = tmp_path / ".pollypm" / "plugins"
     user_plugin = user_root / "override_provider_test"
-    repo_plugin = tmp_path / ".pollypm-state" / "plugins" / "override_provider_test"
+    repo_plugin = tmp_path / ".pollypm" / "plugins" / "override_provider_test"
     monkeypatch.setattr(
         ExtensionHost,
         "_plugin_search_paths",
@@ -146,7 +146,7 @@ def test_get_provider_and_runtime_resolve_through_extension_host(tmp_path: Path)
 def test_transcript_source_plugin_registers_and_resolves(monkeypatch, tmp_path: Path) -> None:
     builtin_root = Path(__file__).resolve().parents[1] / "src" / "pollypm" / "plugins_builtin"
     user_root = tmp_path / "user-plugins"
-    repo_root = tmp_path / ".pollypm-state" / "plugins"
+    repo_root = tmp_path / ".pollypm" / "plugins"
     repo_plugin = repo_root / "transcript_source_test"
     monkeypatch.setattr(
         ExtensionHost,
@@ -183,7 +183,7 @@ def test_transcript_source_plugin_registers_and_resolves(monkeypatch, tmp_path: 
 def test_repo_heartbeat_plugin_overrides_builtin_backend(monkeypatch, tmp_path: Path) -> None:
     builtin_root = Path(__file__).resolve().parents[1] / "src" / "pollypm" / "plugins_builtin"
     user_root = tmp_path / "user-plugins"
-    repo_root = tmp_path / ".pollypm-state" / "plugins"
+    repo_root = tmp_path / ".pollypm" / "plugins"
     repo_plugin = repo_root / "override_heartbeat_test"
     monkeypatch.setattr(
         ExtensionHost,
@@ -245,7 +245,7 @@ entrypoint = "plugin.py:plugin"{top_requires}
 def test_structured_capabilities_parse(monkeypatch, tmp_path: Path) -> None:
     builtin_root = Path(__file__).resolve().parents[1] / "src" / "pollypm" / "plugins_builtin"
     user_root = tmp_path / "user-plugins"
-    repo_root = tmp_path / ".pollypm-state" / "plugins"
+    repo_root = tmp_path / ".pollypm" / "plugins"
     repo_plugin = repo_root / "structured_caps_test"
     monkeypatch.setattr(
         ExtensionHost,
@@ -290,7 +290,7 @@ def test_legacy_bare_string_capabilities_still_parse(monkeypatch, tmp_path: Path
 
     builtin_root = Path(__file__).resolve().parents[1] / "src" / "pollypm" / "plugins_builtin"
     user_root = tmp_path / "user-plugins"
-    repo_root = tmp_path / ".pollypm-state" / "plugins"
+    repo_root = tmp_path / ".pollypm" / "plugins"
     repo_plugin = repo_root / "legacy_caps_test"
     monkeypatch.setattr(
         ExtensionHost,
@@ -317,7 +317,7 @@ def test_legacy_bare_string_capabilities_still_parse(monkeypatch, tmp_path: Path
 def test_requires_api_mismatch_skips_plugin(monkeypatch, tmp_path: Path) -> None:
     builtin_root = Path(__file__).resolve().parents[1] / "src" / "pollypm" / "plugins_builtin"
     user_root = tmp_path / "user-plugins"
-    repo_root = tmp_path / ".pollypm-state" / "plugins"
+    repo_root = tmp_path / ".pollypm" / "plugins"
     repo_plugin = repo_root / "bad_requires_api"
     monkeypatch.setattr(
         ExtensionHost,
@@ -342,7 +342,7 @@ def test_requires_api_mismatch_skips_plugin(monkeypatch, tmp_path: Path) -> None
 def test_per_capability_requires_api_drops_single_capability(monkeypatch, tmp_path: Path) -> None:
     builtin_root = Path(__file__).resolve().parents[1] / "src" / "pollypm" / "plugins_builtin"
     user_root = tmp_path / "user-plugins"
-    repo_root = tmp_path / ".pollypm-state" / "plugins"
+    repo_root = tmp_path / ".pollypm" / "plugins"
     repo_plugin = repo_root / "cap_requires_api"
     monkeypatch.setattr(
         ExtensionHost,
@@ -378,7 +378,7 @@ def test_explicit_replaces_preserves_earlier_provider(monkeypatch, tmp_path: Pat
     """An explicit `replaces` capability wins over implicit last-write."""
     builtin_root = Path(__file__).resolve().parents[1] / "src" / "pollypm" / "plugins_builtin"
     user_root = tmp_path / "user-plugins"
-    repo_root = tmp_path / ".pollypm-state" / "plugins"
+    repo_root = tmp_path / ".pollypm" / "plugins"
     user_plugin = user_root / "explicit_replacer"
     repo_plugin = repo_root / "late_override"
     monkeypatch.setattr(

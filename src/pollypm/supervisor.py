@@ -531,12 +531,12 @@ class Supervisor:
         """Clear stale session markers so all sessions start fresh."""
         for homes_dir in [self.config.project.base_dir / "homes", self.config.project.base_dir / "control-homes"]:
             if homes_dir.is_dir():
-                for marker in homes_dir.glob("*/.pollypm-state/session-markers/*"):
+                for marker in homes_dir.glob("*/.pollypm/session-markers/*"):
                     marker.unlink(missing_ok=True)
         # Also clear markers in account homes (e.g. ~/.pollypm/agent_homes/claude_1)
         for account in self.config.accounts.values():
             if account.home is not None:
-                markers_dir = account.home / ".pollypm-state" / "session-markers"
+                markers_dir = account.home / ".pollypm" / "session-markers"
                 if markers_dir.is_dir():
                     for marker in markers_dir.iterdir():
                         marker.unlink(missing_ok=True)

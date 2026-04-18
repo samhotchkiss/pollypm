@@ -47,7 +47,7 @@ from pollypm.storage.state import StateStore
 
 
 def test_fresh_schema_has_scope_tier_column(tmp_path: Path) -> None:
-    db_path = tmp_path / ".pollypm-state" / "state.db"
+    db_path = tmp_path / ".pollypm" / "state.db"
     store = StateStore(db_path)
     try:
         cols = {
@@ -65,7 +65,7 @@ def test_migration_backfills_scope_tier_on_pre_m03_entries(tmp_path: Path) -> No
     set to ``'project'`` — matching the acceptance contract that
     pre-M03 entries get the never-auto-expire lifecycle.
     """
-    db_path = tmp_path / ".pollypm-state" / "state.db"
+    db_path = tmp_path / ".pollypm" / "state.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Legacy schema — no ``scope_tier`` column.

@@ -33,7 +33,7 @@ from pollypm.plugins_builtin.downtime.handlers.security_scan import (
 logger = logging.getLogger(__name__)
 
 
-ARCHIVE_DIR = Path(".pollypm-state") / "archive"
+ARCHIVE_DIR = Path(".pollypm") / "archive"
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +191,7 @@ def plan_security_scan(
             refused=True,
             refusal_reason=(
                 "Security-scan task modified files outside "
-                ".pollypm-state/security-reports/ — refusing to apply. "
+                ".pollypm/security-reports/ — refusing to apply. "
                 f"Offending paths: {offenders!r}"
             ),
         )

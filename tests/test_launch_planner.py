@@ -31,10 +31,10 @@ def _config(tmp_path: Path) -> PollyPMConfig:
     return PollyPMConfig(
         project=ProjectSettings(
             root_dir=tmp_path,
-            base_dir=tmp_path / ".pollypm-state",
-            logs_dir=tmp_path / ".pollypm-state/logs",
-            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
-            state_db=tmp_path / ".pollypm-state/state.db",
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
         ),
         pollypm=PollyPMSettings(controller_account="claude_controller"),
         accounts={
@@ -42,7 +42,7 @@ def _config(tmp_path: Path) -> PollyPMConfig:
                 name="claude_controller",
                 provider=ProviderKind.CLAUDE,
                 email="claude@example.com",
-                home=tmp_path / ".pollypm-state/homes/claude_controller",
+                home=tmp_path / ".pollypm/homes/claude_controller",
             ),
         },
         sessions={
@@ -154,7 +154,7 @@ def test_default_planner_controller_override_matches(tmp_path: Path) -> None:
         name="codex_backup",
         provider=ProviderKind.CODEX,
         email="codex@example.com",
-        home=tmp_path / ".pollypm-state/homes/codex_backup",
+        home=tmp_path / ".pollypm/homes/codex_backup",
     )
     sup = Supervisor(config)
     sup.ensure_layout()

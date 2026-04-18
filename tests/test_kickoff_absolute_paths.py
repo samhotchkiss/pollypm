@@ -34,10 +34,10 @@ def _config(tmp_path: Path) -> PollyPMConfig:
     return PollyPMConfig(
         project=ProjectSettings(
             root_dir=tmp_path,
-            base_dir=tmp_path / ".pollypm-state",
-            logs_dir=tmp_path / ".pollypm-state/logs",
-            snapshots_dir=tmp_path / ".pollypm-state/snapshots",
-            state_db=tmp_path / ".pollypm-state/state.db",
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
         ),
         pollypm=PollyPMSettings(controller_account="claude_controller"),
         accounts={
@@ -45,7 +45,7 @@ def _config(tmp_path: Path) -> PollyPMConfig:
                 name="claude_controller",
                 provider=ProviderKind.CLAUDE,
                 email="claude@example.com",
-                home=tmp_path / ".pollypm-state/homes/claude_controller",
+                home=tmp_path / ".pollypm/homes/claude_controller",
             ),
         },
         sessions={
@@ -90,7 +90,7 @@ def test_supervisor_kickoff_contains_absolute_prompt_path(tmp_path: Path) -> Non
     kickoff = supervisor._prepare_initial_input("operator", _long_prompt())
 
     expected_prompt = (
-        tmp_path / ".pollypm-state" / "control-prompts" / "operator.md"
+        tmp_path / ".pollypm" / "control-prompts" / "operator.md"
     )
     # The absolute prompt path must appear in the kickoff string.
     assert str(expected_prompt) in kickoff
@@ -146,7 +146,7 @@ def test_supervisor_kickoff_paths_start_with_slash(tmp_path: Path) -> None:
     # We don't parse the exact wording — instead, we confirm both
     # known file references appear as absolute paths.
     prompt_path = (
-        tmp_path / ".pollypm-state" / "control-prompts" / "operator.md"
+        tmp_path / ".pollypm" / "control-prompts" / "operator.md"
     )
     assert str(prompt_path).startswith("/")
     assert str(instruct_path).startswith("/")
@@ -167,7 +167,7 @@ def test_supervisor_kickoff_prompt_file_actually_exists(tmp_path: Path) -> None:
     kickoff = supervisor._prepare_initial_input("operator", _long_prompt())
 
     prompt_path = (
-        tmp_path / ".pollypm-state" / "control-prompts" / "operator.md"
+        tmp_path / ".pollypm" / "control-prompts" / "operator.md"
     )
     assert prompt_path.exists()
     # And the kickoff references that very path.
@@ -190,7 +190,7 @@ def test_supervisor_kickoff_resolves_from_foreign_cwd(
 
     kickoff = supervisor._prepare_initial_input("operator", _long_prompt())
     prompt_path = (
-        tmp_path / ".pollypm-state" / "control-prompts" / "operator.md"
+        tmp_path / ".pollypm" / "control-prompts" / "operator.md"
     )
 
     # Pretend the worker is chdir'd into an unrelated worktree-like dir.
@@ -230,7 +230,7 @@ def test_session_service_kickoff_contains_absolute_prompt_path(
     )
 
     expected_prompt = (
-        tmp_path / ".pollypm-state" / "control-prompts" / "operator.md"
+        tmp_path / ".pollypm" / "control-prompts" / "operator.md"
     )
     assert str(expected_prompt) in kickoff
     # Fragile relative form (the bug) would appear as a bare token,
@@ -262,7 +262,7 @@ def test_session_service_kickoff_resolves_from_foreign_cwd(
     )
 
     prompt_path = (
-        tmp_path / ".pollypm-state" / "control-prompts" / "operator.md"
+        tmp_path / ".pollypm" / "control-prompts" / "operator.md"
     )
 
     foreign_cwd = tmp_path / "fake-worktree"
@@ -301,7 +301,7 @@ def test_session_service_kickoff_worker_role_bypasses_check(
 
     expected_prompt = (
         tmp_path
-        / ".pollypm-state"
+        / ".pollypm"
         / "control-prompts"
         / "worker_e2e_auto_xxx.md"
     )

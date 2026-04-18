@@ -18,14 +18,14 @@ from pollypm.storage.state import StateStore
 
 def test_mechanical_checkpoint_persists_files_and_state(tmp_path: Path) -> None:
     config = PollyPMConfig(
-        project=ProjectSettings(root_dir=tmp_path, base_dir=tmp_path / ".pollypm-state", logs_dir=tmp_path / ".pollypm-state/logs", snapshots_dir=tmp_path / ".pollypm-state/snapshots", state_db=tmp_path / ".pollypm-state/state.db"),
+        project=ProjectSettings(root_dir=tmp_path, base_dir=tmp_path / ".pollypm", logs_dir=tmp_path / ".pollypm/logs", snapshots_dir=tmp_path / ".pollypm/snapshots", state_db=tmp_path / ".pollypm/state.db"),
         pollypm=PollyPMSettings(controller_account="codex_primary"),
         accounts={
             "codex_primary": AccountConfig(
                 name="codex_primary",
                 provider=ProviderKind.CODEX,
                 email="codex@example.com",
-                home=tmp_path / ".pollypm-state/homes/codex_primary",
+                home=tmp_path / ".pollypm/homes/codex_primary",
             )
         },
         sessions={
@@ -53,14 +53,14 @@ def test_mechanical_checkpoint_persists_files_and_state(tmp_path: Path) -> None:
         session=config.sessions["worker"],
         account=config.accounts["codex_primary"],
         window_name="worker-demo",
-        log_path=tmp_path / ".pollypm-state/logs/worker/worker-demo.log",
+        log_path=tmp_path / ".pollypm/logs/worker/worker-demo.log",
         command="codex",
     )
     store = StateStore(config.project.state_db)
     artifact = write_mechanical_checkpoint(
         config,
         launch,
-        snapshot_path=tmp_path / ".pollypm-state/snapshots/worker-demo.txt",
+        snapshot_path=tmp_path / ".pollypm/snapshots/worker-demo.txt",
         snapshot_content="Line 1\nLine 2\n",
         log_bytes=42,
         alerts=["idle_output"],
@@ -76,7 +76,7 @@ def test_mechanical_checkpoint_persists_files_and_state(tmp_path: Path) -> None:
         project_key="demo",
         level="level0",
         artifact=artifact,
-        snapshot_path=tmp_path / ".pollypm-state/snapshots/worker-demo.txt",
+        snapshot_path=tmp_path / ".pollypm/snapshots/worker-demo.txt",
         memory_backend_name="file",
     )
     latest = store.latest_checkpoint("worker")
@@ -92,14 +92,14 @@ def test_mechanical_checkpoint_persists_files_and_state(tmp_path: Path) -> None:
 
 def test_record_checkpoint_preserves_existing_runtime_status(tmp_path: Path) -> None:
     config = PollyPMConfig(
-        project=ProjectSettings(root_dir=tmp_path, base_dir=tmp_path / ".pollypm-state", logs_dir=tmp_path / ".pollypm-state/logs", snapshots_dir=tmp_path / ".pollypm-state/snapshots", state_db=tmp_path / ".pollypm-state/state.db"),
+        project=ProjectSettings(root_dir=tmp_path, base_dir=tmp_path / ".pollypm", logs_dir=tmp_path / ".pollypm/logs", snapshots_dir=tmp_path / ".pollypm/snapshots", state_db=tmp_path / ".pollypm/state.db"),
         pollypm=PollyPMSettings(controller_account="codex_primary"),
         accounts={
             "codex_primary": AccountConfig(
                 name="codex_primary",
                 provider=ProviderKind.CODEX,
                 email="codex@example.com",
-                home=tmp_path / ".pollypm-state/homes/codex_primary",
+                home=tmp_path / ".pollypm/homes/codex_primary",
             )
         },
         sessions={
@@ -127,7 +127,7 @@ def test_record_checkpoint_preserves_existing_runtime_status(tmp_path: Path) -> 
         session=config.sessions["worker"],
         account=config.accounts["codex_primary"],
         window_name="worker-demo",
-        log_path=tmp_path / ".pollypm-state/logs/worker/worker-demo.log",
+        log_path=tmp_path / ".pollypm/logs/worker/worker-demo.log",
         command="codex",
     )
     store = StateStore(config.project.state_db)
@@ -139,7 +139,7 @@ def test_record_checkpoint_preserves_existing_runtime_status(tmp_path: Path) -> 
     artifact = write_mechanical_checkpoint(
         config,
         launch,
-        snapshot_path=tmp_path / ".pollypm-state/snapshots/worker-demo.txt",
+        snapshot_path=tmp_path / ".pollypm/snapshots/worker-demo.txt",
         snapshot_content="Line 1\nLine 2\n",
         log_bytes=42,
         alerts=["needs_followup"],
@@ -151,7 +151,7 @@ def test_record_checkpoint_preserves_existing_runtime_status(tmp_path: Path) -> 
         project_key="demo",
         level="level0",
         artifact=artifact,
-        snapshot_path=tmp_path / ".pollypm-state/snapshots/worker-demo.txt",
+        snapshot_path=tmp_path / ".pollypm/snapshots/worker-demo.txt",
         memory_backend_name="file",
     )
 

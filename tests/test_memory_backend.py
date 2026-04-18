@@ -259,7 +259,7 @@ def test_migration_backfills_type_and_importance_on_existing_entries(
     * existing rows default to type='project' and importance=3
     * the on-disk markdown file is still readable via the backend
     """
-    db_path = tmp_path / ".pollypm-state" / "state.db"
+    db_path = tmp_path / ".pollypm" / "state.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Build a legacy (pre-M01) memory_entries schema by hand — no ``type``,

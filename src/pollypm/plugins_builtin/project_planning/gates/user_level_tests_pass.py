@@ -3,7 +3,7 @@
 Used by the implement_module flow's code_review node. A worker can't
 get a module approved until a user-level test (Playwright for web,
 tmux-driven scenario for CLI/TUI) has produced a pass receipt at
-``.pollypm-state/test-receipts/<task_id>.json``.
+``.pollypm/test-receipts/<task_id>.json``.
 
 Unit tests are assumed, not sufficient. The receipt schema is
 intentionally minimal for v1:
@@ -26,7 +26,7 @@ from typing import Any
 from pollypm.work.models import GateResult, Task
 
 
-RECEIPTS_DIR = ".pollypm-state/test-receipts"
+RECEIPTS_DIR = ".pollypm/test-receipts"
 
 
 class UserLevelTestsPass:

@@ -314,7 +314,7 @@ class TestAutoClose:
         """Acceptance §7: 7-day auto-close verified via time-travel."""
         from dataclasses import dataclass as _dc
 
-        base_dir = tmp_path / ".pollypm-state"
+        base_dir = tmp_path / ".pollypm"
         base_dir.mkdir()
 
         d = parse_decision(EMIT_PAYLOAD)

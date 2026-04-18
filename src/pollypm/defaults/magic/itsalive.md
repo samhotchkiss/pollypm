@@ -10,7 +10,7 @@ Commands:
 - `pm itsalive sweep --project <project_key>` to force a verification/completion check now
 
 Important behavior:
-- First deploys persist pending state in `.pollypm-state/itsalive/pending/`
+- First deploys persist pending state in `.pollypm/itsalive/pending/`
 - Verification links remain valid for 24 hours
 - Heartbeat resumes and completes verified deploys automatically
 - Existing `~/.itsalive` owner tokens skip first-deploy verification

@@ -167,7 +167,7 @@ def _has_source_files(project_path: Path, *, max_scan: int = 2000) -> bool:
     the ``rglob`` itself is cheap, but an uncooperative filesystem can
     still stall us.
     """
-    skip_dirs = {".git", ".pollypm", ".pollypm-state", "node_modules",
+    skip_dirs = {".git", ".pollypm", "node_modules",
                  "__pycache__", ".venv", "venv", "dist", "build", ".tox"}
     count = 0
     try:

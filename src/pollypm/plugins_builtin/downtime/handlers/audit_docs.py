@@ -45,7 +45,7 @@ class AuditDocsResult:
     pr_url: str = ""
 
 
-_AUDIT_SCRATCH_REL = Path(".pollypm-state") / "downtime-audits"
+_AUDIT_SCRATCH_REL = Path(".pollypm") / "downtime-audits"
 
 
 def render_audit_report(*, title: str, description: str) -> str:

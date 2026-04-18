@@ -190,21 +190,56 @@ class Heartbeat:
         now: datetime,
         prev_tick: datetime | None,
     ) -> bool:
-        # A cron entry is due if there exists a fire time strictly greater
-        # than the later of (entry.last_fired_at, prev_tick, first_seen_at)
-        # and ``<= now``. This gives us the catch-up-once guarantee.
-        floor = entry.last_fired_at
-        if floor is None:
-            # Never fired — earliest window is the anchor (first time we saw it).
-            # We use prev_tick if available for a tighter window; otherwise we
-            # accept the first matching minute on or after first_seen_at.
-            anchor = entry.first_seen_at or now
-            # Look for any fire in (anchor - 1 minute, now]. Using anchor - 1m
-            # so a cron that matches exactly at anchor fires on the first tick.
-            from datetime import timedelta
+        # Cron dispatch uses two checks, in order:
+        #
+        # (a) Current-minute match: if ``now``'s minute matches the cron
+        #     expression, fire — provided we haven't already fired in this
+        #     wall-clock minute. This is the path that makes ephemeral
+        #     ``pm heartbeat`` invocations (cron-driven, ``last_fired_at``
+        #     always None across processes) actually dispatch crontab
+        #     handlers. A 15s ticker (or a once-per-minute cron) is
+        #     guaranteed to land at least one tick inside the matching
+        #     minute, and that tick now fires.
+        #
+        # (b) Catch-up: if we have an ``last_fired_at`` from a prior tick
+        #     in the same long-lived process, look for a missed match in
+        #     ``(last_fired_at, now]`` — preserves the original
+        #     "catch-up-once" guarantee for the in-process ticker.
+        #
+        # The previous implementation used only (b) with a 1-minute
+        # lookback derived from ``first_seen_at`` (which equals ``now`` on
+        # the first tick of every fresh process). That window is too
+        # narrow when ``pm heartbeat`` is invoked once per minute by an
+        # external cron: each invocation is a fresh process with
+        # ``last_fired_at == None``, so the only way to fire was to
+        # land a tick in the matching minute *and* have ``next_due``
+        # find that match — which it did, but only if the minute hadn't
+        # passed by the time the tick ran. Skipped/late ticks (busy
+        # cockpit, locked DB, etc.) silently swallowed the fire forever.
+        current_minute = now.replace(second=0, microsecond=0)
+        if sched._matches(current_minute):
+            last = entry.last_fired_at
+            if last is None:
+                return True
+            last_minute = last.replace(second=0, microsecond=0)
+            if last_minute < current_minute:
+                return True
+            # Already fired in this minute (or in the future, e.g. clock
+            # rewind) — don't double-fire from another tick of the same
+            # process.
+            return False
 
-            search_from = anchor - timedelta(minutes=1)
-            next_fire = sched.next_due(search_from)
+        # No current-minute match — fall through to catch-up for the
+        # in-process long-lived ticker case.
+        if entry.last_fired_at is not None:
+            next_fire = sched.next_due(entry.last_fired_at)
             return next_fire is not None and next_fire <= now
-        next_fire = sched.next_due(floor)
-        return next_fire is not None and next_fire <= now
+
+        # No prior fire AND current minute doesn't match. Cross-process
+        # catch-up isn't possible here — we'd have to persist
+        # ``last_fired_at`` to the state store to know whether some other
+        # process already handled the most recent matching minute. The
+        # cron will fire on the next matching minute that any process
+        # ticks during, which is the desired floor for ephemeral
+        # invocations.
+        return False

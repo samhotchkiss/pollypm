@@ -427,6 +427,9 @@ def _dispatch_palette_tag(app: App, tag: str | None) -> None:
         if tag == "nav.activity":
             _palette_nav(app, "activity")
             return
+        if tag == "nav.metrics":
+            _palette_nav(app, "metrics")
+            return
         if tag == "nav.settings":
             _palette_nav(app, "settings")
             return
@@ -7630,6 +7633,447 @@ class PollyWorkerRosterApp(App[None]):
     def _on_row_selected(self, event: DataTable.RowSelected) -> None:
         """Enter on a row → jump to its project dashboard."""
         self.action_jump_to_project()
+
+
+# ---------------------------------------------------------------------------
+# Observability metrics screen — fifth cockpit surface. Gives Sam a
+# single glance at fleet, resources, throughput, failures, and
+# schedulers so he can scan for anomalies in 5 seconds. Reachable via
+# the rail "Metrics" row, the palette "Go to Metrics" command, and
+# ``pm cockpit-pane metrics``. Matches the Worker-Roster structural
+# pattern: a DataTable per section, gather on a thread, optional auto-
+# refresh, and drill-down on Enter.
+# ---------------------------------------------------------------------------
+
+
+_METRICS_TONE_COLOURS: dict[str, str] = {
+    "ok":    "#3ddc84",
+    "warn":  "#f0c45a",
+    "alert": "#ff5f6d",
+    "muted": "#6b7a88",
+}
+
+
+class PollyMetricsApp(App[None]):
+    """Observability metrics panel — ``pm cockpit-pane metrics``.
+
+    Sections:
+
+    1. Fleet — workers / tasks-in-flight / inbox rollup.
+    2. Resources — state.db, worktrees, logs, session RSS.
+    3. Throughput (24h) — completions / rejections / approvals.
+    4. Failures (24h) — state_drift / persona_swap / reprompts.
+    5. Schedulers — last fired-at + staleness.
+
+    Keys: ``R`` refresh, ``A`` auto-refresh (10s, default off), Enter
+    on a section → drill-down modal, ``q``/Esc back.
+    """
+
+    TITLE = "PollyPM"
+    SUB_TITLE = "Metrics"
+
+    AUTO_REFRESH_SECONDS = 10.0
+
+    CSS = """
+    Screen {
+        background: #0f1317;
+        color: #eef2f4;
+        padding: 0;
+    }
+    #me-outer {
+        height: 1fr;
+        padding: 1 2;
+    }
+    #me-topbar {
+        height: 3;
+        padding: 0 0 1 0;
+        border-bottom: solid #1e2730;
+    }
+    #me-counters {
+        height: 1;
+        color: #97a6b2;
+    }
+    #me-scroll {
+        height: 1fr;
+        padding: 1 0 0 0;
+        scrollbar-size: 1 1;
+        scrollbar-color: #2a3340;
+    }
+    .me-section {
+        margin-bottom: 1;
+        padding: 1 2;
+        background: #111820;
+        border: round #1e2730;
+    }
+    .me-section-title {
+        color: #5b8aff;
+        text-style: bold;
+        padding-bottom: 0;
+    }
+    .me-section-body {
+        color: #d6dee5;
+    }
+    .me-section.-selected {
+        border: round #5b8aff;
+    }
+    #me-hint {
+        height: 1;
+        padding: 0 2;
+        color: #3e4c5a;
+        background: #0c0f12;
+    }
+    """
+
+    BINDINGS = [
+        Binding("r,R", "refresh", "Refresh"),
+        Binding("a,A", "toggle_auto", "Auto-refresh"),
+        Binding("down,j", "cursor_down", "Next"),
+        Binding("up,k", "cursor_up", "Prev"),
+        Binding("enter", "drill_down", "Drill-down"),
+        Binding("colon", "open_command_palette", "Palette", priority=True),
+        Binding("question_mark", "show_keyboard_help", "Help", priority=True),
+        Binding("q,escape", "back", "Back"),
+    ]
+
+    _DEFAULT_HINT = (
+        "R refresh \u00b7 A auto-refresh \u00b7 \u2191\u2193 select "
+        "\u00b7 \u21b5 drill-down \u00b7 q back"
+    )
+
+    def __init__(self, config_path: Path) -> None:
+        super().__init__()
+        self.config_path = config_path
+        self.topbar = Static("[b]Metrics[/b]", id="me-topbar", markup=True)
+        self.counters = Static("", id="me-counters", markup=True)
+        self.hint = Static(self._DEFAULT_HINT, id="me-hint", markup=True)
+        self.snapshot = None  # last MetricsSnapshot
+        self._auto_refresh: bool = False
+        self._auto_refresh_timer = None
+        self._selected_index: int = 0
+        # One (title, body) Static pair per section. Keys match the
+        # ``MetricsSection.key`` so renderer + drill-down both find them.
+        self._section_order = ["fleet", "resources", "throughput", "failures", "schedulers"]
+        self._section_titles: dict[str, Static] = {
+            key: Static(
+                f"[b]{key.title()}[/b]",
+                classes="me-section-title", markup=True,
+            )
+            for key in self._section_order
+        }
+        self._section_bodies: dict[str, Static] = {
+            key: Static(
+                "", classes="me-section-body", markup=True,
+            )
+            for key in self._section_order
+        }
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="me-outer"):
+            yield self.topbar
+            yield self.counters
+            with VerticalScroll(id="me-scroll"):
+                for key in self._section_order:
+                    with Vertical(classes="me-section", id=f"me-section-{key}"):
+                        yield self._section_titles[key]
+                        yield self._section_bodies[key]
+        yield self.hint
+
+    def on_mount(self) -> None:
+        self._refresh()
+
+    # ------------------------------------------------------------------
+    # Data gather — hookable seam for tests.
+    # ------------------------------------------------------------------
+
+    def _gather(self):
+        """Build a :class:`MetricsSnapshot` — monkeypatched by tests."""
+        from pollypm.cockpit import _gather_metrics_snapshot
+        try:
+            config = load_config(self.config_path)
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            return _gather_metrics_snapshot(config)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _refresh(self) -> None:
+        snap = self._gather()
+        self.snapshot = snap
+        self._render()
+
+    # ------------------------------------------------------------------
+    # Render
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _tone_colour(tone: str) -> str:
+        return _METRICS_TONE_COLOURS.get(tone, "#d6dee5")
+
+    def _render(self) -> None:
+        snap = self.snapshot
+        auto_tag = (
+            "[#3ddc84]auto on[/#3ddc84]" if self._auto_refresh
+            else "[dim]auto off[/dim]"
+        )
+        ts = getattr(snap, "captured_at", None) if snap else None
+        if ts:
+            # ISO with UTC — show HH:MM:SS so Sam sees the refresh tick.
+            ts_label = ts[11:19] if len(ts) >= 19 else ts
+            self.counters.update(
+                f"[dim]last refresh {_escape(ts_label)} UTC[/dim]  \u00b7  {auto_tag}"
+            )
+        else:
+            self.counters.update(
+                f"[#ff5f6d]no snapshot[/#ff5f6d]  \u00b7  {auto_tag}"
+            )
+        if snap is None:
+            empty = "[dim](metrics unavailable — check state.db)[/dim]"
+            for key in self._section_order:
+                self._section_bodies[key].update(empty)
+            return
+        sections = {s.key: s for s in snap.sections()}
+        for key in self._section_order:
+            section = sections.get(key)
+            title_widget = self._section_titles[key]
+            body_widget = self._section_bodies[key]
+            if section is None:
+                title_widget.update(f"[b]{key.title()}[/b]")
+                body_widget.update("[dim](no data)[/dim]")
+                continue
+            title_widget.update(f"[b]{_escape(section.title)}[/b]")
+            if not section.rows:
+                body_widget.update("[dim](no data)[/dim]")
+                continue
+            lines: list[str] = []
+            for label, value, tone in section.rows:
+                colour = self._tone_colour(tone)
+                dot = "\u25cf"
+                lines.append(
+                    f"[{colour}]{dot}[/{colour}] [dim]{_escape(label)}:[/dim] "
+                    f"[{colour}]{_escape(value)}[/{colour}]"
+                )
+            body_widget.update("\n".join(lines))
+        # Highlight the selected section by toggling a CSS class.
+        for idx, key in enumerate(self._section_order):
+            try:
+                node = self.query_one(f"#me-section-{key}")
+            except Exception:  # noqa: BLE001
+                continue
+            if idx == self._selected_index:
+                node.add_class("-selected")
+            else:
+                node.remove_class("-selected")
+
+    # ------------------------------------------------------------------
+    # Actions
+    # ------------------------------------------------------------------
+
+    def action_refresh(self) -> None:
+        self._refresh()
+
+    def action_toggle_auto(self) -> None:
+        self._auto_refresh = not self._auto_refresh
+        if self._auto_refresh:
+            if self._auto_refresh_timer is None:
+                self._auto_refresh_timer = self.set_interval(
+                    self.AUTO_REFRESH_SECONDS, self._refresh,
+                )
+            self.notify(
+                f"Auto-refresh on ({int(self.AUTO_REFRESH_SECONDS)}s).",
+                severity="information", timeout=2.0,
+            )
+        else:
+            if self._auto_refresh_timer is not None:
+                try:
+                    self._auto_refresh_timer.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._auto_refresh_timer = None
+            self.notify(
+                "Auto-refresh off.", severity="information", timeout=2.0,
+            )
+        self._render()
+
+    def action_cursor_down(self) -> None:
+        if self._selected_index < len(self._section_order) - 1:
+            self._selected_index += 1
+            self._render()
+
+    def action_cursor_up(self) -> None:
+        if self._selected_index > 0:
+            self._selected_index -= 1
+            self._render()
+
+    def action_drill_down(self) -> None:
+        """Open a drill-down modal for the currently-selected section.
+
+        The modal is a simple scrollable Static panel — enough to show
+        per-process RSS for Resources, raw timestamps for Schedulers,
+        and the underlying row labels for the other three sections.
+        """
+        snap = self.snapshot
+        if snap is None:
+            self.notify("No snapshot loaded yet.", severity="warning", timeout=2.0)
+            return
+        try:
+            key = self._section_order[self._selected_index]
+        except IndexError:
+            return
+        section = next((s for s in snap.sections() if s.key == key), None)
+        if section is None:
+            return
+        body = self._build_drill_down_body(section)
+        try:
+            self.push_screen(_MetricsDrillDownModal(section.title, body))
+        except Exception as exc:  # noqa: BLE001
+            self.notify(
+                f"Drill-down failed: {exc}", severity="error", timeout=3.0,
+            )
+
+    def _build_drill_down_body(self, section) -> str:
+        lines: list[str] = []
+        lines.append(f"[b]{_escape(section.title)}[/b]")
+        lines.append("")
+        if not section.rows:
+            lines.append("[dim](no data)[/dim]")
+            return "\n".join(lines)
+        for label, value, tone in section.rows:
+            colour = self._tone_colour(tone)
+            lines.append(
+                f"[{colour}]\u25cf[/{colour}]  [b]{_escape(label)}[/b]"
+                f"\n    [dim]{_escape(value)}[/dim]"
+            )
+            lines.append("")
+        # Resource drill-down: re-render with per-process info when available.
+        if section.key == "resources":
+            try:
+                proc_lines = _metrics_process_breakdown(self.config_path)
+            except Exception:  # noqa: BLE001
+                proc_lines = []
+            if proc_lines:
+                lines.append("[b]Live sessions[/b]")
+                for text in proc_lines:
+                    lines.append(f"  {_escape(text)}")
+        return "\n".join(lines)
+
+    def action_back(self) -> None:
+        self.exit()
+
+    def action_open_command_palette(self) -> None:
+        _open_command_palette(self)
+
+    def action_show_keyboard_help(self) -> None:
+        _open_keyboard_help(self)
+
+
+class _MetricsDrillDownModal(ModalScreen[None]):
+    """Modal overlay shown when the user presses Enter on a metrics section."""
+
+    CSS = """
+    _MetricsDrillDownModal {
+        align: center middle;
+        background: rgba(0, 0, 0, 0.45);
+    }
+    #me-modal-dialog {
+        width: 76;
+        max-width: 95%;
+        height: auto;
+        max-height: 26;
+        padding: 1 2;
+        background: #141a20;
+        border: round #5b8aff;
+    }
+    #me-modal-body {
+        height: auto;
+        max-height: 22;
+        color: #d6dee5;
+        scrollbar-size: 1 1;
+        scrollbar-color: #2a3340;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape,q,enter", "dismiss", "Close"),
+    ]
+
+    def __init__(self, title: str, body: str) -> None:
+        super().__init__()
+        self._title = title
+        self._body_text = body
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="me-modal-dialog"):
+            yield Static(
+                f"[b]{_escape(self._title)}[/b]",
+                id="me-modal-title", markup=True,
+            )
+            yield VerticalScroll(
+                Static(self._body_text, markup=True),
+                id="me-modal-body",
+            )
+            yield Static(
+                "[dim]esc to close[/dim]",
+                id="me-modal-hint", markup=True,
+            )
+
+    def action_dismiss(self) -> None:
+        self.dismiss(None)
+
+
+def _metrics_process_breakdown(config_path: Path) -> list[str]:
+    """Return one-line-per-session RSS breakdown for the drill-down modal.
+
+    Best-effort; invoked from the modal body rather than the main
+    gather path so opening the modal doesn't double the UI-thread cost.
+    """
+    try:
+        config = load_config(config_path)
+    except Exception:  # noqa: BLE001
+        return []
+    try:
+        from pollypm.service_api import PollyPMService
+        from pollypm.cockpit import _rss_bytes_for_pid, _humanize_bytes
+        cfg_path = getattr(
+            getattr(config, "project", None), "config_file", None,
+        ) or getattr(
+            getattr(config, "project", None), "config_path", None,
+        ) or config_path
+        supervisor = PollyPMService(cfg_path).load_supervisor(readonly_state=True)
+    except Exception:  # noqa: BLE001
+        return []
+    try:
+        launches, windows, _alerts, _leases, _errors = supervisor.status()
+    except Exception:  # noqa: BLE001
+        launches, windows = [], []
+    finally:
+        try:
+            supervisor.store.close()
+        except Exception:  # noqa: BLE001
+            pass
+    window_map = {w.name: w for w in windows}
+    lines: list[str] = []
+    for launch in launches:
+        window = window_map.get(launch.window_name)
+        if window is None or getattr(window, "pane_dead", False):
+            continue
+        try:
+            pid = int(getattr(window, "pane_pid", 0) or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid <= 0:
+            continue
+        rss = _rss_bytes_for_pid(pid)
+        if rss is None:
+            continue
+        lines.append(
+            f"{launch.session.name} (pid {pid}) · {_humanize_bytes(rss)}",
+        )
+    return lines
 
 
 # ---------------------------------------------------------------------------

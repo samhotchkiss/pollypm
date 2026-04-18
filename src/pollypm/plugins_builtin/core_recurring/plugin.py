@@ -136,6 +136,10 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     from pollypm.recovery.state_reconciliation import (
         reconcile_expected_advance,
     )
+    from pollypm.recovery.worker_turn_end import (
+        handle_worker_turn_end,
+        is_worker_session_name,
+    )
     from pollypm.work.models import ActorType
     from pollypm.work.task_assignment import SessionRoleIndex
 
@@ -167,6 +171,27 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     # per-type uniqueness guard).
     drift_detected = 0
     drift_alerted = 0
+    # #302 — worker-turn-end auto-reprompt counters. When drift fires
+    # on a ``worker-*`` session we either create a blocking_question
+    # inbox item (if the transcript tail shows blocker language) or
+    # send the canonical reprompt via the session service.
+    worker_blocking_questions = 0
+    worker_reprompts = 0
+    # Config is looked up once per sweep for persona_name resolution
+    # on the blocking_question path. Tolerant of any failure — the
+    # helper falls back to "polly" without a config.
+    try:
+        from pollypm.config import (
+            DEFAULT_CONFIG_PATH, load_config, resolve_config_path,
+        )
+        _cfg_override = payload.get("config_path")
+        _cfg_path = (
+            Path(_cfg_override) if _cfg_override
+            else resolve_config_path(DEFAULT_CONFIG_PATH)
+        )
+        sweep_config = load_config(_cfg_path) if _cfg_path and _cfg_path.exists() else None
+    except Exception:  # noqa: BLE001
+        sweep_config = None
 
     try:
         try:
@@ -300,6 +325,34 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
                     except Exception:  # noqa: BLE001
                         pass
 
+                # #302 — worker-specific auto-reprompt. For worker
+                # sessions (and only worker sessions) we extend the
+                # log+alert path with a concrete action: either
+                # escalate the block to the project PM via an inbox
+                # task or nudge the worker with the canonical reprompt.
+                # Non-worker sessions (architect / reviewer / operator)
+                # fall through unchanged — the alert is enough.
+                if is_worker_session_name(target_name):
+                    try:
+                        outcome = handle_worker_turn_end(
+                            task,
+                            target_name,
+                            work_service=work,
+                            session_service=session_svc,
+                            state_store=state_store,
+                            config=sweep_config,
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "work.progress_sweep: worker_turn_end "
+                            "failed for %s", task.task_id, exc_info=True,
+                        )
+                        outcome = "skipped"
+                    if outcome == "blocking_question":
+                        worker_blocking_questions += 1
+                    elif outcome == "reprompt":
+                        worker_reprompts += 1
+
             # Skip sessions that have recorded ANY event recently — the
             # session is clearly still doing something; a stale task
             # here is orthogonal to session liveness.
@@ -373,6 +426,8 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
         "skipped_no_session": skipped_no_session,
         "drift_detected": drift_detected,
         "drift_alerted": drift_alerted,
+        "worker_blocking_questions": worker_blocking_questions,
+        "worker_reprompts": worker_reprompts,
     }
 
 

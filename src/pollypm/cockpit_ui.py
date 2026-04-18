@@ -2060,6 +2060,37 @@ def _extract_plan_review_meta(labels: list[str] | None) -> dict:
     return meta
 
 
+def _extract_blocking_question_meta(labels: list[str] | None) -> dict:
+    """Parse ``blocking_question`` sidecar labels into a structured dict.
+
+    The drift sweep emits a blocking_question item with labels that
+    encode the blocked task id, the worker session doing the asking,
+    and the project key:
+
+        blocking_question
+        project:<key>
+        task:<project/number>
+        blocking_worker:<session_name>
+
+    Returns ``{task_id, blocking_worker, project}``; keys are
+    present only when the corresponding label was present.
+    """
+    meta: dict[str, object] = {}
+    for raw in labels or []:
+        if not isinstance(raw, str):
+            continue
+        label = raw.strip()
+        if label.startswith("task:"):
+            meta["task_id"] = label[len("task:"):].strip()
+        elif label.startswith("blocking_worker:"):
+            meta["blocking_worker"] = label[
+                len("blocking_worker:"):
+            ].strip()
+        elif label.startswith("project:"):
+            meta["project"] = label[len("project:"):].strip()
+    return meta
+
+
 def _plan_review_has_round_trip(
     replies, *, requester: str = "user",
 ) -> bool:
@@ -2474,6 +2505,11 @@ class PollyInboxApp(App[None]):
         #   user-plus-PM exchange that unlocks Accept (gating rule).
         self._plan_review_meta: dict[str, dict] = {}
         self._plan_review_round_trip: dict[str, bool] = {}
+        # Blocking-question state (#302). Worker drift → inbox handoff.
+        # Parsed sidecar labels (``task:<id>``, ``blocking_worker:<name>``,
+        # ``project:<key>``) land here so reply / jump paths don't have
+        # to re-parse on each keystroke.
+        self._blocking_question_meta: dict[str, dict] = {}
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="inbox-layout"):
@@ -2724,12 +2760,27 @@ class PollyInboxApp(App[None]):
         else:
             self._plan_review_meta.pop(task_id, None)
             self._plan_review_round_trip.pop(task_id, None)
+        # Blocking-question detection (#302). Worker sessions that end
+        # their turn without a state flip and show blocker language
+        # bubble up as a ``blocking_question`` item; the PM's inbox
+        # gets its own hint bar so Sam / the persona knows ``r`` sends
+        # a reply back to the worker via ``pm send --force`` and ``d``
+        # jumps straight into the worker's pane.
+        _is_blocking_question = "blocking_question" in _labels
+        if _is_blocking_question:
+            meta = _extract_blocking_question_meta(_labels)
+            self._blocking_question_meta[task_id] = meta
+            self._update_hint_for_blocking_question()
+        else:
+            self._blocking_question_meta.pop(task_id, None)
         if _is_proposal:
             self._proposal_specs[task_id] = _extract_proposal_spec(
                 task, labels=_labels,
             )
             self._update_hint_for_proposal()
         elif _is_plan_review:
+            self._proposal_specs.pop(task_id, None)
+        elif _is_blocking_question:
             self._proposal_specs.pop(task_id, None)
         else:
             self._proposal_specs.pop(task_id, None)
@@ -3072,13 +3123,35 @@ class PollyInboxApp(App[None]):
                 if sub_project:
                     project_for_pm = sub_project
 
+        # Blocking-question items (#302): ``d`` jumps to the worker
+        # session so the PM can talk to the blocked worker directly,
+        # not the PM persona. We short-circuit before the PM resolution
+        # below so the cockpit route lands in the worker window.
+        task_labels = list(getattr(task, "labels", []) or [])
+        if (
+            "blocking_question" in task_labels
+            and focus_item is None
+        ):
+            bq_meta = _extract_blocking_question_meta(task_labels)
+            worker_name = str(bq_meta.get("blocking_worker") or "")
+            if worker_name:
+                context_line = _build_pm_context_line(task, item=focus_item)
+                self.run_worker(
+                    lambda: self._dispatch_to_worker_sync(
+                        worker_name, context_line,
+                    ),
+                    thread=True,
+                    exclusive=True,
+                    group="jump_to_pm",
+                )
+                return
+
         cockpit_key, pm_label = _resolve_pm_target(
             self.config_path, project_for_pm,
         )
         # Plan-review items (#297) inject a richer primer instead of the
         # generic ``re: inbox/N ...`` line so the PM lands in the
         # conversation with the co-refinement brief already framed.
-        task_labels = list(getattr(task, "labels", []) or [])
         if "plan_review" in task_labels and focus_item is None:
             meta = _extract_plan_review_meta(task_labels)
             explainer_path = str(meta.get("explainer_path") or "")
@@ -3142,6 +3215,80 @@ class PollyInboxApp(App[None]):
             f"Jumped to {pm_label} \u2014 finish your message and hit Enter.",
             severity="information",
             timeout=3.0,
+        )
+
+    def _dispatch_to_worker_sync(
+        self, worker_name: str, context_line: str,
+    ) -> None:
+        """Worker-thread body: route cockpit to the worker window.
+
+        Used by the ``blocking_question`` flow when the PM jumps
+        straight to the stuck worker (``d`` key). Mirrors
+        :meth:`_dispatch_to_pm_sync` but keys the route on the worker
+        session name rather than a PM persona.
+        """
+        try:
+            router = CockpitRouter(self.config_path)
+            router.route_selected(worker_name)
+            supervisor = router._load_supervisor()
+            window_target = (
+                f"{supervisor.config.project.tmux_session}:"
+                f"{router._COCKPIT_WINDOW}"
+            )
+            right_pane = router._right_pane_id(window_target)
+            if right_pane is None:
+                router.tmux.send_keys(
+                    window_target, context_line, press_enter=False,
+                )
+            else:
+                router.tmux.send_keys(
+                    right_pane, context_line, press_enter=False,
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(
+                self.notify,
+                f"Jump to worker failed: {exc}",
+                severity="error",
+            )
+            return
+        self.call_from_thread(
+            self.notify,
+            f"Jumped to worker {worker_name}.",
+            severity="information", timeout=3.0,
+        )
+
+    def _send_reply_to_worker(
+        self, task_id: str, worker_name: str, body: str,
+    ) -> None:
+        """Forward a blocking_question reply back to the worker pane.
+
+        Uses the supervisor's ``send_input`` with ``force=True`` to
+        bypass the worker-role gate (``pm send --force`` semantics from
+        #261). Best-effort: any failure surfaces as a TUI notification
+        but does not roll back the in-thread reply that already landed
+        in the inbox task.
+        """
+        try:
+            from pollypm.service_api.v1 import PollyPMService
+            supervisor = PollyPMService(self.config_path).load_supervisor()
+            supervisor.send_input(
+                worker_name, body,
+                owner="pollypm", force=True, press_enter=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.notify(
+                f"Reply to worker {worker_name} failed: {exc}",
+                severity="warning", timeout=3.0,
+            )
+            return
+        self._emit_event(
+            task_id,
+            "inbox.blocking_question.reply_forwarded",
+            f"reply forwarded to {worker_name} for {task_id}",
+        )
+        self.notify(
+            f"Reply sent to worker {worker_name}.",
+            severity="information", timeout=2.0,
         )
 
     def _perform_pm_dispatch(self, cockpit_key: str, context_line: str) -> None:
@@ -3226,6 +3373,16 @@ class PollyInboxApp(App[None]):
         self._emit_event(
             task_id, "inbox.reply_received", f"user replied to {task_id}: {body[:60]}",
         )
+        # Blocking-question reply (#302): when the inbox item carries
+        # the ``blocking_question`` label, route the reply back to the
+        # worker via ``pm send --force`` so the worker unblocks and
+        # resumes. The in-thread ``add_reply`` above still happens so
+        # the conversation is preserved for audit.
+        meta = self._blocking_question_meta.get(task_id)
+        if meta is not None:
+            worker_name = str(meta.get("blocking_worker") or "")
+            if worker_name:
+                self._send_reply_to_worker(task_id, worker_name, body)
         # Clear the input and re-render so the new reply appears in-thread.
         # Keep focus on the list so j/k works without further keystrokes.
         self.reply_input.value = ""
@@ -3254,6 +3411,20 @@ class PollyInboxApp(App[None]):
     _PLAN_REVIEW_HINT_FAST_TRACK = (
         "v open explainer \u00b7 d discuss \u00b7 A approve \u00b7 q back"
     )
+    # Blocking-question hint (#302). ``r`` replies to the worker via
+    # ``pm send --force`` so the blocker clears without the PM needing
+    # to jump to the pane; ``d`` is the direct-conversation escape
+    # hatch; ``a`` archives once the blocker is resolved.
+    _BLOCKING_QUESTION_HINT = (
+        "r reply to worker \u00b7 d jump to worker \u00b7 "
+        "a archive \u00b7 q back"
+    )
+
+    def _update_hint_for_blocking_question(self) -> None:
+        try:
+            self.hint.update(self._BLOCKING_QUESTION_HINT)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _update_hint_for_proposal(self) -> None:
         try:

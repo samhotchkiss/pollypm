@@ -1160,7 +1160,14 @@ def test_build_review_nudge_evicts_dropped_projects(monkeypatch, tmp_path: Path)
 def _make_launch_for_role(
     config: PollyPMConfig, tmp_path: Path, role: str, *, initial_input: str = "hello worker"
 ) -> SessionLaunchSpec:
-    """Build a SessionLaunchSpec with a real fresh-launch marker on disk."""
+    """Build a SessionLaunchSpec with a real fresh-launch marker on disk.
+
+    Also registers the session in ``config.sessions`` so the persona-swap
+    guard introduced in #266 (``_assert_session_launch_matches``) can
+    resolve a matching launch via ``launch_by_session``. Without this,
+    the guard raises ``persona_swap_detected: no launch for session_name=...``
+    before ``send_keys`` is ever reached.
+    """
     session = SessionConfig(
         name=f"{role}-session",
         role=role,
@@ -1170,6 +1177,9 @@ def _make_launch_for_role(
         project="pollypm",
         window_name=f"pm-{role}",
     )
+    # Register the session so the planner can resolve it and the
+    # persona-swap guard finds a matching launch (#266).
+    config.sessions[session.name] = session
     marker_dir = tmp_path / ".pollypm-state" / "fresh-markers"
     marker_dir.mkdir(parents=True, exist_ok=True)
     marker = marker_dir / f"{role}-session.marker"

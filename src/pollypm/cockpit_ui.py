@@ -17,7 +17,7 @@ from rich.text import Text
 from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, ListItem, ListView, Static
 
@@ -883,6 +883,449 @@ def _open_keyboard_help(app: App) -> None:
     app.push_screen(KeyboardHelpModal(sections, screen_title=title))
 
 
+# ---------------------------------------------------------------------------
+# Live alert toasts — bottom-right overlay shared by every cockpit App.
+# ---------------------------------------------------------------------------
+#
+# Right now alerts are visible only via ``pm doctor``, the Settings page, or
+# the Activity feed (after-the-fact). There's no live awareness when an
+# alert fires while Sam is in the inbox or dashboard. These toasts fix
+# that gap: whenever a new alert appears in the master state.db, we mount
+# a small dismissing widget in the bottom-right of the current App. Each
+# toast auto-dismisses after ``AlertToast.DEFAULT_TIMEOUT_SECONDS``; up to
+# ``AlertNotifier.MAX_VISIBLE`` stack vertically and older ones evict. The
+# whole thing is additive — no existing binding or widget changes.
+#
+# Public shape exposed to tests:
+#   * :class:`AlertToast`     — one toast widget
+#   * :class:`AlertNotifier`  — manager attached to an App via ``_setup_alert_notifier``
+#   * :func:`_setup_alert_notifier`
+#
+# Poll cadence is deliberately slow (5s) so we don't thrash SQLite under
+# the inbox refresh timer. Dedup keys off ``alert_id`` + severity so the
+# same row doesn't re-toast when another field updates. Persistence is
+# in-memory only (resets on cockpit restart) per the spec.
+
+_ALERT_TOAST_SEVERITY_ICONS = {
+    "error": "\U0001f534",     # red circle
+    "critical": "\U0001f534",
+    "warning": "\U0001f7e1",   # yellow circle
+    "warn": "\U0001f7e1",
+    "info": "\U0001f535",      # blue circle (rare — used as a fallback)
+}
+
+
+def _alert_toast_icon(severity: str) -> str:
+    """Return the single-glyph icon for ``severity`` with a sane fallback."""
+    return _ALERT_TOAST_SEVERITY_ICONS.get(
+        (severity or "").lower(), "\U0001f7e1",
+    )
+
+
+class AlertToast(Static):
+    """One bottom-right alert toast.
+
+    Auto-dismisses after :data:`DEFAULT_TIMEOUT_SECONDS`. Can be closed
+    early by clicking anywhere on the widget (acts as an "X") or by
+    pressing Esc while it's focused — but it never steals focus on
+    mount, so Sam's current typing context is preserved.
+
+    Severity drives the border + background colour via two CSS classes:
+    ``severity-warn`` and ``severity-error``. Anything else (e.g. a
+    future ``info``) falls back to the warn palette so the toast still
+    renders.
+    """
+
+    DEFAULT_TIMEOUT_SECONDS = 8.0
+
+    DEFAULT_CSS = """
+    AlertToast {
+        width: 52;
+        height: auto;
+        min-height: 3;
+        max-height: 6;
+        padding: 1 2;
+        margin: 0 0 1 0;
+        content-align: left top;
+        color: #f5f7fa;
+    }
+    AlertToast.severity-warn {
+        background: #2a2411;
+        border: round #f0c45a;
+    }
+    AlertToast.severity-error {
+        background: #2c1618;
+        border: round #ff5f6d;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss_toast", "Dismiss", show=False),
+    ]
+
+    def __init__(
+        self,
+        *,
+        alert_id: int | None,
+        severity: str,
+        message: str,
+        show_action_hint: bool = True,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        super().__init__(markup=True)
+        self.alert_id = alert_id
+        self.severity = (severity or "warn").lower()
+        self.message = message or ""
+        self.show_action_hint = show_action_hint
+        self.timeout_seconds = (
+            timeout_seconds if timeout_seconds is not None
+            else self.DEFAULT_TIMEOUT_SECONDS
+        )
+        self._dismiss_timer = None
+        # Apply severity class up front so the widget paints correctly on
+        # first render (before ``on_mount`` lands).
+        self.add_class(
+            "severity-error" if self.severity in ("error", "critical")
+            else "severity-warn"
+        )
+        self.update(self._render_body())
+
+    def _render_body(self) -> str:
+        icon = _alert_toast_icon(self.severity)
+        # Truncate message at 60 chars — terminals with narrow layouts
+        # still wrap cleanly, and the full text lives in the alerts view.
+        text = self.message.strip().replace("\n", " ")
+        if len(text) > 60:
+            text = text[:57] + "\u2026"
+        body = f"{icon}  [b]{_escape_markup(text) or 'alert'}[/b]"
+        if self.show_action_hint:
+            body += "\n[dim]press [b]a[/b] to view all \u00b7 esc to dismiss[/dim]"
+        else:
+            body += "\n[dim]esc/click to dismiss[/dim]"
+        return body
+
+    def on_mount(self) -> None:
+        # Timer is one-shot — Textual's ``set_timer`` returns a handle we
+        # can cancel if the user dismisses early.
+        try:
+            self._dismiss_timer = self.set_timer(
+                self.timeout_seconds, self.action_dismiss_toast,
+            )
+        except Exception:  # noqa: BLE001
+            self._dismiss_timer = None
+
+    def on_click(self) -> None:
+        # Whole-widget click closes — mimics an "X" without taking extra
+        # horizontal space. Clicking is the most natural discovery path
+        # when the keybinding hint is ambiguous (``a`` may be taken).
+        self.action_dismiss_toast()
+
+    def action_dismiss_toast(self) -> None:
+        if self._dismiss_timer is not None:
+            try:
+                self._dismiss_timer.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._dismiss_timer = None
+        # ``Widget.remove()`` returns an ``AwaitRemove`` that schedules the
+        # prune on the event loop. Tests advance the loop via
+        # ``pilot.pause()``; we just fire-and-forget here.
+        try:
+            self.remove()
+        except Exception:  # noqa: BLE001
+            pass
+        # Synchronously mark the widget "gone" for the notifier's
+        # ``visible_toasts`` check. ``is_mounted`` flips false once the
+        # prune lands, but tests that poll visibility right after the
+        # dismiss call otherwise have to sleep. Setting ``display`` to
+        # False is harmless if the prune has already run.
+        try:
+            self.display = False
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _escape_markup(text: str) -> str:
+    """Minimal Rich-markup escape — avoids interpreting ``[`` as a tag."""
+    return text.replace("[", "\\[")
+
+
+class AlertNotifier:
+    """Background poller that mounts :class:`AlertToast` widgets on an App.
+
+    One notifier is attached per App via :func:`_setup_alert_notifier`
+    during ``on_mount``. The notifier:
+
+    1. Polls the master ``state.db`` every :data:`POLL_INTERVAL_SECONDS`.
+    2. Diffs the result against ``_seen_alert_ids`` — the in-memory
+       dedup set, scoped to this App's lifetime.
+    3. For each new alert, mounts an :class:`AlertToast` in the host
+       App's toast container, evicting the oldest toast when the stack
+       hits :data:`MAX_VISIBLE`.
+
+    The poll runs on the Textual event loop (``set_interval``), not in a
+    thread — ``state.db`` reads are sub-millisecond for the alerts
+    table and the whole cockpit is single-reader anyway. Tests can call
+    :meth:`poll_now` synchronously and bypass the timer entirely.
+
+    Action binding: the notifier registers an app-level action
+    ``action_view_alerts`` which routes via :func:`_palette_nav` to the
+    Metrics screen. Hosts whose ``BINDINGS`` already claim ``a`` can opt
+    into the shorter ``_bind_a_for_alerts=False`` path — the toast still
+    renders, only the keybinding hint changes.
+    """
+
+    POLL_INTERVAL_SECONDS = 5.0
+    MAX_VISIBLE = 3
+
+    def __init__(
+        self,
+        app: App,
+        *,
+        config_path: Path,
+        poll_interval: float | None = None,
+        max_visible: int | None = None,
+        bind_a: bool = True,
+    ) -> None:
+        self.app = app
+        self.config_path = config_path
+        self.poll_interval = (
+            poll_interval if poll_interval is not None
+            else self.POLL_INTERVAL_SECONDS
+        )
+        self.max_visible = (
+            max_visible if max_visible is not None else self.MAX_VISIBLE
+        )
+        self.bind_a = bind_a
+        # Dedup key: alert_id. Falls back to a synthetic (session, type)
+        # key when an alert_id isn't present (shouldn't happen with the
+        # current schema, but keeps us robust against test fakes).
+        self._seen_alert_ids: set = set()
+        self._toasts: list[AlertToast] = []
+        self._container: Container | None = None
+        self._timer = None
+        # Prime the seen-set to the current open alerts on startup so we
+        # don't spam Sam with a bunch of toasts the moment he opens the
+        # cockpit — only *new* alerts should toast.
+        self._prime_seen_set()
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def attach(self, container: Container) -> None:
+        """Bind the notifier to the App's toast-container widget."""
+        self._container = container
+        try:
+            self._timer = self.app.set_interval(
+                self.poll_interval, self.poll_now,
+            )
+        except Exception:  # noqa: BLE001
+            self._timer = None
+
+    def stop(self) -> None:
+        """Cancel the poll timer. Idempotent."""
+        if self._timer is not None:
+            try:
+                self._timer.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._timer = None
+
+    # ------------------------------------------------------------------
+    # Polling
+    # ------------------------------------------------------------------
+
+    def _prime_seen_set(self) -> None:
+        try:
+            alerts = self._fetch_alerts()
+        except Exception:  # noqa: BLE001
+            return
+        for record in alerts:
+            key = self._dedup_key(record)
+            if key is not None:
+                self._seen_alert_ids.add(key)
+
+    def _fetch_alerts(self) -> list:
+        """Return the current open alerts from the master state.db.
+
+        Hookable for tests — override by assigning ``self._fetch_alerts``.
+        """
+        try:
+            config = load_config(self.config_path)
+        except Exception:  # noqa: BLE001
+            return []
+        try:
+            from pollypm.storage.state import StateStore
+            store = StateStore(config.project.state_db)
+        except Exception:  # noqa: BLE001
+            return []
+        try:
+            return list(store.open_alerts())
+        except Exception:  # noqa: BLE001
+            return []
+        finally:
+            try:
+                store.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    @staticmethod
+    def _dedup_key(record) -> object:
+        alert_id = getattr(record, "alert_id", None)
+        if alert_id is not None:
+            return ("id", alert_id)
+        session = getattr(record, "session_name", "")
+        alert_type = getattr(record, "alert_type", "")
+        updated = getattr(record, "updated_at", "")
+        return ("sk", session, alert_type, updated)
+
+    def poll_now(self) -> list[AlertToast]:
+        """Fetch + mount any new toasts immediately. Returns the new list.
+
+        Tests call this directly to exercise the full mount path without
+        waiting on the interval timer.
+        """
+        try:
+            alerts = self._fetch_alerts()
+        except Exception:  # noqa: BLE001
+            return []
+        mounted: list[AlertToast] = []
+        for record in alerts:
+            key = self._dedup_key(record)
+            if key in self._seen_alert_ids:
+                continue
+            self._seen_alert_ids.add(key)
+            toast = self._mount_toast(record)
+            if toast is not None:
+                mounted.append(toast)
+        return mounted
+
+    # ------------------------------------------------------------------
+    # Mount + eviction
+    # ------------------------------------------------------------------
+
+    def _mount_toast(self, record) -> AlertToast | None:
+        container = self._container
+        if container is None:
+            return None
+        toast = AlertToast(
+            alert_id=getattr(record, "alert_id", None),
+            severity=getattr(record, "severity", "warn"),
+            message=getattr(record, "message", "")
+                    or getattr(record, "alert_type", ""),
+            show_action_hint=self.bind_a,
+        )
+        try:
+            container.mount(toast)
+        except Exception:  # noqa: BLE001
+            return None
+        self._toasts.append(toast)
+        self._evict_old()
+        return toast
+
+    def _evict_old(self) -> None:
+        # Trim the visible stack from the oldest end once we exceed the
+        # cap. ``remove()`` on an already-removed widget is safe under
+        # Textual's DOM machinery; wrap in try just in case a stray
+        # third-party patch tightens that invariant.
+        while len(self._toasts) > self.max_visible:
+            oldest = self._toasts.pop(0)
+            try:
+                oldest.action_dismiss_toast()
+            except Exception:  # noqa: BLE001
+                pass
+
+    @property
+    def visible_toasts(self) -> list[AlertToast]:
+        """Return the currently-mounted, non-dismissed toasts.
+
+        Drops widgets that have either already been pruned from the DOM
+        (``is_mounted == False``) or flagged ``display = False`` by the
+        dismiss path. That second check lets tests assert dismissal
+        without awaiting the async prune that backs ``remove()``.
+        """
+        live: list[AlertToast] = []
+        for toast in self._toasts:
+            try:
+                if not toast.is_mounted:
+                    continue
+                if getattr(toast, "display", True) is False:
+                    continue
+                live.append(toast)
+            except Exception:  # noqa: BLE001
+                continue
+        self._toasts = live
+        return list(live)
+
+
+# Container styling is attached per-widget (bypassing the host App's CSS)
+# so a third-party stylesheet never strands toasts in the top-left.
+# ``dock:bottom`` keeps the container pinned to the bottom of the screen
+# across every cockpit app; child AlertToasts are right-aligned inside.
+def _style_toast_container(container: Container) -> None:
+    try:
+        container.styles.dock = "bottom"
+        container.styles.width = "100%"
+        container.styles.height = "auto"
+        container.styles.max_height = 16
+        container.styles.padding = (0, 1, 1, 1)
+        container.styles.background = "transparent"
+        # Right-align the toast stack within the docked container. Each
+        # AlertToast is 52 cols wide so the "bottom-right" shape emerges.
+        container.styles.align_horizontal = "right"
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _setup_alert_notifier(
+    app: App,
+    *,
+    container: Container | None = None,
+    bind_a: bool = True,
+) -> AlertNotifier | None:
+    """Attach an :class:`AlertNotifier` to ``app``.
+
+    Called from each App's ``on_mount``. Idempotent — re-entering
+    ``on_mount`` (tests do this via ``run_test``) reuses the existing
+    notifier rather than mounting a second timer.
+
+    If ``container`` is omitted, one is created and mounted into the
+    App's current screen. Apps can pre-supply their own container if
+    they want the toasts embedded in a specific slot; the default
+    works for every cockpit screen today.
+    """
+    existing = getattr(app, "_alert_notifier", None)
+    if existing is not None:
+        return existing
+    config_path = getattr(app, "config_path", None)
+    if config_path is None:
+        return None
+    if container is None:
+        try:
+            container = Container(id="alert-toasts")
+            _style_toast_container(container)
+            app.screen.mount(container)
+        except Exception:  # noqa: BLE001
+            return None
+    notifier = AlertNotifier(app, config_path=config_path, bind_a=bind_a)
+    notifier.attach(container)
+    setattr(app, "_alert_notifier", notifier)
+    setattr(app, "_alert_toasts_container", container)
+    return notifier
+
+
+def _action_view_alerts(app: App) -> None:
+    """Shared ``action_view_alerts`` body — jumps to Metrics.
+
+    Installed on every App that opts into the ``a`` binding. On Apps
+    that already bind ``a`` for a local action (archive, auto-refresh,
+    approve) we don't install it — the toast's hint reads
+    "esc/click to dismiss" in that case.
+    """
+    _palette_nav(app, "metrics")
+
+
 class RailItem(ListItem):
     def __init__(
         self,
@@ -1095,6 +1538,7 @@ class PollyCockpitApp(App[None]):
         Binding("n", "new_worker", "New Worker"),
         Binding("r", "refresh", "Refresh"),
         Binding("s", "open_settings", "Settings"),
+        Binding("a", "view_alerts", "Alerts", show=False),
         Binding("colon", "open_command_palette", "Palette", priority=True),
         Binding("question_mark", "show_keyboard_help", "Help", priority=True),
         Binding("j,down", "cursor_down", "Down", show=False),
@@ -1169,6 +1613,11 @@ class PollyCockpitApp(App[None]):
         # Failures here are non-fatal — the TUI still works, just
         # without autonomous sweeps. See issue #268 Gap A.
         self._start_core_rail()
+        # Live alert toasts — non-intrusive bottom-right overlay.
+        _setup_alert_notifier(self, bind_a=True)
+
+    def action_view_alerts(self) -> None:
+        _action_view_alerts(self)
 
     def _start_core_rail(self) -> None:
         """Start the process-wide HeartbeatRail via the supervisor, best-effort."""
@@ -2688,6 +3137,7 @@ class PollySettingsPaneApp(App[None]):
         Binding("t", "toggle_project_tracked", "Toggle project", show=False),
         Binding("m", "make_controller", "Controller", show=False),
         Binding("v", "toggle_failover", "Failover", show=False),
+        Binding("a", "view_alerts", "Alerts", show=False),
         Binding("question_mark", "show_keyboard_help", "Help", priority=True),
         Binding("q,escape", "back_or_cancel", "Back"),
     ]
@@ -2779,6 +3229,12 @@ class PollySettingsPaneApp(App[None]):
 
         self._refresh()
         self._show_section(self._active_section)
+        # Live alert toasts. Settings has no ``a`` binding so the toast
+        # surfaces the full hint.
+        _setup_alert_notifier(self, bind_a=True)
+
+    def action_view_alerts(self) -> None:
+        _action_view_alerts(self)
 
     # ------------------------------------------------------------------
     # Data refresh
@@ -4366,6 +4822,9 @@ class PollyInboxApp(App[None]):
         self._refresh_list(select_first=True)
         self.set_interval(self.REFRESH_INTERVAL_SECONDS, self._background_refresh)
         self.list_view.focus()
+        # Live alert toasts. Inbox already claims ``a`` for archive so the
+        # toast advertises "esc/click to dismiss" instead of the ``a`` hint.
+        _setup_alert_notifier(self, bind_a=False)
 
     # ------------------------------------------------------------------
     # Data loading
@@ -6676,6 +7135,7 @@ class PollyProjectDashboardApp(App[None]):
         Binding("g", "plan_scroll_top", "Top", show=False),
         Binding("G", "plan_scroll_bottom", "Bottom", show=False),
         Binding("u,r", "refresh", "Refresh", show=False),
+        Binding("a", "view_alerts", "Alerts", show=False),
         Binding("colon", "open_command_palette", "Palette", priority=True),
         Binding("question_mark", "show_keyboard_help", "Help", priority=True),
         Binding("q,escape", "back", "Back"),
@@ -6785,6 +7245,11 @@ class PollyProjectDashboardApp(App[None]):
     def on_mount(self) -> None:
         self._refresh()
         self.set_interval(self.REFRESH_INTERVAL_SECONDS, self._refresh)
+        # Live alert toasts.
+        _setup_alert_notifier(self, bind_a=True)
+
+    def action_view_alerts(self) -> None:
+        _action_view_alerts(self)
 
     # ------------------------------------------------------------------
     # Data
@@ -7421,6 +7886,9 @@ class PollyWorkerRosterApp(App[None]):
             "Project", "Session", " ", "Task", "Node", "Turn", "Last commit",
         )
         self._refresh()
+        # Live alert toasts. Workers already use ``a`` for auto-refresh so
+        # we skip the ``a`` binding and surface the esc/click hint.
+        _setup_alert_notifier(self, bind_a=False)
 
     # ------------------------------------------------------------------
     # Data — gather runs on a thread; render on the UI thread.
@@ -7784,6 +8252,10 @@ class PollyMetricsApp(App[None]):
 
     def on_mount(self) -> None:
         self._refresh()
+        # Live alert toasts. Metrics claims ``a`` for auto-refresh so the
+        # toast shows the esc/click hint; the user is already *on* the
+        # alerts screen when Metrics is open.
+        _setup_alert_notifier(self, bind_a=False)
 
     # ------------------------------------------------------------------
     # Data gather — hookable seam for tests.
@@ -8280,6 +8752,7 @@ class PollyActivityFeedApp(App[None]):
         Binding("F", "toggle_follow", "Follow"),
         Binding("c", "clear_filters", "Clear"),
         Binding("R,u", "refresh", "Refresh", show=False),
+        Binding("a", "view_alerts", "Alerts", show=False),
         Binding("enter", "open_detail", "Open"),
         Binding("question_mark", "show_keyboard_help", "Help", priority=True),
         Binding("q,escape", "back_or_cancel", "Back"),
@@ -8352,6 +8825,11 @@ class PollyActivityFeedApp(App[None]):
         self.filter_input.display = False
         self._refresh()
         self.table.focus()
+        # Live alert toasts.
+        _setup_alert_notifier(self, bind_a=True)
+
+    def action_view_alerts(self) -> None:
+        _action_view_alerts(self)
 
     # ------------------------------------------------------------------
     # Data — gather runs synchronously here; the projector is cheap

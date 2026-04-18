@@ -76,6 +76,8 @@ class TestCoreRecurringPlugin:
             "notification_staging.prune",
             # Harness agent-worktree hygiene — hourly at minute :23.
             "agent_worktree.prune",
+            # Log-file hygiene — hourly at minute :31.
+            "log.rotate",
         }
 
         # Cadences per issue #164 / #249.
@@ -101,6 +103,9 @@ class TestCoreRecurringPlugin:
         agent_prune = entries["agent_worktree.prune"].schedule
         assert isinstance(agent_prune, CronSchedule)
         assert agent_prune.expression() == "23 * * * *"
+        log_rotate = entries["log.rotate"].schedule
+        assert isinstance(log_rotate, CronSchedule)
+        assert log_rotate.expression() == "31 * * * *"
 
     def test_plugin_declares_expected_capabilities(self) -> None:
         kinds = {cap.kind for cap in core_plugin.capabilities}

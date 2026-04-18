@@ -6,6 +6,7 @@ from pathlib import Path
 from pollypm.plugins_builtin.core_agent_profiles.profiles import heartbeat_prompt, polly_prompt
 from pollypm.models import (
     AccountConfig,
+    LoggingSettings,
     MemorySettings,
     KnownProject,
     PlannerSettings,
@@ -293,6 +294,34 @@ def _parse_planner_settings(raw: dict[str, object]) -> PlannerSettings:
     )
 
 
+def _parse_logging_settings(raw: dict[str, object]) -> LoggingSettings:
+    """Parse the ``[logging]`` TOML section for log-rotation tuning.
+
+    Fat-fingered values (non-int, negative) fall back to defaults so a
+    malformed config never disables rotation silently — the handler
+    still rotates on the 20 MB / 3-keep defaults. Missing section also
+    yields defaults. See LoggingSettings docstring.
+    """
+    logging_raw = raw.get("logging", {})
+    if not isinstance(logging_raw, dict):
+        return LoggingSettings()
+    size_raw = logging_raw.get("rotate_size_mb", 20)
+    try:
+        size_mb = int(size_raw)
+    except (TypeError, ValueError):
+        size_mb = 20
+    if size_mb < 1:
+        size_mb = 20
+    keep_raw = logging_raw.get("rotate_keep", 3)
+    try:
+        keep = int(keep_raw)
+    except (TypeError, ValueError):
+        keep = 3
+    if keep < 0:
+        keep = 3
+    return LoggingSettings(rotate_size_mb=size_mb, rotate_keep=keep)
+
+
 def _parse_plugin_settings(raw: dict[str, object]) -> PluginSettings:
     """Parse the ``[plugins]`` TOML section.
 
@@ -417,6 +446,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
     plugins = _parse_plugin_settings(raw)
     rail = _parse_rail_settings(raw)
     planner = _parse_planner_settings(raw)
+    logging_settings = _parse_logging_settings(raw)
     projects = _parse_known_projects(raw, base=base)
     _merge_project_local_config(sessions, projects, plugins)
     _validate_cross_references(accounts=accounts, sessions=sessions, pollypm=pollypm)
@@ -431,6 +461,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
         plugins=plugins,
         rail=rail,
         planner=planner,
+        logging=logging_settings,
     )
     try:
         _config_cache[config_path] = (config_path.stat().st_mtime, config)
@@ -497,6 +528,17 @@ def _render_global_config(config: PollyPMConfig) -> str:
     if planner_overrides:
         lines.append("[planner]")
         lines.extend(planner_overrides)
+        lines.append("")
+
+    # Emit [logging] only when the user has deviated from the defaults.
+    logging_overrides: list[str] = []
+    if config.logging.rotate_size_mb != 20:
+        logging_overrides.append(f"rotate_size_mb = {config.logging.rotate_size_mb}")
+    if config.logging.rotate_keep != 3:
+        logging_overrides.append(f"rotate_keep = {config.logging.rotate_keep}")
+    if logging_overrides:
+        lines.append("[logging]")
+        lines.extend(logging_overrides)
         lines.append("")
 
     for account_name, account in config.accounts.items():

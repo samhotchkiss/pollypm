@@ -276,33 +276,43 @@ def flush_milestone_digest(
 ) -> str | None:
     """Collapse pending digest rows into one rollup inbox task.
 
+    Issue #341 migrated this reader onto
+    :meth:`Store.query_messages` — ``pm notify --priority digest``
+    (post-#340) writes rows into the unified ``messages`` table with
+    ``state='staged'`` / ``tier='digest'``. This flush picks them up,
+    creates one rollup work-task for cockpit visibility, and closes
+    each staged message row (``state='closed'``) so the next sweep
+    doesn't re-flush.
+
+    For back-compat the function *also* reads the legacy
+    ``notifications_staged`` table via :func:`list_pending` so digest
+    rows written before the writer migration still get flushed. Both
+    sources contribute to the one rollup task.
+
     Returns the new rollup task_id, or None when there was nothing to
     flush (empty staging → no-op).
-
-    The rollup task is created through the same ``SQLiteWorkService.create``
-    path that ``pm notify`` uses so the inbox_view picks it up naturally.
-    Staging rows are marked ``flushed_at=now, rollup_task_id=<id>`` atomically
-    after the task exists.
     """
     conn: sqlite3.Connection = svc._conn  # type: ignore[attr-defined]
     _ensure_staging_table(conn)
 
-    rows = list_pending(conn, project=project, milestone_key=milestone_key)
-    if not rows:
+    legacy_rows = list_pending(conn, project=project, milestone_key=milestone_key)
+    new_rows = _pending_messages(svc, project=project, milestone_key=milestone_key)
+    merged = _merge_digest_rows(legacy_rows, new_rows)
+    if not merged:
         return None
 
     number, name = _milestone_title_components(project_path, milestone_key)
     if number is not None and name:
-        title = f"Milestone {number} ({name}) ready for review — {len(rows)} updates"
+        title = f"Milestone {number} ({name}) ready for review — {len(merged)} updates"
     elif name:
-        title = f"{name} — {len(rows)} updates ready for review"
+        title = f"{name} — {len(merged)} updates ready for review"
     elif milestone_key:
-        title = f"{milestone_key} — {len(rows)} updates ready for review"
+        title = f"{milestone_key} — {len(merged)} updates ready for review"
     else:
-        title = f"Digest — {len(rows)} updates ready for review"
+        title = f"Digest — {len(merged)} updates ready for review"
 
     body_md = _render_digest_body(
-        rows, milestone_key=milestone_key, milestone_name=name,
+        merged, milestone_key=milestone_key, milestone_name=name,
     )
 
     # Mirror pm notify's inbox-visible shape: chat flow + requester=user.
@@ -329,7 +339,7 @@ def flush_milestone_digest(
     # items without re-parsing the markdown body. The entry text is a
     # JSON blob carrying subject, actor, created_at, source project, and
     # the full payload (commit/PR refs).
-    for r in rows:
+    for r in merged:
         payload: dict[str, Any] = {}
         try:
             payload = json.loads(r["payload_json"]) or {}
@@ -354,15 +364,174 @@ def flush_milestone_digest(
             logger.debug("rollup_item persist failed", exc_info=True)
 
     now = _now_iso()
-    ids = [int(r["id"]) for r in rows]
-    placeholders = ",".join("?" for _ in ids)
-    conn.execute(
-        f"UPDATE notification_staging SET flushed_at = ?, rollup_task_id = ? "
-        f"WHERE id IN ({placeholders})",
-        [now, task.task_id, *ids],
-    )
-    conn.commit()
+    legacy_ids = [int(r["id"]) for r in merged if r.get("_source") == "legacy"]
+    message_ids = [int(r["id"]) for r in merged if r.get("_source") == "messages"]
+    if legacy_ids:
+        placeholders = ",".join("?" for _ in legacy_ids)
+        conn.execute(
+            f"UPDATE notification_staging SET flushed_at = ?, rollup_task_id = ? "
+            f"WHERE id IN ({placeholders})",
+            [now, task.task_id, *legacy_ids],
+        )
+        conn.commit()
+    if message_ids:
+        # Close each staged messages-table row so the next sweep
+        # doesn't re-flush. The rollup task_id lives only on the
+        # legacy staging rows (there's no column for it on
+        # ``messages``); a consumer that wants to trace a rollup back
+        # to its children reads the ``rollup_item`` context entries on
+        # the task.
+        try:
+            from pollypm.store import SQLAlchemyStore
+        except Exception:  # noqa: BLE001
+            SQLAlchemyStore = None  # type: ignore[assignment]
+        if SQLAlchemyStore is not None:
+            store_url = _store_url_for_svc(svc)
+            if store_url is not None:
+                store = SQLAlchemyStore(store_url)
+                try:
+                    for msg_id in message_ids:
+                        try:
+                            store.close_message(msg_id)
+                        except Exception:  # noqa: BLE001
+                            logger.debug(
+                                "flush_milestone_digest: close_message "
+                                "failed for id=%s", msg_id, exc_info=True,
+                            )
+                finally:
+                    store.close()
     return task.task_id
+
+
+def _pending_messages(
+    svc,
+    *,
+    project: str,
+    milestone_key: str | None,
+) -> list[dict[str, Any]]:
+    """Query the unified ``messages`` table for pending digest rows.
+
+    ``pm notify --priority digest`` lands rows with
+    ``type='notify'``, ``tier='digest'``, ``state='staged'`` and
+    ``scope=<project>``. The milestone key rides along in
+    ``payload['milestone_key']`` — we filter on it in Python because
+    ``query_messages`` doesn't expose payload-level conditions.
+    """
+    try:
+        from pollypm.store import SQLAlchemyStore
+    except Exception:  # noqa: BLE001
+        return []
+    url = _store_url_for_svc(svc)
+    if url is None:
+        return []
+    try:
+        store = SQLAlchemyStore(url)
+    except Exception:  # noqa: BLE001
+        return []
+    try:
+        try:
+            rows = store.query_messages(
+                type="notify", tier="digest", state="staged", scope=project,
+            )
+        except Exception:  # noqa: BLE001
+            rows = []
+    finally:
+        try:
+            store.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        payload = row.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        row_milestone = payload.get("milestone_key")
+        # Match the legacy list_pending semantics: ``milestone_key=None``
+        # selects rows whose own milestone_key is None; a concrete key
+        # requires an exact match.
+        if row_milestone != milestone_key:
+            continue
+        out.append(row)
+    out.sort(
+        key=lambda r: (str(r.get("created_at") or ""), int(r.get("id") or 0)),
+    )
+    return out
+
+
+def _merge_digest_rows(
+    legacy_rows,
+    new_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Normalize legacy + messages-table rows into a single digest list.
+
+    Both sources contribute to the same rollup task, but the two row
+    shapes differ (legacy has ``actor`` / ``payload_json`` columns;
+    messages rows have ``sender`` / ``payload`` dicts). We normalize
+    into a common dict shape with an extra ``_source`` marker so
+    ``flush_milestone_digest`` can close each row correctly after the
+    rollup exists.
+    """
+    merged: list[dict[str, Any]] = []
+    for r in legacy_rows:
+        merged.append(
+            {
+                "id": r["id"],
+                "subject": r["subject"],
+                "body": r["body"],
+                "actor": r["actor"],
+                "created_at": r["created_at"],
+                "payload_json": r["payload_json"] or "{}",
+                "_source": "legacy",
+            }
+        )
+    for row in new_rows:
+        payload = row.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        merged.append(
+            {
+                "id": int(row.get("id") or 0),
+                "subject": row.get("subject") or "",
+                "body": row.get("body") or "",
+                "actor": payload.get("actor") or row.get("sender") or "polly",
+                "created_at": row.get("created_at") or "",
+                "payload_json": json.dumps(payload, default=str),
+                "_source": "messages",
+            }
+        )
+    merged.sort(key=lambda r: (str(r["created_at"] or ""), int(r["id"] or 0)))
+    return merged
+
+
+def _store_url_for_svc(svc) -> str | None:
+    """Resolve the ``sqlite:///…`` URL matching ``svc``'s underlying DB.
+
+    The work-service exposes ``_db_path`` for single-file SQLite
+    backends; we fall back to the underlying connection's ``database``
+    attribute when the attribute isn't present (e.g. a test double).
+    """
+    for attr in ("_db_path", "db_path"):
+        candidate = getattr(svc, attr, None)
+        if candidate is not None:
+            return f"sqlite:///{candidate}"
+    conn = getattr(svc, "_conn", None)
+    if conn is None:
+        return None
+    # sqlite3.Connection doesn't carry a 'database' attribute in stdlib;
+    # many test doubles do. Try both and fail quietly if neither works.
+    database = getattr(conn, "database", None)
+    if not database:
+        # Introspect via pragma — sqlite3 connections answer this.
+        try:
+            cursor = conn.execute("PRAGMA database_list")
+            row = cursor.fetchone()
+            database = row[2] if row else ""
+        except Exception:  # noqa: BLE001
+            return None
+    if not database or database == ":memory:":
+        return None
+    return f"sqlite:///{database}"
 
 
 # ---------------------------------------------------------------------------

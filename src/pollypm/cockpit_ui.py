@@ -1118,6 +1118,76 @@ def _alert_toast_icon(severity: str) -> str:
     )
 
 
+class _AlertLikeRecord:
+    """Adapter wrapping a :meth:`Store.query_messages` alert row.
+
+    The original :class:`AlertNotifier` consumed
+    :class:`pollypm.storage.state.AlertRecord` instances, which carried
+    ``alert_id`` / ``session_name`` / ``alert_type`` / ``severity`` /
+    ``message`` / ``updated_at`` as attributes. Issue #341 migrated the
+    read path to :meth:`Store.query_messages_with_legacy_bridge`, which
+    returns plain dicts. Rather than rewrite every toast helper that
+    does ``getattr(record, …)``, this shim exposes the same attribute
+    surface so the downstream code reads the new rows unchanged.
+
+    BRIDGE(#349): keep this class — it's the bridge's shape, not a
+    legacy artifact. The bridge itself goes away when the writers
+    migrate, but dict -> attribute access is still the cleanest glue
+    between Store's dict API and the existing attribute-oriented UI.
+    """
+
+    __slots__ = ("_row",)
+
+    def __init__(self, row: dict) -> None:
+        self._row = row
+
+    @property
+    def alert_id(self) -> int | None:
+        raw_id = self._row.get("id")
+        if raw_id is None:
+            return None
+        try:
+            # Negative ids flag legacy bridge rows — normalize to a
+            # positive synthetic id so the dedup set treats them like
+            # messages-table rows. The sign is preserved in ``_source``.
+            return int(raw_id)
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def session_name(self) -> str:
+        return str(self._row.get("scope") or "")
+
+    @property
+    def alert_type(self) -> str:
+        return str(self._row.get("sender") or "")
+
+    @property
+    def severity(self) -> str:
+        payload = self._row.get("payload") or {}
+        if isinstance(payload, dict):
+            sev = payload.get("severity")
+            if isinstance(sev, str) and sev:
+                return sev
+        return "warn"
+
+    @property
+    def message(self) -> str:
+        return str(self._row.get("subject") or "")
+
+    @property
+    def status(self) -> str:
+        return str(self._row.get("state") or "open")
+
+    @property
+    def created_at(self) -> str:
+        return str(self._row.get("created_at") or "")
+
+    @property
+    def updated_at(self) -> str:
+        return str(self._row.get("updated_at") or "")
+
+
 class AlertToast(Static):
     """One bottom-right alert toast.
 
@@ -1343,7 +1413,20 @@ class AlertNotifier:
                 self._seen_alert_ids.add(key)
 
     def _fetch_alerts(self) -> list:
-        """Return the current open alerts from the master state.db.
+        """Return the current open alerts via :class:`Store` with a legacy bridge.
+
+        Issue #341 moved this reader onto
+        :meth:`Store.query_messages_with_legacy_bridge` so alerts
+        written via ``upsert_alert`` into the new ``messages`` table
+        show up in the cockpit toasts. Supervisor / heartbeat writers
+        still hit the legacy ``alerts`` table until #349 lands — the
+        bridge UNIONs both sources and reshapes each into a lightweight
+        record object with the shape the toast renderer expects
+        (``alert_id`` / ``session_name`` / ``alert_type`` / ``severity``
+        / ``message`` / ``updated_at``).
+
+        BRIDGE(#349): swap the ``_with_legacy_bridge`` call for plain
+        :meth:`query_messages` when the writers migrate.
 
         Hookable for tests — override by assigning ``self._fetch_alerts``.
         """
@@ -1352,19 +1435,22 @@ class AlertNotifier:
         except Exception:  # noqa: BLE001
             return []
         try:
-            from pollypm.storage.state import StateStore
-            store = StateStore(config.project.state_db)
+            from pollypm.store import SQLAlchemyStore
+            store = SQLAlchemyStore(f"sqlite:///{config.project.state_db}")
         except Exception:  # noqa: BLE001
             return []
         try:
-            return list(store.open_alerts())
+            rows = store.query_messages_with_legacy_bridge(
+                type="alert", state="open",
+            )
         except Exception:  # noqa: BLE001
-            return []
+            rows = []
         finally:
             try:
                 store.close()
             except Exception:  # noqa: BLE001
                 pass
+        return [_AlertLikeRecord(row) for row in rows]
 
     @staticmethod
     def _dedup_key(record) -> object:

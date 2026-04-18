@@ -1,14 +1,18 @@
 """CLI commands for the work-service-backed inbox view.
 
-Exposes ``pm inbox`` and ``pm inbox show <task_id>``. The inbox is defined
-entirely in terms of work-service queries — see :mod:`inbox_view` for the
-membership rules.
+Exposes ``pm inbox`` and ``pm inbox show <task_id>``. Issue #341 migrated
+the list reader onto the unified :class:`~pollypm.store.Store` messages
+table — ``pm notify`` (the canonical escalation channel) writes rows
+there via :meth:`Store.enqueue_message`, so the inbox must read from the
+same surface or notify items would never appear. Work-service tasks with
+``requester=user`` still participate (the cockpit flow emits them) and
+are UNIONed in via the legacy bridge until #349 drains those writers.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 
@@ -17,6 +21,7 @@ from pollypm.work.cli import (
     _JSON_OPTION,
     _PROJECT_OPTION,
     _project_from_task_id,
+    _resolve_db_path,
     _svc,
     _task_to_dict,
     task_get,
@@ -26,12 +31,45 @@ from pollypm.work.inbox_view import inbox_tasks
 
 inbox_app = typer.Typer(
     help=(
-        "Work assigned to the user (work-service-backed).\n\n"
+        "Work assigned to the user.\n\n"
         "Examples:\n\n"
         "• pm inbox                           — list inbox items\n"
         "• pm inbox show <id>                 — print one inbox item\n"
     )
 )
+
+
+# ---------------------------------------------------------------------------
+# Message-row rendering — ``pm notify`` rows land in the unified messages
+# table (#340), so the inbox reader must surface them alongside the
+# legacy work-service tasks the cockpit flow still emits.
+# ---------------------------------------------------------------------------
+
+
+def _message_row_to_display(row: dict[str, Any]) -> dict[str, Any]:
+    """Project a :meth:`Store.query_messages` row into CLI display shape.
+
+    The id string uses an ``msg:<id>`` prefix so it never collides with a
+    ``project/number`` work-task id the same listing might include.
+    """
+    payload = row.get("payload") or {}
+    scope = row.get("scope") or ""
+    sender = row.get("sender") or ""
+    project = payload.get("project") or scope or "inbox"
+    # Priority inferred from tier — immediate lands open and is actionable.
+    tier = row.get("tier") or "immediate"
+    priority = "high" if tier == "immediate" and row.get("type") == "alert" else "normal"
+    return {
+        "id": f"msg:{row.get('id')}",
+        "title": row.get("subject") or "(no subject)",
+        "type": row.get("type") or "notify",
+        "tier": tier,
+        "priority": priority,
+        "state": row.get("state") or "open",
+        "sender": sender,
+        "project": project,
+        "created_at": str(row.get("created_at") or ""),
+    }
 
 
 @inbox_app.callback(invoke_without_command=True)
@@ -41,14 +79,55 @@ def inbox_root(
     db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
-    """Show tasks waiting on the user.
+    """Show messages + tasks waiting on the user.
 
-    A task appears here when the flow's current node expects a human actor,
-    or when the task's roles assign work to the ``user``.
+    Post-#341 the inbox is the UNION of:
+
+    * ``Store.query_messages_with_legacy_bridge(recipient='user',
+      state='open', type=['notify', 'inbox_task', 'alert'])`` — every
+      ``pm notify`` row and every writer that has migrated to the
+      unified messages table.
+    * ``inbox_tasks(svc)`` — chat-flow tasks whose ``roles`` say ``user``
+      is the requester. Still emitted by the plan-review + agent
+      escalation flows until #349 completes.
+
+    The message rows dominate day-to-day usage (every ``pm notify`` lands
+    there); the task rows are kept so the plan-review flow isn't
+    invisible during the rollout.
     """
     if ctx.invoked_subcommand is not None:
         return
 
+    # --- Messages path (unified Store, #340 writers) -------------------
+    db_path = _resolve_db_path(db, project=project)
+    message_rows: list[dict[str, Any]] = []
+    try:
+        from pollypm.store import SQLAlchemyStore
+        store = SQLAlchemyStore(f"sqlite:///{db_path}")
+        try:
+            filters: dict[str, Any] = dict(
+                recipient="user",
+                state="open",
+                type=["notify", "inbox_task", "alert"],
+            )
+            if project:
+                filters["scope"] = project
+            # BRIDGE(#349): UNION with legacy alerts while supervisor
+            # writers still hit them. Remove the ``_with_legacy_bridge``
+            # suffix when #349 lands.
+            message_rows = store.query_messages_with_legacy_bridge(**filters)
+        finally:
+            store.close()
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(
+            f"Warning: inbox messages query failed ({exc}); "
+            f"falling back to work-service tasks only.",
+            err=True,
+        )
+
+    display_messages = [_message_row_to_display(r) for r in message_rows]
+
+    # --- Tasks path (work-service, chat flow) --------------------------
     svc = _svc(db, project=project)
     tasks = inbox_tasks(svc, project=project)
 
@@ -56,7 +135,8 @@ def inbox_root(
         typer.echo(
             json.dumps(
                 {
-                    "assigned_count": len(tasks),
+                    "assigned_count": len(tasks) + len(display_messages),
+                    "messages": display_messages,
                     "tasks": [_task_to_dict(t) for t in tasks],
                 },
                 indent=2,
@@ -65,17 +145,29 @@ def inbox_root(
         )
         return
 
-    typer.echo(f"Inbox: {len(tasks)} assigned")
-    if not tasks:
-        typer.echo("No tasks waiting for you.")
+    total = len(tasks) + len(display_messages)
+    typer.echo(f"Inbox: {total} items")
+    if total == 0:
+        typer.echo("No messages waiting for you.")
         return
 
-    typer.echo(f"{'ID':<20} {'Status':<14} {'Priority':<10} {'Title'}")
+    typer.echo(f"{'ID':<20} {'Type':<10} {'Priority':<10} {'Title'}")
     typer.echo("-" * 70)
-    for t in tasks:
+    for m in display_messages:
+        title = m["title"]
+        if len(title) > 38:
+            title = title[:37] + "\u2026"
         typer.echo(
-            f"{t.task_id:<20} {t.work_status.value:<14} "
-            f"{t.priority.value:<10} {t.title}"
+            f"{m['id']:<20} {m['type']:<10} "
+            f"{m['priority']:<10} {title}"
+        )
+    for t in tasks:
+        title = t.title or ""
+        if len(title) > 38:
+            title = title[:37] + "\u2026"
+        typer.echo(
+            f"{t.task_id:<20} {t.work_status.value:<10} "
+            f"{t.priority.value:<10} {title}"
         )
 
 

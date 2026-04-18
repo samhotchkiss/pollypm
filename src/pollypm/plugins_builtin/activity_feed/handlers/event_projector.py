@@ -272,76 +272,94 @@ class EventProjector:
         since_ts: str | None,
         limit: int,
     ) -> list[FeedEntry]:
+        """Project state-store rows via :class:`Store` with a legacy bridge.
+
+        Issue #341 moved this reader onto
+        :meth:`Store.query_messages_with_legacy_bridge`. Supervisor +
+        heartbeat writers still hit the legacy ``events`` table (they
+        migrate in #349), so the bridge UNIONs ``messages`` (new writers)
+        with ``events`` (legacy writers) and reshapes both into the same
+        dict shape before we project into :class:`FeedEntry`.
+
+        BRIDGE(#349): when the writers land, swap the
+        ``_with_legacy_bridge`` call for plain :meth:`query_messages`.
+        """
         if not self._state_db.exists():
             return []
-        # Ensure the view exists on a short-lived writable connection
-        # (views are persistent schema objects — a read-only URI
-        # connection can't create one). Harmless no-op once installed.
+        # The legacy ``activity_events`` view is still installed so that
+        # callers who bypass this method (e.g. ad-hoc SQL in ops
+        # runbooks) keep working. We don't query it here — the bridge
+        # reads ``events`` directly.
         _install_view(self._state_db)
-        conn = sqlite3.connect(
-            f"file:{self._state_db}?mode=ro", uri=True, check_same_thread=False,
-        )
+
         try:
-            conn.row_factory = sqlite3.Row
-            where: list[str] = []
-            params: list[Any] = []
-            if since_id is not None:
-                where.append("id > ?")
-                params.append(since_id)
+            from pollypm.store import SQLAlchemyStore
+        except Exception:  # noqa: BLE001
+            return []
+
+        try:
+            store = SQLAlchemyStore(f"sqlite:///{self._state_db}")
+        except Exception:  # noqa: BLE001
+            logger.exception("activity_feed: failed to open Store")
+            return []
+
+        try:
+            filters: dict[str, Any] = {
+                "type": ["event", "notify", "alert"],
+                "limit": int(limit),
+            }
             if since_ts is not None:
-                where.append("timestamp >= ?")
-                params.append(since_ts)
-            where_sql = f"WHERE {' AND '.join(where)}" if where else ""
-            rows = conn.execute(
-                f"SELECT id, timestamp, project, kind, actor, subject, verb, "
-                f"summary, severity, payload_json FROM activity_events "
-                f"{where_sql} ORDER BY id DESC LIMIT ?",
-                (*params, int(limit)),
-            ).fetchall()
-        except sqlite3.OperationalError as exc:
-            # A missing ``events`` table is the common case on a brand-
-            # new state DB that hasn't seen any record_event call yet;
-            # demote to debug so we don't spam tests/CI.
-            if "no such table" in str(exc):
-                logger.debug(
-                    "activity_feed: events table absent on %s — skipping",
-                    self._state_db,
+                try:
+                    filters["since"] = datetime.fromisoformat(since_ts)
+                except (TypeError, ValueError):
+                    pass
+            try:
+                rows = store.query_messages_with_legacy_bridge(**filters)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "activity_feed: query_messages_with_legacy_bridge failed"
                 )
-            else:
-                logger.exception("activity_feed: state-store projection failed")
-            rows = []
-        except sqlite3.DatabaseError:
-            logger.exception("activity_feed: state-store projection failed")
-            rows = []
+                rows = []
         finally:
-            conn.close()
+            try:
+                store.close()
+            except Exception:  # noqa: BLE001
+                pass
 
         entries: list[FeedEntry] = []
         for row in rows:
-            payload = _decode_payload(row["payload_json"])
-            parsed = _parse_message(row["summary"] or "")
-            summary = parsed.summary or _fallback_summary(row["kind"], row["summary"], row["actor"])
-            severity = parsed.severity or row["severity"] or "routine"
-            project = parsed.project or row["project"]
-            actor = row["actor"] or "system"
-            verb = parsed.verb or row["verb"] or row["kind"]
-            subject = parsed.subject or row["subject"]
+            if since_id is not None:
+                legacy_id = _abs_legacy_id(row)
+                if legacy_id is not None and legacy_id <= since_id:
+                    continue
+            payload = row.get("payload") or {}
+            message = row.get("body") or row.get("subject") or ""
+            kind = _kind_from_message_row(row)
+            actor = row.get("scope") or row.get("sender") or "system"
+            parsed = _parse_message(message)
+            summary = parsed.summary or _fallback_summary(
+                kind, message, actor,
+            )
+            severity = parsed.severity or _severity_from_message_row(row)
+            project = parsed.project or (payload.get("project") if isinstance(payload, dict) else None)
+            verb = parsed.verb or kind
+            subject = parsed.subject or (row.get("sender") or None)
             if parsed.extra:
                 payload = {**payload, **parsed.extra}
-            if _is_noise(row["kind"], row["summary"] or "", payload):
+            if _is_noise(kind, message, payload):
                 continue
             entries.append(
                 FeedEntry(
-                    id=f"evt:{row['id']}",
-                    timestamp=row["timestamp"],
+                    id=_entry_id_from_row(row),
+                    timestamp=str(row.get("created_at") or ""),
                     project=project,
-                    kind=row["kind"],
+                    kind=kind,
                     actor=actor,
                     subject=subject,
                     verb=verb,
                     summary=summary,
                     severity=severity,
-                    payload=payload,
+                    payload=payload if isinstance(payload, dict) else {},
                     source="events",
                 )
             )
@@ -525,3 +543,86 @@ def _fallback_summary(kind: str, message: str | None, actor: str | None) -> str:
     if actor:
         return f"{kind} on {actor}"
     return kind
+
+
+# ---------------------------------------------------------------------------
+# BRIDGE(#349) helpers — reshape messages-table / legacy-events rows into
+# the FeedEntry shape. Remove when the writers migrate and this module
+# goes back to a single-source query.
+# ---------------------------------------------------------------------------
+
+
+def _kind_from_message_row(row: dict[str, Any]) -> str:
+    """Pick the ``kind`` label for a messages/events bridged row.
+
+    Legacy events carry the event_type in the ``subject`` column (the
+    bridge reshapes ``event_type`` -> ``subject``). New messages rows
+    use ``type`` (notify/alert/inbox_task/event) — we prefer the
+    payload's ``event_type`` when present so renamed events stay
+    recognizable.
+    """
+    payload = row.get("payload") or {}
+    if isinstance(payload, dict):
+        for key in ("event_type", "kind"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return value
+    # Legacy bridge rows: ``subject`` holds the event_type.
+    if row.get("_source") == "legacy_events":
+        subject = row.get("subject") or ""
+        if subject:
+            return subject
+    msg_type = row.get("type") or ""
+    if msg_type == "event":
+        return row.get("subject") or "event"
+    return msg_type or "event"
+
+
+def _severity_from_message_row(row: dict[str, Any]) -> str:
+    """Map a message/event row to the feed's severity vocabulary.
+
+    Alerts from the new ``messages`` table carry a ``payload.severity``
+    set by :meth:`Store.upsert_alert`. Legacy events infer severity
+    from kind (alert/recovery -> recommendation, error/stuck ->
+    critical, else routine), matching the old ``activity_events`` view.
+    """
+    payload = row.get("payload") or {}
+    if isinstance(payload, dict):
+        sev = payload.get("severity")
+        if isinstance(sev, str) and sev:
+            # Normalize store 'warn'/'error' -> feed vocabulary.
+            if sev in {"critical", "error", "stuck"}:
+                return "critical"
+            if sev in {"warn", "warning"}:
+                return "recommendation"
+    kind = _kind_from_message_row(row)
+    if kind in {"alert", "recovery"}:
+        return "recommendation"
+    if kind in {"error", "stuck"}:
+        return "critical"
+    return "routine"
+
+
+def _entry_id_from_row(row: dict[str, Any]) -> str:
+    """Stable entry id for a bridged messages/events row.
+
+    Legacy events round-tripped through :meth:`query_messages_with_legacy_bridge`
+    carry ``_source='legacy_events'`` and a negated id; reuse the
+    absolute value so consumers that compare against the ``since_id``
+    cursor (the rail badge helper) still land on the same numeric id.
+    """
+    if row.get("_source") == "legacy_events":
+        raw_id = row.get("id") or 0
+        return f"evt:{abs(int(raw_id))}"
+    raw_id = row.get("id") or 0
+    return f"msg:{int(raw_id)}"
+
+
+def _abs_legacy_id(row: dict[str, Any]) -> int | None:
+    """Return the legacy-events absolute id for cursor comparison, else None."""
+    if row.get("_source") != "legacy_events":
+        return None
+    try:
+        return abs(int(row.get("id") or 0))
+    except (TypeError, ValueError):
+        return None

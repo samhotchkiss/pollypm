@@ -448,8 +448,13 @@ class SQLAlchemyStore:
 
         Supported filters: ``type``, ``tier``, ``recipient``, ``state``,
         ``scope``, ``sender``, ``parent_id``, ``since`` (``datetime``),
-        ``limit`` (``int``). Unknown filter keys raise ``ValueError`` —
-        silent filter drops have burned us in the legacy inbox code.
+        ``limit`` (``int``). Any scalar filter may also be passed as a
+        list / tuple / set; the generated SQL switches to ``IN (...)`` so
+        the inbox reader (#341) can say
+        ``type=['notify', 'inbox_task', 'alert']`` in one call instead of
+        running three separate queries and merging in Python. Unknown
+        filter keys raise ``ValueError`` — silent filter drops have
+        burned us in the legacy inbox code.
         """
         limit = filters.pop("limit", None)
         since = filters.pop("since", None)
@@ -472,7 +477,13 @@ class SQLAlchemyStore:
                 f"SQLAlchemyStore.query_messages."
             )
 
-        conditions = [messages.c[key] == value for key, value in filters.items()]
+        conditions = []
+        for key, value in filters.items():
+            column = messages.c[key]
+            if isinstance(value, (list, tuple, set, frozenset)):
+                conditions.append(column.in_(list(value)))
+            else:
+                conditions.append(column == value)
         if since is not None:
             conditions.append(messages.c.created_at >= since)
 
@@ -501,6 +512,229 @@ class SQLAlchemyStore:
                     row["labels"] = json.loads(labels_json)
                 except json.JSONDecodeError:
                     row["labels"] = []
+        return rows
+
+    # ------------------------------------------------------------------
+    # Legacy-bridge reader — temporary (remove when #349 lands).
+    # ------------------------------------------------------------------
+
+    def query_messages_with_legacy_bridge(
+        self, **filters: Any
+    ) -> list[dict[str, Any]]:
+        """:meth:`query_messages` UNIONed with the old ``events`` / ``alerts``.
+
+        Background
+        ----------
+        Issue #341 migrated the reader surface (``pm inbox``, cockpit
+        inbox/activity/alerts, ``pm doctor``, digest flush) onto the
+        unified ``messages`` table. The matching writer migration for
+        supervisor + heartbeat (~199 call sites) lands in #349 — until
+        then, every ``record_event`` / ``upsert_alert`` on the legacy
+        :class:`StateStore` still lands in ``events`` / ``alerts``.
+
+        This method bridges that window: on top of the normal
+        ``messages`` query, it also scans the legacy tables for matching
+        rows and reshapes them into the ``messages`` dict shape so the
+        caller can treat the merged list uniformly. Readers that need
+        the full cockpit view during the rollout call *this* method;
+        readers that only care about the new writers call
+        :meth:`query_messages` directly.
+
+        BRIDGE(#349): remove when D-rest lands and the legacy tables are
+        confirmed drained. Issue F (#342) then drops the tables.
+        """
+        type_filter = filters.get("type")
+        types: set[str]
+        if type_filter is None:
+            types = set()
+        elif isinstance(type_filter, (list, tuple, set, frozenset)):
+            types = set(type_filter)
+        else:
+            types = {type_filter}
+
+        rows = self.query_messages(**filters)
+
+        want_alerts = not types or "alert" in types
+        want_events = not types or "event" in types
+        if want_alerts:
+            rows.extend(self._legacy_alerts_as_messages(filters))
+        if want_events:
+            rows.extend(self._legacy_events_as_messages(filters))
+
+        # Re-sort merged set newest-first so list behaves like a single
+        # query would — callers already expect that ordering.
+        rows.sort(
+            key=lambda r: (
+                str(r.get("created_at") or ""),
+                int(r.get("id") or 0),
+            ),
+            reverse=True,
+        )
+        limit = filters.get("limit")
+        if limit is not None:
+            rows = rows[: int(limit)]
+        return rows
+
+    def _legacy_alerts_as_messages(
+        self, filters: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Read legacy ``alerts WHERE status='open'`` and reshape as messages.
+
+        BRIDGE(#349): remove when D-rest lands.
+        """
+        state = filters.get("state")
+        # The legacy alerts table only knows 'open' / 'cleared'; skip the
+        # scan entirely when the caller asked for a state the legacy row
+        # could never satisfy.
+        if state is not None:
+            wanted = state if isinstance(state, (list, tuple, set, frozenset)) else {state}
+            if "open" not in wanted:
+                return []
+        scope_filter = filters.get("scope")
+        recipient_filter = filters.get("recipient")
+        if recipient_filter is not None:
+            wanted = (
+                recipient_filter
+                if isinstance(recipient_filter, (list, tuple, set, frozenset))
+                else {recipient_filter}
+            )
+            # Legacy alerts are always recipient='user' by contract.
+            if "user" not in wanted:
+                return []
+
+        rows: list[dict[str, Any]] = []
+        try:
+            with self._read_engine.connect() as conn:
+                result = conn.execute(
+                    text(
+                        "SELECT id, session_name, alert_type, severity, "
+                        "message, status, created_at, updated_at "
+                        "FROM alerts WHERE status = 'open' "
+                        "ORDER BY updated_at DESC"
+                    )
+                )
+                raw = result.fetchall()
+        except Exception:  # noqa: BLE001 — table may not exist yet.
+            return []
+        for r in raw:
+            session_name = r[1] or ""
+            if scope_filter is not None:
+                wanted_scopes = (
+                    scope_filter
+                    if isinstance(scope_filter, (list, tuple, set, frozenset))
+                    else {scope_filter}
+                )
+                if session_name not in wanted_scopes:
+                    continue
+            rows.append(
+                {
+                    # Negative ids keep legacy rows distinct from message
+                    # ids so the "which table is this from?" check stays
+                    # trivial (``id < 0``). The absolute value carries
+                    # the legacy PK for debugging.
+                    "id": -int(r[0]),
+                    "scope": session_name,
+                    "type": "alert",
+                    "tier": "immediate",
+                    "recipient": "user",
+                    "sender": r[2] or "",
+                    "state": "open" if (r[5] or "") == "open" else "closed",
+                    "parent_id": None,
+                    "subject": r[4] or "",
+                    "body": "",
+                    "payload_json": json.dumps(
+                        {"severity": r[3] or "", "session_name": session_name}
+                    ),
+                    "labels": "[]",
+                    "created_at": r[6],
+                    "updated_at": r[7],
+                    "closed_at": None,
+                    "payload": {
+                        "severity": r[3] or "",
+                        "session_name": session_name,
+                    },
+                    "_source": "legacy_alerts",
+                }
+            )
+        return rows
+
+    def _legacy_events_as_messages(
+        self, filters: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Read legacy ``events`` and reshape as messages.
+
+        BRIDGE(#349): remove when D-rest lands.
+        """
+        state = filters.get("state")
+        if state is not None:
+            wanted = state if isinstance(state, (list, tuple, set, frozenset)) else {state}
+            # Legacy events have no lifecycle — treat every row as
+            # state='open'. Bail when the caller asked for anything else.
+            if "open" not in wanted:
+                return []
+
+        scope_filter = filters.get("scope")
+        since = filters.get("since")
+        limit = filters.get("limit")
+
+        where: list[str] = []
+        params: dict[str, Any] = {}
+        if since is not None:
+            where.append("created_at >= :since")
+            params["since"] = (
+                since.isoformat() if hasattr(since, "isoformat") else str(since)
+            )
+        where_sql = f" WHERE {' AND '.join(where)}" if where else ""
+        limit_sql = ""
+        if limit is not None:
+            # Fetch a generous slice — merged result trims again below.
+            limit_sql = f" LIMIT {int(limit) * 2}"
+        sql = (
+            "SELECT id, session_name, event_type, message, created_at "
+            "FROM events"
+            + where_sql
+            + " ORDER BY id DESC"
+            + limit_sql
+        )
+        try:
+            with self._read_engine.connect() as conn:
+                result = conn.execute(text(sql), params)
+                raw = result.fetchall()
+        except Exception:  # noqa: BLE001 — table may not exist yet.
+            return []
+
+        rows: list[dict[str, Any]] = []
+        for r in raw:
+            session_name = r[1] or ""
+            if scope_filter is not None:
+                wanted_scopes = (
+                    scope_filter
+                    if isinstance(scope_filter, (list, tuple, set, frozenset))
+                    else {scope_filter}
+                )
+                if session_name not in wanted_scopes:
+                    continue
+            rows.append(
+                {
+                    "id": -int(r[0]),
+                    "scope": session_name,
+                    "type": "event",
+                    "tier": "immediate",
+                    "recipient": "*",
+                    "sender": session_name,
+                    "state": "open",
+                    "parent_id": None,
+                    "subject": r[2] or "",
+                    "body": r[3] or "",
+                    "payload_json": "{}",
+                    "labels": "[]",
+                    "created_at": r[4],
+                    "updated_at": r[4],
+                    "closed_at": None,
+                    "payload": {"event_type": r[2] or ""},
+                    "_source": "legacy_events",
+                }
+            )
         return rows
 
     # ------------------------------------------------------------------

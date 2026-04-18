@@ -41,7 +41,7 @@ import time
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 
 # --------------------------------------------------------------------- #
@@ -1746,6 +1746,48 @@ def _primary_state_db() -> Path | None:
     return candidates[0] if candidates else None
 
 
+def _parse_iso_or_epoch(value: Any) -> float:
+    """Coerce a timestamp string / number / datetime into a POSIX epoch float.
+
+    Accepts ISO-8601 strings ("2026-04-17T12:34:56+00:00"), integer /
+    float epochs, and naive/aware ``datetime`` instances. Used by
+    :func:`check_scheduler_last_fired` to compare handler rows
+    uniformly regardless of whether they came from the unified
+    ``messages`` table (datetime-valued ``created_at``) or the legacy
+    ``events`` table (ISO string).
+
+    Raises
+    ------
+    ValueError
+        When ``value`` can't be parsed — callers treat this as "no
+        event recorded" rather than propagating the failure.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    if value is None:
+        raise ValueError("timestamp is None")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if hasattr(value, "timestamp"):
+        # datetime or anything datetime-shaped.
+        dt = value
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_tz.utc)
+        return dt.timestamp()
+    text_value = str(value).strip()
+    if not text_value:
+        raise ValueError("timestamp is empty")
+    try:
+        parsed = _dt.fromisoformat(text_value)
+    except ValueError:
+        # Try fractional-second variants / 'Z' suffixes the stdlib used
+        # to choke on before 3.11; normalize and retry.
+        normalized = text_value.rstrip("Z") + "+00:00"
+        parsed = _dt.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_tz.utc)
+    return parsed.timestamp()
+
+
 def check_sessions_table_populated() -> CheckResult:
     """A non-empty ``sessions`` table is the post-#268 expectation.
 
@@ -1893,53 +1935,80 @@ _HANDLER_MAX_GAP_SECONDS: dict[str, int] = {
 def check_scheduler_last_fired() -> CheckResult:
     """Confirm scheduled handlers actually fired within their cadence.
 
-    We read the events table (system events recorded by each handler)
-    on the primary state DB. A handler with an event newer than its
-    max-gap is healthy. A handler with no event ever is *informational*
-    — fresh installs haven't run anything yet — but a handler whose
-    last event is older than the gap is a warning.
+    Issue #341 migrated this reader onto
+    :meth:`Store.query_messages_with_legacy_bridge` — we pull one
+    reverse-chronological slice across the new ``messages`` table AND
+    the legacy ``events`` table, then compute max(created_at) per
+    handler in Python. Each handler with an event newer than its
+    max-gap is healthy; one with no event ever is *informational*
+    (fresh installs); one whose last event is older than the gap is a
+    warning.
+
+    BRIDGE(#349): swap ``_with_legacy_bridge`` for plain
+    :meth:`query_messages` when supervisor / heartbeat writers migrate
+    off the legacy ``events`` table.
     """
     db_path = _primary_state_db()
     if db_path is None:
         return _skip("scheduler-cadence check skipped (no state.db)")
-    conn = _open_state_db_ro(db_path)
-    if conn is None:
-        return _skip("scheduler-cadence check skipped (cannot open db)")
+
+    try:
+        from pollypm.store import SQLAlchemyStore
+        store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    except Exception:  # noqa: BLE001
+        return _skip("scheduler-cadence check skipped (cannot open store)")
+
+    latest_per_handler: dict[str, float] = {}
+    try:
+        try:
+            # ``limit=10000`` covers plenty of handler history (each
+            # scheduled handler fires a few times per day; 10k rows is
+            # weeks of events). We scan in Python because MAX() over a
+            # bridged UNION doesn't fit the bridge's single-query shape.
+            rows = store.query_messages_with_legacy_bridge(
+                type=["event", "notify"],
+                limit=10000,
+            )
+        except Exception:  # noqa: BLE001
+            rows = []
+        now_ts = time.time()
+        for row in rows:
+            # Each handler's ``record_event`` call lands the handler
+            # name in ``subject`` for legacy rows and in
+            # ``payload['event_type']`` for new rows. Accept either.
+            handler_key = row.get("subject") or ""
+            payload = row.get("payload") or {}
+            if isinstance(payload, dict):
+                handler_key = payload.get("event_type") or handler_key
+            if handler_key not in _HANDLER_MAX_GAP_SECONDS:
+                continue
+            ts_raw = row.get("created_at") or ""
+            try:
+                ts_val = _parse_iso_or_epoch(ts_raw)
+            except Exception:  # noqa: BLE001
+                continue
+            existing = latest_per_handler.get(handler_key)
+            if existing is None or ts_val > existing:
+                latest_per_handler[handler_key] = ts_val
+    finally:
+        try:
+            store.close()
+        except Exception:  # noqa: BLE001
+            pass
+
     overdue: list[tuple[str, float]] = []
     never_seen: list[str] = []
     healthy: list[str] = []
-    try:
-        try:
-            now_row = conn.execute(
-                "SELECT strftime('%s','now')",
-            ).fetchone()
-            now_ts = float(now_row[0]) if now_row and now_row[0] is not None else time.time()
-        except sqlite3.Error:
-            now_ts = time.time()
-        for handler, max_gap in _HANDLER_MAX_GAP_SECONDS.items():
-            try:
-                row = conn.execute(
-                    "SELECT strftime('%s', MAX(created_at)) FROM events "
-                    "WHERE event_type = ?",
-                    (handler,),
-                ).fetchone()
-            except sqlite3.Error:
-                row = None
-            if row is None or row[0] is None:
-                never_seen.append(handler)
-                continue
-            try:
-                last_ts = float(row[0])
-            except (TypeError, ValueError):
-                never_seen.append(handler)
-                continue
-            gap = now_ts - last_ts
-            if gap > max_gap:
-                overdue.append((handler, gap))
-            else:
-                healthy.append(handler)
-    finally:
-        conn.close()
+    for handler, max_gap in _HANDLER_MAX_GAP_SECONDS.items():
+        last_ts = latest_per_handler.get(handler)
+        if last_ts is None:
+            never_seen.append(handler)
+            continue
+        gap = now_ts - last_ts
+        if gap > max_gap:
+            overdue.append((handler, gap))
+        else:
+            healthy.append(handler)
     data = {
         "overdue": [h for h, _ in overdue],
         "never_seen": never_seen,

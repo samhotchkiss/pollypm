@@ -101,6 +101,17 @@ class Store(Protocol):
         """Return messages matching ``filters`` (ordered by recency)."""
         ...
 
+    def query_messages_with_legacy_bridge(
+        self, **filters: Any
+    ) -> list[dict[str, Any]]:
+        """:meth:`query_messages` UNIONed with legacy ``events`` / ``alerts``.
+
+        BRIDGE(#349): temporary during the rollout window between #341
+        (this reader-migration) and #349 (supervisor/heartbeat writer
+        migration). Remove when the legacy tables drain.
+        """
+        ...
+
     # ------------------------------------------------------------------
     # Alerts — thin wrappers over upsert_message / close_message.
     # ------------------------------------------------------------------

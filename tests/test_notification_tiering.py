@@ -438,6 +438,73 @@ class TestFlushMilestoneDigest:
         )
         assert second is None
 
+    def test_flush_picks_up_messages_table_digest_rows(self, svc):
+        """#341: digest rows in ``messages`` contribute to the rollup.
+
+        ``pm notify --priority digest`` (post-#340) writes rows to the
+        unified ``messages`` table with ``state='staged'``; the flush
+        must pick them up as well as anything still in the legacy
+        ``notification_staging`` table.
+        """
+        from pollypm.store import SQLAlchemyStore
+
+        store = SQLAlchemyStore(f"sqlite:///{svc._db_path}")
+        try:
+            # Two digest notifications land in messages; one legacy
+            # staging row lands via stage_notification.
+            for i in range(2):
+                store.enqueue_message(
+                    type="notify",
+                    tier="digest",
+                    recipient="user",
+                    sender="polly",
+                    subject=f"new-path update {i}",
+                    body=f"notes {i}",
+                    scope="demo",
+                    payload={
+                        "actor": "polly",
+                        "project": "demo",
+                        "milestone_key": "milestones/01-init",
+                    },
+                    state="staged",
+                )
+        finally:
+            store.close()
+
+        ns.stage_notification(
+            svc._conn,
+            project="demo",
+            subject="legacy staged",
+            body="old-path body",
+            actor="polly",
+            priority="digest",
+            milestone_key="milestones/01-init",
+        )
+
+        task_id = ns.flush_milestone_digest(
+            svc,
+            project="demo",
+            milestone_key="milestones/01-init",
+            project_path=svc._project_path,
+        )
+        assert task_id is not None
+        task = svc.get(task_id)
+        assert "3 updates" in task.title
+        # Body mentions each subject from both sources.
+        assert "legacy staged" in task.description
+        assert "new-path update 0" in task.description
+        assert "new-path update 1" in task.description
+
+        # Messages-table rows were closed so they don't re-flush.
+        store = SQLAlchemyStore(f"sqlite:///{svc._db_path}")
+        try:
+            staged = store.query_messages(
+                type="notify", tier="digest", state="staged",
+            )
+            assert staged == []
+        finally:
+            store.close()
+
 
 # ---------------------------------------------------------------------------
 # Milestone detection + on-done flush

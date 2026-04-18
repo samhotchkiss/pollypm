@@ -265,14 +265,21 @@ class TestInboxCLI:
     def test_empty_inbox(self, db_path):
         result = runner.invoke(inbox_app, ["--db", db_path])
         assert result.exit_code == 0, result.output
-        assert "Inbox: 0 assigned" in result.output
-        assert "No tasks waiting for you." in result.output
+        # #341 rewrote the header to reflect the messages+tasks UNION.
+        assert "Inbox: 0 items" in result.output
+        assert "No messages waiting for you." in result.output
 
     def test_json_output_when_empty(self, db_path):
         result = runner.invoke(inbox_app, ["--db", db_path, "--json"])
         assert result.exit_code == 0, result.output
         payload = json.loads(result.output)
-        assert payload == {"assigned_count": 0, "tasks": []}
+        # #341: inbox JSON now emits a ``messages`` key alongside ``tasks``
+        # (the messages-table side of the UNION).
+        assert payload == {
+            "assigned_count": 0,
+            "messages": [],
+            "tasks": [],
+        }
 
     def test_task_at_human_review_appears(self, db_path):
         # Drive a task through the user-review flow until it sits at the

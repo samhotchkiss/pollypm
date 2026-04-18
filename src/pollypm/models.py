@@ -121,6 +121,28 @@ class RailSettings:
 
 
 @dataclass(slots=True)
+class LoggingSettings:
+    """Log-file hygiene configuration from the ``[logging]`` TOML section.
+
+    Controls the hourly ``log.rotate`` recurring handler that keeps
+    ``<logs_dir>/*.log`` files from growing unbounded. Writers (tmux
+    ``pipe-pane``) keep appending to ``<name>.log``; the handler renames
+    the file when it crosses the threshold, gzips the rotation, and
+    truncates the original back to empty so the writer's next append
+    starts at offset 0.
+
+    ``rotate_size_mb`` — threshold in megabytes above which a log is
+    rotated. Files at or below this size are left alone. Default 20 MB.
+    ``rotate_keep`` — number of gzipped rotations to retain per base log
+    name. Older ``.log.<ts>.gz`` files beyond this count are deleted.
+    Default 3.
+    """
+
+    rotate_size_mb: int = 20
+    rotate_keep: int = 3
+
+
+@dataclass(slots=True)
 class PlannerSettings:
     """Project-planner plugin configuration from the ``[planner]`` TOML
     section.
@@ -164,6 +186,7 @@ class PollyPMConfig:
     plugins: PluginSettings = field(default_factory=PluginSettings)
     rail: RailSettings = field(default_factory=RailSettings)
     planner: PlannerSettings = field(default_factory=PlannerSettings)
+    logging: LoggingSettings = field(default_factory=LoggingSettings)
 
 
 @dataclass(slots=True)

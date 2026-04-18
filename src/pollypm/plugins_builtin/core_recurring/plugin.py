@@ -562,6 +562,158 @@ def agent_worktree_prune_handler(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def log_rotate_handler(payload: dict[str, Any]) -> dict[str, Any]:
+    """Rotate + prune oversized log files under ``config.project.logs_dir``.
+
+    Unbounded tmux ``pipe-pane`` captures previously let individual logs
+    grow to tens of megabytes (``pm-operator.log`` hit 60 MB on Sam's
+    machine, total ``~/.pollypm/logs/`` reached 745 MB). This handler
+    implements rename-then-truncate rotation + gzip of the rotated
+    archive + retention pruning of older ``.log.<ts>.gz`` siblings.
+
+    Algorithm per ``<logs_dir>/*.log`` file:
+
+    1. If size <= ``rotate_size_mb`` MB → skip.
+    2. Else: rename ``<name>.log`` → ``<name>.log.<ts>`` (atomic on
+       POSIX). Active writers keep their open file descriptor pointed
+       at the renamed inode — they do not follow the rename — so we
+       recreate an empty ``<name>.log`` so new appends (including
+       ``tmux pipe-pane`` when it reopens) have somewhere to go. The
+       original writers will continue writing to the now-renamed file
+       until they close/reopen; we accept that small tail because tmux
+       reopens on its own schedule.
+    3. Gzip-in-place: ``<name>.log.<ts>`` → ``<name>.log.<ts>.gz``.
+    4. Retention: keep only the ``rotate_keep`` most recent ``.log.*.gz``
+       siblings per base name; delete older rotations.
+
+    Non-``.log`` files in the directory (e.g. JSON state blobs) are
+    never touched. A missing ``logs_dir`` is a no-op — returns zeros
+    with no error.
+
+    Payload overrides (for tests + ad-hoc runs):
+    * ``logs_dir`` — override ``config.project.logs_dir``.
+    * ``rotate_size_mb`` — override ``config.logging.rotate_size_mb``.
+    * ``rotate_keep`` — override ``config.logging.rotate_keep``.
+    """
+    import gzip
+    import os
+    import re
+    import shutil
+    import time
+
+    # Resolve logs_dir + thresholds. When a ``logs_dir`` override is
+    # present in the payload we skip loading config entirely so tests
+    # don't need a full PollyPM config on disk.
+    logs_dir_hint = payload.get("logs_dir") if isinstance(payload, dict) else None
+    size_override = payload.get("rotate_size_mb") if isinstance(payload, dict) else None
+    keep_override = payload.get("rotate_keep") if isinstance(payload, dict) else None
+
+    if logs_dir_hint is not None:
+        logs_dir = Path(logs_dir_hint)
+        rotate_size_mb = int(size_override) if size_override is not None else 20
+        rotate_keep = int(keep_override) if keep_override is not None else 3
+    else:
+        config, _store = _load_config_and_store(payload)
+        logs_dir = config.project.logs_dir
+        rotate_size_mb = (
+            int(size_override) if size_override is not None
+            else config.logging.rotate_size_mb
+        )
+        rotate_keep = (
+            int(keep_override) if keep_override is not None
+            else config.logging.rotate_keep
+        )
+
+    if not logs_dir.is_dir():
+        return {"rotated": 0, "deleted": 0, "errors": 0}
+
+    threshold_bytes = max(1, rotate_size_mb) * 1024 * 1024
+    rotated = 0
+    deleted = 0
+    errors = 0
+
+    # Fixed ts-suffix pattern: <base>.log.<digits>.gz — we use epoch
+    # seconds so retention ordering is a simple numeric sort.
+    rotation_re = re.compile(r"^(?P<base>.+)\.log\.(?P<ts>\d+)\.gz$")
+
+    for log_path in sorted(logs_dir.glob("*.log")):
+        if not log_path.is_file():
+            continue
+        try:
+            size = log_path.stat().st_size
+        except OSError:
+            errors += 1
+            continue
+        if size <= threshold_bytes:
+            continue
+        # Rotate. Use epoch seconds for the stamp — it sorts numerically
+        # and avoids the filesystem-safety concerns of ISO strings.
+        ts = int(time.time())
+        rotated_path = log_path.with_suffix(f".log.{ts}")
+        # If the rotated name already exists (two rotations in the same
+        # second), bump until free.
+        bump = 0
+        while rotated_path.exists():
+            bump += 1
+            rotated_path = log_path.with_suffix(f".log.{ts}.{bump}")
+        try:
+            # Atomic rename on POSIX. Writers with the file open keep
+            # their fd; new opens see the fresh empty file we create
+            # next.
+            os.rename(log_path, rotated_path)
+            # Recreate an empty <name>.log so the next writer to open()
+            # finds it. ``touch`` semantics.
+            log_path.touch()
+        except OSError:
+            logger.debug(
+                "log.rotate: rename failed for %s", log_path, exc_info=True,
+            )
+            errors += 1
+            continue
+        # Gzip the rotated file in place. Stream to avoid loading the
+        # whole thing into memory.
+        gz_path = rotated_path.with_suffix(rotated_path.suffix + ".gz")
+        try:
+            with open(rotated_path, "rb") as src, gzip.open(gz_path, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            rotated_path.unlink()
+            rotated += 1
+        except OSError:
+            logger.debug(
+                "log.rotate: gzip failed for %s", rotated_path, exc_info=True,
+            )
+            errors += 1
+            # Leave the uncompressed rotation in place so it's not lost.
+            continue
+
+    # Retention pass: group ``<base>.log.<ts>.gz`` files by base name
+    # and delete all but the newest ``rotate_keep``.
+    by_base: dict[str, list[tuple[int, Path]]] = {}
+    for gz in logs_dir.glob("*.log.*.gz"):
+        m = rotation_re.match(gz.name)
+        if not m:
+            continue
+        try:
+            ts_val = int(m.group("ts"))
+        except ValueError:
+            continue
+        by_base.setdefault(m.group("base"), []).append((ts_val, gz))
+
+    for base, entries in by_base.items():
+        entries.sort(key=lambda item: item[0], reverse=True)
+        for _ts_val, gz_path in entries[rotate_keep:]:
+            try:
+                gz_path.unlink()
+                deleted += 1
+            except OSError:
+                logger.debug(
+                    "log.rotate: delete failed for %s", gz_path, exc_info=True,
+                )
+                errors += 1
+
+    return {"rotated": rotated, "deleted": deleted, "errors": errors}
+
+
 def notification_staging_prune_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Drop flushed + silent notification_staging rows older than 30d.
 
@@ -650,6 +802,11 @@ def _register_handlers(api: JobHandlerAPI) -> None:
         "agent_worktree.prune", agent_worktree_prune_handler,
         max_attempts=1, timeout_seconds=120.0,
     )
+    # Log-file hygiene — hourly rotation + gzip of oversized logs.
+    api.register_handler(
+        "log.rotate", log_rotate_handler,
+        max_attempts=1, timeout_seconds=120.0,
+    )
 
 
 def _register_roster(api: RosterAPI) -> None:
@@ -683,6 +840,14 @@ def _register_roster(api: RosterAPI) -> None:
         "23 * * * *", "agent_worktree.prune", {},
         dedupe_key="agent_worktree.prune",
     )
+    # Log-file hygiene — every hour at minute 31, off-pattern from the
+    # agent-worktree prune (:23) and the 4am DB hygiene window. Rotates
+    # any ``<logs_dir>/*.log`` over the configured threshold and keeps
+    # only the most recent N gzipped rotations.
+    api.register_recurring(
+        "31 * * * *", "log.rotate", {},
+        dedupe_key="log.rotate",
+    )
 
 
 plugin = PollyPMPlugin(
@@ -705,6 +870,7 @@ plugin = PollyPMPlugin(
         Capability(kind="job_handler", name="memory.ttl_sweep"),
         Capability(kind="job_handler", name="notification_staging.prune"),
         Capability(kind="job_handler", name="agent_worktree.prune"),
+        Capability(kind="job_handler", name="log.rotate"),
         Capability(kind="roster_entry", name="core_recurring"),
     ),
     register_handlers=_register_handlers,

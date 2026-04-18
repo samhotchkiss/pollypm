@@ -506,6 +506,13 @@ def cockpit_pane(
     kind: str = typer.Argument(..., help="Pane type: inbox, settings, or project."),
     target: str | None = typer.Argument(None, help="Optional project key for project panes."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+    project: str | None = typer.Option(
+        None, "--project", "-p",
+        help=(
+            "Preload a project filter (currently used by `activity` to "
+            "scope the feed to one project)."
+        ),
+    ),
 ) -> None:
     if kind == "settings" and target:
         from pollypm.cockpit_ui import PollyProjectSettingsApp
@@ -532,13 +539,17 @@ def cockpit_pane(
         PollyTasksApp(config_path, target).run(mouse=True)
         return
     if kind == "activity":
-        # Live Activity Feed (lf03) — Textual app owned by the plugin
-        # so the cockpit pane doesn't need to know its internals.
-        from pollypm.plugins_builtin.activity_feed.cockpit.feed_panel import (
-            ActivityFeedApp,
-        )
+        # Full-screen activity feed — DataTable-based, project-filterable,
+        # follow mode. Accepts the project filter from either ``--project``
+        # or the positional ``target`` so callers can write
+        # ``pm cockpit-pane activity demo`` (matching ``project demo``)
+        # or ``pm cockpit-pane activity --project demo`` (matching the spec).
+        from pollypm.cockpit_ui import PollyActivityFeedApp
 
-        ActivityFeedApp(config_path).run(mouse=True)
+        project_key = project or target
+        PollyActivityFeedApp(config_path, project_key=project_key).run(
+            mouse=True,
+        )
         return
     if kind == "project" and target:
         # Per-project dashboard — beautiful Textual screen, replaces the

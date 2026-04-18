@@ -1706,11 +1706,18 @@ class CockpitRouter:
         if key == "settings":
             self._show_static_view(supervisor, window_target, "settings")
             return
-        if key == "activity":
-            # Live activity feed (lf03) — a plugin-owned view served
-            # through the standard static-view plumbing. The right-pane
-            # launcher resolves "activity" to the plugin's Textual app.
-            self._show_static_view(supervisor, window_target, "activity")
+        if key == "activity" or key.startswith("activity:"):
+            # Live activity feed — served through the standard static-view
+            # plumbing. ``activity:<project_key>`` preloads the per-project
+            # filter so the dashboard's ``l`` keybinding lands the user
+            # exactly where they were looking.
+            project_key = None
+            if key.startswith("activity:"):
+                _, _, project_key = key.partition(":")
+                project_key = project_key or None
+            self._show_static_view(
+                supervisor, window_target, "activity", project_key,
+            )
             return
         if key.startswith("project:"):
             parts = key.split(":")
@@ -2868,6 +2875,39 @@ def _render_worker_roster_panel(config_path: Path) -> str:
             f"{row.turn_label}  {row.last_commit_label}"
         )
     return "\n".join(lines)
+
+
+def _gather_activity_feed(
+    config,
+    *,
+    project: str | None = None,
+    limit: int = 200,
+):
+    """Project the live activity feed for the cockpit's full-screen view.
+
+    Returns a list of :class:`FeedEntry` records (newest first). Filters
+    by ``project`` server-side when provided so the loaded window is
+    already scoped — client-side filters in the Textual app then apply
+    on the in-memory rows without another DB hit.
+
+    Best-effort: if the projector or any DB read fails, returns an
+    empty list rather than propagating the error. The Textual screen
+    surfaces the empty state as a friendly placeholder.
+    """
+    try:
+        from pollypm.plugins_builtin.activity_feed.plugin import build_projector
+    except Exception:  # noqa: BLE001
+        return []
+    projector = build_projector(config)
+    if projector is None:
+        return []
+    try:
+        return projector.project(
+            limit=limit,
+            projects=[project] if project else None,
+        )
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _register_worker_roster_rail_item(registry, router) -> None:

@@ -23,8 +23,17 @@ from pollypm.cli import app as root_app
 from pollypm.plugins_builtin.core_recurring.plugin import (
     notification_staging_prune_handler,
 )
+from pollypm.store.classifier import classify_priority  # noqa: F401 — re-bind below
 from pollypm.work.models import WorkStatus
 from pollypm.work.sqlite_service import SQLiteWorkService
+
+
+# The classifier moved to :mod:`pollypm.store.classifier` in #340 and the
+# back-compat re-export on :mod:`pollypm.notification_staging` was deleted
+# in #342. Bind the imported name onto ``ns`` so the existing
+# ``ns.classify_priority(...)`` call sites below keep working without a
+# per-site rewrite.
+ns.classify_priority = classify_priority  # type: ignore[attr-defined]
 
 
 runner = CliRunner()

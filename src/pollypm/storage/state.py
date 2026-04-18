@@ -1,3 +1,25 @@
+"""Legacy :class:`StateStore` — domain tables that haven't moved yet.
+
+#342 retired the event/alert/message-shaped surfaces that this module
+used to own (now on :class:`pollypm.store.SQLAlchemyStore`). What's
+left are the domain tables we didn't have time to port to SQLAlchemy
+Core Table defs in a single PR:
+
+* ``sessions`` / ``account_usage`` / ``account_runtime`` /
+  ``session_runtime`` — the operator session model.
+* ``work_jobs`` — background job queue.
+* ``worktrees`` — the shared worktree ledger.
+* ``memory_entries`` + ``memory_summaries`` FTS — knowledge recall.
+* ``heartbeats`` / ``leases`` / ``checkpoints`` / ``token_*`` — ops
+  tables.
+
+TODO(#342-followup): port each of the tables above to Core ``Table()``
+definitions in :mod:`pollypm.store.schema` and move the corresponding
+writers off :class:`StateStore`. Then delete this module entirely. The
+unified ``messages`` writers already live on :class:`Store`; what's
+left is domain-data migration.
+"""
+
 from __future__ import annotations
 
 import json

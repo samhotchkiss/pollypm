@@ -272,17 +272,13 @@ class EventProjector:
         since_ts: str | None,
         limit: int,
     ) -> list[FeedEntry]:
-        """Project state-store rows via :class:`Store` with a legacy bridge.
+        """Project ``messages`` rows into :class:`FeedEntry` values.
 
-        Issue #341 moved this reader onto
-        :meth:`Store.query_messages_with_legacy_bridge`. Supervisor +
-        heartbeat writers still hit the legacy ``events`` table (they
-        migrate in #349), so the bridge UNIONs ``messages`` (new writers)
-        with ``events`` (legacy writers) and reshapes both into the same
-        dict shape before we project into :class:`FeedEntry`.
-
-        BRIDGE(#349): when the writers land, swap the
-        ``_with_legacy_bridge`` call for plain :meth:`query_messages`.
+        Supervisor + heartbeat writers all land on the unified
+        ``messages`` table (#349 + #342). We issue a single
+        :meth:`Store.query_messages` call with ``type in ('event',
+        'notify', 'alert')`` and reshape each row into a
+        :class:`FeedEntry`.
         """
         if not self._state_db.exists():
             return []
@@ -314,10 +310,10 @@ class EventProjector:
                 except (TypeError, ValueError):
                     pass
             try:
-                rows = store.query_messages_with_legacy_bridge(**filters)
+                rows = store.query_messages(**filters)
             except Exception:  # noqa: BLE001
                 logger.exception(
-                    "activity_feed: query_messages_with_legacy_bridge failed"
+                    "activity_feed: query_messages failed"
                 )
                 rows = []
         finally:
@@ -329,8 +325,11 @@ class EventProjector:
         entries: list[FeedEntry] = []
         for row in rows:
             if since_id is not None:
-                legacy_id = _abs_legacy_id(row)
-                if legacy_id is not None and legacy_id <= since_id:
+                try:
+                    row_id = int(row.get("id") or 0)
+                except (TypeError, ValueError):
+                    row_id = 0
+                if row_id and row_id <= since_id:
                     continue
             payload = row.get("payload") or {}
             message = row.get("body") or row.get("subject") or ""
@@ -546,20 +545,16 @@ def _fallback_summary(kind: str, message: str | None, actor: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# BRIDGE(#349) helpers — reshape messages-table / legacy-events rows into
-# the FeedEntry shape. Remove when the writers migrate and this module
-# goes back to a single-source query.
+# Row-shape helpers — project unified ``messages`` rows into FeedEntry fields.
 # ---------------------------------------------------------------------------
 
 
 def _kind_from_message_row(row: dict[str, Any]) -> str:
-    """Pick the ``kind`` label for a messages/events bridged row.
+    """Pick the ``kind`` label for a messages row.
 
-    Legacy events carry the event_type in the ``subject`` column (the
-    bridge reshapes ``event_type`` -> ``subject``). New messages rows
-    use ``type`` (notify/alert/inbox_task/event) — we prefer the
-    payload's ``event_type`` when present so renamed events stay
-    recognizable.
+    Messages rows use ``type`` (notify/alert/inbox_task/event) — we
+    prefer the payload's ``event_type`` when present so renamed events
+    stay recognizable.
     """
     payload = row.get("payload") or {}
     if isinstance(payload, dict):
@@ -567,11 +562,6 @@ def _kind_from_message_row(row: dict[str, Any]) -> str:
             value = payload.get(key)
             if isinstance(value, str) and value:
                 return value
-    # Legacy bridge rows: ``subject`` holds the event_type.
-    if row.get("_source") == "legacy_events":
-        subject = row.get("subject") or ""
-        if subject:
-            return subject
     msg_type = row.get("type") or ""
     if msg_type == "event":
         return row.get("subject") or "event"
@@ -579,12 +569,12 @@ def _kind_from_message_row(row: dict[str, Any]) -> str:
 
 
 def _severity_from_message_row(row: dict[str, Any]) -> str:
-    """Map a message/event row to the feed's severity vocabulary.
+    """Map a message row to the feed's severity vocabulary.
 
-    Alerts from the new ``messages`` table carry a ``payload.severity``
-    set by :meth:`Store.upsert_alert`. Legacy events infer severity
-    from kind (alert/recovery -> recommendation, error/stuck ->
-    critical, else routine), matching the old ``activity_events`` view.
+    Alerts carry a ``payload.severity`` set by
+    :meth:`Store.upsert_alert`. Fallback: infer severity from kind
+    (alert/recovery -> recommendation, error/stuck -> critical, else
+    routine).
     """
     payload = row.get("payload") or {}
     if isinstance(payload, dict):
@@ -604,25 +594,6 @@ def _severity_from_message_row(row: dict[str, Any]) -> str:
 
 
 def _entry_id_from_row(row: dict[str, Any]) -> str:
-    """Stable entry id for a bridged messages/events row.
-
-    Legacy events round-tripped through :meth:`query_messages_with_legacy_bridge`
-    carry ``_source='legacy_events'`` and a negated id; reuse the
-    absolute value so consumers that compare against the ``since_id``
-    cursor (the rail badge helper) still land on the same numeric id.
-    """
-    if row.get("_source") == "legacy_events":
-        raw_id = row.get("id") or 0
-        return f"evt:{abs(int(raw_id))}"
+    """Stable entry id for a ``messages`` row (``msg:<id>``)."""
     raw_id = row.get("id") or 0
     return f"msg:{int(raw_id)}"
-
-
-def _abs_legacy_id(row: dict[str, Any]) -> int | None:
-    """Return the legacy-events absolute id for cursor comparison, else None."""
-    if row.get("_source") != "legacy_events":
-        return None
-    try:
-        return abs(int(row.get("id") or 0))
-    except (TypeError, ValueError):
-        return None

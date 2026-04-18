@@ -235,14 +235,11 @@ class Supervisor:
             from pollypm.plugin_host import extension_host_for_root
             plugin_host = extension_host_for_root(str(config.project.root_dir.resolve()))
             self._core_rail = _CoreRail(config, self.store, plugin_host)
-        # Unified-messages Store for record_event/upsert_alert/clear_alert
-        # (#349). Lives alongside ``self.store`` because StateStore exposes
-        # many methods that aren't on the Store protocol (record_heartbeat,
-        # upsert_session, list_leases, etc.); those call sites stay on
-        # StateStore until Issue F (#342) retires it entirely.
-        # TODO(#342-F): remaining StateStore-specific access (heartbeats,
-        # leases, session runtimes, checkpoints, token ledger) migrates
-        # when StateStore is deleted.
+        # Unified-messages Store for record_event/upsert_alert/clear_alert.
+        # Lives alongside ``self.store`` because StateStore still owns the
+        # domain tables (sessions, heartbeats, leases, session_runtime,
+        # checkpoints, token ledger, worktrees, memory_entries) that #342
+        # left behind for a follow-up Core-Table migration.
         self._msg_store: "Store" = get_store(config)
         # Lazy-init session service to avoid circular imports at construction
         self._session_service = None
@@ -973,13 +970,6 @@ class Supervisor:
         self.store.prune_sessions(
             {session.name for session in self.config.sessions.values() if session.enabled}
         )
-        # One-shot migration of any legacy inbox messages — safe to call on
-        # every boot; guarded by a durable marker so it only runs once.
-        try:
-            from pollypm.inbox_migration import run_inbox_migration_if_needed
-            run_inbox_migration_if_needed(self.config)
-        except Exception:  # noqa: BLE001 - never block startup on migration
-            pass
         return project.base_dir
 
     @property

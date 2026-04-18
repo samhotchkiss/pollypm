@@ -927,26 +927,32 @@ class TmuxSessionService:
                 f"role={session_role!r}"
             )
             logger.error("persona_swap_detected (session_service): %s", details)
-            # #349: emit via the unified Store when one is available; fall
-            # back to the legacy ``record_event`` on StateStore to preserve
-            # behavior in test doubles that don't carry ``append_event``.
+            # Audit the swap on the unified ``messages`` table. The
+            # RuntimeError below still makes the failure unmissable if
+            # the audit write itself fails.
             try:
-                append = getattr(self._store, "append_event", None)
-                if callable(append):
-                    append(
+                from pollypm.store.registry import get_store
+
+                msg_store = get_store(self._config)
+            except Exception:  # noqa: BLE001
+                msg_store = None
+            if msg_store is not None:
+                try:
+                    msg_store.append_event(
                         scope=session_name,
                         sender=session_name,
                         subject="persona_swap_detected",
                         payload={"message": details},
                     )
-                else:
-                    # TODO(#342-F): remove this fallback when StateStore
-                    # is retired; all callers will carry a Store.
-                    self._store.record_event(
-                        session_name, "persona_swap_detected", details,
-                    )
-            except Exception:  # noqa: BLE001
-                pass
+                except Exception:  # noqa: BLE001
+                    pass
+                finally:
+                    close = getattr(msg_store, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception:  # noqa: BLE001
+                            pass
             raise RuntimeError(f"persona_swap_detected: {details}")
 
     def _prepare_initial_input(

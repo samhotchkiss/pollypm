@@ -1935,18 +1935,12 @@ _HANDLER_MAX_GAP_SECONDS: dict[str, int] = {
 def check_scheduler_last_fired() -> CheckResult:
     """Confirm scheduled handlers actually fired within their cadence.
 
-    Issue #341 migrated this reader onto
-    :meth:`Store.query_messages_with_legacy_bridge` — we pull one
-    reverse-chronological slice across the new ``messages`` table AND
-    the legacy ``events`` table, then compute max(created_at) per
+    Pulls one reverse-chronological slice of recent ``messages``
+    (``type in ('event', 'notify')``) and computes max(created_at) per
     handler in Python. Each handler with an event newer than its
     max-gap is healthy; one with no event ever is *informational*
     (fresh installs); one whose last event is older than the gap is a
     warning.
-
-    BRIDGE(#349): swap ``_with_legacy_bridge`` for plain
-    :meth:`query_messages` when supervisor / heartbeat writers migrate
-    off the legacy ``events`` table.
     """
     db_path = _primary_state_db()
     if db_path is None:
@@ -1963,9 +1957,8 @@ def check_scheduler_last_fired() -> CheckResult:
         try:
             # ``limit=10000`` covers plenty of handler history (each
             # scheduled handler fires a few times per day; 10k rows is
-            # weeks of events). We scan in Python because MAX() over a
-            # bridged UNION doesn't fit the bridge's single-query shape.
-            rows = store.query_messages_with_legacy_bridge(
+            # weeks of events).
+            rows = store.query_messages(
                 type=["event", "notify"],
                 limit=10000,
             )

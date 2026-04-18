@@ -26,12 +26,48 @@ from pollypm.plugins_builtin.activity_feed.handlers.event_projector import (
     ensure_activity_events_view,
 )
 from pollypm.plugins_builtin.activity_feed.plugin import build_projector, plugin
+from pollypm.store import SQLAlchemyStore
 from pollypm.storage.state import StateStore
 from pollypm.work.schema import create_work_tables
 
 
-def _seed_event(store: StateStore, *, session: str, event_type: str, message: str) -> None:
-    store.record_event(session, event_type, message)
+def _seed_event(
+    store: StateStore, *, session: str, event_type: str, message: str,
+) -> None:
+    """Write an event row via the unified :class:`Store`.
+
+    #342 retired the legacy ``events`` table — the projector now reads
+    ``messages WHERE type='event'``. Open a short-lived
+    :class:`SQLAlchemyStore` on the same DB path and insert an event
+    row whose ``body`` carries the caller-provided ``message`` string
+    (the projector treats ``body`` as the free-form payload, exactly
+    like the old ``events.message`` column).
+    """
+    import json as _json
+
+    from sqlalchemy import insert as _insert
+
+    from pollypm.store.schema import messages as _messages
+
+    db_path = store.path
+    msg_store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    try:
+        row = {
+            "scope": session,
+            "type": "event",
+            "tier": "immediate",
+            "recipient": "*",
+            "sender": session,
+            "state": "open",
+            "subject": event_type,
+            "body": message,
+            "payload_json": _json.dumps({"event_type": event_type}),
+            "labels": "[]",
+        }
+        with msg_store.transaction() as conn:
+            conn.execute(_insert(_messages), row)
+    finally:
+        msg_store.close()
 
 
 def _seed_work_transition(
@@ -211,16 +247,29 @@ def test_work_transition_projection(tmp_path: Path) -> None:
 def test_since_timedelta_filter(tmp_path: Path) -> None:
     db = tmp_path / "state.db"
     store = StateStore(db)
-    # Seed two rows — one ancient, one fresh. Patch the timestamp on the
-    # ancient row to back-date it past the 1-hour window.
-    _seed_event(store, session="a", event_type="k", message="ancient")
-    store.execute(
-        "UPDATE events SET created_at = ? WHERE message = ?",
-        ("2000-01-01T00:00:00+00:00", "ancient"),
-    )
-    store.commit()
-    _seed_event(store, session="a", event_type="k", message="fresh")
     store.close()
+    # Seed two rows — one ancient, one fresh. Patch the timestamp on the
+    # ancient row in the unified ``messages`` table so the projector's
+    # ``since`` filter must exclude it.
+    _seed_event(store, session="a", event_type="k", message="ancient")
+    msg_store = SQLAlchemyStore(f"sqlite:///{db}")
+    try:
+        with msg_store.transaction() as conn:
+            from sqlalchemy import text as _text
+
+            conn.execute(
+                _text(
+                    "UPDATE messages SET created_at = :created_at "
+                    "WHERE body = :body AND type = 'event'"
+                ),
+                {
+                    "created_at": "2000-01-01T00:00:00+00:00",
+                    "body": "ancient",
+                },
+            )
+    finally:
+        msg_store.close()
+    _seed_event(store, session="a", event_type="k", message="fresh")
 
     entries = EventProjector(db).project(
         since=timedelta(hours=1), limit=10,

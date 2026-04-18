@@ -162,11 +162,19 @@ def _handler_factory(config: Any):
                 entries = []
             if entries:
                 newest = entries[0].id
-                if newest.startswith("evt:"):
-                    try:
-                        _save_last_seen_id(config, int(newest.split(":", 1)[1]))
-                    except ValueError:
-                        pass
+                # Feed entries from the unified ``messages`` table carry
+                # an ``msg:<id>`` prefix (#342). Accept that in addition
+                # to the legacy ``evt:<id>`` shape some projectors may
+                # still hand back.
+                for prefix in ("msg:", "evt:"):
+                    if newest.startswith(prefix):
+                        try:
+                            _save_last_seen_id(
+                                config, int(newest.split(":", 1)[1]),
+                            )
+                        except ValueError:
+                            pass
+                        break
         return PanelSpec(widget=None, focus_hint="activity")
 
     return _handler

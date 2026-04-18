@@ -18,10 +18,18 @@ passed. Classifier rules are intentionally conservative — when in doubt
 we fall back to ``immediate`` so the user never silently loses a
 notification.
 
+TODO(#342-followup): the ``notification_staging`` table lives outside
+the unified ``messages`` surface because milestone rollups are an
+append + flush lifecycle, not a plain message insert. Future work:
+port staging onto a ``type='staging'`` partition of ``messages`` so
+this module collapses into a few Store method wrappers.
+
+Priority classification lives in :mod:`pollypm.store.classifier` (see
+that module for :func:`classify_priority` / :func:`validate_priority`).
+
 This module is the lifecycle owner for the ``notification_staging``
 table. It exposes:
 
-* :func:`classify_priority`        — keyword heuristic
 * :func:`stage_notification`       — insert a staging row
 * :func:`list_pending`             — pending rows for a (project, milestone)
 * :func:`flush_milestone_digest`   — emit one rollup inbox task + mark flushed
@@ -45,20 +53,12 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Priority classification — moved to :mod:`pollypm.store.classifier` in #340.
+# Staging table
 # ---------------------------------------------------------------------------
 #
-# The keyword-driven classifier used to live in this module; issue #340
-# moved it next to the new :class:`Store` writers. We re-export the public
-# helpers here so the existing importers (tests, legacy callers) keep
-# working until Issue F retires :mod:`pollypm.notification_staging`
-# entirely.
-
-from pollypm.store.classifier import classify_priority, validate_priority  # noqa: E402,F401
-
-
-# ---------------------------------------------------------------------------
-# Staging table
+# Priority classification lives in :mod:`pollypm.store.classifier` (moved
+# out in #340 and the back-compat re-export was dropped in #342). Import
+# :func:`classify_priority` / :func:`validate_priority` from there.
 # ---------------------------------------------------------------------------
 
 

@@ -79,21 +79,48 @@ def test_activity_summary_skips_none_extras() -> None:
 
 def test_structured_emission_surfaces_as_feedentry(tmp_path) -> None:
     """End-to-end: write a structured message, project it, see fields."""
+    import json as _json
+
+    from sqlalchemy import insert as _insert
+
     from pollypm.plugins_builtin.activity_feed.handlers.event_projector import (
         EventProjector,
     )
+    from pollypm.store import SQLAlchemyStore
+    from pollypm.store.schema import messages as _messages
     from pollypm.storage.state import StateStore
 
     db = tmp_path / "state.db"
-    store = StateStore(db)
+    StateStore(db).close()
+
     payload = activity_summary(
         summary="Plugin foo errored",
         severity="critical",
         verb="errored",
         subject="foo",
     )
-    store.record_event("plugin", "plugin_error", payload)
-    store.close()
+    # #342 routes events through ``messages``; the projector reads
+    # ``body`` as the free-form message payload.
+    msg_store = SQLAlchemyStore(f"sqlite:///{db}")
+    try:
+        with msg_store.transaction() as conn:
+            conn.execute(
+                _insert(_messages),
+                {
+                    "scope": "plugin",
+                    "type": "event",
+                    "tier": "immediate",
+                    "recipient": "*",
+                    "sender": "plugin",
+                    "state": "open",
+                    "subject": "plugin_error",
+                    "body": payload,
+                    "payload_json": _json.dumps({"event_type": "plugin_error"}),
+                    "labels": "[]",
+                },
+            )
+    finally:
+        msg_store.close()
 
     entries = EventProjector(db).project(limit=5)
     assert len(entries) == 1

@@ -231,16 +231,13 @@ class PollyPMService:
     def clear_alert(self, alert_id: int) -> object:
         """Clear a single open alert by its id and record the clearance event.
 
-        #349: alert rows live on the unified ``messages`` table now, so we
-        resolve ``alert_id`` against ``messages`` first (its row id is the
-        alert id callers see). Falls back to the legacy
-        :meth:`StateStore.clear_alert_by_id` path for any alert created
-        before the writer flip, so pre-migration rows still clear cleanly.
+        Alert rows live exclusively on the unified ``messages`` table
+        (#349 + #342 drained the legacy ``alerts`` surface), so we
+        resolve ``alert_id`` against ``messages`` and close via
+        :meth:`Store.close_message`. Raises :class:`KeyError` when no
+        matching open alert exists.
         """
         supervisor = self.load_supervisor()
-        # Try the unified Store first — if the alert row lives in
-        # ``messages``, close it via the Store and reshape the returned
-        # row into an ``AlertRecord`` for the caller.
         try:
             rows = supervisor.msg_store.query_messages(
                 type="alert",
@@ -250,34 +247,28 @@ class PollyPMService:
         except Exception:  # noqa: BLE001
             rows = []
         target = next((row for row in rows if int(row.get("id", 0)) == alert_id), None)
-        if target is not None:
-            try:
-                supervisor.msg_store.close_message(alert_id)
-            except Exception:  # noqa: BLE001
-                pass
-            payload = target.get("payload") or {}
-            subject = str(target.get("subject") or "")
-            message_text = (
-                subject[len("[Alert] "):] if subject.startswith("[Alert] ")
-                else subject
-            )
-            alert = AlertRecord(
-                session_name=str(target.get("scope") or ""),
-                alert_type=str(target.get("sender") or ""),
-                severity=str(payload.get("severity") or ""),
-                message=message_text,
-                status="cleared",
-                created_at=str(target.get("created_at") or ""),
-                updated_at=str(target.get("updated_at") or ""),
-                alert_id=alert_id,
-            )
-        else:
-            # TODO(#342-F): fallback for pre-migration rows still in the
-            # legacy ``alerts`` table. Remove when StateStore is retired.
-            legacy = supervisor.store.clear_alert_by_id(alert_id)
-            if legacy is None:
-                raise KeyError(f"Unknown alert id: {alert_id}")
-            alert = legacy
+        if target is None:
+            raise KeyError(f"Unknown alert id: {alert_id}")
+        try:
+            supervisor.msg_store.close_message(alert_id)
+        except Exception:  # noqa: BLE001
+            pass
+        payload = target.get("payload") or {}
+        subject = str(target.get("subject") or "")
+        message_text = (
+            subject[len("[Alert] "):] if subject.startswith("[Alert] ")
+            else subject
+        )
+        alert = AlertRecord(
+            session_name=str(target.get("scope") or ""),
+            alert_type=str(target.get("sender") or ""),
+            severity=str(payload.get("severity") or ""),
+            message=message_text,
+            status="cleared",
+            created_at=str(target.get("created_at") or ""),
+            updated_at=str(target.get("updated_at") or ""),
+            alert_id=alert_id,
+        )
 
         supervisor.msg_store.append_event(
             scope=alert.session_name,
@@ -678,8 +669,9 @@ class PollyPMService:
             verification=verification,
         )
         store = StateStore(config.project.state_db)
-        # TODO(#342-F): ``record_checkpoint`` still writes the checkpoints
-        # table through StateStore; migrate when the checkpoint surface moves.
+        # TODO(#342-followup): ``record_checkpoint`` still writes the
+        # ``checkpoints`` domain table through StateStore; port to a Core
+        # Table def when the checkpoint surface moves.
         record_checkpoint(
             store,
             launch,

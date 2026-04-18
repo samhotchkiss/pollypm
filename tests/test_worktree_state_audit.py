@@ -253,6 +253,34 @@ class _FakeStore:
 
         return _Cur()
 
+    # Post-#342 alert-exists probe: the handler queries the unified
+    # ``messages`` table rather than raw SQL on the legacy ``alerts``
+    # table. Return a messages-shaped dict when we hold an open alert.
+    def query_messages(self, **filters: Any) -> list[dict[str, Any]]:
+        if filters.get("type") != "alert":
+            return []
+        if filters.get("state") != "open":
+            return []
+        scope = filters.get("scope")
+        sender = filters.get("sender")
+        if scope is None or sender is None:
+            return []
+        entry = self.alerts.get((scope, sender))
+        if not entry or entry.get("status") != "open":
+            return []
+        return [
+            {
+                "id": 1,
+                "scope": scope,
+                "sender": sender,
+                "type": "alert",
+                "state": "open",
+                "subject": entry.get("message", ""),
+                "body": "",
+                "payload": {"severity": entry.get("severity", "")},
+            }
+        ]
+
 
 class _FakeWork:
     """Minimal SQLiteWorkService stand-in — only the two methods the
@@ -459,6 +487,15 @@ class TestHandler:
         monkeypatch.setattr(
             plugin_module, "_load_config_and_store",
             _fake_load_cm(cfg, fake_store),
+        )
+        # #342: handler reads/writes alerts through the unified Store;
+        # point ``_open_msg_store`` at the fake so existence probes hit
+        # the same in-memory dict the upsert/clear writes land on.
+        monkeypatch.setattr(
+            plugin_module, "_open_msg_store", lambda _config: fake_store,
+        )
+        monkeypatch.setattr(
+            plugin_module, "_close_msg_store", lambda _store: None,
         )
         import pollypm.work.sqlite_service as sqlite_service_mod
 

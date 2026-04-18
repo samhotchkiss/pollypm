@@ -30,7 +30,15 @@ from pollypm import doctor
 
 
 def _make_state_db(path: Path, *, sessions: int = 0) -> Path:
-    """Create a synthetic state DB with the schema bits the checks read."""
+    """Create a synthetic state DB with the schema bits the checks read.
+
+    Installs the ``sessions`` table (domain table still owned by
+    :class:`StateStore`) plus bootstraps the unified ``messages``
+    schema via :class:`SQLAlchemyStore` so ``_record_event`` can write
+    ``type='event'`` rows the scheduler-cadence check consumes.
+    """
+    from pollypm.store import SQLAlchemyStore
+
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     try:
@@ -45,13 +53,6 @@ def _make_state_db(path: Path, *, sessions: int = 0) -> Path:
                 cwd TEXT,
                 window_name TEXT
             );
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_name TEXT,
-                event_type TEXT,
-                message TEXT,
-                created_at TEXT DEFAULT (datetime('now'))
-            );
             """
         )
         for i in range(sessions):
@@ -63,20 +64,49 @@ def _make_state_db(path: Path, *, sessions: int = 0) -> Path:
         conn.commit()
     finally:
         conn.close()
+    # Bootstrap the unified ``messages`` schema on the same DB.
+    SQLAlchemyStore(f"sqlite:///{path}").close()
     return path
 
 
 def _record_event(db_path: Path, event_type: str, *, age_seconds: int = 0) -> None:
-    conn = sqlite3.connect(db_path)
+    """Insert a ``type='event'`` row keyed by ``event_type``, back-dated.
+
+    #342 moved events onto the unified ``messages`` table — the
+    scheduler-cadence check queries :meth:`Store.query_messages` and
+    reads ``subject`` (or ``payload.event_type``) as the handler name.
+    """
+    import json as _json
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import insert as _insert
+
+    from pollypm.store import SQLAlchemyStore
+    from pollypm.store.schema import messages as _messages
+
+    created_at = datetime.now(UTC) - timedelta(seconds=age_seconds)
+    msg_store = SQLAlchemyStore(f"sqlite:///{db_path}")
     try:
-        conn.execute(
-            "INSERT INTO events (session_name, event_type, message, created_at) "
-            "VALUES (?, ?, ?, datetime('now', ?))",
-            ("system", event_type, "ok", f"-{age_seconds} seconds"),
-        )
-        conn.commit()
+        with msg_store.transaction() as conn:
+            conn.execute(
+                _insert(_messages),
+                {
+                    "scope": "system",
+                    "type": "event",
+                    "tier": "immediate",
+                    "recipient": "*",
+                    "sender": "system",
+                    "state": "open",
+                    "subject": event_type,
+                    "body": "ok",
+                    "payload_json": _json.dumps({"event_type": event_type}),
+                    "labels": "[]",
+                    "created_at": created_at,
+                    "updated_at": created_at,
+                },
+            )
     finally:
-        conn.close()
+        msg_store.close()
 
 
 # --------------------------------------------------------------------- #

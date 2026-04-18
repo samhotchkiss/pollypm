@@ -39,6 +39,43 @@ from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
 from pollypm.storage.state import StateStore
 
 
+def _seed_event(state_db: Path, session: str, event_type: str, message: str) -> None:
+    """Insert a ``type='event'`` row on the unified ``messages`` table.
+
+    #342 retired the legacy ``events`` table; panel tests previously
+    called ``StateStore.record_event`` which no longer feeds the
+    projector. Seed via :class:`SQLAlchemyStore` so
+    :class:`EventProjector` sees the row.
+    """
+    import json as _json
+
+    from sqlalchemy import insert as _insert
+
+    from pollypm.store import SQLAlchemyStore
+    from pollypm.store.schema import messages as _messages
+
+    msg_store = SQLAlchemyStore(f"sqlite:///{state_db}")
+    try:
+        with msg_store.transaction() as conn:
+            conn.execute(
+                _insert(_messages),
+                {
+                    "scope": session,
+                    "type": "event",
+                    "tier": "immediate",
+                    "recipient": "*",
+                    "sender": session,
+                    "state": "open",
+                    "subject": event_type,
+                    "body": message,
+                    "payload_json": _json.dumps({"event_type": event_type}),
+                    "labels": "[]",
+                },
+            )
+    finally:
+        msg_store.close()
+
+
 # ---------------------------------------------------------------------------
 # Plain-text render helpers.
 # ---------------------------------------------------------------------------
@@ -173,9 +210,9 @@ def test_render_activity_feed_text_empty_db(tmp_path: Path) -> None:
 
 def test_render_activity_feed_text_with_events(tmp_path: Path) -> None:
     state_db = tmp_path / "state.db"
-    store = StateStore(state_db)
-    store.record_event(
-        "operator", "alert",
+    StateStore(state_db).close()
+    _seed_event(
+        state_db, "operator", "alert",
         activity_summary(
             summary="Disk full",
             severity="critical",
@@ -183,7 +220,6 @@ def test_render_activity_feed_text_with_events(tmp_path: Path) -> None:
             subject="disk",
         ),
     )
-    store.close()
     rendered = render_activity_feed_text(_FakeConfig(state_db))
     assert "Disk full" in rendered
     assert "alerted" in rendered
@@ -196,11 +232,10 @@ def test_render_activity_feed_text_with_events(tmp_path: Path) -> None:
 
 def test_new_event_count_counts_only_newer(tmp_path: Path) -> None:
     state_db = tmp_path / "state.db"
-    store = StateStore(state_db)
-    store.record_event("a", "k", "first")
-    store.record_event("a", "k", "second")
-    store.record_event("a", "k", "third")
-    store.close()
+    StateStore(state_db).close()
+    _seed_event(state_db, "a", "k", "first")
+    _seed_event(state_db, "a", "k", "second")
+    _seed_event(state_db, "a", "k", "third")
 
     projector = EventProjector(state_db)
     # With no cursor we see all three.
@@ -252,10 +287,9 @@ def test_initialize_registers_activity_rail_item(tmp_path: Path) -> None:
 
 def test_badge_provider_counts_unread(tmp_path: Path) -> None:
     state_db = tmp_path / "state.db"
-    store = StateStore(state_db)
-    store.record_event("a", "k", "first")
-    store.record_event("a", "k", "second")
-    store.close()
+    StateStore(state_db).close()
+    _seed_event(state_db, "a", "k", "first")
+    _seed_event(state_db, "a", "k", "second")
 
     config = _FakeConfig(state_db)
     registry = RailRegistry()
@@ -273,9 +307,8 @@ def test_badge_provider_counts_unread(tmp_path: Path) -> None:
 
 def test_handler_persists_last_seen_cursor(tmp_path: Path) -> None:
     state_db = tmp_path / "state.db"
-    store = StateStore(state_db)
-    store.record_event("a", "k", "first")
-    store.close()
+    StateStore(state_db).close()
+    _seed_event(state_db, "a", "k", "first")
 
     config = _FakeConfig(state_db)
     registry = RailRegistry()

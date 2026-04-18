@@ -1125,15 +1125,10 @@ class _AlertLikeRecord:
     :class:`pollypm.storage.state.AlertRecord` instances, which carried
     ``alert_id`` / ``session_name`` / ``alert_type`` / ``severity`` /
     ``message`` / ``updated_at`` as attributes. Issue #341 migrated the
-    read path to :meth:`Store.query_messages_with_legacy_bridge`, which
-    returns plain dicts. Rather than rewrite every toast helper that
-    does ``getattr(record, …)``, this shim exposes the same attribute
+    read path to :meth:`Store.query_messages`, which returns plain
+    dicts. Rather than rewrite every toast helper that does
+    ``getattr(record, …)``, this shim exposes the same attribute
     surface so the downstream code reads the new rows unchanged.
-
-    BRIDGE(#349): keep this class — it's the bridge's shape, not a
-    legacy artifact. The bridge itself goes away when the writers
-    migrate, but dict -> attribute access is still the cleanest glue
-    between Store's dict API and the existing attribute-oriented UI.
     """
 
     __slots__ = ("_row",)
@@ -1147,9 +1142,6 @@ class _AlertLikeRecord:
         if raw_id is None:
             return None
         try:
-            # Negative ids flag legacy bridge rows — normalize to a
-            # positive synthetic id so the dedup set treats them like
-            # messages-table rows. The sign is preserved in ``_source``.
             return int(raw_id)
         except (TypeError, ValueError):
             return None
@@ -1413,20 +1405,15 @@ class AlertNotifier:
                 self._seen_alert_ids.add(key)
 
     def _fetch_alerts(self) -> list:
-        """Return the current open alerts via :class:`Store` with a legacy bridge.
+        """Return the current open alerts via :class:`Store`.
 
-        Issue #341 moved this reader onto
-        :meth:`Store.query_messages_with_legacy_bridge` so alerts
-        written via ``upsert_alert`` into the new ``messages`` table
-        show up in the cockpit toasts. Supervisor / heartbeat writers
-        still hit the legacy ``alerts`` table until #349 lands — the
-        bridge UNIONs both sources and reshapes each into a lightweight
-        record object with the shape the toast renderer expects
+        Every ``upsert_alert`` writer lands rows on the unified
+        ``messages`` table (#349 + #342), so this reader is a single
+        :meth:`Store.query_messages` call with ``type='alert'``,
+        ``state='open'``. Each row is wrapped in :class:`_AlertLikeRecord`
+        so the toast renderer keeps using attribute access
         (``alert_id`` / ``session_name`` / ``alert_type`` / ``severity``
         / ``message`` / ``updated_at``).
-
-        BRIDGE(#349): swap the ``_with_legacy_bridge`` call for plain
-        :meth:`query_messages` when the writers migrate.
 
         Hookable for tests — override by assigning ``self._fetch_alerts``.
         """
@@ -1440,9 +1427,7 @@ class AlertNotifier:
         except Exception:  # noqa: BLE001
             return []
         try:
-            rows = store.query_messages_with_legacy_bridge(
-                type="alert", state="open",
-            )
+            rows = store.query_messages(type="alert", state="open")
         except Exception:  # noqa: BLE001
             rows = []
         finally:

@@ -1182,86 +1182,207 @@ def db_vacuum_handler(payload: dict[str, Any]) -> dict[str, Any]:
         return {"bytes_reclaimed": bytes_reclaimed, "mb_reclaimed": mb_reclaimed}
 
 
-def events_retention_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
-    """Apply tiered retention to the ``events`` table (issue-tracked as #267 follow-up).
+# Tier membership for the events-retention sweep. Each key is the
+# ``subject`` stored on a ``type='event'`` row in the ``messages``
+# table (supervisor + heartbeat writers pass the event name as
+# ``subject`` through :meth:`Store.append_event`). Tiers are disjoint
+# and every known ``subject`` belongs to exactly one tier; anything
+# outside the known set falls through to the default window.
+AUDIT_EVENT_SUBJECTS: frozenset[str] = frozenset({
+    "task.approved", "task.rejected", "task.done", "task.claimed",
+    "task.queued", "plan.approved", "inbox.message.created", "launch",
+    "recovered", "recovery_prompt", "state_drift",
+    "persona_swap_detected", "alert", "escalated",
+})
+OPERATIONAL_EVENT_SUBJECTS: frozenset[str] = frozenset({
+    "lease", "stop", "send_input", "nudge", "ran", "processed",
+    "stabilize_failed", "delivery",
+})
+HIGH_VOLUME_EVENT_SUBJECTS: frozenset[str] = frozenset({
+    "heartbeat", "heartbeat_error", "token_ledger", "scheduled",
+})
 
-    The events ledger is written to on every heartbeat, token-ledger
+
+def events_retention_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
+    """Apply tiered retention to ``messages WHERE type='event'`` (#267 / #342).
+
+    The events stream is written to on every heartbeat, token-ledger
     bump, and task transition — unbounded growth is the single biggest
     contributor to ``state.db`` bloat on long-running installations.
     This handler walks four tiers (``audit`` / ``operational`` /
-    ``high_volume`` / ``default``) and DELETEs rows older than each
-    tier's retention window. One parameterized DELETE per tier — no
-    row-by-row work.
+    ``high_volume`` / ``default``) and deletes rows older than each
+    tier's retention window via :meth:`Store.prune_messages`. One
+    parameterized DELETE per tier — no row-by-row work.
 
     Runs hourly (``37 * * * *`` — off-pattern from the 4am DB hygiene
     window) so the freelist stays small; the daily ``db.vacuum``
     ``PRAGMA incremental_vacuum`` then reclaims the pages. No explicit
     code dependency between the two — purely a cadence contract.
 
-    Tier membership is data, defined in
-    ``pollypm.storage.events_retention``. Retention *windows* are
-    configurable via the ``[events]`` TOML section; the handler honours
-    whatever ``config.events`` resolves to.
+    Retention *windows* are configurable via the ``[events]`` TOML
+    section; the handler honours whatever ``config.events`` resolves
+    to. Tier membership is defined by the ``*_EVENT_SUBJECTS``
+    constants at the top of this module.
 
     Emits a single ``events.retention_sweep`` event only when rows were
-    deleted — a no-op sweep stays silent to avoid the handler logging
-    its own cadence and defeating the purpose.
+    deleted — a no-op sweep stays silent so the handler doesn't grow
+    the table it's trying to shrink.
     """
-    from pollypm.storage.events_retention import (
-        RetentionPolicy,
-        sweep_events,
-    )
+    from datetime import datetime, timedelta, timezone
 
-    with _load_config_and_store(payload) as (config, store):
+    with _load_config_and_store(payload) as (config, _store):
         settings = config.events
-        policy = RetentionPolicy(
-            audit_days=settings.audit_retention_days,
-            operational_days=settings.operational_retention_days,
-            high_volume_days=settings.high_volume_retention_days,
-            default_days=settings.default_retention_days,
-        )
+        now = datetime.now(timezone.utc)
+        msg_store = _open_msg_store(config)
+        if msg_store is None:
+            return {
+                "deleted_audit": 0,
+                "deleted_operational": 0,
+                "deleted_high_volume": 0,
+                "deleted_default": 0,
+                "total": 0,
+            }
 
-        # Serialize against the StateStore's own lock so we don't race
-        # with writers on the shared connection. ``sweep_events`` issues
-        # a commit, so the rowcounts are durable before we return.
-        with store._lock:  # noqa: SLF001 — StateStore exposes no public wrapper
-            result = sweep_events(store._conn, policy)  # noqa: SLF001
+        try:
+            audit_cutoff = now - timedelta(days=settings.audit_retention_days)
+            operational_cutoff = now - timedelta(
+                days=settings.operational_retention_days,
+            )
+            high_volume_cutoff = now - timedelta(
+                days=settings.high_volume_retention_days,
+            )
+            default_cutoff = now - timedelta(days=settings.default_retention_days)
 
-        counts = {
-            "deleted_audit": result.deleted_audit,
-            "deleted_operational": result.deleted_operational,
-            "deleted_high_volume": result.deleted_high_volume,
-            "deleted_default": result.deleted_default,
-            "total": result.total,
-        }
+            deleted_audit = 0
+            deleted_operational = 0
+            deleted_high_volume = 0
+            deleted_default = 0
 
-        # Only log when something actually happened — otherwise every
-        # hourly sweep would itself become a ``high_volume`` event and
-        # grow the table we're trying to shrink.
-        # #349: audit lands on ``messages`` via the unified Store.
-        if result.total > 0:
-            msg_store = _open_msg_store(config)
+            # Per-tier sweeps: ``prune_messages`` has no subject filter,
+            # so we walk the tier's subjects and delete each bucket.
+            # Event volume dwarfs the subject cardinality — a handful
+            # of DELETEs per tier is cheap.
+            for subject in AUDIT_EVENT_SUBJECTS:
+                deleted_audit += _prune_event_subject(
+                    msg_store, subject, audit_cutoff,
+                )
+            for subject in OPERATIONAL_EVENT_SUBJECTS:
+                deleted_operational += _prune_event_subject(
+                    msg_store, subject, operational_cutoff,
+                )
+            for subject in HIGH_VOLUME_EVENT_SUBJECTS:
+                deleted_high_volume += _prune_event_subject(
+                    msg_store, subject, high_volume_cutoff,
+                )
+
+            # Default tier: anything older than ``default_cutoff`` whose
+            # ``subject`` isn't classified into one of the named tiers.
+            # One NOT IN delete keeps the round-trip count bounded
+            # regardless of how many brand-new subjects have slipped in
+            # since the last sweep.
+            known = (
+                AUDIT_EVENT_SUBJECTS
+                | OPERATIONAL_EVENT_SUBJECTS
+                | HIGH_VOLUME_EVENT_SUBJECTS
+            )
             try:
-                if msg_store is not None:
+                from sqlalchemy import and_ as _and
+                from sqlalchemy import delete as _delete
+
+                from pollypm.store.schema import messages as _messages
+
+                result = msg_store.execute(
+                    _delete(_messages).where(
+                        _and(
+                            _messages.c.type == "event",
+                            _messages.c.subject.notin_(tuple(known)),
+                            _messages.c.created_at < default_cutoff,
+                        )
+                    )
+                )
+                deleted_default = int(getattr(result, "rowcount", 0) or 0)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "events.retention_sweep: default-tier delete failed",
+                    exc_info=True,
+                )
+                deleted_default = 0
+
+            total = (
+                deleted_audit
+                + deleted_operational
+                + deleted_high_volume
+                + deleted_default
+            )
+            counts = {
+                "deleted_audit": deleted_audit,
+                "deleted_operational": deleted_operational,
+                "deleted_high_volume": deleted_high_volume,
+                "deleted_default": deleted_default,
+                "total": total,
+            }
+
+            # Only log when something actually happened — otherwise every
+            # hourly sweep would itself become a ``high_volume`` event
+            # and grow the table we're trying to shrink.
+            if total > 0:
+                try:
                     msg_store.append_event(
                         scope="system",
                         sender="system",
                         subject="events.retention_sweep",
                         payload={
                             "message": (
-                                f"deleted {result.total} events "
-                                f"(audit={result.deleted_audit}, "
-                                f"operational={result.deleted_operational}, "
-                                f"high_volume={result.deleted_high_volume}, "
-                                f"default={result.deleted_default})"
+                                f"deleted {total} events "
+                                f"(audit={deleted_audit}, "
+                                f"operational={deleted_operational}, "
+                                f"high_volume={deleted_high_volume}, "
+                                f"default={deleted_default})"
                             ),
                             **counts,
                         },
                     )
-            finally:
-                _close_msg_store(msg_store)
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "events.retention_sweep: audit-event emit failed",
+                        exc_info=True,
+                    )
+        finally:
+            _close_msg_store(msg_store)
 
         return counts
+
+
+def _prune_event_subject(msg_store: Any, subject: str, cutoff: Any) -> int:
+    """Delete ``type='event'`` rows matching ``subject`` older than ``cutoff``.
+
+    Issues one ``DELETE FROM messages WHERE type='event' AND subject=?
+    AND created_at < ?`` via :meth:`Store.execute`. Returns the row
+    count; errors are swallowed and logged so a tier failure doesn't
+    abort the whole sweep.
+    """
+    try:
+        from sqlalchemy import and_ as _and
+        from sqlalchemy import delete as _delete
+
+        from pollypm.store.schema import messages as _messages
+
+        result = msg_store.execute(
+            _delete(_messages).where(
+                _and(
+                    _messages.c.type == "event",
+                    _messages.c.subject == subject,
+                    _messages.c.created_at < cutoff,
+                )
+            )
+        )
+        return int(getattr(result, "rowcount", 0) or 0)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "events.retention_sweep: delete failed for subject=%s",
+            subject, exc_info=True,
+        )
+        return 0
 
 
 def memory_ttl_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1461,14 +1582,27 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
     with _load_config_and_store(payload) as (config, store):
-        # #349: writers flip onto the unified ``messages`` table via Store.
-        # ``store`` (StateStore) stays for raw ``.execute`` reads on the
-        # legacy ``alerts`` table below — those reads run in parallel with
-        # the Store-backed writes so the alert-exists check + the new
-        # upsert still observe the same table during the rollout.
-        # TODO(#342-F): once StateStore is retired, flip the read to
-        # ``msg_store.query_messages(type='alert', scope=..., sender=...)``.
+        # Alerts round-trip through the unified ``messages`` table (#349
+        # + #342). Both the existence-check (``query_messages``) and the
+        # upsert/clear writes share ``msg_store`` so every worktree
+        # audit observes a single source of truth.
         msg_store = _open_msg_store(config)
+
+        def _alert_exists(session_name: str, alert_type: str) -> bool:
+            """True when an open alert for ``(session, alert_type)`` exists."""
+            if msg_store is None:
+                return False
+            try:
+                rows = msg_store.query_messages(
+                    type="alert",
+                    state="open",
+                    scope=session_name,
+                    sender=alert_type,
+                    limit=1,
+                )
+            except Exception:  # noqa: BLE001
+                return False
+            return bool(rows)
 
         # Work service — required to list active work_sessions. Open via
         # the same path ``work.progress_sweep`` uses so we honour the
@@ -1546,15 +1680,7 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 if state in (WorktreeState.CLEAN, WorktreeState.MISSING):
                     for kind in STATE_ALERT_TYPES:
                         alert_type = f"worktree_state:{task_id}:{kind}"
-                        try:
-                            existing = store.execute(
-                                "SELECT id FROM alerts WHERE session_name = ? "
-                                "AND alert_type = ? AND status = 'open'",
-                                (session_key, alert_type),
-                            ).fetchone()
-                        except Exception:  # noqa: BLE001
-                            existing = None
-                        if existing is None:
+                        if not _alert_exists(session_key, alert_type):
                             continue
                         try:
                             (msg_store or store).clear_alert(session_key, alert_type)
@@ -1644,15 +1770,7 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
                         alerts_raised += 1
                     else:
                         # Fresh dirt — clear any prior stale alert.
-                        try:
-                            existing = store.execute(
-                                "SELECT id FROM alerts WHERE session_name = ? "
-                                "AND alert_type = ? AND status = 'open'",
-                                (session_key, alert_type),
-                            ).fetchone()
-                        except Exception:  # noqa: BLE001
-                            existing = None
-                        if existing is not None:
+                        if _alert_exists(session_key, alert_type):
                             try:
                                 (msg_store or store).clear_alert(session_key, alert_type)
                                 alerts_cleared += 1

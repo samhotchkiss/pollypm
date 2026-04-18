@@ -81,19 +81,19 @@ def inbox_root(
 ) -> None:
     """Show messages + tasks waiting on the user.
 
-    Post-#341 the inbox is the UNION of:
+    Post-#342 the inbox is the UNION of:
 
-    * ``Store.query_messages_with_legacy_bridge(recipient='user',
-      state='open', type=['notify', 'inbox_task', 'alert'])`` — every
-      ``pm notify`` row and every writer that has migrated to the
-      unified messages table.
+    * ``Store.query_messages(recipient='user', state='open',
+      type=['notify', 'inbox_task', 'alert'])`` — every ``pm notify``
+      row + everything the supervisor/heartbeat writers emit via the
+      unified Store.
     * ``inbox_tasks(svc)`` — chat-flow tasks whose ``roles`` say ``user``
-      is the requester. Still emitted by the plan-review + agent
-      escalation flows until #349 completes.
+      is the requester. Plan-review + agent escalation flows still emit
+      these; the merge keeps them visible alongside messages.
 
     The message rows dominate day-to-day usage (every ``pm notify`` lands
     there); the task rows are kept so the plan-review flow isn't
-    invisible during the rollout.
+    invisible.
     """
     if ctx.invoked_subcommand is not None:
         return
@@ -112,10 +112,7 @@ def inbox_root(
             )
             if project:
                 filters["scope"] = project
-            # BRIDGE(#349): UNION with legacy alerts while supervisor
-            # writers still hit them. Remove the ``_with_legacy_bridge``
-            # suffix when #349 lands.
-            message_rows = store.query_messages_with_legacy_bridge(**filters)
+            message_rows = store.query_messages(**filters)
         finally:
             store.close()
     except Exception as exc:  # noqa: BLE001

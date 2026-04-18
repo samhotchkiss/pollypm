@@ -93,10 +93,40 @@ def _write_minimal_config(tmp_path: Path) -> Path:
 
 
 def _seed(state_db: Path, records: list[tuple[str, str, str]]) -> None:
-    store = StateStore(state_db)
-    for session, event_type, message in records:
-        store.record_event(session, event_type, message)
-    store.close()
+    """Seed ``type='event'`` rows on the unified ``messages`` table.
+
+    #342 retired the legacy ``events`` table; the CLI + projector read
+    from ``messages`` now. Each row carries ``subject=event_type`` and
+    ``body=message`` to match the shape :meth:`_fallback_summary`
+    consumes when no structured JSON is present.
+    """
+    import json as _json
+
+    from sqlalchemy import insert as _insert
+
+    from pollypm.store import SQLAlchemyStore
+    from pollypm.store.schema import messages as _messages
+
+    StateStore(state_db).close()
+    msg_store = SQLAlchemyStore(f"sqlite:///{state_db}")
+    try:
+        for session, event_type, message in records:
+            row = {
+                "scope": session,
+                "type": "event",
+                "tier": "immediate",
+                "recipient": "*",
+                "sender": session,
+                "state": "open",
+                "subject": event_type,
+                "body": message,
+                "payload_json": _json.dumps({"event_type": event_type}),
+                "labels": "[]",
+            }
+            with msg_store.transaction() as conn:
+                conn.execute(_insert(_messages), row)
+    finally:
+        msg_store.close()
 
 
 def test_activity_cli_prints_entries(tmp_path: Path) -> None:

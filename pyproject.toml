@@ -23,12 +23,12 @@ pollypm = "pollypm.cli:app"
 [project.entry-points."pollypm.store_backend"]
 sqlite = "pollypm.store.sqlalchemy_store:SQLAlchemyStore"
 
-# Provider substrate — Phase A of #397. Phase C replaced the Codex
-# legacy adapter with the real pollypm.providers.codex.CodexProvider
-# class; Claude still uses the Phase A legacy adapter until Phase B
-# extracts it.
+# Phase B (#397) — both providers extracted into their own packages.
+# Phase A shipped the substrate (Protocol + registry + legacy shims);
+# Phase C extracted Codex; Phase B extracts Claude. Third-party providers
+# register by adding their own entry in this group via their own package.
 [project.entry-points."pollypm.provider"]
-claude = "pollypm.acct._legacy_adapters:LegacyClaudeAdapter"
+claude = "pollypm.providers.claude:ClaudeProvider"
 codex = "pollypm.providers.codex:CodexProvider"
 
 [build-system]

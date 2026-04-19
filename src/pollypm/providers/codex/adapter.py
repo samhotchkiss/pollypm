@@ -1,16 +1,36 @@
+"""The launch-command adapter for Codex (formerly ``providers/codex.py``).
+
+This module holds :class:`CodexAdapter`, which the tmux launch path and
+built-in plugin consume to build ``LaunchCommand`` objects for Codex
+sessions. It is distinct from :class:`pollypm.providers.codex.CodexProvider`
+(Phase C of #397): the ``CodexProvider`` satisfies the high-level
+``pollypm.acct.protocol.ProviderAdapter`` Protocol, while
+:class:`CodexAdapter` implements ``pollypm.provider_sdk.ProviderAdapterBase``
+for the lower-level launch/transcript/usage-snapshot surface.
+
+The class body is a verbatim move from the old
+``src/pollypm/providers/codex.py`` file; collapsing ``providers/codex.py``
+and the new ``providers/codex/`` package into a single package requires
+one of the two to change path, and the legacy adapter is the one
+touched by fewer imports outside this module.
+
+Imports of ``pollypm.providers.codex.CodexAdapter`` continue to work via
+the re-export in ``providers/codex/__init__.py``.
+"""
+
 from __future__ import annotations
 
 import re
 import shutil
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pollypm.models import AccountConfig, SessionConfig
 from pollypm.providers.base import LaunchCommand
 from pollypm.provider_sdk import ProviderAdapterBase, ProviderUsageSnapshot, TranscriptSource
 from pollypm.runtime_env import codex_home_dir
 
-from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from pollypm.tmux.client import TmuxClient
 
@@ -109,3 +129,6 @@ class CodexAdapter(ProviderAdapterBase):
             summary=f"{left}% left",
             raw_text=text,
         )
+
+
+__all__ = ["CodexAdapter"]

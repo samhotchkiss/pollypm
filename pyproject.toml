@@ -23,13 +23,13 @@ pollypm = "pollypm.cli:app"
 [project.entry-points."pollypm.store_backend"]
 sqlite = "pollypm.store.sqlalchemy_store:SQLAlchemyStore"
 
-# Phase A of #397 — provider substrate. The Phase A adapters delegate
-# to the existing pollypm.accounts / pollypm.onboarding functions so
-# the registry has something to resolve while Phases B/C extract the
-# real provider packages.
+# Provider substrate — Phase A of #397. Phase C replaced the Codex
+# legacy adapter with the real pollypm.providers.codex.CodexProvider
+# class; Claude still uses the Phase A legacy adapter until Phase B
+# extracts it.
 [project.entry-points."pollypm.provider"]
 claude = "pollypm.acct._legacy_adapters:LegacyClaudeAdapter"
-codex = "pollypm.acct._legacy_adapters:LegacyCodexAdapter"
+codex = "pollypm.providers.codex:CodexProvider"
 
 [build-system]
 requires = ["setuptools>=80", "wheel"]

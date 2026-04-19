@@ -506,19 +506,16 @@ def _decode_jwt_payload(token: str) -> dict[str, object]:
 
 
 def _detect_codex_email(home: Path) -> str | None:
-    auth_path = home / ".codex" / "auth.json"
-    if not auth_path.exists():
-        return None
-    try:
-        data = json.loads(auth_path.read_text())
-        id_token = data.get("tokens", {}).get("id_token")
-        if not isinstance(id_token, str) or id_token.count(".") < 2:
-            return None
-        payload = _decode_jwt_payload(id_token)
-        email = payload.get("email")
-        return str(email).lower() if isinstance(email, str) and email else None
-    except Exception:  # noqa: BLE001
-        return None
+    """Back-compat shim: Phase C of #397 moved this to the Codex package.
+
+    The real implementation now lives at
+    :func:`pollypm.providers.codex.detect.detect_codex_email`. Existing
+    call sites inside this module (and tests) import the shim name
+    unchanged; once Phase D migrates callers, this shim can be deleted.
+    """
+    from pollypm.providers.codex.detect import detect_codex_email
+
+    return detect_codex_email(home)
 
 
 def _isolated_env(provider: ProviderKind, home: Path) -> dict[str, str]:
@@ -576,10 +573,19 @@ def _detect_account_email(provider: ProviderKind, home: Path) -> str | None:
 
 
 def _detect_email_from_pane(provider: ProviderKind, pane_text: str) -> str | None:
+    """Dispatch Codex pane-scraping to the Codex package (Phase C of #397).
+
+    The Codex branch lives at
+    :func:`pollypm.providers.codex.detect.detect_email_from_pane`; the
+    Claude branch stays here until Phase B extracts it. Returning None
+    for unrecognised providers preserves the pre-split behaviour.
+    """
     if provider is ProviderKind.CODEX:
-        match = re.search(r"Account:\s+([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", pane_text)
-        if match:
-            return match.group(1).lower()
+        from pollypm.providers.codex.detect import (
+            detect_email_from_pane as _codex_detect_email_from_pane,
+        )
+
+        return _codex_detect_email_from_pane(pane_text)
     return None
 
 

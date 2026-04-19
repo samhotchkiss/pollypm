@@ -42,19 +42,23 @@ def _collect_work_service_signals(
 
     now = datetime.now(timezone.utc)
 
-    # -- last event tied to this session from the state store -----------
+    # -- last event tied to this session from the unified message store --
     try:
-        store = api.supervisor.store
-        # Use a broad "any event for this session" probe — the previous
-        # event in the ledger tells us the session has been doing
-        # something. Filter by session_name only, no event_type filter.
-        row = store.execute(
-            "SELECT created_at FROM events WHERE session_name = ? "
-            "ORDER BY id DESC LIMIT 1",
-            (context.session_name,),
-        ).fetchone()
-        if row and row[0]:
-            ts = datetime.fromisoformat(row[0])
+        rows = api.supervisor.msg_store.query_messages(
+            type="event",
+            scope=context.session_name,
+            limit=1,
+        )
+        if rows:
+            created_at = rows[0].get("created_at")
+            if created_at is None:
+                raise ValueError("event row missing created_at")
+            stamp = (
+                created_at.isoformat()
+                if hasattr(created_at, "isoformat")
+                else str(created_at)
+            )
+            ts = datetime.fromisoformat(stamp)
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
             out["last_event_seconds_ago"] = int((now - ts).total_seconds())

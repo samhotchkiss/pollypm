@@ -10,21 +10,12 @@ import json
 import logging
 import subprocess
 
+from pollypm.github_labels import WORK_STATUS_TO_GITHUB_LABEL
 from pollypm.work.models import Task, WorkStatus
 
 logger = logging.getLogger(__name__)
 
-# Work status → GitHub label mapping
-STATUS_TO_LABEL: dict[str, str] = {
-    WorkStatus.DRAFT.value: "polly:not-ready",
-    WorkStatus.QUEUED.value: "polly:ready",
-    WorkStatus.IN_PROGRESS.value: "polly:in-progress",
-    WorkStatus.REVIEW.value: "polly:needs-review",
-    WorkStatus.DONE.value: "polly:completed",
-    WorkStatus.CANCELLED.value: "polly:completed",
-    WorkStatus.BLOCKED.value: "polly:blocked",
-    WorkStatus.ON_HOLD.value: "polly:on-hold",
-}
+STATUS_TO_LABEL: dict[str, str] = dict(WORK_STATUS_TO_GITHUB_LABEL)
 
 
 def _run_gh(args: list[str], repo: str) -> subprocess.CompletedProcess[str]:

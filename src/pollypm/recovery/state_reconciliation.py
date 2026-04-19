@@ -144,25 +144,29 @@ def _plan_ready_notify_recent(
     if state_store is None:
         return False
     cutoff_dt = (now or datetime.now(UTC)) - timedelta(seconds=lookback_seconds)
-    cutoff_iso = cutoff_dt.isoformat()
+    query_messages = getattr(state_store, "query_messages", None)
+    if not callable(query_messages):
+        return False
     try:
-        rows = state_store.execute(
-            """
-            SELECT message FROM events
-            WHERE event_type = 'inbox.message.created'
-              AND created_at >= ?
-            ORDER BY id DESC
-            LIMIT 50
-            """,
-            (cutoff_iso,),
-        ).fetchall()
+        rows = query_messages(type="event", since=cutoff_dt, limit=50)
     except Exception:  # noqa: BLE001
         return False
     if not rows:
         return False
     project_key_lc = (project_key or "").lower()
     for row in rows:
-        message = (row[0] or "").lower()
+        payload = row.get("payload") if isinstance(row, dict) else None
+        event_type = str(row.get("subject") or "") if isinstance(row, dict) else ""
+        if not event_type and isinstance(payload, dict):
+            event_type = str(payload.get("event_type") or "")
+        if event_type != "inbox.message.created":
+            continue
+        message = ""
+        if isinstance(payload, dict):
+            message = str(payload.get("message") or "")
+        if not message and isinstance(row, dict):
+            message = str(row.get("body") or "")
+        message = message.lower()
         if not any(phrase in message for phrase in _PLAN_READY_PHRASES):
             continue
         # Soft project match — the notify carries the project key in
@@ -261,7 +265,7 @@ def reconcile_expected_advance(
 
     Pure function — takes a task, the project's filesystem root, a
     handle to the work service (for flow-template lookup), and
-    optionally the state store (for event-ledger heuristics). All of
+    optionally the unified message store (for event-ledger heuristics). All of
     the disk / ledger reads are soft-fail: any exception yields
     ``None`` rather than a false positive.
 

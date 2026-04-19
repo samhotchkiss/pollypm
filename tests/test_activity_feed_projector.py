@@ -1,8 +1,7 @@
 """Tests for the activity_feed event projector (lf01).
 
 Covers:
-    * FeedEntry projection from the StateStore events table via the
-      ``activity_events`` view.
+    * FeedEntry projection from the unified ``messages`` table.
     * FeedEntry projection from per-project ``work_transitions`` rows.
     * Noise filter (tick-with-no-decision, poll-unchanged, heartbeat
       snapshot no-op).
@@ -23,7 +22,6 @@ import pytest
 from pollypm.plugins_builtin.activity_feed.handlers.event_projector import (
     EventProjector,
     FeedEntry,
-    ensure_activity_events_view,
 )
 from pollypm.plugins_builtin.activity_feed.plugin import build_projector, plugin
 from pollypm.store import SQLAlchemyStore
@@ -100,22 +98,6 @@ def _seed_work_transition(
         conn.commit()
     finally:
         conn.close()
-
-
-def test_ensure_activity_events_view_idempotent(tmp_path: Path) -> None:
-    db = tmp_path / "state.db"
-    store = StateStore(db)
-    conn = sqlite3.connect(str(db))
-    try:
-        ensure_activity_events_view(conn)
-        ensure_activity_events_view(conn)  # second call must not raise
-        row = conn.execute(
-            "SELECT count(*) FROM sqlite_master WHERE type='view' AND name='activity_events'"
-        ).fetchone()
-        assert row[0] == 1
-    finally:
-        conn.close()
-        store.close()
 
 
 def test_project_from_state_events(tmp_path: Path) -> None:
@@ -339,7 +321,7 @@ def test_build_projector_uses_config(tmp_path: Path) -> None:
     assert projector.project(limit=5) == []
 
 
-def test_plugin_initialize_installs_view(tmp_path: Path) -> None:
+def test_plugin_initialize_emits_loaded_event_without_view_side_effects(tmp_path: Path) -> None:
     class _Project:
         state_db = tmp_path / "state.db"
 
@@ -365,7 +347,7 @@ def test_plugin_initialize_installs_view(tmp_path: Path) -> None:
         row = conn.execute(
             "SELECT count(*) FROM sqlite_master WHERE type='view' AND name='activity_events'"
         ).fetchone()
-        assert row[0] == 1
+        assert row[0] == 0
     finally:
         conn.close()
     assert api.emitted and api.emitted[0][0] == "loaded"

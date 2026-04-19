@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import shlex
 from pathlib import Path
 
 from pollypm.models import AccountConfig, ProjectSettings
 from pollypm.providers.base import LaunchCommand
 from pollypm.runtime_env import provider_profile_env
+from pollypm.runtimes.base import WrappedRuntimeCommand
 
 
 class LocalRuntimeAdapter:
@@ -56,3 +58,28 @@ class LocalRuntimeAdapter:
             prefix = ""
         inner = f"{prefix}exec {python} -m pollypm.runtime_launcher {payload}"
         return f"sh -lc {shlex.quote(inner)}"
+
+    def wrap_command_exec(
+        self,
+        command: LaunchCommand,
+        account: AccountConfig,
+        project: ProjectSettings,
+    ) -> WrappedRuntimeCommand:
+        env = os.environ.copy()
+        env.update(provider_profile_env(account, base_env=command.env))
+        src_dir = (project.root_dir / "src").resolve()
+        if src_dir.is_dir():
+            existing = env.get("PYTHONPATH")
+            env["PYTHONPATH"] = (
+                f"{src_dir}:{existing}" if existing else str(src_dir)
+            )
+        return WrappedRuntimeCommand(
+            argv=[
+                self._launcher_python(project),
+                "-m",
+                "pollypm.runtime_launcher",
+                self._encode_payload(command, account, project),
+            ],
+            env=env,
+            cwd=command.cwd,
+        )

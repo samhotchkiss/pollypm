@@ -68,7 +68,7 @@ def test_mechanical_checkpoint_persists_files_and_state(tmp_path: Path) -> None:
     assert artifact.json_path.exists()
     assert artifact.summary_path.exists()
     assert artifact.json_path.parent.name == "worker"
-    assert (artifact.json_path.parent / ".session.lock").exists()
+    assert (artifact.json_path.parent / ".session.worker.lock").exists()
 
     record_checkpoint(
         store,

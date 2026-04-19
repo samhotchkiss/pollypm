@@ -161,6 +161,7 @@ def _svc(db: str, project: str | None = None) -> SQLiteWorkService:
             # workers pick up stabilization, initial_input handling, and
             # storage-closet naming from config. Fall back to a raw
             # TmuxClient if config/plugin resolution fails.
+            config = None
             session_service = None
             storage_closet_name = "pollypm-storage-closet"
             try:
@@ -179,6 +180,7 @@ def _svc(db: str, project: str | None = None) -> SQLiteWorkService:
                 tmux_client=create_tmux_client(),
                 work_service=svc,
                 project_path=project_root,
+                config=config,
                 session_service=session_service,
                 storage_closet_name=storage_closet_name,
             )

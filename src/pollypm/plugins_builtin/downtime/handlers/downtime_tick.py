@@ -100,9 +100,10 @@ def schedule_downtime_task(
         return None
 
     try:
+        project_root = Path(getattr(config.project, "root_dir", Path.cwd()))
         svc = SQLiteWorkService(
             db_path=str(db_path) if db_path else ":memory:",
-            project_path=project,
+            project_path=project_root,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("downtime: failed to open work service: %s", exc)
@@ -200,6 +201,7 @@ def has_active_downtime_task(
     *,
     project: str,
     db_path: Path | None = None,
+    project_root: Path | None = None,
 ) -> bool:
     """Return True if any downtime-labelled task is ``in_progress`` or ``review``."""
     try:
@@ -209,7 +211,10 @@ def has_active_downtime_task(
     if db_path is None:
         return False
     try:
-        svc = SQLiteWorkService(db_path=str(db_path), project_path=project)
+        svc = SQLiteWorkService(
+            db_path=str(db_path),
+            project_path=project_root or Path.cwd(),
+        )
     except Exception:
         return False
     try:
@@ -318,16 +323,26 @@ def downtime_tick_handler(payload: dict[str, Any]) -> dict[str, Any]:
         }
 
     # 4. Already in progress?
-    state_db_path = Path(config.project.state_db) if getattr(config.project, "state_db", None) else None
-    work_db_path = base_dir / "work.db"
-    if work_db_path.exists() and has_active_downtime_task(project=project, db_path=work_db_path):
+    project_root = Path(getattr(config.project, "root_dir", Path.cwd()))
+    state_db_path = (
+        Path(config.project.state_db)
+        if getattr(config.project, "state_db", None) else None
+    )
+    if (
+        state_db_path is not None
+        and state_db_path.exists()
+        and has_active_downtime_task(
+            project=project,
+            db_path=state_db_path,
+            project_root=project_root,
+        )
+    ):
         return {"scheduled": None, "skipped": True, "reason": "throttled"}
 
     # 5. Pick a candidate.
     # Indirect through the module so tests can monkeypatch ``pick_candidate``.
     from pollypm.plugins_builtin.downtime.handlers import downtime_tick as _self
 
-    project_root = Path(getattr(config.project, "root_dir", Path.cwd()))
     candidate = _self.pick_candidate(
         config=config, settings=settings, state=state, project_root=project_root,
     )
@@ -350,7 +365,7 @@ def downtime_tick_handler(payload: dict[str, Any]) -> dict[str, Any]:
         candidate=candidate,
         project=project,
         config=config,
-        db_path=work_db_path if work_db_path.exists() else None,
+        db_path=state_db_path,
     )
     if task_id is None:
         return {

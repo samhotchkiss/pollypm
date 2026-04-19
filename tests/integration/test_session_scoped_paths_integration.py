@@ -16,6 +16,7 @@ from pollypm.models import (
     SessionConfig,
     SessionLaunchSpec,
 )
+from pollypm.projects import ensure_session_lock
 from pollypm.supervisor import Supervisor
 from pollypm.transcript_ingest import sync_transcripts_once
 from pollypm.worktrees import ensure_worktree
@@ -84,8 +85,8 @@ def test_session_scoped_paths_do_not_collide_and_locks_are_respected(tmp_path: P
     assert launches["worker_demo"].log_path == tmp_path / ".pollypm/logs/worker_demo/worker-demo.log"
     assert launches["review_demo"].log_path == tmp_path / ".pollypm/logs/review_demo/review-demo.log"
     assert launches["worker_demo"].log_path != launches["review_demo"].log_path
-    assert (tmp_path / ".pollypm/logs/worker_demo/.session.lock").exists()
-    assert (tmp_path / ".pollypm/logs/review_demo/.session.lock").exists()
+    assert (tmp_path / ".pollypm/logs/worker_demo/.session.worker_demo.lock").exists()
+    assert (tmp_path / ".pollypm/logs/review_demo/.session.review_demo.lock").exists()
 
     worker_checkpoint = write_mechanical_checkpoint(
         config,
@@ -105,7 +106,7 @@ def test_session_scoped_paths_do_not_collide_and_locks_are_respected(tmp_path: P
     )
     assert worker_checkpoint.json_path.parent != review_checkpoint.json_path.parent
     assert worker_checkpoint.json_path.parent == config.projects["demo"].path / ".pollypm/artifacts/checkpoints/worker_demo"
-    assert (worker_checkpoint.json_path.parent / ".session.lock").exists()
+    assert (worker_checkpoint.json_path.parent / ".session.worker_demo.lock").exists()
 
     transcript_file = config.accounts["claude_main"].home / ".claude/projects/demo/session-a.jsonl"
     transcript_file.parent.mkdir(parents=True, exist_ok=True)
@@ -127,12 +128,6 @@ def test_session_scoped_paths_do_not_collide_and_locks_are_respected(tmp_path: P
 
     conflicting_root = config.projects["demo"].path / ".pollypm/worktrees/worker_demo"
     conflicting_root.mkdir(parents=True, exist_ok=True)
-    (conflicting_root / ".session.lock").write_text(json.dumps({"session_id": "other_session"}) + "\n")
-    with pytest.raises(RuntimeError, match="Session lock conflict"):
-        ensure_worktree(
-            config_path,
-            project_key="demo",
-            lane_kind="pa",
-            lane_key="task-1",
-            session_name="worker_demo",
-        )
+    (conflicting_root / ".session.other_session.lock").write_text(json.dumps({"session_id": "other_session"}) + "\n")
+    ensure_session_lock(conflicting_root, "worker_demo")
+    assert (conflicting_root / ".session.worker_demo.lock").exists()

@@ -57,7 +57,7 @@ def test_worktree_lifecycle(tmp_path: Path) -> None:
     assert worktree is not None
     assert Path(worktree.path).exists()
     assert Path(worktree.path).parent.name == "worker_demo"
-    assert (Path(worktree.path).parent / ".session.lock").exists()
+    assert (Path(worktree.path).parent / ".session.worker_demo.lock").exists()
     assert list_worktrees(config_path, "demo")
 
     removed = cleanup_worktree(config_path, project_key="demo", lane_kind="pa", lane_key="worker_demo", force=True)

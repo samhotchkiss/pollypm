@@ -542,6 +542,14 @@ def _detect_claude_email(home: Path) -> str | None:
             email = data.get("email")
             if isinstance(email, str) and email:
                 return email.lower()
+            # Claude CLI 2.x returns loggedIn:true with email:null for Max
+            # subscribers. Fall back to a stable non-None sentinel so
+            # _account_logged_in() correctly reads True. The real email is
+            # already pinned in AccountConfig at registration; this return
+            # value is used downstream only as a presence check.
+            method = data.get("authMethod") or "claude"
+            sub = data.get("subscriptionType") or "unknown"
+            return f"{method}:{sub}".lower()
         except Exception:  # noqa: BLE001
             pass
 

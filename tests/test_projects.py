@@ -272,10 +272,23 @@ def test_session_lock_is_atomic_idempotent_and_releasable(tmp_path: Path) -> Non
 
     first = ensure_session_lock(lock_root, "worker")
     second = ensure_session_lock(lock_root, "worker")
+    other = ensure_session_lock(lock_root, "other")
 
     assert first == second
-    with pytest.raises(RuntimeError, match="Session lock conflict"):
-        ensure_session_lock(lock_root, "other")
+    assert other.exists()
 
     release_session_lock(lock_root, "worker")
     assert not first.exists()
+    assert other.exists()
+
+
+def test_session_lock_is_scoped_to_session_id(tmp_path: Path) -> None:
+    lock_root = tmp_path / "locks" / "worker"
+
+    worker_lock = ensure_session_lock(lock_root, "worker")
+    other_lock = ensure_session_lock(lock_root, "other")
+
+    assert worker_lock.name == ".session.worker.lock"
+    assert other_lock.name == ".session.other.lock"
+    assert worker_lock.exists()
+    assert other_lock.exists()

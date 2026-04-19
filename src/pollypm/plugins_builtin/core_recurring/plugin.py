@@ -112,6 +112,46 @@ def _close_msg_store(store: Any) -> None:
             logger.debug("core_recurring: msg_store close raised", exc_info=True)
 
 
+def _open_alert_exists(
+    *,
+    msg_store: Any,
+    state_store: Any,
+    session_name: str,
+    alert_type: str,
+) -> bool:
+    """Return True when an open alert exists for ``(session, alert_type)``."""
+    if msg_store is not None:
+        try:
+            rows = msg_store.query_messages(
+                type="alert",
+                scope=session_name,
+                sender=alert_type,
+                state="open",
+                limit=1,
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(rows)
+
+    if state_store is None:
+        return False
+    open_alerts = getattr(state_store, "open_alerts", None)
+    if not callable(open_alerts):
+        return False
+    try:
+        rows = open_alerts()
+    except Exception:  # noqa: BLE001
+        return False
+    for row in rows:
+        if (
+            getattr(row, "session_name", None) == session_name
+            and getattr(row, "alert_type", None) == alert_type
+            and getattr(row, "status", None) == "open"
+        ):
+            return True
+    return False
+
+
 # Ephemeral session name prefixes (#252). Sessions whose name starts with
 # any of these are NOT in the supervisor's launch plan — they're spawned
 # on-demand for a specific task / critic pass / downtime exploration. The
@@ -531,7 +571,7 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
                     task,
                     Path(project_path),
                     work,
-                    state_store=state_store,
+                    state_store=msg_store or state_store,
                     now=now,
                 )
             except Exception:  # noqa: BLE001
@@ -580,18 +620,13 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
                     # different tasks surfaces as two distinct alerts.
                     alert_type = f"state_drift:{task.task_id}"
                     try:
+                        is_new = not _open_alert_exists(
+                            msg_store=msg_store,
+                            state_store=state_store,
+                            session_name=target_name,
+                            alert_type=alert_type,
+                        )
                         if msg_store is not None:
-                            # Read through the Store so the "is this new?"
-                            # check observes the same table the upsert
-                            # writes to.
-                            existing_rows = msg_store.query_messages(
-                                type="alert",
-                                scope=target_name,
-                                sender=alert_type,
-                                state="open",
-                                limit=1,
-                            )
-                            is_new = not existing_rows
                             msg_store.upsert_alert(
                                 target_name,
                                 alert_type,
@@ -602,12 +637,6 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
                                 ),
                             )
                         else:
-                            existing_row = state_store.execute(
-                                "SELECT id FROM alerts WHERE session_name = ? "
-                                "AND alert_type = ? AND status = 'open'",
-                                (target_name, alert_type),
-                            ).fetchone()
-                            is_new = existing_row is None
                             state_store.upsert_alert(
                                 target_name,
                                 alert_type,
@@ -676,16 +705,22 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 except Exception:  # noqa: BLE001
                     pass
             if recent_ts is None and state_store is not None:
-                try:
-                    row = state_store.execute(
-                        "SELECT created_at FROM events WHERE session_name = ? "
-                        "ORDER BY id DESC LIMIT 1",
-                        (target_name,),
-                    ).fetchone()
-                    if row and row[0]:
-                        recent_ts = str(row[0])
-                except Exception:  # noqa: BLE001
-                    pass
+                recent_events = getattr(state_store, "recent_events", None)
+                if callable(recent_events):
+                    try:
+                        for event_row in recent_events(limit=20):
+                            if getattr(event_row, "session_name", None) != target_name:
+                                continue
+                            stamp = getattr(event_row, "created_at", None)
+                            if stamp:
+                                recent_ts = (
+                                    stamp.isoformat()
+                                    if hasattr(stamp, "isoformat")
+                                    else str(stamp)
+                                )
+                                break
+                    except Exception:  # noqa: BLE001
+                        pass
             if recent_ts is not None:
                 try:
                     last_ts = datetime.fromisoformat(recent_ts)
@@ -863,31 +898,23 @@ def pane_text_classify_handler(payload: dict[str, Any]) -> dict[str, Any]:
                     f"'{rule_name}' matched"
                 )
                 try:
+                    is_new = not _open_alert_exists(
+                        msg_store=msg_store,
+                        state_store=state_store,
+                        session_name=session_name,
+                        alert_type=alert_type,
+                    )
                     # Detect first-fire so the counter reflects real
                     # new notifications rather than idempotent upserts.
                     # #349: read + write through the unified Store.
                     if msg_store is not None:
-                        existing = msg_store.query_messages(
-                            type="alert",
-                            scope=session_name,
-                            sender=alert_type,
-                            state="open",
-                            limit=1,
-                        )
                         msg_store.upsert_alert(
                             session_name, alert_type, severity, message,
                         )
-                        is_new = not existing
                     else:  # pragma: no cover — Store fallback path.
-                        existing_row = state_store.execute(
-                            "SELECT id FROM alerts WHERE session_name = ? "
-                            "AND alert_type = ? AND status = 'open'",
-                            (session_name, alert_type),
-                        ).fetchone()
                         state_store.upsert_alert(
                             session_name, alert_type, severity, message,
                         )
-                        is_new = existing_row is None
                     if is_new:
                         alerts_raised += 1
                         match_counts[rule_name] += 1
@@ -940,26 +967,17 @@ def pane_text_classify_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 # ``clear_alert`` is a no-op when no open alert exists.
                 # #349: read + clear via the unified Store.
                 try:
-                    if msg_store is not None:
-                        existing = msg_store.query_messages(
-                            type="alert",
-                            scope=session_name,
-                            sender=alert_type,
-                            state="open",
-                            limit=1,
-                        )
-                        if existing:
+                    if _open_alert_exists(
+                        msg_store=msg_store,
+                        state_store=state_store,
+                        session_name=session_name,
+                        alert_type=alert_type,
+                    ):
+                        if msg_store is not None:
                             msg_store.clear_alert(session_name, alert_type)
-                            alerts_cleared += 1
-                    else:  # pragma: no cover — Store fallback path.
-                        existing_row = state_store.execute(
-                            "SELECT id FROM alerts WHERE session_name = ? "
-                            "AND alert_type = ? AND status = 'open'",
-                            (session_name, alert_type),
-                        ).fetchone()
-                        if existing_row is not None:
+                        else:  # pragma: no cover — Store fallback path.
                             state_store.clear_alert(session_name, alert_type)
-                            alerts_cleared += 1
+                        alerts_cleared += 1
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -2063,28 +2081,13 @@ def notification_staging_prune_handler(payload: dict[str, Any]) -> dict[str, Any
     connection so the staging table is guaranteed to exist (the
     SQLiteWorkService init path runs the migration).
     """
-    import sqlite3
-
-    from pollypm.notification_staging import prune_old_staging
+    from pollypm.work.sqlite_service import SQLiteWorkService
 
     with _load_config_and_store(payload) as (_config, store):
         retain_days = int(payload.get("retain_days") or 30)
-
-        # The staging table lives in the shared state.db alongside work_*
-        # tables; the work-service migration (v4) creates it. We open a
-        # direct connection here because the prune is a pure DML op and
-        # does not need the full service wrapper.
         db_path = getattr(store, "path", None) or _config.project.state_db
-        conn = sqlite3.connect(str(db_path), timeout=30.0)
-        try:
-            conn.execute("PRAGMA busy_timeout=30000")
-            # Make sure the schema is present — safe no-op when the table
-            # already exists (e.g. SQLiteWorkService ran migration v4).
-            from pollypm.work.schema import create_work_tables
-            create_work_tables(conn)
-            summary = prune_old_staging(conn, retain_days=retain_days)
-        finally:
-            conn.close()
+        with SQLiteWorkService(db_path=db_path) as svc:
+            summary = svc.prune_staged_notifications(retain_days=retain_days)
 
         # #349: audit lands on ``messages`` via the unified Store.
         msg_store = _open_msg_store(_config)

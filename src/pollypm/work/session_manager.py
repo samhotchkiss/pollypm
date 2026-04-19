@@ -1,7 +1,21 @@
 """Worker session lifecycle manager.
 
-Binds task state transitions to deterministic tmux/worktree operations.
-No LLM involved — pure infrastructure code.
+Contract:
+- Inputs: task ids, agent/account names, a tmux client, a work-service
+  implementation, and optional config/session-service facades.
+- Outputs: ``WorkerSession`` / ``TeardownResult`` records plus persisted
+  worker-session rows owned by the work service.
+- Side effects: creates and removes git worktrees, opens and tears down
+  tmux windows, writes prompt/transcript artifacts, and updates worker
+  session bookkeeping through typed work-service methods.
+- Invariants: one active worker session per task, task-scoped provision
+  locks serialize competing claims, configured launches route through the
+  provider/runtime adapters, and prompt/provision failures abort instead
+  of silently launching an unbootstrapped worker.
+- Allowed dependencies: public work-service APIs, provider/runtime
+  registries, session-service facade, and project lock helpers.
+- Private: prompt rendering, tmux bootstrap helpers, and transcript
+  archival details.
 """
 
 from __future__ import annotations
@@ -89,10 +103,12 @@ class SessionManager:
         work_service: object,
         project_path: Path,
         *,
+        config: object | None = None,
         session_service: object | None = None,
         storage_closet_name: str = "pollypm-storage-closet",
     ) -> None:
         self._tmux = tmux_client
+        self._config = config
         self._session_service = session_service
         self._svc = work_service
         self._project_path = project_path
@@ -203,10 +219,15 @@ class SessionManager:
             prompt_path.parent.mkdir(parents=True, exist_ok=True)
             prompt_path.write_text(task_prompt)
         except OSError as exc:
-            # Worker's kickoff references this file — if we can't write
-            # it, the worker will fail to bootstrap. Surface the reason.
-            logger.warning(
-                "Could not write task prompt to %s: %s", prompt_path, exc,
+            worktree_removed = self._remove_worktree(worktree_path)
+            raise ProvisionError(
+                f"Could not write the worker prompt at {prompt_path}: {exc}. "
+                f"Why it matters: the worker launch depends on that file, so "
+                f"starting the session would boot an uninitialized worker. "
+                f"Fix: free up the filesystem or repair the worktree path, "
+                f"then retry the claim. Cleanup "
+                f"{'succeeded' if worktree_removed else 'failed'} for "
+                f"{worktree_path}."
             )
 
         window_name = f"task-{task_slug}"
@@ -224,6 +245,7 @@ class SessionManager:
             window_name=window_name,
             worktree_path=worktree_path,
             agent_name=agent_name,
+            project=project,
             kickoff=kickoff,
         )
 
@@ -255,6 +277,74 @@ class SessionManager:
     # Worker launch helpers
     # ------------------------------------------------------------------
 
+    def _worker_launch_bundle(
+        self,
+        *,
+        worktree_path: Path,
+        agent_name: str,
+        window_name: str,
+        project: str,
+    ) -> tuple[str, str, str, Path | None]:
+        """Return ``(command, provider_name, account_name, fresh_marker)``.
+
+        When config is available we route through the configured
+        provider/runtime adapter pair so worker launch obeys the same
+        account, runtime, and permissions policy as the main planner.
+        Tests that construct ``SessionManager`` without config keep the
+        historical Claude fallback.
+        """
+        if self._config is None:
+            legacy_cmd = (
+                f"cd {_shell_quote(str(worktree_path))} && "
+                f"claude --dangerously-skip-permissions"
+            )
+            return legacy_cmd, "claude", agent_name, None
+
+        from pollypm.models import SessionConfig
+        from pollypm.onboarding import default_session_args
+        from pollypm.providers import get_provider
+        from pollypm.runtimes import get_runtime
+
+        config = self._config
+        accounts = getattr(config, "accounts", {}) or {}
+        account_name = (
+            agent_name if agent_name in accounts
+            else getattr(getattr(config, "pollypm", None), "controller_account", "")
+        )
+        account = accounts.get(account_name)
+        if account is None:
+            if accounts:
+                account_name, account = next(iter(accounts.items()))
+            else:
+                raise ProvisionError(
+                    "Could not provision a worker because no configured account "
+                    "is available for provider/runtime launch planning. "
+                    "Why it matters: the worker session has no provider or "
+                    "runtime to start under. "
+                    "Fix: add at least one account to PollyPM config, then "
+                    "retry the claim."
+                )
+
+        session = SessionConfig(
+            name=window_name,
+            role="worker",
+            provider=account.provider,
+            account=account_name,
+            cwd=worktree_path,
+            project=project,
+            window_name=window_name,
+            args=default_session_args(
+                account.provider,
+                open_permissions=config.pollypm.open_permissions_by_default,
+                role="worker",
+            ),
+        )
+        provider = get_provider(account.provider, root_dir=config.project.root_dir)
+        runtime = get_runtime(account.runtime, root_dir=config.project.root_dir)
+        launch = provider.build_launch_command(session, account)
+        command = runtime.wrap_command(launch, account, config.project)
+        return command, account.provider.value, account_name, launch.fresh_launch_marker
+
     def _launch_worker_window(
         self,
         *,
@@ -262,6 +352,7 @@ class SessionManager:
         window_name: str,
         worktree_path: Path,
         agent_name: str,
+        project: str,
         kickoff: str,
     ) -> str:
         """Launch an interactive Claude window and return its pane id.
@@ -272,9 +363,13 @@ class SessionManager:
         back to raw tmux operations (used by unit tests that inject a
         mock TmuxClient).
         """
-        claude_cmd = (
-            f"cd {_shell_quote(str(worktree_path))} && "
-            f"claude --dangerously-skip-permissions"
+        worker_cmd, provider_name, account_name, fresh_launch_marker = (
+            self._worker_launch_bundle(
+                worktree_path=worktree_path,
+                agent_name=agent_name,
+                window_name=window_name,
+                project=project,
+            )
         )
 
         # Clear any stale window of the same name (e.g. a dead pane from
@@ -292,18 +387,19 @@ class SessionManager:
                 marker_path.write_text(_now())
             except OSError:
                 logger.warning("Could not write fresh_launch_marker for %s", window_name)
+            fresh_launch_marker = fresh_launch_marker or marker_path
 
             handle = self._session_service.create(
                 name=window_name,
-                provider="claude",
-                account=agent_name,
+                provider=provider_name,
+                account=account_name,
                 cwd=worktree_path,
-                command=claude_cmd,
+                command=worker_cmd,
                 window_name=window_name,
                 tmux_session=session_name,
                 stabilize=True,
                 initial_input=kickoff,
-                fresh_launch_marker=marker_path,
+                fresh_launch_marker=fresh_launch_marker,
                 session_role="worker",
             )
             return handle.pane_id or ""
@@ -320,7 +416,7 @@ class SessionManager:
         # already exists" condition.
         if not self._tmux.has_session(session_name):
             try:
-                self._tmux.create_session(session_name, window_name, claude_cmd)
+                self._tmux.create_session(session_name, window_name, worker_cmd)
             except _CalledProcessError as exc:
                 # Most common reason: someone else just created the
                 # session. Verify and fall back to new-window.
@@ -331,7 +427,7 @@ class SessionManager:
                         session_name,
                     )
                     self._tmux.create_window(
-                        session_name, window_name, claude_cmd, detached=True,
+                        session_name, window_name, worker_cmd, detached=True,
                     )
                 else:
                     # Genuinely couldn't create the session. Re-raise
@@ -353,7 +449,7 @@ class SessionManager:
             if pane_id == "%0" and windows:
                 pane_id = windows[0].pane_id
         else:
-            self._tmux.create_window(session_name, window_name, claude_cmd, detached=True)
+            self._tmux.create_window(session_name, window_name, worker_cmd, detached=True)
             windows = self._tmux.list_windows(session_name)
             pane_id = "%0"
             for w in windows:

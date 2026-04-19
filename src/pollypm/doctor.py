@@ -43,6 +43,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from pollypm.service_api import PollyPMService
+
 
 # --------------------------------------------------------------------- #
 # Result model
@@ -1814,15 +1816,13 @@ def check_sessions_table_populated() -> CheckResult:
     def _fix() -> tuple[bool, str]:
         # Run repair_sessions_table via a transient supervisor.
         try:
-            from pollypm.config import DEFAULT_CONFIG_PATH, load_config
-            from pollypm.supervisor import Supervisor
+            from pollypm.config import DEFAULT_CONFIG_PATH
         except Exception as exc:  # noqa: BLE001
             return (False, f"import failed: {exc}")
         if not DEFAULT_CONFIG_PATH.exists():
             return (False, "no config to load")
         try:
-            cfg = load_config(DEFAULT_CONFIG_PATH)
-            sup = Supervisor(cfg)
+            sup = PollyPMService(DEFAULT_CONFIG_PATH).load_supervisor()
             repaired = sup.repair_sessions_table()
             return (True, f"repaired {repaired} session(s)")
         except Exception as exc:  # noqa: BLE001
@@ -2501,15 +2501,13 @@ def check_sessions_table_vs_tmux() -> CheckResult:
     if drift:
         def _fix() -> tuple[bool, str]:
             try:
-                from pollypm.config import DEFAULT_CONFIG_PATH, load_config
-                from pollypm.supervisor import Supervisor
+                from pollypm.config import DEFAULT_CONFIG_PATH
             except Exception as exc:  # noqa: BLE001
                 return (False, f"import failed: {exc}")
             if not DEFAULT_CONFIG_PATH.exists():
                 return (False, "no config to load")
             try:
-                cfg = load_config(DEFAULT_CONFIG_PATH)
-                sup = Supervisor(cfg)
+                sup = PollyPMService(DEFAULT_CONFIG_PATH).load_supervisor()
                 repaired = sup.repair_sessions_table()
                 return (True, f"repaired {repaired} session(s)")
             except Exception as exc:  # noqa: BLE001

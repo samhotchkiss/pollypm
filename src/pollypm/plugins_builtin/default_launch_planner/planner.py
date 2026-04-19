@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Callable
 from pollypm.models import AccountConfig, ProviderKind, SessionConfig, SessionLaunchSpec
 from pollypm.projects import ensure_session_lock
 from pollypm.providers import get_provider
+from pollypm.providers.args import sanitize_provider_args
 from pollypm.providers.base import LaunchCommand
 from pollypm.runtimes import get_runtime
 
@@ -205,11 +206,9 @@ class DefaultLaunchPlanner:
                 )
             else:
                 # Sanitize: strip provider-incompatible flags from project-local configs
-                from pollypm.supervisor import _sanitize_provider_args
-
                 effective = replace(
                     effective,
-                    args=_sanitize_provider_args(effective.args, account.provider),
+                    args=sanitize_provider_args(effective.args, account.provider),
                 )
         return effective
 

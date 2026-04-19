@@ -2,9 +2,8 @@
 
 The event-emission sites across the codebase call
 ``StateStore.record_event(session_name, event_type, message)``. The
-schema's ``message`` column is TEXT, so the ``activity_events`` view
-ships whatever is written there. Per the feed spec §4, new emission
-sites should pack a JSON blob into ``message`` carrying at least
+schema's ``message`` payload lands in the unified ``messages`` table,
+so new emission sites should pack a JSON blob into ``message`` carrying at least
 ``summary`` + ``severity``; the projector (see
 ``handlers/event_projector.py``) decodes that blob back out.
 

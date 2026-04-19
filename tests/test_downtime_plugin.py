@@ -287,9 +287,9 @@ class TestTickHandler:
         self, tmp_path: Path, monkeypatch
     ) -> None:
         config_path = _minimal_config(tmp_path)
-        # Pretend the work.db exists so has_active_downtime_task is invoked.
+        # Pretend the workspace state DB exists so has_active_downtime_task is invoked.
         base_dir = tmp_path / "state"
-        (base_dir / "work.db").write_text("")  # placeholder
+        (base_dir / "state.db").write_text("")  # placeholder
         monkeypatch.setattr(downtime_tick, "compute_used_pct", lambda *a, **kw: 10)
         monkeypatch.setattr(
             downtime_tick, "has_active_downtime_task", lambda **kwargs: True

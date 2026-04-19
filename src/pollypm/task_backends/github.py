@@ -12,23 +12,20 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pollypm.github_labels import (
+    ALL_POLLY_GITHUB_LABELS,
+    GITHUB_LABEL_TO_TRACKER_STATE,
+    TRACKER_STATE_TO_GITHUB_LABEL,
+)
 from pollypm.task_backends.base import TaskBackend, TaskRecord, TRACKER_STATES, validate_task_transition
 
 logger = logging.getLogger(__name__)
 
-# Maps internal state names to GitHub label names
-_STATE_TO_LABEL: dict[str, str] = {
-    "00-not-ready": "polly:not-ready",
-    "01-ready": "polly:ready",
-    "02-in-progress": "polly:in-progress",
-    "03-needs-review": "polly:needs-review",
-    "04-in-review": "polly:in-review",
-    "05-completed": "polly:completed",
-}
+_STATE_TO_LABEL: dict[str, str] = dict(TRACKER_STATE_TO_GITHUB_LABEL)
 
-_LABEL_TO_STATE: dict[str, str] = {v: k for k, v in _STATE_TO_LABEL.items()}
+_LABEL_TO_STATE: dict[str, str] = dict(GITHUB_LABEL_TO_TRACKER_STATE)
 
-_ALL_POLLY_LABELS = list(_STATE_TO_LABEL.values())
+_ALL_POLLY_LABELS = list(ALL_POLLY_GITHUB_LABELS)
 
 
 @dataclass(slots=True)

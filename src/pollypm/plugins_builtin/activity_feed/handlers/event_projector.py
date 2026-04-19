@@ -9,12 +9,10 @@ Sources consumed
 ----------------
 
 1. **Global state store** — ``config.project.state_db``
-   - ``events`` table: every ``StateStore.record_event`` call (sessions,
-     alerts, heartbeats, transcripts, recoveries, workers).
-   - We install an ``activity_events`` SQL view over this table that
-     exposes the unified ``id, timestamp, project, kind, actor, subject,
-     verb, summary, severity, payload_json`` shape. The view is created
-     idempotently by :func:`ensure_activity_events_view`.
+   - ``messages`` table rows with ``type in ('event', 'notify', 'alert')``
+     cover session, alert, heartbeat, transcript, recovery, and worker
+     activity. The projector reads those rows directly through the
+     unified store API.
 
 2. **Per-project work DBs** — ``<project.path>/.pollypm/state.db``
    - ``work_transitions`` table — task state changes.
@@ -93,56 +91,6 @@ class FeedEntry:
             "payload": self.payload,
             "source": self.source,
         }
-
-
-# ---------------------------------------------------------------------------
-# Activity events view — a read-only projection of `events` into the
-# unified shape. Created once per DB in :func:`ensure_activity_events_view`
-# and consumed by the projector.
-# ---------------------------------------------------------------------------
-
-ACTIVITY_EVENTS_VIEW_SQL = """
-CREATE VIEW IF NOT EXISTS activity_events AS
-SELECT
-    id                                                AS id,
-    created_at                                        AS timestamp,
-    NULL                                              AS project,
-    event_type                                        AS kind,
-    session_name                                      AS actor,
-    session_name                                      AS subject,
-    event_type                                        AS verb,
-    message                                           AS summary,
-    CASE
-        WHEN event_type = 'alert'    THEN 'recommendation'
-        WHEN event_type = 'recovery' THEN 'recommendation'
-        WHEN event_type = 'error'    THEN 'critical'
-        WHEN event_type = 'stuck'    THEN 'critical'
-        ELSE 'routine'
-    END                                               AS severity,
-    json_object(
-        'session', session_name,
-        'event_type', event_type,
-        'message', message
-    )                                                 AS payload_json
-FROM events;
-"""
-
-
-def ensure_activity_events_view(conn: sqlite3.Connection) -> None:
-    """Create the ``activity_events`` view on ``conn`` if missing.
-
-    Idempotent — safe to call on every projector invocation. Uses
-    ``CREATE VIEW IF NOT EXISTS`` so concurrent installers can race
-    without conflicting.
-    """
-    try:
-        conn.executescript(ACTIVITY_EVENTS_VIEW_SQL)
-        conn.commit()
-    except sqlite3.DatabaseError:
-        logger.exception(
-            "activity_feed: failed to install activity_events view on %s",
-            getattr(conn, "database", "<unknown>"),
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -282,11 +230,6 @@ class EventProjector:
         """
         if not self._state_db.exists():
             return []
-        # The legacy ``activity_events`` view is still installed so that
-        # callers who bypass this method (e.g. ad-hoc SQL in ops
-        # runbooks) keep working. We don't query it here — the bridge
-        # reads ``events`` directly.
-        _install_view(self._state_db)
 
         try:
             from pollypm.store import SQLAlchemyStore
@@ -483,32 +426,6 @@ class EventProjector:
         filtered = [entry for entry in entries if _keep(entry)]
         filtered.sort(key=lambda e: e.timestamp, reverse=True)
         return filtered[:limit]
-
-
-# ---------------------------------------------------------------------------
-# Helpers.
-# ---------------------------------------------------------------------------
-
-
-def _install_view(path: Path) -> None:
-    """Install the ``activity_events`` view on the state DB.
-
-    SQLite views are persistent schema objects, so a ``mode=ro`` URI
-    connection can't create one. We open a short writable connection,
-    run the ``CREATE VIEW`` script, and close it. After that, all read
-    paths can use the view through read-only connections.
-    """
-    if not path.exists():
-        return
-    try:
-        conn = sqlite3.connect(str(path), check_same_thread=False)
-    except sqlite3.OperationalError:
-        logger.debug("activity_feed: state DB locked; skipping view install", exc_info=True)
-        return
-    try:
-        ensure_activity_events_view(conn)
-    finally:
-        conn.close()
 
 
 def _decode_payload(raw: Any) -> dict[str, Any]:

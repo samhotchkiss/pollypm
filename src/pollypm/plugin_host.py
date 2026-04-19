@@ -1,3 +1,21 @@
+"""Plugin host and discovery/runtime ownership.
+
+Contract:
+- Inputs: root/workspace paths, plugin manifests, entry points, and the
+  public ``PluginAPI`` / registry interfaces plugins register against.
+- Outputs: loaded plugin singletons plus shared job/rail/roster/content
+  registries exposed through ``ExtensionHost``.
+- Side effects: discovers plugins from disk and entry points, imports
+  plugin modules, records lifecycle events, and caches host singletons.
+- Invariants: plugin discovery, registration dedupe, and registry
+  ownership stay inside this module; callers treat plugins through the
+  public host/registry API rather than importing plugin internals.
+- Allowed dependencies: ``plugin_api.v1``, manifest parsing, importlib,
+  and standard library discovery helpers.
+- Private: module-loading mechanics, lifecycle event emission, and the
+  concrete registry wiring behind ``ExtensionHost``.
+"""
+
 from __future__ import annotations
 
 import logging

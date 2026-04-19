@@ -11,6 +11,7 @@ import enum
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 
 # ---------------------------------------------------------------------------
@@ -344,3 +345,16 @@ class WorkerSessionRecord:
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     archive_path: str | None = None
+
+
+@dataclass(slots=True)
+class DigestRollupCandidate:
+    """Typed row consumed by milestone digest rollup code."""
+
+    source: str
+    row_id: int
+    subject: str
+    body: str
+    actor: str
+    created_at: str
+    payload: dict[str, Any] = field(default_factory=dict)

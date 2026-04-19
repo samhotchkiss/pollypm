@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import shlex
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
@@ -16,6 +18,14 @@ from pollypm.work.session_manager import (
     WorkerSession,
     TeardownResult,
     _parse_token_usage,
+)
+from pollypm.models import (
+    AccountConfig,
+    PollyPMConfig,
+    PollyPMSettings,
+    ProjectSettings,
+    ProviderKind,
+    RuntimeKind,
 )
 from pollypm.work.models import WorkerSessionRecord
 
@@ -245,6 +255,51 @@ def manager(mock_tmux, mock_svc, tmp_project):
     )
     mock_svc._conn.commit()
     return SessionManager(mock_tmux, mock_svc, tmp_project)
+
+
+def _decode_local_runtime_payload(command: str) -> dict[str, object]:
+    outer = shlex.split(command)
+    assert outer[:2] == ["sh", "-lc"]
+    inner = shlex.split(outer[2])
+    payload = inner[-1]
+    padded = payload + ("=" * (-len(payload) % 4))
+    return json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+
+
+def _worker_launch_config(
+    tmp_project: Path,
+    *,
+    account_name: str,
+    provider: ProviderKind,
+    runtime: RuntimeKind = RuntimeKind.LOCAL,
+    open_permissions_by_default: bool = False,
+    home: Path | None = None,
+) -> PollyPMConfig:
+    base_dir = tmp_project / ".pollypm"
+    return PollyPMConfig(
+        project=ProjectSettings(
+            name="Fixture",
+            root_dir=tmp_project,
+            tmux_session="pollypm",
+            base_dir=base_dir,
+            logs_dir=base_dir / "logs",
+            snapshots_dir=base_dir / "snapshots",
+            state_db=base_dir / "state.db",
+        ),
+        pollypm=PollyPMSettings(
+            controller_account=account_name,
+            open_permissions_by_default=open_permissions_by_default,
+        ),
+        accounts={
+            account_name: AccountConfig(
+                name=account_name,
+                provider=provider,
+                runtime=runtime,
+                home=home,
+            )
+        },
+        sessions={},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +550,100 @@ class TestProvisionWorker:
         found = manager.session_for_task("proj/1")
         assert found is not None
         assert found.task_id == "proj/1"
+
+    def test_provision_worker_uses_runtime_wrapped_codex_launch(
+        self, mock_tmux, mock_svc, tmp_project, tmp_path,
+    ):
+        mock_svc._conn.execute(
+            "INSERT INTO work_tasks (project, task_number) VALUES (?, ?)",
+            ("proj", 1),
+        )
+        mock_svc._conn.commit()
+        session_service = MagicMock()
+        session_service.create.return_value = MagicMock(pane_id="%9")
+        config = _worker_launch_config(
+            tmp_project,
+            account_name="codex-main",
+            provider=ProviderKind.CODEX,
+            home=tmp_path / "codex-home",
+        )
+        manager = SessionManager(
+            mock_tmux,
+            mock_svc,
+            tmp_project,
+            config=config,
+            session_service=session_service,
+        )
+
+        with patch("pollypm.work.session_manager.subprocess") as mock_sub:
+            mock_sub.run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+            manager.provision_worker("proj/1", "worker")
+
+        kwargs = session_service.create.call_args.kwargs
+        assert kwargs["provider"] == "codex"
+        assert kwargs["account"] == "codex-main"
+        payload = _decode_local_runtime_payload(kwargs["command"])
+        assert payload["argv"] == [
+            "codex",
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "never",
+        ]
+
+    def test_provision_worker_aborts_when_prompt_write_fails(
+        self, manager, mock_tmux, tmp_project,
+    ):
+        from pollypm.work.session_manager import ProvisionError
+
+        worktree_path = tmp_project / ".pollypm" / "worktrees" / "proj-1"
+        worktree_path.mkdir(parents=True, exist_ok=True)
+
+        with patch.object(manager, "_create_worktree", return_value=worktree_path), \
+             patch.object(manager, "_remove_worktree", return_value=True) as mock_remove, \
+             patch.object(manager, "_launch_worker_window") as mock_launch, \
+             patch("pathlib.Path.write_text", side_effect=OSError("disk full")):
+            with pytest.raises(ProvisionError) as excinfo:
+                manager.provision_worker("proj/1", "agent-1")
+
+        assert "worker prompt" in str(excinfo.value)
+        assert "Cleanup succeeded" in str(excinfo.value)
+        mock_remove.assert_called_once_with(worktree_path)
+        mock_launch.assert_not_called()
+
+    def test_provision_worker_honors_closed_permissions_for_claude(
+        self, mock_tmux, mock_svc, tmp_project, tmp_path,
+    ):
+        mock_svc._conn.execute(
+            "INSERT INTO work_tasks (project, task_number) VALUES (?, ?)",
+            ("proj", 1),
+        )
+        mock_svc._conn.commit()
+        session_service = MagicMock()
+        session_service.create.return_value = MagicMock(pane_id="%9")
+        config = _worker_launch_config(
+            tmp_project,
+            account_name="claude-main",
+            provider=ProviderKind.CLAUDE,
+            open_permissions_by_default=False,
+            home=tmp_path / "claude-home",
+        )
+        manager = SessionManager(
+            mock_tmux,
+            mock_svc,
+            tmp_project,
+            config=config,
+            session_service=session_service,
+        )
+
+        with patch("pollypm.work.session_manager.subprocess") as mock_sub:
+            mock_sub.run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+            manager.provision_worker("proj/1", "worker")
+
+        kwargs = session_service.create.call_args.kwargs
+        assert kwargs["provider"] == "claude"
+        payload = _decode_local_runtime_payload(kwargs["command"])
+        assert payload["argv"] == ["claude"]
 
 
 # ---------------------------------------------------------------------------

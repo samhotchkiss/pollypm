@@ -1,7 +1,20 @@
 """SQLite-backed implementation of the WorkService protocol.
 
-Provides task CRUD and state transitions backed by a local SQLite database.
-Flow templates are resolved via the flow engine and persisted on first use.
+Contract:
+- Inputs: typed task/workflow fields, notification metadata, dependency
+  links, worker-session updates, and sync adapter names.
+- Outputs: typed ``Task`` / ``WorkerSessionRecord`` models plus durable
+  side effects in the work SQLite database.
+- Side effects: owns schema creation, task state transitions, workflow
+  execution bookkeeping, dependency mutations, notification staging, and
+  sync-attempt persistence.
+- Invariants: this module is the only owner of work-database connection
+  lifecycle and schema writes; callers use typed methods instead of
+  reaching into ``_conn`` or issuing ad-hoc SQL.
+- Allowed dependencies: flow engine, gates, schema helpers, and the
+  boundary-owned ``service_*.py`` submodules in this package.
+- Private: SQL row shapes, sqlite connection helpers, and internal
+  adapter plumbing delegated to the ``service_*.py`` modules.
 """
 
 from __future__ import annotations
@@ -10,7 +23,7 @@ import hashlib
 import json
 import logging
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -35,58 +48,74 @@ from pollypm.work.models import (
     Task,
     TaskType,
     Transition,
+    DigestRollupCandidate,
     WorkerSessionRecord,
     WorkOutput,
     WorkStatus,
     TERMINAL_STATUSES,
 )
 from pollypm.work.schema import create_work_tables
+from pollypm.work.service_notifications import (
+    find_flushed_rollup_milestone,
+    has_old_pending_digest_rows,
+    list_digest_rollup_candidates,
+    mark_rollup_candidates_flushed,
+    prune_staged_notifications,
+    stage_notification_row,
+)
+from pollypm.work.service_dependencies import (
+    check_auto_unblock,
+    dependent_tasks,
+    has_unresolved_blockers,
+    link_tasks,
+    maybe_block,
+    maybe_unblock,
+    on_cancelled,
+    unlink_tasks,
+    would_create_cycle,
+)
+from pollypm.work.service_queries import (
+    blocked_tasks as read_blocked_tasks,
+    create_task,
+    get_task,
+    list_tasks as read_tasks,
+    my_tasks as read_my_tasks,
+    next_task,
+    state_counts as read_state_counts,
+    update_task,
+)
+from pollypm.work.service_support import (
+    InvalidTransitionError,
+    TaskNotFoundError,
+    ValidationError,
+    WorkServiceError,
+    _now,
+    _parse_task_id,
+)
+from pollypm.work.service_sync import (
+    record_sync_state,
+    sync_status as read_sync_status,
+    trigger_sync as run_trigger_sync,
+)
+from pollypm.work.service_transitions import (
+    advance_to_node,
+    current_node_visit as read_current_node_visit,
+    mark_done as mark_task_done,
+    next_visit as read_next_visit,
+    on_task_done,
+    on_task_transition,
+)
+from pollypm.work.service_worker_sessions import (
+    WORK_SESSIONS_DDL,
+    end_worker_session as finish_worker_session,
+    ensure_worker_session_schema as ensure_worker_sessions,
+    get_worker_session as read_worker_session,
+    list_worker_sessions as read_worker_sessions,
+    row_to_worker_session_record,
+    update_worker_session_tokens as save_worker_session_tokens,
+    upsert_worker_session as save_worker_session,
+)
 from pollypm.work.sync import SyncManager
-
-
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
-
-
-class WorkServiceError(Exception):
-    """Base error for work service operations."""
-
-
-class TaskNotFoundError(WorkServiceError):
-    """Raised when a task_id cannot be resolved."""
-
-
-class InvalidTransitionError(WorkServiceError):
-    """Raised when a state transition is not allowed."""
-
-
-class ValidationError(WorkServiceError):
-    """Raised when input validation fails."""
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _parse_task_id(task_id: str) -> tuple[str, int]:
-    """Parse ``'project/number'`` into (project, task_number)."""
-    parts = task_id.rsplit("/", 1)
-    if len(parts) != 2:
-        raise ValidationError(
-            f"Invalid task_id '{task_id}'. Expected format: 'project/number'."
-        )
-    try:
-        return parts[0], int(parts[1])
-    except ValueError:
-        raise ValidationError(
-            f"Invalid task_id '{task_id}'. Task number must be an integer."
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -748,88 +777,46 @@ class SQLiteWorkService:
         requires_human_review: bool = False,
     ) -> Task:
         """Create a task in draft state."""
-        # Resolve and persist the flow template
-        template = self._ensure_flow_in_db(flow_template)
+        return create_task(
+            self,
+            title=title,
+            description=description,
+            type=type,
+            project=project,
+            flow_template=flow_template,
+            roles=roles,
+            priority=priority,
+            created_by=created_by,
+            acceptance_criteria=acceptance_criteria,
+            constraints=constraints,
+            relevant_files=relevant_files,
+            labels=labels,
+            requires_human_review=requires_human_review,
+        )
 
-        # Validate required roles
-        for role_name, role_def in template.roles.items():
-            is_optional = isinstance(role_def, dict) and role_def.get("optional", False)
-            if not is_optional and role_name not in roles:
-                raise ValidationError(
-                    f"Required role '{role_name}' not provided. "
-                    f"Flow '{template.name}' requires: "
-                    f"{[r for r, d in template.roles.items() if not (isinstance(d, dict) and d.get('optional', False))]}"
-                )
-
-        # Validate enums
-        try:
-            task_type = TaskType(type)
-        except ValueError:
-            raise ValidationError(f"Invalid task type '{type}'.")
-
-        try:
-            task_priority = Priority(priority)
-        except ValueError:
-            raise ValidationError(f"Invalid priority '{priority}'.")
-
-        now = _now()
-
-        # Assign sequential task_number per project
-        row = self._conn.execute(
-            "SELECT COALESCE(MAX(task_number), 0) AS max_num "
-            "FROM work_tasks WHERE project = ?",
-            (project,),
-        ).fetchone()
-        task_number = row["max_num"] + 1
-
+    def set_external_ref(self, task_id: str, key: str, value: str) -> None:
+        """Persist one external reference on a task."""
+        if not key.strip():
+            raise ValidationError(
+                "Cannot persist an external ref with an empty key. "
+                "The work service would have no stable name for the external "
+                "system identifier, so later sync hooks could not retrieve it. "
+                "Fix: pass a non-empty key such as 'github_issue'."
+            )
+        task = self.get(task_id)
+        refs = dict(task.external_refs)
+        refs[str(key)] = str(value)
+        project, task_number = _parse_task_id(task_id)
         self._conn.execute(
-            "INSERT INTO work_tasks "
-            "(project, task_number, title, type, labels, work_status, "
-            "flow_template_id, flow_template_version, current_node_id, "
-            "assignee, priority, requires_human_review, description, "
-            "acceptance_criteria, constraints, relevant_files, "
-            "roles, external_refs, created_at, created_by, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                project,
-                task_number,
-                title,
-                task_type.value,
-                json.dumps(labels or []),
-                WorkStatus.DRAFT.value,
-                template.name,
-                template.version,
-                None,  # current_node_id
-                None,  # assignee
-                task_priority.value,
-                int(requires_human_review),
-                description,
-                acceptance_criteria,
-                constraints,
-                json.dumps(relevant_files or []),
-                json.dumps(roles),
-                json.dumps({}),
-                now,
-                created_by,
-                now,
-            ),
+            "UPDATE work_tasks SET external_refs = ?, updated_at = ? "
+            "WHERE project = ? AND task_number = ?",
+            (json.dumps(refs), _now(), project, task_number),
         )
         self._conn.commit()
-        task = self.get(f"{project}/{task_number}")
-        if self._sync:
-            self._sync.on_create(task)
-        return task
 
     def get(self, task_id: str) -> Task:
         """Read a task by its ``project/number`` identifier."""
-        project, task_number = _parse_task_id(task_id)
-        row = self._conn.execute(
-            "SELECT * FROM work_tasks WHERE project = ? AND task_number = ?",
-            (project, task_number),
-        ).fetchone()
-        if row is None:
-            raise TaskNotFoundError(f"Task '{task_id}' not found.")
-        return self._row_to_task(row)
+        return get_task(self, task_id)
 
     def list_tasks(
         self,
@@ -844,104 +831,21 @@ class SQLiteWorkService:
         offset: int | None = None,
     ) -> list[Task]:
         """Query tasks with optional filters."""
-        clauses: list[str] = []
-        params: list[object] = []
-
-        if work_status is not None:
-            clauses.append("work_status = ?")
-            params.append(work_status)
-        if project is not None:
-            clauses.append("project = ?")
-            params.append(project)
-        if assignee is not None:
-            clauses.append("assignee = ?")
-            params.append(assignee)
-        if type is not None:
-            clauses.append("type = ?")
-            params.append(type)
-
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        sql = f"SELECT * FROM work_tasks{where} ORDER BY project, task_number"
-
-        if limit is not None:
-            sql += f" LIMIT {int(limit)}"
-        if offset is not None:
-            sql += f" OFFSET {int(offset)}"
-
-        rows = self._conn.execute(sql, params).fetchall()
-        token_sums = self._load_task_token_sums_bulk(project=project)
-        tasks = [self._row_to_task(r, token_sums=token_sums) for r in rows]
-
-        # Post-query filters that require derived data
-        if owner is not None:
-            tasks = [t for t in tasks if self.derive_owner(t) == owner]
-        if blocked is not None:
-            tasks = [t for t in tasks if t.blocked == blocked]
-
-        return tasks
+        return read_tasks(
+            self,
+            work_status=work_status,
+            owner=owner,
+            project=project,
+            assignee=assignee,
+            blocked=blocked,
+            type=type,
+            limit=limit,
+            offset=offset,
+        )
 
     def update(self, task_id: str, **fields: object) -> Task:
         """Update mutable fields on a task."""
-        if "work_status" in fields:
-            raise ValidationError(
-                "Cannot change work_status via update(). "
-                "Use lifecycle methods (queue, claim, cancel, etc.)."
-            )
-        if "flow_template" in fields or "flow_template_id" in fields:
-            raise ValidationError("Cannot change flow_template after creation.")
-
-        project, task_number = _parse_task_id(task_id)
-
-        # Ensure task exists
-        existing = self._conn.execute(
-            "SELECT 1 FROM work_tasks WHERE project = ? AND task_number = ?",
-            (project, task_number),
-        ).fetchone()
-        if existing is None:
-            raise TaskNotFoundError(f"Task '{task_id}' not found.")
-
-        ALLOWED = {
-            "title": "title",
-            "description": "description",
-            "priority": "priority",
-            "labels": "labels",
-            "roles": "roles",
-            "acceptance_criteria": "acceptance_criteria",
-            "constraints": "constraints",
-            "relevant_files": "relevant_files",
-        }
-
-        set_clauses: list[str] = []
-        params: list[object] = []
-
-        for key, value in fields.items():
-            col = ALLOWED.get(key)
-            if col is None:
-                raise ValidationError(f"Field '{key}' is not updatable.")
-            if key in ("labels", "relevant_files"):
-                value = json.dumps(value)
-            elif key == "roles":
-                value = json.dumps(value)
-            set_clauses.append(f"{col} = ?")
-            params.append(value)
-
-        if not set_clauses:
-            return self.get(task_id)
-
-        set_clauses.append("updated_at = ?")
-        params.append(_now())
-        params.extend([project, task_number])
-
-        sql = (
-            f"UPDATE work_tasks SET {', '.join(set_clauses)} "
-            f"WHERE project = ? AND task_number = ?"
-        )
-        self._conn.execute(sql, params)
-        self._conn.commit()
-        task = self.get(task_id)
-        if self._sync:
-            self._sync.on_update(task, list(fields.keys()))
-        return task
+        return update_task(self, task_id, **fields)
 
     # ------------------------------------------------------------------
     # State transitions
@@ -1415,13 +1319,7 @@ class SQLiteWorkService:
         self, project: str, task_number: int, node_id: str
     ) -> int:
         """Return the next visit number for a node execution."""
-        row = self._conn.execute(
-            "SELECT COALESCE(MAX(visit), 0) AS max_v "
-            "FROM work_node_executions "
-            "WHERE task_project = ? AND task_number = ? AND node_id = ?",
-            (project, task_number, node_id),
-        ).fetchone()
-        return row["max_v"] + 1
+        return read_next_visit(self, project, task_number, node_id)
 
     def current_node_visit(
         self, project: str, task_number: int, node_id: str
@@ -1440,13 +1338,7 @@ class SQLiteWorkService:
         treats that as one identity bucket (matching the pre-#279
         column default).
         """
-        row = self._conn.execute(
-            "SELECT COALESCE(MAX(visit), 0) AS max_v "
-            "FROM work_node_executions "
-            "WHERE task_project = ? AND task_number = ? AND node_id = ?",
-            (project, task_number, node_id),
-        ).fetchone()
-        return int(row["max_v"] or 0)
+        return read_current_node_visit(self, project, task_number, node_id)
 
     def _advance_to_node(
         self,
@@ -1457,73 +1349,7 @@ class SQLiteWorkService:
         from_status: WorkStatus,
     ) -> None:
         """Advance the task to the next node, updating status and execution."""
-        now = _now()
-
-        if next_node_id is None:
-            raise InvalidTransitionError("No next node defined.")
-
-        next_node = flow.nodes.get(next_node_id)
-        if next_node is None:
-            raise InvalidTransitionError(
-                f"Next node '{next_node_id}' not found in flow."
-            )
-
-        if next_node.type == NodeType.TERMINAL:
-            new_status = WorkStatus.DONE
-            self._conn.execute(
-                "UPDATE work_tasks SET work_status = ?, "
-                "current_node_id = NULL, updated_at = ? "
-                "WHERE project = ? AND task_number = ?",
-                (new_status.value, now, task.project, task.task_number),
-            )
-            self._record_transition(
-                task.project,
-                task.task_number,
-                from_status.value,
-                new_status.value,
-                actor,
-            )
-        elif next_node.type in (NodeType.REVIEW, NodeType.WORK):
-            new_status = (
-                WorkStatus.REVIEW
-                if next_node.type == NodeType.REVIEW
-                else WorkStatus.IN_PROGRESS
-            )
-            visit = self._next_visit(
-                task.project, task.task_number, next_node_id
-            )
-            self._conn.execute(
-                "UPDATE work_tasks SET work_status = ?, "
-                "current_node_id = ?, updated_at = ? "
-                "WHERE project = ? AND task_number = ?",
-                (
-                    new_status.value,
-                    next_node_id,
-                    now,
-                    task.project,
-                    task.task_number,
-                ),
-            )
-            self._conn.execute(
-                "INSERT INTO work_node_executions "
-                "(task_project, task_number, node_id, visit, status, "
-                "started_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    task.project,
-                    task.task_number,
-                    next_node_id,
-                    visit,
-                    ExecutionStatus.ACTIVE.value,
-                    now,
-                ),
-            )
-            self._record_transition(
-                task.project,
-                task.task_number,
-                from_status.value,
-                new_status.value,
-                actor,
-            )
+        advance_to_node(self, task, flow, next_node_id, actor, from_status)
 
     def node_done(
         self,
@@ -2127,94 +1953,18 @@ class SQLiteWorkService:
         ``kind`` must be one of: blocks, relates_to, supersedes, parent.
         For ``blocks``, cycle detection is performed before committing.
         """
-        # Validate kind
-        try:
-            link_kind = LinkKind(kind)
-        except ValueError:
-            raise ValidationError(
-                f"Invalid link kind '{kind}'. "
-                f"Must be one of: {[k.value for k in LinkKind]}."
-            )
-
-        from_project, from_number = _parse_task_id(from_id)
-        to_project, to_number = _parse_task_id(to_id)
-
-        # Validate both tasks exist
-        for tid in (from_id, to_id):
-            p, n = _parse_task_id(tid)
-            row = self._conn.execute(
-                "SELECT 1 FROM work_tasks WHERE project = ? AND task_number = ?",
-                (p, n),
-            ).fetchone()
-            if row is None:
-                raise TaskNotFoundError(f"Task '{tid}' not found.")
-
-        # Cycle detection for blocks
-        if link_kind == LinkKind.BLOCKS:
-            if self._would_create_cycle(from_project, from_number, to_project, to_number):
-                raise ValidationError("circular dependency detected")
-
-        now = _now()
-        self._conn.execute(
-            "INSERT OR IGNORE INTO work_task_dependencies "
-            "(from_project, from_task_number, to_project, to_task_number, kind, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (from_project, from_number, to_project, to_number, link_kind.value, now),
-        )
-        self._conn.commit()
-
-        # For blocks: check if to_id should become blocked
-        if link_kind == LinkKind.BLOCKS:
-            self._maybe_block(to_id)
+        link_tasks(self, from_id, to_id, kind)
 
     def unlink(self, from_id: str, to_id: str, kind: str) -> None:
         """Remove a relationship between two tasks."""
-        try:
-            link_kind = LinkKind(kind)
-        except ValueError:
-            raise ValidationError(
-                f"Invalid link kind '{kind}'. "
-                f"Must be one of: {[k.value for k in LinkKind]}."
-            )
-
-        from_project, from_number = _parse_task_id(from_id)
-        to_project, to_number = _parse_task_id(to_id)
-
-        self._conn.execute(
-            "DELETE FROM work_task_dependencies "
-            "WHERE from_project = ? AND from_task_number = ? "
-            "AND to_project = ? AND to_task_number = ? AND kind = ?",
-            (from_project, from_number, to_project, to_number, link_kind.value),
-        )
-        self._conn.commit()
-
-        # For blocks: check if to_id should become unblocked
-        if link_kind == LinkKind.BLOCKS:
-            self._maybe_unblock(to_id)
+        unlink_tasks(self, from_id, to_id, kind)
 
     def dependents(self, task_id: str) -> list[Task]:
         """Return all tasks blocked by this task, transitively.
 
         Follows ``blocks`` edges from task_id outward via BFS.
         """
-        project, number = _parse_task_id(task_id)
-        visited: set[tuple[str, int]] = set()
-        queue: list[tuple[str, int]] = [(project, number)]
-
-        while queue:
-            current = queue.pop(0)
-            rows = self._conn.execute(
-                "SELECT to_project, to_task_number FROM work_task_dependencies "
-                "WHERE from_project = ? AND from_task_number = ? AND kind = ?",
-                (current[0], current[1], LinkKind.BLOCKS.value),
-            ).fetchall()
-            for r in rows:
-                target = (r["to_project"], r["to_task_number"])
-                if target not in visited:
-                    visited.add(target)
-                    queue.append(target)
-
-        return [self.get(f"{p}/{n}") for p, n in visited]
+        return dependent_tasks(self, task_id)
 
     # ------------------------------------------------------------------
     # Dependency helpers
@@ -2228,149 +1978,33 @@ class SQLiteWorkService:
         to_number: int,
     ) -> bool:
         """DFS from to_id following blocks edges; returns True if from_id is reachable."""
-        target = (from_project, from_number)
-        visited: set[tuple[str, int]] = set()
-        stack: list[tuple[str, int]] = [(to_project, to_number)]
-
-        while stack:
-            current = stack.pop()
-            if current == target:
-                return True
-            if current in visited:
-                continue
-            visited.add(current)
-            rows = self._conn.execute(
-                "SELECT to_project, to_task_number FROM work_task_dependencies "
-                "WHERE from_project = ? AND from_task_number = ? AND kind = ?",
-                (current[0], current[1], LinkKind.BLOCKS.value),
-            ).fetchall()
-            for r in rows:
-                stack.append((r["to_project"], r["to_task_number"]))
-
-        return False
+        return would_create_cycle(
+            self,
+            from_project,
+            from_number,
+            to_project,
+            to_number,
+        )
 
     def _has_unresolved_blockers(self, task_id: str) -> bool:
         """Check if a task has any blockers that are not done."""
-        project, number = _parse_task_id(task_id)
-        rows = self._conn.execute(
-            "SELECT d.from_project, d.from_task_number "
-            "FROM work_task_dependencies d "
-            "WHERE d.to_project = ? AND d.to_task_number = ? AND d.kind = ?",
-            (project, number, LinkKind.BLOCKS.value),
-        ).fetchall()
-        for r in rows:
-            status_row = self._conn.execute(
-                "SELECT work_status FROM work_tasks "
-                "WHERE project = ? AND task_number = ?",
-                (r["from_project"], r["from_task_number"]),
-            ).fetchone()
-            if status_row and status_row["work_status"] not in (
-                WorkStatus.DONE.value,
-                WorkStatus.CANCELLED.value,
-            ):
-                return True
-        return False
+        return has_unresolved_blockers(self, task_id)
 
     def _maybe_block(self, task_id: str) -> None:
         """If task is queued or in_progress and has unresolved blockers, block it."""
-        task = self.get(task_id)
-        if task.work_status not in (WorkStatus.QUEUED, WorkStatus.IN_PROGRESS):
-            return
-        if self._has_unresolved_blockers(task_id):
-            now = _now()
-            self._record_transition(
-                task.project,
-                task.task_number,
-                task.work_status.value,
-                WorkStatus.BLOCKED.value,
-                "system",
-                "blocked by dependency",
-            )
-            self._conn.execute(
-                "UPDATE work_tasks SET work_status = ?, updated_at = ? "
-                "WHERE project = ? AND task_number = ?",
-                (WorkStatus.BLOCKED.value, now, task.project, task.task_number),
-            )
-            self._conn.commit()
+        maybe_block(self, task_id)
 
     def _maybe_unblock(self, task_id: str) -> None:
         """If task is blocked and has no remaining unresolved blockers, unblock it."""
-        task = self.get(task_id)
-        if task.work_status != WorkStatus.BLOCKED:
-            return
-        if not self._has_unresolved_blockers(task_id):
-            now = _now()
-            self._record_transition(
-                task.project,
-                task.task_number,
-                WorkStatus.BLOCKED.value,
-                WorkStatus.QUEUED.value,
-                "system",
-                "all blockers resolved",
-            )
-            self._conn.execute(
-                "UPDATE work_tasks SET work_status = ?, updated_at = ? "
-                "WHERE project = ? AND task_number = ?",
-                (WorkStatus.QUEUED.value, now, task.project, task.task_number),
-            )
-            self._conn.commit()
+        maybe_unblock(self, task_id)
 
     def _check_auto_unblock(self, task_id: str) -> None:
         """After a task moves to done, auto-unblock any tasks it was blocking."""
-        task = self.get(task_id)
-        # Find all tasks directly blocked by this one
-        rows = self._conn.execute(
-            "SELECT to_project, to_task_number FROM work_task_dependencies "
-            "WHERE from_project = ? AND from_task_number = ? AND kind = ?",
-            (task.project, task.task_number, LinkKind.BLOCKS.value),
-        ).fetchall()
-        for r in rows:
-            blocked_id = f"{r['to_project']}/{r['to_task_number']}"
-            blocked_task = self.get(blocked_id)
-            if blocked_task.work_status != WorkStatus.BLOCKED:
-                continue
-            if not self._has_unresolved_blockers(blocked_id):
-                now = _now()
-                self._record_transition(
-                    blocked_task.project,
-                    blocked_task.task_number,
-                    WorkStatus.BLOCKED.value,
-                    WorkStatus.QUEUED.value,
-                    "system",
-                    f"auto-unblocked, blocker {task.task_id} completed",
-                )
-                self._conn.execute(
-                    "UPDATE work_tasks SET work_status = ?, updated_at = ? "
-                    "WHERE project = ? AND task_number = ?",
-                    (
-                        WorkStatus.QUEUED.value,
-                        now,
-                        blocked_task.project,
-                        blocked_task.task_number,
-                    ),
-                )
-                self._conn.commit()
-                unblocked = self.get(blocked_id)
-                self._sync_transition(
-                    unblocked, WorkStatus.BLOCKED.value, WorkStatus.QUEUED.value,
-                )
+        check_auto_unblock(self, task_id)
 
     def _on_cancelled(self, task_id: str) -> None:
         """After a task is cancelled, add context entries on blocked dependents."""
-        task = self.get(task_id)
-        rows = self._conn.execute(
-            "SELECT to_project, to_task_number FROM work_task_dependencies "
-            "WHERE from_project = ? AND from_task_number = ? AND kind = ?",
-            (task.project, task.task_number, LinkKind.BLOCKS.value),
-        ).fetchall()
-        for r in rows:
-            blocked_id = f"{r['to_project']}/{r['to_task_number']}"
-            self.add_context(
-                blocked_id,
-                "system",
-                f"blocker {task.task_id} was cancelled "
-                f"— PM must decide whether to unblock or cancel this task.",
-            )
+        on_cancelled(self, task_id)
 
     def _on_task_done(self, task_id: str, actor: str) -> None:
         """Post-commit hook — fire milestone/digest flush on done transitions.
@@ -2380,22 +2014,7 @@ class SQLiteWorkService:
         Runs after ``_check_auto_unblock`` and ``teardown_worker`` so
         the ordering matches the rest of the completion pipeline.
         """
-        try:
-            from pollypm.notification_staging import check_and_flush_on_done
-
-            task = self.get(task_id)
-            check_and_flush_on_done(
-                self,
-                project=task.project,
-                completed_task=task,
-                actor=actor or "polly",
-                project_path=self._project_path,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "notification-digest flush skipped for %s: %s",
-                task_id, exc, exc_info=True,
-            )
+        on_task_done(self, task_id, actor)
 
     def _on_task_transition(
         self,
@@ -2409,25 +2028,7 @@ class SQLiteWorkService:
         Currently routes regression detection (away from ``done``). Safe
         on every transition; cheap when not applicable.
         """
-        if from_state == "done" and to_state != "done":
-            try:
-                from pollypm.notification_staging import check_regression_on_reopen
-
-                project = task_id.rsplit("/", 1)[0] if "/" in task_id else ""
-                if project:
-                    check_regression_on_reopen(
-                        self,
-                        project=project,
-                        task_id=task_id,
-                        from_state=from_state,
-                        to_state=to_state,
-                        actor=actor or "system",
-                    )
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(
-                    "regression notify skipped for %s (%s→%s): %s",
-                    task_id, from_state, to_state, exc, exc_info=True,
-                )
+        on_task_transition(self, task_id, from_state, to_state, actor)
 
     def mark_done(self, task_id: str, actor: str) -> Task:
         """Move a task to done and trigger auto-unblock on dependents.
@@ -2435,30 +2036,7 @@ class SQLiteWorkService:
         This is a helper for completing tasks. Full flow-based completion
         (approve/node_done) will call ``_check_auto_unblock`` as well.
         """
-        task = self.get(task_id)
-        if task.work_status in TERMINAL_STATUSES:
-            raise InvalidTransitionError(
-                f"Cannot mark done task in terminal state '{task.work_status.value}'."
-            )
-
-        now = _now()
-        from_state = task.work_status.value
-        self._record_transition(
-            task.project,
-            task.task_number,
-            from_state,
-            WorkStatus.DONE.value,
-            actor,
-        )
-        self._conn.execute(
-            "UPDATE work_tasks SET work_status = ?, updated_at = ? "
-            "WHERE project = ? AND task_number = ?",
-            (WorkStatus.DONE.value, now, task.project, task.task_number),
-        )
-        self._conn.commit()
-        self._check_auto_unblock(task_id)
-        self._on_task_done(task_id, actor)
-        return self.get(task_id)
+        return mark_task_done(self, task_id, actor)
 
     # ------------------------------------------------------------------
     # Context log
@@ -2501,6 +2079,75 @@ class SQLiteWorkService:
             text=text,
             entry_type=entry_type,
         )
+
+    def stage_notification(
+        self,
+        *,
+        project: str,
+        subject: str,
+        body: str,
+        actor: str,
+        priority: str,
+        milestone_key: str | None,
+        payload: dict[str, object] | None = None,
+    ) -> int:
+        """Public typed API for digest/silent notification staging."""
+        return stage_notification_row(
+            self,
+            project=project,
+            subject=subject,
+            body=body,
+            actor=actor,
+            priority=priority,
+            milestone_key=milestone_key,
+            payload=payload,
+        )
+
+    def list_digest_rollup_candidates(
+        self,
+        *,
+        project: str,
+        milestone_key: str | None,
+    ) -> list[DigestRollupCandidate]:
+        return list_digest_rollup_candidates(
+            self,
+            project=project,
+            milestone_key=milestone_key,
+        )
+
+    def mark_rollup_candidates_flushed(
+        self,
+        candidates: list[DigestRollupCandidate],
+        *,
+        rollup_task_id: str,
+        flushed_at: str,
+    ) -> None:
+        mark_rollup_candidates_flushed(
+            self,
+            candidates,
+            rollup_task_id=rollup_task_id,
+            flushed_at=flushed_at,
+        )
+
+    def has_old_pending_digest_rows(
+        self,
+        *,
+        project: str,
+        milestone_key: str | None,
+        min_age_seconds: int,
+    ) -> bool:
+        return has_old_pending_digest_rows(
+            self,
+            project=project,
+            milestone_key=milestone_key,
+            min_age_seconds=min_age_seconds,
+        )
+
+    def find_flushed_rollup_milestone(self, *, task_id: str) -> str | None:
+        return find_flushed_rollup_milestone(self, task_id=task_id)
+
+    def prune_staged_notifications(self, *, retain_days: int = 30) -> dict[str, int]:
+        return prune_staged_notifications(self, retain_days=retain_days)
 
     def get_context(
         self,
@@ -2672,44 +2319,7 @@ class SQLiteWorkService:
         Priority ordering: critical > high > normal > low, then FIFO by created_at.
         Does NOT claim the task.
         """
-        clauses = ["t.work_status = ?"]
-        params: list[object] = [WorkStatus.QUEUED.value]
-
-        if project is not None:
-            clauses.append("t.project = ?")
-            params.append(project)
-
-        where = " AND ".join(clauses)
-
-        # Use a CASE expression for priority ordering
-        sql = (
-            "SELECT t.* FROM work_tasks t "
-            f"WHERE {where} "
-            "ORDER BY "
-            "CASE t.priority "
-            "  WHEN 'critical' THEN 0 "
-            "  WHEN 'high' THEN 1 "
-            "  WHEN 'normal' THEN 2 "
-            "  WHEN 'low' THEN 3 "
-            "  ELSE 4 "
-            "END, "
-            "t.created_at ASC"
-        )
-
-        rows = self._conn.execute(sql, params).fetchall()
-
-        for row in rows:
-            task = self._row_to_task(row)
-            # Skip tasks with unresolved blockers
-            if self._has_unresolved_blockers(task.task_id):
-                continue
-            # If agent specified, only tasks where this agent fills the worker role
-            if agent is not None:
-                if task.roles.get("worker") != agent:
-                    continue
-            return task
-
-        return None
+        return next_task(self, agent=agent, project=project)
 
     def my_tasks(self, agent: str) -> list[Task]:
         """All tasks where *agent* fills a role that owns the current node.
@@ -2717,37 +2327,11 @@ class SQLiteWorkService:
         For each task with a non-null current_node_id, resolve the current
         node's actor and check if the agent matches the expected role.
         """
-        rows = self._conn.execute(
-            "SELECT * FROM work_tasks WHERE current_node_id IS NOT NULL",
-        ).fetchall()
-
-        result: list[Task] = []
-        for row in rows:
-            task = self._row_to_task(row)
-            owner = self.derive_owner(task)
-            if owner == agent:
-                result.append(task)
-        return result
+        return read_my_tasks(self, agent)
 
     def state_counts(self, project: str | None = None) -> dict[str, int]:
         """Task counts by work_status. For dashboards."""
-        # Initialise with zero counts for all statuses
-        counts = {s.value: 0 for s in WorkStatus}
-
-        clauses: list[str] = []
-        params: list[object] = []
-        if project is not None:
-            clauses.append("project = ?")
-            params.append(project)
-
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        sql = f"SELECT work_status, COUNT(*) as cnt FROM work_tasks{where} GROUP BY work_status"
-
-        rows = self._conn.execute(sql, params).fetchall()
-        for r in rows:
-            counts[r["work_status"]] = r["cnt"]
-
-        return counts
+        return read_state_counts(self, project)
 
     def blocked_tasks(self, project: str | None = None) -> list[Task]:
         """All tasks with ``work_status == blocked`` in a non-terminal state.
@@ -2758,18 +2342,7 @@ class SQLiteWorkService:
         decide whether to unblock or cancel. Dependency-resolution gating
         is internal to ``next()`` and auto-unblock.
         """
-        clauses = ["work_status = ?"]
-        params: list[object] = [WorkStatus.BLOCKED.value]
-
-        if project is not None:
-            clauses.append("project = ?")
-            params.append(project)
-
-        where = " AND ".join(clauses)
-        sql = f"SELECT * FROM work_tasks WHERE {where} ORDER BY project, task_number"
-
-        rows = self._conn.execute(sql, params).fetchall()
-        return [self._row_to_task(row) for row in rows]
+        return read_blocked_tasks(self, project)
 
     # ------------------------------------------------------------------
     # Flows (public API)
@@ -2847,25 +2420,14 @@ class SQLiteWorkService:
         error: str | None,
     ) -> None:
         """Upsert a work_sync_state row after attempting to sync a task."""
-        now = _now() if success else None
-        # Use UPSERT so (task, adapter) is a single row that tracks the
-        # latest attempt plus an attempt counter.
-        self._conn.execute(
-            """
-            INSERT INTO work_sync_state
-                (task_project, task_number, adapter_name,
-                 last_synced_at, last_error, attempts)
-            VALUES (?, ?, ?, ?, ?, 1)
-            ON CONFLICT(task_project, task_number, adapter_name)
-            DO UPDATE SET
-                last_synced_at = COALESCE(excluded.last_synced_at,
-                                          work_sync_state.last_synced_at),
-                last_error = excluded.last_error,
-                attempts = work_sync_state.attempts + 1
-            """,
-            (project, task_number, adapter_name, now, error),
+        record_sync_state(
+            self,
+            project,
+            task_number,
+            adapter_name,
+            success=success,
+            error=error,
         )
-        self._conn.commit()
 
     def sync_status(self, task_id: str) -> dict[str, object]:
         """Current sync state per registered adapter for a task.
@@ -2874,44 +2436,7 @@ class SQLiteWorkService:
         attempts}``. Adapters that have never attempted a sync for this
         task appear with ``None`` fields and ``attempts=0``.
         """
-        project, task_number = _parse_task_id(task_id)
-        # Validate task exists
-        row = self._conn.execute(
-            "SELECT 1 FROM work_tasks WHERE project = ? AND task_number = ?",
-            (project, task_number),
-        ).fetchone()
-        if row is None:
-            raise TaskNotFoundError(f"Task '{task_id}' not found.")
-
-        rows = self._conn.execute(
-            "SELECT adapter_name, last_synced_at, last_error, attempts "
-            "FROM work_sync_state "
-            "WHERE task_project = ? AND task_number = ?",
-            (project, task_number),
-        ).fetchall()
-        result: dict[str, object] = {
-            r["adapter_name"]: {
-                "last_synced_at": r["last_synced_at"],
-                "last_error": r["last_error"],
-                "attempts": r["attempts"],
-            }
-            for r in rows
-        }
-
-        # Include any registered adapters that have no row yet so callers
-        # see the full adapter set — matches the "current state per adapter"
-        # contract in the Protocol docstring.
-        if self._sync is not None:
-            for adapter in self._sync.adapters:
-                name = getattr(adapter, "name", None)
-                if name and name not in result:
-                    result[name] = {
-                        "last_synced_at": None,
-                        "last_error": None,
-                        "attempts": 0,
-                    }
-
-        return result
+        return read_sync_status(self, task_id)
 
     def trigger_sync(
         self,
@@ -2926,66 +2451,7 @@ class SQLiteWorkService:
         Returns a summary: ``{synced: int, errors: {adapter_name:
         [task_id, ...]}}``.
         """
-        summary: dict[str, object] = {"synced": 0, "errors": {}}
-
-        # Select tasks to sync (validate task_id up-front regardless of
-        # whether any adapters are registered).
-        if task_id is None:
-            rows = self._conn.execute(
-                "SELECT project, task_number FROM work_tasks "
-                "ORDER BY project, task_number"
-            ).fetchall()
-            task_ids = [f"{r['project']}/{r['task_number']}" for r in rows]
-        else:
-            project, task_number = _parse_task_id(task_id)
-            row = self._conn.execute(
-                "SELECT 1 FROM work_tasks "
-                "WHERE project = ? AND task_number = ?",
-                (project, task_number),
-            ).fetchone()
-            if row is None:
-                raise TaskNotFoundError(f"Task '{task_id}' not found.")
-            task_ids = [task_id]
-
-        if self._sync is None:
-            return summary
-
-        adapters = [
-            a for a in self._sync.adapters
-            if adapter is None or getattr(a, "name", None) == adapter
-        ]
-        if not adapters:
-            return summary
-
-        errors: dict[str, list[str]] = {}
-        synced = 0
-
-        for tid in task_ids:
-            try:
-                task = self.get(tid)
-            except TaskNotFoundError:
-                continue
-
-            project, task_number = _parse_task_id(tid)
-
-            for ad in adapters:
-                name = getattr(ad, "name", "unknown")
-                err: str | None = None
-                try:
-                    ad.on_create(task)
-                except Exception as exc:  # noqa: BLE001
-                    err = str(exc)
-                    errors.setdefault(name, []).append(tid)
-
-                self._record_sync_state(
-                    project, task_number, name, success=(err is None), error=err,
-                )
-                if err is None:
-                    synced += 1
-
-        summary["synced"] = synced
-        summary["errors"] = errors
-        return summary
+        return run_trigger_sync(self, task_id=task_id, adapter=adapter)
 
     # ------------------------------------------------------------------
     # Worker sessions
@@ -2996,42 +2462,14 @@ class SQLiteWorkService:
     # ``self._conn``) keeps the session manager honest about the service
     # protocol surface and makes the whole binding mockable.
 
-    _WORK_SESSIONS_DDL = """
-    CREATE TABLE IF NOT EXISTS work_sessions (
-        task_project TEXT NOT NULL,
-        task_number INTEGER NOT NULL,
-        agent_name TEXT NOT NULL,
-        pane_id TEXT,
-        worktree_path TEXT,
-        branch_name TEXT,
-        started_at TEXT NOT NULL,
-        ended_at TEXT,
-        total_input_tokens INTEGER DEFAULT 0,
-        total_output_tokens INTEGER DEFAULT 0,
-        archive_path TEXT,
-        PRIMARY KEY (task_project, task_number),
-        FOREIGN KEY (task_project, task_number) REFERENCES work_tasks(project, task_number)
-    );
-    """
+    _WORK_SESSIONS_DDL = WORK_SESSIONS_DDL
 
     @staticmethod
     def _row_to_worker_session_record(row) -> WorkerSessionRecord:
-        return WorkerSessionRecord(
-            task_project=row["task_project"],
-            task_number=int(row["task_number"]),
-            agent_name=row["agent_name"],
-            pane_id=row["pane_id"],
-            worktree_path=row["worktree_path"],
-            branch_name=row["branch_name"],
-            started_at=row["started_at"],
-            ended_at=row["ended_at"],
-            total_input_tokens=int(row["total_input_tokens"] or 0),
-            total_output_tokens=int(row["total_output_tokens"] or 0),
-            archive_path=row["archive_path"],
-        )
+        return row_to_worker_session_record(row)
 
     def ensure_worker_session_schema(self) -> None:
-        self._conn.executescript(self._WORK_SESSIONS_DDL)
+        ensure_worker_sessions(self)
 
     def upsert_worker_session(
         self,
@@ -3044,23 +2482,16 @@ class SQLiteWorkService:
         branch_name: str,
         started_at: str,
     ) -> None:
-        self._conn.execute(
-            "INSERT INTO work_sessions "
-            "(task_project, task_number, agent_name, pane_id, worktree_path, "
-            "branch_name, started_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT (task_project, task_number) DO UPDATE SET "
-            "pane_id=excluded.pane_id, "
-            "worktree_path=excluded.worktree_path, "
-            "branch_name=excluded.branch_name, "
-            "started_at=excluded.started_at, "
-            "ended_at=NULL, "
-            "archive_path=NULL, "
-            "total_input_tokens=0, "
-            "total_output_tokens=0",
-            (task_project, task_number, agent_name, pane_id, worktree_path,
-             branch_name, started_at),
+        save_worker_session(
+            self,
+            task_project=task_project,
+            task_number=task_number,
+            agent_name=agent_name,
+            pane_id=pane_id,
+            worktree_path=worktree_path,
+            branch_name=branch_name,
+            started_at=started_at,
         )
-        self._conn.commit()
 
     def get_worker_session(
         self,
@@ -3069,21 +2500,12 @@ class SQLiteWorkService:
         task_number: int,
         active_only: bool = False,
     ) -> WorkerSessionRecord | None:
-        if active_only:
-            row = self._conn.execute(
-                "SELECT * FROM work_sessions "
-                "WHERE task_project = ? AND task_number = ? AND ended_at IS NULL",
-                (task_project, task_number),
-            ).fetchone()
-        else:
-            row = self._conn.execute(
-                "SELECT * FROM work_sessions "
-                "WHERE task_project = ? AND task_number = ?",
-                (task_project, task_number),
-            ).fetchone()
-        if row is None:
-            return None
-        return self._row_to_worker_session_record(row)
+        return read_worker_session(
+            self,
+            task_project=task_project,
+            task_number=task_number,
+            active_only=active_only,
+        )
 
     def list_worker_sessions(
         self,
@@ -3091,19 +2513,11 @@ class SQLiteWorkService:
         project: str | None = None,
         active_only: bool = True,
     ) -> list[WorkerSessionRecord]:
-        clauses: list[str] = []
-        params: list[object] = []
-        if active_only:
-            clauses.append("ended_at IS NULL")
-        if project is not None:
-            clauses.append("task_project = ?")
-            params.append(project)
-        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-        rows = self._conn.execute(
-            f"SELECT * FROM work_sessions{where}",
-            tuple(params),
-        ).fetchall()
-        return [self._row_to_worker_session_record(r) for r in rows]
+        return read_worker_sessions(
+            self,
+            project=project,
+            active_only=active_only,
+        )
 
     def end_worker_session(
         self,
@@ -3115,14 +2529,15 @@ class SQLiteWorkService:
         total_output_tokens: int,
         archive_path: str | None,
     ) -> None:
-        self._conn.execute(
-            "UPDATE work_sessions SET ended_at = ?, total_input_tokens = ?, "
-            "total_output_tokens = ?, archive_path = ? "
-            "WHERE task_project = ? AND task_number = ?",
-            (ended_at, total_input_tokens, total_output_tokens, archive_path,
-             task_project, task_number),
+        finish_worker_session(
+            self,
+            task_project=task_project,
+            task_number=task_number,
+            ended_at=ended_at,
+            total_input_tokens=total_input_tokens,
+            total_output_tokens=total_output_tokens,
+            archive_path=archive_path,
         )
-        self._conn.commit()
 
     def update_worker_session_tokens(
         self,
@@ -3133,11 +2548,11 @@ class SQLiteWorkService:
         total_output_tokens: int,
         archive_path: str | None,
     ) -> None:
-        self._conn.execute(
-            "UPDATE work_sessions SET total_input_tokens = ?, "
-            "total_output_tokens = ?, archive_path = ? "
-            "WHERE task_project = ? AND task_number = ?",
-            (total_input_tokens, total_output_tokens, archive_path,
-             task_project, task_number),
+        save_worker_session_tokens(
+            self,
+            task_project=task_project,
+            task_number=task_number,
+            total_input_tokens=total_input_tokens,
+            total_output_tokens=total_output_tokens,
+            archive_path=archive_path,
         )
-        self._conn.commit()

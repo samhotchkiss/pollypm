@@ -20,7 +20,8 @@ Guardrails
 
 3. **No direct SQL on ``StateStore._conn`` / ``SQLiteWorkService._conn``.**
    Those connections are private — callers use the typed accessor methods
-   the stores expose. Only the owning module may touch ``_conn``.
+   the stores expose. Only the owning module or its boundary-owned helper
+   modules may touch ``_conn``.
 
 Allow-list format
 -----------------
@@ -73,6 +74,10 @@ _SUPERVISOR_IMPORT_PATTERN = re.compile(
     r"^\s*from\s+pollypm\.supervisor\s+import\s+[^\n]*\bSupervisor\b",
     re.MULTILINE,
 )
+_SUPERVISOR_PRIVATE_IMPORT_PATTERN = re.compile(
+    r"^\s*from\s+pollypm\.supervisor\s+import\s+[^\n#]*\b_[A-Za-z0-9_]+\b",
+    re.MULTILINE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +115,13 @@ _PRIVATE_CONN_ALLOWLIST: frozenset[str] = frozenset(
     }
 )
 
+# The SQLite work-service split (#365) moved implementation into
+# boundary-owned ``service_*.py`` helpers. Those modules are still part of
+# the owning boundary even though they live beside ``sqlite_service.py``.
+_PRIVATE_CONN_OWNING_PREFIXES: tuple[str, ...] = (
+    "src/pollypm/work/service_",
+)
+
 # Symbol names whose ``._conn`` attribute is the guarded private connection.
 # ``jobs.JobQueue`` also exposes ``_conn`` but that's a different store and
 # isn't part of this guardrail (separate tracking issue).
@@ -139,6 +151,12 @@ def _iter_source_files(root: Path) -> list[Path]:
 
 def _relative_posix(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
+
+
+def _is_private_conn_owner(rel: str) -> bool:
+    if rel in _PRIVATE_CONN_ALLOWLIST:
+        return True
+    return any(rel.startswith(prefix) for prefix in _PRIVATE_CONN_OWNING_PREFIXES)
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +219,25 @@ def test_supervisor_import_allowlist_has_no_stale_entries() -> None:
     assert not stale, (
         "Stale entries in _SUPERVISOR_IMPORT_ALLOWLIST — remove them "
         "(boundary tightening is the whole point):\n  - " + "\n  - ".join(stale)
+    )
+
+
+def test_no_private_supervisor_imports_outside_supervisor() -> None:
+    """Private helpers in ``supervisor.py`` are not a public dependency."""
+    root = _project_root()
+    offenders: list[str] = []
+    for source_file in _iter_source_files(root):
+        rel = _relative_posix(source_file, root)
+        if rel == "src/pollypm/supervisor.py":
+            continue
+        text = source_file.read_text(encoding="utf-8")
+        if _SUPERVISOR_PRIVATE_IMPORT_PATTERN.search(text):
+            offenders.append(rel)
+
+    assert not offenders, (
+        "Private imports from `pollypm.supervisor` are forbidden. Promote "
+        "the helper into a public module first, then import that instead. "
+        "Offenders:\n  - " + "\n  - ".join(offenders)
     )
 
 
@@ -269,7 +306,7 @@ def test_no_private_sqlite_conn_access_outside_owning_modules() -> None:
     offenders: list[tuple[str, int, str]] = []
     for source_file in _iter_source_files(root):
         rel = _relative_posix(source_file, root)
-        if rel in _PRIVATE_CONN_ALLOWLIST:
+        if _is_private_conn_owner(rel):
             continue
         text = source_file.read_text(encoding="utf-8")
         # Fast exit: if none of the guarded class names appear and there's
@@ -306,4 +343,35 @@ def test_no_private_sqlite_conn_access_outside_owning_modules() -> None:
         "accessors, or (if truly unavoidable) add the file to "
         "_PRIVATE_CONN_ALLOWLIST with a TODO. Offenders:\n  - "
         + "\n  - ".join(f"{path}:{lineno}: {content}" for path, lineno, content in offenders)
+    )
+
+
+def test_worker_launch_contract_routes_through_provider_runtime_adapters() -> None:
+    """Worker launch planning must use the public provider/runtime seams."""
+    root = _project_root()
+    source = (
+        root / "src" / "pollypm" / "work" / "session_manager.py"
+    ).read_text(encoding="utf-8")
+
+    required_snippets = (
+        "from pollypm.providers import get_provider",
+        "from pollypm.runtimes import get_runtime",
+        "provider.build_launch_command(session, account)",
+        "runtime.wrap_command(launch, account, config.project)",
+    )
+    missing = [snippet for snippet in required_snippets if snippet not in source]
+    assert not missing, (
+        "Worker launch must route through provider/runtime adapters. "
+        "Missing required session-manager snippets:\n  - "
+        + "\n  - ".join(missing)
+    )
+
+    forbidden_snippets = (
+        'provider="claude"',
+        'runtime="local"',
+    )
+    present = [snippet for snippet in forbidden_snippets if snippet in source]
+    assert not present, (
+        "Worker launch must not hardcode provider/runtime ownership. "
+        "Found forbidden snippets:\n  - " + "\n  - ".join(present)
     )

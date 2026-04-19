@@ -203,6 +203,21 @@ class TestGitHubSyncAdapter:
         # Should have stored the issue number
         assert task.external_refs.get("github_issue") == "42"
 
+    def test_work_service_persists_created_issue_ref(self, tmp_path: Path):
+        """GitHub sync refs survive the create transaction round-trip."""
+        manager = SyncManager()
+        manager.register(GitHubSyncAdapter(repo="owner/repo"))
+        svc = SQLiteWorkService(db_path=tmp_path / "work.db", sync_manager=manager)
+
+        with patch("pollypm.work.sync_github._run_gh") as mock_gh:
+            mock_gh.return_value = MagicMock(
+                stdout="https://github.com/owner/repo/issues/42\n"
+            )
+            task = _make_task(svc)
+
+        reloaded = svc.get(task.task_id)
+        assert reloaded.external_refs.get("github_issue") == "42"
+
     def test_transitions_labels(self):
         """on_transition swaps labels via gh issue edit."""
         adapter = GitHubSyncAdapter(repo="owner/repo")
@@ -287,6 +302,11 @@ class TestGitHubSyncAdapter:
         """Every WorkStatus value has a label mapping."""
         for status in WorkStatus:
             assert status.value in STATUS_TO_LABEL, f"Missing label for {status}"
+
+    def test_blocked_and_on_hold_reuse_tracker_labels(self):
+        """GitHub sync stays on the six-label tracker contract."""
+        assert STATUS_TO_LABEL[WorkStatus.BLOCKED.value] == "polly:in-progress"
+        assert STATUS_TO_LABEL[WorkStatus.ON_HOLD.value] == "polly:not-ready"
 
 
 # ---------------------------------------------------------------------------

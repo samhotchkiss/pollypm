@@ -5,7 +5,6 @@ lf01 scope:
     - Event projector (``handlers/event_projector.py``) that unifies
       events from the global state store with ``work_transitions`` in
       per-project work DBs.
-    - ``activity_events`` SQL view over the global ``events`` table.
 
 lf03 adds:
     - Rail item registration in the ``workflows`` section (index 30,
@@ -34,7 +33,6 @@ from pollypm.plugin_api.v1 import (
 from pollypm.plugins_builtin.activity_feed.handlers.event_projector import (
     EventProjector,
     FeedEntry,
-    ensure_activity_events_view,
 )
 
 logger = logging.getLogger(__name__)
@@ -181,7 +179,7 @@ def _handler_factory(config: Any):
 
 
 def _initialize(api: Any) -> None:
-    """Install the activity_events view + register the rail item.
+    """Register the activity rail item.
 
     The rail registration uses ``section="workflows"`` (non-reserved)
     so the plugin manifest does NOT need the reserved-section flag.
@@ -192,19 +190,6 @@ def _initialize(api: Any) -> None:
     state_db = None
     if config is not None:
         state_db = getattr(getattr(config, "project", None), "state_db", None)
-    if state_db is not None:
-        try:
-            import sqlite3
-
-            conn = sqlite3.connect(str(state_db), check_same_thread=False)
-            try:
-                ensure_activity_events_view(conn)
-            finally:
-                conn.close()
-        except Exception:  # noqa: BLE001
-            # Observability plugin — never brick the rail. Surface via
-            # logger and degraded-plugins machinery if it keeps failing.
-            logger.exception("activity_feed: failed to install activity_events view")
     # Rail registration — silent no-op if the host was built without a
     # rail registry (e.g. CLI-only environments / minimal test stubs).
     rail = None

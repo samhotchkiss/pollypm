@@ -1,5 +1,22 @@
 """PollyPM Supervisor — session orchestration over tmux.
 
+Contract:
+- Inputs: ``PollyPMConfig``, tmux/session state, state-store handles,
+  and collaborator boundaries such as launch planners, recovery policy,
+  heartbeat backend, and session services.
+- Outputs: launch/recovery/status side effects plus typed session/window
+  snapshots returned through the public supervisor API.
+- Side effects: boots and repairs tmux sessions, launches providers via
+  delegated planners/services, writes state-store updates, and mediates
+  recovery/probe/control-home workflows.
+- Invariants: external callers go through ``pollypm.service_api``; the
+  supervisor orchestrates boundaries rather than letting callers reach
+  into provider/runtime/session internals directly.
+- Allowed dependencies: public collaborators in ``core``, ``launch_planner``,
+  ``recovery``, ``session_services``, ``supervision``, and state/store APIs.
+- Private: remaining tmux-layout/bootstrap details and legacy helper
+  methods that have not yet been extracted.
+
 Status: **late-stage decomposition** (see issues #179, #186). The
 Supervisor used to own every moving part of PollyPM's runtime; steps
 0–8 of the split extracted the durable pieces into dedicated modules:
@@ -36,7 +53,6 @@ import os
 import re
 import shlex
 import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -58,13 +74,12 @@ from pollypm.heartbeats.api import SupervisorHeartbeatAPI
 from pollypm.knowledge_extract import EXTRACTION_INTERVAL_SECONDS
 from pollypm.models import AccountConfig, ProviderKind, SessionConfig, SessionLaunchSpec
 from pollypm.onboarding import _prime_claude_home
-from pollypm.providers.base import LaunchCommand
 from pollypm.projects import ensure_project_scaffold
 from pollypm.projects import project_checkpoints_dir, project_transcripts_dir, project_worktrees_dir, release_session_lock
-from pollypm.runtimes import get_runtime
 from pollypm.schedulers import ScheduledJob, get_scheduler_backend
 from pollypm.store.registry import get_store
 from pollypm.transcript_ledger import sync_token_ledger_for_config
+from pollypm.supervision import ControllerProbeService, ControlHomeManager, ProbeRunner
 from pollypm.storage.state import AlertRecord, LeaseRecord, StateStore
 from pollypm.tmux.client import TmuxWindow
 from typing import TYPE_CHECKING
@@ -102,44 +117,6 @@ def _prefix_for_owner(owner: str, text: str) -> str:
     if prefix is None:
         return text
     return f"{prefix} {text}"
-
-
-# Flags that belong to a specific provider and should be stripped when
-# the session's account uses a different provider.
-_CODEX_ONLY_FLAGS = frozenset({
-    "--dangerously-bypass-approvals-and-sandbox",
-    "--sandbox",
-    "--ask-for-approval",
-})
-_CLAUDE_ONLY_FLAGS = frozenset({
-    "--dangerously-skip-permissions",
-    "--allowedTools",
-    "--disallowedTools",
-})
-
-
-def _sanitize_provider_args(args: list[str], provider: ProviderKind) -> list[str]:
-    """Remove flags that belong to a different provider."""
-    bad_flags = _CODEX_ONLY_FLAGS if provider is ProviderKind.CLAUDE else _CLAUDE_ONLY_FLAGS
-    cleaned: list[str] = []
-    skip_next = False
-    for arg in args:
-        if skip_next:
-            skip_next = False
-            continue
-        if arg in bad_flags:
-            # Flags like --sandbox take a value argument; skip it too
-            if arg in ("--sandbox", "--ask-for-approval", "--allowedTools", "--disallowedTools"):
-                skip_next = True
-            continue
-        cleaned.append(arg)
-    # If we stripped everything, fall back to the provider's default open-permissions flag
-    if not cleaned:
-        if provider is ProviderKind.CLAUDE:
-            return ["--dangerously-skip-permissions"]
-        if provider is ProviderKind.CODEX:
-            return ["--dangerously-bypass-approvals-and-sandbox"]
-    return cleaned
 
 
 # Per-project cache of review-task nudge lines keyed by ``state.db`` mtime.
@@ -309,6 +286,30 @@ class Supervisor:
         if getattr(self, "_launch_planner_instance", None) is None:
             self._launch_planner_instance = self._build_launch_planner()
         return self._launch_planner_instance
+
+    @property
+    def control_homes(self) -> ControlHomeManager:
+        """Manager for control-session profile mirroring and runtime metadata."""
+        if getattr(self, "_control_home_manager", None) is None:
+            self._control_home_manager = ControlHomeManager(
+                project=self.config.project,
+                readonly_state=self.readonly_state,
+                control_roles=frozenset(self._CONTROL_ROLES),
+                control_homes_dir_name=self._CONTROL_HOMES_DIR,
+            )
+        return self._control_home_manager
+
+    @property
+    def controller_probe(self) -> ControllerProbeService:
+        """Service that validates controller accounts before bootstrap."""
+        if getattr(self, "_controller_probe_service", None) is None:
+            self._controller_probe_service = ControllerProbeService(
+                config=self.config,
+                effective_session=self._effective_session,
+                effective_account=self._effective_account,
+                probe_account=self._run_probe,
+            )
+        return self._controller_probe_service
 
     @property
     def core_rail(self) -> "CoreRail":
@@ -1922,29 +1923,10 @@ class Supervisor:
 
     def _refresh_account_runtime_metadata(self, account_name: str) -> None:
         account = self.config.accounts[account_name]
-        access_expires_at: str | None = None
-        refresh_available = False
-        if account.provider is ProviderKind.CLAUDE and account.home is not None:
-            credentials_path = account.home / ".claude" / ".credentials.json"
-            if credentials_path.exists():
-                try:
-                    import json
-
-                    data = json.loads(credentials_path.read_text())
-                    oauth = data.get("claudeAiOauth", {})
-                    expires_at = oauth.get("expiresAt")
-                    if isinstance(expires_at, (int, float)):
-                        access_expires_at = datetime.fromtimestamp(expires_at / 1000, UTC).isoformat()
-                    refresh_available = bool(oauth.get("refreshToken"))
-                except Exception:  # noqa: BLE001
-                    access_expires_at = None
-        self.store.upsert_account_runtime(
-            account_name=account_name,
-            provider=account.provider.value,
-            status="healthy",
-            reason="local auth metadata loaded",
-            access_expires_at=access_expires_at,
-            refresh_available=refresh_available,
+        self.control_homes.refresh_account_runtime_metadata(
+            self.store,
+            account_name,
+            account,
         )
 
     def _account_is_viable(self, account_name: str) -> bool:
@@ -2561,158 +2543,22 @@ class Supervisor:
         return candidates
 
     def _probe_controller_account(self, account_name: str) -> None:
-        account = self.config.accounts[account_name]
-        operator_session = self._effective_session(self.config.sessions["operator"], controller_account=account_name)
-        account = self._effective_account(operator_session, self.config.accounts[operator_session.account])
-        output = self._run_probe(account)
-        lowered = output.lower()
-        pane_tail = _last_lines(output, n=5)
-        if account.provider is ProviderKind.CLAUDE:
-            if "ok" in lowered and "authentication" not in lowered:
-                return
-            raise RuntimeError(
-                format_probe_failure(
-                    provider="Claude",
-                    account_name=account_name,
-                    account_email=account.email,
-                    reason=(
-                        "the `claude -p 'Reply with ok'` probe did not "
-                        "return 'ok' within the probe window"
-                    ),
-                    pane_tail=pane_tail,
-                    fix=(
-                        f"run `pm accounts` to check login state, then "
-                        f"`pm relogin {account_name}` if the session expired."
-                    ),
-                )
-            )
-        if account.provider is ProviderKind.CODEX:
-            if "usage limit" in lowered:
-                raise RuntimeError(
-                    format_probe_failure(
-                        provider="Codex",
-                        account_name=account_name,
-                        account_email=account.email,
-                        reason="the account is out of credits",
-                        pane_tail=pane_tail,
-                        fix=(
-                            f"switch the controller to a different account "
-                            f"with `pm failover` (see `pm accounts` for "
-                            f"current state), or top up '{account_name}' "
-                            f"and rerun `pm up`."
-                        ),
-                    )
-                )
-            if "not logged" in lowered or "login" in lowered:
-                raise RuntimeError(
-                    format_probe_failure(
-                        provider="Codex",
-                        account_name=account_name,
-                        account_email=account.email,
-                        reason="the account is not authenticated",
-                        pane_tail=pane_tail,
-                        fix=(
-                            f"run `pm relogin {account_name}` and retry "
-                            f"`pm up`."
-                        ),
-                    )
-                )
-            if "error:" in lowered:
-                raise RuntimeError(
-                    format_probe_failure(
-                        provider="Codex",
-                        account_name=account_name,
-                        account_email=account.email,
-                        reason=(
-                            "the `codex exec 'Reply with ok'` probe "
-                            "returned an unexpected response"
-                        ),
-                        pane_tail=pane_tail,
-                        fix=(
-                            f"`pm relogin {account_name}` usually clears "
-                            f"this. If it persists, run the probe command "
-                            f"manually to see the raw output."
-                        ),
-                    )
-                )
-            return
-        raise RuntimeError(f"Unsupported controller provider: {account.provider.value}")
+        self.controller_probe.probe_controller_account(account_name)
 
     def _run_probe(self, account: AccountConfig) -> str:
-        if account.provider is ProviderKind.CLAUDE:
-            probe = LaunchCommand(
-                argv=["claude", "-p", "Reply with ok"],
-                env=dict(account.env),
-                cwd=self.config.project.root_dir,
-            )
-        elif account.provider is ProviderKind.CODEX:
-            probe = LaunchCommand(
-                argv=["codex", "exec", "--skip-git-repo-check", "Reply with ok and nothing else"],
-                env=dict(account.env),
-                cwd=self.config.project.root_dir,
-            )
-        else:
-            raise RuntimeError(f"Unsupported controller provider: {account.provider.value}")
-
-        runtime = get_runtime(account.runtime, root_dir=self.config.project.root_dir)
-        command = runtime.wrap_command(probe, account, self.config.project)
-        result = subprocess.run(
-            command,
-            check=False,
-            shell=True,
-            text=True,
-            capture_output=True,
-            timeout=90,
-            executable="/bin/zsh",
-        )
-        return "\n".join(part for part in [result.stdout, result.stderr] if part)
+        return ProbeRunner(self.config.project).run_probe(account)
 
     def _control_home(self, session_name: str) -> Path:
-        return self.config.project.base_dir / self._CONTROL_HOMES_DIR / session_name
+        return self.control_homes.control_home(session_name)
 
     def _effective_account(self, session: SessionConfig, account: AccountConfig) -> AccountConfig:
-        if session.role not in self._CONTROL_ROLES or account.home is None:
-            return account
-        if self.readonly_state:
-            return account
-        # Claude auth tokens live in the macOS Keychain, keyed to the CLAUDE_CONFIG_DIR path hash.
-        # Using a different home (control-homes/) would lose the keychain entry.
-        # For Claude accounts, use the original account home directly.
-        if account.provider is ProviderKind.CLAUDE:
-            _prime_claude_home(account.home)
-            return account
-        control_home = self._sync_control_home(account, session.name)
-        return replace(account, home=control_home)
+        return self.control_homes.effective_account(session, account)
 
     def _sync_control_home(self, account: AccountConfig, session_name: str) -> Path:
-        if account.home is None:
-            raise RuntimeError(f"Account {account.name} has no home configured")
-        source_home = account.home
-        target_home = self._control_home(session_name)
-        target_home.mkdir(parents=True, exist_ok=True, mode=0o700)
-
-        if account.provider is ProviderKind.CLAUDE:
-            self._sync_file(source_home / ".claude.json", target_home / ".claude.json")
-            self._sync_file(source_home / ".claude" / ".credentials.json", target_home / ".claude" / ".credentials.json")
-            self._sync_file(source_home / ".claude" / "settings.json", target_home / ".claude" / "settings.json")
-            _prime_claude_home(target_home)
-        elif account.provider is ProviderKind.CODEX:
-            self._sync_file(source_home / ".codex" / ".codex-global-state.json", target_home / ".codex" / ".codex-global-state.json")
-            self._sync_file(source_home / ".codex" / "auth.json", target_home / ".codex" / "auth.json")
-            self._sync_file(source_home / ".codex" / "config.toml", target_home / ".codex" / "config.toml")
-
-        return target_home
+        return self.control_homes.sync_control_home(account, session_name)
 
     def _sync_file(self, source: Path, target: Path) -> None:
-        if source.exists():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
-        elif target.exists() and not source.exists():
-            # Reverse sync: if the control-home has the file but the
-            # account home lost it (e.g. during a recovery reset),
-            # copy it back to prevent auth loss.
-            source.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(target, source)
+        self.control_homes._sync_file(source, target)
 
     def _stabilize_launch(
         self,

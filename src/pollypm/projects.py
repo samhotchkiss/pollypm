@@ -21,6 +21,10 @@ DEFAULT_WORKSPACE_ROOT = Path.home() / "dev"
 DEFAULT_SCAN_ROOT = Path.home()
 TRACKER_TEMPLATE = Path(__file__).resolve().parents[2] / "docs" / "issue-tracker.md"
 PROJECT_INSTRUCTIONS_TEMPLATE = Path(__file__).resolve().parents[2] / ".pollypm" / "INSTRUCT.md"
+PACKAGED_INSTRUCTIONS_TEMPLATE = (
+    Path(__file__).resolve().parent / "defaults" / "docs" / "INSTRUCT.md.template"
+)
+LEGACY_INSTRUCTIONS_LEAD = "Test and operate PollyPM through Polly chat"
 SKIP_DIR_NAMES = {
     ".cache",
     ".cargo",
@@ -131,8 +135,13 @@ def session_scoped_dir(base_dir: Path, session_id: str) -> Path:
     return base_dir / session_id
 
 
-def session_lock_path(base_dir: Path) -> Path:
-    return base_dir / ".session.lock"
+def _session_lock_filename(session_id: str) -> str:
+    safe = session_id.replace("/", "-").replace("\\", "-")
+    return f".session.{safe}.lock"
+
+
+def session_lock_path(base_dir: Path, session_id: str) -> Path:
+    return base_dir / _session_lock_filename(session_id)
 
 
 _LOCK_STALE_SECONDS = 1800  # 30 minutes — locks older than this are considered stale
@@ -140,7 +149,7 @@ _LOCK_STALE_SECONDS = 1800  # 30 minutes — locks older than this are considere
 
 def ensure_session_lock(base_dir: Path, session_id: str) -> Path:
     base_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = session_lock_path(base_dir)
+    lock_path = session_lock_path(base_dir, session_id)
     payload = {"session_id": session_id, "created_at": datetime.now(UTC).isoformat()}
     try:
         fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
@@ -169,18 +178,26 @@ def ensure_session_lock(base_dir: Path, session_id: str) -> Path:
 
 
 def release_session_lock(base_dir: Path, session_id: str | None = None) -> None:
-    lock_path = session_lock_path(base_dir)
-    if not lock_path.exists():
-        return
-    if session_id is not None:
+    if session_id is None:
+        lock_paths = list(base_dir.glob(".session*.lock"))
+    else:
+        lock_paths = [session_lock_path(base_dir, session_id)]
+    for lock_path in lock_paths:
+        if not lock_path.exists():
+            continue
         try:
             existing = json.loads(lock_path.read_text())
         except Exception:  # noqa: BLE001
             existing = {}
         existing_session = existing.get("session_id")
-        if isinstance(existing_session, str) and existing_session and existing_session != session_id:
-            return
-    lock_path.unlink(missing_ok=True)
+        if (
+            session_id is not None
+            and isinstance(existing_session, str)
+            and existing_session
+            and existing_session != session_id
+        ):
+            continue
+        lock_path.unlink(missing_ok=True)
     try:
         if base_dir.exists() and not any(base_dir.iterdir()):
             base_dir.rmdir()
@@ -209,8 +226,14 @@ def ensure_project_scaffold(project_path: Path) -> Path:
     ]:
         directory.mkdir(parents=True, exist_ok=True)
     instructions_target = project_instruction_file(project_path)
-    if PROJECT_INSTRUCTIONS_TEMPLATE.exists() and not instructions_target.exists():
-        shutil.copyfile(PROJECT_INSTRUCTIONS_TEMPLATE, instructions_target)
+    if not instructions_target.exists():
+        if PROJECT_INSTRUCTIONS_TEMPLATE.exists():
+            shutil.copyfile(PROJECT_INSTRUCTIONS_TEMPLATE, instructions_target)
+        elif PACKAGED_INSTRUCTIONS_TEMPLATE.exists():
+            content = PACKAGED_INSTRUCTIONS_TEMPLATE.read_text(encoding="utf-8")
+            if LEGACY_INSTRUCTIONS_LEAD not in content:
+                content = f"{LEGACY_INSTRUCTIONS_LEAD}\n\n{content}"
+            instructions_target.write_text(content, encoding="utf-8")
     # Generate system reference docs for agent consumption
     scaffold_docs(normalize_project_path(project_path))
     _ensure_gitignore_entry(normalize_project_path(project_path), ".pollypm/")

@@ -37,6 +37,7 @@ from pollypm.recovery.state_reconciliation import (
     ReconciliationAction,
     reconcile_expected_advance,
 )
+from pollypm.store import SQLAlchemyStore
 from pollypm.storage.state import StateStore
 from pollypm.work import task_assignment as bus
 from pollypm.work.sqlite_service import SQLiteWorkService
@@ -100,16 +101,19 @@ def _write_plan(path: Path, size_bytes: int = MIN_PLAN_SIZE_BYTES + 200) -> Path
 
 
 def _record_plan_ready_notify(
-    store: StateStore, project: str, actor: str = "architect",
+    store: SQLAlchemyStore, project: str, actor: str = "architect",
 ) -> None:
     """Record a ``pm notify``-shaped event so the reconciler sees it."""
     store.record_event(
-        actor,
-        "inbox.message.created",
-        (
-            f"{actor} -> user: Plan ready for approval on {project} — "
-            f"please review docs/plan/plan.md"
-        ),
+        scope=actor,
+        sender=actor,
+        subject="inbox.message.created",
+        payload={
+            "message": (
+                f"{actor} -> user: Plan ready for approval on {project} - "
+                f"please review docs/plan/plan.md"
+            ),
+        },
     )
 
 
@@ -153,7 +157,7 @@ class TestReconcileExpectedAdvance:
         self, tmp_path: Path,
     ) -> None:
         _write_plan(tmp_path / "docs" / "plan" / "plan.md")
-        store = StateStore(tmp_path / "state.db")
+        store = SQLAlchemyStore(f"sqlite:///{tmp_path / 'state.db'}")
         _record_plan_ready_notify(store, project="demo")
 
         task = FakeTask(
@@ -172,7 +176,7 @@ class TestReconcileExpectedAdvance:
         self, tmp_path: Path,
     ) -> None:
         _write_plan(tmp_path / "docs" / "plan" / "plan.md")
-        store = StateStore(tmp_path / "state.db")
+        store = SQLAlchemyStore(f"sqlite:///{tmp_path / 'state.db'}")
         # No notify fired.
 
         task = FakeTask(
@@ -192,7 +196,7 @@ class TestReconcileExpectedAdvance:
         """Tasks that wrote to docs/project-plan.md (pre-spec-revision
         architects) are honoured too."""
         _write_plan(tmp_path / "docs" / "project-plan.md")
-        store = StateStore(tmp_path / "state.db")
+        store = SQLAlchemyStore(f"sqlite:///{tmp_path / 'state.db'}")
         _record_plan_ready_notify(store, project="demo")
 
         task = FakeTask(
@@ -211,7 +215,7 @@ class TestReconcileExpectedAdvance:
         plan = tmp_path / "docs" / "plan" / "plan.md"
         plan.parent.mkdir(parents=True, exist_ok=True)
         plan.write_text("# Plan\nTODO", encoding="utf-8")
-        store = StateStore(tmp_path / "state.db")
+        store = SQLAlchemyStore(f"sqlite:///{tmp_path / 'state.db'}")
         _record_plan_ready_notify(store, project="demo")
 
         task = FakeTask(
@@ -228,7 +232,7 @@ class TestReconcileExpectedAdvance:
         """A standard worker-flow task with a stray plan.md on disk
         should NOT be treated as drift — heuristic is flow-specific."""
         _write_plan(tmp_path / "docs" / "plan" / "plan.md")
-        store = StateStore(tmp_path / "state.db")
+        store = SQLAlchemyStore(f"sqlite:///{tmp_path / 'state.db'}")
         _record_plan_ready_notify(store, project="demo")
 
         task = FakeTask(
@@ -247,7 +251,7 @@ class TestReconcileExpectedAdvance:
         """When the task has already advanced past synthesize, drift
         detection must not fire — we only reconcile upstream nodes."""
         _write_plan(tmp_path / "docs" / "plan" / "plan.md")
-        store = StateStore(tmp_path / "state.db")
+        store = SQLAlchemyStore(f"sqlite:///{tmp_path / 'state.db'}")
         _record_plan_ready_notify(store, project="demo")
 
         task = FakeTask(
@@ -384,10 +388,8 @@ class TestSweepDriftIntegration:
         # Write the deliverables + fire the notify.
         _write_plan(tmp_path / "docs" / "plan" / "plan.md")
         store = StateStore(tmp_path / "state.db")
-        # #349: drift sweep writes events + alerts via the unified Store.
-        from pollypm.store import SQLAlchemyStore
         msg_store = SQLAlchemyStore(f"sqlite:///{tmp_path / 'state.db'}")
-        _record_plan_ready_notify(store, project="demo")
+        _record_plan_ready_notify(msg_store, project="demo")
 
         svc = FakeSessionService(handles=[FakeHandle("architect-demo")])
         self._patch_resolver_with_factory(
@@ -442,9 +444,8 @@ class TestSweepDriftIntegration:
 
         _write_plan(tmp_path / "docs" / "plan" / "plan.md")
         store = StateStore(tmp_path / "state.db")
-        from pollypm.store import SQLAlchemyStore
         msg_store = SQLAlchemyStore(f"sqlite:///{tmp_path / 'state.db'}")
-        _record_plan_ready_notify(store, project="demo")
+        _record_plan_ready_notify(msg_store, project="demo")
 
         svc = FakeSessionService(handles=[FakeHandle("architect-demo")])
         self._patch_resolver_with_factory(
@@ -518,10 +519,13 @@ class TestSweepDriftIntegration:
         # standard flow shouldn't trigger drift.
         _write_plan(tmp_path / "docs" / "plan" / "plan.md")
         store = StateStore(tmp_path / "state.db")
-        _record_plan_ready_notify(store, project="demo")
+        msg_store = SQLAlchemyStore(f"sqlite:///{tmp_path / 'state.db'}")
+        _record_plan_ready_notify(msg_store, project="demo")
 
         svc = FakeSessionService(handles=[FakeHandle("worker-demo")])
-        self._patch_resolver_with_factory(monkeypatch, tmp_path, svc, store)
+        self._patch_resolver_with_factory(
+            monkeypatch, tmp_path, svc, store, msg_store=msg_store,
+        )
 
         result = work_progress_sweep_handler({})
         assert result["drift_detected"] == 0
@@ -544,13 +548,16 @@ class TestSweepDriftIntegration:
 
         _write_plan(tmp_path / "docs" / "plan" / "plan.md")
         store = StateStore(tmp_path / "state.db")
-        _record_plan_ready_notify(store, project="demo")
+        msg_store = SQLAlchemyStore(f"sqlite:///{tmp_path / 'state.db'}")
+        _record_plan_ready_notify(msg_store, project="demo")
 
         svc = FakeSessionService(
             handles=[FakeHandle("architect-demo")],
             busy={"architect-demo"},
         )
-        self._patch_resolver_with_factory(monkeypatch, tmp_path, svc, store)
+        self._patch_resolver_with_factory(
+            monkeypatch, tmp_path, svc, store, msg_store=msg_store,
+        )
 
         result = work_progress_sweep_handler({})
         assert result["skipped_active_turn"] == 1

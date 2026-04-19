@@ -151,12 +151,17 @@ def _parse_claude_usage_text(text: str) -> tuple[str, str]:
 
 
 def _parse_codex_status_text(text: str) -> tuple[str, str]:
-    summary_match = re.search(r"(\d+)% left", text)
-    if summary_match:
-        return ("healthy", f"{summary_match.group(1)}% left")
-    if "usage limit" in text.lower():
-        return ("capacity-exhausted", "usage limit reached")
-    return ("unknown", "usage unavailable")
+    """Back-compat shim: Phase C of #397 moved this to the Codex package.
+
+    The real parser now lives at
+    :func:`pollypm.providers.codex.usage_parse.parse_codex_status_text`.
+    This shim preserves the legacy private import path so existing
+    tests (``tests/test_account_usage.py``) and the state-store writer
+    keep working; Phase D migrates callers and drops the shim.
+    """
+    from pollypm.providers.codex.usage_parse import parse_codex_status_text
+
+    return parse_codex_status_text(text)
 
 
 def _codex_credentials_store(home: Path) -> str:

@@ -24,7 +24,8 @@ from pollypm.acct import (
     get_provider,
     list_providers,
 )
-from pollypm.acct._legacy_adapters import LegacyClaudeAdapter, LegacyCodexAdapter
+from pollypm.acct._legacy_adapters import LegacyClaudeAdapter
+from pollypm.providers.codex import CodexProvider
 
 
 @pytest.fixture(autouse=True)
@@ -100,16 +101,16 @@ def test_legacy_claude_adapter_satisfies_protocol():
     assert adapter.name == "claude"
 
 
-def test_legacy_codex_adapter_satisfies_protocol():
-    """The Phase A Codex adapter runtime-checks as ``ProviderAdapter``."""
-    adapter = LegacyCodexAdapter()
+def test_codex_provider_satisfies_protocol():
+    """The Phase C Codex provider runtime-checks as ``ProviderAdapter``."""
+    adapter = CodexProvider()
     assert isinstance(adapter, ProviderAdapter)
     assert adapter.name == "codex"
 
 
-def test_legacy_adapters_have_required_method_names():
-    """All six Protocol methods are defined on the legacy adapters."""
-    for adapter_cls in (LegacyClaudeAdapter, LegacyCodexAdapter):
+def test_provider_adapters_have_required_method_names():
+    """All six Protocol methods are defined on every adapter."""
+    for adapter_cls in (LegacyClaudeAdapter, CodexProvider):
         adapter = adapter_cls()
         for method in (
             "detect_logged_in",

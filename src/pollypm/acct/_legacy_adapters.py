@@ -1,23 +1,21 @@
-"""Phase A placeholder adapters that delegate to the existing modules.
+"""Phase A placeholder adapter(s) that delegate to the existing modules.
 
 These classes exist so the ``pollypm.acct`` registry has something to
-resolve from day one. They are wired via
-``[project.entry-points."pollypm.provider"]`` in ``pyproject.toml`` and
-will be **replaced wholesale** in Phase B (Claude) and Phase C (Codex)
-by real provider packages.
+resolve while Phase B (Claude) extracts the real provider package. The
+Phase C (Codex) adapter has already been replaced by
+:class:`pollypm.providers.codex.CodexProvider`; once Phase B lands,
+this whole module can be deleted.
 
 Each method delegates to the current implementation in
 ``pollypm.accounts`` / ``pollypm.onboarding`` / ``pollypm.providers.*``.
 No behavior change: every call path ends in the same function the code
 base has always used.
 
-The adapters are deliberately thin — see the docstring on each method
+The adapter is deliberately thin — see the docstring on each method
 for the exact delegation target. Anything that cannot be answered from
 ``AccountConfig`` alone (e.g. ``probe_usage`` needs a config_path to
 locate the state DB) raises ``NotImplementedError`` with a message that
-points at the higher-level API that already handles it. Phase D
-introduces the manager class that ties them together; Phase A does not
-need that surface yet.
+points at the higher-level API that already handles it.
 """
 
 from __future__ import annotations
@@ -134,13 +132,6 @@ class LegacyClaudeAdapter(_LegacyAdapterBase):
     _provider_kind = ProviderKind.CLAUDE
 
 
-class LegacyCodexAdapter(_LegacyAdapterBase):
-    """Phase A placeholder for the Codex provider."""
-
-    name = "codex"
-    _provider_kind = ProviderKind.CODEX
-
-
 # Re-export the legacy AccountConfig under the private type alias so
 # static checkers can confirm the Protocol methods accept the same
 # dataclass the rest of the codebase uses. The two symbols resolve to
@@ -148,4 +139,4 @@ class LegacyCodexAdapter(_LegacyAdapterBase):
 _LegacyAccountConfig = _ModelAccountConfig
 
 
-__all__ = ["LegacyClaudeAdapter", "LegacyCodexAdapter"]
+__all__ = ["LegacyClaudeAdapter"]

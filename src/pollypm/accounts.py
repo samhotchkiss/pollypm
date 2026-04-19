@@ -137,17 +137,14 @@ def _effective_logged_in(
 
 
 def _parse_claude_usage_text(text: str) -> tuple[str, str]:
-    weekly_match = re.search(
-        r"Current week \(all models\).*?(\d+)% used.*?Resets ([^\n]+)",
-        text,
-        re.IGNORECASE | re.DOTALL,
-    )
-    if not weekly_match:
-        return ("unknown", "usage unavailable")
-    used = int(weekly_match.group(1))
-    remaining = max(0, 100 - used)
-    reset = weekly_match.group(2).strip()
-    return ("healthy", f"{remaining}% left this week · resets {reset}")
+    """Deprecated — use :func:`pollypm.providers.claude.usage_parse.parse_claude_usage_text`.
+
+    Kept as a back-compat shim until Phase D of #397. The underlying
+    regex is unchanged.
+    """
+    from pollypm.providers.claude.usage_parse import parse_claude_usage_text
+
+    return parse_claude_usage_text(text)
 
 
 def _parse_codex_status_text(text: str) -> tuple[str, str]:

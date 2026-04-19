@@ -104,8 +104,11 @@ def test_detect_claude_email_requires_logged_in_flag(monkeypatch, tmp_path: Path
             self.stdout = stdout
             self.returncode = returncode
 
+    # Phase B of #397 moved the real implementation into
+    # ``pollypm.providers.claude.detect``; the onboarding shim delegates
+    # there, so monkeypatch the new home.
     monkeypatch.setattr(
-        "pollypm.onboarding.subprocess.run",
+        "pollypm.providers.claude.detect.subprocess.run",
         lambda *args, **kwargs: Result('{"loggedIn": false, "email": "pearl@swh.me"}'),
     )
 

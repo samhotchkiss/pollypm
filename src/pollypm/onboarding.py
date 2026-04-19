@@ -519,49 +519,29 @@ def _detect_codex_email(home: Path) -> str | None:
 
 
 def _isolated_env(provider: ProviderKind, home: Path) -> dict[str, str]:
+    """Return provider-pinned env vars layered onto ``os.environ``.
+
+    Phase B of #397: the Claude branch delegates to
+    :func:`pollypm.providers.claude.env.isolated_env`; the Codex branch
+    stays here until Phase C extracts it. The shape is unchanged.
+    """
+    if provider is ProviderKind.CLAUDE:
+        from pollypm.providers.claude.env import isolated_env_with_os_environ
+
+        return isolated_env_with_os_environ(home)
     return provider_profile_env_for_provider(provider, home, base_env=os.environ)
 
 
 def _detect_claude_email(home: Path) -> str | None:
-    env = _isolated_env(ProviderKind.CLAUDE, home)
-    json_result = subprocess.run(
-        ["claude", "auth", "status", "--json"],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    if json_result.returncode == 0:
-        try:
-            data = json.loads(json_result.stdout)
-            if not data.get("loggedIn"):
-                return None
-            email = data.get("email")
-            if isinstance(email, str) and email:
-                return email.lower()
-            # Claude CLI 2.x returns loggedIn:true with email:null for Max
-            # subscribers. Fall back to a stable non-None sentinel so
-            # _account_logged_in() correctly reads True. The real email is
-            # already pinned in AccountConfig at registration; this return
-            # value is used downstream only as a presence check.
-            method = data.get("authMethod") or "claude"
-            sub = data.get("subscriptionType") or "unknown"
-            return f"{method}:{sub}".lower()
-        except Exception:  # noqa: BLE001
-            pass
+    """Deprecated — use :func:`pollypm.providers.claude.detect.detect_claude_email`.
 
-    text_result = subprocess.run(
-        ["claude", "auth", "status", "--text"],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    if text_result.returncode == 0:
-        match = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text_result.stdout)
-        if match:
-            return match.group(0).lower()
-    return None
+    Kept as a thin shim so existing callers (and tests) that import
+    ``pollypm.onboarding._detect_claude_email`` keep working until the
+    Phase D removal window. Behavior preserves the #396 fix.
+    """
+    from pollypm.providers.claude.detect import detect_claude_email as _impl
+
+    return _impl(home)
 
 
 def _detect_account_email(provider: ProviderKind, home: Path) -> str | None:
@@ -586,16 +566,24 @@ def _detect_email_from_pane(provider: ProviderKind, pane_text: str) -> str | Non
         )
 
         return _codex_detect_email_from_pane(pane_text)
+    if provider is ProviderKind.CLAUDE:
+        from pollypm.providers.claude.detect import (
+            detect_email_from_pane as _claude_detect_email_from_pane,
+        )
+
+        return _claude_detect_email_from_pane(pane_text)
     return None
 
 
 def _claude_prompt_ready(pane_text: str) -> bool:
-    lowered = pane_text.lower()
-    if "select login method:" in lowered or "please run /login" in lowered:
-        return False
-    if "choose the text style that looks best with your terminal" in lowered:
-        return False
-    return "❯" in pane_text and ("welcome back" in lowered or "claude code v" in lowered)
+    """Deprecated — use :func:`pollypm.providers.claude.detect.claude_prompt_ready`.
+
+    Thin shim for back-compat; kept for callers that imported the
+    private helper before Phase B.
+    """
+    from pollypm.providers.claude.detect import claude_prompt_ready as _impl
+
+    return _impl(pane_text)
 
 
 def _login_completion_marker_seen(pane_text: str) -> bool:

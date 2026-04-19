@@ -24,7 +24,7 @@ from pollypm.acct import (
     get_provider,
     list_providers,
 )
-from pollypm.acct._legacy_adapters import LegacyClaudeAdapter
+from pollypm.providers.claude import ClaudeProvider
 from pollypm.providers.codex import CodexProvider
 
 
@@ -94,9 +94,9 @@ def test_get_provider_caches_instances():
     assert first is second
 
 
-def test_legacy_claude_adapter_satisfies_protocol():
-    """The Phase A Claude adapter runtime-checks as ``ProviderAdapter``."""
-    adapter = LegacyClaudeAdapter()
+def test_phase_b_claude_provider_satisfies_protocol():
+    """The Phase B Claude adapter runtime-checks as ``ProviderAdapter``."""
+    adapter = ClaudeProvider()
     assert isinstance(adapter, ProviderAdapter)
     assert adapter.name == "claude"
 
@@ -108,9 +108,9 @@ def test_codex_provider_satisfies_protocol():
     assert adapter.name == "codex"
 
 
-def test_provider_adapters_have_required_method_names():
-    """All six Protocol methods are defined on every adapter."""
-    for adapter_cls in (LegacyClaudeAdapter, CodexProvider):
+def test_registered_adapters_have_required_method_names():
+    """All six Protocol methods are defined on every registered adapter."""
+    for adapter_cls in (ClaudeProvider, CodexProvider):
         adapter = adapter_cls()
         for method in (
             "detect_logged_in",

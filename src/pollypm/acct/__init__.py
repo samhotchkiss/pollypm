@@ -27,6 +27,16 @@ resolve during Phase A and will be deleted once Phases B/C land.
 from __future__ import annotations
 
 from .errors import AccountNotFound, AcctError, ProviderNotFound
+from .manager import (
+    choose_healthy_for_worker,
+    detect_email,
+    detect_logged_in,
+    isolated_env,
+    list_logged_in,
+    probe_usage,
+    run_login_flow,
+    worker_launch_cmd,
+)
 from .model import AccountConfig, AccountStatus, RuntimeStatus
 from .protocol import ProviderAdapter
 from .registry import get_provider, list_providers
@@ -39,6 +49,14 @@ __all__ = [
     "ProviderAdapter",
     "ProviderNotFound",
     "RuntimeStatus",
+    "choose_healthy_for_worker",
+    "detect_email",
+    "detect_logged_in",
     "get_provider",
+    "isolated_env",
+    "list_logged_in",
     "list_providers",
+    "probe_usage",
+    "run_login_flow",
+    "worker_launch_cmd",
 ]

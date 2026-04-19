@@ -117,9 +117,16 @@ def _account_usage_summary(account: AccountConfig) -> tuple[str, str, str]:
 
 
 def _account_logged_in(account: AccountConfig) -> bool:
-    if account.home is None:
-        return False
-    return _detect_account_email(account.provider, account.home) is not None
+    """Delegating shim — Phase D of #397 moved the live check to the manager.
+
+    Kept as a thin wrapper so existing callers (``pollypm.workers``,
+    internal ``_effective_logged_in``) continue to import the same
+    symbol while the real dispatch happens through the provider-agnostic
+    manager. Phase E removes this shim once call sites migrate.
+    """
+    from pollypm.acct import manager as _acct_manager
+
+    return _acct_manager.detect_logged_in(account)
 
 
 def _effective_logged_in(

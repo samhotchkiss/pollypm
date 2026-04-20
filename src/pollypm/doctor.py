@@ -410,15 +410,23 @@ def check_gh_installed() -> CheckResult:
 def check_gh_authenticated() -> CheckResult:
     if _tool_path("gh") is None:
         return _skip("gh auth skipped (gh not installed)")
-    rc, out = _run_cmd(["gh", "auth", "status"], timeout=3.0)
-    # ``gh auth status`` returns 0 when logged in, non-zero otherwise.
+    # ``--active`` restricts the status check to the currently-active
+    # account so stale multi-account entries (e.g. expired agent tokens
+    # left in ``~/.config/gh/hosts.yml``) don't flip the whole check
+    # red. PollyPM's GitHub flows only use the active account — a
+    # broken non-active entry is a user-config nit, not a PollyPM
+    # blocker. If ``--active`` isn't supported by the installed gh
+    # (pre-2.40), fall through to the no-flag form.
+    rc, out = _run_cmd(["gh", "auth", "status", "--active"], timeout=3.0)
+    if rc != 0 and "unknown flag" in out.lower():
+        rc, out = _run_cmd(["gh", "auth", "status"], timeout=3.0)
     if rc == 0:
         return _ok("gh authenticated")
     return _fail(
         "gh is not authenticated",
         why=(
             "PollyPM's GitHub flows (issue sync, PR creation, review pulls) "
-            "assume `gh auth status` reports a logged-in account."
+            "assume `gh auth status --active` reports a logged-in account."
         ),
         fix=(
             "Authenticate gh —\n"

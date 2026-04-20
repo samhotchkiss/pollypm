@@ -2186,7 +2186,12 @@ def _register_roster(api: RosterAPI) -> None:
     # removed with the legacy inbox subsystem (see iv04).
     api.register_recurring("@every 10s", "session.health_sweep", {})
     api.register_recurring("@every 60s", "capacity.probe", {})
-    api.register_recurring("@every 30s", "transcript.ingest", {})
+    # Every 5 min (was 30s). The scan rglob+stats every .jsonl under
+    # ~/.claude/projects and ~/.codex/sessions; at a grown transcript
+    # root (~7k files) the 30s cadence pinned rail CPU at ~170% in
+    # os.lstat calls. Combined with the mtime-skip in _scan_source,
+    # 5m keeps token-usage freshness acceptable at ~10× less stat load.
+    api.register_recurring("@every 5m", "transcript.ingest", {})
     api.register_recurring("@every 5m", "alerts.gc", {})
     # #249 — work-service-aware stuck-task sweeper.
     api.register_recurring("@every 5m", "work.progress_sweep", {})

@@ -29,6 +29,11 @@ class TranscriptFileCursor:
     session_id: str | None = None
     cwd: str | None = None
     model_name: str | None = None
+    # mtime of the file at the end of the last scan. Used to skip the
+    # open/seek/readline cycle when a file's mtime hasn't advanced —
+    # transcript roots with thousands of archived jsonls were pinning
+    # the rail daemon at ~170% CPU in os.lstat + readline loops.
+    mtime: float = 0.0
 
 
 @dataclass(slots=True)
@@ -127,6 +132,7 @@ def _load_cursor_state(config) -> TranscriptCursorState:
                 session_id=payload.get("session_id"),
                 cwd=payload.get("cwd"),
                 model_name=payload.get("model_name"),
+                mtime=float(payload.get("mtime", 0.0) or 0.0),
             )
     return TranscriptCursorState(files=files)
 
@@ -140,6 +146,7 @@ def _save_cursor_state(config, state: TranscriptCursorState) -> None:
                 "session_id": cursor.session_id,
                 "cwd": cursor.cwd,
                 "model_name": cursor.model_name,
+                "mtime": cursor.mtime,
             }
             for file_path, cursor in state.files.items()
         }
@@ -518,9 +525,17 @@ def _scan_source(config, account_name: str, account: AccountConfig, source: Tran
     for path in sorted(source.root.rglob(source.pattern)):
         file_key = str(path.resolve())
         cursor = state.files.setdefault(file_key, TranscriptFileCursor())
-        size = path.stat().st_size
+        stat = path.stat()
+        size = stat.st_size
+        mtime = stat.st_mtime
         if size < cursor.offset:
             cursor.offset = 0
+        # Skip the open/seek/readline cycle when the file hasn't changed
+        # since the last scan. Saves ~6000 opens per tick on transcript
+        # roots with thousands of archived jsonls. Mismatched offset (we
+        # never caught up) still forces a re-read.
+        if mtime == cursor.mtime and cursor.offset == size:
+            continue
         with path.open("r", encoding="utf-8", errors="ignore") as handle:
             handle.seek(cursor.offset)
             while True:
@@ -557,6 +572,7 @@ def _scan_source(config, account_name: str, account: AccountConfig, source: Tran
                     events = []
                 for event in events:
                     _append_event(config, event)
+        cursor.mtime = mtime
 
 
 def _iter_sources_for_account(config, account_name: str, account: AccountConfig):

@@ -2448,10 +2448,33 @@ def check_logs_dir_size() -> CheckResult:
 
 
 def _ps_claude_rss_kb() -> list[tuple[int, int, str]]:
-    """Return ``(pid, rss_kb, command)`` for every claude/codex process."""
-    rc, out = _run_cmd(["ps", "-axo", "pid=,rss=,command="], timeout=2.0)
+    """Return ``(pid, rss_kb, command)`` for PollyPM-managed provider processes.
+
+    We only count claude/codex processes that PollyPM launched — not
+    the user's own dev-env Claude Code or an unrelated terminal
+    ``codex`` session. The tell is the provider-home env var PollyPM
+    always sets for managed launches (``CLAUDE_CONFIG_DIR`` /
+    ``CODEX_HOME``) — ``ps -axeE`` reveals per-process environments
+    on macOS so we filter to ones whose env pins back to PollyPM's
+    ``agent_homes/`` or ``control-homes/`` directories.
+
+    Without this filter, ``pm doctor`` session-memory flagged the
+    user's interactive Claude Code session when they ran ``pm doctor``
+    from inside it (confusing — "why is my IDE's Claude showing as a
+    session?"). A pre-filter here keeps the check focused on
+    sessions PollyPM actually owns.
+    """
+    rc, out = _run_cmd(["ps", "-axeE", "-o", "pid=,rss=,command="], timeout=3.0)
     if rc != 0:
-        return []
+        # Fall back to the plain form without env. On macOS this
+        # should always succeed, but we keep a path so doctor never
+        # breaks just because env dumping isn't available.
+        rc, out = _run_cmd(["ps", "-axo", "pid=,rss=,command="], timeout=2.0)
+        if rc != 0:
+            return []
+        env_scan = False
+    else:
+        env_scan = True
     rows: list[tuple[int, int, str]] = []
     for raw in out.splitlines():
         line = raw.strip()
@@ -2465,13 +2488,37 @@ def _ps_claude_rss_kb() -> list[tuple[int, int, str]]:
             rss_kb = int(parts[1])
         except ValueError:
             continue
-        cmd = parts[2]
-        # Match the long-running provider processes; skip our own ps probe.
-        lc = cmd.lower()
-        if "claude" in lc or "codex" in lc:
-            if "ps -axo" in cmd:
+        cmd_and_env = parts[2]
+        lc = cmd_and_env.lower()
+        if "claude" not in lc and "codex" not in lc:
+            continue
+        if "ps -axo" in cmd_and_env or "ps -axee" in cmd_and_env.lower():
+            continue  # skip our own probe
+        if env_scan:
+            # Only count processes whose env pins them to a PollyPM-
+            # managed account home. The env portion of ``-axeE`` output
+            # trails the command, so a substring match is sufficient.
+            is_pollypm = (
+                "CLAUDE_CONFIG_DIR=/Users/" in cmd_and_env  # real user home
+                and "/.pollypm/" in cmd_and_env
+            ) or (
+                "CODEX_HOME=/Users/" in cmd_and_env
+                and "/.pollypm/" in cmd_and_env
+            ) or (
+                # Fallback heuristic — ``/agent_homes/`` or
+                # ``/control-homes/`` substring anywhere in the env dump
+                # indicates PollyPM ownership even for custom home dirs.
+                "/agent_homes/" in cmd_and_env
+                or "/control-homes/" in cmd_and_env
+            )
+            if not is_pollypm:
                 continue
-            rows.append((pid, rss_kb, cmd))
+            # Keep only the command portion (before the first env var)
+            # so downstream consumers see a tidy ``claude --flags`` form.
+            cmd = cmd_and_env.split(" TERM=")[0].split(" COLORTERM=")[0]
+        else:
+            cmd = cmd_and_env
+        rows.append((pid, rss_kb, cmd))
     return rows
 
 

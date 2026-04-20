@@ -1,0 +1,10 @@
+api_version = "1"
+name = "human_notify"
+kind = "hook"
+version = "0.1.0"
+entrypoint = "plugin.py:plugin"
+description = "Human-facing push for ActorType.HUMAN tasks. Subscribes to the TaskAssignmentEvent bus and fans out through builtin macOS + webhook + cockpit-fallback adapters. Third-party channels register via the pollypm.human_notifier entry-point group. Closes the gap where inbox items only surfaced while the cockpit was open + focused."
+
+[[capabilities]]
+kind = "hook"
+name = "human_notify.task_assignment"

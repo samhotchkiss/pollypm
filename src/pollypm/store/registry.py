@@ -140,6 +140,36 @@ def get_store(config: "PollyPMConfig") -> "Store":
     )
 
 
+def get_store_by_url(url: str, *, backend: str = "sqlite") -> "Store":
+    """Return the process-wide ``Store`` for ``url`` without a config.
+
+    Use this when only a DB URL is in scope (plugin handlers, service
+    helpers) — it reuses the same ``(backend, url)`` cache as
+    :func:`get_store`, so two code paths with the same URL share one
+    engine pool. Rail-hot callers that used to construct a fresh
+    ``SQLAlchemyStore`` per call would pin ~16 SQLite handles per
+    invocation; routing through this helper keeps the pool singleton.
+    """
+    key = (backend, url)
+    cached = _STORES.get(key)
+    if cached is not None:
+        return cached
+    with _STORE_LOCK:
+        cached = _STORES.get(key)
+        if cached is not None:
+            return cached
+        for ep in importlib.metadata.entry_points(group=ENTRY_POINT_GROUP):
+            if ep.name == backend:
+                cls = ep.load()
+                instance = cls(url=url)
+                _STORES[key] = instance
+                return instance
+    raise StoreBackendNotFound(
+        backend,
+        available=_available_backends(),
+    )
+
+
 def reset_store_cache() -> None:
     """Dispose every cached store and clear the registry.
 
@@ -160,4 +190,9 @@ def reset_store_cache() -> None:
                 pass
 
 
-__all__ = ["ENTRY_POINT_GROUP", "get_store", "reset_store_cache"]
+__all__ = [
+    "ENTRY_POINT_GROUP",
+    "get_store",
+    "get_store_by_url",
+    "reset_store_cache",
+]

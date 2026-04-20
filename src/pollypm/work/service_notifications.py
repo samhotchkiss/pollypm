@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from pollypm.store import SQLAlchemyStore
+from pollypm.store.registry import get_store_by_url
 from pollypm.work.models import DigestRollupCandidate
 
 if TYPE_CHECKING:
@@ -49,7 +50,7 @@ def _ensure_staging_table(conn: sqlite3.Connection) -> None:
 
 
 def _message_store(service: "SQLiteWorkService") -> SQLAlchemyStore:
-    return SQLAlchemyStore(f"sqlite:///{service._db_path}")
+    return get_store_by_url(f"sqlite:///{service._db_path}")  # type: ignore[return-value]
 
 
 def stage_notification_row(

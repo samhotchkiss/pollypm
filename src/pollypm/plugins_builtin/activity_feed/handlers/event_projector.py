@@ -232,12 +232,12 @@ class EventProjector:
             return []
 
         try:
-            from pollypm.store import SQLAlchemyStore
+            from pollypm.store.registry import get_store_by_url
         except Exception:  # noqa: BLE001
             return []
 
         try:
-            store = SQLAlchemyStore(f"sqlite:///{self._state_db}")
+            store = get_store_by_url(f"sqlite:///{self._state_db}")
         except Exception:  # noqa: BLE001
             logger.exception("activity_feed: failed to open Store")
             return []

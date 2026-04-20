@@ -170,56 +170,28 @@ def test_worker_start_role_architect_spawns_architect_session(
     assert "Managed architect architect_foo ready for project foo" in result.output
 
 
-def test_worker_start_no_role_still_spawns_worker(
+def test_worker_start_no_role_exits_deprecated(
     monkeypatch, tmp_path: Path,
 ) -> None:
-    """Backward compat: ``pm worker-start <project>`` without ``--role``
-    still produces a worker session (not an architect)."""
+    """``pm worker-start <project>`` without ``--role`` is deprecated.
+
+    Per-task workers (provisioned automatically by ``pm task claim``)
+    replaced the managed-worker pattern — a managed ``worker-<project>``
+    session leaks memory because it outlives the task that needed it
+    and has no cleanup hook. The CLI now exits with code 2 and a
+    fix-it pointer at ``pm task claim``. ``--role architect`` is still
+    supported (see the test above).
+    """
     config_path = tmp_path / "pollypm.toml"
     config_path.write_text("[project]\nname = \"pollypm\"\n")
-    created: list[dict[str, object]] = []
-
-    class FakeSupervisor:
-        def __init__(self) -> None:
-            self.config = type(
-                "Config",
-                (),
-                {
-                    "sessions": {},
-                    "project": type("Project", (), {"tmux_session": "pollypm"})(),
-                },
-            )()
-
-        def tmux_session_for_launch(self, launch) -> str:
-            return "pollypm-storage-closet"
-
-        def plan_launches(self):
-            session = type("Session", (), {"name": "worker_bar"})()
-            return [
-                type(
-                    "Launch",
-                    (),
-                    {"session": session, "window_name": "worker-bar"},
-                )()
-            ]
-
-    def fake_create(
-        path, project_key, prompt=None, role="worker", agent_profile=None,
-    ):
-        created.append({"role": role, "agent_profile": agent_profile})
-        return type("Session", (), {"name": "worker_bar"})()
-
-    monkeypatch.setattr(cli, "_require_pollypm_session", lambda supervisor: None)
-    monkeypatch.setattr(cli, "_load_supervisor", lambda path: FakeSupervisor())
-    monkeypatch.setattr(cli, "create_worker_session", fake_create)
-    monkeypatch.setattr(cli, "launch_worker_session", lambda path, name: None)
 
     result = runner.invoke(
         cli.app, ["worker-start", "bar", "--config", str(config_path)],
     )
-    assert result.exit_code == 0, result.output
-    assert created == [{"role": "worker", "agent_profile": None}]
-    assert "Managed worker worker_bar" in result.output
+    assert result.exit_code == 2, result.output
+    assert "deprecated" in result.output
+    assert "pm task claim" in result.output
+    assert "--role architect" in result.output
 
 
 # ---------------------------------------------------------------------------

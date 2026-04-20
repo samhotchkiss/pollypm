@@ -2127,7 +2127,15 @@ def _register_handlers(api: JobHandlerAPI) -> None:
     )
     api.register_handler(
         "transcript.ingest", transcript_ingest_handler,
-        max_attempts=2, timeout_seconds=30.0,
+        # 30s was killing the first scan before it could persist cursor
+        # state: with ~7k jsonls under ~/.claude/projects, one cold
+        # pass took multiple minutes and the worker-pool timeout
+        # triggered before `_save_cursor_state` ran. State file stayed
+        # unchanged for 5+ days → every subsequent tick re-scanned
+        # from scratch → rail pegged at ~170% CPU. 10m lets the first
+        # (expensive) scan finish and persist mtimes; after that,
+        # scans are nearly-no-op and finish in <1 s.
+        max_attempts=2, timeout_seconds=600.0,
     )
     api.register_handler(
         "alerts.gc", alerts_gc_handler,

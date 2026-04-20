@@ -2,6 +2,7 @@ from pathlib import Path
 
 from pollypm.accounts import (
     inspect_account_isolation,
+    list_account_statuses,
     probe_account_usage,
 )
 from pollypm.config import write_config
@@ -146,3 +147,61 @@ def test_probe_account_usage_records_claude_refresh_failure(monkeypatch, tmp_pat
 
     assert status.health == "auth-broken"
     assert status.usage_summary == "usage refresh failed · Claude still opens the login flow"
+
+
+def test_list_account_statuses_closes_state_store(monkeypatch, tmp_path: Path) -> None:
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm" / "state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="codex_primary"),
+        accounts={
+            "codex_primary": AccountConfig(
+                name="codex_primary",
+                provider=ProviderKind.CODEX,
+                email="codex@example.com",
+                runtime=RuntimeKind.LOCAL,
+                home=tmp_path / ".pollypm/homes/codex_primary",
+            )
+        },
+        sessions={},
+        projects={},
+    )
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path)
+    created: list["FakeStore"] = []
+
+    class FakeStore:
+        def __init__(self, _db_path: Path) -> None:
+            self.closed = False
+            created.append(self)
+
+        def __enter__(self) -> "FakeStore":
+            return self
+
+        def __exit__(self, *args) -> None:
+            self.close()
+
+        def close(self) -> None:
+            self.closed = True
+
+        def get_account_usage(self, key: str):
+            del key
+            return None
+
+        def get_account_runtime(self, key: str):
+            del key
+            return None
+
+    monkeypatch.setattr("pollypm.accounts.StateStore", FakeStore)
+    monkeypatch.setattr("pollypm.accounts._effective_logged_in", lambda *args, **kwargs: True)
+
+    statuses = list_account_statuses(config_path)
+
+    assert len(statuses) == 1
+    assert created
+    assert all(store.closed for store in created)

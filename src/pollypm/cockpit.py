@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from pollypm.config import load_config
+from pollypm.cockpit_rail import CockpitItem, CockpitRouter  # noqa: F401
 from pollypm.projects import ensure_project_scaffold
 from pollypm.service_api import PollyPMService
 from pollypm.task_backends import get_task_backend

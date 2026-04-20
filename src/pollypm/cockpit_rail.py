@@ -647,30 +647,39 @@ class CockpitRouter:
             pane_text = self.tmux.capture_pane(window.pane_id, lines=15)
         except Exception:  # noqa: BLE001
             return False
-        stripped = pane_text.rstrip()
-        if not stripped:
+        tail_lines = [
+            line.rstrip()
+            for line in pane_text.splitlines()
+            if line.strip()
+        ][-6:]
+        if not tail_lines:
             return False
-        tail = stripped[-200:]
+        tail = "\n".join(tail_lines)
         lowered = tail.lower()
         # Universal working indicator — both Claude and Codex show this during active turns
         if "esc to interrupt" in lowered:
             return True
+        prompt_lines = tail_lines[-2:]
         # Universal idle indicators — if any are present, the session is idle regardless of provider
         idle_markers = (
             "bypass permissions", "new task?", "/clear to save", "shift+tab to cycle",  # Claude
             "press enter to confirm", "% left",  # Codex
         )
-        if any(marker in lowered for marker in idle_markers):
-            return False
         # Provider-specific prompt detection
         provider_value = provider.value if hasattr(provider, "value") else str(provider)
+        if any(marker in lowered for marker in idle_markers):
+            if provider_value == "claude" and any("\u276f" in line for line in prompt_lines):
+                return False
+            if provider_value == "codex" and any("\u203a" in line for line in prompt_lines):
+                return False
+            return False
         if provider_value == "claude":
             return "\u276f" not in tail
         if provider_value == "codex":
             # Codex idle: › prompt
             if "\u203a" in tail:
                 return False
-            return bool(stripped)
+            return bool(tail.strip())
         return False
 
     def _cleanup_duplicate_windows(self, storage_session: str) -> None:

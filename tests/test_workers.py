@@ -153,6 +153,42 @@ def test_auto_select_worker_uses_control_plane_account_before_controller_last_re
     assert selected == "codex_backup"
 
 
+def test_auto_select_worker_closes_state_store_reads(tmp_path: Path, monkeypatch) -> None:
+    _config_data, config_path = _config(tmp_path)
+    created: list["FakeStore"] = []
+
+    class FakeStore:
+        def __init__(self, _db_path: Path) -> None:
+            self.closed = False
+            created.append(self)
+
+        def __enter__(self) -> "FakeStore":
+            return self
+
+        def __exit__(self, *args) -> None:
+            self.close()
+
+        def close(self) -> None:
+            self.closed = True
+
+        def get_session_runtime(self, session_name: str):
+            del session_name
+            return None
+
+        def get_account_runtime(self, account_name: str):
+            del account_name
+            return None
+
+    monkeypatch.setattr("pollypm.workers.StateStore", FakeStore)
+    monkeypatch.setattr("pollypm.workers.detect_logged_in", lambda account: True)
+
+    selected = auto_select_worker_account(config_path)
+
+    assert selected == "codex_backup"
+    assert created
+    assert all(store.closed for store in created)
+
+
 def test_suggest_worker_prompt_returns_empty(tmp_path: Path) -> None:
     _config_data, config_path = _config(tmp_path)
 

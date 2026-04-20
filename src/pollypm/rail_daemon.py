@@ -154,6 +154,10 @@ def main(argv: list[str] | None = None) -> int:
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+    # Attach the centralized error log before any plugin / rail code
+    # runs so boot-time crashes are captured alongside runtime ones.
+    from pollypm.error_log import install as _install_error_log
+    _install_error_log(process_label="rail_daemon")
 
     from pollypm.config import DEFAULT_CONFIG_PATH
     config_path = args.config or DEFAULT_CONFIG_PATH

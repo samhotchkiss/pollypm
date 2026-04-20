@@ -30,6 +30,15 @@ import typer
 
 logger = logging.getLogger(__name__)
 
+# Attach the centralized error log so every ``pm`` invocation writes
+# WARNING+ records (plus any tracebacks from logger.exception) into
+# ``~/.pollypm/errors.log``. Installed at import time — no plugin
+# / rail dependency — so a boot-time crash still lands somewhere
+# grep-able. Idempotent.
+from pollypm.error_log import install as _install_error_log
+
+_install_error_log(process_label="cli")
+
 from pollypm.accounts import (
     add_account_via_login,
     list_account_statuses,

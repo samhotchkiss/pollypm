@@ -121,6 +121,57 @@ def register_maintenance_commands(app: typer.Typer) -> None:
                     f"access_expires_at={account.access_expires_at or '-'}"
                 )
 
+    @app.command()
+    def errors(
+        tail: int = typer.Option(
+            50, "--tail", "-n",
+            help="Show only the last N lines (0 = whole file).",
+        ),
+        follow: bool = typer.Option(
+            False, "--follow", "-f",
+            help="Follow the log as new records land (Ctrl-C to stop).",
+        ),
+        grep: str = typer.Option(
+            "", "--grep", "-g",
+            help="Filter lines to those containing this substring.",
+        ),
+    ) -> None:
+        """Show the centralized ``~/.pollypm/errors.log`` stream.
+
+        Every PollyPM process (rail daemon, cockpit TUI, ``pm`` CLI
+        calls) writes WARNING+ records here — plugin crashes, SQLite
+        failures, provider errors, tracebacks from
+        ``logger.exception``. One place to grep when something looks
+        wrong.
+        """
+        import subprocess as _sp
+        from pollypm.error_log import path as _error_log_path
+
+        log_path = _error_log_path()
+        if not log_path.exists():
+            typer.echo(f"No error log yet at {log_path}. All quiet.")
+            raise typer.Exit(code=0)
+
+        # Stream via shell tools so ``--follow`` works identically to
+        # ``tail -f`` without reimplementing rotation-aware follow.
+        cmd: list[str] = ["tail"]
+        if tail <= 0:
+            cmd = ["cat", str(log_path)]
+        else:
+            cmd += ["-n", str(tail)]
+            if follow:
+                cmd.append("-F")
+            cmd.append(str(log_path))
+        if grep:
+            # Pipe through grep when a filter is requested. Keep the
+            # exit status from grep so "no matches" returns 1 to the
+            # shell per grep convention.
+            proc1 = _sp.Popen(cmd, stdout=_sp.PIPE)
+            proc2 = _sp.Popen(["grep", "--line-buffered", grep], stdin=proc1.stdout)
+            proc1.stdout.close()  # allow SIGPIPE to reach proc1 if proc2 exits
+            raise typer.Exit(code=proc2.wait())
+        raise typer.Exit(code=_sp.call(cmd))
+
     @app.command("account-doctor")
     def account_doctor(
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),

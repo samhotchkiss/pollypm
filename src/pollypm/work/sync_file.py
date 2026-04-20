@@ -86,6 +86,8 @@ class FileSyncAdapter:
 
     def _find_existing_file(self, task: Task) -> Path | None:
         """Find an existing file for this task across all state directories."""
+        if not self._root.exists():
+            return None
         prefix = f"{task.task_number:04d}-"
         for child in self._root.iterdir():
             if child.is_dir():

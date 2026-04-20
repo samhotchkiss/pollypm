@@ -193,7 +193,37 @@ def test_require_pollypm_session_allows_storage_closet() -> None:
     cli._require_pollypm_session(FakeSupervisor())
 
 
-def test_worker_start_creates_and_launches_managed_worker(monkeypatch, tmp_path: Path) -> None:
+def test_worker_start_no_role_is_deprecated(monkeypatch, tmp_path: Path) -> None:
+    """``pm worker-start <project>`` without ``--role`` exits with code 2.
+
+    The managed-worker pattern was replaced by per-task workers (via
+    ``pm task claim``); managed ``worker-<project>`` sessions leaked
+    memory because they outlived their tasks with no cleanup hook.
+    The CLI rejects the call with a three-question-rule banner that
+    points at the supported flows.
+    """
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text("[project]\nname = \"pollypm\"\n")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.app,
+        ["worker-start", "pollypm", "--prompt", "Do the next task",
+         "--config", str(config_path)],
+    )
+    assert result.exit_code == 2
+    assert "deprecated" in result.output
+    assert "pm task claim" in result.output
+
+
+def test_worker_start_role_architect_still_works(monkeypatch, tmp_path: Path) -> None:
+    """``pm worker-start --role architect <project>`` remains supported.
+
+    Architects are long-lived per-project sessions (the planner lane)
+    that the architect 2-hour idle-close mechanism manages. Only the
+    default ``--role worker`` path was deprecated; the architect path
+    is still the canonical way to spawn the planner.
+    """
     config_path = tmp_path / "pollypm.toml"
     config_path.write_text("[project]\nname = \"pollypm\"\n")
     created: list[tuple[Path, str, str | None]] = []
@@ -214,8 +244,8 @@ def test_worker_start_creates_and_launches_managed_worker(monkeypatch, tmp_path:
             return "pollypm-storage-closet"
 
         def plan_launches(self):
-            session = type("Session", (), {"name": "worker_pollypm"})()
-            return [type("Launch", (), {"session": session, "window_name": "worker-pollypm"})()]
+            session = type("Session", (), {"name": "architect_pollypm"})()
+            return [type("Launch", (), {"session": session, "window_name": "architect-pollypm"})()]
 
     monkeypatch.setattr(cli, "_require_pollypm_session", lambda supervisor: None)
     monkeypatch.setattr(cli, "_load_supervisor", lambda path: FakeSupervisor())
@@ -224,61 +254,21 @@ def test_worker_start_creates_and_launches_managed_worker(monkeypatch, tmp_path:
         "create_worker_session",
         lambda path, project_key, prompt=None, role="worker", agent_profile=None: (
             created.append((path, project_key, prompt))
-            or type("Session", (), {"name": "worker_pollypm"})()
+            or type("Session", (), {"name": "architect_pollypm"})()
         ),
     )
     monkeypatch.setattr(cli, "launch_worker_session", lambda path, session_name: launched.append((path, session_name)))
 
     runner = CliRunner()
-    result = runner.invoke(cli.app, ["worker-start", "pollypm", "--prompt", "Do the next task", "--config", str(config_path)])
-
-    assert result.exit_code == 0
-    assert created == [(config_path, "pollypm", "Do the next task")]
-    assert launched == [(config_path, "worker_pollypm")]
-    assert "Managed worker worker_pollypm ready for project pollypm" in result.output
-
-
-def test_worker_start_reuses_existing_managed_worker(monkeypatch, tmp_path: Path) -> None:
-    config_path = tmp_path / "pollypm.toml"
-    config_path.write_text("[project]\nname = \"pollypm\"\n")
-    launched: list[tuple[Path, str]] = []
-    existing_session = type(
-        "Session",
-        (),
-        {"role": "worker", "project": "pollypm", "enabled": True, "name": "worker_pollypm"},
-    )()
-
-    class FakeSupervisor:
-        def __init__(self) -> None:
-            self.config = type(
-                "Config",
-                (),
-                {
-                    "sessions": {"worker_pollypm": existing_session},
-                    "project": type("Project", (), {"tmux_session": "pollypm"})(),
-                },
-            )()
-
-        def tmux_session_for_launch(self, launch) -> str:
-            return "pollypm-storage-closet"
-
-        def plan_launches(self):
-            return [type("Launch", (), {"session": existing_session, "window_name": "worker-pollypm"})()]
-
-    monkeypatch.setattr(cli, "_require_pollypm_session", lambda supervisor: None)
-    monkeypatch.setattr(cli, "_load_supervisor", lambda path: FakeSupervisor())
-    monkeypatch.setattr(
-        cli,
-        "create_worker_session",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not create a new worker")),
+    result = runner.invoke(
+        cli.app,
+        ["worker-start", "pollypm", "--role", "architect",
+         "--prompt", "Plan it", "--config", str(config_path)],
     )
-    monkeypatch.setattr(cli, "launch_worker_session", lambda path, session_name: launched.append((path, session_name)))
-
-    runner = CliRunner()
-    result = runner.invoke(cli.app, ["worker-start", "pollypm", "--config", str(config_path)])
-
     assert result.exit_code == 0
-    assert launched == [(config_path, "worker_pollypm")]
+    assert created == [(config_path, "pollypm", "Plan it")]
+    assert launched == [(config_path, "architect_pollypm")]
+    assert "Managed architect architect_pollypm ready for project pollypm" in result.output
 
 
 def test_help_lists_heartbeat_agent_commands() -> None:

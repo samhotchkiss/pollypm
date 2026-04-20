@@ -2107,7 +2107,12 @@ class Supervisor:
             }
 
             swept = 0
-            for alert in self._msg_store.open_alerts():
+            # Read through ``self.open_alerts()`` — the supervisor method
+            # that routes to the unified ``messages`` store (#349) and
+            # strips the ``[Alert]`` title tag for caller-friendly
+            # ``AlertRecord.message`` access. The unified Store Protocol
+            # itself does not expose ``open_alerts``.
+            for alert in self.open_alerts():
                 session_name = alert.session_name
                 # Ephemeral sessions (task-*, critic_*, downtime_*)
                 # are swept elsewhere (see sweep_ephemeral_sessions in

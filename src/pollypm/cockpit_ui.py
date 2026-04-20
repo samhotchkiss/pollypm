@@ -232,7 +232,7 @@ POLLY_SLOGANS = [
 ]
 
 
-def _wrap_alert_reason(reason: str, *, width: int = 60, max_lines: int = 3) -> list[str]:
+def _wrap_alert_reason(reason: str, *, width: int = 28, max_lines: int = 4) -> list[str]:
     """Break ``reason`` into ≤``max_lines`` display lines of ≤``width`` chars.
 
     Word-wraps on whitespace so a 120-char alert like
@@ -340,7 +340,7 @@ class RailItem(ListItem):
         if self.item.state.startswith("!"):
             reason = self.item.state[2:].strip()  # strip "! " prefix
             if reason:
-                for chunk in _wrap_alert_reason(reason, width=60, max_lines=3):
+                for chunk in _wrap_alert_reason(reason, width=28, max_lines=4):
                     text.append(f"\n    {chunk}", style="#ff5f6d dim")
         self.body.update(text)
 

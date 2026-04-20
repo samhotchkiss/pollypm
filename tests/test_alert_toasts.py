@@ -178,11 +178,15 @@ def test_toast_auto_dismisses_after_timeout(inbox_env, inbox_app) -> None:
             notifier = inbox_app._alert_notifier
             assert notifier is not None
 
-            # Shrink the default to 0.05s so pilot.pause() captures the
-            # dismiss within a single test heartbeat.
+            # Shrink the default so pilot.pause() captures the
+            # dismiss within a single test heartbeat. 0.1s gives the
+            # Textual scheduler enough slack that this test isn't
+            # flaky when the CPU is contended by a parallel test
+            # suite; the dismiss assertion still catches any real
+            # regression in the timer hookup.
             from pollypm.cockpit_ui import AlertToast
             original_default = AlertToast.DEFAULT_TIMEOUT_SECONDS
-            AlertToast.DEFAULT_TIMEOUT_SECONDS = 0.05
+            AlertToast.DEFAULT_TIMEOUT_SECONDS = 0.1
             try:
                 _install_fake_alerts(notifier, [
                     _FakeAlert(alert_id=7, severity="error", message="auth broken"),
@@ -194,8 +198,9 @@ def test_toast_auto_dismisses_after_timeout(inbox_env, inbox_app) -> None:
                 await pilot.pause()
                 assert toast in notifier.visible_toasts
 
-                # Wait a little longer than the shortened timer.
-                await asyncio.sleep(0.2)
+                # Wait several multiples of the shortened timer so
+                # scheduler jitter under load doesn't race us.
+                await asyncio.sleep(0.5)
                 await pilot.pause()
 
                 # After the timer fires, the toast is flagged dismissed

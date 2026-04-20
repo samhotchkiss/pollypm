@@ -378,12 +378,14 @@ class Supervisor:
             self.store.close()
         except Exception:  # noqa: BLE001
             _log.debug("Supervisor.stop(): store.close raised", exc_info=True)
-        try:
-            close = getattr(self._msg_store, "close", None)
-            if callable(close):
-                close()
-        except Exception:  # noqa: BLE001
-            _log.debug("Supervisor.stop(): _msg_store.close raised", exc_info=True)
+        # ``_msg_store`` is now a process-wide singleton returned by
+        # ``store.registry.get_store``. Closing it here would disconnect
+        # every other Supervisor / job handler / plugin that holds the
+        # same reference, which is exactly the leak-workaround pattern
+        # (fresh store per Supervisor) that burned 258 file descriptors
+        # on 2026-04-20. Shutdown is now driven by
+        # :func:`pollypm.store.registry.reset_store_cache`, called from
+        # the CoreRail.stop path and from test teardown.
 
     @property
     def session_service(self):

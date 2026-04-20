@@ -1066,7 +1066,26 @@ class StateStore:
         return row[0] if row else None
 
     def last_heartbeat_at(self) -> str | None:
-        """Return the ISO timestamp of the most recent heartbeat sweep, or None."""
+        """Return the ISO timestamp of the most recent heartbeat sweep, or None.
+
+        Reads from the unified ``messages`` table where heartbeat
+        events have landed since #349. The legacy ``events`` table
+        receives no new heartbeat rows post-migration, so reading it
+        returns the pre-migration timestamp and surfaces in the
+        cockpit as a permanent "Heartbeat offline (NNNm)" warning
+        even though heartbeat is ticking happily on the new table.
+
+        Falls back to the legacy table when the unified lookup finds
+        nothing — covers installs that haven't yet generated a
+        post-migration heartbeat event.
+        """
+        row = self.execute(
+            "SELECT created_at FROM messages "
+            "WHERE type = 'event' AND scope = 'heartbeat' AND subject = 'heartbeat' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if row:
+            return row[0]
         row = self.execute(
             "SELECT created_at FROM events WHERE event_type = 'heartbeat' ORDER BY id DESC LIMIT 1"
         ).fetchone()

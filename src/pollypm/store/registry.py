@@ -30,6 +30,7 @@ both :class:`SQLAlchemyStore` and the Postgres stub honour that shape.
 from __future__ import annotations
 
 import importlib.metadata
+import threading
 from typing import TYPE_CHECKING
 
 from pollypm.errors import StoreBackendNotFound
@@ -40,6 +41,23 @@ if TYPE_CHECKING:
 
 
 ENTRY_POINT_GROUP = "pollypm.store_backend"
+
+# Module-level cache of live ``Store`` instances, keyed by
+# ``(backend, resolved_url)``. Every call site that reaches for
+# ``get_store`` — the supervisor, tmux session service, job handlers,
+# plugin initializers, ``messaging``, ``version_check``, doctor, and
+# more — used to construct a fresh ``SQLAlchemyStore`` (and thus a
+# fresh engine pool) on every invocation. With 9+ callers hit on each
+# heartbeat sweep and a 5-connection pool per store, the rail daemon
+# bled 131 live SQLite + 127 WAL handles in under an hour, blew past
+# the macOS 256-FD soft limit, and started surfacing
+# ``[Errno 24] Too many open files`` toasts from transcript_ingest.
+#
+# Caching the backend per (backend, url) gives every caller the same
+# pool; dispose is now reference-counted via :func:`release_store` so
+# the last caller still tears the engine down cleanly on shutdown.
+_STORES: dict[tuple[str, str], "Store"] = {}
+_STORE_LOCK = threading.Lock()
 
 
 def _resolve_url(config: "PollyPMConfig") -> str:
@@ -66,7 +84,12 @@ def _available_backends() -> list[str]:
 
 
 def get_store(config: "PollyPMConfig") -> "Store":
-    """Load the configured storage backend via entry points.
+    """Return the process-wide ``Store`` instance for ``config``.
+
+    Caches by ``(backend, resolved_url)`` so every caller shares the
+    same engine pool. First call constructs the backend via its
+    entry point; subsequent calls with the same config reuse the
+    cached instance.
 
     Parameters
     ----------
@@ -77,9 +100,11 @@ def get_store(config: "PollyPMConfig") -> "Store":
     Returns
     -------
     Store
-        An instantiated backend satisfying the
-        :class:`pollypm.store.Store` protocol. The caller owns its
-        lifecycle — call ``store.dispose()`` when finished.
+        A singleton :class:`pollypm.store.Store` implementation.
+        **Do not** call ``dispose()`` on the returned instance —
+        other code in the process may still be using it. Use
+        :func:`reset_store_cache` at shutdown to dispose all cached
+        stores cleanly.
 
     Raises
     ------
@@ -89,14 +114,50 @@ def get_store(config: "PollyPMConfig") -> "Store":
         message lists every backend that *is* registered.
     """
     backend = config.storage.backend
-    for ep in importlib.metadata.entry_points(group=ENTRY_POINT_GROUP):
-        if ep.name == backend:
-            cls = ep.load()
-            return cls(url=_resolve_url(config))
+    url = _resolve_url(config)
+    key = (backend, url)
+
+    # Fast path — lock-free read. The dict mutation in the miss path
+    # is serialized by ``_STORE_LOCK``, so a racing read either sees
+    # the fully-constructed store or falls into the slow path.
+    cached = _STORES.get(key)
+    if cached is not None:
+        return cached
+
+    with _STORE_LOCK:
+        cached = _STORES.get(key)
+        if cached is not None:
+            return cached
+        for ep in importlib.metadata.entry_points(group=ENTRY_POINT_GROUP):
+            if ep.name == backend:
+                cls = ep.load()
+                instance = cls(url=url)
+                _STORES[key] = instance
+                return instance
     raise StoreBackendNotFound(
         backend,
         available=_available_backends(),
     )
 
 
-__all__ = ["ENTRY_POINT_GROUP", "get_store"]
+def reset_store_cache() -> None:
+    """Dispose every cached store and clear the registry.
+
+    Called on process shutdown (CoreRail.stop, test teardown).
+    Individual callers should *not* dispose the shared instance —
+    use this to drain all backends at once. Idempotent; safe to
+    call twice.
+    """
+    with _STORE_LOCK:
+        stores = list(_STORES.values())
+        _STORES.clear()
+    for store in stores:
+        dispose = getattr(store, "dispose", None)
+        if callable(dispose):
+            try:
+                dispose()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+__all__ = ["ENTRY_POINT_GROUP", "get_store", "reset_store_cache"]

@@ -208,5 +208,16 @@ class CoreRail:
             self._state_store.close()
         except Exception:  # noqa: BLE001
             logger.debug("CoreRail.stop(): state_store.close raised", exc_info=True)
+        # Drain the unified-Store cache so engine pools release their
+        # SQLite + WAL file descriptors before the interpreter exits.
+        # Without this every process-lifetime leak from
+        # ``store.registry.get_store`` piles up until the OS reclaims
+        # them; with it, tests + clean shutdowns finish with no open
+        # handles to state.db.
+        try:
+            from pollypm.store.registry import reset_store_cache
+            reset_store_cache()
+        except Exception:  # noqa: BLE001
+            logger.debug("CoreRail.stop(): store cache reset raised", exc_info=True)
         self._started = False
         logger.info("CoreRail.stop(): shutdown complete")

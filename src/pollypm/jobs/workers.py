@@ -131,9 +131,17 @@ class JobWorkerPool:
         queue,
         *,
         registry: HandlerRegistryProtocol | dict[str, HandlerSpec],
-        poll_interval: float = 0.2,
+        poll_interval: float = 1.0,
         worker_name_prefix: str = "pollypm-jobworker",
     ) -> None:
+        # ``poll_interval`` is the short-poll cadence when the queue is
+        # empty. The default of 0.2 s (5 polls/worker/s × 4 workers ≈ 20
+        # SQLite queries/s) pinned the rail daemon at 160% CPU on an
+        # otherwise-idle system on 2026-04-20. Bumping to 1.0 s brings
+        # idle CPU down ~5× with worst-case pickup latency ~1 s — well
+        # inside the @every 10 s cadence of the fastest recurring
+        # handler (session.health_sweep). Tests that need tighter
+        # polling can pass ``poll_interval`` explicitly.
         self.queue = queue
         self._registry = registry
         self.poll_interval = poll_interval

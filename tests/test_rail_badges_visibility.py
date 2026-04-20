@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from pollypm.cockpit import (
+from pollypm.cockpit_rail import (
     CockpitItem,
     _rows_for_registration,
     _visibility_passes,

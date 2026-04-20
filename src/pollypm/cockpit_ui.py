@@ -76,11 +76,8 @@ from pollypm.cockpit_palette import (
 )
 from pollypm.cockpit_workers import PollyWorkerRosterApp
 from pollypm.service_api import PollyPMService
-from pollypm.cockpit import (
-    CockpitItem,
-    CockpitRouter,
-    build_cockpit_detail,
-)
+from pollypm.cockpit import build_cockpit_detail
+from pollypm.cockpit_rail import CockpitItem, CockpitRouter
 
 
 import re as _re

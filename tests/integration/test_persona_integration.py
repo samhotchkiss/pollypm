@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pollypm.cockpit import CockpitRouter
+from pollypm.cockpit_rail import CockpitRouter
 from pollypm.config import load_config, project_config_path, write_config
 from pollypm.models import AccountConfig, PollyPMConfig, PollyPMSettings, ProjectSettings, ProviderKind, SessionConfig
 from pollypm.projects import register_project

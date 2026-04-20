@@ -2,7 +2,8 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from pollypm.cockpit import CockpitRouter, build_cockpit_detail
+from pollypm.cockpit import build_cockpit_detail
+from pollypm.cockpit_rail import CockpitRouter
 from pollypm.config import write_config
 from pollypm.cockpit_ui import PollyCockpitApp, PollySettingsPaneApp
 from pollypm.models import (
@@ -1307,7 +1308,7 @@ def test_cockpit_ui_arrow_and_enter_route_selected(tmp_path: Path) -> None:
             return {}
 
         def build_items(self, *, spinner_index: int = 0):
-            from pollypm.cockpit import CockpitItem
+            from pollypm.cockpit_rail import CockpitItem
 
             return [
                 CockpitItem("polly", "Polly", "ready"),

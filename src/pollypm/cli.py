@@ -386,7 +386,7 @@ def up(
 
     # Set up the cockpit layout (split panes) BEFORE the TUI starts,
     # then launch the TUI into the rail pane.
-    from pollypm.cockpit import CockpitRouter
+    from pollypm.cockpit_rail import CockpitRouter
     router = CockpitRouter(config_path)
     try:
         router.ensure_cockpit_layout()

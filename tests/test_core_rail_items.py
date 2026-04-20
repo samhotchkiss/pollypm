@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pollypm.cockpit import CockpitRouter
+from pollypm.cockpit_rail import CockpitRouter
 from pollypm.models import KnownProject, ProjectKind
 from pollypm.plugin_api.v1 import (
     PanelSpec,

@@ -78,7 +78,7 @@ def test_rail_config_tolerates_bad_types(tmp_path: Path) -> None:
 
 
 def test_build_items_skips_hidden_items(monkeypatch, tmp_path: Path) -> None:
-    from pollypm.cockpit import CockpitRouter
+    from pollypm.cockpit_rail import CockpitRouter
     from pollypm.models import KnownProject, ProjectKind
 
     class _FakeConfig:
@@ -106,7 +106,7 @@ def test_build_items_skips_hidden_items(monkeypatch, tmp_path: Path) -> None:
         "pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 0,
     )
     monkeypatch.setattr(
-        "pollypm.cockpit.load_config", lambda path: _FakeConfig(tmp_path),
+        "pollypm.cockpit_rail.load_config", lambda path: _FakeConfig(tmp_path),
     )
     cfg = _FakeConfig(tmp_path)
     cfg_path = tmp_path / "pollypm.toml"
@@ -120,7 +120,7 @@ def test_build_items_skips_hidden_items(monkeypatch, tmp_path: Path) -> None:
 
 
 def test_build_items_collapses_sections(monkeypatch, tmp_path: Path) -> None:
-    from pollypm.cockpit import CockpitRouter
+    from pollypm.cockpit_rail import CockpitRouter
     from pollypm.models import KnownProject, ProjectKind
 
     class _FakeConfig:
@@ -147,7 +147,7 @@ def test_build_items_collapses_sections(monkeypatch, tmp_path: Path) -> None:
         "pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 0,
     )
     monkeypatch.setattr(
-        "pollypm.cockpit.load_config", lambda path: _FakeConfig(tmp_path),
+        "pollypm.cockpit_rail.load_config", lambda path: _FakeConfig(tmp_path),
     )
     cfg = _FakeConfig(tmp_path)
     cfg_path = tmp_path / "pollypm.toml"

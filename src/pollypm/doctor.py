@@ -1140,6 +1140,81 @@ def check_pollypm_plugins_dir() -> CheckResult:
     )
 
 
+def check_rail_daemon_alive() -> CheckResult:
+    """Warn when ``pm up``'s rail daemon isn't running.
+
+    Without the daemon, heartbeat recovery only fires while the cockpit
+    TUI is open. When the cockpit is closed or crashes, a dead
+    ``pm-operator`` won't be auto-recovered — exactly the failure mode
+    behind the 2026-04-19 OOM incident.
+    """
+    import os as _os
+
+    pid_path = _pollypm_home() / "rail_daemon.pid"
+    if not pid_path.exists():
+        return _fail(
+            "rail daemon is not running",
+            why=(
+                "The headless rail daemon runs heartbeat sweeps + "
+                "auto-recovery independently of the cockpit. Without "
+                "it, a crashed core session (e.g. pm-operator) won't "
+                "come back until you manually run `pm alerts` or reopen "
+                "the cockpit."
+            ),
+            fix=(
+                "Start the daemon by running —\n"
+                "  pm up\n"
+                "(idempotent — if PollyPM is already up, this just "
+                "spawns the daemon.)\n"
+                "Recheck: pm doctor"
+            ),
+            severity="warning",
+            fixable=False,
+            data={"pid_path": str(pid_path)},
+        )
+    try:
+        pid = int(pid_path.read_text().strip())
+    except (ValueError, OSError) as exc:
+        return _fail(
+            f"rail daemon PID file unreadable: {exc}",
+            why=(
+                "~/.pollypm/rail_daemon.pid exists but can't be parsed. "
+                "Likely a corrupt write from an earlier crash."
+            ),
+            fix=(
+                "Remove the stale PID file and restart —\n"
+                f"  rm {pid_path}\n"
+                "  pm up\n"
+                "Recheck: pm doctor"
+            ),
+            severity="warning",
+            fixable=False,
+        )
+    try:
+        _os.kill(pid, 0)
+    except ProcessLookupError:
+        return _fail(
+            f"rail daemon PID {pid} is stale (process not running)",
+            why=(
+                "The PID file names a process that no longer exists — "
+                "the daemon crashed or was killed. Auto-recovery is "
+                "currently disabled."
+            ),
+            fix=(
+                "Remove the stale PID file and restart —\n"
+                f"  rm {pid_path}\n"
+                "  pm up\n"
+                "Recheck: pm doctor"
+            ),
+            severity="warning",
+            fixable=False,
+        )
+    except PermissionError:
+        # Process exists but belongs to another user — treat as alive.
+        pass
+    return _ok(f"rail daemon alive (pid {pid})", data={"pid": pid})
+
+
 def check_tracked_project_state_parents() -> CheckResult:
     """Each tracked project's ``.pollypm/`` parent must exist."""
     from pollypm.config import DEFAULT_CONFIG_PATH, load_config
@@ -2697,6 +2772,7 @@ def _registered_checks() -> list[Check]:
         Check("tmux-daemon", check_tmux_daemon, "tmux"),
         Check("storage-closet", check_storage_closet_reachable, "tmux"),
         Check("stale-dead-panes", check_no_stale_dead_panes, "tmux", severity="warning"),
+        Check("rail-daemon-alive", check_rail_daemon_alive, "tmux", severity="warning"),
         # Network
         Check("network-github", check_network_github, "network", severity="warning"),
         Check("network-anthropic", check_network_anthropic, "network", severity="warning"),

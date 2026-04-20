@@ -450,10 +450,17 @@ def _spawn_rail_daemon(config_path: Path) -> None:
     Failures are non-fatal — ``pm up`` succeeds without the daemon,
     users just don't get auto-recovery while the cockpit is closed.
     A warning is printed so the degraded state is visible.
+
+    Tests that exercise ``pm up`` set ``POLLYPM_SKIP_RAIL_DAEMON=1``
+    to opt out of the spawn — otherwise they'd leak detached processes
+    pointing at their pytest-tmp config paths.
     """
+    import os as _os
     import subprocess as _sp
     import sys as _sys
 
+    if _os.environ.get("POLLYPM_SKIP_RAIL_DAEMON"):
+        return
     if _rail_daemon_live():
         return
     pollypm_home = Path(DEFAULT_CONFIG_PATH).parent

@@ -2,10 +2,10 @@
 
 ``CodexProvider`` implements the ``pollypm.acct.protocol.ProviderAdapter``
 Protocol by delegating to the helpers in the sibling modules
-(``detect``, ``login``, ``probe``, ``env``). Keeping the class body
-thin means each life-cycle event has an obvious entry point for
-Phase D when the probe/login signatures grow to include the manager
-context.
+(``detect``, ``login``, ``probe``, ``env``, ``resume``). Keeping the
+class body thin means each life-cycle event has an obvious entry
+point for Phase D when the probe/login signatures grow to include
+the manager context.
 
 This replaces ``LegacyCodexAdapter`` from
 ``pollypm.acct._legacy_adapters``: the entry-point registration in
@@ -19,6 +19,7 @@ from pathlib import Path
 
 from pollypm.acct.model import AccountConfig, AccountStatus
 
+from . import login as _login
 from .detect import detect_codex_email, detect_logged_in
 from .env import isolated_env as _codex_isolated_env
 from .login import run_login_flow as _codex_run_login_flow
@@ -140,6 +141,39 @@ class CodexProvider:
         """
         del account  # reserved for per-account CLI overrides
         return _codex_resume_argv(session_id, args)
+
+    def prime_home(self, home: Path) -> None:
+        """No-op for Codex.
+
+        Codex writes its own state on first launch — there is no
+        equivalent of the Claude welcome wizard to skip. Implemented
+        so the cross-provider dispatch in :mod:`pollypm.onboarding`
+        does not need to special-case the provider kind.
+        """
+        del home  # nothing to seed for Codex
+
+    def login_command(
+        self,
+        *,
+        interactive: bool = False,
+        headless: bool = False,
+    ) -> str:
+        """Return ``"codex login"`` (or ``"codex login --device-auth"``).
+
+        ``interactive`` is accepted for Protocol-shape parity with
+        Claude and ignored — Codex has no interactive REPL login
+        equivalent.
+        """
+        del interactive  # Protocol-shape parity; Codex has no REPL login
+        return _login.login_command(headless=headless)
+
+    def logout_command(self) -> str:
+        """Return ``"codex logout || true"``."""
+        return _login.logout_command()
+
+    def login_completion_marker_seen(self, pane_text: str) -> bool:
+        """Return True iff ``pane_text`` contains the PollyPM done-marker."""
+        return _login.login_completion_marker_seen(pane_text)
 
 
 __all__ = ["CodexProvider"]

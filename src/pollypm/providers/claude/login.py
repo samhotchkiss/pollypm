@@ -1,26 +1,58 @@
 """Claude login-flow orchestration.
 
-Phase B of #397 consolidates the Claude-specific bits of the login flow
-into this module. The *full* login flow still lives in
-:mod:`pollypm.onboarding` because it threads a tmux window label, a
-preferences object, and the cross-provider completion detector — none
-of which belong to Claude alone. What moves here:
+Phase B of #397 consolidated the Claude-specific bits of the login
+flow into this module. Issue #406 extends it with the small shell
+fragments (``login_command``, ``logout_command``,
+``login_completion_marker_seen``) that the cross-provider login loop
+in :mod:`pollypm.onboarding` needs to dispatch through the provider
+package instead of branching on ``ProviderKind``.
 
-* :func:`run_login_flow` — the Protocol-shaped entry point. Phase B
-  keeps the implementation thin: it documents that the real interactive
-  flow requires a tmux context not available on the Protocol and
-  points callers at the existing top-level helpers. Phase D will widen
-  the Protocol with a context object; until then the Phase A NotImplementedError
-  phrasing is preserved here behind the Claude adapter.
-
-Callers that want the detection + env helpers in isolation should
-import them directly from :mod:`pollypm.providers.claude.detect` and
-:mod:`pollypm.providers.claude.env`.
+The high-level interactive flow still lives in
+:mod:`pollypm.onboarding` because it threads a ``TmuxClient`` and a
+window label that the Phase A Protocol does not yet model — see
+:func:`run_login_flow` below.
 """
 
 from __future__ import annotations
 
-from pollypm.models import AccountConfig
+from pollypm.acct.model import AccountConfig
+
+
+def login_command(*, interactive: bool = False) -> str:
+    """Return the shell snippet that launches Claude's login flow.
+
+    ``interactive=True`` opens the Claude REPL itself (the user signs
+    in via the in-app ``/login`` flow); otherwise we kick off the
+    headless ``claude auth login --claudeai`` browser flow.
+    """
+    if interactive:
+        return "claude"
+    return "claude auth login --claudeai"
+
+
+def logout_command() -> str:
+    """Return the shell snippet that clears Claude credentials.
+
+    Used when the caller passes ``force_fresh_auth=True`` to the login
+    flow (e.g. ``pm accounts relogin``) so the next ``claude`` launch
+    starts from a clean keychain entry. Suffixed with ``|| true`` so a
+    "not currently logged in" exit code does not abort the shell
+    pipeline.
+    """
+    return "claude auth logout || true"
+
+
+def login_completion_marker_seen(pane_text: str) -> bool:
+    """Return True iff the Claude login pane shows the completion marker.
+
+    The shared login loop in :mod:`pollypm.onboarding` writes a
+    ``PollyPM: login window complete.`` line at the end of the login
+    shell so it can detect completion without parsing provider output.
+    Claude does not have a stronger marker (the welcome banner can
+    appear before auth completes), so this is the only signal we
+    consume.
+    """
+    return "PollyPM: login window complete." in pane_text
 
 
 def run_login_flow(account: AccountConfig) -> None:
@@ -53,4 +85,9 @@ def run_login_flow(account: AccountConfig) -> None:
     )
 
 
-__all__ = ["run_login_flow"]
+__all__ = [
+    "login_command",
+    "login_completion_marker_seen",
+    "logout_command",
+    "run_login_flow",
+]

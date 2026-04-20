@@ -6,10 +6,18 @@ the Protocol plus two legacy adapters (see ``_legacy_adapters``) that
 delegate to the existing ``pollypm.accounts`` + ``pollypm.onboarding``
 functions so no caller has to move yet.
 
-The Protocol is intentionally narrow: six methods that cover the four
-life-cycle events (detect, login, probe, launch) plus the env shim that
-makes isolated-home execution possible. Anything broader lives in the
-higher-level manager that Phase D will introduce.
+The Protocol covers the full life-cycle every provider participates
+in — detect, login, probe, launch, warm-resume, and onboarding
+priming — plus the env shim that makes isolated-home execution
+possible. Two later waves extended the original six-method surface:
+#406 added ``prime_home`` / ``login_command`` / ``logout_command`` /
+``login_completion_marker_seen`` so provider-specific onboarding
+details can live in provider packages; the architect-lifecycle work
+added ``latest_session_id`` / ``resume_launch_cmd`` so idle-closed
+architects can warm-resume from their provider's session UUID.
+Third-party providers implement the full surface to participate in
+PollyPM's onboarding + recovery + lifecycle paths without editing
+core.
 """
 
 from __future__ import annotations
@@ -29,9 +37,10 @@ class ProviderAdapter(Protocol):
             (``"claude"``, ``"codex"``, …). Must match the entry-point
             name so ``get_provider(adapter.name)`` round-trips.
 
-    The six methods below mirror the four life-cycle events a provider
-    participates in — detect, login, probe, launch — plus the env shim
-    that makes isolated-home execution possible.
+    The methods below span the four life-cycle events a provider
+    participates in — detect, login, probe, launch — plus the env
+    shim, the warm-resume pair for architect idle-close (#403-ish
+    architect_lifecycle), and the onboarding pair added by #406.
     """
 
     name: str
@@ -128,6 +137,58 @@ class ProviderAdapter(Protocol):
         ``--resume <id>``; Codex: ``resume <id>`` subcommand). The
         ``--dangerously-skip-permissions`` posture matches a fresh
         architect launch.
+        """
+        ...
+
+    def prime_home(self, home: Path) -> None:
+        """Seed any provider state that must exist before first launch.
+
+        Issue #406 added this to lift the last Claude-specific dispatch
+        out of :mod:`pollypm.onboarding`. Claude pre-populates
+        ``.claude.json`` and ``settings.json`` so the welcome wizard
+        does not block unattended launches; providers that need no
+        seeding (Codex) implement this as a no-op.
+
+        Idempotent: callers may invoke ``prime_home`` repeatedly during
+        onboarding, control-home sync, and supervisor bootstrap.
+        """
+        ...
+
+    def login_command(
+        self,
+        *,
+        interactive: bool = False,
+        headless: bool = False,
+    ) -> str:
+        """Return the shell snippet that launches the provider login.
+
+        ``interactive`` and ``headless`` are the two flags the shared
+        login loop in :mod:`pollypm.onboarding` understands today.
+        Providers ignore flags they do not care about — Claude reads
+        ``interactive``; Codex reads ``headless``. Adding a new flag
+        here is the only path that lets a third-party provider expose
+        a new launch mode without editing onboarding.
+        """
+        ...
+
+    def logout_command(self) -> str:
+        """Return the shell snippet that clears provider credentials.
+
+        Used by the ``force_fresh_auth=True`` path of the shared login
+        loop (e.g. ``pm accounts relogin``) so the next launch starts
+        from a clean credential store. Implementations should suffix
+        their command with ``|| true`` so a "not currently logged in"
+        exit code does not abort the shell pipeline.
+        """
+        ...
+
+    def login_completion_marker_seen(self, pane_text: str) -> bool:
+        """Return True iff ``pane_text`` shows the provider's done-marker.
+
+        The shared login loop writes ``PollyPM: login window complete.``
+        at the tail of the login shell so providers without a strong
+        native signal can use the same marker. Providers with a richer
+        signal (e.g. a CLI banner) are free to widen this check.
         """
         ...
 

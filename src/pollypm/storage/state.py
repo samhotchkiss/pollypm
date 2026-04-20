@@ -219,22 +219,6 @@ CREATE TABLE IF NOT EXISTS token_usage_hourly (
     PRIMARY KEY (hour_bucket, account_name, provider, model_name, project_key)
 );
 
-CREATE TABLE IF NOT EXISTS inbox_messages (
-    id TEXT PRIMARY KEY,
-    subject TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'open',
-    owner TEXT NOT NULL DEFAULT 'polly',
-    sender TEXT NOT NULL,
-    project TEXT NOT NULL DEFAULT '',
-    message_count INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    closed_at TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox_messages(status);
-CREATE INDEX IF NOT EXISTS idx_inbox_owner ON inbox_messages(owner, status);
-
 CREATE TABLE IF NOT EXISTS memory_entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     scope TEXT NOT NULL,
@@ -770,9 +754,8 @@ class StateStore:
         ]),
         # --- Migration 7 -----------------------------------------------
         # Inbox subsystem retired (iv04 / issue #191).
-        # The ``inbox_messages`` table is left in place for one release
-        # cycle in case a rollback is needed. Nothing writes to it after
-        # this point. A follow-up release will drop the table.
+        # Left as a no-op marker so the migration number sequence
+        # stays stable; the actual drop happens in migration 13.
         (7, "Deprecate legacy inbox_messages table (iv04)", []),
         (8, "Typed memory schema (type/importance/superseded_by/ttl_at)", [
             # Pre-statements left empty — column additions happen in the
@@ -837,6 +820,17 @@ class StateStore:
             # block below (_safe_add_column + explicit CREATE INDEX) so
             # the column is guaranteed to exist before the index touches
             # it, and a fresh DB re-running the migration is idempotent.
+        ]),
+        # --- Migration 13 ----------------------------------------------
+        # Actually drop the ``inbox_messages`` table that migration 7
+        # deprecated but left in place. No live callers remain after
+        # #342, the table is empty on every DB in the wild, and
+        # shipped release notes don't promise an offline rollback.
+        # ``DROP … IF EXISTS`` is idempotent so re-running is safe.
+        (13, "Drop legacy inbox_messages table (promised follow-up to migration 7)", [
+            "DROP INDEX IF EXISTS idx_inbox_status",
+            "DROP INDEX IF EXISTS idx_inbox_owner",
+            "DROP TABLE IF EXISTS inbox_messages",
         ]),
     ]
 

@@ -877,9 +877,17 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             return
 
     def _classify(self, context: HeartbeatSessionContext) -> tuple[str, str]:
-        text = (context.transcript_delta or context.pane_text or "").strip()
-        if not text:
-            return "unclear", "No new transcript or pane output to classify"
+        # Only classify on NEW transcript content. Falling back to the
+        # full pane_text for idle sessions means old "remaining" /
+        # "next" language stays matched forever, continuously firing
+        # ``needs_followup`` alerts against agents that are actually
+        # just waiting for the next user prompt. The heartbeat loop
+        # already emits a separate ``suspected_loop`` signal for true
+        # stuck sessions; classify should only speak about fresh work.
+        delta = (context.transcript_delta or "").strip()
+        if not delta:
+            return "unclear", "No new transcript output since last heartbeat"
+        text = delta
         # Extract a useful snippet from the tail of the text for the reason
         snippet = text.strip().splitlines()[-1][:120] if text.strip() else ""
         lowered = text.lower()

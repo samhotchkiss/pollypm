@@ -27,9 +27,10 @@ def register_worker_commands(app: typer.Typer) -> None:
             "worker",
             "--role",
             help=(
-                "Session role. Defaults to 'worker'. Pass e.g. '--role architect' "
-                "to spawn a non-worker project-scoped session that the task "
-                "sweeper can find via the role-candidate-names resolver."
+                "Session role. DEPRECATED for --role=worker: per-task workers "
+                "(spawned automatically by `pm task claim`) replaced the managed "
+                "worker pattern. Use `--role architect` for the planner lane or "
+                "pick a custom role for a non-standard session."
             ),
         ),
         agent_profile: str | None = typer.Option(
@@ -43,6 +44,31 @@ def register_worker_commands(app: typer.Typer) -> None:
         ),
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     ) -> None:
+        if role == "worker":
+            # Per-task workers replaced the managed-worker pattern — each
+            # task now provisions its own isolated `task-<project>-<n>`
+            # session via `pm task claim`, and the supervisor tears the
+            # session down on task done/cancel. A long-running managed
+            # `worker-<project>` session is pure overhead: it holds a
+            # ~500MB Claude process that outlives the task that needed it,
+            # and PollyPM has no cleanup hook for it (see the 2026-04-19
+            # OOM incident where 12 shipped projects each leaked a
+            # managed worker).
+            typer.echo(
+                "ERROR: `pm worker-start --role worker` is deprecated.\n\n"
+                "Why: per-task workers (provisioned automatically by "
+                "`pm task claim`) replaced the managed-worker pattern. "
+                "Managed workers leak memory because they outlive the "
+                "task that needed them and PollyPM has no cleanup hook.\n\n"
+                f"Fix: to get a worker for {project_key}, queue + claim "
+                f"a task:\n"
+                f"  pm task next -p {project_key}\n"
+                f"  pm task claim <task-id>\n\n"
+                f"If you need a long-running project-scoped session "
+                f"(e.g. the planner), use `--role architect` instead.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
         from pollypm import cli as cli_mod
 
         supervisor = cli_mod._load_supervisor(config_path)
@@ -68,9 +94,8 @@ def register_worker_commands(app: typer.Typer) -> None:
             item for item in refreshed.plan_launches()
             if item.session.name == session.name
         )
-        label = "Managed worker" if role == "worker" else f"Managed {role}"
         typer.echo(
-            f"{label} {session.name} ready for project {project_key} "
+            f"Managed {role} {session.name} ready for project {project_key} "
             f"in {refreshed.tmux_session_for_launch(launch)}:{launch.window_name}"
         )
 

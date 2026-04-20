@@ -11,10 +11,16 @@ PollyPM runs agents in tmux windows inside a "storage closet" session. The cockp
 ## Starting and Stopping
 
 ```bash
-pm up                           # launch everything
-pm reset --force                # kill everything, clean state
-pm worker-start <project_key>   # launch/relaunch one worker
+pm up                            # launch everything (cockpit + control sessions)
+pm reset --force                 # kill everything, clean state
+pm task claim <task_id>          # provisions a per-task worker session for that task
+pm worker-start --role architect <project_key>  # spawn the planner architect (auto-closes after 2hr idle)
 ```
+
+> Per-task workers (provisioned by `pm task claim`) replaced managed
+> `worker-<project>` sessions in the v1 cleanup — see the deprecation
+> note in commands.md. Running `pm worker-start <project>` without
+> `--role` exits with code 2.
 
 ## Assigning Work
 

@@ -28,14 +28,27 @@ All commands use the `pm` CLI. Run `pm --help` for the full list, or `pm <comman
 
 ## Workers
 
+PollyPM uses **per-task workers**: each task that gets claimed (via
+`pm task claim` or the auto-sweeper) provisions its own
+`task-<project>-<n>` session in an isolated worktree. The session is
+torn down automatically when the task hits `done` or `cancelled`. You
+do **not** spawn workers manually — claiming a task is the worker.
+
 | Command | What it does |
 |---------|-------------|
-| `pm worker-start <project_key>` | Create or relaunch a managed worker for a project |
+| `pm task next -p <project_key>` | Find the next queued task for a project |
+| `pm task claim <task_id>` | Claim a task (provisions worktree + worker session) |
+| `pm task done <task_id>` | Hand the task to review (also tears the worker down on approve) |
+| `pm worker-start --role architect <project_key>` | Spawn the project's planner architect (long-lived; auto-closed after 2hr idle) |
 | `pm plan` | Show the launch plan (what sessions would be created) |
 | `pm worktrees` | List active git worktrees per worker |
+| `pm worker-stop <session>` | Stop a managed session and disable heartbeat recovery |
+| `pm switch-provider <session> <provider>` | Switch a session between Claude and Codex with checkpoint |
 
-| `pm worker-stop <session>` | Stop a worker and disable heartbeat recovery |
-| `pm switch-provider <session> <provider>` | Switch a worker between Claude and Codex with checkpoint |
+> **Deprecated:** `pm worker-start <project>` (without `--role architect`)
+> is no longer supported — managed `worker-<project>` sessions leaked
+> RAM because they outlived the task that needed them. Per-task workers
+> replaced them; the command exits with code 2 and a fix-it pointer.
 
 ## Leases
 

@@ -764,18 +764,7 @@ class PollyCockpitApp(App[None]):
             last_hb = supervisor.store.last_heartbeat_at()
             if last_hb:
                 from datetime import UTC, datetime
-                # ``last_heartbeat_at`` now reads from the unified
-                # ``messages`` table (#349). SQLite's default
-                # ``CURRENT_TIMESTAMP`` is naive UTC (``YYYY-MM-DD
-                # HH:MM:SS`` — no ``+00:00``) — if we parse it without
-                # forcing a tz and subtract from ``datetime.now(UTC)``,
-                # Python raises ``TypeError: can't subtract offset-naive
-                # and offset-aware``. Normalize to UTC regardless of
-                # input shape.
-                parsed = datetime.fromisoformat(last_hb.replace(" ", "T"))
-                if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=UTC)
-                elapsed = (datetime.now(UTC) - parsed).total_seconds()
+                elapsed = (datetime.now(UTC) - datetime.fromisoformat(last_hb)).total_seconds()
                 if elapsed > self._HEARTBEAT_STALE_SECONDS:
                     mins = int(elapsed // 60)
                     hint_text = f"\u26a0 Heartbeat offline ({mins}m) \u2014 run `pm heartbeat install`"

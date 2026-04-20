@@ -212,7 +212,7 @@ Provider integration was extracted into a three-layer substrate so third-party p
 
 | Module | What it does | Path | Status |
 | --- | --- | --- | --- |
-| Provider Protocol | `ProviderAdapter` contract (6 methods) | `src/pollypm/acct/protocol.py` | solid |
+| Provider Protocol | `ProviderAdapter` contract (10 methods: detect, login, probe, launch, env, warm-resume, prime_home, login_command/logout_command/marker) | `src/pollypm/acct/protocol.py` | solid |
 | Provider Registry | `pollypm.provider` entry-point discovery | `src/pollypm/acct/registry.py` | solid |
 | Account Manager | Centralized provider dispatcher | `src/pollypm/acct/manager.py` | solid |
 | Account Model | `AccountConfig`/`AccountStatus`/`RuntimeStatus` re-exports | `src/pollypm/acct/model.py` | solid |

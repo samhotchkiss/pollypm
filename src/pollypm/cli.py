@@ -74,7 +74,7 @@ Examples (primary flows):
 • pm                                — bring up / attach to the PollyPM session
 • pm task next                      — find the next queued task to work on
 • pm task claim shortlink_gen/1     — claim a queued task (provisions worktree)
-• pm worker-start <project>         — spin up a managed worker for a project
+• pm worker-start --role architect <project>  — spawn the project's planner architect
 • pm projects                       — list registered projects
 • pm help worker                    — full worker onboarding guide
 

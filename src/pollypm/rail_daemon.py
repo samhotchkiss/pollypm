@@ -37,40 +37,6 @@ def _pid_file(home: Path) -> Path:
     return home / "rail_daemon.pid"
 
 
-def _raise_fd_limit() -> None:
-    """Bump the file-descriptor soft limit to the hard limit.
-
-    The rail daemon opens a SQLite + WAL handle per JobWorkerPool
-    thread, per plugin that touches the state store, and per live
-    transcript-ingest thread. On macOS the default soft limit is
-    256 FDs — easily exceeded within an hour of operation. The hard
-    limit is typically 1024 or unlimited; raising the soft limit
-    to match buys us the headroom while leaving per-connection
-    pooling as a deeper post-v1 cleanup (tracked separately).
-
-    Best-effort: any failure (no ``resource`` module on Windows,
-    rlimit writes rejected by the OS) is swallowed so the daemon
-    still boots with whatever limit it inherited.
-    """
-    try:
-        import resource
-
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        if hard == resource.RLIM_INFINITY:
-            target = 65536
-        else:
-            target = hard
-        if soft < target:
-            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
-            logger.info(
-                "rail_daemon: raised FD soft limit %d → %d (hard=%s)",
-                soft, target,
-                "INF" if hard == resource.RLIM_INFINITY else hard,
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("rail_daemon: could not raise FD limit: %s", exc)
-
-
 def _claim_pid_file(pid_path: Path) -> bool:
     """Write our PID if no live daemon already holds the file.
 
@@ -109,7 +75,6 @@ def run(config_path: Path, *, poll_interval: float = 60.0) -> int:
     Returns the process exit code; 0 on graceful shutdown, 1 if
     another daemon already holds the PID lock.
     """
-    _raise_fd_limit()
     from pollypm.config import load_config, DEFAULT_CONFIG_PATH
     from pollypm.supervisor import Supervisor
 

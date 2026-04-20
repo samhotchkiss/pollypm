@@ -26,6 +26,7 @@ from . import detect as _detect
 from . import env as _env
 from . import login as _login
 from . import probe as _probe
+from . import resume as _resume
 
 
 class ClaudeProvider:
@@ -107,6 +108,37 @@ class ClaudeProvider:
         :func:`pollypm.providers.claude.env.isolated_env`.
         """
         return _env.isolated_env(home)
+
+    def latest_session_id(
+        self,
+        account: AccountConfig,
+        cwd: Path | None,
+    ) -> str | None:
+        """Newest Claude session UUID for ``cwd`` under ``account.home``.
+
+        Claude Code buckets sessions per resolved cwd, so ``cwd`` is
+        required. Returns ``None`` when ``account.home`` is unset, the
+        cwd argument is missing, or no prior session exists for the
+        encoded-cwd bucket.
+        """
+        if account.home is None or cwd is None:
+            return None
+        return _resume.latest_session_id(account.home, cwd)
+
+    def resume_launch_cmd(
+        self,
+        account: AccountConfig,
+        session_id: str,
+        args: list[str],
+    ) -> list[str]:
+        """Return ``["claude", "--dangerously-skip-permissions", "--resume", id, *args]``.
+
+        The same ``--dangerously-skip-permissions`` posture as a fresh
+        architect launch, with ``--resume <session_id>`` threaded in
+        before any caller-provided args.
+        """
+        del account  # reserved for per-account CLI overrides
+        return _resume.resume_argv(session_id, args)
 
 
 __all__ = ["ClaudeProvider"]

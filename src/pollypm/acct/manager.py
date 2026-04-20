@@ -85,6 +85,51 @@ def worker_launch_cmd(account: AccountConfig, args: list[str]) -> list[str]:
     return _adapter_for(account).worker_launch_cmd(account, args)
 
 
+def architect_launch_cmd(
+    account: AccountConfig,
+    args: list[str],
+    *,
+    project_key: str,
+    state_store: object,
+) -> tuple[list[str], bool]:
+    """Return ``(argv, resumed)`` for spawning the project's architect.
+
+    Checks ``architect_resume_tokens`` for ``project_key`` and, if a
+    token is present and was captured under the same provider as
+    ``account``, builds the argv via
+    :meth:`ProviderAdapter.resume_launch_cmd` so the architect comes
+    back warm with its prior context. Otherwise falls through to
+    :meth:`ProviderAdapter.worker_launch_cmd` for a fresh launch.
+
+    Caller should clear the token (via
+    ``state_store.clear_architect_resume_token``) once the resumed
+    architect has confirmed startup. Leaving the token in place on a
+    failed resume means the next attempt picks up from the same
+    UUID — losing state only happens on an explicit clear.
+    """
+    from pollypm.architect_lifecycle import resolve_launch_argv
+
+    return resolve_launch_argv(
+        store=state_store,
+        provider=_adapter_for(account),
+        account=account,
+        project_key=project_key,
+        fresh_args=args,
+    )
+
+
+def latest_session_id(account: AccountConfig, cwd: object) -> str | None:
+    """Return the newest provider session UUID for ``cwd`` under ``account``.
+
+    Thin manager-side wrapper over
+    :meth:`ProviderAdapter.latest_session_id` that lets callers stay
+    on the manager surface instead of importing provider packages
+    directly. Used by the architect-idle-close flow to capture a
+    resume token before tearing down a quiet window.
+    """
+    return _adapter_for(account).latest_session_id(account, cwd)
+
+
 def isolated_env(account: AccountConfig) -> dict[str, str]:
     """Return the env vars that pin the provider binary to ``account.home``.
 

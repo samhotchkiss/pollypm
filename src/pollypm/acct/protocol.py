@@ -94,5 +94,42 @@ class ProviderAdapter(Protocol):
         """
         ...
 
+    def latest_session_id(
+        self,
+        account: AccountConfig,
+        cwd: Path | None,
+    ) -> str | None:
+        """Return the newest provider session UUID for ``cwd`` under this account.
+
+        Used by the architect-idle-close flow: the supervisor calls this
+        right before tearing down a quiet architect window so the UUID
+        can be persisted in ``architect_resume_tokens`` for later
+        :meth:`resume_launch_cmd` use.
+
+        ``cwd`` may be ``None`` for providers (like Codex) that don't
+        bucket sessions by working directory; those implementations
+        should fall back to "newest session under the account home".
+
+        Returns ``None`` when no prior session exists — callers should
+        skip token persistence rather than store a placeholder.
+        """
+        ...
+
+    def resume_launch_cmd(
+        self,
+        account: AccountConfig,
+        session_id: str,
+        args: list[str],
+    ) -> list[str]:
+        """Return the argv to relaunch a previously-closed session.
+
+        Mirrors :meth:`worker_launch_cmd` but threads ``session_id``
+        into the provider-specific resume incantation (Claude:
+        ``--resume <id>``; Codex: ``resume <id>`` subcommand). The
+        ``--dangerously-skip-permissions`` posture matches a fresh
+        architect launch.
+        """
+        ...
+
 
 __all__ = ["ProviderAdapter"]

@@ -23,6 +23,8 @@ from .detect import detect_codex_email, detect_logged_in
 from .env import isolated_env as _codex_isolated_env
 from .login import run_login_flow as _codex_run_login_flow
 from .probe import probe_usage as _codex_probe_usage
+from .resume import latest_session_id as _codex_latest_session_id
+from .resume import resume_argv as _codex_resume_argv
 
 
 class CodexProvider:
@@ -107,6 +109,37 @@ class CodexProvider:
         already provides.
         """
         return _codex_isolated_env(home, base_env={})
+
+    def latest_session_id(
+        self,
+        account: AccountConfig,
+        cwd: Path | None,
+    ) -> str | None:
+        """Newest Codex session UUID under ``account.home``.
+
+        Codex doesn't bucket sessions by working directory the way
+        Claude Code does, so ``cwd`` is unused here. Returns ``None``
+        when ``account.home`` is unset or no rollouts exist.
+        """
+        del cwd  # Codex sessions are not cwd-bucketed
+        if account.home is None:
+            return None
+        return _codex_latest_session_id(account.home)
+
+    def resume_launch_cmd(
+        self,
+        account: AccountConfig,
+        session_id: str,
+        args: list[str],
+    ) -> list[str]:
+        """Return ``["codex", "--dangerously-skip-permissions", "resume", id, *args]``.
+
+        Codex's ``resume`` is a subcommand (not a flag), so the
+        positional ordering matters: top-level flags first, then
+        ``resume <id>``, then any caller-supplied args.
+        """
+        del account  # reserved for per-account CLI overrides
+        return _codex_resume_argv(session_id, args)
 
 
 __all__ = ["CodexProvider"]

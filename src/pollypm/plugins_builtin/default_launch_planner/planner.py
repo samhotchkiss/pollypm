@@ -101,6 +101,24 @@ class DefaultLaunchPlanner:
             provider = get_provider(effective.provider, root_dir=ctx.config.project.root_dir)
             launch = provider.build_launch_command(effective, account)
             launch = ctx.apply_role_launch_restrictions(effective, launch)
+            # Architect warm-resume: when an architect was previously
+            # idle-closed by the heartbeat sweep, swap its argv to the
+            # provider's resume incantation so the new pane comes back
+            # warm with its prior project context. Token is left in
+            # place until the resumed architect produces output (the
+            # heartbeat sweep clears it on first non-empty snapshot).
+            if effective.role == "architect" and effective.project:
+                resume_token = ctx.store.get_architect_resume_token(effective.project)
+                if resume_token is not None and resume_token.provider == account.provider.value:
+                    from pollypm.acct.registry import get_provider as _get_acct_provider
+                    acct_adapter = _get_acct_provider(account.provider.value)
+                    # Strip the binary from existing argv (acct adapter
+                    # prepends its own with the resume incantation).
+                    extra_args = list(launch.argv[1:]) if launch.argv else []
+                    new_argv = acct_adapter.resume_launch_cmd(
+                        account, resume_token.session_id, extra_args,
+                    )
+                    launch = replace(launch, argv=new_argv)
             if effective.provider is ProviderKind.CODEX and effective.role in _CONTROL_ROLES and launch.initial_input:
                 env = dict(launch.env)
                 env["PM_CODEX_HOME_AGENTS_MD"] = launch.initial_input

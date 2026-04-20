@@ -332,6 +332,14 @@ ON work_jobs(status, run_after, id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_work_jobs_dedupe_queued
 ON work_jobs(dedupe_key)
 WHERE dedupe_key IS NOT NULL AND status IN ('queued', 'claimed');
+
+CREATE TABLE IF NOT EXISTS architect_resume_tokens (
+    project_key TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    last_active_at TEXT NOT NULL
+);
 """
 
 
@@ -506,6 +514,22 @@ class MemorySummaryRecord:
     summary_path: str
     entry_count: int
     created_at: str
+
+
+@dataclass(slots=True)
+class ArchitectResumeRecord:
+    """Persisted resume token for an idled-out architect session.
+
+    When an architect-* session has been project-idle for 2h+, the
+    supervisor captures the provider's session UUID, kills the tmux
+    window, and persists this record. On next demand the architect
+    relaunches via ``provider.resume_launch_cmd(session_id, ...)``.
+    """
+    project_key: str
+    provider: str
+    session_id: str
+    captured_at: str
+    last_active_at: str
 
 
 class StateStore:
@@ -1651,6 +1675,67 @@ class StateStore:
                 recovery_window_started_at=row[5], last_failure_type=row[6],
                 last_failure_message=row[7], last_checkpoint_path=row[8],
                 retry_at=row[9], last_recovered_at=row[10], updated_at=row[11],
+            )
+            for row in rows
+        ]
+
+    def upsert_architect_resume_token(
+        self,
+        *,
+        project_key: str,
+        provider: str,
+        session_id: str,
+        last_active_at: str,
+    ) -> None:
+        now = self._now()
+        self.execute(
+            """
+            INSERT INTO architect_resume_tokens (
+                project_key, provider, session_id, captured_at, last_active_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(project_key) DO UPDATE SET
+                provider = excluded.provider,
+                session_id = excluded.session_id,
+                captured_at = excluded.captured_at,
+                last_active_at = excluded.last_active_at
+            """,
+            (project_key, provider, session_id, now, last_active_at),
+        )
+        self.commit()
+
+    def get_architect_resume_token(self, project_key: str) -> ArchitectResumeRecord | None:
+        row = self.execute(
+            """
+            SELECT project_key, provider, session_id, captured_at, last_active_at
+            FROM architect_resume_tokens WHERE project_key = ?
+            """,
+            (project_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return ArchitectResumeRecord(
+            project_key=row[0], provider=row[1], session_id=row[2],
+            captured_at=row[3], last_active_at=row[4],
+        )
+
+    def clear_architect_resume_token(self, project_key: str) -> None:
+        self.execute(
+            "DELETE FROM architect_resume_tokens WHERE project_key = ?",
+            (project_key,),
+        )
+        self.commit()
+
+    def list_architect_resume_tokens(self) -> list[ArchitectResumeRecord]:
+        rows = self.execute(
+            """
+            SELECT project_key, provider, session_id, captured_at, last_active_at
+            FROM architect_resume_tokens
+            """
+        ).fetchall()
+        return [
+            ArchitectResumeRecord(
+                project_key=row[0], provider=row[1], session_id=row[2],
+                captured_at=row[3], last_active_at=row[4],
             )
             for row in rows
         ]

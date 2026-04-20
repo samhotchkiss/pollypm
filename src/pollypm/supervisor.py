@@ -1224,6 +1224,14 @@ class Supervisor:
             failure = self._primary_failure(active_alerts)
             if failure is not None:
                 self._maybe_recover_session(launch, failure_type=failure, failure_message=", ".join(active_alerts))
+            else:
+                # Architect 2hr-idle close: if this launch is an
+                # architect that's been quiet for ≥2h, capture its
+                # provider session UUID into ``architect_resume_tokens``
+                # and kill the window. Polly's next call into the
+                # project warm-resumes from the stored UUID via
+                # ``manager.architect_launch_cmd``.
+                self._maybe_close_idle_architect(launch, window, current_snapshot_hash)
 
         for window_name, session_key in name_by_window.items():
             if window_name in window_map:
@@ -1234,6 +1242,15 @@ class Supervisor:
                 "error",
                 f"Expected tmux window {window_name} in session {self._tmux_session_for_session(session_key)}",
             )
+
+        # Stale-alert sweep: clear alerts whose session is no longer
+        # tracked (configured + enabled) and whose tmux window is
+        # gone. Fresh alerts for live sessions re-open on the next
+        # sweep via upsert_alert; the only alerts that stay cleared
+        # are the truly orphaned ones (shipped projects, removed
+        # sessions, etc.). Without this the cockpit accumulates
+        # decorative junk alerts across sessions of operator work.
+        self._sweep_stale_alerts(window_map=window_map, name_by_window=name_by_window)
 
         current_alerts = self.store.open_alerts()
         self._msg_store.append_event(
@@ -2049,6 +2066,132 @@ class Supervisor:
 
     def _maybe_recover_session(self, launch: SessionLaunchSpec, *, failure_type: str, failure_message: str) -> None:
         return self.maybe_recover_session(launch, failure_type=failure_type, failure_message=failure_message)
+
+    def _sweep_stale_alerts(
+        self,
+        *,
+        window_map: dict,
+        name_by_window: dict,
+    ) -> None:
+        """Close alerts whose session is both unconfigured and window-less.
+
+        Two categories get cleared:
+
+        1. Alerts keyed on session names that aren't in the current
+           launch plan (the session was removed from config or never
+           existed) AND whose expected tmux window doesn't exist.
+        2. Alerts on shipped / removed ``architect-<project>`` sessions
+           that have lingered past their project's lifecycle.
+
+        We intentionally DO NOT clear alerts whose session is still in
+        the launch plan: those represent current state and the caller
+        will re-upsert them next sweep if the underlying condition
+        persists. Any alert that should recur will recur.
+
+        Best-effort. Failures are logged and swallowed so alert-sweep
+        flakiness can't break the heartbeat sweep for live sessions.
+        """
+        try:
+            # Sessions we're actively tracking this sweep — from the
+            # configured launch plan. Alerts keyed on anything outside
+            # this set are candidates for sweep.
+            tracked = {launch.session.name for launch in self.plan_launches()}
+            # Windows that currently exist (keyed by window name).
+            live_window_names = set(window_map.keys())
+            # Reverse map: session_name -> expected window_name for
+            # tracked sessions, so we can tell "has window" vs "missing".
+            expected_window = {
+                v: k for k, v in name_by_window.items()
+            }
+
+            swept = 0
+            for alert in self._msg_store.open_alerts():
+                session_name = alert.session_name
+                # Ephemeral sessions (task-*, critic_*, downtime_*)
+                # are swept elsewhere (see sweep_ephemeral_sessions in
+                # core_recurring). Skip them here so we don't fight.
+                if session_name.startswith(("task_", "critic_", "downtime_")):
+                    continue
+                if session_name in tracked:
+                    window_name = expected_window.get(session_name)
+                    if window_name and window_name in live_window_names:
+                        # Session is live; leave alert alone.
+                        continue
+                    # Tracked but window is missing — the missing_window
+                    # alert set above is the right signal for those.
+                    # Don't clear alerts for an expected-but-missing
+                    # window; let the recovery path handle it.
+                    continue
+                # Not tracked: the session config was removed (shipped
+                # project, disabled, etc.) — its alerts are orphaned.
+                self._msg_store.clear_alert(session_name, alert.alert_type)
+                swept += 1
+
+            if swept > 0:
+                logger.info("stale-alert sweep cleared %d orphaned alert(s)", swept)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("stale-alert sweep skipped: %s", exc)
+
+    def _maybe_close_idle_architect(
+        self,
+        launch: SessionLaunchSpec,
+        window: object,
+        current_snapshot_hash: str,
+    ) -> None:
+        """Close an architect window that's been quiet for ≥2 hours.
+
+        Reads the heartbeat history (already populated by the caller
+        for this sweep), and when the architect's pane has produced
+        the same snapshot for the configured idle threshold, captures
+        the provider session UUID and kills the window.
+
+        Best-effort: any failure inside is swallowed so a flaky idle
+        check can't break the heartbeat sweep for unrelated sessions.
+        """
+        try:
+            from pollypm.acct.registry import get_provider as _get_provider
+            from pollypm.architect_lifecycle import close_idle_architect, should_close_architect
+
+            session_name = launch.session.name
+            role = launch.session.role
+            if not should_close_architect(self.store, session_name, role):
+                return
+
+            project_key = launch.session.project
+            project_path = self._project_path_for_session(project_key)
+            tmux_session = self._tmux_session_for_launch(launch)
+            window_target = f"{tmux_session}:{launch.window_name}"
+
+            captured = close_idle_architect(
+                store=self.store,
+                provider=_get_provider(launch.account.provider.value),
+                account=launch.account,
+                project_key=project_key,
+                cwd=project_path,
+                tmux_kill_window=self.session_service.tmux.kill_window,
+                window_target=window_target,
+                last_active_at=datetime.now(UTC).isoformat(),
+            )
+            self._msg_store.append_event(
+                scope=session_name,
+                sender="heartbeat",
+                subject="architect_idle_close",
+                payload={
+                    "message": (
+                        f"Closed idle architect for {project_key} "
+                        f"(session_id={'captured' if captured else 'none'})"
+                    ),
+                    "project": project_key,
+                    "provider": launch.account.provider.value,
+                    "snapshot_hash": current_snapshot_hash,
+                    "session_id": captured,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "architect idle-close skipped for %s: %s",
+                launch.session.name, exc,
+            )
 
     def maybe_recover_session(self, launch: SessionLaunchSpec, *, failure_type: str, failure_message: str) -> None:
         """Attempt automatic recovery for ``launch`` given a detected failure.

@@ -25,6 +25,7 @@ from pollypm.acct.model import AccountConfig, AccountStatus
 from . import detect as _detect
 from . import env as _env
 from . import login as _login
+from . import onboarding as _onboarding
 from . import probe as _probe
 
 
@@ -107,6 +108,38 @@ class ClaudeProvider:
         :func:`pollypm.providers.claude.env.isolated_env`.
         """
         return _env.isolated_env(home)
+
+    def prime_home(self, home: Path) -> None:
+        """Seed ``.claude.json`` + ``settings.json`` so launches run unattended.
+
+        Delegates to
+        :func:`pollypm.providers.claude.onboarding.prime_claude_home`.
+        Idempotent.
+        """
+        _onboarding.prime_claude_home(home)
+
+    def login_command(
+        self,
+        *,
+        interactive: bool = False,
+        headless: bool = False,
+    ) -> str:
+        """Return ``"claude"`` (interactive) or ``"claude auth login --claudeai"``.
+
+        ``headless`` is accepted for Protocol-shape parity with Codex
+        and intentionally ignored — Claude has no headless equivalent
+        of the browser auth flow today.
+        """
+        del headless  # Protocol-shape parity; Claude has no headless flow
+        return _login.login_command(interactive=interactive)
+
+    def logout_command(self) -> str:
+        """Return ``"claude auth logout || true"``."""
+        return _login.logout_command()
+
+    def login_completion_marker_seen(self, pane_text: str) -> bool:
+        """Return True iff ``pane_text`` contains the PollyPM done-marker."""
+        return _login.login_completion_marker_seen(pane_text)
 
 
 __all__ = ["ClaudeProvider"]

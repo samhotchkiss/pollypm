@@ -19,6 +19,7 @@ from pathlib import Path
 
 from pollypm.acct.model import AccountConfig, AccountStatus
 
+from . import login as _login
 from .detect import detect_codex_email, detect_logged_in
 from .env import isolated_env as _codex_isolated_env
 from .login import run_login_flow as _codex_run_login_flow
@@ -107,6 +108,39 @@ class CodexProvider:
         already provides.
         """
         return _codex_isolated_env(home, base_env={})
+
+    def prime_home(self, home: Path) -> None:
+        """No-op for Codex.
+
+        Codex writes its own state on first launch — there is no
+        equivalent of the Claude welcome wizard to skip. Implemented
+        so the cross-provider dispatch in :mod:`pollypm.onboarding`
+        does not need to special-case the provider kind.
+        """
+        del home  # nothing to seed for Codex
+
+    def login_command(
+        self,
+        *,
+        interactive: bool = False,
+        headless: bool = False,
+    ) -> str:
+        """Return ``"codex login"`` (or ``"codex login --device-auth"``).
+
+        ``interactive`` is accepted for Protocol-shape parity with
+        Claude and ignored — Codex has no interactive REPL login
+        equivalent.
+        """
+        del interactive  # Protocol-shape parity; Codex has no REPL login
+        return _login.login_command(headless=headless)
+
+    def logout_command(self) -> str:
+        """Return ``"codex logout || true"``."""
+        return _login.logout_command()
+
+    def login_completion_marker_seen(self, pane_text: str) -> bool:
+        """Return True iff ``pane_text`` contains the PollyPM done-marker."""
+        return _login.login_completion_marker_seen(pane_text)
 
 
 __all__ = ["CodexProvider"]

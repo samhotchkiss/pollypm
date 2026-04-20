@@ -94,5 +94,57 @@ class ProviderAdapter(Protocol):
         """
         ...
 
+    def prime_home(self, home: Path) -> None:
+        """Seed any provider state that must exist before first launch.
+
+        Issue #406 added this to lift the last Claude-specific dispatch
+        out of :mod:`pollypm.onboarding`. Claude pre-populates
+        ``.claude.json`` and ``settings.json`` so the welcome wizard
+        does not block unattended launches; providers that need no
+        seeding (Codex) implement this as a no-op.
+
+        Idempotent: callers may invoke ``prime_home`` repeatedly during
+        onboarding, control-home sync, and supervisor bootstrap.
+        """
+        ...
+
+    def login_command(
+        self,
+        *,
+        interactive: bool = False,
+        headless: bool = False,
+    ) -> str:
+        """Return the shell snippet that launches the provider login.
+
+        ``interactive`` and ``headless`` are the two flags the shared
+        login loop in :mod:`pollypm.onboarding` understands today.
+        Providers ignore flags they do not care about — Claude reads
+        ``interactive``; Codex reads ``headless``. Adding a new flag
+        here is the only path that lets a third-party provider expose
+        a new launch mode without editing onboarding.
+        """
+        ...
+
+    def logout_command(self) -> str:
+        """Return the shell snippet that clears provider credentials.
+
+        Used by the ``force_fresh_auth=True`` path of the shared login
+        loop (e.g. ``pm accounts relogin``) so the next launch starts
+        from a clean credential store. Implementations should suffix
+        their command with ``|| true`` so a "not currently logged in"
+        exit code does not abort the shell pipeline.
+        """
+        ...
+
+    def login_completion_marker_seen(self, pane_text: str) -> bool:
+        """Return True iff ``pane_text`` shows the provider's done-marker.
+
+        The shared login loop writes ``PollyPM: login window complete.``
+        at the tail of the login shell so providers without a strong
+        native signal can use the same marker. Providers with a richer
+        signal (e.g. a CLI banner) are free to widen this check.
+        """
+        ...
+
 
 __all__ = ["ProviderAdapter"]

@@ -5,11 +5,9 @@ import json
 import re
 import shlex
 import shutil
-import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
@@ -85,37 +83,30 @@ class LoginCancelled(Exception):
     pass
 
 
-_CLAUDE_OPERATOR_TOOLS = "Read,Glob,Grep,LS,Bash,WebFetch,WebSearch,TodoWrite,Task"
-_CLAUDE_HEARTBEAT_TOOLS = "Read,Glob,Grep,LS,WebFetch,WebSearch,TodoWrite,Task"
-_CLAUDE_NO_WRITE_TOOLS = "Edit,Write,MultiEdit,NotebookEdit"
-_CLAUDE_OPERATOR_DISALLOWED = "Agent,Edit,Write,MultiEdit,NotebookEdit"  # PM delegates — never writes files
-
-
 def default_session_args(
     provider: ProviderKind,
     *,
     open_permissions: bool = True,
     role: str = "",
 ) -> list[str]:
-    args: list[str] = []
+    """Dispatch the role-to-CLI-flag mapping to the provider package.
+
+    Each provider owns its own flag vocabulary (Claude uses
+    ``--allowedTools``; Codex uses ``--sandbox``) — see
+    :mod:`pollypm.providers.claude.session_args` and
+    :mod:`pollypm.providers.codex.session_args`. Onboarding stays out
+    of the per-flag details so a third-party provider can ship its
+    own ``session_args`` without patching this module.
+    """
     if provider is ProviderKind.CLAUDE:
-        if open_permissions and role not in {"heartbeat-supervisor", "operator-pm"}:
-            args.append("--dangerously-skip-permissions")
-        if role == "heartbeat-supervisor":
-            args.extend(["--allowedTools", _CLAUDE_HEARTBEAT_TOOLS])
-            args.extend(["--disallowedTools", _CLAUDE_NO_WRITE_TOOLS])
-        elif role == "operator-pm":
-            args.extend(["--allowedTools", _CLAUDE_OPERATOR_TOOLS])
-            args.extend(["--disallowedTools", _CLAUDE_OPERATOR_DISALLOWED])
-        return args
+        from pollypm.providers.claude.session_args import session_args
+
+        return session_args(open_permissions=open_permissions, role=role)
     if provider is ProviderKind.CODEX:
-        if role in {"heartbeat-supervisor", "operator-pm"}:
-            return ["--sandbox", "read-only", "--ask-for-approval", "never"]
-        if role == "worker":
-            return ["--sandbox", "workspace-write", "--ask-for-approval", "never"]
-        if open_permissions:
-            return ["--dangerously-bypass-approvals-and-sandbox"]
-    return args
+        from pollypm.providers.codex.session_args import session_args
+
+        return session_args(open_permissions=open_permissions, role=role)
+    return []
 
 
 def default_control_args(
@@ -127,62 +118,18 @@ def default_control_args(
     return default_session_args(provider, open_permissions=open_permissions, role=role)
 
 
-def _detected_claude_version() -> str:
-    try:
-        result = subprocess.run(
-            ["claude", "--version"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
-        return "2.1.92"
-    match = re.search(r"(\d+\.\d+\.\d+)", result.stdout)
-    if match:
-        return match.group(1)
-    return "2.1.92"
-
-
 def _prime_claude_home(home: Path) -> None:
-    home.mkdir(parents=True, exist_ok=True, mode=0o700)
-    claude_dir = home / ".claude"
-    claude_dir.mkdir(parents=True, exist_ok=True)
+    """Back-compat shim — real impl lives in the Claude provider package.
 
-    # Claude Code reads .claude.json from INSIDE CLAUDE_CONFIG_DIR (home/.claude/)
-    state_path = claude_dir / ".claude.json"
-    data: dict[str, object] = {}
-    if state_path.exists():
-        try:
-            data = json.loads(state_path.read_text())
-        except json.JSONDecodeError:
-            data = {}
+    Tests and a handful of legacy callers (``supervisor``, ``accounts``,
+    ``supervision.control_home``) still import this name; #406 moved
+    the body into :func:`pollypm.providers.claude.onboarding.prime_claude_home`
+    and kept this dispatcher so monkeypatching
+    ``pollypm.onboarding._prime_claude_home`` still works.
+    """
+    from pollypm.providers.claude.onboarding import prime_claude_home
 
-    if "firstStartTime" not in data:
-        data["firstStartTime"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-    if not isinstance(data.get("numStartups"), int):
-        data["numStartups"] = 0
-    data["hasCompletedOnboarding"] = True
-    data["lastOnboardingVersion"] = str(data.get("lastOnboardingVersion") or _detected_claude_version())
-
-    state_path.write_text(json.dumps(data, indent=2) + "\n")
-
-    # Ensure settings.json has the flags needed for unattended operation:
-    # - skipDangerousModePermissionPrompt: skip the "are you sure?" dialog
-    # - bypassWorkspaceTrust: skip the "is this a project you trust?" dialog
-    # - permissions.dangerouslySkipPermissions: match the --dangerously-skip-permissions flag
-    settings_path = claude_dir / "settings.json"
-    settings: dict[str, object] = {}
-    if settings_path.exists():
-        try:
-            settings = json.loads(settings_path.read_text())
-        except json.JSONDecodeError:
-            settings = {}
-    settings["skipDangerousModePermissionPrompt"] = True
-    settings["bypassWorkspaceTrust"] = True
-    if not isinstance(settings.get("permissions"), dict):
-        settings["permissions"] = {}
-    settings["permissions"]["dangerouslySkipPermissions"] = True  # type: ignore[index]
-    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+    prime_claude_home(home)
 
 
 def _available_clis() -> list[CliAvailability]:
@@ -455,15 +402,20 @@ def _login_command(
     interactive: bool = False,
     preferences: LoginPreferences | None = None,
 ) -> str:
-    if provider is ProviderKind.CODEX:
-        if preferences is not None and preferences.codex_headless:
-            return "codex login --device-auth"
-        return "codex login"
-    if provider is ProviderKind.CLAUDE:
-        if interactive:
-            return "claude"
-        return "claude auth login --claudeai"
-    raise ValueError(f"Unsupported provider: {provider.value}")
+    """Dispatch the login shell snippet to the provider package.
+
+    Onboarding stays provider-agnostic: it folds the Codex-only
+    ``codex_headless`` preference into the generic ``headless`` kwarg
+    the Protocol exposes, then asks the registered adapter to render
+    its own command.
+    """
+    from pollypm.acct.registry import get_provider
+
+    headless = preferences is not None and preferences.codex_headless
+    return get_provider(provider.value).login_command(
+        interactive=interactive,
+        headless=headless,
+    )
 
 
 def _build_login_shell(
@@ -484,10 +436,9 @@ def _build_login_shell(
     for key, value in env.items():
         parts.append(f"export {key}={shlex.quote(value)}")
     if force_fresh_auth:
-        if provider is ProviderKind.CLAUDE:
-            parts.append("claude auth logout || true")
-        elif provider is ProviderKind.CODEX:
-            parts.append("codex logout || true")
+        from pollypm.acct.registry import get_provider
+
+        parts.append(get_provider(provider.value).logout_command())
     parts.append(_login_command(provider, interactive=interactive, preferences=preferences))
     if return_to_caller:
         parts.append('printf "\\nPollyPM: login window complete. Returning to onboarding...\\n"')
@@ -542,8 +493,21 @@ def _detect_email_from_pane(provider: ProviderKind, pane_text: str) -> str | Non
     return None
 
 
-def _login_completion_marker_seen(pane_text: str) -> bool:
-    return "PollyPM: login window complete." in pane_text
+def _login_completion_marker_seen(pane_text: str, provider: ProviderKind | None = None) -> bool:
+    """Dispatch the pane-marker check to the provider package.
+
+    ``provider`` is optional so the legacy single-arg call shape kept
+    by tests (and the default ``PollyPM: login window complete.``
+    marker) continues to work. When ``provider`` is omitted we fall
+    back to the shared marker — both built-in providers accept it,
+    and a third-party provider that needs a richer check will be
+    asked through its registered adapter from the wait loop below.
+    """
+    if provider is None:
+        return "PollyPM: login window complete." in pane_text
+    from pollypm.acct.registry import get_provider
+
+    return get_provider(provider.value).login_completion_marker_seen(pane_text)
 
 
 def _wait_for_login_completion(
@@ -564,7 +528,7 @@ def _wait_for_login_completion(
         except Exception:  # noqa: BLE001
             last_pane = ""
 
-        if _login_completion_marker_seen(last_pane):
+        if _login_completion_marker_seen(last_pane, provider):
             return True, last_pane
 
         if _detect_email_from_pane(provider, last_pane):
@@ -623,8 +587,11 @@ def _recover_existing_accounts(root_dir: Path) -> dict[str, ConnectedAccount]:
         actual_home = entry
         if entry.name.startswith("onboarding_"):
             actual_home = _promote_onboarding_home(entry, final_home)
-        if provider is ProviderKind.CLAUDE:
-            _prime_claude_home(actual_home if actual_home.exists() else final_home)
+        from pollypm.acct.registry import get_provider
+
+        get_provider(provider.value).prime_home(
+            actual_home if actual_home.exists() else final_home,
+        )
         connected[account_name] = ConnectedAccount(
             provider=provider,
             email=email,

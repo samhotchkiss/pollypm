@@ -86,6 +86,53 @@ graph TB
 
 > ☑ = default plugin, loaded unless overridden in config.
 
+## Stability & Lifecycle
+
+Three background mechanisms keep PollyPM from leaking resources and
+keep sessions alive without operator intervention:
+
+### Headless rail daemon
+
+The heartbeat sweep (which runs missing-window detection, auto-recovers
+crashed core sessions, sweeps stale alerts, and rotates logs) lives in
+a standalone `pollypm.rail_daemon` process. `pm up` spawns it detached;
+`pm reset` stops it cleanly via its `~/.pollypm/rail_daemon.pid` file.
+
+Without this daemon the rail would only tick while the cockpit TUI is
+open — a cockpit crash or a CLI-only user would silently lose
+auto-recovery.
+
+### Architect idle-close + warm resume
+
+Each project gets one long-lived `architect-<project>` session that
+holds plan context across the project's lifetime. When the architect's
+pane has produced identical snapshots for ≥2h the supervisor:
+
+1. Asks the provider for the latest session UUID (Claude reads from
+   `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`; Codex reads from
+   `~/.codex/sessions/YYYY/MM/DD/rollout-…-<uuid>.jsonl`).
+2. Persists `(project, provider, session_id)` into the
+   `architect_resume_tokens` table.
+3. Kills the tmux window — freeing ~500MB.
+
+On next demand the default launch planner consults the table and
+builds argv via `provider.resume_launch_cmd(...)` —
+`claude --dangerously-skip-permissions --resume <id>` or
+`codex --dangerously-skip-permissions resume <id>` — so the architect
+comes back **warm** with its full prior context. See
+`src/pollypm/architect_lifecycle.py`.
+
+### Per-task workers (managed workers are deprecated)
+
+Work is performed by **per-task** worker sessions — one
+`task-<project>-<n>` session per claimed task, auto-torn-down on
+task done / cancel / approve via `session_manager.teardown_worker`.
+The old `pm worker-start <project>` managed-worker pattern is
+deprecated because those sessions outlive the task that needed them
+and have no cleanup hook. Running `pm worker-start <project>` today
+exits with code 2 and a fix-it pointer to `pm task claim <id>`.
+`--role architect` is still supported for the planner lane.
+
 ## Module Map
 
 Every major subsystem has a defined role, a fixed file path, and is independently replaceable (or on the path to it). Status legend:
@@ -112,6 +159,8 @@ Every major subsystem has a defined role, a fixed file path, and is independentl
 | Worktrees | Git worktree helpers with session lock | `src/pollypm/worktrees.py` | solid |
 | Accounts | Multi-account / failover management | `src/pollypm/accounts.py` | solid |
 | Projects | Project registration and resolution | `src/pollypm/projects.py` | solid |
+| Architect Lifecycle | 2h-idle close + warm-resume for architect sessions | `src/pollypm/architect_lifecycle.py` | solid |
+| Rail Daemon | Headless heartbeat + recovery ticker (survives cockpit close) | `src/pollypm/rail_daemon.py` | solid |
 
 ### Work Service (task management)
 
@@ -157,14 +206,60 @@ Every major subsystem has a defined role, a fixed file path, and is independentl
 | Job Handler Registry | Plugin-registered job handlers | `src/pollypm/plugin_api/handlers.py` | planned |
 | Jobs CLI | `pm jobs …` queue inspection | `src/pollypm/jobs/cli.py` | planned |
 
+### Account Substrate (#397)
+
+Provider integration was extracted into a three-layer substrate so third-party providers can ship as standalone packages without modifying PollyPM core. The key boundary: `acct/` defines contracts and discovers providers; `providers/*/` packages implement those contracts. `acct/` must never import from `providers/`.
+
+| Module | What it does | Path | Status |
+| --- | --- | --- | --- |
+| Provider Protocol | `ProviderAdapter` contract (6 methods) | `src/pollypm/acct/protocol.py` | solid |
+| Provider Registry | `pollypm.provider` entry-point discovery | `src/pollypm/acct/registry.py` | solid |
+| Account Manager | Centralized provider dispatcher | `src/pollypm/acct/manager.py` | solid |
+| Account Model | `AccountConfig`/`AccountStatus`/`RuntimeStatus` re-exports | `src/pollypm/acct/model.py` | solid |
+| Account Errors | `ProviderNotFound`/`AccountNotFound` (three-question rule) | `src/pollypm/acct/errors.py` | solid |
+
+```mermaid
+graph TD
+    subgraph Core["PollyPM Core"]
+        Accounts["accounts.py<br/>(compat bridge)"]
+        Workers["workers.py"]
+        Onboarding["onboarding.py"]
+    end
+
+    subgraph Substrate["acct/ — contracts &amp; registry"]
+        Protocol["protocol.py<br/>ProviderAdapter"]
+        Registry["registry.py<br/>get_provider()"]
+        Manager["manager.py<br/>dispatch fns"]
+        Model["model.py"]
+    end
+
+    subgraph Providers["providers/ — installed packages"]
+        ClaudePkg["providers/claude/<br/>ClaudeProvider"]
+        CodexPkg["providers/codex/<br/>CodexProvider"]
+    end
+
+    Accounts --> Manager
+    Workers --> Manager
+    Onboarding --> Manager
+    Manager --> Registry
+    Manager --> Protocol
+    Registry -->|entry_points| ClaudePkg
+    Registry -->|entry_points| CodexPkg
+    ClaudePkg --> Protocol
+    CodexPkg --> Protocol
+    ClaudePkg --> Model
+    CodexPkg --> Model
+```
+
 ### Providers &amp; Runtimes
 
 | Module | What it does | Path | Status |
 | --- | --- | --- | --- |
 | Provider SDK | Shared provider interface | `src/pollypm/provider_sdk.py` | solid |
-| Provider Protocol | Adapter contract | `src/pollypm/providers/base.py` | solid |
-| Claude provider | Claude Code CLI adapter | `src/pollypm/providers/claude.py` | solid |
-| Codex provider | Codex CLI adapter | `src/pollypm/providers/codex.py` | solid |
+| Provider Protocol (legacy) | Adapter contract (pre-#397) | `src/pollypm/providers/base.py` | solid |
+| Provider args | Shared launch-arg helpers | `src/pollypm/providers/args.py` | solid |
+| Claude provider | Claude Code CLI adapter package | `src/pollypm/providers/claude/` | solid |
+| Codex provider | Codex CLI adapter package | `src/pollypm/providers/codex/` | solid |
 | Claude plugin | Built-in plugin wrapper | `src/pollypm/plugins_builtin/claude/` | solid |
 | Codex plugin | Built-in plugin wrapper | `src/pollypm/plugins_builtin/codex/` | solid |
 | Runtime Protocol | Pluggable execution env | `src/pollypm/runtimes/base.py` | solid |
@@ -255,6 +350,27 @@ Every major subsystem has a defined role, a fixed file path, and is independentl
 | Live activity feed | Real-time cross-session view | `src/pollypm/activity_feed.py` | planned |
 | Morning briefing | Delta-since-last-look report | `src/pollypm/briefing.py` | planned |
 | Proactive rollover | Session rollover at 90% usage | `src/pollypm/rollover.py` | planned |
+
+## Orphaned Functionality
+
+Work that does real things but is not cleanly encapsulated in a module. These are cleanup targets, not bugs — each entry is a candidate for consolidation.
+
+| Item | Path | Why it's orphaned | Tracking |
+| --- | --- | --- | --- |
+| Dashboard sections engine | `src/pollypm/cockpit.py` (15+ `_section_*` fns) | Entire sections subsystem (~600 LOC) lives inline in cockpit.py; blocks per-section tests and plugin sections. | [#403](https://github.com/samhotchkiss/pollypm/issues/403) |
+| CockpitRouter + rail logic | `src/pollypm/cockpit.py` (`CockpitRouter`, `CockpitItem`, ~1000 LOC) | Router lives in cockpit.py even though `cockpit_rail.py` already exists as its intended home. | [#404](https://github.com/samhotchkiss/pollypm/issues/404) |
+| Inbox rendering | `src/pollypm/cockpit.py` (`render_inbox_panel`, `_inbox_db_sources`, 5 fns) | Siblings `cockpit_activity.py` / `cockpit_alerts.py` / `cockpit_workers.py` exist — inbox should follow the same pattern. | [#405](https://github.com/samhotchkiss/pollypm/issues/405) |
+| Claude-specific onboarding helpers | `src/pollypm/onboarding.py` (`_detected_claude_version`, `_prime_claude_home`, claude-login branches) | Post-#397 left provider-specific code behind; blocks third-party providers from integrating with onboarding. | [#406](https://github.com/samhotchkiss/pollypm/issues/406) |
+| `runtime_launcher.py` | `src/pollypm/runtime_launcher.py` | Loose executable shim (base64 payload decoder) with no package home; should wrap into `launchers/` or be folded into `runtimes/`. | — |
+| `atomic_io.py` | `src/pollypm/atomic_io.py` | Two utility functions used from 15+ sites; deserves a `utils/` package or promotion to `storage/`. | — |
+| `messaging.py` | `src/pollypm/messaging.py` | Thin shims over `store.upsert_alert` that predate the durable-alert system; candidates for inlining or moving to the itsalive plugin. | — |
+| `notifications.py` | `src/pollypm/notifications.py` | Pre-unification notification helpers; real alerting now lives in `storage/state.py`. Mostly compat shim. | — |
+| `state_epoch.py` | `src/pollypm/state_epoch.py` | 32-line monotonic counter with no clear home; could move into `storage/` or `config.py`. | — |
+| `notification_staging.py` | `src/pollypm/notification_staging.py` | Staging buffer that survived the unified-messages migration; evaluate for removal. | — |
+| CLI feature bodies | `src/pollypm/cli_features/*.py` | Several subcommand bodies carry service logic (issue sync, project listing) that should be extracted into named service classes. | — |
+| Config layering | `src/pollypm/config.py`, `config_patches.py`, `defaults/`, `models.py` | Four places define defaults + overrides; warrants a unified `config/` package. | — |
+| Heartbeat split | `src/pollypm/heartbeat/` vs `heartbeats/` | Two sibling directories (sealed tick + legacy backend); remove the legacy one once the sealed rail is fully live. | — |
+| `itsalive.py` | `src/pollypm/itsalive.py` | Top-level integration file that mirrors behavior in `plugins_builtin/itsalive/`; pick one canonical home. | — |
 
 ## Writing a Plugin
 

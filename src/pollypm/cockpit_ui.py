@@ -526,7 +526,18 @@ class PollyCockpitApp(App[None]):
         _action_view_alerts(self)
 
     def _start_core_rail(self) -> None:
-        """Start the process-wide HeartbeatRail via the supervisor, best-effort."""
+        """Start the process-wide HeartbeatRail via the supervisor, best-effort.
+
+        Skips the start when a headless ``pollypm.rail_daemon`` is
+        already running (tracked via ``~/.pollypm/rail_daemon.pid``).
+        Otherwise we'd run two HeartbeatRails in parallel — the
+        daemon's and the cockpit's — racing each other on the same
+        state.db, doubling heartbeat sweeps, and burning CPU in a
+        busy-contention loop. That's the failure mode that pinned
+        ``pm cockpit`` at ~200% CPU for hours on 2026-04-20.
+        """
+        if self._rail_daemon_alive():
+            return
         try:
             supervisor = self.router._load_supervisor()
         except Exception:  # noqa: BLE001
@@ -539,6 +550,31 @@ class PollyCockpitApp(App[None]):
         except Exception:  # noqa: BLE001
             # Already logged by CoreRail; swallow so the TUI still mounts.
             pass
+
+    def _rail_daemon_alive(self) -> bool:
+        """True iff the headless rail daemon currently holds its PID file."""
+        import os as _os
+        from pathlib import Path as _Path
+
+        pid_path = _Path.home() / ".pollypm" / "rail_daemon.pid"
+        if not pid_path.exists():
+            return False
+        try:
+            pid = int(pid_path.read_text().strip())
+        except (ValueError, OSError):
+            return False
+        if pid <= 0:
+            return False
+        try:
+            _os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            # Stale PID file — let the daemon's own cleanup clear it
+            # next run; we just report "not alive" for this boot.
+            return False
+        except PermissionError:
+            # Different user owns the PID — treat as alive from our POV.
+            return True
 
     def _enforce_rail_width_once(self) -> None:
         try:

@@ -1667,10 +1667,15 @@ class Supervisor:
         storage = self.storage_closet_session_name()
         storage_target = f"{storage}:{launch.window_name}"
         # Check if the window exists in the storage closet
-        if self.session_service.tmux.has_session(storage):
-            windows = {w.name for w in self.session_service.tmux.list_windows(storage)}
-            if launch.window_name in windows:
-                return storage_target
+        if not self.session_service.tmux.has_session(storage):
+            # Callers such as send_input still need the canonical target
+            # even when tmux has not been bootstrapped yet; let the
+            # downstream tmux call surface the concrete failure if the
+            # caller actually tries to use it before launch.
+            return storage_target
+        windows = {w.name for w in self.session_service.tmux.list_windows(storage)}
+        if launch.window_name in windows:
+            return storage_target
         # Not in storage — check if it's mounted in the cockpit
         cockpit_session = self.config.project.tmux_session
         state_path = self.config.project.base_dir / "cockpit_state.json"

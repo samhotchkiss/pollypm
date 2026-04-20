@@ -16,12 +16,12 @@ from pollypm.worktrees import ensure_worktree
 
 def _effective_control_accounts(config_path: Path) -> set[str]:
     config = load_config(config_path)
-    store = StateStore(config.project.state_db)
     accounts = {config.pollypm.controller_account}
-    for session_name in ("heartbeat", "operator"):
-        runtime = store.get_session_runtime(session_name)
-        if runtime is not None and runtime.effective_account:
-            accounts.add(runtime.effective_account)
+    with StateStore(config.project.state_db) as store:
+        for session_name in ("heartbeat", "operator"):
+            runtime = store.get_session_runtime(session_name)
+            if runtime is not None and runtime.effective_account:
+                accounts.add(runtime.effective_account)
     return {name for name in accounts if name}
 
 
@@ -30,8 +30,8 @@ def _account_is_available(config_path: Path, account_name: str) -> bool:
     account = config.accounts[account_name]
     if not detect_logged_in(account):
         return False
-    store = StateStore(config.project.state_db)
-    runtime = store.get_account_runtime(account_name)
+    with StateStore(config.project.state_db) as store:
+        runtime = store.get_account_runtime(account_name)
     if runtime is not None and runtime.status in {"auth-broken", "exhausted", "provider_outage", "blocked"}:
         return False
     return True

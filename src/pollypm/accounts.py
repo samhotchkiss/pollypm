@@ -293,17 +293,17 @@ def probe_account_usage(config_path: Path, identifier: str) -> AccountStatus:
         else:
             health = default_health
             usage_summary = f"usage refresh failed · {raw_text}"
-    store = StateStore(config.project.state_db)
-    store.upsert_account_usage(
-        account_name=account_name,
-        provider=account.provider.value,
-        plan=plan,
-        health=health if health != "unknown" else default_health,
-        usage_summary=usage_summary if usage_summary != "usage unavailable" else default_summary,
-        raw_text=raw_text,
-    )
-    cached = store.get_account_usage(account_name)
-    runtime = store.get_account_runtime(account_name)
+    with StateStore(config.project.state_db) as store:
+        store.upsert_account_usage(
+            account_name=account_name,
+            provider=account.provider.value,
+            plan=plan,
+            health=health if health != "unknown" else default_health,
+            usage_summary=usage_summary if usage_summary != "usage unavailable" else default_summary,
+            raw_text=raw_text,
+        )
+        cached = store.get_account_usage(account_name)
+        runtime = store.get_account_runtime(account_name)
     isolation_status, isolation_summary, isolation_recommendation, auth_storage, profile_root = inspect_account_isolation(
         account
     )
@@ -335,42 +335,42 @@ def probe_account_usage(config_path: Path, identifier: str) -> AccountStatus:
 
 def list_account_statuses(config_path: Path) -> list[AccountStatus]:
     config = load_config(config_path)
-    store = StateStore(config.project.state_db)
     items: list[AccountStatus] = []
-    for key, account in config.accounts.items():
-        plan, health, usage_summary = _account_usage_summary(account)
-        cached = store.get_account_usage(key)
-        runtime = store.get_account_runtime(key)
-        logged_in = _effective_logged_in(
-            account,
-            cached_health=(cached.health if cached else None),
-            runtime_status=(runtime.status if runtime else None),
-        )
-        isolation_status, isolation_summary, isolation_recommendation, auth_storage, profile_root = inspect_account_isolation(
-            account
-        )
-        items.append(
-            AccountStatus(
-                key=key,
-                provider=account.provider,
-                email=account.email or key,
-                home=account.home,
-                logged_in=logged_in,
-                plan=cached.plan if cached else plan,
-                health=runtime.status if runtime and runtime.status != "healthy" else (cached.health if cached else health),
-                usage_summary=cached.usage_summary if cached else usage_summary,
-                reason=runtime.reason if runtime else "",
-                available_at=runtime.available_at if runtime else None,
-                access_expires_at=runtime.access_expires_at if runtime else None,
-                usage_updated_at=cached.updated_at if cached else None,
-                usage_raw_text=cached.raw_text if cached else "",
-                isolation_status=isolation_status,
-                isolation_summary=isolation_summary,
-                isolation_recommendation=isolation_recommendation,
-                auth_storage=auth_storage,
-                profile_root=profile_root,
+    with StateStore(config.project.state_db) as store:
+        for key, account in config.accounts.items():
+            plan, health, usage_summary = _account_usage_summary(account)
+            cached = store.get_account_usage(key)
+            runtime = store.get_account_runtime(key)
+            logged_in = _effective_logged_in(
+                account,
+                cached_health=(cached.health if cached else None),
+                runtime_status=(runtime.status if runtime else None),
             )
-        )
+            isolation_status, isolation_summary, isolation_recommendation, auth_storage, profile_root = inspect_account_isolation(
+                account
+            )
+            items.append(
+                AccountStatus(
+                    key=key,
+                    provider=account.provider,
+                    email=account.email or key,
+                    home=account.home,
+                    logged_in=logged_in,
+                    plan=cached.plan if cached else plan,
+                    health=runtime.status if runtime and runtime.status != "healthy" else (cached.health if cached else health),
+                    usage_summary=cached.usage_summary if cached else usage_summary,
+                    reason=runtime.reason if runtime else "",
+                    available_at=runtime.available_at if runtime else None,
+                    access_expires_at=runtime.access_expires_at if runtime else None,
+                    usage_updated_at=cached.updated_at if cached else None,
+                    usage_raw_text=cached.raw_text if cached else "",
+                    isolation_status=isolation_status,
+                    isolation_summary=isolation_summary,
+                    isolation_recommendation=isolation_recommendation,
+                    auth_storage=auth_storage,
+                    profile_root=profile_root,
+                )
+            )
     return items
 
 

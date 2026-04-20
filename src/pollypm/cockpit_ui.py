@@ -76,6 +76,7 @@ from pollypm.cockpit_palette import (
 )
 from pollypm.cockpit_workers import PollyWorkerRosterApp
 from pollypm.service_api import PollyPMService
+from pollypm.session_services import create_tmux_client
 from pollypm.cockpit import (
     CockpitItem,
     CockpitRouter,
@@ -1362,6 +1363,47 @@ class PollyTasksApp(App[None]):
             return None
         return SQLiteWorkService(db_path=db_path, project_path=project.path)
 
+    def _format_stage_label(self, task, flow) -> str:
+        node_id = getattr(task, "current_node_id", None)
+        if not node_id:
+            return "—"
+        if flow is None:
+            return str(node_id)
+        node = getattr(flow, "nodes", {}).get(node_id)
+        if node is None:
+            return str(node_id)
+        parts = [str(node_id)]
+        node_type = getattr(getattr(node, "type", None), "value", None) or getattr(node, "type", None)
+        if node_type:
+            parts.append(str(node_type))
+        actor = (
+            getattr(node, "actor_role", None)
+            or getattr(node, "agent_name", None)
+            or getattr(getattr(node, "actor_type", None), "value", None)
+            or getattr(node, "actor_type", None)
+        )
+        if actor:
+            parts.append(str(actor))
+        return " · ".join(parts)
+
+    def _format_event_time(self, value) -> str:
+        if not value:
+            return ""
+        iso = value.isoformat() if hasattr(value, "isoformat") else str(value)
+        return _fmt_time(iso)
+
+    def _peek_session_tail(self, pane_id: str | None) -> list[str]:
+        if not pane_id:
+            return []
+        try:
+            pane_text = create_tmux_client().capture_pane(pane_id, lines=12)
+        except Exception:  # noqa: BLE001
+            return []
+        lines = [line.rstrip() for line in pane_text.splitlines()]
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return lines[-8:]
+
     def _refresh_list(self) -> None:
         svc = self._get_svc()
         lv = self.query_one("#task-list", ListView)
@@ -1397,7 +1439,7 @@ class PollyTasksApp(App[None]):
             icon = self._STATUS_ICONS.get(t.work_status.value, "·")
             assignee = f" [{t.assignee}]" if t.assignee else ""
             label = f"  {icon} #{t.task_number} {t.title}{assignee}"
-            item = ListItem(Static(label), id=f"task-{t.project}-{t.task_number}")
+            item = ListItem(Static(label))
             item._task_id = t.task_id  # type: ignore[attr-defined]
             lv.append(item)
 
@@ -1408,9 +1450,19 @@ class PollyTasksApp(App[None]):
             for t in completed[:10]:
                 icon = self._STATUS_ICONS.get(t.work_status.value, "·")
                 label = f"  {icon} #{t.task_number} {t.title}"
-                item = ListItem(Static(label), id=f"task-{t.project}-{t.task_number}")
+                item = ListItem(Static(label))
                 item._task_id = t.task_id  # type: ignore[attr-defined]
                 lv.append(item)
+
+        if self._selected_task_id is None:
+            return
+        if any(getattr(t, "task_id", None) == self._selected_task_id for t in self._tasks):
+            self._show_detail(self._selected_task_id)
+            return
+        self.query_one("#task-detail", Static).update("")
+        self.query_one("#task-detail-scroll").remove_class("visible")
+        self.query_one("#task-list", ListView).styles.display = "block"
+        self._selected_task_id = None
 
     @on(ListView.Selected)
     def _on_task_selected(self, event: ListView.Selected) -> None:
@@ -1429,17 +1481,27 @@ class PollyTasksApp(App[None]):
             task.context = svc.get_context(task_id, limit=10)
             task.executions = svc.get_execution(task_id)
             owner = svc.derive_owner(task)
+            try:
+                flow = svc.get_flow(task.flow_template_id, project=task.project)
+            except Exception:  # noqa: BLE001
+                flow = None
+            active_session = svc.get_worker_session(
+                task_project=task.project,
+                task_number=task.task_number,
+                active_only=True,
+            )
         finally:
             svc.close()
 
         icon = self._STATUS_ICONS.get(task.work_status.value, "·")
+        stage_label = self._format_stage_label(task, flow)
         lines = [
             f"{icon} #{task.task_number} {task.title}",
             "",
             f"  Status    {task.work_status.value}",
             f"  Priority  {task.priority.value}",
             f"  Flow      {task.flow_template_id}",
-            f"  Node      {task.current_node_id or '—'}",
+            f"  Stage     {stage_label}",
             f"  Owner     {owner or '—'}",
         ]
         if task.roles:
@@ -1447,6 +1509,8 @@ class PollyTasksApp(App[None]):
             lines.append(f"  Roles     {roles}")
         if task.assignee:
             lines.append(f"  Assignee  {task.assignee}")
+        if active_session is not None:
+            lines.append(f"  Session   {active_session.agent_name}")
         # Per-task token usage aggregated across worker sessions (#86).
         tokens_in = getattr(task, "total_input_tokens", 0) or 0
         tokens_out = getattr(task, "total_output_tokens", 0) or 0
@@ -1478,6 +1542,27 @@ class PollyTasksApp(App[None]):
                 # Node label with visit
                 visit_label = f" (attempt {ex.visit})" if ex.visit > 1 else ""
                 line = f"  {marker} {ex.node_id}{visit_label}"
+                time_bits: list[str] = []
+                if status == "active":
+                    started = self._format_event_time(ex.started_at)
+                    if started:
+                        time_bits.append(f"started {started}")
+                    started_rel = _format_relative_age(ex.started_at)
+                    if started_rel:
+                        time_bits.append(started_rel)
+                else:
+                    completed = self._format_event_time(ex.completed_at)
+                    if completed:
+                        time_bits.append(completed)
+                    completed_rel = _format_relative_age(ex.completed_at)
+                    if completed_rel:
+                        time_bits.append(completed_rel)
+                    elif not completed:
+                        started = self._format_event_time(ex.started_at)
+                        if started:
+                            time_bits.append(started)
+                if time_bits:
+                    line += f" — {' · '.join(time_bits)}"
                 # Add decision info
                 if ex.decision:
                     dec = ex.decision.value if hasattr(ex.decision, "value") else ex.decision
@@ -1502,6 +1587,29 @@ class PollyTasksApp(App[None]):
                             if kind and desc:
                                 lines.append(f"    · {kind}: {desc}")
                 lines.append("")
+
+        if active_session is not None:
+            lines.extend(["", "── Live Session ────────────────────────", ""])
+            lines.append(f"  Session   {active_session.agent_name}")
+            if active_session.branch_name:
+                lines.append(f"  Branch    {active_session.branch_name}")
+            if active_session.worktree_path:
+                lines.append(f"  Worktree  {active_session.worktree_path}")
+            started = self._format_event_time(active_session.started_at)
+            started_rel = _format_relative_age(active_session.started_at)
+            if started:
+                started_line = f"  Started   {started}"
+                if started_rel:
+                    started_line += f" · {started_rel}"
+                lines.append(started_line)
+            peek_lines = self._peek_session_tail(active_session.pane_id)
+            if peek_lines:
+                lines.append("  Peek")
+                lines.append("")
+                for peek_line in peek_lines:
+                    lines.append(f"    {peek_line}")
+            else:
+                lines.append("  Peek      unavailable")
 
         # Context log
         if task.context:

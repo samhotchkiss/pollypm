@@ -20,6 +20,8 @@ graph TB
         Inbox["Inbox v2<br/>Threaded messages"]
         Config["Config<br/>TOML resolution"]
         TmuxClient["Tmux Client<br/>Session · window · pane mgmt"]
+        RailDaemon["Rail Daemon<br/>Headless heartbeat + recovery<br/>(survives cockpit close)"]
+        ArchitectLifecycle["Architect Lifecycle<br/>2h-idle close +<br/>warm resume"]
     end
 
     subgraph PluginHost["Plugin Host"]

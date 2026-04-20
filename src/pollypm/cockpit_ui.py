@@ -490,6 +490,11 @@ class PollyCockpitApp(App[None]):
         self._tick_count = 0
         self._last_nav_change = -10  # last tick when user navigated
         self._last_epoch_mtime = 0.0  # state epoch mtime for change detection
+        # Tick index of the last full ``_refresh_rows`` — used by the
+        # rate-limited refresh gate so high-frequency epoch bumps
+        # (heartbeats + token samples commit ~10/sec) don't cause the
+        # visible row flash Sam reported on 2026-04-20.
+        self._last_refresh_tick = -10
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -603,12 +608,27 @@ class PollyCockpitApp(App[None]):
         # Periodic GC
         if self._tick_count % self._GC_INTERVAL == 0:
             gc.collect()
-        # Check if state changed (one stat() call — no subprocess, no FD leak)
+        # Check if state changed (one stat() call — no subprocess, no FD leak).
+        #
+        # Every StateStore.commit() bumps the epoch — heartbeats,
+        # token samples, event rows, checkpoints. At the 10s heartbeat
+        # cadence, that's ~10 bumps/sec across a live install, and
+        # blindly calling ``_refresh_rows`` on every bump caused the
+        # visible flash Sam reported on 2026-04-20. Throttle to at
+        # most one full refresh per 2 seconds; between refreshes we
+        # still pick up individual bumps for the spinner-only update
+        # path below, which is cheap and doesn't reflow the list.
         from pollypm.state_epoch import mtime as epoch_mtime
         current_epoch = epoch_mtime()
         state_changed = current_epoch != self._last_epoch_mtime
-        if state_changed:
+        refresh_gate_ticks = 3  # 3 * 0.8s = ~2.4s minimum between refreshes
+        gated = (
+            state_changed
+            and (self._tick_count - self._last_refresh_tick) < refresh_gate_ticks
+        )
+        if state_changed and not gated:
             self._last_epoch_mtime = current_epoch
+            self._last_refresh_tick = self._tick_count
             try:
                 self._refresh_rows()
             except Exception:  # noqa: BLE001

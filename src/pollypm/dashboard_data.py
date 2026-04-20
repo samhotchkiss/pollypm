@@ -168,7 +168,15 @@ def _session_description(status: str, role: str, snapshot_path: str | None) -> s
     if status == "waiting_on_user":
         return "waiting for your input"
     if status == "healthy":
-        return "working"
+        # Use ``idle`` instead of ``working`` — the rail spinner
+        # activates on any label ending in ``working``, so mapping
+        # the catchall healthy case to ``working`` made Polly's
+        # spinner spin forever whenever she wasn't mid-turn (2026-04-20
+        # desktop screenshot). ``idle`` reads better in the UI and
+        # correctly pauses the spinner until Claude Code itself
+        # reports a ``Working (Nm)`` line in the pane snapshot
+        # (detected above).
+        return "idle"
     if status == "needs_followup":
         return "in progress"
     return status

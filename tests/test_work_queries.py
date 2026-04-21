@@ -40,6 +40,14 @@ def _queue_task(svc, task):
     return svc.queue(task.task_id, "tester")
 
 
+def _work_output_payload(summary="done"):
+    return {
+        "type": "code_change",
+        "summary": summary,
+        "artifacts": [{"kind": "note", "description": summary}],
+    }
+
+
 # ---------------------------------------------------------------------------
 # next() tests
 # ---------------------------------------------------------------------------
@@ -151,6 +159,82 @@ class TestMyTasks:
         bob_tasks = svc.my_tasks("bob")
         assert len(bob_tasks) == 1
         assert bob_tasks[0].title == "Worker2 task"
+
+    def test_my_tasks_hands_off_to_reviewer_after_node_done(self, svc):
+        task = _create_task(
+            svc,
+            title="Handoff task",
+            roles={"worker": "alice", "reviewer": "bob"},
+        )
+        _queue_task(svc, task)
+        svc.claim(task.task_id, "alice")
+
+        svc.node_done(task.task_id, "alice", work_output=_work_output_payload("worker complete"))
+
+        reloaded = svc.get(task.task_id)
+        assert reloaded.current_node_id == "code_review"
+        assert reloaded.assignee == "bob"
+        assert [t.task_id for t in svc.my_tasks("alice")] == []
+        assert [t.task_id for t in svc.my_tasks("bob")] == [task.task_id]
+
+    def test_my_tasks_hands_back_to_worker_after_reject(self, svc):
+        task = _create_task(
+            svc,
+            title="Reject loop task",
+            roles={"worker": "alice", "reviewer": "bob"},
+        )
+        _queue_task(svc, task)
+        svc.claim(task.task_id, "alice")
+        svc.node_done(task.task_id, "alice", work_output=_work_output_payload("ready for review"))
+
+        svc.reject(task.task_id, "bob", "needs changes")
+
+        reloaded = svc.get(task.task_id)
+        assert reloaded.current_node_id == "implement"
+        assert reloaded.assignee == "alice"
+        assert [t.task_id for t in svc.my_tasks("alice")] == [task.task_id]
+        assert [t.task_id for t in svc.my_tasks("bob")] == []
+
+    def test_my_tasks_filters_rows_before_hydration(self, svc, monkeypatch):
+        tasks = [
+            _create_task(
+                svc,
+                title="Alice task",
+                roles={"worker": "alice", "reviewer": "reviewer-a"},
+            ),
+            _create_task(
+                svc,
+                title="Bob task",
+                roles={"worker": "bob", "reviewer": "reviewer-b"},
+            ),
+            _create_task(
+                svc,
+                title="Carol task",
+                roles={"worker": "carol", "reviewer": "reviewer-c"},
+            ),
+        ]
+        for task, actor in zip(tasks, ("alice", "bob", "carol"), strict=True):
+            _queue_task(svc, task)
+            svc.claim(task.task_id, actor)
+
+        hydrated: list[str] = []
+        original_row_to_task = svc._row_to_task
+
+        def counting_row_to_task(row, *args, **kwargs):
+            hydrated.append(f"{row['project']}/{row['task_number']}")
+            return original_row_to_task(row, *args, **kwargs)
+
+        monkeypatch.setattr(svc, "_row_to_task", counting_row_to_task)
+        monkeypatch.setattr(
+            svc,
+            "derive_owner",
+            lambda task: (_ for _ in ()).throw(AssertionError("derive_owner should not run")),
+        )
+
+        alice_tasks = svc.my_tasks("alice")
+
+        assert [task.task_id for task in alice_tasks] == [tasks[0].task_id]
+        assert hydrated == [tasks[0].task_id]
 
 
 # ---------------------------------------------------------------------------

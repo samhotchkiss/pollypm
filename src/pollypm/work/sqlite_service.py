@@ -723,6 +723,25 @@ class SQLiteWorkService:
     # Owner derivation
     # ------------------------------------------------------------------
 
+    def _resolve_node_assignee(
+        self, task: Task, node: FlowNode | None
+    ) -> str | None:
+        """Return the effective owner for ``node`` using ``task`` roles."""
+        if node is None:
+            return task.assignee
+
+        if node.actor_type == ActorType.ROLE:
+            return task.roles.get(node.actor_role or "", task.assignee)
+        if node.actor_type == ActorType.HUMAN:
+            return "human"
+        if node.actor_type == ActorType.PROJECT_MANAGER:
+            return "project_manager"
+        if node.actor_type == ActorType.AGENT:
+            # Fall back to the prior assignee only for legacy rows that
+            # predate stricter flow validation.
+            return node.agent_name or task.assignee
+        return task.assignee
+
     def derive_owner(self, task: Task) -> str | None:
         """Derive the current owner from the flow node's actor configuration."""
         if task.current_node_id is None:
@@ -742,18 +761,7 @@ class SQLiteWorkService:
         if node is None:
             return task.assignee
 
-        if node.actor_type == ActorType.ROLE:
-            return task.roles.get(node.actor_role or "", task.assignee)
-        elif node.actor_type == ActorType.HUMAN:
-            return "human"
-        elif node.actor_type == ActorType.PROJECT_MANAGER:
-            return "project_manager"
-        elif node.actor_type == ActorType.AGENT:
-            # Return the specific named agent from the flow YAML. Fall back
-            # to the assignee only if no agent_name was configured (which
-            # validate_flow now rejects, but guard anyway for legacy DBs).
-            return node.agent_name or task.assignee
-        return task.assignee
+        return self._resolve_node_assignee(task, node)
 
     # ------------------------------------------------------------------
     # Task CRUD
@@ -955,6 +963,8 @@ class SQLiteWorkService:
             task.flow_template_id, task.flow_template_version,
         )
         start_node = flow.start_node
+        start_node_cfg = flow.nodes.get(start_node)
+        assignee = self._resolve_node_assignee(task, start_node_cfg) or actor
         now = _now()
 
         try:
@@ -965,7 +975,7 @@ class SQLiteWorkService:
                 "WHERE project = ? AND task_number = ?",
                 (
                     WorkStatus.IN_PROGRESS.value,
-                    actor,
+                    assignee,
                     start_node,
                     now,
                     task.project,
@@ -1682,12 +1692,14 @@ class SQLiteWorkService:
             next_visit = max_visit_row["max_v"] + 1
 
             # Set status back to in_progress at the reject target
+            reject_assignee = self._resolve_node_assignee(task, reject_target)
             self._conn.execute(
-                "UPDATE work_tasks SET work_status = ?, "
+                "UPDATE work_tasks SET work_status = ?, assignee = ?, "
                 "current_node_id = ?, updated_at = ? "
                 "WHERE project = ? AND task_number = ?",
                 (
                     WorkStatus.IN_PROGRESS.value,
+                    reject_assignee,
                     node.reject_node_id,
                     now,
                     task.project,

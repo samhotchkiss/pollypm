@@ -41,6 +41,7 @@ from pollypm.cockpit_sections.health import (
 )
 from pollypm.cockpit_sections.in_flight import _section_in_flight
 from pollypm.cockpit_sections.insights import _section_insights
+from pollypm.cockpit_sections.just_shipped import _section_just_shipped
 from pollypm.cockpit_sections.project_dashboard import (
     _DASHBOARD_PROJECT_CACHE,
     _dashboard_project_tasks,
@@ -77,6 +78,7 @@ __all__ = [
     "_section_header",
     "_section_in_flight",
     "_section_insights",
+    "_section_just_shipped",
     "_section_quick_actions",
     "_section_recent",
     "_section_summary",

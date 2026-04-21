@@ -12,6 +12,7 @@ from pollypm.cockpit_sections.health import (
     format_project_health_scorecard,
     project_health_rank,
 )
+from pollypm.cockpit_sections.just_shipped import _section_just_shipped
 from pollypm.cockpit_sections.project_dashboard import (
     _DASHBOARD_PROJECT_CACHE,
     _dashboard_project_tasks,
@@ -179,6 +180,8 @@ def _build_dashboard(supervisor, config) -> str:
         if len(all_done) > 8:
             lines.append(f"    + {len(all_done) - 8} more completed")
         lines.append("")
+
+    lines.extend(_section_just_shipped(all_done, now=now))
 
     # ── System activity ──
     lines.append("  ─── Activity ──────────────────────────────────────")

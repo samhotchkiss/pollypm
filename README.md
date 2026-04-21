@@ -377,7 +377,7 @@ graph TD
 | Completion detection | Auto-trigger review when worker signals done | `src/pollypm/work/completion.py` | planned |
 | Triage sessions | Auto-created per-project triage agents | `src/pollypm/triage/` | planned |
 | Cost tracking | Token usage per task (not just session) | `src/pollypm/cost.py` | planned |
-| Live activity feed | Real-time cross-session view | `src/pollypm/activity_feed.py` | planned |
+| Live activity feed | Real-time cross-session view | `src/pollypm/plugins_builtin/activity_feed/plugin.py` | shipped |
 | Morning briefing | Delta-since-last-look report | `src/pollypm/briefing.py` | planned |
 | Proactive rollover | Session rollover at 90% usage | `src/pollypm/rollover.py` | planned |
 

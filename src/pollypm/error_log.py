@@ -36,6 +36,8 @@ import logging
 import os
 from pathlib import Path
 
+from pollypm.error_notifications import CriticalErrorNotificationHandler
+
 DEFAULT_LOG_FILENAME = "errors.log"
 DEFAULT_LEVEL = logging.WARNING
 _FORMAT = (
@@ -85,22 +87,25 @@ def install(
     root = logging.getLogger()
     # Don't stack handlers — a repeat install (cockpit boot after
     # ``pm up`` already installed for its CLI process) is a no-op.
-    if any(getattr(h, "_pollypm_error_handler", False) for h in root.handlers):
-        return
-    target = path or _log_path()
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        handler = logging.FileHandler(target, encoding="utf-8")
-    except Exception:  # noqa: BLE001
-        # Can't write the log file — don't take the whole process
-        # down over it. Callers still get stderr logging from their
-        # own basicConfig.
-        return
-    handler.setLevel(level)
-    handler.setFormatter(logging.Formatter(_FORMAT))
-    handler.addFilter(_ProcessTagFilter(process_label))
-    handler._pollypm_error_handler = True  # type: ignore[attr-defined]
-    root.addHandler(handler)
+    if not any(getattr(h, "_pollypm_error_handler", False) for h in root.handlers):
+        target = path or _log_path()
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            handler = logging.FileHandler(target, encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            # Can't write the log file — don't take the whole process
+            # down over it. Callers still get stderr logging from their
+            # own basicConfig.
+            return
+        handler.setLevel(level)
+        handler.setFormatter(logging.Formatter(_FORMAT))
+        handler.addFilter(_ProcessTagFilter(process_label))
+        handler._pollypm_error_handler = True  # type: ignore[attr-defined]
+        root.addHandler(handler)
+    if not any(getattr(h, "_pollypm_error_notification_handler", False) for h in root.handlers):
+        alert_handler = CriticalErrorNotificationHandler()
+        alert_handler._pollypm_error_notification_handler = True  # type: ignore[attr-defined]
+        root.addHandler(alert_handler)
     if root.level > level:
         root.setLevel(level)
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 import json
 import re
@@ -29,6 +30,15 @@ SECTION_ORDER = (
     "## Risks",
     "## Ideas",
 )
+SECTION_ITEM_LIMITS = {
+    "## Goals": 12,
+    "## Architecture Changes": 12,
+    "## Convention Shifts": 12,
+    "## Decisions": 20,
+    "## Risks": 12,
+    "## Ideas": 20,
+}
+KNOWLEDGE_LEDGER_DIR = ".pollypm/knowledge"
 
 
 @dataclass(slots=True)
@@ -72,6 +82,7 @@ def extract_knowledge_once(config) -> dict[str, int]:
             continue
         processed_events += len(events)
         delta = _extract_with_haiku_or_fallback(events)
+        _append_knowledge_ledger(project_root, delta)
         updated_docs += _apply_docs_delta(project_root, delta)
         memory_entries += _store_memory_entries(config, project_root, delta)
         log_entries += _append_activity_log(project_root, events)
@@ -523,6 +534,50 @@ def _apply_docs_delta(project_root: Path, delta: KnowledgeDelta) -> int:
     return updated
 
 
+def _append_knowledge_ledger(project_root: Path, delta: KnowledgeDelta) -> None:
+    """Persist extracted knowledge outside ``docs/`` as a bounded raw ledger."""
+    kind_map = {
+        "goals": delta.goals,
+        "architecture_changes": delta.architecture_changes,
+        "convention_shifts": delta.convention_shifts,
+        "decisions": delta.decisions,
+        "risks": delta.risks,
+        "ideas": delta.ideas,
+    }
+    base = project_root / KNOWLEDGE_LEDGER_DIR
+    base.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    for kind, items in kind_map.items():
+        cleaned = _sanitize_items(list(items))
+        if not cleaned:
+            continue
+        ledger_path = base / f"{kind}.jsonl"
+        seen: set[str] = set()
+        if ledger_path.exists():
+            for raw in ledger_path.read_text(encoding="utf-8").splitlines():
+                if not raw.strip():
+                    continue
+                try:
+                    payload = json.loads(raw)
+                except Exception:  # noqa: BLE001
+                    continue
+                item = str(payload.get("item", "")).strip()
+                if item:
+                    seen.add(item)
+        with ledger_path.open("a", encoding="utf-8") as handle:
+            for item in cleaned:
+                if item in seen:
+                    continue
+                handle.write(
+                    json.dumps(
+                        {"ts": timestamp, "kind": kind, "item": item},
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+                seen.add(item)
+
+
 def _update_doc(backend, name: str, title: str, updates: dict[str, list[str]]) -> bool:
     existing_entry = backend.read_document(name)
     existing = existing_entry.content if existing_entry else f"# {title}\n"
@@ -531,8 +586,9 @@ def _update_doc(backend, name: str, title: str, updates: dict[str, list[str]]) -
     for heading, items in updates.items():
         if not items:
             continue
-        current_items = _parse_bullets(sections.get(heading, ""))
-        merged = _dedupe(current_items + items)
+        current_items = _sanitize_items(_parse_bullets(sections.get(heading, "")))
+        merged = _dedupe(current_items + _sanitize_items(items))
+        merged = _trim_section_items(heading, merged)
         new_body = _render_bullets(merged)
         if sections.get(heading, "") != new_body:
             sections[heading] = new_body
@@ -585,13 +641,20 @@ def _render_bullets(items: list[str]) -> str:
     return "\n".join(f"- {item}" for item in items)
 
 
+def _trim_section_items(heading: str, items: list[str]) -> list[str]:
+    limit = SECTION_ITEM_LIMITS.get(heading)
+    if limit is None or len(items) <= limit:
+        return items
+    return items[-limit:]
+
+
 def _render_summary(sections: OrderedDict[str, str]) -> str:
     lines: list[str] = []
     for heading in SECTION_ORDER:
         items = _parse_bullets(sections.get(heading, ""))
         if not items or items == ["None yet."]:
             continue
-        lines.append(f"- {heading[3:]}: {items[0]}")
+        lines.append(f"- {heading[3:]}: {items[-1]}")
     return "\n".join(lines[:3]) or "- No extracted updates yet."
 
 

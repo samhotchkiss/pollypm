@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from pollypm.config import write_config
-from pollypm.knowledge_extract import extract_knowledge_once
+from pollypm.knowledge_extract import KNOWLEDGE_LEDGER_DIR, extract_knowledge_once
 from pollypm.models import AccountConfig, KnownProject, PollyPMConfig, PollyPMSettings, ProjectKind, ProjectSettings, ProviderKind, SessionConfig
 from pollypm.storage.state import StateStore
 
@@ -127,6 +127,9 @@ def test_knowledge_extraction_updates_docs_with_checkpointing(tmp_path: Path) ->
     assert "[redacted-secret]" not in risks
     assert "staging tokens must stay out of docs" in risks.lower()
     assert "consider a changelog digest" in ideas.lower()
+    ledger = config.project.root_dir / KNOWLEDGE_LEDGER_DIR / "decisions.jsonl"
+    assert ledger.exists()
+    assert "split the deployment pipeline" in ledger.read_text().lower()
     store = StateStore(config.project.state_db)
     memory_entries = store.list_memory_entries(scope=config.project.root_dir.name, limit=20)
     store.close()

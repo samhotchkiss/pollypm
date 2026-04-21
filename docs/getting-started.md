@@ -151,7 +151,7 @@ Rejection sends the task back to `in_progress` with your feedback attached — t
 - **[docs/morning-briefing-plugin-spec.md](morning-briefing-plugin-spec.md)** — the daily delta-since-last-look report.
 - **`pm activity --help`** — filtering and following the live event stream.
 - **`pm memory --help`** — the memory plugin for long-term context.
-- **[docs/plugin-authoring.md](plugin-authoring.md)** and **[docs/plugin-discovery-spec.md](plugin-discovery-spec.md)** — author your own provider, runtime, or profile plugin.
+- **[docs/plugin-authoring.md](plugin-authoring.md)** — the current starting point for authoring your own provider, runtime, or profile plugin. Use **[docs/plugin-discovery-spec.md](plugin-discovery-spec.md)** afterward when you need the detailed manifest/discovery rules.
 - **[docs/magic-skills.md](magic-skills.md)** — the starter catalog of reusable agent skills.
 - **[docs/project-overview.md](project-overview.md)** — the long-form generated project context after you already know your way around.
 

@@ -548,6 +548,17 @@ def _scan_source(config, account_name: str, account: AccountConfig, source: Tran
                     obj = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(obj, dict):
+                    logger.debug(
+                        "Skipping non-object transcript line",
+                        extra={
+                            "source_path": str(path),
+                            "source_offset": start_offset,
+                            "json_type": type(obj).__name__,
+                            "provider": account.provider.value,
+                        },
+                    )
+                    continue
                 if account.provider is ProviderKind.CLAUDE:
                     events = _normalize_claude_line(
                         obj,

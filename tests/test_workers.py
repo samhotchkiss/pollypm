@@ -14,6 +14,7 @@ from pollypm.models import (
 )
 from pollypm.storage.state import StateStore
 from pollypm.plugins_builtin.core_agent_profiles.profiles import polly_prompt as operator_prompt
+from pollypm.plugins_builtin.core_agent_profiles.profiles import triage_prompt
 from pollypm.workers import auto_select_worker_account, suggest_worker_prompt
 from pollypm.plugins_builtin.core_agent_profiles.profiles import worker_prompt
 
@@ -212,3 +213,10 @@ def test_operator_prompt_requires_delegation_instructions() -> None:
     assert "delegate" in prompt.lower()
     assert "pm" in prompt  # references pm commands
     assert "<principles>" in prompt
+
+
+def test_triage_prompt_points_at_inbox_cli() -> None:
+    prompt = triage_prompt()
+
+    assert "`pm inbox`" in prompt
+    assert "`pm mail`" not in prompt

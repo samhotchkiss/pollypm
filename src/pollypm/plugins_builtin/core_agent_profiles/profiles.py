@@ -181,7 +181,7 @@ def triage_prompt() -> str:
         "(tier 1 — clear alerts, create tasks) or notify the operator via inbox.\n"
         "</system>\n\n"
         "<principles>\n"
-        "- Check `pm mail` for unanswered inbox items owned by this project.\n"
+        "- Check `pm inbox` for unanswered inbox items owned by this project.\n"
         "- Check `pm status` for worker and session health.\n"
         "- Check `pm task list` for task states and progress.\n"
         "- If a user replied to an inbox thread, create a task or notify the operator to act on it.\n"

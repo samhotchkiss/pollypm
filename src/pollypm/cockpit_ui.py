@@ -1867,17 +1867,23 @@ def _settings_status_dot(health: str, logged_in: bool) -> tuple[str, str]:
 
 
 def _settings_dir_size(path: Path) -> int:
-    total = 0
     try:
-        for p in path.rglob("*"):
-            try:
-                if p.is_file():
-                    total += p.stat().st_size
-            except OSError:
-                continue
-    except OSError:
-        return 0
-    return total
+        result = subprocess.run(
+            ["du", "-sk", str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=0.75,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return -1
+    if result.returncode != 0:
+        return -1
+    try:
+        kib = int((result.stdout or "").strip().split()[0])
+    except (IndexError, ValueError):
+        return -1
+    return kib * 1024
 
 
 def _humanize_bytes(n: int) -> str:
@@ -1951,7 +1957,11 @@ def _gather_settings_data(
         if service is None:
             service = PollyPMService(config_path)
         try:
-            account_statuses = list(service.list_account_statuses())
+            list_cached = getattr(service, "list_cached_account_statuses", None)
+            if callable(list_cached):
+                account_statuses = list(list_cached())
+            else:
+                account_statuses = list(service.list_account_statuses())
         except Exception as exc:  # noqa: BLE001
             errors.append(f"Accounts unavailable: {exc}")
             account_statuses = []
@@ -2143,10 +2153,8 @@ def _gather_settings_data(
         sdb = getattr(project_settings, "state_db", None)
         if sdb is not None:
             about_section.append(("State DB", str(sdb)))
-    pollypm_dir = config_path.parent
-    disk = _settings_dir_size(pollypm_dir) if pollypm_dir.exists() else 0
     about_section.append(
-        (f"Disk usage ({pollypm_dir.name}/)", _humanize_bytes(disk))
+        (f"Disk usage ({config_path.parent.name}/)", "loading…")
     )
 
     return SettingsData(
@@ -2522,7 +2530,25 @@ class PollySettingsPaneApp(App[None]):
         elif key == "inbox":
             self._render_kv("Inbox & notifications", data.inbox)
         elif key == "about":
+            self._ensure_about_section_loaded()
             self._render_kv("About", data.about)
+
+    def _ensure_about_section_loaded(self) -> None:
+        data = self.data
+        if data is None:
+            return
+        label = f"Disk usage ({self.config_path.parent.name}/)"
+        for idx, (key, value) in enumerate(data.about):
+            if key != label or value != "loading…":
+                continue
+            disk = (
+                _settings_dir_size(self.config_path.parent)
+                if self.config_path.parent.exists()
+                else -1
+            )
+            rendered = _humanize_bytes(disk) if disk >= 0 else "unavailable"
+            data.about[idx] = (key, rendered)
+            break
 
     # ── Accounts ───────────────────────────────────────────────────
 

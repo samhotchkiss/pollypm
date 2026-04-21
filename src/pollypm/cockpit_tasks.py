@@ -9,6 +9,10 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, Static, TabbedContent, TabPane
 
+from pollypm.cockpit_task_review import (
+    load_task_review_artifact,
+    render_task_review_artifact,
+)
 from pollypm.config import load_config
 from pollypm.session_services import create_tmux_client
 from pollypm.tz import format_time as _fmt_time
@@ -410,12 +414,14 @@ class PollyTasksApp(App[None]):
     }
     #task-tabs { height: 1fr; }
     #task-detail-scroll,
+    #task-review-scroll,
     #task-context-scroll,
     #task-live-scroll {
         height: 1fr;
         overflow-y: auto;
     }
     #task-detail,
+    #task-review,
     #task-context,
     #task-live {
         padding: 0 1 1 1;
@@ -454,6 +460,7 @@ class PollyTasksApp(App[None]):
         self.task_table = DataTable(id="tasks-table", zebra_stripes=True)
         self.detail_header = Static("", id="task-header")
         self.detail_overview = Static("", id="task-detail")
+        self.detail_review = Static("", id="task-review")
         self.detail_context = Static("", id="task-context")
         self.detail_live = Static("", id="task-live")
         self.timeline = DataTable(id="task-timeline", zebra_stripes=True)
@@ -488,6 +495,9 @@ class PollyTasksApp(App[None]):
                         with TabPane("Overview", id="task-tab-overview"):
                             with VerticalScroll(id="task-detail-scroll"):
                                 yield self.detail_overview
+                        with TabPane("Review", id="task-tab-review"):
+                            with VerticalScroll(id="task-review-scroll"):
+                                yield self.detail_review
                         with TabPane("Timeline", id="task-tab-timeline"):
                             yield self.timeline
                         with TabPane("Context", id="task-tab-context"):
@@ -578,6 +588,7 @@ class PollyTasksApp(App[None]):
         self._selected_task_id = None
         self.detail_header.update(message)
         self.detail_overview.update("")
+        self.detail_review.update("")
         self.detail_context.update("")
         self.detail_live.update("")
         self.timeline.clear()
@@ -700,7 +711,18 @@ class PollyTasksApp(App[None]):
         self.reject_button.disabled = not in_review
         self.refresh_live_button.disabled = active_session is None
 
+    def _project_path(self) -> Path | None:
+        try:
+            config = load_config(self.config_path)
+        except Exception:  # noqa: BLE001
+            return None
+        project = getattr(config, "projects", {}).get(self.project_key)
+        if project is None:
+            return None
+        return getattr(project, "path", None)
+
     def _show_detail(self, task_id: str) -> None:
+        previous_task_id = self._selected_task_id
         svc = self._get_svc()
         if svc is None:
             self._set_detail_empty("Could not open the project work service.")
@@ -732,12 +754,21 @@ class PollyTasksApp(App[None]):
                 pass
         self._selected_task_id = task_id
         self._owner_by_task_id[task.task_id] = owner
+        review_artifact = load_task_review_artifact(task, self._project_path())
         self._render_selected_task(
             task,
             owner=owner,
             flow=flow,
             active_session=active_session,
         )
+        self.detail_review.update(render_task_review_artifact(review_artifact))
+        tabs = self.query_one("#task-tabs", TabbedContent)
+        if task_id != previous_task_id:
+            tabs.active = (
+                "task-tab-review"
+                if task.work_status.value == "review" and review_artifact is not None
+                else "task-tab-overview"
+            )
 
     def _background_refresh(self) -> None:
         try:

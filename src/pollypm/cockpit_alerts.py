@@ -14,6 +14,7 @@ Contract:
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 from textual.app import App
 from textual.binding import Binding
@@ -32,6 +33,8 @@ _ALERT_TOAST_SEVERITY_ICONS = {
     "info": "\U0001f535",
 }
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
 
 def _alert_toast_icon(severity: str) -> str:
     """Return the single-glyph icon for ``severity`` with a sane fallback."""
@@ -39,6 +42,19 @@ def _alert_toast_icon(severity: str) -> str:
         (severity or "").lower(),
         "\U0001f7e1",
     )
+
+
+def _alert_toast_width(*, host_width: int, preferred: int = 52) -> int:
+    """Clamp the toast width to the visible host budget."""
+    budget = max(18, int(host_width) - 2)
+    return min(preferred, budget)
+
+
+def _sanitize_alert_message(message: str) -> str:
+    """Strip terminal control sequences and collapse whitespace."""
+    text = _ANSI_ESCAPE_RE.sub("", message or "")
+    text = "".join(ch for ch in text if ch >= " " or ch in "\n\t")
+    return " ".join(text.split())
 
 
 class _AlertLikeRecord:
@@ -131,12 +147,14 @@ class AlertToast(Static):
         message: str,
         show_action_hint: bool = True,
         timeout_seconds: float | None = None,
+        width_chars: int | None = None,
     ) -> None:
         super().__init__(markup=True)
         self.alert_id = alert_id
         self.severity = (severity or "warn").lower()
         self.message = message or ""
         self.show_action_hint = show_action_hint
+        self.width_chars = width_chars
         self.timeout_seconds = (
             timeout_seconds
             if timeout_seconds is not None
@@ -152,7 +170,7 @@ class AlertToast(Static):
 
     def _render_body(self) -> str:
         icon = _alert_toast_icon(self.severity)
-        text = self.message.strip().replace("\n", " ")
+        text = _sanitize_alert_message(self.message)
         if len(text) > 60:
             text = text[:57] + "\u2026"
         body = f"{icon}  [b]{_escape_markup(text) or 'alert'}[/b]"
@@ -163,6 +181,11 @@ class AlertToast(Static):
         return body
 
     def on_mount(self) -> None:
+        if self.width_chars is not None:
+            try:
+                self.styles.width = self.width_chars
+            except Exception:  # noqa: BLE001
+                pass
         try:
             self.call_after_refresh(self._start_dismiss_timer)
         except Exception:  # noqa: BLE001
@@ -318,12 +341,18 @@ class AlertNotifier:
         container = self._container
         if container is None:
             return None
+        host_width = getattr(getattr(container, "size", None), "width", 0) or getattr(
+            self.app.size,
+            "width",
+            52,
+        )
         toast = AlertToast(
             alert_id=getattr(record, "alert_id", None),
             severity=getattr(record, "severity", "warn"),
             message=getattr(record, "message", "")
             or getattr(record, "alert_type", ""),
             show_action_hint=self.bind_a,
+            width_chars=_alert_toast_width(host_width=host_width),
         )
         try:
             container.mount(toast)

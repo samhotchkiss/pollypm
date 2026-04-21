@@ -277,6 +277,46 @@ def test_task_app_surfaces_stage_timestamps_and_live_session_tabs(env, monkeypat
     _run(body())
 
 
+def test_plan_review_task_surfaces_plan_artifact_and_selects_review_tab(
+    env, monkeypatch,
+) -> None:
+    if not _load_config_compatible(env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_tasks import PollyTasksApp
+    from textual.widgets import TabbedContent
+
+    plan_path = env["project_path"] / "docs" / "project-plan.md"
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    plan_path.write_text("# Notesy Plan\n\nShip the review surface.\n")
+
+    review_task = _task(
+        node_id="critic_panel",
+        status=WorkStatus.REVIEW,
+        title="Review Notesy plan",
+    )
+    fake_svc = _FakeSvc(
+        tasks_factory=lambda: [review_task],
+        flow=_flow(),
+    )
+
+    monkeypatch.setattr("pollypm.cockpit_tasks.create_tmux_client", lambda: _FakeTmux([]))
+
+    app = PollyTasksApp(env["config_path"], "demo")
+    app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            tabs = app.query_one("#task-tabs", TabbedContent)
+            review = str(app.query_one("#task-review", Static).render())
+            assert tabs.active == "task-tab-review"
+            assert "Review Artifact" in review
+            assert "docs/project-plan.md" in review
+            assert "Ship the review surface." in review
+
+    _run(body())
+
+
 def test_task_app_refresh_preserves_selected_task_and_updates_tabs(env, monkeypatch) -> None:
     if not _load_config_compatible(env["config_path"]):
         pytest.skip("minimal pollypm.toml fixture not supported by loader")

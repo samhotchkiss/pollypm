@@ -161,6 +161,41 @@ def test_toast_renders_for_new_alert(inbox_env, inbox_app) -> None:
     _run(body())
 
 
+def test_warn_toast_width_respects_narrow_host(inbox_env) -> None:
+    if not _load_config_compatible(inbox_env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_ui import PollyCockpitApp
+
+    app = PollyCockpitApp(inbox_env["config_path"])
+
+    async def body() -> None:
+        async with app.run_test(size=(30, 24)) as pilot:
+            await pilot.pause()
+            notifier = app._alert_notifier
+            assert notifier is not None
+            _install_fake_alerts(
+                notifier,
+                [
+                    _FakeAlert(
+                        alert_id=11,
+                        severity="warn",
+                        message="[Alert] Additional work remains — \x1b[2C\x1b[38;5;246m?\x1b[1Cfor\x1b[1Cshortcuts\x1b[39m",
+                    ),
+                ],
+            )
+            mounted = notifier.poll_now()
+            await pilot.pause()
+            assert len(mounted) == 1
+            toast = mounted[0]
+            assert toast.has_class("severity-warn")
+            assert toast.size.width <= 28
+            rendered = str(toast.render())
+            assert "Additional work remains" in rendered
+            assert "\x1b" not in rendered
+
+    _run(body())
+
+
 # ---------------------------------------------------------------------------
 # 2. Auto-dismisses after timeout
 # ---------------------------------------------------------------------------

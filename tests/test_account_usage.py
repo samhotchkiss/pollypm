@@ -2,6 +2,7 @@ from pathlib import Path
 
 from pollypm.accounts import (
     inspect_account_isolation,
+    list_cached_account_statuses,
     list_account_statuses,
     probe_account_usage,
 )
@@ -205,3 +206,66 @@ def test_list_account_statuses_closes_state_store(monkeypatch, tmp_path: Path) -
     assert len(statuses) == 1
     assert created
     assert all(store.closed for store in created)
+
+
+def test_list_cached_account_statuses_avoids_live_probes(monkeypatch, tmp_path: Path) -> None:
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm" / "state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="claude_primary"),
+        accounts={
+            "claude_primary": AccountConfig(
+                name="claude_primary",
+                provider=ProviderKind.CLAUDE,
+                email="claude@example.com",
+                runtime=RuntimeKind.LOCAL,
+                home=tmp_path / ".pollypm/homes/claude_primary",
+            )
+        },
+        sessions={},
+        projects={},
+    )
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path)
+
+    class FakeStore:
+        def __init__(self, _db_path: Path) -> None:
+            self.closed = False
+
+        def __enter__(self) -> "FakeStore":
+            return self
+
+        def __exit__(self, *args) -> None:
+            self.close()
+
+        def close(self) -> None:
+            self.closed = True
+
+        def get_account_usage(self, key: str):
+            del key
+            return None
+
+        def get_account_runtime(self, key: str):
+            del key
+            return None
+
+    probe_flags: list[bool] = []
+
+    def fake_effective_logged_in(*args, probe_live: bool = True, **kwargs):
+        del args, kwargs
+        probe_flags.append(probe_live)
+        return True
+
+    monkeypatch.setattr("pollypm.accounts.StateStore", FakeStore)
+    monkeypatch.setattr("pollypm.accounts._account_usage_summary", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("live probe should not run")))
+    monkeypatch.setattr("pollypm.accounts._effective_logged_in", fake_effective_logged_in)
+
+    statuses = list_cached_account_statuses(config_path)
+
+    assert len(statuses) == 1
+    assert probe_flags == [False]

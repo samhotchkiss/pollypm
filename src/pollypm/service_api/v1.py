@@ -22,6 +22,7 @@ from pathlib import Path
 from pollypm.accounts import (
     AccountStatus,
     add_account_via_login,
+    list_cached_account_statuses,
     list_account_statuses,
     relogin_account,
     remove_account,
@@ -133,6 +134,10 @@ class PollyPMService:
     def list_account_statuses(self) -> list[AccountStatus]:
         """Return live status (logged-in / expired / etc.) for every configured account."""
         return list_account_statuses(self.config_path)
+
+    def list_cached_account_statuses(self) -> list[AccountStatus]:
+        """Return cached account status for fast interactive views."""
+        return list_cached_account_statuses(self.config_path)
 
     def create_and_launch_worker(
         self,

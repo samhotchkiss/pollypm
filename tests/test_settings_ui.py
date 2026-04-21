@@ -126,8 +126,17 @@ class _FakeService:
         self.permissions_calls: list[bool] = []
         self.tracked_calls: list[tuple[str, bool]] = []
         self.controller_calls: list[str] = []
+        self.cached_calls = 0
+        self.live_calls = 0
 
     def list_account_statuses(self):
+        self.live_calls += 1
+        # Return a copy each call so a test can mutate the source list
+        # between refreshes to exercise the R keybinding reload path.
+        return list(self._statuses)
+
+    def list_cached_account_statuses(self):
+        self.cached_calls += 1
         # Return a copy each call so a test can mutate the source list
         # between refreshes to exercise the R keybinding reload path.
         return list(self._statuses)
@@ -379,6 +388,36 @@ def test_r_refresh_reloads_account_data(settings_env) -> None:
     _run(body())
 
 
+def test_settings_prefers_cached_account_status_snapshot(settings_env) -> None:
+    app = settings_env["app"]
+    service = settings_env["service"]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            assert service.cached_calls >= 1
+            assert service.live_calls == 0
+
+    _run(body())
+
+
+def test_settings_mount_skips_disk_usage_probe(settings_env, monkeypatch) -> None:
+    app = settings_env["app"]
+
+    def _fail(_path: Path) -> int:
+        raise AssertionError("disk usage probe should not run during mount")
+
+    monkeypatch.setattr("pollypm.cockpit_ui._settings_dir_size", _fail)
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            assert app.data is not None
+            assert app._active_section == "accounts"
+
+    _run(body())
+
+
 def test_settings_reload_button_uses_cockpit_shell_reload(settings_env) -> None:
     app = settings_env["app"]
     calls: list[tuple[str, str | None, str | None]] = []
@@ -530,5 +569,23 @@ def test_about_section_lists_version_and_disk(settings_env) -> None:
             assert "PollyPM version" in kv_text
             assert "Python" in kv_text
             assert "Disk usage" in kv_text
+
+    _run(body())
+
+
+def test_about_section_loads_disk_usage_lazily(settings_env, monkeypatch) -> None:
+    app = settings_env["app"]
+    monkeypatch.setattr("pollypm.cockpit_ui._settings_dir_size", lambda _path: 2048)
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            for _ in range(6):
+                await pilot.press("tab")
+                await pilot.pause()
+            assert app._active_section == "about"
+            kv_text = str(app.kv_static.render())
+            assert "Disk usage" in kv_text
+            assert "2.0 KB" in kv_text
 
     _run(body())

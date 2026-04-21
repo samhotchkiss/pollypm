@@ -116,20 +116,67 @@ def _account_usage_summary(account: AccountConfig) -> tuple[str, str, str]:
     return ("unknown", "unknown", "unknown")
 
 
+def _cached_account_usage_summary(account: AccountConfig) -> tuple[str, str, str]:
+    """Return a fast local/default status summary without provider probes."""
+    if account.home is None:
+        return ("unknown", "missing-home", "not configured")
+
+    if account.provider is ProviderKind.CLAUDE:
+        credentials_path = claude_config_dir(account.home) / ".credentials.json"
+        if credentials_path.exists():
+            return ("unknown", "healthy", "logged in")
+        return ("unknown", "unknown", "status unavailable")
+
+    if account.provider is ProviderKind.CODEX:
+        auth_path = account.home / ".codex" / "auth.json"
+        if not auth_path.exists():
+            return ("signed-out", "signed-out", "signed out")
+        try:
+            data = json.loads(auth_path.read_text())
+            id_token = data.get("tokens", {}).get("id_token")
+            payload = (
+                _decode_jwt_payload(id_token)
+                if isinstance(id_token, str) and id_token.count(".") >= 2
+                else {}
+            )
+            auth_data = payload.get("https://api.openai.com/auth", {})
+            if not isinstance(auth_data, dict):
+                auth_data = {}
+            plan = str(auth_data.get("chatgpt_plan_type") or "logged in").lower()
+            return (plan, "healthy", plan)
+        except Exception:  # noqa: BLE001
+            return ("unknown", "auth-broken", "status unreadable")
+
+    return ("unknown", "unknown", "status unavailable")
+
+
 def _effective_logged_in(
     account: AccountConfig,
     *,
     cached_health: str | None = None,
     runtime_status: str | None = None,
+    probe_live: bool = True,
 ) -> bool:
-    from pollypm.acct import detect_logged_in
-
-    logged_in = detect_logged_in(account)
     if runtime_status in {"auth-broken", "signed-out"}:
         return False
     if cached_health in {"auth-broken", "signed-out"}:
         return False
-    return logged_in
+    if not probe_live:
+        if cached_health:
+            return True
+        if runtime_status:
+            return True
+        if account.home is None:
+            return False
+        if account.provider is ProviderKind.CLAUDE:
+            return bool(account.email)
+        if account.provider is ProviderKind.CODEX:
+            return (account.home / ".codex" / "auth.json").exists()
+        return False
+
+    from pollypm.acct import detect_logged_in
+
+    return detect_logged_in(account)
 
 
 def _codex_credentials_store(home: Path) -> str:
@@ -359,6 +406,56 @@ def list_account_statuses(config_path: Path) -> list[AccountStatus]:
                     plan=cached.plan if cached else plan,
                     health=runtime.status if runtime and runtime.status != "healthy" else (cached.health if cached else health),
                     usage_summary=cached.usage_summary if cached else usage_summary,
+                    reason=runtime.reason if runtime else "",
+                    available_at=runtime.available_at if runtime else None,
+                    access_expires_at=runtime.access_expires_at if runtime else None,
+                    usage_updated_at=cached.updated_at if cached else None,
+                    usage_raw_text=cached.raw_text if cached else "",
+                    isolation_status=isolation_status,
+                    isolation_summary=isolation_summary,
+                    isolation_recommendation=isolation_recommendation,
+                    auth_storage=auth_storage,
+                    profile_root=profile_root,
+                )
+            )
+    return items
+
+
+def list_cached_account_statuses(config_path: Path) -> list[AccountStatus]:
+    """Return a fast cached status snapshot suitable for interactive UIs.
+
+    This path does not shell out to provider CLIs. It reads the state-store
+    cache plus local profile files so cockpit screens can render immediately
+    even when a provider auth-status probe is slow or wedged.
+    """
+    config = load_config(config_path)
+    items: list[AccountStatus] = []
+    with StateStore(config.project.state_db) as store:
+        for key, account in config.accounts.items():
+            plan, default_health, default_summary = _cached_account_usage_summary(
+                account
+            )
+            cached = store.get_account_usage(key)
+            runtime = store.get_account_runtime(key)
+            logged_in = _effective_logged_in(
+                account,
+                cached_health=(cached.health if cached else None),
+                runtime_status=(runtime.status if runtime else None),
+                probe_live=False,
+            )
+            isolation_status, isolation_summary, isolation_recommendation, auth_storage, profile_root = inspect_account_isolation(
+                account
+            )
+            items.append(
+                AccountStatus(
+                    key=key,
+                    provider=account.provider,
+                    email=account.email or key,
+                    home=account.home,
+                    logged_in=logged_in,
+                    plan=cached.plan if cached else plan,
+                    health=runtime.status if runtime and runtime.status != "healthy" else (cached.health if cached else default_health),
+                    usage_summary=cached.usage_summary if cached else default_summary,
                     reason=runtime.reason if runtime else "",
                     available_at=runtime.available_at if runtime else None,
                     access_expires_at=runtime.access_expires_at if runtime else None,

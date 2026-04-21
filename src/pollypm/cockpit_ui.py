@@ -50,6 +50,8 @@ from textual.widgets import (
     TabPane,
 )
 
+from pollypm.cockpit_formatting import format_event_time
+from pollypm.cockpit_formatting import format_relative_age as _format_relative_age
 from pollypm.models import ProviderKind
 from pollypm.tz import format_time as _fmt_time
 from pollypm.cockpit_activity import (
@@ -1518,10 +1520,7 @@ class PollyTasksApp(App[None]):
         return " · ".join(parts)
 
     def _format_event_time(self, value) -> str:
-        if not value:
-            return ""
-        iso = value.isoformat() if hasattr(value, "isoformat") else str(value)
-        return _fmt_time(iso)
+        return format_event_time(value, formatter=_fmt_time)
 
     def _peek_session_tail(self, pane_id: str | None) -> list[str]:
         if not pane_id:
@@ -5820,27 +5819,6 @@ def _dashboard_plan_staleness(
     except Exception:  # noqa: BLE001
         return None
     return None
-
-
-def _format_relative_age(value) -> str:
-    """Relative-age formatting that tolerates missing / malformed inputs.
-
-    Accepts either an ISO-8601 string or a :class:`datetime` instance
-    (the work service surfaces both shapes depending on the call site).
-    """
-    if not value:
-        return ""
-    from datetime import datetime as _dt
-    iso_str: str
-    if isinstance(value, _dt):
-        iso_str = value.isoformat()
-    else:
-        iso_str = str(value)
-    try:
-        from pollypm.tz import format_relative
-        return format_relative(iso_str)
-    except Exception:  # noqa: BLE001
-        return iso_str[:16]
 
 
 def _dashboard_status(

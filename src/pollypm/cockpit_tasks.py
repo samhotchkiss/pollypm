@@ -13,6 +13,8 @@ from pollypm.cockpit_task_review import (
     load_task_review_artifact,
     render_task_review_artifact,
 )
+from pollypm.cockpit_formatting import format_event_time
+from pollypm.cockpit_formatting import format_relative_age as _format_relative_age
 from pollypm.config import load_config
 from pollypm.session_services import create_tmux_client
 from pollypm.tz import format_time as _fmt_time
@@ -37,27 +39,8 @@ _FILTER_LABELS = {
 }
 
 
-def _format_relative_age(value) -> str:
-    """Render a human age from a datetime or ISO string."""
-    if not value:
-        return ""
-    from datetime import datetime as _dt
-
-    iso_str = value.isoformat() if isinstance(value, _dt) else str(value)
-    try:
-        from pollypm.tz import format_relative
-
-        return format_relative(iso_str)
-    except Exception:  # noqa: BLE001
-        return iso_str[:16]
-
-
 def _format_event_time(value) -> str:
-    """Stable local timestamp formatting for task detail rows."""
-    if not value:
-        return ""
-    iso = value.isoformat() if hasattr(value, "isoformat") else str(value)
-    return _fmt_time(iso)
+    return format_event_time(value, formatter=_fmt_time)
 
 
 def _timestamp_sort_value(value) -> float:

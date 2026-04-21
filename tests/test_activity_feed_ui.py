@@ -4,7 +4,7 @@ Drives the new full-screen activity feed under Pilot to assert:
 
 1. Mounts with the global scope and shows the loaded entries.
 2. A project filter passed at construction narrows the feed.
-3. Actor and event-type filters apply to the in-memory window.
+3. The top search bar live-filters by worker, task id, and regex type match.
 4. Follow mode toggles a 2-second interval that prepends new rows.
 5. Event-type colours render for the catalogued kinds.
 6. Pressing Enter expands a row to a detail pane below the table.
@@ -75,10 +75,13 @@ def _make_entry(
     project: str | None = "demo",
     kind: str = "task.created",
     actor: str = "worker_demo",
+    subject: str | None = None,
     verb: str = "created",
     summary: str = "Built a thing",
     severity: str = "routine",
     timestamp: str | None = None,
+    payload: dict | None = None,
+    source: str = "events",
 ):
     """Build a :class:`FeedEntry` with sensible defaults for tests."""
     from pollypm.plugins_builtin.activity_feed.handlers.event_projector import (
@@ -92,17 +95,22 @@ def _make_entry(
         project=project,
         kind=kind,
         actor=actor,
-        subject=actor,
+        subject=actor if subject is None else subject,
         verb=verb,
         summary=summary,
         severity=severity,
-        payload={"hint": "synthetic"},
-        source="events",
+        payload={"hint": "synthetic"} if payload is None else payload,
+        source=source,
     )
 
 
 def _run(coro) -> None:
     asyncio.run(coro)
+
+
+def _apply_search(activity_app, query: str) -> None:
+    activity_app.filter_input.value = query
+    activity_app._set_search_query(query)
 
 
 @pytest.fixture
@@ -218,23 +226,84 @@ def test_type_filter_narrows_visible_rows(activity_env, activity_app) -> None:
     _run(body())
 
 
-def test_fuzzy_filter_matches_actor_and_summary(
+def test_search_input_filters_live_by_task_id_and_shows_match_count(
     activity_env, activity_app,
 ) -> None:
-    """Fuzzy text scans actor + verb + kind + summary + project."""
+    """The top search bar narrows by task ids and reports visible matches."""
     async def body() -> None:
         entries = [
-            _make_entry(entry_id="evt:1", actor="alpha", summary="apples"),
-            _make_entry(entry_id="evt:2", actor="bravo", summary="bananas"),
-            _make_entry(entry_id="evt:3", actor="charlie", summary="apples"),
+            _make_entry(
+                entry_id="wt:demo/42:1",
+                kind="task.approved",
+                actor="worker_alpha",
+                subject="demo/42",
+                verb="approved",
+                summary="Approved demo/42",
+                payload={"task_project": "demo", "task_number": 42},
+                source="work_transitions",
+            ),
+            _make_entry(entry_id="evt:2", actor="worker_bravo", summary="bananas"),
+            _make_entry(entry_id="evt:3", actor="worker_charlie", summary="apples"),
         ]
         activity_app._gather = lambda: entries  # type: ignore[method-assign]
         async with activity_app.run_test(size=(160, 40)) as pilot:
             await pilot.pause()
-            activity_app._filter_fuzzy = "apple"
-            activity_app._render()
+            await pilot.press("slash")
             await pilot.pause()
-            # Two entries mention "apples" in the summary.
+            assert activity_app.filter_input.has_focus
+            _apply_search(activity_app, "demo/42")
+            await pilot.pause()
+            assert activity_app.table.row_count == 1
+            counters_text = str(activity_app.counters.render())
+            assert "match" in counters_text
+            assert "1" in counters_text
+    _run(body())
+
+
+def test_search_input_regex_matches_event_type(
+    activity_env, activity_app,
+) -> None:
+    """Regex queries narrow by event type without touching project/type filters."""
+    async def body() -> None:
+        entries = [
+            _make_entry(entry_id="evt:1", kind="task.done", verb="done"),
+            _make_entry(entry_id="evt:2", kind="task.approved", verb="approved"),
+            _make_entry(entry_id="evt:3", kind="heartbeat", verb="tick"),
+        ]
+        activity_app._gather = lambda: entries  # type: ignore[method-assign]
+        async with activity_app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            _apply_search(activity_app, r"re:task\.(done|approved)")
+            await pilot.pause()
+            assert activity_app.table.row_count == 2
+    _run(body())
+
+
+def test_search_query_persists_across_refresh(
+    activity_env, activity_app,
+) -> None:
+    """Refreshing the panel keeps the active search query and input value."""
+    async def body() -> None:
+        initial_entries = [
+            _make_entry(entry_id="evt:1", actor="worker_alpha", summary="alpha a"),
+            _make_entry(entry_id="evt:2", actor="worker_bravo", summary="bravo"),
+        ]
+        refreshed_entries = initial_entries + [
+            _make_entry(entry_id="evt:3", actor="worker_alpha", summary="alpha b"),
+        ]
+        activity_app._gather = lambda: initial_entries  # type: ignore[method-assign]
+        async with activity_app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            _apply_search(activity_app, "worker_alpha")
+            await pilot.pause()
+            assert activity_app.table.row_count == 1
+
+            activity_app._gather = lambda: refreshed_entries  # type: ignore[method-assign]
+            activity_app.action_refresh()
+            await pilot.pause()
+
+            assert activity_app._filter_fuzzy == "worker_alpha"
+            assert activity_app.filter_input.value == "worker_alpha"
             assert activity_app.table.row_count == 2
     _run(body())
 
@@ -531,11 +600,12 @@ def test_clear_filters_resets_state_and_refreshes(
             activity_app._filter_project = "demo"
             activity_app._filter_actor = "worker_demo"
             activity_app._filter_type = "task.created"
-            activity_app._filter_fuzzy = "needle"
+            _apply_search(activity_app, "needle")
             await pilot.press("c")
             await pilot.pause()
             assert activity_app._filter_project is None
             assert activity_app._filter_actor is None
             assert activity_app._filter_type is None
             assert activity_app._filter_fuzzy == ""
+            assert activity_app.filter_input.value == ""
     _run(body())

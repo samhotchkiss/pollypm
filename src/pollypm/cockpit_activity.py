@@ -12,7 +12,9 @@ Contract:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import re
 
 from rich.markup import escape as _escape
 from rich.text import Text
@@ -96,6 +98,61 @@ def _truncate_summary(text: str, *, width: int = 80) -> str:
     if len(cleaned) <= width:
         return cleaned
     return cleaned[: width - 1] + "\u2026"
+
+
+def _entry_search_haystack(entry) -> str:
+    """Flatten a feed entry into searchable text for the live filter."""
+    payload = getattr(entry, "payload", {}) or {}
+    task_project = payload.get("task_project") if isinstance(payload, dict) else None
+    task_number = payload.get("task_number") if isinstance(payload, dict) else None
+    bits: list[str] = [
+        entry.id or "",
+        entry.project or "",
+        entry.actor or "",
+        entry.kind or "",
+        entry.verb or "",
+        entry.summary or "",
+        entry.subject or "",
+        entry.severity or "",
+        getattr(entry, "source", "") or "",
+    ]
+    if task_project and task_number is not None:
+        bits.extend(
+            [
+                f"{task_project}/{task_number}",
+                f"project:{task_project}:task:{task_number}",
+            ]
+        )
+    if payload:
+        try:
+            bits.append(json.dumps(payload, sort_keys=True))
+        except (TypeError, ValueError):
+            bits.append(str(payload))
+    return " ".join(bit for bit in bits if bit).lower()
+
+
+def _parse_search_query(query: str) -> tuple[re.Pattern[str] | None, list[str]]:
+    """Return a compiled regex matcher or lowercase literal tokens."""
+    raw = (query or "").strip()
+    if not raw:
+        return None, []
+
+    regex_source: str | None = None
+    literal_source = raw
+    if raw.startswith("re:"):
+        regex_source = raw[3:].strip()
+        literal_source = regex_source
+    elif len(raw) >= 2 and raw.startswith("/") and raw.endswith("/"):
+        regex_source = raw[1:-1]
+        literal_source = regex_source
+
+    if regex_source:
+        try:
+            return re.compile(regex_source, re.IGNORECASE), []
+        except re.error:
+            pass
+
+    return None, [token.lower() for token in literal_source.split() if token]
 
 
 class PollyActivityFeedApp(App[None]):
@@ -184,7 +241,7 @@ class PollyActivityFeedApp(App[None]):
         Binding("k,up", "cursor_up", "Up", show=False),
         Binding("g,home", "cursor_first", "Top", show=False),
         Binding("G,end", "cursor_last", "Bottom", show=False),
-        Binding("slash", "start_fuzzy", "Filter", show=False),
+        Binding("slash", "start_fuzzy", "Search", show=False),
         Binding("p", "pick_project", "Project"),
         Binding("t", "pick_type", "Type"),
         Binding("F", "toggle_follow", "Follow"),
@@ -197,7 +254,7 @@ class PollyActivityFeedApp(App[None]):
     ]
 
     _DEFAULT_HINT = (
-        "j/k move \u00b7 / fuzzy \u00b7 p project \u00b7 t type "
+        "j/k move \u00b7 / search \u00b7 p project \u00b7 t type "
         "\u00b7 F follow \u00b7 c clear \u00b7 \u21b5 detail \u00b7 q back"
     )
 
@@ -210,7 +267,7 @@ class PollyActivityFeedApp(App[None]):
         self.table = DataTable(id="af-table", zebra_stripes=False)
         self.detail = Static("", id="af-detail", markup=True)
         self.filter_input = Input(
-            placeholder="filter \u2026  (Enter to apply, Esc to cancel)",
+            placeholder=self._search_placeholder(),
             id="af-filter-input",
         )
         self.hint = Static(self._DEFAULT_HINT, id="af-hint", markup=True)
@@ -220,7 +277,6 @@ class PollyActivityFeedApp(App[None]):
         self._filter_type: str | None = None
         self._filter_fuzzy: str = ""
         self._filter_mode: str | None = None
-        self._show_filter_input: bool = False
         self._open_entry_id: str | None = None
         self._follow_on: bool = False
         self._follow_timer = None
@@ -228,18 +284,18 @@ class PollyActivityFeedApp(App[None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="af-outer"):
             yield self.topbar
+            yield self.filter_input
             yield self.counters
             with Vertical(id="af-table-wrap"):
                 yield self.table
             yield self.detail
-            yield self.filter_input
         yield self.hint
 
     def on_mount(self) -> None:
         self.table.cursor_type = "row"
         self.table.add_columns("Time", "Project", "Actor", "Event", "Message")
         self.detail.display = False
-        self.filter_input.display = False
+        self.filter_input.value = self._filter_fuzzy
         self._refresh()
         self.table.focus()
         _setup_alert_notifier(self, bind_a=True)
@@ -294,8 +350,9 @@ class PollyActivityFeedApp(App[None]):
         project = self._filter_project
         actor = self._filter_actor
         kind = self._filter_type
-        fuzzy = self._filter_fuzzy.strip().lower()
-        if not (project or actor or kind or fuzzy):
+        regex, fuzzy_terms = _parse_search_query(self._filter_fuzzy)
+        has_search = regex is not None or bool(fuzzy_terms)
+        if not (project or actor or kind or has_search):
             return list(rows)
         out = []
         for entry in rows:
@@ -305,17 +362,12 @@ class PollyActivityFeedApp(App[None]):
                 continue
             if kind and (entry.kind or "") != kind:
                 continue
-            if fuzzy:
-                hay = " ".join(
-                    [
-                        entry.actor or "",
-                        entry.kind or "",
-                        entry.verb or "",
-                        entry.summary or "",
-                        entry.project or "",
-                    ]
-                ).lower()
-                if fuzzy not in hay:
+            if has_search:
+                hay = _entry_search_haystack(entry)
+                if regex is not None:
+                    if regex.search(hay) is None:
+                        continue
+                elif any(term not in hay for term in fuzzy_terms):
                     continue
             out.append(entry)
         return out
@@ -340,6 +392,8 @@ class PollyActivityFeedApp(App[None]):
     def _render(self) -> None:
         filtered_entries = self._filtered_entries()
         events_last_24h = self._events_in_last_24h()
+        visible_count = len(filtered_entries)
+        total_count = len(self._entries)
         title_bits = ["[b #eef6ff]Activity[/b #eef6ff]"]
         if self._filter_project:
             title_bits.append(
@@ -348,7 +402,8 @@ class PollyActivityFeedApp(App[None]):
         self.topbar.update("  ".join(title_bits))
 
         chips: list[str] = [
-            f"[b]{events_last_24h}[/b] [dim]event{'s' if events_last_24h != 1 else ''} in last 24h[/dim]"
+            f"[b]{events_last_24h}[/b] [dim]event{'s' if events_last_24h != 1 else ''} in last 24h[/dim]",
+            f"[b]{visible_count}[/b] [dim]match{'es' if visible_count != 1 else ''} of {total_count} loaded[/dim]",
         ]
         filter_description = self._describe_filters()
         if filter_description:
@@ -358,6 +413,11 @@ class PollyActivityFeedApp(App[None]):
         )
         self.counters.update("  \u00b7  ".join(chips))
 
+        if self._open_entry_id is not None and all(
+            entry.id != self._open_entry_id for entry in filtered_entries
+        ):
+            self._open_entry_id = None
+
         self._render_table(filtered_entries)
         if self._open_entry_id is not None:
             self._render_detail()
@@ -365,11 +425,15 @@ class PollyActivityFeedApp(App[None]):
             self.detail.update("")
             self.detail.display = False
 
-        self.filter_input.display = self._show_filter_input
-        if self._show_filter_input:
+        if self._filter_mode is not None:
             mode_label = self._filter_mode or "filter"
             self.hint.update(
                 f"[dim]{mode_label}: type to filter \u00b7 \u21b5 apply \u00b7 esc cancel[/dim]"
+            )
+        elif self.filter_input.has_focus:
+            self.hint.update(
+                "[dim]search filters live \u00b7 re:<pattern> or /pattern/ for regex "
+                "\u00b7 \u21b5 table \u00b7 esc back[/dim]"
             )
         elif self._open_entry_id is not None:
             self.hint.update("[dim]\u21b5 close detail \u00b7 j/k next \u00b7 q back[/dim]")
@@ -425,8 +489,24 @@ class PollyActivityFeedApp(App[None]):
         if self._filter_type:
             bits.append(f"type={self._filter_type}")
         if self._filter_fuzzy:
-            bits.append(f'"{self._filter_fuzzy}"')
+            bits.append(f'search="{self._filter_fuzzy}"')
         return " \u00b7 ".join(bits)
+
+    def _search_placeholder(self) -> str:
+        return "Search task id / worker / type / text  (re:<pattern> for regex)"
+
+    def _focus_search(self) -> None:
+        self._filter_mode = None
+        self.filter_input.placeholder = self._search_placeholder()
+        self.filter_input.value = self._filter_fuzzy
+        self.filter_input.focus()
+        self.filter_input.cursor_position = len(self.filter_input.value)
+        self._render()
+
+    def _set_search_query(self, value: str) -> None:
+        self._filter_fuzzy = value or ""
+        self.filter_input.placeholder = self._search_placeholder()
+        self._render()
 
     def _entry_by_id(self, entry_id: str | None):
         if entry_id is None:
@@ -461,7 +541,7 @@ class PollyActivityFeedApp(App[None]):
             pass
 
     def action_start_fuzzy(self) -> None:
-        self._open_filter("fuzzy", placeholder="fuzzy: actor or event type")
+        self._focus_search()
 
     def action_pick_project(self) -> None:
         keys = sorted({entry.project or "" for entry in self._entries if entry.project})
@@ -483,33 +563,39 @@ class PollyActivityFeedApp(App[None]):
 
     def _open_filter(self, mode: str, *, placeholder: str) -> None:
         self._filter_mode = mode
-        self._show_filter_input = True
-        if mode == "fuzzy":
-            self.filter_input.value = self._filter_fuzzy
-        elif mode == "project":
+        if mode == "project":
             self.filter_input.value = self._filter_project or ""
         elif mode == "type":
             self.filter_input.value = self._filter_type or ""
         self.filter_input.placeholder = placeholder
         self._render()
         self.filter_input.focus()
+        self.filter_input.cursor_position = len(self.filter_input.value)
 
     def _close_filter(self) -> None:
         self._filter_mode = None
-        self._show_filter_input = False
-        self.filter_input.value = ""
+        self.filter_input.value = self._filter_fuzzy
+        self.filter_input.placeholder = self._search_placeholder()
         self._render()
         self.table.focus()
+
+    @on(Input.Changed, "#af-filter-input")
+    def _on_filter_changed(self, event: Input.Changed) -> None:
+        if self._filter_mode is not None:
+            return
+        self._set_search_query(event.value or "")
 
     @on(Input.Submitted, "#af-filter-input")
     def _on_filter_submit(self, event: Input.Submitted) -> None:
         value = (event.value or "").strip()
-        if self._filter_mode == "fuzzy":
-            self._filter_fuzzy = value
-        elif self._filter_mode == "project":
+        if self._filter_mode == "project":
             self._filter_project = value or None
         elif self._filter_mode == "type":
             self._filter_type = value or None
+        if self._filter_mode is None:
+            self.table.focus()
+            self._render()
+            return
         self._close_filter()
 
     def action_clear_filters(self) -> None:
@@ -517,6 +603,9 @@ class PollyActivityFeedApp(App[None]):
         self._filter_actor = None
         self._filter_type = None
         self._filter_fuzzy = ""
+        self._filter_mode = None
+        self.filter_input.value = ""
+        self.filter_input.placeholder = self._search_placeholder()
         self._refresh()
 
     def action_toggle_follow(self) -> None:
@@ -565,8 +654,12 @@ class PollyActivityFeedApp(App[None]):
         self._refresh()
 
     def action_back_or_cancel(self) -> None:
-        if self._show_filter_input:
+        if self._filter_mode is not None:
             self._close_filter()
+            return
+        if self.filter_input.has_focus:
+            self.table.focus()
+            self._render()
             return
         if self._open_entry_id is not None:
             self._open_entry_id = None

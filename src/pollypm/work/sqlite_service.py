@@ -64,17 +64,6 @@ from pollypm.work.service_notifications import (
     prune_staged_notifications,
     stage_notification_row,
 )
-from pollypm.work.service_dependencies import (
-    check_auto_unblock,
-    dependent_tasks,
-    has_unresolved_blockers,
-    link_tasks,
-    maybe_block,
-    maybe_unblock,
-    on_cancelled,
-    unlink_tasks,
-    would_create_cycle,
-)
 from pollypm.work.service_queries import (
     blocked_tasks as read_blocked_tasks,
     create_task,
@@ -98,6 +87,8 @@ from pollypm.work.service_sync import (
     sync_status as read_sync_status,
     trigger_sync as run_trigger_sync,
 )
+from pollypm.work.service_dependency_manager import WorkDependencyManager
+from pollypm.work.service_worker_session_manager import WorkSessionManager
 from pollypm.work.service_transitions import (
     advance_to_node,
     current_node_visit as read_current_node_visit,
@@ -106,16 +97,6 @@ from pollypm.work.service_transitions import (
     on_task_transition,
 )
 from pollypm.work.service_transition_manager import WorkTransitionManager
-from pollypm.work.service_worker_sessions import (
-    WORK_SESSIONS_DDL,
-    end_worker_session as finish_worker_session,
-    ensure_worker_session_schema as ensure_worker_sessions,
-    get_worker_session as read_worker_session,
-    list_worker_sessions as read_worker_sessions,
-    row_to_worker_session_record,
-    update_worker_session_tokens as save_worker_session_tokens,
-    upsert_worker_session as save_worker_session,
-)
 from pollypm.work.sync import SyncManager
 
 
@@ -149,7 +130,9 @@ class SQLiteWorkService:
         create_work_tables(self._conn)
         self._gate_registry = GateRegistry(project_path=project_path)
         self._flow_cache: dict[tuple[str, int], FlowTemplate] = {}
+        self._dependency_mgr = WorkDependencyManager(self)
         self._transition_mgr = WorkTransitionManager(self)
+        self._worker_session_mgr = WorkSessionManager(self)
         # Last-provision-error breadcrumb — set by ``claim()`` when
         # ``provision_worker`` fails so the CLI can surface it instead
         # of reporting a silent success (#243).
@@ -1356,18 +1339,18 @@ class SQLiteWorkService:
         ``kind`` must be one of: blocks, relates_to, supersedes, parent.
         For ``blocks``, cycle detection is performed before committing.
         """
-        link_tasks(self, from_id, to_id, kind)
+        self._dependency_mgr.link(from_id, to_id, kind)
 
     def unlink(self, from_id: str, to_id: str, kind: str) -> None:
         """Remove a relationship between two tasks."""
-        unlink_tasks(self, from_id, to_id, kind)
+        self._dependency_mgr.unlink(from_id, to_id, kind)
 
     def dependents(self, task_id: str) -> list[Task]:
         """Return all tasks blocked by this task, transitively.
 
         Follows ``blocks`` edges from task_id outward via BFS.
         """
-        return dependent_tasks(self, task_id)
+        return self._dependency_mgr.dependents(task_id)
 
     # ------------------------------------------------------------------
     # Dependency helpers
@@ -1381,8 +1364,7 @@ class SQLiteWorkService:
         to_number: int,
     ) -> bool:
         """DFS from to_id following blocks edges; returns True if from_id is reachable."""
-        return would_create_cycle(
-            self,
+        return self._dependency_mgr.would_create_cycle(
             from_project,
             from_number,
             to_project,
@@ -1391,23 +1373,23 @@ class SQLiteWorkService:
 
     def _has_unresolved_blockers(self, task_id: str) -> bool:
         """Check if a task has any blockers that are not done."""
-        return has_unresolved_blockers(self, task_id)
+        return self._dependency_mgr.has_unresolved_blockers(task_id)
 
     def _maybe_block(self, task_id: str) -> None:
         """If task is queued or in_progress and has unresolved blockers, block it."""
-        maybe_block(self, task_id)
+        self._dependency_mgr.maybe_block(task_id)
 
     def _maybe_unblock(self, task_id: str) -> None:
         """If task is blocked and has no remaining unresolved blockers, unblock it."""
-        maybe_unblock(self, task_id)
+        self._dependency_mgr.maybe_unblock(task_id)
 
     def _check_auto_unblock(self, task_id: str) -> None:
         """After a task moves to done, auto-unblock any tasks it was blocking."""
-        check_auto_unblock(self, task_id)
+        self._dependency_mgr.check_auto_unblock(task_id)
 
     def _on_cancelled(self, task_id: str) -> None:
         """After a task is cancelled, add context entries on blocked dependents."""
-        on_cancelled(self, task_id)
+        self._dependency_mgr.on_cancelled(task_id)
 
     def _has_incoming_parent_link(self, task: Task) -> bool:
         """Return True when ``task`` is linked as a child of another task."""
@@ -2031,14 +2013,8 @@ class SQLiteWorkService:
     # ``self._conn``) keeps the session manager honest about the service
     # protocol surface and makes the whole binding mockable.
 
-    _WORK_SESSIONS_DDL = WORK_SESSIONS_DDL
-
-    @staticmethod
-    def _row_to_worker_session_record(row) -> WorkerSessionRecord:
-        return row_to_worker_session_record(row)
-
     def ensure_worker_session_schema(self) -> None:
-        ensure_worker_sessions(self)
+        self._worker_session_mgr.ensure_schema()
 
     def upsert_worker_session(
         self,
@@ -2051,8 +2027,7 @@ class SQLiteWorkService:
         branch_name: str,
         started_at: str,
     ) -> None:
-        save_worker_session(
-            self,
+        self._worker_session_mgr.upsert(
             task_project=task_project,
             task_number=task_number,
             agent_name=agent_name,
@@ -2069,8 +2044,7 @@ class SQLiteWorkService:
         task_number: int,
         active_only: bool = False,
     ) -> WorkerSessionRecord | None:
-        return read_worker_session(
-            self,
+        return self._worker_session_mgr.get(
             task_project=task_project,
             task_number=task_number,
             active_only=active_only,
@@ -2082,8 +2056,7 @@ class SQLiteWorkService:
         project: str | None = None,
         active_only: bool = True,
     ) -> list[WorkerSessionRecord]:
-        return read_worker_sessions(
-            self,
+        return self._worker_session_mgr.list(
             project=project,
             active_only=active_only,
         )
@@ -2098,8 +2071,7 @@ class SQLiteWorkService:
         total_output_tokens: int,
         archive_path: str | None,
     ) -> None:
-        finish_worker_session(
-            self,
+        self._worker_session_mgr.end(
             task_project=task_project,
             task_number=task_number,
             ended_at=ended_at,
@@ -2117,8 +2089,7 @@ class SQLiteWorkService:
         total_output_tokens: int,
         archive_path: str | None,
     ) -> None:
-        save_worker_session_tokens(
-            self,
+        self._worker_session_mgr.update_tokens(
             task_project=task_project,
             task_number=task_number,
             total_input_tokens=total_input_tokens,

@@ -558,6 +558,52 @@ class TestBlock:
             svc.block(task.task_id, "pm", "bad-blocker-id")
 
 
+class TestWorkerSessions:
+    def test_worker_session_round_trip(self, svc):
+        task = _create_standard_task(svc, description="Session-backed task")
+        svc.ensure_worker_session_schema()
+
+        svc.upsert_worker_session(
+            task_project=task.project,
+            task_number=task.task_number,
+            agent_name="agent-1",
+            pane_id="pane-1",
+            worktree_path="/tmp/worktree",
+            branch_name="branch-1",
+            started_at="2026-04-21T00:00:00+00:00",
+        )
+
+        record = svc.get_worker_session(
+            task_project=task.project,
+            task_number=task.task_number,
+        )
+        assert record is not None
+        assert record.agent_name == "agent-1"
+        assert record.branch_name == "branch-1"
+
+        active = svc.list_worker_sessions(project=task.project)
+        assert len(active) == 1
+        assert active[0].task_number == task.task_number
+
+        svc.end_worker_session(
+            task_project=task.project,
+            task_number=task.task_number,
+            ended_at="2026-04-21T01:00:00+00:00",
+            total_input_tokens=11,
+            total_output_tokens=22,
+            archive_path="/tmp/archive.tar.gz",
+        )
+
+        ended = svc.get_worker_session(
+            task_project=task.project,
+            task_number=task.task_number,
+        )
+        assert ended is not None
+        assert ended.ended_at == "2026-04-21T01:00:00+00:00"
+        assert ended.total_input_tokens == 11
+        assert ended.total_output_tokens == 22
+
+
 # ---------------------------------------------------------------------------
 # Owner derivation
 # ---------------------------------------------------------------------------

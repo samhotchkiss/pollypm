@@ -149,6 +149,104 @@ cwd = "."
     assert config.sessions["worker"].cwd == tmp_path
 
 
+def test_load_config_flattens_legacy_global_dot_pollypm_paths(
+    tmp_path: Path,
+) -> None:
+    config_dir = tmp_path / ".pollypm"
+    config_dir.mkdir()
+    config_path = config_dir / "pollypm.toml"
+    config_path.write_text(
+        """
+[project]
+name = "pollypm"
+tmux_session = "pollypm"
+base_dir = ".pollypm"
+logs_dir = ".pollypm/logs"
+snapshots_dir = ".pollypm/snapshots"
+state_db = ".pollypm/state.db"
+
+[pollypm]
+controller_account = "claude_primary"
+
+[accounts.claude_primary]
+provider = "claude"
+home = ".pollypm/homes/claude_primary"
+
+[sessions.heartbeat]
+role = "heartbeat-supervisor"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[sessions.operator]
+role = "operator-pm"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+"""
+    )
+
+    config = load_config(config_path)
+
+    assert config.project.root_dir == config_dir
+    assert config.project.base_dir == config_dir
+    assert config.project.logs_dir == config_dir / "logs"
+    assert config.project.snapshots_dir == config_dir / "snapshots"
+    assert config.project.state_db == config_dir / "state.db"
+    assert config.accounts["claude_primary"].home == (
+        config_dir / "homes" / "claude_primary"
+    )
+
+
+def test_write_config_flattens_global_dot_pollypm_paths(tmp_path: Path) -> None:
+    config_dir = tmp_path / ".pollypm"
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            name="PollyPM",
+            root_dir=config_dir,
+            base_dir=config_dir / ".pollypm",
+            logs_dir=config_dir / ".pollypm" / "logs",
+            snapshots_dir=config_dir / ".pollypm" / "snapshots",
+            state_db=config_dir / ".pollypm" / "state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="claude_primary"),
+        accounts={
+            "claude_primary": AccountConfig(
+                name="claude_primary",
+                provider=ProviderKind.CLAUDE,
+                home=config_dir / ".pollypm" / "homes" / "claude_primary",
+            )
+        },
+        sessions={
+            "heartbeat": SessionConfig(
+                name="heartbeat",
+                role="heartbeat-supervisor",
+                provider=ProviderKind.CLAUDE,
+                account="claude_primary",
+                cwd=config_dir,
+            ),
+            "operator": SessionConfig(
+                name="operator",
+                role="operator-pm",
+                provider=ProviderKind.CLAUDE,
+                account="claude_primary",
+                cwd=config_dir,
+            ),
+        },
+        projects={},
+    )
+    config_path = config_dir / "pollypm.toml"
+
+    write_config(config, config_path, force=True)
+
+    rendered = config_path.read_text()
+    assert 'base_dir = "."' in rendered
+    assert 'logs_dir = "logs"' in rendered
+    assert 'snapshots_dir = "snapshots"' in rendered
+    assert 'state_db = "state.db"' in rendered
+    assert 'home = "homes/claude_primary"' in rendered
+
+
 def test_load_config_parses_custom_lease_timeout_minutes(tmp_path: Path) -> None:
     config_path = tmp_path / "pollypm.toml"
     config_path.write_text(

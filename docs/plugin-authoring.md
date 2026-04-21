@@ -1,8 +1,14 @@
 # Writing a PollyPM Plugin
 
-A hello-world walkthrough for building, testing, and installing a PollyPM plugin end-to-end. Target audience: external authors who want to ship a new provider, runtime, session service, or agent profile without forking the core repo.
+This is the current how-to guide for building, testing, and installing a
+PollyPM plugin end-to-end. Target audience: external authors who want to ship
+or install a new provider, runtime, session service, or agent profile without
+forking the core repo.
 
-For the exhaustive spec see [`plugin-discovery-spec.md`](plugin-discovery-spec.md). This doc is the on-ramp.
+If you are trying to build a plugin today, start here. For the normative
+discovery and manifest design doc, see
+[`plugin-discovery-spec.md`](plugin-discovery-spec.md), which remains a
+draft/future-state spec rather than the first doc to read.
 
 ---
 

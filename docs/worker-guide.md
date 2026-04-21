@@ -13,8 +13,10 @@ You are **not** the PM (Polly), and you are **not** the reviewer (Russell).
 
 - The PM decomposes projects into tasks. You do not plan scope.
 - The reviewer approves or rejects your work. You do not approve your own.
-- You work inside a git **worktree** on a `task/<slug>` branch. Do not touch
-  other projects, other tasks, or `main` directly.
+- You work inside a real git **worktree** under
+  `.pollypm/worktrees/<project>-<number>` on branch
+  `task/<project>-<number>`. Do not touch other projects, other tasks, or
+  `main` directly.
 
 ## The task lifecycle
 
@@ -72,26 +74,35 @@ This:
 
 - Sets `work_status = in_progress`.
 - Assigns the task to you (`--actor worker` by default).
-- Provisions a git worktree at `.pollypm/worktrees/<project>-<number>` on
-  branch `task/<project>-<number>`.
+- Provisions a real git worktree at `.pollypm/worktrees/<project>-<number>`.
+- Checks out branch `task/<project>-<number>` in that worktree.
+- Starts that branch from the project's current `HEAD` when the worktree is
+  first created, so you should expect a clean checkout of the repo, not the
+  main working directory with someone else's uncommitted edits.
+- Writes `.pollypm-task-prompt.md` into the worktree root.
 - Launches an interactive Claude session in a tmux window named
-  `task-<project>-<number>`.
+  `task-<project>-<number>` with its current directory already set to that
+  worktree.
 
 If you are **already inside** the per-task worker session Polly opened for
 this claim, you do not need to run `claim` again — the PM already did it.
-You will simply see the task prompt land in your current window.
+You will simply see the task prompt land in your current window. You do not
+need to find or clone anything. You are already inside that worktree. Run
+`pwd` or `git status -sb` if you want to confirm where you landed.
 
 ### 4. Build
 
-Open the worktree. Read `.pollypm-task-prompt.md` in the worktree root — it
-contains the distilled task brief. Then:
+If you claimed from a normal shell, `cd .pollypm/worktrees/<project>-<number>`.
+If PollyPM opened the worker tmux window for you, you should already be there.
+Read `.pollypm-task-prompt.md` in the worktree root — it contains the
+distilled task brief. Then:
 
 - Write code.
 - Write tests (`uv run python -m pytest --tb=short -q`).
 - Commit at least once. Your commit SHA becomes the primary artifact.
 
-Work on `task/<slug>`. Do **not** commit to `main`. Do **not** edit files
-outside the worktree.
+Work on `task/<project>-<number>`. Do **not** commit to `main`. Do **not** edit
+files outside the worktree.
 
 ### 5. Mark the node done with a work output
 

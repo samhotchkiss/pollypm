@@ -23,54 +23,13 @@ left is domain-data migration.
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-
-def _normalize_fts_query(query: str) -> str:
-    """Convert a free-text query into an FTS5-safe MATCH expression.
-
-    FTS5's query syntax treats a fistful of characters as operators
-    (``" ( ) : . * + -``) and rejects malformed input with
-    ``sqlite3.OperationalError: fts5: syntax error``. We take the belt-
-    and-braces approach: split the input on anything that isn't a word
-    character, drop empty fragments, wrap each surviving token in
-    double quotes (FTS5 treats a quoted token as a literal phrase — no
-    operators), and join with implicit-AND. Tokens shorter than two
-    characters are dropped because FTS5's unicode61 tokenizer will
-    silently skip them anyway, and empty queries fall back to an
-    all-columns wildcard so the MATCH always matches nothing (we
-    surface that to the caller by returning a sentinel which the
-    caller can treat as "no results" — see note below).
-
-    Returns a string safe to pass as the right-hand side of a
-    ``col MATCH ?`` parameterized query.
-    """
-    # Extract alphanumeric runs; underscore is included so identifiers
-    # like ``state_store`` stay whole.
-    tokens = re.findall(r"[\w]+", query.lower(), flags=re.UNICODE)
-    # Drop single-char tokens — FTS5 unicode61 filters them anyway and
-    # keeping them just bloats the query.
-    tokens = [t for t in tokens if len(t) >= 2]
-    if not tokens:
-        # Fall back to a query that matches nothing. FTS5 requires *some*
-        # valid term, so we use an obviously-nonsense token. Callers that
-        # want "all entries" should pass empty string to recall() which
-        # short-circuits before reaching this helper.
-        return '"__pollypm_no_match_sentinel__"'
-    # OR the tokens so a multi-word query like "testing strategy" still
-    # surfaces entries that match either word (bm25 ranks entries that
-    # match both higher, which is what we want). Each token is quoted to
-    # neutralise any operator characters that slip through (the regex
-    # already strips them, but quoting is cheap insurance). The porter
-    # tokenizer on the FTS table handles stemming so ``testing`` matches
-    # entries containing ``tests`` or ``tested`` without any prefix-``*``
-    # gymnastics.
-    return " OR ".join(f'"{t}"' for t in tokens)
+from pollypm.storage.fts_query import normalize_fts_query
 
 
 SCHEMA = """
@@ -2283,7 +2242,7 @@ class StateStore:
             ORDER BY bm25_score ASC
             LIMIT ?
             """
-            fts_query = _normalize_fts_query(query_text)
+            fts_query = normalize_fts_query(query_text)
             rows = self.execute(sql, (fts_query, *params, fetch_limit)).fetchall()
         else:
             where = " AND ".join(clauses)

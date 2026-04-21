@@ -91,7 +91,9 @@ class TestCoreRecurringPlugin:
         # Cadences per issue #164 / #249.
         assert _interval_seconds(entries["session.health_sweep"]) == 10
         assert _interval_seconds(entries["capacity.probe"]) == 60
-        assert _interval_seconds(entries["transcript.ingest"]) == 30
+        # Transcript ingestion was widened to 5m after the 30s cadence
+        # proved too expensive on large roots.
+        assert _interval_seconds(entries["transcript.ingest"]) == 300
         assert _interval_seconds(entries["alerts.gc"]) == 300
         assert _interval_seconds(entries["work.progress_sweep"]) == 300
         # #250 — pane-text classifier runs every 30s.

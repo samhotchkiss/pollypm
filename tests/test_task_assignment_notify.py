@@ -1446,7 +1446,9 @@ class TestRejectBounceDedupe:
             version = store.execute(
                 "SELECT MAX(version) FROM schema_version"
             ).fetchone()[0]
-            assert version == 12
+            # The v11 fixture must upgrade through migration 12 and on
+            # to the current schema head.
+            assert version >= 12
         finally:
             store.close()
 

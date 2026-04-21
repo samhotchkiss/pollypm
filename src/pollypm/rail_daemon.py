@@ -76,7 +76,7 @@ def run(config_path: Path, *, poll_interval: float = 60.0) -> int:
     another daemon already holds the PID lock.
     """
     from pollypm.config import load_config, DEFAULT_CONFIG_PATH
-    from pollypm.supervisor import Supervisor
+    from pollypm.service_api import PollyPMService
 
     cfg = load_config(config_path)
     pollypm_home = Path(DEFAULT_CONFIG_PATH).parent
@@ -88,7 +88,7 @@ def run(config_path: Path, *, poll_interval: float = 60.0) -> int:
         )
         return 1
 
-    supervisor = Supervisor(cfg)
+    supervisor = PollyPMService(config_path).load_supervisor()
     rail = getattr(supervisor, "core_rail", None)
     if rail is None:
         logger.error("rail_daemon: supervisor has no core_rail attribute")

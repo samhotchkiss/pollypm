@@ -256,7 +256,7 @@ A restart of `pm` is required for newly installed plugins to take effect — no 
 
 ```
 $ pm plugins disable hello-world
-Disabled 'hello-world'. Restart pm for the change to take effect.
+Disabled 'hello-world'. Restart PollyPM for the change to take effect.
 ```
 
 This writes `[plugins].disabled = ["hello-world"]` in `~/.pollypm/pollypm.toml`. `pm plugins list` still shows the plugin with a `disabled` marker and reason.

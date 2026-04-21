@@ -152,7 +152,7 @@ Each emit creates an inbox entry with `kind=advisor_insight`. User actions:
 
 - `pm task approve <id>` — "acknowledged, factored in." Closes.
 - `pm task reject <id> --reason topic_cooldown` — "not this, not now." Records a soft signal in `.pollypm-state/advisor-state.json` that the advisor's next prompt-pack will mention ("user rejected topic X 30 minutes ago — weight accordingly"). **Not a system-enforced cooldown** — the persona is expected to respect it intelligently.
-- `pm task convert <id> --to-task` — convert insight to a full work-service task with default `flow=implement_module` or similar.
+- Convert the insight into a normal work-service task from the inbox/cockpit flow, or create one manually with `pm task create ...` using the insight as the task brief.
 - Silent no-action → auto-closes after 7 days.
 
 ## 8. Observability — `pm advisor history`

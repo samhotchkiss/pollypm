@@ -174,7 +174,7 @@ commit, and re-run `pm task done` with an updated payload.
 
 ### 1. "No such command 'show'"
 
-`pm task show` does not exist. Use:
+The old `task show` spelling does not exist. Use:
 
 ```bash
 pm task get shortlink_gen/1
@@ -184,7 +184,7 @@ pm task get shortlink_gen/1
 
 The hard gate `has_work_output` requires at least one artifact. Re-run
 `pm task done` with an artifact list — the examples above are copy-paste
-ready. You do **not** need a separate `pm task output` command; the artifacts
+ready. You do **not** need a separate output-registration command; the artifacts
 travel in `--output`.
 
 ### 3. "provision_worker failed … tmux new-session exit 1"
@@ -194,9 +194,9 @@ usually benign when the PM already claimed the task from an existing worker
 session — that session picks up the work. If you ran `pm task claim` from a
 fresh shell and see this, either:
 
-- Work inside the existing session (check `pm session list`), or
-- Run `pm task release <id>` and re-claim from inside an active worker
-  session.
+- Work inside the existing session (check the cockpit rail or `pm status`), or
+- If the claimant session is gone, ask Polly to recover the stale claim before
+  retrying from a fresh worker shell.
 
 ### 4. "Task already claimed by <other>"
 
@@ -204,13 +204,13 @@ Another worker (or a stale claim) owns the task. Check:
 
 ```bash
 pm task get shortlink_gen/1          # look for "assignee"
-pm session list                      # find the claimant's session
+pm status                            # confirm core session health
 ```
 
-If the claim is stale (session dead, worker gone), release and re-claim:
+If the claim is stale (session dead, worker gone), confirm the worker is
+actually gone and then re-claim once Polly has cleared the stale assignment:
 
 ```bash
-pm task release shortlink_gen/1
 pm task claim shortlink_gen/1
 ```
 
@@ -305,7 +305,7 @@ pm task done <id> --output '{            # hand to review
 }'
 
 pm task context <id> --text "..."        # leave a breadcrumb
-pm task release <id>                     # drop a claim
+pm status                                # check cockpit/core health
 pm task list --status <status>           # browse
 pm help worker                           # re-read this guide
 ```

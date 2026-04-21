@@ -748,7 +748,7 @@ A GitHub API outage shouldn't block the work service. Mitigations:
 - Sync adapters are async, best-effort, eventually consistent
 - Failed syncs are queued for retry with backoff
 - The work service state is always authoritative — sync failure means the projection is stale, not that work is blocked
-- Sync status is queryable: `pm task sync-status <id>` shows per-adapter state
+- Operators can force a resync with `pm task sync`; per-task sync-state inspection is stored in `work_sync_state` and does not yet have its own dedicated CLI surface
 
 ### P-4: Gate Brittleness
 

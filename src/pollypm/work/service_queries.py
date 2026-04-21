@@ -227,12 +227,42 @@ def update_task(service: "SQLiteWorkService", task_id: str, **fields: object) ->
     return task
 
 
+def _unresolved_blocked_task_keys(
+    service: "SQLiteWorkService",
+    *,
+    project: str | None = None,
+) -> set[tuple[str, int]]:
+    clauses = [
+        "d.kind = ?",
+        "t.work_status NOT IN (?, ?)",
+    ]
+    params: list[object] = [
+        "blocks",
+        WorkStatus.DONE.value,
+        WorkStatus.CANCELLED.value,
+    ]
+    if project is not None:
+        clauses.append("d.to_project = ?")
+        params.append(project)
+    rows = service._conn.execute(
+        "SELECT DISTINCT d.to_project, d.to_task_number "
+        "FROM work_task_dependencies d "
+        "JOIN work_tasks t "
+        "  ON t.project = d.from_project "
+        " AND t.task_number = d.from_task_number "
+        f"WHERE {' AND '.join(clauses)}",
+        params,
+    ).fetchall()
+    return {(row["to_project"], row["to_task_number"]) for row in rows}
+
+
 def next_task(
     service: "SQLiteWorkService",
     *,
     agent: str | None = None,
     project: str | None = None,
 ) -> Task | None:
+    blocked_keys = _unresolved_blocked_task_keys(service, project=project)
     clauses = ["t.work_status = ?"]
     params: list[object] = [WorkStatus.QUEUED.value]
     if project is not None:
@@ -254,12 +284,12 @@ def next_task(
     )
     rows = service._conn.execute(sql, params).fetchall()
     for row in rows:
-        task = service._row_to_task(row)
-        if service._has_unresolved_blockers(task.task_id):
+        task_key = (row["project"], row["task_number"])
+        if task_key in blocked_keys:
             continue
-        if agent is not None and task.roles.get("worker") != agent:
+        if agent is not None and json.loads(row["roles"]).get("worker") != agent:
             continue
-        return task
+        return service._row_to_task(row)
     return None
 
 

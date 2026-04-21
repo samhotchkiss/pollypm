@@ -123,6 +123,62 @@ class TestNext:
         _create_task(svc, title="Draft task")
         assert svc.next() is None
 
+    def test_next_does_not_call_per_task_blocker_lookup(self, svc, monkeypatch):
+        blocker = _create_task(svc, title="Blocker")
+        blocked = _create_task(svc, title="Blocked")
+        winner = _create_task(svc, title="Winner")
+
+        _queue_task(svc, blocked)
+        _queue_task(svc, winner)
+        svc.link(blocker.task_id, blocked.task_id, "blocks")
+
+        def _fail(_: str) -> bool:
+            raise AssertionError("next() should not call per-task blocker lookups")
+
+        monkeypatch.setattr(svc, "_has_unresolved_blockers", _fail)
+
+        result = svc.next()
+        assert result is not None
+        assert result.task_id == winner.task_id
+
+    def test_next_hydrates_only_selected_matching_task(self, svc, monkeypatch):
+        blocker = _create_task(svc, title="Blocker")
+        blocked = _create_task(
+            svc,
+            title="Blocked",
+            roles={"worker": "alice", "reviewer": "reviewer"},
+        )
+        wrong_agent = _create_task(
+            svc,
+            title="Wrong Agent",
+            roles={"worker": "bob", "reviewer": "reviewer"},
+        )
+        winner = _create_task(
+            svc,
+            title="Winner",
+            roles={"worker": "alice", "reviewer": "reviewer"},
+        )
+
+        _queue_task(svc, blocked)
+        _queue_task(svc, wrong_agent)
+        _queue_task(svc, winner)
+        svc.link(blocker.task_id, blocked.task_id, "blocks")
+
+        original = svc._row_to_task
+        hydrate_calls = 0
+
+        def _counting_row_to_task(*args, **kwargs):
+            nonlocal hydrate_calls
+            hydrate_calls += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(svc, "_row_to_task", _counting_row_to_task)
+
+        result = svc.next(agent="alice")
+        assert result is not None
+        assert result.task_id == winner.task_id
+        assert hydrate_calls == 1
+
 
 # ---------------------------------------------------------------------------
 # my_tasks() tests

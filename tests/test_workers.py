@@ -16,6 +16,7 @@ from pollypm.storage.state import StateStore
 from pollypm.plugins_builtin.core_agent_profiles.profiles import heartbeat_prompt
 from pollypm.plugins_builtin.core_agent_profiles.profiles import polly_prompt as operator_prompt
 from pollypm.plugins_builtin.core_agent_profiles.profiles import triage_prompt
+from pollypm.plugins_builtin.core_agent_profiles.profiles import reviewer_prompt
 from pollypm.workers import auto_select_worker_account, suggest_worker_prompt
 from pollypm.plugins_builtin.core_agent_profiles.profiles import worker_prompt
 
@@ -205,6 +206,8 @@ def test_worker_prompt_requires_core_identity() -> None:
     assert "<identity>" in prompt
     assert "worker" in prompt.lower()
     assert "<principles>" in prompt
+    assert "--output" in prompt
+    assert " -o " not in prompt
 
 
 def test_operator_prompt_requires_delegation_instructions() -> None:
@@ -213,8 +216,9 @@ def test_operator_prompt_requires_delegation_instructions() -> None:
     assert "<identity>" in prompt
     assert "delegate" in prompt.lower()
     assert "pm" in prompt  # references pm commands
+    assert "pm inbox" in prompt
+    assert "pm mail" not in prompt
     assert "<principles>" in prompt
-
 
 def test_heartbeat_prompt_describes_recovery_protocol() -> None:
     prompt = heartbeat_prompt()
@@ -234,3 +238,12 @@ def test_triage_prompt_points_at_inbox_cli() -> None:
 
     assert "`pm inbox`" in prompt
     assert "`pm mail`" not in prompt
+
+
+def test_reviewer_prompt_states_code_review_gate_semantics() -> None:
+    prompt = reviewer_prompt()
+
+    assert "`code_review`" in prompt
+    assert "`done`" in prompt
+    assert "`implement`" in prompt
+    assert "stays parked at `code_review`" in prompt

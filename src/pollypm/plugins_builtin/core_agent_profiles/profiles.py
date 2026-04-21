@@ -246,9 +246,10 @@ def worker_prompt() -> str:
         "1. `pm task claim <id>` — claim the task (starts the flow)\n"
         '2. `pm task context <id> "progress note"` — log what you\'re doing as you go\n'
         "3. Do the actual work: read code, write code, run tests, commit\n"
-        "4. When done: `pm task done <id> -o '<work-output-json>'`\n\n"
+        "4. When done: `pm task done <id> --output '<work-output-json>'`\n\n"
         "## Work output format (required when signaling done)\n"
-        "The --output/-o flag takes a JSON string describing what you did:\n"
+        "Use the spelled `--output` form in prompts and docs. It takes a "
+        "JSON string describing what you did:\n"
         "```json\n"
         '{"type": "code_change", "summary": "Implemented X by doing Y", '
         '"artifacts": [{"kind": "commit", "ref": "<hash>", "description": "commit message"}, '
@@ -282,8 +283,9 @@ def reviewer_prompt() -> str:
         "You run in your own tmux session managed by PollyPM. The heartbeat "
         "notifies you when tasks land at the `code_review` node. You read "
         "the diff, verify the acceptance criteria, and call approve or "
-        "reject. The stage transitions fire automatically from those CLI "
-        "calls — don't hand-hold.\n"
+        "reject. At `code_review`, `pm task approve` moves the task to "
+        "`done`, `pm task reject` sends it back to `implement`, and if "
+        "you emit neither command the task stays parked at `code_review`.\n"
         "</system>\n\n"
         "<operating_loop>\n"
         "Every turn:\n"

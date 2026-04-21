@@ -27,6 +27,9 @@ from pollypm.work.models import GateResult, Task
 
 
 RECEIPTS_DIR = ".pollypm/test-receipts"
+RECEIPT_SCHEMA_EXAMPLE = (
+    '{"passed": true, "details": "Playwright 5/5 passed; screenshot report.html"}'
+)
 
 
 class UserLevelTestsPass:
@@ -53,8 +56,9 @@ class UserLevelTestsPass:
                 passed=False,
                 reason=(
                     f"No user-level test receipt at {receipt_path}. "
-                    "Worker must run the Playwright/tmux scenario and "
-                    "write a pass receipt before code_review."
+                    f"Expected a JSON object like {RECEIPT_SCHEMA_EXAMPLE}. "
+                    "Fix: run the Playwright/tmux scenario, then write that "
+                    "exact file before asking the reviewer to approve."
                 ),
             )
 
@@ -63,7 +67,10 @@ class UserLevelTestsPass:
         except (OSError, json.JSONDecodeError) as exc:
             return GateResult(
                 passed=False,
-                reason=f"Receipt at {receipt_path} is not valid JSON: {exc}",
+                reason=(
+                    f"Receipt at {receipt_path} is not valid JSON: {exc}. "
+                    f"Expected {RECEIPT_SCHEMA_EXAMPLE}."
+                ),
             )
 
         if not isinstance(data, dict):
@@ -71,19 +78,44 @@ class UserLevelTestsPass:
                 passed=False,
                 reason=(
                     f"Receipt at {receipt_path} is not a JSON object "
-                    f"(got {type(data).__name__})."
+                    f"(got {type(data).__name__}). "
+                    f"Expected {RECEIPT_SCHEMA_EXAMPLE}."
                 ),
             )
 
         passed = data.get("passed")
+        details = data.get("details")
+        if not isinstance(passed, bool):
+            return GateResult(
+                passed=False,
+                reason=(
+                    f"Receipt at {receipt_path} has invalid schema. "
+                    "Expected boolean field 'passed' and optional string "
+                    f"'details'. Example: {RECEIPT_SCHEMA_EXAMPLE}."
+                ),
+            )
+        if details is not None and not isinstance(details, str):
+            return GateResult(
+                passed=False,
+                reason=(
+                    f"Receipt at {receipt_path} has invalid schema. "
+                    "Field 'details' must be a string when present. "
+                    f"Example: {RECEIPT_SCHEMA_EXAMPLE}."
+                ),
+            )
+
         if passed is True:
-            details = data.get("details", "")
+            detail_text = (details or "").strip()
             return GateResult(
                 passed=True,
-                reason=f"User-level tests pass. {details}".strip(),
+                reason=f"User-level tests pass. {detail_text}".strip(),
             )
-        details = data.get("details", "no details supplied")
+        detail_text = (details or "no details supplied").strip()
         return GateResult(
             passed=False,
-            reason=f"User-level tests did not pass: {details}",
+            reason=(
+                f"User-level tests did not pass per {receipt_path}: "
+                f"{detail_text}. Reviewer expects {RECEIPT_SCHEMA_EXAMPLE} "
+                "with passed=true before code_review can pass."
+            ),
         )

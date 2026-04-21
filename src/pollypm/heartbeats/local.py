@@ -273,6 +273,18 @@ def _select_intervention(
 class LocalHeartbeatBackend(HeartbeatBackend):
     name = "local"
     _UNMANAGED_WINDOW_ALERT_PREFIX = "unmanaged_window:"
+    _MUTATING_SESSION_ROLES = frozenset(
+        {
+            "architect",
+            "heartbeat-supervisor",
+            "operator-pm",
+            "review",
+            "reviewer",
+            "triage",
+            "worker",
+        }
+    )
+    _WORKER_MUTATING_SESSION_ROLES = frozenset({"worker"})
 
     _AUTH_FAILURE_PATTERNS = (
         "authentication failure",
@@ -355,6 +367,70 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         )
         return open_alerts
 
+    def _assert_role_allows_write(
+        self,
+        context: HeartbeatSessionContext,
+        *,
+        action: str,
+        allowed_roles: frozenset[str],
+    ) -> None:
+        if context.role in allowed_roles:
+            return
+        allowed = ", ".join(sorted(allowed_roles))
+        raise AssertionError(
+            f"heartbeat {action} is not allowed for role "
+            f"{context.role!r} on {context.session_name}; allowed roles: {allowed}"
+        )
+
+    def _set_session_status(
+        self,
+        api,
+        context: HeartbeatSessionContext,
+        status: str,
+        *,
+        reason: str,
+    ) -> None:
+        self._assert_role_allows_write(
+            context,
+            action="set_session_status",
+            allowed_roles=self._MUTATING_SESSION_ROLES,
+        )
+        api.set_session_status(context.session_name, status, reason=reason)
+
+    def _recover_session(
+        self,
+        api,
+        context: HeartbeatSessionContext,
+        *,
+        failure_type: str,
+        message: str,
+    ) -> None:
+        self._assert_role_allows_write(
+            context,
+            action="recover_session",
+            allowed_roles=self._MUTATING_SESSION_ROLES,
+        )
+        api.recover_session(
+            context.session_name,
+            failure_type=failure_type,
+            message=message,
+        )
+
+    def _send_worker_message(
+        self,
+        api,
+        context: HeartbeatSessionContext,
+        text: str,
+        *,
+        owner: str = "heartbeat",
+    ) -> None:
+        self._assert_role_allows_write(
+            context,
+            action="send_session_message",
+            allowed_roles=self._WORKER_MUTATING_SESSION_ROLES,
+        )
+        api.send_session_message(context.session_name, text, owner=owner)
+
     def _process_unmanaged_windows(self, api) -> None:
         current_alert_types: set[str] = set()
         existing_alert_types = {
@@ -406,8 +482,18 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 "error",
                 f"Expected tmux window {context.window_name} in session {context.tmux_session}",
             )
-            api.set_session_status(context.session_name, "recovering", reason="Expected tmux window is missing")
-            api.recover_session(context.session_name, failure_type="missing_window", message="Expected tmux window is missing")
+            self._set_session_status(
+                api,
+                context,
+                "recovering",
+                reason="Expected tmux window is missing",
+            )
+            self._recover_session(
+                api,
+                context,
+                failure_type="missing_window",
+                message="Expected tmux window is missing",
+            )
             api.update_cursor(
                 context.session_name,
                 source_path=context.source_path,
@@ -427,8 +513,13 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 "error",
                 f"Pane {context.pane_id} in window {context.window_name} has exited",
             )
-            api.set_session_status(context.session_name, "recovering", reason="Pane exited")
-            api.recover_session(context.session_name, failure_type="pane_dead", message="Pane exited")
+            self._set_session_status(api, context, "recovering", reason="Pane exited")
+            self._recover_session(
+                api,
+                context,
+                failure_type="pane_dead",
+                message="Pane exited",
+            )
             alerts.append("pane_dead")
         else:
             api.clear_alert(context.session_name, "pane_dead")
@@ -501,7 +592,12 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 context.provider,
                 reason="live session reported authentication failure",
             )
-            api.set_session_status(context.session_name, "auth_broken", reason="Authentication failure reported")
+            self._set_session_status(
+                api,
+                context,
+                "auth_broken",
+                reason="Authentication failure reported",
+            )
             alerts.append("auth_broken")
             status_locked = True
         else:
@@ -514,13 +610,18 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             verdict, reason = ("healthy", "Heartbeat supervisor only checks mechanical session health")
             api.clear_alert(context.session_name, "needs_followup")
             if not status_locked:
-                api.set_session_status(context.session_name, "healthy", reason=reason)
+                self._set_session_status(api, context, "healthy", reason=reason)
         else:
             verdict, reason = self._classify(context)
             if verdict == "needs_followup":
                 api.raise_alert(context.session_name, "needs_followup", "warn", reason)
                 if not status_locked:
-                    api.set_session_status(context.session_name, "needs_followup", reason=reason)
+                    self._set_session_status(
+                        api,
+                        context,
+                        "needs_followup",
+                        reason=reason,
+                    )
                 # Alerts are visible in the cockpit and via `pm alerts`.
                 # No need to inject messages into the operator chat —
                 # the operator gets nudged only when *it* is stalled.
@@ -529,11 +630,21 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 api.clear_alert(context.session_name, "needs_followup")
                 if not status_locked:
                     if verdict == "blocked":
-                        api.set_session_status(context.session_name, "waiting_on_user", reason=reason)
+                        self._set_session_status(
+                            api,
+                            context,
+                            "waiting_on_user",
+                            reason=reason,
+                        )
                     elif verdict == "done":
-                        api.set_session_status(context.session_name, "idle", reason=reason)
+                        self._set_session_status(api, context, "idle", reason=reason)
                     else:
-                        api.set_session_status(context.session_name, "healthy", reason=reason)
+                        self._set_session_status(
+                            api,
+                            context,
+                            "healthy",
+                            reason=reason,
+                        )
 
         api.record_checkpoint(context, alerts=alerts)
         api.update_cursor(
@@ -663,8 +774,9 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         ordinary nudges so we don't spam a worker that's slow to pick up.
         """
         try:
-            api.send_session_message(
-                context.session_name,
+            self._send_worker_message(
+                api,
+                context,
                 "pm task next",
                 owner="heartbeat",
             )
@@ -857,8 +969,9 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     most_recent_age = age
             # Circuit breaker: too many nudges → recover the worker.
             if nudge_count >= self._MAX_NUDGES_BEFORE_RECOVERY:
-                api.recover_session(
-                    context.session_name,
+                self._recover_session(
+                    api,
+                    context,
                     failure_type="unresponsive",
                     message=f"Worker unresponsive after {nudge_count} nudges — restarting",
                 )
@@ -876,7 +989,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             message = "You hit an error. Read it carefully, fix the root cause, and continue."
         else:
             message = "State the remaining task in one sentence, execute the next step, and report."
-        api.send_session_message(context.session_name, message, owner="heartbeat")
+        self._send_worker_message(api, context, message, owner="heartbeat")
         try:
             from pollypm.plugins_builtin.activity_feed.summaries import (
                 activity_summary,
@@ -950,8 +1063,9 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         # Worker asking for permission → push forward
         proceed_signals = ["if you want", "shall i", "should i", "want me to", "i can do"]
         if any(sig in lowered for sig in proceed_signals):
-            api.send_session_message(
-                context.session_name,
+            self._send_worker_message(
+                api,
+                context,
                 "Yes, proceed. Do the next step you outlined.",
                 owner="heartbeat",
             )

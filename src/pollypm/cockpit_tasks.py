@@ -9,6 +9,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, Static, TabbedContent, TabPane
 
+from pollypm.approval_notifications import notify_task_approved
 from pollypm.cockpit_task_review import (
     load_task_review_artifact,
     render_task_review_artifact,
@@ -791,7 +792,7 @@ class PollyTasksApp(App[None]):
                 return
             if decision == "approve":
                 svc.approve(task_id, "user", reason or "Approved from task cockpit")
-                self.notify(f"Approved {task_id}", severity="information")
+                notify_task_approved(task, notify=self.notify)
             else:
                 svc.reject(task_id, "user", reason or "Rejected from task cockpit")
                 self.notify(f"Rejected {task_id}", severity="information")

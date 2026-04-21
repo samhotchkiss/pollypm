@@ -14,6 +14,11 @@ from pollypm.cockpit_sections.base import (
     _format_tokens,
     _iso_to_dt,
 )
+from pollypm.cockpit_sections.health import (
+    format_project_health_scorecard,
+    project_health_rank,
+)
+from pollypm.cockpit_sections.just_shipped import _section_just_shipped
 from pollypm.cockpit_sections.project_dashboard import (
     _DASHBOARD_PROJECT_CACHE,
     _dashboard_project_tasks,
@@ -311,7 +316,11 @@ def _recent_briefing_entry(base_dir: Path, *, now: datetime, status: str):
 
 
 def _briefing_banner(config, *, config_path: Path | None, now: datetime) -> DashboardBriefingBanner | None:
-    base_dir = Path(config.project.base_dir)
+    project_cfg = getattr(config, "project", None)
+    base_dir_value = getattr(project_cfg, "base_dir", None)
+    if not base_dir_value:
+        return None
+    base_dir = Path(base_dir_value)
     entry, created_at = _recent_briefing_entry(base_dir, now=now, status="open")
     if entry is None:
         recent_any, _created_any = _recent_briefing_entry(base_dir, now=now, status="all")
@@ -340,10 +349,11 @@ def _briefing_banner(config, *, config_path: Path | None, now: datetime) -> Dash
                     except Exception:  # noqa: BLE001
                         zone = UTC
                     now_local = now.astimezone(zone)
-                    if state.last_briefing_date != iso_date(now_local.date()):
+                    root_dir_value = getattr(project_cfg, "root_dir", None)
+                    if state.last_briefing_date != iso_date(now_local.date()) and root_dir_value:
                         try:
                             result = fire_briefing(
-                                project_root=Path(config.project.root_dir),
+                                project_root=Path(root_dir_value),
                                 base_dir=base_dir,
                                 settings=settings,
                                 now_local=now_local,
@@ -464,11 +474,13 @@ def _build_dashboard(supervisor, config, config_path: Path | None = None) -> str
     all_blocked: list[tuple[str, object]] = []
     all_done: list[tuple[str, object]] = []
     all_tasks: list[tuple[str, object]] = []
+    project_scorecards: list[tuple[int, str, str]] = []
     total_counts: dict[str, int] = {}
     live_keys: set[str] = set()
     for project_key, project in config.projects.items():
         live_keys.add(project_key)
         partitioned, counts = _dashboard_project_tasks(project_key, project.path)
+        project_tasks = [task for bucket in partitioned.values() for task in bucket]
         for status, count in counts.items():
             total_counts[status] = total_counts.get(status, 0) + count
         for status_name, bucket in partitioned.items():
@@ -485,6 +497,18 @@ def _build_dashboard(supervisor, config, config_path: Path | None = None) -> str
                     all_blocked.append(pair)
                 elif status_name == "done":
                     all_done.append(pair)
+        label = (
+            project.display_label()
+            if hasattr(project, "display_label")
+            else getattr(project, "name", None) or project_key
+        )
+        project_scorecards.append(
+            (
+                project_health_rank(project_tasks, now=now),
+                str(label).lower(),
+                format_project_health_scorecard(label, counts, project_tasks, now=now),
+            )
+        )
     for stale_key in list(_DASHBOARD_PROJECT_CACHE.keys()):
         if stale_key not in live_keys:
             _DASHBOARD_PROJECT_CACHE.pop(stale_key, None)
@@ -557,6 +581,13 @@ def _build_dashboard(supervisor, config, config_path: Path | None = None) -> str
         lines.append("  " + " · ".join(count_parts))
     lines.append("")
 
+    if project_scorecards:
+        lines.append(_dashboard_divider("Projects"))
+        lines.append("")
+        for _rank, _label, line in sorted(project_scorecards):
+            lines.append(f"  {line}")
+        lines.append("")
+
     lines.extend(_render_suggestions(suggestions))
 
     if all_active or all_review:
@@ -609,6 +640,8 @@ def _build_dashboard(supervisor, config, config_path: Path | None = None) -> str
         if len(all_done) > 8:
             lines.append(f"    + {len(all_done) - 8} more completed")
         lines.append("")
+
+    lines.extend(_section_just_shipped(all_done, now=now))
 
     lines.append(_dashboard_divider("Activity"))
     lines.append("")

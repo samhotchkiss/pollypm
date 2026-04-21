@@ -6,6 +6,14 @@ Architecturally, PollyPM is a modular monolith: one local system with explicit r
 
 **New here? Start with [docs/getting-started.md](docs/getting-started.md)** — a 15-minute walkthrough from install to your first completed task. See [CHANGELOG.md](CHANGELOG.md) for release notes and migration notes. The rest of this README is the module map and architecture reference for contributors.
 
+## Document Map
+
+Use the front-door docs in this order:
+
+- `README.md` — what PollyPM is, how the system is shaped, and where the major modules live.
+- [`docs/getting-started.md`](docs/getting-started.md) — install, first-run, first-project, first-task walkthrough.
+- [`docs/project-overview.md`](docs/project-overview.md) — deep project context and regenerated background material; not the best first read.
+
 ## Architecture
 
 ```mermaid

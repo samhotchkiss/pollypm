@@ -4,6 +4,12 @@ PollyPM is a tmux-first control plane for running multiple AI coding agents in p
 
 This guide gets you from zero to a first completed task in under 15 minutes.
 
+Use the docs in this order:
+
+- [README.md](../README.md) for the high-level module map and architecture.
+- `docs/getting-started.md` for the install and first-run walkthrough.
+- [docs/project-overview.md](project-overview.md) only when you want the deeper generated background and historical context.
+
 ## Install
 
 PollyPM needs Python 3.13+, `tmux`, `git`, and at least one of the `claude` or `codex` CLIs on your PATH. Install those first if you don't have them.
@@ -137,6 +143,7 @@ Rejection sends the task back to `in_progress` with your feedback attached — t
 
 ## Where to go next
 
+- **[README.md](../README.md)** — architecture map, module boundaries, and the current system shape.
 - **[docs/worker-guide.md](worker-guide.md)** — the worker lifecycle, `pm task` commands, and the output format workers use to hand off.
 - **[docs/planner-plugin-spec.md](planner-plugin-spec.md)** — how `pm project plan` decomposes work through an architect + 5-critic pipeline.
 - **[docs/downtime-plugin-spec.md](downtime-plugin-spec.md)** — the downtime plugin for scheduled background work.
@@ -146,5 +153,6 @@ Rejection sends the task back to `in_progress` with your feedback attached — t
 - **`pm memory --help`** — the memory plugin for long-term context.
 - **[docs/plugin-authoring.md](plugin-authoring.md)** and **[docs/plugin-discovery-spec.md](plugin-discovery-spec.md)** — author your own provider, runtime, or profile plugin.
 - **[docs/magic-skills-catalog.md](magic-skills-catalog.md)** — the starter catalog of reusable agent skills.
+- **[docs/project-overview.md](project-overview.md)** — the long-form generated project context after you already know your way around.
 
 If something doesn't match what you're seeing, run `pm debug` for a one-screen snapshot of sessions, alerts, and recent events — that's the right thing to paste into a bug report.

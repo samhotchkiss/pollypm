@@ -38,6 +38,29 @@ from pollypm.heartbeat.roster import (
 __all__ = ["Heartbeat", "JobQueueProtocol", "TickResult", "EnqueuedJob"]
 
 
+def _is_immutable_payload_value(value: Any) -> bool:
+    """Return True when a payload value is safe to reuse without deep copy."""
+    if value is None or isinstance(value, (str, bytes, int, float, bool)):
+        return True
+    if isinstance(value, tuple):
+        return all(_is_immutable_payload_value(item) for item in value)
+    if isinstance(value, frozenset):
+        return all(_is_immutable_payload_value(item) for item in value)
+    if isinstance(value, dict):
+        return all(
+            _is_immutable_payload_value(key) and _is_immutable_payload_value(item)
+            for key, item in value.items()
+        )
+    return False
+
+
+def _snapshot_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Take the cheapest safe snapshot for an enqueued heartbeat payload."""
+    if _is_immutable_payload_value(payload):
+        return dict(payload)
+    return copy.deepcopy(payload)
+
+
 class JobQueueProtocol(Protocol):
     """Structural interface for the queue dependency.
 
@@ -116,7 +139,7 @@ class Heartbeat:
                 entry.first_seen_at = now
 
             if self._is_due(entry, now, prev):
-                payload_snapshot = copy.deepcopy(entry.payload)
+                payload_snapshot = _snapshot_payload(entry.payload)
                 job_id = self.queue.enqueue(
                     entry.handler_name,
                     payload_snapshot,

@@ -132,6 +132,24 @@ class TestCoreRecurringPlugin:
         assert "roster_entry" in kinds or "roster" in kinds  # legacy-compat
         assert "job_handler" in kinds
 
+    def test_split_modules_back_the_plugin_surface(self) -> None:
+        from pollypm.plugins_builtin.core_recurring import maintenance, shared, sweeps
+        from pollypm.plugins_builtin.core_recurring.plugin import (
+            _ephemeral_alert_type,
+            is_ephemeral_session_name,
+            log_rotate_handler,
+            sweep_ephemeral_sessions,
+            work_progress_sweep_handler,
+        )
+
+        assert shared.sweep_ephemeral_sessions is sweep_ephemeral_sessions
+        assert shared.is_ephemeral_session_name is is_ephemeral_session_name
+        assert maintenance.log_rotate_handler is log_rotate_handler
+        assert sweeps.work_progress_sweep_handler is work_progress_sweep_handler
+        assert _ephemeral_alert_type("task-demo-1", "missing_window").startswith(
+            "ephemeral_session_dead:"
+        )
+
 
 def _interval_seconds(entry) -> int:
     """Extract the EverySchedule interval in seconds from a roster entry."""

@@ -318,6 +318,37 @@ def test_follow_mode_toggles_and_merges_new_entries(
     _run(body())
 
 
+def test_follow_tick_keeps_activity_window_bounded(
+    activity_env, activity_app,
+) -> None:
+    """Long-running follow mode must keep only the latest bounded window."""
+
+    async def body() -> None:
+        initial_entries = [
+            _make_entry(entry_id=f"evt:{i}", summary=f"seed {i}")
+            for i in range(activity_app.MAX_ROWS_IN_MEMORY)
+        ]
+        newest_entries = [
+            _make_entry(entry_id=f"evt:new:{i}", summary=f"new {i}")
+            for i in range(10)
+        ]
+
+        activity_app._gather = lambda: initial_entries  # type: ignore[method-assign]
+        async with activity_app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            assert len(activity_app._entries) == activity_app.MAX_ROWS_IN_MEMORY
+
+            activity_app._gather = lambda: newest_entries + initial_entries  # type: ignore[method-assign]
+            activity_app._follow_tick()
+            await pilot.pause()
+
+            assert len(activity_app._entries) == activity_app.MAX_ROWS_IN_MEMORY
+            assert activity_app._entries[0].id == "evt:new:0"
+            assert activity_app._entries[9].id == "evt:new:9"
+
+    _run(body())
+
+
 # ---------------------------------------------------------------------------
 # 5. Event-type colour rendering.
 # ---------------------------------------------------------------------------

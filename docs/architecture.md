@@ -47,4 +47,4 @@ Service API v1.1 will make the allow-list empty and turn the boundary
 into a hard guard. Until then, adding a new direct Supervisor import
 outside core requires adding the file to the allow-list with a TODO.
 
-*Last updated: 2026-04-16 (Step 5 / issue #182)*
+*Last updated: 2026-04-21 (Step 5 / issue #182)*

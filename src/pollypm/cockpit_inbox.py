@@ -32,6 +32,10 @@ from typing import Literal
 from pollypm.config import load_config
 from pollypm.cockpit_task_priority import priority_glyph, priority_rank
 from pollypm.cockpit_sections.base import _STATUS_ICONS
+from pollypm.cockpit_worker_identity import (
+    load_worker_color_overrides,
+    worker_identity,
+)
 from pollypm.heartbeats.snapshots import read_recent_heartbeat_snapshot
 
 
@@ -892,6 +896,7 @@ def _render_worker_roster_panel(config_path: Path) -> str:
             "No active worker sessions.\n\n"
             "Start one with `pm cockpit-pane project <key>` and press `w`."
         )
+    color_overrides = load_worker_color_overrides(config_path)
     lines = ["Workers", ""]
     dot_for = {
         "working": "\u25cf", "idle": "\u25cb",
@@ -899,13 +904,14 @@ def _render_worker_roster_panel(config_path: Path) -> str:
     }
     for row in rows:
         dot = dot_for.get(row.status, "\u25cb")
+        identity = worker_identity(row.session_name, color_overrides=color_overrides)
         task_part = (
             f"#{row.task_number} {row.task_title}"
             if row.task_number is not None else "(none)"
         )
         lines.append(
             f"  {dot} {row.status:<7}  {row.project_name:<18}  "
-            f"{row.session_name:<22}  {task_part}  @{row.current_node or '-'}  "
+            f"{(identity.avatar + ' ' + row.session_name):<22}  {task_part}  @{row.current_node or '-'}  "
             f"{row.turn_label}  {row.last_commit_label}"
         )
     return "\n".join(lines)

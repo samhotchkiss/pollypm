@@ -317,6 +317,8 @@ def test_architect_prompt_includes_stage_transitions_block() -> None:
     assert "Ship the literal brief first." in text
     assert "smallest faithful product" in text
     assert "Everything else goes to `docs/downtime-backlog.md`" in text
+    assert "single source of truth" in text
+    assert "Copy module names, acceptance criteria, and user-level test descriptions" in text
     # Mentions every work stage by name so the agent can match its
     # current node to an instruction.
     for stage in (

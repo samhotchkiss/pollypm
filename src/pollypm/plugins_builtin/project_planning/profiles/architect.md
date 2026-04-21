@@ -104,6 +104,7 @@ One `pm task done` call per stage. No chaining.
    - reject with feedback, which bounces the task back to `synthesize` (you re-enter synthesize; repeat step 6).
 
 8. **emit** — emit the backlog tasks (one `implement_module` task per module).
+   `docs/project-plan.md` is the single source of truth here. Re-read the approved plan before creating each backlog task. Copy module names, acceptance criteria, and user-level test descriptions from the approved plan artifact itself; do NOT reuse earlier candidate text, rejected drafts, or memory.
    Then: `pm task done ...`
    Advances: emit → done (terminal).
 

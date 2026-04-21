@@ -40,10 +40,20 @@ class CompletedItem:
 
 
 @dataclass(slots=True)
+class InboxPreview:
+    sender: str
+    title: str
+    project: str
+    task_id: str
+    age_seconds: float
+
+
+@dataclass(slots=True)
 class DashboardData:
     active_sessions: list[SessionActivity]
     recent_commits: list[CommitInfo]
     completed_items: list[CompletedItem]
+    recent_messages: list[InboxPreview]
     daily_tokens: list[tuple[str, int]]  # (date, tokens)
     today_tokens: int
     total_tokens: int
@@ -205,6 +215,71 @@ def _count_inbox_tasks(config: PollyPMConfig) -> int:
     return total
 
 
+def _inbox_sender(task) -> str:
+    roles = getattr(task, "roles", {}) or {}
+    operator = roles.get("operator")
+    if operator and operator != "user":
+        return str(operator)
+    created_by = getattr(task, "created_by", "")
+    if created_by and created_by != "user":
+        return str(created_by)
+    return "polly"
+
+
+def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[InboxPreview]:
+    try:
+        from pollypm.work.inbox_view import inbox_tasks
+        from pollypm.work.sqlite_service import SQLiteWorkService
+    except Exception:  # noqa: BLE001
+        return []
+
+    now = datetime.now(UTC)
+    seen_task_ids: set[str] = set()
+    previews: list[InboxPreview] = []
+    sources: list[tuple[str | None, str, Path, Path]] = []
+    for project_key, project in getattr(config, "projects", {}).items():
+        sources.append((project_key, project.display_label(), project.path / ".pollypm" / "state.db", project.path))
+    workspace_root = getattr(getattr(config, "project", None), "workspace_root", None)
+    if workspace_root is not None:
+        workspace_path = Path(workspace_root)
+        sources.append((None, "Workspace", workspace_path / ".pollypm" / "state.db", workspace_path))
+
+    for project_key, project_label, db_path, project_path in sources:
+        if not db_path.exists():
+            continue
+        try:
+            with SQLiteWorkService(db_path=db_path, project_path=project_path) as svc:
+                for task in inbox_tasks(svc, project=project_key):
+                    if task.task_id in seen_task_ids:
+                        continue
+                    seen_task_ids.add(task.task_id)
+                    stamped = getattr(task, "updated_at", None) or getattr(task, "created_at", None)
+                    if hasattr(stamped, "timestamp"):
+                        age_seconds = max(0.0, now.timestamp() - float(stamped.timestamp()))
+                    else:
+                        try:
+                            age_seconds = max(
+                                0.0,
+                                (now - datetime.fromisoformat(str(stamped))).total_seconds(),
+                            )
+                        except (ValueError, TypeError):
+                            age_seconds = 0.0
+                    previews.append(
+                        InboxPreview(
+                            sender=_inbox_sender(task),
+                            title=(getattr(task, "title", "") or "(untitled)")[:80],
+                            project=project_label,
+                            task_id=task.task_id,
+                            age_seconds=age_seconds,
+                        )
+                    )
+        except Exception:  # noqa: BLE001
+            continue
+
+    previews.sort(key=lambda item: item.age_seconds)
+    return previews[:limit]
+
+
 def load_dashboard(config_path: Path) -> tuple[PollyPMConfig, DashboardData]:
     """Load config + state store and gather one blocking dashboard snapshot."""
     config = load_config(config_path)
@@ -266,6 +341,7 @@ def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
     commits = _recent_commits(config, hours=24)
     completed = _completed_issues(config, hours=72)
     inbox_count = _count_inbox_tasks(config)
+    recent_messages = _recent_inbox_messages(config)
     sweeps = sum(1 for e in day_events if e.event_type == "heartbeat")
     recoveries = sum(1 for e in day_events if "recover" in e.event_type)
 
@@ -288,6 +364,7 @@ def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
         active_sessions=active,
         recent_commits=commits,
         completed_items=completed,
+        recent_messages=recent_messages,
         daily_tokens=daily,
         today_tokens=today_tokens,
         total_tokens=sum(values),

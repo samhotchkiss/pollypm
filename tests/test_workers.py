@@ -13,6 +13,7 @@ from pollypm.models import (
     KnownProject,
 )
 from pollypm.storage.state import StateStore
+from pollypm.plugins_builtin.core_agent_profiles.profiles import heartbeat_prompt
 from pollypm.plugins_builtin.core_agent_profiles.profiles import polly_prompt as operator_prompt
 from pollypm.plugins_builtin.core_agent_profiles.profiles import triage_prompt
 from pollypm.workers import auto_select_worker_account, suggest_worker_prompt
@@ -213,6 +214,19 @@ def test_operator_prompt_requires_delegation_instructions() -> None:
     assert "delegate" in prompt.lower()
     assert "pm" in prompt  # references pm commands
     assert "<principles>" in prompt
+
+
+def test_heartbeat_prompt_describes_recovery_protocol() -> None:
+    prompt = heartbeat_prompt()
+
+    assert "<protocol>" in prompt
+    assert "idle" in prompt
+    assert "stuck" in prompt
+    assert "looping" in prompt
+    assert "exited" in prompt
+    assert "auth_broken" in prompt
+    assert "resume ping" in prompt.lower()
+    assert "pm task next" in prompt
 
 
 def test_triage_prompt_points_at_inbox_cli() -> None:

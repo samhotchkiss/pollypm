@@ -92,6 +92,7 @@ from pollypm.cockpit_palette import (
     _record_palette_command,
     _resolve_recent_commands,
 )
+from pollypm.cockpit_sections.action_bar import render_project_action_bar
 from pollypm.cockpit_settings_accounts import (
     SETTINGS_ACCOUNT_ACTIONS,
     render_settings_account_detail,
@@ -6702,6 +6703,23 @@ class PollyProjectDashboardApp(App[None]):
         color: #97a6b2;
         padding-top: 0;
     }
+    #proj-action-bar {
+        margin-top: 1;
+        padding: 0 1;
+        background: #16202a;
+        color: #6b7a88;
+        border: round #243241;
+    }
+    #proj-action-bar.-attention {
+        background: #3a2c08;
+        color: #f7d67a;
+        border: round #7a5a14;
+    }
+    #proj-action-bar.-critical {
+        background: #3a1719;
+        color: #ffd7d9;
+        border: round #8d3137;
+    }
     #proj-body {
         height: 1fr;
         padding: 1 0 0 0;
@@ -6793,6 +6811,7 @@ class PollyProjectDashboardApp(App[None]):
         self.project_key = project_key
         self.topbar = Static("", id="proj-topbar", markup=True)
         self.status_line = Static("", id="proj-status", markup=True)
+        self.action_bar = Static("", id="proj-action-bar", markup=True)
         self.now_title = Static(
             "[b]Current activity[/b]",
             classes="proj-section-title",
@@ -6854,6 +6873,7 @@ class PollyProjectDashboardApp(App[None]):
         with Vertical(id="proj-outer"):
             yield self.topbar
             yield self.status_line
+            yield self.action_bar
             with VerticalScroll(id="proj-body"):
                 with Vertical(classes="proj-section", id="proj-now-section"):
                     yield self.now_title
@@ -6918,6 +6938,7 @@ class PollyProjectDashboardApp(App[None]):
             f"[#97a6b2]{_escape(data.status_label)}[/]"
         )
         self.status_line.update(status_markup)
+        self._update_action_bar(data)
 
         # ── Current activity ──
         self.now_body.update(self._render_now_body(data))
@@ -6937,6 +6958,21 @@ class PollyProjectDashboardApp(App[None]):
         self.inbox_body.update(self._render_inbox_body(data))
 
         self.hint.update(self._DEFAULT_HINT)
+
+    def _update_action_bar(self, data: ProjectDashboardData) -> None:
+        review_count = int(data.task_counts.get("review", 0))
+        summary = render_project_action_bar(
+            review_count=review_count,
+            alert_count=data.alert_count,
+            inbox_count=data.inbox_count,
+        )
+        self.action_bar.remove_class("-attention")
+        self.action_bar.remove_class("-critical")
+        if data.alert_count:
+            self.action_bar.add_class("-critical")
+        elif review_count or data.inbox_count:
+            self.action_bar.add_class("-attention")
+        self.action_bar.update(f"[b]{_escape(summary)}[/b]")
 
     # ------------------------------------------------------------------
     # Section renderers — all return Rich-markup strings, all handle

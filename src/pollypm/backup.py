@@ -24,6 +24,7 @@ Design notes:
 from __future__ import annotations
 
 import gzip
+import os
 import shutil
 import sqlite3
 import tarfile
@@ -209,6 +210,26 @@ def _gunzip_file(src_gz: Path, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(src_gz, "rb") as fin, dest.open("wb") as fout:
         shutil.copyfileobj(fin, fout)
+
+
+def _sqlite_sidecars(db_path: Path) -> tuple[Path, Path]:
+    return (
+        db_path.with_name(db_path.name + "-wal"),
+        db_path.with_name(db_path.name + "-shm"),
+    )
+
+
+def _remove_sqlite_sidecars(db_path: Path) -> None:
+    """Remove stale WAL/SHM sidecars before a restore swap."""
+    for sidecar in _sqlite_sidecars(db_path):
+        if not sidecar.exists():
+            continue
+        try:
+            sidecar.unlink()
+        except OSError as exc:
+            raise RuntimeError(
+                f"Could not remove SQLite sidecar {sidecar}: {exc}. Restore aborted."
+            ) from exc
 
 
 # --------------------------------------------------------------------- #
@@ -445,7 +466,7 @@ def execute_restore(plan: RestorePlan) -> RestoreResult:
     # 2. Materialize the snapshot into a plain file we can move into
     #    place.
     live_db.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory() as staging:
+    with tempfile.TemporaryDirectory(dir=live_db.parent, prefix=".restore-") as staging:
         staged_db = Path(staging) / "restored.db"
 
         if plan.is_tar:
@@ -461,23 +482,13 @@ def execute_restore(plan: RestorePlan) -> RestoreResult:
         else:
             shutil.copy2(snapshot, staged_db)
 
-        # 3. Atomic-ish replace. On POSIX ``os.replace`` is atomic on
-        #    the same filesystem; the tempdir is in /tmp which may
-        #    differ, so we copy into place instead.
-        shutil.copy2(staged_db, live_db)
+        # 3. Remove stale WAL/SHM sidecars from the old DB before we
+        #    atomically swap in the restored snapshot. If cleanup fails,
+        #    abort loudly instead of risking a mixed restore + stale WAL.
+        _remove_sqlite_sidecars(live_db)
 
-    # 4. Clean up WAL / SHM sidecars from the old DB — they belong to
-    #    the previous transaction log and would confuse SQLite after
-    #    we've swapped in a cold snapshot. Best-effort.
-    for sidecar in (
-        live_db.with_name(live_db.name + "-wal"),
-        live_db.with_name(live_db.name + "-shm"),
-    ):
-        try:
-            if sidecar.exists():
-                sidecar.unlink()
-        except OSError:
-            pass
+        # 4. Atomic replace on the same filesystem.
+        os.replace(staged_db, live_db)
 
     return RestoreResult(
         snapshot_path=snapshot,

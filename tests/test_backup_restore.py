@@ -459,6 +459,93 @@ def test_backup_module_raises_named_error_when_database_stays_locked(
         )
 
 
+def test_execute_restore_matches_snapshot_bytes_and_clears_sidecars(
+    fake_home: Path, state_db: Path, tmp_path: Path
+) -> None:
+    snapshot = backup_mod.backup_state_db(
+        state_db,
+        base_dir=fake_home,
+        output=tmp_path / "backups" / "snapshot.db.gz",
+        full=False,
+        keep=7,
+    ).path
+    expected_bytes = gzip.decompress(snapshot.read_bytes())
+
+    conn = sqlite3.connect(state_db)
+    try:
+        conn.execute("UPDATE probe SET v = ? WHERE k = ?", ("mutated", "hello"))
+        conn.commit()
+    finally:
+        conn.close()
+
+    wal = state_db.with_name(state_db.name + "-wal")
+    shm = state_db.with_name(state_db.name + "-shm")
+    wal.write_bytes(b"stale wal")
+    shm.write_bytes(b"stale shm")
+
+    plan = backup_mod.plan_restore(snapshot, state_db)
+    result = backup_mod.execute_restore(plan)
+
+    assert result.live_db_path == state_db
+    assert state_db.read_bytes() == expected_bytes
+    assert not wal.exists()
+    assert not shm.exists()
+
+
+def test_execute_restore_aborts_when_sidecar_cleanup_fails(
+    fake_home: Path, state_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = backup_mod.backup_state_db(
+        state_db,
+        base_dir=fake_home,
+        output=tmp_path / "backups" / "snapshot.db.gz",
+        full=False,
+        keep=7,
+    ).path
+
+    conn = sqlite3.connect(state_db)
+    try:
+        conn.execute("UPDATE probe SET v = ? WHERE k = ?", ("mutated", "hello"))
+        conn.commit()
+    finally:
+        conn.close()
+
+    wal = state_db.with_name(state_db.name + "-wal")
+    wal.write_bytes(b"stale wal")
+
+    real_unlink = Path.unlink
+
+    def fail_wal_unlink(self: Path, *args, **kwargs):
+        if self == wal:
+            raise OSError("permission denied")
+        return real_unlink(self, *args, **kwargs)
+
+    replace_called = {"value": False}
+    real_replace = backup_mod.os.replace
+
+    def fail_if_replace(*args, **kwargs):
+        replace_called["value"] = True
+        return real_replace(*args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_wal_unlink)
+    monkeypatch.setattr(backup_mod.os, "replace", fail_if_replace)
+
+    plan = backup_mod.plan_restore(snapshot, state_db)
+    with pytest.raises(RuntimeError, match="Restore aborted"):
+        backup_mod.execute_restore(plan)
+
+    assert replace_called["value"] is False
+
+    conn = sqlite3.connect(state_db)
+    try:
+        row = conn.execute(
+            "SELECT v FROM probe WHERE k = ?", ("hello",)
+        ).fetchone()
+        assert row == ("mutated",)
+    finally:
+        conn.close()
+
+
 def test_plan_restore_rejects_full_archive_missing_state_db(
     fake_home: Path, tmp_path: Path
 ) -> None:

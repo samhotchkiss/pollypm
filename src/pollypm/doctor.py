@@ -45,6 +45,10 @@ from typing import Any, Callable, Iterable
 
 from pollypm.service_api import PollyPMService
 
+# Allow ``pollypm.doctor`` to host internal submodules while keeping the
+# public import path stable as a module-level facade.
+__path__ = [str(Path(__file__).resolve().with_name("doctor"))]
+
 
 # --------------------------------------------------------------------- #
 # Result model
@@ -490,429 +494,46 @@ def check_terminal_color_support() -> CheckResult:
     )
 
 
-# --------------------------------------------------------------------- #
-# PollyPM install-state checks
-# --------------------------------------------------------------------- #
+# The system checks now live in ``pollypm.doctor.system``. Keep these
+# public names wired to the extracted module so imports and CLI behavior
+# stay stable while the implementation moves out of this file.
+from pollypm.doctor import system as _doctor_system
 
-
-def check_pm_binary_resolves() -> CheckResult:
-    path = _tool_path("pm") or _tool_path("pollypm")
-    if path is None:
-        return _fail(
-            "pm / pollypm binary not on PATH",
-            why=(
-                "The canonical entry point is the `pm` command installed by "
-                "`uv tool install --editable .`. Without it, every user-facing "
-                "workflow requires `uv run pm ...`."
-            ),
-            fix=(
-                "Install the global entry points —\n"
-                "  uv tool install --editable .\n"
-                "Or run via uv:  uv run pm doctor\n"
-                "Recheck: pm doctor"
-            ),
-        )
-    return _ok(f"pm binary at {path}", data={"path": path})
-
-
-def check_installed_version_matches_pyproject() -> CheckResult:
-    """Warn when the installed package version drifts from pyproject.toml.
-
-    Common gotcha: the user ran ``git pull`` but did not rebuild the
-    editable install, so ``pm --version`` or the running module reports
-    an older version than source. We compare the packaged metadata
-    against the ``[project].version`` in ``pyproject.toml``.
-    """
-    declared = _read_pyproject_version()
-    if not declared:
-        return _skip("pyproject.toml version not readable")
-    try:
-        from importlib.metadata import PackageNotFoundError, version as _mdver
-
-        installed = _mdver("pollypm")
-    except PackageNotFoundError:
-        return _fail(
-            "pollypm package metadata not found",
-            why=(
-                "PollyPM must be installed (editable or otherwise) for the "
-                "CLI entry points to resolve. `uv run pm ...` still works, "
-                "but first-class `pm` requires the install step."
-            ),
-            fix=(
-                "Install PollyPM editable —\n"
-                "  uv tool install --editable .\n"
-                "Recheck: pm doctor"
-            ),
-        )
-    except Exception as exc:  # noqa: BLE001
-        return _skip(f"package metadata unreadable ({exc})")
-    if installed != declared:
-        return _fail(
-            f"installed pollypm={installed} drifts from source {declared}",
-            why=(
-                "An editable install can fall behind after `git pull` if the "
-                "entry point was reinstalled from a prior revision. Running "
-                "`pm ...` may execute stale code."
-            ),
-            fix=(
-                "Reinstall the editable package —\n"
-                "  uv tool install --editable --reinstall .\n"
-                "Or:  uv sync --reinstall\n"
-                "Recheck: pm doctor"
-            ),
-            severity="warning",
-            data={"installed": installed, "source": declared},
-        )
-    return _ok(f"pollypm {installed} matches pyproject", data={"version": installed})
-
-
-def check_config_file() -> CheckResult:
-    """Check for a PollyPM config at the global or project-local path."""
-    from pollypm.config import DEFAULT_CONFIG_PATH
-
-    if DEFAULT_CONFIG_PATH.exists():
-        return _ok(f"config present at {DEFAULT_CONFIG_PATH}", data={"path": str(DEFAULT_CONFIG_PATH)})
-    return _fail(
-        f"no PollyPM config at {DEFAULT_CONFIG_PATH}",
-        why=(
-            "PollyPM loads accounts, sessions, and project settings from "
-            "~/.pollypm/pollypm.toml. Without it the CLI runs first-run "
-            "onboarding every time."
-        ),
-        fix=(
-            "Run onboarding or scaffold an example config —\n"
-            "  pm onboard\n"
-            "Or:  pm init\n"
-            "Recheck: pm doctor"
-        ),
-    )
-
-
-def check_provider_account_configured() -> CheckResult:
-    """At least one provider account must be configured."""
-    from pollypm.config import DEFAULT_CONFIG_PATH, load_config
-
-    if not DEFAULT_CONFIG_PATH.exists():
-        return _skip("account check skipped (no config)")
-    try:
-        config = load_config(DEFAULT_CONFIG_PATH)
-    except Exception as exc:  # noqa: BLE001
-        return _fail(
-            f"config failed to parse ({exc})",
-            why=(
-                "A broken ~/.pollypm/pollypm.toml prevents the CLI from "
-                "loading any accounts or sessions."
-            ),
-            fix=(
-                "Inspect and fix the config —\n"
-                "  pm example-config   # reference template\n"
-                "  edit ~/.pollypm/pollypm.toml\n"
-                "Recheck: pm doctor"
-            ),
-            data={"error": str(exc)},
-        )
-    accounts = getattr(config, "accounts", {}) or {}
-    if not accounts:
-        return _fail(
-            "no provider accounts configured",
-            why=(
-                "PollyPM needs at least one Claude or Codex account to launch "
-                "agent sessions. Heartbeat, workers, and cockpit all require "
-                "a provider-bound account."
-            ),
-            fix=(
-                "Add an account via onboarding —\n"
-                "  pm onboard\n"
-                "Or edit ~/.pollypm/pollypm.toml and add an [accounts.*] block\n"
-                "(see `pm example-config`).\n"
-                "Recheck: pm doctor"
-            ),
-        )
-    return _ok(
-        f"{len(accounts)} provider account(s) configured",
-        data={"accounts": sorted(accounts.keys())},
-    )
-
-
-def check_storage_backend() -> CheckResult:
-    """Resolve the configured storage backend via entry points (issue #343).
-
-    Calls :func:`pollypm.store.registry.get_store` and reports which
-    backend is active plus its URL. A missing config skips. A
-    :class:`~pollypm.errors.StoreBackendNotFound` surfaces the
-    three-question-rule message verbatim so the user sees what, why,
-    and how to fix.
-    """
-    from pollypm.config import DEFAULT_CONFIG_PATH, load_config
-    from pollypm.errors import StoreBackendNotFound
-    from pollypm.store.registry import get_store
-
-    if not DEFAULT_CONFIG_PATH.exists():
-        return _skip("storage backend check skipped (no config)")
-    try:
-        config = load_config(DEFAULT_CONFIG_PATH)
-    except Exception as exc:  # noqa: BLE001
-        return _fail(
-            f"config failed to parse ({exc})",
-            why=(
-                "Doctor cannot resolve the storage backend without a "
-                "parseable ~/.pollypm/pollypm.toml."
-            ),
-            fix=(
-                "Inspect and fix the config —\n"
-                "  pm example-config   # reference template\n"
-                "  edit ~/.pollypm/pollypm.toml\n"
-                "Recheck: pm doctor"
-            ),
-            data={"error": str(exc)},
-        )
-    backend_name = config.storage.backend
-    try:
-        store = get_store(config)
-    except StoreBackendNotFound as exc:
-        return _fail(
-            f"storage backend '{backend_name}' not installed",
-            why=(
-                "PollyPM resolves its persistent-state backend via the "
-                "'pollypm.store_backend' entry-point group; no installed "
-                "package registered that name. Every subsystem that writes "
-                "state will fail until this is fixed."
-            ),
-            fix=(
-                "Set [storage].backend in ~/.pollypm/pollypm.toml to an "
-                "installed backend, or install the package that ships the "
-                f"'{backend_name}' backend.\n"
-                f"Available: {', '.join(exc.available) or 'none'}\n"
-                "Recheck: pm doctor"
-            ),
-            data={"backend": backend_name, "available": exc.available},
-        )
-    except Exception as exc:  # noqa: BLE001
-        return _fail(
-            f"storage backend '{backend_name}' failed to initialise ({exc})",
-            why=(
-                "The entry point loaded but construction raised — the "
-                "backend is registered but not usable in this environment."
-            ),
-            fix=(
-                "Inspect the error above, check [storage].url in "
-                "~/.pollypm/pollypm.toml, and verify the backend package's "
-                "own dependencies.\n"
-                "Recheck: pm doctor"
-            ),
-            data={"backend": backend_name, "error": str(exc)},
-        )
-    # Grab the URL for reporting, then release the resources the store
-    # just opened. Doctor must not leave connection pools dangling.
-    url = getattr(store, "url", "<unknown>")
-    try:
-        dispose = getattr(store, "dispose", None)
-        if callable(dispose):
-            dispose()
-    except Exception:  # noqa: BLE001
-        pass
-    return _ok(
-        f"storage backend '{backend_name}' active at {url}",
-        data={"backend": backend_name, "url": url},
-    )
-
-
-def check_registered_providers() -> CheckResult:
-    """Probe the ``pollypm.provider`` entry-point registry (issue #397).
-
-    Phase E of the account-management refactor introduced a
-    provider-agnostic substrate at :mod:`pollypm.acct`; each provider
-    (Claude, Codex, and any third-party plugin) registers its adapter
-    via the ``pollypm.provider`` entry-point group. Doctor walks the
-    registry and confirms every registered adapter can be imported and
-    instantiated — a misconfigured entry point or a broken adapter
-    class would otherwise only surface when an account tries to probe.
-
-    Mirrors the ``storage-backend`` check: one call to the registry,
-    per-provider try/except so a single broken adapter does not mask
-    the others.
-    """
-    from pollypm.acct import get_provider, list_providers
-
-    names = list_providers()
-    if not names:
-        return _fail(
-            "no providers registered",
-            why=(
-                "PollyPM resolves every account (Claude, Codex, plugin) "
-                "via the 'pollypm.provider' entry-point group; with no "
-                "entry points registered, no account can run and every "
-                "`pm account` command will fail."
-            ),
-            fix=(
-                "Reinstall PollyPM so the built-in 'claude' and 'codex' "
-                "entry points are registered —\n"
-                "  uv tool install --editable --reinstall .\n"
-                "If a third-party provider is expected, reinstall the "
-                "plugin package that ships it.\n"
-                "Recheck: pm doctor"
-            ),
-            data={"providers": []},
-        )
-
-    failures: dict[str, str] = {}
-    for name in names:
-        try:
-            get_provider(name)
-        except Exception as exc:  # noqa: BLE001
-            failures[name] = f"{type(exc).__name__}: {exc}"
-
-    if failures:
-        first_name = next(iter(failures))
-        first_error = failures[first_name]
-        return _fail(
-            f"{first_name} failed to load ({first_error})",
-            why=(
-                "A registered provider adapter raised on import or "
-                "instantiation. Every account whose provider string "
-                "maps to that adapter will fail before any subprocess "
-                "runs — the failure is silent until the user actually "
-                "probes an account."
-            ),
-            fix=(
-                "Inspect the error above, verify the provider plugin's "
-                "installation, and fix the import / constructor issue.\n"
-                f"Registered providers: {', '.join(names)}\n"
-                f"Failing: {', '.join(sorted(failures))}\n"
-                "Recheck: pm doctor"
-            ),
-            data={"providers": names, "failures": failures},
-        )
-
-    return _ok(
-        f"registered-providers: {', '.join(names)}",
-        data={"providers": names},
-    )
+check_python_version = _doctor_system.check_python_version
+check_tmux = _doctor_system.check_tmux
+check_git = _doctor_system.check_git
+check_gh_installed = _doctor_system.check_gh_installed
+check_gh_authenticated = _doctor_system.check_gh_authenticated
+check_uv = _doctor_system.check_uv
+check_terminal_color_support = _doctor_system.check_terminal_color_support
 
 
 # --------------------------------------------------------------------- #
-# Plugin health
+# PollyPM install-state / plugin / filesystem checks now live in
+# ``pollypm.doctor.install_state``, ``pollypm.doctor.plugins``, and
+# ``pollypm.doctor.filesystem``. Keep public names stable here.
 # --------------------------------------------------------------------- #
 
+from pollypm.doctor import filesystem as _doctor_filesystem
+from pollypm.doctor import install_state as _doctor_install_state
+from pollypm.doctor import plugins as _doctor_plugins
 
-_CRITICAL_PLUGINS_FOR_BOOT = ("tmux_session_service",)
+check_pm_binary_resolves = _doctor_install_state.check_pm_binary_resolves
+check_installed_version_matches_pyproject = _doctor_install_state.check_installed_version_matches_pyproject
+check_config_file = _doctor_install_state.check_config_file
+check_provider_account_configured = _doctor_install_state.check_provider_account_configured
+check_storage_backend = _doctor_install_state.check_storage_backend
+check_registered_providers = _doctor_install_state.check_registered_providers
 
+check_builtin_plugin_manifests = _doctor_plugins.check_builtin_plugin_manifests
+check_no_critical_plugin_disabled = _doctor_plugins.check_no_critical_plugin_disabled
+check_plugin_capabilities_no_deprecations = _doctor_plugins.check_plugin_capabilities_no_deprecations
 
-def check_builtin_plugin_manifests() -> CheckResult:
-    """Every builtin plugin's manifest must parse as TOML."""
-    here = Path(__file__).resolve().parent
-    builtin_root = here / "plugins_builtin"
-    if not builtin_root.is_dir():
-        return _fail(
-            f"plugins_builtin dir missing at {builtin_root}",
-            why=(
-                "The builtin plugin tree ships inside the package. Its "
-                "absence indicates a broken install."
-            ),
-            fix=(
-                "Reinstall PollyPM —\n"
-                "  uv tool install --editable --reinstall .\n"
-                "Recheck: pm doctor"
-            ),
-        )
-    bad: list[tuple[str, str]] = []
-    seen = 0
-    for manifest in builtin_root.glob("*/pollypm-plugin.toml"):
-        seen += 1
-        try:
-            tomllib.loads(manifest.read_text())
-        except Exception as exc:  # noqa: BLE001
-            bad.append((manifest.parent.name, str(exc)))
-    if bad:
-        summary = ", ".join(f"{n} ({e[:40]})" for n, e in bad)
-        return _fail(
-            f"{len(bad)} plugin manifest(s) failed to parse: {summary}",
-            why=(
-                "Plugin discovery halts on malformed manifests; affected "
-                "capabilities silently vanish from the host."
-            ),
-            fix=(
-                "Re-pull source and reinstall —\n"
-                "  git pull\n"
-                "  uv tool install --editable --reinstall .\n"
-                "Recheck: pm doctor"
-            ),
-            data={"bad": [n for n, _ in bad]},
-        )
-    return _ok(f"{seen} builtin plugin manifest(s) parse", data={"count": seen})
-
-
-def check_no_critical_plugin_disabled() -> CheckResult:
-    """Configured ``[plugins].disabled`` must not include boot-critical plugins."""
-    from pollypm.config import DEFAULT_CONFIG_PATH, load_config
-
-    if not DEFAULT_CONFIG_PATH.exists():
-        return _skip("critical-plugin check skipped (no config)")
-    try:
-        config = load_config(DEFAULT_CONFIG_PATH)
-    except Exception:  # noqa: BLE001
-        # Surfaced by check_provider_account_configured already.
-        return _skip("critical-plugin check skipped (config parse error)")
-    disabled = set(getattr(getattr(config, "plugins", None), "disabled", ()) or ())
-    conflicts = sorted(disabled & set(_CRITICAL_PLUGINS_FOR_BOOT))
-    if conflicts:
-        return _fail(
-            f"critical plugin(s) disabled: {', '.join(conflicts)}",
-            why=(
-                "PollyPM's session lifecycle is driven by the tmux_session_service "
-                "plugin. Disabling it leaves every `pm up`, `pm attach`, and "
-                "worker-start with no session backend."
-            ),
-            fix=(
-                "Remove these names from [plugins].disabled in ~/.pollypm/pollypm.toml —\n"
-                f"  {', '.join(conflicts)}\n"
-                "Then: pm doctor"
-            ),
-            data={"conflicts": conflicts},
-        )
-    return _ok("no critical plugin disabled")
-
-
-def check_plugin_capabilities_no_deprecations() -> CheckResult:
-    """Builtin plugin manifests must not use deprecated capability-shape forms.
-
-    The v1 plugin API (see ``plugin_api/v1.py``) migrated from free-form
-    capability strings to a structured ``[[capabilities]]`` table. A
-    plugin that declares capabilities as a bare list of strings still
-    loads but emits a deprecation warning at load time. We flag these
-    here so a first-run user does not see mysterious warnings later.
-    """
-    here = Path(__file__).resolve().parent
-    builtin_root = here / "plugins_builtin"
-    offenders: list[str] = []
-    for manifest in builtin_root.glob("*/pollypm-plugin.toml"):
-        try:
-            data = tomllib.loads(manifest.read_text())
-        except Exception:  # noqa: BLE001
-            continue
-        caps = data.get("capabilities") if isinstance(data, dict) else None
-        if isinstance(caps, list):
-            for entry in caps:
-                if not isinstance(entry, dict):
-                    offenders.append(manifest.parent.name)
-                    break
-    if offenders:
-        return _fail(
-            f"deprecated capability shape in: {', '.join(sorted(set(offenders)))}",
-            why=(
-                "Plugin API v1 requires [[capabilities]] tables; string-list "
-                "shorthand is a migration artefact that emits a warning at "
-                "plugin-load time."
-            ),
-            fix=(
-                "Update each flagged manifest to use [[capabilities]] blocks —\n"
-                "  see docs/plugin-discovery-spec.md §4\n"
-                "Recheck: pm doctor"
-            ),
-            data={"plugins": sorted(set(offenders))},
-            severity="warning",
-        )
-    return _ok("no deprecated capability shapes in builtin plugins")
+check_pollypm_home_writable = _doctor_filesystem.check_pollypm_home_writable
+check_pollypm_plugins_dir = _doctor_filesystem.check_pollypm_plugins_dir
+check_tracked_project_state_parents = _doctor_filesystem.check_tracked_project_state_parents
+check_db_layout_canonical = _doctor_filesystem.check_db_layout_canonical
+check_disk_space = _doctor_filesystem.check_disk_space
 
 
 # --------------------------------------------------------------------- #
@@ -1069,83 +690,6 @@ def check_work_migrations() -> CheckResult:
 
 def _pollypm_home() -> Path:
     return Path.home() / ".pollypm"
-
-
-def check_pollypm_home_writable() -> CheckResult:
-    home = _pollypm_home()
-
-    def _fix() -> tuple[bool, str]:
-        try:
-            home.mkdir(parents=True, exist_ok=True)
-            # Touch a throwaway file to prove writability.
-            probe = home / ".doctor_probe"
-            probe.write_text("ok")
-            probe.unlink(missing_ok=True)
-            return (True, f"created {home}")
-        except Exception as exc:  # noqa: BLE001
-            return (False, f"mkdir failed: {exc}")
-
-    if not home.exists():
-        return _fail(
-            f"~/.pollypm/ does not exist",
-            why=(
-                "PollyPM writes global config, plugins, and caches under "
-                "~/.pollypm/. Its absence means every write path fails."
-            ),
-            fix=(
-                "Create the directory —\n"
-                "  mkdir -p ~/.pollypm\n"
-                "Or run:  pm doctor --fix\n"
-                "Recheck: pm doctor"
-            ),
-            fixable=True,
-            fix_fn=_fix,
-        )
-    if not os.access(home, os.W_OK):
-        return _fail(
-            f"~/.pollypm/ is not writable",
-            why=(
-                "PollyPM must write config, caches, and state under "
-                "~/.pollypm/. A read-only home directory breaks every flow."
-            ),
-            fix=(
-                "Fix permissions —\n"
-                f"  chmod u+w {home}\n"
-                "Recheck: pm doctor"
-            ),
-        )
-    return _ok(f"{home} writable", data={"path": str(home)})
-
-
-def check_pollypm_plugins_dir() -> CheckResult:
-    plugins_dir = _pollypm_home() / "plugins"
-
-    def _fix() -> tuple[bool, str]:
-        try:
-            plugins_dir.mkdir(parents=True, exist_ok=True)
-            return (True, f"created {plugins_dir}")
-        except Exception as exc:  # noqa: BLE001
-            return (False, f"mkdir failed: {exc}")
-
-    if plugins_dir.is_dir():
-        return _ok(f"{plugins_dir} exists", data={"path": str(plugins_dir)})
-    return _fail(
-        f"~/.pollypm/plugins/ does not exist",
-        why=(
-            "User-installed plugins live at ~/.pollypm/plugins/<name>/. "
-            "The directory is not required for builtins but its absence "
-            "breaks `pm plugins install ...`."
-        ),
-        fix=(
-            "Create the directory —\n"
-            f"  mkdir -p {plugins_dir}\n"
-            "Or run:  pm doctor --fix\n"
-            "Recheck: pm doctor"
-        ),
-        severity="warning",
-        fixable=True,
-        fix_fn=_fix,
-    )
 
 
 def check_rail_daemon_alive() -> CheckResult:
@@ -1328,32 +872,6 @@ def check_db_layout_canonical() -> CheckResult:
             data=data,
         )
     return _ok("DB layout canonical (two scopes)", data=data)
-
-
-def check_disk_space() -> CheckResult:
-    """At least 1 GB free in $HOME."""
-    try:
-        usage = shutil.disk_usage(Path.home())
-    except Exception as exc:  # noqa: BLE001
-        return _skip(f"disk space check skipped ({exc})")
-    gb_free = usage.free / (1024 ** 3)
-    if gb_free < 1.0:
-        return _fail(
-            f"only {gb_free:.2f} GB free on $HOME",
-            why=(
-                "PollyPM writes worktrees, transcripts, and state DBs under "
-                "$HOME. Running out of space leaves state partially written "
-                "and can corrupt SQLite."
-            ),
-            fix=(
-                "Free up disk space before continuing —\n"
-                "  du -sh ~/* | sort -h | tail\n"
-                "  rm -rf ~/.cache/  # if you know it's safe\n"
-                "Recheck: pm doctor"
-            ),
-            data={"free_gb": round(gb_free, 2)},
-        )
-    return _ok(f"{gb_free:.1f} GB free on $HOME", data={"free_gb": round(gb_free, 2)})
 
 
 # --------------------------------------------------------------------- #
@@ -2895,132 +2413,10 @@ def run_checks(checks: Iterable[Check] | None = None) -> DoctorReport:
 # Rendering
 # --------------------------------------------------------------------- #
 
+from pollypm.doctor import rendering as _doctor_rendering
 
-_TICK = "\u2713"  # ✓
-_CROSS = "\u2717"  # ✗
-_WARN = "!"
-_SKIP = "-"
-
-
-# Display labels for the section headers; falls back to ``category.title()``
-# for any category not listed here.
-_CATEGORY_LABELS: dict[str, str] = {
-    "system": "Environment",
-    "install": "Install",
-    "plugins": "Plugins",
-    "migrations": "Migrations",
-    "filesystem": "Filesystem",
-    "tmux": "Tmux",
-    "network": "Network",
-    "pipeline": "Pipeline",
-    "schedulers": "Schedulers",
-    "resources": "Resources",
-    "inbox": "Inbox",
-    "sessions": "Sessions",
-}
-
-
-def _category_label(category: str) -> str:
-    return _CATEGORY_LABELS.get(category, category.replace("_", " ").title())
-
-
-def render_human(report: DoctorReport) -> str:
-    """Return the section-grouped checklist + per-failure detail block.
-
-    Output preserves backward compat:
-    * Each result still appears as ``<glyph> <name>: <status>`` on its
-      own line (existing assertions in ``test_doctor.py`` rely on this).
-    * The classic ``Summary: ...`` line is unchanged.
-    * Section headers and the compact footer are new — they are layered
-      *above* and *below* the existing checklist + summary block.
-    """
-    lines: list[str] = []
-    last_category: str | None = None
-    for check, result in report.results:
-        if check.category != last_category:
-            if last_category is not None:
-                lines.append("")
-            lines.append(f"-- {_category_label(check.category)} --")
-            last_category = check.category
-        if result.skipped:
-            glyph = _SKIP
-        elif result.passed:
-            glyph = _TICK
-        elif result.severity == "warning":
-            glyph = _WARN
-        else:
-            glyph = _CROSS
-        status = result.status or ("ok" if result.passed else "fail")
-        lines.append(f"{glyph} {check.name}: {status}")
-
-    passed = report.passed_count
-    total = len(report.results)
-    errors = len(report.errors)
-    warnings = len(report.warnings)
-    skipped = report.skipped_count
-    lines.append("")
-    lines.append(
-        f"Summary: {passed}/{total} passed, {warnings} warning(s), "
-        f"{errors} error(s), {skipped} skipped "
-        f"({report.duration_seconds:.2f}s)"
-    )
-    # Compact footer per the doctor enhancement spec. Easy for scripts
-    # to grep; complements (does not replace) the human Summary line.
-    lines.append(
-        f"{total} checks · {passed} passed · {warnings} warnings · {errors} errors"
-    )
-
-    failures = [
-        (c, r) for c, r in report.results
-        if not r.passed and not r.skipped
-    ]
-    if failures:
-        lines.append("")
-        lines.append("Failures:")
-        for check, result in failures:
-            glyph = _WARN if result.severity == "warning" else _CROSS
-            lines.append("")
-            lines.append(f"{glyph} {check.name}: {result.status}")
-            if result.why:
-                lines.append("")
-                lines.append(f"  Why: {result.why}")
-            if result.fix:
-                lines.append("")
-                # Indent each line of the fix block by 2 spaces so the
-                # whole block reads as a unit in the checklist.
-                for fix_line in result.fix.splitlines():
-                    lines.append(f"  {fix_line}" if fix_line else "")
-    return "\n".join(lines)
-
-
-def render_json(report: DoctorReport) -> str:
-    payload = {
-        "ok": report.ok,
-        "duration_seconds": round(report.duration_seconds, 4),
-        "summary": {
-            "total": len(report.results),
-            "passed": report.passed_count,
-            "warnings": len(report.warnings),
-            "errors": len(report.errors),
-            "skipped": report.skipped_count,
-        },
-        "checks": [
-            {
-                "name": check.name,
-                "category": check.category,
-                "passed": result.passed,
-                "skipped": result.skipped,
-                "severity": result.severity,
-                "status": result.status,
-                "why": result.why,
-                "fix": result.fix,
-                "fixable": result.fixable,
-                "data": result.data,
-            }
-            for check, result in report.results
-        ],
-    }
-    return json.dumps(payload, indent=2, sort_keys=True)
+render_human = _doctor_rendering.render_human
+render_json = _doctor_rendering.render_json
 
 
 # --------------------------------------------------------------------- #

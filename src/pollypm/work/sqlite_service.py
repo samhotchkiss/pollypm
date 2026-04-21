@@ -148,6 +148,7 @@ class SQLiteWorkService:
         self._conn.execute("PRAGMA busy_timeout=30000")
         create_work_tables(self._conn)
         self._gate_registry = GateRegistry(project_path=project_path)
+        self._flow_cache: dict[tuple[str, int], FlowTemplate] = {}
         self._transition_mgr = WorkTransitionManager(self)
         # Last-provision-error breadcrumb — set by ``claim()`` when
         # ``provision_worker`` fails so the CLI can surface it instead
@@ -165,6 +166,7 @@ class SQLiteWorkService:
 
     def close(self) -> None:
         """Close the database connection."""
+        self._flow_cache.clear()
         self._conn.close()
 
     def __enter__(self):
@@ -282,6 +284,7 @@ class SQLiteWorkService:
         self, template: FlowTemplate, version: int,
     ) -> None:
         """Persist ``template`` at ``version`` in work_flow_templates/nodes."""
+        self._invalidate_flow_cache(name=template.name, version=version)
         now = _now()
         self._conn.execute(
             "INSERT INTO work_flow_templates "
@@ -317,6 +320,22 @@ class SQLiteWorkService:
                     json.dumps(node.gates),
                 ),
             )
+
+    def _invalidate_flow_cache(
+        self,
+        *,
+        name: str | None = None,
+        version: int | None = None,
+    ) -> None:
+        if name is None:
+            self._flow_cache.clear()
+            return
+        if version is not None:
+            self._flow_cache.pop((name, version), None)
+            return
+        stale = [key for key in self._flow_cache if key[0] == name]
+        for key in stale:
+            self._flow_cache.pop(key, None)
 
     def _ensure_flow_in_db(self, name: str) -> FlowTemplate:
         """Load a flow via the engine and persist it, bumping version on change.
@@ -387,13 +406,19 @@ class SQLiteWorkService:
 
     def _load_flow_from_db(self, name: str, version: int) -> FlowTemplate:
         """Load a flow template from the database."""
+        cache_key = (name, version)
+        cached = self._flow_cache.get(cache_key)
+        if cached is not None:
+            return cached
         row = self._conn.execute(
             "SELECT * FROM work_flow_templates WHERE name = ? AND version = ?",
             (name, version),
         ).fetchone()
         if row is None:
             # Fall back to engine resolution
-            return resolve_flow(name, self._project_path)
+            flow = resolve_flow(name, self._project_path)
+            self._flow_cache[cache_key] = flow
+            return flow
 
         roles = json.loads(row["roles"])
         nodes: dict[str, FlowNode] = {}
@@ -420,7 +445,7 @@ class SQLiteWorkService:
                 gates=json.loads(nr["gates"]),
             )
 
-        return FlowTemplate(
+        flow = FlowTemplate(
             name=row["name"],
             description=row["description"],
             roles=roles,
@@ -429,6 +454,8 @@ class SQLiteWorkService:
             version=row["version"],
             is_current=bool(row["is_current"]),
         )
+        self._flow_cache[cache_key] = flow
+        return flow
 
     # ------------------------------------------------------------------
     # Internal: task reconstruction
@@ -571,17 +598,15 @@ class SQLiteWorkService:
         self, project: str, task_number: int
     ) -> dict:
         """Load dependency relationships for a task from work_task_dependencies."""
-        # Outgoing edges: this task is from_id
-        out_rows = self._conn.execute(
-            "SELECT to_project, to_task_number, kind FROM work_task_dependencies "
-            "WHERE from_project = ? AND from_task_number = ?",
-            (project, task_number),
-        ).fetchall()
-        # Incoming edges: this task is to_id
-        in_rows = self._conn.execute(
-            "SELECT from_project, from_task_number, kind FROM work_task_dependencies "
-            "WHERE to_project = ? AND to_task_number = ?",
-            (project, task_number),
+        rows = self._conn.execute(
+            "SELECT "
+            "from_project, from_task_number, "
+            "to_project, to_task_number, "
+            "kind "
+            "FROM work_task_dependencies "
+            "WHERE (from_project = ? AND from_task_number = ?) "
+            "   OR (to_project = ? AND to_task_number = ?)",
+            (project, task_number, project, task_number),
         ).fetchall()
 
         rels: dict = {
@@ -593,36 +618,41 @@ class SQLiteWorkService:
             "superseded_by_task_number": None,
         }
 
-        for r in out_rows:
+        for r in rows:
             kind = r["kind"]
-            target = (r["to_project"], r["to_task_number"])
-            if kind == LinkKind.BLOCKS.value:
-                rels["blocks"].append(target)
-            elif kind == LinkKind.RELATES_TO.value:
-                rels["relates_to"].append(target)
-            elif kind == LinkKind.PARENT.value:
-                rels["children"].append(target)
-            elif kind == LinkKind.SUPERSEDES.value:
-                # outgoing supersedes: this task supersedes target
-                pass  # stored in supersedes_project/supersedes_task_number columns
-
-        for r in in_rows:
-            kind = r["kind"]
-            source = (r["from_project"], r["from_task_number"])
-            if kind == LinkKind.BLOCKS.value:
-                rels["blocked_by"].append(source)
-            elif kind == LinkKind.RELATES_TO.value:
-                # relates_to is bidirectional
-                if source not in rels["relates_to"]:
-                    rels["relates_to"].append(source)
-            elif kind == LinkKind.PARENT.value:
-                # incoming parent: source is parent of this task
-                # update parent fields (override column-based values)
-                pass  # parent is set via from_id=parent, to_id=child
-            elif kind == LinkKind.SUPERSEDES.value:
-                # incoming supersedes: source supersedes this task
-                rels["superseded_by_project"] = r["from_project"]
-                rels["superseded_by_task_number"] = r["from_task_number"]
+            is_outgoing = (
+                r["from_project"] == project and r["from_task_number"] == task_number
+            )
+            is_incoming = (
+                r["to_project"] == project and r["to_task_number"] == task_number
+            )
+            if is_outgoing:
+                target = (r["to_project"], r["to_task_number"])
+                if kind == LinkKind.BLOCKS.value:
+                    rels["blocks"].append(target)
+                elif kind == LinkKind.RELATES_TO.value:
+                    rels["relates_to"].append(target)
+                elif kind == LinkKind.PARENT.value:
+                    rels["children"].append(target)
+                elif kind == LinkKind.SUPERSEDES.value:
+                    # outgoing supersedes: this task supersedes target
+                    pass  # stored in supersedes_project/supersedes_task_number columns
+            if is_incoming:
+                source = (r["from_project"], r["from_task_number"])
+                if kind == LinkKind.BLOCKS.value:
+                    rels["blocked_by"].append(source)
+                elif kind == LinkKind.RELATES_TO.value:
+                    # relates_to is bidirectional
+                    if source not in rels["relates_to"]:
+                        rels["relates_to"].append(source)
+                elif kind == LinkKind.PARENT.value:
+                    # incoming parent: source is parent of this task
+                    # update parent fields (override column-based values)
+                    pass  # parent is set via from_id=parent, to_id=child
+                elif kind == LinkKind.SUPERSEDES.value:
+                    # incoming supersedes: source supersedes this task
+                    rels["superseded_by_project"] = r["from_project"]
+                    rels["superseded_by_task_number"] = r["from_task_number"]
 
         return rels
 

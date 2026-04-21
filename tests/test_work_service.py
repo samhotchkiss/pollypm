@@ -794,6 +794,98 @@ class TestFlowImmutability:
         assert svc.get(t2.task_id).flow_template_version == 1
 
 
+def test_load_flow_from_db_uses_cached_template_on_repeat_load(tmp_path, monkeypatch):
+    flows_dir = tmp_path / ".pollypm" / "flows"
+    flows_dir.mkdir(parents=True, exist_ok=True)
+    (flows_dir / "standard.yaml").write_text(
+        """name: standard
+description: cached-body
+roles:
+  worker: worker
+  reviewer: reviewer
+nodes:
+  implement:
+    name: Implement
+    type: work
+    actor_type: role
+    actor_role: worker
+    next_node: review
+  review:
+    name: Review
+    type: review
+    actor_type: role
+    actor_role: reviewer
+    next_node: done
+    reject_node: implement
+  done:
+    name: Done
+    type: terminal
+    actor_type: project_manager
+start_node: implement
+"""
+    )
+    db = tmp_path / "work.db"
+    svc = SQLiteWorkService(db_path=db, project_path=tmp_path)
+    task = _create_standard_task(svc)
+    flow = svc._load_flow_from_db(
+        task.flow_template_id,
+        task.flow_template_version,
+    )
+
+    class GuardConn:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, params=()):
+            if "work_flow_templates" in sql or "work_flow_nodes" in sql:
+                raise AssertionError("flow template DB lookup should be served from cache")
+            return self._conn.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    monkeypatch.setattr(svc, "_conn", GuardConn(svc._conn))
+
+    cached = svc._load_flow_from_db(
+        task.flow_template_id,
+        task.flow_template_version,
+    )
+
+    assert cached is flow
+
+
+def test_load_relationships_uses_one_dependency_query(svc, monkeypatch):
+    blocker = _create_standard_task(svc, title="Blocker")
+    target = _create_standard_task(svc, title="Target")
+    related = _create_standard_task(svc, title="Related")
+
+    svc.link(blocker.task_id, target.task_id, "blocks")
+    svc.link(target.task_id, related.task_id, "relates_to")
+
+    dependency_queries = 0
+
+    class GuardConn:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, params=()):
+            nonlocal dependency_queries
+            if "FROM work_task_dependencies" in sql:
+                dependency_queries += 1
+            return self._conn.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    monkeypatch.setattr(svc, "_conn", GuardConn(svc._conn))
+
+    rels = svc._load_relationships(target.project, target.task_number)
+
+    assert dependency_queries == 1
+    assert rels["blocked_by"] == [(blocker.project, blocker.task_number)]
+    assert rels["relates_to"] == [(related.project, related.task_number)]
+
+
 # ---------------------------------------------------------------------------
 # actor_type=agent — named agent resolution (#140)
 # ---------------------------------------------------------------------------

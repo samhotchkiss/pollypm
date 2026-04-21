@@ -183,6 +183,8 @@ class WorkTransitionManager:
             task.flow_template_version,
         )
         start_node = flow.start_node
+        start_node_cfg = flow.nodes.get(start_node)
+        assignee = self.service._resolve_node_assignee(task, start_node_cfg) or actor
         now = _now()
 
         self._commit(
@@ -193,7 +195,7 @@ class WorkTransitionManager:
                     "WHERE project = ? AND task_number = ?",
                     (
                         WorkStatus.IN_PROGRESS.value,
-                        actor,
+                        assignee,
                         start_node,
                         now,
                         task.project,

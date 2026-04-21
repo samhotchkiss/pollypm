@@ -495,6 +495,32 @@ def test_search_filters_accounts(settings_env) -> None:
     _run(body())
 
 
+def test_accounts_section_reuses_filtered_rows_within_one_render(
+    settings_env, monkeypatch,
+) -> None:
+    app = settings_env["app"]
+    filtered_calls = 0
+    original = app._filtered_accounts
+
+    def _count_filtered(data):
+        nonlocal filtered_calls
+        filtered_calls += 1
+        return original(data)
+
+    monkeypatch.setattr(app, "_filtered_accounts", _count_filtered)
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            filtered_calls_before = filtered_calls
+            app._search_query = "claude"
+            app._render_section("accounts")
+            await pilot.pause()
+            assert filtered_calls - filtered_calls_before == 1
+
+    _run(body())
+
+
 # ---------------------------------------------------------------------------
 # 6. R refresh reloads live data (service.list_account_statuses called
 #    again)

@@ -2403,6 +2403,9 @@ class PollySettingsPaneApp(App[None]):
         self._nav_widgets: dict[str, Static] = {}
         self._selected_account_key: str | None = None
         self._selected_project_key: str | None = None
+        self._visible_account_rows: list[dict] = []
+        self._visible_project_rows: list[dict] = []
+        self._visible_plugin_rows: list[dict] = []
         self._nav_cursor: int = 0
         self._focus_target: str = "nav"  # nav | table
 
@@ -2579,11 +2582,20 @@ class PollySettingsPaneApp(App[None]):
             return
 
         if key == "accounts":
-            self._render_accounts(data)
+            rows = self._filtered_accounts(data)
+            self._visible_account_rows = rows
+            self._render_accounts(rows)
+            self._render_account_detail(rows)
         elif key == "projects":
-            self._render_projects(data)
+            rows = self._filtered_projects(data)
+            self._visible_project_rows = rows
+            self._render_projects(rows)
+            self._render_project_detail(rows)
         elif key == "plugins":
-            self._render_plugins(data)
+            rows = self._filtered_plugins(data)
+            self._visible_plugin_rows = rows
+            self._render_plugins(rows)
+            self._render_plugin_detail(rows)
         elif key == "heartbeat":
             self._render_kv("Heartbeat & recovery", data.heartbeat)
         elif key == "planner":
@@ -2625,9 +2637,8 @@ class PollySettingsPaneApp(App[None]):
             or q in a["plan"].lower()
         ]
 
-    def _render_accounts(self, data: SettingsData) -> None:
+    def _render_accounts(self, rows: list[dict]) -> None:
         self.accounts.clear()
-        rows = self._filtered_accounts(data)
         for a in rows:
             dot, colour = _settings_status_dot(a["health"], a["logged_in"])
             fo_mark = f"#{a['failover_pos']}" if a["failover_pos"] else ""
@@ -2653,10 +2664,8 @@ class PollySettingsPaneApp(App[None]):
                 pass
         elif self.accounts.row_count and self.accounts.cursor_row < 0:
             self.accounts.move_cursor(row=0)
-        self._render_account_detail(data)
 
-    def _render_account_detail(self, data: SettingsData) -> None:
-        rows = self._filtered_accounts(data)
+    def _render_account_detail(self, rows: list[dict]) -> None:
         if not rows:
             self.detail.update(
                 "[dim]No accounts match the current filter.[/dim]\n\n"
@@ -2707,9 +2716,8 @@ class PollySettingsPaneApp(App[None]):
             or q in p["path"].lower()
         ]
 
-    def _render_projects(self, data: SettingsData) -> None:
+    def _render_projects(self, rows: list[dict]) -> None:
         self.projects_table.clear()
-        rows = self._filtered_projects(data)
         for p in rows:
             dot_colour = "#3ddc84" if p["tracked"] else "#4a5568"
             dot = Text("\u25cf", style=dot_colour)
@@ -2741,10 +2749,8 @@ class PollySettingsPaneApp(App[None]):
             and self.projects_table.cursor_row < 0
         ):
             self.projects_table.move_cursor(row=0)
-        self._render_project_detail(data)
 
-    def _render_project_detail(self, data: SettingsData) -> None:
-        rows = self._filtered_projects(data)
+    def _render_project_detail(self, rows: list[dict]) -> None:
         if not rows:
             self.detail.update(
                 "[dim]No projects match the current filter.[/dim]"
@@ -2801,9 +2807,8 @@ class PollySettingsPaneApp(App[None]):
             or q in p["status"].lower()
         ]
 
-    def _render_plugins(self, data: SettingsData) -> None:
+    def _render_plugins(self, rows: list[dict]) -> None:
         self.plugins_table.clear()
-        rows = self._filtered_plugins(data)
         for p in rows:
             status = p["status"]
             if status == "loaded":
@@ -2825,10 +2830,8 @@ class PollySettingsPaneApp(App[None]):
             and self.plugins_table.cursor_row < 0
         ):
             self.plugins_table.move_cursor(row=0)
-        self._render_plugin_detail(data)
 
-    def _render_plugin_detail(self, data: SettingsData) -> None:
-        rows = self._filtered_plugins(data)
+    def _render_plugin_detail(self, rows: list[dict]) -> None:
         if not rows:
             self.detail.update(
                 "[dim]No plugins match the current filter.[/dim]"
@@ -3181,12 +3184,12 @@ class PollySettingsPaneApp(App[None]):
             return
         if self._active_section == "accounts":
             self._selected_account_key = self._current_accounts_key()
-            self._render_account_detail(data)
+            self._render_account_detail(self._visible_account_rows)
         elif self._active_section == "projects":
             self._selected_project_key = self._current_projects_key()
-            self._render_project_detail(data)
+            self._render_project_detail(self._visible_project_rows)
         elif self._active_section == "plugins":
-            self._render_plugin_detail(data)
+            self._render_plugin_detail(self._visible_plugin_rows)
 
     @on(DataTable.RowHighlighted, "#accounts")
     def on_account_highlighted(

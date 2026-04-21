@@ -28,6 +28,7 @@ import shutil
 import sqlite3
 import tarfile
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +44,8 @@ _FULL_SNAPSHOT_SUFFIX = ".tar.gz"
 
 # Default retention for plain DB snapshots; keep the last N.
 DEFAULT_KEEP = 7
+BACKUP_LOCK_RETRY_MAX_SECONDS = 3.0
+BACKUP_LOCK_RETRY_INITIAL_SECONDS = 0.1
 
 
 # --------------------------------------------------------------------- #
@@ -73,6 +76,10 @@ class RestoreResult:
     live_db_path: Path
     safety_path: Path
     is_tar: bool
+
+
+class BackupLockedError(RuntimeError):
+    """Raised when the live SQLite DB stays locked across backup retries."""
 
 
 # --------------------------------------------------------------------- #
@@ -159,18 +166,37 @@ def _classify_snapshot(path: Path) -> str:
     raise ValueError(f"unrecognized snapshot format: {path}")
 
 
+def _is_locked_sqlite_error(exc: sqlite3.OperationalError) -> bool:
+    return "locked" in str(exc).lower()
+
+
 def _online_backup_to_plain_file(source_db: Path, dest: Path) -> None:
     """Use SQLite's online backup API to copy ``source_db`` -> ``dest``."""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    src = sqlite3.connect(f"file:{source_db}?mode=ro", uri=True)
-    try:
-        dst = sqlite3.connect(dest)
+    delay = BACKUP_LOCK_RETRY_INITIAL_SECONDS
+    deadline = time.monotonic() + BACKUP_LOCK_RETRY_MAX_SECONDS
+    while True:
         try:
-            src.backup(dst)
-        finally:
-            dst.close()
-    finally:
-        src.close()
+            src = sqlite3.connect(f"file:{source_db}?mode=ro", uri=True)
+            try:
+                dst = sqlite3.connect(dest)
+                try:
+                    src.backup(dst)
+                    return
+                finally:
+                    dst.close()
+            finally:
+                src.close()
+        except sqlite3.OperationalError as exc:
+            if not _is_locked_sqlite_error(exc):
+                raise
+            if time.monotonic() >= deadline:
+                raise BackupLockedError(
+                    "state.db is locked by an active writer. Wait for the cockpit or heartbeat "
+                    "to quiesce, then retry the backup."
+                ) from exc
+            time.sleep(delay)
+            delay = min(delay * 2, 1.0)
 
 
 def _gzip_file(src: Path, dest_gz: Path) -> None:
@@ -479,6 +505,7 @@ def humanize_bytes(n: int) -> str:
 
 
 __all__ = [
+    "BackupLockedError",
     "BackupResult",
     "RestorePlan",
     "RestoreResult",

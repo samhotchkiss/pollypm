@@ -406,6 +406,59 @@ def test_backup_module_retention_prunes_only_default_dir(
     assert len(remaining) == 3
 
 
+def test_backup_module_retries_locked_database_then_succeeds(
+    fake_home: Path, state_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_connect = backup_mod.sqlite3.connect
+    attempts = {"count": 0}
+    sleeps: list[float] = []
+
+    def flaky_connect(*args, **kwargs):
+        target = args[0]
+        if kwargs.get("uri") and isinstance(target, str) and "mode=ro" in target:
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise sqlite3.OperationalError("database is locked")
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(backup_mod.sqlite3, "connect", flaky_connect)
+    monkeypatch.setattr(backup_mod.time, "sleep", sleeps.append)
+
+    result = backup_mod.backup_state_db(
+        state_db,
+        base_dir=fake_home,
+        output=tmp_path / "custom" / "retry.db.gz",
+        full=False,
+        keep=7,
+    )
+
+    assert result.path.exists()
+    assert attempts["count"] == 3
+    assert sleeps == [0.1, 0.2]
+
+
+def test_backup_module_raises_named_error_when_database_stays_locked(
+    fake_home: Path, state_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        backup_mod.sqlite3,
+        "connect",
+        lambda *args, **kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")),
+    )
+    monkeypatch.setattr(backup_mod.time, "sleep", lambda _seconds: None)
+    monotonic_values = iter([0.0, 0.0, 0.1, 0.3, 0.7, 1.5, 3.1])
+    monkeypatch.setattr(backup_mod.time, "monotonic", lambda: next(monotonic_values))
+
+    with pytest.raises(backup_mod.BackupLockedError, match="quiesce"):
+        backup_mod.backup_state_db(
+            state_db,
+            base_dir=fake_home,
+            output=tmp_path / "custom" / "locked.db.gz",
+            full=False,
+            keep=7,
+        )
+
+
 def test_plan_restore_rejects_full_archive_missing_state_db(
     fake_home: Path, tmp_path: Path
 ) -> None:

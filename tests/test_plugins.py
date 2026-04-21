@@ -1,6 +1,8 @@
 from pathlib import Path
 import shutil
 
+import pytest
+
 from pollypm.models import ProviderKind, RuntimeKind
 from pollypm.plugin_api.v1 import Capability, HookFilterResult
 from pollypm.plugin_host import ExtensionHost
@@ -100,6 +102,26 @@ def test_extension_host_rejects_wrong_api_version(tmp_path: Path) -> None:
 
     assert "bad" not in host.plugins()
     assert any("API version 99" in item for item in host.errors)
+
+
+@pytest.mark.parametrize("plugin_name", ["../escape", "BadName"])
+def test_extension_host_rejects_invalid_plugin_name_at_manifest_boundary(
+    tmp_path: Path, plugin_name: str,
+) -> None:
+    plugin_dir = tmp_path / ".pollypm" / "plugins" / "invalid_name"
+    _write_plugin(
+        plugin_dir,
+        name=plugin_name,
+        body=(
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "plugin = PollyPMPlugin(name='invalid_name')\n"
+        ),
+    )
+
+    host = ExtensionHost(tmp_path)
+
+    assert plugin_name not in host.plugins()
+    assert any(f"plugin name {plugin_name!r}" in item for item in host.errors)
 
 
 def test_extension_host_runs_observers_and_filters_safely(tmp_path: Path) -> None:
@@ -631,6 +653,14 @@ def test_content_paths_missing_directories_are_not_errors(tmp_path: Path) -> Non
     # No raised exceptions; directories don't need to exist.
     for path in paths:
         assert not path.exists() or path.is_dir()
+
+
+@pytest.mark.parametrize("plugin_name", ["../escape", "/tmp/escape"])
+def test_content_paths_reject_invalid_plugin_names(tmp_path: Path, plugin_name: str) -> None:
+    host = ExtensionHost(tmp_path)
+
+    with pytest.raises(ValueError, match="plugin name"):
+        host.content_paths(plugin_name, kind="magic_skill")
 
 
 def test_content_paths_precedence_order(monkeypatch, tmp_path: Path) -> None:

@@ -19,6 +19,7 @@ Contract:
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib.util import module_from_spec, spec_from_file_location
@@ -44,6 +45,16 @@ logger = logging.getLogger(__name__)
 
 PLUGIN_MANIFEST = "pollypm-plugin.toml"
 PLUGIN_API_VERSION = "1"
+PLUGIN_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_-]*$")
+
+
+def _validate_plugin_name(plugin_name: str) -> str:
+    """Reject ambiguous or path-like plugin names at the host boundary."""
+    if not PLUGIN_NAME_PATTERN.fullmatch(plugin_name):
+        raise ValueError(
+            f"plugin name {plugin_name!r} must match {PLUGIN_NAME_PATTERN.pattern!r}"
+        )
+    return plugin_name
 
 
 def _emit_plugin_lifecycle_event(
@@ -206,6 +217,7 @@ class ExtensionHost:
         Directories are returned even if they don't exist yet; callers
         filter with ``path.is_dir()`` and mkdir-on-write as needed.
         """
+        plugin_name = _validate_plugin_name(plugin_name)
         if self._plugins is None:
             self.plugins()
 
@@ -710,7 +722,7 @@ class ExtensionHost:
 
     def _read_manifest(self, manifest_path: Path, source: str) -> PluginManifest:
         raw = tomllib.loads(manifest_path.read_text())
-        name = str(raw["name"])
+        name = _validate_plugin_name(str(raw["name"]))
         capabilities = self._parse_capability_entries(raw.get("capabilities", []), plugin_name=name)
         content = self._parse_content_declaration(raw.get("content"), plugin_name=name)
         reserved_flag = bool(raw.get("contributes_to_reserved_section", False))

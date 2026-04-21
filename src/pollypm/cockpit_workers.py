@@ -26,6 +26,10 @@ from textual.widgets import DataTable, Static
 from pollypm.cockpit_rail import CockpitRouter
 from pollypm.cockpit_alerts import _setup_alert_notifier
 from pollypm.cockpit_palette import _open_command_palette, _open_keyboard_help
+from pollypm.cockpit_worker_identity import (
+    load_worker_color_overrides,
+    worker_identity,
+)
 from pollypm.config import load_config
 
 
@@ -136,6 +140,7 @@ class PollyWorkerRosterApp(App[None]):
         self._auto_refresh_timer = None
         self._active_shipments: set[str] = set()
         self._seen_shipments: set[str] = set()
+        self._worker_color_overrides = load_worker_color_overrides(config_path)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="wr-outer"):
@@ -174,6 +179,7 @@ class PollyWorkerRosterApp(App[None]):
 
     def _refresh(self) -> None:
         try:
+            self._worker_color_overrides = load_worker_color_overrides(self.config_path)
             rows = self._gather()
         except Exception as exc:  # noqa: BLE001
             self.topbar.update(
@@ -219,6 +225,10 @@ class PollyWorkerRosterApp(App[None]):
         self.hint.update(self._DEFAULT_HINT)
         for row in rows:
             celebrating = self._is_celebrating(row)
+            identity = worker_identity(
+                row.session_name,
+                color_overrides=self._worker_color_overrides,
+            )
             glyph, colour = self._HEALTH_GLYPHS.get(
                 getattr(row, "health", ""),
                 ("\U0001f7e1", "#6b7a88"),
@@ -227,12 +237,20 @@ class PollyWorkerRosterApp(App[None]):
                 dot = Text("\u2713", style="bold #dcf4e6 on #173322")
                 project_style = "bold #dcf4e6 on #173322"
                 cell_style = "bold #dcf4e6 on #173322"
+                session_style = project_style
+                avatar_style = project_style
             else:
                 dot = Text.assemble((glyph, colour))
                 project_style = "#5b8aff"
                 cell_style = "#d6dee5"
+                session_style = f"bold {identity.color}"
+                avatar_style = f"bold {identity.color}"
             project_cell = Text(row.project_name or row.project_key, style=project_style)
-            session_cell = Text(row.session_name, style=cell_style)
+            session_cell = Text.assemble(
+                (identity.avatar, avatar_style),
+                (" ", cell_style),
+                (row.session_name, session_style),
+            )
             task_text = (
                 f"#{row.task_number} {row.task_title}".rstrip()
                 if row.task_number is not None

@@ -21,6 +21,7 @@ from typing import Any
 
 import typer
 
+from pollypm.cli_help import help_with_examples
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config, resolve_config_path
 from pollypm.memory_backends import FileMemoryBackend, MemoryEntry, get_memory_backend
 
@@ -29,12 +30,13 @@ __all__ = ["memory_app", "build_backend_for_config"]
 
 
 memory_app = typer.Typer(
-    help=(
-        "Inspect and manage the memory store.\n\n"
-        "Examples:\n\n"
-        "• pm memory list                     — show memories for the user\n"
-        "• pm memory show <id>                — print one memory's body\n"
-        "• pm memory search <query>           — full-text search across memories\n"
+    help=help_with_examples(
+        "Inspect and manage the memory store.",
+        [
+            ("pm memory list", "show recent memory entries"),
+            ('pm memory recall "deploy playbook"', "run a recall query"),
+            ("pm memory show 42", "print one memory entry in full"),
+        ],
     )
 )
 

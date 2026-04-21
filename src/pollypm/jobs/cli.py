@@ -25,6 +25,7 @@ from typing import Any, Callable
 
 import typer
 
+from pollypm.cli_help import help_with_examples
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config, resolve_config_path
 from pollypm.jobs.queue import Job, JobQueue, JobStatus
 
@@ -33,12 +34,13 @@ __all__ = ["jobs_app", "build_queue_for_config"]
 
 
 jobs_app = typer.Typer(
-    help=(
-        "Inspect and manage the durable job queue.\n\n"
-        "Examples:\n\n"
-        "• pm jobs list                       — show queued / running jobs\n"
-        "• pm jobs show <id>                  — inspect one job\n"
-        "• pm jobs retry <id>                 — retry a failed job\n"
+    help=help_with_examples(
+        "Inspect and manage the durable job queue.",
+        [
+            ("pm jobs list", "show queued and running jobs"),
+            ("pm jobs show 42", "inspect one job"),
+            ("pm jobs retry 42", "retry a failed job"),
+        ],
     )
 )
 

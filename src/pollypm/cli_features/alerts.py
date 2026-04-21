@@ -19,33 +19,42 @@ from pathlib import Path
 
 import typer
 
+from pollypm.cli_help import help_with_examples
 from pollypm.config import DEFAULT_CONFIG_PATH
 
 
 alert_app = typer.Typer(
-    help=(
-        "Manage durable alerts.\n\n"
-        "Examples:\n\n"
-        "• pm alert list                      — show open alerts\n"
-        "• pm alert ack <id>                  — acknowledge one\n"
+    help=help_with_examples(
+        "Manage durable alerts.",
+        [
+            ("pm alert list", "show open alerts"),
+            ('pm alert raise blocked worker_demo "pane died"', "raise a manual alert"),
+            ("pm alert clear 12", "clear one alert by id"),
+        ],
     )
 )
 
 session_app = typer.Typer(
-    help=(
-        "Manage session runtime state.\n\n"
-        "Examples:\n\n"
-        "• pm session set-status <name> idle       — mark a session idle\n"
-        "• pm session set-status <name> working    — mark a session as working\n"
+    help=help_with_examples(
+        "Manage session runtime state.",
+        [
+            ("pm session set-status operator idle", "mark a session idle"),
+            (
+                'pm session set-status worker_demo working --reason "running tests"',
+                "record a working state with context",
+            ),
+        ],
     )
 )
 
 heartbeat_app = typer.Typer(
-    help=(
-        "Run or record heartbeat state.\n\n"
-        "Examples:\n\n"
-        "• pm heartbeat run                   — run the heartbeat loop once\n"
-        "• pm heartbeat status                — show last heartbeat tick\n"
+    help=help_with_examples(
+        "Run or record heartbeat state.",
+        [
+            ("pm heartbeat", "run one heartbeat sweep"),
+            ("pm heartbeat --json", "emit the sweep result as JSON"),
+            ("pm heartbeat install", "install the cron-based heartbeat runner"),
+        ],
     )
 )
 

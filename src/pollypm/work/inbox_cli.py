@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 import typer
 
+from pollypm.cli_help import help_with_examples
 from pollypm.work.cli import (
     _DB_OPTION,
     _JSON_OPTION,
@@ -30,11 +31,13 @@ from pollypm.work.inbox_view import inbox_tasks
 
 
 inbox_app = typer.Typer(
-    help=(
-        "Work assigned to the user.\n\n"
-        "Examples:\n\n"
-        "• pm inbox                           — list inbox items\n"
-        "• pm inbox show <id>                 — print one inbox item\n"
+    help=help_with_examples(
+        "Work assigned to the user.",
+        [
+            ("pm inbox", "list open inbox items"),
+            ("pm inbox show demo/1", "print one inbox task or message"),
+            ("pm inbox --json", "emit the merged inbox view as JSON"),
+        ],
     )
 )
 

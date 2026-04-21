@@ -23,6 +23,7 @@ from typing import Any
 
 import typer
 
+from pollypm.cli_help import help_with_examples
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config, resolve_config_path
 from pollypm.plugins_builtin.advisor.handlers.history_log import (
     HistoryEntry,
@@ -43,13 +44,13 @@ from pollypm.plugins_builtin.advisor.state import (
 
 
 advisor_app = typer.Typer(
-    help=(
-        "Manage the advisor (every-30m alignment coach).\n\n"
-        "Examples:\n\n"
-        "• pm advisor status                  — show advisor state and next run\n"
-        "• pm advisor enable                  — turn on the advisor\n"
-        "• pm advisor pause                   — stop runs without disabling\n"
-        "• pm advisor history                 — recent advisor decisions\n"
+    help=help_with_examples(
+        "Manage the advisor (every-30m alignment coach).",
+        [
+            ("pm advisor status", "show advisor state and next run"),
+            ("pm advisor pause", "stop runs without disabling the plugin"),
+            ("pm advisor history --since 7d", "inspect recent advisor decisions"),
+        ],
     ),
     no_args_is_help=True,
 )

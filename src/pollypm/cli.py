@@ -43,6 +43,7 @@ from pollypm.config import (
     render_example_config,
     write_example_config,
 )
+from pollypm.cli_help import help_with_examples
 from pollypm.errors import format_config_not_found_error
 from pollypm.cli_features.alerts import alert_app, heartbeat_app, session_app
 from pollypm.cli_features.issues import issue_app, itsalive_app, report_app
@@ -52,23 +53,76 @@ from pollypm.cli_features.ui import register_ui_commands
 from pollypm.cli_features.workers import register_worker_commands
 
 
-# wg05 / #242: every `pm ... --help` gains an Examples section so
-# first-time users see copy-paste-ready commands for the common flows
-# alongside the raw subcommand table. Bullet formatting survives
-# typer's rich re-flow (epilog does not).
-_APP_HELP = """PollyPM CLI.
+_APP_HELP = help_with_examples(
+    "PollyPM CLI.",
+    [
+        ("pm", "start or attach to the PollyPM tmux session"),
+        ("pm add-project ~/dev/my-app", "register a project in the workspace"),
+        ('pm send operator "Build a weather CLI"', "hand a request to Polly"),
+    ],
+    trailing=(
+        "Sub-help:  pm task --help, pm session --help, pm project --help, "
+        "pm plugins --help.\n"
+        "Role guides: pm help worker."
+    ),
+)
 
-Examples (primary flows):
+_UP_HELP = help_with_examples(
+    "Create or attach to the PollyPM tmux session and boot the cockpit.",
+    [
+        ("pm up", "start the tmux session or attach if it already exists"),
+        (
+            "pm up --config ~/.pollypm/pollypm.toml",
+            "boot a specific PollyPM config",
+        ),
+    ],
+)
 
-• pm                                — bring up / attach to the PollyPM session
-• pm task next                      — find the next queued task to work on
-• pm task claim shortlink_gen/1     — claim a queued task (provisions worktree)
-• pm worker-start --role architect <project>  — spawn the project's planner architect
-• pm projects                       — list registered projects
-• pm help worker                    — full worker onboarding guide
+_STATUS_HELP = help_with_examples(
+    "Show configured session state, runtime status, and open-alert counts.",
+    [
+        ("pm status", "show every configured session"),
+        ("pm status operator", "inspect one session by name"),
+        ("pm status --json", "emit structured status for scripts"),
+    ],
+)
 
-Sub-help:  pm task --help, pm session --help, pm project --help, pm plugins --help.
-"""
+_SEND_HELP = help_with_examples(
+    "Send input directly into a managed tmux pane.",
+    [
+        ('pm send operator "Build a weather CLI"', "ask Polly to start work"),
+        (
+            'pm send reviewer "Please rerun the tests" --owner human',
+            "post a human follow-up to the reviewer",
+        ),
+        (
+            'pm send worker_demo "continue" --force',
+            "bypass the worker guard for a manual nudge",
+        ),
+    ],
+)
+
+_NOTIFY_HELP = help_with_examples(
+    (
+        "Create a work-service inbox item for the human user.\n\n"
+        "This is PollyPM's canonical escalation channel for blockers, "
+        "handoffs, and status updates."
+    ),
+    [
+        (
+            'pm notify "Deploy blocked" "Needs verification email click."',
+            "open an immediate user-visible inbox item",
+        ),
+        (
+            'echo "Longer body" | pm notify "Status update" -',
+            "read the notification body from stdin",
+        ),
+        (
+            'pm notify "Plan ready" "Review the explainer" --priority immediate',
+            "create a high-priority review notification",
+        ),
+    ],
+)
 
 app = typer.Typer(help=_APP_HELP, invoke_without_command=True, no_args_is_help=False)
 app.add_typer(alert_app, name="alert")
@@ -354,7 +408,7 @@ def onboard(
     typer.echo("Next step: run `pollypm up` or `uv run pm up` to create or attach to the PollyPM tmux session.")
 
 
-@app.command()
+@app.command(help=_UP_HELP)
 def up(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
@@ -450,7 +504,7 @@ def up(
     raise typer.Exit(code=supervisor.tmux.attach_session(session_name))
 
 
-@app.command()
+@app.command(help=_UP_HELP)
 def launch(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
@@ -631,7 +685,7 @@ def reset(
     typer.echo(f"Killed {len(sessions_to_kill)} session(s): {', '.join(sessions_to_kill)}")
 
 
-@app.command()
+@app.command(help=_STATUS_HELP)
 def status(
     session_name: str | None = typer.Argument(None, help="Optional session name from config."),
     json_output: bool = typer.Option(False, "--json", help="Emit structured JSON."),
@@ -821,7 +875,7 @@ def release(
     typer.echo(f"Lease released for {session_name}")
 
 
-@app.command()
+@app.command(help=_SEND_HELP)
 def send(
     session_name: str = typer.Argument(..., help="Session name from config."),
     text: str = typer.Argument(..., help="Text to send into the tmux pane."),
@@ -869,7 +923,7 @@ def send(
     typer.echo(f"Sent input to {session_name}")
 
 
-@app.command()
+@app.command(help=_NOTIFY_HELP)
 def notify(
     subject: str = typer.Argument(..., help="Short title for the inbox item."),
     body: str = typer.Argument(..., help="Message body. Pass '-' to read from stdin."),
@@ -921,26 +975,6 @@ def notify(
         help="Path to SQLite database (default: same resolution as `pm inbox`).",
     ),
 ) -> None:
-    """Create a work-service inbox item for the human user.
-
-    This is the canonical escalation channel referenced by the operator
-    runbook and control prompts. Polly (or any agent) uses ``pm notify``
-    to reach the user when something needs attention — a blocker, a
-    completed deliverable, a status update.
-
-    The notification is stored as a work-service task on the ``chat``
-    flow with ``roles.requester=user``, so it appears in ``pm inbox``
-    immediately.
-
-    Examples:
-
-    • pm notify "Deploy blocked" "Needs verification email click."
-    • pm notify "Done: homepage rewrite" "Review at https://…"
-    • echo "long body" | pm notify "Subject" -
-    • pm notify "Plan ready" "Review the plan" --priority immediate \\
-          --label plan_review --label "plan_task:demo/5" \\
-          --label "explainer:/abs/path/reports/plan-review.html"
-    """
     if not subject.strip():
         typer.echo("Error: subject must not be empty.", err=True)
         raise typer.Exit(code=1)

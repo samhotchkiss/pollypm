@@ -31,6 +31,7 @@ from typing import Any, Literal, Optional
 
 import typer
 
+from pollypm.cli_help import help_with_examples
 from pollypm.config import (
     DEFAULT_CONFIG_PATH,
     load_config,
@@ -39,12 +40,13 @@ from pollypm.config import (
 
 
 project_app = typer.Typer(
-    help=(
-        "Planner-backed project lifecycle (new / plan / replan).\n\n"
-        "Examples:\n\n"
-        "• pm project new <name>              — create a new planner-backed project\n"
-        "• pm project plan <name>             — (re)run the tree-of-plans planner\n"
-        "• pm project replan <name>           — regenerate the plan from current state\n"
+    help=help_with_examples(
+        "Planner-backed project lifecycle (new / plan / replan).",
+        [
+            ("pm project new ~/dev/my-app", "register a project and offer to plan it"),
+            ("pm project plan my_app", "queue a fresh planning task"),
+            ("pm project replan my_app", "run the drift-aware planner again"),
+        ],
     ),
     no_args_is_help=True,
 )

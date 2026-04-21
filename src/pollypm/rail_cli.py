@@ -16,13 +16,16 @@ from typing import Any
 
 import typer
 
+from pollypm.cli_help import help_with_examples
+
 rail_app = typer.Typer(
-    help=(
-        "Manage cockpit rail items.\n\n"
-        "Examples:\n\n"
-        "• pm rail list                       — show configured rail items\n"
-        "• pm rail add <plugin>               — add a plugin's rail item\n"
-        "• pm rail remove <plugin>            — remove a plugin's rail item\n"
+    help=help_with_examples(
+        "Manage cockpit rail items.",
+        [
+            ("pm rail list", "show configured rail items"),
+            ("pm rail hide tools.activity", "hide one rail item"),
+            ("pm rail show tools.activity", "restore a hidden rail item"),
+        ],
     )
 )
 

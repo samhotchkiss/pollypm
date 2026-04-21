@@ -29,6 +29,7 @@ from pathlib import Path
 
 from pollypm.config import load_config
 from pollypm.cockpit_sections.base import _STATUS_ICONS
+from pollypm.heartbeats.snapshots import read_recent_heartbeat_snapshot
 
 
 def _render_work_service_issues(project: object) -> str:
@@ -356,6 +357,15 @@ def _worker_roster_sort_key(row: "WorkerRosterRow") -> tuple[int, str]:
     )
 
 
+def _pane_text_shows_active_turn(pane_text: str) -> bool:
+    lowered = pane_text.lower()
+    return (
+        "\u23fa" in pane_text
+        or "working (" in lowered
+        or "esc to interrupt" in lowered
+    )
+
+
 def _format_worker_turn_label(
     *, last_heartbeat_iso: str | None, is_turn_active: bool,
 ) -> str:
@@ -517,20 +527,8 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
             session_name = ws.agent_name or window_name
 
             last_heartbeat_iso: str | None = None
+            heartbeat = None
             is_turn_active = False
-            if has_window and tmux is not None:
-                try:
-                    pane_text = tmux.capture_pane(window.pane_id, lines=15)
-                except Exception:  # noqa: BLE001
-                    pane_text = ""
-                lowered = pane_text.lower()
-                if "\u23fa" in pane_text or "working" in lowered:
-                    is_turn_active = True
-                if (
-                    "working (" in lowered
-                    and "esc to interrupt" in lowered
-                ):
-                    is_turn_active = True
 
             stuck = False
             if supervisor is not None:
@@ -552,11 +550,21 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
                         if drift_dt >= datetime.now(UTC) - timedelta(minutes=30):
                             stuck = True
                 try:
-                    hb = supervisor.store.latest_heartbeat(session_name)
+                    heartbeat = supervisor.store.latest_heartbeat(session_name)
                 except Exception:  # noqa: BLE001
-                    hb = None
-                if hb is not None:
-                    last_heartbeat_iso = getattr(hb, "created_at", None)
+                    heartbeat = None
+                if heartbeat is not None:
+                    last_heartbeat_iso = getattr(heartbeat, "created_at", None)
+
+            if has_window:
+                pane_text = read_recent_heartbeat_snapshot(heartbeat)
+                if pane_text is None and tmux is not None:
+                    try:
+                        pane_text = tmux.capture_pane(window.pane_id, lines=15)
+                    except Exception:  # noqa: BLE001
+                        pane_text = ""
+                if pane_text:
+                    is_turn_active = _pane_text_shows_active_turn(pane_text)
 
             if not has_window:
                 status = "offline"
@@ -760,4 +768,3 @@ def _register_worker_roster_rail_item(registry, router) -> None:
         registry.add(reg)
     except Exception:  # noqa: BLE001
         pass
-

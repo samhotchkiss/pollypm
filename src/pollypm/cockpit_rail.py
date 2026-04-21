@@ -36,6 +36,7 @@ from pathlib import Path
 
 from pollypm.atomic_io import atomic_write_json
 from pollypm.config import load_config
+from pollypm.heartbeats.snapshots import read_recent_heartbeat_snapshot
 from pollypm.providers import get_provider
 from pollypm.runtimes import get_runtime
 from pollypm.service_api import PollyPMService
@@ -604,7 +605,21 @@ class CockpitRouter:
             return "dead"
         spinners = ["\u25dc", "\u25dd", "\u25de", "\u25df"]
         if launch.session.role in ("worker", "operator-pm", "reviewer"):
-            working = self._is_pane_working(window, launch.session.provider)
+            heartbeat = None
+            try:
+                supervisor = self._load_supervisor()
+            except Exception:  # noqa: BLE001
+                supervisor = None
+            if supervisor is not None:
+                try:
+                    heartbeat = supervisor.store.latest_heartbeat(session_name)
+                except Exception:  # noqa: BLE001
+                    heartbeat = None
+            working = self._is_pane_working(
+                window,
+                launch.session.provider,
+                heartbeat=heartbeat,
+            )
             if working:
                 return spinners[spinner_index % 4] + " working"
             if launch.session.role == "worker":
@@ -641,17 +656,22 @@ class CockpitRouter:
         except Exception:  # noqa: BLE001
             return None
 
-    def _is_pane_working(self, window, provider) -> bool:
+    def _is_pane_working(self, window, provider, *, heartbeat=None) -> bool:
         """Check if a session pane has an active turn (agent is working, not idle at prompt)."""
+        pane_text = read_recent_heartbeat_snapshot(heartbeat)
+        if pane_text is None:
+            try:
+                pane_text = self.tmux.capture_pane(window.pane_id, lines=15)
+            except Exception:  # noqa: BLE001
+                return False
         try:
-            pane_text = self.tmux.capture_pane(window.pane_id, lines=15)
+            tail_lines = [
+                line.rstrip()
+                for line in pane_text.splitlines()
+                if line.strip()
+            ][-6:]
         except Exception:  # noqa: BLE001
             return False
-        tail_lines = [
-            line.rstrip()
-            for line in pane_text.splitlines()
-            if line.strip()
-        ][-6:]
         if not tail_lines:
             return False
         tail = "\n".join(tail_lines)

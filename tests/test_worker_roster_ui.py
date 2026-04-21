@@ -335,3 +335,128 @@ def test_gather_worker_roster_picks_up_worker_session(tmp_path: Path) -> None:
     assert rows[0].status == "offline"
     assert rows[0].task_number == t.task_number
     assert "Build favicon" in rows[0].task_title
+
+
+def test_gather_worker_roster_reuses_recent_heartbeat_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Fresh heartbeat snapshots should satisfy turn-status checks without tmux capture."""
+    from datetime import UTC, datetime
+
+    import pollypm.cockpit_inbox as cockpit_inbox
+    import pollypm.session_services as session_services
+    from pollypm.cockpit import _gather_worker_roster
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    (project_path / ".pollypm").mkdir()
+    db_path = project_path / ".pollypm" / "state.db"
+
+    svc = SQLiteWorkService(db_path=db_path, project_path=project_path)
+    try:
+        task = svc.create(
+            title="Build favicon",
+            description="Fetch and cache site favicons for every shortlink.",
+            type="task",
+            project="demo",
+            flow_template="standard",
+            roles={"worker": "pete", "reviewer": "russell"},
+            priority="normal",
+            created_by="polly",
+        )
+        svc.queue(task.task_id, "polly")
+        svc.claim(task.task_id, "worker")
+        svc.ensure_worker_session_schema()
+        svc.upsert_worker_session(
+            task_project="demo",
+            task_number=task.task_number,
+            agent_name="worker_demo",
+            pane_id="%1",
+            worktree_path=str(tmp_path / "wt"),
+            branch_name="task/demo-1",
+            started_at=datetime.now(UTC).isoformat(),
+        )
+    finally:
+        svc.close()
+
+    snapshot_path = tmp_path / "worker-snapshot.txt"
+    snapshot_path.write_text(
+        "\n".join(
+            [
+                "OpenAI Codex",
+                "• Working (12s • esc to interrupt)",
+                "› Implement {feature}",
+            ]
+        )
+    )
+
+    class _Project:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+            self.name = "Demo"
+            self.key = "demo"
+
+        def display_label(self) -> str:
+            return self.name
+
+    class _InnerProject:
+        tmux_session = "pollypm-test"
+
+    class _Config:
+        project = _InnerProject()
+
+        def __init__(self, project_path: Path) -> None:
+            self.projects = {"demo": _Project(project_path)}
+
+    class FakeStore:
+        def last_event_at(self, session_name: str, event_type: str):
+            assert session_name == "worker_demo"
+            assert event_type == "state_drift"
+            return None
+
+        def latest_heartbeat(self, session_name: str):
+            assert session_name == "worker_demo"
+            return type(
+                "Heartbeat",
+                (),
+                {
+                    "snapshot_path": str(snapshot_path),
+                    "created_at": datetime.now(UTC).isoformat(),
+                },
+            )()
+
+        def close(self) -> None:
+            return None
+
+    class FakeSupervisor:
+        store = FakeStore()
+
+    class FakeTmux:
+        def list_windows(self, session_name: str):
+            assert session_name == "pollypm-test-storage-closet"
+            return [
+                type(
+                    "Window",
+                    (),
+                    {
+                        "name": f"task-demo-{task.task_number}",
+                        "pane_id": "%1",
+                        "pane_dead": False,
+                    },
+                )()
+            ]
+
+        def capture_pane(self, pane_id: str, lines: int = 15) -> str:
+            raise AssertionError("capture_pane should not run when heartbeat snapshot is fresh")
+
+    monkeypatch.setattr(cockpit_inbox, "_try_load_supervisor_for_config", lambda config: FakeSupervisor())
+    monkeypatch.setattr(session_services, "create_tmux_client", lambda: FakeTmux())
+
+    rows = _gather_worker_roster(_Config(project_path))
+
+    assert len(rows) == 1
+    assert rows[0].session_name == "worker_demo"
+    assert rows[0].status == "working"
+    assert rows[0].turn_label.startswith("active")

@@ -1,0 +1,22 @@
+"""Sticky one-line attention summary for project dashboards."""
+
+from __future__ import annotations
+
+
+def render_project_action_bar(
+    *,
+    review_count: int,
+    alert_count: int,
+    inbox_count: int,
+) -> str:
+    """Return a compact summary of the project's actionable work."""
+    bits: list[str] = []
+    if review_count:
+        bits.append(f"{review_count} approval{'s' if review_count != 1 else ''}")
+    if alert_count:
+        bits.append(f"{alert_count} alert{'s' if alert_count != 1 else ''}")
+    if inbox_count:
+        bits.append(f"{inbox_count} new in inbox")
+    if not bits:
+        return "▸ Clear · no approvals, alerts, or inbox items"
+    return "▸ " + " · ".join(bits)

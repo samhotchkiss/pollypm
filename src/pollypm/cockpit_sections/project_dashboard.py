@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pollypm.cockpit_sections.action_bar import render_project_action_bar
 from pollypm.cockpit_sections.activity import _section_activity
 from pollypm.cockpit_sections.base import (
     _DASHBOARD_BULLET,
@@ -101,9 +102,19 @@ def _render_project_dashboard(
 
     # Single SQLite open per render \u2014 every downstream section reuses
     # this hydrated task list and the counts map.
+    inbox_count = 0
     with SQLiteWorkService(db_path=db_path, project_path=project.path) as svc:
+        try:
+            from pollypm.work.inbox_view import inbox_tasks
+        except Exception:  # noqa: BLE001
+            inbox_tasks = None
         counts = svc.state_counts(project=project_key)
         tasks = svc.list_tasks(project=project_key)
+        if inbox_tasks is not None:
+            try:
+                inbox_count = len(inbox_tasks(svc, project=project_key))
+            except Exception:  # noqa: BLE001
+                inbox_count = 0
 
     tokens = _aggregate_project_tokens(db_path, project_key)
 
@@ -158,6 +169,12 @@ def _render_project_dashboard(
     out: list[str] = [
         _section_header(name, presence),
         _DASHBOARD_BULLET + "\u2500" * (_DASHBOARD_DIVIDER_WIDTH - 2),
+        _DASHBOARD_BULLET
+        + render_project_action_bar(
+            review_count=len(review),
+            alert_count=len(project_alerts),
+            inbox_count=inbox_count,
+        ),
         _section_summary(counts),
         format_project_health_scorecard(name, counts, tasks),
         "",

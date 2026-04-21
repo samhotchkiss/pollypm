@@ -321,27 +321,25 @@ def build_worker_protocol_injection(
     session_role: str | None,
     guide_text: str | None = None,
 ) -> str:
-    """Render a ``## Worker Protocol`` section containing the worker guide.
+    """Render a short ``## Worker Protocol`` pointer for workers.
 
     Returns an empty string when ``session_role`` is not exactly
     ``"worker"``. Non-worker roles (PM, reviewer, operator, supervisor)
     get nothing — this is intentional, so adding the injection to the
     existing memory-injection path is a no-op for those sessions.
 
-    ``guide_text`` overrides the on-disk lookup; tests use it to avoid
-    a filesystem dependency.
+    ``guide_text`` is accepted for compatibility with the old guide-
+    loading implementation, but the rendered prompt now points workers
+    at ``docs/worker-guide.md`` instead of inlining the whole guide.
     """
     if session_role != "worker":
         return ""
-    text = guide_text if guide_text is not None else load_worker_guide_text()
-    if not text.strip():
-        return ""
-    # The guide starts with its own "# Worker Guide" H1. We wrap it in
-    # an H2 section so the persona prompt keeps a consistent hierarchy
-    # (the memory section is also H2). Strip a trailing newline before
-    # re-wrapping so the final render has exactly one trailing newline.
-    body = text.rstrip("\n")
-    return f"{WORKER_PROTOCOL_HEADING}\n\n{body}\n"
+    # Keep the kickoff compact: the full playbook lives in docs/worker-guide.md.
+    return (
+        f"{WORKER_PROTOCOL_HEADING}\n\n"
+        "Read `docs/worker-guide.md` for the worker playbook, including how to "
+        "claim work, ship it, and recover."
+    )
 
 
 def prepend_worker_protocol(prompt: str, injection: str) -> str:

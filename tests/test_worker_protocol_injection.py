@@ -60,41 +60,45 @@ def test_injection_empty_for_non_worker_roles():
 def test_injection_non_empty_for_worker_role():
     out = build_worker_protocol_injection(session_role="worker")
     assert out.startswith(WORKER_PROTOCOL_HEADING)
-    # Contains load-bearing signal strings from the guide.
-    assert "pm task claim" in out
-    assert "pm task done" in out
+    assert "docs/worker-guide.md" in out
+    assert "claim work" in out
+    assert "ship it" in out
+    assert "recover" in out
+    assert "pm task done" not in out
 
 
 def test_injection_accepts_explicit_guide_text_for_isolation():
-    """Tests pin a known payload without needing the real doc on disk."""
+    """The legacy ``guide_text`` hook should not inline the guide."""
     payload = "# Worker Guide\n\nBody goes here."
     out = build_worker_protocol_injection(
         session_role="worker",
         guide_text=payload,
     )
     assert out.startswith(WORKER_PROTOCOL_HEADING + "\n")
-    assert "Body goes here." in out
+    assert "docs/worker-guide.md" in out
+    assert "Body goes here." not in out
 
 
-def test_injection_empty_when_guide_missing():
-    """Blank guide text → empty injection. Session startup must not
-    choke on a missing doc in a slim install."""
+def test_injection_uses_pointer_when_guide_missing():
+    """Blank guide text no longer inlines the guide; it still points
+    workers at docs/worker-guide.md."""
     out = build_worker_protocol_injection(
         session_role="worker",
         guide_text="",
     )
-    assert out == ""
+    assert out.startswith(WORKER_PROTOCOL_HEADING)
+    assert "docs/worker-guide.md" in out
+    assert "Body goes here." not in out
 
 
-def test_injection_has_single_trailing_newline():
+def test_injection_has_no_trailing_newline():
     out = build_worker_protocol_injection(
         session_role="worker",
         guide_text="# Worker Guide\n\nBody.",
     )
-    # Exactly one trailing newline so prepend functions add exactly
-    # one blank line of separation.
-    assert out.endswith("\n")
-    assert not out.endswith("\n\n")
+    # The pointer prompt is compact; the prepend helper supplies the
+    # separator when composing with the persona prompt.
+    assert not out.endswith("\n")
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +208,7 @@ def test_tmux_service_injects_worker_protocol_for_worker(tmux_service):
         user_id="operator",
     )
     assert WORKER_PROTOCOL_HEADING in out
-    assert "pm task done" in out
+    assert "docs/worker-guide.md" in out
     assert persona in out
     # Protocol appears above the persona.
     assert out.index(WORKER_PROTOCOL_HEADING) < out.index(persona)
@@ -229,9 +233,9 @@ def test_tmux_service_skips_worker_protocol_for_other_roles(tmux_service, role):
     assert persona in out
 
 
-def test_tmux_service_injects_nothing_for_missing_guide(tmux_service, monkeypatch):
-    """If the guide can't be located, worker sessions still launch —
-    they just don't get the protocol section. Defensive resilience."""
+def test_tmux_service_injects_worker_protocol_even_without_guide_text(tmux_service, monkeypatch):
+    """The kickoff now points to docs/worker-guide.md directly, so a
+    missing on-disk guide_text hook must not suppress the pointer."""
     import pollypm.memory_prompts as mp
 
     monkeypatch.setattr(mp, "load_worker_guide_text", lambda: "")
@@ -244,6 +248,6 @@ def test_tmux_service_injects_nothing_for_missing_guide(tmux_service, monkeypatc
         task_description=None,
         user_id="operator",
     )
-    # No crash, no protocol, persona intact.
-    assert WORKER_PROTOCOL_HEADING not in out
+    assert WORKER_PROTOCOL_HEADING in out
+    assert "docs/worker-guide.md" in out
     assert persona in out

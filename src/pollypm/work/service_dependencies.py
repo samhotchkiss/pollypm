@@ -93,23 +93,40 @@ def unlink_tasks(service: "SQLiteWorkService", from_id: str, to_id: str, kind: s
 
 def dependent_tasks(service: "SQLiteWorkService", task_id: str) -> list[Task]:
     project, number = _parse_task_id(task_id)
-    visited: set[tuple[str, int]] = set()
-    queue: list[tuple[str, int]] = [(project, number)]
+    rows = service._conn.execute(
+        """
+        WITH RECURSIVE deps(project, task_number) AS (
+            SELECT to_project, to_task_number
+            FROM work_task_dependencies
+            WHERE from_project = ? AND from_task_number = ? AND kind = ?
+            UNION
+            SELECT d.to_project, d.to_task_number
+            FROM work_task_dependencies d
+            JOIN deps
+              ON d.from_project = deps.project
+             AND d.from_task_number = deps.task_number
+            WHERE d.kind = ?
+        )
+        SELECT DISTINCT project, task_number
+        FROM deps
+        ORDER BY project, task_number
+        """,
+        (project, number, LinkKind.BLOCKS.value, LinkKind.BLOCKS.value),
+    ).fetchall()
+    task_keys = [(row["project"], row["task_number"]) for row in rows]
+    if not task_keys:
+        return []
 
-    while queue:
-        current = queue.pop(0)
-        rows = service._conn.execute(
-            "SELECT to_project, to_task_number FROM work_task_dependencies "
-            "WHERE from_project = ? AND from_task_number = ? AND kind = ?",
-            (current[0], current[1], LinkKind.BLOCKS.value),
-        ).fetchall()
-        for row in rows:
-            target = (row["to_project"], row["to_task_number"])
-            if target not in visited:
-                visited.add(target)
-                queue.append(target)
-
-    return [service.get(f"{project}/{number}") for project, number in visited]
+    where = " OR ".join("(project = ? AND task_number = ?)" for _ in task_keys)
+    params: list[object] = []
+    for task_project, task_number in task_keys:
+        params.extend((task_project, task_number))
+    task_rows = service._conn.execute(
+        f"SELECT * FROM work_tasks WHERE {where} ORDER BY project, task_number",
+        params,
+    ).fetchall()
+    token_sums = service._load_task_token_sums_bulk()
+    return [service._row_to_task(row, token_sums=token_sums) for row in task_rows]
 
 
 def would_create_cycle(

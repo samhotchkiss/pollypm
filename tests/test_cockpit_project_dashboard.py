@@ -8,6 +8,8 @@ integration test that seeds a real SQLite-backed work service.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from datetime import UTC, datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +38,10 @@ from pollypm.cockpit import (
     _worker_presence,
 )
 from pollypm.cockpit_sections.action_bar import render_project_action_bar
+from pollypm.cockpit_sections.recent_commits import (
+    _list_recent_commits,
+    _section_recent_commits,
+)
 from pollypm.work.models import (
     Artifact,
     ArtifactKind,
@@ -92,6 +98,8 @@ class _FakeTask:
         assignee: str | None = None,
         current_node_id: str | None = None,
         blocked_by: list[tuple[str, int]] | None = None,
+        total_input_tokens: int = 0,
+        total_output_tokens: int = 0,
     ) -> None:
         self.task_number = task_number
         self.title = title
@@ -103,6 +111,8 @@ class _FakeTask:
         self.assignee = assignee
         self.current_node_id = current_node_id
         self.blocked_by = blocked_by or []
+        self.total_input_tokens = total_input_tokens
+        self.total_output_tokens = total_output_tokens
 
 
 class _FakeEvent:
@@ -205,6 +215,60 @@ class TestSectionVelocity:
         assert any("Cycle time" in l for l in lines)
         # 30m per task on average.
         assert any("30m avg" in l for l in lines)
+
+    def test_cost_sparkline_renders_from_completed_task_tokens(self):
+        now = datetime.now(UTC)
+        tasks = [
+            _FakeTask(
+                task_number=1,
+                title="this week expensive",
+                status="done",
+                updated_at=now - timedelta(days=2),
+                total_input_tokens=100_000,
+                total_output_tokens=0,
+            ),
+            _FakeTask(
+                task_number=2,
+                title="this week moderate",
+                status="done",
+                updated_at=now - timedelta(days=4),
+                total_input_tokens=80_000,
+                total_output_tokens=20_000,
+            ),
+            _FakeTask(
+                task_number=3,
+                title="last week cheaper",
+                status="done",
+                updated_at=now - timedelta(days=9),
+                total_input_tokens=40_000,
+                total_output_tokens=10_000,
+            ),
+            _FakeTask(
+                task_number=4,
+                title="last week cheaper too",
+                status="done",
+                updated_at=now - timedelta(days=11),
+                total_input_tokens=30_000,
+                total_output_tokens=20_000,
+            ),
+        ]
+        lines = _section_velocity(tasks, None)
+        cost_line = next((line for line in lines if "Cost/task" in line), "")
+        assert "avg $0.75/task" in cost_line
+        assert "this wk ↗ +$0.50 vs last" in cost_line
+
+    def test_cost_sparkline_skipped_when_no_task_tokens(self):
+        now = datetime.now(UTC)
+        tasks = [
+            _FakeTask(
+                task_number=1,
+                title="no usage",
+                status="done",
+                updated_at=now - timedelta(days=1),
+            )
+        ]
+        lines = _section_velocity(tasks, None)
+        assert not any("Cost/task" in line for line in lines)
 
     def test_tokens_line_present_when_tokens_supplied(self):
         lines = _section_velocity([], (45200, 12100))
@@ -351,6 +415,28 @@ class TestSectionRecent:
         assert "approved by russell" in joined
         assert "commit 237dfb0" in joined
         assert "25m cycle" in joined
+
+
+class TestSectionRecentCommits:
+    def test_recent_commits_without_git_repo(self, tmp_path: Path):
+        lines = _section_recent_commits(tmp_path)
+        assert any("(none)" in line for line in lines)
+
+    def test_recent_commits_renders_git_timeline(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        _init_git_repo(repo)
+        _git_commit(repo, "feat(router): wire cockpit rail", filename="router.txt")
+        _git_commit(repo, "fix(ingest): guard JSONL types", filename="ingest.txt")
+
+        lines = _section_recent_commits(repo)
+        joined = "\n".join(lines)
+        assert "Recent commits" in joined
+        assert "feat(router): wire cockpit rail" in joined
+        assert "fix(ingest): guard JSONL types" in joined
+
+        commits = _list_recent_commits(repo)
+        assert len(commits) == 2
+        assert commits[0].subject == "fix(ingest): guard JSONL types"
 
 
 class TestSectionActivity:
@@ -697,6 +783,36 @@ def _seed_project(tmp_path: Path) -> tuple[Path, str]:
     )
     svc.close()
     return proj_path, "shortlink-gen"
+
+
+def _git(project_path: Path, *args: str, env: dict[str, str] | None = None) -> None:
+    merged_env = None
+    if env is not None:
+        merged_env = dict(os.environ)
+        merged_env.update(env)
+    subprocess.run(
+        ["git", *args],
+        cwd=project_path,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=merged_env,
+    )
+
+
+def _init_git_repo(project_path: Path) -> None:
+    project_path.mkdir(parents=True, exist_ok=True)
+    _git(project_path, "init", "-q")
+    _git(project_path, "config", "user.email", "test@example.com")
+    _git(project_path, "config", "user.name", "Test User")
+    _git(project_path, "config", "commit.gpgsign", "false")
+
+
+def _git_commit(project_path: Path, subject: str, *, filename: str) -> None:
+    target = project_path / filename
+    target.write_text(subject + "\n", encoding="utf-8")
+    _git(project_path, "add", filename)
+    _git(project_path, "commit", "-q", "-m", subject)
 
 
 class _DashFakeProject:

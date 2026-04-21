@@ -26,6 +26,7 @@ from pollypm.cockpit_sections.in_flight import _section_in_flight
 from pollypm.cockpit_sections.insights import _section_insights
 from pollypm.cockpit_sections.quick_actions import _section_quick_actions
 from pollypm.cockpit_sections.recent import _section_recent
+from pollypm.cockpit_sections.recent_commits import _section_recent_commits
 from pollypm.cockpit_sections.summary import _section_summary
 from pollypm.cockpit_sections.velocity import _section_velocity
 from pollypm.cockpit_sections.you_need_to import _section_you_need_to
@@ -188,6 +189,7 @@ def _render_project_dashboard(
     out.extend(_section_you_need_to(review, project_alerts, 0))
     out.extend(_section_in_flight(in_progress, blocked))
     out.extend(_section_recent(completed))
+    out.extend(_section_recent_commits(project.path))
     out.extend(_section_activity(tasks, system_events))
     out.extend(_section_insights(project.path, project_key))
     out.extend(_section_downtime(project.path))

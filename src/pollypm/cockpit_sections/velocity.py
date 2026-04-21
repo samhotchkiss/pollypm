@@ -1,4 +1,4 @@
-"""Velocity / cycle-time / token aggregation rows (#403)."""
+"""Velocity / cycle-time / cost / token aggregation rows (#403, #501)."""
 
 from __future__ import annotations
 
@@ -11,8 +11,68 @@ from pollypm.cockpit_sections.base import (
 )
 
 
+_BLENDED_USD_PER_1K_TOKENS = 0.01
+
+
+def _done_tasks(tasks: list) -> list:
+    """Newest-first list of completed tasks that shipped work."""
+    from datetime import UTC, datetime
+
+    completed = [
+        t for t in tasks if getattr(t, "work_status", None) is not None
+        and t.work_status.value == "done"
+    ]
+    completed.sort(
+        key=lambda t: _iso_to_dt(t.updated_at)
+        or datetime.min.replace(tzinfo=UTC),
+        reverse=True,
+    )
+    return completed
+
+
+def _estimate_task_cost_usd(task) -> float | None:
+    """Blended token-cost estimate until model pricing lands in the ledger."""
+    total_tokens = (
+        int(getattr(task, "total_input_tokens", 0) or 0)
+        + int(getattr(task, "total_output_tokens", 0) or 0)
+    )
+    if total_tokens <= 0:
+        return None
+    return (total_tokens / 1000.0) * _BLENDED_USD_PER_1K_TOKENS
+
+
+def _format_usd(amount: float) -> str:
+    return f"${amount:.2f}"
+
+
+def _cost_delta_label(completed: list, now) -> str:
+    """Short this-week vs last-week summary for completed-task cost."""
+    this_week: list[float] = []
+    last_week: list[float] = []
+    for task in completed:
+        dt = _iso_to_dt(getattr(task, "updated_at", None))
+        cost = _estimate_task_cost_usd(task)
+        if dt is None or cost is None:
+            continue
+        age_days = (now - dt).days
+        if 0 <= age_days < 7:
+            this_week.append(cost)
+        elif 7 <= age_days < 14:
+            last_week.append(cost)
+    if not this_week or not last_week:
+        return ""
+    this_avg = sum(this_week) / len(this_week)
+    last_avg = sum(last_week) / len(last_week)
+    delta = this_avg - last_avg
+    if abs(delta) < 0.005:
+        return "this wk → flat vs last"
+    arrow = "↗" if delta > 0 else "↘"
+    sign = "+" if delta > 0 else "-"
+    return f"this wk {arrow} {sign}{_format_usd(abs(delta))} vs last"
+
+
 def _section_velocity(tasks: list, tokens: tuple[int, int] | None) -> list[str]:
-    """Velocity + cycle-time sparklines and token aggregation."""
+    """Velocity + cycle-time + cost sparklines and token aggregation."""
     from datetime import UTC, datetime
 
     lines: list[str] = []
@@ -50,15 +110,7 @@ def _section_velocity(tasks: list, tokens: tuple[int, int] | None) -> list[str]:
 
     # Cycle time sparkline: median minutes for each of the last 7 completed tasks.
     cycles: list[int] = []
-    completed = [
-        t for t in tasks if getattr(t, "work_status", None) is not None
-        and t.work_status.value == "done"
-    ]
-    completed.sort(
-        key=lambda t: _iso_to_dt(t.updated_at)
-        or datetime.min.replace(tzinfo=UTC),
-        reverse=True,
-    )
+    completed = _done_tasks(tasks)
     for t in completed[:7]:
         m = _task_cycle_minutes(t)
         if m is not None:
@@ -69,6 +121,24 @@ def _section_velocity(tasks: list, tokens: tuple[int, int] | None) -> list[str]:
         lines.append(
             f"{_DASHBOARD_BULLET}Cycle time  {_spark_bar(cycles_asc):<8}    "
             f"{avg_min}m avg"
+        )
+
+    # Cost sparkline: blended $ estimate from per-task token totals.
+    recent_costs_desc = [
+        cost for cost in (_estimate_task_cost_usd(task) for task in completed[:7])
+        if cost is not None
+    ]
+    if recent_costs_desc:
+        avg_cost = sum(recent_costs_desc) / len(recent_costs_desc)
+        cost_spark_values = [
+            max(1, int(round(cost * 100)))
+            for cost in reversed(recent_costs_desc)
+        ]
+        delta_label = _cost_delta_label(completed, now)
+        suffix = f" · {delta_label}" if delta_label else ""
+        lines.append(
+            f"{_DASHBOARD_BULLET}Cost/task  {_spark_bar(cost_spark_values):<8}    "
+            f"avg {_format_usd(avg_cost)}/task{suffix}"
         )
 
     # Token aggregation \u2014 drops the line entirely when unavailable.

@@ -3,7 +3,6 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
-from pollypm.plugins_builtin.core_agent_profiles.profiles import heartbeat_prompt, polly_prompt
 from pollypm.models import (
     AccountConfig,
     EventsRetentionSettings,
@@ -48,10 +47,22 @@ def _normalize_session_prompt(session_name: str, prompt: str | None) -> str | No
     if prompt is None:
         return None
     if session_name == "heartbeat" and "You are PollyPM session 0," in prompt:
-        return heartbeat_prompt()
+        return _heartbeat_prompt()
     if session_name == "operator" and "You are Polly, the PollyPM project manager, in session 1." in prompt:
-        return polly_prompt()
+        return _polly_prompt()
     return prompt
+
+
+def _heartbeat_prompt() -> str:
+    from pollypm.plugins_builtin.core_agent_profiles.profiles import heartbeat_prompt
+
+    return heartbeat_prompt()
+
+
+def _polly_prompt() -> str:
+    from pollypm.plugins_builtin.core_agent_profiles.profiles import polly_prompt
+
+    return polly_prompt()
 
 
 def _resolve_path(base: Path, raw_path: str) -> Path:
@@ -813,7 +824,7 @@ def _build_example_config(root: Path) -> PollyPMConfig:
                 cwd=root,
                 project="pollypm",
                 window_name="pm-heartbeat",
-                prompt=heartbeat_prompt(),
+                prompt=_heartbeat_prompt(),
                 agent_profile="heartbeat",
             ),
             "operator": SessionConfig(
@@ -824,7 +835,7 @@ def _build_example_config(root: Path) -> PollyPMConfig:
                 cwd=root,
                 project="pollypm",
                 window_name="pm-operator",
-                prompt=polly_prompt(),
+                prompt=_polly_prompt(),
                 agent_profile="polly",
             ),
             "worker_demo": SessionConfig(

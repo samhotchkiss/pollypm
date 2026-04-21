@@ -6,17 +6,10 @@ Provides ``pm task ...`` and ``pm flow ...`` subcommands via Typer.
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 from typing import Optional
 
 import typer
-
-from pollypm.work.flow_engine import parse_flow_yaml
-from pollypm.work.sqlite_service import (
-    SQLiteWorkService,
-    WorkServiceError,
-)
 
 # Worked examples block — shown in `pm task --help` so a worker
 # hitting --help for the first time sees a copy-paste flow instead of
@@ -61,6 +54,8 @@ _JSON_OPTION = typer.Option(False, "--json", help="Output as JSON.")
 
 def _run(fn, *args, **kwargs):
     """Call a work service method, catching errors for clean CLI output."""
+    from pollypm.work.sqlite_service import WorkServiceError
+
     try:
         return fn(*args, **kwargs)
     except WorkServiceError as exc:
@@ -141,6 +136,7 @@ def _svc(db: str, project: str | None = None) -> SQLiteWorkService:
 
     from pollypm.work.sync import SyncManager
     from pollypm.work.sync_file import FileSyncAdapter
+    from pollypm.work.sqlite_service import SQLiteWorkService
 
     db_path = _resolve_db_path(db, project=project)
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1121,6 +1117,8 @@ def flow_validate(
 
     text = p.read_text(encoding="utf-8")
     try:
+        from pollypm.work.flow_engine import parse_flow_yaml
+
         template = parse_flow_yaml(text)
         if output_json:
             typer.echo(json.dumps({"valid": True, "name": template.name}))

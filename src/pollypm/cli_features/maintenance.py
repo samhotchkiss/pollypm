@@ -17,13 +17,6 @@ from pathlib import Path
 
 import typer
 
-from pollypm.accounts import (
-    add_account_via_login,
-    list_account_statuses,
-    probe_account_usage,
-    relogin_account,
-    remove_account as remove_account_entry,
-)
 from pollypm.config import (
     DEFAULT_CONFIG_PATH,
     GLOBAL_CONFIG_DIR,
@@ -32,9 +25,44 @@ from pollypm.config import (
 from pollypm.doc_scaffold import repair_docs, verify_docs
 from pollypm.errors import format_config_not_found_error
 from pollypm.models import ProviderKind
-from pollypm.service_api import PollyPMService
 from pollypm.storage.state import StateStore
 from pollypm.worktrees import list_worktrees as list_project_worktrees
+
+
+def _service(config_path: Path):
+    from pollypm.service_api import PollyPMService
+
+    return PollyPMService(config_path)
+
+
+def _list_account_statuses(config_path: Path):
+    from pollypm.accounts import list_account_statuses
+
+    return list_account_statuses(config_path)
+
+
+def _probe_account_usage(config_path: Path, account: str):
+    from pollypm.accounts import probe_account_usage
+
+    return probe_account_usage(config_path, account)
+
+
+def _add_account_via_login(config_path: Path, provider_kind: ProviderKind):
+    from pollypm.accounts import add_account_via_login
+
+    return add_account_via_login(config_path, provider_kind)
+
+
+def _relogin_account(config_path: Path, account: str):
+    from pollypm.accounts import relogin_account
+
+    return relogin_account(config_path, account)
+
+
+def _remove_account_entry(config_path: Path, account: str, *, delete_home: bool = False):
+    from pollypm.accounts import remove_account as remove_account_entry
+
+    return remove_account_entry(config_path, account, delete_home=delete_home)
 
 
 def register_maintenance_commands(app: typer.Typer) -> None:
@@ -97,7 +125,7 @@ def register_maintenance_commands(app: typer.Typer) -> None:
     def accounts(
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     ) -> None:
-        for account in list_account_statuses(config_path):
+        for account in _list_account_statuses(config_path):
             typer.echo(
                 f"- {account.key}: {account.email} [{account.provider.value}] "
                 f"logged_in={'yes' if account.logged_in else 'no'} "
@@ -177,7 +205,7 @@ def register_maintenance_commands(app: typer.Typer) -> None:
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     ) -> None:
         config = load_config(config_path)
-        statuses = list_account_statuses(config_path)
+        statuses = _list_account_statuses(config_path)
         if not statuses:
             typer.echo("No configured accounts.")
             return
@@ -201,7 +229,7 @@ def register_maintenance_commands(app: typer.Typer) -> None:
         account: str = typer.Argument(..., help="Account key or email."),
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     ) -> None:
-        status = probe_account_usage(config_path, account)
+        status = _probe_account_usage(config_path, account)
         typer.echo(
             f"{status.key}: plan={status.plan} health={status.health} "
             f"usage={status.usage_summary}"
@@ -212,7 +240,7 @@ def register_maintenance_commands(app: typer.Typer) -> None:
         account: str | None = typer.Option(None, "--account", help="Optional account key or email to limit scanning."),
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     ) -> None:
-        service = PollyPMService(config_path)
+        service = _service(config_path)
         count = service.sync_token_ledger(account=account)
         typer.echo(f"Synced {count} transcript token sample(s).")
 
@@ -221,7 +249,7 @@ def register_maintenance_commands(app: typer.Typer) -> None:
         limit: int = typer.Option(10, "--limit", min=1, max=100, help="Maximum rows to show."),
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     ) -> None:
-        service = PollyPMService(config_path)
+        service = _service(config_path)
         rows = service.recent_token_usage(limit=limit)
         if not rows:
             typer.echo("No token usage recorded yet.")
@@ -300,7 +328,7 @@ def register_maintenance_commands(app: typer.Typer) -> None:
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     ) -> None:
         provider_kind = ProviderKind(provider.lower())
-        key, email = add_account_via_login(config_path, provider_kind)
+        key, email = _add_account_via_login(config_path, provider_kind)
         typer.echo(f"Added {email} as {key}")
 
     @app.command()
@@ -308,7 +336,7 @@ def register_maintenance_commands(app: typer.Typer) -> None:
         account: str = typer.Argument(..., help="Account key or email."),
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     ) -> None:
-        key, email = relogin_account(config_path, account)
+        key, email = _relogin_account(config_path, account)
         typer.echo(f"Re-authenticated {email} ({key})")
 
     @app.command()
@@ -317,7 +345,7 @@ def register_maintenance_commands(app: typer.Typer) -> None:
         delete_home: bool = typer.Option(False, "--delete-home", help="Also delete the isolated account home."),
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     ) -> None:
-        key, email = remove_account_entry(
+        key, email = _remove_account_entry(
             config_path,
             account,
             delete_home=delete_home,

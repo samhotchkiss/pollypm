@@ -20,6 +20,72 @@ from __future__ import annotations
 from pathlib import Path
 
 
+def format_cli_error(
+    summary: str,
+    *,
+    why: str | None = None,
+    fix: str | None = None,
+    details: list[str] | None = None,
+) -> str:
+    """Build a compact CLI error block that follows the three-question rule."""
+    lines = [f"✗ {summary.strip()}"]
+    if why:
+        lines.append(f"  Why: {why.strip()}")
+    for detail in details or []:
+        if detail and detail.strip():
+            lines.append(f"  {detail.strip()}")
+    if fix:
+        lines.append(f"  Fix: {fix.strip()}")
+    return "\n".join(lines)
+
+
+def render_cli_error(message: str) -> str:
+    """Normalize an existing error string to the standard CLI layout."""
+    lines = [line.rstrip() for line in str(message or "").strip().splitlines()]
+    if not lines:
+        return "✗ Command failed."
+
+    head = lines[0].strip()
+    if head.startswith("Error: "):
+        head = head[len("Error: "):].strip()
+    if head.startswith("✗ "):
+        rendered = [head]
+    else:
+        rendered = [f"✗ {head}"]
+
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        rendered.append(f"  {line.strip()}")
+    return "\n".join(rendered)
+
+
+def format_task_not_found_error(
+    task_id: str,
+    *,
+    why: str,
+    fix: str,
+    suggestion: str | None = None,
+) -> str:
+    """Return the canonical CLI error for a missing work-service task."""
+    details = [f"Did you mean {suggestion}?"] if suggestion else None
+    return format_cli_error(
+        f"Task {task_id} not found.",
+        why=why,
+        fix=fix,
+        details=details,
+    )
+
+
+def format_invalid_task_id_error(task_id: str, *, why: str) -> str:
+    """Return the canonical CLI error for a malformed work-service task id."""
+    return format_cli_error(
+        f"Task id {task_id!r} is invalid.",
+        why=why,
+        fix="pass a task id like `demo/1`.",
+    )
+
+
 def format_config_not_found_error(path: Path) -> str:
     """Return the canonical "config not found" message for ``path``.
 

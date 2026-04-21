@@ -332,6 +332,18 @@ class TestInboxCLI:
         assert "ID:       proj/1" in result.output
         assert "Alias target" in result.output
 
+    def test_reply_missing_task_includes_why_and_fix(self, db_path):
+        _create_user_review_task(db_path, "Existing task")
+
+        result = runner.invoke(
+            inbox_app, ["reply", "proj/9", "hello", "--db", db_path],
+        )
+
+        assert result.exit_code == 1
+        assert "✗ Task proj/9 not found." in result.output
+        assert "Why: project 'proj' does not have task number 9." in result.output
+        assert "Fix: run `pm task list --project proj` to see available task ids." in result.output
+
 
 # ---------------------------------------------------------------------------
 # Cockpit panel rendering with a fake work service

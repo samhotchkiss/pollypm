@@ -188,6 +188,38 @@ class TestCliJsonOutput:
         assert data["task_id"] == "proj/1"
 
 
+class TestCliErrors:
+    def test_cli_get_missing_task_includes_why_fix_and_suggestion(self, db_path):
+        _create_task(db_path, title="Only task")
+
+        result = runner.invoke(task_app, ["get", "proj/9", "--db", db_path])
+
+        assert result.exit_code == 1
+        assert "✗ Task proj/9 not found." in result.output
+        assert "Why: project 'proj' does not have task number 9." in result.output
+        assert "Fix: run `pm task list --project proj` to see available task ids." in result.output
+        assert "Did you mean proj/1?" in result.output
+
+    def test_cli_get_invalid_task_id_includes_example_fix(self, db_path):
+        result = runner.invoke(task_app, ["get", "bogus", "--db", db_path])
+
+        assert result.exit_code == 1
+        assert "✗ Task id 'bogus' is invalid." in result.output
+        assert "Why: work-service task ids must use the form `project/number`." in result.output
+        assert "Fix: pass a task id like `demo/1`." in result.output
+
+    def test_cli_update_without_fields_includes_fix(self, db_path):
+        _create_task(db_path, title="Needs update")
+
+        result = runner.invoke(task_app, ["update", "proj/1", "--db", db_path])
+
+        assert result.exit_code == 1
+        assert "✗ No updatable fields provided." in result.output
+        assert "Why: `pm task update` only changes fields you pass as flags." in result.output
+        assert "--title" in result.output
+        assert "--relevant-files" in result.output
+
+
 class TestCliContext:
     def test_cli_context(self, db_path):
         _create_task(db_path, title="Context task")
@@ -257,4 +289,16 @@ class TestCliFlowValidate:
 
         result = runner.invoke(flow_app, ["validate", str(bad)])
         assert result.exit_code == 1
-        assert "Invalid" in result.output or "error" in result.output.lower()
+        assert f"✗ Flow {bad} is invalid." in result.output
+        assert "Why:" in result.output
+        assert f"Fix: edit {bad} to satisfy the reported constraint" in result.output
+
+    def test_cli_flow_validate_missing_file_includes_fix(self, tmp_path):
+        missing = tmp_path / "missing.yaml"
+
+        result = runner.invoke(flow_app, ["validate", str(missing)])
+
+        assert result.exit_code == 1
+        assert f"✗ Flow file {missing} not found." in result.output
+        assert "Why: `pm flow validate` reads a YAML file from disk." in result.output
+        assert "Fix: pass the path to an existing `.yaml` flow file." in result.output

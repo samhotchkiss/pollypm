@@ -6,12 +6,19 @@ Provides ``pm task ...`` and ``pm flow ...`` subcommands via Typer.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Optional
 
 import typer
 
 from pollypm.cli_help import help_with_examples
+from pollypm.errors import (
+    format_cli_error,
+    format_invalid_task_id_error,
+    format_task_not_found_error,
+    render_cli_error,
+)
 
 _TASK_APP_HELP = help_with_examples(
     "Manage work tasks.",
@@ -31,6 +38,8 @@ _TASK_APP_HELP = help_with_examples(
         "templates and common failure modes."
     ),
 )
+from pollypm.work.sqlite_service import SQLiteWorkService
+from pollypm.work.service_support import TaskNotFoundError, ValidationError
 
 task_app = typer.Typer(help=_TASK_APP_HELP)
 flow_app = typer.Typer(
@@ -51,6 +60,66 @@ _DB_OPTION = typer.Option(".pollypm/state.db", "--db", help="Path to SQLite data
 _PROJECT_OPTION = typer.Option(None, "--project", "-p", help="Project filter.")
 _JSON_OPTION = typer.Option(False, "--json", help="Output as JSON.")
 
+_TASK_NOT_FOUND_RE = re.compile(r"Task '([^']+)' not found\.")
+_INVALID_TASK_ID_RE = re.compile(r"Invalid task_id '([^']+)'\.")
+
+
+def _nearest_task_id(service: object | None, task_id: str) -> str | None:
+    """Return the closest existing task id in the same project, if any."""
+    if service is None or "/" not in task_id:
+        return None
+    project, raw_number = task_id.rsplit("/", 1)
+    if not project or not raw_number.isdigit():
+        return None
+    try:
+        tasks = service.list_tasks(project=project)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - best-effort error formatting path
+        return None
+    if not tasks:
+        return None
+    requested = int(raw_number)
+    nearest = min(tasks, key=lambda task: (abs(task.task_number - requested), task.task_number))
+    return getattr(nearest, "task_id", None)
+
+
+def _render_work_service_error(exc: Exception, fn) -> str:
+    """Format work-service exceptions for CLI output."""
+    message = str(exc)
+    service = getattr(fn, "__self__", None)
+
+    if isinstance(exc, TaskNotFoundError):
+        match = _TASK_NOT_FOUND_RE.search(message)
+        if match:
+            task_id = match.group(1)
+            project, _, raw_number = task_id.rpartition("/")
+            if project and raw_number.isdigit():
+                suggestion = _nearest_task_id(service, task_id)
+                return format_task_not_found_error(
+                    task_id,
+                    why=f"project '{project}' does not have task number {raw_number}.",
+                    fix=f"run `pm task list --project {project}` to see available task ids.",
+                    suggestion=suggestion if suggestion != task_id else None,
+                )
+            return format_task_not_found_error(
+                task_id,
+                why="the work-service database does not contain a task with that id.",
+                fix="run `pm task list` to see available task ids.",
+            )
+
+    if isinstance(exc, ValidationError):
+        match = _INVALID_TASK_ID_RE.search(message)
+        if match:
+            task_id = match.group(1)
+            if "Expected format" in message:
+                why = "work-service task ids must use the form `project/number`."
+            elif "must be an integer" in message:
+                why = "the text after `/` must be a whole-number task id."
+            else:
+                why = message
+            return format_invalid_task_id_error(task_id, why=why)
+
+    return render_cli_error(message)
+
 
 def _run(fn, *args, **kwargs):
     """Call a work service method, catching errors for clean CLI output."""
@@ -59,7 +128,7 @@ def _run(fn, *args, **kwargs):
     try:
         return fn(*args, **kwargs)
     except WorkServiceError as exc:
-        typer.echo(f"Error: {exc}", err=True)
+        typer.echo(_render_work_service_error(exc, fn), err=True)
         raise typer.Exit(code=1) from exc
 
 
@@ -598,7 +667,19 @@ def task_update(
         fields["relevant_files"] = list(relevant_files)
 
     if not fields:
-        typer.echo("Error: no updatable fields provided.", err=True)
+        typer.echo(
+            format_cli_error(
+                "No updatable fields provided.",
+                why="`pm task update` only changes fields you pass as flags.",
+                fix=(
+                    "pass one or more of `--title`, `--description`, "
+                    "`--priority`, `--label`, `--role`, "
+                    "`--acceptance-criteria`, `--constraints`, or "
+                    "`--relevant-files`."
+                ),
+            ),
+            err=True,
+        )
         raise typer.Exit(code=1)
 
     svc = _svc(db, project=_project_from_task_id(task_id))
@@ -1145,7 +1226,14 @@ def flow_validate(
         if output_json:
             typer.echo(json.dumps({"valid": False, "error": f"File not found: {path}"}))
         else:
-            typer.echo(f"Error: file not found: {path}")
+            typer.echo(
+                format_cli_error(
+                    f"Flow file {path} not found.",
+                    why="`pm flow validate` reads a YAML file from disk.",
+                    fix="pass the path to an existing `.yaml` flow file.",
+                ),
+                err=True,
+            )
         raise typer.Exit(1)
 
     text = p.read_text(encoding="utf-8")
@@ -1161,7 +1249,14 @@ def flow_validate(
         if output_json:
             typer.echo(json.dumps({"valid": False, "error": str(e)}))
         else:
-            typer.echo(f"Invalid: {e}")
+            typer.echo(
+                format_cli_error(
+                    f"Flow {path} is invalid.",
+                    why=str(e),
+                    fix=f"edit {path} to satisfy the reported constraint, then rerun `pm flow validate {path}`.",
+                ),
+                err=True,
+            )
         raise typer.Exit(1)
 
 
@@ -1298,12 +1393,26 @@ def task_pickup_log(
 
         config_path = resolve_config_path(DEFAULT_CONFIG_PATH)
         if not config_path.exists():
-            typer.echo("No PollyPM config found; nothing to show.", err=True)
+            typer.echo(
+                format_cli_error(
+                    "No PollyPM config found.",
+                    why="`pm task pickup-log` reads the state store path from your PollyPM config.",
+                    fix="run `pm onboard`, `pm init`, or pass `--config <path>` before retrying.",
+                ),
+                err=True,
+            )
             raise typer.Exit(code=1)
         config = load_config(config_path)
         store = StateStore(config.project.state_db)
     except Exception as exc:  # noqa: BLE001
-        typer.echo(f"Error loading state store: {exc}", err=True)
+        typer.echo(
+            format_cli_error(
+                "Could not load the PollyPM state store.",
+                why=str(exc),
+                fix="verify your config/state DB path, then rerun `pm task pickup-log`.",
+            ),
+            err=True,
+        )
         raise typer.Exit(code=1) from exc
 
     try:

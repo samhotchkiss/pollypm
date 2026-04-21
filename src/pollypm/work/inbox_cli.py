@@ -22,6 +22,7 @@ from pollypm.work.cli import (
     _JSON_OPTION,
     _PROJECT_OPTION,
     _project_from_task_id,
+    _render_work_service_error,
     _resolve_db_path,
     _svc,
     _task_to_dict,
@@ -210,7 +211,7 @@ def inbox_reply(
     try:
         entry = svc.add_reply(task_id, body, actor=actor)
     except Exception as exc:  # noqa: BLE001
-        typer.echo(f"Error: {exc}", err=True)
+        typer.echo(_render_work_service_error(exc, svc.add_reply), err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"{task_id} reply @ {entry.timestamp.isoformat()}")
 
@@ -227,6 +228,6 @@ def inbox_archive(
     try:
         task = svc.archive_task(task_id, actor=actor)
     except Exception as exc:  # noqa: BLE001
-        typer.echo(f"Error: {exc}", err=True)
+        typer.echo(_render_work_service_error(exc, svc.archive_task), err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"{task.task_id} → {task.work_status.value}")

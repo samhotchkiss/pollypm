@@ -103,6 +103,11 @@ def test_detect_email_preserves_issue_396_sentinel(monkeypatch, tmp_path: Path) 
     assert result == "claude.ai:max"
 
 
+def test_detect_email_from_pane_delegates_to_detect_helper() -> None:
+    provider = ClaudeProvider()
+    assert provider.detect_email_from_pane("Account: no-email-here") is None
+
+
 def test_isolated_env_returns_claude_config_dir(tmp_path: Path) -> None:
     provider = ClaudeProvider()
     env = provider.isolated_env(tmp_path)
@@ -151,5 +156,6 @@ def test_all_six_protocol_methods_are_present() -> None:
         "probe_usage",
         "worker_launch_cmd",
         "isolated_env",
+        "detect_email_from_pane",
     ):
         assert callable(getattr(provider, method)), f"missing {method}"

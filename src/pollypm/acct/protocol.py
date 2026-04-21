@@ -11,13 +11,13 @@ in — detect, login, probe, launch, warm-resume, and onboarding
 priming — plus the env shim that makes isolated-home execution
 possible. Two later waves extended the original six-method surface:
 #406 added ``prime_home`` / ``login_command`` / ``logout_command`` /
-``login_completion_marker_seen`` so provider-specific onboarding
-details can live in provider packages; the architect-lifecycle work
-added ``latest_session_id`` / ``resume_launch_cmd`` so idle-closed
-architects can warm-resume from their provider's session UUID.
-Third-party providers implement the full surface to participate in
-PollyPM's onboarding + recovery + lifecycle paths without editing
-core.
+``login_completion_marker_seen`` / ``detect_email_from_pane`` so
+provider-specific onboarding details can live in provider packages;
+the architect-lifecycle work added ``latest_session_id`` /
+``resume_launch_cmd`` so idle-closed architects can warm-resume from
+their provider's session UUID. Third-party providers implement the
+full surface to participate in PollyPM's onboarding + recovery +
+lifecycle paths without editing core.
 """
 
 from __future__ import annotations
@@ -211,6 +211,16 @@ class ProviderAdapter(Protocol):
         at the tail of the login shell so providers without a strong
         native signal can use the same marker. Providers with a richer
         signal (e.g. a CLI banner) are free to widen this check.
+        """
+        ...
+
+    def detect_email_from_pane(self, pane_text: str) -> str | None:
+        """Return the authenticated email scraped from ``pane_text``.
+
+        Used by the shared onboarding wait-loop to notice a completed
+        login before the provider's on-disk auth files are flushed.
+        Providers that never print the email in their pane output
+        return ``None``.
         """
         ...
 

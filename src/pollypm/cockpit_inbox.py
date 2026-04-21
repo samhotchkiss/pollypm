@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from pollypm.config import load_config
 from pollypm.cockpit_sections.base import _STATUS_ICONS
@@ -144,6 +145,117 @@ def _count_inbox_tasks_for_label(config) -> int:
         except Exception:  # noqa: BLE001
             continue
     return len(seen_task_ids)
+
+
+@dataclass(slots=True, frozen=True)
+class InboxThreadRow:
+    """One visible row in the inbox thread tree.
+
+    The inbox UI renders root task rows plus optional inline reply rows
+    underneath expanded tasks. This shape stays data-only so the Textual
+    app can consume it without embedding tree math in widget callbacks.
+    """
+
+    key: str
+    kind: Literal["task", "reply"]
+    task_id: str
+    task: object
+    reply: object | None = None
+    reply_index: int | None = None
+    reply_count: int = 0
+    expanded: bool = False
+    depth: int = 0
+
+    @property
+    def is_task(self) -> bool:
+        return self.kind == "task"
+
+    @property
+    def is_reply(self) -> bool:
+        return self.kind == "reply"
+
+    @property
+    def has_children(self) -> bool:
+        return self.reply_count > 0
+
+
+def build_inbox_thread_rows(
+    tasks: list[object],
+    replies_by_task: dict[str, list[object]],
+    expanded_task_ids: set[str],
+) -> list[InboxThreadRow]:
+    """Flatten task threads into the visible list rows for the inbox UI."""
+
+    rows: list[InboxThreadRow] = []
+    for task in tasks:
+        task_id = getattr(task, "task_id", "")
+        replies = list(replies_by_task.get(task_id, ()))
+        expanded = task_id in expanded_task_ids and bool(replies)
+        rows.append(
+            InboxThreadRow(
+                key=f"task:{task_id}",
+                kind="task",
+                task_id=task_id,
+                task=task,
+                reply_count=len(replies),
+                expanded=expanded,
+            )
+        )
+        if not expanded:
+            continue
+        for reply_index, reply in enumerate(replies):
+            rows.append(
+                InboxThreadRow(
+                    key=f"reply:{task_id}:{reply_index}",
+                    kind="reply",
+                    task_id=task_id,
+                    task=task,
+                    reply=reply,
+                    reply_index=reply_index,
+                    reply_count=len(replies),
+                    depth=1,
+                )
+            )
+    return rows
+
+
+def inbox_thread_right_action(
+    rows: list[InboxThreadRow],
+    selected_index: int | None,
+) -> tuple[Literal["noop", "expand", "select_child"], int | None]:
+    """Return the tree-navigation action for ``Right`` on ``selected_index``."""
+
+    if selected_index is None or selected_index < 0 or selected_index >= len(rows):
+        return "noop", None
+    row = rows[selected_index]
+    if row.is_reply or not row.has_children:
+        return "noop", None
+    if not row.expanded:
+        return "expand", None
+    child_index = selected_index + 1
+    if child_index < len(rows) and rows[child_index].is_reply and rows[child_index].task_id == row.task_id:
+        return "select_child", child_index
+    return "noop", None
+
+
+def inbox_thread_left_action(
+    rows: list[InboxThreadRow],
+    selected_index: int | None,
+) -> tuple[Literal["noop", "collapse", "select_parent"], int | None]:
+    """Return the tree-navigation action for ``Left`` on ``selected_index``."""
+
+    if selected_index is None or selected_index < 0 or selected_index >= len(rows):
+        return "noop", None
+    row = rows[selected_index]
+    if row.is_reply:
+        for index in range(selected_index - 1, -1, -1):
+            candidate = rows[index]
+            if candidate.is_task and candidate.task_id == row.task_id:
+                return "select_parent", index
+        return "noop", None
+    if row.expanded and row.has_children:
+        return "collapse", None
+    return "noop", None
 
 
 def render_inbox_panel(service, projects: list[object] | None = None) -> str:
@@ -760,4 +872,3 @@ def _register_worker_roster_rail_item(registry, router) -> None:
         registry.add(reg)
     except Exception:  # noqa: BLE001
         pass
-

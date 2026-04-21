@@ -72,6 +72,29 @@ def _seed_project(project_path: Path) -> list[str]:
         svc.close()
 
 
+def _seed_threaded_task(project_path: Path) -> str:
+    """Create one inbox task with a short two-reply thread."""
+    db_path = project_path / ".pollypm" / "state.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    svc = SQLiteWorkService(db_path=db_path, project_path=project_path)
+    try:
+        task = svc.create(
+            title="Feedback on task #5",
+            description="Waiting on a quick follow-up.",
+            type="task",
+            project="demo",
+            flow_template="chat",
+            roles={"requester": "user", "operator": "polly"},
+            priority="normal",
+            created_by="polly",
+        )
+        svc.add_reply(task.task_id, "Got it, shipping fix", actor="user")
+        svc.add_reply(task.task_id, "Approved, looks good", actor="polly")
+        return task.task_id
+    finally:
+        svc.close()
+
+
 @pytest.fixture
 def inbox_env(tmp_path: Path):
     project_path = tmp_path / "demo"
@@ -282,6 +305,54 @@ def test_reply_flow_persists_and_appears_in_thread(inbox_env, inbox_app) -> None
             # Detail pane re-renders with the reply visible in-thread.
             rendered = str(inbox_app.detail.render())
             assert "Got it, thanks" in rendered
+    _run(body())
+
+
+def test_right_left_expand_and_collapse_inline_thread_rows(tmp_path: Path) -> None:
+    """Right expands a thread inline; left walks back to parent then collapses."""
+    async def body() -> None:
+        project_path = tmp_path / "demo"
+        project_path.mkdir()
+        (project_path / ".git").mkdir()
+        config_path = tmp_path / "pollypm.toml"
+        _write_minimal_config(project_path, config_path)
+        task_id = _seed_threaded_task(project_path)
+        if not _load_config_compatible(config_path):
+            pytest.skip("minimal pollypm.toml fixture not supported by loader")
+
+        from pollypm.cockpit_ui import PollyInboxApp, _InboxListItem
+        app = PollyInboxApp(config_path)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            assert app._selected_task_id == task_id
+            assert [row.kind for row in app._visible_rows] == ["task"]
+            assert app._visible_rows[0].reply_count == 2
+
+            await pilot.press("right")
+            await pilot.pause()
+            assert [row.kind for row in app._visible_rows] == ["task", "reply", "reply"]
+            assert app._visible_rows[0].expanded is True
+
+            rows = [
+                child for child in app.list_view.children
+                if isinstance(child, _InboxListItem)
+            ]
+            assert "Got it, shipping fix" in str(rows[1]._body.render())
+
+            await pilot.press("right")
+            await pilot.pause()
+            assert app.list_view.index == 1
+            assert app._visible_rows[1].is_reply is True
+
+            await pilot.press("left")
+            await pilot.pause()
+            assert app.list_view.index == 0
+            assert app._visible_rows[0].is_task is True
+
+            await pilot.press("left")
+            await pilot.pause()
+            assert [row.kind for row in app._visible_rows] == ["task"]
+            assert app._visible_rows[0].expanded is False
     _run(body())
 
 

@@ -64,6 +64,12 @@ from pollypm.cockpit_alerts import (
     _action_view_alerts,
     _setup_alert_notifier,
 )
+from pollypm.cockpit_inbox import (
+    InboxThreadRow,
+    build_inbox_thread_rows,
+    inbox_thread_left_action,
+    inbox_thread_right_action,
+)
 from pollypm.cockpit_metrics import (
     PollyMetricsApp,
     _MetricsDrillDownModal,
@@ -3200,7 +3206,14 @@ def _format_sender(task) -> str:
     return "polly"
 
 
-def _format_inbox_row(task, *, is_unread: bool, width: int = 38) -> Text:
+def _format_inbox_row(
+    task,
+    *,
+    is_unread: bool,
+    width: int = 38,
+    tree_marker: str = "",
+    reply_count: int = 0,
+) -> Text:
     """Render one inbox-list row as two lines of Rich text.
 
     Matches the cockpit aesthetic from RailItem: yellow diamond for
@@ -3213,18 +3226,26 @@ def _format_inbox_row(task, *, is_unread: bool, width: int = 38) -> Text:
     from pollypm.tz import format_relative
 
     text = Text(no_wrap=True, overflow="ellipsis")
+    if tree_marker:
+        text.append(tree_marker, style="#6b7a88")
     if is_unread:
         text.append("\u25c6 ", style="#f0c45a")  # yellow diamond
     else:
         text.append("\u25cb ", style="#4a5568")  # dim circle
     subject = task.title or "(no subject)"
+    reply_suffix = ""
+    if reply_count:
+        noun = "reply" if reply_count == 1 else "replies"
+        reply_suffix = f" ({reply_count} {noun})"
     # Account for the 2-char marker glyph prefix so the total row still
     # fits the target list-pane width without wrapping.
-    max_subject = max(8, width - 2)
+    max_subject = max(8, width - 2 - len(tree_marker) - len(reply_suffix))
     if len(subject) > max_subject:
         subject = subject[: max_subject - 1] + "\u2026"
     subject_style = "bold #eef2f4" if is_unread else "bold #b8c4cf"
     text.append(subject, style=subject_style)
+    if reply_suffix:
+        text.append(reply_suffix, style="#6b7a88")
 
     # Line 2: project · age, dim. Indent by 2 so it lines up under the
     # subject text (past the marker glyph).
@@ -3235,10 +3256,59 @@ def _format_inbox_row(task, *, is_unread: bool, width: int = 38) -> Text:
     meta_bits = [project]
     if age:
         meta_bits.append(age)
-    meta_line = "  " + "  \u00b7  ".join(meta_bits)
+    meta_indent = " " * max(2, len(tree_marker) + 2)
+    meta_line = meta_indent + "  \u00b7  ".join(meta_bits)
     text.append("\n")
     text.append(meta_line, style="#6b7a88")
     return text
+
+
+def _format_inbox_reply_row(task, reply, *, width: int = 38) -> Text:
+    """Render one inline reply row underneath its parent inbox task."""
+    from pollypm.tz import format_relative
+
+    text = Text(no_wrap=True, overflow="ellipsis")
+    actor = (getattr(reply, "actor", "") or "user").strip() or "user"
+    speaker = "you" if actor == "user" else actor
+    target = _format_sender(task) if actor == "user" else "you"
+    preview = (getattr(reply, "text", "") or "").strip().splitlines()
+    subject = preview[0] if preview else "(no reply text)"
+    header = f"{speaker} \u2192 {target}  "
+    prefix = "  \u2514 "
+    max_subject = max(8, width - len(prefix) - len(header))
+    if len(subject) > max_subject:
+        subject = subject[: max_subject - 1] + "\u2026"
+    text.append(prefix, style="#6b7a88")
+    text.append(header, style="#97a6b2")
+    text.append(subject, style="#c8d2da")
+
+    stamped = getattr(reply, "timestamp", None)
+    iso = stamped.isoformat() if hasattr(stamped, "isoformat") else str(stamped or "")
+    age = format_relative(iso) if iso else ""
+    text.append("\n")
+    text.append("    " + (age or "reply"), style="#586773")
+    return text
+
+
+def _format_inbox_thread_row(
+    row: InboxThreadRow,
+    *,
+    is_unread: bool,
+    width: int = 38,
+) -> Text:
+    """Render either a root task row or an inline reply row."""
+    if row.is_reply and row.reply is not None:
+        return _format_inbox_reply_row(row.task, row.reply, width=width)
+    tree_marker = ""
+    if row.has_children:
+        tree_marker = "\u25be " if row.expanded else "\u25b8 "
+    return _format_inbox_row(
+        row.task,
+        is_unread=is_unread,
+        width=width,
+        tree_marker=tree_marker,
+        reply_count=row.reply_count,
+    )
 
 
 def _task_is_rollup(task) -> bool:
@@ -3723,24 +3793,27 @@ class _RollupItem(ListItem):
 class _InboxListItem(ListItem):
     """One message in the inbox list — carries the task_id + unread flag."""
 
-    def __init__(self, task, *, is_unread: bool) -> None:
-        self.task_id = task.task_id
-        self.task_ref = task
+    def __init__(self, row: InboxThreadRow, *, is_unread: bool) -> None:
+        self.row_ref = row
+        self.task_id = row.task_id
+        self.task_ref = row.task
         self.is_unread = is_unread
-        self._body = Static(_format_inbox_row(task, is_unread=is_unread), markup=False)
-        super().__init__(self._body, classes="inbox-row")
+        row_classes = "inbox-row reply-row" if row.is_reply else "inbox-row"
+        self._body = Static(_format_inbox_thread_row(row, is_unread=is_unread), markup=False)
+        super().__init__(self._body, classes=row_classes)
         if is_unread:
             self.add_class("unread")
 
-    def mark_read(self, task=None) -> None:
+    def mark_read(self, row: InboxThreadRow | None = None) -> None:
         """Flip the row to read styling in place (no reflow of the list)."""
         if self.is_unread is False:
             return
         self.is_unread = False
         self.remove_class("unread")
-        if task is not None:
-            self.task_ref = task
-        self._body.update(_format_inbox_row(self.task_ref, is_unread=False))
+        if row is not None:
+            self.row_ref = row
+            self.task_ref = row.task
+        self._body.update(_format_inbox_thread_row(self.row_ref, is_unread=False))
 
 
 class PollyInboxApp(App[None]):
@@ -3780,6 +3853,9 @@ class PollyInboxApp(App[None]):
     }
     #inbox-list > .inbox-row.unread {
         color: #eef2f4;
+    }
+    #inbox-list > .inbox-row.reply-row {
+        color: #97a6b2;
     }
     #inbox-list > .inbox-row.-highlight {
         background: #1e2730;
@@ -3904,6 +3980,8 @@ class PollyInboxApp(App[None]):
         Binding("k,up", "cursor_up", "Up", show=False),
         Binding("g,home", "cursor_first", "First", show=False),
         Binding("G,end", "cursor_last", "Last", show=False),
+        Binding("right", "thread_right", "Expand", show=False),
+        Binding("left", "thread_left", "Collapse", show=False),
         Binding("enter,o", "open_selected", "Open", show=False),
         Binding("r", "start_reply", "Reply"),
         Binding("a", "archive_selected", "Archive"),
@@ -3981,7 +4059,11 @@ class PollyInboxApp(App[None]):
         )
         self._tasks: list = []
         self._selected_task_id: str | None = None
+        self._selected_row_key: str | None = None
         self._unread_ids: set[str] = set()
+        self._replies_by_task: dict[str, list] = {}
+        self._visible_rows: list[InboxThreadRow] = []
+        self._thread_expanded_task_ids: set[str] = set()
         # Filter state (#NEW). Session-scoped — cleared on each mount
         # via :meth:`on_mount`. All filters AND-combine.
         self._filter_text: str = ""
@@ -4052,8 +4134,8 @@ class PollyInboxApp(App[None]):
     # Data loading
     # ------------------------------------------------------------------
 
-    def _load_inbox(self) -> tuple[list, set[str]]:
-        """Open each project's work-service DB, compute (tasks, unread_ids).
+    def _load_inbox(self) -> tuple[list, set[str], dict[str, list]]:
+        """Open each project's work-service DB plus reply threads.
 
         All services are closed before return — callers don't need to
         manage lifecycle. Per-task operations open a fresh svc via
@@ -4065,6 +4147,7 @@ class PollyInboxApp(App[None]):
         config = load_config(self.config_path)
         tasks: list = []
         unread: set[str] = set()
+        replies_by_task: dict[str, list] = {}
         for project_key, project in getattr(config, "projects", {}).items():
             db_path = project.path / ".pollypm" / "state.db"
             if not db_path.exists():
@@ -4090,13 +4173,19 @@ class PollyInboxApp(App[None]):
                         rows = []
                     if not rows:
                         unread.add(t.task_id)
+                    try:
+                        replies = svc.list_replies(t.task_id)
+                    except Exception:  # noqa: BLE001
+                        replies = []
+                    if replies:
+                        replies_by_task[t.task_id] = replies
             finally:
                 try:
                     svc.close()
                 except Exception:  # noqa: BLE001
                     pass
         tasks.sort(key=_inbox_sort_key)
-        return tasks, unread
+        return tasks, unread, replies_by_task
 
     def _svc_for_task(self, task_id: str):
         """Open a SQLiteWorkService rooted at the project owning ``task_id``.
@@ -4125,18 +4214,27 @@ class PollyInboxApp(App[None]):
     # ------------------------------------------------------------------
 
     def _refresh_list(self, *, select_first: bool = False) -> None:
-        tasks, unread = self._load_inbox()
+        tasks, unread, replies_by_task = self._load_inbox()
         self._tasks = tasks
         self._unread_ids = unread
+        self._replies_by_task = replies_by_task
+        active_thread_ids = {
+            task.task_id for task in tasks if replies_by_task.get(task.task_id)
+        }
+        self._thread_expanded_task_ids.intersection_update(active_thread_ids)
         self._render_list(select_first=select_first)
 
     def _render_list(self, *, select_first: bool = False) -> None:
-        previous = self._selected_task_id
+        previous_row_key = self._selected_row_key
+        previous_task_id = self._selected_task_id
         self.list_view.clear()
+        self._visible_rows = []
         # Refresh chip line on every render so toggles + project changes
         # land in the UI even when the list itself didn't shrink.
         self._update_filter_chips()
         if not self._tasks:
+            self._selected_task_id = None
+            self._selected_row_key = None
             self.list_view.append(
                 ListItem(Static("(empty)", classes="inbox-empty"), disabled=True)
             )
@@ -4153,6 +4251,8 @@ class PollyInboxApp(App[None]):
             # Friendly empty-match copy so a fully-filtered list isn't a
             # blank pane. The list stays in the tree (one disabled row)
             # so cursor focus has somewhere to land without crashing.
+            self._selected_task_id = None
+            self._selected_row_key = None
             self.list_view.append(
                 ListItem(
                     Static(
@@ -4169,19 +4269,40 @@ class PollyInboxApp(App[None]):
             self._update_status(total=total, shown=0)
             return
         restore_index: int | None = 0 if select_first else None
-        for idx, task in enumerate(visible):
-            is_unread = task.task_id in self._unread_ids
-            row = _InboxListItem(task, is_unread=is_unread)
+        fallback_index: int | None = None
+        visible_rows = build_inbox_thread_rows(
+            visible,
+            self._replies_by_task,
+            self._thread_expanded_task_ids,
+        )
+        self._visible_rows = visible_rows
+        for idx, row_ref in enumerate(visible_rows):
+            is_unread = row_ref.is_task and row_ref.task_id in self._unread_ids
+            row = _InboxListItem(row_ref, is_unread=is_unread)
             self.list_view.append(row)
-            if previous and task.task_id == previous:
+            if previous_row_key and row_ref.key == previous_row_key:
                 restore_index = idx
+            elif (
+                fallback_index is None
+                and previous_task_id
+                and row_ref.is_task
+                and row_ref.task_id == previous_task_id
+            ):
+                fallback_index = idx
+        if restore_index is None and fallback_index is not None:
+            restore_index = fallback_index
         if restore_index is not None and self.list_view.index != restore_index:
             self.list_view.index = restore_index
             # Render detail for the restored selection so the right pane
             # shows content immediately on refresh.
-            task = visible[restore_index]
-            self._selected_task_id = task.task_id
-            self._render_detail(task.task_id)
+            row_ref = visible_rows[restore_index]
+            self._selected_task_id = row_ref.task_id
+            self._selected_row_key = row_ref.key
+            self._render_detail(row_ref.task_id)
+        elif restore_index is not None and 0 <= restore_index < len(visible_rows):
+            row_ref = visible_rows[restore_index]
+            self._selected_task_id = row_ref.task_id
+            self._selected_row_key = row_ref.key
         self._update_status(total=total, shown=len(visible))
 
     def _update_status(self, *, total: int, shown: int) -> None:
@@ -4679,39 +4800,79 @@ class PollyInboxApp(App[None]):
 
     def _sync_selection_from_list(self) -> None:
         idx = self.list_view.index
-        if idx is None or idx < 0 or idx >= len(self._tasks):
+        if idx is None or idx < 0 or idx >= len(self._visible_rows):
             return
-        task = self._tasks[idx]
-        if task.task_id == self._selected_task_id:
+        row = self._visible_rows[idx]
+        if row.key == self._selected_row_key:
             return
-        self._selected_task_id = task.task_id
+        task_changed = row.task_id != self._selected_task_id
+        self._selected_task_id = row.task_id
+        self._selected_row_key = row.key
         # Clear any in-progress reply draft when the selection changes so
         # a half-typed message doesn't get posted to a different task.
-        if self.reply_input.value:
+        if task_changed and self.reply_input.value:
             self.reply_input.value = ""
-        self._render_detail(task.task_id)
-        self._mark_open_read(task.task_id, idx)
+        self._render_detail(row.task_id)
+        self._mark_open_read(row.task_id)
 
     def action_cursor_down(self) -> None:
-        if self.reply_input.has_focus:
+        if self.reply_input.has_focus or self.filter_input.has_focus:
             return
         self.list_view.action_cursor_down()
         self._sync_selection_from_list()
 
     def action_cursor_up(self) -> None:
-        if self.reply_input.has_focus:
+        if self.reply_input.has_focus or self.filter_input.has_focus:
             return
         self.list_view.action_cursor_up()
         self._sync_selection_from_list()
 
     def action_cursor_first(self) -> None:
-        if self._tasks:
+        if self._visible_rows:
             self.list_view.index = 0
             self._sync_selection_from_list()
 
     def action_cursor_last(self) -> None:
-        if self._tasks:
-            self.list_view.index = len(self._tasks) - 1
+        if self._visible_rows:
+            self.list_view.index = len(self._visible_rows) - 1
+            self._sync_selection_from_list()
+
+    def action_thread_right(self) -> None:
+        if self.reply_input.has_focus or self.filter_input.has_focus:
+            return
+        action, target = inbox_thread_right_action(
+            self._visible_rows, self.list_view.index,
+        )
+        if action == "expand":
+            current = self.list_view.index
+            if current is None or current < 0 or current >= len(self._visible_rows):
+                return
+            task_id = self._visible_rows[current].task_id
+            self._thread_expanded_task_ids.add(task_id)
+            self._selected_row_key = self._visible_rows[current].key
+            self._render_list(select_first=False)
+            return
+        if action == "select_child" and target is not None:
+            self.list_view.index = target
+            self._sync_selection_from_list()
+
+    def action_thread_left(self) -> None:
+        if self.reply_input.has_focus or self.filter_input.has_focus:
+            return
+        action, target = inbox_thread_left_action(
+            self._visible_rows, self.list_view.index,
+        )
+        if action == "collapse":
+            current = self.list_view.index
+            if current is None or current < 0 or current >= len(self._visible_rows):
+                return
+            task_id = self._visible_rows[current].task_id
+            self._thread_expanded_task_ids.discard(task_id)
+            self._selected_row_key = f"task:{task_id}"
+            self._render_list(select_first=False)
+            return
+        if action == "select_parent" and target is not None:
+            self.list_view.index = target
             self._sync_selection_from_list()
 
     def action_open_selected(self) -> None:
@@ -4747,9 +4908,9 @@ class PollyInboxApp(App[None]):
         if not isinstance(row, _InboxListItem):
             return
         self._selected_task_id = row.task_id
+        self._selected_row_key = row.row_ref.key
         self._render_detail(row.task_id)
-        idx = self.list_view.index or 0
-        self._mark_open_read(row.task_id, idx)
+        self._mark_open_read(row.task_id)
 
     @on(ListView.Highlighted, "#inbox-list")
     def _on_row_highlighted(self, event: ListView.Highlighted) -> None:
@@ -4758,10 +4919,12 @@ class PollyInboxApp(App[None]):
         row = event.item
         if not isinstance(row, _InboxListItem):
             return
-        if self._selected_task_id == row.task_id:
+        if self._selected_row_key == row.row_ref.key:
             return
+        task_changed = self._selected_task_id != row.task_id
         self._selected_task_id = row.task_id
-        if self.reply_input.value:
+        self._selected_row_key = row.row_ref.key
+        if task_changed and self.reply_input.value:
             self.reply_input.value = ""
         self._render_detail(row.task_id)
 
@@ -4769,7 +4932,7 @@ class PollyInboxApp(App[None]):
     # Read / archive / reply actions
     # ------------------------------------------------------------------
 
-    def _mark_open_read(self, task_id: str, row_index: int) -> None:
+    def _mark_open_read(self, task_id: str) -> None:
         if task_id not in self._unread_ids:
             return
         svc = self._svc_for_task(task_id)
@@ -4793,11 +4956,14 @@ class PollyInboxApp(App[None]):
         # the underlying mark_read raced.
         self._unread_ids.discard(task_id)
         try:
-            children = list(self.list_view.children)
-            if 0 <= row_index < len(children):
-                row = children[row_index]
-                if isinstance(row, _InboxListItem):
+            for row in self.list_view.children:
+                if (
+                    isinstance(row, _InboxListItem)
+                    and row.row_ref.is_task
+                    and row.task_id == task_id
+                ):
                     row.mark_read()
+                    break
         except Exception:  # noqa: BLE001
             pass
 
@@ -4838,8 +5004,11 @@ class PollyInboxApp(App[None]):
         # (the 8s background refresh would do it anyway, but snappy UX).
         self._tasks = [t for t in self._tasks if t.task_id != task_id]
         self._unread_ids.discard(task_id)
+        self._replies_by_task.pop(task_id, None)
+        self._thread_expanded_task_ids.discard(task_id)
         if self._selected_task_id == task_id:
             self._selected_task_id = None
+            self._selected_row_key = None
         self._render_list(select_first=bool(self._tasks))
 
     def action_start_reply(self) -> None:
@@ -5163,7 +5332,7 @@ class PollyInboxApp(App[None]):
         # Keep focus on the list so j/k works without further keystrokes.
         self.reply_input.value = ""
         self.list_view.focus()
-        self._render_detail(task_id)
+        self._refresh_list(select_first=False)
 
     # ------------------------------------------------------------------
     # Improvement proposals (#275) — Accept / Reject

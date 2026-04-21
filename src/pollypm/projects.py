@@ -147,6 +147,14 @@ def session_lock_path(base_dir: Path, session_id: str) -> Path:
 _LOCK_STALE_SECONDS = 1800  # 30 minutes — locks older than this are considered stale
 
 
+def _read_session_lock_payload(lock_path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(lock_path.read_text())
+    except Exception:  # noqa: BLE001
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def ensure_session_lock(base_dir: Path, session_id: str) -> Path:
     base_dir.mkdir(parents=True, exist_ok=True)
     lock_path = session_lock_path(base_dir, session_id)
@@ -154,10 +162,7 @@ def ensure_session_lock(base_dir: Path, session_id: str) -> Path:
     try:
         fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     except FileExistsError:
-        try:
-            existing = json.loads(lock_path.read_text())
-        except Exception:  # noqa: BLE001
-            existing = {}
+        existing = _read_session_lock_payload(lock_path)
         existing_session = existing.get("session_id")
         if isinstance(existing_session, str) and existing_session == session_id:
             return lock_path
@@ -170,7 +175,16 @@ def ensure_session_lock(base_dir: Path, session_id: str) -> Path:
             lock_path.unlink(missing_ok=True)
         else:
             raise RuntimeError(f"Session lock conflict at {base_dir}: owned by {existing_session or 'unknown'}")
-        fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError as exc:
+            existing = _read_session_lock_payload(lock_path)
+            existing_session = existing.get("session_id")
+            if isinstance(existing_session, str) and existing_session == session_id:
+                return lock_path
+            raise RuntimeError(
+                f"Session lock conflict at {base_dir}: owned by {existing_session or 'unknown'}"
+            ) from exc
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
         handle.write("\n")

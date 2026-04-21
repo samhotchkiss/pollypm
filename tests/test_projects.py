@@ -292,3 +292,36 @@ def test_session_lock_is_scoped_to_session_id(tmp_path: Path) -> None:
     assert other_lock.name == ".session.other.lock"
     assert worker_lock.exists()
     assert other_lock.exists()
+
+
+def test_session_lock_stale_unlink_race_surfaces_new_owner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    lock_root = tmp_path / "locks" / "worker"
+    lock_root.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_root / ".session.worker.lock"
+    stale_created_at = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    lock_path.write_text(
+        f'{{"session_id": "stale-owner", "created_at": "{stale_created_at}"}}\n'
+    )
+
+    real_open = __import__("os").open
+    calls = {"count": 0}
+
+    def fake_open(path, flags, mode=0o777):
+        if Path(path) != lock_path:
+            return real_open(path, flags, mode)
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise FileExistsError
+        if calls["count"] == 2:
+            lock_path.write_text(
+                f'{{"session_id": "fresh-owner", "created_at": "{datetime.now(UTC).isoformat()}"}}\n'
+            )
+            raise FileExistsError
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr("pollypm.projects.os.open", fake_open)
+
+    with pytest.raises(RuntimeError, match="owned by fresh-owner"):
+        ensure_session_lock(lock_root, "worker")

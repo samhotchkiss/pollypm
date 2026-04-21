@@ -596,17 +596,15 @@ class SQLiteWorkService:
         self, project: str, task_number: int
     ) -> dict:
         """Load dependency relationships for a task from work_task_dependencies."""
-        # Outgoing edges: this task is from_id
-        out_rows = self._conn.execute(
-            "SELECT to_project, to_task_number, kind FROM work_task_dependencies "
-            "WHERE from_project = ? AND from_task_number = ?",
-            (project, task_number),
-        ).fetchall()
-        # Incoming edges: this task is to_id
-        in_rows = self._conn.execute(
-            "SELECT from_project, from_task_number, kind FROM work_task_dependencies "
-            "WHERE to_project = ? AND to_task_number = ?",
-            (project, task_number),
+        rows = self._conn.execute(
+            "SELECT "
+            "from_project, from_task_number, "
+            "to_project, to_task_number, "
+            "kind "
+            "FROM work_task_dependencies "
+            "WHERE (from_project = ? AND from_task_number = ?) "
+            "   OR (to_project = ? AND to_task_number = ?)",
+            (project, task_number, project, task_number),
         ).fetchall()
 
         rels: dict = {
@@ -618,36 +616,41 @@ class SQLiteWorkService:
             "superseded_by_task_number": None,
         }
 
-        for r in out_rows:
+        for r in rows:
             kind = r["kind"]
-            target = (r["to_project"], r["to_task_number"])
-            if kind == LinkKind.BLOCKS.value:
-                rels["blocks"].append(target)
-            elif kind == LinkKind.RELATES_TO.value:
-                rels["relates_to"].append(target)
-            elif kind == LinkKind.PARENT.value:
-                rels["children"].append(target)
-            elif kind == LinkKind.SUPERSEDES.value:
-                # outgoing supersedes: this task supersedes target
-                pass  # stored in supersedes_project/supersedes_task_number columns
-
-        for r in in_rows:
-            kind = r["kind"]
-            source = (r["from_project"], r["from_task_number"])
-            if kind == LinkKind.BLOCKS.value:
-                rels["blocked_by"].append(source)
-            elif kind == LinkKind.RELATES_TO.value:
-                # relates_to is bidirectional
-                if source not in rels["relates_to"]:
-                    rels["relates_to"].append(source)
-            elif kind == LinkKind.PARENT.value:
-                # incoming parent: source is parent of this task
-                # update parent fields (override column-based values)
-                pass  # parent is set via from_id=parent, to_id=child
-            elif kind == LinkKind.SUPERSEDES.value:
-                # incoming supersedes: source supersedes this task
-                rels["superseded_by_project"] = r["from_project"]
-                rels["superseded_by_task_number"] = r["from_task_number"]
+            is_outgoing = (
+                r["from_project"] == project and r["from_task_number"] == task_number
+            )
+            is_incoming = (
+                r["to_project"] == project and r["to_task_number"] == task_number
+            )
+            if is_outgoing:
+                target = (r["to_project"], r["to_task_number"])
+                if kind == LinkKind.BLOCKS.value:
+                    rels["blocks"].append(target)
+                elif kind == LinkKind.RELATES_TO.value:
+                    rels["relates_to"].append(target)
+                elif kind == LinkKind.PARENT.value:
+                    rels["children"].append(target)
+                elif kind == LinkKind.SUPERSEDES.value:
+                    # outgoing supersedes: this task supersedes target
+                    pass  # stored in supersedes_project/supersedes_task_number columns
+            if is_incoming:
+                source = (r["from_project"], r["from_task_number"])
+                if kind == LinkKind.BLOCKS.value:
+                    rels["blocked_by"].append(source)
+                elif kind == LinkKind.RELATES_TO.value:
+                    # relates_to is bidirectional
+                    if source not in rels["relates_to"]:
+                        rels["relates_to"].append(source)
+                elif kind == LinkKind.PARENT.value:
+                    # incoming parent: source is parent of this task
+                    # update parent fields (override column-based values)
+                    pass  # parent is set via from_id=parent, to_id=child
+                elif kind == LinkKind.SUPERSEDES.value:
+                    # incoming supersedes: source supersedes this task
+                    rels["superseded_by_project"] = r["from_project"]
+                    rels["superseded_by_task_number"] = r["from_task_number"]
 
         return rels
 

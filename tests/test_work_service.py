@@ -737,6 +737,38 @@ class TestFlowImmutability:
         assert cached is flow
 
 
+def test_load_relationships_uses_one_dependency_query(svc, monkeypatch):
+    blocker = _create_standard_task(svc, title="Blocker")
+    target = _create_standard_task(svc, title="Target")
+    related = _create_standard_task(svc, title="Related")
+
+    svc.link(blocker.task_id, target.task_id, "blocks")
+    svc.link(target.task_id, related.task_id, "relates_to")
+
+    dependency_queries = 0
+
+    class GuardConn:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, params=()):
+            nonlocal dependency_queries
+            if "FROM work_task_dependencies" in sql:
+                dependency_queries += 1
+            return self._conn.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    monkeypatch.setattr(svc, "_conn", GuardConn(svc._conn))
+
+    rels = svc._load_relationships(target.project, target.task_number)
+
+    assert dependency_queries == 1
+    assert rels["blocked_by"] == [(blocker.project, blocker.task_number)]
+    assert rels["relates_to"] == [(related.project, related.task_number)]
+
+
 # ---------------------------------------------------------------------------
 # actor_type=agent — named agent resolution (#140)
 # ---------------------------------------------------------------------------

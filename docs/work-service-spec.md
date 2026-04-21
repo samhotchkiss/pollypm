@@ -79,7 +79,7 @@ These races exist because agents directly read and write the filesystem. There i
                     ┌──────────────┼──────────────┐
                     ▼              ▼              ▼
                 Workers      File Issues    GitHub Issues
-              (claim/move     (sync out)     (sync both ways)
+            (claim/advance    (sync out)     (sync out)
                via API)
 ```
 
@@ -91,13 +91,20 @@ The work service exposes its operations through the Layer 3 Service API, meaning
 
 ### Process Boundary
 
-The work service runs as a long-lived process (daemon) accessed via Unix domain socket. The `pm` CLI connects, sends a JSON request, gets a JSON response.
+V1 ships the work service as an in-process library. The `pm` CLI and other
+local callers construct `SQLiteWorkService` directly against the shared
+`state.db`; there is no separate daemon or Unix socket in the current build.
 
-- **Startup**: The supervisor starts the work service daemon on launch and monitors it via heartbeat.
-- **Failure mode**: If the daemon is down, agents cannot mutate work state but can still read cached state. The supervisor restarts the daemon.
-- **Socket location**: `<pollypm-state-dir>/work-service.sock`
+- **Startup**: no dedicated service bootstrap. Each caller resolves config and
+  builds the service object when needed.
+- **Failure mode**: a caller-side failure aborts only that operation. The next
+  CLI command or supervisor action can reconstruct the service cleanly.
+- **Future transport**: the API boundary is intentionally transport-agnostic,
+  so a Unix-socket daemon can still be introduced later without redesigning
+  flows, gates, or storage.
 
-Reads against the underlying storage may be served directly (without going through the daemon) for performance, since reads are safe against concurrent mutation when there is a single writer.
+SQLite WAL mode handles concurrent reads while writes stay serialized through
+the work-service boundary.
 
 ## 4. Task Schema
 
@@ -262,7 +269,9 @@ A `Transition`:
 
 ## 5. API Surface
 
-The work service exposes these operations. All mutations are serialized through the single-writer daemon. All operations return structured results (not raw file contents).
+The work service exposes these operations. In the current build, all mutations
+flow through the in-process `SQLiteWorkService` boundary. All operations return
+structured results (not raw file contents).
 
 ### Task Lifecycle
 
@@ -270,7 +279,7 @@ The work service exposes these operations. All mutations are serialized through 
 |-----------|-----------|---------|-------------|
 | `create` | title, description, type, project, flow_template, roles, priority, acceptance_criteria?, constraints?, relevant_files?, labels?, requires_human_review? | Task | Create a task in `draft` state. Validates that all required roles for the flow are filled. |
 | `get` | task_id | Task | Read a task with all fields including current flow node and execution state. |
-| `list` | work_status?, owner?, project?, assignee?, blocked?, type?, limit?, offset? | list[Task] | Query tasks with filters. |
+| `list_tasks` | work_status?, owner?, project?, assignee?, blocked?, type?, limit?, offset? | list[Task] | Query tasks with filters. |
 | `queue` | task_id, actor | Task | Move from `draft` to `queued`. If `requires_human_review`, validates human has approved via inbox. |
 | `claim` | task_id, actor | Task | Atomic: set assignee + activate first flow node + set `work_status=in_progress`. Task must be `queued`. |
 | `next` | agent?, project? | Task? | Return the highest-priority queued+unblocked task, optionally filtered by project. Does not claim it. |
@@ -310,7 +319,7 @@ The work service exposes these operations. All mutations are serialized through 
 |-----------|-----------|---------|-------------|
 | `available_flows` | project? | list[FlowTemplate] | List all flows after override resolution. If project is specified, includes project-local flows. |
 | `get_flow` | name, project? | FlowTemplate | Resolve a flow by name through the override chain. |
-| `validate_advance` | task_id, actor | ValidationResult | Dry-run: can this actor advance the current node? Returns pass/fail with reasons for each gate. |
+| `validate_advance` | task_id, actor | list[GateResult] | Dry-run: can this actor advance the current node? Returns one gate result per evaluated gate. |
 
 ### Sync
 
@@ -562,9 +571,8 @@ class SyncAdapter(Protocol):
     name: str  # e.g., "github", "file"
 
     def on_create(self, task: Task) -> None: ...
-    def on_transition(self, task: Task, transition: Transition) -> None: ...
+    def on_transition(self, task: Task, old_status: str, new_status: str) -> None: ...
     def on_update(self, task: Task, changed_fields: list[str]) -> None: ...
-    def poll_inbound(self, project: str) -> list[InboundChange]: ...
 ```
 
 ### Built-in Adapters
@@ -574,7 +582,6 @@ class SyncAdapter(Protocol):
 - `on_create` → writes a markdown file to the appropriate state directory
 - `on_transition` → moves the file between state directories
 - `on_update` → rewrites the markdown content
-- `poll_inbound` → not implemented (one-way sync)
 
 The adapter projects every `work_status` onto one of five physical folders. Tooling (UIs, scripts, heartbeat checks) may rely on this mapping being stable:
 
@@ -596,23 +603,16 @@ The adapter projects every `work_status` onto one of five physical folders. Tool
 - `on_create` → creates a GitHub issue with the appropriate state label
 - `on_transition` → swaps labels (e.g., remove `polly:in-progress`, add `polly:needs-review`)
 - `on_update` → updates issue title/body
-- `poll_inbound` → checks for label changes, new issues, closures made outside PollyPM
 
-### Two-Way GitHub Sync
+### Inbound GitHub Sync
 
-Inbound changes from GitHub are **requests, not commands**. They enter through the same API and hit the same transition gates.
+Inbound GitHub sync is **not shipped in the current build**. The live adapter is
+one-way push only (`work service -> GitHub`) via `gh`.
 
-```
-GitHub webhook/poll detects: issue #42 labeled "polly:needs-review"
-  → GitHub adapter calls: work_service.move(task_id, "needs-review", actor="github")
-  → Work service validates transition gates
-  → If valid: state updates, other adapters notified
-  → If invalid: logged as sync conflict, flagged for operator via inbox
-```
-
-**Inbound creation**: A new GitHub issue is ingested into the work service in `not-ready` state (safe default). Polly triages it through the normal process.
-
-**Conflict resolution**: The work service is always authoritative. If a GitHub label change violates transition rules, it is rejected and the conflict is surfaced to the operator. The GitHub adapter may optionally revert the label to match the work service state.
+The deferred inbound design is still the right shape: inbound changes should be
+treated as requests, not commands, and should pass through the same transition
+gates as local actions. But that conflict policy is future work, not a v1
+behavioral guarantee.
 
 **Sync state tracking**: Each adapter maintains a cursor/timestamp per task to detect changes since the last sync cycle.
 
@@ -677,7 +677,7 @@ If `pm task next` returns null, the worker goes idle. The heartbeat detects the 
 | Work status state machine | Eight states (`draft` through `cancelled`) derived from OtterCamp v2. `work_status` is a projection of flow node state, not an independent controller. |
 | File-first philosophy | The file sync adapter maintains `issues/` as a human-inspectable projection. `ls issues/01-ready/` still works. |
 | Override chain | Built-in < user-global < project-local. Same precedence model as rules, magic, and agent profiles. |
-| Heartbeat supervision | Still monitors agent health. Now also monitors the work service daemon. |
+| Heartbeat supervision | Still monitors agent health. Work-state mutations remain safe because the service is in-process and SQLite-backed. |
 
 ## 12. Open Questions
 
@@ -726,13 +726,15 @@ Yes, cross-project dependencies are allowed. A task in project A can be blocked 
 
 ## 13. Potential Pitfalls
 
-### P-1: Daemon Reliability
+### P-1: In-Process Boundary Erosion
 
-A long-running daemon is a new operational concern. If it crashes or hangs, all task mutations stop. Mitigations:
-- Supervisor health-checks the daemon on every heartbeat cycle
-- Automatic restart with exponential backoff
-- Read path works without the daemon (cached/direct reads)
-- Graceful degradation: agents can still work, they just can't move tasks until the daemon recovers
+Because v1 is in-process, callers could be tempted to reach around the service
+and mutate tables directly. That would bypass flows, gates, sync hooks, and
+transition logging. Mitigations:
+- Keep CLI and supervisor mutations routed through `SQLiteWorkService`
+- Maintain import-boundary tests around service helpers and storage access
+- Reserve a future transport boundary for the point where stronger process
+  isolation is actually needed
 
 ### P-2: Flow Definition Errors
 
@@ -748,7 +750,10 @@ A GitHub API outage shouldn't block the work service. Mitigations:
 - Sync adapters are async, best-effort, eventually consistent
 - Failed syncs are queued for retry with backoff
 - The work service state is always authoritative — sync failure means the projection is stale, not that work is blocked
-- Operators can force a resync with `pm task sync`; per-task sync-state inspection is stored in `work_sync_state` and does not yet have its own dedicated CLI surface
+- Operators can force a resync with `pm task sync`; per-adapter sync state
+  lives in `work_sync_state` and is queryable via the service's
+  `sync_status(task_id)` method, but the CLI does not yet expose a dedicated
+  per-task sync-status command.
 
 ### P-4: Gate Brittleness
 
@@ -1010,7 +1015,7 @@ test_move_records_transition
 
 test_update_cannot_change_state
   When calling update with state="done"
-  Then update fails with "use move() to change state"
+  Then update fails with "use lifecycle operations to change state"
 
 test_add_context_appends
   Given a task with 3 context entries
@@ -1150,7 +1155,7 @@ test_migrate_idempotent
 
 ```
 test_e2e_worker_claims_and_completes
-  Start work service daemon
+  Build a real SQLiteWorkService against a temp DB
   Polly calls: create → queue
   Worker calls: next → claim → add_context → node_done with work output
   Polly calls: approve
@@ -1167,14 +1172,13 @@ test_e2e_gate_blocks_advance
   Verify advance is rejected with gate failure message
 
 test_e2e_supervisor_assigns_work
-  Start work service
+  Build a real SQLiteWorkService
   Polly creates and assigns a task
   Verify the task shows up in my_tasks for the assigned worker
 
-test_e2e_daemon_restart_recovery
-  Start work service, create some tasks
-  Kill the daemon
-  Restart the daemon
+test_e2e_service_reopen_recovery
+  Build a SQLiteWorkService, create some tasks, then drop it
+  Re-open a fresh SQLiteWorkService against the same DB
   Verify all state is preserved and operations resume
 ```
 
@@ -1183,7 +1187,7 @@ test_e2e_daemon_restart_recovery
 ```
 test_1000_tasks_list_performance
   Create 1000 tasks
-  Verify list() completes in under 500ms
+  Verify list_tasks() completes in under 500ms
 
 test_100_concurrent_reads
   Create tasks, then issue 100 simultaneous list/get requests
@@ -1228,7 +1232,9 @@ Each worker session gets an isolated git worktree:
 - Created on `claim()`: `git worktree add .pollypm/worktrees/<task-id> -b task/<task-slug>`
 - Worker operates exclusively in this worktree — never touches the main working directory
 - Multiple workers on the same project get separate worktrees on separate branches
-- On task completion: worktree is removed after branch merge (if applicable) and JSONL archival
+- On task completion: approval attempts an auto-merge of the task branch into
+  the project's canonical branch, then teardown archives JSONL and removes the
+  worktree
 - On task cancellation: worktree is removed, branch optionally preserved for forensics
 
 ### JSONL Archival
@@ -1256,10 +1262,12 @@ Each task accumulates token usage from its worker session(s):
 |-------|------|-------------|
 | `total_input_tokens` | int | Total input tokens across all turns |
 | `total_output_tokens` | int | Total output tokens across all turns |
-| `total_cost_usd` | float | Estimated cost (computed from token counts + model pricing) |
 | `session_count` | int | Number of sessions (usually 1, but could be >1 if session crashed and was recovered) |
 
-Stored in the task's metadata. Populated from the JSONL on archival. Queryable: `pm task get #7` shows token usage, and aggregate queries can show cost per project, per flow, per agent.
+These fields are derived from `work_sessions`, not stored directly on
+`work_tasks`. `pm task get <id>` shows the token totals; aggregate cost views
+currently live elsewhere (for example `pm costs` at the project/account level)
+rather than as a per-task cost field.
 
 ### Parallel Workers
 

@@ -750,6 +750,13 @@ class SQLiteWorkService:
         parts = [f"[skip-gates] {r.gate_name}: {r.reason}" for r in failures]
         return "; ".join(parts)
 
+    def _gate_kwargs(self) -> dict[str, object]:
+        """Build common kwargs for gate evaluation."""
+        kwargs: dict[str, object] = {"get_task": self.get}
+        if self._project_path is not None:
+            kwargs["project_root"] = self._project_path
+        return kwargs
+
     # ------------------------------------------------------------------
     # Owner derivation
     # ------------------------------------------------------------------
@@ -913,7 +920,7 @@ class SQLiteWorkService:
         # Gate: has_description
         gate_results = evaluate_gates(
             task, ["has_description"], self._gate_registry,
-            get_task=self.get,
+            **self._gate_kwargs(),
         )
         if not skip_gates and has_hard_failure(gate_results):
             failing = [r for r in gate_results if not r.passed]
@@ -1323,22 +1330,42 @@ class SQLiteWorkService:
     # Actors that are always treated as human for actor_type=HUMAN nodes.
     _HUMAN_ACTOR_NAMES = frozenset({"human", "user", "sam"})
 
+    @staticmethod
+    def _ordered_names(*names: str | None) -> list[str]:
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for name in names:
+            if not name or name in seen:
+                continue
+            ordered.append(name)
+            seen.add(name)
+        return ordered
+
     def _validate_actor_role(
         self, task: Task, node: FlowNode, actor: str
     ) -> None:
         """Validate that actor matches the node's expected role."""
         if node.actor_type == ActorType.HUMAN:
             # Accept well-known human names plus the assigned reviewer role value
-            allowed = set(self._HUMAN_ACTOR_NAMES)
+            reviewer = None
             if node.actor_role:
                 reviewer = task.roles.get(node.actor_role)
-                if reviewer:
-                    allowed.add(reviewer)
+            allowed = self._ordered_names(
+                reviewer, *sorted(self._HUMAN_ACTOR_NAMES),
+            )
             if actor not in allowed:
+                schema = "actor_type='human'"
+                if node.actor_role:
+                    schema += f", actor_role='{node.actor_role}'"
+                    if reviewer:
+                        schema += (
+                            f", task.roles['{node.actor_role}']='{reviewer}'"
+                        )
                 raise ValidationError(
-                    f"Node '{node.name}' requires human review. "
-                    f"Actor '{actor}' is not authorized — "
-                    f"accepted actors: {', '.join(sorted(allowed))}."
+                    f"Node '{node.name}' requires human review ({schema}). "
+                    f"Actor '{actor}' is not authorized. "
+                    f"Accepted actors: {', '.join(repr(name) for name in allowed)}. "
+                    f"Fix: rerun this action with --actor {allowed[0]}."
                 )
         elif node.actor_type == ActorType.ROLE and node.actor_role:
             expected_actor = task.roles.get(node.actor_role)
@@ -1347,13 +1374,32 @@ class SQLiteWorkService:
                 if actor != node.actor_role:
                     raise ValidationError(
                         f"Actor '{actor}' does not match role "
-                        f"'{node.actor_role}' (expected '{expected_actor}')."
+                        f"'{node.actor_role}' (expected '{expected_actor}'). "
+                        f"Node '{node.name}' uses actor_type='role', "
+                        f"actor_role='{node.actor_role}', "
+                        f"task.roles['{node.actor_role}']='{expected_actor}'. "
+                        f"Accepted actors: '{expected_actor}' or literal role "
+                        f"name '{node.actor_role}'. "
+                        f"Fix: rerun this action with --actor {expected_actor}."
                     )
+            elif expected_actor is None and actor != node.actor_role:
+                raise ValidationError(
+                    f"Actor '{actor}' does not match role '{node.actor_role}'. "
+                    f"Node '{node.name}' uses actor_type='role', "
+                    f"actor_role='{node.actor_role}', but this task has no "
+                    f"binding in task.roles['{node.actor_role}']. "
+                    f"Accepted actor: '{node.actor_role}'. "
+                    f"Fix: rerun this action with --actor {node.actor_role}, "
+                    f"or update the role binding."
+                )
         elif node.actor_type == ActorType.AGENT and node.agent_name:
             if actor != node.agent_name:
                 raise ValidationError(
                     f"Node '{node.name}' is pinned to agent "
-                    f"'{node.agent_name}'. Actor '{actor}' is not authorized."
+                    f"'{node.agent_name}' (actor_type='agent', "
+                    f"agent_name='{node.agent_name}'). Actor '{actor}' is not "
+                    f"authorized. Fix: rerun this action with --actor "
+                    f"{node.agent_name}."
                 )
 
     def _next_visit(
@@ -1423,7 +1469,7 @@ class SQLiteWorkService:
         if node.gates:
             gate_results = evaluate_gates(
                 task, node.gates, self._gate_registry,
-                get_task=self.get,
+                **self._gate_kwargs(),
             )
             if not skip_gates and has_hard_failure(gate_results):
                 failing = [r for r in gate_results if not r.passed and r.gate_type == "hard"]
@@ -1566,7 +1612,7 @@ class SQLiteWorkService:
         if node.gates:
             gate_results = evaluate_gates(
                 task, node.gates, self._gate_registry,
-                get_task=self.get,
+                **self._gate_kwargs(),
             )
             if not skip_gates and has_hard_failure(gate_results):
                 failing = [r for r in gate_results if not r.passed and r.gate_type == "hard"]
@@ -1986,7 +2032,7 @@ class SQLiteWorkService:
             results.extend(
                 evaluate_gates(
                     task, node.gates, self._gate_registry,
-                    get_task=self.get,
+                    **self._gate_kwargs(),
                 )
             )
 

@@ -103,6 +103,61 @@ class TestCliLifecycle:
         data = json.loads(result.output)
         assert data["work_status"] == "done"
 
+    def test_cli_approve_without_actor_uses_bound_reviewer(self, db_path):
+        _create_task(
+            db_path,
+            title="Auto approve",
+            roles=["worker=pete", "reviewer=polly"],
+        )
+        assert runner.invoke(task_app, ["queue", "proj/1", "--db", db_path]).exit_code == 0
+        assert runner.invoke(
+            task_app, ["claim", "proj/1", "--actor", "pete", "--db", db_path],
+        ).exit_code == 0
+        wo = json.dumps(
+            {
+                "type": "code_change",
+                "summary": "Implemented the feature",
+                "artifacts": [
+                    {"kind": "commit", "description": "abc123", "ref": "abc123"},
+                ],
+            }
+        )
+        assert runner.invoke(
+            task_app, ["done", "proj/1", "--output", wo, "--actor", "pete", "--db", db_path],
+        ).exit_code == 0
+
+        result = runner.invoke(task_app, ["approve", "proj/1", "--db", db_path])
+        assert result.exit_code == 0, result.output
+        assert "Approved proj/1" in result.output
+
+    def test_cli_approve_without_actor_uses_human_for_user_review(self, db_path):
+        _create_task(
+            db_path,
+            title="Human approve",
+            flow="user-review",
+            roles=["worker=pete"],
+        )
+        assert runner.invoke(task_app, ["queue", "proj/1", "--db", db_path]).exit_code == 0
+        assert runner.invoke(
+            task_app, ["claim", "proj/1", "--actor", "pete", "--db", db_path],
+        ).exit_code == 0
+        wo = json.dumps(
+            {
+                "type": "code_change",
+                "summary": "Implemented the feature",
+                "artifacts": [
+                    {"kind": "commit", "description": "abc123", "ref": "abc123"},
+                ],
+            }
+        )
+        assert runner.invoke(
+            task_app, ["done", "proj/1", "--output", wo, "--actor", "pete", "--db", db_path],
+        ).exit_code == 0
+
+        result = runner.invoke(task_app, ["approve", "proj/1", "--db", db_path])
+        assert result.exit_code == 0, result.output
+        assert "Approved proj/1" in result.output
+
 
 class TestCliNext:
     def test_cli_next(self, db_path):

@@ -375,6 +375,8 @@ def test_user_level_tests_pass_blocks_without_receipt(tmp_path: Path) -> None:
     gate = GateRegistry().get("user_level_tests_pass")
     result = gate.check(_make_task(), project_root=tmp_path)
     assert result.passed is False
+    assert ".pollypm/test-receipts/demo-1.json" in result.reason
+    assert '"passed": true' in result.reason
 
 
 def test_user_level_tests_pass_blocks_with_failing_receipt(tmp_path: Path) -> None:
@@ -391,6 +393,24 @@ def test_user_level_tests_pass_blocks_with_failing_receipt(tmp_path: Path) -> No
     result = gate.check(_make_task(), project_root=tmp_path)
     assert result.passed is False
     assert "3/5" in result.reason
+    assert '"passed": true' in result.reason
+
+
+def test_user_level_tests_pass_blocks_with_invalid_schema(tmp_path: Path) -> None:
+    import json as _json
+
+    from pollypm.work.gates import GateRegistry
+
+    gate = GateRegistry().get("user_level_tests_pass")
+    receipts = tmp_path / ".pollypm" / "test-receipts"
+    receipts.mkdir(parents=True)
+    receipts.joinpath("demo-1.json").write_text(
+        _json.dumps({"details": "Playwright 5/5"})
+    )
+    result = gate.check(_make_task(), project_root=tmp_path)
+    assert result.passed is False
+    assert "invalid schema" in result.reason
+    assert "boolean field 'passed'" in result.reason
 
 
 def test_user_level_tests_pass_passes_with_receipt(tmp_path: Path) -> None:

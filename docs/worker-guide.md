@@ -145,6 +145,17 @@ pm task done shortlink_gen/1 --output '{
 
 On success, the task moves to `review` and the reviewer is notified.
 
+If your task was emitted on the `implement_module` flow, review also expects a
+user-level test receipt on disk before approval succeeds. Write:
+
+```json
+{"passed": true, "details": "Playwright 5/5 passed; screenshot report.html"}
+```
+
+to `.pollypm/test-receipts/<project>-<number>.json` in the project root
+(example: `demo/1` → `.pollypm/test-receipts/demo-1.json`). Unit tests alone do
+not satisfy that gate.
+
 ### 6. If the reviewer rejects
 
 ```bash

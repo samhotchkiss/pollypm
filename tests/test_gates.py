@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import textwrap
 
 import pytest
@@ -453,3 +454,54 @@ class TestValidateAdvance:
             if r.gate_name == "actor_role" and not r.passed
         ]
         assert actor_failures == []
+
+
+class TestProjectRootGateResolution:
+    def test_approve_uses_service_project_root_for_receipt_lookup(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        project_root = tmp_path / "demo"
+        project_root.mkdir()
+        db_path = project_root / ".pollypm" / "state.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        outside_cwd = tmp_path / "elsewhere"
+        outside_cwd.mkdir()
+
+        svc = SQLiteWorkService(db_path=db_path, project_path=project_root)
+        try:
+            task = svc.create(
+                title="Module task",
+                description="Implement module",
+                type="task",
+                project="demo",
+                flow_template="implement_module",
+                roles={"worker": "agent-1", "reviewer": "agent-2"},
+                priority="normal",
+                created_by="tester",
+            )
+            svc.queue(task.task_id, "pm")
+            svc.claim(task.task_id, "agent-1")
+            output = {
+                "type": "code_change",
+                "summary": "module implemented",
+                "artifacts": [
+                    {"kind": "commit", "description": "impl", "ref": "HEAD"},
+                ],
+            }
+            svc.node_done(task.task_id, "agent-1", output)
+            svc.node_done(task.task_id, "agent-1", output)
+
+            receipts = project_root / ".pollypm" / "test-receipts"
+            receipts.mkdir(parents=True)
+            receipts.joinpath("demo-1.json").write_text(
+                json.dumps({"passed": True, "details": "tmux 1/1"}),
+                encoding="utf-8",
+            )
+
+            monkeypatch.chdir(outside_cwd)
+            approved = svc.approve(task.task_id, "agent-2")
+            assert approved.work_status == WorkStatus.DONE
+        finally:
+            svc.close()

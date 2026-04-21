@@ -154,6 +154,66 @@ class TestApproveNonReviewTask:
         assert "worker" in msg.lower()
 
 
+class TestReviewActorGuidance:
+    def test_approve_wrong_actor_names_role_binding_and_fix(self, svc):
+        task = _queued_task(svc)
+        svc.claim(task.task_id, "agent-1")
+        svc.node_done(
+            task.task_id,
+            "agent-1",
+            {
+                "type": "code_change",
+                "summary": "did the thing",
+                "artifacts": [
+                    {"kind": "commit", "description": "impl", "ref": "HEAD"},
+                ],
+            },
+        )
+
+        with pytest.raises(ValidationError) as excinfo:
+            svc.approve(task.task_id, "agent-1")
+
+        msg = str(excinfo.value)
+        assert "does not match role 'reviewer'" in msg
+        assert "actor_type='role'" in msg
+        assert "task.roles['reviewer']='agent-2'" in msg
+        assert "--actor agent-2" in msg
+
+    def test_human_review_wrong_actor_names_expected_human_actor(self, svc):
+        task = svc.create(
+            title="t",
+            description="d",
+            type="task",
+            project="proj",
+            flow_template="user-review",
+            roles={"worker": "agent-1"},
+            priority="normal",
+            created_by="tester",
+        )
+        svc.queue(task.task_id, "pm")
+        svc.claim(task.task_id, "agent-1")
+        svc.node_done(
+            task.task_id,
+            "agent-1",
+            {
+                "type": "code_change",
+                "summary": "did the thing",
+                "artifacts": [
+                    {"kind": "commit", "description": "impl", "ref": "HEAD"},
+                ],
+            },
+        )
+
+        with pytest.raises(ValidationError) as excinfo:
+            svc.approve(task.task_id, "polly")
+
+        msg = str(excinfo.value)
+        assert "requires human review" in msg
+        assert "actor_type='human'" in msg
+        assert "'human'" in msg
+        assert "--actor human" in msg
+
+
 # ---------------------------------------------------------------------------
 # Catalog entry 6: `pm task claim` on already-claimed task
 # ---------------------------------------------------------------------------

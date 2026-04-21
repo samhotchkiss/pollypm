@@ -36,7 +36,9 @@ pm task blocked -p <project>       # tasks with unresolved blockers
 When a task reaches a review node:
 
 ```bash
+pm task approve <id>                         # auto-uses bound reviewer/human actor
 pm task approve <id> --actor polly --reason "looks good"
+pm task reject <id> --reason "specific feedback"  # auto-uses bound reviewer/human actor
 pm task reject <id> --actor polly --reason "specific feedback"
 ```
 

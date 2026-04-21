@@ -188,6 +188,21 @@ def _svc(db: str, project: str | None = None) -> SQLiteWorkService:
     return svc
 
 
+def _resolve_actor_for_task(
+    svc: SQLiteWorkService,
+    task_id: str,
+    actor: str | None,
+) -> str:
+    """Use the task's bound actor when the CLI caller omits ``--actor``."""
+    if actor:
+        return actor
+    try:
+        task = svc.get(task_id)
+    except WorkServiceError:
+        return "cli"
+    return svc.derive_owner(task) or "cli"
+
+
 def _print_task(task, as_json: bool = False) -> None:
     """Print a single task."""
     if as_json:
@@ -677,13 +692,22 @@ def task_done(
 def task_approve(
     task_id: str = typer.Argument(..., help="Task ID (project/number)"),
     reason: Optional[str] = typer.Option(None, "--reason", help="Approval reason"),
-    actor: str = typer.Option("cli", "--actor", help="Actor approving"),
+    actor: Optional[str] = typer.Option(
+        None,
+        "--actor",
+        help="Actor approving (defaults to the task's bound reviewer/human approver)",
+    ),
     db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Approve at a review node."""
     svc = _svc(db, project=_project_from_task_id(task_id))
-    task = _run(svc.approve, task_id, actor, reason)
+    task = _run(
+        svc.approve,
+        task_id,
+        _resolve_actor_for_task(svc, task_id, actor),
+        reason,
+    )
     if output_json:
         typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
     else:
@@ -694,13 +718,22 @@ def task_approve(
 def task_reject(
     task_id: str = typer.Argument(..., help="Task ID (project/number)"),
     reason: str = typer.Option(..., "--reason", help="Rejection reason (required)"),
-    actor: str = typer.Option("cli", "--actor", help="Actor rejecting"),
+    actor: Optional[str] = typer.Option(
+        None,
+        "--actor",
+        help="Actor rejecting (defaults to the task's bound reviewer/human approver)",
+    ),
     db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Reject at a review node."""
     svc = _svc(db, project=_project_from_task_id(task_id))
-    task = _run(svc.reject, task_id, actor, reason)
+    task = _run(
+        svc.reject,
+        task_id,
+        _resolve_actor_for_task(svc, task_id, actor),
+        reason,
+    )
     if output_json:
         typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
     else:

@@ -85,6 +85,10 @@ from pollypm.cockpit_palette import (
     _record_palette_command,
     _resolve_recent_commands,
 )
+from pollypm.cockpit_settings_accounts import (
+    SETTINGS_ACCOUNT_ACTIONS,
+    render_settings_account_detail,
+)
 from pollypm.cockpit_workers import PollyWorkerRosterApp
 from pollypm.session_services import create_tmux_client
 from pollypm.service_api import PollyPMService
@@ -1992,6 +1996,11 @@ def _gather_settings_data(
                 "plan": getattr(status, "plan", "") or "",
                 "usage_summary": getattr(status, "usage_summary", "") or "",
                 "usage_raw_text": getattr(status, "usage_raw_text", "") or "",
+                "usage_updated_at": getattr(status, "usage_updated_at", "") or "",
+                "used_pct": getattr(status, "used_pct", None),
+                "remaining_pct": getattr(status, "remaining_pct", None),
+                "reset_at": getattr(status, "reset_at", "") or "",
+                "period_label": getattr(status, "period_label", "") or "",
                 "reason": getattr(status, "reason", "") or "",
                 "available_at": getattr(status, "available_at", "") or "",
                 "access_expires_at": getattr(status, "access_expires_at", "") or "",
@@ -2212,6 +2221,13 @@ class PollySettingsPaneApp(App[None]):
         height: auto;
         padding-bottom: 1;
     }
+    #settings-account-actions {
+        height: auto;
+        padding-bottom: 1;
+    }
+    #settings-account-actions Button {
+        margin-right: 1;
+    }
     #settings-reload-cockpit {
         min-width: 18;
     }
@@ -2373,6 +2389,13 @@ class PollySettingsPaneApp(App[None]):
                             id="settings-actions-note",
                         )
                     yield self.section_title
+                    with Horizontal(id="settings-account-actions"):
+                        for spec in SETTINGS_ACCOUNT_ACTIONS:
+                            yield Button(
+                                spec.label,
+                                id=spec.button_id,
+                                variant=spec.variant,
+                            )
                     with Vertical(id="settings-table-wrap"):
                         yield self.accounts
                         yield self.projects_table
@@ -2506,6 +2529,7 @@ class PollySettingsPaneApp(App[None]):
         self.plugins_table.display = key == "plugins"
         self.kv_static.display = key in {"heartbeat", "planner", "inbox", "about"}
         self.detail.display = key in {"accounts", "projects", "plugins"}
+        self.query_one("#settings-account-actions").display = key == "accounts"
 
         title_map = dict(_SETTINGS_SECTIONS)
         self.section_title.update(
@@ -2607,45 +2631,18 @@ class PollySettingsPaneApp(App[None]):
             or rows[0]["key"]
         )
         selected = next((a for a in rows if a["key"] == key), rows[0])
-        sep = "[dim]" + "\u2500" * 40 + "[/dim]"
         dot, colour = _settings_status_dot(
             selected["health"], selected["logged_in"],
         )
-        lines = [
-            f"[{colour}]{dot}[/{colour}] [b]{_escape(selected['key'])}[/b]"
-            f"  [dim]({_escape(selected['provider'])})[/dim]",
-            sep,
-            f"[dim]Email:[/dim]      {_escape(selected['email'])}",
-            f"[dim]Logged in:[/dim]  {'yes' if selected['logged_in'] else 'no'}",
-            f"[dim]Health:[/dim]     {_escape(selected['health']) or '-'}",
-            f"[dim]Plan:[/dim]       {_escape(selected['plan']) or '-'}",
-            f"[dim]Usage:[/dim]      {_escape(selected['usage_summary']) or '-'}",
-            f"[dim]Controller:[/dim] {'yes' if selected['is_controller'] else 'no'}",
-            f"[dim]Failover:[/dim]   "
-            f"{'#' + str(selected['failover_pos']) if selected['failover_pos'] else 'no'}",
-            f"[dim]Home:[/dim]       {_escape(selected['home']) or '-'}",
-            f"[dim]Isolation:[/dim]  {_escape(selected['isolation_status']) or '-'}",
-            f"[dim]Storage:[/dim]    {_escape(selected['auth_storage']) or '-'}",
-        ]
-        if selected["available_at"]:
-            lines.append(
-                f"[dim]Available:[/dim]  {_escape(selected['available_at'])}"
+        self.detail.update(
+            render_settings_account_detail(
+                {
+                    **selected,
+                    "status_dot": dot,
+                    "status_colour": colour,
+                }
             )
-        if selected["access_expires_at"]:
-            lines.append(
-                f"[dim]Expires:[/dim]    {_escape(selected['access_expires_at'])}"
-            )
-        if selected["reason"]:
-            lines.extend(
-                [sep, f"[dim]Reason:[/dim]     {_escape(selected['reason'])}"]
-            )
-        if selected["usage_raw_text"]:
-            snippet = selected["usage_raw_text"].strip().splitlines()[:6]
-            if snippet:
-                lines.append(sep)
-                lines.append("[dim]Latest usage snapshot:[/dim]")
-                lines.extend(f"  {_escape(line)}" for line in snippet)
-        self.detail.update("\n".join(lines))
+        )
 
     def _current_accounts_key(self) -> str | None:
         if self.accounts.row_count == 0 or self.accounts.cursor_row < 0:
@@ -3026,6 +3023,61 @@ class PollySettingsPaneApp(App[None]):
             return
         self._refresh()
 
+    def action_add_claude_account(self) -> None:
+        self._add_account(ProviderKind.CLAUDE)
+
+    def action_add_codex_account(self) -> None:
+        self._add_account(ProviderKind.CODEX)
+
+    def action_refresh_selected_account_usage(self) -> None:
+        if self._active_section != "accounts":
+            return
+        key = self._current_accounts_key()
+        if not key:
+            try:
+                self.notify("No account selected.", severity="warning")
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        refresher = getattr(self.service, "refresh_account_usage", None)
+        if refresher is None:
+            return
+        try:
+            refresher(key)
+            self._selected_account_key = key
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.notify(
+                    f"Usage refresh failed: {exc}", severity="error",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        self._refresh()
+        try:
+            self.notify(f"Refreshed usage for {key}.", timeout=1.5)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def action_remove_selected_account(self) -> None:
+        if self._active_section != "accounts":
+            return
+        key = self._current_accounts_key()
+        if not key:
+            try:
+                self.notify("No account selected.", severity="warning")
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        self.push_screen(
+            _SettingsConfirmModal(
+                title="Remove account",
+                prompt=f"Remove account {key} from PollyPM config?",
+                confirm_label="Remove",
+            ),
+            lambda confirmed: self._confirm_remove_account(key, confirmed),
+        )
+
     def action_back_or_cancel(self) -> None:
         if self.search_input.has_class("-active"):
             self.search_input.remove_class("-active")
@@ -3120,11 +3172,125 @@ class PollySettingsPaneApp(App[None]):
     def on_reload_cockpit_pressed(self, _event: Button.Pressed) -> None:
         self.action_reload_cockpit()
 
+    @on(Button.Pressed, "#settings-account-add-claude")
+    def on_add_claude_account_pressed(self, _event: Button.Pressed) -> None:
+        self.action_add_claude_account()
+
+    @on(Button.Pressed, "#settings-account-add-codex")
+    def on_add_codex_account_pressed(self, _event: Button.Pressed) -> None:
+        self.action_add_codex_account()
+
+    @on(Button.Pressed, "#settings-account-refresh-usage")
+    def on_refresh_account_usage_pressed(self, _event: Button.Pressed) -> None:
+        self.action_refresh_selected_account_usage()
+
+    @on(Button.Pressed, "#settings-account-remove")
+    def on_remove_account_pressed(self, _event: Button.Pressed) -> None:
+        self.action_remove_selected_account()
+
     @on(DataTable.RowSelected, "#accounts")
     def on_account_selected(self, _event: DataTable.RowSelected) -> None:
         self._selected_account_key = self._current_accounts_key()
         if self.data is not None:
             self._render_account_detail(self.data)
+
+    def _add_account(self, provider: ProviderKind) -> None:
+        adder = getattr(self.service, "add_account", None)
+        if adder is None:
+            return
+        try:
+            key, _email = adder(provider)
+            self._selected_account_key = key
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.notify(f"Add account failed: {exc}", severity="error")
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        self._refresh()
+        try:
+            self.notify(f"Added {provider.value} account {key}.", timeout=1.5)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _confirm_remove_account(self, key: str, confirmed: bool) -> None:
+        if not confirmed:
+            return
+        remover = getattr(self.service, "remove_account", None)
+        if remover is None:
+            return
+        try:
+            remover(key, delete_home=False)
+            if self._selected_account_key == key:
+                self._selected_account_key = None
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.notify(f"Remove account failed: {exc}", severity="error")
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        self._refresh()
+        try:
+            self.notify(f"Removed account {key}.", timeout=1.5)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class _SettingsConfirmModal(ModalScreen[bool]):
+    CSS = """
+    Screen {
+        align: center middle;
+    }
+    #settings-confirm {
+        width: 72;
+        height: auto;
+        padding: 1 2;
+        background: $panel;
+        border: heavy $warning;
+    }
+    #settings-confirm-title {
+        padding-bottom: 1;
+        text-style: bold;
+    }
+    #settings-confirm-buttons {
+        height: auto;
+        align-horizontal: right;
+        padding-top: 1;
+    }
+    #settings-confirm-buttons Button {
+        margin-left: 1;
+    }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(
+        self,
+        *,
+        title: str,
+        prompt: str,
+        confirm_label: str = "Confirm",
+        cancel_label: str = "Cancel",
+    ) -> None:
+        super().__init__()
+        self._title = title
+        self._prompt = prompt
+        self._confirm_label = confirm_label
+        self._cancel_label = cancel_label
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="settings-confirm"):
+            yield Static(self._title, id="settings-confirm-title")
+            yield Static(self._prompt)
+            with Horizontal(id="settings-confirm-buttons"):
+                yield Button(self._cancel_label, id="cancel")
+                yield Button(self._confirm_label, variant="primary", id="confirm")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "confirm")
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
 
 
 # ---------------------------------------------------------------------------

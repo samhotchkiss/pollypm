@@ -10,6 +10,7 @@ from pollypm.config import write_config
 from pollypm.models import AccountConfig, ProjectSettings, PollyPMConfig, PollyPMSettings, ProviderKind, RuntimeKind
 from pollypm.providers.claude.usage_parse import parse_claude_usage_text
 from pollypm.providers.codex.usage_parse import parse_codex_status_text
+from pollypm.storage.state import StateStore
 
 
 def test_parse_claude_usage_text() -> None:
@@ -274,3 +275,53 @@ def test_list_cached_account_statuses_avoids_live_probes(monkeypatch, tmp_path: 
 
     assert len(statuses) == 1
     assert probe_flags == [False]
+
+
+def test_list_cached_account_statuses_exposes_structured_usage_fields(tmp_path: Path) -> None:
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm" / "state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="claude_primary"),
+        accounts={
+            "claude_primary": AccountConfig(
+                name="claude_primary",
+                provider=ProviderKind.CLAUDE,
+                email="claude@example.com",
+                runtime=RuntimeKind.LOCAL,
+                home=tmp_path / ".pollypm/homes/claude_primary",
+            )
+        },
+        sessions={},
+        projects={},
+    )
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path)
+
+    with StateStore(config.project.state_db) as store:
+        store.upsert_account_usage(
+            account_name="claude_primary",
+            provider="claude",
+            plan="max",
+            health="healthy",
+            usage_summary="79% left this week",
+            raw_text="Current week (all models)",
+            used_pct=21,
+            remaining_pct=79,
+            reset_at="Apr 24 at 1am",
+            period_label="current week",
+        )
+
+    statuses = list_cached_account_statuses(config_path)
+
+    assert len(statuses) == 1
+    status = statuses[0]
+    assert status.used_pct == 21
+    assert status.remaining_pct == 79
+    assert status.reset_at == "Apr 24 at 1am"
+    assert status.period_label == "current week"
+    assert status.usage_updated_at is not None

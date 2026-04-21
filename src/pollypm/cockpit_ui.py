@@ -50,6 +50,7 @@ from textual.widgets import (
     TabPane,
 )
 
+from pollypm.approval_notifications import notify_task_approved
 from pollypm.cockpit_formatting import format_event_time
 from pollypm.cockpit_formatting import format_relative_age as _format_relative_age
 from pollypm.models import ProviderKind
@@ -1857,7 +1858,7 @@ class PollyTasksApp(App[None]):
                 self.notify("Task is not in review state", severity="warning")
                 return
             svc.approve(self._selected_task_id, "user", "Approved from cockpit")
-            self.notify(f"Approved {self._selected_task_id}", severity="information")
+            notify_task_approved(task, notify=self.notify)
             self._show_detail(self._selected_task_id)
         except Exception as exc:  # noqa: BLE001
             self.notify(f"Approve failed: {exc}", severity="error")

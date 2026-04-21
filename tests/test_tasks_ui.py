@@ -153,6 +153,8 @@ class _FakeSvc:
         self._flow = flow
         self._worker_sessions = worker_sessions or {}
         self._owner_by_id = owner_by_id or {}
+        self.approvals: list[tuple[str, str, str]] = []
+        self.rejections: list[tuple[str, str, str]] = []
 
     def list_tasks(self, *, project: str):
         assert project == "demo"
@@ -190,6 +192,12 @@ class _FakeSvc:
         assert task_project == "demo"
         assert active_only is True
         return self._worker_sessions.get(f"{task_project}/{task_number}")
+
+    def approve(self, task_id: str, actor: str, reason: str) -> None:
+        self.approvals.append((task_id, actor, reason))
+
+    def reject(self, task_id: str, actor: str, reason: str) -> None:
+        self.rejections.append((task_id, actor, reason))
 
     def close(self) -> None:
         return None
@@ -457,3 +465,32 @@ def test_task_app_filters_drive_table_contents(env, monkeypatch) -> None:
             assert rows[0][2] == "Done already"
 
     _run(body())
+
+
+def test_task_app_approval_routes_through_shared_notification(env, monkeypatch) -> None:
+    if not _load_config_compatible(env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_tasks import PollyTasksApp
+
+    review_task = _task(node_id="critic_panel", status=WorkStatus.REVIEW)
+    fake_svc = _FakeSvc(
+        tasks_factory=lambda: [review_task],
+        flow=_flow(),
+    )
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        "pollypm.cockpit_tasks.notify_task_approved",
+        lambda task, *, notify: calls.append(task.task_id),
+    )
+
+    app = PollyTasksApp(env["config_path"], "demo")
+    app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
+    app._refresh_list = lambda select_first=False: None  # type: ignore[method-assign]
+
+    app._review_task("demo/1", decision="approve")
+
+    assert fake_svc.approvals == [
+        ("demo/1", "user", "Approved from task cockpit")
+    ]
+    assert calls == ["demo/1"]

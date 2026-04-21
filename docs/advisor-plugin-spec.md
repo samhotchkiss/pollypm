@@ -1,6 +1,6 @@
 # Advisor Plugin Specification
 
-**Status:** v1 target. Depends on: planner plugin, work service, session service, roster/jobs APIs, inbox view.
+**Status:** v1 shipped - implemented in `src/pollypm/plugins_builtin/advisor/plugin.py`. Depends on: planner plugin, work service, session service, roster/jobs APIs, inbox view.
 
 ## 1. Purpose
 

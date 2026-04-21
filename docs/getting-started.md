@@ -27,7 +27,7 @@ Verify your environment:
 pm doctor
 ```
 
-You should see JSON reporting that `tmux`, `claude` (or `codex`), and optionally `docker` are found. If `pm doctor` isn't available yet in your checkout, skip it — the onboarding flow will still tell you what's missing.
+You should see JSON reporting that `tmux`, `claude` (or `codex`), and optionally `docker` are found. Run `pm doctor` — it reports tmux, git, provider auth, and storage health. Fix anything that comes back red before continuing.
 
 Now launch PollyPM:
 

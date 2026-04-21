@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from pollypm.config import load_config
 from pollypm.config import PollyPMConfig
 from pollypm.storage.state import StateStore
 
@@ -202,6 +203,17 @@ def _count_inbox_tasks(config: PollyPMConfig) -> int:
         except Exception:  # noqa: BLE001
             continue
     return total
+
+
+def load_dashboard(config_path: Path) -> tuple[PollyPMConfig, DashboardData]:
+    """Load config + state store and gather one blocking dashboard snapshot."""
+    config = load_config(config_path)
+    store = StateStore(config.project.state_db)
+    try:
+        data = gather(config, store)
+    finally:
+        store.close()
+    return config, data
 
 
 def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:

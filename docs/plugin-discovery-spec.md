@@ -2,6 +2,13 @@
 
 **Status:** draft — target for v1.1. Supersedes ad-hoc discovery in `plugin_host.py`.
 
+> **Warning:** This document is still a draft target for v1.1, and some
+> sections may describe behavior that is not yet shipped or not yet
+> stable in the current v1 release.
+> If you're authoring a plugin today, start with
+> [`plugin-authoring.md`](plugin-authoring.md) and confirm details
+> against the current `pm plugins` behavior.
+
 This spec defines how PollyPM finds plugins, how plugins advertise what they provide, and how users add, disable, and inspect plugins. It also codifies the distinction between *plugins* (code that extends the rail) and *content* (data that extends what a plugin already provides).
 
 ---

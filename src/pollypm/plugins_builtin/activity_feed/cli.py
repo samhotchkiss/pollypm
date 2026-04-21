@@ -23,19 +23,15 @@ import sys
 import time
 from datetime import timedelta
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 import typer
 
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config
-from pollypm.plugins_builtin.activity_feed.cockpit.feed_panel import (
-    FeedFilter,
-    format_entry_row,
-)
-from pollypm.plugins_builtin.activity_feed.handlers.event_projector import (
-    FeedEntry,
-)
-from pollypm.plugins_builtin.activity_feed.plugin import build_projector
+
+if TYPE_CHECKING:
+    from pollypm.plugins_builtin.activity_feed.cockpit.feed_panel import FeedFilter
+    from pollypm.plugins_builtin.activity_feed.handlers.event_projector import FeedEntry
 
 
 activity_app = typer.Typer(
@@ -89,6 +85,8 @@ def parse_duration(raw: str | None) -> timedelta | None:
 
 
 def _entries_as_text(entries: Iterable[FeedEntry]) -> str:
+    from pollypm.plugins_builtin.activity_feed.cockpit.feed_panel import format_entry_row
+
     return "\n".join(format_entry_row(e) for e in entries)
 
 
@@ -97,6 +95,8 @@ def _entries_as_json_lines(entries: Iterable[FeedEntry]) -> str:
 
 
 def _resolve_projector(config_path: Path):
+    from pollypm.plugins_builtin.activity_feed.plugin import build_projector
+
     config = load_config(config_path)
     return build_projector(config)
 
@@ -107,6 +107,8 @@ def _build_filter(
     actor: str | None,
     since: str | None,
 ) -> FeedFilter:
+    from pollypm.plugins_builtin.activity_feed.cockpit.feed_panel import FeedFilter
+
     f = FeedFilter()
     if project:
         f = f.with_project(project)

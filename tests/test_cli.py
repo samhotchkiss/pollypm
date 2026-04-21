@@ -1,4 +1,7 @@
+import json
 from pathlib import Path
+import subprocess
+import sys
 
 from typer.testing import CliRunner
 
@@ -73,6 +76,49 @@ def test_discover_config_path_returns_global_config(monkeypatch, tmp_path: Path)
     assert resolved == cli.DEFAULT_CONFIG_PATH.resolve()
 
 
+def test_importing_cli_defers_heavy_runtime_modules() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    script = """
+import json
+import sys
+import pollypm.cli
+
+payload = {
+    "sqlalchemy": any(m == "sqlalchemy" or m.startswith("sqlalchemy.") for m in sys.modules),
+    "plugin_host": "pollypm.plugin_host" in sys.modules,
+    "service_api": any(m == "pollypm.service_api" or m.startswith("pollypm.service_api.") for m in sys.modules),
+    "accounts": "pollypm.accounts" in sys.modules,
+    "activity_panel": "pollypm.plugins_builtin.activity_feed.cockpit.feed_panel" in sys.modules,
+    "activity_plugin": "pollypm.plugins_builtin.activity_feed.plugin" in sys.modules,
+    "activity_projector": "pollypm.plugins_builtin.activity_feed.handlers.event_projector" in sys.modules,
+    "jobs_workers": "pollypm.jobs.workers" in sys.modules,
+    "memory_store": "pollypm.store.sqlalchemy_store" in sys.modules,
+    "work_sqlite": "pollypm.work.sqlite_service" in sys.modules,
+}
+print(json.dumps(payload, sort_keys=True))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert json.loads(result.stdout) == {
+        "accounts": False,
+        "activity_panel": False,
+        "activity_plugin": False,
+        "activity_projector": False,
+        "jobs_workers": False,
+        "memory_store": False,
+        "plugin_host": False,
+        "service_api": False,
+        "sqlalchemy": False,
+        "work_sqlite": False,
+    }
+
+
 def test_root_command_attaches_existing_session_when_default_config_missing(monkeypatch, tmp_path: Path) -> None:
     called: dict[str, object] = {}
 
@@ -87,7 +133,6 @@ def test_root_command_attaches_existing_session_when_default_config_missing(monk
             called["attached"] = name
             return 0
 
-    from pollypm.config import GLOBAL_CONFIG_DIR
     fake_default = tmp_path / "no-such-dir" / "pollypm.toml"
     monkeypatch.setattr(cli, "DEFAULT_CONFIG_PATH", fake_default)
     monkeypatch.setattr(cli, "_discover_config_path", lambda p: fake_default)

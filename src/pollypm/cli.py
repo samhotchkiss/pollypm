@@ -18,10 +18,7 @@ Contract:
 
 from __future__ import annotations
 
-import json
 import logging
-import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -39,37 +36,19 @@ from pollypm.error_log import install as _install_error_log
 
 _install_error_log(process_label="cli")
 
-from pollypm.accounts import (
-    add_account_via_login,
-    list_account_statuses,
-    probe_account_usage,
-    relogin_account,
-    remove_account as remove_account_entry,
-)
 from pollypm.config import (
     DEFAULT_CONFIG_PATH,
-    load_config,
     resolve_config_path,
     render_example_config,
     write_example_config,
 )
 from pollypm.errors import format_config_not_found_error
-from pollypm.service_api import PollyPMService
-from pollypm.service_api import render_json
 from pollypm.cli_features.alerts import alert_app, heartbeat_app, session_app
 from pollypm.cli_features.issues import issue_app, itsalive_app, report_app
 from pollypm.cli_features.maintenance import register_maintenance_commands
 from pollypm.cli_features.projects import register_project_commands
 from pollypm.cli_features.ui import register_ui_commands
 from pollypm.cli_features.workers import register_worker_commands
-from pollypm.session_services import (
-    attach_existing_session,
-    current_session_name,
-    probe_session,
-    switch_client_to_session,
-)
-from pollypm.transcript_ingest import start_transcript_ingestion
-from pollypm.workers import create_worker_session, launch_worker_session
 
 
 # wg05 / #242: every `pm ... --help` gains an Examples section so
@@ -138,6 +117,48 @@ register_maintenance_commands(app)
 register_worker_commands(app)
 
 
+def attach_existing_session(session_name: str) -> int:
+    from pollypm.session_services import attach_existing_session as _attach_existing_session
+
+    return _attach_existing_session(session_name)
+
+
+def current_session_name() -> str | None:
+    from pollypm.session_services import current_session_name as _current_session_name
+
+    return _current_session_name()
+
+
+def probe_session(session_name: str) -> bool:
+    from pollypm.session_services import probe_session as _probe_session
+
+    return _probe_session(session_name)
+
+
+def switch_client_to_session(session_name: str) -> int:
+    from pollypm.session_services import switch_client_to_session as _switch_client_to_session
+
+    return _switch_client_to_session(session_name)
+
+
+def start_transcript_ingestion(config) -> None:
+    from pollypm.transcript_ingest import start_transcript_ingestion as _start_transcript_ingestion
+
+    _start_transcript_ingestion(config)
+
+
+def create_worker_session(*args, **kwargs):
+    from pollypm.workers import create_worker_session as _create_worker_session
+
+    return _create_worker_session(*args, **kwargs)
+
+
+def launch_worker_session(*args, **kwargs):
+    from pollypm.workers import launch_worker_session as _launch_worker_session
+
+    return _launch_worker_session(*args, **kwargs)
+
+
 def _session_name_candidates() -> list[str]:
     return ["pollypm", "pollypm-storage-closet"]
 
@@ -165,6 +186,8 @@ def _attach_existing_session_without_config() -> bool:
 
 def _load_supervisor(config_path: Path):
     """Return a full Supervisor via the service_api facade."""
+    from pollypm.service_api import PollyPMService
+
     return PollyPMService(config_path).load_supervisor()
 
 
@@ -181,6 +204,8 @@ def _cli_status(msg: str) -> None:
 
 
 def _emit_json(payload: object) -> None:
+    from pollypm.service_api import render_json
+
     typer.echo(render_json(payload), nl=False)
 
 
@@ -605,6 +630,8 @@ def status(
     json_output: bool = typer.Option(False, "--json", help="Emit structured JSON."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
+    from pollypm.service_api import PollyPMService
+
     if not _config_option_was_explicit():
         config_path = _discover_config_path(config_path)
     payload = PollyPMService(config_path).session_status(session_name)
@@ -674,6 +701,8 @@ def alerts(
     json_output: bool = typer.Option(False, "--json", help="Emit structured JSON."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
+    from pollypm.service_api import PollyPMService
+
     items = PollyPMService(config_path).list_alerts()
     if not items:
         typer.echo("No open alerts.")
@@ -690,6 +719,8 @@ def failover(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
     """Show failover configuration: controller account and failover order."""
+    from pollypm.config import load_config
+
     config = load_config(config_path)
     typer.echo(f"Controller: {config.pollypm.controller_account}")
     typer.echo(f"Failover enabled: {'yes' if config.pollypm.failover_enabled else 'no'}")

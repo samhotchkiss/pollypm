@@ -16,7 +16,6 @@ from pathlib import Path
 import typer
 
 from pollypm.config import DEFAULT_CONFIG_PATH
-from pollypm.service_api import PollyPMService
 
 
 issue_app = typer.Typer(
@@ -47,13 +46,19 @@ itsalive_app = typer.Typer(
 )
 
 
+def _service(config_path: Path):
+    from pollypm.service_api import PollyPMService
+
+    return PollyPMService(config_path)
+
+
 @issue_app.command("list")
 def issue_list(
     project: str = typer.Option(..., "--project", help="Project key."),
     state: list[str] | None = typer.Option(None, "--state", help="Optional tracker state filter."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
-    service = PollyPMService(config_path)
+    service = _service(config_path)
     tasks = service.list_tasks(project, states=state)
     if not tasks:
         typer.echo("No issues found.")
@@ -68,7 +73,7 @@ def issue_info(
     project: str = typer.Option(..., "--project", help="Project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
-    service = PollyPMService(config_path)
+    service = _service(config_path)
     task = service.get_task(project, task_id)
     typer.echo(f"{task.task_id} [{task.state}] {task.title}")
 
@@ -78,7 +83,7 @@ def issue_next(
     project: str = typer.Option(..., "--project", help="Project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
-    service = PollyPMService(config_path)
+    service = _service(config_path)
     task = service.next_available_task(project)
     if task is None:
         typer.echo("No ready issue found.")
@@ -92,7 +97,7 @@ def issue_history(
     project: str = typer.Option(..., "--project", help="Project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
-    service = PollyPMService(config_path)
+    service = _service(config_path)
     entries = service.task_history(project, task_id)
     if not entries:
         typer.echo("No history found.")
@@ -109,7 +114,7 @@ def issue_create(
     state: str = typer.Option("01-ready", "--state", help="Initial tracker state."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
-    service = PollyPMService(config_path)
+    service = _service(config_path)
     task = service.create_task(project, title=title, body=body, state=state)
     typer.echo(f"Created issue {task.task_id} [{task.state}] {task.title}")
 
@@ -121,7 +126,7 @@ def issue_transition(
     project: str = typer.Option(..., "--project", help="Project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
-    service = PollyPMService(config_path)
+    service = _service(config_path)
     try:
         task = service.move_task(project, task_id, to_state=to_state)
     except ValueError as exc:
@@ -137,7 +142,7 @@ def issue_comment(
     project: str = typer.Option(..., "--project", help="Project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
-    service = PollyPMService(config_path)
+    service = _service(config_path)
     path = service.append_task_note(project, task_name, text=text)
     typer.echo(f"Updated {path}")
 
@@ -152,7 +157,7 @@ def issue_handoff(
     project: str = typer.Option(..., "--project", help="Project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
-    service = PollyPMService(config_path)
+    service = _service(config_path)
     path = service.append_task_handoff(
         project,
         task_name,
@@ -172,7 +177,7 @@ def issue_approve(
     project: str = typer.Option(..., "--project", help="Project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
-    service = PollyPMService(config_path)
+    service = _service(config_path)
     try:
         task = service.review_task(
             project,
@@ -196,7 +201,7 @@ def issue_request_changes(
     project: str = typer.Option(..., "--project", help="Project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
-    service = PollyPMService(config_path)
+    service = _service(config_path)
     try:
         task = service.review_task(
             project,
@@ -217,7 +222,7 @@ def issue_counts(
     project: str = typer.Option(..., "--project", help="Project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
-    service = PollyPMService(config_path)
+    service = _service(config_path)
     counts = service.task_state_counts(project)
     for state, count in counts.items():
         typer.echo(f"{state}: {count}")
@@ -247,7 +252,7 @@ def itsalive_deploy(
     publish_dir: str = typer.Option(".", "--dir", help="Directory to deploy relative to the project root."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
-    service = PollyPMService(config_path)
+    service = _service(config_path)
     outcome = service.itsalive_deploy(
         project_key=project,
         subdomain=subdomain,
@@ -270,7 +275,7 @@ def itsalive_status(
     project: str = typer.Option(..., "--project", help="Project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
-    service = PollyPMService(config_path)
+    service = _service(config_path)
     items = service.itsalive_pending(project_key=project)
     if not items:
         typer.echo("No pending itsalive deployments.")
@@ -287,7 +292,7 @@ def itsalive_sweep(
     project: str = typer.Option(..., "--project", help="Project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
-    service = PollyPMService(config_path)
+    service = _service(config_path)
     outcomes = service.itsalive_sweep(project_key=project)
     if not outcomes:
         typer.echo("No itsalive deployment updates.")
@@ -303,7 +308,7 @@ def issue_validate(
     project: str = typer.Option(..., "--project", help="Project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
-    service = PollyPMService(config_path)
+    service = _service(config_path)
     result = service.validate_task_backend(project)
     if getattr(result, "passed", False):
         typer.echo("Task backend validation passed.")
@@ -315,4 +320,3 @@ def issue_validate(
         typer.echo(f"error: {error}")
     if not getattr(result, "passed", False):
         raise typer.Exit(code=1)
-

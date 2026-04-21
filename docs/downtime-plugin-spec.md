@@ -111,7 +111,7 @@ When a downtime task reaches `awaiting_approval`, the handler:
 3. User sees in `pm inbox` / cockpit inbox panel. Actions:
    - `pm task approve <id>` → advance to `apply` node, which commits/merges per §6.
    - `pm task reject <id>` → advance to `apply` node, which archives per §6.
-   - `pm task comment <id> "..."` + approve → like approve, with user's note logged.
+   - `pm inbox reply <id> "..."` + approve → like approve, with the user's note logged.
 
 ## 8. Planner integration
 

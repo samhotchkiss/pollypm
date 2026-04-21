@@ -87,7 +87,7 @@ Herald tone: morning-coffee-briefing, not status-meeting. Direct, organized, no 
 
 Single inbox entry per day, kind=`morning_briefing`. Body is the herald's synthesized text. User actions:
 - Read it → auto-close after 24h (next briefing supersedes).
-- `pm task comment <id>` to note follow-ups against it.
+- `pm inbox reply <id> "..."` to note follow-ups against it.
 
 The briefing is a read-only informational message; no approve/reject semantics.
 

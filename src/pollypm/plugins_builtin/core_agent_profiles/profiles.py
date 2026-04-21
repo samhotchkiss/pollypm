@@ -412,7 +412,15 @@ def _read_instruct_rules(project_root: Path) -> str:
     - SYSTEM.md  — universal behavioral rules (deliverables, inbox, quality)
     - INSTRUCT.md — project-specific instructions written by the user
     """
-    parts: list[str] = []
+    parts: list[str] = [
+        (
+            "<project-overrides>\n"
+            "`.pollypm/INSTRUCT.md` and `.pollypm/docs/SYSTEM.md` are optional project-level "
+            "overrides written by the PM. When present, they override the built-in defaults. "
+            "If either is missing, defaults apply — continue without blocking.\n"
+            "</project-overrides>"
+        )
+    ]
     system_path = project_root / ".pollypm" / "docs" / "SYSTEM.md"
     if system_path.exists():
         parts.append(system_path.read_text().strip())

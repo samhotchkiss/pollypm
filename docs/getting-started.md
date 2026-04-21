@@ -152,7 +152,7 @@ Rejection sends the task back to `in_progress` with your feedback attached — t
 - **`pm activity --help`** — filtering and following the live event stream.
 - **`pm memory --help`** — the memory plugin for long-term context.
 - **[docs/plugin-authoring.md](plugin-authoring.md)** and **[docs/plugin-discovery-spec.md](plugin-discovery-spec.md)** — author your own provider, runtime, or profile plugin.
-- **[docs/magic-skills-catalog.md](magic-skills-catalog.md)** — the starter catalog of reusable agent skills.
+- **[docs/magic-skills.md](magic-skills.md)** — the starter catalog of reusable agent skills.
 - **[docs/project-overview.md](project-overview.md)** — the long-form generated project context after you already know your way around.
 
 If something doesn't match what you're seeing, run `pm debug` for a one-screen snapshot of sessions, alerts, and recent events — that's the right thing to paste into a bug report.

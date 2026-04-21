@@ -8,6 +8,16 @@ allow-list.
 
 The public surface is re-exported from :mod:`pollypm.service_api`. Anything
 underscore-prefixed is internal.
+
+Example:
+    from pathlib import Path
+    from pollypm.models import ProviderKind
+    from pollypm.service_api.v1 import PollyPMService
+
+    service = PollyPMService(Path("/path/to/pollypm.toml"))
+    sessions = service.session_status()["sessions"]
+    accounts = service.list_cached_account_statuses()
+    service.add_account(ProviderKind.CLAUDE)
 """
 
 from __future__ import annotations

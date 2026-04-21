@@ -1,3 +1,25 @@
+"""PollyPM Plugin API v1.
+
+Stable registration surface for plugin authors. The module is mostly type
+declarations, so keep a concrete example here to show the intended shape.
+
+Example:
+    from pollypm.plugin_api.v1 import Capability, PluginAPI, PollyPMPlugin
+
+    def initialize(api: PluginAPI) -> None:
+        for path in api.content_paths(kind="magic_skill"):
+            api.emit_event("content_path_seen", {"path": str(path)})
+
+    plugin = PollyPMPlugin(
+        name="example_plugin",
+        description="Minimal example plugin",
+        capabilities=(
+            Capability(kind="hook", name="example_plugin"),
+        ),
+        initialize=initialize,
+    )
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

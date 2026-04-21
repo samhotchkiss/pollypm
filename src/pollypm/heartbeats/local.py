@@ -911,7 +911,25 @@ class LocalHeartbeatBackend(HeartbeatBackend):
     # Rate limit nudges: max once per session per 10 minutes
     # Rate limits for worker nudges
     _NUDGE_COOLDOWN_SECONDS = 600
+    _NUDGE_ESCALATION_IDLE_CYCLES = 8
     _MAX_NUDGES_BEFORE_RECOVERY = 6
+
+    def _repeated_snapshot_count(
+        self,
+        api,
+        context: HeartbeatSessionContext,
+        *,
+        limit: int,
+    ) -> int:
+        hashes = api.recent_snapshot_hashes(context.session_name, limit=limit)
+        repeated = 0
+        if hashes:
+            for value in hashes:
+                if value == hashes[0]:
+                    repeated += 1
+                else:
+                    break
+        return repeated
 
     def _nudge_stalled_worker(self, api, context: HeartbeatSessionContext) -> None:
         """Send a targeted nudge to a stalled WORKER. Never targets the operator."""
@@ -929,6 +947,11 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 limit=200,
             )
             now = datetime.now(UTC)
+            idle_cycles = self._repeated_snapshot_count(
+                api,
+                context,
+                limit=self._NUDGE_ESCALATION_IDLE_CYCLES,
+            )
 
             def _age_seconds(event: dict) -> float | None:
                 created_at = event.get("created_at")
@@ -957,8 +980,22 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             # Rate limit + circuit breaker.
             nudge_count = 0
             most_recent_age: float | None = None
+            same_episode_nudge = False
+            same_episode_escalated = False
             for event in recent:
-                if event.get("subject") != "nudge":
+                payload = event.get("payload") or {}
+                subject = event.get("subject")
+                if (
+                    subject == "nudge"
+                    and payload.get("snapshot_hash") == context.snapshot_hash
+                ):
+                    same_episode_nudge = True
+                if (
+                    subject == "nudge_escalated"
+                    and payload.get("snapshot_hash") == context.snapshot_hash
+                ):
+                    same_episode_escalated = True
+                if subject != "nudge":
                     continue
                 age = _age_seconds(event)
                 if age is None:
@@ -967,6 +1004,29 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     nudge_count += 1
                 if most_recent_age is None:
                     most_recent_age = age
+            if same_episode_escalated:
+                return
+            if same_episode_nudge:
+                if idle_cycles >= self._NUDGE_ESCALATION_IDLE_CYCLES:
+                    api.raise_alert(
+                        context.session_name,
+                        "stuck_session",
+                        "warn",
+                        (
+                            f"{context.session_name} stayed stalled after a heartbeat "
+                            f"nudge for {idle_cycles} identical heartbeats"
+                        ),
+                    )
+                    api.supervisor.msg_store.append_event(
+                        scope=context.session_name,
+                        sender=context.session_name,
+                        subject="nudge_escalated",
+                        payload={
+                            "snapshot_hash": context.snapshot_hash,
+                            "idle_cycles": idle_cycles,
+                        },
+                    )
+                return
             # Circuit breaker: too many nudges → recover the worker.
             if nudge_count >= self._MAX_NUDGES_BEFORE_RECOVERY:
                 self._recover_session(
@@ -1006,6 +1066,8 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                         verb="nudged",
                         subject=context.session_name,
                     ),
+                    "snapshot_hash": context.snapshot_hash,
+                    "idle_cycles": idle_cycles,
                 },
             )
         except Exception:  # noqa: BLE001

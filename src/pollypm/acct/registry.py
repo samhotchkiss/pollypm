@@ -20,8 +20,18 @@ from functools import lru_cache
 
 from .errors import ProviderNotFound
 from .protocol import ProviderAdapter
+from pollypm.plugin_trust import warn_third_party_extension_trust_once
 
 _ENTRY_POINT_GROUP = "pollypm.provider"
+
+
+def _is_builtin_provider_entry_point(ep: importlib.metadata.EntryPoint) -> bool:
+    """Return True when ``ep`` resolves to a PollyPM-shipped provider."""
+    module_name = getattr(ep, "module", None)
+    if not module_name:
+        value = getattr(ep, "value", "")
+        module_name = str(value).split(":", 1)[0]
+    return str(module_name).startswith("pollypm.")
 
 
 def _entry_points() -> list[importlib.metadata.EntryPoint]:
@@ -34,7 +44,10 @@ def _entry_points() -> list[importlib.metadata.EntryPoint]:
     # ``entry_points()`` returns an ``EntryPoints`` selectable view on
     # 3.10+ but iterating it yields ``EntryPoint``s — normalize to a
     # list so callers can cheaply len()/sort() the result.
-    return list(eps)
+    normalized = list(eps)
+    if any(not _is_builtin_provider_entry_point(ep) for ep in normalized):
+        warn_third_party_extension_trust_once()
+    return normalized
 
 
 @lru_cache(maxsize=None)

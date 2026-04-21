@@ -415,7 +415,7 @@ plugin = PollyPMPlugin(
 )
 ```
 
-The plugin host discovers plugins from four sources (precedence low → high): built-in, Python entry_points under `pollypm.plugins`, user-global `~/.pollypm/plugins/`, and project-local `<project>/.pollypm/plugins/`. See [docs/plugin-discovery-spec.md](docs/plugin-discovery-spec.md) for the full specification, [docs/plugin-authoring.md](docs/plugin-authoring.md) for a from-scratch walkthrough, and [docs/plugin-boundaries.md](docs/plugin-boundaries.md) for boundary contracts between plugins.
+The plugin host discovers plugins from four sources (precedence low → high): built-in, Python entry_points under `pollypm.plugins`, user-global `~/.pollypm/plugins/`, and project-local `<project>/.pollypm/plugins/`. Third-party plugins and provider packages are not sandboxed; see [docs/plugin-trust.md](docs/plugin-trust.md) before installing one. For the full specification, see [docs/plugin-discovery-spec.md](docs/plugin-discovery-spec.md), [docs/plugin-authoring.md](docs/plugin-authoring.md), and [docs/plugin-boundaries.md](docs/plugin-boundaries.md).
 
 ## Session Roles
 

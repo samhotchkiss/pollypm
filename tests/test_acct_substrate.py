@@ -87,6 +87,47 @@ def test_list_providers_returns_sorted_names():
     assert set(providers) >= {"claude", "codex"}
 
 
+def test_external_provider_entry_points_emit_trust_warning_once(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "pollypm.plugin_trust._THIRD_PARTY_EXTENSION_WARNING_EMITTED", False,
+    )
+
+    class FakeEntryPoint:
+        name = "external-provider"
+        value = "external_pkg.provider:ExternalProvider"
+
+    monkeypatch.setattr(
+        "pollypm.acct.registry.importlib.metadata.entry_points",
+        lambda *, group: [FakeEntryPoint()],
+    )
+
+    assert list_providers() == ["external-provider"]
+    assert "full user privileges" in capsys.readouterr().err
+
+    assert list_providers() == ["external-provider"]
+    assert capsys.readouterr().err == ""
+
+
+def test_builtin_provider_entry_points_do_not_emit_trust_warning(
+    monkeypatch, capsys,
+):
+    monkeypatch.setattr(
+        "pollypm.plugin_trust._THIRD_PARTY_EXTENSION_WARNING_EMITTED", False,
+    )
+
+    class FakeEntryPoint:
+        name = "claude"
+        value = "pollypm.providers.claude:ClaudeProvider"
+
+    monkeypatch.setattr(
+        "pollypm.acct.registry.importlib.metadata.entry_points",
+        lambda *, group: [FakeEntryPoint()],
+    )
+
+    assert list_providers() == ["claude"]
+    assert capsys.readouterr().err == ""
+
+
 def test_get_provider_caches_instances():
     """Repeated ``get_provider()`` calls return the same instance."""
     first = get_provider("claude")

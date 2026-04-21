@@ -10,6 +10,8 @@ and working design docs. If you are not sure where to start, start here:
   sessions.
 - [Plugin Authoring](plugin-authoring.md) — the shortest path to building and
   testing a PollyPM plugin.
+- [Plugin Trust Model](plugin-trust.md) — what installing a third-party
+  plugin or provider means in v1.
 
 ## User
 
@@ -30,6 +32,8 @@ and working design docs. If you are not sure where to start, start here:
 
 - [Plugin Authoring](plugin-authoring.md) — end-to-end walkthrough for writing,
   testing, and installing a plugin.
+- [Plugin Trust Model](plugin-trust.md) — the security boundary for external
+  plugins and provider packages.
 - [Provider Plugin SDK](provider-plugin-sdk.md) — stable adapter surface for
   adding a new CLI provider.
 - [Plugin Discovery Spec](plugin-discovery-spec.md) — manifests, capabilities,

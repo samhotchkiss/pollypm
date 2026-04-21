@@ -15,6 +15,7 @@ from textual.screen import ModalScreen
 from textual.worker import Worker, WorkerState
 from textual.widgets import Button, Checkbox, Footer, RadioButton, RadioSet, SelectionList, Static
 
+from pollypm.cli_shortcuts import shortcut_rows
 from pollypm.config import write_config
 from pollypm.models import KnownProject, ProjectKind, PollyPMConfig, ProviderKind
 from pollypm.onboarding import (
@@ -721,12 +722,23 @@ class OnboardingApp(App[OnboardingResult | None]):
         keys_table.add_row("Ctrl-Q", "Shut down PollyPM and stop all agent sessions.")
         keys_section.mount(Static(Group(keys_table)))
 
+        shortcuts_section = Vertical(classes="section")
+        stage.mount(shortcuts_section)
+        shortcuts_section.mount(Static("Shortcut commands", classes="section-title"))
+        shortcuts_table = Table.grid(expand=True, padding=(0, 1))
+        shortcuts_table.add_column(style="bold #e0e8ef", width=14)
+        shortcuts_table.add_column(style="#a8b8c4")
+        for label, commands in shortcut_rows():
+            shortcuts_table.add_row(label, commands)
+        shortcuts_section.mount(Static(Group(shortcuts_table)))
+
         # ── Tips
         tips_section = Vertical(classes="section")
         stage.mount(tips_section)
         tips_section.mount(Static("Tips", classes="section-title"))
         tips_section.mount(Static(
             "[#a8b8c4]You can reopen PollyPM anytime with [bold #e0e8ef]pm[/] from any terminal.\n"
+            "Run [bold #e0e8ef]pm shortcuts[/] anytime for the same quick command list.\n"
             "Add more accounts or projects later from settings.\n"
             "PollyPM stores all state in [bold #e0e8ef]~/.pollypm/[/] — nothing is written to your project repos.[/]"
         ))

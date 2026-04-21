@@ -36,6 +36,7 @@ from pollypm.error_log import install as _install_error_log
 
 _install_error_log(process_label="cli")
 
+from pollypm.cli_shortcuts import render_shortcuts_text
 from pollypm.config import (
     DEFAULT_CONFIG_PATH,
     resolve_config_path,
@@ -265,6 +266,12 @@ def init(
 @app.command()
 def example_config() -> None:
     typer.echo(render_example_config())
+
+
+@app.command()
+def shortcuts() -> None:
+    """Print a curated cheatsheet of PollyPM commands."""
+    typer.echo(render_shortcuts_text())
 
 
 _ROLE_GUIDES = {

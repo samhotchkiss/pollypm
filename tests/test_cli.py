@@ -261,6 +261,19 @@ def test_worker_start_no_role_is_deprecated(monkeypatch, tmp_path: Path) -> None
     assert "pm task claim" in result.output
 
 
+def test_shortcuts_command_prints_curated_cheatsheet() -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(cli.app, ["shortcuts"])
+
+    assert result.exit_code == 0
+    assert "PollyPM shortcuts" in result.output
+    assert "Create" in result.output
+    assert "pm task create" in result.output
+    assert "pm activity --follow" in result.output
+    assert "pm briefing" in result.output
+
+
 def test_worker_start_role_architect_still_works(monkeypatch, tmp_path: Path) -> None:
     """``pm worker-start --role architect <project>`` remains supported.
 

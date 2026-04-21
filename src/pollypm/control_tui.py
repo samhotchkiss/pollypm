@@ -27,6 +27,11 @@ from pollypm.accounts import (
     AccountStatus,
 )
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+from pollypm.control_tui_routes import (
+    focus_attr_for_tab,
+    resolve_button_route,
+    resolve_tab_shortcut,
+)
 from pollypm.models import ProviderKind
 from pollypm.projects import (
     discover_git_repositories,
@@ -1289,59 +1294,25 @@ class PollyPMApp(App[None]):
             self.action_focus_alert_session()
 
     def on_key(self, event: events.Key) -> None:
-        tab_map = {
-            "1": "dashboard-tab",
-            "2": "accounts-tab",
-            "3": "projects-tab",
-            "4": "sessions-tab",
-            "5": "alerts-tab",
-            "6": "events-tab",
-        }
         if event.key == "b":
             self.action_toggle_open_permissions()
             event.stop()
             return
-        tab_id = tab_map.get(event.key)
+        tab_id = resolve_tab_shortcut(event.key)
         if tab_id is None:
             return
         self._set_active_tab(tab_id)
         event.stop()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        actions = {
-            "dashboard-open": self.action_open_selected_session,
-            "dashboard-ensure": self.action_ensure_pollypm,
-            "dashboard-heartbeat": self.action_run_heartbeat,
-            "dashboard-permissions": self.action_toggle_open_permissions,
-            "accounts-add-codex": self.action_add_codex_account,
-            "accounts-add-claude": self.action_add_claude_account,
-            "accounts-usage": self.action_refresh_selected_account_usage,
-            "accounts-relogin": self.action_relogin_selected_account,
-            "accounts-switch-operator": self.action_switch_operator,
-            "accounts-controller": self.action_make_controller,
-            "accounts-failover": self.action_toggle_failover,
-            "accounts-remove": self.action_remove_selected_account,
-            "projects-scan": self.action_scan_projects,
-            "projects-add": self.action_add_project,
-            "projects-tracker": self.action_init_project_tracker,
-            "projects-root": self.action_set_workspace_root,
-            "projects-worker": self.action_new_worker,
-            "projects-remove": self.action_remove_selected_project,
-            "sessions-open": self.action_open_selected_session,
-            "sessions-send": self.action_send_input_selected,
-            "sessions-claim": self.action_claim_selected_session,
-            "sessions-release": self.action_release_selected_session,
-            "sessions-stop": self.action_stop_selected_session,
-            "sessions-remove": self.action_remove_selected_session,
-            "alerts-focus": self.action_focus_alert_session,
-        }
-        button_id = event.button.id or ""
-        if button_id.startswith("nav-"):
-            self._set_active_tab(button_id.removeprefix("nav-"))
+        route = resolve_button_route(event.button.id or "")
+        if route is None:
             return
-        action = actions.get(button_id)
-        if action is not None:
-            action()
+        if route.tab_id is not None:
+            self._set_active_tab(route.tab_id)
+            return
+        if route.action_name is not None:
+            getattr(self, route.action_name)()
 
     def _active_tab(self) -> str:
         try:
@@ -1351,15 +1322,8 @@ class PollyPMApp(App[None]):
 
     def _set_active_tab(self, tab_id: str) -> None:
         self.query_one("#tabs", TabbedContent).active = tab_id
-        focus_map = {
-            "dashboard-tab": self.cockpit_table,
-            "accounts-tab": self.accounts_table,
-            "projects-tab": self.projects_table,
-            "sessions-tab": self.sessions_table,
-            "alerts-tab": self.alerts_table,
-            "events-tab": self.events_table,
-        }
-        widget = focus_map.get(tab_id)
+        focus_attr = focus_attr_for_tab(tab_id)
+        widget = getattr(self, focus_attr, None) if focus_attr is not None else None
         if widget is not None:
             widget.focus()
         self.session_preview_cache = None

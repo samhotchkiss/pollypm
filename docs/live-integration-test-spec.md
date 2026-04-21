@@ -35,7 +35,8 @@ before proceeding. The test is about the task flow, not session recovery.
 
 **Verify**:
 - [ ] Polly runs `pm add-project /Users/sam/dev/weather-cli` or equivalent
-- [ ] Polly runs `pm worker-start weather_cli`
+- [ ] Polly creates and queues the first task for `weather_cli`
+- [ ] Polly claims that task (`pm task claim <id>`) or otherwise dispatches it through the task system
 - [ ] A worker session appears in the storage closet
 - [ ] Project appears in the cockpit rail
 - [ ] Polly confirms the project is set up

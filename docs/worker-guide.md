@@ -77,9 +77,9 @@ This:
 - Launches an interactive Claude session in a tmux window named
   `task-<project>-<number>`.
 
-If you are **already inside** a worker session that was started by
-`pm worker-start`, you do not need to run `claim` — the PM does that. You will
-simply see the task prompt land in your current window.
+If you are **already inside** the per-task worker session Polly opened for
+this claim, you do not need to run `claim` again — the PM already did it.
+You will simply see the task prompt land in your current window.
 
 ### 4. Build
 
@@ -163,9 +163,9 @@ travel in `--output`.
 ### 3. "provision_worker failed … tmux new-session exit 1"
 
 The storage-closet tmux session already exists. In the current build this is
-benign for workers launched via `pm worker-start` — your existing session
-picks up the work. If you ran `pm task claim` from a fresh shell and see this,
-either:
+usually benign when the PM already claimed the task from an existing worker
+session — that session picks up the work. If you ran `pm task claim` from a
+fresh shell and see this, either:
 
 - Work inside the existing session (check `pm session list`), or
 - Run `pm task release <id>` and re-claim from inside an active worker
@@ -198,8 +198,8 @@ pm task queue shortlink_gen/1
 
 ### 6. "No project '<name>' registered"
 
-`pm worker-start` or `pm task create` was given a project name that isn't
-registered. List what's available:
+`pm task create` or another project-scoped command was given a project name
+that isn't registered. List what's available:
 
 ```bash
 pm projects

@@ -18,6 +18,107 @@ from pollypm.recovery.default import DefaultRecoveryPolicy
 logger = logging.getLogger(__name__)
 
 
+def _registered_worktree_head(project_path: Path, worktree_path: str) -> str | None:
+    """Return the registered HEAD OID for ``worktree_path`` under ``project_path``.
+
+    The heartbeat only needs read-only metadata, so it resolves the worktree
+    against the project's own git worktree registry instead of running git in
+    the claimed worktree directory.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_path), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "work-signal: git worktree list failed for %s",
+            project_path, exc_info=True,
+        )
+        return None
+
+    if result.returncode != 0:
+        logger.debug(
+            "work-signal: git worktree list exited %d for %s: %s",
+            result.returncode,
+            project_path,
+            result.stderr.strip(),
+        )
+        return None
+
+    try:
+        target = Path(worktree_path).resolve()
+    except OSError:
+        target = Path(worktree_path)
+
+    registered_path: Path | None = None
+    registered_head: str | None = None
+    for line in result.stdout.splitlines():
+        if not line:
+            if registered_path == target and registered_head:
+                return registered_head
+            registered_path = None
+            registered_head = None
+            continue
+        if line.startswith("worktree "):
+            registered = line[len("worktree "):].strip()
+            try:
+                registered_path = Path(registered).resolve()
+            except OSError:
+                registered_path = Path(registered)
+            registered_head = None
+            continue
+        if registered_path is not None and line.startswith("HEAD "):
+            registered_head = line[len("HEAD "):].strip()
+
+    if registered_path == target and registered_head:
+        return registered_head
+    return None
+
+
+def _last_commit_age_for_worktree(
+    project_path: Path,
+    worktree_path: str,
+    *,
+    now: datetime,
+) -> int | None:
+    """Return the last commit age for a registered worktree, if available."""
+    head = _registered_worktree_head(project_path, worktree_path)
+    if not head:
+        logger.debug(
+            "work-signal: skipping git log for unregistered worktree %s",
+            worktree_path,
+        )
+        return None
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_path), "log", "-1", "--format=%ct", head],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "work-signal: git log failed for registered worktree %s",
+            worktree_path, exc_info=True,
+        )
+        return None
+
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+
+    try:
+        commit_ts = int(result.stdout.strip())
+    except ValueError:
+        return None
+    return int(now.timestamp() - commit_ts)
+
+
 def _collect_work_service_signals(
     api: Any, context: HeartbeatSessionContext,
 ) -> dict[str, Any]:
@@ -130,19 +231,13 @@ def _collect_work_service_signals(
         # Git commit timestamp on the claimed task's worktree.
         if worktree_path:
             try:
-                result = subprocess.run(
-                    ["git", "log", "-1", "--format=%ct"],
-                    cwd=worktree_path,
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                    check=False,
+                commit_age = _last_commit_age_for_worktree(
+                    project_path,
+                    worktree_path,
+                    now=now,
                 )
-                if result.returncode == 0 and result.stdout.strip():
-                    ct = int(result.stdout.strip())
-                    out["last_commit_seconds_ago"] = int(
-                        now.timestamp() - ct,
-                    )
+                if commit_age is not None:
+                    out["last_commit_seconds_ago"] = commit_age
             except Exception:  # noqa: BLE001
                 logger.debug(
                     "work-signal: git log failed for %s",

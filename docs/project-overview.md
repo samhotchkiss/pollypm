@@ -2,6 +2,11 @@
 
 # PollyPM Overview
 
+This document is the deep context dump for contributors who already know the
+basics. Start with [README.md](../README.md) for the system map and
+[docs/getting-started.md](getting-started.md) for install and first-run
+instructions; this file is intentionally the third stop, not the front door.
+
 ## Summary
 - Goals: ✓ CRITICAL-EMERGENCY: Recovered from 270+ minute catastrophic failure
 - Architecture Changes: Start with issue #1 (global/project-local config split).

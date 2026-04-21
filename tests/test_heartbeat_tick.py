@@ -372,6 +372,29 @@ class TestHeartbeatTick:
         roster.entries[0].payload["items"].append(99)
         assert queue.enqueued[0]["payload"] == {"items": [1, 2, 3]}
 
+    def test_primitive_payload_avoids_deepcopy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        roster = Roster()
+        roster.register(
+            schedule="@on_startup",
+            handler_name="boot",
+            payload={"project": "pollypm", "count": 3, "enabled": True},
+        )
+        queue = FakeQueue()
+        hb = Heartbeat(roster, queue)
+
+        def _boom(_value):
+            raise AssertionError("deepcopy should not run for primitive payloads")
+
+        monkeypatch.setattr("pollypm.heartbeat.tick.copy.deepcopy", _boom)
+
+        result = hb.tick(_utc())
+        assert result.enqueued_count == 1
+        assert result.enqueued[0].payload == {
+            "project": "pollypm",
+            "count": 3,
+            "enabled": True,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Performance

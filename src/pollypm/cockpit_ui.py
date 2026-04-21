@@ -97,6 +97,10 @@ from pollypm.cockpit_settings_accounts import (
     render_settings_account_detail,
 )
 from pollypm.cockpit_workers import PollyWorkerRosterApp
+from pollypm.rejection_feedback import (
+    feedback_target_task_id,
+    is_rejection_feedback_task,
+)
 from pollypm.session_services import create_tmux_client
 from pollypm.service_api import PollyPMService
 from pollypm.cockpit import build_cockpit_detail
@@ -3503,6 +3507,10 @@ def _format_inbox_row(
         text.append("\u25c6 ", style="#f0c45a")  # yellow diamond
     else:
         text.append("\u25cb ", style="#4a5568")  # dim circle
+    subject_prefix = ""
+    if is_rejection_feedback_task(task):
+        subject_prefix = "🔄 "
+        text.append(subject_prefix, style="#ffb454")
     subject = task.title or "(no subject)"
     reply_suffix = ""
     if reply_count:
@@ -3510,7 +3518,9 @@ def _format_inbox_row(
         reply_suffix = f" ({reply_count} {noun})"
     # Account for the 2-char marker glyph prefix so the total row still
     # fits the target list-pane width without wrapping.
-    max_subject = max(8, width - 2 - len(tree_marker) - len(reply_suffix))
+    max_subject = max(
+        8, width - 2 - len(tree_marker) - len(reply_suffix) - len(subject_prefix)
+    )
     if len(subject) > max_subject:
         subject = subject[: max_subject - 1] + "\u2026"
     subject_style = "bold #eef2f4" if is_unread else "bold #b8c4cf"
@@ -3525,6 +3535,10 @@ def _format_inbox_row(
     age = format_relative(iso) if iso else ""
     project = (task.project or "").strip() or "\u2014"
     meta_bits = [project]
+    if is_rejection_feedback_task(task):
+        target_task = feedback_target_task_id(task)
+        if target_task:
+            meta_bits.append(f"feedback for {target_task}")
     if age:
         meta_bits.append(age)
     meta_indent = " " * max(2, len(tree_marker) + 2)
@@ -4074,6 +4088,8 @@ class _InboxListItem(ListItem):
         super().__init__(self._body, classes=row_classes)
         if is_unread:
             self.add_class("unread")
+        if row.is_task and is_rejection_feedback_task(row.task):
+            self.add_class("rejection-feedback")
 
     def mark_read(self, row: InboxThreadRow | None = None) -> None:
         """Flip the row to read styling in place (no reflow of the list)."""
@@ -4128,12 +4144,23 @@ class PollyInboxApp(App[None]):
     #inbox-list > .inbox-row.reply-row {
         color: #97a6b2;
     }
+    #inbox-list > .inbox-row.rejection-feedback {
+        border-left: thick #ffb454;
+        background: #17110d;
+    }
     #inbox-list > .inbox-row.-highlight {
         background: #1e2730;
+    }
+    #inbox-list > .inbox-row.rejection-feedback.-highlight {
+        background: #23180f;
     }
     #inbox-list:focus > .inbox-row.-highlight {
         background: #253140;
         color: #f2f6f8;
+    }
+    #inbox-list:focus > .inbox-row.rejection-feedback.-highlight {
+        background: #2d1e10;
+        color: #fff3df;
     }
     #inbox-detail-wrap {
         height: 1fr;

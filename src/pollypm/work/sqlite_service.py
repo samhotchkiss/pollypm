@@ -28,6 +28,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+from pollypm.rejection_feedback import emit_rejection_feedback
 from pollypm.work.flow_engine import resolve_flow
 from pollypm.work.gates import GateRegistry, evaluate_gates, has_hard_failure
 from pollypm.work.models import (
@@ -1767,6 +1768,12 @@ class SQLiteWorkService:
 
         result = self.get(task_id)
         self._sync_transition(result, WorkStatus.REVIEW.value, WorkStatus.IN_PROGRESS.value)
+        try:
+            emit_rejection_feedback(self, task=result, reviewer=actor, reason=reason)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "emit_rejection_feedback failed for %s: %s", task_id, exc,
+            )
         # Notify the per-task worker session about the rejection
         if self._session_mgr is not None:
             try:

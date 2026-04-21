@@ -12,6 +12,7 @@ from textual.widgets import DataTable, Static
 
 from pollypm.work.models import (
     ActorType,
+    ContextEntry,
     ExecutionStatus,
     FlowNode,
     FlowNodeExecution,
@@ -75,19 +76,23 @@ def _task(
     priority: Priority = Priority.HIGH,
     updated_at: datetime | None = None,
     executions: list[FlowNodeExecution] | None = None,
+    labels: list[str] | None = None,
+    flow_template_id: str = "plan_project",
+    description: str = "Make the live task detail useful.",
 ) -> Task:
     return Task(
         project="demo",
         task_number=task_number,
         title=title,
         type=TaskType.TASK,
+        labels=list(labels or []),
         work_status=status,
-        flow_template_id="plan_project",
+        flow_template_id=flow_template_id,
         flow_template_version=1,
         current_node_id=node_id,
         assignee="architect_demo",
         priority=priority,
-        description="Make the live task detail useful.",
+        description=description,
         roles={"architect": "architect_demo", "operator": "polly"},
         created_at=datetime(2026, 4, 20, 16, 0, tzinfo=UTC),
         created_by="polly",
@@ -149,11 +154,13 @@ class _FakeSvc:
         flow: FlowTemplate,
         worker_sessions: dict[str, WorkerSessionRecord | None] | None = None,
         owner_by_id: dict[str, str] | None = None,
+        context_by_id: dict[tuple[str, str | None], list] | None = None,
     ) -> None:
         self._tasks_factory = tasks_factory
         self._flow = flow
         self._worker_sessions = worker_sessions or {}
         self._owner_by_id = owner_by_id or {}
+        self._context_by_id = context_by_id or {}
         self.approvals: list[tuple[str, str, str]] = []
         self.rejections: list[tuple[str, str, str]] = []
 
@@ -167,10 +174,14 @@ class _FakeSvc:
                 return deepcopy(task)
         raise AssertionError(task_id)
 
-    def get_context(self, task_id: str, limit: int = 15):
+    def get_context(
+        self,
+        task_id: str,
+        limit: int = 15,
+        entry_type: str | None = None,
+    ):
         assert task_id.startswith("demo/")
-        assert limit == 15
-        return []
+        return list(self._context_by_id.get((task_id, entry_type), []))
 
     def get_execution(self, task_id: str):
         return list(self.get(task_id).executions)
@@ -505,6 +516,91 @@ def test_task_app_surfaces_priority_glyphs_and_sorts_critical_first(env, monkeyp
             assert rows[0][2] == "🔴 Critical fix"
             assert rows[1][2] == "🟢 Low follow-up"
             assert "Priority   🔴 critical" in overview
+
+    _run(body())
+
+
+def test_task_app_surfaces_unread_rejection_feedback(env, monkeypatch) -> None:
+    if not _load_config_compatible(env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_tasks import PollyTasksApp
+
+    work_task = _task(node_id="synthesize", title="Ship Notesy visibility")
+    feedback_task = _task(
+        task_number=99,
+        node_id="chat",
+        title="Rejected demo/1 — Ship Notesy visibility",
+        flow_template_id="chat",
+        labels=["review_feedback", "task:demo/1", "project:demo"],
+        description="Need better rollback coverage.\n\nReturned for rework.",
+    )
+    fake_svc = _FakeSvc(
+        tasks_factory=lambda: [work_task, feedback_task],
+        flow=_flow(),
+    )
+
+    monkeypatch.setattr("pollypm.cockpit_tasks.create_tmux_client", lambda: _FakeTmux([]))
+
+    app = PollyTasksApp(env["config_path"], "demo")
+    app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            rows = _table_rows(app.query_one("#tasks-table", DataTable))
+            overview = str(app.query_one("#task-detail", Static).render())
+
+            assert len(rows) == 1
+            assert rows[0][1] == "in_progress · feedback"
+            assert rows[0][2] == "🔄 🟠 Ship Notesy visibility"
+            assert rows[0][4] == "synthesize · Rejected"
+            assert "Inbox Feedback" in overview
+            assert "Need better rollback coverage." in overview
+
+    _run(body())
+
+
+def test_task_app_clears_rejection_feedback_after_inbox_open(env, monkeypatch) -> None:
+    if not _load_config_compatible(env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_tasks import PollyTasksApp
+
+    work_task = _task(node_id="synthesize", title="Ship Notesy visibility")
+    feedback_task = _task(
+        task_number=99,
+        node_id="chat",
+        title="Rejected demo/1 — Ship Notesy visibility",
+        flow_template_id="chat",
+        labels=["review_feedback", "task:demo/1", "project:demo"],
+        description="Need better rollback coverage.\n\nReturned for rework.",
+    )
+    read_marker = ContextEntry(
+        actor="user",
+        timestamp=datetime(2026, 4, 20, 17, 30, tzinfo=UTC),
+        text="opened in cockpit inbox",
+        entry_type="read",
+    )
+    fake_svc = _FakeSvc(
+        tasks_factory=lambda: [work_task, feedback_task],
+        flow=_flow(),
+        context_by_id={("demo/99", "read"): [read_marker]},
+    )
+
+    monkeypatch.setattr("pollypm.cockpit_tasks.create_tmux_client", lambda: _FakeTmux([]))
+
+    app = PollyTasksApp(env["config_path"], "demo")
+    app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            rows = _table_rows(app.query_one("#tasks-table", DataTable))
+            overview = str(app.query_one("#task-detail", Static).render())
+
+            assert len(rows) == 1
+            assert rows[0][1] == "in_progress"
+            assert rows[0][2] == "🟠 Ship Notesy visibility"
+            assert "Inbox Feedback" not in overview
 
     _run(body())
 

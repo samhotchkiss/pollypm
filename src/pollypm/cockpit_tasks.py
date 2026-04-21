@@ -22,6 +22,11 @@ from pollypm.cockpit_task_review import (
 from pollypm.cockpit_formatting import format_event_time
 from pollypm.cockpit_formatting import format_relative_age as _format_relative_age
 from pollypm.config import load_config
+from pollypm.rejection_feedback import (
+    RejectionFeedbackNotice,
+    is_rejection_feedback_task,
+    unread_rejection_feedback,
+)
 from pollypm.session_services import create_tmux_client
 from pollypm.tz import format_time as _fmt_time
 
@@ -161,7 +166,14 @@ def _task_matches_query(task, owner: str | None, query: str) -> bool:
     return query in haystack
 
 
-def _render_overview(task, *, owner: str | None, flow, active_session) -> str:
+def _render_overview(
+    task,
+    *,
+    owner: str | None,
+    flow,
+    active_session,
+    rejection_feedback: RejectionFeedbackNotice | None = None,
+) -> str:
     icon = PollyTasksApp._STATUS_ICONS.get(task.work_status.value, "·")
     lines = [
         f"{icon} #{task.task_number} {priority_glyph(task)} {task.title}",
@@ -193,6 +205,16 @@ def _render_overview(task, *, owner: str | None, flow, active_session) -> str:
         lines.append(line)
     if active_session is not None:
         lines.append(f"Session    {active_session.agent_name}")
+    if rejection_feedback is not None:
+        lines.extend(
+            [
+                "",
+                "Inbox Feedback",
+                "",
+                f"Status     Rejected — feedback in inbox ({rejection_feedback.inbox_task_id})",
+                f"Preview    {rejection_feedback.preview}",
+            ]
+        )
     if task.description:
         lines.extend(["", "Description", "", task.description])
     if task.acceptance_criteria:
@@ -438,6 +460,7 @@ class PollyTasksApp(App[None]):
         self.project_key = project_key
         self._tasks: list = []
         self._owner_by_task_id: dict[str, str | None] = {}
+        self._rejection_feedback_by_task_id: dict[str, RejectionFeedbackNotice] = {}
         self._selected_task_id: str | None = None
         self._status_filter = "active"
         self._search_query = ""
@@ -523,17 +546,24 @@ class PollyTasksApp(App[None]):
             return None
         return SQLiteWorkService(db_path=db_path, project_path=project.path)
 
-    def _load_tasks(self) -> tuple[list, dict[str, str | None]]:
+    def _load_tasks(
+        self,
+    ) -> tuple[list, dict[str, str | None], dict[str, RejectionFeedbackNotice]]:
         svc = self._get_svc()
         if svc is None:
-            return [], {}
+            return [], {}, {}
         try:
-            tasks = list(svc.list_tasks(project=self.project_key))
+            tasks = [
+                task
+                for task in svc.list_tasks(project=self.project_key)
+                if not is_rejection_feedback_task(task)
+            ]
             owners = {task.task_id: svc.derive_owner(task) for task in tasks}
+            feedback = unread_rejection_feedback(svc, project=self.project_key)
         finally:
             svc.close()
         tasks.sort(key=_task_sort_key)
-        return tasks, owners
+        return tasks, owners, feedback
 
     def _filtered_tasks(self) -> list:
         visible: list = []
@@ -607,12 +637,20 @@ class PollyTasksApp(App[None]):
             updated = _format_event_time(
                 getattr(task, "updated_at", None) or getattr(task, "created_at", None)
             )
+            feedback = self._rejection_feedback_by_task_id.get(task.task_id)
+            status = task.work_status.value
+            title = f"{priority_glyph(task)} {task.title}"
+            stage = task.current_node_id or "—"
+            if feedback is not None:
+                status = f"{status} · feedback"
+                title = f"🔄 {title}"
+                stage = f"{stage} · Rejected"
             self.task_table.add_row(
                 f"#{task.task_number}",
-                task.work_status.value,
-                f"{priority_glyph(task)} {task.title}",
+                status,
+                title,
                 owner,
-                task.current_node_id or "—",
+                stage,
                 updated or "—",
                 key=task.task_id,
             )
@@ -629,7 +667,9 @@ class PollyTasksApp(App[None]):
         self._show_detail(target_id)
 
     def _refresh_list(self, *, select_first: bool = False) -> None:
-        self._tasks, self._owner_by_task_id = self._load_tasks()
+        self._tasks, self._owner_by_task_id, self._rejection_feedback_by_task_id = (
+            self._load_tasks()
+        )
         self._render_table(select_first=select_first)
 
     def _render_timeline(self, executions: list) -> None:
@@ -680,10 +720,13 @@ class PollyTasksApp(App[None]):
 
     def _render_selected_task(self, task, *, owner: str | None, flow, active_session) -> None:
         icon = self._STATUS_ICONS.get(task.work_status.value, "·")
+        feedback = self._rejection_feedback_by_task_id.get(task.task_id)
         header_bits = [
-            f"{icon} #{task.task_number} {priority_glyph(task)} {task.title}",
+            f"{'🔄 ' if feedback is not None else ''}{icon} #{task.task_number} {priority_glyph(task)} {task.title}",
             f"{task.work_status.value} · {_format_relative_age(task.updated_at or task.created_at)}",
         ]
+        if feedback is not None:
+            header_bits.append("Rejected — feedback in inbox")
         self.detail_header.update("\n".join(header_bits))
         self.detail_overview.update(
             _render_overview(
@@ -691,6 +734,7 @@ class PollyTasksApp(App[None]):
                 owner=owner,
                 flow=flow,
                 active_session=active_session,
+                rejection_feedback=feedback,
             )
         )
         self.detail_context.update(_render_context(task))

@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import pytest
 
+from pollypm.rejection_feedback import (
+    feedback_target_task_id,
+    is_rejection_feedback_task,
+    rejection_feedback_preview,
+)
 from pollypm.work.models import (
     Artifact,
     ArtifactKind,
@@ -219,6 +224,23 @@ class TestReject:
 
         with pytest.raises(ValidationError, match="Reason is required"):
             svc.reject(task.task_id, "polly", "")
+
+    def test_reject_creates_feedback_inbox_item(self, svc):
+        task = _create_task(svc)
+        _claim_task(svc, task)
+        svc.node_done(task.task_id, "pete", _valid_work_output())
+
+        svc.reject(task.task_id, "polly", "Needs better rollback coverage")
+
+        feedback_tasks = [
+            candidate
+            for candidate in svc.list_tasks(project="proj")
+            if is_rejection_feedback_task(candidate)
+        ]
+        assert len(feedback_tasks) == 1
+        feedback = feedback_tasks[0]
+        assert feedback_target_task_id(feedback) == task.task_id
+        assert rejection_feedback_preview(feedback) == "Needs better rollback coverage"
 
     def test_full_rejection_cycle(self, svc):
         """implement(v1) -> review -> reject -> implement(v2) -> review -> approve -> done"""

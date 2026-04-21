@@ -186,6 +186,31 @@ def test_list_row_renders_title_on_line1_and_project_age_on_line2(
     _run(body())
 
 
+def test_inbox_row_marks_rejection_feedback_threads(inbox_env) -> None:
+    from pollypm.cockpit_ui import _format_inbox_row
+
+    db_path = inbox_env["project_path"] / ".pollypm" / "state.db"
+    svc = SQLiteWorkService(db_path=db_path, project_path=inbox_env["project_path"])
+    try:
+        task = svc.create(
+            title="Rejected demo/1 — Smoke subject",
+            description="Need better rollback coverage.\n\nReturned for rework.",
+            type="task",
+            project="demo",
+            flow_template="chat",
+            roles={"requester": "polly", "operator": "user"},
+            priority="high",
+            created_by="polly",
+            labels=["review_feedback", "task:demo/1", "project:demo"],
+        )
+    finally:
+        svc.close()
+
+    plain = _format_inbox_row(task, is_unread=True).plain.splitlines()
+    assert plain[0].startswith("◆ 🔄 Rejected demo/1")
+    assert "feedback for demo/1" in plain[1]
+
+
 def test_selecting_a_row_renders_detail_and_clears_unread(inbox_env, inbox_app) -> None:
     """Keyboard navigation opens the message and records a read marker."""
     async def body() -> None:

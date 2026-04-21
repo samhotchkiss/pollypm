@@ -146,6 +146,76 @@ def test_sync_transcripts_once_normalizes_claude_and_codex_events(tmp_path: Path
     # See transcript_ingest.py:154.
 
 
+def test_sync_transcripts_once_skips_non_dict_json_lines(tmp_path: Path, caplog) -> None:
+    config, _config_path = _config(tmp_path)
+    claude_file = config.accounts["claude_main"].home / ".claude/projects/demo/session-a.jsonl"
+    claude_file.parent.mkdir(parents=True, exist_ok=True)
+    claude_file.write_text(
+        "\n".join(
+            [
+                json.dumps([]),
+                json.dumps(
+                    {
+                        "timestamp": "2026-04-10T00:00:00Z",
+                        "type": "assistant",
+                        "sessionId": "session-a",
+                        "cwd": str(config.project.root_dir),
+                        "message": {
+                            "content": [{"type": "text", "text": "Claude survived."}],
+                            "usage": {"total_tokens": 3},
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+
+    codex_file = config.accounts["codex_main"].home / ".codex/sessions/2026/04/10/rollout-test.jsonl"
+    codex_file.parent.mkdir(parents=True, exist_ok=True)
+    codex_file.write_text(
+        "\n".join(
+            [
+                json.dumps("bad shape"),
+                json.dumps(
+                    {
+                        "timestamp": "2026-04-10T00:00:00Z",
+                        "type": "session_meta",
+                        "payload": {"id": "session-b", "cwd": str(config.project.root_dir)},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-04-10T00:00:01Z",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {"last_token_usage": {"total_tokens": 8}},
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+
+    with caplog.at_level("DEBUG", logger="pollypm.transcript_ingest"):
+        sync_transcripts_once(config)
+
+    claude_events = [
+        json.loads(line)
+        for line in (config.project.root_dir / ".pollypm/transcripts/session-a/events.jsonl").read_text().splitlines()
+    ]
+    codex_events = [
+        json.loads(line)
+        for line in (config.project.root_dir / ".pollypm/transcripts/session-b/events.jsonl").read_text().splitlines()
+    ]
+
+    assert [event["event_type"] for event in claude_events] == ["assistant_turn", "token_usage"]
+    assert [event["event_type"] for event in codex_events] == ["session_state", "token_usage"]
+    assert sum(record.message == "Skipping non-object transcript line" for record in caplog.records) == 2
+
+
 def test_sync_transcripts_once_resumes_and_picks_up_rotated_file(tmp_path: Path) -> None:
     config, _config_path = _config(tmp_path)
     claude_root = config.accounts["claude_main"].home / ".claude/projects/demo"

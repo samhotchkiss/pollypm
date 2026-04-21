@@ -232,6 +232,121 @@ def _remove_sqlite_sidecars(db_path: Path) -> None:
             ) from exc
 
 
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _add_path_to_archive(
+    tar: tarfile.TarFile,
+    source: Path,
+    *,
+    arcname: str,
+    allowed_root: Path,
+) -> None:
+    """Add ``source`` to ``tar`` while refusing symlinks and special files."""
+    if source.is_symlink():
+        raise ValueError(f"refusing to include symlink in full backup: {source}")
+
+    try:
+        resolved = source.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(
+            f"refusing to include unreadable path in full backup: {source}: {exc}"
+        ) from exc
+
+    if not _path_is_within(resolved, allowed_root):
+        raise ValueError(
+            f"refusing to include path outside archive root {allowed_root}: {source}"
+        )
+
+    if source.is_dir():
+        tar.add(source, arcname=arcname, recursive=False)
+        for child in sorted(source.iterdir()):
+            _add_path_to_archive(
+                tar,
+                child,
+                arcname=f"{arcname}/{child.name}",
+                allowed_root=allowed_root,
+            )
+        return
+
+    if source.is_file():
+        tar.add(source, arcname=arcname, recursive=False)
+        return
+
+    raise ValueError(f"refusing to include non-file path in full backup: {source}")
+
+
+def _archive_member_kind(member: tarfile.TarInfo) -> str:
+    if member.isfile():
+        return "regular file"
+    if member.isdir():
+        return "directory"
+    if member.issym():
+        return "symlink"
+    if member.islnk():
+        return "hard link"
+    if member.ischr():
+        return "character device"
+    if member.isblk():
+        return "block device"
+    if member.isfifo():
+        return "fifo"
+    return f"type {member.type!r}"
+
+
+def _require_regular_state_db_member(
+    tar: tarfile.TarFile, snapshot_path: Path
+) -> tarfile.TarInfo:
+    matches = [member for member in tar.getmembers() if member.name == "state.db"]
+    if not matches:
+        raise ValueError(
+            f"full backup is missing state.db at the archive root: {snapshot_path}"
+        )
+    if len(matches) != 1:
+        raise ValueError(
+            f"full backup has duplicate state.db entries at the archive root: {snapshot_path}"
+        )
+
+    member = matches[0]
+    if not member.isfile():
+        kind = _archive_member_kind(member)
+        raise ValueError(
+            f"full backup state.db must be a regular file, found {kind}: {snapshot_path}"
+        )
+    return member
+
+
+def _extract_valid_state_db_from_archive(snapshot_path: Path, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with tarfile.open(snapshot_path, mode="r:gz") as tar:
+            member = _require_regular_state_db_member(tar, snapshot_path)
+            extracted = tar.extractfile(member)
+            if extracted is None:
+                raise ValueError(
+                    f"full backup could not open state.db payload: {snapshot_path}"
+                )
+            try:
+                with dest.open("wb") as fout:
+                    shutil.copyfileobj(extracted, fout)
+            finally:
+                extracted.close()
+    except (tarfile.TarError, OSError, KeyError) as exc:
+        raise ValueError(
+            f"failed to read state.db from full backup: {snapshot_path}: {exc}"
+        ) from exc
+
+    if not _is_valid_sqlite_file(dest):
+        raise ValueError(
+            f"full backup state.db is not a valid SQLite database: {snapshot_path}"
+        )
+
+
 # --------------------------------------------------------------------- #
 # Retention
 # --------------------------------------------------------------------- #
@@ -331,23 +446,42 @@ def backup_state_db(
         with tempfile.TemporaryDirectory() as staging:
             staging_db = Path(staging) / "state.db"
             _online_backup_to_plain_file(state_db, staging_db)
+            base_root = base_dir.resolve()
 
-            with tarfile.open(archive_path, mode="w:gz") as tar:
-                tar.add(staging_db, arcname="state.db")
-                # Bundle the base_dir tree — but skip the ``backups/``
-                # subdir so archives don't grow recursively each run.
-                if base_dir.exists():
-                    for child in sorted(base_dir.iterdir()):
-                        if child.resolve() == backup_dir.resolve():
+            try:
+                with tarfile.open(archive_path, mode="w:gz") as tar:
+                    tar.add(staging_db, arcname="state.db", recursive=False)
+                    # Bundle the base_dir tree — but skip the ``backups/``
+                    # subdir so archives don't grow recursively each run.
+                    if base_dir.exists():
+                        for child in sorted(base_dir.iterdir()):
+                            if child == backup_dir:
+                                continue
+                            if child == state_db:
+                                # Already captured as the online backup
+                                continue
+                            _add_path_to_archive(
+                                tar,
+                                child,
+                                arcname=f"base/{child.name}",
+                                allowed_root=base_root,
+                            )
+                    for extra in extra_roots or []:
+                        if not extra.exists():
                             continue
-                        if child.resolve() == state_db.resolve():
-                            # Already captured as the online backup
-                            continue
-                        tar.add(child, arcname=f"base/{child.name}")
-                for extra in extra_roots or []:
-                    if not extra.exists():
-                        continue
-                    tar.add(extra, arcname=f"extra/{extra.name}")
+                        _add_path_to_archive(
+                            tar,
+                            extra,
+                            arcname=f"extra/{extra.name}",
+                            allowed_root=extra.resolve(),
+                        )
+            except Exception:
+                try:
+                    if archive_path.exists():
+                        archive_path.unlink()
+                except OSError:
+                    pass
+                raise
 
         return BackupResult(
             path=archive_path,
@@ -423,13 +557,9 @@ def plan_restore(snapshot_path: Path, live_db: Path) -> RestorePlan:
     else:  # tar
         if not _is_valid_tar_gz(snapshot_path):
             raise ValueError(f"snapshot is not a valid tar.gz: {snapshot_path}")
-        # Ensure it contains a state.db member.
-        with tarfile.open(snapshot_path, mode="r:gz") as tar:
-            names = tar.getnames()
-        if "state.db" not in names:
-            raise ValueError(
-                f"full backup is missing state.db at the archive root: {snapshot_path}"
-            )
+        with tempfile.TemporaryDirectory() as staging:
+            extracted = Path(staging) / "probe.db"
+            _extract_valid_state_db_from_archive(snapshot_path, extracted)
 
     safety_path = live_db.with_name(f"{live_db.name}.before-restore-{_timestamp()}")
     return RestorePlan(
@@ -470,13 +600,7 @@ def execute_restore(plan: RestorePlan) -> RestoreResult:
         staged_db = Path(staging) / "restored.db"
 
         if plan.is_tar:
-            with tarfile.open(snapshot, mode="r:gz") as tar:
-                member = tar.getmember("state.db")
-                extracted = tar.extractfile(member)
-                if extracted is None:
-                    raise RuntimeError("tarfile could not open state.db entry")
-                with staged_db.open("wb") as fout:
-                    shutil.copyfileobj(extracted, fout)
+            _extract_valid_state_db_from_archive(snapshot, staged_db)
         elif snapshot.suffix == ".gz":
             _gunzip_file(snapshot, staged_db)
         else:

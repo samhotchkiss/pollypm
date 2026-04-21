@@ -51,6 +51,13 @@ def _seed_state_db(path: Path) -> None:
         conn.close()
 
 
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"symlinks unsupported in this environment: {exc}")
+
+
 @pytest.fixture
 def fake_home(tmp_path: Path) -> Path:
     """A ``base_dir`` root that mimics ``~/.pollypm/``."""
@@ -227,6 +234,21 @@ def test_full_backup_creates_tar_gz_with_expected_contents(
     # The backups/ subdir itself must NOT be inside the archive
     # (otherwise each run would grow quadratically).
     assert not any(n.startswith("base/backups") for n in names), names
+
+
+def test_full_backup_rejects_symlinked_entries(
+    fake_home: Path, state_db: Path, tmp_path: Path
+) -> None:
+    logs_dir = fake_home / "logs"
+    logs_dir.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside\n")
+    _symlink_or_skip(logs_dir / "escape.txt", outside)
+
+    with pytest.raises(ValueError, match="symlink"):
+        backup_mod.backup_state_db(state_db, base_dir=fake_home, full=True)
+
+    assert not list((fake_home / "backups").glob("full-*.tar.gz"))
 
 
 # --------------------------------------------------------------------- #
@@ -556,4 +578,22 @@ def test_plan_restore_rejects_full_archive_missing_state_db(
         tar.add(junk, arcname="junk.txt")
 
     with pytest.raises(ValueError):
+        backup_mod.plan_restore(broken, fake_home / "state.db")
+
+
+def test_plan_restore_rejects_full_archive_with_symlinked_state_db(
+    fake_home: Path, tmp_path: Path
+) -> None:
+    broken = tmp_path / "symlink-state.tar.gz"
+    payload = tmp_path / "payload.txt"
+    payload.write_text("not a database")
+
+    with tarfile.open(broken, mode="w:gz") as tar:
+        tar.add(payload, arcname="base/payload.txt")
+        link = tarfile.TarInfo("state.db")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "base/payload.txt"
+        tar.addfile(link)
+
+    with pytest.raises(ValueError, match="regular file"):
         backup_mod.plan_restore(broken, fake_home / "state.db")

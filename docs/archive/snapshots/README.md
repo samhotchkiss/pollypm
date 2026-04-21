@@ -1,9 +1,17 @@
 # Archived Snapshots
 
-These files were moved here as stale point-in-time snapshots:
+This directory holds point-in-time status snapshots and generated logs that are
+kept for historical reference only.
 
-- `status-report.md` - archived generated status report from 2026-04-14
-- `system-state-2026-04-11.md` - archived system-state snapshot from 2026-04-11
-- `activity-log.md` - archived activity log snapshot
+These files are intentionally removed from the live docs surface because they
+describe specific pre-v1 moments in time and can mislead readers if presented
+as current documentation.
 
-Use live-generated docs for current status surfaces. These files are historical only.
+Archived snapshots in this directory:
+
+- `status-report-2026-04-14.md`
+- `system-state-2026-04-11.md`
+- `activity-log.md`
+
+If PollyPM needs a current status surface, it should be generated from live
+system state rather than maintained here as a committed snapshot.

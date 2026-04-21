@@ -1,5 +1,11 @@
-# Archived Activity Log Snapshot
+# Activity Log
 
-The historical activity log was moved to [docs/archive/snapshots/activity-log.md](archive/snapshots/activity-log.md).
+This page is archived.
 
-If you need a current activity surface, generate it from live state rather than a committed snapshot.
+The historical generated activity log was moved to
+`docs/archive/snapshots/activity-log.md`. It remains available for forensic or
+historical reference, but it should not appear as active product
+documentation.
+
+For current state and workflow visibility, use live cockpit/task views rather
+than this committed event dump.

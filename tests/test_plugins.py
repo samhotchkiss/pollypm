@@ -598,6 +598,32 @@ def test_entry_point_plugin_with_wrong_api_version_skipped(monkeypatch, tmp_path
     assert any("API version 99" in e for e in host.errors)
 
 
+def test_external_plugin_discovery_emits_trust_warning_once(
+    monkeypatch, tmp_path: Path, capsys,
+) -> None:
+    monkeypatch.setattr(
+        "pollypm.plugin_trust._THIRD_PARTY_EXTENSION_WARNING_EMITTED", False,
+    )
+    plugin_dir = tmp_path / ".pollypm" / "plugins" / "hello"
+    _write_plugin(
+        plugin_dir,
+        name="hello",
+        body=(
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "plugin = PollyPMPlugin(name='hello')\n"
+        ),
+        capabilities=(),
+    )
+
+    host = ExtensionHost(tmp_path)
+    assert "hello" in host.plugins()
+    assert "full user privileges" in capsys.readouterr().err
+
+    host = ExtensionHost(tmp_path)
+    host.plugins()
+    assert capsys.readouterr().err == ""
+
+
 # ---------------------------------------------------------------------------
 # Issue #169 — content_paths(plugin, kind) helper
 # ---------------------------------------------------------------------------

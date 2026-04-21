@@ -40,6 +40,7 @@ from pollypm.plugin_api.v1 import (
     RosterAPI,
     check_requires_api,
 )
+from pollypm.plugin_trust import warn_third_party_extension_trust_once
 
 logger = logging.getLogger(__name__)
 
@@ -620,7 +621,12 @@ class ExtensionHost:
 
         # "repo" is a legacy alias for "project" used by older tests; we
         # accept both so internal call sites can transition gradually.
-        for manifest in self._discover_directory_manifests(sources=("user", "project", "repo")):
+        external_manifests = self._discover_directory_manifests(
+            sources=("user", "project", "repo"),
+        )
+        if external_manifests:
+            warn_third_party_extension_trust_once()
+        for manifest in external_manifests:
             _install_from_manifest(manifest)
 
         self._plugin_sources = sources  # exposed for doctor / CLI later
@@ -677,6 +683,8 @@ class ExtensionHost:
         except Exception as exc:  # noqa: BLE001
             self.errors.append(f"Failed to enumerate pollypm.plugins entry points: {exc}")
             return found
+        if eps:
+            warn_third_party_extension_trust_once()
         for ep in eps:
             try:
                 obj = ep.load()

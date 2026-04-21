@@ -2,6 +2,8 @@
 
 PollyPM uses a file-based plugin system. Plugins are directories containing a manifest (`pollypm-plugin.toml`) and a Python module. No pip install required — just drop the directory in the right location.
 
+Third-party plugins and provider packages are not sandboxed. They run with the same user privileges as PollyPM, so only install code you trust.
+
 ## Plugin Types
 
 | Type | What it provides | Example |

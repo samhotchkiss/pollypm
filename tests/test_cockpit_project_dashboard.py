@@ -35,6 +35,7 @@ from pollypm.cockpit import (
     _task_cycle_minutes,
     _worker_presence,
 )
+from pollypm.cockpit_sections.action_bar import render_project_action_bar
 from pollypm.work.models import (
     Artifact,
     ArtifactKind,
@@ -716,6 +717,7 @@ def test_render_project_dashboard_integration(tmp_path: Path):
         assert heading in out, f"missing section: {heading}"
 
     # Content spot-checks.
+    assert "▸ Clear · no approvals, alerts, or inbox items" in out
     assert "shortlink-gen" in out
     assert "1 in progress" in out
     assert "1 done" in out
@@ -798,3 +800,14 @@ def test_dashboard_visual_structure_is_stable(tmp_path: Path):
         idx = out.find(heading, cursor)
         assert idx >= 0, f"section {heading!r} missing or out of order"
         cursor = idx
+
+
+def test_render_project_action_bar_summarizes_pending_counts() -> None:
+    assert (
+        render_project_action_bar(review_count=3, alert_count=1, inbox_count=5)
+        == "▸ 3 approvals · 1 alert · 5 new in inbox"
+    )
+    assert (
+        render_project_action_bar(review_count=0, alert_count=0, inbox_count=0)
+        == "▸ Clear · no approvals, alerts, or inbox items"
+    )

@@ -4,10 +4,13 @@ from pathlib import Path
 from pollypm.models import KnownProject, ProviderKind
 from pollypm.onboarding import CliAvailability, ConnectedAccount
 from pollypm.onboarding_tui import (
+    ONBOARDING_STAGES,
     OnboardingApp,
     default_controller_account,
     installed_provider_statuses,
     merge_selected_projects,
+    onboarding_progress_lines,
+    onboarding_step_header,
     run_onboarding_app,
 )
 
@@ -196,3 +199,19 @@ def test_connect_provider_cancel_returns_to_onboarding(monkeypatch, tmp_path: Pa
 
     assert rendered == ["rendered"]
     assert messages[-1] == "Login cancelled. Returned to onboarding."
+
+
+def test_onboarding_progress_header_shows_step_count_and_bar() -> None:
+    header = onboarding_step_header("projects")
+
+    assert "Step 3 of 4" in header
+    assert "Add projects" in header
+    assert "█" in header
+
+
+def test_onboarding_progress_lines_mark_done_current_and_up_next() -> None:
+    lines = onboarding_progress_lines("controller")
+
+    assert f"✓[/] [#3ddc84]{ONBOARDING_STAGES[0][1]}" in lines[0]
+    assert f"◉[/] [#5b8aff bold]{ONBOARDING_STAGES[1][1]}" in lines[1]
+    assert f"○[/] [#6b7a88]{ONBOARDING_STAGES[2][1]}" in lines[2]

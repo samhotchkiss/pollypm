@@ -33,6 +33,13 @@ from pollypm.onboarding import (
 from pollypm.projects import discover_recent_git_repositories, ensure_project_scaffold, make_project_key
 from pollypm.session_services import create_tmux_client
 
+ONBOARDING_STAGES = (
+    ("accounts", "Connect account"),
+    ("controller", "Choose controller"),
+    ("projects", "Add projects"),
+    ("tour", "Launch PollyPM"),
+)
+
 
 def installed_provider_statuses(statuses: list[CliAvailability]) -> list[CliAvailability]:
     return [status for status in statuses if status.installed]
@@ -66,6 +73,42 @@ def merge_selected_projects(
         existing_paths.add(normalized)
         keys_in_use.add(project.key)
     return merged
+
+
+def onboarding_step_header(step: str) -> str:
+    """Return the visible step counter + progress bar for ``step``."""
+    stage_ids = [stage_id for stage_id, _label in ONBOARDING_STAGES]
+    total = len(stage_ids)
+    try:
+        index = stage_ids.index(step)
+    except ValueError:
+        index = 0
+    current = index + 1
+    done = min(total, current)
+    bar = "[#3ddc84]" + ("█" * done) + "[/][#253140]" + ("█" * (total - done)) + "[/]"
+    label = ONBOARDING_STAGES[index][1]
+    return f"[#5b8aff bold]Step {current} of {total}[/]  {bar}  [dim]{label}[/]"
+
+
+def onboarding_progress_lines(step: str) -> list[str]:
+    """Return the rail-friendly progress checklist for ``step``."""
+    stage_ids = [stage_id for stage_id, _label in ONBOARDING_STAGES]
+    try:
+        current_index = stage_ids.index(step)
+    except ValueError:
+        current_index = 0
+
+    lines: list[str] = []
+    for index, (_stage_id, label) in enumerate(ONBOARDING_STAGES):
+        if index < current_index:
+            lines.append(f"[#3ddc84]✓[/] [#3ddc84]{label}[/]")
+        elif index == current_index:
+            lines.append(f"[#5b8aff]◉[/] [#5b8aff bold]{label}[/]")
+        else:
+            lines.append(f"[#6b7a88]○[/] [#6b7a88]{label}[/]")
+    lines.append("")
+    lines.append("[dim]Mouse is enabled. Click buttons, choices, and project selections directly.[/dim]")
+    return lines
 
 
 @dataclass(slots=True)
@@ -448,27 +491,11 @@ class OnboardingApp(App[OnboardingResult | None]):
         return Panel("\n".join(lines), title="Connected Accounts", border_style="#253140")
 
     def _progress_panel(self) -> Panel:
-        stages = [
-            ("accounts", "Connect agent accounts"),
-            ("controller", "Choose Polly's control account"),
-            ("projects", "Review suggested projects"),
-        ]
-        step_order = [s[0] for s in stages]
-        current_index = step_order.index(self.step) if self.step in step_order else -1
-        lines = []
-        for i, (step_id, label) in enumerate(stages):
-            if i < current_index:
-                marker = "[#3ddc84]━[/]"
-                lines.append(f"{marker} [#3ddc84]{label}[/]")
-            elif step_id == self.step:
-                marker = "[#5b8aff]►[/]"
-                lines.append(f"{marker} [#5b8aff bold]{label}[/]")
-            else:
-                marker = "[#3e4c5a]─[/]"
-                lines.append(f"{marker} [#3e4c5a]{label}[/]")
-        lines.append("")
-        lines.append("[dim]Mouse is enabled. Click buttons, choices, and project selections directly.[/dim]")
-        return Panel("\n".join(lines), title="Setup", border_style="#253140")
+        return Panel(
+            "\n".join(onboarding_progress_lines(self.step)),
+            title="Setup Progress",
+            border_style="#253140",
+        )
 
     def _tmux_ready(self) -> bool:
         return shutil.which("tmux") is not None
@@ -490,7 +517,7 @@ class OnboardingApp(App[OnboardingResult | None]):
 
     def _render_accounts_step(self) -> None:
         installed = installed_provider_statuses(self.state.statuses)
-        self.eyebrow_widget.update("Setup Step 1")
+        self.eyebrow_widget.update(onboarding_step_header("accounts"))
         self.title_widget.update("Connect your first agent account")
         self.intro_widget.update(
             "PollyPM opens the real Claude or Codex login flow, waits for it to finish, and saves the result "
@@ -563,7 +590,7 @@ class OnboardingApp(App[OnboardingResult | None]):
         return "Connect Codex\nImplementation, shell-heavy work, fast coding loops"
 
     def _render_controller_step(self) -> None:
-        self.eyebrow_widget.update("Setup Step 2")
+        self.eyebrow_widget.update(onboarding_step_header("controller"))
         self.title_widget.update("Choose the account that runs PollyPM")
         self.intro_widget.update(
             "This account runs Polly and heartbeat. If it becomes unavailable, PollyPM can fail over to another "
@@ -621,7 +648,7 @@ class OnboardingApp(App[OnboardingResult | None]):
         actions.mount(Button("Continue", id="controller-next", variant="success"))
 
     def _render_projects_step(self) -> None:
-        self.eyebrow_widget.update("Setup Step 3")
+        self.eyebrow_widget.update(onboarding_step_header("projects"))
         self.title_widget.update("Add active projects")
         self.intro_widget.update(
             "PollyPM looked through your home folder for git repos where your local git identity authored a commit "
@@ -688,7 +715,7 @@ class OnboardingApp(App[OnboardingResult | None]):
         actions.mount(Button(finish_label, id="projects-finish", variant="success"))
 
     def _render_tour_step(self) -> None:
-        self.eyebrow_widget.update("Ready to launch")
+        self.eyebrow_widget.update(onboarding_step_header("tour"))
         self.title_widget.update("Your cockpit is ready")
         self.intro_widget.update("")
         stage = Vertical(classes="stage")

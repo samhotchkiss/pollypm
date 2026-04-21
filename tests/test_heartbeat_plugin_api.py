@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -116,6 +117,10 @@ class FakeHeartbeatAPI:
         self.recoveries: list[tuple[str, str, str]] = []
         self.account_marks: list[tuple[str, str, str]] = []
         self.messages: list[tuple[str, str, str]] = []
+        self.supervisor = SimpleNamespace(
+            config=SimpleNamespace(sessions={}, projects={}),
+            msg_store=_FakeMessageStore(),
+        )
 
     def list_sessions(self) -> list[HeartbeatSessionContext]:
         return list(self._contexts)
@@ -176,6 +181,52 @@ class FakeHeartbeatAPI:
 
     def queue_polly_followup(self, session_name: str, reason: str) -> None:
         self.messages.append(("operator", f"Heartbeat follow-up for {session_name}: {reason}", "heartbeat"))
+
+
+class _FakeMessageStore:
+    def __init__(self) -> None:
+        self._events: list[dict[str, object]] = []
+
+    def query_messages(
+        self,
+        *,
+        type: str | None = None,
+        scope: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, object]]:
+        rows = [
+            event
+            for event in self._events
+            if (type is None or event.get("type") == type)
+            and (scope is None or event.get("scope") == scope)
+        ]
+        rows.sort(key=lambda row: row["created_at"], reverse=True)
+        if limit is not None:
+            rows = rows[:limit]
+        return rows
+
+    def append_event(
+        self,
+        *,
+        scope: str,
+        sender: str,
+        subject: str,
+        payload: dict[str, object],
+        created_at: datetime | None = None,
+    ) -> None:
+        self._events.append(
+            {
+                "type": "event",
+                "scope": scope,
+                "sender": sender,
+                "subject": subject,
+                "payload": payload,
+                "created_at": created_at or datetime.now(timezone.utc),
+            }
+        )
+
+    def upsert_alert(self, *_args, **_kwargs) -> None:
+        return None
 
 
 def _work_signal_api(tmp_path: Path, session_name: str = "worker_pollypm") -> SimpleNamespace:
@@ -645,3 +696,77 @@ def test_local_heartbeat_backend_clears_stale_unmanaged_window_alerts() -> None:
     LocalHeartbeatBackend().run(api)
 
     assert ("heartbeat", "unmanaged_window:pollypm:e2e-sandbox") not in api.alerts
+
+
+def test_worker_nudge_skips_repeat_for_same_snapshot_episode(monkeypatch) -> None:
+    backend = LocalHeartbeatBackend()
+    api = FakeHeartbeatAPI(
+        [],
+        hashes={"worker_pollypm": ["hash-1"] * 7},
+    )
+    context = _context(
+        transcript_delta="",
+        pane_text="Still stalled",
+        previous_snapshot_hash="hash-1",
+        snapshot_hash="hash-1",
+    )
+    monkeypatch.setattr(backend, "_has_pending_work", lambda *_args: True)
+    api.supervisor.msg_store.append_event(
+        scope=context.session_name,
+        sender=context.session_name,
+        subject="nudge",
+        payload={"snapshot_hash": "hash-1"},
+        created_at=datetime.now(timezone.utc) - timedelta(seconds=601),
+    )
+
+    backend._nudge_stalled_worker(api, context)
+
+    assert api.messages == []
+    nudge_events = [
+        event
+        for event in api.supervisor.msg_store.query_messages(
+            type="event",
+            scope=context.session_name,
+            limit=20,
+        )
+        if event.get("subject") == "nudge"
+    ]
+    assert len(nudge_events) == 1
+
+
+def test_worker_nudge_escalates_when_same_episode_keeps_repeating(monkeypatch) -> None:
+    backend = LocalHeartbeatBackend()
+    api = FakeHeartbeatAPI(
+        [],
+        hashes={"worker_pollypm": ["hash-1"] * 8},
+    )
+    context = _context(
+        transcript_delta="",
+        pane_text="Still stalled",
+        previous_snapshot_hash="hash-1",
+        snapshot_hash="hash-1",
+    )
+    monkeypatch.setattr(backend, "_has_pending_work", lambda *_args: True)
+    api.supervisor.msg_store.append_event(
+        scope=context.session_name,
+        sender=context.session_name,
+        subject="nudge",
+        payload={"snapshot_hash": "hash-1"},
+        created_at=datetime.now(timezone.utc) - timedelta(seconds=601),
+    )
+
+    backend._nudge_stalled_worker(api, context)
+
+    assert api.messages == []
+    assert ("worker_pollypm", "stuck_session") in api.alerts
+    escalations = [
+        event
+        for event in api.supervisor.msg_store.query_messages(
+            type="event",
+            scope=context.session_name,
+            limit=20,
+        )
+        if event.get("subject") == "nudge_escalated"
+    ]
+    assert len(escalations) == 1
+    assert escalations[0]["payload"]["snapshot_hash"] == "hash-1"

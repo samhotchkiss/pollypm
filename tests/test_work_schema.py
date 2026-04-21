@@ -206,6 +206,15 @@ def _indexes(conn: sqlite3.Connection) -> set[str]:
     return {row[0] for row in cur.fetchall()}
 
 
+def _index_sql(conn: sqlite3.Connection, name: str) -> str:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name = ?",
+        (name,),
+    ).fetchone()
+    assert row is not None and row[0] is not None
+    return row[0]
+
+
 class TestIndexes:
     def test_key_indexes_exist(self, conn):
         create_work_tables(conn)
@@ -214,11 +223,44 @@ class TestIndexes:
             "idx_work_tasks_status",
             "idx_work_tasks_project_status",
             "idx_work_tasks_assignee",
+            "idx_work_tasks_active",
             "idx_work_tasks_priority",
             "idx_work_deps_to",
+            "idx_work_deps_from",
             "idx_work_exec_task",
             "idx_work_context_task",
             "idx_work_transitions_task",
         }
         for name in expected:
             assert name in idxs, f"Missing index: {name}"
+
+    def test_active_tasks_index_is_partial(self, conn):
+        create_work_tables(conn)
+        sql = _index_sql(conn, "idx_work_tasks_active")
+        assert "current_node_id" in sql
+        assert "WHERE current_node_id IS NOT NULL" in sql
+
+
+def test_legacy_db_gets_hot_query_indexes_and_schema_bump(conn):
+    conn.executescript(
+        """
+        CREATE TABLE work_schema_version (
+            version INTEGER NOT NULL,
+            description TEXT NOT NULL,
+            applied_at TEXT NOT NULL
+        );
+        INSERT INTO work_schema_version (version, description, applied_at)
+        VALUES (4, 'old', '2026-01-01T00:00:00+00:00');
+        """
+    )
+
+    create_work_tables(conn)
+
+    idxs = _indexes(conn)
+    assert "idx_work_tasks_active" in idxs
+    assert "idx_work_deps_from" in idxs
+
+    version = conn.execute(
+        "SELECT COALESCE(MAX(version), 0) FROM work_schema_version"
+    ).fetchone()[0]
+    assert version == 5

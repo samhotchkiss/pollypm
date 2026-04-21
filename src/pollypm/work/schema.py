@@ -101,6 +101,10 @@ CREATE INDEX IF NOT EXISTS idx_work_tasks_assignee
     ON work_tasks(assignee)
     WHERE assignee IS NOT NULL;
 
+CREATE INDEX IF NOT EXISTS idx_work_tasks_active
+    ON work_tasks(current_node_id)
+    WHERE current_node_id IS NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_work_tasks_priority
     ON work_tasks(priority, work_status);
 
@@ -124,6 +128,9 @@ CREATE TABLE IF NOT EXISTS work_task_dependencies (
 
 CREATE INDEX IF NOT EXISTS idx_work_deps_to
     ON work_task_dependencies(to_project, to_task_number);
+
+CREATE INDEX IF NOT EXISTS idx_work_deps_from
+    ON work_task_dependencies(from_project, from_task_number, kind);
 
 -- -------------------------------------------------------------------
 -- Flow node executions
@@ -326,6 +333,21 @@ _WORK_MIGRATIONS: list[tuple[int, str, list[str]]] = [
             """
             CREATE INDEX IF NOT EXISTS idx_notification_staging_created
                 ON notification_staging(created_at)
+            """,
+        ],
+    ),
+    (
+        5,
+        "Add hot-path indexes for active-task and dependency-from queries",
+        [
+            """
+            CREATE INDEX IF NOT EXISTS idx_work_tasks_active
+                ON work_tasks(current_node_id)
+                WHERE current_node_id IS NOT NULL
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_work_deps_from
+                ON work_task_dependencies(from_project, from_task_number, kind)
             """,
         ],
     ),

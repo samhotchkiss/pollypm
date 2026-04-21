@@ -20,6 +20,7 @@ from pollypm.cockpit_sections.base import (
 )
 from pollypm.cockpit_sections.downtime import _section_downtime
 from pollypm.cockpit_sections.header import _section_header, _worker_presence
+from pollypm.cockpit_sections.health import format_project_health_scorecard
 from pollypm.cockpit_sections.in_flight import _section_in_flight
 from pollypm.cockpit_sections.insights import _section_insights
 from pollypm.cockpit_sections.quick_actions import _section_quick_actions
@@ -158,6 +159,7 @@ def _render_project_dashboard(
         _section_header(name, presence),
         _DASHBOARD_BULLET + "\u2500" * (_DASHBOARD_DIVIDER_WIDTH - 2),
         _section_summary(counts),
+        format_project_health_scorecard(name, counts, tasks),
         "",
     ]
     velocity_lines = _section_velocity(tasks, tokens)

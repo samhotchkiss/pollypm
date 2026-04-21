@@ -8,6 +8,10 @@ that ships when the user selects ``polly``/``dashboard`` in the rail.
 from __future__ import annotations
 
 from pollypm.cockpit_sections.base import _STATUS_ICONS
+from pollypm.cockpit_sections.health import (
+    format_project_health_scorecard,
+    project_health_rank,
+)
 from pollypm.cockpit_sections.project_dashboard import (
     _DASHBOARD_PROJECT_CACHE,
     _dashboard_project_tasks,
@@ -46,11 +50,13 @@ def _build_dashboard(supervisor, config) -> str:
     all_queued: list[tuple[str, object]] = []  # ready for pickup
     all_blocked: list[tuple[str, object]] = []
     all_done: list[tuple[str, object]] = []
+    project_scorecards: list[tuple[int, str, str]] = []
     total_counts: dict[str, int] = {}
     live_keys: set[str] = set()
     for pk, proj in config.projects.items():
         live_keys.add(pk)
         partitioned, counts = _dashboard_project_tasks(pk, proj.path)
+        tasks = [task for bucket in partitioned.values() for task in bucket]
         for s, n in counts.items():
             total_counts[s] = total_counts.get(s, 0) + n
         for t in partitioned.get("in_progress", ()):
@@ -63,6 +69,18 @@ def _build_dashboard(supervisor, config) -> str:
             all_blocked.append((pk, t))
         for t in partitioned.get("done", ()):
             all_done.append((pk, t))
+        label = (
+            proj.display_label()
+            if hasattr(proj, "display_label")
+            else getattr(proj, "name", None) or pk
+        )
+        project_scorecards.append(
+            (
+                project_health_rank(tasks, now=now),
+                str(label).lower(),
+                format_project_health_scorecard(label, counts, tasks, now=now),
+            )
+        )
     # Evict cache entries for projects no longer in config.
     for stale_key in list(_DASHBOARD_PROJECT_CACHE.keys()):
         if stale_key not in live_keys:
@@ -108,6 +126,13 @@ def _build_dashboard(supervisor, config) -> str:
     if count_parts:
         lines.append("  " + " · ".join(count_parts))
     lines.append("")
+
+    if project_scorecards:
+        lines.append("  ─── Projects ─────────────────────────────────────")
+        lines.append("")
+        for _rank, _label, line in sorted(project_scorecards):
+            lines.append(f"  {line}")
+        lines.append("")
 
     # ── What's happening right now ──
     if all_active or all_review:

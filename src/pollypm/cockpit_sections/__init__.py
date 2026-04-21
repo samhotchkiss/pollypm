@@ -33,6 +33,12 @@ from pollypm.cockpit_sections.base import (
 from pollypm.cockpit_sections.dashboard import _build_dashboard
 from pollypm.cockpit_sections.downtime import _section_downtime
 from pollypm.cockpit_sections.header import _section_header, _worker_presence
+from pollypm.cockpit_sections.health import (
+    format_project_health_scorecard,
+    project_health_glyph,
+    project_health_rank,
+    stuck_task_count,
+)
 from pollypm.cockpit_sections.in_flight import _section_in_flight
 from pollypm.cockpit_sections.insights import _section_insights
 from pollypm.cockpit_sections.project_dashboard import (
@@ -63,6 +69,9 @@ __all__ = [
     "_format_tokens",
     "_iso_to_dt",
     "_render_project_dashboard",
+    "format_project_health_scorecard",
+    "project_health_glyph",
+    "project_health_rank",
     "_section_activity",
     "_section_downtime",
     "_section_header",
@@ -74,6 +83,7 @@ __all__ = [
     "_section_velocity",
     "_section_you_need_to",
     "_spark_bar",
+    "stuck_task_count",
     "_task_cycle_minutes",
     "_worker_presence",
 ]

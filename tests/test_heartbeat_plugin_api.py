@@ -547,6 +547,86 @@ def test_collect_work_service_signals_reads_registered_worktree_commit_via_proje
     ]
 
 
+def test_has_pending_work_skips_review_only_tasks(tmp_path: Path, monkeypatch) -> None:
+    api = _work_signal_api(tmp_path)
+    context = _context()
+    backend = LocalHeartbeatBackend()
+
+    class _NoTaskBackend:
+        def exists(self) -> bool:
+            return False
+
+    class FakeSQLiteWorkService:
+        def __init__(self, *, db_path: Path, project_path: Path) -> None:
+            self.db_path = db_path
+            self.project_path = project_path
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def list_tasks(self, *, project: str):
+            return [
+                SimpleNamespace(
+                    task_id=f"{project}/1",
+                    work_status=SimpleNamespace(value="review"),
+                )
+            ]
+
+    monkeypatch.setattr(
+        "pollypm.task_backends.get_task_backend",
+        lambda _path: _NoTaskBackend(),
+    )
+    monkeypatch.setattr(
+        "pollypm.work.sqlite_service.SQLiteWorkService",
+        FakeSQLiteWorkService,
+    )
+
+    assert backend._has_pending_work(api, context) is False
+
+
+def test_has_pending_work_keeps_in_progress_tasks_actionable(tmp_path: Path, monkeypatch) -> None:
+    api = _work_signal_api(tmp_path)
+    context = _context()
+    backend = LocalHeartbeatBackend()
+
+    class _NoTaskBackend:
+        def exists(self) -> bool:
+            return False
+
+    class FakeSQLiteWorkService:
+        def __init__(self, *, db_path: Path, project_path: Path) -> None:
+            self.db_path = db_path
+            self.project_path = project_path
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def list_tasks(self, *, project: str):
+            return [
+                SimpleNamespace(
+                    task_id=f"{project}/1",
+                    work_status=SimpleNamespace(value="in_progress"),
+                )
+            ]
+
+    monkeypatch.setattr(
+        "pollypm.task_backends.get_task_backend",
+        lambda _path: _NoTaskBackend(),
+    )
+    monkeypatch.setattr(
+        "pollypm.work.sqlite_service.SQLiteWorkService",
+        FakeSQLiteWorkService,
+    )
+
+    assert backend._has_pending_work(api, context) is True
+
+
 def test_local_heartbeat_backend_marks_followup_when_work_remains() -> None:
     api = FakeHeartbeatAPI([_context(transcript_delta="Implemented the parser. Next step: add coverage.")])
 

@@ -35,6 +35,14 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from pollypm.atomic_io import atomic_write_json
+from pollypm.cockpit_rail_routes import (
+    LiveSessionRoute,
+    ProjectRoute,
+    StaticViewRoute,
+    resolve_live_session_route,
+    resolve_project_route,
+    resolve_static_view_route,
+)
 from pollypm.config import load_config
 from pollypm.heartbeats.snapshots import read_recent_heartbeat_snapshot
 from pollypm.providers import get_provider
@@ -875,6 +883,105 @@ class CockpitRouter:
             return None
         return min(panes, key=self._pane_left).pane_id
 
+    def _route_live_session(
+        self,
+        supervisor,
+        window_target: str,
+        route: LiveSessionRoute,
+    ) -> None:
+        launches = supervisor.plan_launches()
+        storage_session = supervisor.storage_closet_session_name()
+        launch = next((item for item in launches if item.session.name == route.session_name), None)
+        if launch is not None:
+            storage_windows = {window.name for window in self.tmux.list_windows(storage_session)}
+            if launch.window_name not in storage_windows:
+                try:
+                    supervisor.launch_session(route.session_name)
+                except Exception:  # noqa: BLE001
+                    pass
+        try:
+            self._show_live_session(supervisor, route.session_name, window_target)
+        except Exception:  # noqa: BLE001
+            self._show_static_view(supervisor, window_target, route.fallback_kind)
+
+    def _route_static_view(
+        self,
+        supervisor,
+        window_target: str,
+        route: StaticViewRoute,
+    ) -> None:
+        self._show_static_view(supervisor, window_target, route.kind, route.project_key)
+
+    def _route_project_selection(
+        self,
+        supervisor,
+        window_target: str,
+        route: ProjectRoute,
+    ) -> None:
+        project_key = route.project_key
+        sub_view = route.sub_view
+        if sub_view is None or sub_view == "dashboard":
+            self.set_selected_key(f"project:{project_key}:dashboard")
+            self._show_static_view(supervisor, window_target, "project", project_key)
+            return
+        if sub_view in ("settings", "issues"):
+            self._show_static_view(supervisor, window_target, sub_view, project_key)
+            return
+        if sub_view == "task" and route.task_num:
+            task_num = route.task_num
+            window_name = f"task-{project_key}-{task_num}"
+            storage = supervisor.storage_closet_session_name()
+            try:
+                storage_windows = self.tmux.list_windows(storage)
+                target_win = next((w for w in storage_windows if w.name == window_name), None)
+                if target_win is not None:
+                    self._park_mounted_session(supervisor, window_target)
+                    self._cleanup_extra_panes(window_target)
+                    left_pane = self._left_pane_id(window_target)
+                    right_pane_id = self._right_pane_id(window_target)
+                    if right_pane_id is not None:
+                        self.tmux.kill_pane(right_pane_id)
+                    source = f"{storage}:{target_win.index}.0"
+                    self.tmux.join_pane(source, left_pane, horizontal=True)
+                    panes = self.tmux.list_panes(window_target)
+                    left_p = min(panes, key=self._pane_left)
+                    self._try_resize_rail(left_p.pane_id)
+                    right_p = max(panes, key=self._pane_left)
+                    self.tmux.set_pane_history_limit(right_p.pane_id, 200)
+                    state = self._load_state()
+                    state["mounted_session"] = window_name
+                    state["right_pane_id"] = right_p.pane_id
+                    self._write_state(state)
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+            self.set_selected_key(f"project:{project_key}:dashboard")
+            self._show_static_view(supervisor, window_target, "project", project_key)
+            return
+        if sub_view == "session":
+            launches = supervisor.plan_launches()
+            session_name = self._project_session_map(launches).get(project_key)
+            if session_name is not None:
+                if not self._session_available_for_mount(supervisor, session_name, window_target):
+                    try:
+                        supervisor.launch_session(session_name)
+                    except Exception:  # noqa: BLE001
+                        pass
+                try:
+                    self._show_live_session(supervisor, session_name, window_target)
+                except Exception:  # noqa: BLE001
+                    self.set_selected_key(f"project:{project_key}:dashboard")
+                    self._show_static_view(supervisor, window_target, "project", project_key)
+            else:
+                try:
+                    self.create_worker_and_route(project_key)
+                except Exception:  # noqa: BLE001
+                    self.set_selected_key(f"project:{project_key}:dashboard")
+                    self._show_static_view(supervisor, window_target, "project", project_key)
+            return
+        self.set_selected_key(f"project:{project_key}:dashboard")
+        self._show_static_view(supervisor, window_target, "project", project_key)
+
     def route_selected(self, key: str) -> None:
         supervisor = self._load_supervisor()
         window_target = f"{supervisor.config.project.tmux_session}:{self._COCKPIT_WINDOW}"
@@ -884,140 +991,17 @@ class CockpitRouter:
             raise RuntimeError("Cockpit right pane is not available.")
 
         self.set_selected_key(key)
-        if key == "polly":
-            # Launch operator session if not running
-            launches = supervisor.plan_launches()
-            storage_session = supervisor.storage_closet_session_name()
-            op_launch = next((l for l in launches if l.session.name == "operator"), None)
-            if op_launch is not None:
-                storage_windows = {w.name for w in self.tmux.list_windows(storage_session)}
-                if op_launch.window_name not in storage_windows:
-                    try:
-                        supervisor.launch_session("operator")
-                    except Exception:
-                        pass
-            try:
-                self._show_live_session(supervisor, "operator", window_target)
-            except Exception:
-                self._show_static_view(supervisor, window_target, "polly")
+        live_route = resolve_live_session_route(key)
+        if live_route is not None:
+            self._route_live_session(supervisor, window_target, live_route)
             return
-        if key == "russell":
-            # Launch reviewer session if not running
-            launches = supervisor.plan_launches()
-            storage_session = supervisor.storage_closet_session_name()
-            rev_launch = next((l for l in launches if l.session.name == "reviewer"), None)
-            if rev_launch is not None:
-                storage_windows = {w.name for w in self.tmux.list_windows(storage_session)}
-                if rev_launch.window_name not in storage_windows:
-                    try:
-                        supervisor.launch_session("reviewer")
-                    except Exception:
-                        pass
-            try:
-                self._show_live_session(supervisor, "reviewer", window_target)
-            except Exception:
-                self._show_static_view(supervisor, window_target, "polly")
+        static_route = resolve_static_view_route(key)
+        if static_route is not None:
+            self._route_static_view(supervisor, window_target, static_route)
             return
-        if key == "inbox":
-            self._show_static_view(supervisor, window_target, "inbox")
-            return
-        if key == "workers":
-            self._show_static_view(supervisor, window_target, "workers")
-            return
-        if key == "metrics":
-            self._show_static_view(supervisor, window_target, "metrics")
-            return
-        if key == "settings":
-            self._show_static_view(supervisor, window_target, "settings")
-            return
-        if key == "activity" or key.startswith("activity:"):
-            # Live activity feed — served through the standard static-view
-            # plumbing. ``activity:<project_key>`` preloads the per-project
-            # filter so the dashboard's ``l`` keybinding lands the user
-            # exactly where they were looking.
-            project_key = None
-            if key.startswith("activity:"):
-                _, _, project_key = key.partition(":")
-                project_key = project_key or None
-            self._show_static_view(
-                supervisor, window_target, "activity", project_key,
-            )
-            return
-        if key.startswith("project:"):
-            parts = key.split(":")
-            project_key = parts[1]
-            sub_view = parts[2] if len(parts) > 2 else None
-            if sub_view is None or sub_view == "dashboard":
-                # Clicking project parent or Dashboard — show dashboard,
-                # and set selection to the dashboard sub-item
-                self.set_selected_key(f"project:{project_key}:dashboard")
-                self._show_static_view(supervisor, window_target, "project", project_key)
-                return
-            if sub_view in ("settings", "issues"):
-                self._show_static_view(supervisor, window_target, sub_view, project_key)
-                return
-            if sub_view == "task" and len(parts) > 3:
-                # Per-task worker session — mount it from storage closet
-                task_num = parts[3]
-                window_name = f"task-{project_key}-{task_num}"
-                storage = supervisor.storage_closet_session_name()
-                try:
-                    storage_windows = self.tmux.list_windows(storage)
-                    target_win = next((w for w in storage_windows if w.name == window_name), None)
-                    if target_win is not None:
-                        self._park_mounted_session(supervisor, window_target)
-                        self._cleanup_extra_panes(window_target)
-                        left_pane = self._left_pane_id(window_target)
-                        right_pane_id = self._right_pane_id(window_target)
-                        if right_pane_id is not None:
-                            self.tmux.kill_pane(right_pane_id)
-                        source = f"{storage}:{target_win.index}.0"
-                        self.tmux.join_pane(source, left_pane, horizontal=True)
-                        panes = self.tmux.list_panes(window_target)
-                        left_p = min(panes, key=self._pane_left)
-                        self._try_resize_rail(left_p.pane_id)
-                        right_p = max(panes, key=self._pane_left)
-                        self.tmux.set_pane_history_limit(right_p.pane_id, 200)
-                        state = self._load_state()
-                        state["mounted_session"] = window_name
-                        state["right_pane_id"] = right_p.pane_id
-                        self._write_state(state)
-                        return
-                except Exception:  # noqa: BLE001
-                    pass
-                # Fallback to dashboard
-                self.set_selected_key(f"project:{project_key}:dashboard")
-                self._show_static_view(supervisor, window_target, "project", project_key)
-                return
-            if sub_view == "session":
-                # PM Chat — mount live session, spawning if needed
-                launches = supervisor.plan_launches()
-                session_name = self._project_session_map(launches).get(project_key)
-                if session_name is not None:
-                    if not self._session_available_for_mount(supervisor, session_name, window_target):
-                        # Session exists in config but not running — launch it
-                        try:
-                            supervisor.launch_session(session_name)
-                        except Exception:
-                            pass
-                    try:
-                        self._show_live_session(supervisor, session_name, window_target)
-                    except Exception:
-                        # Mount failed (e.g. duplicate windows) — fall back to dashboard
-                        self.set_selected_key(f"project:{project_key}:dashboard")
-                        self._show_static_view(supervisor, window_target, "project", project_key)
-                else:
-                    # No session configured — try to create one
-                    try:
-                        self.create_worker_and_route(project_key)
-                    except Exception:
-                        # Creation failed (e.g. no git commits) — fall back to dashboard
-                        self.set_selected_key(f"project:{project_key}:dashboard")
-                        self._show_static_view(supervisor, window_target, "project", project_key)
-                return
-            # Unknown sub_view — fall back to dashboard
-            self.set_selected_key(f"project:{project_key}:dashboard")
-            self._show_static_view(supervisor, window_target, "project", project_key)
+        project_route = resolve_project_route(key)
+        if project_route is not None:
+            self._route_project_selection(supervisor, window_target, project_route)
             return
         raise RuntimeError(f"Unknown cockpit item: {key}")
 

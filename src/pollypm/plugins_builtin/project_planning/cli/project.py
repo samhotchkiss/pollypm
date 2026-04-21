@@ -189,7 +189,37 @@ def _has_source_files(project_path: Path, *, max_scan: int = 2000) -> bool:
     return False
 
 
-def _has_work_tasks(project_path: Path) -> bool:
+def _planner_db_path(
+    project_path: Path,
+    *,
+    config_path: Path | None = None,
+    create_parent: bool = False,
+) -> Path:
+    """Return the planner/work-task DB for project-planning entry points.
+
+    Post-#339, planner-created tasks belong in the workspace-scope DB.
+    Fall back to the project-local path only when no config is available,
+    which keeps older isolated tests and recovery paths working.
+    """
+    db_path = project_path / ".pollypm" / "state.db"
+    try:
+        cfg = load_config(config_path) if config_path is not None else load_config()
+        workspace_root = getattr(cfg.project, "workspace_root", None)
+        if workspace_root is not None:
+            db_path = Path(workspace_root) / ".pollypm" / "state.db"
+    except Exception:  # noqa: BLE001
+        pass
+    if create_parent:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+    return db_path
+
+
+def _has_work_tasks(
+    project_path: Path,
+    *,
+    project_key: str | None = None,
+    config_path: Path | None = None,
+) -> bool:
     """Return True iff the project's work-service DB has ≥1 work_tasks row.
 
     Reads the sqlite table directly — ``SQLiteWorkService`` is a heavier
@@ -198,7 +228,7 @@ def _has_work_tasks(project_path: Path) -> bool:
     any DB / IO error returns False so we don't accidentally flag a
     greenfield project as existing on a transient error.
     """
-    db_path = project_path / ".pollypm" / "state.db"
+    db_path = _planner_db_path(project_path, config_path=config_path)
     if not db_path.exists():
         return False
     try:
@@ -211,7 +241,13 @@ def _has_work_tasks(project_path: Path) -> bool:
             )
             if cur.fetchone() is None:
                 return False
-            cur = conn.execute("SELECT 1 FROM work_tasks LIMIT 1")
+            if project_key:
+                cur = conn.execute(
+                    "SELECT 1 FROM work_tasks WHERE project = ? LIMIT 1",
+                    (project_key,),
+                )
+            else:
+                cur = conn.execute("SELECT 1 FROM work_tasks LIMIT 1")
             return cur.fetchone() is not None
     except Exception:  # noqa: BLE001
         return False
@@ -219,6 +255,8 @@ def _has_work_tasks(project_path: Path) -> bool:
 
 def _classify_project_state(
     project_path: Path,
+    project_key: str | None = None,
+    config_path: Path | None = None,
 ) -> Literal["greenfield", "existing"]:
     """Classify a project directory for the ``pm project new`` routing.
 
@@ -241,7 +279,11 @@ def _classify_project_state(
         return "existing"
     if _has_source_files(project_path):
         return "existing"
-    if _has_work_tasks(project_path):
+    if _has_work_tasks(
+        project_path,
+        project_key=project_key,
+        config_path=config_path,
+    ):
         return "existing"
     return "greenfield"
 
@@ -250,6 +292,7 @@ def _plan_project_task(
     project_key: str,
     project_path: Path,
     *,
+    config_path: Path | None = None,
     title_prefix: str = "Plan",
     description: str = "",
     actor: str = "architect",
@@ -262,8 +305,11 @@ def _plan_project_task(
     # a full SQLite environment yet.
     from pollypm.work.sqlite_service import SQLiteWorkService
 
-    db_path = project_path / ".pollypm" / "state.db"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path = _planner_db_path(
+        project_path,
+        config_path=config_path,
+        create_parent=True,
+    )
 
     with SQLiteWorkService(db_path=db_path, project_path=project_path) as svc:
         task = svc.create(
@@ -310,7 +356,12 @@ def plan_cmd(
     """
     path = _require_config(config_path)
     key, project_path = _resolve_project_key(path, project)
-    task = _plan_project_task(key, project_path, title_prefix="Plan project")
+    task = _plan_project_task(
+        key,
+        project_path,
+        config_path=path,
+        title_prefix="Plan project",
+    )
 
     if as_json:
         typer.echo(json.dumps({
@@ -361,7 +412,10 @@ def replan_cmd(
     path = _require_config(config_path)
     key, project_path = _resolve_project_key(path, project)
     task = _plan_project_task(
-        key, project_path, title_prefix="Replan project",
+        key,
+        project_path,
+        config_path=path,
+        title_prefix="Replan project",
         description=(
             f"Re-run the architecture planner on {key}. Stage-0 research "
             "should read the existing plan and produce a drift analysis "
@@ -491,7 +545,11 @@ def new_cmd(
         mode = "greenfield"
         typer.echo("Fresh project — running cold-start planner.")
     else:
-        mode = _classify_project_state(project.path)
+        mode = _classify_project_state(
+            project.path,
+            project.key,
+            path,
+        )
         if mode == "existing":
             typer.echo(
                 "Detected existing project — running drift-aware replan."
@@ -542,7 +600,11 @@ def new_cmd(
             # task on the project's work service. If it did, the
             # interactive prompt below becomes redundant — auto-fire
             # already satisfied the user's "plan this project" intent.
-            auto_fired = _plan_task_exists(project.path, project.key)
+            auto_fired = _plan_task_exists(
+                project.path,
+                project.key,
+                config_path=path,
+            )
         except Exception as exc:  # noqa: BLE001
             # Auto-fire is best-effort, but a silent swallow meant users
             # couldn't tell when the planner failed to boot. Emit a
@@ -591,6 +653,7 @@ def new_cmd(
     if mode == "existing":
         task = _plan_project_task(
             project.key, project.path,
+            config_path=path,
             title_prefix="Replan project",
             description=(
                 f"Re-run the architecture planner on {project.key}. Stage-0 "
@@ -600,7 +663,10 @@ def new_cmd(
         )
     else:
         task = _plan_project_task(
-            project.key, project.path, title_prefix="Plan project",
+            project.key,
+            project.path,
+            config_path=path,
+            title_prefix="Plan project",
         )
     typer.echo(
         f"Created planning task {task.task_id} on project "
@@ -689,7 +755,12 @@ def _auto_spawn_architect(config_path: Path, project_key: str) -> None:
         )
 
 
-def _plan_task_exists(project_path: Path, project_key: str) -> bool:
+def _plan_task_exists(
+    project_path: Path,
+    project_key: str,
+    *,
+    config_path: Path | None = None,
+) -> bool:
     """Return True if a ``plan_project`` task already exists on the
     project's work service.
 
@@ -698,7 +769,7 @@ def _plan_task_exists(project_path: Path, project_key: str) -> bool:
     interactive prompt becomes redundant. Safe to call on a project
     that never opened its work DB (returns False without creating one).
     """
-    db_path = project_path / ".pollypm" / "state.db"
+    db_path = _planner_db_path(project_path, config_path=config_path)
     if not db_path.exists():
         return False
     try:

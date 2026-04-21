@@ -73,6 +73,7 @@ def _write_minimal_config(
     config = PollyPMConfig(
         project=ProjectSettings(
             root_dir=tmp_path,
+            workspace_root=tmp_path,
             base_dir=tmp_path / ".pollypm",
             logs_dir=tmp_path / ".pollypm/logs",
             snapshots_dir=tmp_path / ".pollypm/snapshots",
@@ -97,13 +98,13 @@ def _write_minimal_config(
     return config_path
 
 
-def _only_plan_task(repo: Path, project_key: str):
-    """Return the single plan_project task on ``repo``, failing clearly."""
+def _only_plan_task(workspace_root: Path, project_key: str):
+    """Return the single plan_project task in the workspace DB."""
     from pollypm.work.sqlite_service import SQLiteWorkService
 
-    db_path = repo / ".pollypm" / "state.db"
+    db_path = workspace_root / ".pollypm" / "state.db"
     assert db_path.exists(), "auto-fire should have opened the work DB"
-    with SQLiteWorkService(db_path=db_path, project_path=repo) as svc:
+    with SQLiteWorkService(db_path=db_path, project_path=workspace_root) as svc:
         tasks = [
             t for t in svc.list_tasks(project=project_key)
             if t.flow_template_id == "plan_project"
@@ -146,7 +147,7 @@ class TestProjectNewReplanRouting:
         assert "cold-start planner" in result.stdout
         # Auto-fired task is a plan (not replan).
         assert "Auto-created plan_project task" in result.stdout
-        task = _only_plan_task(repo, "fresh")
+        task = _only_plan_task(tmp_path, "fresh")
         assert task.title.startswith("Plan project")
         assert "Re-run" not in (task.description or "")
 
@@ -176,7 +177,7 @@ class TestProjectNewReplanRouting:
         assert "Detected existing project" in result.stdout
         assert "drift-aware replan" in result.stdout
         assert "Auto-created replan task" in result.stdout
-        task = _only_plan_task(repo, "existing")
+        task = _only_plan_task(tmp_path, "existing")
         assert task.title.startswith("Replan project")
         assert "drift" in (task.description or "").lower()
 
@@ -208,7 +209,7 @@ class TestProjectNewReplanRouting:
         )
         assert result.exit_code == 0, result.stdout + result.stderr
         assert "Detected existing project" in result.stdout
-        task = _only_plan_task(repo, "planned")
+        task = _only_plan_task(tmp_path, "planned")
         assert task.title.startswith("Replan project")
 
     def test_existing_py_files_classifies_existing_replan(
@@ -236,8 +237,66 @@ class TestProjectNewReplanRouting:
         )
         assert result.exit_code == 0, result.stdout + result.stderr
         assert "Detected existing project" in result.stdout
-        task = _only_plan_task(repo, "pycode")
+        task = _only_plan_task(tmp_path, "pycode")
         assert task.title.startswith("Replan project")
+
+    def test_existing_workspace_tasks_classify_existing_replan(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Existing rows in the workspace DB should classify as replan."""
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        repo = tmp_path / "existing_tasks"
+        repo.mkdir()
+        _git_init(repo, commits=0)
+        config_path = _write_minimal_config(tmp_path)
+        (tmp_path / ".pollypm").mkdir(parents=True, exist_ok=True)
+
+        with SQLiteWorkService(
+            db_path=tmp_path / ".pollypm" / "state.db",
+            project_path=tmp_path,
+        ) as svc:
+            svc.create(
+                title="Plan project existing_tasks",
+                description="seed existing task",
+                type="task",
+                project="existing_tasks",
+                flow_template="plan_project",
+                roles={"architect": "architect"},
+                priority="high",
+            )
+
+        assert project_cli._classify_project_state(
+            repo,
+            "existing_tasks",
+            config_path,
+        ) == "existing"
+
+        monkeypatch.setattr(
+            project_cli, "_prompt_run_planner",
+            lambda default_yes=True: (_ for _ in ()).throw(
+                AssertionError("prompt should not fire"),
+            ),
+        )
+
+        result = runner.invoke(
+            project_app,
+            ["new", str(repo), "--config", str(config_path)],
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        assert "Detected existing project" in result.stdout
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        with SQLiteWorkService(
+            db_path=tmp_path / ".pollypm" / "state.db",
+            project_path=tmp_path,
+        ) as svc:
+            tasks = [
+                t for t in svc.list_tasks(project="existing_tasks")
+                if t.flow_template_id == "plan_project"
+            ]
+        assert len(tasks) == 2
+        assert tasks[-1].title.startswith("Replan project")
 
     def test_skip_planner_suppresses_both_paths(
         self, tmp_path: Path, monkeypatch,
@@ -269,7 +328,7 @@ class TestProjectNewReplanRouting:
         assert "Detected existing project" not in result.stdout
         assert "Fresh project" not in result.stdout
         # No plan task (no DB at all).
-        assert not (repo / ".pollypm" / "state.db").exists()
+        assert not (tmp_path / ".pollypm" / "state.db").exists()
 
     def test_force_cold_start_overrides_existing_classification(
         self, tmp_path: Path, monkeypatch,
@@ -301,6 +360,6 @@ class TestProjectNewReplanRouting:
         assert "Fresh project" in result.stdout
         assert "Detected existing project" not in result.stdout
         assert "Auto-created plan_project task" in result.stdout
-        task = _only_plan_task(repo, "override")
+        task = _only_plan_task(tmp_path, "override")
         assert task.title.startswith("Plan project")
         assert "drift" not in (task.description or "").lower()

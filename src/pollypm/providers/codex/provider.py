@@ -23,7 +23,7 @@ from pollypm.provider_sdk import ProviderUsageSnapshot
 
 from . import login as _login
 from .adapter import CodexAdapter as _RuntimeCodexAdapter
-from .detect import detect_codex_email, detect_logged_in
+from .detect import detect_codex_email, detect_email_from_pane, detect_logged_in
 from .env import isolated_env as _codex_isolated_env
 from .login import run_login_flow as _codex_run_login_flow
 from .probe import probe_usage as _codex_probe_usage
@@ -193,6 +193,10 @@ class CodexProvider:
     def login_completion_marker_seen(self, pane_text: str) -> bool:
         """Return True iff ``pane_text`` contains the PollyPM done-marker."""
         return _login.login_completion_marker_seen(pane_text)
+
+    def detect_email_from_pane(self, pane_text: str) -> str | None:
+        """Return the account email if the Codex login pane prints it."""
+        return detect_email_from_pane(pane_text)
 
 
 __all__ = ["CodexProvider"]

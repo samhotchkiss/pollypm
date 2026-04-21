@@ -167,6 +167,7 @@ def test_registered_adapters_have_required_method_names():
             "login_command",
             "logout_command",
             "login_completion_marker_seen",
+            "detect_email_from_pane",
         ):
             assert hasattr(adapter, method), f"{adapter_cls.__name__} missing {method}"
             assert callable(getattr(adapter, method))

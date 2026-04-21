@@ -192,5 +192,9 @@ class ClaudeProvider:
         """Return True iff ``pane_text`` contains the PollyPM done-marker."""
         return _login.login_completion_marker_seen(pane_text)
 
+    def detect_email_from_pane(self, pane_text: str) -> str | None:
+        """Claude never surfaces the account email in pane output."""
+        return _detect.detect_email_from_pane(pane_text)
+
 
 __all__ = ["ClaudeProvider"]

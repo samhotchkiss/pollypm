@@ -116,6 +116,13 @@ def test_detect_email_returns_none_when_home_is_none() -> None:
     assert provider.detect_email(_account("codex_1", None)) is None
 
 
+def test_detect_email_from_pane_reads_codex_status_line() -> None:
+    provider = CodexProvider()
+    pane = "Account:                     s@swh.me (Pro)"
+
+    assert provider.detect_email_from_pane(pane) == "s@swh.me"
+
+
 def test_isolated_env_sets_codex_home_additively(tmp_path: Path) -> None:
     provider = CodexProvider()
     env = provider.isolated_env(tmp_path / "home")

@@ -20,6 +20,11 @@ Defaults for the built-in personas:
 | ``architect`` (planner) | ``[claude, codex]`` | Planning is a reading/reasoning task. |
 | Each critic (``critic_*``) | ``[claude, codex]`` | Planner-plugin diversity resolver may override one critic to Codex for real model diversity (pp06). |
 
+``architect`` and each ``critic_*`` persona are contributed by the
+``project_planning`` plugin; they are only available when that plugin is
+loaded. Core personas shipped in v1 are ``polly``, ``russell``, and
+``worker``.
+
 **Overrides.** Users override per-persona in ``pollypm.toml``:
 
 ```toml

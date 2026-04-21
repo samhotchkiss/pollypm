@@ -8,6 +8,7 @@ from pollypm.recovery_prompt import (
     RecoveryPrompt,
     RecoveryPromptSection,
     _build_from_checkpoint,
+    _build_fallback_prompt,
     _render_claude,
     _render_codex,
     _truncate_sections,
@@ -123,6 +124,21 @@ class TestRenderCodex:
 
 
 class TestBuildFromCheckpoint:
+    def test_fresh_launch_banner(self, tmp_path: Path) -> None:
+        config = _config(tmp_path)
+
+        prompt = _build_fallback_prompt(
+            config,
+            "test",
+            provider=ProviderKind.CLAUDE,
+            task_prompt="",
+            max_chars=DEFAULT_MAX_CHARS,
+        )
+
+        rendered = prompt.render()
+        assert "RECOVERY MODE: FRESH LAUNCH" in rendered
+        assert "no checkpoint to resume from" in rendered
+
     def test_includes_all_sections(self, tmp_path: Path) -> None:
         config = _config(tmp_path)
         checkpoint = CheckpointData(
@@ -152,6 +168,8 @@ class TestBuildFromCheckpoint:
         assert "Run integration tests" in rendered
         assert "API rate limit" in rendered
         assert "bcrypt or argon2" in rendered
+        assert "RECOVERY MODE: RESUMING FROM CHECKPOINT test-123" in rendered
+        assert "last state was Writing unit tests" in rendered
 
     def test_includes_task_prompt(self, tmp_path: Path) -> None:
         config = _config(tmp_path)

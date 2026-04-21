@@ -59,12 +59,13 @@ class RecoveryPrompt:
     checkpoint_id: str = ""
     session_name: str = ""
     is_fallback: bool = False
+    recovery_mode_banner: str = ""
 
     def render(self) -> str:
         """Render the full recovery prompt as text."""
         if self.provider == ProviderKind.CODEX:
-            return _render_codex(self.sections)
-        return _render_claude(self.sections)
+            return _render_codex(self.sections, self.recovery_mode_banner, self.is_fallback)
+        return _render_claude(self.sections, self.recovery_mode_banner, self.is_fallback)
 
     @property
     def total_chars(self) -> int:
@@ -117,6 +118,11 @@ def _build_from_checkpoint(
 ) -> RecoveryPrompt:
     """Build recovery prompt from checkpoint data."""
     sections: list[RecoveryPromptSection] = []
+    recovery_mode_banner = _checkpoint_banner(
+        checkpoint_id=checkpoint.checkpoint_id,
+        is_fallback=False,
+        state=_checkpoint_state(checkpoint),
+    )
 
     # Section 1: Project Context
     project_context = _load_project_context(config, checkpoint.project)
@@ -206,6 +212,7 @@ def _build_from_checkpoint(
         provider=provider,
         checkpoint_id=checkpoint.checkpoint_id,
         session_name=checkpoint.session_name,
+        recovery_mode_banner=recovery_mode_banner,
     )
 
 
@@ -259,6 +266,11 @@ def _build_fallback_prompt(
 ) -> RecoveryPrompt:
     """Build fallback prompt when no checkpoint exists."""
     sections: list[RecoveryPromptSection] = []
+    recovery_mode_banner = _checkpoint_banner(
+        checkpoint_id="",
+        is_fallback=True,
+        state="",
+    )
 
     project_context = _load_project_context(config, project_key)
     if project_context:
@@ -296,6 +308,7 @@ def _build_fallback_prompt(
         sections=sections,
         provider=provider,
         is_fallback=True,
+        recovery_mode_banner=recovery_mode_banner,
     )
 
 
@@ -304,14 +317,34 @@ def _build_fallback_prompt(
 # ---------------------------------------------------------------------------
 
 
-def _render_claude(sections: list[RecoveryPromptSection]) -> str:
+def _render_claude(
+    sections: list[RecoveryPromptSection],
+    recovery_mode_banner: str = "",
+    is_fallback: bool = False,
+) -> str:
     """Render recovery prompt for Claude CLI."""
     parts: list[str] = [
-        "RECOVERY: Your previous session was interrupted and has been restarted. You are resuming work.",
-        "The context below describes what you were doing. Resume your work — do NOT",
-        "treat this as a new task or analysis request. Pick up where you left off.",
-        "",
     ]
+    if recovery_mode_banner:
+        parts.append(recovery_mode_banner)
+    if is_fallback:
+        parts.extend([
+            "This is a fresh launch, not a resuming checkpoint.",
+            "Use the context below to start cleanly instead of looking for prior state.",
+        ])
+    elif recovery_mode_banner:
+        parts.extend([
+            "Your previous session was interrupted and has been restarted. You are resuming work.",
+            "The context below describes what you were doing. Resume your work — do NOT",
+            "treat this as a new task or analysis request. Pick up where you left off.",
+        ])
+    else:
+        parts.extend([
+            "RECOVERY: Your previous session was interrupted and has been restarted. You are resuming work.",
+            "The context below describes what you were doing. Resume your work — do NOT",
+            "treat this as a new task or analysis request. Pick up where you left off.",
+        ])
+    parts.append("")
     for section in sections:
         parts.append(f"## {section.heading}")
         parts.append("")
@@ -320,12 +353,28 @@ def _render_claude(sections: list[RecoveryPromptSection]) -> str:
     return "\n".join(parts).rstrip()
 
 
-def _render_codex(sections: list[RecoveryPromptSection]) -> str:
+def _render_codex(
+    sections: list[RecoveryPromptSection],
+    recovery_mode_banner: str = "",
+    is_fallback: bool = False,
+) -> str:
     """Render recovery prompt for Codex CLI."""
-    parts: list[str] = [
-        "RECOVERY CONTEXT: You are resuming an interrupted session.",
-        "",
-    ]
+    parts: list[str] = []
+    if recovery_mode_banner:
+        parts.append(recovery_mode_banner)
+    if is_fallback:
+        parts.extend([
+            "Fresh launch: there is no checkpoint to resume from.",
+            "Use the context below to start cleanly.",
+        ])
+    elif recovery_mode_banner:
+        parts.append("You are resuming an interrupted session.")
+    else:
+        parts.extend([
+            "RECOVERY CONTEXT: You are resuming an interrupted session.",
+            "",
+        ])
+    parts.append("")
     for section in sections:
         parts.append(f"### {section.heading}")
         parts.append("")
@@ -429,6 +478,18 @@ def _load_project_context(config: PollyPMConfig, project_key: str) -> str:
     if len(content) > 10000:
         return content[:2000] + "\n...(truncated)"
     return content[:4000]
+
+
+def _checkpoint_state(checkpoint: CheckpointData) -> str:
+    """Return the most useful one-line summary of the checkpoint state."""
+    return checkpoint.sub_step or checkpoint.objective or checkpoint.role or "unknown"
+
+
+def _checkpoint_banner(*, checkpoint_id: str, is_fallback: bool, state: str) -> str:
+    """Return the explicit banner for the recovery mode."""
+    if is_fallback:
+        return "RECOVERY MODE: FRESH LAUNCH — no checkpoint to resume from."
+    return f"RECOVERY MODE: RESUMING FROM CHECKPOINT {checkpoint_id} — last state was {state}."
 
 
 def _live_git_state(config: PollyPMConfig, project_key: str) -> str:

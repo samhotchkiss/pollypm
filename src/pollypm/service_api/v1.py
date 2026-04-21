@@ -139,6 +139,10 @@ class PollyPMService:
         """Return cached account status for fast interactive views."""
         return list_cached_account_statuses(self.config_path)
 
+    def refresh_account_usage(self, identifier: str) -> AccountStatus:
+        """Refresh one account usage snapshot and return the updated status."""
+        return probe_account_usage(self.config_path, identifier)
+
     def create_and_launch_worker(
         self,
         *,

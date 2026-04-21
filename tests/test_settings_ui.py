@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 
 import pytest
+from textual.widgets import Button
 
 from pollypm.models import ProviderKind
 
@@ -39,6 +40,11 @@ def _fake_status(
     usage: str = "80% left",
     plan: str = "max",
     logged_in: bool = True,
+    usage_updated_at: str | None = "2026-04-21T16:45:00+00:00",
+    used_pct: int | None = 20,
+    remaining_pct: int | None = 80,
+    reset_at: str | None = "Apr 24 at 1am",
+    period_label: str | None = "current week",
 ) -> object:
     class _Status:
         pass
@@ -54,12 +60,16 @@ def _fake_status(
     s.reason = ""
     s.available_at = None
     s.access_expires_at = None
-    s.usage_updated_at = None
+    s.usage_updated_at = usage_updated_at
     s.isolation_status = "host-profile"
     s.isolation_summary = ""
     s.isolation_recommendation = ""
     s.auth_storage = "file"
     s.profile_root = None
+    s.used_pct = used_pct
+    s.remaining_pct = remaining_pct
+    s.reset_at = reset_at
+    s.period_label = period_label
     s.home = Path("/tmp") / key
     return s
 
@@ -126,6 +136,9 @@ class _FakeService:
         self.permissions_calls: list[bool] = []
         self.tracked_calls: list[tuple[str, bool]] = []
         self.controller_calls: list[str] = []
+        self.add_account_calls: list[ProviderKind] = []
+        self.remove_account_calls: list[tuple[str, bool]] = []
+        self.refresh_usage_calls: list[str] = []
         self.cached_calls = 0
         self.live_calls = 0
 
@@ -150,6 +163,41 @@ class _FakeService:
 
     def set_controller_account(self, key: str) -> None:
         self.controller_calls.append(key)
+
+    def add_account(self, provider: ProviderKind) -> tuple[str, str]:
+        self.add_account_calls.append(provider)
+        key = f"{provider.value}_new"
+        email = f"{key}@example.com"
+        self._statuses.append(
+            _fake_status(
+                key,
+                provider=provider,
+                email=email,
+                usage="93% left this week",
+                used_pct=7,
+                remaining_pct=93,
+                reset_at="Apr 28 at 1am",
+            )
+        )
+        return key, email
+
+    def refresh_account_usage(self, key: str):
+        self.refresh_usage_calls.append(key)
+        for status in self._statuses:
+            if status.key == key:
+                status.usage_summary = "92% left this week"
+                status.used_pct = 8
+                status.remaining_pct = 92
+                status.reset_at = "Apr 28 at 1am"
+                status.period_label = "current week"
+                status.usage_updated_at = "2026-04-21T17:00:00+00:00"
+                return status
+        raise KeyError(key)
+
+    def remove_account(self, key: str, *, delete_home: bool = False) -> tuple[str, str]:
+        self.remove_account_calls.append((key, delete_home))
+        self._statuses = [status for status in self._statuses if status.key != key]
+        return key, "removed"
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +301,92 @@ def test_accounts_section_lists_configured_accounts(settings_env) -> None:
             # accounts too — even though the detail only shows one.
             keys = [a["key"] for a in app.data.accounts]
             assert keys == ["claude_demo", "codex_demo", "claude_stale"]
+
+    _run(body())
+
+
+def test_accounts_detail_shows_cached_usage_snapshot_fields(settings_env) -> None:
+    app = settings_env["app"]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            detail_text = str(app.detail.render())
+            assert "Remaining:" in detail_text
+            assert "80%" in detail_text
+            assert "Used:" in detail_text
+            assert "Window:" in detail_text
+            assert "current week" in detail_text
+            assert "Resets:" in detail_text
+            assert "Sampled:" in detail_text
+
+    _run(body())
+
+
+def test_accounts_section_exposes_account_action_buttons(settings_env) -> None:
+    app = settings_env["app"]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            assert app.query_one("#settings-account-add-claude", Button) is not None
+            assert app.query_one("#settings-account-add-codex", Button) is not None
+            assert app.query_one("#settings-account-refresh-usage", Button) is not None
+            assert app.query_one("#settings-account-remove", Button) is not None
+
+    _run(body())
+
+
+def test_add_account_actions_refresh_the_accounts_snapshot(settings_env) -> None:
+    app = settings_env["app"]
+    service = settings_env["service"]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.action_add_codex_account()
+            await pilot.pause()
+            keys = [a["key"] for a in app.data.accounts]
+            assert service.add_account_calls == [ProviderKind.CODEX]
+            assert "codex_new" in keys
+
+    _run(body())
+
+
+def test_refresh_usage_action_updates_cached_account_detail(settings_env) -> None:
+    app = settings_env["app"]
+    service = settings_env["service"]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.action_refresh_selected_account_usage()
+            await pilot.pause()
+            assert service.refresh_usage_calls == ["claude_demo"]
+            detail_text = str(app.detail.render())
+            assert "92%" in detail_text
+            assert "Sampled:" in detail_text
+
+    _run(body())
+
+
+def test_remove_account_action_confirms_and_refreshes_snapshot(settings_env, monkeypatch) -> None:
+    app = settings_env["app"]
+    service = settings_env["service"]
+
+    def _auto_confirm(_screen, callback):
+        callback(True)
+
+    monkeypatch.setattr(app, "push_screen", _auto_confirm)
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.action_remove_selected_account()
+            await pilot.pause()
+            keys = [a["key"] for a in app.data.accounts]
+            assert service.remove_account_calls == [("claude_demo", False)]
+            assert "claude_demo" not in keys
 
     _run(body())
 

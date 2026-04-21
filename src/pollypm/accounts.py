@@ -44,6 +44,10 @@ class AccountStatus:
     access_expires_at: str | None = None
     usage_updated_at: str | None = None
     usage_raw_text: str = ""
+    used_pct: int | None = None
+    remaining_pct: int | None = None
+    reset_at: str | None = None
+    period_label: str | None = None
     isolation_status: str = "unknown"
     isolation_summary: str = "unknown"
     isolation_recommendation: str = ""
@@ -309,6 +313,10 @@ def probe_account_usage(config_path: Path, identifier: str) -> AccountStatus:
         access_expires_at=runtime.access_expires_at if runtime else None,
         usage_updated_at=(cached.updated_at if cached else None),
         usage_raw_text=(cached.raw_text if cached else ""),
+        used_pct=(cached.used_pct if cached else None),
+        remaining_pct=(cached.remaining_pct if cached else None),
+        reset_at=(cached.reset_at if cached else None),
+        period_label=(cached.period_label if cached else None),
         isolation_status=isolation_status,
         isolation_summary=isolation_summary,
         isolation_recommendation=isolation_recommendation,
@@ -348,6 +356,10 @@ def list_account_statuses(config_path: Path) -> list[AccountStatus]:
                     access_expires_at=runtime.access_expires_at if runtime else None,
                     usage_updated_at=cached.updated_at if cached else None,
                     usage_raw_text=cached.raw_text if cached else "",
+                    used_pct=cached.used_pct if cached else None,
+                    remaining_pct=cached.remaining_pct if cached else None,
+                    reset_at=cached.reset_at if cached else None,
+                    period_label=cached.period_label if cached else None,
                     isolation_status=isolation_status,
                     isolation_summary=isolation_summary,
                     isolation_recommendation=isolation_recommendation,
@@ -398,6 +410,10 @@ def list_cached_account_statuses(config_path: Path) -> list[AccountStatus]:
                     access_expires_at=runtime.access_expires_at if runtime else None,
                     usage_updated_at=cached.updated_at if cached else None,
                     usage_raw_text=cached.raw_text if cached else "",
+                    used_pct=cached.used_pct if cached else None,
+                    remaining_pct=cached.remaining_pct if cached else None,
+                    reset_at=cached.reset_at if cached else None,
+                    period_label=cached.period_label if cached else None,
                     isolation_status=isolation_status,
                     isolation_summary=isolation_summary,
                     isolation_recommendation=isolation_recommendation,

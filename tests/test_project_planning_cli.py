@@ -47,6 +47,7 @@ def _write_minimal_config(
     config = PollyPMConfig(
         project=ProjectSettings(
             root_dir=tmp_path,
+            workspace_root=tmp_path,
             base_dir=tmp_path / ".pollypm",
             logs_dir=tmp_path / ".pollypm/logs",
             snapshots_dir=tmp_path / ".pollypm/snapshots",
@@ -90,8 +91,9 @@ class TestPlan:
         assert payload["project"] == "demo"
         assert payload["flow"] == "plan_project"
         assert payload["task_id"].startswith("demo/")
-        # Work-service DB created at the expected location.
-        assert (repo / ".pollypm" / "state.db").exists()
+        # Work-service DB is workspace-scoped, not project-local.
+        assert (tmp_path / ".pollypm" / "state.db").exists()
+        assert not (repo / ".pollypm" / "state.db").exists()
 
     def test_plan_text_output(self, tmp_path: Path) -> None:
         repo = _make_project_repo(tmp_path)
@@ -163,8 +165,8 @@ class TestReplan:
         # Title prefix differs from plan — assert via the created task.
         from pollypm.work.sqlite_service import SQLiteWorkService
         with SQLiteWorkService(
-            db_path=repo / ".pollypm" / "state.db",
-            project_path=repo,
+            db_path=tmp_path / ".pollypm" / "state.db",
+            project_path=tmp_path,
         ) as svc:
             task = svc.get(payload["task_id"])
             assert "Replan" in task.title
@@ -211,8 +213,9 @@ class TestNew:
         # Auto-fire branch produces this message; the explicit-prompt
         # branch produces "Created planning task …".
         assert "Auto-created plan_project task" in result.stdout
-        # DB was created by the observer.
-        assert (repo / ".pollypm" / "state.db").exists()
+        # DB was created at workspace scope by the observer.
+        assert (tmp_path / ".pollypm" / "state.db").exists()
+        assert not (repo / ".pollypm" / "state.db").exists()
 
     def test_new_declines_does_not_create_task(
         self, tmp_path: Path, monkeypatch
@@ -238,7 +241,7 @@ class TestNew:
         assert "Created planning task" not in result.stdout
         assert "Auto-created plan_project task" not in result.stdout
         # No work-service DB means no task was created.
-        assert not (repo / ".pollypm" / "state.db").exists()
+        assert not (tmp_path / ".pollypm" / "state.db").exists()
 
     def test_new_skip_planner_flag_bypasses_prompt(
         self, tmp_path: Path, monkeypatch
@@ -330,7 +333,8 @@ class TestNew:
         assert result.exit_code == 0, result.stdout + result.stderr
 
         with SQLiteWorkService(
-            db_path=repo / ".pollypm" / "state.db", project_path=repo,
+            db_path=tmp_path / ".pollypm" / "state.db",
+            project_path=tmp_path,
         ) as svc:
             tasks = svc.list_tasks(project="fresh")
         plan_tasks = [t for t in tasks if t.flow_template_id == "plan_project"]
@@ -357,7 +361,7 @@ class TestNew:
         )
         assert result.exit_code == 0, result.stdout + result.stderr
         # No plan_project task was created (no DB at all).
-        assert not (repo / ".pollypm" / "state.db").exists()
+        assert not (tmp_path / ".pollypm" / "state.db").exists()
         assert "Auto-created plan_project task" not in result.stdout
 
     def test_new_config_disable_suppresses_auto_fire(
@@ -377,7 +381,7 @@ class TestNew:
             ["new", str(repo), "--config", str(config_path)],
         )
         assert result.exit_code == 0, result.stdout + result.stderr
-        assert not (repo / ".pollypm" / "state.db").exists()
+        assert not (tmp_path / ".pollypm" / "state.db").exists()
         assert "Auto-created plan_project task" not in result.stdout
 
 
@@ -426,9 +430,9 @@ class TestAddProjectAutoFire:
         result = self._invoke_add_project(repo=repo, config_path=config_path)
         assert result.exit_code == 0, result.stdout + result.stderr
 
-        db_path = repo / ".pollypm" / "state.db"
+        db_path = tmp_path / ".pollypm" / "state.db"
         assert db_path.exists(), "auto-fire should have opened the work DB"
-        with SQLiteWorkService(db_path=db_path, project_path=repo) as svc:
+        with SQLiteWorkService(db_path=db_path, project_path=tmp_path) as svc:
             tasks = svc.list_tasks(project="fresh")
         plan_tasks = [t for t in tasks if t.flow_template_id == "plan_project"]
         assert len(plan_tasks) == 1
@@ -445,7 +449,7 @@ class TestAddProjectAutoFire:
         )
         assert result.exit_code == 0, result.stdout + result.stderr
         # --skip-plan means no observer-driven task, so no DB either.
-        assert not (repo / ".pollypm" / "state.db").exists()
+        assert not (tmp_path / ".pollypm" / "state.db").exists()
 
     def test_add_project_config_disabled_suppresses_auto_fire(
         self, tmp_path: Path
@@ -455,7 +459,7 @@ class TestAddProjectAutoFire:
 
         result = self._invoke_add_project(repo=repo, config_path=config_path)
         assert result.exit_code == 0, result.stdout + result.stderr
-        assert not (repo / ".pollypm" / "state.db").exists()
+        assert not (tmp_path / ".pollypm" / "state.db").exists()
 
     def test_add_project_re_add_does_not_double_fire(
         self, tmp_path: Path
@@ -472,7 +476,8 @@ class TestAddProjectAutoFire:
         result = self._invoke_add_project(repo=repo, config_path=config_path)
         assert result.exit_code == 0, result.stdout + result.stderr
         with SQLiteWorkService(
-            db_path=repo / ".pollypm" / "state.db", project_path=repo,
+            db_path=tmp_path / ".pollypm" / "state.db",
+            project_path=tmp_path,
         ) as svc:
             first_tasks = svc.list_tasks(project="fresh")
         assert len([t for t in first_tasks if t.flow_template_id == "plan_project"]) == 1
@@ -481,7 +486,8 @@ class TestAddProjectAutoFire:
         result = self._invoke_add_project(repo=repo, config_path=config_path)
         assert result.exit_code == 0, result.stdout + result.stderr
         with SQLiteWorkService(
-            db_path=repo / ".pollypm" / "state.db", project_path=repo,
+            db_path=tmp_path / ".pollypm" / "state.db",
+            project_path=tmp_path,
         ) as svc:
             second_tasks = svc.list_tasks(project="fresh")
         plan_tasks = [t for t in second_tasks if t.flow_template_id == "plan_project"]

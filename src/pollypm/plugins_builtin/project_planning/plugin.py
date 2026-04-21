@@ -122,6 +122,7 @@ def _on_project_created(context) -> None:
         # config (fresh install, or a test ExtensionHost with no
         # pollypm.toml) means default ``auto_on_project_created=True``.
         auto_fire = True
+        workspace_db_path = None
         try:
             from pathlib import Path as _Path2
             from pollypm.config import DEFAULT_CONFIG_PATH, load_config, resolve_config_path
@@ -135,6 +136,9 @@ def _on_project_created(context) -> None:
             if cfg_path.exists():
                 cfg = load_config(cfg_path)
                 auto_fire = bool(cfg.planner.auto_on_project_created)
+                workspace_root = getattr(cfg.project, "workspace_root", None)
+                if workspace_root is not None:
+                    workspace_db_path = _Path2(workspace_root) / ".pollypm" / "state.db"
         except Exception as exc:  # noqa: BLE001
             log.debug(
                 "project_planning: config read failed, defaulting auto_fire=True (%s)",
@@ -168,7 +172,7 @@ def _on_project_created(context) -> None:
         from pollypm.work.sqlite_service import SQLiteWorkService
 
         project_path = _Path(project_path_raw)
-        db_path = project_path / ".pollypm" / "state.db"
+        db_path = workspace_db_path or (project_path / ".pollypm" / "state.db")
         db_path.parent.mkdir(parents=True, exist_ok=True)
         if is_replan:
             title = f"Replan project {project_key}"

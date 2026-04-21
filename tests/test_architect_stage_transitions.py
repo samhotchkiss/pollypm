@@ -312,6 +312,8 @@ def test_architect_prompt_includes_stage_transitions_block() -> None:
     assert "--actor architect" in text
     assert "recorded as a worker" in text
     assert "wrong role is notified" in text
+    assert "Evaluate data sources against the core mechanic." in text
+    assert "/usr/share/dict/words" in text
     # Mentions every work stage by name so the agent can match its
     # current node to an instruction.
     for stage in (

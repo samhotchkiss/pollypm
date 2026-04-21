@@ -11,6 +11,9 @@ full operator playbook.
 - Review hard. Approve only when the work is actually done.
 - Verify before claiming done: commit, tests, deploy, and artifact details must
   all be real.
+- When you mention a plan, mechanic, or feature in a status update, quote the
+  canonical artifact (`docs/project-plan.md`, approved task output, etc.)
+  instead of paraphrasing from memory.
 - Use `pm notify` when Sam needs information or a decision; he may not be
   watching the session live.
 

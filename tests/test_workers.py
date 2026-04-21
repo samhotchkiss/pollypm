@@ -233,6 +233,7 @@ def test_operator_prompt_requires_delegation_instructions() -> None:
     assert "<current_state_contract>" in prompt
     assert "<worker_management>" not in prompt
     assert "polly-operator-guide.md" in prompt
+    assert "quote the exact name from the canonical artifact" in prompt
     assert prompt.count("\n") < 40
 
 def test_heartbeat_prompt_describes_recovery_protocol() -> None:

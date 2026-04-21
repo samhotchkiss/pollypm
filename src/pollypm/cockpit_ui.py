@@ -1249,6 +1249,10 @@ class PollyDashboardApp(App[None]):
 
     TITLE = "PollyPM"
     SUB_TITLE = "Dashboard"
+    BINDINGS = [
+        Binding("i", "jump_inbox", "Inbox"),
+        Binding("r", "refresh", "Refresh"),
+    ]
     CSS = """
     Screen {
         background: #0d1117;
@@ -1277,6 +1281,8 @@ class PollyDashboardApp(App[None]):
         self.header_w = Static("", classes="header", markup=True)
         self.now_title = Static("[b]Now[/b]", classes="section-title", markup=True)
         self.now_body = Static("", classes="section-body", markup=True)
+        self.messages_title = Static("[b]Recent Messages[/b]", classes="section-title", markup=True)
+        self.messages_body = Static("", classes="section-body", markup=True)
         self.done_title = Static("[b]Done[/b]", classes="section-title", markup=True)
         self.done_body = Static("", classes="done-section", markup=True)
         self.chart_title = Static("[b]Tokens[/b]", classes="section-title", markup=True)
@@ -1291,6 +1297,8 @@ class PollyDashboardApp(App[None]):
         yield self.header_w
         yield self.now_title
         yield self.now_body
+        yield self.messages_title
+        yield self.messages_body
         yield self.done_title
         yield self.done_body
         yield self.chart_title
@@ -1390,6 +1398,28 @@ class PollyDashboardApp(App[None]):
                 lines.append(f"{icon} {name}  [dim]{s.status}[/dim]")
         self.now_body.update("\n".join(lines) if lines else "[dim]No active sessions[/dim]")
 
+        # ── Recent messages ──
+        message_lines: list[str] = []
+        if data.recent_messages:
+            for item in data.recent_messages:
+                sender = _escape(item.sender)
+                title = _escape(item.title)
+                age = self._age_str(item.age_seconds)
+                message_lines.append(
+                    f"[#58a6ff]{sender}[/#58a6ff] [dim]\u2192 you[/dim]  {title}"
+                )
+                meta = " \u00b7 ".join(
+                    part
+                    for part in (_escape(item.project), _escape(item.task_id), age)
+                    if part
+                )
+                message_lines.append(f"  [dim]{meta}[/dim]")
+                message_lines.append("")
+            message_lines.append("[dim]Press [b]i[/b] to jump to the inbox[/dim]")
+        else:
+            message_lines.append("[dim]Inbox is clear.[/dim]")
+        self.messages_body.update("\n".join(message_lines))
+
         # ── Done: commits + completed issues ──
         done_lines: list[str] = []
         if data.recent_commits:
@@ -1467,6 +1497,28 @@ class PollyDashboardApp(App[None]):
             footer += "  \u00b7  stale cache"
         footer += "[/dim]"
         self.footer_w.update(footer)
+
+    def action_jump_inbox(self) -> None:
+        self.run_worker(
+            self._route_to_inbox_sync,
+            thread=True,
+            exclusive=True,
+            group="polly_dashboard_inbox",
+        )
+
+    def _route_to_inbox_sync(self) -> None:
+        try:
+            self._route_to_inbox()
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(
+                self.notify,
+                f"Jump to inbox failed: {exc}",
+                severity="error",
+            )
+
+    def _route_to_inbox(self) -> None:
+        router = CockpitRouter(self.config_path)
+        router.route_selected("inbox")
 
 
 class PollyCockpitPaneApp(App[None]):

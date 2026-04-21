@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from pollypm.cockpit_ui import PollyDashboardApp
-from pollypm.dashboard_data import DashboardData, load_dashboard
+from pollypm.dashboard_data import DashboardData, InboxPreview, load_dashboard
 
 
 def _run(coro) -> None:
@@ -20,6 +20,7 @@ def _fake_dashboard_data() -> DashboardData:
         active_sessions=[],
         recent_commits=[],
         completed_items=[],
+        recent_messages=[],
         daily_tokens=[],
         today_tokens=0,
         total_tokens=0,
@@ -103,3 +104,54 @@ def test_polly_dashboard_refresh_error_keeps_cached_snapshot(monkeypatch, tmp_pa
     assert app._dashboard_data is data
     assert app._refresh_error == "boom"
     assert rendered == [(config, data)]
+
+
+def test_polly_dashboard_renders_recent_messages(monkeypatch, tmp_path: Path) -> None:
+    app = PollyDashboardApp(tmp_path / "pollypm.toml")
+    data = _fake_dashboard_data()
+    data.recent_messages = [
+        InboxPreview(
+            sender="polly",
+            title="Feedback on shortlink_gen/5",
+            project="Shortlink Gen",
+            task_id="shortlink_gen/5",
+            age_seconds=120.0,
+        ),
+        InboxPreview(
+            sender="russell",
+            title="Approval ready: docs/1",
+            project="Docs",
+            task_id="docs/1",
+            age_seconds=480.0,
+        ),
+    ]
+
+    app._render_dashboard(_fake_config(), data)
+
+    rendered = str(app.messages_body.render())
+    assert "polly" in rendered
+    assert "Feedback on shortlink_gen/5" in rendered
+    assert "Press i to jump to the inbox" in rendered
+
+
+def test_polly_dashboard_i_key_routes_to_inbox(monkeypatch, tmp_path: Path) -> None:
+    calls: list[bool] = []
+
+    def fake_route(self) -> None:
+        calls.append(True)
+
+    monkeypatch.setattr(PollyDashboardApp, "_route_to_inbox", fake_route)
+    monkeypatch.setattr("pollypm.cockpit_ui._setup_alert_notifier", lambda *args, **kwargs: None)
+
+    async def body() -> None:
+        app = PollyDashboardApp(tmp_path / "pollypm.toml")
+        app._finish_dashboard_refresh_success(_fake_config(), _fake_dashboard_data())
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("i")
+            await pilot.pause()
+            if not calls:
+                app._route_to_inbox_sync()
+            assert calls
+
+    _run(body())

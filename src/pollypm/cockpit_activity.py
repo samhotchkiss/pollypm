@@ -338,6 +338,8 @@ class PollyActivityFeedApp(App[None]):
         return count
 
     def _render(self) -> None:
+        filtered_entries = self._filtered_entries()
+        events_last_24h = self._events_in_last_24h()
         title_bits = ["[b #eef6ff]Activity[/b #eef6ff]"]
         if self._filter_project:
             title_bits.append(
@@ -346,7 +348,7 @@ class PollyActivityFeedApp(App[None]):
         self.topbar.update("  ".join(title_bits))
 
         chips: list[str] = [
-            f"[b]{self._events_in_last_24h()}[/b] [dim]event{'s' if self._events_in_last_24h() != 1 else ''} in last 24h[/dim]"
+            f"[b]{events_last_24h}[/b] [dim]event{'s' if events_last_24h != 1 else ''} in last 24h[/dim]"
         ]
         filter_description = self._describe_filters()
         if filter_description:
@@ -356,7 +358,7 @@ class PollyActivityFeedApp(App[None]):
         )
         self.counters.update("  \u00b7  ".join(chips))
 
-        self._render_table()
+        self._render_table(filtered_entries)
         if self._open_entry_id is not None:
             self._render_detail()
         else:
@@ -374,9 +376,9 @@ class PollyActivityFeedApp(App[None]):
         else:
             self.hint.update(self._DEFAULT_HINT)
 
-    def _render_table(self) -> None:
+    def _render_table(self, rows: list) -> None:
         self.table.clear()
-        for entry in self._filtered_entries():
+        for entry in rows:
             time_text = Text(_format_activity_relative(entry.timestamp), style="#97a6b2")
             project_label = entry.project or "\u2014"
             if self._filter_project and (entry.project or "") == self._filter_project:

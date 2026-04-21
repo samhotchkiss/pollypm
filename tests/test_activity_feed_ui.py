@@ -239,6 +239,48 @@ def test_fuzzy_filter_matches_actor_and_summary(
     _run(body())
 
 
+def test_render_scans_filtered_rows_only_once_per_render(
+    activity_env, activity_app, monkeypatch,
+) -> None:
+    """The counters/table path should not rescan the same in-memory window."""
+
+    async def body() -> None:
+        entries = [
+            _make_entry(entry_id="evt:1", summary="one"),
+            _make_entry(entry_id="evt:2", summary="two"),
+        ]
+        activity_app._gather = lambda: entries  # type: ignore[method-assign]
+
+        filtered_calls = 0
+        last_24h_calls = 0
+        original_filtered = activity_app._filtered_entries
+        original_last_24h = activity_app._events_in_last_24h
+
+        def _count_filtered():
+            nonlocal filtered_calls
+            filtered_calls += 1
+            return original_filtered()
+
+        def _count_last_24h():
+            nonlocal last_24h_calls
+            last_24h_calls += 1
+            return original_last_24h()
+
+        monkeypatch.setattr(activity_app, "_filtered_entries", _count_filtered)
+        monkeypatch.setattr(activity_app, "_events_in_last_24h", _count_last_24h)
+
+        async with activity_app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            filtered_calls = 0
+            last_24h_calls = 0
+            activity_app._render()
+            await pilot.pause()
+            assert filtered_calls == 1
+            assert last_24h_calls == 1
+
+    _run(body())
+
+
 # ---------------------------------------------------------------------------
 # 4. Follow mode toggles + refreshes.
 # ---------------------------------------------------------------------------

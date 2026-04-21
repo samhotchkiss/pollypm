@@ -71,12 +71,15 @@ def _make_row(**overrides):
         project_name="Demo",
         session_name="worker_demo",
         status="working",
+        health="alive",
+        health_tooltip="last heartbeat now · 168 tokens · session: worker_demo",
         task_id="demo/1",
         task_number=1,
         task_title="Build favicon",
         current_node="implement",
         turn_label="active 2m",
         last_commit_label="5m ago",
+        token_total=168,
         tmux_window="task-demo-1",
         last_heartbeat="2026-04-17T00:00:00+00:00",
         worktree_path="/tmp/wt",
@@ -130,26 +133,21 @@ def test_roster_renders_all_configured_workers(roster_env, roster_app) -> None:
 
 
 def test_status_dots_for_each_category(roster_env, roster_app) -> None:
-    """Each status maps to a distinct dot glyph from ``_STATUS_DOTS``."""
+    """Health states map to the expected glyph set."""
     async def body() -> None:
         rows = [
-            _make_row(status="stuck", session_name="s"),
-            _make_row(status="working", session_name="w"),
-            _make_row(status="idle", session_name="i"),
-            _make_row(status="offline", session_name="o"),
+            _make_row(status="stuck", health="unresponsive", session_name="s"),
+            _make_row(status="working", health="alive", session_name="w"),
+            _make_row(status="idle", health="idle_warn", session_name="i"),
+            _make_row(status="offline", health="unresponsive", session_name="o"),
         ]
         roster_app._gather = lambda: rows  # type: ignore[method-assign]
         async with roster_app.run_test(size=(160, 40)) as pilot:
             await pilot.pause()
-            dots = roster_app._STATUS_DOTS
-            # Sanity: the four statuses are all represented.
-            assert "stuck" in dots
-            assert "working" in dots
-            assert "idle" in dots
-            assert "offline" in dots
-            # Dot glyphs distinguish stuck (triangle) from the circles.
-            assert dots["stuck"][0] != dots["working"][0]
-            assert dots["stuck"][0] != dots["idle"][0]
+            dots = roster_app._HEALTH_GLYPHS
+            assert dots["alive"][0] == "🟢"
+            assert dots["idle_warn"][0] == "🟡"
+            assert dots["unresponsive"][0] == "🔴"
             # Counters line reflects the group tallies.
             counter_text = str(roster_app.counters.render())
             assert "1" in counter_text  # at least one of each
@@ -281,7 +279,30 @@ def test_recent_shipment_flashes_checkmark_then_clears(
             assert _table_rows(roster_app.table)[0][2] == "✓"
             await asyncio.sleep(0.9)
             await pilot.pause()
-            assert _table_rows(roster_app.table)[0][2] == "○"
+            assert _table_rows(roster_app.table)[0][2] == "🟢"
+
+    _run(body())
+
+
+def test_row_highlight_updates_health_tooltip_hint(roster_env, roster_app) -> None:
+    async def body() -> None:
+        rows = [
+            _make_row(
+                status="idle",
+                health="idle_warn",
+                health_tooltip="last heartbeat 7m ago · 2.4M tokens · session: worker_demo",
+                token_total=2_400_000,
+            ),
+        ]
+        roster_app._gather = lambda: rows  # type: ignore[method-assign]
+        async with roster_app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            roster_app.table.focus()
+            await pilot.pause()
+            hint_text = str(roster_app.hint.render())
+            assert "last heartbeat 7m ago" in hint_text
+            assert "2.4M tokens" in hint_text
+            assert "session: worker_demo" in hint_text
 
     _run(body())
 
@@ -365,6 +386,7 @@ def test_gather_worker_roster_picks_up_worker_session(tmp_path: Path) -> None:
     assert rows[0].session_name == "worker_demo"
     # No tmux server in tests → window is absent → status is "offline".
     assert rows[0].status == "offline"
+    assert rows[0].health == "unresponsive"
     assert rows[0].task_number == t.task_number
     assert "Build favicon" in rows[0].task_title
 
@@ -491,4 +513,6 @@ def test_gather_worker_roster_reuses_recent_heartbeat_snapshot(
     assert len(rows) == 1
     assert rows[0].session_name == "worker_demo"
     assert rows[0].status == "working"
+    assert rows[0].health == "alive"
+    assert "session: worker_demo" in rows[0].health_tooltip
     assert rows[0].turn_label.startswith("active")

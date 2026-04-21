@@ -330,12 +330,15 @@ class WorkerRosterRow:
     project_name: str
     session_name: str
     status: str  # "working" | "idle" | "stuck" | "offline"
+    health: str  # "alive" | "idle_warn" | "unresponsive"
+    health_tooltip: str
     task_id: str | None
     task_number: int | None
     task_title: str
     current_node: str | None
     turn_label: str
     last_commit_label: str
+    token_total: int
     tmux_window: str | None  # e.g. "task-<project>-<number>"
     last_heartbeat: str | None
     worktree_path: str | None
@@ -454,6 +457,64 @@ def _last_commit_age(project_path: Path, branch_name: str | None) -> str:
     return f"{total_s // (3600 * 24)}d ago"
 
 
+def _format_heartbeat_age(last_heartbeat_iso: str | None) -> str:
+    """Return a tooltip-friendly relative heartbeat age."""
+    if not last_heartbeat_iso:
+        return "unknown"
+    try:
+        dt = datetime.fromisoformat(last_heartbeat_iso)
+    except (TypeError, ValueError):
+        return "unknown"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    delta = datetime.now(UTC) - dt
+    total_s = max(0, int(delta.total_seconds()))
+    if total_s < 60:
+        return "now"
+    if total_s < 3600:
+        return f"{total_s // 60}m ago"
+    if total_s < 3600 * 24:
+        return f"{total_s // 3600}h ago"
+    return f"{total_s // (3600 * 24)}d ago"
+
+
+def _format_token_total(total: int) -> str:
+    if total < 1_000:
+        return f"{total}"
+    if total < 1_000_000:
+        return f"{total / 1_000:.1f}K"
+    return f"{total / 1_000_000:.1f}M"
+
+
+def _worker_health_snapshot(
+    *,
+    status: str,
+    last_heartbeat_iso: str | None,
+    token_total: int,
+    session_name: str,
+) -> tuple[str, str]:
+    """Map worker state to a health bucket + tooltip."""
+    heartbeat_age = _format_heartbeat_age(last_heartbeat_iso)
+    if status in {"stuck", "offline"}:
+        health = "unresponsive"
+    elif status == "idle":
+        try:
+            dt = datetime.fromisoformat(last_heartbeat_iso) if last_heartbeat_iso else None
+        except (TypeError, ValueError):
+            dt = None
+        if dt is not None and dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        idle_long = dt is not None and dt <= datetime.now(UTC) - timedelta(minutes=5)
+        health = "idle_warn" if idle_long else "alive"
+    else:
+        health = "alive"
+    tooltip = (
+        f"last heartbeat {heartbeat_age} · {_format_token_total(token_total)} tokens"
+        f" · session: {session_name}"
+    )
+    return health, tooltip
+
+
 def _gather_worker_roster(config) -> list[WorkerRosterRow]:
     """Walk every tracked project's work-service + tmux state.
 
@@ -539,6 +600,12 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
                 getattr(task, "current_node_id", None)
                 if task is not None else None
             )
+            token_total = 0
+            if task is not None:
+                token_total = int(
+                    (getattr(task, "total_input_tokens", 0) or 0)
+                    + (getattr(task, "total_output_tokens", 0) or 0)
+                )
             just_shipped, shipment_token = _recent_worker_shipment(task)
             window_name = f"task-{project_key}-{ws.task_number}"
             window = storage_windows.get(window_name)
@@ -601,6 +668,12 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
                 is_turn_active=is_turn_active,
             )
             last_commit_label = _last_commit_age(project_path, ws.branch_name)
+            health, health_tooltip = _worker_health_snapshot(
+                status=status,
+                last_heartbeat_iso=last_heartbeat_iso,
+                token_total=token_total,
+                session_name=session_name,
+            )
 
             rows.append(
                 WorkerRosterRow(
@@ -608,12 +681,15 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
                     project_name=str(project_name),
                     session_name=session_name,
                     status=status,
+                    health=health,
+                    health_tooltip=health_tooltip,
                     task_id=task_id,
                     task_number=ws.task_number,
                     task_title=task_title,
                     current_node=current_node,
                     turn_label=turn_label,
                     last_commit_label=last_commit_label,
+                    token_total=token_total,
                     tmux_window=window_name,
                     last_heartbeat=last_heartbeat_iso,
                     worktree_path=ws.worktree_path,

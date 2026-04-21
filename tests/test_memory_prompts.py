@@ -232,6 +232,34 @@ def test_build_memory_injection_budget_override_works(seeded_backend: FileMemory
     assert len(tiny) <= 400
 
 
+def test_build_memory_injection_marks_when_entries_are_truncated(tmp_path: Path) -> None:
+    backend = FileMemoryBackend(tmp_path)
+    for i in range(12):
+        backend.write_entry(
+            ProjectMemory(
+                fact=f"Large fact {i:02d} " + ("z " * 80),
+                why="x " * 120,
+                how_to_apply="y " * 120,
+                scope="pollypm",
+                scope_tier="project",
+                importance=4,
+            )
+        )
+
+    injection = build_memory_injection(
+        backend,
+        user_id="operator",
+        project_name="pollypm",
+        task_context_summary="large corpus test",
+        limit=12,
+        budget_chars=300,
+    )
+
+    assert len(injection) <= 300
+    assert "Memory truncated:" in injection
+    assert "pm memory recall" in injection
+
+
 # ---------------------------------------------------------------------------
 # Importance filter — entries below the importance floor are excluded
 # ---------------------------------------------------------------------------

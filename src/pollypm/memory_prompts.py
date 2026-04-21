@@ -189,9 +189,17 @@ def _render_injection(
     # a simple loop — the worst case is O(limit^2) entry renders, but
     # limit is small (default 15) so it's negligible.
     ordered = _flatten_for_budget(by_type)
+    total_entries = len(ordered)
 
     while True:
         rendered = _render_by_type(by_type)
+        shown_entries = sum(len(entries) for entries in by_type.values())
+        if shown_entries < total_entries:
+            rendered = _append_truncation_notice(
+                rendered,
+                shown_entries=shown_entries,
+                total_entries=total_entries,
+            )
         if len(rendered) <= budget_chars:
             return rendered
         if not ordered:
@@ -251,6 +259,23 @@ def _render_entry_bullet(entry: MemoryEntry) -> str:
     """
     raw = (entry.title or entry.body or "").strip()
     return " ".join(raw.split())
+
+
+def _append_truncation_notice(
+    rendered: str,
+    *,
+    shown_entries: int,
+    total_entries: int,
+) -> str:
+    if not rendered:
+        return rendered
+    notice = (
+        f"_[Memory truncated: {shown_entries} of {total_entries} entries shown. "
+        "Ask for more with `pm memory recall`.]_"
+    )
+    if rendered.endswith("\n"):
+        return f"{rendered}{notice}\n"
+    return f"{rendered}\n{notice}\n"
 
 
 def prepend_memory_injection(prompt: str, injection: str) -> str:

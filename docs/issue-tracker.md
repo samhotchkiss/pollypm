@@ -1,65 +1,59 @@
 # PollyPM Issue Tracker
 
-> **Note**: This document describes the legacy file-based issue tracker.
-> The **work service** (`pm task`, `pm flow`) is now the source of truth
-> for all task management. The `issues/` folder is maintained as a
-> **read-only projection** by the file sync adapter — it mirrors work
-> service state for human inspection but is never the authority. See
-> `docs/work-service-spec.md` for the current system.
+This document describes the GitHub-backed issue flow used by PollyPM projects
+that manage work through `gh issue ...` and `polly:` labels.
 
 ## Source of Truth
 
-The work service SQLite database (`.pollypm/state.db` per project) owns
-all task state: status, flow position, execution history, context log,
-dependencies, and roles. Agents interact with it via `pm task` CLI
-commands, not by moving files.
+GitHub Issues is the tracker. A task's state is encoded by exactly one PollyPM
+label at a time:
 
-The `issues/` folder structure is kept in sync automatically so that
-`ls issues/01-ready/` still works for quick inspection, but:
+| GitHub label | State |
+|--------------|-------|
+| `polly:not-ready` | `00-not-ready` |
+| `polly:ready` | `01-ready` |
+| `polly:in-progress` | `02-in-progress` |
+| `polly:needs-review` | `03-needs-review` |
+| `polly:in-review` | `04-in-review` |
+| `polly:completed` | `05-completed` |
 
-- **Never move files manually** — the sync adapter will overwrite your
-  changes on the next transition.
-- **Never treat file presence/absence as authoritative** — if the sync
-  is stale, the work service is correct.
+GitHub Projects boards are optional views only. The label on the issue is the
+state. Comments carry the handoff notes between implementation and review.
 
-## Folder Mapping (projection only)
+## Working The Queue
 
-The file sync adapter maps work service status to folders:
+1. Create issues with `polly:not-ready` when the work still needs scoping, or
+   `polly:ready` when it is fully specified.
+2. Pick the oldest issue with `polly:ready`.
+3. Move it to `polly:in-progress` before implementation starts.
+4. Finish the work, then move it to `polly:needs-review` and leave a comment
+   with what changed and how to verify it.
+5. Reviewers move it to `polly:in-review`, inspect the diff, and either:
+   - move it back to `polly:in-progress` with a corrective comment, or
+   - move it to `polly:completed` and close the issue.
 
-| Work Status   | Folder             |
-|---------------|--------------------|
-| draft         | `00-not-ready`     |
-| queued        | `01-ready`         |
-| in_progress   | `02-in-progress`   |
-| blocked       | `02-in-progress`   |
-| on_hold       | `00-not-ready`     |
-| review        | `03-needs-review`  |
-| done          | `05-completed`     |
-| cancelled     | `05-completed`     |
+## Handoff Notes
 
-## Legacy Role Split
+Use GitHub comments for the handoff trail:
 
-For projects still using the old file-based system (no `.pollypm/state.db`):
+- Implementation handoff: what was changed, what was tested, and any known
+  follow-up.
+- Review feedback: specific fixes needed before the issue can complete.
+- Completion note: confirm the issue is done and reference the PR if there is
+  one.
 
-- PA owns implementation.
-- PM owns review and merge.
+## Practical `gh` Commands
 
-PA responsibilities:
-- pick the next small issue
-- move it to `02-in-progress`
-- implement and test it
-- move it to `03-needs-review`
-- notify PM that review is needed
+```bash
+gh issue list --label polly:ready --state all --repo owner/repo
+gh issue view 123 --repo owner/repo
+gh issue edit 123 --remove-label polly:ready --add-label polly:in-progress --repo owner/repo
+gh issue comment 123 --body "Ready for review: ..."
+gh issue close 123 --repo owner/repo
+```
 
-PM responsibilities:
-- move issues to `04-in-review`
-- review and validate the work
-- request changes or move to `05-completed`
-- merge when approval criteria are satisfied
+## When To Use This
 
-## Guidance
-
-- Keep issues small, testable, and independently shippable.
-- Prefer many small issues over a few large ones.
-- Keep the project north star visible while executing issue-level work.
-- Use PM to review drift, scope creep, and low-value loops.
+Use this flow for GitHub-hosted projects that want issue tracking to stay in
+the repository and visible to the team. If a project is still on the local
+filesystem tracker, use the project-local issue instructions instead.

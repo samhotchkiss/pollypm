@@ -120,6 +120,34 @@ def test_supervisor_failover_prefers_viable_backup(monkeypatch, tmp_path: Path) 
     }
 
 
+def test_ensure_layout_skips_scaffolding_global_control_root(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    config_root = tmp_path / ".pollypm"
+    config = _config(config_root)
+    real_project = tmp_path / "demo"
+    config.projects = {
+        "demo": KnownProject(
+            key="demo",
+            path=real_project,
+            name="Demo",
+            kind=ProjectKind.FOLDER,
+        ),
+    }
+    supervisor = Supervisor(config)
+    scaffolded: list[Path] = []
+
+    monkeypatch.setattr(
+        "pollypm.supervisor.ensure_project_scaffold",
+        lambda path: (scaffolded.append(Path(path)), Path(path))[1],
+    )
+
+    supervisor.ensure_layout()
+
+    assert config.project.root_dir not in scaffolded
+    assert real_project in scaffolded
+
+
 def test_human_input_creates_automatic_lease(monkeypatch, tmp_path: Path) -> None:
     config = _config(tmp_path)
     supervisor = Supervisor(config)

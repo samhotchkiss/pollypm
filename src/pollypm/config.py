@@ -66,6 +66,13 @@ def _polly_prompt() -> str:
 
 
 def _resolve_path(base: Path, raw_path: str) -> Path:
+    # Global configs live in ``~/.pollypm/pollypm.toml``. Older renders
+    # wrote sibling paths as ``.pollypm/...`` relative to that same
+    # directory, which reloads as a bogus nested ``~/.pollypm/.pollypm``.
+    if base.name == GLOBAL_CONFIG_DIR.name:
+        rel = Path(raw_path)
+        if not rel.is_absolute() and rel.parts[:1] == (GLOBAL_CONFIG_DIR.name,):
+            raw_path = str(Path(*rel.parts[1:])) if len(rel.parts) > 1 else "."
     path = Path(raw_path)
     if path.is_absolute():
         return path
@@ -84,6 +91,12 @@ def _toml_str(value: str) -> str:
 
 
 def _format_path(path: Path, root: Path) -> str:
+    if root.resolve().name == GLOBAL_CONFIG_DIR.name:
+        legacy_nested_root = root.resolve() / GLOBAL_CONFIG_DIR.name
+        try:
+            return str(path.resolve().relative_to(legacy_nested_root))
+        except ValueError:
+            pass
     try:
         return str(path.resolve().relative_to(root.resolve()))
     except ValueError:

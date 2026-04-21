@@ -67,7 +67,7 @@ logger = logging.getLogger(__name__)
 from pollypm.agent_profiles import get_agent_profile
 from pollypm.agent_profiles.base import AgentProfileContext
 from pollypm.checkpoints import record_checkpoint, snapshot_hash, write_mechanical_checkpoint
-from pollypm.config import PollyPMConfig
+from pollypm.config import GLOBAL_CONFIG_DIR, PollyPMConfig
 from pollypm.errors import _last_lines, format_probe_failure
 from pollypm.heartbeats import get_heartbeat_backend
 from pollypm.heartbeats.api import SupervisorHeartbeatAPI
@@ -952,7 +952,22 @@ class Supervisor:
         project.base_dir.mkdir(parents=True, exist_ok=True)
         project.logs_dir.mkdir(parents=True, exist_ok=True)
         project.snapshots_dir.mkdir(parents=True, exist_ok=True)
-        ensure_project_scaffold(project.root_dir)
+        root_dir = project.root_dir.resolve()
+        base_dir = project.base_dir.resolve()
+        # The user-global config lives under ``~/.pollypm``. That control
+        # root is not a real project checkout, so scaffolding it creates a
+        # fake ``~/.pollypm/.pollypm`` project tree. Skip the ambient-root
+        # scaffold for both the normalized shape (root == base) and the
+        # legacy nested-base shape written by older configs/onboarding.
+        should_scaffold_root = (
+            root_dir != base_dir
+            and not (
+                root_dir.name == GLOBAL_CONFIG_DIR.name
+                and base_dir == root_dir / GLOBAL_CONFIG_DIR.name
+            )
+        )
+        if should_scaffold_root:
+            ensure_project_scaffold(project.root_dir)
         for known_project in self.config.projects.values():
             ensure_project_scaffold(known_project.path)
         for account in self.config.accounts.values():

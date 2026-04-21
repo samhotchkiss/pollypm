@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import subprocess
+
 import pytest
+from unittest.mock import MagicMock
 
 from pollypm.rejection_feedback import (
     feedback_target_task_id,
@@ -84,6 +87,47 @@ def _claim_task(svc, task):
     """Queue and claim a task, returning the claimed task."""
     svc.queue(task.task_id, "pm")
     return svc.claim(task.task_id, "pete")
+
+
+def _git_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=repo, check=True)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+    return repo
+
+
+def _git_stdout(repo, *args):
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _create_review_task_on_git_repo(tmp_path):
+    repo = _git_repo(tmp_path)
+    svc = SQLiteWorkService(db_path=tmp_path / "work.db", project_path=repo)
+    task = _create_task(svc)
+    _claim_task(svc, task)
+
+    current_branch = _git_stdout(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    task_branch = f"task/{task.project}-{task.task_number}"
+    subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", task_branch], check=True)
+    (repo / "feature.txt").write_text("done\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "feature.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "feat: worker change"], check=True)
+    subprocess.run(["git", "-C", str(repo), "checkout", "-q", current_branch], check=True)
+
+    svc.node_done(task.task_id, "pete", _valid_work_output())
+    return repo, svc, task, task_branch
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +236,33 @@ class TestApprove:
         assert len(review_execs) == 1
         assert review_execs[0].decision == Decision.APPROVED
         assert review_execs[0].decision_reason == "LGTM"
+
+    def test_approve_auto_merges_task_branch_into_repo(self, tmp_path):
+        repo, svc, task, task_branch = _create_review_task_on_git_repo(tmp_path)
+
+        result = svc.approve(task.task_id, "polly")
+
+        assert result.work_status == WorkStatus.DONE
+        assert (repo / "feature.txt").read_text(encoding="utf-8") == "done\n"
+        merged = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", task_branch, "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert merged.returncode == 0
+
+    def test_approve_refuses_auto_merge_when_repo_dirty(self, tmp_path):
+        repo, svc, task, _task_branch = _create_review_task_on_git_repo(tmp_path)
+        (repo / "README.md").write_text("dirty\n", encoding="utf-8")
+        session_mgr = MagicMock()
+        svc.set_session_manager(session_mgr)
+
+        with pytest.raises(ValidationError, match="uncommitted changes"):
+            svc.approve(task.task_id, "polly")
+
+        assert svc.get(task.task_id).work_status == WorkStatus.REVIEW
+        session_mgr.teardown_worker.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

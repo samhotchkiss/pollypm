@@ -23,6 +23,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -1621,6 +1622,9 @@ class SQLiteWorkService:
                     f"Gate check failed on node '{node.name}': {reasons}"
                 )
 
+        if task.current_node_id == "code_review" and node.next_node_id == "done":
+            self._auto_merge_approved_task_branch(task)
+
         now = _now()
 
         try:
@@ -2473,6 +2477,98 @@ class SQLiteWorkService:
             return candidate
 
         return self._project_path
+
+    def _auto_merge_approved_task_branch(self, task: Task) -> None:
+        """Merge an approved task branch into the repo's current branch.
+
+        Runs before the task flips to ``done`` so merge failures leave the task
+        parked at review and preserve the worker worktree for intervention.
+        """
+        project_path = self._resolve_project_path(task.project)
+        if project_path is None or not (project_path / ".git").exists():
+            return
+
+        task_branch = f"task/{task.project}-{task.task_number}"
+        current_branch = self._git_stdout(
+            project_path,
+            "rev-parse",
+            "--abbrev-ref",
+            "HEAD",
+            error_prefix="Cannot determine the canonical branch for auto-merge.",
+        )
+        if current_branch == task_branch:
+            return
+
+        status = self._git_run(project_path, "status", "--porcelain")
+        if status.returncode != 0:
+            detail = status.stderr.strip() or status.stdout.strip() or "git status failed"
+            raise ValidationError(
+                "Cannot auto-merge approved work right now. "
+                f"Git status failed in {project_path}: {detail}"
+            )
+        if status.stdout.strip():
+            raise ValidationError(
+                "Cannot auto-merge approved work because the project root has "
+                "uncommitted changes. Commit or stash them, then retry approve."
+            )
+
+        branch_exists = self._git_run(project_path, "rev-parse", "--verify", task_branch)
+        if branch_exists.returncode != 0:
+            raise ValidationError(
+                f"Cannot auto-merge approved work because branch `{task_branch}` "
+                "does not exist."
+            )
+
+        already_merged = self._git_run(
+            project_path,
+            "merge-base",
+            "--is-ancestor",
+            task_branch,
+            "HEAD",
+        )
+        if already_merged.returncode == 0:
+            return
+
+        ff_only = self._git_run(project_path, "merge", "--ff-only", task_branch)
+        if ff_only.returncode == 0:
+            return
+
+        merge = self._git_run(project_path, "merge", "--no-ff", "--no-edit", task_branch)
+        if merge.returncode == 0:
+            return
+
+        # Best-effort cleanup so retrying approve starts from a clean repo.
+        self._git_run(project_path, "merge", "--abort")
+        detail = (
+            merge.stderr.strip()
+            or merge.stdout.strip()
+            or ff_only.stderr.strip()
+            or "git merge failed"
+        )
+        raise ValidationError(
+            f"Could not auto-merge `{task_branch}` into `{current_branch}`. "
+            f"Resolve the repo state and retry approve. Git said: {detail}"
+        )
+
+    def _git_run(self, project_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(project_path), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    def _git_stdout(
+        self,
+        project_path: Path,
+        *args: str,
+        error_prefix: str,
+    ) -> str:
+        result = self._git_run(project_path, *args)
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "git command failed"
+            raise ValidationError(f"{error_prefix} {detail}")
+        return result.stdout.strip()
 
     def available_flows(self, project: str | None = None) -> list[FlowTemplate]:
         """List all available flows after override resolution.

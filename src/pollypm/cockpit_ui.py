@@ -1263,6 +1263,10 @@ class PollyDashboardApp(App[None]):
         self.chart_title = Static("[b]Tokens[/b]", classes="section-title", markup=True)
         self.chart_body = Static("", classes="chart-section", markup=True)
         self.footer_w = Static("", classes="footer", markup=True)
+        self._dashboard_config = None
+        self._dashboard_data = None
+        self._refresh_running = False
+        self._refresh_error: str | None = None
 
     def compose(self) -> ComposeResult:
         yield self.header_w
@@ -1288,19 +1292,49 @@ class PollyDashboardApp(App[None]):
         return f"{int(seconds // 86400)}d ago"
 
     def _refresh(self) -> None:
-        try:
-            from pollypm.dashboard_data import gather
-            config = load_config(self.config_path)
-            from pollypm.storage.state import StateStore
-            store = StateStore(config.project.state_db)
-            try:
-                data = gather(config, store)
-            finally:
-                store.close()
-        except Exception as exc:  # noqa: BLE001
-            self.header_w.update(f"[dim]Error: {exc}[/dim]")
+        self._render_cached_dashboard()
+        if self._refresh_running:
             return
+        self._refresh_running = True
+        self.run_worker(
+            self._refresh_dashboard_sync,
+            thread=True,
+            exclusive=True,
+            group="polly_dashboard_refresh",
+        )
 
+    def _render_cached_dashboard(self) -> None:
+        if self._dashboard_config is not None and self._dashboard_data is not None:
+            self._render_dashboard(self._dashboard_config, self._dashboard_data)
+            return
+        if self._refresh_error:
+            self.header_w.update(f"[dim]Error: {_escape(self._refresh_error)}[/dim]")
+            return
+        self.header_w.update("[dim]Loading dashboard…[/dim]")
+
+    def _refresh_dashboard_sync(self) -> None:
+        try:
+            from pollypm.dashboard_data import load_dashboard
+
+            config, data = load_dashboard(self.config_path)
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self._finish_dashboard_refresh_error, str(exc))
+            return
+        self.call_from_thread(self._finish_dashboard_refresh_success, config, data)
+
+    def _finish_dashboard_refresh_success(self, config, data) -> None:
+        self._dashboard_config = config
+        self._dashboard_data = data
+        self._refresh_running = False
+        self._refresh_error = None
+        self._render_dashboard(config, data)
+
+    def _finish_dashboard_refresh_error(self, error: str) -> None:
+        self._refresh_running = False
+        self._refresh_error = error
+        self._render_cached_dashboard()
+
+    def _render_dashboard(self, config, data) -> None:
         # ── Header ──
         parts = [f"[b]{len(config.projects)}[/b] projects", f"[b]{len(config.sessions)}[/b] agents"]
         if data.inbox_count:
@@ -1405,11 +1439,15 @@ class PollyDashboardApp(App[None]):
             self.chart_body.update("[dim]No token data yet[/dim]")
 
         # ── Footer ──
-        self.footer_w.update(
+        footer = (
             "[dim]Click Polly to connect  \u00b7  "
             f"{data.sweep_count_24h} sweeps today  \u00b7  "
-            f"{data.message_count_24h} messages[/dim]"
+            f"{data.message_count_24h} messages"
         )
+        if self._refresh_error:
+            footer += "  \u00b7  stale cache"
+        footer += "[/dim]"
+        self.footer_w.update(footer)
 
 
 class PollyCockpitPaneApp(App[None]):

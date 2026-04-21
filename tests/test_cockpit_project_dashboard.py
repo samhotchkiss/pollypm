@@ -91,6 +91,7 @@ class _FakeTask:
         executions: list | None = None,
         assignee: str | None = None,
         current_node_id: str | None = None,
+        blocked_by: list[tuple[str, int]] | None = None,
     ) -> None:
         self.task_number = task_number
         self.title = title
@@ -101,6 +102,7 @@ class _FakeTask:
         self.executions = executions or []
         self.assignee = assignee
         self.current_node_id = current_node_id
+        self.blocked_by = blocked_by or []
 
 
 class _FakeEvent:
@@ -273,6 +275,48 @@ class TestSectionInFlight:
         task_lines = [line for line in lines if "#7" in line or "#2" in line]
         assert task_lines[0].startswith("  ⟳ 🔴 #7 Patch auth outage")
         assert task_lines[1].startswith("  ⟳ 🟢 #2 Add favicon")
+
+    def test_blocked_tasks_render_nested_under_their_blocker(self):
+        blocker = _FakeTask(
+            task_number=2,
+            title="Ship router",
+            status="in_progress",
+            assignee="worker",
+            current_node_id="implement",
+            updated_at=datetime.now(UTC),
+        )
+        blocked = _FakeTask(
+            task_number=3,
+            title="Wire alerts",
+            status="blocked",
+            assignee="worker",
+            current_node_id="implement",
+            updated_at=datetime.now(UTC),
+            blocked_by=[("proj", 2)],
+        )
+
+        lines = _section_in_flight([blocker], [blocked])
+        joined = "\n".join(lines)
+
+        assert "#2 Ship router" in joined
+        assert "└─ ⊘" in joined
+        assert "#3 Wire alerts" in joined
+        assert "waiting on #2" in joined
+
+    def test_orphan_blocked_tasks_render_with_wait_reason(self):
+        blocked = _FakeTask(
+            task_number=8,
+            title="Retry sync",
+            status="blocked",
+            updated_at=datetime.now(UTC),
+            blocked_by=[("proj", 1), ("proj", 4)],
+        )
+
+        lines = _section_in_flight([], [blocked])
+        joined = "\n".join(lines)
+
+        assert "#8 Retry sync" in joined
+        assert "waiting on #1, #4" in joined
 
 
 class TestSectionRecent:

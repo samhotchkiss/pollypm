@@ -124,6 +124,7 @@ def _render_project_dashboard(
     in_progress = [
         t for t in tasks if t.work_status.value == "in_progress"
     ]
+    blocked = [t for t in tasks if t.work_status.value == "blocked"]
     review = [t for t in tasks if t.work_status.value == "review"]
     completed = [t for t in tasks if t.work_status.value == "done"]
     completed.sort(
@@ -185,7 +186,7 @@ def _render_project_dashboard(
         out.append("")
 
     out.extend(_section_you_need_to(review, project_alerts, 0))
-    out.extend(_section_in_flight(in_progress))
+    out.extend(_section_in_flight(in_progress, blocked))
     out.extend(_section_recent(completed))
     out.extend(_section_activity(tasks, system_events))
     out.extend(_section_insights(project.path, project_key))

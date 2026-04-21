@@ -28,10 +28,17 @@ from pollypm.provider_sdk import (
 from pollypm.runtime_env import claude_config_dir
 
 from .probe import collect_usage_snapshot as _collect_usage_snapshot
+from .resume import recorded_session_id as _recorded_session_id
+from .resume import resume_argv as _resume_argv
 from .usage_parse import parse_claude_usage_snapshot
 
 if TYPE_CHECKING:
     from pollypm.tmux.client import TmuxClient
+
+
+_RESUMABLE_CONTROL_ROLES = frozenset(
+    {"heartbeat-supervisor", "operator-pm", "reviewer", "triage"}
+)
 
 
 class ClaudeAdapter(ProviderAdapterBase):
@@ -57,14 +64,15 @@ class ClaudeAdapter(ProviderAdapterBase):
             fresh_launch_marker = (
                 account.home / ".pollypm" / "session-markers" / f"{session.name}.fresh"
             )
-        if (
-            session.role in {"heartbeat-supervisor", "operator-pm"}
-            and account.home is not None
-        ):
-            resume_argv = [self.binary, "--continue", *session.args]
+        if session.role in _RESUMABLE_CONTROL_ROLES and account.home is not None:
             resume_marker = (
                 account.home / ".pollypm" / "session-markers" / f"{session.name}.resume"
             )
+            session_id = _recorded_session_id(resume_marker)
+            if session_id:
+                resume_argv = _resume_argv(session_id, list(session.args))
+            else:
+                resume_argv = [self.binary, "--continue", *session.args]
         return LaunchCommand(
             argv=argv,
             env=dict(account.env),
@@ -81,7 +89,7 @@ class ClaudeAdapter(ProviderAdapterBase):
         account: AccountConfig,
     ) -> LaunchCommand | None:
         if (
-            session.role not in {"heartbeat-supervisor", "operator-pm"}
+            session.role not in _RESUMABLE_CONTROL_ROLES
             or account.home is None
         ):
             return None

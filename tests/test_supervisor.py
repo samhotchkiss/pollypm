@@ -540,6 +540,56 @@ def test_claude_control_sessions_use_original_account_home(tmp_path: Path) -> No
     assert operator_home == source_home
 
 
+def test_create_session_window_records_claude_resume_ids(tmp_path: Path, monkeypatch) -> None:
+    config = _config(tmp_path)
+    source_home = config.accounts["claude_controller"].home
+    assert source_home is not None
+    (source_home / ".claude").mkdir(parents=True, exist_ok=True)
+    (source_home / ".claude" / "settings.json").write_text("{}\n")
+    (source_home / ".claude.json").write_text('{"hasCompletedOnboarding": true}\n')
+
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+
+    bucket = source_home / ".claude" / "projects" / str(tmp_path.resolve()).replace("/", "-")
+    created_tmux_sessions: set[str] = set()
+
+    def _write_transcript(session_name: str) -> None:
+        bucket.mkdir(parents=True, exist_ok=True)
+        session_id = f"{session_name}-uuid"
+        (bucket / f"{session_id}.jsonl").write_text('{"sessionId": "%s"}\n' % session_id)
+
+    def _create_session(tmux_session: str, window_name: str, command: str) -> str:
+        del command
+        created_tmux_sessions.add(tmux_session)
+        _write_transcript("heartbeat")
+        return "%1"
+
+    def _create_window(tmux_session: str, window_name: str, command: str, detached: bool = True) -> str:
+        del tmux_session, command, detached
+        _write_transcript("operator")
+        return "%2"
+
+    monkeypatch.setattr(supervisor, "_window_map", lambda: {})
+    monkeypatch.setattr(supervisor.tmux, "has_session", lambda name: name in created_tmux_sessions)
+    monkeypatch.setattr(supervisor.tmux, "create_session", _create_session)
+    monkeypatch.setattr(supervisor.tmux, "create_window", _create_window)
+    monkeypatch.setattr(supervisor.tmux, "set_window_option", lambda *args, **kwargs: None)
+    monkeypatch.setattr(supervisor.tmux, "set_pane_history_limit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(supervisor.tmux, "pipe_pane", lambda *args, **kwargs: None)
+
+    heartbeat_launch, heartbeat_target = supervisor.create_session_window("heartbeat")
+    operator_launch, operator_target = supervisor.create_session_window("operator")
+
+    storage_session = supervisor.storage_closet_session_name()
+    assert heartbeat_target == f"{storage_session}:0"
+    assert operator_target == f"{storage_session}:pm-operator"
+    assert heartbeat_launch.resume_marker is not None
+    assert operator_launch.resume_marker is not None
+    assert heartbeat_launch.resume_marker.read_text(encoding="utf-8").strip() == "heartbeat-uuid"
+    assert operator_launch.resume_marker.read_text(encoding="utf-8").strip() == "operator-uuid"
+
+
 def test_codex_control_home_syncs_global_state(tmp_path: Path) -> None:
     config = _config(tmp_path)
     config.accounts["codex_backup"] = AccountConfig(

@@ -76,6 +76,8 @@ from pollypm.models import AccountConfig, ProviderKind, SessionConfig, SessionLa
 from pollypm.onboarding import _prime_claude_home
 from pollypm.projects import ensure_project_scaffold
 from pollypm.projects import project_checkpoints_dir, project_transcripts_dir, project_worktrees_dir, release_session_lock
+from pollypm.providers.claude.resume import recorded_session_id as _recorded_claude_session_id
+from pollypm.providers.claude.resume import session_ids as _claude_session_ids
 from pollypm.schedulers import ScheduledJob, get_scheduler_backend
 from pollypm.store.registry import get_store
 from pollypm.transcript_ledger import sync_token_ledger_for_config
@@ -2576,6 +2578,15 @@ class Supervisor:
         window_map = self._window_map()
         if launch.window_name in window_map:
             return launch, None
+        existing_claude_ids: set[str] | None = None
+        if (
+            launch.session.provider is ProviderKind.CLAUDE
+            and launch.account.home is not None
+            and launch.resume_marker is not None
+        ):
+            existing_claude_ids = set(
+                _claude_session_ids(launch.account.home, launch.session.cwd)
+            )
 
         if on_status:
             on_status(f"Creating tmux window for {session_name}...")
@@ -2591,6 +2602,11 @@ class Supervisor:
         self.session_service.tmux.set_pane_history_limit(target, 200)
         self.session_service.tmux.pipe_pane(target, launch.log_path)
         self._record_launch(launch)
+        if existing_claude_ids is not None:
+            self._capture_claude_resume_session_id(
+                launch,
+                previous_ids=existing_claude_ids,
+            )
         return launch, target
 
     def stop_session(self, session_name: str) -> None:
@@ -2787,8 +2803,53 @@ class Supervisor:
         marker = launch.resume_marker
         if marker is None:
             return
+        if (
+            launch.session.provider is ProviderKind.CLAUDE
+            and _recorded_claude_session_id(marker) is not None
+        ):
+            return
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(datetime.now(UTC).isoformat().replace("+00:00", "Z") + "\n")
+
+    def _capture_claude_resume_session_id(
+        self,
+        launch: SessionLaunchSpec,
+        *,
+        previous_ids: set[str] | None = None,
+        poll_timeout_s: float = 10.0,
+    ) -> None:
+        """Persist the fresh Claude transcript UUID for ``launch``.
+
+        Claude control sessions on macOS share one auth home, so a bare
+        ``claude --continue`` can jump into a sibling session's transcript.
+        Capturing the UUID created for this tmux window lets later restarts
+        use ``claude --resume <uuid>`` instead.
+        """
+        marker = launch.resume_marker
+        home = launch.account.home
+        if (
+            marker is None
+            or home is None
+            or launch.session.provider is not ProviderKind.CLAUDE
+        ):
+            return
+
+        before = set(previous_ids or set())
+        deadline = time.monotonic() + poll_timeout_s
+        chosen: str | None = None
+        while time.monotonic() < deadline:
+            ids = _claude_session_ids(home, launch.session.cwd)
+            fresh = [sid for sid in ids if sid not in before]
+            if fresh:
+                chosen = fresh[0]
+                break
+            if ids:
+                chosen = ids[0]
+            time.sleep(0.2)
+        if chosen is None:
+            return
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(chosen + "\n", encoding="utf-8")
 
     def _send_initial_input_if_fresh(self, launch: SessionLaunchSpec, target: str) -> None:
         if launch.session.role not in self._INITIAL_INPUT_ROLES:

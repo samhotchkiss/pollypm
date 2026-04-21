@@ -48,14 +48,40 @@ def latest_session_id(home: Path, cwd: Path) -> str | None:
     ``.jsonl``) is the session UUID Claude Code accepts via
     ``--resume``.
     """
+    ids = session_ids(home, cwd)
+    if not ids:
+        return None
+    return ids[0]
+
+
+def session_ids(home: Path, cwd: Path) -> list[str]:
+    """Return Claude transcript UUIDs for ``cwd`` newest-first.
+
+    The UUIDs are the ``.stem`` values of transcript ``*.jsonl`` files
+    under Claude's encoded-cwd bucket. Newest ``mtime`` wins so callers
+    can compare a pre-launch snapshot against the post-launch bucket and
+    detect the fresh transcript a new tmux window created.
+    """
     bucket = home / ".claude" / "projects" / _encoded_cwd(cwd)
     if not bucket.is_dir():
-        return None
+        return []
     candidates = [p for p in bucket.iterdir() if p.suffix == ".jsonl"]
-    if not candidates:
-        return None
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return candidates[0].stem
+    return [candidate.stem for candidate in candidates]
+
+
+def recorded_session_id(marker: Path) -> str | None:
+    """Read a previously-recorded Claude session UUID from ``marker``.
+
+    The marker is PollyPM-owned state under ``.pollypm/session-markers``.
+    When it contains a non-empty line, that line is the exact Claude
+    transcript UUID we should pass to ``claude --resume``.
+    """
+    try:
+        raw = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return raw or None
 
 
 def resume_argv(session_id: str, extra_args: list[str] | None = None) -> list[str]:
@@ -78,5 +104,4 @@ def resume_argv(session_id: str, extra_args: list[str] | None = None) -> list[st
         *extra,
     ]
 
-
-__all__ = ["latest_session_id", "resume_argv"]
+__all__ = ["latest_session_id", "recorded_session_id", "resume_argv", "session_ids"]

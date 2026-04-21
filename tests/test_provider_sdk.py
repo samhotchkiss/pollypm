@@ -55,6 +55,38 @@ def test_claude_provider_exposes_transcript_sources_and_usage_snapshot(tmp_path:
     assert adapter.build_resume_command(session, account) is not None
 
 
+def test_claude_provider_prefers_recorded_resume_session_id(tmp_path: Path) -> None:
+    adapter = ClaudeAdapter()
+    account = AccountConfig(
+        name="claude_primary",
+        provider=ProviderKind.CLAUDE,
+        home=tmp_path / "home",
+    )
+    session = SessionConfig(
+        name="operator",
+        role="operator-pm",
+        provider=ProviderKind.CLAUDE,
+        account="claude_primary",
+        cwd=tmp_path,
+        project="pollypm",
+        args=["--model", "sonnet"],
+    )
+    marker = account.home / ".pollypm" / "session-markers" / "operator.resume"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("claude-session-123\n", encoding="utf-8")
+
+    launch = adapter.build_launch_command(session, account)
+
+    assert launch.resume_argv == [
+        "claude",
+        "--dangerously-skip-permissions",
+        "--resume",
+        "claude-session-123",
+        "--model",
+        "sonnet",
+    ]
+
+
 def test_codex_provider_exposes_transcript_sources_and_usage_snapshot(tmp_path: Path) -> None:
     adapter = CodexAdapter()
     account = AccountConfig(

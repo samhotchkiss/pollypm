@@ -105,11 +105,10 @@ class PollyWorkerRosterApp(App[None]):
     AUTO_REFRESH_SECONDS = 5.0
     CELEBRATION_SECONDS = 0.8
 
-    _STATUS_DOTS: dict[str, tuple[str, str]] = {
-        "working": ("\u25cf", "#3ddc84"),
-        "idle": ("\u25cb", "#97a6b2"),
-        "stuck": ("\u25b2", "#ff5f6d"),
-        "offline": ("\u25cf", "#4a5568"),
+    _HEALTH_GLYPHS: dict[str, tuple[str, str]] = {
+        "alive": ("\U0001f7e2", "#3ddc84"),
+        "idle_warn": ("\U0001f7e1", "#f0c45a"),
+        "unresponsive": ("\U0001f534", "#ff5f6d"),
     }
 
     _DEFAULT_HINT = (
@@ -149,7 +148,7 @@ class PollyWorkerRosterApp(App[None]):
     def on_mount(self) -> None:
         self.table.cursor_type = "row"
         self.table.add_columns(
-            "Project", "Session", " ", "Task", "Node", "Turn", "Last commit",
+            "Project", "Session", "Health", "Task", "Node", "Turn", "Last commit",
         )
         self._refresh()
         _setup_alert_notifier(self, bind_a=False)
@@ -220,7 +219,10 @@ class PollyWorkerRosterApp(App[None]):
         self.hint.update(self._DEFAULT_HINT)
         for row in rows:
             celebrating = self._is_celebrating(row)
-            glyph, colour = self._STATUS_DOTS.get(row.status, ("\u25cb", "#6b7a88"))
+            glyph, colour = self._HEALTH_GLYPHS.get(
+                getattr(row, "health", ""),
+                ("\U0001f7e1", "#6b7a88"),
+            )
             if celebrating:
                 dot = Text("\u2713", style="bold #dcf4e6 on #173322")
                 project_style = "bold #dcf4e6 on #173322"
@@ -246,6 +248,7 @@ class PollyWorkerRosterApp(App[None]):
                 Text(row.last_commit_label, style=cell_style),
                 key=f"{row.project_key}:{row.session_name}",
             )
+        self._sync_health_tooltip()
 
     def _is_celebrating(self, row) -> bool:
         token = getattr(row, "shipment_token", None)
@@ -279,6 +282,22 @@ class PollyWorkerRosterApp(App[None]):
         if not (0 <= cursor < len(self._rows)):
             return None
         return self._rows[cursor]
+
+    def _sync_health_tooltip(self) -> None:
+        row = self._selected_row()
+        tooltip = getattr(row, "health_tooltip", "") if row is not None else ""
+        try:
+            self.table.tooltip = tooltip or None
+        except Exception:  # noqa: BLE001
+            pass
+        if row is None:
+            self.hint.update(self._DEFAULT_HINT)
+            return
+        self.hint.update(
+            f"[dim]{_escape(tooltip)}[/dim]  \u00b7  "
+            "R refresh \u00b7 A auto-refresh \u00b7 \u21b5 open project "
+            "\u00b7 d discuss \u00b7 q back"
+        )
 
     def action_refresh(self) -> None:
         self._refresh()
@@ -381,3 +400,7 @@ class PollyWorkerRosterApp(App[None]):
     def _on_row_selected(self, event: DataTable.RowSelected) -> None:
         """Enter on a row → jump to its project dashboard."""
         self.action_jump_to_project()
+
+    @on(DataTable.RowHighlighted, "#wr-table")
+    def _on_row_highlighted(self, _event: DataTable.RowHighlighted) -> None:
+        self._sync_health_tooltip()

@@ -273,6 +273,7 @@ def _select_intervention(
 class LocalHeartbeatBackend(HeartbeatBackend):
     name = "local"
     _UNMANAGED_WINDOW_ALERT_PREFIX = "unmanaged_window:"
+    _WORKER_ACTIONABLE_STATUSES = frozenset({"queued", "in_progress", "blocked"})
     _MUTATING_SESSION_ROLES = frozenset(
         {
             "architect",
@@ -1090,8 +1091,9 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 tasks = backend.list_tasks(states=["01-ready", "02-in-progress"])
                 if tasks:
                     return True
-            # Check the work service for non-terminal tasks assigned to this
-            # worker's project.
+            # Check the work service for worker-actionable tasks on this
+            # worker's project. Review / on_hold / done are idle-by-design
+            # for workers — the reviewer or user owns the next step there.
             try:
                 from pollypm.work.sqlite_service import SQLiteWorkService
 
@@ -1102,7 +1104,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     ) as svc:
                         tasks = svc.list_tasks(project=session.project)
                     for t in tasks:
-                        if t.work_status.value not in ("done", "cancelled"):
+                        if t.work_status.value in self._WORKER_ACTIONABLE_STATUSES:
                             return True
             except Exception:  # noqa: BLE001
                 pass

@@ -141,6 +141,25 @@ class TestDependents:
         assert b.task_id in dep_ids
         assert c.task_id in dep_ids
 
+    def test_dependents_bulk_loads_without_per_node_get(self, svc, monkeypatch):
+        a = _mk(svc, title="A")
+        b = _mk(svc, title="B")
+        c = _mk(svc, title="C")
+        svc.link(a.task_id, b.task_id, "blocks")
+        svc.link(b.task_id, c.task_id, "blocks")
+
+        monkeypatch.setattr(
+            svc,
+            "get",
+            lambda task_id: (_ for _ in ()).throw(
+                AssertionError(f"dependents should not call get(): {task_id}")
+            ),
+        )
+
+        deps = svc.dependents(a.task_id)
+
+        assert {d.task_id for d in deps} == {b.task_id, c.task_id}
+
     def test_dependents_transitive(self, svc):
         a = _mk(svc, title="A")
         b = _mk(svc, title="B")

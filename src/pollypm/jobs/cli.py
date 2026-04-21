@@ -26,7 +26,7 @@ from typing import Any, Callable
 import typer
 
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config, resolve_config_path
-from pollypm.jobs import Job, JobQueue, JobStatus
+from pollypm.jobs.queue import Job, JobQueue, JobStatus
 
 
 __all__ = ["jobs_app", "build_queue_for_config"]

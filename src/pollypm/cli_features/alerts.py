@@ -20,7 +20,6 @@ from pathlib import Path
 import typer
 
 from pollypm.config import DEFAULT_CONFIG_PATH
-from pollypm.service_api import PollyPMService
 
 
 alert_app = typer.Typer(
@@ -49,6 +48,12 @@ heartbeat_app = typer.Typer(
         "• pm heartbeat status                — show last heartbeat tick\n"
     )
 )
+
+
+def _service(config_path: Path):
+    from pollypm.service_api import PollyPMService
+
+    return PollyPMService(config_path)
 
 
 @heartbeat_app.callback(invoke_without_command=True)
@@ -87,7 +92,7 @@ def alert_raise(
 ) -> None:
     from pollypm import cli as cli_mod
 
-    alert = PollyPMService(config_path).raise_alert(
+    alert = _service(config_path).raise_alert(
         alert_type,
         session_name,
         message,
@@ -108,7 +113,7 @@ def alert_clear(
     from pollypm import cli as cli_mod
 
     try:
-        alert = PollyPMService(config_path).clear_alert(alert_id)
+        alert = _service(config_path).clear_alert(alert_id)
     except KeyError as exc:
         raise typer.BadParameter(str(exc)) from exc
     if json_output:
@@ -124,7 +129,7 @@ def alert_list(
 ) -> None:
     from pollypm import cli as cli_mod
 
-    items = PollyPMService(config_path).list_alerts()
+    items = _service(config_path).list_alerts()
     if json_output:
         cli_mod._emit_json({"alerts": items})
         return
@@ -148,7 +153,7 @@ def session_set_status(
 ) -> None:
     from pollypm import cli as cli_mod
 
-    runtime = PollyPMService(config_path).set_session_status(
+    runtime = _service(config_path).set_session_status(
         session_name,
         status,
         reason=reason,
@@ -234,9 +239,8 @@ def heartbeat_record(
         raise typer.BadParameter(f"Invalid heartbeat JSON: {exc}") from exc
     if not isinstance(payload, dict):
         raise typer.BadParameter("Heartbeat payload must be a JSON object.")
-    record = PollyPMService(config_path).record_heartbeat(session_name, payload)
+    record = _service(config_path).record_heartbeat(session_name, payload)
     if json_output:
         cli_mod._emit_json({"heartbeat": record})
         return
     typer.echo(f"Recorded heartbeat for {session_name}")
-

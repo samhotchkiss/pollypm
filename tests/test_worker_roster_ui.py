@@ -154,6 +154,18 @@ def test_status_dots_for_each_category(roster_env, roster_app) -> None:
     _run(body())
 
 
+def test_session_column_prefixes_avatar(roster_env, roster_app) -> None:
+    async def body() -> None:
+        rows = [_make_row(session_name="task-demo-42")]
+        roster_app._gather = lambda: rows  # type: ignore[method-assign]
+        async with roster_app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            session_cell = roster_app.table.get_row_at(0)[1]
+            assert getattr(session_cell, "plain", str(session_cell)) == "W42 task-demo-42"
+
+    _run(body())
+
+
 def test_sort_order_stuck_then_working_then_idle_then_offline(
     roster_env, roster_app,
 ) -> None:

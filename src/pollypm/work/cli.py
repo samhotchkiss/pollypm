@@ -12,17 +12,11 @@ from typing import Optional
 import typer
 
 from pollypm.cli_help import help_with_examples
-from pollypm.work.flow_engine import parse_flow_yaml
-from pollypm.work.sqlite_service import (
-    SQLiteWorkService,
-    WorkServiceError,
-)
 
 _TASK_APP_HELP = help_with_examples(
     "Manage work tasks.",
     [
         ("pm task next", "find work"),
-        ("pm task get shortlink_gen/1", "read the spec"),
         (
             "pm task claim shortlink_gen/1",
             "pick it up",

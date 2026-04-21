@@ -15,33 +15,48 @@ from pathlib import Path
 
 import typer
 
+from pollypm.cli_help import help_with_examples
 from pollypm.config import DEFAULT_CONFIG_PATH
 
 
 issue_app = typer.Typer(
-    help=(
-        "Manage project issues through the configured backend.\n\n"
-        "Examples:\n\n"
-        "• pm issue list                      — list issues for the active project\n"
-        "• pm issue show <id>                 — print a single issue\n"
+    help=help_with_examples(
+        "Manage project issues through the configured backend.",
+        [
+            ("pm issue list --project my_app", "list issues for one project"),
+            ("pm issue info my_app/1 --project my_app", "print one issue"),
+            (
+                "pm issue transition my_app/1 03-needs-review --project my_app",
+                "move an issue to its next tracker state",
+            ),
+        ],
     )
 )
 
 report_app = typer.Typer(
-    help=(
-        "Report project status summaries.\n\n"
-        "Examples:\n\n"
-        "• pm report status                   — summarize all projects\n"
-        "• pm report status --project <name>  — summarize one project\n"
+    help=help_with_examples(
+        "Report project status summaries.",
+        [
+            ("pm report status --project my_app", "summarize one project"),
+            (
+                "pm report status --project marketing_site",
+                "summarize a second project workspace",
+            ),
+        ],
     )
 )
 
 itsalive_app = typer.Typer(
-    help=(
-        "Manage itsalive deployments.\n\n"
-        "Examples:\n\n"
-        "• pm itsalive status                 — show deployment state\n"
-        "• pm itsalive deploy                 — deploy the project\n"
+    help=help_with_examples(
+        "Manage itsalive deployments.",
+        [
+            ("pm itsalive status --project marketing_site", "show deployment state"),
+            (
+                "pm itsalive deploy --project marketing_site --subdomain marketing-site --email ops@example.com",
+                "request or retry a deployment",
+            ),
+            ("pm itsalive sweep --project marketing_site", "poll pending deploys"),
+        ],
     )
 )
 

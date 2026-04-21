@@ -18,13 +18,16 @@ from typing import Any
 
 import typer
 
+from pollypm.cli_help import help_with_examples
+
 plugins_app = typer.Typer(
-    help=(
-        "Manage PollyPM plugins.\n\n"
-        "Examples:\n\n"
-        "• pm plugins list                    — show installed plugins\n"
-        "• pm plugins show <name>             — inspect one plugin's manifest\n"
-        "• pm plugins scaffold <name>         — scaffold a new plugin\n"
+    help=help_with_examples(
+        "Manage PollyPM plugins.",
+        [
+            ("pm plugins list", "show installed and disabled plugins"),
+            ("pm plugins show local_heartbeat", "inspect one plugin manifest"),
+            ("pm plugins install ~/dev/my-plugin", "install a local plugin"),
+        ],
     )
 )
 

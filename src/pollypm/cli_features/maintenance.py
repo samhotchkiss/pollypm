@@ -17,6 +17,7 @@ from pathlib import Path
 
 import typer
 
+from pollypm.cli_help import help_with_examples
 from pollypm.config import (
     DEFAULT_CONFIG_PATH,
     GLOBAL_CONFIG_DIR,
@@ -66,7 +67,16 @@ def _remove_account_entry(config_path: Path, account: str, *, delete_home: bool 
 
 
 def register_maintenance_commands(app: typer.Typer) -> None:
-    @app.command()
+    @app.command(
+        help=help_with_examples(
+            "Run the diagnostic checklist and optionally apply safe fixes.",
+            [
+                ("pm doctor", "show the full health checklist"),
+                ("pm doctor --fix", "apply safe automatic repairs"),
+                ("pm doctor --json", "emit the report as machine-readable JSON"),
+            ],
+        )
+    )
     def doctor(
         json_output: bool = typer.Option(
             False,

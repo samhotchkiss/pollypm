@@ -16,6 +16,7 @@ from pathlib import Path
 
 import typer
 
+from pollypm.cli_help import help_with_examples
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config
 from pollypm.projects import (
     enable_tracked_project,
@@ -27,7 +28,18 @@ logger = logging.getLogger(__name__)
 
 
 def register_project_commands(app: typer.Typer) -> None:
-    @app.command()
+    @app.command(
+        help=help_with_examples(
+            "List the projects registered in the current PollyPM workspace.",
+            [
+                ("pm projects", "show every registered project"),
+                (
+                    "pm projects --config ~/.pollypm/pollypm.toml",
+                    "inspect a specific config file",
+                ),
+            ],
+        )
+    )
     def projects(
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     ) -> None:
@@ -52,7 +64,22 @@ def register_project_commands(app: typer.Typer) -> None:
         for project in added:
             typer.echo(f"- {project.name or project.key}: {project.path}")
 
-    @app.command()
+    @app.command(
+        help=help_with_examples(
+            "Register a repository as a PollyPM project.",
+            [
+                ("pm add-project ~/dev/my-app", "register a repo and import its history"),
+                (
+                    'pm add-project ~/dev/my-app --name "My App"',
+                    "override the display name",
+                ),
+                (
+                    "pm add-project ~/dev/my-app --skip-plan",
+                    "register the repo without planner auto-fire",
+                ),
+            ],
+        )
+    )
     def add_project(
         repo_path: Path = typer.Argument(..., help="Path to the project folder."),
         name: str | None = typer.Option(None, "--name", help="Optional display name."),
@@ -176,4 +203,3 @@ def register_project_commands(app: typer.Typer) -> None:
     ) -> None:
         tracked = enable_tracked_project(config_path, project)
         typer.echo(f"Enabled tracked-project mode for {tracked.name or tracked.key}")
-

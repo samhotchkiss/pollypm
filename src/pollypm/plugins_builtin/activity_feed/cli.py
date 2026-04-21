@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Iterable
 
 import typer
 
+from pollypm.cli_help import help_with_examples
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config
 
 if TYPE_CHECKING:
@@ -35,12 +36,16 @@ if TYPE_CHECKING:
 
 
 activity_app = typer.Typer(
-    help=(
-        "Live activity feed. `pm activity --follow` tails live events.\n\n"
-        "Examples:\n\n"
-        "• pm activity                        — print the most recent events\n"
-        "• pm activity --follow               — tail the event stream\n"
-        "• pm activity --since 15m            — events from the last 15 minutes\n"
+    help=help_with_examples(
+        "Live activity feed. `pm activity --follow` tails live events.",
+        [
+            ("pm activity", "print the most recent events"),
+            ("pm activity --follow", "tail the live event stream"),
+            (
+                "pm activity --project my_app --since 15m",
+                "filter to one project and a recent time window",
+            ),
+        ],
     ),
     invoke_without_command=True,
     no_args_is_help=False,

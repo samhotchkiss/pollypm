@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 
 import typer
 
+from pollypm.cli_help import help_with_examples
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config, resolve_config_path
 from pollypm.plugins_builtin.morning_briefing.handlers import briefing_tick as _tick
 from pollypm.plugins_builtin.morning_briefing.inbox import (
@@ -46,13 +47,13 @@ from pollypm.plugins_builtin.morning_briefing.state import (
 
 
 briefing_app = typer.Typer(
-    help=(
-        "Manage the morning briefing (daily inbox digest).\n\n"
-        "Examples:\n\n"
-        "• pm briefing status                 — show briefing configuration\n"
-        "• pm briefing enable                 — turn on the daily briefing\n"
-        "• pm briefing now                    — render today's briefing immediately\n"
-        "• pm briefing preview                — dry-run without delivering\n"
+    help=help_with_examples(
+        "Manage the morning briefing (daily inbox digest).",
+        [
+            ("pm briefing status", "show briefing configuration"),
+            ("pm briefing preview", "dry-run without delivering"),
+            ("pm briefing now", "render today's briefing immediately"),
+        ],
     ),
     no_args_is_help=True,
 )

@@ -23,6 +23,7 @@ from typing import Any, Optional
 import typer
 
 from pollypm.atomic_io import atomic_write_text
+from pollypm.cli_help import help_with_examples
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config, resolve_config_path
 from pollypm.plugins_builtin.downtime.handlers.pick_candidate import (
     USER_QUEUE_RELATIVE_PATH,
@@ -41,12 +42,16 @@ from pollypm.plugins_builtin.downtime.state import (
 
 
 downtime_app = typer.Typer(
-    help=(
-        "Manage the downtime exploration plugin (idle-LLM-budget tasks).\n\n"
-        "Examples:\n\n"
-        "• pm downtime status                 — show downtime state\n"
-        "• pm downtime enable                 — turn on downtime exploration\n"
-        "• pm downtime list                   — show exploration runs\n"
+    help=help_with_examples(
+        "Manage the downtime exploration plugin (idle-LLM-budget tasks).",
+        [
+            ("pm downtime status", "show downtime state"),
+            (
+                'pm downtime add "Profile the dashboard query"',
+                "queue a user-suggested exploration",
+            ),
+            ("pm downtime pause --until 2026-04-30", "pause downtime until a date"),
+        ],
     ),
     no_args_is_help=True,
 )

@@ -1,9 +1,9 @@
-"""Tests for wg05 / #242: every `pm ... --help` carries an Examples section.
+"""Tests for CLI help examples.
 
 Typer's rich renderer collapses whitespace in the epilog, so examples
 are embedded in the top-level help text itself (bullet format, which
-Typer preserves). This module asserts that every documented subgroup's
---help output mentions 'Examples' and contains at least 2 copy-paste
+Typer preserves). This module asserts that every documented help
+surface carries a literal ``Examples:`` block with 2-3 copy-paste
 invocations.
 
 It also exercises the new `pm help worker` meta-command.
@@ -23,10 +23,10 @@ def runner():
     return CliRunner()
 
 
-# Every group listed here must carry an "Examples:" section with at
-# least 2 `pm …` invocations. If a subgroup is deprecated or removed
-# in the future, drop it here (and mention why in the commit).
-_GROUPS_WITH_EXAMPLES = [
+# Every help surface listed here must carry an "Examples:" section with
+# 2-3 `• pm ...` invocations. If a subgroup is deprecated or removed in
+# the future, drop it here (and mention why in the commit).
+_SURFACES_WITH_EXAMPLES = [
     (),  # top-level pm --help
     ("task",),
     ("session",),
@@ -46,27 +46,36 @@ _GROUPS_WITH_EXAMPLES = [
     ("issue",),
     ("report",),
     ("itsalive",),
+    ("up",),
+    ("launch",),
+    ("status",),
+    ("send",),
+    ("notify",),
+    ("doctor",),
+    ("projects",),
+    ("add-project",),
 ]
 
 
-@pytest.mark.parametrize("group", _GROUPS_WITH_EXAMPLES)
-def test_group_help_has_examples_section(runner, group):
-    args = list(group) + ["--help"]
+@pytest.mark.parametrize("surface", _SURFACES_WITH_EXAMPLES)
+def test_help_surface_has_uniform_examples_block(runner, surface):
+    args = list(surface) + ["--help"]
     result = runner.invoke(app, args)
     # Help should render (exit 0 for --help)
     assert result.exit_code == 0, (
         f"`pm {' '.join(args)}` help did not render:\n{result.output}"
     )
-    # The literal word "Examples" — either "Examples:" or
-    # "Examples (typical worker flow):" qualifies.
-    assert "Examples" in result.output, (
-        f"`pm {' '.join(args)}` --help has no Examples section:\n{result.output}"
+    assert "Examples:" in result.output, (
+        f"`pm {' '.join(args)}` --help has no literal Examples: section:\n"
+        f"{result.output}"
     )
-    # At least two `pm ` invocations (copy-paste-ready commands).
-    pm_mentions = result.output.count("pm ")
-    assert pm_mentions >= 2, (
-        f"`pm {' '.join(args)}` --help has only {pm_mentions} "
-        f"`pm ` references; expected >= 2 concrete examples:\n"
+    example_lines = [
+        line for line in result.output.splitlines()
+        if "• pm " in line
+    ]
+    assert 2 <= len(example_lines) <= 3, (
+        f"`pm {' '.join(args)}` --help has {len(example_lines)} example lines; "
+        "expected 2-3 concrete examples:\n"
         f"{result.output}"
     )
 
@@ -104,7 +113,6 @@ def test_task_help_shows_typical_worker_flow(runner):
     assert result.exit_code == 0
     # The worker flow sequence should be readable top-to-bottom.
     assert "pm task next" in result.output
-    assert "pm task get" in result.output
     assert "pm task claim" in result.output
     assert "pm task done" in result.output
 
@@ -114,3 +122,33 @@ def test_top_level_help_points_to_worker_guide(runner):
     assert result.exit_code == 0
     # Users should see the help-worker meta-command prominently.
     assert "pm help worker" in result.output
+
+
+def test_memory_help_uses_recall_not_search(runner):
+    result = runner.invoke(app, ["memory", "--help"])
+    assert result.exit_code == 0
+    assert "pm memory recall" in result.output
+    assert "pm memory search" not in result.output
+
+
+def test_issue_help_uses_real_issue_commands(runner):
+    result = runner.invoke(app, ["issue", "--help"])
+    assert result.exit_code == 0
+    assert "pm issue info" in result.output
+    assert "pm issue transition" in result.output
+    assert "pm issue show" not in result.output
+
+
+def test_rail_help_uses_hide_and_show(runner):
+    result = runner.invoke(app, ["rail", "--help"])
+    assert result.exit_code == 0
+    assert "pm rail hide" in result.output
+    assert "pm rail show" in result.output
+    assert "pm rail add" not in result.output
+
+
+def test_plugins_help_uses_install_not_scaffold(runner):
+    result = runner.invoke(app, ["plugins", "--help"])
+    assert result.exit_code == 0
+    assert "pm plugins install" in result.output
+    assert "pm plugins scaffold" not in result.output

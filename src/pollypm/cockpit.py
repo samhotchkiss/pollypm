@@ -93,7 +93,7 @@ def _build_cockpit_detail_inner(config_path: Path, kind: str, target: str | None
 def _build_cockpit_detail_dispatch(supervisor, config_path: Path, kind: str, target: str | None = None) -> str:
     config = supervisor.config
     if kind in ("polly", "dashboard"):
-        return _build_dashboard(supervisor, config)
+        return _build_dashboard(supervisor, config, config_path=config_path)
 
     if kind == "inbox":
         return _render_inbox_panel(config)

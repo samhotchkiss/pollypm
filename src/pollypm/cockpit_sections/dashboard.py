@@ -1,13 +1,19 @@
-"""Global Polly dashboard renderer (#403).
-
-Aggregates per-project task partitions, system events, and inbox counts
-into the cockpit's "what does the whole workspace look like?" summary
-that ships when the user selects ``polly``/``dashboard`` in the rail.
-"""
+"""Global Polly dashboard renderer (#403 + #505 + #511 + #512 + #515)."""
 
 from __future__ import annotations
 
-from pollypm.cockpit_sections.base import _STATUS_ICONS
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+from pollypm.cockpit_sections.base import (
+    _STATUS_ICONS,
+    _age_from_dt,
+    _dashboard_divider,
+    _format_tokens,
+    _iso_to_dt,
+)
 from pollypm.cockpit_sections.health import (
     format_project_health_scorecard,
     project_health_rank,
@@ -19,90 +25,538 @@ from pollypm.cockpit_sections.project_dashboard import (
 )
 
 
-def _build_dashboard(supervisor, config) -> str:
-    from datetime import UTC, datetime, timedelta
+@dataclass(slots=True)
+class DashboardSuggestion:
+    label: str
+    detail: str = ""
 
+
+@dataclass(slots=True)
+class DashboardTokenGauge:
+    account_name: str
+    provider: str
+    used_pct: int
+    summary: str
+    severity: str
+    used_tokens: int | None = None
+    limit_tokens: int | None = None
+    burn_rate_per_hour: float = 0.0
+    eta_seconds: float | None = None
+    reset_at: str = ""
+
+
+@dataclass(slots=True)
+class DashboardBriefingBanner:
+    text: str
+    date_local: str = ""
+    created_at: datetime | None = None
+
+
+def _enum_value(value: object) -> str:
+    raw = getattr(value, "value", value)
+    return str(raw or "")
+
+
+def _task_id(project_key: str, task: object) -> str:
+    task_id = getattr(task, "task_id", None)
+    if task_id:
+        return str(task_id)
+    number = getattr(task, "task_number", None)
+    if number is None:
+        return project_key
+    return f"{project_key}/{number}"
+
+
+def _task_worker(task: object) -> str:
+    assignee = getattr(task, "assignee", None)
+    if assignee:
+        return str(assignee)
+    roles = getattr(task, "roles", None)
+    if isinstance(roles, dict) and roles.get("worker"):
+        return str(roles["worker"])
+    for transition in getattr(task, "transitions", None) or []:
+        if _enum_value(getattr(transition, "to_state", "")) != "in_progress":
+            continue
+        actor = getattr(transition, "actor", None)
+        if actor and actor not in {"system", "pm"}:
+            return str(actor)
+    return ""
+
+
+def _task_done_at(task: object):
+    last_done = None
+    for transition in getattr(task, "transitions", None) or []:
+        if _enum_value(getattr(transition, "to_state", "")) != "done":
+            continue
+        dt = _iso_to_dt(getattr(transition, "timestamp", None))
+        if dt is not None and (last_done is None or dt > last_done):
+            last_done = dt
+    if last_done is not None:
+        return last_done
+    status = _enum_value(getattr(task, "work_status", ""))
+    if status == "done":
+        return _iso_to_dt(getattr(task, "updated_at", None))
+    return None
+
+
+def _task_last_rejection_at(task: object):
+    last_rejected = None
+    for execution in getattr(task, "executions", None) or []:
+        if _enum_value(getattr(execution, "decision", "")) != "rejected":
+            continue
+        dt = _iso_to_dt(getattr(execution, "completed_at", None))
+        if dt is not None and (last_rejected is None or dt > last_rejected):
+            last_rejected = dt
+    for transition in getattr(task, "transitions", None) or []:
+        if _enum_value(getattr(transition, "from_state", "")) != "review":
+            continue
+        if _enum_value(getattr(transition, "to_state", "")) != "in_progress":
+            continue
+        dt = _iso_to_dt(getattr(transition, "timestamp", None))
+        if dt is not None and (last_rejected is None or dt > last_rejected):
+            last_rejected = dt
+    return last_rejected
+
+
+def _task_has_rejection(task: object) -> bool:
+    return _task_last_rejection_at(task) is not None
+
+
+def _shipper_streaks(task_pairs: list[tuple[str, object]], *, now: datetime) -> dict[str, int]:
+    cutoff = now - timedelta(hours=24)
+    events: dict[str, list[tuple[datetime, bool]]] = defaultdict(list)
+    for _project_key, task in task_pairs:
+        worker = _task_worker(task)
+        if not worker:
+            continue
+        done_at = _task_done_at(task)
+        rejected_at = _task_last_rejection_at(task)
+        if done_at is not None and done_at >= cutoff:
+            events[worker].append((done_at, not _task_has_rejection(task)))
+            continue
+        if rejected_at is not None and rejected_at >= cutoff:
+            events[worker].append((rejected_at, False))
+    streaks: dict[str, int] = {}
+    for worker, worker_events in events.items():
+        streak = 0
+        for _when, clean_done in sorted(worker_events, key=lambda item: item[0], reverse=True):
+            if not clean_done:
+                break
+            streak += 1
+        if streak:
+            streaks[worker] = streak
+    return streaks
+
+
+def _streak_badge(worker: str, streaks: dict[str, int]) -> str:
+    streak = streaks.get(worker, 0)
+    if streak < 2:
+        return ""
+    return f" 🔥{streak}"
+
+
+def _render_streak_header(streaks: dict[str, int]) -> str:
+    hottest = sorted(
+        ((worker, streak) for worker, streak in streaks.items() if streak >= 2),
+        key=lambda item: (-item[1], item[0]),
+    )
+    if not hottest:
+        return ""
+    leaders = ", ".join(f"{worker} ({streak})" for worker, streak in hottest[:3])
+    return f"🔥 Hottest workers today: {leaders}"
+
+
+def _task_priority_rank(task: object) -> int:
+    priority = _enum_value(getattr(task, "priority", "normal"))
+    return {
+        "critical": 0,
+        "high": 1,
+        "normal": 2,
+        "low": 3,
+    }.get(priority, 4)
+
+
+def _period_window_days(period_label: str) -> int:
+    label = period_label.lower()
+    if "day" in label:
+        return 1
+    if "month" in label:
+        return 30
+    return 7
+
+
+def _hours_between(start, end) -> float:
+    if start is None or end is None:
+        return 0.0
+    return max(0.0, (end - start).total_seconds() / 3600.0)
+
+
+def _build_token_gauge(supervisor, config, *, now: datetime) -> DashboardTokenGauge | None:
+    try:
+        token_rows = list(supervisor.store.recent_token_usage(limit=5000))
+    except Exception:  # noqa: BLE001
+        token_rows = []
+
+    gauges: list[DashboardTokenGauge] = []
+    for account_name, account in getattr(config, "accounts", {}).items():
+        try:
+            usage = supervisor.store.get_account_usage(account_name)
+        except Exception:  # noqa: BLE001
+            usage = None
+        if usage is None or usage.used_pct is None:
+            continue
+
+        window_days = _period_window_days(usage.period_label or "")
+        cutoff = now - timedelta(days=window_days)
+        account_rows: list[tuple[datetime, object]] = []
+        for row in token_rows:
+            if getattr(row, "account_name", "") != account_name:
+                continue
+            hour_bucket = _iso_to_dt(getattr(row, "hour_bucket", None))
+            if hour_bucket is None or hour_bucket < cutoff:
+                continue
+            account_rows.append((hour_bucket, row))
+
+        period_tokens = sum(int(getattr(row, "tokens_used", 0) or 0) for _dt, row in account_rows)
+        used_tokens = None
+        limit_tokens = None
+        if usage.used_pct and period_tokens > 0:
+            used_tokens = period_tokens
+            limit_tokens = int(round(period_tokens / (usage.used_pct / 100.0)))
+
+        burn_cutoff = now - timedelta(hours=3)
+        recent_rows = [(dt, row) for dt, row in account_rows if dt >= burn_cutoff]
+        burn_tokens = sum(int(getattr(row, "tokens_used", 0) or 0) for _dt, row in recent_rows)
+        burn_rate = 0.0
+        if recent_rows:
+            burn_start = min(dt for dt, _row in recent_rows)
+            hours = max(1.0, _hours_between(burn_start, now))
+            burn_rate = burn_tokens / hours
+
+        eta_seconds = None
+        if used_tokens is not None and limit_tokens is not None and burn_rate > 0:
+            remaining_tokens = max(0, limit_tokens - used_tokens)
+            if remaining_tokens > 0:
+                eta_seconds = remaining_tokens / burn_rate * 3600.0
+
+        severity = "normal"
+        if usage.used_pct >= 95:
+            severity = "critical"
+        elif usage.used_pct >= 80:
+            severity = "warning"
+
+        gauges.append(
+            DashboardTokenGauge(
+                account_name=account_name,
+                provider=getattr(account, "provider", getattr(usage, "provider", "")),
+                used_pct=int(usage.used_pct),
+                summary=str(getattr(usage, "usage_summary", "") or ""),
+                severity=severity,
+                used_tokens=used_tokens,
+                limit_tokens=limit_tokens,
+                burn_rate_per_hour=burn_rate,
+                eta_seconds=eta_seconds,
+                reset_at=str(getattr(usage, "reset_at", "") or ""),
+            )
+        )
+
+    if not gauges:
+        return None
+    gauges.sort(
+        key=lambda gauge: (
+            -gauge.used_pct,
+            -(1 if gauge.burn_rate_per_hour > 0 else 0),
+            -gauge.burn_rate_per_hour,
+            gauge.account_name,
+        )
+    )
+    return gauges[0]
+
+
+def _format_eta(seconds: float) -> str:
+    if seconds < 3600:
+        return f"{max(1, int(seconds // 60))}m"
+    if seconds < 86400:
+        return f"{max(1, int(seconds // 3600))}h"
+    return f"{max(1, int(seconds // 86400))}d"
+
+
+def _render_token_gauge(gauge: DashboardTokenGauge) -> str:
+    marker = "!!" if gauge.severity == "critical" else "!" if gauge.severity == "warning" else "·"
+    if gauge.used_tokens is not None and gauge.limit_tokens is not None:
+        usage_text = (
+            f"~{_format_tokens(gauge.used_tokens)} / ~{_format_tokens(gauge.limit_tokens)} "
+            f"({gauge.used_pct}%)"
+        )
+    else:
+        usage_text = f"{gauge.used_pct}% used"
+    line = f"{marker} Token burn: {gauge.account_name} · {usage_text}"
+    if gauge.eta_seconds is not None and gauge.burn_rate_per_hour > 0:
+        line += (
+            f" · ~{_format_eta(gauge.eta_seconds)} left "
+            f"@ {_format_tokens(int(gauge.burn_rate_per_hour))}/h"
+        )
+    elif gauge.reset_at:
+        line += f" · resets {gauge.reset_at}"
+    elif gauge.summary:
+        line += f" · {gauge.summary}"
+    return line
+
+
+def _recent_briefing_entry(base_dir: Path, *, now: datetime, status: str):
+    from pollypm.plugins_builtin.morning_briefing.inbox import list_briefings
+
+    for entry in list_briefings(base_dir, status=status, limit=8):
+        created_at = _iso_to_dt(getattr(entry, "created_at", ""))
+        if created_at is None:
+            continue
+        if created_at >= now - timedelta(hours=24):
+            return entry, created_at
+    return None, None
+
+
+def _briefing_banner(config, *, config_path: Path | None, now: datetime) -> DashboardBriefingBanner | None:
+    project_cfg = getattr(config, "project", None)
+    base_dir_value = getattr(project_cfg, "base_dir", None)
+    if not base_dir_value:
+        return None
+    base_dir = Path(base_dir_value)
+    entry, created_at = _recent_briefing_entry(base_dir, now=now, status="open")
+    if entry is None:
+        recent_any, _created_any = _recent_briefing_entry(base_dir, now=now, status="all")
+        if recent_any is None and config_path is not None:
+            try:
+                from pollypm.plugins_builtin.morning_briefing.handlers.briefing_tick import (
+                    fire_briefing,
+                )
+                from pollypm.plugins_builtin.morning_briefing.settings import load_briefing_settings
+                from pollypm.plugins_builtin.morning_briefing.state import (
+                    iso_date,
+                    load_state,
+                    save_state,
+                )
+            except Exception:  # noqa: BLE001
+                fire_briefing = None
+            else:
+                settings = load_briefing_settings(config_path)
+                if settings.enabled and fire_briefing is not None:
+                    state = load_state(base_dir)
+                    tz_name = getattr(getattr(config, "pollypm", None), "timezone", "") or ""
+                    try:
+                        from zoneinfo import ZoneInfo
+
+                        zone = ZoneInfo(settings.timezone or tz_name) if (settings.timezone or tz_name) else UTC
+                    except Exception:  # noqa: BLE001
+                        zone = UTC
+                    now_local = now.astimezone(zone)
+                    root_dir_value = getattr(project_cfg, "root_dir", None)
+                    if state.last_briefing_date != iso_date(now_local.date()) and root_dir_value:
+                        try:
+                            result = fire_briefing(
+                                project_root=Path(root_dir_value),
+                                base_dir=base_dir,
+                                settings=settings,
+                                now_local=now_local,
+                                state=state,
+                                config=config,
+                            )
+                        except Exception:  # noqa: BLE001
+                            result = {"fired": False}
+                        if isinstance(result, dict) and result.get("fired"):
+                            state.last_briefing_date = iso_date(now_local.date())
+                            state.last_fire_at = now_local.astimezone().isoformat()
+                            save_state(base_dir, state)
+        entry, created_at = _recent_briefing_entry(base_dir, now=now, status="open")
+    if entry is None:
+        return None
+    text = "Morning briefing available — press B to read"
+    age = _age_from_dt(created_at, now=now)
+    if age:
+        text += f" ({age})"
+    return DashboardBriefingBanner(
+        text=text,
+        date_local=str(getattr(entry, "date_local", "") or ""),
+        created_at=created_at,
+    )
+
+
+def _rank_dashboard_suggestions(
+    *,
+    review_tasks: list[tuple[str, object]],
+    blocked_tasks: list[tuple[str, object]],
+    queued_tasks: list[tuple[str, object]],
+    briefing_banner: DashboardBriefingBanner | None,
+    user_inbox: int,
+    config,
+    now: datetime,
+) -> list[DashboardSuggestion]:
+    suggestions: list[DashboardSuggestion] = []
+
+    if review_tasks:
+        review_project, review_task = sorted(
+            review_tasks,
+            key=lambda item: _iso_to_dt(getattr(item[1], "updated_at", None)) or now,
+        )[0]
+        suggestions.append(
+            DashboardSuggestion(
+                label=f"Approve {_task_id(review_project, review_task)}",
+                detail=f"review needed {_age_from_dt(_iso_to_dt(getattr(review_task, 'updated_at', None)), now=now)}",
+            )
+        )
+
+    if blocked_tasks:
+        blocked_project, blocked_task = sorted(
+            blocked_tasks,
+            key=lambda item: _iso_to_dt(getattr(item[1], "updated_at", None)) or now,
+        )[0]
+        suggestions.append(
+            DashboardSuggestion(
+                label=f"Check why {_task_id(blocked_project, blocked_task)} is blocked",
+                detail=_age_from_dt(_iso_to_dt(getattr(blocked_task, "updated_at", None)), now=now),
+            )
+        )
+
+    if briefing_banner is not None:
+        detail = f"{briefing_banner.date_local} · press B" if briefing_banner.date_local else "press B"
+        suggestions.append(DashboardSuggestion(label="Read morning briefing", detail=detail))
+    elif user_inbox:
+        suggestions.append(
+            DashboardSuggestion(
+                label="Review inbox",
+                detail=f"{user_inbox} item{'s' if user_inbox != 1 else ''} waiting",
+            )
+        )
+
+    if queued_tasks:
+        queued_project, queued_task = sorted(
+            queued_tasks,
+            key=lambda item: (
+                _task_priority_rank(item[1]),
+                _iso_to_dt(getattr(item[1], "updated_at", None)) or now,
+            ),
+        )[0]
+        project = config.projects.get(queued_project)
+        project_label = project.display_label() if project else queued_project
+        suggestions.append(
+            DashboardSuggestion(
+                label=f"Claim {_task_id(queued_project, queued_task)}",
+                detail=f"{getattr(queued_task, 'title', '')} ({project_label})",
+            )
+        )
+
+    return suggestions[:4]
+
+
+def _render_suggestions(suggestions: list[DashboardSuggestion]) -> list[str]:
+    lines = [_dashboard_divider("What's next?"), ""]
+    if not suggestions:
+        lines.append("  Nothing urgent — the workspace is clear.")
+        lines.append("")
+        return lines
+    for idx, suggestion in enumerate(suggestions, start=1):
+        detail = f" · {suggestion.detail}" if suggestion.detail else ""
+        lines.append(f"  {idx}. {suggestion.label}{detail}")
+    lines.append("")
+    return lines
+
+
+def _build_dashboard(supervisor, config, config_path: Path | None = None) -> str:
     # Imported lazily to avoid a hard cycle with pollypm.cockpit while the
-    # inbox helpers still live there (Issue #405 will move them).
+    # inbox helpers still live there.
     from pollypm.cockpit import _count_inbox_tasks_for_label
 
     lines: list[str] = []
     now = datetime.now(UTC)
 
-    def _age(ts_str: str) -> str:
-        try:
-            dt = datetime.fromisoformat(ts_str)
-            secs = (now - dt).total_seconds()
-            if secs < 60:
-                return "just now"
-            if secs < 3600:
-                return f"{int(secs // 60)}m ago"
-            if secs < 86400:
-                return f"{int(secs // 3600)}h ago"
-            return f"{int(secs // 86400)}d ago"
-        except (ValueError, TypeError):
-            return ""
-
-    # ── Gather task data across all projects ──
-    # Partition + counts are cached per project by state.db mtime; unchanged
-    # projects skip SQLite on each render.
-    all_active: list[tuple[str, object]] = []  # in_progress
-    all_review: list[tuple[str, object]] = []  # waiting for review
-    all_queued: list[tuple[str, object]] = []  # ready for pickup
+    all_active: list[tuple[str, object]] = []
+    all_review: list[tuple[str, object]] = []
+    all_queued: list[tuple[str, object]] = []
     all_blocked: list[tuple[str, object]] = []
     all_done: list[tuple[str, object]] = []
+    all_tasks: list[tuple[str, object]] = []
     project_scorecards: list[tuple[int, str, str]] = []
     total_counts: dict[str, int] = {}
     live_keys: set[str] = set()
-    for pk, proj in config.projects.items():
-        live_keys.add(pk)
-        partitioned, counts = _dashboard_project_tasks(pk, proj.path)
-        tasks = [task for bucket in partitioned.values() for task in bucket]
-        for s, n in counts.items():
-            total_counts[s] = total_counts.get(s, 0) + n
-        for t in partitioned.get("in_progress", ()):
-            all_active.append((pk, t))
-        for t in partitioned.get("review", ()):
-            all_review.append((pk, t))
-        for t in partitioned.get("queued", ()):
-            all_queued.append((pk, t))
-        for t in partitioned.get("blocked", ()):
-            all_blocked.append((pk, t))
-        for t in partitioned.get("done", ()):
-            all_done.append((pk, t))
+    for project_key, project in config.projects.items():
+        live_keys.add(project_key)
+        partitioned, counts = _dashboard_project_tasks(project_key, project.path)
+        project_tasks = [task for bucket in partitioned.values() for task in bucket]
+        for status, count in counts.items():
+            total_counts[status] = total_counts.get(status, 0) + count
+        for status_name, bucket in partitioned.items():
+            for task in bucket:
+                pair = (project_key, task)
+                all_tasks.append(pair)
+                if status_name == "in_progress":
+                    all_active.append(pair)
+                elif status_name == "review":
+                    all_review.append(pair)
+                elif status_name == "queued":
+                    all_queued.append(pair)
+                elif status_name == "blocked":
+                    all_blocked.append(pair)
+                elif status_name == "done":
+                    all_done.append(pair)
         label = (
-            proj.display_label()
-            if hasattr(proj, "display_label")
-            else getattr(proj, "name", None) or pk
+            project.display_label()
+            if hasattr(project, "display_label")
+            else getattr(project, "name", None) or project_key
         )
         project_scorecards.append(
             (
-                project_health_rank(tasks, now=now),
+                project_health_rank(project_tasks, now=now),
                 str(label).lower(),
-                format_project_health_scorecard(label, counts, tasks, now=now),
+                format_project_health_scorecard(label, counts, project_tasks, now=now),
             )
         )
-    # Evict cache entries for projects no longer in config.
     for stale_key in list(_DASHBOARD_PROJECT_CACHE.keys()):
         if stale_key not in live_keys:
             _DASHBOARD_PROJECT_CACHE.pop(stale_key, None)
-    all_done.sort(key=lambda x: x[1].updated_at or "", reverse=True)
+    all_done.sort(
+        key=lambda item: _task_done_at(item[1]) or _iso_to_dt(getattr(item[1], "updated_at", None)) or now,
+        reverse=True,
+    )
 
-    # ── Gather system data ──
-    open_alerts = supervisor.store.open_alerts()
+    try:
+        open_alerts = supervisor.store.open_alerts()
+    except Exception:  # noqa: BLE001
+        open_alerts = []
     user_inbox = _count_inbox_tasks_for_label(config)
-    actionable_alerts = [a for a in open_alerts if a.alert_type not in (
-        "suspected_loop", "stabilize_failed", "needs_followup",
-    )]
-    recent = supervisor.store.recent_events(limit=300)
+    actionable_alerts = [
+        alert
+        for alert in open_alerts
+        if alert.alert_type not in ("suspected_loop", "stabilize_failed", "needs_followup")
+    ]
+    try:
+        recent = supervisor.store.recent_events(limit=300)
+    except Exception:  # noqa: BLE001
+        recent = []
     cutoff_24h = (now - timedelta(hours=24)).isoformat()
-    day_events = [e for e in recent if e.created_at >= cutoff_24h]
+    day_events = [event for event in recent if event.created_at >= cutoff_24h]
 
-    # ── Header ──
+    streaks = _shipper_streaks(all_tasks, now=now)
+    streak_header = _render_streak_header(streaks)
+    token_gauge = _build_token_gauge(supervisor, config, now=now)
+    briefing_banner = _briefing_banner(config, config_path=config_path, now=now)
+    suggestions = _rank_dashboard_suggestions(
+        review_tasks=all_review,
+        blocked_tasks=all_blocked,
+        queued_tasks=all_queued,
+        briefing_banner=briefing_banner,
+        user_inbox=user_inbox,
+        config=config,
+        now=now,
+    )
+
     lines.append("  PollyPM")
+    if token_gauge is not None:
+        lines.append("  " + _render_token_gauge(token_gauge))
+    if streak_header:
+        lines.append(f"  {streak_header}")
+    if briefing_banner is not None:
+        lines.append(f"  ☀ {briefing_banner.text}")
     lines.append("")
 
-    # Status line: what needs YOUR attention right now (actionable items only)
     attention: list[str] = []
     if all_review:
         attention.append(f"◉ {len(all_review)} awaiting review")
@@ -114,81 +568,89 @@ def _build_dashboard(supervisor, config) -> str:
         lines.append("  " + "  ·  ".join(attention))
         lines.append("")
 
-    # Task count summary
     count_parts = []
     for status in ("in_progress", "review", "queued", "blocked"):
-        n = total_counts.get(status, 0)
-        if n:
+        count = total_counts.get(status, 0)
+        if count:
             icon = _STATUS_ICONS.get(status, "·")
-            count_parts.append(f"{icon} {n} {status.replace('_', ' ')}")
-    done_n = total_counts.get("done", 0)
-    if done_n:
-        count_parts.append(f"✓ {done_n} done")
+            count_parts.append(f"{icon} {count} {status.replace('_', ' ')}")
+    done_count = total_counts.get("done", 0)
+    if done_count:
+        count_parts.append(f"✓ {done_count} done")
     if count_parts:
         lines.append("  " + " · ".join(count_parts))
     lines.append("")
 
     if project_scorecards:
-        lines.append("  ─── Projects ─────────────────────────────────────")
+        lines.append(_dashboard_divider("Projects"))
         lines.append("")
         for _rank, _label, line in sorted(project_scorecards):
             lines.append(f"  {line}")
         lines.append("")
 
-    # ── What's happening right now ──
+    lines.extend(_render_suggestions(suggestions))
+
     if all_active or all_review:
-        lines.append("  ─── Now ───────────────────────────────────────────")
+        lines.append(_dashboard_divider("Now"))
         lines.append("")
-        for pk, t in all_active:
-            project = config.projects.get(pk)
-            proj_label = project.display_label() if project else pk
-            assignee = f" [{t.assignee}]" if t.assignee else ""
-            node = t.current_node_id or ""
-            age = _age(t.updated_at) if t.updated_at else ""
-            lines.append(f"  ⟳ {t.title}")
-            lines.append(f"    {proj_label}{assignee} · {node} · {age}")
+        for project_key, task in all_active:
+            project = config.projects.get(project_key)
+            project_label = project.display_label() if project else project_key
+            worker = _task_worker(task)
+            assignee = f" [{worker}{_streak_badge(worker, streaks)}]" if worker else ""
+            node = getattr(task, "current_node_id", None) or ""
+            age = _age_from_dt(_iso_to_dt(getattr(task, "updated_at", None)), now=now)
+            lines.append(f"  ⟳ {getattr(task, 'title', '')}")
+            lines.append(f"    {project_label}{assignee} · {node} · {age}")
             lines.append("")
-        for pk, t in all_review:
-            project = config.projects.get(pk)
-            proj_label = project.display_label() if project else pk
-            age = _age(t.updated_at) if t.updated_at else ""
-            lines.append(f"  ◉ {t.title}")
-            lines.append(f"    {proj_label} · waiting for Russell · {age}")
+        for project_key, task in all_review:
+            project = config.projects.get(project_key)
+            project_label = project.display_label() if project else project_key
+            worker = _task_worker(task)
+            worker_text = f" · by {worker}{_streak_badge(worker, streaks)}" if worker else ""
+            age = _age_from_dt(_iso_to_dt(getattr(task, "updated_at", None)), now=now)
+            lines.append(f"  ◉ {getattr(task, 'title', '')}")
+            lines.append(f"    {project_label}{worker_text} · waiting for Russell · {age}")
             lines.append("")
 
-    # ── Queued (ready for pickup) ──
     if all_queued:
-        lines.append("  ─── Ready ─────────────────────────────────────────")
+        lines.append(_dashboard_divider("Ready"))
         lines.append("")
-        for pk, t in all_queued[:5]:
-            project = config.projects.get(pk)
-            proj_label = project.display_label() if project else pk
-            lines.append(f"  ○ {t.title}  ({proj_label})")
+        for project_key, task in all_queued[:5]:
+            project = config.projects.get(project_key)
+            project_label = project.display_label() if project else project_key
+            lines.append(f"  ○ {getattr(task, 'title', '')}  ({project_label})")
         if len(all_queued) > 5:
             lines.append(f"    + {len(all_queued) - 5} more queued")
         lines.append("")
 
-    # ── Recently completed ──
     if all_done:
-        lines.append("  ─── Done ──────────────────────────────────────────")
+        lines.append(_dashboard_divider("Done"))
         lines.append("")
-        for pk, t in all_done[:8]:
-            project = config.projects.get(pk)
-            proj_label = project.display_label() if project else pk
-            age = _age(t.updated_at) if t.updated_at else ""
-            lines.append(f"  ✓ {t.title}  ({proj_label})  {age}")
+        for project_key, task in all_done[:8]:
+            project = config.projects.get(project_key)
+            project_label = project.display_label() if project else project_key
+            worker = _task_worker(task)
+            worker_text = f" · {worker}{_streak_badge(worker, streaks)}" if worker else ""
+            age = _age_from_dt(
+                _task_done_at(task) or _iso_to_dt(getattr(task, "updated_at", None)),
+                now=now,
+            )
+            lines.append(f"  ✓ {getattr(task, 'title', '')}  ({project_label}{worker_text})  {age}")
         if len(all_done) > 8:
             lines.append(f"    + {len(all_done) - 8} more completed")
         lines.append("")
 
     lines.extend(_section_just_shipped(all_done, now=now))
 
-    # ── System activity ──
-    lines.append("  ─── Activity ──────────────────────────────────────")
+    lines.append(_dashboard_divider("Activity"))
     lines.append("")
-    commits = [e for e in day_events if "commit" in e.message.lower()]
-    recoveries = [e for e in day_events if e.event_type in ("recover", "recovery", "stabilize_failed")]
-    sends = [e for e in day_events if e.event_type == "send_input"]
+    commits = [event for event in day_events if "commit" in event.message.lower()]
+    recoveries = [
+        event for event in day_events
+        if event.event_type in ("recover", "recovery", "stabilize_failed")
+    ]
+    sends = [event for event in day_events if event.event_type == "send_input"]
     activity_parts = []
     if commits:
         activity_parts.append(f"{len(commits)} commits")
@@ -202,25 +664,26 @@ def _build_dashboard(supervisor, config) -> str:
         lines.append("  No notable activity today.")
     lines.append("")
 
-    # Show last few notable events with timestamps
-    notable = [e for e in day_events if e.event_type not in ("heartbeat", "token_ledger", "polly_followup")][:6]
+    notable = [
+        event
+        for event in day_events
+        if event.event_type not in ("heartbeat", "token_ledger", "polly_followup")
+    ][:6]
     for event in notable:
-        age = _age(event.created_at)
-        session = event.session_name
-        msg = event.message[:55]
-        lines.append(f"  {age:>8}  {session}: {msg}")
+        age = _age_from_dt(_iso_to_dt(getattr(event, "created_at", None)), now=now)
+        session = getattr(event, "session_name", "")
+        message = getattr(event, "message", "")[:55]
+        lines.append(f"  {age:>8}  {session}: {message}")
     if notable:
         lines.append("")
 
-    # ── Alerts (if any) ──
     if actionable_alerts:
-        lines.append("  ─── Alerts ────────────────────────────────────────")
+        lines.append(_dashboard_divider("Alerts"))
         lines.append("")
         for alert in actionable_alerts[:5]:
             lines.append(f"  ▲ {alert.session_name}: {alert.message[:55]}")
         lines.append("")
 
-    # ── Footer ──
     project_count = len(config.projects)
     lines.append(f"  {project_count} projects  ·  j/k navigate  ·  S settings")
 

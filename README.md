@@ -459,17 +459,20 @@ stateDiagram-v2
 ## Quick Start
 
 ```bash
-# First run — walks you through account setup and launches everything
+# Start or attach to the PollyPM tmux session with Polly in the operator pane.
+# On first run, `pm` also walks you through account setup.
 pm
 
-# That's it. From here you talk to Polly.
+# Leave that tmux session running, then send work to Polly.
 pm send operator "Build a weather CLI with current conditions and 5-day forecast"
 ```
 
-`pm` is the only command you need. On first run it handles onboarding, account login, and session launch. After that:
+`pm send operator ...` talks to the already-running operator session in tmux.
+`pm` is the easiest way to start or attach to that session. On first run it
+also handles onboarding and account login. After that:
 
 ```bash
-pm                  # Attach to the cockpit
+pm                  # Start or attach to the cockpit
 pm cockpit          # Open the main Textual cockpit
 pm ui               # Open the legacy control palette
 pm status           # System overview

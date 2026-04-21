@@ -704,6 +704,38 @@ class TestFlowImmutability:
         t2 = self._make_task(svc)
         assert svc.get(t2.task_id).flow_template_version == 1
 
+    def test_load_flow_from_db_uses_cached_template_on_repeat_load(self, tmp_path, monkeypatch):
+        self._write_custom_standard(tmp_path, description="cached-body")
+        db = tmp_path / "work.db"
+        svc = SQLiteWorkService(db_path=db, project_path=tmp_path)
+
+        task = self._make_task(svc)
+        flow = svc._load_flow_from_db(
+            task.flow_template_id,
+            task.flow_template_version,
+        )
+
+        class GuardConn:
+            def __init__(self, conn):
+                self._conn = conn
+
+            def execute(self, sql, params=()):
+                if "work_flow_templates" in sql or "work_flow_nodes" in sql:
+                    raise AssertionError("flow template DB lookup should be served from cache")
+                return self._conn.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        monkeypatch.setattr(svc, "_conn", GuardConn(svc._conn))
+
+        cached = svc._load_flow_from_db(
+            task.flow_template_id,
+            task.flow_template_version,
+        )
+
+        assert cached is flow
+
 
 # ---------------------------------------------------------------------------
 # actor_type=agent — named agent resolution (#140)

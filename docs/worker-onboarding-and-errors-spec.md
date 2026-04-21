@@ -52,7 +52,7 @@ CLI-level entry point: `pm help worker` renders the guide (same content). Also `
 
 ### 4.1 Rules for every error
 
-Every error raised by `pm task`, `pm session`, `pm worker-start`, `pm project`, and friends must answer three questions:
+Every error raised by `pm task`, `pm session`, `pm project`, and related worker-management commands must answer three questions:
 
 1. **What happened** — one sentence.
 2. **Why** — one sentence where the cause is knowable.
@@ -81,12 +81,12 @@ See `pm task output --help` for other kinds (pr, file_change, action).
 Each of these gets the three-question treatment:
 
 - `pm task done` without output → §4.1 example above.
-- `pm task claim` with failing provision → "Claim recorded in DB but session provisioning failed: tmux session `pollypm-storage-closet` already exists / tmux exit <code>. If you're inside an already-running worker session, you're fine — continue working. Otherwise run `pm session list` and attach to an existing worker, or ask the PM to `pm worker-start <project>`."
+- `pm task claim` with failing provision → "Claim recorded in DB but session provisioning failed: tmux session `pollypm-storage-closet` already exists / tmux exit <code>. If you're inside an already-running worker session, you're fine — continue working. Otherwise run `pm session list` and attach to the active worker, or ask the PM to retry the claim from the task system."
 - `pm task show` typo → Typer-level "Did you mean `pm task get`?" with `--suggest-only` flag disabled by default so it's always on.
 - `pm project new` missing → "Command not registered. This usually means the pm binary hasn't been rebuilt since the project_planning plugin shipped. Fix: `cd /path/to/pollypm && uv pip install -e .` then try again. Workaround: `pm add-project <path> --name <name>`."
 - `pm task approve` on a draft task → "Task is in `draft` status; only `review` tasks can be approved. Did you mean `pm task queue <id>`?"
 - `pm task claim` on already-claimed task → "Task already claimed by <actor> at <time>. Use `pm task get <id>` to see current state, or `pm task release <id>` if the claim is stale."
-- `pm worker-start` on a non-existent project → "No project `<name>` registered. Run `pm projects` to see registered projects, or `pm add-project <path>` to register a new one."
+- `pm task create` or `pm task claim` on a non-existent project → "No project `<name>` registered. Run `pm projects` to see registered projects, or `pm add-project <path>` to register a new one."
 
 Every entry is a one-line code change (raise-with-better-message) plus a unit test asserting the guidance text is present.
 

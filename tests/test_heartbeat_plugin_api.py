@@ -4,6 +4,8 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from pollypm.heartbeats.api import SupervisorHeartbeatAPI
 from pollypm.heartbeats.base import HeartbeatCursor, HeartbeatSessionContext, HeartbeatUnmanagedWindow
 from pollypm.heartbeats.local import LocalHeartbeatBackend, _collect_work_service_signals
@@ -522,6 +524,37 @@ def test_local_heartbeat_backend_recovers_missing_window() -> None:
     assert api.statuses["worker_pollypm"][0] == "recovering"
     assert api.recoveries == [("worker_pollypm", "missing_window", "Expected tmux window is missing")]
     assert ("worker_pollypm", "missing_window") in api.alerts
+
+
+def test_local_heartbeat_backend_rejects_unknown_role_for_mutating_session_writes() -> None:
+    backend = LocalHeartbeatBackend()
+    api = FakeHeartbeatAPI([])
+    context = _context(session_name="mystery", role="mystery")
+
+    with pytest.raises(AssertionError, match="set_session_status"):
+        backend._set_session_status(
+            api,
+            context,
+            "recovering",
+            reason="Expected tmux window is missing",
+        )
+
+    with pytest.raises(AssertionError, match="recover_session"):
+        backend._recover_session(
+            api,
+            context,
+            failure_type="missing_window",
+            message="Expected tmux window is missing",
+        )
+
+
+def test_local_heartbeat_backend_rejects_non_worker_message_injection() -> None:
+    backend = LocalHeartbeatBackend()
+    api = FakeHeartbeatAPI([])
+    context = _context(session_name="operator", role="operator-pm")
+
+    with pytest.raises(AssertionError, match="send_session_message"):
+        backend._send_worker_message(api, context, "pm task next")
 
 
 def test_local_heartbeat_backend_marks_auth_broken() -> None:

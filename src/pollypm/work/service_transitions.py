@@ -77,11 +77,19 @@ def advance_to_node(
     new_status = (
         WorkStatus.REVIEW if next_node.type == NodeType.REVIEW else WorkStatus.IN_PROGRESS
     )
+    next_assignee = service._resolve_node_assignee(task, next_node)
     visit = next_visit(service, task.project, task.task_number, next_node_id)
     service._conn.execute(
-        "UPDATE work_tasks SET work_status = ?, current_node_id = ?, updated_at = ? "
+        "UPDATE work_tasks SET work_status = ?, assignee = ?, current_node_id = ?, updated_at = ? "
         "WHERE project = ? AND task_number = ?",
-        (new_status.value, next_node_id, now, task.project, task.task_number),
+        (
+            new_status.value,
+            next_assignee,
+            next_node_id,
+            now,
+            task.project,
+            task.task_number,
+        ),
     )
     service._conn.execute(
         "INSERT INTO work_node_executions "

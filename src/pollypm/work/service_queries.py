@@ -295,14 +295,12 @@ def next_task(
 
 def my_tasks(service: "SQLiteWorkService", agent: str) -> list[Task]:
     rows = service._conn.execute(
-        "SELECT * FROM work_tasks WHERE current_node_id IS NOT NULL",
+        "SELECT * FROM work_tasks "
+        "WHERE current_node_id IS NOT NULL AND assignee = ? "
+        "ORDER BY project, task_number",
+        (agent,),
     ).fetchall()
-    result: list[Task] = []
-    for row in rows:
-        task = service._row_to_task(row)
-        if service.derive_owner(task) == agent:
-            result.append(task)
-    return result
+    return [service._row_to_task(row) for row in rows]
 
 
 def state_counts(service: "SQLiteWorkService", project: str | None = None) -> dict[str, int]:

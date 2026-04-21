@@ -20,7 +20,7 @@ import typer
 
 
 def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
-    @app.command()
+    @app.command(help=helpers._UP_HELP)
     def launch(
         config_path: Path = typer.Option("~/.pollypm/pollypm.toml", "--config", help="PollyPM config path."),
     ) -> None:

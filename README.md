@@ -474,7 +474,7 @@ pm cockpit          # Open the main Textual cockpit
 pm ui               # Open the legacy control palette
 pm status           # System overview
 pm send operator …  # Send work to Polly
-pm down             # Shut everything down
+pm reset            # Shut everything down
 ```
 
 Usage is refreshed automatically in the background every 5 minutes. Run

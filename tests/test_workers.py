@@ -223,6 +223,9 @@ def test_operator_prompt_requires_delegation_instructions() -> None:
     assert "CAN, without asking" in prompt
     assert "MUST ESCALATE to Sam" in prompt
     assert "scope changes" in prompt.lower()
+    assert "background probe" in prompt.lower()
+    assert "non-blocking" in prompt.lower()
+    assert "not a task for you" in prompt.lower()
 
 def test_heartbeat_prompt_describes_recovery_protocol() -> None:
     prompt = heartbeat_prompt()

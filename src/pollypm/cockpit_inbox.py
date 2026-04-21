@@ -25,6 +25,7 @@ callers + the test suite.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from pollypm.config import load_config
@@ -339,6 +340,8 @@ class WorkerRosterRow:
     last_heartbeat: str | None
     worktree_path: str | None
     branch_name: str | None
+    just_shipped: bool = False
+    shipment_token: str | None = None
 
 
 # Order used by the renderer + sort helpers. Lower = earlier in the table.
@@ -355,6 +358,23 @@ def _worker_roster_sort_key(row: "WorkerRosterRow") -> tuple[int, str]:
         _WORKER_ROSTER_STATUS_ORDER.get(row.status, 9),
         (row.project_name or row.project_key or "").lower(),
     )
+
+
+def _recent_worker_shipment(task) -> tuple[bool, str | None]:
+    work_status = getattr(getattr(task, "work_status", None), "value", "")
+    updated_at = getattr(task, "updated_at", None)
+    task_id = getattr(task, "task_id", None)
+    if work_status != "review" or not updated_at or not task_id:
+        return False, None
+    try:
+        updated_dt = datetime.fromisoformat(str(updated_at))
+    except (TypeError, ValueError):
+        return False, None
+    if updated_dt.tzinfo is None:
+        updated_dt = updated_dt.replace(tzinfo=UTC)
+    if updated_dt < datetime.now(UTC) - timedelta(seconds=20):
+        return False, None
+    return True, f"{task_id}:{updated_dt.isoformat()}"
 
 
 def _pane_text_shows_active_turn(pane_text: str) -> bool:
@@ -519,6 +539,7 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
                 getattr(task, "current_node_id", None)
                 if task is not None else None
             )
+            just_shipped, shipment_token = _recent_worker_shipment(task)
             window_name = f"task-{project_key}-{ws.task_number}"
             window = storage_windows.get(window_name)
             has_window = window is not None and not getattr(
@@ -597,6 +618,8 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
                     last_heartbeat=last_heartbeat_iso,
                     worktree_path=ws.worktree_path,
                     branch_name=ws.branch_name,
+                    just_shipped=just_shipped,
+                    shipment_token=shipment_token,
                 )
             )
 

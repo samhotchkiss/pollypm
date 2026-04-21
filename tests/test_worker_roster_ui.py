@@ -22,6 +22,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from textual.widgets import DataTable
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +81,8 @@ def _make_row(**overrides):
         last_heartbeat="2026-04-17T00:00:00+00:00",
         worktree_path="/tmp/wt",
         branch_name="task/demo-1",
+        just_shipped=False,
+        shipment_token=None,
     )
     defaults.update(overrides)
     return WorkerRosterRow(**defaults)
@@ -87,6 +90,13 @@ def _make_row(**overrides):
 
 def _run(coro) -> None:
     asyncio.run(coro)
+
+
+def _table_rows(table: DataTable) -> list[list[str]]:
+    return [
+        [str(cell) for cell in table.get_row_at(row_index)]
+        for row_index in range(table.row_count)
+    ]
 
 
 @pytest.fixture
@@ -251,6 +261,28 @@ def test_d_dispatches_to_worker_tmux_window(roster_env, roster_app) -> None:
                 roster_app._dispatch_to_worker_sync(rows[0])
             assert targets, "expected _perform_worker_dispatch to be called"
             assert targets[-1] == ("gamma", 42)
+    _run(body())
+
+
+def test_recent_shipment_flashes_checkmark_then_clears(
+    roster_env, roster_app,
+) -> None:
+    async def body() -> None:
+        rows = [
+            _make_row(
+                status="idle",
+                just_shipped=True,
+                shipment_token="demo/1:2026-04-21T16:00:00+00:00",
+            ),
+        ]
+        roster_app._gather = lambda: rows  # type: ignore[method-assign]
+        async with roster_app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            assert _table_rows(roster_app.table)[0][2] == "✓"
+            await asyncio.sleep(0.9)
+            await pilot.pause()
+            assert _table_rows(roster_app.table)[0][2] == "○"
+
     _run(body())
 
 

@@ -103,6 +103,7 @@ class PollyWorkerRosterApp(App[None]):
     ]
 
     AUTO_REFRESH_SECONDS = 5.0
+    CELEBRATION_SECONDS = 0.8
 
     _STATUS_DOTS: dict[str, tuple[str, str]] = {
         "working": ("\u25cf", "#3ddc84"),
@@ -134,6 +135,8 @@ class PollyWorkerRosterApp(App[None]):
         self._rows: list = []
         self._auto_refresh: bool = False
         self._auto_refresh_timer = None
+        self._active_shipments: set[str] = set()
+        self._seen_shipments: set[str] = set()
 
     def compose(self) -> ComposeResult:
         with Vertical(id="wr-outer"):
@@ -216,10 +219,18 @@ class PollyWorkerRosterApp(App[None]):
 
         self.hint.update(self._DEFAULT_HINT)
         for row in rows:
+            celebrating = self._is_celebrating(row)
             glyph, colour = self._STATUS_DOTS.get(row.status, ("\u25cb", "#6b7a88"))
-            dot = Text.assemble((glyph, colour))
-            project_cell = Text(row.project_name or row.project_key, style="#5b8aff")
-            session_cell = Text(row.session_name, style="#d6dee5")
+            if celebrating:
+                dot = Text("\u2713", style="bold #dcf4e6 on #173322")
+                project_style = "bold #dcf4e6 on #173322"
+                cell_style = "bold #dcf4e6 on #173322"
+            else:
+                dot = Text.assemble((glyph, colour))
+                project_style = "#5b8aff"
+                cell_style = "#d6dee5"
+            project_cell = Text(row.project_name or row.project_key, style=project_style)
+            session_cell = Text(row.session_name, style=cell_style)
             task_text = (
                 f"#{row.task_number} {row.task_title}".rstrip()
                 if row.task_number is not None
@@ -229,12 +240,31 @@ class PollyWorkerRosterApp(App[None]):
                 project_cell,
                 session_cell,
                 dot,
-                Text(task_text, style="#d6dee5"),
-                Text(row.current_node or "\u2014", style="#97a6b2"),
-                Text(row.turn_label, style="#97a6b2"),
-                Text(row.last_commit_label, style="#6b7a88"),
+                Text(task_text, style=cell_style),
+                Text(row.current_node or "\u2014", style=cell_style),
+                Text(row.turn_label, style=cell_style),
+                Text(row.last_commit_label, style=cell_style),
                 key=f"{row.project_key}:{row.session_name}",
             )
+
+    def _is_celebrating(self, row) -> bool:
+        token = getattr(row, "shipment_token", None)
+        if not getattr(row, "just_shipped", False) or not token:
+            return False
+        if token not in self._seen_shipments:
+            self._seen_shipments.add(token)
+            self._active_shipments.add(token)
+            self.set_timer(
+                self.CELEBRATION_SECONDS,
+                lambda token=token: self._clear_celebration(token),
+            )
+        return token in self._active_shipments
+
+    def _clear_celebration(self, token: str) -> None:
+        if token not in self._active_shipments:
+            return
+        self._active_shipments.remove(token)
+        self._render()
 
     def _selected_row(self):
         """Return the row currently under the cursor, or ``None``."""

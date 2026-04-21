@@ -58,7 +58,7 @@ The single command you use at every stage boundary is:
       ]
     }'
 
-`<task_id>` is the `project/number` you claimed in step 1 of `<kickoff>`. Always pass `--actor architect` so the work-service knows it's you driving the transition.
+`<task_id>` is the `project/number` you claimed in step 1 of `<kickoff>`. Always pass `--actor architect` so the work-service knows it's you driving the transition; if you omit it, the action is recorded as a worker and the wrong role is notified.
 
 ## When to advance
 

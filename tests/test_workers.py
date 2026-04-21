@@ -208,6 +208,10 @@ def test_worker_prompt_requires_core_identity() -> None:
     assert "<principles>" in prompt
     assert "--output" in prompt
     assert " -o " not in prompt
+    assert "commit" in prompt
+    assert "file_change" in prompt
+    assert "operations with side effects" in prompt
+    assert "decision, blocker, or observation" in prompt
 
 
 def test_operator_prompt_requires_delegation_instructions() -> None:

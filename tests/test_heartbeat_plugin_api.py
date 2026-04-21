@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 from pollypm.heartbeats.api import SupervisorHeartbeatAPI
 from pollypm.heartbeats.base import HeartbeatCursor, HeartbeatSessionContext, HeartbeatUnmanagedWindow
-from pollypm.heartbeats.local import LocalHeartbeatBackend
+from pollypm.heartbeats.local import LocalHeartbeatBackend, _collect_work_service_signals
 from pollypm.memory_backends import get_memory_backend
 from pollypm.models import (
     AccountConfig,
@@ -175,6 +176,28 @@ class FakeHeartbeatAPI:
         self.messages.append(("operator", f"Heartbeat follow-up for {session_name}: {reason}", "heartbeat"))
 
 
+def _work_signal_api(tmp_path: Path, session_name: str = "worker_pollypm") -> SimpleNamespace:
+    config = _config(tmp_path)
+    config.sessions[session_name] = SessionConfig(
+        name=session_name,
+        role="worker",
+        provider=ProviderKind.CLAUDE,
+        account="claude_controller",
+        cwd=tmp_path,
+        project="pollypm",
+        window_name=session_name,
+    )
+    state_db = tmp_path / ".pollypm" / "state.db"
+    state_db.parent.mkdir(parents=True, exist_ok=True)
+    state_db.touch()
+    return SimpleNamespace(
+        supervisor=SimpleNamespace(
+            config=config,
+            msg_store=SimpleNamespace(query_messages=lambda **_kwargs: []),
+        )
+    )
+
+
 def test_supervisor_heartbeat_api_persists_cursor_and_reads_incremental_delta(tmp_path: Path, monkeypatch) -> None:
     supervisor = Supervisor(_config(tmp_path))
     supervisor.ensure_layout()
@@ -339,6 +362,136 @@ def test_supervisor_heartbeat_api_deduplicates_snapshot_learnings(tmp_path: Path
     # Knowledge extraction moved to session_intelligence — record_checkpoint
     # only creates checkpoint entries now. Two calls = two checkpoints.
     assert len(checkpoints) == 2
+
+
+def test_collect_work_service_signals_skips_git_log_for_unregistered_worktree(tmp_path: Path, monkeypatch) -> None:
+    api = _work_signal_api(tmp_path)
+    context = _context()
+    claimed_worktree = tmp_path / ".pollypm" / "worktrees" / "pollypm-1"
+    other_worktree = tmp_path / ".pollypm" / "worktrees" / "other"
+
+    class FakeSQLiteWorkService:
+        def __init__(self, *, db_path: Path, project_path: Path) -> None:
+            self.db_path = db_path
+            self.project_path = project_path
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def list_worker_sessions(self, *, project: str, active_only: bool = True):
+            return [
+                SimpleNamespace(
+                    task_project=project,
+                    task_number=1,
+                    started_at="2026-04-21T00:00:00+00:00",
+                    worktree_path=str(claimed_worktree),
+                    branch_name="task/pollypm-1",
+                )
+            ]
+
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append((list(args), kwargs))
+        assert kwargs.get("cwd") is None
+        if list(args) == ["git", "-C", str(tmp_path), "worktree", "list", "--porcelain"]:
+            stdout = f"worktree {other_worktree}\nHEAD deadbeef\nbranch refs/heads/task/other\n"
+            return subprocess.CompletedProcess(args, 0, stdout, "")
+        raise AssertionError(f"unexpected subprocess call: {args}")
+
+    monkeypatch.setattr("pollypm.work.sqlite_service.SQLiteWorkService", FakeSQLiteWorkService)
+    monkeypatch.setattr("pollypm.heartbeats.local.subprocess.run", fake_run)
+
+    signals = _collect_work_service_signals(api, context)
+
+    assert signals["last_commit_seconds_ago"] is None
+    assert calls == [
+        (
+            ["git", "-C", str(tmp_path), "worktree", "list", "--porcelain"],
+            {
+                "capture_output": True,
+                "text": True,
+                "timeout": 5,
+                "check": False,
+            },
+        )
+    ]
+
+
+def test_collect_work_service_signals_reads_registered_worktree_commit_via_project_repo(tmp_path: Path, monkeypatch) -> None:
+    api = _work_signal_api(tmp_path)
+    context = _context()
+    claimed_worktree = tmp_path / ".pollypm" / "worktrees" / "pollypm-1"
+
+    class FakeSQLiteWorkService:
+        def __init__(self, *, db_path: Path, project_path: Path) -> None:
+            self.db_path = db_path
+            self.project_path = project_path
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def list_worker_sessions(self, *, project: str, active_only: bool = True):
+            return [
+                SimpleNamespace(
+                    task_project=project,
+                    task_number=1,
+                    started_at="2026-04-21T00:00:00+00:00",
+                    worktree_path=str(claimed_worktree),
+                    branch_name="task/pollypm-1",
+                )
+            ]
+
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    commit_ts = 1_700_000_000
+    head_oid = "abc123def456"
+
+    def fake_run(args, **kwargs):
+        calls.append((list(args), kwargs))
+        assert kwargs.get("cwd") is None
+        if list(args) == ["git", "-C", str(tmp_path), "worktree", "list", "--porcelain"]:
+            stdout = (
+                f"worktree {claimed_worktree}\n"
+                f"HEAD {head_oid}\n"
+                "branch refs/heads/task/pollypm-1\n"
+            )
+            return subprocess.CompletedProcess(args, 0, stdout, "")
+        if list(args) == ["git", "-C", str(tmp_path), "log", "-1", "--format=%ct", head_oid]:
+            return subprocess.CompletedProcess(args, 0, f"{commit_ts}\n", "")
+        raise AssertionError(f"unexpected subprocess call: {args}")
+
+    monkeypatch.setattr("pollypm.work.sqlite_service.SQLiteWorkService", FakeSQLiteWorkService)
+    monkeypatch.setattr("pollypm.heartbeats.local.subprocess.run", fake_run)
+
+    signals = _collect_work_service_signals(api, context)
+
+    assert signals["last_commit_seconds_ago"] is not None
+    assert calls == [
+        (
+            ["git", "-C", str(tmp_path), "worktree", "list", "--porcelain"],
+            {
+                "capture_output": True,
+                "text": True,
+                "timeout": 5,
+                "check": False,
+            },
+        ),
+        (
+            ["git", "-C", str(tmp_path), "log", "-1", "--format=%ct", head_oid],
+            {
+                "capture_output": True,
+                "text": True,
+                "timeout": 5,
+                "check": False,
+            },
+        ),
+    ]
 
 
 def test_local_heartbeat_backend_marks_followup_when_work_remains() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -15,6 +16,13 @@ from pollypm.projects import (
 )
 from pollypm.storage.state import StateStore, WorktreeRecord
 
+_SAFE_WORKTREE_KEY_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def _validate_worktree_key(param_name: str, param_value: str) -> None:
+    if not _SAFE_WORKTREE_KEY_RE.fullmatch(param_value):
+        raise typer.BadParameter(f"{param_name} contains invalid characters: {param_value}")
+
 
 def ensure_worktree(
     config_path: Path,
@@ -25,11 +33,13 @@ def ensure_worktree(
     session_name: str | None = None,
     issue_key: str | None = None,
 ) -> WorktreeRecord | None:
-    import re
-    # Validate lane parameters to prevent path traversal
-    for param_name, param_value in [("lane_kind", lane_kind), ("lane_key", lane_key)]:
-        if not re.match(r"^[a-zA-Z0-9_-]+$", param_value):
-            raise typer.BadParameter(f"{param_name} contains invalid characters: {param_value}")
+    # Validate branch/path components before they reach git arguments.
+    for param_name, param_value in [
+        ("project_key", project_key),
+        ("lane_kind", lane_kind),
+        ("lane_key", lane_key),
+    ]:
+        _validate_worktree_key(param_name, param_value)
 
     config = load_config(config_path)
     project = config.projects.get(project_key)
@@ -52,7 +62,7 @@ def ensure_worktree(
     branch = f"pollypm/{project_key}/{lane_kind}/{lane_key}"
     if not path.exists():
         result = subprocess.run(
-            ["git", "-C", str(project.path), "worktree", "add", "-B", branch, str(path), "HEAD"],
+            ["git", "-C", str(project.path), "worktree", "add", "-B", branch, "--", str(path), "HEAD"],
             check=False,
             text=True,
             capture_output=True,
@@ -84,6 +94,13 @@ def cleanup_worktree(
     lane_key: str,
     force: bool = False,
 ) -> Path:
+    for param_name, param_value in [
+        ("project_key", project_key),
+        ("lane_kind", lane_kind),
+        ("lane_key", lane_key),
+    ]:
+        _validate_worktree_key(param_name, param_value)
+
     config = load_config(config_path)
     project = config.projects.get(project_key)
     if project is None:
@@ -103,9 +120,10 @@ def cleanup_worktree(
         )
         if status.stdout.strip():
             raise typer.BadParameter(f"Worktree {path} has uncommitted changes; use force to clean it up.")
-    remove_cmd = ["git", "-C", str(project.path), "worktree", "remove", str(path)]
+    remove_cmd = ["git", "-C", str(project.path), "worktree", "remove"]
     if force:
         remove_cmd.append("--force")
+    remove_cmd.extend(["--", str(path)])
     subprocess.run(remove_cmd, check=False, text=True, capture_output=True, timeout=300)
     subprocess.run(
         ["git", "-C", str(project.path), "worktree", "prune"],

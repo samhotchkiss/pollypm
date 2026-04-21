@@ -167,6 +167,26 @@ def test_check_terminal_color_ok(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.passed
 
 
+def test_extracted_system_module_is_importable_and_uses_public_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pollypm.doctor import system as doctor_system
+
+    monkeypatch.setattr(doctor, "_tool_path", lambda name: None)
+    result = doctor_system.check_uv()
+    assert not result.passed
+    assert "uv not found" in result.status
+
+
+def test_extracted_doctor_modules_reexport_public_checks() -> None:
+    from pollypm.doctor import filesystem, install_state, plugins, rendering
+
+    assert install_state.check_pm_binary_resolves is doctor.check_pm_binary_resolves
+    assert plugins.check_builtin_plugin_manifests is doctor.check_builtin_plugin_manifests
+    assert filesystem.check_disk_space is doctor.check_disk_space
+    assert rendering.render_json is doctor.render_json
+
+
 # --------------------------------------------------------------------- #
 # Install state
 # --------------------------------------------------------------------- #

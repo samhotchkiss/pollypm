@@ -531,11 +531,13 @@ def test_task_review_tab_shows_resubmission_diff_and_confidence_chip(
             await pilot.pause()
             review = str(app.query_one("#task-review", Static).render())
             confidence = str(app.query_one("#task-review-confidence-chip", Static).render())
+            inline_diff = app.query_one("#task-review-inline-diff", Static)
             toggle = app.query_one("#task-review-diff-toggle", Button)
             diff = str(app.query_one("#task-review-diff", Static).render())
 
             assert "Review Artifact" in review
             assert "Russell: 8/10" in confidence
+            assert not inline_diff.display
             assert toggle.display
             assert "last rejected attempt" in diff
 
@@ -547,6 +549,275 @@ def test_task_review_tab_shows_resubmission_diff_and_confidence_chip(
             assert "Resubmission Diff" in diff
             assert "-Summary: Implemented the feature" in diff
             assert "+Summary: Implemented the feature with review fixes" in diff
+
+    _run(body())
+
+
+def test_task_review_diff_prefers_artifact_over_git_fallback(tmp_path, monkeypatch) -> None:
+    from pollypm.cockpit_task_review import (
+        ReviewArtifact,
+        ReviewSection,
+        load_task_review_diff,
+    )
+
+    artifact = ReviewArtifact(
+        title="Review Artifact",
+        summary="Review the change before approving it.",
+        sections=[
+            ReviewSection(
+                title="Project Plan",
+                path=Path("docs/project-plan.md"),
+                body=(
+                    "Plan notes.\n\n"
+                    "```diff\n"
+                    "--- a/src/app.py\n"
+                    "+++ b/src/app.py\n"
+                    "@@ -1 +1 @@\n"
+                    "-print('old')\n"
+                    "+print('new')\n"
+                    "```\n"
+                ),
+            )
+        ],
+    )
+    task = _task(
+        node_id="critic_panel",
+        status=WorkStatus.REVIEW,
+        flow_template_id="chat",
+        external_refs={
+            "github_pr": "123",
+            "base_branch": "origin/main",
+            "head_branch": "issue-663-inline-review-diff",
+        },
+    )
+
+    def _unexpected_git_diff(*args, **kwargs):
+        raise AssertionError("captured artifact diff should win before git fallback")
+
+    monkeypatch.setattr(
+        "pollypm.cockpit_task_review.subprocess.run",
+        _unexpected_git_diff,
+    )
+
+    bundle = load_task_review_diff(task, tmp_path, review_artifact=artifact)
+    assert bundle is not None
+    assert bundle.source_label == "Review Artifact Diff"
+    assert len(bundle.files) == 1
+    assert bundle.files[0].path == "src/app.py"
+    assert "-print('old')" in bundle.files[0].patch
+    assert "+print('new')" in bundle.files[0].patch
+
+
+def test_task_review_diff_falls_back_to_git_for_pr_linked_tasks(tmp_path, monkeypatch) -> None:
+    from pollypm.cockpit_task_review import load_task_review_diff
+
+    task = _task(
+        node_id="critic_panel",
+        status=WorkStatus.REVIEW,
+        flow_template_id="chat",
+        external_refs={"github_pr": "123"},
+    )
+
+    def fake_run(cmd, *, capture_output, text, check):  # noqa: ANN001
+        assert cmd[-1] == "origin/main..feature/notesy"
+        assert capture_output is True
+        assert text is True
+        assert check is False
+        return type(
+            "Proc",
+            (),
+            {
+                "returncode": 0,
+                "stdout": (
+                    "diff --git a/src/app.py b/src/app.py\n"
+                    "--- a/src/app.py\n"
+                    "+++ b/src/app.py\n"
+                    "@@ -1 +1 @@\n"
+                    "-print('old')\n"
+                    "+print('new')\n"
+                ),
+                "stderr": "",
+            },
+        )()
+
+    monkeypatch.setattr("pollypm.cockpit_task_review.subprocess.run", fake_run)
+
+    bundle = load_task_review_diff(
+        task,
+        tmp_path,
+        review_artifact=None,
+        active_branch="feature/notesy",
+    )
+
+    assert bundle is not None
+    assert bundle.source_label == "git diff origin/main..feature/notesy"
+    assert len(bundle.files) == 1
+    assert bundle.files[0].path == "src/app.py"
+    assert "+print('new')" in bundle.files[0].patch
+
+
+def test_task_review_tab_shows_inline_review_diff_without_resubmission_toggle(
+    env, monkeypatch,
+) -> None:
+    if not _load_config_compatible(env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_tasks import PollyTasksApp
+    from rich.syntax import Syntax
+    from textual.widgets import TabbedContent
+
+    plan_path = env["project_path"] / "docs" / "project-plan.md"
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    plan_path.write_text(
+        "# Notesy Plan\n\n"
+        "Review the embedded diff inline.\n\n"
+        "```diff\n"
+        "--- a/src/app.py\n"
+        "+++ b/src/app.py\n"
+        "@@ -1 +1 @@\n"
+        "-print('old')\n"
+        "+print('new')\n"
+        "```\n"
+    )
+
+    review_task = _task(
+        node_id="critic_panel",
+        status=WorkStatus.REVIEW,
+        title="Review Notesy plan",
+    )
+    fake_svc = _FakeSvc(
+        tasks_factory=lambda: [review_task],
+        flow=_flow(),
+    )
+
+    monkeypatch.setattr("pollypm.cockpit_tasks.create_tmux_client", lambda: _FakeTmux([]))
+
+    app = PollyTasksApp(env["config_path"], "demo")
+    app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            tabs = app.query_one("#task-tabs", TabbedContent)
+            review = str(app.query_one("#task-review", Static).render())
+            inline_diff_header = app.query_one("#task-review-inline-diff-header", Static)
+            inline_diff_expand = app.query_one("#task-review-inline-diff-expand", Button)
+            inline_diff = app.query_one("#task-review-inline-diff", Static)
+            toggle = app.query_one("#task-review-diff-toggle", Button)
+            renderable = inline_diff.content
+
+            assert tabs.active == "task-tab-review"
+            assert "Review Artifact" in review
+            assert inline_diff_header.display
+            assert "Code Diff" in str(inline_diff_header.render())
+            assert "src/app.py" in str(inline_diff_header.render())
+            assert inline_diff.display
+            assert isinstance(renderable, Syntax)
+            assert renderable.line_numbers
+            assert "-print('old')" in renderable.code
+            assert "+print('new')" in renderable.code
+            assert not inline_diff_expand.display
+            assert not toggle.display
+
+    _run(body())
+
+
+def test_task_review_tab_uses_git_diff_navigation_and_expand(env, monkeypatch) -> None:
+    if not _load_config_compatible(env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_tasks import PollyTasksApp
+    from rich.syntax import Syntax
+    from textual.widgets import TabbedContent
+
+    git_calls: list[list[str]] = []
+    large_lines = "\n".join(f"+big line {idx}" for idx in range(520))
+    git_diff = (
+        "diff --git a/src/app.py b/src/app.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/app.py\n"
+        "+++ b/src/app.py\n"
+        "@@ -1 +1 @@\n"
+        "-print('old')\n"
+        "+print('new')\n"
+        "diff --git a/src/big.py b/src/big.py\n"
+        "index 3333333..4444444 100644\n"
+        "--- a/src/big.py\n"
+        "+++ b/src/big.py\n"
+        "@@ -0,0 +1,520 @@\n"
+        f"{large_lines}\n"
+    )
+
+    def _fake_git_diff(cmd, **kwargs):
+        git_calls.append(list(cmd))
+        return type(
+            "Proc",
+            (),
+            {"returncode": 0, "stdout": git_diff, "stderr": ""},
+        )()
+
+    review_task = _task(
+        node_id="critic_panel",
+        status=WorkStatus.REVIEW,
+        title="Review git-backed diff",
+        flow_template_id="chat",
+        external_refs={
+            "github_pr": "123",
+            "base_branch": "origin/main",
+            "head_branch": "issue-663-inline-review-diff",
+        },
+    )
+    fake_svc = _FakeSvc(tasks_factory=lambda: [review_task], flow=_flow())
+
+    monkeypatch.setattr("pollypm.cockpit_tasks.create_tmux_client", lambda: _FakeTmux([]))
+    monkeypatch.setattr("pollypm.cockpit_task_review.subprocess.run", _fake_git_diff)
+
+    app = PollyTasksApp(env["config_path"], "demo")
+    app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            tabs = app.query_one("#task-tabs", TabbedContent)
+            inline_diff_header = app.query_one("#task-review-inline-diff-header", Static)
+            inline_diff_expand = app.query_one("#task-review-inline-diff-expand", Button)
+            inline_diff = app.query_one("#task-review-inline-diff", Static)
+
+            assert tabs.active == "task-tab-review"
+            assert git_calls
+            assert git_calls[0][-1] == "origin/main..issue-663-inline-review-diff"
+            assert "src/app.py" in str(inline_diff_header.render())
+
+            renderable = inline_diff.content
+            assert isinstance(renderable, Syntax)
+            assert renderable.line_numbers
+            assert "+print('new')" in renderable.code
+            assert not inline_diff_expand.display
+
+            await pilot.press("]")
+            await pilot.press("f")
+            await pilot.pause()
+
+            header_text = str(inline_diff_header.render())
+            assert "git diff origin/main..issue-663-inline-review-diff" in header_text
+            assert "src/big.py" in header_text
+            assert inline_diff_expand.display
+            assert "Expand (+" in str(inline_diff_expand.label)
+
+            renderable = inline_diff.content
+            assert isinstance(renderable, Syntax)
+            assert "+big line 494" in renderable.code
+            assert "+big line 519" not in renderable.code
+
+            inline_diff_expand.press()
+            await pilot.pause()
+            renderable = inline_diff.content
+            assert isinstance(renderable, Syntax)
+            assert "+big line 519" in renderable.code
+            assert str(inline_diff_expand.label) == "Collapse"
+
+            await pilot.press("[")
+            await pilot.press("f")
+            await pilot.pause()
+            assert "src/app.py" in str(inline_diff_header.render())
 
     _run(body())
 

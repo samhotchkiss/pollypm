@@ -3,6 +3,7 @@ from pathlib import Path
 
 from pollypm.models import KnownProject, ProviderKind
 from pollypm.onboarding import CliAvailability, ConnectedAccount
+from pollypm.projects import make_project_key
 from pollypm.onboarding_tui import (
     BlockingAutoFix,
     ONBOARDING_STAGES,
@@ -314,7 +315,7 @@ def test_onboarding_progress_lines_mark_done_current_and_up_next() -> None:
 
 def test_projects_step_can_offer_demo_repo_fallback(monkeypatch, tmp_path: Path) -> None:
     async def run() -> None:
-        demo_path = tmp_path / "workspace" / "pollypm-demo"
+        demo_path = tmp_path / "demo-polly"
         monkeypatch.setattr(
             "pollypm.onboarding_tui.demo_project_fallback_destination",
             lambda _config_path: demo_path,
@@ -348,7 +349,7 @@ def test_projects_step_can_offer_demo_repo_fallback(monkeypatch, tmp_path: Path)
 
             assert app.state.recent_projects == [demo_path]
             assert app.state.selected_project_paths == [demo_path]
-            assert app.state.seeded_demo_project_key == "pollypm_demo"
+            assert app.state.seeded_demo_project_key == make_project_key(demo_path, set())
             assert app.state.seeded_demo_task_id == "demo/1"
             assert app.project_selection is not None
             assert list(app.project_selection.selected) == [demo_path]
@@ -359,7 +360,7 @@ def test_projects_step_can_offer_demo_repo_fallback(monkeypatch, tmp_path: Path)
 
 def test_demo_task_choice_keeps_seeded_task(monkeypatch, tmp_path: Path) -> None:
     app = OnboardingApp(tmp_path / "pollypm.toml")
-    demo_path = tmp_path / "workspace" / "pollypm-demo"
+    demo_path = tmp_path / "demo-polly"
     app._pending_demo_repo_path = demo_path
     app.state.known_projects = {}
 
@@ -375,10 +376,10 @@ def test_demo_task_choice_keeps_seeded_task(monkeypatch, tmp_path: Path) -> None
 
     app._handle_demo_task_choice("keep")
 
-    assert seeded == [(demo_path, "pollypm_demo")]
+    assert seeded == [(demo_path, make_project_key(demo_path, set()))]
     assert app.state.recent_projects == [demo_path]
     assert app.state.selected_project_paths == [demo_path]
-    assert app.state.seeded_demo_project_key == "pollypm_demo"
+    assert app.state.seeded_demo_project_key == make_project_key(demo_path, set())
     assert app.state.seeded_demo_task_id == "demo/1"
     assert rendered == ["rendered"]
     assert "Seeded task demo/1" in messages[-1]
@@ -386,7 +387,7 @@ def test_demo_task_choice_keeps_seeded_task(monkeypatch, tmp_path: Path) -> None
 
 def test_demo_task_choice_can_forget_seeded_task(monkeypatch, tmp_path: Path) -> None:
     app = OnboardingApp(tmp_path / "pollypm.toml")
-    demo_path = tmp_path / "workspace" / "pollypm-demo"
+    demo_path = tmp_path / "demo-polly"
     app._pending_demo_repo_path = demo_path
     app.state.known_projects = {}
     app.state.seeded_demo_task_id = "demo/1"

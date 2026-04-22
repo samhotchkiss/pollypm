@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 
 from typer.testing import CliRunner
 
@@ -11,6 +12,8 @@ from pollypm.models import KnownProject, ProviderKind
 from pollypm.projects import DEFAULT_WORKSPACE_ROOT
 from pollypm.onboarding import (
     ConnectedAccount,
+    DEMO_PROJECT_TEMPLATE_DIR,
+    DEMO_PROJECT_REPLAY_COMMIT_COUNT,
     OnboardingResult,
     _scan_recent_projects,
     _seeded_demo_route,
@@ -182,18 +185,9 @@ def test_provision_demo_project_fallback_creates_self_contained_repo(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    workspace_root = tmp_path / "workspace"
     config_path = tmp_path / "pollypm.toml"
-    git_calls: list[list[str]] = []
-
-    def _fake_run(command: list[str], **_kwargs):
-        git_calls.append(command)
-        (workspace_root / "pollypm-demo" / ".git").mkdir(parents=True, exist_ok=True)
-        return type("Result", (), {"returncode": 0})()
-
-    monkeypatch.setattr("pollypm.onboarding.DEFAULT_WORKSPACE_ROOT", workspace_root)
+    monkeypatch.setattr("pollypm.onboarding.Path.home", lambda: tmp_path)
     monkeypatch.setattr("pollypm.onboarding.shutil.which", lambda name: "/usr/bin/git" if name == "git" else None)
-    monkeypatch.setattr("pollypm.onboarding.subprocess.run", _fake_run)
 
     target = provision_demo_project_fallback(config_path)
 
@@ -201,27 +195,52 @@ def test_provision_demo_project_fallback_creates_self_contained_repo(
     assert (target / ".pollypm-demo-fallback").exists()
     assert (target / "README.md").exists()
     assert (target / "demo_app.py").exists()
+    assert (target / "demo_cli.py").exists()
+    assert (target / "demo_data.py").exists()
+    assert (target / "demo_history.md").exists()
     assert (target / "TASK.md").exists()
     assert (target / "tests" / "test_demo_app.py").exists()
+    assert (target / "tests" / "test_demo_cli.py").exists()
+    assert (target / "tests" / "test_demo_data.py").exists()
+    assert (target / "tests" / "test_demo_history.py").exists()
+    assert (target / "tests" / "test_demo_task.py").exists()
     assert (target / ".pollypm").exists()
-    assert git_calls == [["git", "init", "-q", str(target)]]
+
+    git_count = subprocess.run(
+        ["git", "-C", str(target), "rev-list", "--count", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert git_count.stdout.strip() == str(DEMO_PROJECT_REPLAY_COMMIT_COUNT)
+    template_files = [
+        path for path in DEMO_PROJECT_TEMPLATE_DIR.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts and not path.suffix == ".pyc"
+    ]
+    assert len(template_files) == 12
 
     same_target = provision_demo_project_fallback(config_path)
     assert same_target == target
-    assert git_calls == [["git", "init", "-q", str(target)]]
+    git_count_again = subprocess.run(
+        ["git", "-C", str(target), "rev-list", "--count", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert git_count_again.stdout.strip() == str(DEMO_PROJECT_REPLAY_COMMIT_COUNT)
 
 
 def test_seed_demo_project_task_creates_a_visible_queue_item(tmp_path: Path) -> None:
-    project_path = tmp_path / "pollypm-demo"
+    project_path = tmp_path / "demo-polly"
     project_path.mkdir()
 
-    task_id = seed_demo_project_task(project_path, project_key="pollypm_demo")
+    task_id = seed_demo_project_task(project_path, project_key="demo_polly")
 
     from pollypm.work.sqlite_service import SQLiteWorkService
 
     with SQLiteWorkService(db_path=project_path / ".pollypm" / "state.db", project_path=project_path) as svc:
         task = svc.get(task_id)
-        assert task.project == "pollypm_demo"
+        assert task.project == "demo_polly"
         assert task.work_status.value == "queued"
         assert task.title == "Fix the demo queue estimate bug"
 

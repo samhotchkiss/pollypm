@@ -193,12 +193,6 @@ class CockpitPresence:
             return ARC_SPINNER[0]
         return ARC_SPINNER[spinner_index % len(ARC_SPINNER)]
 
-    def heartbeat_frame(self, spinner_index: int) -> str:
-        frames = ("♥", "♡")
-        if not self.should_animate():
-            return frames[0]
-        return frames[spinner_index % len(frames)]
-
 
 # ── Rail data model + router ─────────────────────────────────────────────
 #
@@ -870,7 +864,7 @@ class CockpitRouter:
                 return "\u25cf live"
             return "ready"
         if launch.session.role == "heartbeat-supervisor":
-            return "heartbeat"
+            return "watch"
         if launch.session.role == "triage":
             return "triage"
         return "live"
@@ -1916,8 +1910,8 @@ class PollyCockpitRail:
             return "\u25b2", PALETTE["alert_indicator"]
         if item.state == "dead":
             return "\u2715", PALETTE["dead"]
-        if item.state in {"heartbeat", "watch"}:
-            return self.presence.heartbeat_frame(self.spinner_index), PALETTE["live_indicator"]
+        if item.state == "watch":
+            return "\u25ce", PALETTE["live_indicator"]
         if item.state == "ready":
             return "\u25cf", PALETTE["sel_accent"]
         # Key-based fallbacks for items with no meaningful state

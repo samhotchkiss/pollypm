@@ -142,7 +142,7 @@ def test_cockpit_router_session_state_uses_heartbeat_state(tmp_path: Path) -> No
             self.pane_current_command = "python"
 
     router = CockpitRouter(config_path)
-    assert router._session_state("heartbeat", [FakeLaunch()], [FakeWindow()], [], 0) == "heartbeat"
+    assert router._session_state("heartbeat", [FakeLaunch()], [FakeWindow()], [], 0) == "watch"
 
 
 def test_cockpit_presence_treats_outside_tmux_as_attached() -> None:
@@ -207,7 +207,6 @@ def test_cockpit_presence_calm_mode_disables_animation(monkeypatch) -> None:
 
     assert presence.should_animate() is False
     assert presence.working_frame(3) == "◜"
-    assert presence.heartbeat_frame(1) == "♥"
 
 
 def test_cockpit_router_config_cache_reuses_loaded_config(monkeypatch, tmp_path: Path) -> None:

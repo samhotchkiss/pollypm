@@ -24,12 +24,13 @@ import json
 import logging
 import sqlite3
 import subprocess
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
 
+from pollypm.atomic_io import atomic_write_json
 from pollypm.work.flow_engine import resolve_flow
 from pollypm.work.gates import GateRegistry, evaluate_gates, has_hard_failure
 from pollypm.work.models import (
@@ -101,6 +102,140 @@ from pollypm.work.service_transition_manager import WorkTransitionManager
 from pollypm.work.sync import SyncManager
 
 
+_STATE_FILENAME = "state.json"
+
+
+class _HasExecutions(Protocol):
+    def get_execution(
+        self,
+        task_id: str,
+        node_id: str | None = None,
+        visit: int | None = None,
+    ) -> list[Any]:
+        ...
+
+
+def state_path() -> Path:
+    return Path.home() / ".pollypm" / _STATE_FILENAME
+
+
+def load_state(path: Path | None = None) -> dict[str, Any]:
+    resolved = path or state_path()
+    if not resolved.exists():
+        return {}
+    try:
+        payload = json.loads(resolved.read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def first_shipped_at(path: Path | None = None) -> str | None:
+    value = load_state(path).get("first_shipped_at")
+    return str(value) if isinstance(value, str) and value else None
+
+
+def mark_first_shipped(
+    *,
+    path: Path | None = None,
+    when: datetime | None = None,
+) -> bool:
+    resolved = path or state_path()
+    state = load_state(resolved)
+    if isinstance(state.get("first_shipped_at"), str) and state["first_shipped_at"]:
+        return False
+    state["first_shipped_at"] = (when or datetime.now(UTC)).isoformat()
+    atomic_write_json(resolved, state)
+    return True
+
+
+def _record_first_shipped_activity(
+    *,
+    project_path: Path | None,
+    project_key: str | None,
+    when: datetime | None = None,
+) -> None:
+    """Persist the one-time shipment milestone into the project feed."""
+    if project_path is None:
+        return
+    try:
+        from pollypm.store import SQLAlchemyStore
+    except Exception:  # noqa: BLE001
+        return
+
+    state_db = project_path / ".pollypm" / "state.db"
+    state_db.parent.mkdir(parents=True, exist_ok=True)
+    shipped_at = (when or datetime.now(UTC)).isoformat()
+    body = json.dumps(
+        {
+            "summary": "First PR shipped with Polly 🎉",
+            "severity": "routine",
+            "verb": "celebrated",
+            "subject": "first shipment",
+            "project": project_key,
+            "shipped_at": shipped_at,
+        }
+    )
+    payload = {
+        "kind": "first_shipped",
+        "project": project_key,
+        "pinned": True,
+        "shipped_at": shipped_at,
+    }
+    store = SQLAlchemyStore(f"sqlite:///{state_db}")
+    try:
+        store.enqueue_message(
+            type="event",
+            tier="immediate",
+            recipient="*",
+            sender="polly",
+            subject="first_shipped",
+            body=body,
+            scope="polly",
+            payload=payload,
+        )
+    finally:
+        store.close()
+
+
+def task_landed_commit(service: _HasExecutions, task_id: str) -> bool:
+    try:
+        executions = service.get_execution(task_id)
+    except Exception:  # noqa: BLE001
+        return False
+    for execution in reversed(executions):
+        work_output = getattr(execution, "work_output", None)
+        if work_output is None:
+            continue
+        artifacts = getattr(work_output, "artifacts", None) or []
+        for artifact in artifacts:
+            if getattr(artifact, "kind", None) == ArtifactKind.COMMIT:
+                return True
+    return False
+
+
+def maybe_record_first_shipped(
+    service: _HasExecutions,
+    task_id: str,
+    *,
+    path: Path | None = None,
+    project_path: Path | None = None,
+    when: datetime | None = None,
+) -> bool:
+    if not task_landed_commit(service, task_id):
+        return False
+    created = mark_first_shipped(path=path, when=when)
+    if not created:
+        return False
+    project_key = task_id.split("/", 1)[0] if "/" in task_id else None
+    _record_first_shipped_activity(
+        project_path=project_path,
+        project_key=project_key,
+        when=when,
+    )
+    return True
+
+
 # ---------------------------------------------------------------------------
 # SQLiteWorkService
 # ---------------------------------------------------------------------------
@@ -139,6 +274,7 @@ class SQLiteWorkService:
         # ``provision_worker`` fails so the CLI can surface it instead
         # of reporting a silent success (#243).
         self.last_provision_error: str | None = None
+        self.last_first_shipped_created: bool = False
 
     def set_session_manager(self, session_manager: object) -> None:
         """Wire up the session manager after construction.
@@ -1205,12 +1341,20 @@ class SQLiteWorkService:
         skip_gates: bool = False,
     ) -> Task:
         """Approve at a review node."""
-        return self._transition_mgr.approve(
+        self.last_first_shipped_created = False
+        result = self._transition_mgr.approve(
             task_id,
             actor,
             reason=reason,
             skip_gates=skip_gates,
         )
+        if result.work_status == WorkStatus.DONE:
+            self.last_first_shipped_created = maybe_record_first_shipped(
+                self,
+                task_id,
+                project_path=self._project_path,
+            )
+        return result
 
     def reject(
         self,

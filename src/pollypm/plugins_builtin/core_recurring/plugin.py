@@ -141,6 +141,7 @@ def events_retention_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
             try:
                 from sqlalchemy import and_ as _and
                 from sqlalchemy import delete as _delete
+                from sqlalchemy import func as _func
 
                 from pollypm.store.schema import messages as _messages
 
@@ -150,6 +151,11 @@ def events_retention_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
                             _messages.c.type == "event",
                             _messages.c.subject.notin_(tuple(known)),
                             _messages.c.created_at < default_cutoff,
+                            _func.coalesce(
+                                _func.json_extract(_messages.c.payload_json, "$.pinned"),
+                                0,
+                            )
+                            != 1,
                         )
                     )
                 )
@@ -208,6 +214,7 @@ def _prune_event_subject(msg_store: Any, subject: str, cutoff: Any) -> int:
     try:
         from sqlalchemy import and_ as _and
         from sqlalchemy import delete as _delete
+        from sqlalchemy import func as _func
 
         from pollypm.store.schema import messages as _messages
 
@@ -217,6 +224,11 @@ def _prune_event_subject(msg_store: Any, subject: str, cutoff: Any) -> int:
                     _messages.c.type == "event",
                     _messages.c.subject == subject,
                     _messages.c.created_at < cutoff,
+                    _func.coalesce(
+                        _func.json_extract(_messages.c.payload_json, "$.pinned"),
+                        0,
+                    )
+                    != 1,
                 )
             )
         )

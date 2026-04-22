@@ -205,7 +205,8 @@ def format_entry_row(entry: FeedEntry, *, now: datetime | None = None) -> str:
     actor = entry.actor or "system"
     verb = entry.verb or entry.kind
     prefix = "!" if entry.severity == "critical" else " "
-    return f"{prefix} {rel:>8}  [{project}]  [{actor}]  {verb}: {entry.summary}"
+    pin = "📌 " if entry.pinned else ""
+    return f"{prefix} {rel:>8}  [{project}]  [{actor}]  {verb}: {pin}{entry.summary}"
 
 
 def render_entries_as_text(entries: Iterable[FeedEntry]) -> str:
@@ -245,6 +246,8 @@ def render_entry_detail(entry: FeedEntry, *, now: datetime | None = None) -> str
         lines.append(f"Subject: {entry.subject}")
     lines.append(f"Verb: {entry.verb}")
     lines.append(f"Severity: {entry.severity}")
+    if entry.pinned:
+        lines.append("Pinned: yes")
     lines.append("")
     lines.append("Summary:")
     lines.append(f"  {entry.summary}")

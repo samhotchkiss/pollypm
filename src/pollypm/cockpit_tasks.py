@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import difflib
+import subprocess
+import tomllib
+from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 
-from textual import on
+from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -21,7 +26,7 @@ from pollypm.cockpit_task_review import (
 )
 from pollypm.cockpit_formatting import format_event_time
 from pollypm.cockpit_formatting import format_relative_age as _format_relative_age
-from pollypm.config import load_config
+from pollypm.config import load_config, project_config_path
 from pollypm.rejection_feedback import (
     RejectionFeedbackNotice,
     is_rejection_feedback_task,
@@ -48,6 +53,188 @@ _FILTER_LABELS = {
     "blocked": "Blocked",
     "done": "Done",
 }
+
+_PENDING_UNDO_SECONDS = 5.0
+
+
+@dataclass(slots=True)
+class _PendingReviewAction:
+    task_id: str
+    task_number: int
+    decision: str
+    reason: str | None
+    deadline: float
+
+
+class _TaskLiveScroll(VerticalScroll):
+    """Live-pane scroll container that pauses tailing when the user scrolls up."""
+
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        app = getattr(self, "app", None)
+        if not isinstance(app, PollyTasksApp):
+            return
+        if new_value >= self.max_scroll_y:
+            app._set_live_tail_paused(False)
+        elif new_value < old_value:
+            app._set_live_tail_paused(True)
+
+    def action_scroll_up(self) -> None:
+        self.scroll_up(animate=False, force=True)
+        app = getattr(self, "app", None)
+        if isinstance(app, PollyTasksApp):
+            app._set_live_tail_paused(True)
+
+    @on(events.MouseScrollUp)
+    def _on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        event.stop()
+        self.action_scroll_up()
+
+
+def _execution_completed_output_lines(execution) -> list[str]:
+    work_output = getattr(execution, "work_output", None)
+    if work_output is None:
+        return []
+    lines = [f"Summary: {getattr(work_output, 'summary', '') or '(empty)'}"]
+    for artifact in getattr(work_output, "artifacts", []) or []:
+        kind = getattr(getattr(artifact, "kind", None), "value", None) or getattr(
+            artifact, "kind", None
+        )
+        bits = [str(kind or "artifact")]
+        description = getattr(artifact, "description", None)
+        if description:
+            bits.append(str(description))
+        ref = getattr(artifact, "ref", None)
+        if ref:
+            bits.append(f"ref={ref}")
+        path = getattr(artifact, "path", None)
+        if path:
+            bits.append(f"path={path}")
+        external_ref = getattr(artifact, "external_ref", None)
+        if external_ref:
+            bits.append(f"external={external_ref}")
+        lines.append(" | ".join(bits))
+    return lines
+
+
+def _execution_snapshot_label(execution) -> str:
+    node_id = getattr(execution, "node_id", "submission")
+    visit = getattr(execution, "visit", "?")
+    completed_at = getattr(execution, "completed_at", None) or getattr(
+        execution, "started_at", None
+    )
+    if completed_at is None:
+        return f"{node_id} v{visit}"
+    return f"{node_id} v{visit} · {_format_event_time(completed_at)}"
+
+
+def _review_submission_executions(task) -> list:
+    submissions: list = []
+    for execution in list(getattr(task, "executions", None) or []):
+        if getattr(execution, "work_output", None) is not None:
+            submissions.append(execution)
+    submissions.sort(
+        key=lambda execution: (
+            _timestamp_sort_value(
+                getattr(execution, "completed_at", None)
+                or getattr(execution, "started_at", None)
+            ),
+            int(getattr(execution, "visit", 0) or 0),
+        )
+    )
+    return submissions
+
+
+def _render_review_submission_diff(task) -> str:
+    submissions = _review_submission_executions(task)
+    if len(submissions) < 2:
+        return "No resubmission diff yet."
+    before = submissions[-2]
+    after = submissions[-1]
+    before_lines = _execution_completed_output_lines(before)
+    after_lines = _execution_completed_output_lines(after)
+    diff_lines = list(
+        difflib.unified_diff(
+            before_lines,
+            after_lines,
+            fromfile=_execution_snapshot_label(before),
+            tofile=_execution_snapshot_label(after),
+            lineterm="",
+        )
+    )
+    if not diff_lines:
+        return "No changes between the latest two submissions."
+    rendered = ["[b]Resubmission Diff[/b]"]
+    for line in diff_lines:
+        if line.startswith(("---", "+++")):
+            rendered.append(f"[dim]{line}[/dim]")
+        elif line.startswith("@@"):
+            rendered.append(f"[yellow]{line}[/yellow]")
+        elif line.startswith("+"):
+            rendered.append(f"[green]{line}[/green]")
+        elif line.startswith("-"):
+            rendered.append(f"[red]{line}[/red]")
+        else:
+            rendered.append(line)
+    return "\n".join(rendered)
+
+
+def _review_confidence_score(task, review_artifact) -> int:
+    submissions = _review_submission_executions(task)
+    score = 35
+    if review_artifact is not None:
+        score += 20
+        score += min(10, 2 * len(getattr(review_artifact, "sections", []) or []))
+    if submissions:
+        score += 15
+        latest = submissions[-1]
+        latest_output = getattr(latest, "work_output", None)
+        if latest_output is not None:
+            score += 10
+            score += min(10, 3 * len(getattr(latest_output, "artifacts", []) or []))
+    if getattr(task, "acceptance_criteria", None):
+        score += 5
+    if getattr(task, "constraints", None):
+        score += 5
+    if getattr(task, "relevant_files", None):
+        score += min(5, len(getattr(task, "relevant_files", []) or []))
+    if any(
+        getattr(getattr(execution, "decision", None), "value", None) == "rejected"
+        for execution in getattr(task, "executions", None) or []
+    ):
+        score += 5
+    return max(0, min(score, 100))
+
+
+def _task_is_trivial_chore(task) -> bool:
+    status = getattr(getattr(task, "work_status", None), "value", None) or str(
+        getattr(task, "work_status", "") or ""
+    )
+    if status != "review":
+        return False
+    title = (getattr(task, "title", "") or "").lower()
+    description = (getattr(task, "description", "") or "").lower()
+    labels = {str(label).lower() for label in getattr(task, "labels", []) or []}
+    haystack = " ".join([title, description, " ".join(sorted(labels))])
+    keyword_hits = any(
+        keyword in haystack
+        for keyword in (
+            "chore",
+            "cleanup",
+            "clean up",
+            "typo",
+            "docs",
+            "documentation",
+            "format",
+            "lint",
+            "rename",
+            "trivial",
+        )
+    )
+    if labels.intersection({"chore", "cleanup", "docs", "trivial"}):
+        return True
+    if keyword_hits and not getattr(task, "acceptance_criteria", None):
+        return True
+    return False
 
 
 def _format_event_time(value) -> str:
@@ -119,6 +306,41 @@ def _peek_session_tail(pane_id: str | None) -> list[str]:
     while lines and not lines[-1].strip():
         lines.pop()
     return lines[-8:]
+
+
+def _project_auto_merge_on_approve_enabled(project_path: Path | None) -> bool:
+    """Read the per-project auto-merge flag, defaulting on for review flow."""
+
+    if project_path is None:
+        return True
+    config_file = project_config_path(project_path)
+    if not config_file.exists():
+        return True
+    try:
+        raw = tomllib.loads(config_file.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return True
+    for section_name in ("project", "cockpit", "task_ui"):
+        section = raw.get(section_name)
+        if isinstance(section, dict) and "auto_merge_on_approve" in section:
+            return bool(section["auto_merge_on_approve"])
+    return True
+
+
+def _task_pr_number(task) -> str | None:
+    refs = getattr(task, "external_refs", {}) or {}
+    for key in ("github_pr", "github_pr_number", "pull_request", "pr_number"):
+        value = refs.get(key)
+        if value in (None, ""):
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        if text.startswith("http"):
+            text = text.rstrip("/").rsplit("/", 1)[-1]
+        if text.isdigit():
+            return text
+    return None
 
 
 def _task_counts(tasks: list) -> dict[str, int]:
@@ -274,8 +496,8 @@ def _render_live(task, active_session) -> str:
     return "\n".join(lines)
 
 
-class _TaskRejectReasonModal(ModalScreen[str | None]):
-    """Small modal that captures a rejection reason for review tasks."""
+class _TaskRejectFixModal(ModalScreen[str | None]):
+    """Follow-up modal for the "write fix instructions" reject path."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
     CSS = """
@@ -283,12 +505,103 @@ class _TaskRejectReasonModal(ModalScreen[str | None]):
         align: center middle;
         background: rgba(8, 12, 15, 0.65);
     }
-    #task-reject-modal {
+    #task-reject-fix-modal {
         width: 72;
         height: auto;
         padding: 1 2;
         border: round #394754;
         background: #111920;
+    }
+    #task-reject-fix-actions {
+        height: auto;
+        padding-top: 1;
+    }
+    #task-reject-fix-actions Button {
+        margin-right: 1;
+    }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reason_input = Input(
+            placeholder="Write the fix instructions...",
+            id="task-reject-fix-reason",
+        )
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="task-reject-fix-modal"):
+            yield Static("Write Fix Instructions", id="task-reject-fix-title")
+            yield Static(
+                "Be specific enough that the next pass can move immediately.",
+                id="task-reject-fix-copy",
+            )
+            yield self.reason_input
+            with Horizontal(id="task-reject-fix-actions"):
+                yield Button("Save", id="task-reject-fix-submit", variant="warning")
+                yield Button("Cancel", id="task-reject-fix-cancel")
+
+    def on_mount(self) -> None:
+        self.reason_input.focus()
+
+    def on_key(self, event: events.Key) -> None:
+        key = event.key
+        if key == "1":
+            event.stop()
+            self.action_pick_tests()
+        elif key == "2":
+            event.stop()
+            self.action_pick_scope()
+        elif key == "3":
+            event.stop()
+            self.action_pick_fix()
+        elif key == "4":
+            event.stop()
+            self.action_pick_other()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Input.Submitted, "#task-reject-fix-reason")
+    def _on_submit(self, event: Input.Submitted) -> None:
+        reason = (event.value or "").strip()
+        self.dismiss(reason or None)
+
+    @on(Button.Pressed, "#task-reject-fix-submit")
+    def _on_press_submit(self) -> None:
+        reason = (self.reason_input.value or "").strip()
+        self.dismiss(reason or None)
+
+    @on(Button.Pressed, "#task-reject-fix-cancel")
+    def _on_press_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class _TaskRejectReasonModal(ModalScreen[str | None]):
+    """Quick-pick reject modal with a free-text escape hatch."""
+
+    BINDINGS = [
+        Binding("1", "pick_tests", "Tests missing or broken", show=False, priority=True),
+        Binding("2", "pick_scope", "Scope drift", show=False, priority=True),
+        Binding("3", "pick_fix", "Write fix instructions", show=False, priority=True),
+        Binding("4", "pick_other", "Other", show=False, priority=True),
+        Binding("escape", "cancel", "Cancel", show=False),
+    ]
+    CSS = """
+    Screen {
+        align: center middle;
+        background: rgba(8, 12, 15, 0.65);
+    }
+    #task-reject-modal {
+        width: 78;
+        height: auto;
+        padding: 1 2;
+        border: round #394754;
+        background: #111920;
+    }
+    #task-reject-reasons {
+        height: auto;
+        padding: 1 0;
+        color: #b7c4d1;
     }
     #task-reject-actions {
         height: auto;
@@ -302,7 +615,7 @@ class _TaskRejectReasonModal(ModalScreen[str | None]):
     def __init__(self) -> None:
         super().__init__()
         self.reason_input = Input(
-            placeholder="Why is this being rejected?",
+            placeholder="Type a custom rejection reason, then press Enter",
             id="task-reject-reason",
         )
 
@@ -310,13 +623,18 @@ class _TaskRejectReasonModal(ModalScreen[str | None]):
         with Vertical(id="task-reject-modal"):
             yield Static("Reject Review Task", id="task-reject-title")
             yield Static(
-                "Record a concrete reason so the next pass has a clear target.",
-                id="task-reject-copy",
+                "[1] Tests missing or broken\n"
+                "[2] Scope drift\n"
+                "[3] Write fix instructions\n"
+                "[4] Other (free text)",
+                id="task-reject-reasons",
             )
             yield self.reason_input
             with Horizontal(id="task-reject-actions"):
-                yield Button("Reject", id="task-reject-submit", variant="warning")
-                yield Button("Cancel", id="task-reject-cancel")
+                yield Button("1 Tests", id="task-reject-tests", variant="default")
+                yield Button("2 Scope", id="task-reject-scope", variant="default")
+                yield Button("3 Fix", id="task-reject-fix", variant="default")
+                yield Button("4 Other", id="task-reject-other", variant="default")
 
     def on_mount(self) -> None:
         self.reason_input.focus()
@@ -324,19 +642,45 @@ class _TaskRejectReasonModal(ModalScreen[str | None]):
     def action_cancel(self) -> None:
         self.dismiss(None)
 
+    def action_pick_tests(self) -> None:
+        self.dismiss("Tests missing or broken")
+
+    def action_pick_scope(self) -> None:
+        self.dismiss("Scope drift")
+
+    def action_pick_fix(self) -> None:
+        def _after(reason: str | None) -> None:
+            self.dismiss(reason or None)
+
+        self.app.push_screen(_TaskRejectFixModal(), _after)
+
+    def action_pick_other(self) -> None:
+        reason = (self.reason_input.value or "").strip()
+        if reason:
+            self.dismiss(reason)
+            return
+        self.reason_input.focus()
+
     @on(Input.Submitted, "#task-reject-reason")
     def _on_submit(self, event: Input.Submitted) -> None:
         reason = (event.value or "").strip()
         self.dismiss(reason or None)
 
-    @on(Button.Pressed, "#task-reject-submit")
-    def _on_press_submit(self) -> None:
-        reason = (self.reason_input.value or "").strip()
-        self.dismiss(reason or None)
+    @on(Button.Pressed, "#task-reject-tests")
+    def _on_press_tests(self) -> None:
+        self.action_pick_tests()
 
-    @on(Button.Pressed, "#task-reject-cancel")
-    def _on_press_cancel(self) -> None:
-        self.dismiss(None)
+    @on(Button.Pressed, "#task-reject-scope")
+    def _on_press_scope(self) -> None:
+        self.action_pick_scope()
+
+    @on(Button.Pressed, "#task-reject-fix")
+    def _on_press_fix(self) -> None:
+        self.action_pick_fix()
+
+    @on(Button.Pressed, "#task-reject-other")
+    def _on_press_other(self) -> None:
+        self.action_pick_other()
 
 
 class PollyTasksApp(App[None]):
@@ -358,6 +702,9 @@ class PollyTasksApp(App[None]):
         Binding("r", "refresh", "Refresh"),
         Binding("a", "approve_task", "Approve"),
         Binding("x", "reject_task", "Reject"),
+        Binding("z", "undo_pending_review", "Undo", show=False),
+        Binding("G", "resume_live_tail", "Resume Live", show=False),
+        Binding("end", "resume_live_tail", "Resume Live", show=False),
         Binding("o", "refresh_live", "Refresh Live", show=False),
         Binding("escape", "back", "Back"),
     ]
@@ -387,6 +734,14 @@ class PollyTasksApp(App[None]):
     #tasks-filters Button {
         margin-left: 1;
         min-width: 8;
+    }
+    #tasks-filter-chips {
+        height: auto;
+        padding: 0 1 1 1;
+        background: #0d1419;
+    }
+    #tasks-filter-chips Button {
+        margin-right: 1;
     }
     #tasks-body { height: 1fr; }
     #tasks-list-pane {
@@ -424,6 +779,28 @@ class PollyTasksApp(App[None]):
     #task-actions Button {
         margin-right: 1;
     }
+    #task-review-panel {
+        height: 1fr;
+    }
+    #task-review-confidence-chip {
+        height: auto;
+        padding: 0 1;
+        margin: 0 0 1 0;
+        border: round #3d4d60;
+        background: #18232d;
+        color: #cfe1ff;
+    }
+    #task-review-diff {
+        height: auto;
+        margin-top: 1;
+        padding: 1 0 0 0;
+    }
+    #tasks-banner {
+        height: auto;
+        padding: 0 1 1 1;
+        color: #b7c4d1;
+        background: #0d1419;
+    }
     #task-tabs { height: 1fr; }
     #task-detail-scroll,
     #task-review-scroll,
@@ -431,6 +808,20 @@ class PollyTasksApp(App[None]):
     #task-live-scroll {
         height: 1fr;
         overflow-y: auto;
+    }
+    #task-live-header {
+        height: auto;
+        padding: 0 0 1 0;
+    }
+    #task-live-header-fill {
+        width: 1fr;
+    }
+    #task-live-end-pill {
+        width: auto;
+        padding: 0 1;
+        border: round #3d4d60;
+        background: #18232d;
+        color: #cfe1ff;
     }
     #task-detail,
     #task-review,
@@ -474,16 +865,32 @@ class PollyTasksApp(App[None]):
         self.detail_header = Static("", id="task-header")
         self.detail_overview = Static("", id="task-detail")
         self.detail_review = Static("", id="task-review")
+        self.review_confidence = Static("", id="task-review-confidence-chip")
+        self.review_diff = Static("", id="task-review-diff")
         self.detail_context = Static("", id="task-context")
         self.detail_live = Static("", id="task-live")
         self.timeline = DataTable(id="task-timeline", zebra_stripes=True)
+        self.filter_chips_status = Button("", id="tasks-chip-status")
+        self.filter_chips_search = Button("", id="tasks-chip-search")
+        self.filter_chips_clear = Button("×clear", id="tasks-chip-clear-all", variant="default")
         self.filter_buttons = {
             key: Button(label, id=f"tasks-filter-{key}")
             for key, label in _FILTER_LABELS.items()
         }
         self.approve_button = Button("Approve", id="task-approve", variant="success")
         self.reject_button = Button("Reject", id="task-reject", variant="warning")
+        self.bulk_approve_button = Button(
+            "Bulk Approve Trivial", id="task-bulk-approve", variant="success"
+        )
         self.refresh_live_button = Button("Refresh Live", id="task-refresh-live")
+        self.live_tail_fill = Static("", id="task-live-header-fill")
+        self.live_tail_pill = Static("[End]", id="task-live-end-pill")
+        self.banner = Static("", id="tasks-banner", markup=False)
+        self._pending_review_action: _PendingReviewAction | None = None
+        self._pending_commit_timer = None
+        self._pending_countdown_timer = None
+        self._live_tail_paused = False
+        self._active_reject_modal: _TaskRejectReasonModal | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="tasks-root"):
@@ -493,6 +900,10 @@ class PollyTasksApp(App[None]):
                 with Horizontal(id="tasks-filters"):
                     for button in self.filter_buttons.values():
                         yield button
+            with Horizontal(id="tasks-filter-chips"):
+                yield self.filter_chips_status
+                yield self.filter_chips_search
+                yield self.filter_chips_clear
             with Horizontal(id="tasks-body"):
                 with Vertical(id="tasks-list-pane"):
                     yield self.summary
@@ -503,26 +914,38 @@ class PollyTasksApp(App[None]):
                     with Horizontal(id="task-actions"):
                         yield self.approve_button
                         yield self.reject_button
+                        yield self.bulk_approve_button
                         yield self.refresh_live_button
                     with TabbedContent(initial="task-tab-overview", id="task-tabs"):
                         with TabPane("Overview", id="task-tab-overview"):
                             with VerticalScroll(id="task-detail-scroll"):
                                 yield self.detail_overview
                         with TabPane("Review", id="task-tab-review"):
-                            with VerticalScroll(id="task-review-scroll"):
-                                yield self.detail_review
+                            with Vertical(id="task-review-panel"):
+                                yield self.review_confidence
+                                with VerticalScroll(id="task-review-scroll"):
+                                    yield self.detail_review
+                                    yield self.review_diff
                         with TabPane("Timeline", id="task-tab-timeline"):
                             yield self.timeline
                         with TabPane("Context", id="task-tab-context"):
                             with VerticalScroll(id="task-context-scroll"):
                                 yield self.detail_context
                         with TabPane("Live", id="task-tab-live"):
-                            with VerticalScroll(id="task-live-scroll"):
-                                yield self.detail_live
+                            with Vertical(id="task-live-panel"):
+                                with Horizontal(id="task-live-header"):
+                                    yield self.live_tail_fill
+                                    yield self.live_tail_pill
+                                with _TaskLiveScroll(id="task-live-scroll"):
+                                    yield self.detail_live
+            yield self.banner
 
     def on_mount(self) -> None:
         self._configure_tables()
         self._sync_filter_buttons()
+        self._sync_filter_chips()
+        self._sync_live_tail_indicator()
+        self._sync_banner()
         self._set_detail_empty("No task selected.")
         self._refresh_list(select_first=True)
         self.set_interval(8, self._background_refresh)
@@ -604,17 +1027,73 @@ class PollyTasksApp(App[None]):
         for key, button in self.filter_buttons.items():
             button.variant = "primary" if key == self._status_filter else "default"
 
+    def _sync_filter_chips(self) -> None:
+        chips: list[tuple[Button, str, bool]] = [
+            (
+                self.filter_chips_status,
+                f"Status: {_FILTER_LABELS.get(self._status_filter, self._status_filter)} ×",
+                self._status_filter != "all",
+            ),
+            (
+                self.filter_chips_search,
+                f"Search: {self._search_query.strip()} ×",
+                bool(self._search_query.strip()),
+            ),
+        ]
+        any_visible = False
+        for button, label, visible in chips:
+            button.label = label
+            button.display = visible
+            any_visible = any_visible or visible
+        self.filter_chips_clear.display = any_visible
+        try:
+            chips_row = self.query_one("#tasks-filter-chips", Horizontal)
+        except Exception:  # noqa: BLE001
+            return
+        chips_row.display = any_visible
+
+    def _sync_live_tail_indicator(self) -> None:
+        self.live_tail_pill.display = self._live_tail_paused
+        try:
+            header_row = self.query_one("#task-live-header", Horizontal)
+        except Exception:  # noqa: BLE001
+            return
+        header_row.display = self._live_tail_paused
+
+    def _sync_banner(self) -> None:
+        banner = ""
+        if self._pending_review_action is not None:
+            seconds_left = max(
+                0,
+                int(self._pending_review_action.deadline - monotonic() + 0.999),
+            )
+            verb = (
+                "Approve"
+                if self._pending_review_action.decision == "approve"
+                else "Reject"
+            )
+            banner = (
+                f"{verb} #{self._pending_review_action.task_number} "
+                f"— [Z] Undo ({seconds_left}s)"
+            )
+        self.banner.update(banner)
+        self.banner.display = bool(banner)
+
     def _set_detail_empty(self, message: str) -> None:
         self._selected_task_id = None
         self.detail_header.update(message)
         self.detail_overview.update("")
         self.detail_review.update("")
+        self.review_confidence.update("")
+        self.review_diff.update("")
         self.detail_context.update("")
         self.detail_live.update("")
         self.timeline.clear()
         self.approve_button.disabled = True
         self.reject_button.disabled = True
+        self.bulk_approve_button.disabled = True
         self.refresh_live_button.disabled = True
+        self._set_live_tail_paused(False)
 
     def _render_table(self, *, select_first: bool) -> None:
         visible = self._filtered_tasks()
@@ -627,6 +1106,7 @@ class PollyTasksApp(App[None]):
                 else "  ·  / search · a approve · x reject"
             )
         )
+        self._sync_filter_chips()
         previous = self._selected_task_id
         self.task_table.clear()
         if not visible:
@@ -664,6 +1144,9 @@ class PollyTasksApp(App[None]):
             0,
         )
         self.task_table.move_cursor(row=row_index, column=0, animate=False, scroll=True)
+        self.bulk_approve_button.disabled = not any(
+            _task_is_trivial_chore(task) for task in visible
+        )
         self._show_detail(target_id)
 
     def _refresh_list(self, *, select_first: bool = False) -> None:
@@ -743,7 +1226,15 @@ class PollyTasksApp(App[None]):
         in_review = task.work_status.value == "review"
         self.approve_button.disabled = not in_review
         self.reject_button.disabled = not in_review
+        self.bulk_approve_button.disabled = not any(
+            _task_is_trivial_chore(candidate) for candidate in self._filtered_tasks()
+        )
         self.refresh_live_button.disabled = active_session is None
+        if active_session is None:
+            self._set_live_tail_paused(False)
+        self._sync_live_tail_indicator()
+        if active_session is not None and not self._live_tail_paused:
+            self.call_after_refresh(self._tail_live_scroll_to_end)
 
     def _project_path(self) -> Path | None:
         try:
@@ -789,6 +1280,8 @@ class PollyTasksApp(App[None]):
         self._selected_task_id = task_id
         self._owner_by_task_id[task.task_id] = owner
         review_artifact = load_task_review_artifact(task, self._project_path())
+        if task_id != previous_task_id:
+            self._set_live_tail_paused(False)
         self._render_selected_task(
             task,
             owner=owner,
@@ -796,6 +1289,10 @@ class PollyTasksApp(App[None]):
             active_session=active_session,
         )
         self.detail_review.update(render_task_review_artifact(review_artifact))
+        self.review_confidence.update(
+            f"Reviewer confidence: {_review_confidence_score(task, review_artifact)}/100"
+        )
+        self.review_diff.update(_render_review_submission_diff(task))
         tabs = self.query_one("#task-tabs", TabbedContent)
         if task_id != previous_task_id:
             tabs.active = (
@@ -803,6 +1300,8 @@ class PollyTasksApp(App[None]):
                 if task.work_status.value == "review" and review_artifact is not None
                 else "task-tab-overview"
             )
+        if active_session is not None and not self._live_tail_paused:
+            self.call_after_refresh(self._tail_live_scroll_to_end)
 
     def _background_refresh(self) -> None:
         try:
@@ -830,51 +1329,223 @@ class PollyTasksApp(App[None]):
         tabs.active = "task-tab-live"
         self._show_detail(self._selected_task_id)
 
-    def _review_task(self, task_id: str, *, decision: str, reason: str | None = None) -> None:
+    def action_resume_live_tail(self) -> None:
+        self._set_live_tail_paused(False)
+        self._sync_live_tail_indicator()
+        if self._selected_task_id:
+            self.call_after_refresh(self._tail_live_scroll_to_end)
+
+    def action_undo_pending_review(self) -> None:
+        if self._pending_review_action is None:
+            return
+        self._clear_pending_review_action()
+
+    def _set_live_tail_paused(self, paused: bool) -> None:
+        if self._live_tail_paused == paused:
+            return
+        self._live_tail_paused = paused
+        self._sync_live_tail_indicator()
+
+    def _tail_live_scroll_to_end(self) -> None:
+        if self._live_tail_paused:
+            return
+        try:
+            live_scroll = self.query_one("#task-live-scroll", _TaskLiveScroll)
+        except Exception:  # noqa: BLE001
+            return
+        live_scroll.scroll_end(animate=False, force=True)
+
+    def _clear_pending_review_action(self) -> None:
+        if self._pending_commit_timer is not None:
+            self._pending_commit_timer.stop()
+            self._pending_commit_timer = None
+        if self._pending_countdown_timer is not None:
+            self._pending_countdown_timer.stop()
+            self._pending_countdown_timer = None
+        self._pending_review_action = None
+        self._sync_banner()
+
+    def _start_pending_review_action(
+        self,
+        *,
+        task_id: str,
+        task_number: int,
+        decision: str,
+        reason: str | None = None,
+    ) -> None:
+        if self._pending_review_action is not None:
+            self._commit_pending_review_action()
+        self._pending_review_action = _PendingReviewAction(
+            task_id=task_id,
+            task_number=task_number,
+            decision=decision,
+            reason=reason,
+            deadline=monotonic() + _PENDING_UNDO_SECONDS,
+        )
+        self._pending_commit_timer = self.set_timer(
+            _PENDING_UNDO_SECONDS,
+            self._commit_pending_review_action,
+        )
+        self._pending_countdown_timer = self.set_interval(1, self._sync_banner)
+        self._sync_banner()
+
+    def _merge_task_pr(self, task) -> None:
+        pr_number = _task_pr_number(task)
+        if pr_number is None:
+            return
+        if not _project_auto_merge_on_approve_enabled(self._project_path()):
+            return
+        project_path = self._project_path()
+        if project_path is None:
+            return
+        try:
+            subprocess.run(
+                ["gh", "pr", "merge", pr_number, "--squash"],
+                cwd=project_path,
+                capture_output=True,
+                text=True,
+                timeout=45,
+                check=True,
+            )
+            self.notify(f"Merged PR #{pr_number}", severity="information")
+        except Exception as exc:  # noqa: BLE001
+            self.notify(f"Auto-merge failed: {exc}", severity="error")
+
+    def _commit_pending_review_action(self) -> None:
+        pending = self._pending_review_action
+        if pending is None:
+            return
+        self._clear_pending_review_action()
         svc = self._get_svc()
         if svc is None:
             self.notify("Could not open project database.", severity="error")
             return
         try:
-            task = svc.get(task_id)
+            task = svc.get(pending.task_id)
             if task.work_status.value != "review":
                 self.notify("Task is not in review state.", severity="warning")
                 return
-            if decision == "approve":
-                svc.approve(task_id, "user", reason or "Approved from task cockpit")
-                notify_task_approved(task, notify=self.notify)
+            if pending.decision == "approve":
+                approved = svc.approve(
+                    pending.task_id,
+                    "user",
+                    pending.reason or "Approved from task cockpit",
+                )
+                notify_task_approved(approved, notify=self.notify)
+                self._merge_task_pr(approved)
             else:
-                svc.reject(task_id, "user", reason or "Rejected from task cockpit")
-                self.notify(f"Rejected {task_id}", severity="information")
+                svc.reject(
+                    pending.task_id,
+                    "user",
+                    pending.reason or "Rejected from task cockpit",
+                )
+                self.notify(f"Rejected {pending.task_id}", severity="information")
         except Exception as exc:  # noqa: BLE001
-            action = "Approve" if decision == "approve" else "Reject"
+            action = "Approve" if pending.decision == "approve" else "Reject"
             self.notify(f"{action} failed: {exc}", severity="error")
         finally:
             try:
                 svc.close()
             except Exception:  # noqa: BLE001
                 pass
-        self._refresh_list(select_first=False)
+        try:
+            self._refresh_list(select_first=False)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _review_task(self, task_id: str, *, decision: str, reason: str | None = None) -> None:
+        task = None
+        svc = self._get_svc()
+        if svc is None:
+            self.notify("Could not open project database.", severity="error")
+            return
+        try:
+            task = svc.get(task_id)
+        except Exception as exc:  # noqa: BLE001
+            self.notify(f"Review failed: {exc}", severity="error")
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+        if task is None:
+            return
+        if task.work_status.value != "review":
+            self.notify("Task is not in review state.", severity="warning")
+            return
+        self._start_pending_review_action(
+            task_id=task_id,
+            task_number=task.task_number,
+            decision=decision,
+            reason=reason,
+        )
 
     def action_approve_task(self) -> None:
         if not self._selected_task_id:
             return
         self._review_task(self._selected_task_id, decision="approve")
 
+    def _approve_visible_trivial_tasks(self) -> int:
+        visible = [
+            task
+            for task in self._filtered_tasks()
+            if _task_is_trivial_chore(task)
+        ]
+        if not visible:
+            return 0
+        svc = self._get_svc()
+        if svc is None:
+            self.notify("Could not open project database.", severity="error")
+            return 0
+        approved = 0
+        try:
+            for task in visible:
+                current = svc.get(task.task_id)
+                if current.work_status.value != "review":
+                    continue
+                approved_task = svc.approve(
+                    task.task_id,
+                    "user",
+                    "Bulk-approved trivial chore",
+                )
+                approved += 1
+                self._merge_task_pr(approved_task)
+        except Exception as exc:  # noqa: BLE001
+            self.notify(f"Bulk approve failed: {exc}", severity="error")
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+        if approved:
+            self.notify(
+                f"Approved {approved} trivial review task"
+                + ("s" if approved != 1 else ""),
+                severity="information",
+            )
+        try:
+            self._refresh_list(select_first=False)
+        except Exception:  # noqa: BLE001
+            pass
+        return approved
+
     def action_reject_task(self) -> None:
         if not self._selected_task_id:
             return
+        task_id = self._selected_task_id
+        modal = _TaskRejectReasonModal()
+        self._active_reject_modal = modal
 
         def _after(reason: str | None) -> None:
+            self._active_reject_modal = None
             if reason is None:
                 return
-            self._review_task(
-                self._selected_task_id or "",
-                decision="reject",
-                reason=reason,
-            )
+            self._review_task(task_id, decision="reject", reason=reason)
 
-        self.push_screen(_TaskRejectReasonModal(), _after)
+        self.push_screen(modal, _after)
+
+    def action_bulk_approve_trivial(self) -> None:
+        self._approve_visible_trivial_tasks()
 
     @on(Input.Changed, "#tasks-search")
     def _on_search_changed(self, event: Input.Changed) -> None:
@@ -915,6 +1586,26 @@ class PollyTasksApp(App[None]):
         self._sync_filter_buttons()
         self._render_table(select_first=True)
 
+    @on(Button.Pressed, "#tasks-chip-status")
+    def _on_press_status_chip(self) -> None:
+        self._status_filter = "all"
+        self._sync_filter_buttons()
+        self._render_table(select_first=True)
+
+    @on(Button.Pressed, "#tasks-chip-search")
+    def _on_press_search_chip(self) -> None:
+        self._search_query = ""
+        self.search_input.value = ""
+        self._render_table(select_first=True)
+
+    @on(Button.Pressed, "#tasks-chip-clear-all")
+    def _on_press_clear_all_chips(self) -> None:
+        self._status_filter = "all"
+        self._search_query = ""
+        self.search_input.value = ""
+        self._sync_filter_buttons()
+        self._render_table(select_first=True)
+
     @on(Button.Pressed, "#task-approve")
     def _on_press_approve(self) -> None:
         self.action_approve_task()
@@ -923,9 +1614,30 @@ class PollyTasksApp(App[None]):
     def _on_press_reject(self) -> None:
         self.action_reject_task()
 
+    @on(Button.Pressed, "#task-bulk-approve")
+    def _on_press_bulk_approve(self) -> None:
+        self.action_bulk_approve_trivial()
+
     @on(Button.Pressed, "#task-refresh-live")
     def _on_press_refresh_live(self) -> None:
         self.action_refresh_live()
+
+    def on_key(self, event: events.Key) -> None:
+        modal = self._active_reject_modal
+        if modal is None:
+            return
+        if event.key == "1":
+            event.stop()
+            modal.action_pick_tests()
+        elif event.key == "2":
+            event.stop()
+            modal.action_pick_scope()
+        elif event.key == "3":
+            event.stop()
+            modal.action_pick_fix()
+        elif event.key == "4":
+            event.stop()
+            modal.action_pick_other()
 
     @on(DataTable.RowHighlighted, "#tasks-table")
     def _on_task_highlighted(self) -> None:

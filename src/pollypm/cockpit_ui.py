@@ -124,7 +124,7 @@ from pollypm.rejection_feedback import (
 from pollypm.session_services import create_tmux_client
 from pollypm.service_api import PollyPMService
 from pollypm.cockpit import build_cockpit_detail
-from pollypm.cockpit_rail import CockpitItem, CockpitPresence, CockpitRouter, _viewer_attached
+from pollypm.cockpit_rail import CockpitItem, CockpitPresence, CockpitRouter
 
 
 import re as _re
@@ -1069,8 +1069,13 @@ class PollyCockpitApp(App[None]):
         return None
 
     def _event_ticker_text(self) -> str:
-        if not _viewer_attached():
-            return ""
+        # Gate on real tmux-client attachment (not just isatty). When the
+        # user detaches from tmux, animation should stop — see #656.
+        try:
+            if not self.router._presence().is_tmux_attached():
+                return ""
+        except Exception:  # noqa: BLE001
+            pass  # fall through — render as if attached if gate fails
         try:
             supervisor = self.router._load_supervisor()
             events = list(supervisor.store.recent_events(limit=12))
@@ -1078,11 +1083,21 @@ class PollyCockpitApp(App[None]):
             return ""
         if not events:
             return ""
-        index = int((time.monotonic() - self._ticker_started_at) // 10)
-        event = events[index % len(events)]
-        event_type = getattr(event, "event_type", "event")
-        session_name = getattr(event, "session_name", "") or "system"
-        return f"events · {event_type}:{session_name}"
+        # #667 acceptance: show the 3 newest events, cycle the window so
+        # a re-glance sees a different set. supervisor.recent_events()
+        # returns rows in arbitrary order — newest-first comes from the
+        # created_at column, which the store already sorts descending.
+        window_size = min(3, len(events))
+        # Advance one event per 10s so the user sees motion without the
+        # header flickering on every cockpit tick.
+        offset = int((time.monotonic() - self._ticker_started_at) // 10)
+        cycled = [events[(offset + i) % len(events)] for i in range(window_size)]
+        labels = []
+        for event in cycled:
+            event_type = getattr(event, "event_type", "event")
+            session_name = getattr(event, "session_name", "") or "system"
+            labels.append(f"{event_type}:{session_name}")
+        return "events · " + " · ".join(labels)
 
     def _update_ticker(self) -> None:
         ticker_text = self._event_ticker_text()
@@ -1092,7 +1107,7 @@ class PollyCockpitApp(App[None]):
     _HEARTBEAT_STALE_SECONDS = 180  # warn if no heartbeat in 3 minutes
 
     def _update_hint(self) -> None:
-        hint_text = "j/k move \u00b7 \u21b5 open \u00b7 n new"
+        hint_text = "j/k move \u00b7 \u21b5 open \u00b7 n new \u00b7 t activity \u00b7 p pin"
         try:
             supervisor = self.router._load_supervisor()
             last_hb = supervisor.store.last_heartbeat_at()

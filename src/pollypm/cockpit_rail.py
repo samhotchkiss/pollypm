@@ -215,13 +215,6 @@ class CockpitPresence:
         return frames[frame_index]
 
 
-def _viewer_attached() -> bool:
-    """Best-effort check for a live terminal viewer."""
-    try:
-        return sys.stdin.isatty() and sys.stdout.isatty()
-    except Exception:  # noqa: BLE001
-        return False
-
 # ── Rail data model + router ─────────────────────────────────────────────
 #
 # Moved out of pollypm.cockpit in #404 so the routing concern (which rail
@@ -722,12 +715,25 @@ class CockpitRouter:
         data["ui_initialized_sessions"] = items
         self._write_state(data)
 
-    def pinned_projects(self) -> set[str]:
+    def pinned_projects(self) -> list[str]:
+        """Return pinned project keys in most-recently-pinned-first order.
+
+        Persisted as a JSON list so the insertion order survives restarts
+        (#677 acceptance: "Multiple pins maintain their relative pin
+        order (most recently pinned first)").
+        """
         data = self._load_state()
         value = data.get("pinned_projects")
         if not isinstance(value, list):
-            return set()
-        return {item for item in value if isinstance(item, str) and item}
+            return []
+        # Dedupe while preserving first-seen order.
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for item in value:
+            if isinstance(item, str) and item and item not in seen:
+                seen.add(item)
+                ordered.append(item)
+        return ordered
 
     def is_project_pinned(self, project_key: str) -> bool:
         return project_key in self.pinned_projects()
@@ -739,9 +745,11 @@ class CockpitRouter:
             current.remove(project_key)
             pinned = False
         else:
-            current.add(project_key)
+            # Most-recently-pinned first — prepend so the newest pin
+            # sorts to the top.
+            current.insert(0, project_key)
             pinned = True
-        data["pinned_projects"] = sorted(current)
+        data["pinned_projects"] = current
         self._write_state(data)
         return pinned
 
@@ -1009,11 +1017,18 @@ class CockpitRouter:
 
         project_region: list[CockpitItem] = []
         if project_blocks:
+            # Pinned projects sort first, ordered by most-recently-pinned
+            # (pinned_projects() returns newest-first, see #677). The
+            # selected project bubbles ahead of unpinned; unpinned
+            # projects sort alphabetically.
+            pin_order = self.pinned_projects()
+            pin_rank = {key: idx for idx, key in enumerate(pin_order)}
             project_blocks.sort(
                 key=lambda row: (
-                    not row[2],
-                    not row[3],
-                    row[0].lower(),
+                    not row[2],  # pinned ahead of unpinned
+                    pin_rank.get(row[0], 0),  # pinned: by recency
+                    not row[3],  # selected ahead of other unpinned
+                    row[0].lower(),  # unpinned: alphabetical
                 ),
             )
             for _key, block, _pinned, _selected in project_blocks:
@@ -2120,20 +2135,31 @@ class PollyCockpitRail:
                 self._write(clear_line + "\r\n")
 
     def _event_ticker_text(self) -> str:
-        if not _viewer_attached():
-            return ""
+        # #656 gate: use the router's CockpitPresence so tmux detach
+        # actually pauses the ticker. ``sys.stdin.isatty()`` stays True
+        # across detach and was burning CPU with no viewer.
+        try:
+            if not self.router._presence().is_tmux_attached():
+                return ""
+        except Exception:  # noqa: BLE001
+            pass
         try:
             supervisor = self.router._load_supervisor()
-            events = list(supervisor.store.recent_events(limit=4))
+            events = list(supervisor.store.recent_events(limit=12))
         except Exception:  # noqa: BLE001
             return ""
         if not events:
             return ""
-        index = int((time.monotonic() - self._ticker_started_at) // 10)
-        event = events[index % len(events)]
-        event_type = getattr(event, "event_type", "event")
-        session_name = getattr(event, "session_name", "") or "system"
-        return f"events · {event_type}:{session_name}"
+        # #667 acceptance: cycle a window of the 3 newest events.
+        window_size = min(3, len(events))
+        offset = int((time.monotonic() - self._ticker_started_at) // 10)
+        cycled = [events[(offset + i) % len(events)] for i in range(window_size)]
+        labels = []
+        for event in cycled:
+            event_type = getattr(event, "event_type", "event")
+            session_name = getattr(event, "session_name", "") or "system"
+            labels.append(f"{event_type}:{session_name}")
+        return "events · " + " · ".join(labels)
 
     def _section_header(self, label: str, width: int) -> RenderRow:
         pad = " " * GUTTER

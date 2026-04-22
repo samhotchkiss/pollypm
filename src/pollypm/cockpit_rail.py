@@ -214,6 +214,7 @@ class CockpitPresence:
         self._heartbeat_states[session_name] = (heartbeat_at, frame_index)
         return frames[frame_index]
 
+
 # ── Rail data model + router ─────────────────────────────────────────────
 #
 # Moved out of pollypm.cockpit in #404 so the routing concern (which rail
@@ -714,6 +715,44 @@ class CockpitRouter:
         data["ui_initialized_sessions"] = items
         self._write_state(data)
 
+    def pinned_projects(self) -> list[str]:
+        """Return pinned project keys in most-recently-pinned-first order.
+
+        Persisted as a JSON list so the insertion order survives restarts
+        (#677 acceptance: "Multiple pins maintain their relative pin
+        order (most recently pinned first)").
+        """
+        data = self._load_state()
+        value = data.get("pinned_projects")
+        if not isinstance(value, list):
+            return []
+        # Dedupe while preserving first-seen order.
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for item in value:
+            if isinstance(item, str) and item and item not in seen:
+                seen.add(item)
+                ordered.append(item)
+        return ordered
+
+    def is_project_pinned(self, project_key: str) -> bool:
+        return project_key in self.pinned_projects()
+
+    def toggle_pinned_project(self, project_key: str) -> bool:
+        data = self._load_state()
+        current = self.pinned_projects()
+        if project_key in current:
+            current.remove(project_key)
+            pinned = False
+        else:
+            # Most-recently-pinned first — prepend so the newest pin
+            # sorts to the top.
+            current.insert(0, project_key)
+            pinned = True
+        data["pinned_projects"] = current
+        self._write_state(data)
+        return pinned
+
     def build_items(self, *, spinner_index: int = 0) -> list[CockpitItem]:
         """Build rail rows by walking the plugin-host rail registry.
 
@@ -733,6 +772,11 @@ class CockpitRouter:
         supervisor = self._load_supervisor()
         config = supervisor.config
         launches, windows, alerts, _leases, _errors = supervisor.status()
+        recent_events = []
+        try:
+            recent_events = list(supervisor.store.recent_events(limit=300))
+        except Exception:  # noqa: BLE001
+            recent_events = []
 
         cockpit_state = self._load_state()
         ctx = RailContext(
@@ -784,7 +828,10 @@ class CockpitRouter:
             rows = grouped.get(section) or []
             if not rows:
                 continue
-            if section in collapsed_sections:
+            active_rows = [row for row in rows if self._row_is_active(row)]
+            if section in collapsed_sections or (
+                section not in {"top", "system"} and not active_rows
+            ):
                 # Collapsed sections render as a disabled header row so
                 # the user can still see the section exists. Expansion
                 # is a runtime concept tracked via set_selected_key.
@@ -799,7 +846,13 @@ class CockpitRouter:
                 continue
             items.extend(rows)
 
-        return items
+        return self._decorate_project_items(
+            items,
+            selected_project=_selected_project_key(cockpit_state.get("selected")),
+            launches=launches,
+            recent_events=recent_events,
+            project_session_map=project_session_map,
+        )
 
     def _attach_session_metadata(
         self,
@@ -898,6 +951,144 @@ class CockpitRouter:
                 continue
             project_session_map.setdefault(launch.session.project, launch.session.name)
         return project_session_map
+
+    def _decorate_project_items(
+        self,
+        items: list[CockpitItem],
+        *,
+        selected_project: str | None,
+        launches,
+        recent_events: list,
+        project_session_map: dict[str, str],
+    ) -> list[CockpitItem]:
+        from pollypm.cockpit_sections.base import _iso_to_dt, _spark_bar
+
+        first_project = next((idx for idx, item in enumerate(items) if item.key.startswith("project:")), None)
+        if first_project is None:
+            return items
+        last_project = max(
+            (idx for idx, item in enumerate(items) if item.key.startswith("project:")),
+            default=None,
+        )
+        if last_project is None:
+            return items
+
+        prefix = list(items[:first_project])
+        region = list(items[first_project : last_project + 1])
+        suffix = list(items[last_project + 1 :])
+        project_event_spark = self._project_activity_sparkline(
+            project_session_map,
+            recent_events,
+            _iso_to_dt=_iso_to_dt,
+            _spark_bar=_spark_bar,
+        )
+
+        project_blocks: list[tuple[str, list[CockpitItem], bool, bool]] = []
+        current_key: str | None = None
+        current_block: list[CockpitItem] = []
+        current_pinned = False
+        current_selected = False
+
+        def flush_block() -> None:
+            nonlocal current_key, current_block, current_pinned, current_selected
+            if current_key is not None and current_block:
+                project_blocks.append((current_key, current_block, current_pinned, current_selected))
+            current_key = None
+            current_block = []
+            current_pinned = False
+            current_selected = False
+
+        for item in region:
+            if item.key.startswith("project:"):
+                parts = item.key.split(":")
+                if len(parts) == 2:
+                    flush_block()
+                    current_key = parts[1]
+                    current_selected = current_key == selected_project
+                    current_pinned = self.is_project_pinned(current_key)
+                    current_block = [self._decorate_project_row(item, project_event_spark.get(current_key))]
+                    continue
+                if current_key is not None and len(parts) > 2 and parts[1] == current_key:
+                    current_block.append(item)
+                    continue
+            flush_block()
+            prefix.append(item)
+        flush_block()
+
+        project_region: list[CockpitItem] = []
+        if project_blocks:
+            # Pinned projects sort first, ordered by most-recently-pinned
+            # (pinned_projects() returns newest-first, see #677). The
+            # selected project bubbles ahead of unpinned; unpinned
+            # projects sort alphabetically.
+            pin_order = self.pinned_projects()
+            pin_rank = {key: idx for idx, key in enumerate(pin_order)}
+            project_blocks.sort(
+                key=lambda row: (
+                    not row[2],  # pinned ahead of unpinned
+                    pin_rank.get(row[0], 0),  # pinned: by recency
+                    not row[3],  # selected ahead of other unpinned
+                    row[0].lower(),  # unpinned: alphabetical
+                ),
+            )
+            for _key, block, _pinned, _selected in project_blocks:
+                project_region.extend(block)
+        return [*prefix, *project_region, *suffix]
+
+    def _decorate_project_row(self, item: CockpitItem, sparkline: str | None) -> CockpitItem:
+        label = item.label
+        if self.is_project_pinned(item.key.split(":", 1)[1]):
+            label = f"📌 {label}"
+        if sparkline:
+            label = f"{label} {sparkline}"
+        return replace(item, label=label)
+
+    def _project_activity_sparkline(
+        self,
+        project_session_map: dict[str, str],
+        recent_events: list,
+        *,
+        _iso_to_dt,
+        _spark_bar,
+    ) -> dict[str, str]:
+        from datetime import UTC, datetime
+
+        if not recent_events:
+            return {}
+        now = datetime.now(UTC)
+        buckets: dict[str, list[int]] = {key: [0] * 10 for key in project_session_map}
+        session_to_project = {
+            session_name: project_key
+            for project_key, session_name in project_session_map.items()
+        }
+        for event in recent_events:
+            project_key = session_to_project.get(getattr(event, "session_name", ""))
+            if project_key is None:
+                continue
+            dt = _iso_to_dt(getattr(event, "created_at", None))
+            if dt is None:
+                continue
+            age_minutes = int((now - dt).total_seconds() // 60)
+            if age_minutes < 0 or age_minutes >= 60:
+                continue
+            bucket = 9 - (age_minutes // 6)
+            buckets[project_key][bucket] += 1
+        result: dict[str, str] = {}
+        for project_key, values in buckets.items():
+            if any(values):
+                result[project_key] = _spark_bar(values)
+            else:
+                result[project_key] = "·" * len(values)
+        return result
+
+    def _row_is_active(self, item: CockpitItem) -> bool:
+        state = item.state.strip().lower()
+        if not state or state in {"idle", "separator", "sub"}:
+            return False
+        return any(
+            marker in state
+            for marker in ("working", "live", "watch", "ready", "alert", "active")
+        ) or state.startswith("!")
 
     # Alert types that are informational / auto-managed — don't show red triangle
     _SILENT_ALERT_TYPES = frozenset({
@@ -1738,6 +1929,7 @@ class PollyCockpitRail:
         self.selected_key = self.router.selected_key()
         self.spinner_index = 0
         self.slogan_started_at = time.time()
+        self._ticker_started_at = time.monotonic()
         self._last_items: list[CockpitItem] = []
         self._slogan_phase = 0
 
@@ -1796,6 +1988,14 @@ class PollyCockpitRail:
         if key in {b"i", b"I"}:
             self.router.route_selected("inbox")
             self.selected_key = "inbox"
+            return True
+        if key in {b"t", b"T"}:
+            self.router.route_selected("activity")
+            self.selected_key = "activity"
+            return True
+        if key in {b"p", b"P"} and self.selected_key.startswith("project:"):
+            project_key = self.selected_key.split(":", 2)[1]
+            self.router.toggle_pinned_project(project_key)
             return True
         if key in {b"\x0b"}:
             # Raw rail has no palette UI of its own; jump to settings so
@@ -1910,11 +2110,14 @@ class PollyCockpitRail:
             lines.append(self._section_header("system", width))
             lines.append(self._item_row(settings_item, width, active_view))
 
-        # ── Hint line
-        while len(lines) < height - 2:
+        ticker_text = self._event_ticker_text()
+        reserve = 3 if ticker_text else 2
+        while len(lines) < height - reserve:
             lines.append(RenderRow(""))
         lines.append(RenderRow(""))
-        hint = f"{pad}j/k move \u00b7 \u21b5 open \u00b7 n new"
+        if ticker_text:
+            lines.append(RenderRow(ticker_text[:width], fg=PALETTE["hint"]))
+        hint = f"{pad}j/k move \u00b7 \u21b5 open \u00b7 n new \u00b7 t activity \u00b7 p pin"
         lines.append(RenderRow(hint[:width], fg=PALETTE["hint"]))
 
         # ── Flush
@@ -1930,6 +2133,33 @@ class PollyCockpitRail:
                     self._write(_sgr(row) + row.text.ljust(width)[:width] + "\x1b[0m\r\n")
             else:
                 self._write(clear_line + "\r\n")
+
+    def _event_ticker_text(self) -> str:
+        # #656 gate: use the router's CockpitPresence so tmux detach
+        # actually pauses the ticker. ``sys.stdin.isatty()`` stays True
+        # across detach and was burning CPU with no viewer.
+        try:
+            if not self.router._presence().is_tmux_attached():
+                return ""
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            supervisor = self.router._load_supervisor()
+            events = list(supervisor.store.recent_events(limit=12))
+        except Exception:  # noqa: BLE001
+            return ""
+        if not events:
+            return ""
+        # #667 acceptance: cycle a window of the 3 newest events.
+        window_size = min(3, len(events))
+        offset = int((time.monotonic() - self._ticker_started_at) // 10)
+        cycled = [events[(offset + i) % len(events)] for i in range(window_size)]
+        labels = []
+        for event in cycled:
+            event_type = getattr(event, "event_type", "event")
+            session_name = getattr(event, "session_name", "") or "system"
+            labels.append(f"{event_type}:{session_name}")
+        return "events · " + " · ".join(labels)
 
     def _section_header(self, label: str, width: int) -> RenderRow:
         pad = " " * GUTTER

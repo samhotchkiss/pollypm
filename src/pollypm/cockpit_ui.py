@@ -25,6 +25,7 @@ import resource
 from collections import deque
 from pathlib import Path
 import subprocess
+import time
 from typing import Callable
 
 # Raise FD limit early — the cockpit opens many subprocesses and file handles.
@@ -677,6 +678,12 @@ class PollyCockpitApp(App[None]):
         background: #253140;
         color: #f2f6f8;
     }
+    #ticker {
+        height: 1;
+        padding: 0 1;
+        color: #4a5568;
+        background: transparent;
+    }
     #hint {
         height: 3;
         color: #3e4c5a;
@@ -687,6 +694,8 @@ class PollyCockpitApp(App[None]):
     BINDINGS = [
         Binding("enter,o", "open_selected", "Open"),
         Binding("n", "new_worker", "New Worker"),
+        Binding("t", "open_activity", "Activity"),
+        Binding("p", "toggle_project_pin", "Pin Project"),
         Binding("r", "refresh", "Refresh"),
         Binding("s", "open_settings", "Settings"),
         Binding("a", "view_alerts", "Alerts", show=False),
@@ -726,10 +735,12 @@ class PollyCockpitApp(App[None]):
         self.tagline = Static("\n" + POLLY_SLOGANS[0], id="tagline")
         self.nav = ListView(id="nav")
         self.settings_row = Static("\u2699 Settings", id="settings-row")
+        self.ticker = Static("", id="ticker")
         self.hint = Static("", id="hint")
         self.spinner_index = 0
         self.slogan_index = 0
         self._slogan_tick = 0
+        self._ticker_started_at = time.monotonic()
         self.selected_key = "polly"
         self._items: list[CockpitItem] = []
         self._row_widgets: dict[str, RailItem] = {}
@@ -753,11 +764,13 @@ class PollyCockpitApp(App[None]):
             yield self.tagline
             yield self.nav
             yield self.settings_row
+            yield self.ticker
             yield self.hint
 
     def on_mount(self) -> None:
         self.selected_key = self.router.selected_key()
         self._refresh_rows()
+        self._update_ticker()
         self.set_interval(0.8, self._tick)
         self.set_interval(self.SCHEDULER_POLL_INTERVAL_SECONDS, self._tick_scheduler)
         self.nav.focus()
@@ -915,6 +928,7 @@ class PollyCockpitApp(App[None]):
                         row.item.state = f"{frame} working"
                     row.spinner_index = self.spinner_index
                     row.update_body()
+        self._update_ticker()
         # Layout check much less frequently
         if self._tick_count % self._LAYOUT_CHECK_INTERVAL == 0:
             try:
@@ -1039,6 +1053,7 @@ class PollyCockpitApp(App[None]):
             self.settings_row.display = True
         else:
             self.settings_row.display = False
+        self._update_ticker()
         self._update_hint()
 
     def _selected_row_key(self) -> str | None:
@@ -1053,10 +1068,46 @@ class PollyCockpitApp(App[None]):
             return child.cockpit_key
         return None
 
+    def _event_ticker_text(self) -> str:
+        # Gate on real tmux-client attachment (not just isatty). When the
+        # user detaches from tmux, animation should stop — see #656.
+        try:
+            if not self.router._presence().is_tmux_attached():
+                return ""
+        except Exception:  # noqa: BLE001
+            pass  # fall through — render as if attached if gate fails
+        try:
+            supervisor = self.router._load_supervisor()
+            events = list(supervisor.store.recent_events(limit=12))
+        except Exception:  # noqa: BLE001
+            return ""
+        if not events:
+            return ""
+        # #667 acceptance: show the 3 newest events, cycle the window so
+        # a re-glance sees a different set. supervisor.recent_events()
+        # returns rows in arbitrary order — newest-first comes from the
+        # created_at column, which the store already sorts descending.
+        window_size = min(3, len(events))
+        # Advance one event per 10s so the user sees motion without the
+        # header flickering on every cockpit tick.
+        offset = int((time.monotonic() - self._ticker_started_at) // 10)
+        cycled = [events[(offset + i) % len(events)] for i in range(window_size)]
+        labels = []
+        for event in cycled:
+            event_type = getattr(event, "event_type", "event")
+            session_name = getattr(event, "session_name", "") or "system"
+            labels.append(f"{event_type}:{session_name}")
+        return "events · " + " · ".join(labels)
+
+    def _update_ticker(self) -> None:
+        ticker_text = self._event_ticker_text()
+        self.ticker.update(ticker_text)
+        self.ticker.display = bool(ticker_text)
+
     _HEARTBEAT_STALE_SECONDS = 180  # warn if no heartbeat in 3 minutes
 
     def _update_hint(self) -> None:
-        hint_text = "j/k move \u00b7 \u21b5 open \u00b7 n new"
+        hint_text = "j/k move \u00b7 \u21b5 open \u00b7 n new \u00b7 t activity \u00b7 p pin"
         try:
             supervisor = self.router._load_supervisor()
             last_hb = supervisor.store.last_heartbeat_at()
@@ -1134,6 +1185,25 @@ class PollyCockpitApp(App[None]):
             self.router.route_selected("settings")
         except Exception as exc:  # noqa: BLE001
             self.hint.update(f"Error: {exc}"[:60])
+        self._refresh_rows()
+
+    def action_open_activity(self) -> None:
+        self.selected_key = "activity"
+        try:
+            self.router.route_selected("activity")
+        except Exception as exc:  # noqa: BLE001
+            self.hint.update(f"Error: {exc}"[:60])
+        self._refresh_rows()
+
+    def action_toggle_project_pin(self) -> None:
+        key = self._selected_row_key()
+        if key is None or not key.startswith("project:"):
+            return
+        try:
+            self.router.toggle_pinned_project(key.split(":", 1)[1])
+        except Exception as exc:  # noqa: BLE001
+            self.hint.update(f"Error: {exc}"[:60])
+            return
         self._refresh_rows()
 
     def action_new_worker(self) -> None:

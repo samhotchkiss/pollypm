@@ -1380,8 +1380,9 @@ def task_pickup_log(
 ) -> None:
     """Show task-assignment notifications (who got pinged about what, when).
 
-    Reads the ``task_notifications`` dedupe table written by the
-    ``task_assignment_notify`` plugin. Helpful for auditing worker /
+    Reads the unified ``messages`` ledger rows written by the
+    ``task_assignment_notify`` plugin (legacy ``task_notifications``
+    rows migrate there during #411). Helpful for auditing worker /
     reviewer pickup after the E2E gap closed by issue #244.
     """
     since_seconds = _parse_since(since)

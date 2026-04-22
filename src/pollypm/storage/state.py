@@ -1,7 +1,10 @@
 """Legacy :class:`StateStore` — domain tables that haven't moved yet.
 
-#342 retired the event/alert/message-shaped surfaces that this module
-used to own (now on :class:`pollypm.store.SQLAlchemyStore`). What's
+#342 retired the message-shaped storage surfaces onto the unified
+``messages`` table. #411 finishes that retirement for the remaining
+compatibility APIs on this class: ``record_event()``, ``upsert_alert()``,
+and the task-assignment notification helpers still exist, but they now
+persist/read through ``messages`` rather than legacy side tables. What's
 left are the domain tables we didn't have time to port to SQLAlchemy
 Core Table defs in a single PR:
 
@@ -49,13 +52,36 @@ CREATE TABLE IF NOT EXISTS sessions (
     window_name TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS events (
+CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_name TEXT NOT NULL,
-    event_type TEXT NOT NULL,
-    message TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    scope TEXT NOT NULL,
+    type TEXT NOT NULL,
+    tier TEXT NOT NULL DEFAULT 'immediate',
+    recipient TEXT NOT NULL,
+    sender TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'open',
+    parent_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    labels TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    closed_at TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_messages_recipient_state
+ON messages(recipient, state);
+
+CREATE INDEX IF NOT EXISTS idx_messages_type_tier
+ON messages(type, tier);
+
+CREATE INDEX IF NOT EXISTS idx_messages_scope_created
+ON messages(scope, created_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_open_alert_unique
+ON messages(scope, sender)
+WHERE type = 'alert' AND state = 'open';
 
 CREATE TABLE IF NOT EXISTS heartbeats (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,21 +95,6 @@ CREATE TABLE IF NOT EXISTS heartbeats (
     snapshot_hash TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS alerts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_name TEXT NOT NULL,
-    alert_type TEXT NOT NULL,
-    severity TEXT NOT NULL,
-    message TEXT NOT NULL,
-    status TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_open
-ON alerts(session_name, alert_type)
-WHERE status = 'open';
 
 CREATE TABLE IF NOT EXISTS leases (
     session_name TEXT PRIMARY KEY,
@@ -288,6 +299,43 @@ CREATE TABLE IF NOT EXISTS architect_resume_tokens (
     last_active_at TEXT NOT NULL
 );
 """
+
+
+def _json_object(raw: str | None) -> dict[str, object]:
+    if not raw:
+        return {}
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _alert_message(subject: str, body: str) -> str:
+    text = (body or "").strip()
+    if text:
+        return text
+    title = (subject or "").strip()
+    if title.startswith("[Alert] "):
+        return title[len("[Alert] "):]
+    if title.startswith("[Alert]"):
+        return title[len("[Alert]"):].lstrip()
+    return title
+
+
+def _alert_status(state: str) -> str:
+    return "open" if state == "open" else "cleared"
+
+
+def _event_message(subject: str, body: str, payload_json: str | None) -> str:
+    text = (body or "").strip()
+    if text:
+        return text
+    payload = _json_object(payload_json)
+    candidate = payload.get("message")
+    if isinstance(candidate, str) and candidate.strip():
+        return candidate
+    return (subject or "").strip()
 
 
 @dataclass(slots=True)
@@ -511,9 +559,11 @@ class StateStore:
                 try:
                     self._conn.executescript(SCHEMA)
                 except sqlite3.IntegrityError:
-                    # Duplicates exist that conflict with a UNIQUE index.
-                    # Deduplicate and retry.
-                    self._deduplicate_alerts()
+                    # Old DBs can carry duplicate open alert rows in
+                    # ``messages`` from pre-index boots. Close the
+                    # duplicates, then retry the schema bootstrap so the
+                    # uniqueness contract lands cleanly.
+                    self._deduplicate_open_alert_messages()
                     self._conn.executescript(SCHEMA)
                 try:
                     self._migrate()
@@ -628,19 +678,6 @@ class StateStore:
             pass
         return deleted
 
-    def _deduplicate_alerts(self) -> None:
-        """Remove duplicate alerts, keeping the most recently updated row."""
-        try:
-            self._conn.execute("""
-                DELETE FROM alerts WHERE rowid NOT IN (
-                    SELECT MAX(rowid) FROM alerts
-                    GROUP BY session_name, alert_type
-                )
-            """)
-            self._conn.commit()
-        except Exception:  # noqa: BLE001
-            pass
-
     def __enter__(self):
         return self
 
@@ -675,6 +712,42 @@ class StateStore:
     def _now(self) -> str:
         return datetime.now(UTC).isoformat()
 
+    def _deduplicate_open_alert_messages(self) -> None:
+        """Close duplicate open alert rows, keeping the newest per key."""
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT id, scope, sender
+                FROM messages
+                WHERE type = 'alert' AND state = 'open'
+                ORDER BY id DESC
+                """
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return
+        keep: set[tuple[str, str]] = set()
+        duplicate_ids: list[int] = []
+        for row_id, scope, sender in rows:
+            key = (str(scope or ""), str(sender or ""))
+            if key in keep:
+                duplicate_ids.append(int(row_id))
+                continue
+            keep.add(key)
+        if not duplicate_ids:
+            return
+        now = self._now()
+        self._conn.executemany(
+            """
+            UPDATE messages
+            SET state = 'closed',
+                closed_at = COALESCE(closed_at, updated_at, ?),
+                updated_at = COALESCE(updated_at, ?)
+            WHERE id = ?
+            """,
+            [(now, now, row_id) for row_id in duplicate_ids],
+        )
+        self._conn.commit()
+
     # ------------------------------------------------------------------
     # Schema migrations — append-only list.  Each entry is
     # (version, description, sql_statements).  The runner applies any
@@ -683,18 +756,15 @@ class StateStore:
     # so they are safe to replay on databases created before versioning.
     # ------------------------------------------------------------------
     _MIGRATIONS: list[tuple[int, str, list[str]]] = [
-        (1, "Rebuild alerts unique index", [
-            "DROP INDEX IF EXISTS idx_alerts_open",
-            """CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_open
-               ON alerts(session_name, alert_type) WHERE status = 'open'""",
-        ]),
+        # Legacy alerts table retired by migration 15. Keep the version
+        # marker so old databases still walk the same version sequence.
+        (1, "Rebuild alerts unique index", []),
         (2, "Add project column to sessions", [
             # Column-existence check is handled by _safe_add_column below.
         ]),
         (3, "Add snapshot_hash to heartbeats", []),
         (4, "Add cache_read_tokens to token_usage_hourly", []),
         (5, "Add indexes on events and heartbeats for heartbeat sweep performance", [
-            "CREATE INDEX IF NOT EXISTS idx_events_session_type ON events(session_name, event_type, id DESC)",
             "CREATE INDEX IF NOT EXISTS idx_heartbeats_session ON heartbeats(session_name, id DESC)",
         ]),
         (6, "Add work_jobs table for durable job queue", [
@@ -748,46 +818,16 @@ class StateStore:
             # it from SCHEMA). The index is created afterwards.
         ]),
         # --- Migration 11 ----------------------------------------------
-        # Task-assignment notification dedupe table (#244). Records
-        # every ping sent to a session about a given task so the notify
-        # handler can throttle re-sends to once per 30 minutes and the
-        # ``pm task pickup-log`` CLI can surface delivery history.
-        (11, "Task-assignment notifications dedupe table (#244)", [
-            """CREATE TABLE IF NOT EXISTS task_notifications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_name TEXT NOT NULL,
-                task_id TEXT NOT NULL,
-                project TEXT NOT NULL DEFAULT '',
-                notified_at TEXT NOT NULL,
-                delivery_status TEXT NOT NULL DEFAULT 'sent',
-                message TEXT NOT NULL DEFAULT ''
-            )""",
-            """CREATE INDEX IF NOT EXISTS idx_task_notifications_recent
-               ON task_notifications(notified_at DESC)""",
-            """CREATE INDEX IF NOT EXISTS idx_task_notifications_session_task
-               ON task_notifications(session_name, task_id, notified_at DESC)""",
-        ]),
+        # Task-assignment notifications now live on ``messages`` (type
+        # ``task_notification``). Keep the version marker so pre-#411 DBs
+        # still advance through the historical sequence before migration 15
+        # copies/drops the legacy table.
+        (11, "Task-assignment notifications dedupe table (#244)", []),
         # --- Migration 12 ----------------------------------------------
-        # Reject-bounce retry fix (#279). The dedupe for task-assignment
-        # pings was keyed on ``(session_name, task_id)`` only, which
-        # meant a rejected worker couldn't be re-pinged when the task
-        # bounced back to ``implement`` — the 30-minute dedupe window
-        # kept the retry ping suppressed. We add an ``execution_version``
-        # column (the ``work_node_executions.visit`` counter for the
-        # task's current node at ping time) so the dedupe key becomes
-        # ``(session_name, task_id, execution_version)``. A reject that
-        # opens a fresh ``(node, visit=N+1)`` execution counts as a new
-        # ping opportunity; identical-state pings within the window are
-        # still suppressed. Existing rows default to ``0`` (column
-        # DEFAULT) — the same default a freshly-built event carries when
-        # the work service can't compute a visit — so pre-migration
-        # dedupe semantics survive the upgrade.
-        (12, "Dedupe includes execution_version (#279)", [
-            # Column addition + index creation handled via the dispatch
-            # block below (_safe_add_column + explicit CREATE INDEX) so
-            # the column is guaranteed to exist before the index touches
-            # it, and a fresh DB re-running the migration is idempotent.
-        ]),
+        # Historical marker only — migration 15 preserves the
+        # ``execution_version`` semantics when it copies any remaining
+        # ``task_notifications`` rows into ``messages``.
+        (12, "Dedupe includes execution_version (#279)", []),
         # --- Migration 13 ----------------------------------------------
         # Actually drop the ``inbox_messages`` table that migration 7
         # deprecated but left in place. No live callers remain after
@@ -802,6 +842,10 @@ class StateStore:
         (14, "Structured account_usage fields for sampler snapshots", [
             # Column additions handled in the dispatch block below.
         ]),
+        # --- Migration 15 ----------------------------------------------
+        # Move the remaining message-shaped legacy rows into the unified
+        # ``messages`` table, then retire the old tables outright.
+        (15, "Retire legacy events / alerts / task_notifications tables", []),
     ]
 
     def _migrate(self) -> None:
@@ -872,37 +916,135 @@ class StateStore:
                     "CREATE INDEX IF NOT EXISTS idx_memory_entries_tier "
                     "ON memory_entries(scope_tier, scope, id DESC)"
                 )
-            elif version == 12:
-                # Reject-bounce retry fix (#279). The dedupe key now
-                # includes the current node's execution version (the
-                # ``work_node_executions.visit`` counter at ping time).
-                # Existing rows back-fill to ``0`` via the column
-                # DEFAULT, which matches the default version emitted by
-                # freshly-rebuilt events whose work service can't
-                # compute a visit — so pre-migration dedupe semantics
-                # survive the upgrade intact.
-                self._safe_add_column(
-                    "task_notifications",
-                    "execution_version",
-                    "INTEGER NOT NULL DEFAULT 0",
-                )
-                # Composite index supports the new dedupe query path —
-                # ``WHERE session = ? AND task = ? AND version = ? AND
-                # notified_at >= ?``. The original per-session-task
-                # index (migration 11) stays in place for pickup-log
-                # filters that don't care about version.
-                self.execute(
-                    "CREATE INDEX IF NOT EXISTS "
-                    "idx_task_notifications_session_task_version "
-                    "ON task_notifications("
-                    "session_name, task_id, execution_version, "
-                    "notified_at DESC)"
-                )
             elif version == 14:
                 self._safe_add_column("account_usage", "used_pct", "INTEGER")
                 self._safe_add_column("account_usage", "remaining_pct", "INTEGER")
                 self._safe_add_column("account_usage", "reset_at", "TEXT")
                 self._safe_add_column("account_usage", "period_label", "TEXT")
+            elif version == 15:
+                if self._table_exists("events"):
+                    rows = self.execute(
+                        "SELECT session_name, event_type, message, created_at FROM events ORDER BY id"
+                    ).fetchall()
+                    for session_name, event_type, message, created_at in rows:
+                        self.execute(
+                            """
+                            INSERT INTO messages (
+                                scope, type, tier, recipient, sender, state,
+                                subject, body, payload_json, labels,
+                                created_at, updated_at
+                            )
+                            VALUES (?, 'event', 'immediate', '*', ?, 'open', ?, ?, ?, '[]', ?, ?)
+                            """,
+                            (
+                                session_name,
+                                event_type,
+                                event_type,
+                                message,
+                                json.dumps(
+                                    {
+                                        "session_name": session_name,
+                                        "event_type": event_type,
+                                    }
+                                ),
+                                created_at,
+                                created_at,
+                            ),
+                        )
+                if self._table_exists("alerts"):
+                    rows = self.execute(
+                        "SELECT id, session_name, alert_type, severity, message, status, created_at, updated_at "
+                        "FROM alerts ORDER BY id"
+                    ).fetchall()
+                    latest_open_by_key: dict[tuple[str, str], int] = {}
+                    for row in rows:
+                        if row[5] == "open":
+                            latest_open_by_key[(str(row[1]), str(row[2]))] = int(row[0])
+                    for row_id, session_name, alert_type, severity, message, status, created_at, updated_at in rows:
+                        if status == "open" and latest_open_by_key.get((str(session_name), str(alert_type))) != int(row_id):
+                            continue
+                        state = "open" if status == "open" else "closed"
+                        closed_at = None if state == "open" else updated_at
+                        self.execute(
+                            """
+                            INSERT INTO messages (
+                                scope, type, tier, recipient, sender, state,
+                                subject, body, payload_json, labels,
+                                created_at, updated_at, closed_at
+                            )
+                            VALUES (?, 'alert', 'immediate', 'user', ?, ?, ?, '', ?, '[]', ?, ?, ?)
+                            """,
+                            (
+                                session_name,
+                                alert_type,
+                                state,
+                                message,
+                                json.dumps(
+                                    {
+                                        "severity": severity,
+                                        "session_name": session_name,
+                                    }
+                                ),
+                                created_at,
+                                updated_at,
+                                closed_at,
+                            ),
+                        )
+                if self._table_exists("task_notifications"):
+                    has_execution_version = self._column_exists(
+                        self._conn, "task_notifications", "execution_version"
+                    )
+                    columns = (
+                        "session_name, task_id, project, notified_at, delivery_status, message, execution_version"
+                        if has_execution_version
+                        else "session_name, task_id, project, notified_at, delivery_status, message"
+                    )
+                    rows = self.execute(
+                        f"SELECT {columns} FROM task_notifications ORDER BY id"
+                    ).fetchall()
+                    for row in rows:
+                        session_name, task_id, project, notified_at, delivery_status, message, *rest = row
+                        execution_version = int(rest[0] or 0) if rest else 0
+                        self.execute(
+                            """
+                            INSERT INTO messages (
+                                scope, type, tier, recipient, sender, state,
+                                subject, body, payload_json, labels,
+                                created_at, updated_at
+                            )
+                            VALUES (?, 'task_notification', 'immediate', ?, ?, 'open', ?, ?, ?, '[]', ?, ?)
+                            """,
+                            (
+                                session_name,
+                                project,
+                                task_id,
+                                task_id,
+                                message,
+                                json.dumps(
+                                    {
+                                        "project": project,
+                                        "delivery_status": delivery_status,
+                                        "execution_version": execution_version,
+                                    }
+                                ),
+                                notified_at,
+                                notified_at,
+                            ),
+                        )
+                self._deduplicate_open_alert_messages()
+                self.execute(
+                    """CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_open_alert_unique
+                       ON messages(scope, sender)
+                       WHERE type = 'alert' AND state = 'open'"""
+                )
+                self.execute("DROP INDEX IF EXISTS idx_task_notifications_session_task_version")
+                self.execute("DROP INDEX IF EXISTS idx_task_notifications_recent")
+                self.execute("DROP INDEX IF EXISTS idx_task_notifications_session_task")
+                self.execute("DROP INDEX IF EXISTS idx_alerts_open")
+                self.execute("DROP INDEX IF EXISTS idx_events_session_type")
+                self.execute("DROP TABLE IF EXISTS task_notifications")
+                self.execute("DROP TABLE IF EXISTS alerts")
+                self.execute("DROP TABLE IF EXISTS events")
             self.execute(
                 "INSERT INTO schema_version (version, description, applied_at) VALUES (?, ?, ?)",
                 (version, description, datetime.now(UTC).isoformat()),
@@ -912,6 +1054,13 @@ class StateStore:
     def _column_exists(cursor, table: str, column: str) -> bool:
         cols = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})").fetchall()}
         return column in cols
+
+    def _table_exists(self, table: str) -> bool:
+        row = self.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name = ?",
+            (table,),
+        ).fetchone()
+        return row is not None
 
     def _safe_add_column(self, table: str, column: str, typedef: str) -> None:
         if not self._column_exists(self._conn, table, column):
@@ -971,11 +1120,11 @@ class StateStore:
             )
             self.execute(
                 f"""
-                UPDATE alerts
-                SET status = 'cleared', updated_at = ?
-                WHERE status = 'open' AND session_name NOT IN ({placeholders})
+                UPDATE messages
+                SET state = 'closed', closed_at = ?, updated_at = ?
+                WHERE type = 'alert' AND state = 'open' AND scope NOT IN ({placeholders})
                 """,
-                (now, *sorted(valid_session_names)),
+                (now, now, *sorted(valid_session_names)),
             )
             # M03 (#232): session-tier memory entries auto-purge when
             # their session ends. The supervisor's session-reconciliation
@@ -997,11 +1146,11 @@ class StateStore:
             self.execute("DELETE FROM leases")
             self.execute(
                 """
-                UPDATE alerts
-                SET status = 'cleared', updated_at = ?
-                WHERE status = 'open'
+                UPDATE messages
+                SET state = 'closed', closed_at = ?, updated_at = ?
+                WHERE type = 'alert' AND state = 'open'
                 """,
-                (now,),
+                (now, now),
             )
             # No live sessions ⇒ all session-tier memory is orphaned.
             self.execute(
@@ -1019,17 +1168,35 @@ class StateStore:
     def record_event(self, session_name: str, event_type: str, message: str) -> None:
         self.execute(
             """
-            INSERT INTO events (session_name, event_type, message, created_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO messages (
+                scope, type, tier, recipient, sender, state,
+                subject, body, payload_json, labels, created_at, updated_at
+            )
+            VALUES (?, 'event', 'immediate', '*', ?, 'open', ?, ?, ?, '[]', ?, ?)
             """,
-            (session_name, event_type, message, self._now()),
+            (
+                session_name,
+                event_type,
+                event_type,
+                message,
+                json.dumps(
+                    {
+                        "session_name": session_name,
+                        "event_type": event_type,
+                    }
+                ),
+                self._now(),
+                self._now(),
+            ),
         )
         self.commit()
 
     def last_event_at(self, session_name: str, event_type: str) -> str | None:
         """Return the ISO timestamp of the most recent event of this type, or None."""
         row = self.execute(
-            "SELECT created_at FROM events WHERE session_name = ? AND event_type = ? ORDER BY id DESC LIMIT 1",
+            "SELECT created_at FROM messages "
+            "WHERE type = 'event' AND scope = ? AND subject = ? "
+            "ORDER BY id DESC LIMIT 1",
             (session_name, event_type),
         ).fetchone()
         return row[0] if row else None
@@ -1037,40 +1204,41 @@ class StateStore:
     def last_heartbeat_at(self) -> str | None:
         """Return the ISO timestamp of the most recent heartbeat sweep, or None.
 
-        Reads from the unified ``messages`` table where heartbeat
-        events have landed since #349. The legacy ``events`` table
-        receives no new heartbeat rows post-migration, so reading it
-        returns the pre-migration timestamp and surfaces in the
-        cockpit as a permanent "Heartbeat offline (NNNm)" warning
-        even though heartbeat is ticking happily on the new table.
-
-        Falls back to the legacy table when the unified lookup finds
-        nothing — covers installs that haven't yet generated a
-        post-migration heartbeat event.
+        #411 retires the legacy ``events`` table, so this is now a
+        straight lookup against unified ``messages`` rows with
+        ``type='event'`` / ``subject='heartbeat'``.
         """
         row = self.execute(
             "SELECT created_at FROM messages "
-            "WHERE type = 'event' AND scope = 'heartbeat' AND subject = 'heartbeat' "
+            "WHERE type = 'event' AND subject = 'heartbeat' "
             "ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        if row:
-            return row[0]
-        row = self.execute(
-            "SELECT created_at FROM events WHERE event_type = 'heartbeat' ORDER BY id DESC LIMIT 1"
         ).fetchone()
         return row[0] if row else None
 
     def recent_events(self, limit: int = 20) -> list[EventRecord]:
         rows = self.execute(
             """
-            SELECT session_name, event_type, message, created_at
-            FROM events
-            ORDER BY id DESC
+            SELECT scope, subject, body, payload_json, created_at
+            FROM messages
+            WHERE type = 'event'
+            ORDER BY created_at DESC, id DESC
             LIMIT ?
             """,
             (limit,),
         ).fetchall()
-        return [EventRecord(*row) for row in rows]
+        return [
+            EventRecord(
+                session_name=str(row[0] or ""),
+                event_type=str(row[1] or ""),
+                message=_event_message(
+                    str(row[1] or ""),
+                    str(row[2] or ""),
+                    row[3] if isinstance(row[3], str) else None,
+                ),
+                created_at=str(row[4] or ""),
+            )
+            for row in rows
+        ]
 
     def prune_old_data(self, *, event_days: int = 7, heartbeat_hours: int = 24) -> dict[str, int]:
         """Remove old events and heartbeat observations. Returns counts of pruned rows."""
@@ -1079,7 +1247,10 @@ class StateStore:
         event_cutoff = (now - timedelta(days=event_days)).isoformat()
         heartbeat_cutoff = (now - timedelta(hours=heartbeat_hours)).isoformat()
         with self._lock:
-            e_cursor = self._conn.execute("DELETE FROM events WHERE created_at < ?", (event_cutoff,))
+            e_cursor = self._conn.execute(
+                "DELETE FROM messages WHERE type = 'event' AND created_at < ?",
+                (event_cutoff,),
+            )
             events_pruned = e_cursor.rowcount
             h_cursor = self._conn.execute("DELETE FROM heartbeats WHERE created_at < ?", (heartbeat_cutoff,))
             heartbeats_pruned = h_cursor.rowcount
@@ -1175,35 +1346,48 @@ class StateStore:
 
     def upsert_alert(self, session_name: str, alert_type: str, severity: str, message: str) -> None:
         now = self._now()
-        # Use INSERT OR IGNORE + UPDATE to avoid check-then-act race
         with self._lock:
             existing = self._conn.execute(
                 """
-                SELECT id, message, severity
-                FROM alerts
-                WHERE session_name = ? AND alert_type = ? AND status = 'open'
+                SELECT id
+                FROM messages
+                WHERE type = 'alert' AND scope = ? AND sender = ? AND state = 'open'
+                ORDER BY id DESC
+                LIMIT 1
                 """,
                 (session_name, alert_type),
             ).fetchone()
             if existing is None:
-                try:
-                    self._conn.execute(
-                        """
-                        INSERT INTO alerts (session_name, alert_type, severity, message, status, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, 'open', ?, ?)
-                        """,
-                        (session_name, alert_type, severity, message, now, now),
+                self._conn.execute(
+                    """
+                    INSERT INTO messages (
+                        scope, type, tier, recipient, sender, state,
+                        subject, body, payload_json, labels, created_at, updated_at, closed_at
                     )
-                except sqlite3.IntegrityError:
-                    pass  # Another process inserted first — that's fine
+                    VALUES (?, 'alert', 'immediate', 'user', ?, 'open', ?, '', ?, '[]', ?, ?, NULL)
+                    """,
+                    (
+                        session_name,
+                        alert_type,
+                        message,
+                        json.dumps({"severity": severity, "session_name": session_name}),
+                        now,
+                        now,
+                    ),
+                )
             else:
                 self._conn.execute(
                     """
-                    UPDATE alerts
-                    SET severity = ?, message = ?, updated_at = ?
+                    UPDATE messages
+                    SET subject = ?, body = '', payload_json = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (severity, message, now, existing[0]),
+                    (
+                        message,
+                        json.dumps({"severity": severity, "session_name": session_name}),
+                        now,
+                        existing[0],
+                    ),
                 )
             self._conn.commit()
             try:
@@ -1215,32 +1399,32 @@ class StateStore:
     def clear_alert(self, session_name: str, alert_type: str) -> None:
         self.execute(
             """
-            UPDATE alerts
-            SET status = 'cleared', updated_at = ?
-            WHERE session_name = ? AND alert_type = ? AND status = 'open'
+            UPDATE messages
+            SET state = 'closed', closed_at = ?, updated_at = ?
+            WHERE type = 'alert' AND scope = ? AND sender = ? AND state = 'open'
             """,
-            (self._now(), session_name, alert_type),
+            (self._now(), self._now(), session_name, alert_type),
         )
         self.commit()
 
     def open_alerts(self) -> list[AlertRecord]:
         rows = self.execute(
             """
-            SELECT id, session_name, alert_type, severity, message, status, created_at, updated_at
-            FROM alerts
-            WHERE status = 'open'
-            ORDER BY updated_at DESC
+            SELECT id, scope, sender, payload_json, state, subject, body, created_at, updated_at
+            FROM messages
+            WHERE type = 'alert' AND state = 'open'
+            ORDER BY updated_at DESC, id DESC
             """
         ).fetchall()
         return [
             AlertRecord(
-                session_name=row[1],
-                alert_type=row[2],
-                severity=row[3],
-                message=row[4],
-                status=row[5],
-                created_at=row[6],
-                updated_at=row[7],
+                session_name=str(row[1] or ""),
+                alert_type=str(row[2] or ""),
+                severity=str(_json_object(row[3] if isinstance(row[3], str) else None).get("severity") or ""),
+                message=_alert_message(str(row[5] or ""), str(row[6] or "")),
+                status=_alert_status(str(row[4] or "")),
+                created_at=str(row[7] or ""),
+                updated_at=str(row[8] or ""),
                 alert_id=int(row[0]),
             )
             for row in rows
@@ -1249,22 +1433,22 @@ class StateStore:
     def get_alert(self, alert_id: int) -> AlertRecord | None:
         row = self.execute(
             """
-            SELECT id, session_name, alert_type, severity, message, status, created_at, updated_at
-            FROM alerts
-            WHERE id = ?
+            SELECT id, scope, sender, payload_json, state, subject, body, created_at, updated_at
+            FROM messages
+            WHERE type = 'alert' AND id = ?
             """,
             (alert_id,),
         ).fetchone()
         if row is None:
             return None
         return AlertRecord(
-            session_name=row[1],
-            alert_type=row[2],
-            severity=row[3],
-            message=row[4],
-            status=row[5],
-            created_at=row[6],
-            updated_at=row[7],
+            session_name=str(row[1] or ""),
+            alert_type=str(row[2] or ""),
+            severity=str(_json_object(row[3] if isinstance(row[3], str) else None).get("severity") or ""),
+            message=_alert_message(str(row[5] or ""), str(row[6] or "")),
+            status=_alert_status(str(row[4] or "")),
+            created_at=str(row[7] or ""),
+            updated_at=str(row[8] or ""),
             alert_id=int(row[0]),
         )
 
@@ -1274,11 +1458,11 @@ class StateStore:
             return None
         self.execute(
             """
-            UPDATE alerts
-            SET status = 'cleared', updated_at = ?
-            WHERE id = ? AND status = 'open'
+            UPDATE messages
+            SET state = 'closed', closed_at = ?, updated_at = ?
+            WHERE type = 'alert' AND id = ? AND state = 'open'
             """,
-            (self._now(), alert_id),
+            (self._now(), self._now(), alert_id),
         )
         self.commit()
         return self.get_alert(alert_id)
@@ -1309,21 +1493,30 @@ class StateStore:
         correctly treats as a new ping opportunity instead of a
         duplicate within the 30-minute window.
         """
+        now = self._now()
         self.execute(
             """
-            INSERT INTO task_notifications
-                (session_name, task_id, project, notified_at,
-                 delivery_status, message, execution_version)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO messages (
+                scope, type, tier, recipient, sender, state,
+                subject, body, payload_json, labels, created_at, updated_at
+            )
+            VALUES (?, 'task_notification', 'immediate', ?, ?, 'open', ?, ?, ?, '[]', ?, ?)
             """,
             (
                 session_name,
-                task_id,
                 project,
-                self._now(),
-                delivery_status,
+                task_id,
+                task_id,
                 message,
-                int(execution_version),
+                json.dumps(
+                    {
+                        "project": project,
+                        "delivery_status": delivery_status,
+                        "execution_version": int(execution_version),
+                    }
+                ),
+                now,
+                now,
             ),
         )
         self.commit()
@@ -1344,26 +1537,30 @@ class StateStore:
         ``execution_version`` (#279) is matched exactly. A reject-bounce
         that advances the task's current node execution to a fresh
         ``visit`` yields a different version, so the dedupe returns
-        ``False`` and the retry ping gets through. Pre-#279 notification
-        rows back-fill to ``0`` via the column DEFAULT; events built
-        when the work service can't compute a visit also emit ``0``, so
-        identical-state pings still dedupe correctly across the
-        migration boundary.
+        ``False`` and the retry ping gets through. Legacy
+        ``task_notifications`` rows migrate into ``messages`` with
+        version ``0`` when the old column was absent, so identical-state
+        pings still dedupe correctly across the migration boundary.
         """
         from datetime import timedelta
         cutoff = (datetime.now(UTC) - timedelta(seconds=window_seconds)).isoformat()
-        row = self.execute(
+        rows = self.execute(
             """
-            SELECT 1 FROM task_notifications
-            WHERE session_name = ?
-              AND task_id = ?
-              AND execution_version = ?
-              AND notified_at >= ?
-            LIMIT 1
+            SELECT payload_json
+            FROM messages
+            WHERE type = 'task_notification'
+              AND scope = ?
+              AND sender = ?
+              AND created_at >= ?
+            ORDER BY id DESC
             """,
-            (session_name, task_id, int(execution_version), cutoff),
-        ).fetchone()
-        return row is not None
+            (session_name, task_id, cutoff),
+        ).fetchall()
+        for (payload_json,) in rows:
+            payload = _json_object(payload_json if isinstance(payload_json, str) else None)
+            if int(payload.get("execution_version") or 0) == int(execution_version):
+                return True
+        return False
 
     def recent_notifications(
         self,
@@ -1377,25 +1574,24 @@ class StateStore:
 
         Backs ``pm task pickup-log``. Filters compose (AND).
         """
-        clauses: list[str] = []
+        clauses: list[str] = ["type = 'task_notification'"]
         params: list[object] = []
         if since_seconds is not None:
             from datetime import timedelta
             cutoff = (datetime.now(UTC) - timedelta(seconds=since_seconds)).isoformat()
-            clauses.append("notified_at >= ?")
+            clauses.append("created_at >= ?")
             params.append(cutoff)
         if project is not None:
-            clauses.append("project = ?")
+            clauses.append("recipient = ?")
             params.append(project)
         if task_id is not None:
-            clauses.append("task_id = ?")
+            clauses.append("sender = ?")
             params.append(task_id)
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        where = " WHERE " + " AND ".join(clauses)
         sql = (
-            "SELECT session_name, task_id, project, notified_at, "
-            "delivery_status, message, execution_version "
-            "FROM task_notifications"
-            f"{where} ORDER BY notified_at DESC LIMIT ?"
+            "SELECT scope, sender, recipient, payload_json, body, created_at "
+            "FROM messages"
+            f"{where} ORDER BY created_at DESC, id DESC LIMIT ?"
         )
         params.append(int(limit))
         rows = self.execute(sql, tuple(params)).fetchall()
@@ -1404,10 +1600,12 @@ class StateStore:
                 "session_name": r[0],
                 "task_id": r[1],
                 "project": r[2],
-                "notified_at": r[3],
-                "delivery_status": r[4],
-                "message": r[5],
-                "execution_version": r[6] if len(r) > 6 else 0,
+                "notified_at": r[5],
+                "delivery_status": _json_object(r[3] if isinstance(r[3], str) else None).get("delivery_status", ""),
+                "message": r[4],
+                "execution_version": int(
+                    _json_object(r[3] if isinstance(r[3], str) else None).get("execution_version") or 0
+                ),
             }
             for r in rows
         ]

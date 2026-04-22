@@ -35,6 +35,7 @@ from sqlalchemy import (
     Table,
     Text,
     func,
+    text,
 )
 
 
@@ -98,10 +99,18 @@ messages = Table(
     ),
     Column("closed_at", DateTime(timezone=True), nullable=True),
     # Hot-path indexes: inbox list (recipient+state), firehose filter
-    # (type+tier), and per-scope recency scans.
+    # (type+tier), per-scope recency scans, and legacy alert upsert
+    # dedupe on open rows.
     Index("idx_messages_recipient_state", "recipient", "state"),
     Index("idx_messages_type_tier", "type", "tier"),
     Index("idx_messages_scope_created", "scope", "created_at"),
+    Index(
+        "idx_messages_open_alert_unique",
+        "scope",
+        "sender",
+        unique=True,
+        sqlite_where=text("type = 'alert' AND state = 'open'"),
+    ),
 )
 
 

@@ -32,6 +32,7 @@ from typing import Any, Iterator
 
 from sqlalchemy import Executable, MetaData, and_, delete, insert, select, text, update
 from sqlalchemy.engine import Connection, CursorResult, Engine
+from sqlalchemy.exc import IntegrityError
 
 from pollypm.store.engine import make_engines
 from pollypm.store.event_buffer import EventBuffer
@@ -155,10 +156,49 @@ class SQLAlchemyStore:
         ``checkfirst=True`` default, and the FTS DDL uses ``IF NOT EXISTS``
         guards, so re-running on an already-bootstrapped DB is a no-op.
         """
-        metadata.create_all(self._write_engine)
+        try:
+            metadata.create_all(self._write_engine)
+        except IntegrityError:
+            self._deduplicate_open_alert_messages()
+            metadata.create_all(self._write_engine)
         with self.transaction() as conn:
             for stmt in FTS_DDL_STATEMENTS:
                 conn.execute(text(stmt))
+
+    def _deduplicate_open_alert_messages(self) -> None:
+        """Close duplicate open alert rows before the unique index lands."""
+        with self.transaction() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT id, scope, sender
+                    FROM messages
+                    WHERE type = 'alert' AND state = 'open'
+                    ORDER BY id DESC
+                    """
+                )
+            ).fetchall()
+            keep: set[tuple[str, str]] = set()
+            duplicate_ids: list[int] = []
+            for row_id, scope, sender in rows:
+                key = (str(scope or ""), str(sender or ""))
+                if key in keep:
+                    duplicate_ids.append(int(row_id))
+                    continue
+                keep.add(key)
+            if not duplicate_ids:
+                return
+            now = datetime.now(timezone.utc)
+            for row_id in duplicate_ids:
+                conn.execute(
+                    update(messages)
+                    .where(messages.c.id == row_id)
+                    .values(
+                        state="closed",
+                        closed_at=now,
+                        updated_at=now,
+                    )
+                )
 
     # ------------------------------------------------------------------
     # Event log — firehose ('event' type) entries.

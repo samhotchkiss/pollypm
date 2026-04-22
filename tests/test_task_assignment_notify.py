@@ -513,23 +513,37 @@ def test_event_to_payload_round_trip():
 # ---------------------------------------------------------------------------
 
 
-def test_migration_creates_task_notifications(tmp_path):
+def test_fresh_db_retires_legacy_message_tables(tmp_path):
     store = StateStore(tmp_path / "state.db")
     try:
-        row = store.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='task_notifications'"
-        ).fetchone()
-        assert row is not None
-        # Indexes present
-        indexes = [
-            r[0] for r in store.execute(
-                "SELECT name FROM sqlite_master WHERE type='index' "
-                "AND tbl_name='task_notifications'"
+        tables = {
+            r[0]
+            for r in store.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name IN ('events', 'alerts', 'task_notifications')"
             ).fetchall()
-        ]
-        assert any("recent" in i for i in indexes)
-        assert any("session_task" in i for i in indexes)
-        # Round-trip a row.
+        }
+        assert tables == set()
+        indexes = {
+            r[0]
+            for r in store.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND name='idx_messages_open_alert_unique'"
+            ).fetchall()
+        }
+        assert indexes == {"idx_messages_open_alert_unique"}
+
+        store.record_event("worker-demo", "heartbeat", "tick")
+        events = store.recent_events(limit=5)
+        assert events and events[0].event_type == "heartbeat"
+        assert events[0].message == "tick"
+
+        store.upsert_alert("worker-demo", "idle_output", "warn", "No new output")
+        alerts = store.open_alerts()
+        assert len(alerts) == 1
+        assert alerts[0].alert_type == "idle_output"
+        assert alerts[0].message == "No new output"
+
         store.record_notification(
             session_name="worker-demo", task_id="demo/1",
             project="demo", message="hi", delivery_status="sent",
@@ -537,6 +551,101 @@ def test_migration_creates_task_notifications(tmp_path):
         assert store.was_notified_within("worker-demo", "demo/1", 60)
         rows = store.recent_notifications(limit=10)
         assert rows and rows[0]["session_name"] == "worker-demo"
+    finally:
+        store.close()
+
+
+def test_migration_moves_legacy_message_rows_into_messages_and_drops_tables(tmp_path):
+    import sqlite3
+
+    p = tmp_path / "legacy.db"
+    conn = sqlite3.connect(p)
+    conn.executescript(
+        """
+        CREATE TABLE schema_version (
+            version INTEGER NOT NULL,
+            description TEXT NOT NULL,
+            applied_at TEXT NOT NULL
+        );
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_name TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            message TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_name TEXT NOT NULL,
+            alert_type TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            message TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE task_notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_name TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            project TEXT NOT NULL DEFAULT '',
+            notified_at TEXT NOT NULL,
+            delivery_status TEXT NOT NULL DEFAULT 'sent',
+            message TEXT NOT NULL DEFAULT '',
+            execution_version INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO schema_version VALUES
+            (14, 'v14 baseline', '2026-01-01T00:00:00+00:00');
+        INSERT INTO events (session_name, event_type, message, created_at)
+        VALUES ('worker-legacy', 'heartbeat', 'legacy event', '2026-04-21T01:00:00+00:00');
+        INSERT INTO alerts
+            (session_name, alert_type, severity, message, status, created_at, updated_at)
+        VALUES
+            ('task_assignment', 'legacy_alert', 'warning', 'legacy alert',
+             'open', '2026-04-21T01:01:00+00:00', '2026-04-21T01:01:00+00:00');
+        INSERT INTO task_notifications
+            (session_name, task_id, project, notified_at, delivery_status, message, execution_version)
+        VALUES
+            ('worker-legacy', 'legacy/1', 'demo',
+             '2026-04-21T01:02:00+00:00', 'sent', 'legacy ping', 3);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = StateStore(p)
+    try:
+        tables = {
+            r[0]
+            for r in store.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name IN ('events', 'alerts', 'task_notifications')"
+            ).fetchall()
+        }
+        assert tables == set()
+
+        events = store.recent_events(limit=10)
+        assert events and events[0].session_name == "worker-legacy"
+        assert events[0].event_type == "heartbeat"
+        assert events[0].message == "legacy event"
+
+        alerts = store.open_alerts()
+        assert len(alerts) == 1
+        assert alerts[0].alert_type == "legacy_alert"
+        assert alerts[0].message == "legacy alert"
+
+        rows = store.recent_notifications(limit=10)
+        assert rows and rows[0]["session_name"] == "worker-legacy"
+        assert rows[0]["task_id"] == "legacy/1"
+        assert rows[0]["execution_version"] == 3
+        assert store.was_notified_within(
+            "worker-legacy", "legacy/1", 3650 * 24 * 3600, execution_version=3,
+        )
+
+        version = store.execute(
+            "SELECT MAX(version) FROM schema_version"
+        ).fetchone()[0]
+        assert version >= 15
     finally:
         store.close()
 
@@ -1338,29 +1447,17 @@ class TestRejectBounceDedupe:
         assert len(svc.sent) == 0
 
     def test_migration_adds_execution_version_column(self, tmp_path):
-        """Migration 12 adds ``execution_version`` with DEFAULT 0 and
-        creates the version-aware composite index. Fresh DBs get the
-        column from the migration runner; pre-#279 DBs back-fill
-        existing rows to ``0`` via the column DEFAULT."""
+        """Notification dedupe still keys on ``execution_version`` after #411."""
         store = StateStore(tmp_path / "state.db")
         try:
-            cols = {
-                r[1] for r in store.execute(
-                    "PRAGMA table_info(task_notifications)"
+            tables = {
+                r[0]
+                for r in store.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name='task_notifications'"
                 ).fetchall()
             }
-            assert "execution_version" in cols
-            indexes = [
-                r[0] for r in store.execute(
-                    "SELECT name FROM sqlite_master WHERE type='index' "
-                    "AND tbl_name='task_notifications'"
-                ).fetchall()
-            ]
-            assert any("session_task_version" in i for i in indexes), (
-                f"version-aware dedupe index missing: {indexes!r}"
-            )
-            # Round-trip with + without the column: both forms work,
-            # and default rows dedupe at version=0.
+            assert tables == set()
             store.record_notification(
                 session_name="worker-demo", task_id="demo/1",
                 project="demo", message="default", delivery_status="sent",
@@ -1387,10 +1484,7 @@ class TestRejectBounceDedupe:
             store.close()
 
     def test_migration_upgrades_pre_existing_v11_database(self, tmp_path):
-        """A database that existed before #279 (schema v11) with
-        ``task_notifications`` rows must upgrade cleanly to v12 — the
-        new column appears, existing rows back-fill to 0, and the old
-        dedupe behaviour survives for any still-pending ping."""
+        """A schema-v11 DB upgrades directly onto messages and drops the table."""
         import sqlite3
         p = tmp_path / "legacy.db"
         # Hand-build a v11-shaped DB (no execution_version column).
@@ -1428,27 +1522,33 @@ class TestRejectBounceDedupe:
         # place without losing data.
         store = StateStore(p)
         try:
-            cols = {
-                r[1] for r in store.execute(
-                    "PRAGMA table_info(task_notifications)"
+            tables = {
+                r[0]
+                for r in store.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name='task_notifications'"
                 ).fetchall()
             }
-            assert "execution_version" in cols, (
-                f"migration 12 did not add column: {cols!r}"
-            )
-            rows = store.execute(
-                "SELECT session_name, task_id, execution_version "
-                "FROM task_notifications"
-            ).fetchall()
-            assert rows == [("worker-legacy", "legacy/1", 0)], (
-                f"legacy row did not back-fill to version=0: {rows!r}"
+            assert tables == set()
+            rows = store.recent_notifications(limit=10)
+            assert rows == [
+                {
+                    "session_name": "worker-legacy",
+                    "task_id": "legacy/1",
+                    "project": "legacy",
+                    "notified_at": "2026-04-17T00:00:00+00:00",
+                    "delivery_status": "sent",
+                    "message": "legacy ping",
+                    "execution_version": 0,
+                }
+            ]
+            assert store.was_notified_within(
+                "worker-legacy", "legacy/1", 3650 * 24 * 3600, execution_version=0,
             )
             version = store.execute(
                 "SELECT MAX(version) FROM schema_version"
             ).fetchone()[0]
-            # The v11 fixture must upgrade through migration 12 and on
-            # to the current schema head.
-            assert version >= 12
+            assert version >= 15
         finally:
             store.close()
 

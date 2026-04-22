@@ -140,10 +140,11 @@ def _unfulfilled_pm_notify(tail: str, work_service: Any) -> bool:
 
     Best-effort: in v1 we simply check for the command-shaped text in
     the tail. If we see the intent and no corresponding
-    ``task_notifications`` row landed, we treat the turn-end as an
-    escalation attempt that the agent gave up on mid-flight. ``work_service``
-    is unused in v1 but the parameter stays so a v2 stricter match can
-    correlate on subject/body without changing callers.
+    task-assignment notification row landed in the unified messages
+    ledger, we treat the turn-end as an escalation attempt that the
+    agent gave up on mid-flight. ``work_service`` is unused in v1 but
+    the parameter stays so a v2 stricter match can correlate on
+    subject/body without changing callers.
     """
     _ = work_service
     lower = tail.lower()
@@ -165,7 +166,7 @@ def determine_worker_response(
     * Scan the last 2000 chars of the transcript for any phrase in
       ``_BLOCKER_PHRASES`` → blocking_question.
     * Otherwise, if the tail shows a ``pm notify`` / ``pm task block``
-      intent that has no matching row in ``task_notifications`` →
+      intent that has no matching task-assignment notification row →
       blocking_question.
     * Otherwise → reprompt.
 

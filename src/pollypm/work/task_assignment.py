@@ -51,8 +51,9 @@ class TaskAssignmentEvent:
       event rather than suppressing it inside the 30-min window.
       Defaults to ``0`` for environments that can't compute a visit
       (bare test doubles, pre-#279 rehydrated events) — pre-migration
-      dedupe semantics survive the default because existing
-      ``task_notifications`` rows back-fill to ``0`` as well.
+      dedupe semantics survive the default because legacy
+      task-assignment notification rows migrate into the unified
+      ledger with ``execution_version=0`` as well.
     """
 
     task_id: str

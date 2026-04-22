@@ -1,11 +1,15 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from pollypm.cockpit import build_cockpit_detail
 from pollypm.cockpit_rail import CockpitItem, CockpitPresence, CockpitRouter, PollyCockpitRail
+from pollypm.cockpit_ui import PollyCockpitApp, PollyDashboardApp, PollySettingsPaneApp, RailItem
 from pollypm.config import write_config
-from pollypm.cockpit_ui import PollyCockpitApp, PollySettingsPaneApp, RailItem
+from pollypm.dashboard_data import DashboardData, SessionActivity
 from pollypm.models import (
     AccountConfig,
     KnownProject,
@@ -16,6 +20,15 @@ from pollypm.models import (
     ProviderKind,
     SessionConfig,
 )
+from pollypm.recovery.base import SessionHealth
+
+
+class _CaptureWidget:
+    def __init__(self) -> None:
+        self.value = ""
+
+    def update(self, value: str) -> None:
+        self.value = value
 
 
 def test_cockpit_router_build_items_includes_core_entries(monkeypatch, tmp_path: Path) -> None:
@@ -76,6 +89,94 @@ def test_cockpit_router_build_items_includes_core_entries(monkeypatch, tmp_path:
     project_labels = [i.label for i in items if i.key.startswith("project:")]
     assert "Demo" in project_labels
     assert "PollyPM" in project_labels
+
+
+EXPECTED_SESSION_HEALTH_RENDER_STATES = [
+    SessionHealth.ACTIVE,
+    SessionHealth.IDLE,
+    SessionHealth.STUCK,
+    SessionHealth.LOOPING,
+    SessionHealth.EXITED,
+    SessionHealth.ERROR,
+    SessionHealth.BLOCKED_NO_CAPACITY,
+    SessionHealth.AUTH_BROKEN,
+    SessionHealth.WAITING_ON_USER,
+    SessionHealth.HEALTHY,
+    SessionHealth.STUCK_ON_TASK,
+    SessionHealth.SILENT_WORKER,
+    SessionHealth.STATE_DRIFT,
+]
+
+
+def _dashboard_snapshot(status: str) -> tuple[SimpleNamespace, DashboardData]:
+    config = SimpleNamespace(
+        projects={"demo": object()},
+        sessions={"worker_demo": object()},
+    )
+    data = DashboardData(
+        active_sessions=[
+            SessionActivity(
+                name="worker_demo",
+                role="worker",
+                project="demo",
+                project_label="Demo",
+                status=status,
+                description="worker is in this state",
+                age_seconds=125.0,
+            ),
+        ],
+        recent_commits=[],
+        completed_items=[],
+        recent_messages=[],
+        daily_tokens=[],
+        today_tokens=0,
+        total_tokens=0,
+        sweep_count_24h=0,
+        message_count_24h=0,
+        recovery_count_24h=0,
+        inbox_count=0,
+        alert_count=0,
+        briefing="",
+    )
+    return config, data
+
+
+@pytest.mark.parametrize("session_health", EXPECTED_SESSION_HEALTH_RENDER_STATES)
+def test_dashboard_now_panel_renders_each_session_health_state(
+    session_health: SessionHealth,
+    tmp_path: Path,
+) -> None:
+    app = PollyDashboardApp(tmp_path / "pollypm.toml")
+    app.header_w = _CaptureWidget()
+    app.now_body = _CaptureWidget()
+    app.messages_body = _CaptureWidget()
+    app.done_body = _CaptureWidget()
+    app.chart_body = _CaptureWidget()
+    app.footer_w = _CaptureWidget()
+
+    config, data = _dashboard_snapshot(session_health.value)
+    app._render_dashboard(config, data)
+
+    body = app.now_body.value
+    assert "Demo" in body
+
+    if session_health is SessionHealth.HEALTHY:
+        assert "[#3fb950]●[/#3fb950] [b]Demo[/b]" in body
+        assert "worker is in this state" in body
+        assert "[dim]2m ago[/dim]" in body
+        assert session_health.value not in body
+    elif session_health is SessionHealth.WAITING_ON_USER:
+        assert "[#f85149]◇[/#f85149] [b]Demo[/b]" in body
+        assert "[#f85149]worker is in this state[/#f85149]" in body
+        assert session_health.value not in body
+    else:
+        assert f"[dim]○[/dim] [dim]Demo[/dim]  [dim]{session_health.value}[/dim]" in body
+
+
+def test_dashboard_now_cases_cover_current_session_health_enum() -> None:
+    assert [state.value for state in EXPECTED_SESSION_HEALTH_RENDER_STATES] == [
+        state.value for state in SessionHealth
+    ]
 
 
 def test_cockpit_router_session_state_ignores_silent_alerts(tmp_path: Path) -> None:

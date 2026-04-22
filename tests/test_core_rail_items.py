@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from pollypm.cockpit_rail import CockpitRouter
 from pollypm.models import KnownProject, ProjectKind
 from pollypm.plugin_api.v1 import (
@@ -16,6 +18,7 @@ from pollypm.plugin_api.v1 import (
     RailRegistry,
 )
 from pollypm.plugin_host import ExtensionHost
+from pollypm.plugins_builtin.core_rail_items import plugin as core_rail_items_plugin
 
 
 def _write_config(tmp_path: Path) -> Path:
@@ -170,6 +173,18 @@ def test_removing_core_rail_items_yields_empty_rail(monkeypatch, tmp_path: Path)
     items = router.build_items(spinner_index=0)
     # Rail should be completely empty.
     assert items == []
+
+
+def test_core_rail_items_surfaces_router_errors_when_strict(monkeypatch, tmp_path: Path) -> None:
+    class ExplodingRouter:
+        def _session_state(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            raise RuntimeError("boom")
+
+    ctx = RailContext(extras={"router": ExplodingRouter()})
+    monkeypatch.setenv("POLLYPM_STRICT_RAIL_ERRORS", "1")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        core_rail_items_plugin._session_state(ctx, "operator")
 
 
 def test_third_party_plugin_registers_below_core(monkeypatch, tmp_path: Path) -> None:

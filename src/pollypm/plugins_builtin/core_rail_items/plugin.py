@@ -18,6 +18,7 @@ an in-line list.
 
 from __future__ import annotations
 
+import os
 import logging
 from typing import Any
 
@@ -29,6 +30,16 @@ from pollypm.plugin_api.v1 import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _strict_rail_errors_enabled() -> bool:
+    """Return ``True`` when rail render failures should surface in tests.
+
+    ``CI=1`` keeps the failure loud in automation, while the explicit
+    override gives local tests a way to opt in without changing the
+    broader environment.
+    """
+    return os.getenv("CI") == "1" or os.getenv("POLLYPM_STRICT_RAIL_ERRORS") == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +92,8 @@ def _session_state(ctx: RailContext, session_name: str) -> str:
         )
     except Exception:  # noqa: BLE001
         logger.exception("core_rail_items: _session_state(%s) raised", session_name)
+        if _strict_rail_errors_enabled():
+            raise
         return "idle"
 
 

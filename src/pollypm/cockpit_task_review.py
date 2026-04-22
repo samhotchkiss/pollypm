@@ -10,6 +10,7 @@ Contract:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,6 +27,7 @@ class ReviewArtifact:
     title: str
     summary: str
     sections: list[ReviewSection]
+    confidence: int | None = None
 
 
 _PLAN_REVIEW_DEFAULTS: tuple[tuple[str, str], ...] = (
@@ -34,12 +36,28 @@ _PLAN_REVIEW_DEFAULTS: tuple[tuple[str, str], ...] = (
     ("Planning Session Log", "docs/planning-session-log.md"),
 )
 
+_CONFIDENCE_PATTERN = re.compile(
+    r"(?im)\bconfidence\s*[:=-]?\s*(10|[0-9])\s*/\s*10\b"
+)
+
+
+def extract_confidence_score(text: str | None) -> int | None:
+    """Return an explicit 0-10 confidence score when one is present."""
+    if not text:
+        return None
+    match = _CONFIDENCE_PATTERN.search(text)
+    if match is None:
+        return None
+    score = int(match.group(1))
+    return score if 0 <= score <= 10 else None
+
 
 def load_task_review_artifact(task, project_path: Path | None) -> ReviewArtifact | None:
     """Load reviewable project artifacts for ``task`` if they exist."""
     if project_path is None:
         return None
     sections: list[ReviewSection] = []
+    confidence: int | None = None
     seen: set[Path] = set()
     for title, path in _candidate_review_paths(task, project_path):
         try:
@@ -54,6 +72,8 @@ def load_task_review_artifact(task, project_path: Path | None) -> ReviewArtifact
             continue
         if not body:
             continue
+        if confidence is None:
+            confidence = extract_confidence_score(body)
         sections.append(ReviewSection(title=title, path=path, body=body))
         seen.add(resolved)
     if not sections:
@@ -65,6 +85,7 @@ def load_task_review_artifact(task, project_path: Path | None) -> ReviewArtifact
         title="Review Artifact",
         summary=summary,
         sections=sections,
+        confidence=confidence,
     )
 
 
@@ -103,6 +124,7 @@ def _candidate_review_paths(
 __all__ = [
     "ReviewArtifact",
     "ReviewSection",
+    "extract_confidence_score",
     "load_task_review_artifact",
     "render_task_review_artifact",
 ]

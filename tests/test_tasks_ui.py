@@ -509,9 +509,10 @@ def test_task_review_tab_shows_resubmission_diff_and_confidence_chip(
                 task_id="demo/1",
                 node_id="critic_panel",
                 visit=2,
-                status=ExecutionStatus.ACTIVE,
+                status=ExecutionStatus.COMPLETED,
                 started_at=datetime(2026, 4, 20, 17, 22, tzinfo=UTC),
                 decision=Decision.REJECTED,
+                decision_reason="Confidence: 8/10 — tighten the review evidence",
             ),
         ],
         acceptance_criteria="Show the latest review evidence.",
@@ -530,13 +531,60 @@ def test_task_review_tab_shows_resubmission_diff_and_confidence_chip(
             await pilot.pause()
             review = str(app.query_one("#task-review", Static).render())
             confidence = str(app.query_one("#task-review-confidence-chip", Static).render())
+            toggle = app.query_one("#task-review-diff-toggle", Button)
             diff = str(app.query_one("#task-review-diff", Static).render())
 
             assert "Review Artifact" in review
-            assert "Reviewer confidence:" in confidence
+            assert "Russell: 8/10" in confidence
+            assert toggle.display
+            assert "last rejected attempt" in diff
+
+            await pilot.press("d")
+            await pilot.pause()
+            diff = str(app.query_one("#task-review-diff", Static).render())
+
+            assert "Diff Since Rejection: On" in str(toggle.label)
             assert "Resubmission Diff" in diff
             assert "-Summary: Implemented the feature" in diff
             assert "+Summary: Implemented the feature with review fixes" in diff
+
+    _run(body())
+
+
+def test_task_review_confidence_chip_requires_explicit_score(env, monkeypatch) -> None:
+    if not _load_config_compatible(env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_tasks import PollyTasksApp
+
+    review_task = _task(
+        node_id="critic_panel",
+        status=WorkStatus.REVIEW,
+        executions=[
+            FlowNodeExecution(
+                task_id="demo/1",
+                node_id="critic_panel",
+                visit=1,
+                status=ExecutionStatus.COMPLETED,
+                decision=Decision.APPROVED,
+                decision_reason="Looks good to me.",
+                completed_at=datetime(2026, 4, 20, 17, 22, tzinfo=UTC),
+            ),
+        ],
+    )
+    fake_svc = _FakeSvc(tasks_factory=lambda: [review_task], flow=_flow())
+
+    monkeypatch.setattr("pollypm.cockpit_tasks.create_tmux_client", lambda: _FakeTmux([]))
+
+    app = PollyTasksApp(env["config_path"], "demo")
+    app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            confidence = app.query_one("#task-review-confidence-chip", Static)
+
+            assert not confidence.display
+            assert str(confidence.render()) == ""
 
     _run(body())
 
@@ -711,28 +759,26 @@ def test_task_app_clears_rejection_feedback_after_inbox_open(env, monkeypatch) -
 
     _run(body())
 
-def test_task_bulk_approve_trivial_chores(env, monkeypatch) -> None:
+def test_task_bulk_selection_and_batch_review(env, monkeypatch) -> None:
     if not _load_config_compatible(env["config_path"]):
         pytest.skip("minimal pollypm.toml fixture not supported by loader")
     from pollypm.cockpit_tasks import PollyTasksApp
 
-    trivial = _task(
+    first = _task(
         node_id="critic_panel",
         status=WorkStatus.REVIEW,
-        title="Chore: tidy docs links",
-        labels=["chore"],
-        external_refs={},
+        title="Docs: tidy links",
     )
-    non_trivial = _task(
+    second = _task(
         task_number=2,
         node_id="critic_panel",
         status=WorkStatus.REVIEW,
-        title="Refactor task review pane",
-        acceptance_criteria="Keep the layout stable.",
+        title="Bump a dependency",
     )
-    fake_svc = _FakeSvc(tasks_factory=lambda: [trivial, non_trivial], flow=_flow())
+    fake_svc = _FakeSvc(tasks_factory=lambda: [first, second], flow=_flow())
 
     monkeypatch.setattr("pollypm.cockpit_tasks.create_tmux_client", lambda: _FakeTmux([]))
+    monkeypatch.setattr("pollypm.cockpit_tasks._PENDING_UNDO_SECONDS", 0.2)
 
     app = PollyTasksApp(env["config_path"], "demo")
     app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
@@ -740,18 +786,43 @@ def test_task_bulk_approve_trivial_chores(env, monkeypatch) -> None:
     async def body() -> None:
         async with app.run_test(size=(140, 50)) as pilot:
             await pilot.pause()
-            app._status_filter = "all"
-            app._sync_filter_buttons()
-            app._render_table(select_first=True)
+            await pilot.press("A")
             await pilot.pause()
-            bulk = app.query_one("#task-bulk-approve", Button)
-            assert not bulk.disabled
+            assert fake_svc.approve_calls == []
 
-            bulk.press()
+            await pilot.press("space")
             await pilot.pause()
+            table = app.query_one("#tasks-table", DataTable)
+            assert table.get_row_at(0)[0] == "◉ #1"
 
+            table.move_cursor(row=1, column=0, animate=False)
+            await pilot.pause()
+            await pilot.press("space")
+            await pilot.pause()
+            rows = _table_rows(table)
+            assert rows[0][0] == "◉ #1"
+            assert rows[1][0] == "◉ #2"
+
+            await pilot.press("A")
+            await pilot.pause()
+            banner = str(app.query_one("#tasks-banner", Static).render())
+            assert "Approve 2 tasks" in banner
+            assert fake_svc.approve_calls == []
+
+            await asyncio.sleep(0.3)
+            await pilot.pause()
             assert fake_svc.approve_calls == [
-                ("demo/1", "user", "Bulk-approved trivial chore"),
+                ("demo/1", "user", "Approved from task cockpit"),
+                ("demo/2", "user", "Approved from task cockpit"),
+            ]
+
+            await pilot.press("space")
+            await pilot.pause()
+            await pilot.press("X")
+            await asyncio.sleep(0.3)
+            await pilot.pause()
+            assert fake_svc.reject_calls == [
+                ("demo/2", "user", "Bulk rejected from task cockpit"),
             ]
 
     _run(body())

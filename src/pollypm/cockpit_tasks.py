@@ -21,6 +21,7 @@ from pollypm.cockpit_task_priority import (
     priority_rank,
 )
 from pollypm.cockpit_task_review import (
+    extract_confidence_score,
     load_task_review_artifact,
     render_task_review_artifact,
 )
@@ -59,8 +60,8 @@ _PENDING_UNDO_SECONDS = 5.0
 
 @dataclass(slots=True)
 class _PendingReviewAction:
-    task_id: str
-    task_number: int
+    task_ids: tuple[str, ...]
+    task_numbers: tuple[int, ...]
     decision: str
     reason: str | None
     deadline: float
@@ -178,63 +179,57 @@ def _render_review_submission_diff(task) -> str:
     return "\n".join(rendered)
 
 
-def _review_confidence_score(task, review_artifact) -> int:
+def _task_has_resubmission_diff(task) -> bool:
     submissions = _review_submission_executions(task)
-    score = 35
-    if review_artifact is not None:
-        score += 20
-        score += min(10, 2 * len(getattr(review_artifact, "sections", []) or []))
-    if submissions:
-        score += 15
-        latest = submissions[-1]
-        latest_output = getattr(latest, "work_output", None)
-        if latest_output is not None:
-            score += 10
-            score += min(10, 3 * len(getattr(latest_output, "artifacts", []) or []))
-    if getattr(task, "acceptance_criteria", None):
-        score += 5
-    if getattr(task, "constraints", None):
-        score += 5
-    if getattr(task, "relevant_files", None):
-        score += min(5, len(getattr(task, "relevant_files", []) or []))
-    if any(
+    if len(submissions) < 2:
+        return False
+    return any(
         getattr(getattr(execution, "decision", None), "value", None) == "rejected"
         for execution in getattr(task, "executions", None) or []
-    ):
-        score += 5
-    return max(0, min(score, 100))
+    )
 
 
-def _task_is_trivial_chore(task) -> bool:
-    status = getattr(getattr(task, "work_status", None), "value", None) or str(
-        getattr(task, "work_status", "") or ""
+def _review_confidence_score(task, review_artifact) -> int | None:
+    if review_artifact is not None and getattr(review_artifact, "confidence", None) is not None:
+        return int(review_artifact.confidence)
+    executions = list(getattr(task, "executions", None) or [])
+    executions.sort(
+        key=lambda execution: (
+            _timestamp_sort_value(
+                getattr(execution, "completed_at", None)
+                or getattr(execution, "started_at", None)
+            ),
+            int(getattr(execution, "visit", 0) or 0),
+        ),
+        reverse=True,
     )
-    if status != "review":
-        return False
-    title = (getattr(task, "title", "") or "").lower()
-    description = (getattr(task, "description", "") or "").lower()
-    labels = {str(label).lower() for label in getattr(task, "labels", []) or []}
-    haystack = " ".join([title, description, " ".join(sorted(labels))])
-    keyword_hits = any(
-        keyword in haystack
-        for keyword in (
-            "chore",
-            "cleanup",
-            "clean up",
-            "typo",
-            "docs",
-            "documentation",
-            "format",
-            "lint",
-            "rename",
-            "trivial",
-        )
-    )
-    if labels.intersection({"chore", "cleanup", "docs", "trivial"}):
-        return True
-    if keyword_hits and not getattr(task, "acceptance_criteria", None):
-        return True
-    return False
+    for execution in executions:
+        score = extract_confidence_score(getattr(execution, "decision_reason", None))
+        if score is not None:
+            return score
+        work_output = getattr(execution, "work_output", None)
+        if work_output is None:
+            continue
+        score = extract_confidence_score(getattr(work_output, "summary", None))
+        if score is not None:
+            return score
+        for artifact in getattr(work_output, "artifacts", []) or []:
+            score = extract_confidence_score(getattr(artifact, "description", None))
+            if score is not None:
+                return score
+    return None
+
+
+def _review_confidence_markup(score: int | None) -> str:
+    if score is None:
+        return ""
+    if score >= 8:
+        style = "black on #2f9e44"
+    elif score >= 5:
+        style = "black on #f4b942"
+    else:
+        style = "black on #d94841"
+    return f"[{style}] Russell: {score}/10 [/] "
 
 
 def _format_event_time(value) -> str:
@@ -702,6 +697,10 @@ class PollyTasksApp(App[None]):
         Binding("r", "refresh", "Refresh"),
         Binding("a", "approve_task", "Approve"),
         Binding("x", "reject_task", "Reject"),
+        Binding("space", "toggle_task_selection", "Select", show=False),
+        Binding("A", "bulk_approve_selected", "Approve Selected", show=False),
+        Binding("X", "bulk_reject_selected", "Reject Selected", show=False),
+        Binding("d", "toggle_resubmission_diff", "Review Diff", show=False),
         Binding("z", "undo_pending_review", "Undo", show=False),
         Binding("G", "resume_live_tail", "Resume Live", show=False),
         Binding("end", "resume_live_tail", "Resume Live", show=False),
@@ -866,6 +865,11 @@ class PollyTasksApp(App[None]):
         self.detail_overview = Static("", id="task-detail")
         self.detail_review = Static("", id="task-review")
         self.review_confidence = Static("", id="task-review-confidence-chip")
+        self.review_diff_toggle = Button(
+            "Diff Since Rejection: Off [D]",
+            id="task-review-diff-toggle",
+            variant="default",
+        )
         self.review_diff = Static("", id="task-review-diff")
         self.detail_context = Static("", id="task-context")
         self.detail_live = Static("", id="task-live")
@@ -880,7 +884,7 @@ class PollyTasksApp(App[None]):
         self.approve_button = Button("Approve", id="task-approve", variant="success")
         self.reject_button = Button("Reject", id="task-reject", variant="warning")
         self.bulk_approve_button = Button(
-            "Bulk Approve Trivial", id="task-bulk-approve", variant="success"
+            "Approve Selected", id="task-bulk-approve", variant="success"
         )
         self.refresh_live_button = Button("Refresh Live", id="task-refresh-live")
         self.live_tail_fill = Static("", id="task-live-header-fill")
@@ -891,6 +895,8 @@ class PollyTasksApp(App[None]):
         self._pending_countdown_timer = None
         self._live_tail_paused = False
         self._active_reject_modal: _TaskRejectReasonModal | None = None
+        self._selected_task_ids: set[str] = set()
+        self._show_resubmission_diff = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="tasks-root"):
@@ -923,6 +929,7 @@ class PollyTasksApp(App[None]):
                         with TabPane("Review", id="task-tab-review"):
                             with Vertical(id="task-review-panel"):
                                 yield self.review_confidence
+                                yield self.review_diff_toggle
                                 with VerticalScroll(id="task-review-scroll"):
                                     yield self.detail_review
                                     yield self.review_diff
@@ -1072,10 +1079,11 @@ class PollyTasksApp(App[None]):
                 if self._pending_review_action.decision == "approve"
                 else "Reject"
             )
-            banner = (
-                f"{verb} #{self._pending_review_action.task_number} "
-                f"— [Z] Undo ({seconds_left}s)"
-            )
+            if len(self._pending_review_action.task_numbers) == 1:
+                target = f"#{self._pending_review_action.task_numbers[0]}"
+            else:
+                target = f"{len(self._pending_review_action.task_numbers)} tasks"
+            banner = f"{verb} {target} — [Z] Undo ({seconds_left}s)"
         self.banner.update(banner)
         self.banner.display = bool(banner)
 
@@ -1085,7 +1093,10 @@ class PollyTasksApp(App[None]):
         self.detail_overview.update("")
         self.detail_review.update("")
         self.review_confidence.update("")
+        self.review_confidence.display = False
+        self.review_diff_toggle.display = False
         self.review_diff.update("")
+        self.review_diff.display = False
         self.detail_context.update("")
         self.detail_live.update("")
         self.timeline.clear()
@@ -1097,13 +1108,15 @@ class PollyTasksApp(App[None]):
 
     def _render_table(self, *, select_first: bool) -> None:
         visible = self._filtered_tasks()
+        visible_ids = {task.task_id for task in visible}
+        self._selected_task_ids.intersection_update(visible_ids)
         self.summary.update(self._summary_text(visible))
         self.status.update(
             f"Filter: {_FILTER_LABELS.get(self._status_filter, self._status_filter)}"
             + (
                 f"  ·  Search: {self._search_query}"
                 if self._search_query.strip()
-                else "  ·  / search · a approve · x reject"
+                else "  ·  / search · space select · a approve · x reject"
             )
         )
         self._sync_filter_chips()
@@ -1121,12 +1134,15 @@ class PollyTasksApp(App[None]):
             status = task.work_status.value
             title = f"{priority_glyph(task)} {task.title}"
             stage = task.current_node_id or "—"
+            task_number = f"#{task.task_number}"
+            if task.task_id in self._selected_task_ids:
+                task_number = f"◉ {task_number}"
             if feedback is not None:
                 status = f"{status} · feedback"
                 title = f"🔄 {title}"
                 stage = f"{stage} · Rejected"
             self.task_table.add_row(
-                f"#{task.task_number}",
+                task_number,
                 status,
                 title,
                 owner,
@@ -1144,10 +1160,23 @@ class PollyTasksApp(App[None]):
             0,
         )
         self.task_table.move_cursor(row=row_index, column=0, animate=False, scroll=True)
-        self.bulk_approve_button.disabled = not any(
-            _task_is_trivial_chore(task) for task in visible
+        selected_review_count = len(self._selected_review_task_ids(visible=visible))
+        self.bulk_approve_button.label = (
+            f"Approve Selected ({selected_review_count})"
+            if selected_review_count
+            else "Approve Selected"
         )
+        self.bulk_approve_button.disabled = selected_review_count == 0
         self._show_detail(target_id)
+
+    def _selected_review_task_ids(self, *, visible: list | None = None) -> list[str]:
+        tasks = visible if visible is not None else self._filtered_tasks()
+        return [
+            task.task_id
+            for task in tasks
+            if task.task_id in self._selected_task_ids
+            and getattr(getattr(task, "work_status", None), "value", None) == "review"
+        ]
 
     def _refresh_list(self, *, select_first: bool = False) -> None:
         self._tasks, self._owner_by_task_id, self._rejection_feedback_by_task_id = (
@@ -1226,15 +1255,43 @@ class PollyTasksApp(App[None]):
         in_review = task.work_status.value == "review"
         self.approve_button.disabled = not in_review
         self.reject_button.disabled = not in_review
-        self.bulk_approve_button.disabled = not any(
-            _task_is_trivial_chore(candidate) for candidate in self._filtered_tasks()
-        )
+        self.bulk_approve_button.disabled = len(self._selected_review_task_ids()) == 0
         self.refresh_live_button.disabled = active_session is None
         if active_session is None:
             self._set_live_tail_paused(False)
         self._sync_live_tail_indicator()
         if active_session is not None and not self._live_tail_paused:
             self.call_after_refresh(self._tail_live_scroll_to_end)
+
+    def _sync_review_panel(self, task, review_artifact) -> None:
+        self.detail_review.update(render_task_review_artifact(review_artifact))
+        score = _review_confidence_score(task, review_artifact)
+        if score is None:
+            self.review_confidence.update("")
+            self.review_confidence.display = False
+        else:
+            self.review_confidence.update(_review_confidence_markup(score))
+            self.review_confidence.display = True
+        diff_available = _task_has_resubmission_diff(task)
+        self.review_diff_toggle.display = diff_available
+        self.review_diff_toggle.disabled = not diff_available
+        if not diff_available:
+            self._show_resubmission_diff = False
+            self.review_diff.update("")
+            self.review_diff.display = False
+            return
+        self.review_diff_toggle.label = (
+            "Diff Since Rejection: On [D]"
+            if self._show_resubmission_diff
+            else "Diff Since Rejection: Off [D]"
+        )
+        if self._show_resubmission_diff:
+            self.review_diff.update(_render_review_submission_diff(task))
+        else:
+            self.review_diff.update(
+                "[dim]Press [D] to compare this submission against the last rejected attempt.[/dim]"
+            )
+        self.review_diff.display = True
 
     def _project_path(self) -> Path | None:
         try:
@@ -1282,17 +1339,14 @@ class PollyTasksApp(App[None]):
         review_artifact = load_task_review_artifact(task, self._project_path())
         if task_id != previous_task_id:
             self._set_live_tail_paused(False)
+            self._show_resubmission_diff = False
         self._render_selected_task(
             task,
             owner=owner,
             flow=flow,
             active_session=active_session,
         )
-        self.detail_review.update(render_task_review_artifact(review_artifact))
-        self.review_confidence.update(
-            f"Reviewer confidence: {_review_confidence_score(task, review_artifact)}/100"
-        )
-        self.review_diff.update(_render_review_submission_diff(task))
+        self._sync_review_panel(task, review_artifact)
         tabs = self.query_one("#task-tabs", TabbedContent)
         if task_id != previous_task_id:
             tabs.active = (
@@ -1368,16 +1422,16 @@ class PollyTasksApp(App[None]):
     def _start_pending_review_action(
         self,
         *,
-        task_id: str,
-        task_number: int,
+        task_ids: tuple[str, ...],
+        task_numbers: tuple[int, ...],
         decision: str,
         reason: str | None = None,
     ) -> None:
         if self._pending_review_action is not None:
             self._commit_pending_review_action()
         self._pending_review_action = _PendingReviewAction(
-            task_id=task_id,
-            task_number=task_number,
+            task_ids=task_ids,
+            task_numbers=task_numbers,
             decision=decision,
             reason=reason,
             deadline=monotonic() + _PENDING_UNDO_SECONDS,
@@ -1421,25 +1475,45 @@ class PollyTasksApp(App[None]):
             self.notify("Could not open project database.", severity="error")
             return
         try:
-            task = svc.get(pending.task_id)
-            if task.work_status.value != "review":
-                self.notify("Task is not in review state.", severity="warning")
-                return
-            if pending.decision == "approve":
-                approved = svc.approve(
-                    pending.task_id,
-                    "user",
-                    pending.reason or "Approved from task cockpit",
-                )
-                notify_task_approved(approved, notify=self.notify)
-                self._merge_task_pr(approved)
-            else:
-                svc.reject(
-                    pending.task_id,
-                    "user",
-                    pending.reason or "Rejected from task cockpit",
-                )
-                self.notify(f"Rejected {pending.task_id}", severity="information")
+            processed_ids: list[str] = []
+            approve_count = 0
+            reject_count = 0
+            for task_id in pending.task_ids:
+                task = svc.get(task_id)
+                if task.work_status.value != "review":
+                    self.notify(f"{task_id} is not in review state.", severity="warning")
+                    continue
+                if pending.decision == "approve":
+                    approved = svc.approve(
+                        task_id,
+                        "user",
+                        pending.reason or "Approved from task cockpit",
+                    )
+                    notify_task_approved(approved, notify=self.notify)
+                    self._merge_task_pr(approved)
+                    approve_count += 1
+                else:
+                    svc.reject(
+                        task_id,
+                        "user",
+                        pending.reason or "Rejected from task cockpit",
+                    )
+                    reject_count += 1
+                processed_ids.append(task_id)
+            if len(processed_ids) > 1:
+                if approve_count:
+                    self.notify(
+                        f"Approved {approve_count} selected task"
+                        + ("s" if approve_count != 1 else ""),
+                        severity="information",
+                    )
+                if reject_count:
+                    self.notify(
+                        f"Rejected {reject_count} selected task"
+                        + ("s" if reject_count != 1 else ""),
+                        severity="information",
+                    )
+            self._selected_task_ids.difference_update(processed_ids)
         except Exception as exc:  # noqa: BLE001
             action = "Approve" if pending.decision == "approve" else "Reject"
             self.notify(f"{action} failed: {exc}", severity="error")
@@ -1474,8 +1548,8 @@ class PollyTasksApp(App[None]):
             self.notify("Task is not in review state.", severity="warning")
             return
         self._start_pending_review_action(
-            task_id=task_id,
-            task_number=task.task_number,
+            task_ids=(task_id,),
+            task_numbers=(task.task_number,),
             decision=decision,
             reason=reason,
         )
@@ -1485,49 +1559,39 @@ class PollyTasksApp(App[None]):
             return
         self._review_task(self._selected_task_id, decision="approve")
 
-    def _approve_visible_trivial_tasks(self) -> int:
-        visible = [
+    def action_toggle_task_selection(self) -> None:
+        task_id = self._current_task_key()
+        if task_id is None:
+            return
+        if task_id in self._selected_task_ids:
+            self._selected_task_ids.remove(task_id)
+        else:
+            self._selected_task_ids.add(task_id)
+        self._render_table(select_first=False)
+
+    def _review_selected_tasks(self, *, decision: str, reason: str | None = None) -> None:
+        selected_tasks = [
             task
             for task in self._filtered_tasks()
-            if _task_is_trivial_chore(task)
+            if task.task_id in self._selected_task_ids and task.work_status.value == "review"
         ]
-        if not visible:
-            return 0
-        svc = self._get_svc()
-        if svc is None:
-            self.notify("Could not open project database.", severity="error")
-            return 0
-        approved = 0
-        try:
-            for task in visible:
-                current = svc.get(task.task_id)
-                if current.work_status.value != "review":
-                    continue
-                approved_task = svc.approve(
-                    task.task_id,
-                    "user",
-                    "Bulk-approved trivial chore",
-                )
-                approved += 1
-                self._merge_task_pr(approved_task)
-        except Exception as exc:  # noqa: BLE001
-            self.notify(f"Bulk approve failed: {exc}", severity="error")
-        finally:
-            try:
-                svc.close()
-            except Exception:  # noqa: BLE001
-                pass
-        if approved:
-            self.notify(
-                f"Approved {approved} trivial review task"
-                + ("s" if approved != 1 else ""),
-                severity="information",
-            )
-        try:
-            self._refresh_list(select_first=False)
-        except Exception:  # noqa: BLE001
-            pass
-        return approved
+        if not selected_tasks:
+            return
+        self._start_pending_review_action(
+            task_ids=tuple(task.task_id for task in selected_tasks),
+            task_numbers=tuple(task.task_number for task in selected_tasks),
+            decision=decision,
+            reason=reason,
+        )
+
+    def action_bulk_approve_selected(self) -> None:
+        self._review_selected_tasks(decision="approve")
+
+    def action_bulk_reject_selected(self) -> None:
+        self._review_selected_tasks(
+            decision="reject",
+            reason="Bulk rejected from task cockpit",
+        )
 
     def action_reject_task(self) -> None:
         if not self._selected_task_id:
@@ -1544,8 +1608,26 @@ class PollyTasksApp(App[None]):
 
         self.push_screen(modal, _after)
 
-    def action_bulk_approve_trivial(self) -> None:
-        self._approve_visible_trivial_tasks()
+    def action_toggle_resubmission_diff(self) -> None:
+        if not self._selected_task_id:
+            return
+        svc = self._get_svc()
+        if svc is None:
+            return
+        try:
+            task = svc.get(self._selected_task_id)
+            task.executions = svc.get_execution(self._selected_task_id)
+        except Exception:  # noqa: BLE001
+            return
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+        if not _task_has_resubmission_diff(task):
+            return
+        self._show_resubmission_diff = not self._show_resubmission_diff
+        self._show_detail(self._selected_task_id)
 
     @on(Input.Changed, "#tasks-search")
     def _on_search_changed(self, event: Input.Changed) -> None:
@@ -1616,7 +1698,11 @@ class PollyTasksApp(App[None]):
 
     @on(Button.Pressed, "#task-bulk-approve")
     def _on_press_bulk_approve(self) -> None:
-        self.action_bulk_approve_trivial()
+        self.action_bulk_approve_selected()
+
+    @on(Button.Pressed, "#task-review-diff-toggle")
+    def _on_press_review_diff_toggle(self) -> None:
+        self.action_toggle_resubmission_diff()
 
     @on(Button.Pressed, "#task-refresh-live")
     def _on_press_refresh_live(self) -> None:

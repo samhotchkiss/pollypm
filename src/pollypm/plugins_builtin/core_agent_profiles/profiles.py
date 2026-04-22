@@ -262,9 +262,9 @@ def reviewer_prompt() -> str:
         "4. Score each acceptance criterion individually (see <quality_bar>).\n"
         "5. Decide:\n"
         "   - All criteria ✓ and no blocking issues → `pm task approve "
-        "<id> --actor russell`.\n"
+        '<id> --actor russell --reason "Confidence: <0-10>/10 — <brief rationale>"`.\n'
         "   - Anything missing or wrong → `pm task reject <id> --actor "
-        'russell --reason "<specific reason>"`.\n'
+        'russell --reason "Confidence: <0-10>/10 — <specific reason>"`.\n'
         "</operating_loop>\n\n"
         "<quality_bar>\n"
         "Check every item. If ANY fails, reject.\n\n"

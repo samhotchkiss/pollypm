@@ -401,3 +401,77 @@ def test_write_config_splits_worker_sessions_into_project_local_files(tmp_path: 
     assert "worker_wire" in loaded.sessions
     assert loaded.sessions["worker_wire"].project == "wire"
     assert loaded.projects["wire"].persona_name == "Wren"
+
+
+def _minimal_config_text(*, release_channel_line: str = "") -> str:
+    """Minimal config TOML with a single account + operator session.
+
+    Used by the release_channel tests so they focus on parsing the
+    channel field without cross-referencing other config surfaces.
+    """
+    return (
+        "[project]\n"
+        'name = "pollypm"\n'
+        'tmux_session = "pollypm"\n'
+        "\n"
+        "[pollypm]\n"
+        'controller_account = "claude_primary"\n'
+        + (f"{release_channel_line}\n" if release_channel_line else "")
+        + "\n"
+        "[accounts.claude_primary]\n"
+        'provider = "claude"\n'
+        'home = ".pollypm/homes/claude_primary"\n'
+        "\n"
+        "[sessions.operator]\n"
+        'role = "operator-pm"\n'
+        'provider = "claude"\n'
+        'account = "claude_primary"\n'
+        'cwd = "."\n'
+        "\n"
+        "[projects.pollypm]\n"
+        'path = "."\n'
+        'name = "pollypm"\n'
+    )
+
+
+def test_release_channel_default_is_stable(tmp_path: Path) -> None:
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(_minimal_config_text())
+    config = load_config(config_path)
+    assert config.pollypm.release_channel == "stable"
+
+
+def test_release_channel_beta_round_trips(tmp_path: Path) -> None:
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        _minimal_config_text(release_channel_line='release_channel = "beta"')
+    )
+
+    config = load_config(config_path)
+    assert config.pollypm.release_channel == "beta"
+
+    out_path = tmp_path / "rewritten.toml"
+    write_config(config, out_path, force=True)
+    rendered = out_path.read_text()
+    assert 'release_channel = "beta"' in rendered
+    reloaded = load_config(out_path)
+    assert reloaded.pollypm.release_channel == "beta"
+
+
+def test_release_channel_invalid_falls_back_to_stable(
+    tmp_path: Path, caplog
+) -> None:
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        _minimal_config_text(release_channel_line='release_channel = "bogus"')
+    )
+    import logging as _logging
+
+    with caplog.at_level(_logging.WARNING, logger="pollypm.config"):
+        config = load_config(config_path)
+
+    assert config.pollypm.release_channel == "stable"
+    assert any(
+        "release_channel" in record.getMessage() and "bogus" in record.getMessage()
+        for record in caplog.records
+    )

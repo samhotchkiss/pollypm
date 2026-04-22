@@ -101,6 +101,7 @@ def register_maintenance_commands(app: typer.Typer) -> None:
             apply_fixes,
             manual_fixes,
             planned_fixes,
+            release_channel_line,
             render_fix_dry_run,
             render_fix_summary,
             render_human,
@@ -137,6 +138,7 @@ def register_maintenance_commands(app: typer.Typer) -> None:
                 typer.echo("")
             typer.echo(render_human(report))
             typer.echo("")
+            typer.echo(release_channel_line())
             typer.echo(setup_tag_line())
         if fix_summary:
             typer.echo("")

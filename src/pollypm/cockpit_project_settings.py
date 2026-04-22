@@ -21,10 +21,10 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Static
+from textual.widgets import Button, RadioButton, RadioSet, Static
 
 from pollypm.account_usage_sampler import load_cached_account_usage
-from pollypm.config import load_config
+from pollypm.config import load_config, write_config
 from pollypm.cockpit_settings_history import (
     UndoAction,
     consume_settings_history,
@@ -115,6 +115,18 @@ class PollyProjectSettingsApp(App[None]):
         with Vertical(classes="settings-section"):
             yield Static("Recent Tasks", classes="section-label")
             yield Static("", id="task-info")
+        with Vertical(classes="settings-section", id="release-channel-section"):
+            yield Static("Release channel", classes="section-label")
+            yield Static(
+                "Stable: Production builds. Recommended.\n"
+                "Beta: Pre-release builds. Faster features, occasional breakage.",
+                id="release-channel-explainer",
+            )
+            yield RadioSet(
+                RadioButton("Stable", id="release-channel-stable"),
+                RadioButton("Beta", id="release-channel-beta"),
+                id="release-channel-radio",
+            )
         with Horizontal(id="actions"):
             yield Button(Text("[R] Reset Session"), id="reset-session", variant="warning")
             yield Button(Text("[C] Switch to Claude"), id="switch-claude", variant="primary")
@@ -131,6 +143,9 @@ class PollyProjectSettingsApp(App[None]):
             self.title_bar.update(f"Project not found: {self.project_key}")
             return
         self.title_bar.update(f"{project.name or project.key} • Settings")
+        pollypm_settings = getattr(config, "pollypm", None)
+        current_channel = getattr(pollypm_settings, "release_channel", "stable")
+        self._sync_release_channel_radio(current_channel)
 
         worker = None
         for session in config.sessions.values():
@@ -306,6 +321,53 @@ class PollyProjectSettingsApp(App[None]):
     def _consume_undo_history(self, action: UndoAction) -> None:
         if action.entry_id:
             consume_settings_history(action.entry_id)
+
+    def _sync_release_channel_radio(self, channel: str) -> None:
+        """Mirror the on-disk channel into the radio picker.
+
+        The write-back handler short-circuits when the on-disk value
+        already matches the radio, so firing ``RadioSet.Changed`` during
+        sync is benign — no suppression plumbing needed.
+        """
+        try:
+            stable = self.query_one("#release-channel-stable", RadioButton)
+            beta = self.query_one("#release-channel-beta", RadioButton)
+        except Exception:  # noqa: BLE001
+            return
+        target = beta if channel == "beta" else stable
+        if target.value:
+            return
+        target.value = True
+
+    @on(RadioSet.Changed, "#release-channel-radio")
+    def on_release_channel_changed(self, event: RadioSet.Changed) -> None:
+        button = event.pressed
+        if button is None:
+            return
+        new_channel = "beta" if button.id == "release-channel-beta" else "stable"
+        try:
+            config = load_config(self.config_path)
+        except Exception as exc:  # noqa: BLE001
+            self._notify(f"Release channel update failed: {exc}")
+            return
+        current = getattr(getattr(config, "pollypm", None), "release_channel", "stable")
+        if current == new_channel:
+            return
+        config.pollypm.release_channel = new_channel
+        try:
+            write_config(config, self.config_path, force=True)
+        except Exception as exc:  # noqa: BLE001
+            self._notify(f"Release channel update failed: {exc}")
+            return
+        # Invalidate the cached release check so the next probe re-queries
+        # against the new channel. The cache module from #714 doesn't
+        # exist yet — unlink defensively.
+        cache_path = Path.home() / ".pollypm" / "release-check.json"
+        try:
+            cache_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self._notify(f"Release channel set to {new_channel}.")
 
     @on(Button.Pressed, "#reset-session")
     def on_reset(self, _event: Button.Pressed | None) -> None:

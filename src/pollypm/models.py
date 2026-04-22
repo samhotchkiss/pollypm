@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import Literal
 
 
 class ProviderKind(StrEnum):
@@ -82,6 +83,7 @@ class PollyPMSettings:
     scheduler_backend: str = "inline"
     lease_timeout_minutes: int = 30
     timezone: str = ""  # IANA timezone (e.g. "America/Denver"). Empty = auto-detect.
+    release_channel: Literal["stable", "beta"] = "stable"
 
 
 @dataclass(slots=True)

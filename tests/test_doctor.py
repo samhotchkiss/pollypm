@@ -800,3 +800,64 @@ def test_cli_doctor_all_pass_returns_zero(monkeypatch: pytest.MonkeyPatch) -> No
     result = runner.invoke(cli_mod.app, ["doctor"])
     assert result.exit_code == 0
     assert "Summary: 1/1" in result.stdout
+
+
+def test_release_channel_line_defaults_to_stable_without_config(tmp_path: Path) -> None:
+    missing = tmp_path / "does-not-exist.toml"
+    assert doctor.release_channel_line(missing) == "Release channel: stable"
+
+
+def test_release_channel_line_reads_configured_channel(tmp_path: Path) -> None:
+    from pollypm.config import load_config, write_config
+
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        "[project]\n"
+        'name = "pollypm"\n'
+        'tmux_session = "pollypm"\n'
+        "\n"
+        "[pollypm]\n"
+        'controller_account = "claude_primary"\n'
+        'release_channel = "beta"\n'
+        "\n"
+        "[accounts.claude_primary]\n"
+        'provider = "claude"\n'
+        'home = ".pollypm/homes/claude_primary"\n'
+        "\n"
+        "[sessions.operator]\n"
+        'role = "operator-pm"\n'
+        'provider = "claude"\n'
+        'account = "claude_primary"\n'
+        'cwd = "."\n'
+        "\n"
+        "[projects.pollypm]\n"
+        'path = "."\n'
+        'name = "pollypm"\n'
+    )
+    # Force a re-render through write_config so the rendered TOML matches
+    # what ``pm doctor`` would see after any on-disk mutation.
+    write_config(load_config(config_path), config_path, force=True)
+
+    assert doctor.release_channel_line(config_path) == "Release channel: beta"
+
+
+def test_cli_doctor_prints_release_channel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The human ``pm doctor`` output must contain a release-channel line."""
+    from pollypm import doctor as doctor_mod
+
+    def _pass() -> doctor_mod.CheckResult:
+        return doctor_mod._ok("ok")
+
+    monkeypatch.setattr(
+        doctor_mod, "_registered_checks",
+        lambda: [doctor_mod.Check("demo", _pass, "test")],
+    )
+    monkeypatch.setattr(
+        doctor_mod, "release_channel_line", lambda: "Release channel: beta"
+    )
+    import pollypm.cli as cli_mod
+
+    runner = CliRunner()
+    result = runner.invoke(cli_mod.app, ["doctor"])
+    assert result.exit_code == 0
+    assert "Release channel: beta" in result.stdout

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import tomllib
 from pathlib import Path
 
@@ -26,6 +27,27 @@ GLOBAL_CONFIG_DIR = Path.home() / ".pollypm"
 DEFAULT_CONFIG_PATH = GLOBAL_CONFIG_DIR / "pollypm.toml"
 PROJECT_CONFIG_DIRNAME = ".pollypm/config"
 PROJECT_CONFIG_FILENAME = "project.toml"
+
+_VALID_RELEASE_CHANNELS = ("stable", "beta")
+
+_log = logging.getLogger(__name__)
+
+
+def _validate_release_channel(value: object) -> str:
+    """Coerce a raw config value into one of the valid release channels.
+
+    Invariant: any unknown or non-string value falls back to ``"stable"``
+    with a warning — a fat-fingered channel must never brick the CLI.
+    See issue #713.
+    """
+    if isinstance(value, str) and value in _VALID_RELEASE_CHANNELS:
+        return value
+    if value is not None:
+        _log.warning(
+            "Invalid release_channel %r in pollypm.toml; falling back to 'stable'.",
+            value,
+        )
+    return "stable"
 
 
 def _normalize_project_display_name(key: str, name: str | None) -> str | None:
@@ -245,6 +267,7 @@ def _parse_pollypm_settings(raw: dict[str, object], sessions: dict[str, SessionC
         scheduler_backend=str(pollypm_raw.get("scheduler_backend", "inline")),
         lease_timeout_minutes=max(1, int(pollypm_raw.get("lease_timeout_minutes", 30))),
         timezone=_validate_timezone(str(pollypm_raw.get("timezone", ""))),
+        release_channel=_validate_release_channel(pollypm_raw.get("release_channel")),
     )
 
 
@@ -610,6 +633,7 @@ def _render_global_config(config: PollyPMConfig) -> str:
         f'heartbeat_backend = "{config.pollypm.heartbeat_backend}"',
         f'scheduler_backend = "{config.pollypm.scheduler_backend}"',
         f"lease_timeout_minutes = {config.pollypm.lease_timeout_minutes}",
+        f'release_channel = "{config.pollypm.release_channel}"',
     ]
     if config.pollypm.timezone:
         lines.append(f'timezone = "{config.pollypm.timezone}"')

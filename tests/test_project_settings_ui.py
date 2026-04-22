@@ -235,3 +235,99 @@ def test_project_settings_buttons_include_inline_key_hints(project_settings_env)
             assert app.query_one("#undo", Button).label.plain == "[U] Undo"
 
     _run(body())
+
+
+def test_project_settings_release_channel_picker_persists(tmp_path: Path, monkeypatch) -> None:
+    """Changing the Release channel radio writes the selection to config."""
+    from textual.widgets import RadioButton
+
+    from pollypm.config import load_config, write_config
+    from pollypm.models import (
+        AccountConfig,
+        KnownProject,
+        PollyPMConfig,
+        PollyPMSettings,
+        ProjectKind,
+        ProjectSettings,
+        ProviderKind,
+        SessionConfig,
+    )
+
+    # Build a minimal real config so ``load_config`` / ``write_config``
+    # round-trip exercises the actual parse path — this is the
+    # integration we care about for the picker.
+    config_path = tmp_path / "pollypm.toml"
+    base_dir = tmp_path
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            name="PollyPM",
+            root_dir=base_dir,
+            base_dir=base_dir,
+            logs_dir=base_dir / "logs",
+            snapshots_dir=base_dir / "snapshots",
+            state_db=base_dir / "state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="claude_primary"),
+        accounts={
+            "claude_primary": AccountConfig(
+                name="claude_primary",
+                provider=ProviderKind.CLAUDE,
+                home=base_dir / "homes" / "claude_primary",
+            )
+        },
+        sessions={
+            "operator": SessionConfig(
+                name="operator",
+                role="operator-pm",
+                provider=ProviderKind.CLAUDE,
+                account="claude_primary",
+                cwd=base_dir,
+            ),
+            "worker_alpha": SessionConfig(
+                name="worker_alpha",
+                role="worker",
+                provider=ProviderKind.CLAUDE,
+                account="claude_primary",
+                cwd=base_dir,
+                project="alpha",
+            ),
+        },
+        projects={
+            "alpha": KnownProject(
+                key="alpha",
+                path=base_dir,
+                name="Alpha",
+                kind=ProjectKind.FOLDER,
+            ),
+        },
+    )
+    write_config(config, config_path, force=True)
+    assert load_config(config_path).pollypm.release_channel == "stable"
+
+    # Point the cache-invalidation target at an isolated home so the
+    # unlink stays sandboxed.
+    fake_home = tmp_path / "home"
+    (fake_home / ".pollypm").mkdir(parents=True)
+    cache_path = fake_home / ".pollypm" / "release-check.json"
+    cache_path.write_text("{}")
+    monkeypatch.setattr(
+        "pollypm.cockpit_project_settings.Path.home",
+        lambda: fake_home,
+    )
+
+    from pollypm.cockpit_project_settings import PollyProjectSettingsApp
+
+    app = PollyProjectSettingsApp(config_path, "alpha")
+
+    async def body() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            beta = app.query_one("#release-channel-beta", RadioButton)
+            beta.value = True
+            await pilot.pause()
+
+    _run(body())
+
+    reloaded = load_config(config_path)
+    assert reloaded.pollypm.release_channel == "beta"
+    assert not cache_path.exists()

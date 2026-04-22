@@ -501,6 +501,26 @@ def setup_tag_line(config_path: Path | None = None) -> str:
     return f"pollypm setup: {tag} - share this if something looks off"
 
 
+def release_channel_line(config_path: Path | None = None) -> str:
+    """Return a single-line ``Release channel: <value>`` summary.
+
+    Falls back to the default channel when the config is missing or
+    unparseable — ``pm doctor`` must stay useful even before a first-run
+    user has written a config. See issue #713.
+    """
+    from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+
+    path = config_path or DEFAULT_CONFIG_PATH
+    channel = "stable"
+    if path.exists():
+        try:
+            config = load_config(path)
+            channel = config.pollypm.release_channel
+        except Exception:  # noqa: BLE001
+            channel = "stable"
+    return f"Release channel: {channel}"
+
+
 def decode_setup_tag(tag: str) -> dict[str, object] | None:
     for entry in _setup_tags_store():
         if entry.get("tag") == tag:

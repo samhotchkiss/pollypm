@@ -502,6 +502,7 @@ def _open_command_palette(app: App) -> None:
 
 
 _GLOBAL_HELP_BINDINGS: list[tuple[str, str]] = [
+    ("ctrl+k", "command palette"),
     (":", "command palette"),
     ("?", "this help"),
     ("ctrl+q", "quit"),
@@ -542,6 +543,7 @@ def _format_binding_keys(key_field: str) -> str:
             "end": "End",
             "tab": "Tab",
             "shift+tab": "Shift+Tab",
+            "ctrl+k": "Ctrl+K",
             "colon": ":",
             "slash": "/",
             "question_mark": "?",
@@ -576,7 +578,7 @@ def _collect_keybindings_for_screen(
         if not key_field:
             continue
         norm_keys = {key.strip() for key in key_field.split(",")}
-        if norm_keys & {"question_mark", "colon"}:
+        if norm_keys & {"question_mark", "colon", "ctrl+k"}:
             continue
         screen_rows.append(
             (_format_binding_keys(key_field), desc or "(no description)")

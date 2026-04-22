@@ -25,6 +25,7 @@ import resource
 from collections import deque
 from pathlib import Path
 import subprocess
+from typing import Callable
 
 # Raise FD limit early — the cockpit opens many subprocesses and file handles.
 try:
@@ -55,6 +56,7 @@ from pollypm.approval_notifications import notify_task_approved
 from pollypm.cockpit_formatting import format_event_time
 from pollypm.cockpit_formatting import format_relative_age as _format_relative_age
 from pollypm.models import ProviderKind
+from pollypm.account_usage_sampler import load_cached_account_usage
 from pollypm.tz import format_time as _fmt_time
 from pollypm.cockpit_activity import (
     PollyActivityFeedApp,
@@ -99,9 +101,12 @@ from pollypm.cockpit_palette import (
 )
 from pollypm.cockpit_project_settings import PollyProjectSettingsApp
 from pollypm.cockpit_sections.action_bar import render_project_action_bar
-from pollypm.cockpit_settings_accounts import (
-    SETTINGS_ACCOUNT_ACTIONS,
-    render_settings_account_detail,
+from pollypm.cockpit_settings_accounts import SETTINGS_ACCOUNT_ACTIONS
+from pollypm.cockpit_settings_history import (
+    UndoAction,
+    make_undo_action,
+    undo_expired,
+    undo_expires_text,
 )
 from pollypm.cockpit_settings_projects import collect_settings_projects
 from pollypm.cockpit_workers import PollyWorkerRosterApp
@@ -679,7 +684,7 @@ class PollyCockpitApp(App[None]):
         Binding("r", "refresh", "Refresh"),
         Binding("s", "open_settings", "Settings"),
         Binding("a", "view_alerts", "Alerts", show=False),
-        Binding("colon", "open_command_palette", "Palette", priority=True),
+        Binding("ctrl+k,colon", "open_command_palette", "Palette", priority=True),
         Binding(
             "question_mark",
             "show_keyboard_help",
@@ -2011,6 +2016,54 @@ def _humanize_bytes(n: int) -> str:
     return f"{n} B"
 
 
+def _budget_level(summary: str) -> str:
+    match = _re.search(r"(\d{1,3})\s*%", summary or "")
+    if not match:
+        lowered = (summary or "").lower()
+        if any(token in lowered for token in ("offline", "unavailable", "error")):
+            return "error"
+        return "unknown"
+    pct = int(match.group(1))
+    if pct <= 20:
+        return "error"
+    if pct <= 50:
+        return "warn"
+    return "ok"
+
+
+def _budget_fields_from_cached_usage(record: object | None) -> tuple[str, str, str]:
+    if record is None:
+        return ("budget unavailable", "unknown", "No cached usage yet.")
+    used_pct = getattr(record, "used_pct", None)
+    remaining_pct = getattr(record, "remaining_pct", None)
+    usage_summary = getattr(record, "usage_summary", "") or "usage unavailable"
+    if used_pct is not None and remaining_pct is not None:
+        budget_summary = f"{used_pct}% used / {remaining_pct}% left"
+    elif remaining_pct is not None:
+        budget_summary = f"{remaining_pct}% left"
+    else:
+        budget_summary = usage_summary
+    updated_at = getattr(record, "updated_at", "") or ""
+    if updated_at:
+        budget_summary = f"{budget_summary} · updated {updated_at}"
+    return (budget_summary, _budget_level(budget_summary), "Cached from account_usage")
+
+
+def _format_recent_task(task: object) -> str:
+    task_id = str(getattr(task, "task_id", ""))
+    title = str(getattr(task, "title", "") or "(untitled)")
+    project = str(getattr(task, "project", "") or "")
+    status_obj = getattr(task, "work_status", getattr(task, "status", ""))
+    status = getattr(status_obj, "value", status_obj)
+    bits = [f"[b]{_escape(task_id)}[/b]"]
+    if project:
+        bits.append(f"[dim]{_escape(project)}[/dim]")
+    if status:
+        bits.append(f"[dim]{_escape(str(status))}[/dim]")
+    bits.append(f"[dim]{_escape(title)}[/dim]")
+    return " · ".join(bits)
+
+
 class SettingsData:
     """Snapshot of everything the settings screen renders — gathered once."""
 
@@ -2045,6 +2098,67 @@ class SettingsData:
         self.inbox = inbox
         self.about = about
         self.errors = errors
+
+
+def _collect_recent_tasks_by_account(
+    config,
+    account_statuses: list,
+    *,
+    max_per_account: int = 3,
+) -> dict[str, list[dict[str, str]]]:
+    recent: dict[str, list[dict[str, str]]] = {
+        str(getattr(status, "key", "")): [] for status in account_statuses
+    }
+    projects = getattr(config, "projects", {}) or {}
+    for project_key, project in projects.items():
+        path = getattr(project, "path", None)
+        if path is None:
+            continue
+        project_path = Path(path)
+        if not project_path.exists():
+            continue
+        db_path = project_path / ".pollypm" / "state.db"
+        if not db_path.exists():
+            continue
+        try:
+            from pollypm.work.sqlite_service import SQLiteWorkService
+
+            with SQLiteWorkService(db_path=db_path, project_path=project_path) as svc:
+                for status in account_statuses:
+                    key = str(getattr(status, "key", ""))
+                    if not key:
+                        continue
+                    try:
+                        tasks = svc.list_tasks(assignee=key, limit=max_per_account)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    for task in tasks:
+                        recent[key].append(
+                            {
+                                "task_id": str(getattr(task, "task_id", "")),
+                                "project": str(getattr(task, "project", project_key) or project_key),
+                                "title": str(getattr(task, "title", "") or "(untitled)"),
+                                "work_status": getattr(
+                                    getattr(task, "work_status", None),
+                                    "value",
+                                    str(getattr(task, "work_status", "")),
+                                ),
+                                "updated_at": (
+                                    getattr(task, "updated_at", None).isoformat()
+                                    if hasattr(getattr(task, "updated_at", None), "isoformat")
+                                    else str(getattr(task, "updated_at", "") or "")
+                                ),
+                            }
+                        )
+        except Exception:  # noqa: BLE001
+            continue
+    for key, rows in recent.items():
+        rows.sort(
+            key=lambda row: (_iso_sort_weight(row["updated_at"]), row["task_id"]),
+            reverse=True,
+        )
+        recent[key] = rows[:max_per_account]
+    return recent
 
 
 def _gather_settings_data(
@@ -2086,6 +2200,10 @@ def _gather_settings_data(
         list(getattr(pp, "failover_accounts", []) or [])
         if pp is not None else []
     )
+    try:
+        cached_usages = load_cached_account_usage(config_path) if config is not None else {}
+    except Exception:  # noqa: BLE001
+        cached_usages = {}
     for idx, status in enumerate(account_statuses):
         provider = getattr(status, "provider", None)
         provider_name = (
@@ -2094,6 +2212,10 @@ def _gather_settings_data(
         home = getattr(status, "home", None)
         failover_pos = (
             (fo_list.index(status.key) + 1) if status.key in fo_list else None
+        )
+        usage_record = cached_usages.get(status.key)
+        budget_summary, budget_level, budget_rationale = _budget_fields_from_cached_usage(
+            usage_record,
         )
         accounts.append(
             {
@@ -2118,6 +2240,12 @@ def _gather_settings_data(
                 "access_expires_at": getattr(status, "access_expires_at", "") or "",
                 "isolation_status": getattr(status, "isolation_status", "") or "",
                 "auth_storage": getattr(status, "auth_storage", "") or "",
+                "budget_summary": budget_summary,
+                "budget_level": budget_level,
+                "rationale": (
+                    "Provider budgets come from the cached account_usage sampler so the UI stays offline-safe."
+                ),
+                "budget_rationale": budget_rationale,
                 "status_obj": status,
                 "index": idx,
             }
@@ -2129,6 +2257,22 @@ def _gather_settings_data(
             config,
             format_relative_age=_format_relative_age,
         )
+        for project in projects:
+            project.setdefault(
+                "rationale",
+                "Tracked projects stay visible in the cockpit and feed task counts.",
+            )
+
+    if config is not None and accounts:
+        recent_by_account = _collect_recent_tasks_by_account(
+            config,
+            account_statuses or [],
+        )
+        for account in accounts:
+            account["recent_tasks"] = recent_by_account.get(account["key"], [])
+    else:
+        for account in accounts:
+            account["recent_tasks"] = []
 
     heartbeat: list[tuple[str, str]] = []
     if pp is not None:
@@ -2295,6 +2439,10 @@ class PollySettingsPaneApp(App[None]):
     #settings-account-actions Button {
         margin-right: 1;
     }
+    #settings-account-actions-note {
+        color: #97a6b2;
+        content-align: left middle;
+    }
     #settings-reload-cockpit {
         min-width: 18;
     }
@@ -2337,6 +2485,15 @@ class PollySettingsPaneApp(App[None]):
         text-style: bold;
         padding-bottom: 1;
         height: 1;
+    }
+    #settings-preview {
+        height: auto;
+        min-height: 6;
+        color: #d6dee5;
+        background: #111820;
+        border: round #253140;
+        padding: 1;
+        margin-bottom: 1;
     }
     #settings-table-wrap {
         height: 1fr;
@@ -2386,22 +2543,31 @@ class PollySettingsPaneApp(App[None]):
         Binding("[", "section_prev", "Prev section", show=False),
         Binding("enter", "activate_row", "Open", show=False),
         Binding("slash", "start_search", "Search", show=False),
-        Binding("r,u", "refresh", "Refresh"),
+        Binding("ctrl+k,colon", "open_command_palette", "Palette", priority=True),
+        Binding("r", "refresh", "Refresh"),
         Binding("b", "toggle_permissions", "Permissions"),
+        Binding("c", "add_claude_account", "Add Claude", show=False),
+        Binding("o", "add_codex_account", "Add Codex", show=False),
+        Binding("x", "remove_account", "Remove account", show=False),
         Binding("t", "toggle_project_tracked", "Toggle project", show=False),
         Binding("m", "make_controller", "Controller", show=False),
         Binding("v", "toggle_failover", "Failover", show=False),
         Binding("a", "view_alerts", "Alerts", show=False),
+        Binding("u", "undo_recent_change", "Undo", show=False),
         Binding("question_mark", "show_keyboard_help", "Help", priority=True),
         Binding("q,escape", "back_or_cancel", "Back"),
     ]
+
+    def action_open_command_palette(self) -> None:
+        _open_command_palette(self)
 
     def action_show_keyboard_help(self) -> None:
         _open_keyboard_help(self)
 
     _DEFAULT_HINT = (
-        "j/k move \u00b7 Tab section \u00b7 / search \u00b7 R refresh \u00b7 "
-        "b permissions \u00b7 t toggle project \u00b7 q back"
+        "j/k move \u00b7 Tab section \u00b7 / search \u00b7 r refresh \u00b7 "
+        "b permissions \u00b7 c/o add account \u00b7 x remove \u00b7 "
+        "t project \u00b7 m controller \u00b7 v failover \u00b7 u undo \u00b7 q back"
     )
 
     def __init__(self, config_path: Path) -> None:
@@ -2414,6 +2580,7 @@ class PollySettingsPaneApp(App[None]):
         self.section_title = Static(
             "", id="settings-section-title", markup=True,
         )
+        self.preview = Static("", id="settings-preview", markup=True)
         self.accounts = DataTable(id="accounts")  # backwards-compat name
         self.projects_table = DataTable(id="projects-table")
         self.plugins_table = DataTable(id="plugins-table")
@@ -2437,6 +2604,7 @@ class PollySettingsPaneApp(App[None]):
         self._visible_plugin_rows: list[dict] = []
         self._nav_cursor: int = 0
         self._focus_target: str = "nav"  # nav | table
+        self._undo_action: UndoAction | None = None
 
     # ------------------------------------------------------------------
     # Layout
@@ -2459,6 +2627,7 @@ class PollySettingsPaneApp(App[None]):
                             id="settings-actions-note",
                         )
                     yield self.section_title
+                    yield self.preview
                     with Horizontal(id="settings-account-actions"):
                         for spec in SETTINGS_ACCOUNT_ACTIONS:
                             yield Button(
@@ -2466,6 +2635,10 @@ class PollySettingsPaneApp(App[None]):
                                 id=spec.button_id,
                                 variant=spec.variant,
                             )
+                        yield Static(
+                            "c/o add \u00b7 x remove \u00b7 u undo",
+                            id="settings-account-actions-note",
+                        )
                     with Vertical(id="settings-table-wrap"):
                         yield self.accounts
                         yield self.projects_table
@@ -2480,7 +2653,7 @@ class PollySettingsPaneApp(App[None]):
         self.accounts.cursor_type = "row"
         self.accounts.zebra_stripes = True
         self.accounts.add_columns(
-            "", "Key", "Email", "Provider", "Ctrl", "FO", "Usage",
+            "", "Key", "Email", "Provider", "Budget", "Ctrl", "FO", "Usage",
         )
         self.projects_table.cursor_type = "row"
         self.projects_table.zebra_stripes = True
@@ -2528,6 +2701,7 @@ class PollySettingsPaneApp(App[None]):
         self._render_topbar()
         self._render_nav()
         self._render_section(self._active_section)
+        self._render_preview(self._active_section)
 
     def _render_topbar(self) -> None:
         data = self.data
@@ -2581,6 +2755,113 @@ class PollySettingsPaneApp(App[None]):
         cnt = f"  [dim]{count}[/dim]" if count is not None else ""
         return f"{marker} {_escape(label)}{cnt}"
 
+    def _clear_expired_undo(self) -> None:
+        if undo_expired(self._undo_action):
+            self._undo_action = None
+
+    def _record_undo(self, label: str, apply: Callable[[], None]) -> None:
+        self._undo_action = make_undo_action(label, apply)
+
+    def _render_preview(self, key: str) -> None:
+        self._clear_expired_undo()
+        data = self.data
+        if data is None:
+            self.preview.update("")
+            return
+        if key == "accounts":
+            self.preview.update(self._account_preview_text())
+            return
+        if key == "projects":
+            self.preview.update(self._project_preview_text())
+            return
+        if key == "plugins":
+            self.preview.update(
+                "[b]Preview[/b]\n"
+                "[dim]Plugin state is read-only in settings. Loaded, degraded, and disabled entries are summarized here.[/dim]"
+            )
+            return
+        if key == "heartbeat":
+            self.preview.update(
+                "[b]Preview[/b]\n"
+                "[dim]Heartbeat controls controller leasing and background scheduling. These values are shown for quick audit before changing account or project defaults.[/dim]"
+            )
+            return
+        if key == "planner":
+            self.preview.update(
+                "[b]Preview[/b]\n"
+                "[dim]Planner settings determine when new projects get work automatically and whether the plan gate stays enforced.[/dim]"
+            )
+            return
+        if key == "inbox":
+            self.preview.update(
+                "[b]Preview[/b]\n"
+                "[dim]Inbox paths point at the shared state database and logs directory for this workspace.[/dim]"
+            )
+            return
+        if key == "about":
+            lines = [
+                "[b]Preview[/b]",
+                "[dim]About is a quick diff-free summary of the install and disk footprint.[/dim]",
+            ]
+            if self._undo_action is not None:
+                lines.append(
+                    f"[dim]Undo available for {_escape(self._undo_action.label)} "
+                    f"until {undo_expires_text(self._undo_action)}[/dim]"
+                )
+            self.preview.update("\n".join(lines))
+            return
+        self.preview.update("")
+
+    def _account_preview_text(self) -> str:
+        rows = self._visible_account_rows
+        if not rows:
+            return "[b]Preview[/b]\n[dim]No accounts match the current filter.[/dim]"
+        key = self._selected_account_key or self._current_accounts_key() or rows[0]["key"]
+        selected = next((a for a in rows if a["key"] == key), rows[0])
+        lines = [
+            "[b]Diff preview[/b]",
+            f"Current provider: [b]{_escape(selected['provider'])}[/b]",
+            f"Budget indicator: [b]{_escape(selected.get('budget_summary') or '-')}[/b] "
+            f"([dim]{selected.get('budget_level', 'unknown')}[/dim])",
+            f"Rationale: {_escape(selected.get('rationale') or 'No rationale available.')}",
+            f"[dim]Actions:[/] c add Claude · o add Codex · x remove selected",
+            "[dim]Keyboard:[/] b permissions · m controller · v failover · u undo",
+        ]
+        if self._undo_action is not None:
+            lines.append(
+                f"[dim]Undo available:[/] {_escape(self._undo_action.label)} "
+                f"until {undo_expires_text(self._undo_action)}"
+            )
+        recent = selected.get("recent_tasks") or []
+        if recent:
+            lines.append("[dim]Recent tasks:[/dim]")
+            for task in recent[:3]:
+                lines.append("  " + _format_recent_task(type("TaskPreview", (), task)()))
+        else:
+            lines.append("[dim]Recent tasks: none recorded for this account yet.[/dim]")
+        return "\n".join(lines)
+
+    def _project_preview_text(self) -> str:
+        rows = self._visible_project_rows
+        if not rows:
+            return "[b]Preview[/b]\n[dim]No projects match the current filter.[/dim]"
+        key = self._selected_project_key or self._current_projects_key() or rows[0]["key"]
+        selected = next((p for p in rows if p["key"] == key), rows[0])
+        current = "tracked" if selected["tracked"] else "paused"
+        next_state = "paused" if selected["tracked"] else "tracked"
+        lines = [
+            "[b]Diff preview[/b]",
+            f"Current status: [b]{current}[/b] -> [b]{next_state}[/b] via [b]t[/b]",
+            f"Rationale: {_escape(selected.get('rationale') or 'No rationale available.')}",
+            "[dim]Keyboard:[/] t toggle project · u undo",
+        ]
+        if self._undo_action is not None:
+            lines.append(
+                f"[dim]Undo available:[/] {_escape(self._undo_action.label)} "
+                f"until {undo_expires_text(self._undo_action)}"
+            )
+        return "\n".join(lines)
+
     # ------------------------------------------------------------------
     # Section switching / rendering
     # ------------------------------------------------------------------
@@ -2592,6 +2873,7 @@ class PollySettingsPaneApp(App[None]):
         self.search_input.value = ""
         self._render_nav()
         self._render_section(key)
+        self._render_preview(key)
 
     def _render_section(self, key: str) -> None:
         self.accounts.display = key == "accounts"
@@ -2599,7 +2881,10 @@ class PollySettingsPaneApp(App[None]):
         self.plugins_table.display = key == "plugins"
         self.kv_static.display = key in {"heartbeat", "planner", "inbox", "about"}
         self.detail.display = key in {"accounts", "projects", "plugins"}
-        self.query_one("#settings-account-actions").display = key == "accounts"
+        try:
+            self.query_one("#settings-account-actions").display = key == "accounts"
+        except Exception:  # noqa: BLE001
+            pass
 
         title_map = dict(_SETTINGS_SECTIONS)
         self.section_title.update(
@@ -2634,6 +2919,7 @@ class PollySettingsPaneApp(App[None]):
         elif key == "about":
             self._ensure_about_section_loaded()
             self._render_kv("About", data.about)
+        self._render_preview(key)
 
     def _ensure_about_section_loaded(self) -> None:
         data = self.data
@@ -2672,11 +2958,19 @@ class PollySettingsPaneApp(App[None]):
             dot, colour = _settings_status_dot(a["health"], a["logged_in"])
             fo_mark = f"#{a['failover_pos']}" if a["failover_pos"] else ""
             ctrl_mark = "\u2713" if a["is_controller"] else ""
+            budget_level = a.get("budget_level", "unknown")
+            budget_style = {
+                "ok": "#3ddc84",
+                "warn": "#f0c45a",
+                "error": "#ff5f6d",
+            }.get(budget_level, "#97a6b2")
+            budget_cell = Text(a.get("budget_summary") or "-", style=budget_style)
             self.accounts.add_row(
                 Text(dot, style=colour),
                 a["key"],
                 a["email"],
                 a["provider"],
+                budget_cell,
                 ctrl_mark,
                 fo_mark,
                 a["usage_summary"] or "-",
@@ -2710,15 +3004,66 @@ class PollySettingsPaneApp(App[None]):
         dot, colour = _settings_status_dot(
             selected["health"], selected["logged_in"],
         )
-        self.detail.update(
-            render_settings_account_detail(
-                {
-                    **selected,
-                    "status_dot": dot,
-                    "status_colour": colour,
-                }
+        sep = "[dim]" + "\u2500" * 40 + "[/dim]"
+        lines = [
+            f"[{colour}]{dot}[/{colour}] [b]{_escape(selected['key'])}[/b]"
+            f"  [dim]({_escape(selected['provider'])})[/dim]",
+            sep,
+            f"[dim]Email:[/dim]      {_escape(selected['email'])}",
+            f"[dim]Budget:[/dim]     {_escape(selected.get('budget_summary') or '-')}",
+            f"[dim]Logged in:[/dim]  {'yes' if selected['logged_in'] else 'no'}",
+            f"[dim]Health:[/dim]     {_escape(selected['health']) or '-'}",
+            f"[dim]Plan:[/dim]       {_escape(selected['plan']) or '-'}",
+            f"[dim]Usage:[/dim]      {_escape(selected['usage_summary']) or '-'}",
+            f"[dim]Remaining:[/dim]  "
+            f"{selected['remaining_pct']}%" if selected.get("remaining_pct") is not None
+            else "[dim]Remaining:[/dim]  -",
+            f"[dim]Used:[/dim]       "
+            f"{selected['used_pct']}%" if selected.get("used_pct") is not None
+            else "[dim]Used:[/dim]       -",
+            f"[dim]Window:[/dim]     {_escape(selected.get('period_label') or '-')}",
+            f"[dim]Resets:[/dim]     {_escape(selected.get('reset_at') or '-')}",
+            f"[dim]Sampled:[/dim]    {_escape(selected.get('usage_updated_at') or '-')}",
+            f"[dim]Controller:[/dim] {'yes' if selected['is_controller'] else 'no'}",
+            f"[dim]Failover:[/dim]   "
+            f"{'#' + str(selected['failover_pos']) if selected['failover_pos'] else 'no'}",
+            f"[dim]Home:[/dim]       {_escape(selected['home']) or '-'}",
+            f"[dim]Isolation:[/dim]  {_escape(selected['isolation_status']) or '-'}",
+            f"[dim]Storage:[/dim]    {_escape(selected['auth_storage']) or '-'}",
+            f"[dim]Budget note:[/dim] {_escape(selected.get('budget_rationale', 'Cached from account_usage'))}",
+        ]
+        if selected["available_at"]:
+            lines.append(
+                f"[dim]Available:[/dim]  {_escape(selected['available_at'])}"
             )
+        if selected["access_expires_at"]:
+            lines.append(
+                f"[dim]Expires:[/dim]    {_escape(selected['access_expires_at'])}"
+            )
+        if selected["reason"]:
+            lines.extend([sep, f"[dim]Reason:[/dim]     {_escape(selected['reason'])}"])
+        lines.extend(
+            [
+                sep,
+                f"[dim]Rationale:[/dim]  {_escape(selected.get('rationale') or 'No rationale available.')}",
+                f"[dim]Actions:[/dim]    c add Claude · o add Codex · x remove selected · u undo",
+            ]
         )
+        if selected["usage_raw_text"]:
+            snippet = selected["usage_raw_text"].strip().splitlines()[:6]
+            if snippet:
+                lines.append(sep)
+                lines.append("[dim]Latest usage snapshot:[/dim]")
+                lines.extend(f"  {_escape(line)}" for line in snippet)
+        recent = selected.get("recent_tasks") or []
+        lines.append(sep)
+        if recent:
+            lines.append("[dim]Recent tasks:[/dim]")
+            for task in recent[:3]:
+                lines.append("  " + _format_recent_task(type("TaskPreview", (), task)()))
+        else:
+            lines.append("[dim]Recent tasks: none recorded for this account yet.[/dim]")
+        self.detail.update("\n".join(lines))
 
     def _current_accounts_key(self) -> str | None:
         if self.accounts.row_count == 0 or self.accounts.cursor_row < 0:
@@ -2805,6 +3150,7 @@ class PollySettingsPaneApp(App[None]):
             f"[dim]Status:[/dim] {tracked_line}",
             f"[dim]Tasks:[/dim]  {selected.get('task_total_label', selected['task_total'])}",
             f"[dim]Last:[/dim]   {_escape(selected['last_activity']) or '-'}",
+            f"[dim]Rationale:[/dim] {_escape(selected.get('rationale') or 'No rationale available.')}",
         ]
         self.detail.update("\n".join(lines))
 
@@ -3003,8 +3349,13 @@ class PollySettingsPaneApp(App[None]):
     def action_toggle_permissions(self) -> None:
         try:
             config = load_config(self.config_path)
+            previous = bool(getattr(config.pollypm, "open_permissions_by_default", False))
             enabled = not config.pollypm.open_permissions_by_default
             self.service.set_open_permissions_default(enabled)
+            self._record_undo(
+                f"permissions {'on' if previous else 'off'}",
+                lambda: self.service.set_open_permissions_default(previous),
+            )
         except Exception as exc:  # noqa: BLE001
             try:
                 self.notify(
@@ -3042,7 +3393,12 @@ class PollySettingsPaneApp(App[None]):
             )
             if current is None:
                 return
+            previous = bool(current["tracked"])
             setter(key, not current["tracked"])
+            self._record_undo(
+                f"project {key} tracked {'on' if previous else 'off'}",
+                lambda: setter(key, previous),
+            )
         except Exception as exc:  # noqa: BLE001
             try:
                 self.notify(f"Toggle failed: {exc}", severity="error")
@@ -3061,7 +3417,14 @@ class PollySettingsPaneApp(App[None]):
         if setter is None:
             return
         try:
+            config = load_config(self.config_path)
+            previous = getattr(config.pollypm, "controller_account", "")
             setter(key)
+            if previous:
+                self._record_undo(
+                    f"controller {previous}",
+                    lambda: setter(previous),
+                )
         except Exception as exc:  # noqa: BLE001
             try:
                 self.notify(
@@ -3082,7 +3445,13 @@ class PollySettingsPaneApp(App[None]):
         if setter is None:
             return
         try:
+            config = load_config(self.config_path)
+            previous = key in (getattr(config.pollypm, "failover_accounts", []) or [])
             setter(key)
+            self._record_undo(
+                f"failover {key} {'on' if previous else 'off'}",
+                lambda: setter(key),
+            )
         except Exception as exc:  # noqa: BLE001
             try:
                 self.notify(
@@ -3129,6 +3498,9 @@ class PollySettingsPaneApp(App[None]):
         except Exception:  # noqa: BLE001
             pass
 
+    def action_remove_account(self) -> None:
+        self.action_remove_selected_account()
+
     def action_remove_selected_account(self) -> None:
         if self._active_section != "accounts":
             return
@@ -3147,6 +3519,27 @@ class PollySettingsPaneApp(App[None]):
             ),
             lambda confirmed: self._confirm_remove_account(key, confirmed),
         )
+
+    def action_undo_recent_change(self) -> None:
+        self._clear_expired_undo()
+        action = self._undo_action
+        if action is None:
+            try:
+                self.notify("Nothing recent to undo.", timeout=1.2)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        try:
+            action.apply()
+            self.notify(f"Undid {action.label}.", timeout=1.5)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.notify(f"Undo failed: {exc}", severity="error")
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            self._undo_action = None
+        self._refresh()
 
     def action_back_or_cancel(self) -> None:
         if self.search_input.has_class("-active"):
@@ -3219,6 +3612,7 @@ class PollySettingsPaneApp(App[None]):
             self._render_project_detail(self._visible_project_rows)
         elif self._active_section == "plugins":
             self._render_plugin_detail(self._visible_plugin_rows)
+        self._render_preview(self._active_section)
 
     @on(DataTable.RowHighlighted, "#accounts")
     def on_account_highlighted(
@@ -3262,15 +3656,21 @@ class PollySettingsPaneApp(App[None]):
     def on_account_selected(self, _event: DataTable.RowSelected) -> None:
         self._selected_account_key = self._current_accounts_key()
         if self.data is not None:
-            self._render_account_detail(self.data)
+            self._render_account_detail(self._visible_account_rows)
+            self._render_preview(self._active_section)
 
     def _add_account(self, provider: ProviderKind) -> None:
         adder = getattr(self.service, "add_account", None)
-        if adder is None:
+        remover = getattr(self.service, "remove_account", None)
+        if adder is None or remover is None:
             return
         try:
-            key, _email = adder(provider)
+            key, email = adder(provider)
             self._selected_account_key = key
+            self._record_undo(
+                f"add account {key}",
+                lambda: remover(key, delete_home=False),
+            )
         except Exception as exc:  # noqa: BLE001
             try:
                 self.notify(f"Add account failed: {exc}", severity="error")
@@ -3279,7 +3679,10 @@ class PollySettingsPaneApp(App[None]):
             return
         self._refresh()
         try:
-            self.notify(f"Added {provider.value} account {key}.", timeout=1.5)
+            self.notify(
+                f"Added {provider.value} account {key} ({email}).",
+                timeout=1.5,
+            )
         except Exception:  # noqa: BLE001
             pass
 
@@ -4266,7 +4669,7 @@ class PollyInboxApp(App[None]):
         # Refresh: ``u`` re-bound to filter, so refresh moves to ``ctrl+r``
         # (palette 'session.refresh' still works from any screen).
         Binding("ctrl+r", "refresh", "Refresh", show=False),
-        Binding("colon", "open_command_palette", "Palette", priority=True),
+        Binding("ctrl+k,colon", "open_command_palette", "Palette", priority=True),
         Binding("question_mark", "show_keyboard_help", "Help", priority=True),
         Binding("q,escape", "back_or_cancel", "Back"),
     ]
@@ -6924,7 +7327,7 @@ class PollyProjectDashboardApp(App[None]):
         Binding("G", "plan_scroll_bottom", "Bottom", show=False),
         Binding("u,r", "refresh", "Refresh", show=False),
         Binding("a", "view_alerts", "Alerts", show=False),
-        Binding("colon", "open_command_palette", "Palette", priority=True),
+        Binding("ctrl+k,colon", "open_command_palette", "Palette", priority=True),
         Binding("question_mark", "show_keyboard_help", "Help", priority=True),
         Binding("q,escape", "back", "Back"),
     ]

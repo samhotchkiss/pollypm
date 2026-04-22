@@ -1,9 +1,4 @@
-"""Focused tests for :class:`pollypm.cockpit_project_settings.PollyProjectSettingsApp`.
-
-The screen is intentionally kept small: it renders project worker/account
-state and can stop or retarget the worker session. These tests exercise
-the extracted module directly so the split stays behavior-identical.
-"""
+"""Focused tests for :class:`pollypm.cockpit_project_settings.PollyProjectSettingsApp`."""
 
 from __future__ import annotations
 
@@ -125,6 +120,9 @@ def test_project_settings_renders_worker_and_account(project_settings_env) -> No
             model_info = str(app.query_one("#model-info").render())
             assert "claude@example.com" in model_info
             assert "claude" in model_info
+            preview = str(app.query_one("#preview").render())
+            assert "Diff preview" in preview
+            assert "Undo" in preview or "undo" in preview.lower()
 
     _run(body())
 
@@ -142,5 +140,8 @@ def test_project_settings_reset_and_switch_provider(project_settings_env) -> Non
             app.on_switch_codex(None)
             assert service.switched == [("worker-alpha", "codex_main")]
             assert "Switched to codex" in str(app.query_one("#message").render())
+            app.action_undo_recent_change()
+            assert service.switched[-1] == ("worker-alpha", "claude_main")
+            assert "Undid" in str(app.query_one("#message").render())
 
     _run(body())

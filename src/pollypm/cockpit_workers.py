@@ -101,7 +101,7 @@ class PollyWorkerRosterApp(App[None]):
         Binding("a,A", "toggle_auto", "Auto-refresh"),
         Binding("enter", "jump_to_project", "Open"),
         Binding("d", "jump_to_worker", "Discuss"),
-        Binding("colon", "open_command_palette", "Palette", priority=True),
+        Binding("ctrl+k,colon", "open_command_palette", "Palette", priority=True),
         Binding("question_mark", "show_keyboard_help", "Help", priority=True),
         Binding("q,escape", "back", "Back"),
     ]

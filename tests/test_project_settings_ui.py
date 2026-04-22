@@ -45,6 +45,14 @@ class _FakeAccount:
         self.provider = provider
 
 
+class _FakeUsage:
+    def __init__(self, *, used_pct: int, remaining_pct: int, usage_summary: str, updated_at: str) -> None:
+        self.used_pct = used_pct
+        self.remaining_pct = remaining_pct
+        self.usage_summary = usage_summary
+        self.updated_at = updated_at
+
+
 class _FakeConfig:
     def __init__(self) -> None:
         self.projects = {"alpha": _FakeProject("alpha", name="Alpha Project")}
@@ -90,6 +98,23 @@ def project_settings_env(tmp_path: Path, monkeypatch):
         lambda _path: service,
     )
     monkeypatch.setattr(
+        "pollypm.cockpit_project_settings.load_cached_account_usage",
+        lambda _path: {
+            "claude_main": _FakeUsage(
+                used_pct=19,
+                remaining_pct=81,
+                usage_summary="81% left this week",
+                updated_at="2026-04-21T09:00:00+00:00",
+            ),
+            "codex_main": _FakeUsage(
+                used_pct=78,
+                remaining_pct=22,
+                usage_summary="22% left this week",
+                updated_at="2026-04-21T09:30:00+00:00",
+            ),
+        },
+    )
+    monkeypatch.setattr(
         "pollypm.cockpit_settings_history.Path.home",
         lambda: tmp_path / "home",
     )
@@ -128,7 +153,12 @@ def test_project_settings_renders_worker_and_account(project_settings_env) -> No
             assert "claude" in model_info
             preview = str(app.query_one("#preview").render())
             assert "Diff preview" in preview
-            assert "Undo" in preview or "undo" in preview.lower()
+            assert "Current budget" in preview
+            assert "19% used / 81% left" in preview
+            assert "Claude target" in preview
+            assert "22% left" in preview
+            assert "Codex target" in preview
+            assert "Default account" in preview
 
     _run(body())
 
@@ -160,6 +190,35 @@ def test_project_settings_reset_and_switch_provider(project_settings_env, monkey
             new_app.action_undo_recent_change()
             assert service.switched[-1] == ("worker-alpha", "claude_main")
             assert "Undid" in str(new_app.query_one("#message").render())
+
+    _run(body())
+
+
+def test_project_settings_preview_uses_latest_history_event(project_settings_env, monkeypatch, tmp_path: Path) -> None:
+    from pollypm.cockpit_settings_history import record_settings_history
+
+    monkeypatch.setattr(
+        "pollypm.cockpit_settings_history.Path.home",
+        lambda: tmp_path / "home",
+    )
+    record_settings_history(
+        "manual_switch",
+        "worker-alpha -> codex_main",
+        {
+            "session_name": "worker-alpha",
+            "from_account": "claude_main",
+            "to_account": "codex_main",
+        },
+    )
+
+    app = project_settings_env["app"]
+
+    async def body() -> None:
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            preview = str(app.query_one("#preview").render())
+            assert "Recent manual switch" in preview
+            assert "codex_main" in preview
 
     _run(body())
 

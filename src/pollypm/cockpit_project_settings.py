@@ -23,10 +23,12 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
+from pollypm.account_usage_sampler import load_cached_account_usage
 from pollypm.config import load_config
 from pollypm.cockpit_settings_history import (
     UndoAction,
     consume_settings_history,
+    history_rationale_for_account,
     latest_settings_history_entry,
     make_undo_action,
     record_settings_history,
@@ -204,14 +206,27 @@ class PollyProjectSettingsApp(App[None]):
         return "\n".join(lines)
 
     def _build_preview(self, worker, *, account_label: str) -> str:
+        current_budget = self._budget_summary_for_account(worker.account)
         lines = [
             "[b]Diff preview[/b]",
             f"Current: [b]{worker.provider.value}[/b] on {account_label}",
+            f"Current budget: [b]{current_budget}[/b]",
         ]
         claude = self._target_account_for(ProviderKind.CLAUDE)
         codex = self._target_account_for(ProviderKind.CODEX)
-        lines.append(f"Claude target: {claude or '[dim]none available[/dim]'}")
-        lines.append(f"Codex target: {codex or '[dim]none available[/dim]'}")
+        lines.append(
+            f"Claude target: {claude or '[dim]none available[/dim]'}"
+            f" · budget: [b]{self._budget_summary_for_account(claude)}[/b]"
+        )
+        lines.append(
+            f"Codex target: {codex or '[dim]none available[/dim]'}"
+            f" · budget: [b]{self._budget_summary_for_account(codex)}[/b]"
+        )
+        rationale = history_rationale_for_account(
+            worker.account,
+            default_account=worker.account,
+        )
+        lines.append(f"Rationale: {rationale}")
         lines.append("[dim]Press Enter or click a switch button to apply. U undoes the last reversible switch for 24h.[/dim]")
         return "\n".join(lines)
 
@@ -221,6 +236,30 @@ class PollyProjectSettingsApp(App[None]):
             if account.provider is target_provider:
                 return name
         return None
+
+    def _budget_summary_for_account(self, account_key: str | None) -> str:
+        if not account_key:
+            return "budget unavailable"
+        try:
+            cached = load_cached_account_usage(self.config_path)
+        except Exception:  # noqa: BLE001
+            cached = {}
+        record = cached.get(account_key)
+        if record is None:
+            return "budget unavailable"
+        used_pct = getattr(record, "used_pct", None)
+        remaining_pct = getattr(record, "remaining_pct", None)
+        usage_summary = getattr(record, "usage_summary", "") or "usage unavailable"
+        if used_pct is not None and remaining_pct is not None:
+            summary = f"{used_pct}% used / {remaining_pct}% left"
+        elif remaining_pct is not None:
+            summary = f"{remaining_pct}% left"
+        else:
+            summary = usage_summary
+        updated_at = getattr(record, "updated_at", "") or ""
+        if updated_at:
+            summary = f"{summary} · updated {updated_at}"
+        return summary
 
     def _record_undo(
         self,

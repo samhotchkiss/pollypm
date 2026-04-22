@@ -178,6 +178,7 @@ def history_rationale_for_account(
     *,
     entries: Sequence[SettingsHistoryEntry] | None = None,
     path: Path | None = None,
+    default_account: str | None = None,
 ) -> str | None:
     if not account_key:
         return None
@@ -185,22 +186,26 @@ def history_rationale_for_account(
     for entry in reversed(history):
         payload = entry.payload
         stamp = entry.created_at.astimezone(timezone.utc).strftime("%H:%M UTC")
-        if entry.kind == "session.switch":
-            to_account = str(payload.get("to_account") or "")
-            from_account = str(payload.get("from_account") or "")
+        if entry.kind in {"session.switch", "manual_switch"}:
+            to_account = str(payload.get("to_account") or payload.get("account") or "")
+            from_account = str(payload.get("from_account") or payload.get("previous_account") or "")
             session_name = str(payload.get("session_name") or "session")
             if account_key == to_account:
-                return f"Recent switch: {session_name} moved to {to_account} at {stamp}."
+                return f"Recent manual switch: {session_name} moved to {to_account} at {stamp}."
             if account_key == from_account:
-                return f"Recent switch: {session_name} moved away from {from_account} at {stamp}."
-        if entry.kind == "account.failover":
+                return f"Recent manual switch: {session_name} moved away from {from_account} at {stamp}."
+        if entry.kind in {"account.failover", "failover"}:
             if account_key == str(payload.get("account") or ""):
                 state = "enabled" if bool(payload.get("enabled")) else "disabled"
-                return f"Failover {state} for {account_key} at {stamp}."
-        if entry.kind == "account.controller":
+                return f"Recent failover {state} for {account_key} at {stamp}."
+        if entry.kind in {"account.controller", "default", "account.default"}:
             if account_key == str(payload.get("account") or ""):
-                return f"Controller account set to {account_key} at {stamp}."
-    return None
+                return f"Default account set to {account_key} at {stamp}."
+    if default_account:
+        if account_key == default_account:
+            return f"Default account from config: {default_account}."
+        return f"Default account from config: {default_account}."
+    return "No recent manual-switch or failover event recorded."
 
 
 def history_rationale_for_project(

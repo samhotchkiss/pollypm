@@ -604,14 +604,18 @@ def test_settings_data_uses_history_rationale(settings_env, monkeypatch, tmp_pat
     from pollypm.cockpit_settings_history import record_settings_history
 
     record_settings_history(
-        "account.failover",
-        "failover claude_demo on",
-        {"account": "claude_demo", "enabled": True},
+        "manual_switch",
+        "worker-alpha -> codex_demo",
+        {
+            "session_name": "worker-alpha",
+            "from_account": "claude_demo",
+            "to_account": "codex_demo",
+        },
     )
     record_settings_history(
-        "project.tracked",
-        "project alpha tracked off",
-        {"project_key": "alpha", "previous": True, "enabled": False},
+        "failover",
+        "failover claude_demo on",
+        {"account": "claude_demo", "enabled": True},
     )
 
     app = settings_env["app"]
@@ -619,10 +623,12 @@ def test_settings_data_uses_history_rationale(settings_env, monkeypatch, tmp_pat
     async def body() -> None:
         async with app.run_test(size=(140, 40)) as pilot:
             await pilot.pause()
-            account = next(a for a in app.data.accounts if a["key"] == "claude_demo")
-            assert "Failover enabled for claude_demo" in account["rationale"]
-            project = next(p for p in app.data.projects if p["key"] == "alpha")
-            assert "marked paused" in project["rationale"]
+            switched = next(a for a in app.data.accounts if a["key"] == "codex_demo")
+            assert "Recent manual switch" in switched["rationale"]
+            failed_over = next(a for a in app.data.accounts if a["key"] == "claude_demo")
+            assert "Recent failover enabled for claude_demo" in failed_over["rationale"]
+            defaulted = next(a for a in app.data.accounts if a["key"] == "claude_stale")
+            assert "Default account from config: claude_demo." in defaulted["rationale"]
 
     _run(body())
 

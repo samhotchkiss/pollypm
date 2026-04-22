@@ -2255,6 +2255,7 @@ def _gather_settings_data(
                 "rationale": history_rationale_for_account(
                     status.key,
                     entries=history,
+                    default_account=ctrl or None,
                 )
                 or (
                     "Provider budgets come from the cached account_usage sampler so the UI stays offline-safe."

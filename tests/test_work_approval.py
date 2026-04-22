@@ -139,5 +139,6 @@ def test_first_shipped_records_once_on_commit_approval(tmp_path: Path, monkeypat
         assert len(first_shipped_entries) == 1
         assert first_shipped_entries[0].summary == "First PR shipped with Polly 🎉"
         assert first_shipped_entries[0].payload["pinned"] is True
+        assert first_shipped_entries[0].pinned is True
     finally:
         reopened.close()

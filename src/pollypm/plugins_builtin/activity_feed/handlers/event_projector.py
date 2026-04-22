@@ -75,6 +75,7 @@ class FeedEntry:
     summary: str
     severity: str
     payload: dict[str, Any] = field(default_factory=dict)
+    pinned: bool = False
     source: str = "events"
 
     def as_dict(self) -> dict[str, Any]:
@@ -89,6 +90,7 @@ class FeedEntry:
             "summary": self.summary,
             "severity": self.severity,
             "payload": self.payload,
+            "pinned": self.pinned,
             "source": self.source,
         }
 
@@ -302,6 +304,7 @@ class EventProjector:
                     summary=summary,
                     severity=severity,
                     payload=payload if isinstance(payload, dict) else {},
+                    pinned=bool(payload.get("pinned")) if isinstance(payload, dict) else False,
                     source="events",
                 )
             )
@@ -367,6 +370,7 @@ class EventProjector:
                         "task_project": row["task_project"],
                         "task_number": row["task_number"],
                     },
+                    pinned=False,
                     source="work_transitions",
                 )
             )

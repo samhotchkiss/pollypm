@@ -50,6 +50,7 @@ def _insert_event_row(
     *,
     subject: str,
     created_at: datetime,
+    payload_json: str = "{}",
 ) -> int:
     """Insert one ``type='event'`` row with a caller-specified timestamp."""
     row = {
@@ -61,7 +62,7 @@ def _insert_event_row(
         "state": "open",
         "subject": subject,
         "body": "",
-        "payload_json": "{}",
+        "payload_json": payload_json,
         "labels": "[]",
         "created_at": created_at,
         "updated_at": created_at,
@@ -290,3 +291,25 @@ class TestRetentionSweepHandler:
         assert any(
             row.get("subject") == "events.retention_sweep" for row in audits
         )
+
+    def test_pinned_event_is_kept_even_when_older_than_retention(
+        self, store: SQLAlchemyStore, tmp_path: Path,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        _insert_event_row(
+            store,
+            subject="heartbeat",
+            created_at=now - timedelta(days=10),
+            payload_json='{"pinned": true, "kind": "first_shipped"}',
+        )
+
+        result = _run_handler(store, _StubConfig(tmp_path / "state.db"))
+
+        assert result["deleted_high_volume"] == 0
+        rows = store.query_messages(type="event")
+        pinned = [
+            row for row in rows
+            if row.get("subject") == "heartbeat"
+            and (row.get("payload") or {}).get("pinned") is True
+        ]
+        assert len(pinned) == 1

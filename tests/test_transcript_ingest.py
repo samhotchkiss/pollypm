@@ -363,6 +363,51 @@ def test_sync_transcripts_once_reads_live_append_without_fresh_rglob(monkeypatch
     assert [event["payload"]["text"] for event in events if event["event_type"] == "assistant_turn"] == ["First", "Second"]
 
 
+def test_sync_transcripts_once_skips_full_rescan_when_root_mtime_stable(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config, _config_path = _config(tmp_path)
+    claude_root = config.accounts["claude_main"].home / ".claude/projects/demo"
+    live_file = claude_root / "session-stable.jsonl"
+    live_file.parent.mkdir(parents=True, exist_ok=True)
+    live_file.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-04-10T00:00:00Z",
+                "type": "assistant",
+                "sessionId": "session-stable",
+                "cwd": str(config.project.root_dir),
+                "message": {"content": [{"type": "text", "text": "First"}], "usage": {"total_tokens": 1}},
+            }
+        )
+        + "\n"
+    )
+
+    sync_transcripts_once(config)
+    from pollypm import transcript_ingest as ingest
+
+    for cache in ingest._SOURCE_SCAN_CACHE.values():
+        cache.last_full_scan_at = time.time() - ingest.FULL_RESCAN_SECONDS - 5
+
+    full_scan_calls = 0
+    original_full_scan = ingest._full_scan_paths
+
+    def counting_full_scan(source, *, now):
+        nonlocal full_scan_calls
+        full_scan_calls += 1
+        return original_full_scan(source, now=now)
+
+    monkeypatch.setattr("pollypm.transcript_ingest._full_scan_paths", counting_full_scan)
+    sync_transcripts_once(config)
+
+    events = [
+        json.loads(line)
+        for line in (config.project.root_dir / ".pollypm/transcripts/session-stable/events.jsonl").read_text().splitlines()
+    ]
+    assert full_scan_calls == 0
+    assert [event["payload"]["text"] for event in events if event["event_type"] == "assistant_turn"] == ["First"]
+
+
 def test_service_load_supervisor_does_not_start_transcript_ingestion(monkeypatch, tmp_path: Path) -> None:
     _loaded_config, config_path = _config(tmp_path)
     calls: list[str] = []

@@ -261,6 +261,7 @@ class PollyActivityFeedApp(App[None]):
     def __init__(self, config_path: Path, *, project_key: str | None = None) -> None:
         super().__init__()
         self.config_path = config_path
+        self._config = None
         self._initial_project_filter = project_key or None
         self.topbar = Static("", id="af-topbar", markup=True)
         self.counters = Static("", id="af-counters", markup=True)
@@ -280,6 +281,11 @@ class PollyActivityFeedApp(App[None]):
         self._open_entry_id: str | None = None
         self._follow_on: bool = False
         self._follow_timer = None
+
+    def _load_config(self):
+        if self._config is None:
+            self._config = load_config(self.config_path)
+        return self._config
 
     def compose(self) -> ComposeResult:
         with Vertical(id="af-outer"):
@@ -311,7 +317,7 @@ class PollyActivityFeedApp(App[None]):
         from pollypm.cockpit import _gather_activity_feed
 
         try:
-            config = load_config(self.config_path)
+            config = self._load_config()
         except Exception:  # noqa: BLE001
             return []
         return _gather_activity_feed(
@@ -545,8 +551,9 @@ class PollyActivityFeedApp(App[None]):
 
     def action_pick_project(self) -> None:
         keys = sorted({entry.project or "" for entry in self._entries if entry.project})
+        ellipsis = " …" if len(keys) > 6 else ""
         hint = (
-            f"project: {', '.join(keys[:6])}{' \u2026' if len(keys) > 6 else ''}"
+            f"project: {', '.join(keys[:6])}{ellipsis}"
             if keys
             else "project: (no projects in current window)"
         )
@@ -554,8 +561,9 @@ class PollyActivityFeedApp(App[None]):
 
     def action_pick_type(self) -> None:
         kinds = sorted({entry.kind or "" for entry in self._entries if entry.kind})
+        ellipsis = " …" if len(kinds) > 6 else ""
         hint = (
-            f"type: {', '.join(kinds[:6])}{' \u2026' if len(kinds) > 6 else ''}"
+            f"type: {', '.join(kinds[:6])}{ellipsis}"
             if kinds
             else "type: (no event types in current window)"
         )

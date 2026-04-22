@@ -120,6 +120,7 @@ class CockpitPresence:
     _cached_attached: bool | None = None
     _cached_at: float = 0.0
     _cached_session: str | None = None
+    _heartbeat_states: dict[str, tuple[str | None, int]] = field(default_factory=dict)
 
     def _calm_mode(self) -> bool:
         value = os.environ.get("POLLY_CALM", "")
@@ -193,6 +194,25 @@ class CockpitPresence:
             return ARC_SPINNER[0]
         return ARC_SPINNER[spinner_index % len(ARC_SPINNER)]
 
+    def heartbeat_frame(self, spinner_index: int) -> str:
+        frames = ("♥", "♡")
+        if not self.should_animate():
+            return frames[0]
+        return frames[spinner_index % len(frames)]
+
+    def heartbeat_frame_for(
+        self,
+        session_name: str,
+        heartbeat_at: str | None,
+    ) -> str:
+        frames = ("♥", "♡")
+        if not self.should_animate():
+            return frames[0]
+        previous_at, frame_index = self._heartbeat_states.get(session_name, (None, 0))
+        if heartbeat_at and heartbeat_at != previous_at:
+            frame_index = (frame_index + 1) % len(frames)
+        self._heartbeat_states[session_name] = (heartbeat_at, frame_index)
+        return frames[frame_index]
 
 # ── Rail data model + router ─────────────────────────────────────────────
 #
@@ -209,6 +229,9 @@ class CockpitItem:
     label: str
     state: str
     selectable: bool = True
+    session_name: str | None = None
+    work_state: str | None = None
+    heartbeat_at: str | None = None
 
 
 def _selected_project_key(selected: object) -> str | None:
@@ -734,6 +757,7 @@ class CockpitRouter:
         collapsed_sections = self._collapsed_rail_sections_cached(config)
         grouped_registrations = self._grouped_rail_registrations(config, registry)
         grouped: dict[str, list[CockpitItem]] = {name: [] for name in RAIL_SECTIONS}
+        project_session_map = self._project_session_map(launches)
 
         for section, registrations in grouped_registrations.items():
             for reg in registrations:
@@ -746,6 +770,12 @@ class CockpitRouter:
                         label=row.label,
                         state=row.state,
                         selectable=row.selectable,
+                    )
+                    self._attach_session_metadata(
+                        item,
+                        launches=launches,
+                        supervisor=supervisor,
+                        project_session_map=project_session_map,
                     )
                     grouped.setdefault(section, []).append(item)
 
@@ -770,6 +800,55 @@ class CockpitRouter:
             items.extend(rows)
 
         return items
+
+    def _attach_session_metadata(
+        self,
+        item: CockpitItem,
+        *,
+        launches,
+        supervisor,
+        project_session_map: dict[str, str],
+    ) -> None:
+        session_name = self._session_name_for_item(item, project_session_map)
+        if session_name is None:
+            return
+        item.session_name = session_name
+        launch = next((entry for entry in launches if entry.session.name == session_name), None)
+        if launch is None:
+            return
+        item.work_state = self._work_state_for_item_state(item.state, launch.session.role)
+        try:
+            heartbeat = supervisor.store.latest_heartbeat(session_name)
+        except Exception:  # noqa: BLE001
+            heartbeat = None
+        item.heartbeat_at = getattr(heartbeat, "created_at", None)
+
+    def _session_name_for_item(
+        self,
+        item: CockpitItem,
+        project_session_map: dict[str, str],
+    ) -> str | None:
+        if item.key == "polly":
+            return "operator"
+        if item.key == "russell":
+            return "reviewer"
+        if not item.key.startswith("project:") or item.key.count(":") != 1:
+            return None
+        project_key = item.key.split(":", 1)[1]
+        return project_session_map.get(project_key)
+
+    def _work_state_for_item_state(self, state: str, role: str) -> str | None:
+        if state == "dead":
+            return "exited"
+        if state.startswith("!"):
+            return "stuck"
+        if state.endswith("working"):
+            return "writing"
+        if role == "reviewer":
+            return "reviewing"
+        if state.endswith("live") or state in {"idle", "ready"}:
+            return "idle"
+        return None
 
     def _rail_registry(self):
         """Return the plugin-host rail registry for the active root dir."""
@@ -1861,7 +1940,8 @@ class PollyCockpitRail:
         # Build the text with gutter (2-char prefix for alignment)
         bar = "\u258c " if is_selected else "  "
         label = item.label
-        max_label = width - 6  # 2 bar + 1 indicator + 1 space + 2 margin
+        indicator_width = max(1, len(indicator))
+        max_label = width - (5 + indicator_width)
         if len(label) > max_label and max_label > 3:
             label = label[: max_label - 1] + "\u2026"
         text = f" {bar}{indicator} {label}"
@@ -1910,6 +1990,13 @@ class PollyCockpitRail:
         return row
 
     def _indicator(self, item: CockpitItem) -> tuple[str, _C | None]:
+        if item.session_name and item.work_state:
+            pulse = self.presence.heartbeat_frame_for(
+                item.session_name,
+                item.heartbeat_at,
+            )
+            work_glyph, color = self._session_work_glyph(item.work_state)
+            return f"{pulse}{work_glyph}", color
         # State-based indicators first (apply to any item type including projects)
         if item.state.endswith("working"):
             char = self.presence.working_frame(self.spinner_index)
@@ -1939,6 +2026,17 @@ class PollyCockpitRail:
         if item.state == "sub":
             return " ", None
         return "\u25cb", PALETTE["idle"]
+
+    def _session_work_glyph(self, work_state: str) -> tuple[str, _C | None]:
+        if work_state == "writing":
+            return self.presence.working_frame(self.spinner_index), PALETTE["live_indicator"]
+        if work_state == "reviewing":
+            return "✎", PALETTE["live_indicator"]
+        if work_state == "stuck":
+            return "⚠", PALETTE["alert_indicator"]
+        if work_state == "exited":
+            return "✕", PALETTE["dead"]
+        return "·", PALETTE["idle"]
 
     def _write(self, text: str) -> None:
         sys.stdout.write(text)

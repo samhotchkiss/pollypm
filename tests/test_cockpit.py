@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from pollypm.cockpit import build_cockpit_detail
-from pollypm.cockpit_rail import CockpitPresence, CockpitRouter
+from pollypm.cockpit_rail import CockpitItem, CockpitPresence, CockpitRouter, PollyCockpitRail
 from pollypm.config import write_config
 from pollypm.cockpit_ui import PollyCockpitApp, PollySettingsPaneApp
 from pollypm.models import (
@@ -207,6 +207,83 @@ def test_cockpit_presence_calm_mode_disables_animation(monkeypatch) -> None:
 
     assert presence.should_animate() is False
     assert presence.working_frame(3) == "◜"
+
+
+def test_cockpit_presence_heartbeat_frame_advances_only_on_new_heartbeat() -> None:
+    class _FakeTmux:
+        def current_session_name(self) -> str | None:
+            return "pollypm"
+
+        def list_clients(self, session_name: str) -> str:
+            del session_name
+            return "client"
+
+    presence = CockpitPresence(_FakeTmux())
+
+    first = presence.heartbeat_frame_for("worker_demo", "2026-04-21T23:00:00+00:00")
+    second = presence.heartbeat_frame_for("worker_demo", "2026-04-21T23:00:00+00:00")
+    third = presence.heartbeat_frame_for("worker_demo", "2026-04-21T23:05:00+00:00")
+
+    assert first == "♡"
+    assert second == "♡"
+    assert third == "♥"
+
+
+def test_cockpit_rail_session_indicator_combines_pulse_and_work_glyph(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+
+    class _FakeTmux:
+        def current_session_name(self) -> str | None:
+            return "pollypm"
+
+        def list_clients(self, session_name: str) -> str:
+            del session_name
+            return "client"
+
+    rail = PollyCockpitRail(config_path)
+    rail.router.tmux = _FakeTmux()  # type: ignore[assignment]
+    rail.presence = CockpitPresence(_FakeTmux())
+
+    writing = CockpitItem(
+        "project:demo",
+        "Demo",
+        "◜ working",
+        session_name="worker_demo",
+        work_state="writing",
+        heartbeat_at="2026-04-21T23:00:00+00:00",
+    )
+    reviewing = CockpitItem(
+        "russell",
+        "Russell",
+        "ready",
+        session_name="reviewer",
+        work_state="reviewing",
+        heartbeat_at="2026-04-21T23:00:00+00:00",
+    )
+    stuck = CockpitItem(
+        "project:demo",
+        "Demo",
+        "! pane dead",
+        session_name="worker_demo",
+        work_state="stuck",
+        heartbeat_at="2026-04-21T23:00:00+00:00",
+    )
+    exited = CockpitItem(
+        "project:demo",
+        "Demo",
+        "dead",
+        session_name="worker_demo",
+        work_state="exited",
+        heartbeat_at="2026-04-21T23:00:00+00:00",
+    )
+
+    assert rail._indicator(writing)[0] == "♡◜"
+    assert rail._indicator(reviewing)[0] == "♡✎"
+    assert rail._indicator(stuck)[0] == "♡⚠"
+    assert rail._indicator(exited)[0] == "♡✕"
 
 
 def test_cockpit_router_config_cache_reuses_loaded_config(monkeypatch, tmp_path: Path) -> None:

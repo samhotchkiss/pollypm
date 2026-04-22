@@ -519,16 +519,7 @@ def test_migration_creates_task_notifications(tmp_path):
         row = store.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='task_notifications'"
         ).fetchone()
-        assert row is not None
-        # Indexes present
-        indexes = [
-            r[0] for r in store.execute(
-                "SELECT name FROM sqlite_master WHERE type='index' "
-                "AND tbl_name='task_notifications'"
-            ).fetchall()
-        ]
-        assert any("recent" in i for i in indexes)
-        assert any("session_task" in i for i in indexes)
+        assert row is None
         # Round-trip a row.
         store.record_notification(
             session_name="worker-demo", task_id="demo/1",
@@ -537,6 +528,10 @@ def test_migration_creates_task_notifications(tmp_path):
         assert store.was_notified_within("worker-demo", "demo/1", 60)
         rows = store.recent_notifications(limit=10)
         assert rows and rows[0]["session_name"] == "worker-demo"
+        msg_rows = store.execute(
+            "SELECT scope, recipient, sender FROM messages WHERE type = 'task_notification'"
+        ).fetchall()
+        assert msg_rows == [("worker-demo", "demo", "demo/1")]
     finally:
         store.close()
 
@@ -1338,27 +1333,12 @@ class TestRejectBounceDedupe:
         assert len(svc.sent) == 0
 
     def test_migration_adds_execution_version_column(self, tmp_path):
-        """Migration 12 adds ``execution_version`` with DEFAULT 0 and
-        creates the version-aware composite index. Fresh DBs get the
-        column from the migration runner; pre-#279 DBs back-fill
-        existing rows to ``0`` via the column DEFAULT."""
+        """Notification dedupe stores ``execution_version`` in messages payload."""
         store = StateStore(tmp_path / "state.db")
         try:
-            cols = {
-                r[1] for r in store.execute(
-                    "PRAGMA table_info(task_notifications)"
-                ).fetchall()
-            }
-            assert "execution_version" in cols
-            indexes = [
-                r[0] for r in store.execute(
-                    "SELECT name FROM sqlite_master WHERE type='index' "
-                    "AND tbl_name='task_notifications'"
-                ).fetchall()
-            ]
-            assert any("session_task_version" in i for i in indexes), (
-                f"version-aware dedupe index missing: {indexes!r}"
-            )
+            assert store.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='task_notifications'"
+            ).fetchone() is None
             # Round-trip with + without the column: both forms work,
             # and default rows dedupe at version=0.
             store.record_notification(
@@ -1383,14 +1363,18 @@ class TestRejectBounceDedupe:
             # downstream tooling can display it.
             rows = store.recent_notifications(task_id="demo/2")
             assert rows and rows[0]["execution_version"] == 3
+            payload = store.execute(
+                "SELECT json_extract(payload_json, '$.execution_version') "
+                "FROM messages WHERE type = 'task_notification' AND sender = 'demo/2'"
+            ).fetchone()
+            assert payload == (3,)
         finally:
             store.close()
 
     def test_migration_upgrades_pre_existing_v11_database(self, tmp_path):
         """A database that existed before #279 (schema v11) with
-        ``task_notifications`` rows must upgrade cleanly to v12 — the
-        new column appears, existing rows back-fill to 0, and the old
-        dedupe behaviour survives for any still-pending ping."""
+        ``task_notifications`` rows must upgrade cleanly to the unified
+        ``messages`` table with version payload back-filled to 0."""
         import sqlite3
         p = tmp_path / "legacy.db"
         # Hand-build a v11-shaped DB (no execution_version column).
@@ -1428,27 +1412,22 @@ class TestRejectBounceDedupe:
         # place without losing data.
         store = StateStore(p)
         try:
-            cols = {
-                r[1] for r in store.execute(
-                    "PRAGMA table_info(task_notifications)"
-                ).fetchall()
-            }
-            assert "execution_version" in cols, (
-                f"migration 12 did not add column: {cols!r}"
-            )
+            assert store.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='task_notifications'"
+            ).fetchone() is None
             rows = store.execute(
-                "SELECT session_name, task_id, execution_version "
-                "FROM task_notifications"
+                "SELECT scope, sender, json_extract(payload_json, '$.execution_version') "
+                "FROM messages WHERE type = 'task_notification'"
             ).fetchall()
             assert rows == [("worker-legacy", "legacy/1", 0)], (
-                f"legacy row did not back-fill to version=0: {rows!r}"
+                f"legacy row did not migrate to messages with version=0: {rows!r}"
             )
             version = store.execute(
                 "SELECT MAX(version) FROM schema_version"
             ).fetchone()[0]
-            # The v11 fixture must upgrade through migration 12 and on
+            # The v11 fixture must upgrade through the retirement pass
             # to the current schema head.
-            assert version >= 12
+            assert version >= 15
         finally:
             store.close()
 

@@ -49,13 +49,32 @@ CREATE TABLE IF NOT EXISTS sessions (
     window_name TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS events (
+CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_name TEXT NOT NULL,
-    event_type TEXT NOT NULL,
-    message TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    scope TEXT NOT NULL,
+    type TEXT NOT NULL,
+    tier TEXT NOT NULL DEFAULT 'immediate',
+    recipient TEXT NOT NULL,
+    sender TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'open',
+    parent_id INTEGER,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    labels TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    closed_at TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_messages_recipient_state
+ON messages(recipient, state);
+
+CREATE INDEX IF NOT EXISTS idx_messages_type_tier
+ON messages(type, tier);
+
+CREATE INDEX IF NOT EXISTS idx_messages_scope_created
+ON messages(scope, created_at);
 
 CREATE TABLE IF NOT EXISTS heartbeats (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,21 +88,6 @@ CREATE TABLE IF NOT EXISTS heartbeats (
     snapshot_hash TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS alerts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_name TEXT NOT NULL,
-    alert_type TEXT NOT NULL,
-    severity TEXT NOT NULL,
-    message TEXT NOT NULL,
-    status TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_open
-ON alerts(session_name, alert_type)
-WHERE status = 'open';
 
 CREATE TABLE IF NOT EXISTS leases (
     session_name TEXT PRIMARY KEY,
@@ -483,6 +487,14 @@ class ArchitectResumeRecord:
     last_active_at: str
 
 
+def _strip_alert_subject(subject: str) -> str:
+    if subject.startswith("[Alert] "):
+        return subject[len("[Alert] "):]
+    if subject.startswith("[Alert]"):
+        return subject[len("[Alert]"):].lstrip()
+    return subject
+
+
 class StateStore:
     def __init__(self, path: Path, *, readonly: bool = False) -> None:
         self.path = path
@@ -632,10 +644,12 @@ class StateStore:
         """Remove duplicate alerts, keeping the most recently updated row."""
         try:
             self._conn.execute("""
-                DELETE FROM alerts WHERE rowid NOT IN (
-                    SELECT MAX(rowid) FROM alerts
-                    GROUP BY session_name, alert_type
+                DELETE FROM messages WHERE rowid NOT IN (
+                    SELECT MAX(rowid) FROM messages
+                    WHERE type = 'alert' AND state = 'open'
+                    GROUP BY scope, sender
                 )
+                AND type = 'alert' AND state = 'open'
             """)
             self._conn.commit()
         except Exception:  # noqa: BLE001
@@ -683,18 +697,13 @@ class StateStore:
     # so they are safe to replay on databases created before versioning.
     # ------------------------------------------------------------------
     _MIGRATIONS: list[tuple[int, str, list[str]]] = [
-        (1, "Rebuild alerts unique index", [
-            "DROP INDEX IF EXISTS idx_alerts_open",
-            """CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_open
-               ON alerts(session_name, alert_type) WHERE status = 'open'""",
-        ]),
+        (1, "Rebuild alerts unique index", []),
         (2, "Add project column to sessions", [
             # Column-existence check is handled by _safe_add_column below.
         ]),
         (3, "Add snapshot_hash to heartbeats", []),
         (4, "Add cache_read_tokens to token_usage_hourly", []),
         (5, "Add indexes on events and heartbeats for heartbeat sweep performance", [
-            "CREATE INDEX IF NOT EXISTS idx_events_session_type ON events(session_name, event_type, id DESC)",
             "CREATE INDEX IF NOT EXISTS idx_heartbeats_session ON heartbeats(session_name, id DESC)",
         ]),
         (6, "Add work_jobs table for durable job queue", [
@@ -752,21 +761,7 @@ class StateStore:
         # every ping sent to a session about a given task so the notify
         # handler can throttle re-sends to once per 30 minutes and the
         # ``pm task pickup-log`` CLI can surface delivery history.
-        (11, "Task-assignment notifications dedupe table (#244)", [
-            """CREATE TABLE IF NOT EXISTS task_notifications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_name TEXT NOT NULL,
-                task_id TEXT NOT NULL,
-                project TEXT NOT NULL DEFAULT '',
-                notified_at TEXT NOT NULL,
-                delivery_status TEXT NOT NULL DEFAULT 'sent',
-                message TEXT NOT NULL DEFAULT ''
-            )""",
-            """CREATE INDEX IF NOT EXISTS idx_task_notifications_recent
-               ON task_notifications(notified_at DESC)""",
-            """CREATE INDEX IF NOT EXISTS idx_task_notifications_session_task
-               ON task_notifications(session_name, task_id, notified_at DESC)""",
-        ]),
+        (11, "Task-assignment notifications dedupe table (#244)", []),
         # --- Migration 12 ----------------------------------------------
         # Reject-bounce retry fix (#279). The dedupe for task-assignment
         # pings was keyed on ``(session_name, task_id)`` only, which
@@ -802,6 +797,10 @@ class StateStore:
         (14, "Structured account_usage fields for sampler snapshots", [
             # Column additions handled in the dispatch block below.
         ]),
+        # --- Migration 15 ----------------------------------------------
+        # Move the remaining message-shaped rows into the unified
+        # ``messages`` table, then retire the legacy tables outright.
+        (15, "Retire legacy events / alerts / task_notifications tables", []),
     ]
 
     def _migrate(self) -> None:
@@ -881,28 +880,150 @@ class StateStore:
                 # freshly-rebuilt events whose work service can't
                 # compute a visit — so pre-migration dedupe semantics
                 # survive the upgrade intact.
-                self._safe_add_column(
-                    "task_notifications",
-                    "execution_version",
-                    "INTEGER NOT NULL DEFAULT 0",
-                )
-                # Composite index supports the new dedupe query path —
-                # ``WHERE session = ? AND task = ? AND version = ? AND
-                # notified_at >= ?``. The original per-session-task
-                # index (migration 11) stays in place for pickup-log
-                # filters that don't care about version.
-                self.execute(
-                    "CREATE INDEX IF NOT EXISTS "
-                    "idx_task_notifications_session_task_version "
-                    "ON task_notifications("
-                    "session_name, task_id, execution_version, "
-                    "notified_at DESC)"
-                )
+                if self.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='task_notifications'"
+                ).fetchone():
+                    self._safe_add_column(
+                        "task_notifications",
+                        "execution_version",
+                        "INTEGER NOT NULL DEFAULT 0",
+                    )
+                    # Composite index supports the new dedupe query path —
+                    # ``WHERE session = ? AND task = ? AND version = ? AND
+                    # notified_at >= ?``. The original per-session-task
+                    # index (migration 11) stays in place for pickup-log
+                    # filters that don't care about version.
+                    self.execute(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "idx_task_notifications_session_task_version "
+                        "ON task_notifications("
+                        "session_name, task_id, execution_version, "
+                        "notified_at DESC)"
+                    )
             elif version == 14:
                 self._safe_add_column("account_usage", "used_pct", "INTEGER")
                 self._safe_add_column("account_usage", "remaining_pct", "INTEGER")
                 self._safe_add_column("account_usage", "reset_at", "TEXT")
                 self._safe_add_column("account_usage", "period_label", "TEXT")
+            elif version == 15:
+                if self.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='events'"
+                ).fetchone():
+                    rows = self.execute(
+                        "SELECT session_name, event_type, message, created_at FROM events ORDER BY id"
+                    ).fetchall()
+                    for session_name, event_type, message, created_at in rows:
+                        self.execute(
+                            """
+                            INSERT INTO messages (
+                                scope, type, tier, recipient, sender, state,
+                                subject, body, payload_json, labels,
+                                created_at, updated_at
+                            )
+                            VALUES (?, 'event', 'immediate', '*', ?, 'open', ?, ?, ?, '[]', ?, ?)
+                            """,
+                            (
+                                session_name,
+                                session_name,
+                                event_type,
+                                message,
+                                json.dumps(
+                                    {
+                                        "session_name": session_name,
+                                        "event_type": event_type,
+                                        "message": message,
+                                    }
+                                ),
+                                created_at,
+                                created_at,
+                            ),
+                        )
+                if self.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='alerts'"
+                ).fetchone():
+                    rows = self.execute(
+                        "SELECT session_name, alert_type, severity, message, status, created_at, updated_at FROM alerts ORDER BY id"
+                    ).fetchall()
+                    for session_name, alert_type, severity, message, status, created_at, updated_at in rows:
+                        state = "open" if status == "open" else "closed"
+                        closed_at = None if state == "open" else updated_at
+                        self.execute(
+                            """
+                            INSERT INTO messages (
+                                scope, type, tier, recipient, sender, state,
+                                subject, body, payload_json, labels,
+                                created_at, updated_at, closed_at
+                            )
+                            VALUES (?, 'alert', 'immediate', 'user', ?, ?, ?, '', ?, '[]', ?, ?, ?)
+                            """,
+                            (
+                                session_name,
+                                alert_type,
+                                state,
+                                f"[Alert] {message}",
+                                json.dumps(
+                                    {
+                                        "severity": severity,
+                                        "session_name": session_name,
+                                    }
+                                ),
+                                created_at,
+                                updated_at,
+                                closed_at,
+                            ),
+                        )
+                if self.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='task_notifications'"
+                ).fetchone():
+                    cols = {
+                        row[1]
+                        for row in self.execute("PRAGMA table_info(task_notifications)").fetchall()
+                    }
+                    execution_sql = (
+                        "COALESCE(execution_version, 0)"
+                        if "execution_version" in cols
+                        else "0"
+                    )
+                    rows = self.execute(
+                        f"SELECT session_name, task_id, project, notified_at, "
+                        f"delivery_status, message, {execution_sql} "
+                        f"FROM task_notifications ORDER BY id"
+                    ).fetchall()
+                    for session_name, task_id, project, notified_at, delivery_status, message, execution_version in rows:
+                        self.execute(
+                            """
+                            INSERT INTO messages (
+                                scope, type, tier, recipient, sender, state,
+                                subject, body, payload_json, labels,
+                                created_at, updated_at
+                            )
+                            VALUES (?, 'task_notification', 'immediate', ?, ?, 'open', ?, ?, ?, '[]', ?, ?)
+                            """,
+                            (
+                                session_name,
+                                project,
+                                task_id,
+                                task_id,
+                                message,
+                                json.dumps(
+                                    {
+                                        "project": project,
+                                        "delivery_status": delivery_status,
+                                        "execution_version": int(execution_version or 0),
+                                    }
+                                ),
+                                notified_at,
+                                notified_at,
+                            ),
+                        )
+                self.execute("DROP INDEX IF EXISTS idx_task_notifications_session_task_version")
+                self.execute("DROP INDEX IF EXISTS idx_task_notifications_recent")
+                self.execute("DROP INDEX IF EXISTS idx_task_notifications_session_task")
+                self.execute("DROP INDEX IF EXISTS idx_alerts_open")
+                self.execute("DROP INDEX IF EXISTS idx_events_session_type")
+                self.execute("DROP TABLE IF EXISTS task_notifications")
+                self.execute("DROP TABLE IF EXISTS alerts")
+                self.execute("DROP TABLE IF EXISTS events")
             self.execute(
                 "INSERT INTO schema_version (version, description, applied_at) VALUES (?, ?, ?)",
                 (version, description, datetime.now(UTC).isoformat()),
@@ -971,11 +1092,13 @@ class StateStore:
             )
             self.execute(
                 f"""
-                UPDATE alerts
-                SET status = 'cleared', updated_at = ?
-                WHERE status = 'open' AND session_name NOT IN ({placeholders})
+                UPDATE messages
+                SET state = 'closed', closed_at = ?, updated_at = ?
+                WHERE type = 'alert'
+                  AND state = 'open'
+                  AND scope NOT IN ({placeholders})
                 """,
-                (now, *sorted(valid_session_names)),
+                (now, now, *sorted(valid_session_names)),
             )
             # M03 (#232): session-tier memory entries auto-purge when
             # their session ends. The supervisor's session-reconciliation
@@ -997,11 +1120,11 @@ class StateStore:
             self.execute("DELETE FROM leases")
             self.execute(
                 """
-                UPDATE alerts
-                SET status = 'cleared', updated_at = ?
-                WHERE status = 'open'
+                UPDATE messages
+                SET state = 'closed', closed_at = ?, updated_at = ?
+                WHERE type = 'alert' AND state = 'open'
                 """,
-                (now,),
+                (now, now),
             )
             # No live sessions ⇒ all session-tier memory is orphaned.
             self.execute(
@@ -1019,17 +1142,36 @@ class StateStore:
     def record_event(self, session_name: str, event_type: str, message: str) -> None:
         self.execute(
             """
-            INSERT INTO events (session_name, event_type, message, created_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO messages (
+                scope, type, tier, recipient, sender, state,
+                subject, body, payload_json, labels, created_at, updated_at
+            )
+            VALUES (?, 'event', 'immediate', '*', ?, 'open', ?, ?, ?, '[]', ?, ?)
             """,
-            (session_name, event_type, message, self._now()),
+            (
+                session_name,
+                session_name,
+                event_type,
+                message,
+                json.dumps(
+                    {
+                        "session_name": session_name,
+                        "event_type": event_type,
+                        "message": message,
+                    }
+                ),
+                self._now(),
+                self._now(),
+            ),
         )
         self.commit()
 
     def last_event_at(self, session_name: str, event_type: str) -> str | None:
         """Return the ISO timestamp of the most recent event of this type, or None."""
         row = self.execute(
-            "SELECT created_at FROM events WHERE session_name = ? AND event_type = ? ORDER BY id DESC LIMIT 1",
+            "SELECT created_at FROM messages "
+            "WHERE type = 'event' AND scope = ? AND subject = ? "
+            "ORDER BY id DESC LIMIT 1",
             (session_name, event_type),
         ).fetchone()
         return row[0] if row else None
@@ -1038,33 +1180,33 @@ class StateStore:
         """Return the ISO timestamp of the most recent heartbeat sweep, or None.
 
         Reads from the unified ``messages`` table where heartbeat
-        events have landed since #349. The legacy ``events`` table
-        receives no new heartbeat rows post-migration, so reading it
-        returns the pre-migration timestamp and surfaces in the
-        cockpit as a permanent "Heartbeat offline (NNNm)" warning
-        even though heartbeat is ticking happily on the new table.
-
-        Falls back to the legacy table when the unified lookup finds
-        nothing — covers installs that haven't yet generated a
-        post-migration heartbeat event.
+        events have landed since #349. Migration 15 copies any
+        surviving legacy rows into ``messages`` before dropping the
+        physical ``events`` table, so this path must stay table-agnostic.
         """
         row = self.execute(
             "SELECT created_at FROM messages "
             "WHERE type = 'event' AND scope = 'heartbeat' AND subject = 'heartbeat' "
             "ORDER BY id DESC LIMIT 1"
         ).fetchone()
-        if row:
-            return row[0]
-        row = self.execute(
-            "SELECT created_at FROM events WHERE event_type = 'heartbeat' ORDER BY id DESC LIMIT 1"
-        ).fetchone()
         return row[0] if row else None
 
     def recent_events(self, limit: int = 20) -> list[EventRecord]:
         rows = self.execute(
             """
-            SELECT session_name, event_type, message, created_at
-            FROM events
+            SELECT
+                scope AS session_name,
+                COALESCE(json_extract(payload_json, '$.event_type'), subject) AS event_type,
+                CASE
+                    WHEN body != '' THEN body
+                    WHEN json_extract(payload_json, '$.message') IS NOT NULL
+                        THEN json_extract(payload_json, '$.message')
+                    WHEN payload_json != '{}' THEN payload_json
+                    ELSE subject
+                END AS message,
+                created_at
+            FROM messages
+            WHERE type = 'event'
             ORDER BY id DESC
             LIMIT ?
             """,
@@ -1079,7 +1221,12 @@ class StateStore:
         event_cutoff = (now - timedelta(days=event_days)).isoformat()
         heartbeat_cutoff = (now - timedelta(hours=heartbeat_hours)).isoformat()
         with self._lock:
-            e_cursor = self._conn.execute("DELETE FROM events WHERE created_at < ?", (event_cutoff,))
+            e_cursor = self._conn.execute(
+                "DELETE FROM messages "
+                "WHERE type = 'event' AND created_at < ? "
+                "AND COALESCE(json_extract(payload_json, '$.pinned'), 0) != 1",
+                (event_cutoff,),
+            )
             events_pruned = e_cursor.rowcount
             h_cursor = self._conn.execute("DELETE FROM heartbeats WHERE created_at < ?", (heartbeat_cutoff,))
             heartbeats_pruned = h_cursor.rowcount
@@ -1179,31 +1326,56 @@ class StateStore:
         with self._lock:
             existing = self._conn.execute(
                 """
-                SELECT id, message, severity
-                FROM alerts
-                WHERE session_name = ? AND alert_type = ? AND status = 'open'
+                SELECT id
+                FROM messages
+                WHERE type = 'alert'
+                  AND scope = ?
+                  AND sender = ?
+                  AND state = 'open'
                 """,
                 (session_name, alert_type),
             ).fetchone()
             if existing is None:
-                try:
-                    self._conn.execute(
-                        """
-                        INSERT INTO alerts (session_name, alert_type, severity, message, status, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, 'open', ?, ?)
-                        """,
-                        (session_name, alert_type, severity, message, now, now),
+                self._conn.execute(
+                    """
+                    INSERT INTO messages (
+                        scope, type, tier, recipient, sender, state,
+                        subject, body, payload_json, labels, created_at, updated_at
                     )
-                except sqlite3.IntegrityError:
-                    pass  # Another process inserted first — that's fine
+                    VALUES (?, 'alert', 'immediate', 'user', ?, 'open', ?, '', ?, '[]', ?, ?)
+                    """,
+                    (
+                        session_name,
+                        alert_type,
+                        f"[Alert] {message}",
+                        json.dumps(
+                            {
+                                "severity": severity,
+                                "session_name": session_name,
+                            }
+                        ),
+                        now,
+                        now,
+                    ),
+                )
             else:
                 self._conn.execute(
                     """
-                    UPDATE alerts
-                    SET severity = ?, message = ?, updated_at = ?
+                    UPDATE messages
+                    SET subject = ?, payload_json = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (severity, message, now, existing[0]),
+                    (
+                        f"[Alert] {message}",
+                        json.dumps(
+                            {
+                                "severity": severity,
+                                "session_name": session_name,
+                            }
+                        ),
+                        now,
+                        existing[0],
+                    ),
                 )
             self._conn.commit()
             try:
@@ -1215,53 +1387,60 @@ class StateStore:
     def clear_alert(self, session_name: str, alert_type: str) -> None:
         self.execute(
             """
-            UPDATE alerts
-            SET status = 'cleared', updated_at = ?
-            WHERE session_name = ? AND alert_type = ? AND status = 'open'
+            UPDATE messages
+            SET state = 'closed', closed_at = ?, updated_at = ?
+            WHERE type = 'alert'
+              AND scope = ?
+              AND sender = ?
+              AND state = 'open'
             """,
-            (self._now(), session_name, alert_type),
+            (self._now(), self._now(), session_name, alert_type),
         )
         self.commit()
 
     def open_alerts(self) -> list[AlertRecord]:
         rows = self.execute(
             """
-            SELECT id, session_name, alert_type, severity, message, status, created_at, updated_at
-            FROM alerts
-            WHERE status = 'open'
+            SELECT id, scope, sender, payload_json, subject, state, created_at, updated_at
+            FROM messages
+            WHERE type = 'alert' AND state = 'open'
             ORDER BY updated_at DESC
             """
         ).fetchall()
-        return [
-            AlertRecord(
-                session_name=row[1],
-                alert_type=row[2],
-                severity=row[3],
-                message=row[4],
-                status=row[5],
-                created_at=row[6],
-                updated_at=row[7],
-                alert_id=int(row[0]),
+        out: list[AlertRecord] = []
+        for row in rows:
+            payload = json.loads(row[3]) if row[3] else {}
+            out.append(
+                AlertRecord(
+                    session_name=row[1],
+                    alert_type=row[2],
+                    severity=str(payload.get("severity") or ""),
+                    message=_strip_alert_subject(str(row[4] or "")),
+                    status=row[5],
+                    created_at=row[6],
+                    updated_at=row[7],
+                    alert_id=int(row[0]),
+                )
             )
-            for row in rows
-        ]
+        return out
 
     def get_alert(self, alert_id: int) -> AlertRecord | None:
         row = self.execute(
             """
-            SELECT id, session_name, alert_type, severity, message, status, created_at, updated_at
-            FROM alerts
+            SELECT id, scope, sender, payload_json, subject, state, created_at, updated_at
+            FROM messages
             WHERE id = ?
             """,
             (alert_id,),
         ).fetchone()
         if row is None:
             return None
+        payload = json.loads(row[3]) if row[3] else {}
         return AlertRecord(
             session_name=row[1],
             alert_type=row[2],
-            severity=row[3],
-            message=row[4],
+            severity=str(payload.get("severity") or ""),
+            message=_strip_alert_subject(str(row[4] or "")),
             status=row[5],
             created_at=row[6],
             updated_at=row[7],
@@ -1274,11 +1453,11 @@ class StateStore:
             return None
         self.execute(
             """
-            UPDATE alerts
-            SET status = 'cleared', updated_at = ?
-            WHERE id = ? AND status = 'open'
+            UPDATE messages
+            SET state = 'closed', closed_at = ?, updated_at = ?
+            WHERE id = ? AND state = 'open'
             """,
-            (self._now(), alert_id),
+            (self._now(), self._now(), alert_id),
         )
         self.commit()
         return self.get_alert(alert_id)
@@ -1311,19 +1490,27 @@ class StateStore:
         """
         self.execute(
             """
-            INSERT INTO task_notifications
-                (session_name, task_id, project, notified_at,
-                 delivery_status, message, execution_version)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO messages (
+                scope, type, tier, recipient, sender, state,
+                subject, body, payload_json, labels, created_at, updated_at
+            )
+            VALUES (?, 'task_notification', 'immediate', ?, ?, 'open', ?, ?, ?, '[]', ?, ?)
             """,
             (
                 session_name,
-                task_id,
                 project,
-                self._now(),
-                delivery_status,
+                task_id,
+                task_id,
                 message,
-                int(execution_version),
+                json.dumps(
+                    {
+                        "project": project,
+                        "delivery_status": delivery_status,
+                        "execution_version": int(execution_version),
+                    }
+                ),
+                self._now(),
+                self._now(),
             ),
         )
         self.commit()
@@ -1354,11 +1541,12 @@ class StateStore:
         cutoff = (datetime.now(UTC) - timedelta(seconds=window_seconds)).isoformat()
         row = self.execute(
             """
-            SELECT 1 FROM task_notifications
-            WHERE session_name = ?
-              AND task_id = ?
-              AND execution_version = ?
-              AND notified_at >= ?
+            SELECT 1 FROM messages
+            WHERE type = 'task_notification'
+              AND scope = ?
+              AND sender = ?
+              AND COALESCE(json_extract(payload_json, '$.execution_version'), 0) = ?
+              AND created_at >= ?
             LIMIT 1
             """,
             (session_name, task_id, int(execution_version), cutoff),
@@ -1382,35 +1570,39 @@ class StateStore:
         if since_seconds is not None:
             from datetime import timedelta
             cutoff = (datetime.now(UTC) - timedelta(seconds=since_seconds)).isoformat()
-            clauses.append("notified_at >= ?")
+            clauses.append("created_at >= ?")
             params.append(cutoff)
         if project is not None:
-            clauses.append("project = ?")
+            clauses.append("recipient = ?")
             params.append(project)
         if task_id is not None:
-            clauses.append("task_id = ?")
+            clauses.append("sender = ?")
             params.append(task_id)
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        where = " WHERE type = 'task_notification'"
+        if clauses:
+            where += " AND " + " AND ".join(clauses)
         sql = (
-            "SELECT session_name, task_id, project, notified_at, "
-            "delivery_status, message, execution_version "
-            "FROM task_notifications"
-            f"{where} ORDER BY notified_at DESC LIMIT ?"
+            "SELECT scope, sender, recipient, created_at, body, payload_json "
+            "FROM messages"
+            f"{where} ORDER BY created_at DESC LIMIT ?"
         )
         params.append(int(limit))
         rows = self.execute(sql, tuple(params)).fetchall()
-        return [
-            {
-                "session_name": r[0],
-                "task_id": r[1],
-                "project": r[2],
-                "notified_at": r[3],
-                "delivery_status": r[4],
-                "message": r[5],
-                "execution_version": r[6] if len(r) > 6 else 0,
-            }
-            for r in rows
-        ]
+        out: list[dict] = []
+        for row in rows:
+            payload = json.loads(row[5]) if row[5] else {}
+            out.append(
+                {
+                    "session_name": row[0],
+                    "task_id": row[1],
+                    "project": row[2],
+                    "notified_at": row[3],
+                    "delivery_status": str(payload.get("delivery_status") or ""),
+                    "message": row[4],
+                    "execution_version": int(payload.get("execution_version") or 0),
+                }
+            )
+        return out
 
     def set_lease(self, session_name: str, owner: str, note: str = "") -> None:
         now = self._now()

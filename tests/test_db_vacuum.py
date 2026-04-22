@@ -40,9 +40,9 @@ def test_incremental_vacuum_reclaims_space_after_bulk_delete(tmp_path: Path) -> 
     store = StateStore(tmp_path / "state.db")
     try:
         # Insert enough dummy rows to guarantee multiple pages land on the
-        # freelist after delete. ``events`` is a cheap table for this —
-        # no foreign keys, no triggers, no FTS. 2000 rows with a 1 KB
-        # message is ~2 MB, plenty to exceed a single 4 KB page.
+        # freelist after delete. ``messages`` is the durable event ledger
+        # post-#411, and 2000 rows with a 1 KB body is ~2 MB, plenty to
+        # exceed a single 4 KB page.
         big_message = "x" * 1024
         for i in range(2000):
             store.record_event(
@@ -55,7 +55,11 @@ def test_incremental_vacuum_reclaims_space_after_bulk_delete(tmp_path: Path) -> 
         # this, the "reclaimed" measurement is dominated by WAL mechanics
         # rather than freelist behaviour.
         store.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        store.execute("DELETE FROM events WHERE event_type = 'bulk.test'")
+        store.execute(
+            "DELETE FROM messages "
+            "WHERE type = 'event' AND subject = 'bulk.test' AND body = ?",
+            (big_message,),
+        )
         store.commit()
         store.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 

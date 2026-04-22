@@ -56,65 +56,7 @@ if TYPE_CHECKING:
 
 DEMO_PROJECT_BASENAME = "pollypm-demo"
 DEMO_PROJECT_MARKER = ".pollypm-demo-fallback"
-DEMO_PROJECT_FILES: dict[str, str] = {
-    DEMO_PROJECT_MARKER: "demo-fallback-v1\n",
-    ".gitignore": ".pollypm/\n__pycache__/\n.pytest_cache/\n",
-    "README.md": """# PollyPM Demo Repo
-
-This repo is the offline fallback used by onboarding when no recent local
-projects are detected.
-
-## What To Try
-
-- Run `python -m unittest discover -s tests -p "test_*.py"`
-- Read `demo_app.py`
-- Ask Polly to explain, extend, or test the queue summary behavior
-
-Everything in this repo uses only the Python standard library.
-""",
-    "demo_app.py": '''"""Small offline demo for PollyPM onboarding."""
-
-from __future__ import annotations
-
-
-def summarize_queue(items: list[str]) -> str:
-    cleaned = [item.strip() for item in items if item.strip()]
-    if not cleaned:
-        return "No tasks queued."
-    if len(cleaned) == 1:
-        return f"1 task queued: {cleaned[0]}"
-    preview = ", ".join(cleaned[:2])
-    if len(cleaned) > 2:
-        preview += f", +{len(cleaned) - 2} more"
-    return f"{len(cleaned)} tasks queued: {preview}"
-
-
-def estimate_focus_minutes(task_count: int, *, per_task: int = 25) -> int:
-    if task_count <= 0:
-        return 0
-    return task_count * per_task
-''',
-    "tests/test_demo_app.py": """import unittest
-
-from demo_app import estimate_focus_minutes, summarize_queue
-
-
-class DemoAppTests(unittest.TestCase):
-    def test_summarize_queue_handles_empty_input(self) -> None:
-        self.assertEqual(summarize_queue([]), "No tasks queued.")
-
-    def test_summarize_queue_shows_preview_and_count(self) -> None:
-        summary = summarize_queue(["plan onboarding", "write docs", "ship fallback"])
-        self.assertEqual(summary, "3 tasks queued: plan onboarding, write docs, +1 more")
-
-    def test_estimate_focus_minutes_uses_default_block(self) -> None:
-        self.assertEqual(estimate_focus_minutes(3), 75)
-
-
-if __name__ == "__main__":
-    unittest.main()
-""",
-}
+DEMO_PROJECT_TEMPLATE_DIR = Path(__file__).resolve().parent / "defaults" / "demo"
 
 
 class LoginCancelled(Exception):
@@ -368,10 +310,16 @@ def demo_project_fallback_destination(config_path: Path) -> Path:
 
 
 def _write_demo_project_files(target: Path) -> None:
-    for relative_name, content in DEMO_PROJECT_FILES.items():
+    marker_path = target / DEMO_PROJECT_MARKER
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text("demo-fallback-v1\n", encoding="utf-8")
+    for source in sorted(DEMO_PROJECT_TEMPLATE_DIR.rglob("*")):
+        if not source.is_file():
+            continue
+        relative_name = source.relative_to(DEMO_PROJECT_TEMPLATE_DIR)
         destination = target / relative_name
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(content, encoding="utf-8")
+        shutil.copyfile(source, destination)
 
 
 def _init_demo_project_git(target: Path) -> None:

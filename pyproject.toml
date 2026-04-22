@@ -57,6 +57,8 @@ pollypm = [
   "defaults/magic/*/LICENSE",
   "defaults/docs/*.template",
   "defaults/docs/reference/*.md",
+  "defaults/demo/*",
+  "defaults/demo/**/*",
   "work/flows/*.yaml",
 ]
 

@@ -829,8 +829,12 @@ class CockpitRouter:
             if not rows:
                 continue
             active_rows = [row for row in rows if self._row_is_active(row)]
+            # ``projects`` is the primary navigation surface — keep it
+            # visible even when no project has an active session, so the
+            # user can still click into a project from the rail. Only
+            # transient/dynamic sections get auto-collapsed when idle.
             if section in collapsed_sections or (
-                section not in {"top", "system"} and not active_rows
+                section not in {"top", "system", "projects"} and not active_rows
             ):
                 # Collapsed sections render as a disabled header row so
                 # the user can still see the section exists. Expansion

@@ -61,5 +61,9 @@ def test_project_rule_appears_in_worker_prompt_manifest(tmp_path: Path) -> None:
     assert "Project deploy process" in prompt
     assert "bugfix" in prompt
     assert ".pollypm/MANIFEST.md" in prompt
-    assert "pollypm/defaults/rules/bugfix.md" not in prompt
+    # Per #709 cluster 6, display_paths for both builtin and project-local
+    # catalog entries are now inlined so workers can resolve the exact
+    # file to read without grepping MANIFEST.md.
+    assert "pollypm/defaults/rules/bugfix.md" in prompt
+    assert ".pollypm/rules/deploy.md" in prompt
     assert (project_root / ".pollypm" / "MANIFEST.md").exists()

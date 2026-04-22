@@ -61,6 +61,10 @@ def _write_minimal_config(
     config = PollyPMConfig(
         project=ProjectSettings(
             root_dir=tmp_path,
+            # Pin workspace_root to tmp_path so planner-created tasks
+            # land under the test's sandbox rather than the ambient
+            # ``~/dev`` default picked up by ``_planner_db_path``.
+            workspace_root=tmp_path,
             base_dir=tmp_path / ".pollypm",
             logs_dir=tmp_path / ".pollypm/logs",
             snapshots_dir=tmp_path / ".pollypm/snapshots",
@@ -249,8 +253,10 @@ def test_project_new_auto_spawns_architect_session(
     )
     assert result.exit_code == 0, result.stdout + result.stderr
     # Plan task was auto-created (regression guard against #255 breakage).
+    # Post-#339 planner tasks land in the workspace-scope DB
+    # (``workspace_root/.pollypm/state.db``), not the project-local path.
     with SQLiteWorkService(
-        db_path=repo / ".pollypm" / "state.db", project_path=repo,
+        db_path=tmp_path / ".pollypm" / "state.db", project_path=repo,
     ) as svc:
         tasks = svc.list_tasks(project="fresh")
     plan_tasks = [t for t in tasks if t.flow_template_id == "plan_project"]

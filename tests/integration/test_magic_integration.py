@@ -61,5 +61,9 @@ def test_project_magic_appears_in_worker_prompt_manifest(tmp_path: Path) -> None
     assert "Screenshot verification" in prompt
     assert "deploy-site" in prompt
     assert ".pollypm/MANIFEST.md" in prompt
-    assert "pollypm/defaults/magic/deploy-site.md" not in prompt
+    # Per #709 cluster 6, display_paths for both builtin and project-local
+    # catalog entries are now inlined so workers can resolve the exact
+    # file to read without grepping MANIFEST.md.
+    assert "pollypm/defaults/magic/deploy-site.md" in prompt
+    assert ".pollypm/magic/screenshot-verify.md" in prompt
     assert (project_root / ".pollypm" / "MANIFEST.md").exists()

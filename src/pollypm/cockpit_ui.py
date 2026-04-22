@@ -556,6 +556,8 @@ class RailItem(ListItem):
         presence = self.presence
         if work_state == "writing":
             if presence is not None:
+                if not presence.should_animate():
+                    return "…", "#3ddc84"
                 return presence.working_frame(self.spinner_index), "#3ddc84"
             return "\u25c6", "#3ddc84"
         if work_state == "reviewing":

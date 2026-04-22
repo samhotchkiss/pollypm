@@ -209,6 +209,35 @@ def test_cockpit_presence_calm_mode_disables_animation(monkeypatch) -> None:
     assert presence.working_frame(3) == "◜"
 
 
+def test_cockpit_ui_rail_item_uses_static_ellipsis_in_calm_mode(monkeypatch) -> None:
+    monkeypatch.setattr(RailItem, "update_body", lambda self: None)
+
+    class _FakeTmux:
+        def current_session_name(self) -> str | None:
+            return "pollypm"
+
+        def list_clients(self, session_name: str) -> str:
+            del session_name
+            return "client"
+
+    monkeypatch.setenv("POLLY_CALM", "1")
+    presence = CockpitPresence(_FakeTmux())
+    item = RailItem(
+        CockpitItem(
+            "project:demo",
+            "Demo",
+            "ready",
+            session_name="worker_demo",
+            work_state="writing",
+            heartbeat_at="2026-04-21T23:00:00+00:00",
+        ),
+        active_view=False,
+        presence=presence,
+    )
+
+    assert item._indicator()[0] == "♥…"
+
+
 def test_cockpit_presence_heartbeat_frame_advances_only_on_new_heartbeat() -> None:
     class _FakeTmux:
         def current_session_name(self) -> str | None:
@@ -352,6 +381,40 @@ def test_cockpit_rail_session_indicator_combines_pulse_and_work_glyph(monkeypatc
     assert rail._indicator(reviewing)[0] == "♡✎"
     assert rail._indicator(stuck)[0] == "♡⚠"
     assert rail._indicator(exited)[0] == "♡✕"
+
+
+def test_cockpit_rail_session_indicator_uses_static_ellipsis_in_calm_mode(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("POLLY_CALM", "1")
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+
+    class _FakeTmux:
+        def current_session_name(self) -> str | None:
+            return "pollypm"
+
+        def list_clients(self, session_name: str) -> str:
+            del session_name
+            return "client"
+
+    rail = PollyCockpitRail(config_path)
+    rail.router.tmux = _FakeTmux()  # type: ignore[assignment]
+    rail.presence = CockpitPresence(_FakeTmux())
+
+    writing = CockpitItem(
+        "project:demo",
+        "Demo",
+        "◜ working",
+        session_name="worker_demo",
+        work_state="writing",
+        heartbeat_at="2026-04-21T23:00:00+00:00",
+    )
+
+    assert rail._indicator(writing)[0] == "♥…"
 
 
 def test_cockpit_ui_help_legend_mentions_glyph_alphabet() -> None:

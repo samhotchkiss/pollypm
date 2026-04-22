@@ -2029,6 +2029,8 @@ class PollyCockpitRail:
 
     def _session_work_glyph(self, work_state: str) -> tuple[str, _C | None]:
         if work_state == "writing":
+            if not self.presence.should_animate():
+                return "…", PALETTE["live_indicator"]
             return self.presence.working_frame(self.spinner_index), PALETTE["live_indicator"]
         if work_state == "reviewing":
             return "✎", PALETTE["live_indicator"]

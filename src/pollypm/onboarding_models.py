@@ -38,6 +38,18 @@ class LoginPreferences:
 class OnboardingResult:
     config_path: Path
     launch_requested: bool = False
+    seeded_demo_project_key: str | None = None
+    seeded_demo_task_id: str | None = None
+
+    @property
+    def parent(self) -> Path:
+        return self.config_path.parent
+
+    def resolve(self) -> Path:
+        return self.config_path.resolve()
+
+    def __str__(self) -> str:
+        return str(self.config_path)
 
 
 __all__ = [

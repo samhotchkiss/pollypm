@@ -3,13 +3,17 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from pollypm.cli import app as cli_app
+import pytest
+from click.exceptions import Exit as ClickExit
 from pollypm.config import load_config, write_config
 from pollypm.doctor import decode_setup_tag, setup_tag_line
 from pollypm.models import KnownProject, ProviderKind
 from pollypm.projects import DEFAULT_WORKSPACE_ROOT
 from pollypm.onboarding import (
     ConnectedAccount,
+    OnboardingResult,
     _scan_recent_projects,
+    _seeded_demo_route,
     build_onboarded_config,
     demo_project_fallback_destination,
     provision_demo_project_fallback,
@@ -255,3 +259,54 @@ def test_scan_recent_projects_offers_demo_repo_when_discovery_is_empty(
 
     assert [project.path for project in projects] == [demo_path]
     assert any("demo repo" in message.lower() for message in messages)
+
+
+def test_onboarding_result_keeps_path_compatibility(tmp_path: Path) -> None:
+    result = OnboardingResult(
+        config_path=tmp_path / "pollypm.toml",
+        launch_requested=True,
+        seeded_demo_project_key="pollypm_demo",
+        seeded_demo_task_id="demo/1",
+    )
+
+    assert result.parent == tmp_path
+    assert result.resolve() == (tmp_path / "pollypm.toml").resolve()
+    assert str(result) == str(tmp_path / "pollypm.toml")
+
+
+def test_run_onboarding_launches_seeded_demo_experience(monkeypatch, tmp_path: Path) -> None:
+    result = OnboardingResult(
+        config_path=tmp_path / "pollypm.toml",
+        launch_requested=True,
+        seeded_demo_project_key="pollypm_demo",
+        seeded_demo_task_id="demo/1",
+    )
+    launched: list[OnboardingResult] = []
+
+    monkeypatch.setattr(
+        "pollypm.onboarding_tui.run_onboarding_app",
+        lambda config_path, force=False: result,
+    )
+    monkeypatch.setattr(
+        "pollypm.onboarding._launch_onboarding_experience",
+        lambda launch_result: launched.append(launch_result) or True,
+    )
+
+    with pytest.raises(ClickExit):
+        __import__("pollypm.onboarding", fromlist=["run_onboarding"]).run_onboarding(
+            config_path=result.config_path,
+            force=True,
+        )
+
+    assert launched == [result]
+
+
+def test_seeded_demo_route_parses_project_and_task_number(tmp_path: Path) -> None:
+    result = OnboardingResult(
+        config_path=tmp_path / "pollypm.toml",
+        launch_requested=True,
+        seeded_demo_project_key="pollypm_demo",
+        seeded_demo_task_id="demo/17",
+    )
+
+    assert _seeded_demo_route(result) == "project:pollypm_demo:task:17"

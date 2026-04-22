@@ -890,6 +890,77 @@ def build_onboarded_config(
         projects=dict(projects or {}),
     )
 
+def _seeded_demo_route(result: OnboardingResult) -> str | None:
+    project_key = result.seeded_demo_project_key
+    task_id = result.seeded_demo_task_id
+    if not project_key or not task_id:
+        return None
+    task_num = task_id.rsplit("/", 1)[-1].rsplit(":", 1)[-1].strip()
+    if not task_num:
+        return None
+    return f"project:{project_key}:task:{task_num}"
+
+
+def _launch_onboarding_experience(result: OnboardingResult) -> bool:
+    """Best-effort launch of the seeded demo cockpit after onboarding consent."""
+    from pollypm.cockpit_rail import CockpitRouter
+    from pollypm.service_api import PollyPMService
+    from pollypm.transcript_ingest import start_transcript_ingestion
+
+    service = PollyPMService(result.config_path)
+    supervisor = service.load_supervisor()
+    session_name = supervisor.config.project.tmux_session
+    launched = False
+
+    try:
+        if supervisor.tmux.has_session(session_name):
+            supervisor.ensure_layout()
+        else:
+            supervisor.bootstrap_tmux(skip_probe=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        start_transcript_ingestion(supervisor.config)
+    except Exception:  # noqa: BLE001
+        pass
+
+    route_key = _seeded_demo_route(result)
+    if route_key is not None:
+        try:
+            CockpitRouter(result.config_path).route_selected(route_key)
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        subprocess.run(
+            ["uv", "tool", "install", "--editable", "--reinstall", str(result.parent)],
+            cwd=result.parent,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        current_tmux = create_tmux_client().current_session_name()
+    except Exception:  # noqa: BLE001
+        current_tmux = None
+    if current_tmux == session_name:
+        launched = True
+        try:
+            supervisor.focus_console()
+        except Exception:  # noqa: BLE001
+            pass
+        return launched
+    try:
+        supervisor.tmux.attach_session(session_name)
+        launched = True
+    except Exception:  # noqa: BLE001
+        pass
+    return launched
+
 
 def _account_ready_for_welcome_back(account: AccountConfig) -> bool:
     if account.home is None:
@@ -918,6 +989,8 @@ def run_onboarding(
     *,
     no_animation: bool = False,
 ) -> OnboardingResult:
+    from pollypm.onboarding_tui import run_onboarding_app
+
     if not force and config_path.exists():
         try:
             config = load_config(config_path)
@@ -932,18 +1005,25 @@ def run_onboarding(
             typer.echo("3. Re-run full onboarding")
             choice = typer.prompt("Choose", default="1")
             if choice == "1":
-                return OnboardingResult(config_path=config_path, launch_requested=True)
+                result = OnboardingResult(config_path=config_path, launch_requested=True)
+                if _launch_onboarding_experience(result):
+                    raise typer.Exit()
+                return result
             if choice == "2":
-                from pollypm.onboarding_tui import run_onboarding_app
-
-                return run_onboarding_app(config_path=config_path, force=False, no_animation=no_animation)
+                result = run_onboarding_app(config_path=config_path, force=False, no_animation=no_animation)
+                if result.launch_requested and _launch_onboarding_experience(result):
+                    raise typer.Exit()
+                return result
             if choice == "3":
-                from pollypm.onboarding_tui import run_onboarding_app
+                result = run_onboarding_app(config_path=config_path, force=True, no_animation=no_animation)
+                if result.launch_requested and _launch_onboarding_experience(result):
+                    raise typer.Exit()
+                return result
 
-                return run_onboarding_app(config_path=config_path, force=True, no_animation=no_animation)
-    from pollypm.onboarding_tui import run_onboarding_app
-
-    return run_onboarding_app(config_path=config_path, force=force, no_animation=no_animation)
+    result = run_onboarding_app(config_path=config_path, force=force, no_animation=no_animation)
+    if result.launch_requested and _launch_onboarding_experience(result):
+        raise typer.Exit()
+    return result
 
 
 def relogin_account(config_path: Path, identifier: str) -> tuple[str, str]:

@@ -348,6 +348,7 @@ def test_projects_step_can_offer_demo_repo_fallback(monkeypatch, tmp_path: Path)
 
             assert app.state.recent_projects == [demo_path]
             assert app.state.selected_project_paths == [demo_path]
+            assert app.state.seeded_demo_project_key == "pollypm_demo"
             assert app.state.seeded_demo_task_id == "demo/1"
             assert app.project_selection is not None
             assert list(app.project_selection.selected) == [demo_path]
@@ -377,6 +378,7 @@ def test_demo_task_choice_keeps_seeded_task(monkeypatch, tmp_path: Path) -> None
     assert seeded == [(demo_path, "pollypm_demo")]
     assert app.state.recent_projects == [demo_path]
     assert app.state.selected_project_paths == [demo_path]
+    assert app.state.seeded_demo_project_key == "pollypm_demo"
     assert app.state.seeded_demo_task_id == "demo/1"
     assert rendered == ["rendered"]
     assert "Seeded task demo/1" in messages[-1]
@@ -402,6 +404,7 @@ def test_demo_task_choice_can_forget_seeded_task(monkeypatch, tmp_path: Path) ->
 
     assert app.state.recent_projects == [demo_path]
     assert app.state.selected_project_paths == [demo_path]
+    assert app.state.seeded_demo_project_key is None
     assert app.state.seeded_demo_task_id is None
     assert rendered == ["rendered"]
     assert "No seeded task" in messages[-1]

@@ -44,6 +44,7 @@ from pollypm.onboarding import (
     discover_recent_project_candidates,
     provision_demo_project_fallback,
 )
+from pollypm.onboarding_models import OnboardingResult
 from pollypm.projects import ensure_project_scaffold, make_project_key
 from pollypm.session_services import create_tmux_client
 
@@ -150,24 +151,10 @@ class OnboardingState:
     failover_enabled: bool = True
     recent_projects: list[Path] = field(default_factory=list)
     selected_project_paths: list[Path] = field(default_factory=list)
+    seeded_demo_project_key: str | None = None
     seeded_demo_task_id: str | None = None
     scan_complete: bool = False
     scan_started: bool = False
-
-
-@dataclass(slots=True)
-class OnboardingResult:
-    config_path: Path
-    launch_requested: bool = False
-
-
-@dataclass(slots=True)
-class BlockingAutoFix:
-    button_id: str
-    label: str
-    summary: str
-    plan: AutoFixPlan
-
 
 class ExitModal(ModalScreen[None]):
     CSS = """
@@ -1084,7 +1071,14 @@ class OnboardingApp(App[OnboardingResult | None]):
             self._render_current_step()
             return
         if button_id == "tour-launch":
-            self.exit(OnboardingResult(config_path=self.config_path, launch_requested=True))
+            self.exit(
+                OnboardingResult(
+                    config_path=self.config_path,
+                    launch_requested=True,
+                    seeded_demo_project_key=self.state.seeded_demo_project_key,
+                    seeded_demo_task_id=self.state.seeded_demo_task_id,
+                )
+            )
 
     @on(RadioSet.Changed)
     def on_controller_changed(self, event: RadioSet.Changed) -> None:
@@ -1157,14 +1151,17 @@ class OnboardingApp(App[OnboardingResult | None]):
                 self.state.seeded_demo_task_id = None
                 self._set_message(f"Demo repo copied, but seeding the task failed: {exc}")
             else:
+                self.state.seeded_demo_project_key = project_key
                 self.state.seeded_demo_task_id = task_id
                 self._set_message(
                     f"Demo repo ready at {demo_path}. Seeded task {task_id} is waiting in the cockpit."
                 )
         elif choice == "forget":
+            self.state.seeded_demo_project_key = None
             self.state.seeded_demo_task_id = None
             self._set_message(f"Demo repo ready at {demo_path}. No seeded task was kept.")
         else:
+            self.state.seeded_demo_project_key = None
             self.state.seeded_demo_task_id = None
             self._set_message(f"Demo repo ready at {demo_path}.")
         self._render_current_step()

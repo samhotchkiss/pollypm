@@ -7,6 +7,11 @@ from pollypm.storage.state import StateStore
 
 def test_state_store_alerts_leases_and_heartbeats(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state.db")
+    for table in ("events", "alerts", "task_notifications"):
+        assert store.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone() is None
     store.upsert_session(
         name="worker",
         role="worker",

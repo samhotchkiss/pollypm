@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 
+from rich.syntax import Syntax
 from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -21,9 +22,13 @@ from pollypm.cockpit_task_priority import (
     priority_rank,
 )
 from pollypm.cockpit_task_review import (
+    ReviewDiffBundle,
+    collapse_review_diff_file,
     extract_confidence_score,
+    load_task_review_diff,
     load_task_review_artifact,
     render_task_review_artifact,
+    review_diff_hidden_line_count,
 )
 from pollypm.cockpit_formatting import format_event_time
 from pollypm.cockpit_formatting import format_relative_age as _format_relative_age
@@ -789,6 +794,25 @@ class PollyTasksApp(App[None]):
         background: #18232d;
         color: #cfe1ff;
     }
+    #task-review-inline-diff-header {
+        height: auto;
+        padding: 0 1;
+        margin: 0 0 1 0;
+        border-left: thick #36536b;
+        color: #d7e8ff;
+    }
+    #task-review-inline-diff-expand {
+        width: auto;
+        margin: 0 0 1 1;
+    }
+    #task-review-inline-diff {
+        height: auto;
+        margin-top: 1;
+        padding: 0 1;
+        border: round #3d4d60;
+        background: #0f161d;
+        color: #d8e4ef;
+    }
     #task-review-diff {
         height: auto;
         margin-top: 1;
@@ -865,6 +889,13 @@ class PollyTasksApp(App[None]):
         self.detail_overview = Static("", id="task-detail")
         self.detail_review = Static("", id="task-review")
         self.review_confidence = Static("", id="task-review-confidence-chip")
+        self.review_inline_diff_header = Static("", id="task-review-inline-diff-header")
+        self.review_inline_diff_expand = Button(
+            "Expand",
+            id="task-review-inline-diff-expand",
+            variant="default",
+        )
+        self.review_inline_diff = Static("", id="task-review-inline-diff")
         self.review_diff_toggle = Button(
             "Diff Since Rejection: Off [D]",
             id="task-review-diff-toggle",
@@ -897,6 +928,10 @@ class PollyTasksApp(App[None]):
         self._active_reject_modal: _TaskRejectReasonModal | None = None
         self._selected_task_ids: set[str] = set()
         self._show_resubmission_diff = False
+        self._review_inline_diff: ReviewDiffBundle | None = None
+        self._review_inline_diff_file_index = 0
+        self._review_inline_diff_expanded = False
+        self._review_nav_prefix: str | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="tasks-root"):
@@ -929,9 +964,12 @@ class PollyTasksApp(App[None]):
                         with TabPane("Review", id="task-tab-review"):
                             with Vertical(id="task-review-panel"):
                                 yield self.review_confidence
+                                yield self.review_inline_diff_header
+                                yield self.review_inline_diff_expand
                                 yield self.review_diff_toggle
                                 with VerticalScroll(id="task-review-scroll"):
                                     yield self.detail_review
+                                    yield self.review_inline_diff
                                     yield self.review_diff
                         with TabPane("Timeline", id="task-tab-timeline"):
                             yield self.timeline
@@ -1094,6 +1132,11 @@ class PollyTasksApp(App[None]):
         self.detail_review.update("")
         self.review_confidence.update("")
         self.review_confidence.display = False
+        self.review_inline_diff_header.update("")
+        self.review_inline_diff_header.display = False
+        self.review_inline_diff_expand.display = False
+        self.review_inline_diff.update("")
+        self.review_inline_diff.display = False
         self.review_diff_toggle.display = False
         self.review_diff.update("")
         self.review_diff.display = False
@@ -1105,6 +1148,10 @@ class PollyTasksApp(App[None]):
         self.bulk_approve_button.disabled = True
         self.refresh_live_button.disabled = True
         self._set_live_tail_paused(False)
+        self._review_inline_diff = None
+        self._review_inline_diff_file_index = 0
+        self._review_inline_diff_expanded = False
+        self._review_nav_prefix = None
 
     def _render_table(self, *, select_first: bool) -> None:
         visible = self._filtered_tasks()
@@ -1263,7 +1310,7 @@ class PollyTasksApp(App[None]):
         if active_session is not None and not self._live_tail_paused:
             self.call_after_refresh(self._tail_live_scroll_to_end)
 
-    def _sync_review_panel(self, task, review_artifact) -> None:
+    def _sync_review_panel(self, task, review_artifact, review_diff_bundle) -> None:
         self.detail_review.update(render_task_review_artifact(review_artifact))
         score = _review_confidence_score(task, review_artifact)
         if score is None:
@@ -1272,6 +1319,8 @@ class PollyTasksApp(App[None]):
         else:
             self.review_confidence.update(_review_confidence_markup(score))
             self.review_confidence.display = True
+        self._review_inline_diff = review_diff_bundle
+        self._sync_inline_review_diff()
         diff_available = _task_has_resubmission_diff(task)
         self.review_diff_toggle.display = diff_available
         self.review_diff_toggle.disabled = not diff_available
@@ -1292,6 +1341,87 @@ class PollyTasksApp(App[None]):
                 "[dim]Press [D] to compare this submission against the last rejected attempt.[/dim]"
             )
         self.review_diff.display = True
+
+    def _sync_inline_review_diff(self) -> None:
+        bundle = self._review_inline_diff
+        if bundle is None or not bundle.files:
+            self.review_inline_diff_header.update("")
+            self.review_inline_diff_header.display = False
+            self.review_inline_diff_expand.display = False
+            self.review_inline_diff.update("")
+            self.review_inline_diff.display = False
+            return
+        self._review_inline_diff_file_index = max(
+            0,
+            min(self._review_inline_diff_file_index, len(bundle.files) - 1),
+        )
+        diff_file = bundle.files[self._review_inline_diff_file_index]
+        current_file = self._review_inline_diff_file_index + 1
+        self.review_inline_diff_header.update(
+            "\n".join(
+                [
+                    (
+                        f"[b]Code Diff[/b] · {bundle.source_label}"
+                        f" · {current_file}/{len(bundle.files)} files"
+                    ),
+                    (
+                        f"{diff_file.path}"
+                        + (
+                            " [dim]· [f prev · ]f next[/dim]"
+                            if len(bundle.files) > 1
+                            else ""
+                        )
+                    ),
+                ]
+            )
+        )
+        self.review_inline_diff_header.display = True
+        hidden_lines = review_diff_hidden_line_count(diff_file)
+        collapsed = hidden_lines > 0 and not self._review_inline_diff_expanded
+        if hidden_lines > 0:
+            self.review_inline_diff_expand.label = (
+                "Collapse"
+                if self._review_inline_diff_expanded
+                else f"Expand (+{hidden_lines} lines)"
+            )
+            self.review_inline_diff_expand.display = True
+        else:
+            self.review_inline_diff_expand.display = False
+        self.review_inline_diff.update(
+            Syntax(
+                diff_file.patch if not collapsed else collapse_review_diff_file(diff_file),
+                "diff",
+                line_numbers=True,
+                word_wrap=False,
+                background_color="default",
+            )
+        )
+        self.review_inline_diff.display = True
+
+    def _review_tab_is_active(self) -> bool:
+        try:
+            tabs = self.query_one("#task-tabs", TabbedContent)
+        except Exception:  # noqa: BLE001
+            return False
+        return tabs.active == "task-tab-review"
+
+    def _scroll_review_panel_home(self) -> None:
+        try:
+            review_scroll = self.query_one("#task-review-scroll", VerticalScroll)
+        except Exception:  # noqa: BLE001
+            return
+        review_scroll.scroll_home(animate=False)
+
+    def _jump_review_diff_file(self, step: int) -> None:
+        bundle = self._review_inline_diff
+        if bundle is None or len(bundle.files) < 2:
+            return
+        self._review_inline_diff_file_index = (
+            self._review_inline_diff_file_index + step
+        ) % len(bundle.files)
+        self._review_inline_diff_expanded = False
+        self._sync_inline_review_diff()
+        self.call_after_refresh(self._scroll_review_panel_home)
 
     def _project_path(self) -> Path | None:
         try:
@@ -1336,22 +1466,38 @@ class PollyTasksApp(App[None]):
                 pass
         self._selected_task_id = task_id
         self._owner_by_task_id[task.task_id] = owner
-        review_artifact = load_task_review_artifact(task, self._project_path())
+        project_path = self._project_path()
+        review_artifact = load_task_review_artifact(task, project_path)
         if task_id != previous_task_id:
             self._set_live_tail_paused(False)
             self._show_resubmission_diff = False
+            self._review_inline_diff_file_index = 0
+            self._review_inline_diff_expanded = False
+        review_diff_bundle = load_task_review_diff(
+            task,
+            project_path,
+            review_artifact=review_artifact,
+            active_branch=getattr(active_session, "branch_name", None),
+        )
+        if review_diff_bundle is None:
+            self._review_inline_diff_file_index = 0
+            self._review_inline_diff_expanded = False
+        elif self._review_inline_diff_file_index >= len(review_diff_bundle.files):
+            self._review_inline_diff_file_index = 0
+            self._review_inline_diff_expanded = False
         self._render_selected_task(
             task,
             owner=owner,
             flow=flow,
             active_session=active_session,
         )
-        self._sync_review_panel(task, review_artifact)
+        self._sync_review_panel(task, review_artifact, review_diff_bundle)
         tabs = self.query_one("#task-tabs", TabbedContent)
         if task_id != previous_task_id:
             tabs.active = (
                 "task-tab-review"
-                if task.work_status.value == "review" and review_artifact is not None
+                if task.work_status.value == "review"
+                and (review_artifact is not None or review_diff_bundle is not None)
                 else "task-tab-overview"
             )
         if active_session is not None and not self._live_tail_paused:
@@ -1704,11 +1850,24 @@ class PollyTasksApp(App[None]):
     def _on_press_review_diff_toggle(self) -> None:
         self.action_toggle_resubmission_diff()
 
+    @on(Button.Pressed, "#task-review-inline-diff-expand")
+    def _on_press_review_inline_diff_expand(self) -> None:
+        bundle = self._review_inline_diff
+        if bundle is None:
+            return
+        diff_file = bundle.files[self._review_inline_diff_file_index]
+        if review_diff_hidden_line_count(diff_file) == 0:
+            return
+        self._review_inline_diff_expanded = not self._review_inline_diff_expanded
+        self._sync_inline_review_diff()
+        self.call_after_refresh(self._scroll_review_panel_home)
+
     @on(Button.Pressed, "#task-refresh-live")
     def _on_press_refresh_live(self) -> None:
         self.action_refresh_live()
 
     def on_key(self, event: events.Key) -> None:
+        self._review_nav_prefix = self._handle_review_diff_key(event)
         modal = self._active_reject_modal
         if modal is None:
             return
@@ -1724,6 +1883,22 @@ class PollyTasksApp(App[None]):
         elif event.key == "4":
             event.stop()
             modal.action_pick_other()
+
+    def _handle_review_diff_key(self, event: events.Key) -> str | None:
+        if isinstance(getattr(self, "focused", None), Input):
+            return None
+        if not self._review_tab_is_active():
+            return None
+        bundle = self._review_inline_diff
+        if bundle is None or len(bundle.files) < 2:
+            return None
+        key_char = event.character or ""
+        if key_char in {"[", "]"}:
+            return key_char
+        if key_char == "f" and self._review_nav_prefix in {"[", "]"}:
+            event.stop()
+            self._jump_review_diff_file(1 if self._review_nav_prefix == "]" else -1)
+        return None
 
     @on(DataTable.RowHighlighted, "#tasks-table")
     def _on_task_highlighted(self) -> None:

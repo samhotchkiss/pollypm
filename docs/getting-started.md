@@ -43,6 +43,10 @@ pm
 
 On a fresh machine, `pm` runs onboarding: it writes a default config to `~/.pollypm/config.toml`, walks you through your first account login, and creates the PollyPM tmux session. When it finishes, you're attached to the cockpit — a tmux layout with Polly on one side and a project/session rail on the other.
 
+If onboarding can't find any recently active local git repos, it can also copy
+a small self-contained demo repo into your workspace so you can exercise PollyPM
+without any network dependency beyond the account login you already completed.
+
 If you're already inside tmux when you run `pm`, PollyPM prints the attach command instead of grabbing your client:
 
 ```

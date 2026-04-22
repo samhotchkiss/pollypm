@@ -4,6 +4,7 @@ import base64
 import json
 import re
 import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -51,6 +52,28 @@ from pollypm.session_services import create_tmux_client
 
 if TYPE_CHECKING:
     from pollypm.tmux.client import TmuxClient
+
+
+DEMO_PROJECT_BASENAME = "demo-polly"
+DEMO_PROJECT_MARKER = ".pollypm-demo-fallback"
+DEMO_PROJECT_TEMPLATE_DIR = Path(__file__).resolve().parent / "defaults" / "demo"
+DEMO_PROJECT_TASK_TITLE = "Fix the demo queue estimate bug"
+DEMO_PROJECT_TASK_DESCRIPTION = (
+    "The offline demo intentionally ships a tiny regression in demo_app.py.\n"
+    "Open TASK.md and tests/test_demo_app.py, fix estimate_focus_minutes(), "
+    "and keep the seeded PollyPM task until you are done."
+)
+DEMO_PROJECT_REPLAY_COMMIT_COUNT = 3
+DEMO_PROJECT_REPLAY_HISTORY_FILES = {
+    "demo_history.md",
+}
+DEMO_PROJECT_REPLAY_TASK_FILES = {
+    "TASK.md",
+    "tests/test_demo_history.py",
+    "tests/test_demo_task.py",
+}
+
+
 class LoginCancelled(Exception):
     pass
 
@@ -242,6 +265,15 @@ def _scan_recent_projects(config_path: Path) -> list[KnownProject]:
     discovered = discover_recent_project_candidates(config_path)
     if not discovered:
         typer.echo("No recently active git repos were found in your home folder.")
+        demo_path = demo_project_fallback_destination(config_path)
+        typer.echo(
+            f"You can copy a self-contained demo repo to {demo_path} and use it offline."
+        )
+        if typer.confirm("Copy the demo repo and use it as your first project?", default=True):
+            return add_selected_projects(
+                config_path,
+                [provision_demo_project_fallback(config_path)],
+            )
         return []
 
     typer.echo("")
@@ -253,10 +285,381 @@ def _scan_recent_projects(config_path: Path) -> list[KnownProject]:
     return add_selected_projects(config_path, selected)
 
 
-def discover_recent_project_candidates(config_path: Path) -> list[Path]:
-    config = load_config(config_path)
-    known_paths = {project.path.resolve() for project in config.projects.values()}
-    return discover_recent_git_repositories(Path.home(), known_paths=known_paths, recent_days=14)
+def discover_recent_project_candidates(
+    config_path: Path,
+    *,
+    scan_root: Path | None = None,
+    recent_days: int = 14,
+) -> list[Path]:
+    try:
+        config = load_config(config_path)
+        known_paths = {project.path.resolve() for project in config.projects.values()}
+    except Exception:  # noqa: BLE001
+        known_paths = set()
+    return discover_recent_git_repositories(
+        scan_root or Path.home(),
+        known_paths=known_paths,
+        recent_days=recent_days,
+    )
+
+
+def _workspace_root_for_onboarding(config_path: Path) -> Path:
+    try:
+        config = load_config(config_path)
+        workspace_root = getattr(config.project, "workspace_root", DEFAULT_WORKSPACE_ROOT)
+    except Exception:  # noqa: BLE001
+        workspace_root = DEFAULT_WORKSPACE_ROOT
+    return Path(workspace_root).expanduser()
+
+
+def demo_project_fallback_destination(config_path: Path) -> Path:
+    del config_path
+    workspace_root = Path.home()
+    for index in range(100):
+        suffix = "" if index == 0 else f"-{index}"
+        candidate = workspace_root / f"{DEMO_PROJECT_BASENAME}{suffix}"
+        if (candidate / DEMO_PROJECT_MARKER).exists():
+            return candidate
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError("Could not find a free path for the onboarding demo repo.")
+
+
+def _write_demo_project_files(target: Path) -> None:
+    marker_path = target / DEMO_PROJECT_MARKER
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text("demo-fallback-v1\n", encoding="utf-8")
+    for source in sorted(DEMO_PROJECT_TEMPLATE_DIR.rglob("*")):
+        if not source.is_file():
+            continue
+        relative_name = source.relative_to(DEMO_PROJECT_TEMPLATE_DIR)
+        destination = target / relative_name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+
+
+def _demo_repo_stage_one_contents() -> dict[str, str]:
+    return {
+        "README.md": (
+            "# PollyPM Demo Repo\n\n"
+            "This offline fallback gives onboarding a tiny local project to copy.\n\n"
+            "It ships a queue-summary helper, a small CLI, sample data, and tests.\n"
+        ),
+        "demo_app.py": (
+            '"""Small offline demo for PollyPM onboarding."""\n\n'
+            "from __future__ import annotations\n\n\n"
+            "def summarize_queue(items: list[str]) -> str:\n"
+            "    cleaned = [item.strip() for item in items if item.strip()]\n"
+            "    if not cleaned:\n"
+            '        return "No tasks queued."\n'
+            "    if len(cleaned) == 1:\n"
+            '        return f"1 task queued: {cleaned[0]}"\n'
+            '    preview = ", ".join(cleaned[:2])\n'
+            "    if len(cleaned) > 2:\n"
+            '        preview += f", +{len(cleaned) - 2} more"\n'
+            '    return f"{len(cleaned)} tasks queued: {preview}"\n\n\n'
+            "def estimate_focus_minutes(task_count: int, *, per_task: int = 25) -> int:\n"
+            "    if task_count <= 0:\n"
+            "        return 0\n"
+            "    if task_count == 1:\n"
+            "        return 30\n"
+            "    return task_count * per_task\n"
+        ),
+        "demo_cli.py": (
+            "from __future__ import annotations\n\n"
+            "import argparse\n\n"
+            "from demo_app import estimate_focus_minutes, summarize_queue\n"
+            "from demo_data import demo_task_titles\n\n\n"
+            "def build_parser() -> argparse.ArgumentParser:\n"
+            '    parser = argparse.ArgumentParser(prog="demo-polly")\n'
+            "    subparsers = parser.add_subparsers(dest=\"command\", required=True)\n"
+            '    subparsers.add_parser("summary", help="Print the queue summary.")\n'
+            '    subparsers.add_parser("tasks", help="Print the sample demo tasks.")\n'
+            '    subparsers.add_parser("focus", help="Print the focus estimate.")\n'
+            "    return parser\n\n\n"
+            "def main(argv: list[str] | None = None) -> int:\n"
+            "    args = build_parser().parse_args(argv)\n"
+            "    if args.command == \"summary\":\n"
+            "        print(summarize_queue(demo_task_titles()))\n"
+            "        return 0\n"
+            "    if args.command == \"tasks\":\n"
+            "        for title in demo_task_titles():\n"
+            "            print(f\"- {title}\")\n"
+            "        return 0\n"
+            "    if args.command == \"focus\":\n"
+            "        print(f\"{estimate_focus_minutes(len(demo_task_titles()))} minutes\")\n"
+            "        return 0\n"
+            "    return 1\n\n\n"
+            "if __name__ == \"__main__\":\n"
+            "    raise SystemExit(main())\n"
+        ),
+        "demo_data.py": (
+            '"""Sample tasks for the offline PollyPM demo."""\n\n'
+            "from __future__ import annotations\n\n"
+            "DEMO_TASKS: list[dict[str, str]] = [\n"
+            '    {"title": "Fix the queue estimate bug", "kind": "bug"},\n'
+            '    {"title": "Write a demo launch note", "kind": "docs"},\n'
+            '    {"title": "Review the seeded git history", "kind": "ops"},\n'
+            "]\n\n\n"
+            "def demo_task_titles() -> list[str]:\n"
+            '    return [item["title"] for item in DEMO_TASKS]\n'
+        ),
+        "demo_history.md": (
+            "# Demo History\n\n"
+            "This repo is replayable: onboarding seeds a short git history so the\n"
+            "demo feels like a real project instead of a single snapshot.\n"
+        ),
+        ".gitignore": ".pollypm/\n__pycache__/\n.pytest_cache/\n",
+        "tests/test_demo_app.py": (
+            "import unittest\n\n"
+            "from demo_app import estimate_focus_minutes, summarize_queue\n\n\n"
+            "class DemoAppTests(unittest.TestCase):\n"
+            "    def test_summarize_queue_handles_empty_input(self) -> None:\n"
+            '        self.assertEqual(summarize_queue([]), "No tasks queued.")\n\n'
+            "    def test_summarize_queue_shows_preview_and_count(self) -> None:\n"
+            '        summary = summarize_queue(["plan onboarding", "write docs", "ship fallback"])\n'
+            '        self.assertEqual(summary, "3 tasks queued: plan onboarding, write docs, +1 more")\n\n'
+            "    def test_estimate_focus_minutes_uses_default_block(self) -> None:\n"
+            "        self.assertEqual(estimate_focus_minutes(3), 75)\n\n"
+            "    def test_estimate_focus_minutes_reserves_a_half_hour_for_one_task(self) -> None:\n"
+            "        self.assertEqual(estimate_focus_minutes(1), 30)\n\n\n"
+            "if __name__ == \"__main__\":\n"
+            "    unittest.main()\n"
+        ),
+        "tests/test_demo_cli.py": (
+            "from contextlib import redirect_stdout\n"
+            "from io import StringIO\n\n"
+            "from demo_cli import main\n\n\n"
+            "def test_summary_command_prints_queue_summary() -> None:\n"
+            "    buffer = StringIO()\n"
+            "    with redirect_stdout(buffer):\n"
+            '        assert main(["summary"]) == 0\n'
+            "    output = buffer.getvalue()\n"
+            '    assert "tasks queued" in output\n'
+            '    assert "Fix the queue estimate bug" in output\n'
+        ),
+        "tests/test_demo_data.py": (
+            "from demo_data import DEMO_TASKS, demo_task_titles\n\n\n"
+            "def test_demo_data_exposes_three_sample_tasks() -> None:\n"
+            "    assert len(DEMO_TASKS) == 3\n"
+            '    assert demo_task_titles()[0] == "Fix the queue estimate bug"\n'
+        ),
+    }
+
+
+def _demo_repo_stage_two_contents() -> dict[str, str]:
+    stage = _demo_repo_stage_one_contents()
+    stage["README.md"] = (
+        "# PollyPM Demo Repo\n\n"
+        "The offline demo intentionally carries a small queue-estimate regression.\n"
+        "Run the unit tests, fix the bug in `demo_app.py`, and keep the seeded task\n"
+        "while you work.\n"
+    )
+    stage["demo_app.py"] = (
+        '"""Small offline demo for PollyPM onboarding."""\n\n'
+        "from __future__ import annotations\n\n\n"
+        "def summarize_queue(items: list[str]) -> str:\n"
+        "    cleaned = [item.strip() for item in items if item.strip()]\n"
+        "    if not cleaned:\n"
+        '        return "No tasks queued."\n'
+        "    if len(cleaned) == 1:\n"
+        '        return f"1 task queued: {cleaned[0]}"\n'
+        '    preview = ", ".join(cleaned[:2])\n'
+        "    if len(cleaned) > 2:\n"
+        '        preview += f", +{len(cleaned) - 2} more"\n'
+        '    return f"{len(cleaned)} tasks queued: {preview}"\n\n\n'
+        "def estimate_focus_minutes(task_count: int, *, per_task: int = 25) -> int:\n"
+        '    """Intentional demo bug: a single task still underestimates by five minutes."""\n'
+        "    if task_count <= 0:\n"
+        "        return 0\n"
+        "    return task_count * per_task\n"
+    )
+    stage["tests/test_demo_app.py"] = (
+        "import unittest\n\n"
+        "from demo_app import estimate_focus_minutes, summarize_queue\n\n\n"
+        "class DemoAppTests(unittest.TestCase):\n"
+        "    def test_summarize_queue_handles_empty_input(self) -> None:\n"
+        '        self.assertEqual(summarize_queue([]), "No tasks queued.")\n\n'
+        "    def test_summarize_queue_shows_preview_and_count(self) -> None:\n"
+        '        summary = summarize_queue(["plan onboarding", "write docs", "ship fallback"])\n'
+        '        self.assertEqual(summary, "3 tasks queued: plan onboarding, write docs, +1 more")\n\n'
+        "    def test_estimate_focus_minutes_uses_default_block(self) -> None:\n"
+        "        self.assertEqual(estimate_focus_minutes(3), 75)\n\n"
+        "    def test_estimate_focus_minutes_reserves_a_half_hour_for_one_task(self) -> None:\n"
+        "        \"\"\"Intentional demo bug: the helper still underestimates a single task.\"\"\"\n"
+        "        self.assertEqual(estimate_focus_minutes(1), 30)\n\n\n"
+        "if __name__ == \"__main__\":\n"
+        "    unittest.main()\n"
+    )
+    return stage
+
+
+def _demo_repo_stage_three_contents() -> dict[str, str]:
+    stage = _demo_repo_stage_two_contents()
+    stage["README.md"] = (
+        "# PollyPM Demo Repo\n\n"
+        "This repo is the offline fallback used by onboarding when no recent local\n"
+        "projects are detected.\n\n"
+        "It is intentionally small, but self-contained:\n\n"
+        "- `demo_app.py` contains a tiny queue-summary helper with one deliberate bug.\n"
+        "- `tests/test_demo_app.py` contains the matching failing regression test.\n"
+        "- `demo_cli.py` is a tiny entrypoint that prints the demo queue summary.\n"
+        "- `demo_data.py` holds sample task titles used by the CLI and tests.\n"
+        "- `demo_history.md` explains the replayable git history seeded by onboarding.\n"
+        "- `TASK.md` describes the seeded PollyPM task that onboarding can add to the\n"
+        "  project database.\n\n"
+        "## What To Try\n\n"
+        "- Run `python -m unittest discover -s tests -p \"test_*.py\"`\n"
+        "- Read `TASK.md` and `demo_history.md`\n"
+        "- Fix the queue estimate regression, then rerun the demo tests\n"
+        "- Ask Polly to explain, extend, or test the queue summary behavior\n\n"
+        "Everything in this repo uses only the Python standard library.\n"
+    )
+    stage["TASK.md"] = (
+        "# Demo Task\n\n"
+        "Fix the queue estimate regression in `demo_app.py`.\n\n"
+        "The follow-up is intentionally small:\n\n"
+        "- `estimate_focus_minutes(1)` should reserve a 30-minute block.\n"
+        "- The demo test suite already includes a failing regression test.\n"
+        "- The repo history is replayable so you can inspect the change in three commits.\n"
+        "- Keep the task in PollyPM if you want it to show up in the seeded inbox.\n"
+    )
+    stage["tests/test_demo_history.py"] = (
+        "from pathlib import Path\n\n\n"
+        "def test_demo_history_describes_the_seeded_git_log() -> None:\n"
+        "    text = Path(\"demo_history.md\").read_text(encoding=\"utf-8\")\n"
+        "    lowered = text.lower()\n"
+        '    assert "replayable" in lowered\n'
+        '    assert "three commits" in lowered or "3 commits" in lowered\n'
+    )
+    stage["tests/test_demo_task.py"] = (
+        "from pathlib import Path\n\n\n"
+        "def test_task_doc_points_at_the_seeded_bug_and_tests() -> None:\n"
+        "    text = Path(\"TASK.md\").read_text(encoding=\"utf-8\")\n"
+        '    assert "demo_app.py" in text\n'
+        '    assert "tests/test_demo_app.py" in text\n'
+        '    assert "30-minute block" in text\n'
+    )
+    return stage
+
+
+def _write_demo_repo_files(target: Path, files: dict[str, str]) -> None:
+    for relative_name, contents in files.items():
+        destination = target / relative_name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(contents, encoding="utf-8")
+
+
+def _remove_demo_repo_files(target: Path, relative_names: set[str]) -> None:
+    for relative_name in relative_names:
+        path = target / relative_name
+        if path.exists():
+            path.unlink()
+
+
+def seed_demo_project_task(project_path: Path, *, project_key: str) -> str:
+    """Seed one small PollyPM task into the demo project's work DB."""
+    from pollypm.projects import ensure_project_scaffold
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    ensure_project_scaffold(project_path)
+    db_path = project_path / ".pollypm" / "state.db"
+    with SQLiteWorkService(db_path=db_path, project_path=project_path) as svc:
+        existing = svc.list_tasks(project=project_key)
+        for task in existing:
+            if task.title == DEMO_PROJECT_TASK_TITLE:
+                return task.task_id
+        task = svc.create(
+            title=DEMO_PROJECT_TASK_TITLE,
+            description=DEMO_PROJECT_TASK_DESCRIPTION,
+            type="task",
+            project=project_key,
+            flow_template="standard",
+            roles={"worker": "demo_worker", "reviewer": "demo_reviewer"},
+            priority="normal",
+            created_by="onboarding",
+            labels=["demo", "onboarding"],
+        )
+        svc.queue(task.task_id, "onboarding", skip_gates=True)
+        return task.task_id
+
+
+def _init_demo_project_git(target: Path) -> None:
+    if shutil.which("git") is None or (target / ".git").exists():
+        return
+    subprocess.run(
+        ["git", "init", "-q", str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _seed_demo_project_git_history(target: Path) -> None:
+    git = ["git", "-C", str(target)]
+    subprocess.run([*git, "config", "user.name", "PollyPM Demo"], check=False, capture_output=True, text=True)
+    subprocess.run([*git, "config", "user.email", "demo@pollypm.local"], check=False, capture_output=True, text=True)
+
+    stage_one = _demo_repo_stage_one_contents()
+    _write_demo_repo_files(target, stage_one)
+    _remove_demo_repo_files(target, DEMO_PROJECT_REPLAY_TASK_FILES)
+    subprocess.run([*git, "add", "-A"], check=False, capture_output=True, text=True)
+    subprocess.run(
+        [*git, "commit", "-q", "-m", "demo: scaffold offline fallback"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    stage_two = _demo_repo_stage_two_contents()
+    _write_demo_repo_files(target, stage_two)
+    subprocess.run([*git, "add", "-A"], check=False, capture_output=True, text=True)
+    subprocess.run(
+        [*git, "commit", "-q", "-m", "demo: introduce the queue bug"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    stage_three = _demo_repo_stage_three_contents()
+    _write_demo_repo_files(target, stage_three)
+    subprocess.run([*git, "add", "-A"], check=False, capture_output=True, text=True)
+    subprocess.run(
+        [*git, "commit", "-q", "-m", "demo: add task notes and replay guide"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _demo_project_history_seeded(target: Path) -> bool:
+    if not (target / ".git").exists():
+        return False
+    result = subprocess.run(
+        ["git", "-C", str(target), "rev-list", "--count", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return False
+    try:
+        return int(result.stdout.strip() or "0") >= DEMO_PROJECT_REPLAY_COMMIT_COUNT
+    except ValueError:
+        return False
+
+
+def provision_demo_project_fallback(config_path: Path) -> Path:
+    target = demo_project_fallback_destination(config_path)
+    marker = target / DEMO_PROJECT_MARKER
+    if not marker.exists():
+        target.mkdir(parents=True, exist_ok=True)
+        _write_demo_project_files(target)
+    _init_demo_project_git(target)
+    if shutil.which("git") is not None and not _demo_project_history_seeded(target):
+        _seed_demo_project_git_history(target)
+    ensure_project_scaffold(target)
+    return target
 
 
 def add_selected_projects(config_path: Path, selected_paths: list[Path]) -> list[KnownProject]:
@@ -772,6 +1175,77 @@ def build_onboarded_config(
         projects=dict(projects or {}),
     )
 
+def _seeded_demo_route(result: OnboardingResult) -> str | None:
+    project_key = result.seeded_demo_project_key
+    task_id = result.seeded_demo_task_id
+    if not project_key or not task_id:
+        return None
+    task_num = task_id.rsplit("/", 1)[-1].rsplit(":", 1)[-1].strip()
+    if not task_num:
+        return None
+    return f"project:{project_key}:task:{task_num}"
+
+
+def _launch_onboarding_experience(result: OnboardingResult) -> bool:
+    """Best-effort launch of the seeded demo cockpit after onboarding consent."""
+    from pollypm.cockpit_rail import CockpitRouter
+    from pollypm.service_api import PollyPMService
+    from pollypm.transcript_ingest import start_transcript_ingestion
+
+    service = PollyPMService(result.config_path)
+    supervisor = service.load_supervisor()
+    session_name = supervisor.config.project.tmux_session
+    launched = False
+
+    try:
+        if supervisor.tmux.has_session(session_name):
+            supervisor.ensure_layout()
+        else:
+            supervisor.bootstrap_tmux(skip_probe=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        start_transcript_ingestion(supervisor.config)
+    except Exception:  # noqa: BLE001
+        pass
+
+    route_key = _seeded_demo_route(result)
+    if route_key is not None:
+        try:
+            CockpitRouter(result.config_path).route_selected(route_key)
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        subprocess.run(
+            ["uv", "tool", "install", "--editable", "--reinstall", str(result.parent)],
+            cwd=result.parent,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        current_tmux = create_tmux_client().current_session_name()
+    except Exception:  # noqa: BLE001
+        current_tmux = None
+    if current_tmux == session_name:
+        launched = True
+        try:
+            supervisor.focus_console()
+        except Exception:  # noqa: BLE001
+            pass
+        return launched
+    try:
+        supervisor.tmux.attach_session(session_name)
+        launched = True
+    except Exception:  # noqa: BLE001
+        pass
+    return launched
+
 
 def _account_ready_for_welcome_back(account: AccountConfig) -> bool:
     if account.home is None:
@@ -800,6 +1274,8 @@ def run_onboarding(
     *,
     no_animation: bool = False,
 ) -> OnboardingResult:
+    from pollypm.onboarding_tui import run_onboarding_app
+
     if not force and config_path.exists():
         try:
             config = load_config(config_path)
@@ -814,18 +1290,25 @@ def run_onboarding(
             typer.echo("3. Re-run full onboarding")
             choice = typer.prompt("Choose", default="1")
             if choice == "1":
-                return OnboardingResult(config_path=config_path, launch_requested=True)
+                result = OnboardingResult(config_path=config_path, launch_requested=True)
+                if _launch_onboarding_experience(result):
+                    raise typer.Exit()
+                return result
             if choice == "2":
-                from pollypm.onboarding_tui import run_onboarding_app
-
-                return run_onboarding_app(config_path=config_path, force=False, no_animation=no_animation)
+                result = run_onboarding_app(config_path=config_path, force=False, no_animation=no_animation)
+                if result.launch_requested and _launch_onboarding_experience(result):
+                    raise typer.Exit()
+                return result
             if choice == "3":
-                from pollypm.onboarding_tui import run_onboarding_app
+                result = run_onboarding_app(config_path=config_path, force=True, no_animation=no_animation)
+                if result.launch_requested and _launch_onboarding_experience(result):
+                    raise typer.Exit()
+                return result
 
-                return run_onboarding_app(config_path=config_path, force=True, no_animation=no_animation)
-    from pollypm.onboarding_tui import run_onboarding_app
-
-    return run_onboarding_app(config_path=config_path, force=force, no_animation=no_animation)
+    result = run_onboarding_app(config_path=config_path, force=force, no_animation=no_animation)
+    if result.launch_requested and _launch_onboarding_experience(result):
+        raise typer.Exit()
+    return result
 
 
 def relogin_account(config_path: Path, identifier: str) -> tuple[str, str]:

@@ -1,13 +1,27 @@
 from pathlib import Path
+import subprocess
 
 from typer.testing import CliRunner
 
 from pollypm.cli import app as cli_app
+import pytest
+from click.exceptions import Exit as ClickExit
 from pollypm.config import load_config, write_config
 from pollypm.doctor import decode_setup_tag, setup_tag_line
 from pollypm.models import KnownProject, ProviderKind
 from pollypm.projects import DEFAULT_WORKSPACE_ROOT
-from pollypm.onboarding import ConnectedAccount, build_onboarded_config
+from pollypm.onboarding import (
+    ConnectedAccount,
+    DEMO_PROJECT_TEMPLATE_DIR,
+    DEMO_PROJECT_REPLAY_COMMIT_COUNT,
+    OnboardingResult,
+    _scan_recent_projects,
+    _seeded_demo_route,
+    build_onboarded_config,
+    demo_project_fallback_destination,
+    provision_demo_project_fallback,
+    seed_demo_project_task,
+)
 
 
 def test_build_onboarded_config_uses_controller_for_pollypm_sessions(tmp_path: Path) -> None:
@@ -165,3 +179,153 @@ def test_decode_setup_tag_cli_round_trips(monkeypatch, tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert '"accounts": 2' in result.output
+
+
+def test_provision_demo_project_fallback_creates_self_contained_repo(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "pollypm.toml"
+    monkeypatch.setattr("pollypm.onboarding.Path.home", lambda: tmp_path)
+    monkeypatch.setattr("pollypm.onboarding.shutil.which", lambda name: "/usr/bin/git" if name == "git" else None)
+
+    target = provision_demo_project_fallback(config_path)
+
+    assert target == demo_project_fallback_destination(config_path)
+    assert (target / ".pollypm-demo-fallback").exists()
+    assert (target / "README.md").exists()
+    assert (target / "demo_app.py").exists()
+    assert (target / "demo_cli.py").exists()
+    assert (target / "demo_data.py").exists()
+    assert (target / "demo_history.md").exists()
+    assert (target / "TASK.md").exists()
+    assert (target / "tests" / "test_demo_app.py").exists()
+    assert (target / "tests" / "test_demo_cli.py").exists()
+    assert (target / "tests" / "test_demo_data.py").exists()
+    assert (target / "tests" / "test_demo_history.py").exists()
+    assert (target / "tests" / "test_demo_task.py").exists()
+    assert (target / ".pollypm").exists()
+
+    git_count = subprocess.run(
+        ["git", "-C", str(target), "rev-list", "--count", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert git_count.stdout.strip() == str(DEMO_PROJECT_REPLAY_COMMIT_COUNT)
+    template_files = [
+        path for path in DEMO_PROJECT_TEMPLATE_DIR.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts and not path.suffix == ".pyc"
+    ]
+    assert len(template_files) == 12
+
+    same_target = provision_demo_project_fallback(config_path)
+    assert same_target == target
+    git_count_again = subprocess.run(
+        ["git", "-C", str(target), "rev-list", "--count", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert git_count_again.stdout.strip() == str(DEMO_PROJECT_REPLAY_COMMIT_COUNT)
+
+
+def test_seed_demo_project_task_creates_a_visible_queue_item(tmp_path: Path) -> None:
+    project_path = tmp_path / "demo-polly"
+    project_path.mkdir()
+
+    task_id = seed_demo_project_task(project_path, project_key="demo_polly")
+
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    with SQLiteWorkService(db_path=project_path / ".pollypm" / "state.db", project_path=project_path) as svc:
+        task = svc.get(task_id)
+        assert task.project == "demo_polly"
+        assert task.work_status.value == "queued"
+        assert task.title == "Fix the demo queue estimate bug"
+
+
+def test_scan_recent_projects_offers_demo_repo_when_discovery_is_empty(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "pollypm.toml"
+    demo_path = tmp_path / "workspace" / "pollypm-demo"
+    messages: list[str] = []
+
+    monkeypatch.setattr(
+        "pollypm.onboarding.discover_recent_project_candidates",
+        lambda _config_path: [],
+    )
+    monkeypatch.setattr(
+        "pollypm.onboarding.demo_project_fallback_destination",
+        lambda _config_path: demo_path,
+    )
+    monkeypatch.setattr(
+        "pollypm.onboarding.provision_demo_project_fallback",
+        lambda _config_path: demo_path,
+    )
+    monkeypatch.setattr(
+        "pollypm.onboarding.add_selected_projects",
+        lambda _config_path, selected_paths: [
+            KnownProject(key="pollypm_demo", path=selected_paths[0], name="PollyPM Demo")
+        ],
+    )
+    monkeypatch.setattr("pollypm.onboarding.typer.confirm", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr("pollypm.onboarding.typer.echo", lambda message="": messages.append(message))
+
+    projects = _scan_recent_projects(config_path)
+
+    assert [project.path for project in projects] == [demo_path]
+    assert any("demo repo" in message.lower() for message in messages)
+
+
+def test_onboarding_result_keeps_path_compatibility(tmp_path: Path) -> None:
+    result = OnboardingResult(
+        config_path=tmp_path / "pollypm.toml",
+        launch_requested=True,
+        seeded_demo_project_key="pollypm_demo",
+        seeded_demo_task_id="demo/1",
+    )
+
+    assert result.parent == tmp_path
+    assert result.resolve() == (tmp_path / "pollypm.toml").resolve()
+    assert str(result) == str(tmp_path / "pollypm.toml")
+
+
+def test_run_onboarding_launches_seeded_demo_experience(monkeypatch, tmp_path: Path) -> None:
+    result = OnboardingResult(
+        config_path=tmp_path / "pollypm.toml",
+        launch_requested=True,
+        seeded_demo_project_key="pollypm_demo",
+        seeded_demo_task_id="demo/1",
+    )
+    launched: list[OnboardingResult] = []
+
+    monkeypatch.setattr(
+        "pollypm.onboarding_tui.run_onboarding_app",
+        lambda config_path, force=False, no_animation=False: result,
+    )
+    monkeypatch.setattr(
+        "pollypm.onboarding._launch_onboarding_experience",
+        lambda launch_result: launched.append(launch_result) or True,
+    )
+
+    with pytest.raises(ClickExit):
+        __import__("pollypm.onboarding", fromlist=["run_onboarding"]).run_onboarding(
+            config_path=result.config_path,
+            force=True,
+        )
+
+    assert launched == [result]
+
+
+def test_seeded_demo_route_parses_project_and_task_number(tmp_path: Path) -> None:
+    result = OnboardingResult(
+        config_path=tmp_path / "pollypm.toml",
+        launch_requested=True,
+        seeded_demo_project_key="pollypm_demo",
+        seeded_demo_task_id="demo/17",
+    )
+
+    assert _seeded_demo_route(result) == "project:pollypm_demo:task:17"

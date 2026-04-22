@@ -3,6 +3,7 @@ from pathlib import Path
 
 from pollypm.models import KnownProject, ProviderKind
 from pollypm.onboarding import CliAvailability, ConnectedAccount
+from pollypm.projects import make_project_key
 from pollypm.onboarding_tui import (
     BlockingAutoFix,
     ONBOARDING_STAGES,
@@ -310,3 +311,101 @@ def test_onboarding_progress_lines_mark_done_current_and_up_next() -> None:
     assert f"✓[/] [#3ddc84]{ONBOARDING_STAGES[0][1]}" in lines[0]
     assert f"◉[/] [#5b8aff bold]{ONBOARDING_STAGES[1][1]}" in lines[1]
     assert f"○[/] [#6b7a88]{ONBOARDING_STAGES[2][1]}" in lines[2]
+
+
+def test_projects_step_can_offer_demo_repo_fallback(monkeypatch, tmp_path: Path) -> None:
+    async def run() -> None:
+        demo_path = tmp_path / "demo-polly"
+        monkeypatch.setattr(
+            "pollypm.onboarding_tui.demo_project_fallback_destination",
+            lambda _config_path: demo_path,
+        )
+        monkeypatch.setattr(
+            "pollypm.onboarding_tui.provision_demo_project_fallback",
+            lambda _config_path: demo_path,
+        )
+        monkeypatch.setattr(
+            "pollypm.onboarding.seed_demo_project_task",
+            lambda project_path, *, project_key: "demo/1",
+        )
+
+        app = OnboardingApp(tmp_path / "pollypm.toml")
+        app.step = "projects"
+        app.state.scan_started = True
+        app.state.scan_complete = True
+        app.state.recent_projects = []
+        app.state.selected_project_paths = []
+        monkeypatch.setattr(
+            app,
+            "push_screen",
+            lambda _screen, callback: callback("keep"),
+        )
+
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert app.query_one("#projects-use-demo") is not None
+            await pilot.click("#projects-use-demo")
+            await pilot.pause()
+
+            assert app.state.recent_projects == [demo_path]
+            assert app.state.selected_project_paths == [demo_path]
+            assert app.state.seeded_demo_project_key == make_project_key(demo_path, set())
+            assert app.state.seeded_demo_task_id == "demo/1"
+            assert app.project_selection is not None
+            assert list(app.project_selection.selected) == [demo_path]
+            assert "Seeded task demo/1" in str(app.message_widget.render())
+
+    asyncio.run(run())
+
+
+def test_demo_task_choice_keeps_seeded_task(monkeypatch, tmp_path: Path) -> None:
+    app = OnboardingApp(tmp_path / "pollypm.toml")
+    demo_path = tmp_path / "demo-polly"
+    app._pending_demo_repo_path = demo_path
+    app.state.known_projects = {}
+
+    seeded: list[tuple[Path, str]] = []
+    monkeypatch.setattr(
+        "pollypm.onboarding.seed_demo_project_task",
+        lambda project_path, *, project_key: seeded.append((project_path, project_key)) or "demo/1",
+    )
+    rendered: list[str] = []
+    monkeypatch.setattr(app, "_render_current_step", lambda: rendered.append("rendered"))
+    messages: list[str] = []
+    monkeypatch.setattr(app, "_set_message", lambda message="": messages.append(message))
+
+    app._handle_demo_task_choice("keep")
+
+    assert seeded == [(demo_path, make_project_key(demo_path, set()))]
+    assert app.state.recent_projects == [demo_path]
+    assert app.state.selected_project_paths == [demo_path]
+    assert app.state.seeded_demo_project_key == make_project_key(demo_path, set())
+    assert app.state.seeded_demo_task_id == "demo/1"
+    assert rendered == ["rendered"]
+    assert "Seeded task demo/1" in messages[-1]
+
+
+def test_demo_task_choice_can_forget_seeded_task(monkeypatch, tmp_path: Path) -> None:
+    app = OnboardingApp(tmp_path / "pollypm.toml")
+    demo_path = tmp_path / "demo-polly"
+    app._pending_demo_repo_path = demo_path
+    app.state.known_projects = {}
+    app.state.seeded_demo_task_id = "demo/1"
+
+    monkeypatch.setattr(
+        "pollypm.onboarding.seed_demo_project_task",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not seed")),
+    )
+    rendered: list[str] = []
+    monkeypatch.setattr(app, "_render_current_step", lambda: rendered.append("rendered"))
+    messages: list[str] = []
+    monkeypatch.setattr(app, "_set_message", lambda message="": messages.append(message))
+
+    app._handle_demo_task_choice("forget")
+
+    assert app.state.recent_projects == [demo_path]
+    assert app.state.selected_project_paths == [demo_path]
+    assert app.state.seeded_demo_project_key is None
+    assert app.state.seeded_demo_task_id is None
+    assert rendered == ["rendered"]
+    assert "No seeded task" in messages[-1]

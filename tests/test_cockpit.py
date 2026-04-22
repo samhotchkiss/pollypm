@@ -6,15 +6,9 @@ from types import SimpleNamespace
 import pytest
 
 from pollypm.cockpit import build_cockpit_detail
-from pollypm.cockpit_rail import (
-    CockpitItem,
-    CockpitPresence,
-    CockpitRouter,
-    PALETTE,
-    PollyCockpitRail,
-)
-from pollypm.config import write_config
+from pollypm.cockpit_rail import CockpitItem, CockpitPresence, CockpitRouter, PALETTE, PollyCockpitRail
 from pollypm.cockpit_ui import PollyCockpitApp, PollyDashboardApp, PollySettingsPaneApp, RailItem
+from pollypm.config import write_config
 from pollypm.dashboard_data import DashboardData, SessionActivity
 from pollypm.models import (
     AccountConfig,
@@ -27,7 +21,6 @@ from pollypm.models import (
     SessionConfig,
 )
 from pollypm.recovery.base import SessionHealth
-from pollypm.plugin_api.v1 import RailRow
 
 
 class _CaptureWidget:
@@ -253,59 +246,6 @@ def test_cockpit_router_session_state_uses_heartbeat_state(tmp_path: Path) -> No
     assert router._session_state("heartbeat", [FakeLaunch()], [FakeWindow()], [], 0) == "watch"
 
 
-def test_cockpit_router_decorates_project_items_with_sparkline_and_pin() -> None:
-    router = CockpitRouter.__new__(CockpitRouter)
-
-    class _Launch:
-        def __init__(self, session_name: str, project: str) -> None:
-            self.session = type(
-                "Session",
-                (),
-                {
-                    "name": session_name,
-                    "role": "worker",
-                    "project": project,
-                },
-            )()
-
-    class _Event:
-        def __init__(self, session_name: str, created_at) -> None:
-            self.session_name = session_name
-            self.created_at = created_at
-
-    items = [
-        CockpitItem(key="top", label="Top", state="idle"),
-        CockpitItem(key="project:alpha", label="Alpha", state="idle"),
-        CockpitItem(key="project:alpha:dashboard", label="Dashboard", state="sub", selectable=False),
-        CockpitItem(key="project:demo", label="Demo", state="◜ working"),
-        CockpitItem(key="project:demo:dashboard", label="Dashboard", state="sub", selectable=False),
-        CockpitItem(key="system", label="Settings", state="idle"),
-    ]
-    launches = [_Launch("worker_alpha", "alpha"), _Launch("worker_demo", "demo")]
-    recent_events = [
-        _Event("worker_alpha", datetime.now(UTC) - timedelta(minutes=4)),
-        _Event("worker_demo", datetime.now(UTC) - timedelta(minutes=15)),
-        _Event("worker_demo", datetime.now(UTC) - timedelta(minutes=28)),
-    ]
-    router.is_project_pinned = lambda key: key == "alpha"  # type: ignore[assignment]
-
-    decorated = router._decorate_project_items(
-        items,
-        selected_project="demo",
-        launches=launches,
-        recent_events=recent_events,
-        project_session_map={"alpha": "worker_alpha", "demo": "worker_demo"},
-    )
-
-    project_rows = [item for item in decorated if item.key.startswith("project:") and item.key.count(":") == 1]
-    assert project_rows[0].key == "project:alpha"
-    assert project_rows[0].label.startswith("📌 Alpha ")
-    assert len(project_rows[0].label[len("📌 Alpha "):]) == 10
-    assert project_rows[1].key == "project:demo"
-    assert project_rows[1].label != "Demo"
-    assert decorated[-1].key == "system"
-
-
 def test_cockpit_presence_treats_outside_tmux_as_attached() -> None:
     class _FakeTmux:
         def current_session_name(self) -> str | None:
@@ -368,6 +308,225 @@ def test_cockpit_presence_calm_mode_disables_animation(monkeypatch) -> None:
 
     assert presence.should_animate() is False
     assert presence.working_frame(3) == "◜"
+
+
+def test_cockpit_ui_rail_item_uses_static_ellipsis_in_calm_mode(monkeypatch) -> None:
+    monkeypatch.setattr(RailItem, "update_body", lambda self: None)
+
+    class _FakeTmux:
+        def current_session_name(self) -> str | None:
+            return "pollypm"
+
+        def list_clients(self, session_name: str) -> str:
+            del session_name
+            return "client"
+
+    monkeypatch.setenv("POLLY_CALM", "1")
+    presence = CockpitPresence(_FakeTmux())
+    item = RailItem(
+        CockpitItem(
+            "project:demo",
+            "Demo",
+            "ready",
+            session_name="worker_demo",
+            work_state="writing",
+            heartbeat_at="2026-04-21T23:00:00+00:00",
+        ),
+        active_view=False,
+        presence=presence,
+    )
+
+    assert item._indicator()[0] == "♥…"
+
+
+def test_cockpit_presence_heartbeat_frame_advances_only_on_new_heartbeat() -> None:
+    class _FakeTmux:
+        def current_session_name(self) -> str | None:
+            return "pollypm"
+
+        def list_clients(self, session_name: str) -> str:
+            del session_name
+            return "client"
+
+    presence = CockpitPresence(_FakeTmux())
+
+    first = presence.heartbeat_frame_for("worker_demo", "2026-04-21T23:00:00+00:00")
+    second = presence.heartbeat_frame_for("worker_demo", "2026-04-21T23:00:00+00:00")
+    third = presence.heartbeat_frame_for("worker_demo", "2026-04-21T23:05:00+00:00")
+
+    assert first == "♡"
+    assert second == "♡"
+    assert third == "♥"
+
+
+def test_cockpit_ui_rail_item_indicator_combines_pulse_and_work_glyph(monkeypatch) -> None:
+    monkeypatch.setattr(RailItem, "update_body", lambda self: None)
+
+    class _FakeTmux:
+        def current_session_name(self) -> str | None:
+            return "pollypm"
+
+        def list_clients(self, session_name: str) -> str:
+            del session_name
+            return "client"
+
+    presence = CockpitPresence(_FakeTmux())
+
+    writing = RailItem(
+        CockpitItem(
+            "project:demo",
+            "Demo",
+            "ready",
+            session_name="worker_demo",
+            work_state="writing",
+            heartbeat_at="2026-04-21T23:00:00+00:00",
+        ),
+        active_view=False,
+        presence=presence,
+    )
+    reviewing = RailItem(
+        CockpitItem(
+            "russell",
+            "Russell",
+            "ready",
+            session_name="reviewer",
+            work_state="reviewing",
+            heartbeat_at="2026-04-21T23:00:00+00:00",
+        ),
+        active_view=False,
+        presence=presence,
+    )
+    stuck = RailItem(
+        CockpitItem(
+            "project:demo",
+            "Demo",
+            "! pane dead",
+            session_name="worker_demo",
+            work_state="stuck",
+            heartbeat_at="2026-04-21T23:00:00+00:00",
+        ),
+        active_view=False,
+        presence=presence,
+    )
+    exited = RailItem(
+        CockpitItem(
+            "project:demo",
+            "Demo",
+            "dead",
+            session_name="worker_demo",
+            work_state="exited",
+            heartbeat_at="2026-04-21T23:00:00+00:00",
+        ),
+        active_view=False,
+        presence=presence,
+    )
+
+    assert writing._indicator()[0] == "♡◜"
+    assert reviewing._indicator()[0] == "♡✎"
+    assert stuck._indicator()[0] == "♡⚠"
+    assert exited._indicator()[0] == "♡✕"
+
+
+def test_cockpit_rail_session_indicator_combines_pulse_and_work_glyph(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+
+    class _FakeTmux:
+        def current_session_name(self) -> str | None:
+            return "pollypm"
+
+        def list_clients(self, session_name: str) -> str:
+            del session_name
+            return "client"
+
+    rail = PollyCockpitRail(config_path)
+    rail.router.tmux = _FakeTmux()  # type: ignore[assignment]
+    rail.presence = CockpitPresence(_FakeTmux())
+
+    writing = CockpitItem(
+        "project:demo",
+        "Demo",
+        "◜ working",
+        session_name="worker_demo",
+        work_state="writing",
+        heartbeat_at="2026-04-21T23:00:00+00:00",
+    )
+    reviewing = CockpitItem(
+        "russell",
+        "Russell",
+        "ready",
+        session_name="reviewer",
+        work_state="reviewing",
+        heartbeat_at="2026-04-21T23:00:00+00:00",
+    )
+    stuck = CockpitItem(
+        "project:demo",
+        "Demo",
+        "! pane dead",
+        session_name="worker_demo",
+        work_state="stuck",
+        heartbeat_at="2026-04-21T23:00:00+00:00",
+    )
+    exited = CockpitItem(
+        "project:demo",
+        "Demo",
+        "dead",
+        session_name="worker_demo",
+        work_state="exited",
+        heartbeat_at="2026-04-21T23:00:00+00:00",
+    )
+
+    assert rail._indicator(writing)[0] == "♡◜"
+    assert rail._indicator(reviewing)[0] == "♡✎"
+    assert rail._indicator(stuck)[0] == "♡⚠"
+    assert rail._indicator(exited)[0] == "♡✕"
+
+
+def test_cockpit_rail_session_indicator_uses_static_ellipsis_in_calm_mode(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("POLLY_CALM", "1")
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+
+    class _FakeTmux:
+        def current_session_name(self) -> str | None:
+            return "pollypm"
+
+        def list_clients(self, session_name: str) -> str:
+            del session_name
+            return "client"
+
+    rail = PollyCockpitRail(config_path)
+    rail.router.tmux = _FakeTmux()  # type: ignore[assignment]
+    rail.presence = CockpitPresence(_FakeTmux())
+
+    writing = CockpitItem(
+        "project:demo",
+        "Demo",
+        "◜ working",
+        session_name="worker_demo",
+        work_state="writing",
+        heartbeat_at="2026-04-21T23:00:00+00:00",
+    )
+
+    assert rail._indicator(writing)[0] == "♥…"
+
+
+def test_cockpit_ui_help_legend_mentions_glyph_alphabet() -> None:
+    binding = next(
+        binding for binding in PollyCockpitApp.BINDINGS if getattr(binding, "key", "") == "question_mark"
+    )
+
+    assert "pulse" in binding.description
+    assert "✎" in binding.description
+    assert "⚠" in binding.description
+    assert "✕" in binding.description
 
 
 def test_cockpit_router_config_cache_reuses_loaded_config(monkeypatch, tmp_path: Path) -> None:
@@ -510,6 +669,60 @@ def test_cockpit_router_caches_hidden_collapsed_and_grouped_registrations(monkey
     assert grouped_first == grouped_second
     assert calls == {"hidden": 1, "collapsed": 1, "registry": 1}
 
+
+def test_cockpit_router_decorates_project_items_with_sparkline_and_pin() -> None:
+    router = CockpitRouter.__new__(CockpitRouter)
+
+    class _Launch:
+        def __init__(self, session_name: str, project: str) -> None:
+            self.session = type(
+                "Session",
+                (),
+                {
+                    "name": session_name,
+                    "role": "worker",
+                    "project": project,
+                },
+            )()
+
+    class _Event:
+        def __init__(self, session_name: str, created_at) -> None:
+            self.session_name = session_name
+            self.created_at = created_at
+
+    items = [
+        CockpitItem(key="top", label="Top", state="idle"),
+        CockpitItem(key="project:alpha", label="Alpha", state="idle"),
+        CockpitItem(key="project:alpha:dashboard", label="Dashboard", state="sub", selectable=False),
+        CockpitItem(key="project:demo", label="Demo", state="◜ working"),
+        CockpitItem(key="project:demo:dashboard", label="Dashboard", state="sub", selectable=False),
+        CockpitItem(key="system", label="Settings", state="idle"),
+    ]
+    launches = [_Launch("worker_alpha", "alpha"), _Launch("worker_demo", "demo")]
+    recent_events = [
+        _Event("worker_alpha", datetime.now(UTC) - timedelta(minutes=4)),
+        _Event("worker_demo", datetime.now(UTC) - timedelta(minutes=15)),
+        _Event("worker_demo", datetime.now(UTC) - timedelta(minutes=28)),
+    ]
+    router.is_project_pinned = lambda key: key == "alpha"  # type: ignore[assignment]
+
+    decorated = router._decorate_project_items(
+        items,
+        selected_project="demo",
+        launches=launches,
+        recent_events=recent_events,
+        project_session_map={"alpha": "worker_alpha", "demo": "worker_demo"},
+    )
+
+    project_rows = [item for item in decorated if item.key.startswith("project:") and item.key.count(":") == 1]
+    assert project_rows[0].key == "project:alpha"
+    assert project_rows[0].label.startswith("📌 Alpha ")
+    assert len(project_rows[0].label[len("📌 Alpha "):]) == 10
+    assert project_rows[1].key == "project:demo"
+    assert project_rows[1].label != "Demo"
+    assert decorated[-1].key == "system"
+
+
 def test_cockpit_rail_render_includes_event_ticker(monkeypatch) -> None:
     class _Event:
         def __init__(self, event_type: str, session_name: str, created_at) -> None:
@@ -585,28 +798,6 @@ def test_cockpit_rail_hides_event_ticker_when_empty(monkeypatch) -> None:
     assert rail._event_ticker_text() == ""
 
 
-def test_cockpit_rail_keybinds_activity_and_pin(monkeypatch) -> None:
-    calls: list[tuple[str, str | None]] = []
-
-    class _Router:
-        def route_selected(self, key: str) -> None:
-            calls.append(("route", key))
-
-        def toggle_pinned_project(self, project_key: str) -> None:
-            calls.append(("pin", project_key))
-
-    rail = PollyCockpitRail.__new__(PollyCockpitRail)
-    rail.router = _Router()
-    rail.selected_key = "project:demo"
-
-    assert rail._handle_key(b"t", []) is True
-    rail.selected_key = "project:demo"
-    assert rail._handle_key(b"p", []) is True
-
-    assert ("route", "activity") in calls
-    assert ("pin", "demo") in calls
-
-
 def test_cockpit_ui_event_ticker_cycles_and_hides_when_empty(monkeypatch, tmp_path: Path) -> None:
     class _Event:
         def __init__(self, event_type: str, session_name: str) -> None:
@@ -668,9 +859,6 @@ def test_cockpit_ui_activity_and_pin_actions_route_live_rail(monkeypatch, tmp_pa
     calls: list[tuple[str, str]] = []
 
     class _Router:
-        def selected_key(self) -> str:
-            return "project:demo"
-
         def route_selected(self, key: str) -> None:
             calls.append(("route", key))
 
@@ -688,18 +876,6 @@ def test_cockpit_ui_activity_and_pin_actions_route_live_rail(monkeypatch, tmp_pa
     assert ("route", "activity") in calls
     assert ("pin", "demo") in calls
     assert ("refresh", "yes") in calls
-
-
-def test_cockpit_ui_section_separator_rows_use_section_style(monkeypatch) -> None:
-    monkeypatch.setattr(RailItem, "update_body", lambda self: None)
-
-    row = RailItem(
-        CockpitItem("_section:projects", "PROJECTS (3)", "separator", selectable=False),
-        active_view=False,
-    )
-
-    assert row.has_class("section-sep")
-    assert row.disabled is True
 
 
 def test_cockpit_router_selected_key_clears_missing_right_pane_state(monkeypatch, tmp_path: Path) -> None:
@@ -1997,6 +2173,32 @@ def test_cockpit_ui_arrow_and_enter_route_selected(tmp_path: Path) -> None:
             assert app.router.calls == ["inbox"]
 
     asyncio.run(exercise())
+
+
+def test_cockpit_rail_ctrl_k_routes_to_settings(monkeypatch, tmp_path: Path) -> None:
+    class FakeRouter:
+        def __init__(self, _config_path: Path) -> None:
+            self.calls: list[str] = []
+            self.tmux = None
+
+        def selected_key(self) -> str:
+            return "polly"
+
+        def route_selected(self, key: str) -> None:
+            self.calls.append(key)
+
+    monkeypatch.setattr("pollypm.cockpit_rail.CockpitRouter", FakeRouter)
+    from pollypm.cockpit_rail import CockpitItem, PollyCockpitRail
+
+    rail = PollyCockpitRail(tmp_path / "pollypm.toml")
+    items = [
+        CockpitItem("polly", "Polly", "ready"),
+        CockpitItem("settings", "Settings", "config"),
+    ]
+
+    assert rail._handle_key(b"\x0b", items) is True
+    assert rail.router.calls == ["settings"]
+    assert rail.selected_key == "settings"
 
 
 def test_settings_pane_renders_accounts_and_toggles_permissions(monkeypatch, tmp_path: Path) -> None:

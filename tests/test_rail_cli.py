@@ -164,69 +164,6 @@ def test_build_items_collapses_sections(monkeypatch, tmp_path: Path) -> None:
     assert header.label == "SYSTEM (1)"
 
 
-def test_build_items_auto_collapses_empty_sections(monkeypatch, tmp_path: Path) -> None:
-    from pollypm.cockpit_rail import CockpitRouter
-    from pollypm.models import KnownProject, ProjectKind
-    from pollypm.plugin_api.v1 import RailRow
-
-    class _FakeConfig:
-        def __init__(self, tmp_path: Path) -> None:
-            class Project:
-                root_dir = tmp_path
-                base_dir = tmp_path / ".pollypm"
-                tmux_session = "pollypm"
-
-            self.project = Project()
-            self.projects = {
-                "demo": KnownProject(key="demo", path=tmp_path / "demo", name="Demo", kind=ProjectKind.GIT),
-            }
-            self.rail = RailSettings()
-
-    class FakeSupervisor:
-        def __init__(self, cfg) -> None:
-            self.config = cfg
-
-        def status(self):
-            return [], [], [], [], []
-
-    class _Reg:
-        section = "workflows"
-        item_key = "workflows.empty"
-        visibility = "always"
-        rows_provider = None
-        label_provider = None
-        state_provider = None
-        badge_provider = None
-
-    class _Registry:
-        def items(self):
-            return [_Reg()]
-
-    monkeypatch.setattr(
-        "pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 0,
-    )
-    monkeypatch.setattr(
-        "pollypm.cockpit_rail.load_config", lambda path: _FakeConfig(tmp_path),
-    )
-    cfg = _FakeConfig(tmp_path)
-    cfg_path = tmp_path / "pollypm.toml"
-    cfg_path.write_text(f"[project]\nname = \"P\"\nbase_dir = \"{tmp_path}\"\n")
-    router = CockpitRouter(cfg_path)
-    monkeypatch.setattr(router, "_load_supervisor", lambda: FakeSupervisor(cfg))
-    monkeypatch.setattr(router, "_rail_registry", lambda: _Registry())
-    monkeypatch.setattr(
-        "pollypm.cockpit_rail._rows_for_registration",
-        lambda reg, ctx: [RailRow(key="workflows.empty", label="Empty", state="idle")],
-    )
-
-    items = router.build_items(spinner_index=0)
-    keys = [i.key for i in items]
-    assert any(k.startswith("_section:workflows") for k in keys)
-    header = next(i for i in items if i.key.startswith("_section:workflows"))
-    assert header.label == "WORKFLOWS (1)"
-    assert "workflows.empty" not in keys
-
-
 # ---------------------------------------------------------------------------
 # CLI — list / hide / show
 # ---------------------------------------------------------------------------

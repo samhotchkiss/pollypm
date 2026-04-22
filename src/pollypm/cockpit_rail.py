@@ -120,6 +120,7 @@ class CockpitPresence:
     _cached_attached: bool | None = None
     _cached_at: float = 0.0
     _cached_session: str | None = None
+    _heartbeat_states: dict[str, tuple[str | None, int]] = field(default_factory=dict)
 
     def _calm_mode(self) -> bool:
         value = os.environ.get("POLLY_CALM", "")
@@ -193,19 +194,33 @@ class CockpitPresence:
             return ARC_SPINNER[0]
         return ARC_SPINNER[spinner_index % len(ARC_SPINNER)]
 
+    def heartbeat_frame(self, spinner_index: int) -> str:
+        frames = ("♥", "♡")
+        if not self.should_animate():
+            return frames[0]
+        return frames[spinner_index % len(frames)]
+
+    def heartbeat_frame_for(
+        self,
+        session_name: str,
+        heartbeat_at: str | None,
+    ) -> str:
+        frames = ("♥", "♡")
+        if not self.should_animate():
+            return frames[0]
+        previous_at, frame_index = self._heartbeat_states.get(session_name, (None, 0))
+        if heartbeat_at and heartbeat_at != previous_at:
+            frame_index = (frame_index + 1) % len(frames)
+        self._heartbeat_states[session_name] = (heartbeat_at, frame_index)
+        return frames[frame_index]
+
 
 def _viewer_attached() -> bool:
-    """Best-effort check for a live terminal viewer.
-
-    The legacy rail is a direct TTY renderer, so this stays local to the
-    rail module rather than depending on the newer cockpit presence
-    stack.
-    """
+    """Best-effort check for a live terminal viewer."""
     try:
         return sys.stdin.isatty() and sys.stdout.isatty()
     except Exception:  # noqa: BLE001
         return False
-
 
 # ── Rail data model + router ─────────────────────────────────────────────
 #
@@ -222,6 +237,9 @@ class CockpitItem:
     label: str
     state: str
     selectable: bool = True
+    session_name: str | None = None
+    work_state: str | None = None
+    heartbeat_at: str | None = None
 
 
 def _selected_project_key(selected: object) -> str | None:
@@ -388,7 +406,6 @@ class CockpitRouter:
         # value: (db_mtime, git_mtime, is_active, has_working_task)
         # Skips re-opening SQLite on every 0.8s cockpit tick when nothing changed.
         self._project_activity_cache: dict[str, tuple[float, float, bool, bool]] = {}
-        self._pinned_projects_cache: set[str] | None = None
 
     def _presence(self) -> CockpitPresence:
         presence = getattr(self, "presence", None)
@@ -579,29 +596,6 @@ class CockpitRouter:
             self._state_cache_mtime_ns = None
         self._state_dirty_since = None
 
-    def pinned_projects(self) -> set[str]:
-        data = self._load_state()
-        value = data.get("pinned_projects")
-        if not isinstance(value, list):
-            return set()
-        return {item for item in value if isinstance(item, str) and item}
-
-    def is_project_pinned(self, project_key: str) -> bool:
-        return project_key in self.pinned_projects()
-
-    def toggle_pinned_project(self, project_key: str) -> bool:
-        data = self._load_state()
-        current = self.pinned_projects()
-        if project_key in current:
-            current.remove(project_key)
-            pinned = False
-        else:
-            current.add(project_key)
-            pinned = True
-        data["pinned_projects"] = sorted(current)
-        self._write_state(data)
-        return pinned
-
     def rail_width(self) -> int:
         """Return the persisted rail width, falling back to the default."""
         data = self._load_state()
@@ -728,6 +722,29 @@ class CockpitRouter:
         data["ui_initialized_sessions"] = items
         self._write_state(data)
 
+    def pinned_projects(self) -> set[str]:
+        data = self._load_state()
+        value = data.get("pinned_projects")
+        if not isinstance(value, list):
+            return set()
+        return {item for item in value if isinstance(item, str) and item}
+
+    def is_project_pinned(self, project_key: str) -> bool:
+        return project_key in self.pinned_projects()
+
+    def toggle_pinned_project(self, project_key: str) -> bool:
+        data = self._load_state()
+        current = self.pinned_projects()
+        if project_key in current:
+            current.remove(project_key)
+            pinned = False
+        else:
+            current.add(project_key)
+            pinned = True
+        data["pinned_projects"] = sorted(current)
+        self._write_state(data)
+        return pinned
+
     def build_items(self, *, spinner_index: int = 0) -> list[CockpitItem]:
         """Build rail rows by walking the plugin-host rail registry.
 
@@ -776,6 +793,7 @@ class CockpitRouter:
         collapsed_sections = self._collapsed_rail_sections_cached(config)
         grouped_registrations = self._grouped_rail_registrations(config, registry)
         grouped: dict[str, list[CockpitItem]] = {name: [] for name in RAIL_SECTIONS}
+        project_session_map = self._project_session_map(launches)
 
         for section, registrations in grouped_registrations.items():
             for reg in registrations:
@@ -788,6 +806,12 @@ class CockpitRouter:
                         label=row.label,
                         state=row.state,
                         selectable=row.selectable,
+                    )
+                    self._attach_session_metadata(
+                        item,
+                        launches=launches,
+                        supervisor=supervisor,
+                        project_session_map=project_session_map,
                     )
                     grouped.setdefault(section, []).append(item)
 
@@ -814,12 +838,6 @@ class CockpitRouter:
                 continue
             items.extend(rows)
 
-        project_session_map: dict[str, str] = {}
-        for launch in launches:
-            if launch.session.role in {"operator-pm", "heartbeat-supervisor", "triage", "reviewer"}:
-                continue
-            project_session_map.setdefault(launch.session.project, launch.session.name)
-
         return self._decorate_project_items(
             items,
             selected_project=_selected_project_key(cockpit_state.get("selected")),
@@ -827,6 +845,104 @@ class CockpitRouter:
             recent_events=recent_events,
             project_session_map=project_session_map,
         )
+
+    def _attach_session_metadata(
+        self,
+        item: CockpitItem,
+        *,
+        launches,
+        supervisor,
+        project_session_map: dict[str, str],
+    ) -> None:
+        session_name = self._session_name_for_item(item, project_session_map)
+        if session_name is None:
+            return
+        item.session_name = session_name
+        launch = next((entry for entry in launches if entry.session.name == session_name), None)
+        if launch is None:
+            return
+        item.work_state = self._work_state_for_item_state(item.state, launch.session.role)
+        try:
+            heartbeat = supervisor.store.latest_heartbeat(session_name)
+        except Exception:  # noqa: BLE001
+            heartbeat = None
+        item.heartbeat_at = getattr(heartbeat, "created_at", None)
+
+    def _session_name_for_item(
+        self,
+        item: CockpitItem,
+        project_session_map: dict[str, str],
+    ) -> str | None:
+        if item.key == "polly":
+            return "operator"
+        if item.key == "russell":
+            return "reviewer"
+        if not item.key.startswith("project:") or item.key.count(":") != 1:
+            return None
+        project_key = item.key.split(":", 1)[1]
+        return project_session_map.get(project_key)
+
+    def _work_state_for_item_state(self, state: str, role: str) -> str | None:
+        if state == "dead":
+            return "exited"
+        if state.startswith("!"):
+            return "stuck"
+        if state.endswith("working"):
+            return "writing"
+        if role == "reviewer":
+            return "reviewing"
+        if state.endswith("live") or state in {"idle", "ready"}:
+            return "idle"
+        return None
+
+    def _rail_registry(self):
+        """Return the plugin-host rail registry for the active root dir."""
+        from pollypm.plugin_host import extension_host_for_root
+
+        config = self._load_config()
+        host = extension_host_for_root(str(config.project.root_dir.resolve()))
+        # Initialize plugins so the rail registry is populated. Safe to
+        # call repeatedly — it tracks which plugins have been init'd.
+        try:
+            host.initialize_plugins(config=config)
+        except Exception:  # noqa: BLE001
+            # Plugin init failures surface via degraded_plugins; don't
+            # block the rail rendering.
+            pass
+        registry = host.rail_registry()
+        # Worker roster top-rail entry. Registered here (not in
+        # ``core_rail_items``) so the cockpit router + roster Textual
+        # app land in one feature drop — the rail row, the route handler
+        # (``route_selected("workers")``), and the panel renderer all
+        # live alongside each other. The registration is gated on
+        # ``core_rail_items`` being active so disabling the core plugin
+        # still yields an empty rail (see
+        # ``test_removing_core_rail_items_yields_empty_rail``).
+        try:
+            core_enabled = "core_rail_items" in host.plugins()
+        except Exception:  # noqa: BLE001
+            core_enabled = True
+        if core_enabled:
+            # Deferred imports: the worker roster + metrics registrations
+            # live in ``pollypm.cockpit`` alongside the gather helpers
+            # they call into. Importing them at module load time would
+            # create a cycle (cockpit imports cockpit_rail to re-export
+            # the router), so we resolve them per-tick instead.
+            from pollypm.cockpit import (
+                _register_metrics_rail_item,
+                _register_worker_roster_rail_item,
+            )
+            _register_worker_roster_rail_item(registry, self)
+            _register_metrics_rail_item(registry, self)
+        return registry
+
+    def _project_session_map(self, launches) -> dict[str, str]:
+        project_session_map: dict[str, str] = {}
+        for launch in launches:
+            if launch.session.role in {"operator-pm", "heartbeat-supervisor", "triage", "reviewer"}:
+                continue
+            project_session_map.setdefault(launch.session.project, launch.session.name)
+        return project_session_map
 
     def _decorate_project_items(
         self,
@@ -837,7 +953,6 @@ class CockpitRouter:
         recent_events: list,
         project_session_map: dict[str, str],
     ) -> list[CockpitItem]:
-        """Keep project rows together while decorating their presentation."""
         from pollypm.cockpit_sections.base import _iso_to_dt, _spark_bar
 
         first_project = next((idx for idx, item in enumerate(items) if item.key.startswith("project:")), None)
@@ -853,7 +968,6 @@ class CockpitRouter:
         prefix = list(items[:first_project])
         region = list(items[first_project : last_project + 1])
         suffix = list(items[last_project + 1 :])
-
         project_event_spark = self._project_activity_sparkline(
             project_session_map,
             recent_events,
@@ -947,19 +1061,10 @@ class CockpitRouter:
         result: dict[str, str] = {}
         for project_key, values in buckets.items():
             if any(values):
-                result[project_key] = self._sparkline(values)
+                result[project_key] = _spark_bar(values)
             else:
                 result[project_key] = "·" * len(values)
         return result
-
-    def _sparkline(self, values: list[int]) -> str:
-        from pollypm.cockpit_sections.base import _spark_bar
-
-        if not values:
-            return ""
-        if max(values) <= 0:
-            return "·" * len(values)
-        return _spark_bar(values)
 
     def _row_is_active(self, item: CockpitItem) -> bool:
         state = item.state.strip().lower()
@@ -969,55 +1074,6 @@ class CockpitRouter:
             marker in state
             for marker in ("working", "live", "watch", "ready", "alert", "active")
         ) or state.startswith("!")
-
-    def _rail_registry(self):
-        """Return the plugin-host rail registry for the active root dir."""
-        from pollypm.plugin_host import extension_host_for_root
-
-        config = self._load_config()
-        host = extension_host_for_root(str(config.project.root_dir.resolve()))
-        # Initialize plugins so the rail registry is populated. Safe to
-        # call repeatedly — it tracks which plugins have been init'd.
-        try:
-            host.initialize_plugins(config=config)
-        except Exception:  # noqa: BLE001
-            # Plugin init failures surface via degraded_plugins; don't
-            # block the rail rendering.
-            pass
-        registry = host.rail_registry()
-        # Worker roster top-rail entry. Registered here (not in
-        # ``core_rail_items``) so the cockpit router + roster Textual
-        # app land in one feature drop — the rail row, the route handler
-        # (``route_selected("workers")``), and the panel renderer all
-        # live alongside each other. The registration is gated on
-        # ``core_rail_items`` being active so disabling the core plugin
-        # still yields an empty rail (see
-        # ``test_removing_core_rail_items_yields_empty_rail``).
-        try:
-            core_enabled = "core_rail_items" in host.plugins()
-        except Exception:  # noqa: BLE001
-            core_enabled = True
-        if core_enabled:
-            # Deferred imports: the worker roster + metrics registrations
-            # live in ``pollypm.cockpit`` alongside the gather helpers
-            # they call into. Importing them at module load time would
-            # create a cycle (cockpit imports cockpit_rail to re-export
-            # the router), so we resolve them per-tick instead.
-            from pollypm.cockpit import (
-                _register_metrics_rail_item,
-                _register_worker_roster_rail_item,
-            )
-            _register_worker_roster_rail_item(registry, self)
-            _register_metrics_rail_item(registry, self)
-        return registry
-
-    def _project_session_map(self, launches) -> dict[str, str]:
-        project_session_map: dict[str, str] = {}
-        for launch in launches:
-            if launch.session.role in {"operator-pm", "heartbeat-supervisor", "triage", "reviewer"}:
-                continue
-            project_session_map.setdefault(launch.session.project, launch.session.name)
-        return project_session_map
 
     # Alert types that are informational / auto-managed — don't show red triangle
     _SILENT_ALERT_TYPES = frozenset({
@@ -1926,6 +1982,12 @@ class PollyCockpitRail:
             project_key = self.selected_key.split(":", 2)[1]
             self.router.toggle_pinned_project(project_key)
             return True
+        if key in {b"\x0b"}:
+            # Raw rail has no palette UI of its own; jump to settings so
+            # the user's ctrl-k habit still lands in the palette-enabled pane.
+            self.router.route_selected("settings")
+            self.selected_key = "settings"
+            return True
         return True
 
     # ── Navigation ───────────────────────────────────────────────────────
@@ -2024,7 +2086,7 @@ class PollyCockpitRail:
 
         # ── Spacer + settings at bottom
         if settings_item is not None:
-            target_lines = len(lines) + 5  # section header + blank + item + ticker + footer
+            target_lines = len(lines) + 4  # section header + blank + item + hint
             while len(lines) < height - target_lines + len(lines):
                 if len(lines) >= height - 4:
                     break
@@ -2033,13 +2095,13 @@ class PollyCockpitRail:
             lines.append(self._section_header("system", width))
             lines.append(self._item_row(settings_item, width, active_view))
 
-        # ── Bottom ticker + hint/footer
         ticker_text = self._event_ticker_text()
-        while len(lines) < height - 3:
+        reserve = 3 if ticker_text else 2
+        while len(lines) < height - reserve:
             lines.append(RenderRow(""))
+        lines.append(RenderRow(""))
         if ticker_text:
-            lines.append(RenderRow(""))
-            lines.append(RenderRow(f"{pad}{ticker_text}"[:width], fg=PALETTE["hint"]))
+            lines.append(RenderRow(ticker_text[:width], fg=PALETTE["hint"]))
         hint = f"{pad}j/k move \u00b7 \u21b5 open \u00b7 n new \u00b7 t activity \u00b7 p pin"
         lines.append(RenderRow(hint[:width], fg=PALETTE["hint"]))
 
@@ -2057,19 +2119,12 @@ class PollyCockpitRail:
             else:
                 self._write(clear_line + "\r\n")
 
-    def _section_header(self, label: str, width: int) -> RenderRow:
-        pad = " " * GUTTER
-        prefix = f"{pad}\u2500\u2500 {label.upper()} "
-        remaining = width - len(prefix)
-        rule = "\u2500" * max(0, remaining)
-        return RenderRow((prefix + rule)[:width], fg=PALETTE["section_label"])
-
     def _event_ticker_text(self) -> str:
         if not _viewer_attached():
             return ""
         try:
             supervisor = self.router._load_supervisor()
-            events = list(supervisor.store.recent_events(limit=12))
+            events = list(supervisor.store.recent_events(limit=4))
         except Exception:  # noqa: BLE001
             return ""
         if not events:
@@ -2080,6 +2135,13 @@ class PollyCockpitRail:
         session_name = getattr(event, "session_name", "") or "system"
         return f"events · {event_type}:{session_name}"
 
+    def _section_header(self, label: str, width: int) -> RenderRow:
+        pad = " " * GUTTER
+        prefix = f"{pad}\u2500\u2500 {label.upper()} "
+        remaining = width - len(prefix)
+        rule = "\u2500" * max(0, remaining)
+        return RenderRow((prefix + rule)[:width], fg=PALETTE["section_label"])
+
     def _item_row(self, item: CockpitItem, width: int, active_view: str) -> RenderRow:
         is_selected = item.key == self.selected_key
         is_active = item.key == active_view
@@ -2088,7 +2150,8 @@ class PollyCockpitRail:
         # Build the text with gutter (2-char prefix for alignment)
         bar = "\u258c " if is_selected else "  "
         label = item.label
-        max_label = width - 6  # 2 bar + 1 indicator + 1 space + 2 margin
+        indicator_width = max(1, len(indicator))
+        max_label = width - (5 + indicator_width)
         if len(label) > max_label and max_label > 3:
             label = label[: max_label - 1] + "\u2026"
         text = f" {bar}{indicator} {label}"
@@ -2137,6 +2200,13 @@ class PollyCockpitRail:
         return row
 
     def _indicator(self, item: CockpitItem) -> tuple[str, _C | None]:
+        if item.session_name and item.work_state:
+            pulse = self.presence.heartbeat_frame_for(
+                item.session_name,
+                item.heartbeat_at,
+            )
+            work_glyph, color = self._session_work_glyph(item.work_state)
+            return f"{pulse}{work_glyph}", color
         # State-based indicators first (apply to any item type including projects)
         if item.state.endswith("working"):
             char = self.presence.working_frame(self.spinner_index)
@@ -2166,6 +2236,19 @@ class PollyCockpitRail:
         if item.state == "sub":
             return " ", None
         return "\u25cb", PALETTE["idle"]
+
+    def _session_work_glyph(self, work_state: str) -> tuple[str, _C | None]:
+        if work_state == "writing":
+            if not self.presence.should_animate():
+                return "…", PALETTE["live_indicator"]
+            return self.presence.working_frame(self.spinner_index), PALETTE["live_indicator"]
+        if work_state == "reviewing":
+            return "✎", PALETTE["live_indicator"]
+        if work_state == "stuck":
+            return "⚠", PALETTE["alert_indicator"]
+        if work_state == "exited":
+            return "✕", PALETTE["dead"]
+        return "·", PALETTE["idle"]
 
     def _write(self, text: str) -> None:
         sys.stdout.write(text)

@@ -15,6 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
+from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -109,10 +110,10 @@ class PollyProjectSettingsApp(App[None]):
             yield Static("Recent Tasks", classes="section-label")
             yield Static("", id="task-info")
         with Horizontal(id="actions"):
-            yield Button("Reset Session", id="reset-session", variant="warning")
-            yield Button("Switch to Claude", id="switch-claude", variant="primary")
-            yield Button("Switch to Codex", id="switch-codex", variant="primary")
-            yield Button("Undo", id="undo", variant="default")
+            yield Button(Text("[R] Reset Session"), id="reset-session", variant="warning")
+            yield Button(Text("[C] Switch to Claude"), id="switch-claude", variant="primary")
+            yield Button(Text("[X] Switch to Codex"), id="switch-codex", variant="primary")
+            yield Button(Text("[U] Undo"), id="undo", variant="default")
 
     def on_mount(self) -> None:
         self._refresh()

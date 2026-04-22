@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from textual.widgets import Button
+
 from pollypm.models import ProviderKind
 
 
@@ -143,5 +145,19 @@ def test_project_settings_reset_and_switch_provider(project_settings_env) -> Non
             app.action_undo_recent_change()
             assert service.switched[-1] == ("worker-alpha", "claude_main")
             assert "Undid" in str(app.query_one("#message").render())
+
+    _run(body())
+
+
+def test_project_settings_buttons_include_inline_key_hints(project_settings_env) -> None:
+    app = project_settings_env["app"]
+
+    async def body() -> None:
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            assert app.query_one("#reset-session", Button).label.plain == "[R] Reset Session"
+            assert app.query_one("#switch-claude", Button).label.plain == "[C] Switch to Claude"
+            assert app.query_one("#switch-codex", Button).label.plain == "[X] Switch to Codex"
+            assert app.query_one("#undo", Button).label.plain == "[U] Undo"
 
     _run(body())

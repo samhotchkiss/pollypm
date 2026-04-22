@@ -357,6 +357,7 @@ class CockpitRouter:
         self.config_path = config_path
         self.service = PollyPMService(config_path)
         self.tmux = create_tmux_client()
+        self.presence = CockpitPresence(self.tmux)
         self._supervisor = None
         self._config_cache: object | None = None
         self._config_cache_mtime_ns: int | None = None
@@ -374,6 +375,15 @@ class CockpitRouter:
         # value: (db_mtime, git_mtime, is_active, has_working_task)
         # Skips re-opening SQLite on every 0.8s cockpit tick when nothing changed.
         self._project_activity_cache: dict[str, tuple[float, float, bool, bool]] = {}
+
+    def _presence(self) -> CockpitPresence:
+        presence = getattr(self, "presence", None)
+        if not isinstance(presence, CockpitPresence):
+            presence = CockpitPresence(self.tmux)
+            self.presence = presence
+        elif presence.tmux is not self.tmux:
+            presence.tmux = self.tmux
+        return presence
 
     def _load_config(self):
         try:
@@ -859,7 +869,7 @@ class CockpitRouter:
                 heartbeat=heartbeat,
             )
             if working:
-                return f"{self.presence.working_frame(spinner_index)} working"
+                return f"{self._presence().working_frame(spinner_index)} working"
             if launch.session.role == "worker":
                 return "\u25cf live"
             return "ready"

@@ -24,12 +24,13 @@ import json
 import logging
 import sqlite3
 import subprocess
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
 
+from pollypm.atomic_io import atomic_write_json
 from pollypm.work.flow_engine import resolve_flow
 from pollypm.work.gates import GateRegistry, evaluate_gates, has_hard_failure
 from pollypm.work.models import (
@@ -101,6 +102,81 @@ from pollypm.work.service_transition_manager import WorkTransitionManager
 from pollypm.work.sync import SyncManager
 
 
+_STATE_FILENAME = "state.json"
+
+
+class _HasExecutions(Protocol):
+    def get_execution(
+        self,
+        task_id: str,
+        node_id: str | None = None,
+        visit: int | None = None,
+    ) -> list[Any]:
+        ...
+
+
+def state_path() -> Path:
+    return Path.home() / ".pollypm" / _STATE_FILENAME
+
+
+def load_state(path: Path | None = None) -> dict[str, Any]:
+    resolved = path or state_path()
+    if not resolved.exists():
+        return {}
+    try:
+        payload = json.loads(resolved.read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def first_shipped_at(path: Path | None = None) -> str | None:
+    value = load_state(path).get("first_shipped_at")
+    return str(value) if isinstance(value, str) and value else None
+
+
+def mark_first_shipped(
+    *,
+    path: Path | None = None,
+    when: datetime | None = None,
+) -> bool:
+    resolved = path or state_path()
+    state = load_state(resolved)
+    if isinstance(state.get("first_shipped_at"), str) and state["first_shipped_at"]:
+        return False
+    state["first_shipped_at"] = (when or datetime.now(UTC)).isoformat()
+    atomic_write_json(resolved, state)
+    return True
+
+
+def task_landed_commit(service: _HasExecutions, task_id: str) -> bool:
+    try:
+        executions = service.get_execution(task_id)
+    except Exception:  # noqa: BLE001
+        return False
+    for execution in reversed(executions):
+        work_output = getattr(execution, "work_output", None)
+        if work_output is None:
+            continue
+        artifacts = getattr(work_output, "artifacts", None) or []
+        for artifact in artifacts:
+            if getattr(artifact, "kind", None) == ArtifactKind.COMMIT:
+                return True
+    return False
+
+
+def maybe_record_first_shipped(
+    service: _HasExecutions,
+    task_id: str,
+    *,
+    path: Path | None = None,
+    when: datetime | None = None,
+) -> bool:
+    if not task_landed_commit(service, task_id):
+        return False
+    return mark_first_shipped(path=path, when=when)
+
+
 # ---------------------------------------------------------------------------
 # SQLiteWorkService
 # ---------------------------------------------------------------------------
@@ -139,6 +215,7 @@ class SQLiteWorkService:
         # ``provision_worker`` fails so the CLI can surface it instead
         # of reporting a silent success (#243).
         self.last_provision_error: str | None = None
+        self.last_first_shipped_created: bool = False
 
     def set_session_manager(self, session_manager: object) -> None:
         """Wire up the session manager after construction.
@@ -1205,12 +1282,19 @@ class SQLiteWorkService:
         skip_gates: bool = False,
     ) -> Task:
         """Approve at a review node."""
-        return self._transition_mgr.approve(
+        self.last_first_shipped_created = False
+        result = self._transition_mgr.approve(
             task_id,
             actor,
             reason=reason,
             skip_gates=skip_gates,
         )
+        if result.work_status == WorkStatus.DONE:
+            self.last_first_shipped_created = maybe_record_first_shipped(
+                self,
+                task_id,
+            )
+        return result
 
     def reject(
         self,

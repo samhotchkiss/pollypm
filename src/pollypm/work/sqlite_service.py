@@ -26,6 +26,7 @@ import sqlite3
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +131,7 @@ class SQLiteWorkService:
         create_work_tables(self._conn)
         self._gate_registry = GateRegistry(project_path=project_path)
         self._flow_cache: dict[tuple[str, int], FlowTemplate] = {}
+        self._work_output_cache: dict[str, dict[str, Any]] = {}
         self._dependency_mgr = WorkDependencyManager(self)
         self._transition_mgr = WorkTransitionManager(self)
         self._worker_session_mgr = WorkSessionManager(self)
@@ -150,6 +152,7 @@ class SQLiteWorkService:
     def close(self) -> None:
         """Close the database connection."""
         self._flow_cache.clear()
+        self._work_output_cache.clear()
         self._conn.close()
 
     def __enter__(self):
@@ -585,10 +588,20 @@ class SQLiteWorkService:
             "SELECT "
             "from_project, from_task_number, "
             "to_project, to_task_number, "
-            "kind "
+            "kind, "
+            "1 AS is_outgoing, "
+            "0 AS is_incoming "
             "FROM work_task_dependencies "
-            "WHERE (from_project = ? AND from_task_number = ?) "
-            "   OR (to_project = ? AND to_task_number = ?)",
+            "WHERE from_project = ? AND from_task_number = ? "
+            "UNION ALL "
+            "SELECT "
+            "from_project, from_task_number, "
+            "to_project, to_task_number, "
+            "kind, "
+            "0 AS is_outgoing, "
+            "1 AS is_incoming "
+            "FROM work_task_dependencies "
+            "WHERE to_project = ? AND to_task_number = ?",
             (project, task_number, project, task_number),
         ).fetchall()
 
@@ -603,13 +616,7 @@ class SQLiteWorkService:
 
         for r in rows:
             kind = r["kind"]
-            is_outgoing = (
-                r["from_project"] == project and r["from_task_number"] == task_number
-            )
-            is_incoming = (
-                r["to_project"] == project and r["to_task_number"] == task_number
-            )
-            if is_outgoing:
+            if r["is_outgoing"]:
                 target = (r["to_project"], r["to_task_number"])
                 if kind == LinkKind.BLOCKS.value:
                     rels["blocks"].append(target)
@@ -620,7 +627,7 @@ class SQLiteWorkService:
                 elif kind == LinkKind.SUPERSEDES.value:
                     # outgoing supersedes: this task supersedes target
                     pass  # stored in supersedes_project/supersedes_task_number columns
-            if is_incoming:
+            if r["is_incoming"]:
                 source = (r["from_project"], r["from_task_number"])
                 if kind == LinkKind.BLOCKS.value:
                     rels["blocked_by"].append(source)
@@ -666,24 +673,7 @@ class SQLiteWorkService:
         ).fetchall()
         result: list[FlowNodeExecution] = []
         for r in rows:
-            wo_raw = r["work_output"]
-            work_output: WorkOutput | None = None
-            if wo_raw:
-                wo_dict = json.loads(wo_raw)
-                work_output = WorkOutput(
-                    type=OutputType(wo_dict["type"]),
-                    summary=wo_dict["summary"],
-                    artifacts=[
-                        Artifact(
-                            kind=ArtifactKind(a["kind"]),
-                            description=a.get("description", ""),
-                            ref=a.get("ref"),
-                            path=a.get("path"),
-                            external_ref=a.get("external_ref"),
-                        )
-                        for a in wo_dict.get("artifacts", [])
-                    ],
-                )
+            work_output = self._decode_work_output(r["work_output"])
             result.append(
                 FlowNodeExecution(
                     task_id=f"{r['task_project']}/{r['task_number']}",
@@ -708,6 +698,31 @@ class SQLiteWorkService:
                 )
             )
         return result
+
+    def _decode_work_output(self, raw: str | None) -> WorkOutput | None:
+        if not raw:
+            return None
+        wo_dict = self._work_output_cache.get(raw)
+        if wo_dict is None:
+            parsed = json.loads(raw)
+            if not isinstance(parsed, dict):
+                return None
+            wo_dict = parsed
+            self._work_output_cache[raw] = wo_dict
+        return WorkOutput(
+            type=OutputType(wo_dict["type"]),
+            summary=wo_dict["summary"],
+            artifacts=[
+                Artifact(
+                    kind=ArtifactKind(a["kind"]),
+                    description=a.get("description", ""),
+                    ref=a.get("ref"),
+                    path=a.get("path"),
+                    external_ref=a.get("external_ref"),
+                )
+                for a in wo_dict.get("artifacts", [])
+            ],
+        )
 
     def _record_transition(
         self,
@@ -1238,24 +1253,7 @@ class SQLiteWorkService:
 
         result: list[FlowNodeExecution] = []
         for r in rows:
-            wo_raw = r["work_output"]
-            wo: WorkOutput | None = None
-            if wo_raw:
-                wo_dict = json.loads(wo_raw)
-                wo = WorkOutput(
-                    type=OutputType(wo_dict["type"]),
-                    summary=wo_dict["summary"],
-                    artifacts=[
-                        Artifact(
-                            kind=ArtifactKind(a["kind"]),
-                            description=a.get("description", ""),
-                            ref=a.get("ref"),
-                            path=a.get("path"),
-                            external_ref=a.get("external_ref"),
-                        )
-                        for a in wo_dict.get("artifacts", [])
-                    ],
-                )
+            wo = self._decode_work_output(r["work_output"])
             result.append(
                 FlowNodeExecution(
                     task_id=f"{r['task_project']}/{r['task_number']}",

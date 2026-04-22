@@ -49,6 +49,7 @@ class TranscriptCursorState:
 class TranscriptSourceScanCache:
     known_files: tuple[str, ...] = ()
     dir_mtimes: dict[str, float] = field(default_factory=dict)
+    root_mtime_ns: int = 0
     last_full_scan_at: float = 0.0
 
 
@@ -549,9 +550,14 @@ def _build_source_scan_cache(root: Path, files: list[Path], *, now: float) -> Tr
             dir_mtimes[directory_key] = Path(directory_key).stat().st_mtime
         except OSError:
             continue
+    try:
+        root_mtime_ns = root.stat().st_mtime_ns
+    except OSError:
+        root_mtime_ns = 0
     return TranscriptSourceScanCache(
         known_files=tuple(str(path) for path in files),
         dir_mtimes=dir_mtimes,
+        root_mtime_ns=root_mtime_ns,
         last_full_scan_at=now,
     )
 
@@ -591,9 +597,18 @@ def _scan_paths_for_source(source: TranscriptSource, state: TranscriptCursorStat
     cache = _SOURCE_SCAN_CACHE.get(cache_key)
     if cache is None:
         return _full_scan_paths(source, now=now)
-    if now - cache.last_full_scan_at >= FULL_RESCAN_SECONDS:
+    try:
+        current_root_mtime_ns = source.root.stat().st_mtime_ns
+    except OSError:
         return _full_scan_paths(source, now=now)
     if _dir_snapshot_changed(cache):
+        return _full_scan_paths(source, now=now)
+    if (
+        now - cache.last_full_scan_at >= FULL_RESCAN_SECONDS
+        and current_root_mtime_ns == cache.root_mtime_ns
+    ):
+        return _incremental_scan_paths(cache, state, now=now)
+    if now - cache.last_full_scan_at >= FULL_RESCAN_SECONDS:
         return _full_scan_paths(source, now=now)
     return _incremental_scan_paths(cache, state, now=now)
 

@@ -350,6 +350,33 @@ def test_render_scans_filtered_rows_only_once_per_render(
     _run(body())
 
 
+def test_activity_panel_caches_loaded_config(activity_env, monkeypatch) -> None:
+    """The panel should load config once per app instance."""
+    if not _load_config_compatible(activity_env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+
+    from pollypm.cockpit_ui import PollyActivityFeedApp
+
+    calls = 0
+    fake_config = object()
+
+    def fake_load(_path):
+        nonlocal calls
+        calls += 1
+        return fake_config
+
+    monkeypatch.setattr("pollypm.cockpit_activity.load_config", fake_load)
+    monkeypatch.setattr(
+        "pollypm.cockpit._gather_activity_feed",
+        lambda config, **_kwargs: [config],
+    )
+
+    app = PollyActivityFeedApp(activity_env["config_path"])
+    assert app._gather() == [fake_config]
+    assert app._gather() == [fake_config]
+    assert calls == 1
+
+
 # ---------------------------------------------------------------------------
 # 4. Follow mode toggles + refreshes.
 # ---------------------------------------------------------------------------

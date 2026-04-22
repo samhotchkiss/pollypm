@@ -161,6 +161,19 @@ def test_plan_content_empty_when_no_file(env, app) -> None:
     _run(body())
 
 
+def test_md_to_rich_preserves_inline_markdown_helpers() -> None:
+    """The markdown-to-rich helper should keep its inline formatting."""
+    from pollypm.cockpit_ui import _md_to_rich
+
+    rendered = _md_to_rich("**bold** *italic* `code`\n1. item\n- bullet")
+
+    assert "[b]bold[/b]" in rendered
+    assert "[i]italic[/i]" in rendered
+    assert "[dim]code[/dim]" in rendered
+    assert "1. item" in rendered
+    assert "• bullet" in rendered
+
+
 # ---------------------------------------------------------------------------
 # 3. TOC lists H2 sections
 # ---------------------------------------------------------------------------

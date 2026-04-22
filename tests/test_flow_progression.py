@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 
 import pytest
@@ -539,6 +540,33 @@ class TestGetExecution:
         assert stored.artifacts[0].kind == ArtifactKind.COMMIT
         assert stored.artifacts[0].ref == "sha123"
         assert stored.artifacts[1].path == "src/main.py"
+
+    def test_get_execution_reuses_decoded_work_output(self, svc, monkeypatch):
+        task = _create_task(svc)
+        _claim_task(svc, task)
+
+        wo = _valid_work_output()
+        svc.node_done(task.task_id, "pete", wo)
+        svc.reject(task.task_id, "polly", "Redo it")
+        svc.node_done(task.task_id, "pete", wo)
+        svc._work_output_cache.clear()
+
+        loads = 0
+        original_loads = json.loads
+
+        def counting_loads(raw, *args, **kwargs):
+            nonlocal loads
+            loads += 1
+            return original_loads(raw, *args, **kwargs)
+
+        monkeypatch.setattr("pollypm.work.sqlite_service.json.loads", counting_loads)
+
+        first = svc.get_execution(task.task_id, node_id="implement")
+        second = svc.get_execution(task.task_id, node_id="implement")
+
+        assert len(first) == 2
+        assert len(second) == 2
+        assert loads == 1
 
     def test_get_execution_filters(self, svc):
         task = _create_task(svc)

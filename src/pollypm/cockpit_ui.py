@@ -117,6 +117,12 @@ from pollypm.cockpit_rail import CockpitItem, CockpitRouter
 import re as _re
 
 
+_INLINE_BOLD_RE = _re.compile(r"\*\*(.+?)\*\*")
+_INLINE_ITALIC_RE = _re.compile(r"\*(.+?)\*")
+_INLINE_CODE_RE = _re.compile(r"`(.+?)`")
+_ORDERED_LIST_RE = _re.compile(r"\s*\d+\.\s")
+
+
 def _md_to_rich(text: str) -> str:
     """Convert common markdown to Rich markup for Textual Static widgets."""
     lines: list[str] = []
@@ -138,15 +144,15 @@ def _md_to_rich(text: str) -> str:
             lines.append(f"\n[b u]{line[2:]}[/b u]")
         else:
             # Inline formatting first (applies to all non-code lines)
-            line = _re.sub(r"\*\*(.+?)\*\*", r"[b]\1[/b]", line)
-            line = _re.sub(r"\*(.+?)\*", r"[i]\1[/i]", line)
-            line = _re.sub(r"`(.+?)`", r"[dim]\1[/dim]", line)
+            line = _INLINE_BOLD_RE.sub(r"[b]\1[/b]", line)
+            line = _INLINE_ITALIC_RE.sub(r"[i]\1[/i]", line)
+            line = _INLINE_CODE_RE.sub(r"[dim]\1[/dim]", line)
             # Bullet points
             if line.strip().startswith("- "):
                 indent = len(line) - len(line.lstrip())
                 content = line.strip()[2:]
                 lines.append(f"{'  ' * (indent // 2)}  • {content}")
-            elif _re.match(r"\s*\d+\.\s", line):
+            elif _ORDERED_LIST_RE.match(line):
                 lines.append(f"  {line.strip()}")
             else:
                 lines.append(line)
@@ -3851,7 +3857,8 @@ class _RollupItem(ListItem):
             header += f"  [dim]{_escape(age)}[/dim]"
         lines = [header]
         if ref_bits:
-            lines.append(f"[dim]{_escape(' \u00b7 '.join(ref_bits))}[/dim]")
+            separator = " · "
+            lines.append(f"[dim]{_escape(separator.join(ref_bits))}[/dim]")
         if self.expanded:
             body = (self.item.get("body") or "").strip()
             if body:
@@ -3866,7 +3873,8 @@ class _RollupItem(ListItem):
                 meta_bits.append(source_project)
             if meta_bits:
                 lines.append("")
-                lines.append(f"[dim]{_escape(' \u00b7 '.join(meta_bits))}[/dim]")
+                meta_separator = " · "
+                lines.append(f"[dim]{_escape(meta_separator.join(meta_bits))}[/dim]")
         return "\n".join(lines)
 
 

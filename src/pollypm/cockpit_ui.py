@@ -678,6 +678,13 @@ class PollyCockpitApp(App[None]):
         background: #253140;
         color: #f2f6f8;
     }
+    #update-pill {
+        height: 1;
+        padding: 0 1;
+        color: #7aa2f7;
+        background: transparent;
+        text-style: bold;
+    }
     #ticker {
         height: 1;
         padding: 0 1;
@@ -698,6 +705,8 @@ class PollyCockpitApp(App[None]):
         Binding("p", "toggle_project_pin", "Pin Project"),
         Binding("r", "refresh", "Refresh"),
         Binding("s", "open_settings", "Settings"),
+        Binding("u", "trigger_upgrade", "Upgrade", show=False),
+        Binding("x", "dismiss_update_pill", "Dismiss Update", show=False),
         Binding("a", "view_alerts", "Alerts", show=False),
         Binding("ctrl+k,colon", "open_command_palette", "Palette", priority=True),
         Binding(
@@ -735,8 +744,13 @@ class PollyCockpitApp(App[None]):
         self.tagline = Static("\n" + POLLY_SLOGANS[0], id="tagline")
         self.nav = ListView(id="nav")
         self.settings_row = Static("\u2699 Settings", id="settings-row")
+        self.update_pill = Static("", id="update-pill", markup=True)
         self.ticker = Static("", id="ticker")
         self.hint = Static("", id="hint")
+        # True once the user presses ``x`` on the pill — hides it for
+        # the remainder of this cockpit session. Re-appears on next
+        # cockpit launch if an update is still available.
+        self._update_pill_dismissed = False
         self.spinner_index = 0
         self.slogan_index = 0
         self._slogan_tick = 0
@@ -764,6 +778,7 @@ class PollyCockpitApp(App[None]):
             yield self.tagline
             yield self.nav
             yield self.settings_row
+            yield self.update_pill
             yield self.ticker
             yield self.hint
 
@@ -771,6 +786,7 @@ class PollyCockpitApp(App[None]):
         self.selected_key = self.router.selected_key()
         self._refresh_rows()
         self._update_ticker()
+        self._update_pill_refresh()
         self.set_interval(0.8, self._tick)
         self.set_interval(self.SCHEDULER_POLL_INTERVAL_SECONDS, self._tick_scheduler)
         self.nav.focus()
@@ -929,6 +945,13 @@ class PollyCockpitApp(App[None]):
                     row.spinner_index = self.spinner_index
                     row.update_body()
         self._update_ticker()
+        # Release-check cache is 24h so polling each tick is cheap —
+        # almost always a dict lookup. Only the first tick per cache
+        # window touches the network (and that path short-circuits on
+        # any failure). This keeps the pill current without a separate
+        # timer.
+        if self._tick_count % 5 == 0:
+            self._update_pill_refresh()
         # Layout check much less frequently
         if self._tick_count % self._LAYOUT_CHECK_INTERVAL == 0:
             try:
@@ -1103,6 +1126,64 @@ class PollyCockpitApp(App[None]):
         ticker_text = self._event_ticker_text()
         self.ticker.update(ticker_text)
         self.ticker.display = bool(ticker_text)
+
+    def _update_pill_refresh(self) -> None:
+        """Refresh the update-available pill in the rail top area.
+
+        Shows ``↑ v<latest> available · u: upgrade · x: dismiss`` when
+        ``release_check.check_latest`` reports a newer version on the
+        active channel. Hidden otherwise — including when dismissed for
+        this session, when the check is cached as "up-to-date", and
+        when the check is offline or raised.
+        """
+        if self._update_pill_dismissed:
+            self.update_pill.display = False
+            return
+        try:
+            from pollypm.release_check import _resolve_channel, check_latest
+            channel = _resolve_channel(None)
+            check = check_latest(channel)
+        except Exception:  # noqa: BLE001
+            self.update_pill.display = False
+            return
+        if check is None or not check.upgrade_available:
+            self.update_pill.display = False
+            return
+        channel_label = (
+            f" ({check.channel})" if check.channel != "stable" else ""
+        )
+        self.update_pill.update(
+            f"[#7aa2f7]↑ v{check.latest} available{channel_label}"
+            "[/] · [dim]u: upgrade · x: dismiss[/]"
+        )
+        self.update_pill.display = True
+
+    def action_trigger_upgrade(self) -> None:
+        """Kick off the upgrade flow from the rail ``u`` keybind.
+
+        The full one-click pane flow ships in #719. Until that lands,
+        this action emits a friendly notice pointing at the CLI path
+        and closes. Users can already run ``pm upgrade`` directly.
+        """
+        try:
+            self.notify(
+                "Rail upgrade flow ships with #719. For now, run "
+                "`pm upgrade` in a terminal. See `pm doctor` for the "
+                "currently available version.",
+                timeout=6,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def action_dismiss_update_pill(self) -> None:
+        """Hide the update pill for this cockpit session.
+
+        Dismissal is session-scoped — the pill re-appears on next
+        cockpit launch if the upgrade is still available. This keeps
+        the nudge visible to future-you even if current-you is busy.
+        """
+        self._update_pill_dismissed = True
+        self.update_pill.display = False
 
     _HEARTBEAT_STALE_SECONDS = 180  # warn if no heartbeat in 3 minutes
 

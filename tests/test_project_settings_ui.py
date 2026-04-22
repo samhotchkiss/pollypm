@@ -1,9 +1,4 @@
-"""Focused tests for :class:`pollypm.cockpit_project_settings.PollyProjectSettingsApp`.
-
-The screen is intentionally kept small: it renders project worker/account
-state and can stop or retarget the worker session. These tests exercise
-the extracted module directly so the split stays behavior-identical.
-"""
+"""Focused tests for :class:`pollypm.cockpit_project_settings.PollyProjectSettingsApp`."""
 
 from __future__ import annotations
 
@@ -11,6 +6,8 @@ import asyncio
 from pathlib import Path
 
 import pytest
+
+from textual.widgets import Button
 
 from pollypm.models import ProviderKind
 
@@ -92,6 +89,10 @@ def project_settings_env(tmp_path: Path, monkeypatch):
         "pollypm.cockpit_project_settings.PollyPMService",
         lambda _path: service,
     )
+    monkeypatch.setattr(
+        "pollypm.cockpit_settings_history.Path.home",
+        lambda: tmp_path / "home",
+    )
     from pollypm.cockpit_project_settings import PollyProjectSettingsApp
 
     return {
@@ -125,13 +126,22 @@ def test_project_settings_renders_worker_and_account(project_settings_env) -> No
             model_info = str(app.query_one("#model-info").render())
             assert "claude@example.com" in model_info
             assert "claude" in model_info
+            preview = str(app.query_one("#preview").render())
+            assert "Diff preview" in preview
+            assert "Undo" in preview or "undo" in preview.lower()
 
     _run(body())
 
 
-def test_project_settings_reset_and_switch_provider(project_settings_env) -> None:
+def test_project_settings_reset_and_switch_provider(project_settings_env, monkeypatch) -> None:
     app = project_settings_env["app"]
     service = project_settings_env["service"]
+
+    def _auto_confirm(_screen, callback=None, **_kwargs):
+        if callback is not None:
+            callback(True)
+
+    monkeypatch.setattr(app, "push_screen", _auto_confirm)
 
     async def body() -> None:
         async with app.run_test(size=(120, 30)) as pilot:
@@ -142,5 +152,27 @@ def test_project_settings_reset_and_switch_provider(project_settings_env) -> Non
             app.on_switch_codex(None)
             assert service.switched == [("worker-alpha", "codex_main")]
             assert "Switched to codex" in str(app.query_one("#message").render())
+
+        new_app = type(app)(project_settings_env["config_path"], "alpha")
+        monkeypatch.setattr(new_app, "push_screen", _auto_confirm)
+        async with new_app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            new_app.action_undo_recent_change()
+            assert service.switched[-1] == ("worker-alpha", "claude_main")
+            assert "Undid" in str(new_app.query_one("#message").render())
+
+    _run(body())
+
+
+def test_project_settings_buttons_include_inline_key_hints(project_settings_env) -> None:
+    app = project_settings_env["app"]
+
+    async def body() -> None:
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            assert app.query_one("#reset-session", Button).label.plain == "[R] Reset Session"
+            assert app.query_one("#switch-claude", Button).label.plain == "[C] Switch to Claude"
+            assert app.query_one("#switch-codex", Button).label.plain == "[X] Switch to Codex"
+            assert app.query_one("#undo", Button).label.plain == "[U] Undo"
 
     _run(body())

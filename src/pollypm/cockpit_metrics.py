@@ -98,7 +98,7 @@ class PollyMetricsApp(App[None]):
         Binding("down,j", "cursor_down", "Next"),
         Binding("up,k", "cursor_up", "Prev"),
         Binding("enter", "drill_down", "Drill-down"),
-        Binding("colon", "open_command_palette", "Palette", priority=True),
+        Binding("ctrl+k,colon", "open_command_palette", "Palette", priority=True),
         Binding("question_mark", "show_keyboard_help", "Help", priority=True),
         Binding("q,escape", "back", "Back"),
     ]

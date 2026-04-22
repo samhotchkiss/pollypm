@@ -273,6 +273,22 @@ def test_colon_opens_command_palette_modal(inbox_app) -> None:
     _run(body())
 
 
+def test_ctrl_k_opens_command_palette_modal(inbox_app) -> None:
+    """Pressing ``Ctrl-K`` from anywhere inside the inbox opens the palette."""
+
+    async def body() -> None:
+        async with inbox_app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert _find_palette_modal(inbox_app) is None
+            await pilot.press("ctrl+k")
+            await pilot.pause()
+            modal = _find_palette_modal(inbox_app)
+            assert modal is not None, "expected CommandPaletteModal on screen stack"
+            assert modal.input.has_focus
+
+    _run(body())
+
+
 def test_typing_filters_the_command_list(inbox_app) -> None:
     """Typing into the palette shrinks the visible command list."""
     async def body() -> None:
@@ -413,7 +429,7 @@ def test_shortcuts_command_populates_help_payload(inbox_app) -> None:
 def test_palette_binding_present_on_inbox_and_dashboard_and_rail(
     single_project_config: Path,
 ) -> None:
-    """Every top-level cockpit App declares the ``:`` palette binding."""
+    """Every top-level cockpit App declares the palette binding."""
     from pollypm.cockpit_ui import (
         PollyCockpitApp,
         PollyInboxApp,
@@ -421,14 +437,14 @@ def test_palette_binding_present_on_inbox_and_dashboard_and_rail(
         PollyWorkerRosterApp,
     )
 
-    def _has_colon(cls) -> bool:
+    def _has_palette_keys(cls) -> bool:
         for binding in getattr(cls, "BINDINGS", []):
             keys = getattr(binding, "key", "")
-            if "colon" in keys:
+            if "colon" in keys and "ctrl+k" in keys:
                 return True
         return False
 
-    assert _has_colon(PollyCockpitApp)
-    assert _has_colon(PollyInboxApp)
-    assert _has_colon(PollyProjectDashboardApp)
-    assert _has_colon(PollyWorkerRosterApp)
+    assert _has_palette_keys(PollyCockpitApp)
+    assert _has_palette_keys(PollyInboxApp)
+    assert _has_palette_keys(PollyProjectDashboardApp)
+    assert _has_palette_keys(PollyWorkerRosterApp)

@@ -23,7 +23,7 @@ from pollypm.models import ProviderKind, SessionConfig
 from pollypm.providers import get_provider
 from pollypm.runtimes import get_runtime
 from pollypm.session_services import create_tmux_client
-from pollypm.storage.state import StateStore
+from pollypm.storage.state import AccountUsageRecord, StateStore
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +181,21 @@ def persist_account_usage_sample(config_path: Path, sample: AccountUsageSample) 
         )
 
 
+def load_cached_account_usage(config_path: Path) -> dict[str, AccountUsageRecord]:
+    """Return cached usage rows for configured accounts only."""
+    config = load_config(config_path)
+    account_names = list(getattr(config, "accounts", {}) or {})
+    if not account_names:
+        return {}
+    with StateStore(config.project.state_db) as store:
+        cached: dict[str, AccountUsageRecord] = {}
+        for account_name in account_names:
+            usage = store.get_account_usage(account_name)
+            if usage is not None:
+                cached[account_name] = usage
+        return cached
+
+
 def _probe_session_spec(root_dir: Path, account_name: str, provider: ProviderKind) -> SessionConfig:
     return SessionConfig(
         name=f"probe_{account_name}",
@@ -202,6 +217,7 @@ def _build_probe_command(config, account, session: SessionConfig) -> str:
 __all__ = [
     "AccountUsageSample",
     "collect_account_usage_sample",
+    "load_cached_account_usage",
     "persist_account_usage_sample",
     "refresh_account_usage",
     "refresh_all_account_usage",

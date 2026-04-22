@@ -1866,6 +1866,32 @@ def test_cockpit_ui_arrow_and_enter_route_selected(tmp_path: Path) -> None:
     asyncio.run(exercise())
 
 
+def test_cockpit_rail_ctrl_k_routes_to_settings(monkeypatch, tmp_path: Path) -> None:
+    class FakeRouter:
+        def __init__(self, _config_path: Path) -> None:
+            self.calls: list[str] = []
+            self.tmux = None
+
+        def selected_key(self) -> str:
+            return "polly"
+
+        def route_selected(self, key: str) -> None:
+            self.calls.append(key)
+
+    monkeypatch.setattr("pollypm.cockpit_rail.CockpitRouter", FakeRouter)
+    from pollypm.cockpit_rail import CockpitItem, PollyCockpitRail
+
+    rail = PollyCockpitRail(tmp_path / "pollypm.toml")
+    items = [
+        CockpitItem("polly", "Polly", "ready"),
+        CockpitItem("settings", "Settings", "config"),
+    ]
+
+    assert rail._handle_key(b"\x0b", items) is True
+    assert rail.router.calls == ["settings"]
+    assert rail.selected_key == "settings"
+
+
 def test_settings_pane_renders_accounts_and_toggles_permissions(monkeypatch, tmp_path: Path) -> None:
     class FakeStatus:
         def __init__(self) -> None:

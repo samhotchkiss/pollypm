@@ -1797,6 +1797,12 @@ class PollyCockpitRail:
             self.router.route_selected("inbox")
             self.selected_key = "inbox"
             return True
+        if key in {b"\x0b"}:
+            # Raw rail has no palette UI of its own; jump to settings so
+            # the user's ctrl-k habit still lands in the palette-enabled pane.
+            self.router.route_selected("settings")
+            self.selected_key = "settings"
+            return True
         return True
 
     # ── Navigation ───────────────────────────────────────────────────────

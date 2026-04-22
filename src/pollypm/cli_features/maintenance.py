@@ -129,6 +129,12 @@ def register_maintenance_commands(app: typer.Typer) -> None:
         if json_output:
             typer.echo(render_json(report))
         else:
+            from pollypm.release_check import update_banner_line
+
+            banner = update_banner_line()
+            if banner:
+                typer.echo(banner)
+                typer.echo("")
             typer.echo(render_human(report))
             typer.echo("")
             typer.echo(setup_tag_line())

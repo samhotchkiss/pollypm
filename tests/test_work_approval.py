@@ -4,6 +4,8 @@ import json
 import textwrap
 from pathlib import Path
 
+from pollypm.plugins_builtin.activity_feed.handlers.event_projector import EventProjector
+from pollypm.store import SQLAlchemyStore
 from pollypm.work.models import Artifact, ArtifactKind, OutputType, WorkOutput
 from pollypm.work.sqlite_service import SQLiteWorkService, first_shipped_at
 
@@ -81,6 +83,18 @@ def test_first_shipped_records_once_on_commit_approval(tmp_path: Path, monkeypat
         first = first_shipped_at(state_file)
         assert first is not None
         assert svc.last_first_shipped_created is True
+        state_db = tmp_path / ".pollypm" / "state.db"
+        store = SQLAlchemyStore(f"sqlite:///{state_db}")
+        try:
+            activity_rows = [
+                row
+                for row in store.query_messages(type="event", scope="polly")
+                if (row.get("payload") or {}).get("kind") == "first_shipped"
+            ]
+        finally:
+            store.close()
+        assert len(activity_rows) == 1
+        assert activity_rows[0]["payload"]["pinned"] is True
 
         second_task = svc.create(
             title="Ship again",
@@ -117,3 +131,13 @@ def test_first_shipped_records_once_on_commit_approval(tmp_path: Path, monkeypat
         assert persisted["first_shipped_at"] == first
     finally:
         svc.close()
+
+    reopened = SQLiteWorkService(db_path=tmp_path / "work.db", project_path=tmp_path)
+    try:
+        entries = EventProjector(tmp_path / ".pollypm" / "state.db").project(limit=20)
+        first_shipped_entries = [entry for entry in entries if entry.kind == "first_shipped"]
+        assert len(first_shipped_entries) == 1
+        assert first_shipped_entries[0].summary == "First PR shipped with Polly 🎉"
+        assert first_shipped_entries[0].payload["pinned"] is True
+    finally:
+        reopened.close()

@@ -149,6 +149,55 @@ def mark_first_shipped(
     return True
 
 
+def _record_first_shipped_activity(
+    *,
+    project_path: Path | None,
+    project_key: str | None,
+    when: datetime | None = None,
+) -> None:
+    """Persist the one-time shipment milestone into the project feed."""
+    if project_path is None:
+        return
+    try:
+        from pollypm.store import SQLAlchemyStore
+    except Exception:  # noqa: BLE001
+        return
+
+    state_db = project_path / ".pollypm" / "state.db"
+    state_db.parent.mkdir(parents=True, exist_ok=True)
+    shipped_at = (when or datetime.now(UTC)).isoformat()
+    body = json.dumps(
+        {
+            "summary": "First PR shipped with Polly 🎉",
+            "severity": "routine",
+            "verb": "celebrated",
+            "subject": "first shipment",
+            "project": project_key,
+            "shipped_at": shipped_at,
+        }
+    )
+    payload = {
+        "kind": "first_shipped",
+        "project": project_key,
+        "pinned": True,
+        "shipped_at": shipped_at,
+    }
+    store = SQLAlchemyStore(f"sqlite:///{state_db}")
+    try:
+        store.enqueue_message(
+            type="event",
+            tier="immediate",
+            recipient="*",
+            sender="polly",
+            subject="first_shipped",
+            body=body,
+            scope="polly",
+            payload=payload,
+        )
+    finally:
+        store.close()
+
+
 def task_landed_commit(service: _HasExecutions, task_id: str) -> bool:
     try:
         executions = service.get_execution(task_id)
@@ -170,11 +219,21 @@ def maybe_record_first_shipped(
     task_id: str,
     *,
     path: Path | None = None,
+    project_path: Path | None = None,
     when: datetime | None = None,
 ) -> bool:
     if not task_landed_commit(service, task_id):
         return False
-    return mark_first_shipped(path=path, when=when)
+    created = mark_first_shipped(path=path, when=when)
+    if not created:
+        return False
+    project_key = task_id.split("/", 1)[0] if "/" in task_id else None
+    _record_first_shipped_activity(
+        project_path=project_path,
+        project_key=project_key,
+        when=when,
+    )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1293,6 +1352,7 @@ class SQLiteWorkService:
             self.last_first_shipped_created = maybe_record_first_shipped(
                 self,
                 task_id,
+                project_path=self._project_path,
             )
         return result
 

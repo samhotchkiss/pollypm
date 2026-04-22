@@ -156,6 +156,15 @@ class OnboardingState:
     scan_complete: bool = False
     scan_started: bool = False
 
+
+@dataclass(slots=True)
+class BlockingAutoFix:
+    button_id: str
+    label: str
+    summary: str
+    plan: AutoFixPlan
+
+
 class ExitModal(ModalScreen[None]):
     CSS = """
     ModalScreen {

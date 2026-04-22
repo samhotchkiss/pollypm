@@ -304,7 +304,7 @@ def test_run_onboarding_launches_seeded_demo_experience(monkeypatch, tmp_path: P
 
     monkeypatch.setattr(
         "pollypm.onboarding_tui.run_onboarding_app",
-        lambda config_path, force=False: result,
+        lambda config_path, force=False, no_animation=False: result,
     )
     monkeypatch.setattr(
         "pollypm.onboarding._launch_onboarding_experience",

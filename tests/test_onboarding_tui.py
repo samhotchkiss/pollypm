@@ -4,8 +4,10 @@ from pathlib import Path
 from pollypm.models import KnownProject, ProviderKind
 from pollypm.onboarding import CliAvailability, ConnectedAccount
 from pollypm.onboarding_tui import (
+    BlockingAutoFix,
     ONBOARDING_STAGES,
     OnboardingApp,
+    OnboardingResult,
     default_controller_account,
     installed_provider_statuses,
     merge_selected_projects,
@@ -68,19 +70,19 @@ def test_merge_selected_projects_adds_new_git_projects_without_duplicates(tmp_pa
 
 def test_run_onboarding_app_runs_textual_app_directly(monkeypatch, tmp_path: Path) -> None:
     class FakeApp:
-        def __init__(self, config_path: Path, force: bool = False) -> None:
+        def __init__(self, config_path: Path, force: bool = False, no_animation: bool = False) -> None:
             self.config_path = config_path
             self.force = force
 
         def run(self, mouse: bool = False):
             assert mouse is True
-            return self.config_path
+            return OnboardingResult(config_path=self.config_path, launch_requested=True)
 
     monkeypatch.setattr("pollypm.onboarding_tui.OnboardingApp", FakeApp)
 
     result = run_onboarding_app(tmp_path / "pollypm.toml", force=True)
 
-    assert result == tmp_path / "pollypm.toml"
+    assert result == OnboardingResult(config_path=tmp_path / "pollypm.toml", launch_requested=True)
 
 
 def test_scan_loading_message_animates(tmp_path: Path) -> None:
@@ -96,6 +98,98 @@ def test_scan_loading_message_animates(tmp_path: Path) -> None:
 
     assert "Scanning" in first
     assert first != second
+
+
+def test_onboarding_app_lazily_creates_tmux_client(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        "pollypm.onboarding_tui.create_tmux_client",
+        lambda: (_ for _ in ()).throw(AssertionError("tmux client should be lazy")),
+    )
+
+    app = OnboardingApp(tmp_path / "pollypm.toml")
+
+    assert app.tmux is None
+
+
+def test_blocking_auto_fixes_exposes_tmux_fix(monkeypatch, tmp_path: Path) -> None:
+    app = OnboardingApp(tmp_path / "pollypm.toml")
+    monkeypatch.setattr(app, "_tmux_ready", lambda: False)
+    monkeypatch.setattr(
+        "pollypm.onboarding_tui.check_tmux",
+        lambda: type(
+            "Result",
+            (),
+            {
+                "status": "tmux missing",
+                "auto_fix": type(
+                    "Plan",
+                    (),
+                    {
+                        "description": "Install tmux",
+                        "command": ["brew", "install", "tmux"],
+                        "requires_sudo": False,
+                        "platforms": ["macos"],
+                    },
+                )(),
+            },
+        )(),
+    )
+
+    fixes = app._blocking_auto_fixes()
+
+    assert fixes[0].button_id == "fix-tmux"
+    assert fixes[0].label == "Install tmux"
+
+
+def test_run_machine_fix_refreshes_statuses(monkeypatch, tmp_path: Path) -> None:
+    app = OnboardingApp(tmp_path / "pollypm.toml")
+    messages: list[str] = []
+    renders: list[str] = []
+    app.state.statuses = []
+    monkeypatch.setattr(
+        app,
+        "_blocking_auto_fixes",
+        lambda: [
+            BlockingAutoFix(
+                button_id="fix-tmux",
+                label="Install tmux",
+                summary="tmux missing",
+                plan=type(
+                    "Plan",
+                    (),
+                    {
+                        "description": "Install tmux",
+                        "command": ["brew", "install", "tmux"],
+                        "requires_sudo": False,
+                        "platforms": ["macos"],
+                    },
+                )(),
+            )
+        ],
+    )
+    monkeypatch.setattr("pollypm.onboarding_tui.run_auto_fix", lambda _plan: (True, "Install tmux completed."))
+    monkeypatch.setattr(
+        "pollypm.onboarding_tui._available_clis",
+        lambda: [CliAvailability(provider=ProviderKind.CLAUDE, label="Claude CLI", binary="claude", installed=True)],
+    )
+    monkeypatch.setattr(app, "_set_message", lambda message="": messages.append(message))
+    monkeypatch.setattr(app, "_render_current_step", lambda: renders.append("rendered"))
+    monkeypatch.setattr(app, "refresh", lambda *args, **kwargs: None)
+
+    class _Suspend:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(app, "suspend", lambda: _Suspend())
+
+    app._run_machine_fix("fix-tmux")
+
+    assert renders == ["rendered"]
+    assert messages[-1] == "Install tmux completed."
+    assert app.state.statuses[0].installed is True
 
 
 def test_codex_login_mode_routes_remote_to_headless(monkeypatch, tmp_path: Path) -> None:
@@ -133,6 +227,7 @@ def test_codex_login_mode_routes_local_to_standard_login(monkeypatch, tmp_path: 
 def test_codex_login_modal_is_centered(monkeypatch, tmp_path: Path) -> None:
     async def run() -> None:
         monkeypatch.setattr("pollypm.onboarding_tui._recover_existing_accounts", lambda _root: {})
+        monkeypatch.setattr("pollypm.onboarding_tui._detected_host_account", lambda provider: None)
         monkeypatch.setattr(
             "pollypm.onboarding_tui._available_clis",
             lambda: [

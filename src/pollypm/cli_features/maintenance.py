@@ -11,6 +11,7 @@ Contract:
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -28,6 +29,8 @@ from pollypm.errors import format_config_not_found_error
 from pollypm.models import ProviderKind
 from pollypm.storage.state import StateStore
 from pollypm.worktrees import list_worktrees as list_project_worktrees
+
+debug_app = typer.Typer(help="Low-level debugging helpers.")
 
 
 def _service(config_path: Path):
@@ -103,6 +106,7 @@ def register_maintenance_commands(app: typer.Typer) -> None:
             render_human,
             render_json,
             run_checks,
+            setup_tag_line,
         )
 
         report = run_checks()
@@ -126,6 +130,8 @@ def register_maintenance_commands(app: typer.Typer) -> None:
             typer.echo(render_json(report))
         else:
             typer.echo(render_human(report))
+            typer.echo("")
+            typer.echo(setup_tag_line())
         if fix_summary:
             typer.echo("")
             typer.echo(fix_summary)
@@ -725,3 +731,16 @@ def register_maintenance_commands(app: typer.Typer) -> None:
         typer.echo("Next steps:")
         typer.echo("  pm up                  # relaunch the cockpit")
         typer.echo("  pm doctor              # verify the restored state")
+
+
+@debug_app.command("decode-setup-tag")
+def decode_setup_tag(
+    tag: str = typer.Argument(..., help="The 6-8 hex setup tag to decode."),
+) -> None:
+    from pollypm.doctor import decode_setup_tag as _decode_setup_tag
+
+    fingerprint = _decode_setup_tag(tag)
+    if fingerprint is None:
+        typer.echo(f"Unknown setup tag: {tag}", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(json.dumps(fingerprint, indent=2, sort_keys=True))

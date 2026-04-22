@@ -29,9 +29,12 @@ Design notes
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import platform
 import re
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -40,6 +43,7 @@ import sys
 import time
 import tomllib
 from dataclasses import dataclass, field
+from importlib.metadata import PackageNotFoundError, version as _package_version
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -59,6 +63,16 @@ Severity = str  # "error" | "warning" | "info"
 
 
 @dataclass(slots=True)
+class AutoFixPlan:
+    """A shell command the doctor can present as a one-keypress fix."""
+
+    description: str
+    command: list[str]
+    requires_sudo: bool = False
+    platforms: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class CheckResult:
     """Outcome of a single check.
 
@@ -75,6 +89,8 @@ class CheckResult:
     ``fixable`` — true when ``--fix`` can safely auto-resolve this.
     ``fix_fn`` — optional zero-arg callable invoked by ``--fix``. Must
         return a tuple of ``(bool, str)`` — ``(success, message)``.
+    ``auto_fix`` — optional shell-command plan for interactive surfaces
+        to present as a one-keypress fix.
     """
 
     passed: bool
@@ -86,6 +102,7 @@ class CheckResult:
     skipped: bool = False
     fixable: bool = False
     fix_fn: Callable[[], tuple[bool, str]] | None = None
+    auto_fix: AutoFixPlan | None = None
 
 
 @dataclass(slots=True)
@@ -200,6 +217,132 @@ def _skip(status: str) -> CheckResult:
     return CheckResult(passed=True, status=status, skipped=True)
 
 
+def _current_platform() -> str:
+    if sys.platform == "darwin":
+        return "macos"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    if sys.platform.startswith("win"):
+        return "windows"
+    return sys.platform
+
+
+def _auto_fix_supported(plan: AutoFixPlan | None) -> bool:
+    if plan is None:
+        return False
+    if not plan.platforms:
+        return True
+    return _current_platform() in plan.platforms
+
+
+def _auto_fix_payload(plan: AutoFixPlan | None) -> dict[str, object] | None:
+    if plan is None:
+        return None
+    return {
+        "description": plan.description,
+        "command": plan.command,
+        "requires_sudo": plan.requires_sudo,
+        "platforms": plan.platforms,
+        "supported": _auto_fix_supported(plan),
+    }
+
+
+def _brew_auto_fix(package: str, *, description: str) -> AutoFixPlan | None:
+    if _tool_path("brew") is None:
+        return None
+    return AutoFixPlan(
+        description=description,
+        command=["brew", "install", package],
+        requires_sudo=False,
+        platforms=["macos"],
+    )
+
+
+def _linux_pkg_manager_auto_fix(
+    package: str,
+    *,
+    description: str,
+) -> AutoFixPlan | None:
+    for manager in ("apt-get", "dnf", "yum"):
+        if _tool_path(manager) is None:
+            continue
+        return AutoFixPlan(
+            description=description,
+            command=["sudo", manager, "install", "-y", package],
+            requires_sudo=True,
+            platforms=["linux"],
+        )
+    return None
+
+
+def _npm_global_auto_fix(package: str, *, description: str) -> AutoFixPlan | None:
+    if _tool_path("npm") is None:
+        return None
+    return AutoFixPlan(
+        description=description,
+        command=["npm", "i", "-g", package],
+        requires_sudo=False,
+        platforms=["macos", "linux"],
+    )
+
+
+def _reinstall_editable_auto_fix(description: str) -> AutoFixPlan | None:
+    if _tool_path("uv") is None:
+        return None
+    project_root = _pyproject_path().parent
+    return AutoFixPlan(
+        description=description,
+        command=[
+            "sh",
+            "-lc",
+            f"cd {shlex.quote(str(project_root))} && uv tool install --editable --reinstall .",
+        ],
+        requires_sudo=False,
+        platforms=["macos", "linux"],
+    )
+
+
+def _uv_install_auto_fix() -> AutoFixPlan | None:
+    if _current_platform() not in {"macos", "linux"}:
+        return None
+    if _tool_path("brew") is not None and _current_platform() == "macos":
+        return AutoFixPlan(
+            description="Install uv with Homebrew",
+            command=["brew", "install", "uv"],
+            requires_sudo=False,
+            platforms=["macos"],
+        )
+    return AutoFixPlan(
+        description="Install uv with Astral's installer",
+        command=["sh", "-lc", "curl -LsSf https://astral.sh/uv/install.sh | sh"],
+        requires_sudo=False,
+        platforms=["macos", "linux"],
+    )
+
+
+def _command_text(command: list[str]) -> str:
+    try:
+        return shlex.join(command)
+    except AttributeError:  # pragma: no cover
+        return " ".join(shlex.quote(part) for part in command)
+
+
+def run_auto_fix(plan: AutoFixPlan) -> tuple[bool, str]:
+    """Execute an auto-fix plan with inherited stdio for interactive use."""
+    try:
+        result = subprocess.run(plan.command, check=False)
+    except FileNotFoundError as exc:
+        return (False, f"{plan.description} failed: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        return (False, f"{plan.description} failed: {exc}")
+    if result.returncode == 0:
+        return (True, f"{plan.description} completed.")
+    return (
+        False,
+        f"{plan.description} exited with status {result.returncode}: {_command_text(plan.command)}",
+    )
+
+
 # --------------------------------------------------------------------- #
 # System prerequisite checks
 # --------------------------------------------------------------------- #
@@ -253,6 +396,118 @@ def _read_pyproject_version() -> str | None:
         return None
     version = project.get("version")
     return version if isinstance(version, str) else None
+
+
+def _setup_tags_path() -> Path:
+    return Path.home() / ".pollypm" / "setup-tags.json"
+
+
+def _tool_version(binary: str, *, timeout: float = 2.0) -> str | None:
+    path = _tool_path(binary)
+    if path is None:
+        return None
+    rc, out = _run_cmd([binary, "--version"], timeout=timeout)
+    if rc != 0:
+        return None
+    version = _parse_version(out)
+    if version is not None:
+        return ".".join(str(part) for part in version)
+    line = (out.splitlines()[0] if out else "").strip()
+    return line or None
+
+
+def _tool_major(binary: str, *, timeout: float = 2.0) -> int | None:
+    version = _tool_version(binary, timeout=timeout)
+    parsed = _parse_version(version or "")
+    return parsed[0] if parsed is not None else None
+
+
+def _provider_home_mode(provider: str, config) -> str:
+    accounts = getattr(config, "accounts", {}) or {}
+    for account in accounts.values():
+        value = str(getattr(getattr(account, "provider", None), "value", getattr(account, "provider", "")))
+        if value != provider:
+            continue
+        if getattr(account, "home", None) is not None:
+            return "isolated"
+    return "default-profile"
+
+
+def _setup_fingerprint(config_path: Path | None = None) -> dict[str, object]:
+    from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+
+    path = config_path or DEFAULT_CONFIG_PATH
+    config = None
+    if path.exists():
+        try:
+            config = load_config(path)
+        except Exception:  # noqa: BLE001
+            config = None
+
+    accounts = getattr(config, "accounts", {}) if config is not None else {}
+    projects = getattr(config, "projects", {}) if config is not None else {}
+    try:
+        pollypm_version = _package_version("pollypm")
+    except PackageNotFoundError:
+        pollypm_version = "unknown"
+    except Exception:  # noqa: BLE001
+        pollypm_version = "unknown"
+
+    return {
+        "platform": f"{platform.system().lower()}-{platform.machine().lower()}",
+        "pollypm_version": pollypm_version,
+        "claude_version": _tool_version("claude"),
+        "claude_home_mode": _provider_home_mode("claude", config) if config is not None else "default-profile",
+        "codex_version": _tool_version("codex"),
+        "codex_home_mode": _provider_home_mode("codex", config) if config is not None else "default-profile",
+        "tmux_major": _tool_major("tmux"),
+        "git_major": _tool_major("git"),
+        "node_major": _tool_major("node"),
+        "accounts": len(accounts) if isinstance(accounts, dict) else 0,
+        "projects": len(projects) if isinstance(projects, dict) else 0,
+    }
+
+
+def _setup_tag_for_fingerprint(fingerprint: dict[str, object]) -> str:
+    canonical = json.dumps(fingerprint, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:6]
+
+
+def _setup_tags_store() -> list[dict[str, object]]:
+    path = _setup_tags_path()
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:  # noqa: BLE001
+        return []
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
+
+def _store_setup_tag(tag: str, fingerprint: dict[str, object]) -> None:
+    path = _setup_tags_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entries = [entry for entry in _setup_tags_store() if entry.get("tag") != tag]
+    entries.append({"tag": tag, "fingerprint": fingerprint})
+    path.write_text(json.dumps(entries[-50:], indent=2, sort_keys=True) + "\n")
+
+
+def setup_tag_line(config_path: Path | None = None) -> str:
+    fingerprint = _setup_fingerprint(config_path)
+    tag = _setup_tag_for_fingerprint(fingerprint)
+    _store_setup_tag(tag, fingerprint)
+    return f"pollypm setup: {tag} - share this if something looks off"
+
+
+def decode_setup_tag(tag: str) -> dict[str, object] | None:
+    for entry in _setup_tags_store():
+        if entry.get("tag") == tag:
+            fingerprint = entry.get("fingerprint")
+            if isinstance(fingerprint, dict):
+                return fingerprint
+    return None
 
 
 def check_python_version() -> CheckResult:
@@ -505,6 +760,8 @@ check_git = _doctor_system.check_git
 check_gh_installed = _doctor_system.check_gh_installed
 check_gh_authenticated = _doctor_system.check_gh_authenticated
 check_uv = _doctor_system.check_uv
+check_claude_cli = _doctor_system.check_claude_cli
+check_codex_cli = _doctor_system.check_codex_cli
 check_terminal_color_support = _doctor_system.check_terminal_color_support
 
 
@@ -2320,6 +2577,8 @@ def _registered_checks() -> list[Check]:
         Check("gh-installed", check_gh_installed, "system"),
         Check("gh-authenticated", check_gh_authenticated, "system"),
         Check("uv", check_uv, "system"),
+        Check("claude-cli", check_claude_cli, "system"),
+        Check("codex-cli", check_codex_cli, "system"),
         Check("terminal-color", check_terminal_color_support, "system", severity="warning"),
         # Install state
         Check("pm-binary", check_pm_binary_resolves, "install"),
@@ -2435,14 +2694,17 @@ def apply_fixes(report: DoctorReport) -> list[tuple[str, bool, str]]:
     for check, result in report.results:
         if result.passed or result.skipped:
             continue
-        if not result.fixable or result.fix_fn is None:
+        if result.fix_fn is not None and result.fixable:
+            try:
+                success, message = result.fix_fn()
+            except Exception as exc:  # noqa: BLE001
+                results.append((check.name, False, f"fix_fn raised {exc}"))
+                continue
+            results.append((check.name, success, message))
             continue
-        try:
-            success, message = result.fix_fn()
-        except Exception as exc:  # noqa: BLE001
-            results.append((check.name, False, f"fix_fn raised {exc}"))
-            continue
-        results.append((check.name, success, message))
+        if _auto_fix_supported(result.auto_fix):
+            success, message = run_auto_fix(result.auto_fix)
+            results.append((check.name, success, message))
     return results
 
 
@@ -2457,7 +2719,7 @@ def planned_fixes(report: DoctorReport) -> list[tuple[str, str]]:
     for check, result in report.results:
         if result.passed or result.skipped:
             continue
-        if not result.fixable or result.fix_fn is None:
+        if not ((result.fixable and result.fix_fn is not None) or _auto_fix_supported(result.auto_fix)):
             continue
         # First non-blank line of the fix block makes a readable
         # intention summary for dry-run output.
@@ -2484,7 +2746,7 @@ def manual_fixes(report: DoctorReport) -> list[tuple[str, str]]:
     for check, result in report.results:
         if result.passed or result.skipped:
             continue
-        if result.fixable and result.fix_fn is not None:
+        if (result.fixable and result.fix_fn is not None) or _auto_fix_supported(result.auto_fix):
             continue
         manual.append((check.name, result.fix or result.status))
     return manual

@@ -36,6 +36,12 @@ def check_python_version() -> doctor.CheckResult:
 def check_tmux() -> doctor.CheckResult:
     path = doctor._tool_path("tmux")
     if path is None:
+        auto_fix = doctor._brew_auto_fix("tmux", description="Install tmux with Homebrew")
+        if auto_fix is None:
+            auto_fix = doctor._linux_pkg_manager_auto_fix(
+                "tmux",
+                description="Install tmux with the system package manager",
+            )
         return doctor._fail(
             "tmux not found on PATH",
             why=(
@@ -49,6 +55,7 @@ def check_tmux() -> doctor.CheckResult:
                 "  Build:  https://github.com/tmux/tmux/wiki/Installing\n"
                 "Recheck: pm doctor"
             ),
+            auto_fix=auto_fix,
         )
     rc, out = doctor._run_cmd(["tmux", "-V"])
     version = doctor._parse_version(out) if rc == 0 else None
@@ -198,8 +205,53 @@ def check_uv() -> doctor.CheckResult:
                 "  Or: brew install uv\n"
                 "Recheck: pm doctor"
             ),
+            auto_fix=doctor._uv_install_auto_fix(),
         )
     return doctor._ok("uv installed", data={"path": path})
+
+
+def check_claude_cli() -> doctor.CheckResult:
+    path = doctor._tool_path("claude")
+    if path is None:
+        return doctor._fail(
+            "claude CLI not found on PATH",
+            why=(
+                "PollyPM launches Claude Code sessions for Claude provider accounts. "
+                "Without the `claude` binary, onboarding and session bootstrap cannot start."
+            ),
+            fix=(
+                "Install Claude Code —\n"
+                "  npm i -g @anthropic-ai/claude-code\n"
+                "Recheck: pm doctor"
+            ),
+            auto_fix=doctor._npm_global_auto_fix(
+                "@anthropic-ai/claude-code",
+                description="Install Claude Code globally",
+            ),
+        )
+    return doctor._ok("claude CLI installed", data={"path": path})
+
+
+def check_codex_cli() -> doctor.CheckResult:
+    path = doctor._tool_path("codex")
+    if path is None:
+        return doctor._fail(
+            "codex CLI not found on PATH",
+            why=(
+                "PollyPM launches Codex sessions for Codex provider accounts. "
+                "Without the `codex` binary, onboarding and session bootstrap cannot start."
+            ),
+            fix=(
+                "Install Codex —\n"
+                "  npm i -g @openai/codex\n"
+                "Recheck: pm doctor"
+            ),
+            auto_fix=doctor._npm_global_auto_fix(
+                "@openai/codex",
+                description="Install Codex globally",
+            ),
+        )
+    return doctor._ok("codex CLI installed", data={"path": path})
 
 
 def check_terminal_color_support() -> doctor.CheckResult:

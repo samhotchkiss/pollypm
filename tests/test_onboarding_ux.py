@@ -1,11 +1,13 @@
 import base64
 import json
+from io import StringIO
 from pathlib import Path
 
 from pollypm.models import ProviderKind
 from pollypm.onboarding import (
     _build_login_shell,
     _connect_account_via_tmux,
+    _detected_host_account,
     _detect_email_from_pane,
     _login_completion_marker_seen,
     _provider_choices,
@@ -14,6 +16,7 @@ from pollypm.onboarding import (
     ConnectedAccount,
     LoginPreferences,
 )
+from pollypm.onboarding_tui import stream_text
 from pollypm.providers.claude.detect import detect_claude_email
 from pollypm.providers.codex.detect import detect_codex_email
 
@@ -157,3 +160,31 @@ def test_connect_account_via_tmux_requires_verified_claude_auth(monkeypatch, tmp
         )
 
     assert "managed PollyPM profile is still not authenticated" in str(exc.value)
+
+
+def test_stream_text_skips_animation_for_non_terminal(monkeypatch) -> None:
+    console = type(
+        "Console",
+        (),
+        {
+            "is_terminal": False,
+            "file": StringIO(),
+            "print": lambda self, text, end="": self.file.write(text + end),
+        },
+    )()
+
+    stream_text(console, "hello", chars_per_sec=80)
+
+    assert console.file.getvalue() == "hello"
+
+
+def test_detected_host_account_requires_smoke_success(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("pollypm.onboarding.Path.home", lambda: tmp_path)
+    monkeypatch.setattr("pollypm.onboarding._detect_host_claude_login", lambda: (True, "sam@example.com"))
+    monkeypatch.setattr("pollypm.onboarding._smoke_test_host_login", lambda provider: True)
+
+    account = _detected_host_account(ProviderKind.CLAUDE)
+
+    assert account is not None
+    assert account.home is None
+    assert account.email == "sam@example.com"

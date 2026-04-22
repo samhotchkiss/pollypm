@@ -50,7 +50,8 @@ def render_human(report: doctor.DoctorReport) -> str:
         else:
             glyph = _CROSS
         status = result.status or ("ok" if result.passed else "fail")
-        lines.append(f"{glyph} {check.name}: {status}")
+        badge = " [f] Fix" if not result.passed and doctor._auto_fix_supported(result.auto_fix) else ""
+        lines.append(f"{glyph} {check.name}: {status}{badge}")
 
     passed = report.passed_count
     total = len(report.results)
@@ -110,6 +111,8 @@ def render_json(report: doctor.DoctorReport) -> str:
                 "why": result.why,
                 "fix": result.fix,
                 "fixable": result.fixable,
+                "auto_fix": doctor._auto_fix_payload(result.auto_fix),
+                "auto_fix_available": doctor._auto_fix_supported(result.auto_fix),
                 "data": result.data,
             }
             for check, result in report.results

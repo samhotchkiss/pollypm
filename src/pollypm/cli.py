@@ -46,7 +46,7 @@ from pollypm.config import (
 from pollypm.cli_help import help_with_examples
 from pollypm.cli_features.alerts import alert_app, heartbeat_app, session_app
 from pollypm.cli_features.issues import issue_app, itsalive_app, report_app
-from pollypm.cli_features.maintenance import register_maintenance_commands
+from pollypm.cli_features.maintenance import debug_app, register_maintenance_commands
 from pollypm.cli_features.projects import register_project_commands
 from pollypm.cli_features.session_runtime import register_session_runtime_commands
 from pollypm.cli_features.ui import register_ui_commands
@@ -131,6 +131,7 @@ app.add_typer(heartbeat_app, name="heartbeat")
 app.add_typer(issue_app, name="issue")
 app.add_typer(report_app, name="report")
 app.add_typer(itsalive_app, name="itsalive")
+app.add_typer(debug_app, name="debug")
 
 from pollypm.work.cli import task_app, flow_app
 app.add_typer(task_app, name="task")

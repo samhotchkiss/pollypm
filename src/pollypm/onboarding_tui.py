@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 import shutil
+import time
 
+from rich.console import Console
 from rich.console import Group
 from rich.panel import Panel
 from rich.table import Table
@@ -17,6 +20,13 @@ from textual.widgets import Button, Checkbox, Footer, RadioButton, RadioSet, Sel
 
 from pollypm.cli_shortcuts import shortcut_rows
 from pollypm.config import write_config
+from pollypm.doctor import (
+    AutoFixPlan,
+    check_claude_cli,
+    check_codex_cli,
+    check_tmux,
+    run_auto_fix,
+)
 from pollypm.models import KnownProject, ProjectKind, PollyPMConfig, ProviderKind
 from pollypm.onboarding import (
     CliAvailability,
@@ -27,6 +37,7 @@ from pollypm.onboarding import (
     _connect_account_via_tmux,
     _default_failover_accounts,
     _display_label,
+    _detected_host_account,
     _recover_existing_accounts,
     build_onboarded_config,
 )
@@ -39,6 +50,20 @@ ONBOARDING_STAGES = (
     ("projects", "Add projects"),
     ("tour", "Launch PollyPM"),
 )
+
+
+def stream_text(console: Console, text: str, chars_per_sec: int = 80) -> None:
+    """Stream text through ``console`` unless animation should stay static."""
+    if chars_per_sec <= 0 or os.environ.get("NO_COLOR") or not console.is_terminal:
+        console.print(text, end="")
+        return
+    delay = 1.0 / chars_per_sec
+    for char in text:
+        console.file.write(char)
+        console.file.flush()
+        if char != "\n":
+            time.sleep(delay)
+    console.file.flush()
 
 
 def installed_provider_statuses(statuses: list[CliAvailability]) -> list[CliAvailability]:
@@ -130,6 +155,14 @@ class OnboardingState:
 class OnboardingResult:
     config_path: Path
     launch_requested: bool = False
+
+
+@dataclass(slots=True)
+class BlockingAutoFix:
+    button_id: str
+    label: str
+    summary: str
+    plan: AutoFixPlan
 
 
 class ExitModal(ModalScreen[None]):
@@ -369,12 +402,13 @@ class OnboardingApp(App[OnboardingResult | None]):
         Binding("escape", "go_back", "Back"),
     ]
 
-    def __init__(self, config_path: Path, force: bool = False) -> None:
+    def __init__(self, config_path: Path, force: bool = False, no_animation: bool = False) -> None:
         super().__init__()
         self.config_path = config_path
         self.force = force
+        self.no_animation = no_animation
         self.root_dir = config_path.resolve().parent
-        self.tmux = create_tmux_client()
+        self.tmux = None
         self.step = "accounts"
 
         known_projects: dict[str, KnownProject] = {}
@@ -390,6 +424,11 @@ class OnboardingApp(App[OnboardingResult | None]):
                 known_projects = {}
 
         accounts = _recover_existing_accounts(self.root_dir)
+        for provider in (ProviderKind.CLAUDE, ProviderKind.CODEX):
+            detected = _detected_host_account(provider)
+            if detected is None or detected.account_name in accounts:
+                continue
+            accounts[detected.account_name] = detected
         statuses = _available_clis()
         controller = default_controller_account(accounts)
         self.state = OnboardingState(
@@ -417,6 +456,40 @@ class OnboardingApp(App[OnboardingResult | None]):
         self.scan_loading_widget: Static | None = None
         self.scan_frame_index = 0
         self.launch_button: Button | None = None
+
+    def _blocking_auto_fixes(self) -> list[BlockingAutoFix]:
+        fixes: list[BlockingAutoFix] = []
+        if not self._tmux_ready():
+            result = check_tmux()
+            if result.auto_fix is not None:
+                fixes.append(
+                    BlockingAutoFix(
+                        button_id="fix-tmux",
+                        label="Install tmux",
+                        summary=result.status,
+                        plan=result.auto_fix,
+                    )
+                )
+        if installed_provider_statuses(self.state.statuses):
+            return fixes
+        for provider, check, label in (
+            (ProviderKind.CLAUDE, check_claude_cli, "Install Claude CLI"),
+            (ProviderKind.CODEX, check_codex_cli, "Install Codex CLI"),
+        ):
+            if any(status.provider is provider and status.installed for status in self.state.statuses):
+                continue
+            result = check()
+            if result.auto_fix is None:
+                continue
+            fixes.append(
+                BlockingAutoFix(
+                    button_id=f"fix-{provider.value}-cli",
+                    label=label,
+                    summary=result.status,
+                    plan=result.auto_fix,
+                )
+            )
+        return fixes
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="shell"):
@@ -517,41 +590,62 @@ class OnboardingApp(App[OnboardingResult | None]):
 
     def _render_accounts_step(self) -> None:
         installed = installed_provider_statuses(self.state.statuses)
+        auto_fixes = self._blocking_auto_fixes()
         self.eyebrow_widget.update(onboarding_step_header("accounts"))
         self.title_widget.update("Connect your first agent account")
         self.intro_widget.update(
-            "PollyPM opens the real Claude or Codex login flow, waits for it to finish, and saves the result "
-            "as a reusable profile for day-to-day work, failover, and recovery."
+            "Hi, I'm Polly — your AI coding PM.\n\n"
+            "I'll connect your CLIs, pick a project, and open your control room. "
+            "Most of the setup takes about a minute, and I handle most of it for you."
         )
         stage = Vertical(classes="stage")
         self.step_host.mount(stage)
 
         if not self._tmux_ready():
-            stage.mount(
+            blockers = Vertical(classes="section")
+            stage.mount(blockers)
+            blockers.mount(
                 Panel(
                     "[red]tmux is required before PollyPM can continue.[/red]\n"
-                    "Install tmux, then rerun `pollypm`.",
+                    "Install tmux here, then keep going without restarting onboarding.",
                     title="tmux Required",
                     border_style="red",
                 )
             )
+            if auto_fixes:
+                actions = Horizontal(classes="button-row")
+                blockers.mount(actions)
+                for item in auto_fixes:
+                    if item.button_id == "fix-tmux":
+                        actions.mount(Button(item.label, id=item.button_id, variant="warning"))
             return
 
         if not installed:
-            stage.mount(
+            blockers = Vertical(classes="section")
+            stage.mount(blockers)
+            blockers.mount(
                 Panel(
                     "[red]No supported agent CLI was found.[/red]\n\n"
-                    "Install Claude CLI or Codex CLI, then rerun `pollypm`.",
+                    "Install Claude CLI or Codex CLI here, then continue without restarting onboarding.",
                     title="Install a CLI First",
                     border_style="red",
                 )
             )
+            if auto_fixes:
+                actions = Horizontal(classes="button-row")
+                blockers.mount(actions)
+                for item in auto_fixes:
+                    if item.button_id != "fix-tmux":
+                        actions.mount(Button(item.label, id=item.button_id, variant="warning"))
             return
 
-        intro_section = Static(
-            "Connect one real account to begin. After that, you can keep adding more now or later from the Accounts tab.",
-            classes="section",
-        )
+        intro_lines = [
+            "Connect one real account to begin.",
+            "After that, you can keep adding more now or later from the Accounts tab.",
+        ]
+        if any(account.home is None for account in self.state.accounts.values()):
+            intro_lines.insert(0, "Found a host login and connected it automatically.")
+        intro_section = Static("\n".join(intro_lines), classes="section")
         stage.mount(intro_section)
         provider_buttons = Horizontal(id="provider-buttons")
         provider_section = Vertical(classes="section")
@@ -819,6 +913,27 @@ class OnboardingApp(App[OnboardingResult | None]):
             projects=projects,
         )
 
+    def _ensure_tmux_client(self):
+        if self.tmux is None:
+            self.tmux = create_tmux_client()
+        return self.tmux
+
+    def _run_machine_fix(self, button_id: str) -> None:
+        for item in self._blocking_auto_fixes():
+            if item.button_id != button_id:
+                continue
+            self._set_message(f"Running: {item.label}…")
+            try:
+                with self.suspend():
+                    success, detail = run_auto_fix(item.plan)
+            except Exception as exc:  # noqa: BLE001
+                success, detail = (False, str(exc))
+            self.state.statuses = _available_clis()
+            self.refresh(repaint=True, layout=True)
+            self._render_current_step()
+            self._set_message(detail)
+            return
+
     def _connect_provider(self, provider: ProviderKind, *, login_preferences: LoginPreferences | None = None) -> None:
         index = len([account for account in self.state.accounts.values() if account.provider is provider]) + 1
         self._set_message(f"Opening a {provider.value} login window…")
@@ -826,7 +941,7 @@ class OnboardingApp(App[OnboardingResult | None]):
         try:
             with self.suspend():
                 account = _connect_account_via_tmux(
-                    self.tmux,
+                    self._ensure_tmux_client(),
                     root_dir=self.root_dir,
                     provider=provider,
                     index=index,
@@ -857,6 +972,9 @@ class OnboardingApp(App[OnboardingResult | None]):
     @on(Button.Pressed)
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
+        if button_id.startswith("fix-"):
+            self._run_machine_fix(button_id)
+            return
         if button_id == "connect-claude":
             self._connect_provider(ProviderKind.CLAUDE)
             return
@@ -946,8 +1064,24 @@ class OnboardingApp(App[OnboardingResult | None]):
         self._render_current_step()
 
 
-def run_onboarding_app(config_path: Path, force: bool = False) -> OnboardingResult:
-    app = OnboardingApp(config_path=config_path, force=force)
+def run_onboarding_app(config_path: Path, force: bool = False, no_animation: bool = False) -> OnboardingResult:
+    console = Console()
+    intro = (
+        "Hi, I'm Polly — your AI coding PM.\n\n"
+        "I'll connect your CLIs, pick a project, and open your control room. "
+        "About a minute, most of which I'll handle for you.\n\n"
+        "Let's go.\n"
+    )
+    if no_animation or os.environ.get("NO_COLOR") or not console.is_terminal:
+        console.print(intro, end="")
+    else:
+        stream_text(console, intro, chars_per_sec=80)
+    try:
+        app = OnboardingApp(config_path=config_path, force=force, no_animation=no_animation)
+    except TypeError as exc:
+        if "no_animation" not in str(exc):
+            raise
+        app = OnboardingApp(config_path=config_path, force=force)
     result = app.run(mouse=True)
     if result is None:
         raise SystemExit(1)

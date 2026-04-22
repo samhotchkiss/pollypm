@@ -4,6 +4,7 @@ import base64
 import json
 import re
 import shlex
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -103,8 +104,89 @@ def _prime_claude_home(home: Path) -> None:
     prime_claude_home(home)
 
 
+def _detect_host_claude_login() -> tuple[bool, str | None]:
+    home = Path.home()
+    credentials_path = home / ".claude" / ".credentials.json"
+    if not credentials_path.exists():
+        return (False, None)
+    try:
+        from pollypm.providers.claude.detect import detect_claude_email
+
+        email = detect_claude_email(home)
+    except Exception:  # noqa: BLE001
+        return (False, None)
+    return (bool(email), email)
+
+
+def _detect_host_codex_login() -> tuple[bool, str | None]:
+    home = Path.home()
+    auth_path = home / ".codex" / "auth.json"
+    if not auth_path.exists():
+        return (False, None)
+    try:
+        from pollypm.providers.codex.detect import detect_codex_email
+
+        email = detect_codex_email(home)
+    except Exception:  # noqa: BLE001
+        return (False, None)
+    return (bool(email), email)
+
+
+def _smoke_test_host_login(provider: ProviderKind) -> bool:
+    try:
+        if provider is ProviderKind.CLAUDE:
+            result = subprocess.run(
+                ["claude", "auth", "status", "--json"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if result.returncode != 0:
+                return False
+            try:
+                data = json.loads(result.stdout or "{}")
+            except json.JSONDecodeError:
+                return False
+            return bool(data.get("loggedIn"))
+        result = subprocess.run(
+            ["codex", "auth", "status"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode != 0:
+            return False
+        text = (result.stdout + result.stderr).lower()
+        return "not logged in" not in text and "sign in" not in text
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _detected_host_account(provider: ProviderKind) -> ConnectedAccount | None:
+    if provider is ProviderKind.CLAUDE:
+        logged_in, email = _detect_host_claude_login()
+    elif provider is ProviderKind.CODEX:
+        logged_in, email = _detect_host_codex_login()
+    else:
+        return None
+    if not logged_in or not email:
+        return None
+    if not _smoke_test_host_login(provider):
+        return None
+    return ConnectedAccount(
+        provider=provider,
+        email=email,
+        account_name=_slugify_email(provider, email),
+        home=None,
+    )
+
+
 def _select_provider_to_connect(installed: list[CliAvailability], accounts: dict[str, ConnectedAccount]) -> ProviderKind | None:
     if len(installed) == 1:
+        if any(account.provider is installed[0].provider for account in accounts.values()):
+            return None
         if not accounts:
             _render_account_step_intro(installed, accounts)
             typer.prompt("Press Return to start", default="", show_default=False)
@@ -691,10 +773,59 @@ def build_onboarded_config(
     )
 
 
-def run_onboarding(config_path: Path = DEFAULT_CONFIG_PATH, force: bool = False) -> OnboardingResult:
+def _account_ready_for_welcome_back(account: AccountConfig) -> bool:
+    if account.home is None:
+        detected = _detected_host_account(account.provider)
+        return detected is not None and detected.email.lower() == (account.email or "").lower()
+    return account.home.exists()
+
+
+def _render_welcome_back_summary(config: PollyPMConfig) -> list[str]:
+    lines = ["Welcome back.", "", "Accounts:"]
+    for name, account in config.accounts.items():
+        ok = _account_ready_for_welcome_back(account)
+        label = account.email or name
+        mode = "default profile" if account.home is None else "isolated home"
+        lines.append(f"- {label} [{account.provider.value}] ({mode}) {'ok' if ok else 'needs re-login'}")
+    if config.projects:
+        lines.extend(["", "Projects:"])
+        for project in config.projects.values():
+            lines.append(f"- {project.display_label()} -> {project.path}")
+    return lines
+
+
+def run_onboarding(
+    config_path: Path = DEFAULT_CONFIG_PATH,
+    force: bool = False,
+    *,
+    no_animation: bool = False,
+) -> OnboardingResult:
+    if not force and config_path.exists():
+        try:
+            config = load_config(config_path)
+        except Exception:  # noqa: BLE001
+            config = None
+        if config is not None:
+            for line in _render_welcome_back_summary(config):
+                typer.echo(line)
+            typer.echo("")
+            typer.echo("1. Open cockpit")
+            typer.echo("2. Add another account")
+            typer.echo("3. Re-run full onboarding")
+            choice = typer.prompt("Choose", default="1")
+            if choice == "1":
+                return OnboardingResult(config_path=config_path, launch_requested=True)
+            if choice == "2":
+                from pollypm.onboarding_tui import run_onboarding_app
+
+                return run_onboarding_app(config_path=config_path, force=False, no_animation=no_animation)
+            if choice == "3":
+                from pollypm.onboarding_tui import run_onboarding_app
+
+                return run_onboarding_app(config_path=config_path, force=True, no_animation=no_animation)
     from pollypm.onboarding_tui import run_onboarding_app
 
-    return run_onboarding_app(config_path=config_path, force=force)
+    return run_onboarding_app(config_path=config_path, force=force, no_animation=no_animation)
 
 
 def relogin_account(config_path: Path, identifier: str) -> tuple[str, str]:

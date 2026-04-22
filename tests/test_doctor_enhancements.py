@@ -969,3 +969,131 @@ def test_manual_fixes_excludes_skipped_and_passing() -> None:
     manual = doctor.manual_fixes(report)
     names = [n for n, _ in manual]
     assert names == ["d"]
+
+
+def test_tmux_missing_exposes_brew_auto_fix(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(doctor, "_tool_path", lambda name: "/opt/homebrew/bin/brew" if name == "brew" else None)
+    monkeypatch.setattr(doctor, "_current_platform", lambda: "macos")
+    result = doctor.check_tmux()
+    assert not result.passed
+    assert result.auto_fix is not None
+    assert result.auto_fix.command == ["brew", "install", "tmux"]
+    assert result.auto_fix.platforms == ["macos"]
+
+
+def test_tmux_missing_exposes_linux_package_manager_auto_fix(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _tool_path(name: str) -> str | None:
+        return "/usr/bin/apt-get" if name == "apt-get" else None
+
+    monkeypatch.setattr(doctor, "_tool_path", _tool_path)
+    monkeypatch.setattr(doctor, "_current_platform", lambda: "linux")
+    result = doctor.check_tmux()
+    assert not result.passed
+    assert result.auto_fix is not None
+    assert result.auto_fix.requires_sudo is True
+    assert result.auto_fix.command == ["sudo", "apt-get", "install", "-y", "tmux"]
+
+
+def test_claude_cli_missing_has_auto_fix(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _tool_path(name: str) -> str | None:
+        return "/usr/bin/npm" if name == "npm" else None
+
+    monkeypatch.setattr(doctor, "_tool_path", _tool_path)
+    monkeypatch.setattr(doctor, "_current_platform", lambda: "linux")
+    result = doctor.check_claude_cli()
+    assert not result.passed
+    assert result.auto_fix is not None
+    assert result.auto_fix.command == ["npm", "i", "-g", "@anthropic-ai/claude-code"]
+
+
+def test_codex_cli_missing_has_auto_fix(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _tool_path(name: str) -> str | None:
+        return "/usr/bin/npm" if name == "npm" else None
+
+    monkeypatch.setattr(doctor, "_tool_path", _tool_path)
+    monkeypatch.setattr(doctor, "_current_platform", lambda: "linux")
+    result = doctor.check_codex_cli()
+    assert not result.passed
+    assert result.auto_fix is not None
+    assert result.auto_fix.command == ["npm", "i", "-g", "@openai/codex"]
+
+
+def test_render_human_shows_fix_badge_for_supported_auto_fix() -> None:
+    auto_fix = doctor.AutoFixPlan(
+        description="Install tmux",
+        command=["brew", "install", "tmux"],
+        platforms=["macos", "linux"],
+    )
+
+    def _fail() -> doctor.CheckResult:
+        return doctor._fail("missing tmux", why="x", fix="y", auto_fix=auto_fix)
+
+    report = doctor.run_checks([doctor.Check("tmux", _fail, "system")])
+    text = doctor.render_human(report)
+    assert "[f] Fix" in text
+
+
+def test_render_human_hides_fix_badge_for_unsupported_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    auto_fix = doctor.AutoFixPlan(
+        description="Install tmux",
+        command=["brew", "install", "tmux"],
+        platforms=["macos"],
+    )
+
+    monkeypatch.setattr(doctor, "_current_platform", lambda: "windows")
+
+    def _fail() -> doctor.CheckResult:
+        return doctor._fail("missing tmux", why="x", fix="y", auto_fix=auto_fix)
+
+    report = doctor.run_checks([doctor.Check("tmux", _fail, "system")])
+    text = doctor.render_human(report)
+    assert "[f] Fix" not in text
+
+
+def test_json_output_includes_auto_fix_metadata() -> None:
+    auto_fix = doctor.AutoFixPlan(
+        description="Install Claude Code globally",
+        command=["npm", "i", "-g", "@anthropic-ai/claude-code"],
+        platforms=["macos", "linux"],
+    )
+
+    def _fail() -> doctor.CheckResult:
+        return doctor._fail("missing", why="x", fix="y", auto_fix=auto_fix)
+
+    report = doctor.run_checks([doctor.Check("claude", _fail, "system")])
+    payload = json.loads(doctor.render_json(report))
+    check = payload["checks"][0]
+    assert check["auto_fix"]["description"] == "Install Claude Code globally"
+    assert check["auto_fix"]["command"] == ["npm", "i", "-g", "@anthropic-ai/claude-code"]
+    assert check["auto_fix_available"] is True
+
+
+def test_apply_fixes_runs_supported_auto_fix_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    auto_fix = doctor.AutoFixPlan(
+        description="Install Claude Code globally",
+        command=["npm", "i", "-g", "@anthropic-ai/claude-code"],
+        platforms=["macos", "linux"],
+    )
+
+    def _fail() -> doctor.CheckResult:
+        return doctor._fail("missing", why="x", fix="y", auto_fix=auto_fix)
+
+    monkeypatch.setattr(doctor, "run_auto_fix", lambda plan: (True, plan.description))
+
+    report = doctor.run_checks([doctor.Check("claude", _fail, "system")])
+    assert doctor.apply_fixes(report) == [("claude", True, "Install Claude Code globally")]
+
+
+def test_planned_and_manual_fix_lists_treat_supported_auto_fix_as_runnable() -> None:
+    auto_fix = doctor.AutoFixPlan(
+        description="Install tmux",
+        command=["brew", "install", "tmux"],
+        platforms=["macos", "linux"],
+    )
+
+    def _fail() -> doctor.CheckResult:
+        return doctor._fail("missing tmux", why="x", fix="Install tmux", auto_fix=auto_fix)
+
+    report = doctor.run_checks([doctor.Check("tmux", _fail, "system")])
+    assert doctor.planned_fixes(report) == [("tmux", "Install tmux")]
+    assert doctor.manual_fixes(report) == []

@@ -21,6 +21,7 @@ def check_pm_binary_resolves() -> doctor.CheckResult:
                 "Or run via uv:  uv run pm doctor\n"
                 "Recheck: pm doctor"
             ),
+            auto_fix=doctor._reinstall_editable_auto_fix("Install PollyPM editable"),
         )
     return doctor._ok(f"pm binary at {path}", data={"path": path})
 
@@ -47,6 +48,7 @@ def check_installed_version_matches_pyproject() -> doctor.CheckResult:
                 "  uv tool install --editable .\n"
                 "Recheck: pm doctor"
             ),
+            auto_fix=doctor._reinstall_editable_auto_fix("Install PollyPM editable"),
         )
     except Exception as exc:  # noqa: BLE001
         return doctor._skip(f"package metadata unreadable ({exc})")
@@ -66,6 +68,7 @@ def check_installed_version_matches_pyproject() -> doctor.CheckResult:
             ),
             severity="warning",
             data={"installed": installed, "source": declared},
+            auto_fix=doctor._reinstall_editable_auto_fix("Reinstall the editable PollyPM package"),
         )
     return doctor._ok(f"pollypm {installed} matches pyproject", data={"version": installed})
 

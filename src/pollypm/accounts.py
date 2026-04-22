@@ -55,6 +55,10 @@ class AccountStatus:
     profile_root: str | None = None
 
 
+def _provider_account_count(accounts: dict[str, AccountConfig], provider: ProviderKind) -> int:
+    return sum(1 for account in accounts.values() if account.provider is provider)
+
+
 def _account_usage_summary(account: AccountConfig) -> tuple[str, str, str]:
     if account.home is None:
         return ("unknown", "missing-home", "not configured")
@@ -199,7 +203,11 @@ def _codex_credentials_store(home: Path) -> str:
     return "auto"
 
 
-def inspect_account_isolation(account: AccountConfig) -> tuple[str, str, str, str, str | None]:
+def inspect_account_isolation(
+    account: AccountConfig,
+    *,
+    provider_account_count: int | None = None,
+) -> tuple[str, str, str, str, str | None]:
     if account.runtime.value == "docker":
         return (
             "isolated-runtime",
@@ -210,11 +218,14 @@ def inspect_account_isolation(account: AccountConfig) -> tuple[str, str, str, st
         )
 
     if account.home is None:
+        remediation = ""
+        if provider_account_count is None or provider_account_count > 1:
+            remediation = "Configure an isolated home/profile root or switch this account to Docker."
         return (
-            "shared-host",
-            "Account is using the shared host environment without an isolated profile root.",
-            "Configure an isolated home/profile root or switch this account to Docker.",
-            "shared-host",
+            "default-profile",
+            "Account uses your default ~/.claude/ (or ~/.codex/) login - no isolation.",
+            remediation,
+            "default-profile",
             None,
         )
 
@@ -293,7 +304,8 @@ def probe_account_usage(config_path: Path, identifier: str) -> AccountStatus:
     default_health = cached.health if cached is not None else "unknown"
     default_summary = cached.usage_summary if cached is not None else "usage unavailable"
     isolation_status, isolation_summary, isolation_recommendation, auth_storage, profile_root = inspect_account_isolation(
-        account
+        account,
+        provider_account_count=_provider_account_count(config.accounts, account.provider),
     )
     return AccountStatus(
         key=account_name,
@@ -339,7 +351,8 @@ def list_account_statuses(config_path: Path) -> list[AccountStatus]:
                 runtime_status=(runtime.status if runtime else None),
             )
             isolation_status, isolation_summary, isolation_recommendation, auth_storage, profile_root = inspect_account_isolation(
-                account
+                account,
+                provider_account_count=_provider_account_count(config.accounts, account.provider),
             )
             items.append(
                 AccountStatus(
@@ -393,7 +406,8 @@ def list_cached_account_statuses(config_path: Path) -> list[AccountStatus]:
                 probe_live=False,
             )
             isolation_status, isolation_summary, isolation_recommendation, auth_storage, profile_root = inspect_account_isolation(
-                account
+                account,
+                provider_account_count=_provider_account_count(config.accounts, account.provider),
             )
             items.append(
                 AccountStatus(

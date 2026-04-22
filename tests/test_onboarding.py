@@ -1,6 +1,10 @@
 from pathlib import Path
 
+from typer.testing import CliRunner
+
+from pollypm.cli import app as cli_app
 from pollypm.config import load_config, write_config
+from pollypm.doctor import decode_setup_tag, setup_tag_line
 from pollypm.models import KnownProject, ProviderKind
 from pollypm.projects import DEFAULT_WORKSPACE_ROOT
 from pollypm.onboarding import ConnectedAccount, build_onboarded_config
@@ -103,3 +107,61 @@ def test_build_onboarded_config_can_disable_open_permissions(tmp_path: Path) -> 
     assert "--disallowedTools" in config.sessions["operator"].args
     assert "--dangerously-skip-permissions" not in config.sessions["heartbeat"].args
     assert "--dangerously-skip-permissions" not in config.sessions["operator"].args
+
+
+def test_setup_tag_round_trips(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("pollypm.doctor.Path.home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "pollypm.doctor._tool_version",
+        lambda binary, timeout=2.0: {"claude": "2.1.0", "codex": "0.1.0"}.get(binary),
+    )
+    monkeypatch.setattr("pollypm.doctor._tool_major", lambda binary, timeout=2.0: {"tmux": 3, "git": 2, "node": 20}.get(binary))
+    monkeypatch.setattr(
+        "pollypm.doctor._setup_fingerprint",
+        lambda config_path=None: {
+            "platform": "darwin-arm64",
+            "pollypm_version": "1.2.3",
+            "claude_version": "2.1.0",
+            "claude_home_mode": "default-profile",
+            "codex_version": "0.1.0",
+            "codex_home_mode": "isolated",
+            "tmux_major": 3,
+            "git_major": 2,
+            "node_major": 20,
+            "accounts": 2,
+            "projects": 4,
+        },
+    )
+
+    line = setup_tag_line(tmp_path / "pollypm.toml")
+    tag = line.split()[2]
+
+    assert decode_setup_tag(tag)["accounts"] == 2
+
+
+def test_decode_setup_tag_cli_round_trips(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("pollypm.doctor.Path.home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "pollypm.doctor._setup_fingerprint",
+        lambda config_path=None: {
+            "platform": "darwin-arm64",
+            "pollypm_version": "1.2.3",
+            "claude_version": "2.1.0",
+            "claude_home_mode": "default-profile",
+            "codex_version": "0.1.0",
+            "codex_home_mode": "isolated",
+            "tmux_major": 3,
+            "git_major": 2,
+            "node_major": 20,
+            "accounts": 2,
+            "projects": 4,
+        },
+    )
+
+    line = setup_tag_line(tmp_path / "pollypm.toml")
+    tag = line.split()[2]
+
+    result = CliRunner().invoke(cli_app, ["debug", "decode-setup-tag", tag])
+
+    assert result.exit_code == 0
+    assert '"accounts": 2' in result.output

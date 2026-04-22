@@ -112,7 +112,7 @@ from pollypm.rejection_feedback import (
 from pollypm.session_services import create_tmux_client
 from pollypm.service_api import PollyPMService
 from pollypm.cockpit import build_cockpit_detail
-from pollypm.cockpit_rail import CockpitItem, CockpitRouter
+from pollypm.cockpit_rail import CockpitItem, CockpitPresence, CockpitRouter
 
 
 import re as _re
@@ -414,18 +414,36 @@ class RailItem(ListItem):
         *,
         active_view: bool,
         first_project: bool = False,
+        presence: CockpitPresence | None = None,
+        spinner_index: int = 0,
     ) -> None:
         self.body = Static(classes="rail-item-body")
         self.item = item
+        self.presence = presence
+        self.spinner_index = spinner_index
         super().__init__(self.body, classes="rail-row", disabled=not item.selectable)
-        self.apply_item(item, active_view=active_view, first_project=first_project)
+        self.apply_item(
+            item,
+            active_view=active_view,
+            first_project=first_project,
+            spinner_index=spinner_index,
+        )
 
     @property
     def cockpit_key(self) -> str:
         return self.item.key
 
-    def apply_item(self, item: CockpitItem, *, active_view: bool, first_project: bool) -> None:
+    def apply_item(
+        self,
+        item: CockpitItem,
+        *,
+        active_view: bool,
+        first_project: bool,
+        spinner_index: int | None = None,
+    ) -> None:
         self.item = item
+        if spinner_index is not None:
+            self.spinner_index = spinner_index
         self.disabled = not item.selectable
         for class_name in [
             "inbox-entry",
@@ -483,6 +501,20 @@ class RailItem(ListItem):
         self.body.update(text)
 
     def _indicator(self) -> tuple[str, str]:
+        presence = self.presence
+        if (
+            presence is not None
+            and self.item.session_name
+            and self.item.work_state
+        ):
+            pulse = presence.heartbeat_frame_for(
+                self.item.session_name,
+                self.item.heartbeat_at,
+            )
+            work_glyph, color = self._session_work_glyph(self.item.work_state)
+            return f"{pulse}{work_glyph}", color
+        if presence is not None and self.item.state in {"heartbeat", "watch"}:
+            return presence.heartbeat_frame(self.spinner_index), "#3ddc84"
         # Alerts (red triangle)
         if self.item.state.startswith("!"):
             return "\u25b2", "#ff5f6d"
@@ -514,9 +546,27 @@ class RailItem(ListItem):
         # Projects: yellow for active task, dim for idle
         if self.item.key.startswith("project:"):
             if "working" in self.item.state:
+                if presence is not None:
+                    return presence.working_frame(self.spinner_index), "#3ddc84"
                 return "\u25c6", "#f0c45a"  # yellow diamond — active task
             return "\u25cb", "#4a5568"  # dim circle — idle
         return "\u25cb", "#4a5568"
+
+    def _session_work_glyph(self, work_state: str) -> tuple[str, str]:
+        presence = self.presence
+        if work_state == "writing":
+            if presence is not None:
+                if not presence.should_animate():
+                    return "…", "#3ddc84"
+                return presence.working_frame(self.spinner_index), "#3ddc84"
+            return "\u25c6", "#3ddc84"
+        if work_state == "reviewing":
+            return "\u270e", "#3ddc84"
+        if work_state == "stuck":
+            return "\u26a0", "#ff5f6d"
+        if work_state == "exited":
+            return "\u2715", "#4a5568"
+        return "\u00b7", "#4a5568"
 
 
 class PollyCockpitApp(App[None]):
@@ -630,7 +680,12 @@ class PollyCockpitApp(App[None]):
         Binding("s", "open_settings", "Settings"),
         Binding("a", "view_alerts", "Alerts", show=False),
         Binding("colon", "open_command_palette", "Palette", priority=True),
-        Binding("question_mark", "show_keyboard_help", "Help", priority=True),
+        Binding(
+            "question_mark",
+            "show_keyboard_help",
+            "Help: pulse ♥/♡, writing ◜◝◞◟, review ✎, idle ·, stuck ⚠, exited ✕",
+            priority=True,
+        ),
         Binding("j,down", "cursor_down", "Down", show=False),
         Binding("k,up", "cursor_up", "Up", show=False),
         Binding("g,home", "cursor_first", "First", show=False),
@@ -649,6 +704,7 @@ class PollyCockpitApp(App[None]):
         super().__init__()
         self.config_path = config_path
         self.router = CockpitRouter(config_path)
+        self.presence = CockpitPresence(self.router.tmux)
         self.service = PollyPMService(config_path)
         _lines = ASCII_POLLY.split("\n")
         self.brand = Static(
@@ -835,8 +891,18 @@ class PollyCockpitApp(App[None]):
                 if item.state.endswith("working"):
                     item.state = f"{frame} working"
             for key, row in self._row_widgets.items():
-                if row.item.state.endswith("working"):
-                    row.item.state = f"{frame} working"
+                should_animate = row.item.state.endswith("working")
+                rewrite_state = should_animate
+                if row.item.state in {"heartbeat", "watch"}:
+                    should_animate = True
+                    rewrite_state = False
+                if row.item.session_name and row.item.work_state == "writing":
+                    should_animate = True
+                    rewrite_state = False
+                if should_animate:
+                    if rewrite_state:
+                        row.item.state = f"{frame} working"
+                    row.spinner_index = self.spinner_index
                     row.update_body()
         # Layout check much less frequently
         if self._tick_count % self._LAYOUT_CHECK_INTERVAL == 0:
@@ -921,11 +987,18 @@ class PollyCockpitApp(App[None]):
                     item,
                     active_view=item.key == self.selected_key,
                     first_project=first_project,
+                    presence=self.presence,
+                    spinner_index=self.spinner_index,
                 )
                 self._row_widgets[item.key] = row
             else:
                 row = self._row_widgets[item.key]
-                row.apply_item(item, active_view=item.key == self.selected_key, first_project=first_project)
+                row.apply_item(
+                    item,
+                    active_view=item.key == self.selected_key,
+                    first_project=first_project,
+                    spinner_index=self.spinner_index,
+                )
             rows.append(row)
             if selected_key is not None and item.key == selected_key:
                 restore_index = nav_index

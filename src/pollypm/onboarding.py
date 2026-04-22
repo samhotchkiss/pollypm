@@ -57,6 +57,12 @@ if TYPE_CHECKING:
 DEMO_PROJECT_BASENAME = "pollypm-demo"
 DEMO_PROJECT_MARKER = ".pollypm-demo-fallback"
 DEMO_PROJECT_TEMPLATE_DIR = Path(__file__).resolve().parent / "defaults" / "demo"
+DEMO_PROJECT_TASK_TITLE = "Fix the demo queue estimate bug"
+DEMO_PROJECT_TASK_DESCRIPTION = (
+    "The offline demo intentionally ships a tiny regression in demo_app.py.\n"
+    "Open TASK.md and tests/test_demo_app.py, fix estimate_focus_minutes(), "
+    "and keep the seeded PollyPM task until you are done."
+)
 
 
 class LoginCancelled(Exception):
@@ -320,6 +326,33 @@ def _write_demo_project_files(target: Path) -> None:
         destination = target / relative_name
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
+
+
+def seed_demo_project_task(project_path: Path, *, project_key: str) -> str:
+    """Seed one small PollyPM task into the demo project's work DB."""
+    from pollypm.projects import ensure_project_scaffold
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    ensure_project_scaffold(project_path)
+    db_path = project_path / ".pollypm" / "state.db"
+    with SQLiteWorkService(db_path=db_path, project_path=project_path) as svc:
+        existing = svc.list_tasks(project=project_key)
+        for task in existing:
+            if task.title == DEMO_PROJECT_TASK_TITLE:
+                return task.task_id
+        task = svc.create(
+            title=DEMO_PROJECT_TASK_TITLE,
+            description=DEMO_PROJECT_TASK_DESCRIPTION,
+            type="task",
+            project=project_key,
+            flow_template="standard",
+            roles={"worker": "demo_worker", "reviewer": "demo_reviewer"},
+            priority="normal",
+            created_by="onboarding",
+            labels=["demo", "onboarding"],
+        )
+        svc.queue(task.task_id, "onboarding", skip_gates=True)
+        return task.task_id
 
 
 def _init_demo_project_git(target: Path) -> None:

@@ -150,6 +150,7 @@ class OnboardingState:
     failover_enabled: bool = True
     recent_projects: list[Path] = field(default_factory=list)
     selected_project_paths: list[Path] = field(default_factory=list)
+    seeded_demo_task_id: str | None = None
     scan_complete: bool = False
     scan_started: bool = False
 
@@ -275,6 +276,59 @@ class CodexLoginModeModal(ModalScreen[str | None]):
             return
         if event.button.id == "codex-mode-remote":
             self.dismiss("remote")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class DemoTaskModal(ModalScreen[str | None]):
+    CSS = """
+    ModalScreen {
+        align: center middle;
+        background: rgba(0, 0, 0, 0.55);
+    }
+    #demo-task-dialog {
+        width: 78;
+        height: auto;
+        padding: 1 2;
+        background: #141a20;
+        border: heavy #3ddc84;
+    }
+    #demo-task-title {
+        text-style: bold;
+        color: #f0f4f8;
+        padding-bottom: 1;
+    }
+    #demo-task-actions {
+        height: auto;
+        padding-top: 1;
+        align-horizontal: right;
+    }
+    #demo-task-actions Button {
+        margin-left: 1;
+    }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        with CenterMiddle():
+            with Vertical(id="demo-task-dialog"):
+                yield Static("Keep the seeded demo task?", id="demo-task-title")
+                yield Static(
+                    "The demo repo includes one PollyPM task pointing at the intentional bug in demo_app.py. "
+                    "Keeping it adds the task to the project DB so it shows up in the cockpit."
+                )
+                with Horizontal(id="demo-task-actions"):
+                    yield Button("Keep", id="demo-task-keep", variant="primary")
+                    yield Button("Forget", id="demo-task-forget", variant="warning")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "demo-task-keep":
+            self.dismiss("keep")
+            return
+        if event.button.id == "demo-task-forget":
+            self.dismiss("forget")
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -459,6 +513,7 @@ class OnboardingApp(App[OnboardingResult | None]):
         self.scan_loading_widget: Static | None = None
         self.scan_frame_index = 0
         self.launch_button: Button | None = None
+        self._pending_demo_repo_path: Path | None = None
 
     def _blocking_auto_fixes(self) -> list[BlockingAutoFix]:
         fixes: list[BlockingAutoFix] = []
@@ -1013,10 +1068,8 @@ class OnboardingApp(App[OnboardingResult | None]):
             except Exception as exc:  # noqa: BLE001
                 self._set_message(f"Could not prepare the demo repo: {exc}")
                 return
-            self.state.recent_projects = [demo_path]
-            self.state.selected_project_paths = [demo_path]
-            self._set_message(f"Demo repo ready at {demo_path}.")
-            self._render_current_step()
+            self._pending_demo_repo_path = demo_path
+            self.push_screen(DemoTaskModal(), self._handle_demo_task_choice)
             return
         if button_id == "projects-finish":
             if self.project_selection is not None:
@@ -1084,6 +1137,36 @@ class OnboardingApp(App[OnboardingResult | None]):
             self._set_message(
                 "No recent repos matched your local commit history. You can use the demo repo fallback or add projects later."
             )
+        self._render_current_step()
+
+    def _handle_demo_task_choice(self, choice: str | None) -> None:
+        demo_path = self._pending_demo_repo_path
+        self._pending_demo_repo_path = None
+        if demo_path is None:
+            return
+
+        self.state.recent_projects = [demo_path]
+        self.state.selected_project_paths = [demo_path]
+        if choice == "keep":
+            from pollypm.onboarding import seed_demo_project_task
+
+            project_key = make_project_key(demo_path, set(self.state.known_projects))
+            try:
+                task_id = seed_demo_project_task(demo_path, project_key=project_key)
+            except Exception as exc:  # noqa: BLE001
+                self.state.seeded_demo_task_id = None
+                self._set_message(f"Demo repo copied, but seeding the task failed: {exc}")
+            else:
+                self.state.seeded_demo_task_id = task_id
+                self._set_message(
+                    f"Demo repo ready at {demo_path}. Seeded task {task_id} is waiting in the cockpit."
+                )
+        elif choice == "forget":
+            self.state.seeded_demo_task_id = None
+            self._set_message(f"Demo repo ready at {demo_path}. No seeded task was kept.")
+        else:
+            self.state.seeded_demo_task_id = None
+            self._set_message(f"Demo repo ready at {demo_path}.")
         self._render_current_step()
 
 

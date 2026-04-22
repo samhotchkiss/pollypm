@@ -13,6 +13,7 @@ from pollypm.onboarding import (
     build_onboarded_config,
     demo_project_fallback_destination,
     provision_demo_project_fallback,
+    seed_demo_project_task,
 )
 
 
@@ -196,6 +197,7 @@ def test_provision_demo_project_fallback_creates_self_contained_repo(
     assert (target / ".pollypm-demo-fallback").exists()
     assert (target / "README.md").exists()
     assert (target / "demo_app.py").exists()
+    assert (target / "TASK.md").exists()
     assert (target / "tests" / "test_demo_app.py").exists()
     assert (target / ".pollypm").exists()
     assert git_calls == [["git", "init", "-q", str(target)]]
@@ -203,6 +205,21 @@ def test_provision_demo_project_fallback_creates_self_contained_repo(
     same_target = provision_demo_project_fallback(config_path)
     assert same_target == target
     assert git_calls == [["git", "init", "-q", str(target)]]
+
+
+def test_seed_demo_project_task_creates_a_visible_queue_item(tmp_path: Path) -> None:
+    project_path = tmp_path / "pollypm-demo"
+    project_path.mkdir()
+
+    task_id = seed_demo_project_task(project_path, project_key="pollypm_demo")
+
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    with SQLiteWorkService(db_path=project_path / ".pollypm" / "state.db", project_path=project_path) as svc:
+        task = svc.get(task_id)
+        assert task.project == "pollypm_demo"
+        assert task.work_status.value == "queued"
+        assert task.title == "Fix the demo queue estimate bug"
 
 
 def test_scan_recent_projects_offers_demo_repo_when_discovery_is_empty(

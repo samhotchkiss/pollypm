@@ -16,6 +16,11 @@ def summarize_queue(items: list[str]) -> str:
 
 
 def estimate_focus_minutes(task_count: int, *, per_task: int = 25) -> int:
+    """Return a rough focus block estimate for the queue.
+
+    The demo task deliberately asks the user to fix the single-item
+    estimate bug in the follow-up regression test.
+    """
     if task_count <= 0:
         return 0
     return task_count * per_task

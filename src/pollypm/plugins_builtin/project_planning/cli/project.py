@@ -220,15 +220,26 @@ def _has_work_tasks(
     project_key: str | None = None,
     config_path: Path | None = None,
 ) -> bool:
-    """Return True iff the project's work-service DB has ≥1 work_tasks row.
+    """Return True iff *this* project's DB has ≥1 work_tasks row.
 
     Reads the sqlite table directly — ``SQLiteWorkService`` is a heavier
     entrypoint and this path runs on the happy path for every
     ``pm project new`` invocation, so we keep it lean. Fails closed:
     any DB / IO error returns False so we don't accidentally flag a
     greenfield project as existing on a transient error.
+
+    Post-#339 the workspace-scope DB holds tasks for *every* registered
+    project — so counting "any row in the workspace DB" for an unkeyed
+    call would leak state from sibling projects into the classification
+    of a fresh directory. When ``project_key`` is None we therefore
+    look only at the project-local DB (``<path>/.pollypm/state.db``);
+    callers that know their key pass it through so the workspace DB
+    filter is safe.
     """
-    db_path = _planner_db_path(project_path, config_path=config_path)
+    if project_key:
+        db_path = _planner_db_path(project_path, config_path=config_path)
+    else:
+        db_path = project_path / ".pollypm" / "state.db"
     if not db_path.exists():
         return False
     try:

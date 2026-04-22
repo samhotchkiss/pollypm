@@ -315,6 +315,7 @@ def _invoke_handler_with_fakes(
     swapped for fakes. Returns (result, store, work) so assertions can
     inspect side effects."""
     from pollypm.plugins_builtin.core_recurring import plugin as plugin_module
+    from pollypm.plugins_builtin.core_recurring import sweeps as sweeps_module
 
     fake_store = _FakeStore()
     fake_work = _FakeWork(sessions)
@@ -329,9 +330,18 @@ def _invoke_handler_with_fakes(
 
     cfg = _FakeConfig(project=_FakeProject(root_dir=project_root))
 
+    # ``worktree_state_audit_handler`` lives in ``sweeps`` and imports
+    # the shared helpers by name from ``.shared`` — patching those names
+    # in the ``plugin`` module alone would no-op, so route both.
     monkeypatch.setattr(
-        plugin_module, "_load_config_and_store",
+        sweeps_module, "_load_config_and_store",
         _fake_load_cm(cfg, fake_store),
+    )
+    monkeypatch.setattr(
+        sweeps_module, "_open_msg_store", lambda _config: fake_store,
+    )
+    monkeypatch.setattr(
+        sweeps_module, "_close_msg_store", lambda _store: None,
     )
     # Patch SQLiteWorkService to return our fake regardless of args.
     import pollypm.work.sqlite_service as sqlite_service_mod
@@ -465,6 +475,7 @@ class TestHandler:
         ]
         # Prime the store with a stale open alert simulating a prior sweep.
         from pollypm.plugins_builtin.core_recurring import plugin as plugin_module
+        from pollypm.plugins_builtin.core_recurring import sweeps as sweeps_module
 
         fake_store = _FakeStore()
         fake_work = _FakeWork(sessions)
@@ -484,18 +495,21 @@ class TestHandler:
             project: _FakeProject
 
         cfg = _FakeConfig(project=_FakeProject(root_dir=repo))
+        # The handler lives in ``sweeps`` and pulls shared helpers
+        # directly from ``.shared``; patch the names on the sweeps
+        # module so the in-handler references resolve to the fake.
         monkeypatch.setattr(
-            plugin_module, "_load_config_and_store",
+            sweeps_module, "_load_config_and_store",
             _fake_load_cm(cfg, fake_store),
         )
         # #342: handler reads/writes alerts through the unified Store;
         # point ``_open_msg_store`` at the fake so existence probes hit
         # the same in-memory dict the upsert/clear writes land on.
         monkeypatch.setattr(
-            plugin_module, "_open_msg_store", lambda _config: fake_store,
+            sweeps_module, "_open_msg_store", lambda _config: fake_store,
         )
         monkeypatch.setattr(
-            plugin_module, "_close_msg_store", lambda _store: None,
+            sweeps_module, "_close_msg_store", lambda _store: None,
         )
         import pollypm.work.sqlite_service as sqlite_service_mod
 

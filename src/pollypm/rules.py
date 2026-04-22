@@ -241,7 +241,14 @@ def _render_compact_catalog(
     names = sorted(entries)
     for name in names[:_SESSION_SECTION_LIMIT]:
         entry = entries[name]
-        lines.append(f"- {entry.name}: {entry.description}")
+        # Include display_path so both project-local overrides
+        # (``.pollypm/rules/build.md``) and their builtin fallbacks
+        # (``pollypm/defaults/rules/build.md``) are unambiguous to the
+        # session. Workers need the exact file to read for any rule they
+        # invoke.
+        lines.append(
+            f"- {entry.name}: {entry.description} ({entry.display_path})"
+        )
     remaining = len(names) - _SESSION_SECTION_LIMIT
     if remaining > 0:
         lines.append(f"- … {remaining} more in `{_SESSION_MANIFEST_PATH.as_posix()}`")

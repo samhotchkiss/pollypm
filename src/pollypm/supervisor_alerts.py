@@ -20,6 +20,7 @@ from typing import Protocol
 
 from pollypm.config import PollyPMConfig
 from pollypm.models import SessionLaunchSpec
+from pollypm.store.protocol import Store
 from pollypm.storage.state import StateStore
 from pollypm.tmux.client import TmuxWindow
 
@@ -27,7 +28,7 @@ from pollypm.tmux.client import TmuxWindow
 class SupervisorAlertBoundary(Protocol):
     config: PollyPMConfig
     store: StateStore
-    _msg_store: object
+    msg_store: Store
     _STALL_NUDGE_MESSAGE: str
 
     def send_input(
@@ -40,11 +41,11 @@ class SupervisorAlertBoundary(Protocol):
         press_enter: bool = True,
     ) -> None: ...
 
-    def _pane_has_auth_failure(self, lowered_pane: str) -> bool: ...
+    def pane_has_auth_failure(self, lowered_pane: str) -> bool: ...
 
-    def _pane_has_capacity_failure(self, lowered_pane: str) -> bool: ...
+    def pane_has_capacity_failure(self, lowered_pane: str) -> bool: ...
 
-    def _pane_has_provider_outage(self, lowered_pane: str) -> bool: ...
+    def pane_has_provider_outage(self, lowered_pane: str) -> bool: ...
 
 
 _REVIEW_NUDGE_CACHE: dict[str, tuple[float, list[str]]] = {}
@@ -94,7 +95,7 @@ def _update_alerts(
     active_alerts: list[str] = []
 
     if window.pane_dead:
-        supervisor._msg_store.upsert_alert(
+        supervisor.msg_store.upsert_alert(
             session_name,
             "pane_dead",
             "error",
@@ -102,10 +103,10 @@ def _update_alerts(
         )
         active_alerts.append("pane_dead")
     else:
-        supervisor._msg_store.clear_alert(session_name, "pane_dead")
+        supervisor.msg_store.clear_alert(session_name, "pane_dead")
 
     if window.pane_current_command in shell_commands:
-        supervisor._msg_store.upsert_alert(
+        supervisor.msg_store.upsert_alert(
             session_name,
             "shell_returned",
             "warn",
@@ -113,10 +114,10 @@ def _update_alerts(
         )
         active_alerts.append("shell_returned")
     else:
-        supervisor._msg_store.clear_alert(session_name, "shell_returned")
+        supervisor.msg_store.clear_alert(session_name, "shell_returned")
 
     if previous_log_bytes is not None and current_log_bytes <= previous_log_bytes:
-        supervisor._msg_store.upsert_alert(
+        supervisor.msg_store.upsert_alert(
             session_name,
             "idle_output",
             "warn",
@@ -124,7 +125,7 @@ def _update_alerts(
         )
         active_alerts.append("idle_output")
     else:
-        supervisor._msg_store.clear_alert(session_name, "idle_output")
+        supervisor.msg_store.clear_alert(session_name, "idle_output")
 
     if previous_snapshot_hash and previous_snapshot_hash == current_snapshot_hash:
         history = supervisor.store.recent_heartbeats(session_name, limit=3)
@@ -132,9 +133,9 @@ def _update_alerts(
         if len(recent_hashes) == 3 and len(set(recent_hashes)) == 1:
             role = launch.session.role
             if role in {"heartbeat-supervisor", "operator-pm", "reviewer"} or launch.session.name in {"worker_pollypm"}:
-                supervisor._msg_store.clear_alert(session_name, "suspected_loop")
+                supervisor.msg_store.clear_alert(session_name, "suspected_loop")
             else:
-                supervisor._msg_store.upsert_alert(
+                supervisor.msg_store.upsert_alert(
                     session_name,
                     "suspected_loop",
                     "warn",
@@ -146,13 +147,13 @@ def _update_alerts(
                 if len(longer_hashes) == 5 and len(set(longer_hashes)) == 1:
                     _maybe_nudge_stalled_session(supervisor, launch)
         else:
-            supervisor._msg_store.clear_alert(session_name, "suspected_loop")
+            supervisor.msg_store.clear_alert(session_name, "suspected_loop")
     else:
-        supervisor._msg_store.clear_alert(session_name, "suspected_loop")
+        supervisor.msg_store.clear_alert(session_name, "suspected_loop")
 
     lowered_pane = pane_text.lower()
-    if supervisor._pane_has_auth_failure(lowered_pane):
-        supervisor._msg_store.upsert_alert(
+    if supervisor.pane_has_auth_failure(lowered_pane):
+        supervisor.msg_store.upsert_alert(
             session_name,
             "auth_broken",
             "error",
@@ -166,10 +167,10 @@ def _update_alerts(
         )
         active_alerts.append("auth_broken")
     else:
-        supervisor._msg_store.clear_alert(session_name, "auth_broken")
+        supervisor.msg_store.clear_alert(session_name, "auth_broken")
 
-    if supervisor._pane_has_capacity_failure(lowered_pane):
-        supervisor._msg_store.upsert_alert(
+    if supervisor.pane_has_capacity_failure(lowered_pane):
+        supervisor.msg_store.upsert_alert(
             session_name,
             "capacity_exhausted",
             "error",
@@ -183,10 +184,10 @@ def _update_alerts(
         )
         active_alerts.append("capacity_exhausted")
     else:
-        supervisor._msg_store.clear_alert(session_name, "capacity_exhausted")
+        supervisor.msg_store.clear_alert(session_name, "capacity_exhausted")
 
-    if supervisor._pane_has_provider_outage(lowered_pane):
-        supervisor._msg_store.upsert_alert(
+    if supervisor.pane_has_provider_outage(lowered_pane):
+        supervisor.msg_store.upsert_alert(
             session_name,
             "provider_outage",
             "warn",
@@ -201,7 +202,7 @@ def _update_alerts(
         )
         active_alerts.append("provider_outage")
     else:
-        supervisor._msg_store.clear_alert(session_name, "provider_outage")
+        supervisor.msg_store.clear_alert(session_name, "provider_outage")
 
     return active_alerts
 
@@ -216,7 +217,7 @@ def _maybe_nudge_stalled_session(supervisor: SupervisorAlertBoundary, launch: Se
         return
     lease = supervisor.store.get_lease(launch.session.name)
     if lease is not None and lease.owner == "human":
-        supervisor._msg_store.record_event(
+        supervisor.msg_store.record_event(
             scope=launch.session.name,
             sender=launch.session.name,
             subject="heartbeat_nudge_skipped",

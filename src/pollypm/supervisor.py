@@ -1633,6 +1633,10 @@ class Supervisor:
     def leases(self) -> list[LeaseRecord]:
         return self.store.list_leases()
 
+    def pane_has_auth_failure(self, lowered_pane: str) -> bool:
+        """Public alert-boundary detector for authentication failures."""
+        return self._pane_has_auth_failure(lowered_pane)
+
     def _pane_has_auth_failure(self, lowered_pane: str) -> bool:
         patterns = [
             "please run /login",
@@ -1641,6 +1645,10 @@ class Supervisor:
             "not authenticated",
         ]
         return any(pattern in lowered_pane for pattern in patterns)
+
+    def pane_has_capacity_failure(self, lowered_pane: str) -> bool:
+        """Public alert-boundary detector for provider quota failures."""
+        return self._pane_has_capacity_failure(lowered_pane)
 
     def _pane_has_capacity_failure(self, lowered_pane: str) -> bool:
         patterns = [
@@ -1651,6 +1659,10 @@ class Supervisor:
             "credit balance is too low",
         ]
         return any(pattern in lowered_pane for pattern in patterns)
+
+    def pane_has_provider_outage(self, lowered_pane: str) -> bool:
+        """Public alert-boundary detector for upstream provider outages."""
+        return self._pane_has_provider_outage(lowered_pane)
 
     def _pane_has_provider_outage(self, lowered_pane: str) -> bool:
         patterns = [

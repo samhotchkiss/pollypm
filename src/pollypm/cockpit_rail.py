@@ -111,6 +111,89 @@ POLLY_SLOGANS = [
 GUTTER = 2
 
 
+@dataclass(slots=True)
+class CockpitPresence:
+    """Presence-aware glyph helper for the rail renderer."""
+
+    tmux: object
+    _cache_ttl_seconds: float = 2.0
+    _cached_attached: bool | None = None
+    _cached_at: float = 0.0
+    _cached_session: str | None = None
+
+    def _calm_mode(self) -> bool:
+        value = os.environ.get("POLLY_CALM", "")
+        return value not in {"", "0", "false", "False", "no", "NO"}
+
+    def is_tmux_attached(self) -> bool:
+        """Return True when animation should behave as if tmux is attached."""
+        if self._calm_mode():
+            return False
+        session_name = self._current_session_name()
+        if session_name is None:
+            return True
+        now = time.monotonic()
+        if (
+            self._cached_session == session_name
+            and self._cached_attached is not None
+            and now - self._cached_at < self._cache_ttl_seconds
+        ):
+            return self._cached_attached
+        attached = self._probe_attached(session_name)
+        self._cached_session = session_name
+        self._cached_attached = attached
+        self._cached_at = now
+        return attached
+
+    def _current_session_name(self) -> str | None:
+        getter = getattr(self.tmux, "current_session_name", None)
+        if not callable(getter):
+            return None
+        try:
+            value = getter()
+            return str(value) if value else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _probe_attached(self, session_name: str) -> bool:
+        list_clients = getattr(self.tmux, "list_clients", None)
+        if callable(list_clients):
+            try:
+                result = list_clients(session_name)
+            except Exception:  # noqa: BLE001
+                return True
+            if isinstance(result, str):
+                return bool(result.strip())
+            try:
+                return bool(list(result))
+            except TypeError:
+                return True
+        run = getattr(self.tmux, "run", None)
+        if not callable(run):
+            return True
+        try:
+            result = run(
+                "list-clients",
+                "-t",
+                session_name,
+                "-F",
+                "#{client_tty}",
+                check=False,
+            )
+        except Exception:  # noqa: BLE001
+            return True
+        stdout = getattr(result, "stdout", "") or ""
+        return bool(str(stdout).strip())
+
+    def should_animate(self) -> bool:
+        return self.is_tmux_attached()
+
+    def working_frame(self, spinner_index: int) -> str:
+        if not self.should_animate():
+            return ARC_SPINNER[0]
+        return ARC_SPINNER[spinner_index % len(ARC_SPINNER)]
+
+
 # ── Rail data model + router ─────────────────────────────────────────────
 #
 # Moved out of pollypm.cockpit in #404 so the routing concern (which rail
@@ -268,16 +351,105 @@ class CockpitRouter:
     _STATE_FILE = "cockpit_state.json"
     _COCKPIT_WINDOW = "PollyPM"
     _LEFT_PANE_WIDTH = 30  # default; actual value persisted in cockpit state.
+    _STATE_WRITE_DEBOUNCE_SECONDS = 0.25
 
     def __init__(self, config_path: Path) -> None:
         self.config_path = config_path
         self.service = PollyPMService(config_path)
         self.tmux = create_tmux_client()
+        self.presence = CockpitPresence(self.tmux)
         self._supervisor = None
+        self._config_cache: object | None = None
+        self._config_cache_mtime_ns: int | None = None
+        self._state_cache: dict[str, object] | None = None
+        self._state_cache_mtime_ns: int | None = None
+        self._state_cache_path: Path | None = None
+        self._state_dirty_since: float | None = None
+        self._hidden_items_cache_key: int | None = None
+        self._hidden_items_cache: frozenset[str] | None = None
+        self._collapsed_sections_cache_key: int | None = None
+        self._collapsed_sections_cache: frozenset[str] | None = None
+        self._grouped_rail_cache_key: int | None = None
+        self._grouped_rail_cache: dict[str, tuple[object, ...]] | None = None
         # Per-project activity cache keyed by project key.
         # value: (db_mtime, git_mtime, is_active, has_working_task)
         # Skips re-opening SQLite on every 0.8s cockpit tick when nothing changed.
         self._project_activity_cache: dict[str, tuple[float, float, bool, bool]] = {}
+
+    def _presence(self) -> CockpitPresence:
+        presence = getattr(self, "presence", None)
+        if not isinstance(presence, CockpitPresence):
+            presence = CockpitPresence(self.tmux)
+            self.presence = presence
+        elif presence.tmux is not self.tmux:
+            presence.tmux = self.tmux
+        return presence
+
+    def _load_config(self):
+        try:
+            mtime_ns = self.config_path.stat().st_mtime_ns
+        except OSError:
+            mtime_ns = None
+        if self._config_cache is not None and self._config_cache_mtime_ns == mtime_ns:
+            return self._config_cache
+        self._clear_rail_caches()
+        config = load_config(self.config_path)
+        self._config_cache = config
+        self._config_cache_mtime_ns = mtime_ns
+        return config
+
+    def _clear_rail_caches(self) -> None:
+        self._hidden_items_cache_key = None
+        self._hidden_items_cache = None
+        self._collapsed_sections_cache_key = None
+        self._collapsed_sections_cache = None
+        self._grouped_rail_cache_key = None
+        self._grouped_rail_cache = None
+
+    def _config_identity(self, config: object) -> int:
+        return id(config)
+
+    def _hidden_rail_items_cached(self, config: object) -> frozenset[str]:
+        cache_key = self._config_identity(config)
+        if self._hidden_items_cache_key == cache_key and self._hidden_items_cache is not None:
+            return self._hidden_items_cache
+        hidden = _hidden_rail_items(config)
+        self._hidden_items_cache_key = cache_key
+        self._hidden_items_cache = hidden
+        return hidden
+
+    def _collapsed_rail_sections_cached(self, config: object) -> frozenset[str]:
+        cache_key = self._config_identity(config)
+        if (
+            self._collapsed_sections_cache_key == cache_key
+            and self._collapsed_sections_cache is not None
+        ):
+            return self._collapsed_sections_cache
+        collapsed = _collapsed_rail_sections(config)
+        self._collapsed_sections_cache_key = cache_key
+        self._collapsed_sections_cache = collapsed
+        return collapsed
+
+    def _grouped_rail_registrations(
+        self,
+        config: object,
+        registry,
+    ) -> dict[str, tuple[object, ...]]:
+        cache_key = self._config_identity(config)
+        if self._grouped_rail_cache_key == cache_key and self._grouped_rail_cache is not None:
+            return self._grouped_rail_cache
+        from pollypm.plugin_api.v1 import RAIL_SECTIONS
+
+        hidden_keys = self._hidden_rail_items_cached(config)
+        grouped: dict[str, list[object]] = {name: [] for name in RAIL_SECTIONS}
+        for reg in registry.items():
+            if reg.item_key in hidden_keys:
+                continue
+            grouped.setdefault(reg.section, []).append(reg)
+        cache_value = {section: tuple(rows) for section, rows in grouped.items()}
+        self._grouped_rail_cache_key = cache_key
+        self._grouped_rail_cache = cache_value
+        return cache_value
 
     def _load_supervisor(self, *, fresh: bool = False):
         # Reload config if the file changed (picks up new projects, sessions, etc.)
@@ -292,6 +464,9 @@ class CockpitRouter:
         if fresh or self._supervisor is None:
             if self._supervisor is not None:
                 self._supervisor.store.close()
+            self._clear_rail_caches()
+            self._config_cache = None
+            self._config_cache_mtime_ns = None
             self._supervisor = self.service.load_supervisor()
             self._supervisor.ensure_layout()
             try:
@@ -307,7 +482,7 @@ class CockpitRouter:
         return self._supervisor
 
     def _state_path(self) -> Path:
-        config = load_config(self.config_path)
+        config = self._load_config()
         config.project.base_dir.mkdir(parents=True, exist_ok=True)
         return config.project.base_dir / self._STATE_FILE
 
@@ -336,16 +511,59 @@ class CockpitRouter:
 
     def _load_state(self) -> dict[str, object]:
         path = self._state_path()
+        if self._state_cache is not None and self._state_cache_path == path:
+            if self._state_dirty_since is not None:
+                self._maybe_flush_state()
+                return dict(self._state_cache)
+            try:
+                mtime_ns = path.stat().st_mtime_ns
+            except OSError:
+                self._state_cache = {}
+                self._state_cache_mtime_ns = None
+                self._state_dirty_since = None
+                return {}
+            if self._state_cache_mtime_ns == mtime_ns:
+                return dict(self._state_cache)
         if not path.exists():
+            self._state_cache = {}
+            self._state_cache_path = path
+            self._state_cache_mtime_ns = None
+            self._state_dirty_since = None
             return {}
         try:
             payload = json.loads(path.read_text())
         except json.JSONDecodeError:
-            return {}
-        return payload if isinstance(payload, dict) else {}
+            payload = {}
+        state = payload if isinstance(payload, dict) else {}
+        self._state_cache = dict(state)
+        self._state_cache_path = path
+        try:
+            self._state_cache_mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            self._state_cache_mtime_ns = None
+        self._state_dirty_since = None
+        return dict(self._state_cache)
 
     def _write_state(self, data: dict[str, object]) -> None:
-        atomic_write_json(self._state_path(), data)
+        path = self._state_path()
+        if (
+            self._state_cache is not None
+            and self._state_cache_path == path
+            and self._state_dirty_since is not None
+        ):
+            merged = dict(self._state_cache)
+            merged.update(data)
+            data = merged
+        else:
+            data = dict(data)
+        atomic_write_json(path, data)
+        self._state_cache = dict(data)
+        self._state_cache_path = path
+        try:
+            self._state_cache_mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            self._state_cache_mtime_ns = None
+        self._state_dirty_since = None
 
     def rail_width(self) -> int:
         """Return the persisted rail width, falling back to the default."""
@@ -363,7 +581,21 @@ class CockpitRouter:
         if data.get("rail_width") == width:
             return
         data["rail_width"] = width
-        self._write_state(data)
+        self._state_cache = dict(data)
+        self._state_cache_path = self._state_path()
+        self._state_dirty_since = time.monotonic()
+        self._maybe_flush_state()
+
+    def _maybe_flush_state(self) -> None:
+        if (
+            self._state_dirty_since is None
+            or self._state_cache is None
+            or self._state_cache_path is None
+        ):
+            return
+        if time.monotonic() - self._state_dirty_since < self._STATE_WRITE_DEBOUNCE_SECONDS:
+            return
+        self._write_state(self._state_cache)
 
     def _validate_state(self, *, panes: list | None = None, target: str | None = None) -> list:
         """Clear stale entries from cockpit_state.json.
@@ -378,7 +610,7 @@ class CockpitRouter:
         state = self._load_state()
         dirty = False
         if target is None:
-            config = load_config(self.config_path)
+            config = self._load_config()
             target = f"{config.project.tmux_session}:{self._COCKPIT_WINDOW}"
         if panes is None:
             panes = self._safe_list_panes(target)
@@ -499,25 +731,23 @@ class CockpitRouter:
         # Hidden items + visibility predicates land in er03 / er04. The
         # renderer here runs them every tick — badge providers likewise
         # (a crash falls back to no-badge).
-        hidden_keys = _hidden_rail_items(config)
-        collapsed_sections = _collapsed_rail_sections(config)
-
+        collapsed_sections = self._collapsed_rail_sections_cached(config)
+        grouped_registrations = self._grouped_rail_registrations(config, registry)
         grouped: dict[str, list[CockpitItem]] = {name: [] for name in RAIL_SECTIONS}
 
-        for reg in registry.items():
-            if reg.item_key in hidden_keys:
-                continue
-            if not _visibility_passes(reg, ctx):
-                continue
-            rows = _rows_for_registration(reg, ctx)
-            for row in rows:
-                item = CockpitItem(
-                    key=row.key,
-                    label=row.label,
-                    state=row.state,
-                    selectable=row.selectable,
-                )
-                grouped.setdefault(reg.section, []).append(item)
+        for section, registrations in grouped_registrations.items():
+            for reg in registrations:
+                if not _visibility_passes(reg, ctx):
+                    continue
+                rows = _rows_for_registration(reg, ctx)
+                for row in rows:
+                    item = CockpitItem(
+                        key=row.key,
+                        label=row.label,
+                        state=row.state,
+                        selectable=row.selectable,
+                    )
+                    grouped.setdefault(section, []).append(item)
 
         items: list[CockpitItem] = []
         for section in RAIL_SECTIONS:
@@ -531,7 +761,7 @@ class CockpitRouter:
                 items.append(
                     CockpitItem(
                         key=f"_section:{section}",
-                        label=f"{section.upper()} (collapsed)",
+                        label=f"{section.upper()} ({len(rows)})",
                         state="separator",
                         selectable=False,
                     )
@@ -545,7 +775,7 @@ class CockpitRouter:
         """Return the plugin-host rail registry for the active root dir."""
         from pollypm.plugin_host import extension_host_for_root
 
-        config = load_config(self.config_path)
+        config = self._load_config()
         host = extension_host_for_root(str(config.project.root_dir.resolve()))
         # Initialize plugins so the rail registry is populated. Safe to
         # call repeatedly — it tracks which plugins have been init'd.
@@ -622,7 +852,6 @@ class CockpitRouter:
             return "idle"
         if window.pane_dead:
             return "dead"
-        spinners = ["\u25dc", "\u25dd", "\u25de", "\u25df"]
         if launch.session.role in ("worker", "operator-pm", "reviewer"):
             heartbeat = None
             try:
@@ -640,7 +869,7 @@ class CockpitRouter:
                 heartbeat=heartbeat,
             )
             if working:
-                return spinners[spinner_index % 4] + " working"
+                return f"{self._presence().working_frame(spinner_index)} working"
             if launch.session.role == "worker":
                 return "\u25cf live"
             return "ready"
@@ -738,7 +967,7 @@ class CockpitRouter:
                 seen[window.name] = window.index
 
     def ensure_cockpit_layout(self) -> None:
-        config = load_config(self.config_path)
+        config = self._load_config()
         target = f"{config.project.tmux_session}:{self._COCKPIT_WINDOW}"
         # Single list-panes baseline shared with ``_validate_state``. See
         # #175: subsequent list-panes calls only run after a mutation that
@@ -1006,7 +1235,7 @@ class CockpitRouter:
         raise RuntimeError(f"Unknown cockpit item: {key}")
 
     def focus_right_pane(self) -> None:
-        config = load_config(self.config_path)
+        config = self._load_config()
         window_target = f"{config.project.tmux_session}:{self._COCKPIT_WINDOW}"
         self.ensure_cockpit_layout()
         right_pane = self._right_pane_id(window_target)
@@ -1426,6 +1655,7 @@ def _sgr(row: RenderRow) -> str:
 class PollyCockpitRail:
     def __init__(self, config_path: Path) -> None:
         self.router = CockpitRouter(config_path)
+        self.presence = CockpitPresence(self.router.tmux)
         self.selected_key = self.router.selected_key()
         self.spinner_index = 0
         self.slogan_started_at = time.time()
@@ -1444,7 +1674,8 @@ class PollyCockpitRail:
                 self._last_items = items
                 self._clamp_selection(items)
                 self._render(items)
-                self.spinner_index = (self.spinner_index + 1) % 4
+                if self.presence.should_animate():
+                    self.spinner_index = (self.spinner_index + 1) % 4
                 self._tick_slogan()
                 ready, _, _ = select.select([sys.stdin], [], [], 1.0)
                 if not ready:
@@ -1681,7 +1912,7 @@ class PollyCockpitRail:
     def _indicator(self, item: CockpitItem) -> tuple[str, _C | None]:
         # State-based indicators first (apply to any item type including projects)
         if item.state.endswith("working"):
-            char = ARC_SPINNER[self.spinner_index]
+            char = self.presence.working_frame(self.spinner_index)
             return char, PALETTE["live_indicator"]
         if item.state.endswith("live"):
             return "\u25cf", PALETTE["live_indicator"]

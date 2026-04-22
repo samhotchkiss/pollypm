@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from pollypm.cockpit import build_cockpit_detail
-from pollypm.cockpit_rail import CockpitRouter
+from pollypm.cockpit_rail import CockpitPresence, CockpitRouter
 from pollypm.config import write_config
 from pollypm.cockpit_ui import PollyCockpitApp, PollySettingsPaneApp
 from pollypm.models import (
@@ -113,6 +113,241 @@ def test_cockpit_router_session_state_ignores_silent_alerts(tmp_path: Path) -> N
 
     assert router._session_state("worker_demo", launches, windows, [make_alert("needs_followup")], 0).endswith("live")
     assert router._session_state("worker_demo", launches, windows, [make_alert("pane_dead")], 0) == "! pane dead"
+
+
+def test_cockpit_router_session_state_uses_heartbeat_state(tmp_path: Path) -> None:
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+
+    class FakeLaunch:
+        def __init__(self) -> None:
+            self.window_name = "heartbeat"
+            self.session = type(
+                "Session",
+                (),
+                {
+                    "name": "heartbeat",
+                    "role": "heartbeat-supervisor",
+                    "project": "pollypm",
+                    "provider": type("P", (), {"value": "claude"})(),
+                },
+            )()
+
+    class FakeWindow:
+        def __init__(self) -> None:
+            self.name = "heartbeat"
+            self.pane_dead = False
+            self.pane_current_command = "python"
+
+    router = CockpitRouter(config_path)
+    assert router._session_state("heartbeat", [FakeLaunch()], [FakeWindow()], [], 0) == "watch"
+
+
+def test_cockpit_presence_treats_outside_tmux_as_attached() -> None:
+    class _FakeTmux:
+        def current_session_name(self) -> str | None:
+            return None
+
+    presence = CockpitPresence(_FakeTmux())
+
+    assert presence.is_tmux_attached() is True
+    assert presence.should_animate() is True
+
+
+def test_cockpit_presence_caches_attached_result_for_about_two_seconds(monkeypatch) -> None:
+    class _FakeTmux:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def current_session_name(self) -> str | None:
+            return "pollypm"
+
+        def list_clients(self, session_name: str) -> str:
+            del session_name
+            self.calls += 1
+            return ""
+
+    tmux = _FakeTmux()
+    presence = CockpitPresence(tmux)
+    times = iter([10.0, 10.5, 12.5])
+    monkeypatch.setattr("pollypm.cockpit_rail.time.monotonic", lambda: next(times))
+
+    assert presence.is_tmux_attached() is False
+    assert presence.is_tmux_attached() is False
+    assert presence.is_tmux_attached() is False
+    assert tmux.calls == 2
+
+
+def test_cockpit_presence_defaults_to_attached_on_detection_failure() -> None:
+    class _BrokenTmux:
+        def current_session_name(self) -> str | None:
+            return "pollypm"
+
+        def run(self, *args, **kwargs):  # noqa: ANN001
+            raise RuntimeError("boom")
+
+    presence = CockpitPresence(_BrokenTmux())
+
+    assert presence.is_tmux_attached() is True
+
+
+def test_cockpit_presence_calm_mode_disables_animation(monkeypatch) -> None:
+    class _FakeTmux:
+        def current_session_name(self) -> str | None:
+            return "pollypm"
+
+        def list_clients(self, session_name: str) -> str:
+            del session_name
+            return "client"
+
+    monkeypatch.setenv("POLLY_CALM", "1")
+    presence = CockpitPresence(_FakeTmux())
+
+    assert presence.should_animate() is False
+    assert presence.working_frame(3) == "◜"
+
+
+def test_cockpit_router_config_cache_reuses_loaded_config(monkeypatch, tmp_path: Path) -> None:
+    class _Config:
+        class Project:
+            root_dir = tmp_path
+            base_dir = tmp_path / ".pollypm"
+            tmux_session = "pollypm"
+
+        project = Project()
+
+    calls: list[Path] = []
+    monkeypatch.setattr("pollypm.cockpit_rail.load_config", lambda path: calls.append(path) or _Config())
+
+    router = CockpitRouter(tmp_path / "pollypm.toml")
+
+    first = router._load_config()
+    second = router._load_config()
+
+    assert first is second
+    assert len(calls) == 1
+
+
+def test_cockpit_router_state_cache_reuses_loaded_dict(monkeypatch, tmp_path: Path) -> None:
+    class _Config:
+        class Project:
+            root_dir = tmp_path
+            base_dir = tmp_path / ".pollypm"
+            tmux_session = "pollypm"
+
+        project = Project()
+
+    monkeypatch.setattr("pollypm.cockpit_rail.load_config", lambda path: _Config())
+
+    config_path = tmp_path / "pollypm.toml"
+    router = CockpitRouter(config_path)
+    router._write_state({"selected": "polly", "rail_width": 44})
+
+    reader = CockpitRouter(config_path)
+    reads: list[Path] = []
+    original_read_text = Path.read_text
+    state_path = reader._state_path()
+
+    def counting_read_text(self: Path, *args, **kwargs):
+        if self == state_path:
+            reads.append(self)
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counting_read_text)
+
+    first = reader._load_state()
+    second = reader._load_state()
+
+    assert first == second == {"selected": "polly", "rail_width": 44}
+    assert len(reads) == 1
+
+
+def test_cockpit_router_debounces_rail_width_writes(monkeypatch, tmp_path: Path) -> None:
+    class _Config:
+        class Project:
+            root_dir = tmp_path
+            base_dir = tmp_path / ".pollypm"
+            tmux_session = "pollypm"
+
+        project = Project()
+
+    monkeypatch.setattr("pollypm.cockpit_rail.load_config", lambda path: _Config())
+
+    config_path = tmp_path / "pollypm.toml"
+    router = CockpitRouter(config_path)
+    router._write_state({"rail_width": 30})
+
+    writes: list[dict[str, object]] = []
+    from pollypm import cockpit_rail as cockpit_rail_module
+
+    original_atomic_write_json = cockpit_rail_module.atomic_write_json
+
+    def counting_atomic_write_json(path: Path, data: dict[str, object]) -> None:
+        writes.append(dict(data))
+        original_atomic_write_json(path, data)
+
+    times = iter([0.0, 0.0, 0.1, 0.1, 0.5])
+    monkeypatch.setattr("pollypm.cockpit_rail.atomic_write_json", counting_atomic_write_json)
+    monkeypatch.setattr("pollypm.cockpit_rail.time.monotonic", lambda: next(times))
+
+    router.set_rail_width(42)
+    router.set_rail_width(44)
+    router._maybe_flush_state()
+
+    assert writes == [{"rail_width": 44}]
+    assert router.rail_width() == 44
+
+
+def test_cockpit_router_caches_hidden_collapsed_and_grouped_registrations(monkeypatch, tmp_path: Path) -> None:
+    router = CockpitRouter.__new__(CockpitRouter)
+    router._hidden_items_cache_key = None
+    router._hidden_items_cache = None
+    router._collapsed_sections_cache_key = None
+    router._collapsed_sections_cache = None
+    router._grouped_rail_cache_key = None
+    router._grouped_rail_cache = None
+
+    calls = {"hidden": 0, "collapsed": 0, "registry": 0}
+
+    def _hidden(config):
+        del config
+        calls["hidden"] += 1
+        return frozenset({"top.Hidden"})
+
+    def _collapsed(config):
+        del config
+        calls["collapsed"] += 1
+        return frozenset({"system"})
+
+    monkeypatch.setattr("pollypm.cockpit_rail._hidden_rail_items", _hidden)
+    monkeypatch.setattr("pollypm.cockpit_rail._collapsed_rail_sections", _collapsed)
+
+    class _Reg:
+        def __init__(self, item_key: str, section: str) -> None:
+            self.item_key = item_key
+            self.section = section
+
+    class _Registry:
+        def items(self):
+            calls["registry"] += 1
+            return [_Reg("top.Inbox", "top"), _Reg("system.Settings", "system")]
+
+    config = object()
+    registry = _Registry()
+
+    hidden_first = router._hidden_rail_items_cached(config)
+    hidden_second = router._hidden_rail_items_cached(config)
+    collapsed_first = router._collapsed_rail_sections_cached(config)
+    collapsed_second = router._collapsed_rail_sections_cached(config)
+    grouped_first = router._grouped_rail_registrations(config, registry)
+    grouped_second = router._grouped_rail_registrations(config, registry)
+
+    assert hidden_first == hidden_second == frozenset({"top.Hidden"})
+    assert collapsed_first == collapsed_second == frozenset({"system"})
+    assert grouped_first == grouped_second
+    assert calls == {"hidden": 1, "collapsed": 1, "registry": 1}
 
 
 def test_cockpit_router_selected_key_clears_missing_right_pane_state(monkeypatch, tmp_path: Path) -> None:

@@ -123,6 +123,29 @@ def test_build_items_identical_to_legacy_shape(monkeypatch, tmp_path: Path) -> N
     assert items[-1].key == "settings"
 
 
+def test_build_items_preserves_working_project_session_state(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """Working sessions must not silently fall back to idle in rail rows."""
+    monkeypatch.setattr(
+        "pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 0,
+    )
+    _write_config(tmp_path)
+    router = CockpitRouter(tmp_path / "pollypm.toml")
+    monkeypatch.setattr(router, "_load_supervisor", lambda: _fake_supervisor(tmp_path))
+    monkeypatch.setattr(
+        router,
+        "_is_pane_working",
+        lambda window, provider, *, heartbeat=None: True,
+    )
+
+    items = router.build_items(spinner_index=1)
+    demo_item = next(item for item in items if item.key == "project:demo")
+
+    assert demo_item.state.endswith("working")
+    assert demo_item.state != "idle"
+
+
 def test_removing_core_rail_items_yields_empty_rail(monkeypatch, tmp_path: Path) -> None:
     """Acceptance: if `core_rail_items` is removed, the rail is empty.
 

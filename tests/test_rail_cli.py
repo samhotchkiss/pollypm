@@ -158,8 +158,10 @@ def test_build_items_collapses_sections(monkeypatch, tmp_path: Path) -> None:
     items = router.build_items(spinner_index=0)
     # Settings section should be rendered as a collapsed marker row.
     keys = [i.key for i in items]
+    header = next(i for i in items if i.key.startswith("_section:system"))
     assert "settings" not in keys
     assert any(k.startswith("_section:system") for k in keys)
+    assert header.label == "SYSTEM (1)"
 
 
 # ---------------------------------------------------------------------------

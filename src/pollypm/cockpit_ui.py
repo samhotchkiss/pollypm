@@ -20,6 +20,7 @@ Contract:
 from __future__ import annotations
 
 import gc
+import json
 import os
 import resource
 from collections import deque
@@ -952,6 +953,11 @@ class PollyCockpitApp(App[None]):
         # timer.
         if self._tick_count % 5 == 0:
             self._update_pill_refresh()
+        # Post-upgrade flag lands when ``pm upgrade`` finishes — switch
+        # the pill to a restart nudge. Check on every tick so the
+        # feedback loop from "upgrade complete" → visible notice is
+        # sub-second.
+        self._check_post_upgrade_flag()
         # Layout check much less frequently
         if self._tick_count % self._LAYOUT_CHECK_INTERVAL == 0:
             try:
@@ -1159,21 +1165,90 @@ class PollyCockpitApp(App[None]):
         self.update_pill.display = True
 
     def action_trigger_upgrade(self) -> None:
-        """Kick off the upgrade flow from the rail ``u`` keybind.
+        """Spawn ``pm upgrade`` in a new tmux window.
 
-        The full one-click pane flow ships in #719. Until that lands,
-        this action emits a friendly notice pointing at the CLI path
-        and closes. Users can already run ``pm upgrade`` directly.
+        Runs in its own window so the rail stays usable during install.
+        When the upgrade finishes, ``pm upgrade`` writes a sentinel at
+        ``~/.pollypm/post-upgrade.flag`` that ``_tick`` watches for —
+        on detection the pill swaps to a "Restart cockpit to pick up
+        v<new>" nudge. Auto-restart of the rail + daemons ships in
+        #720; for now the user presses ctrl+q to relaunch.
+
+        Non-blocking: a failed spawn falls back to a ``notify()``
+        pointing at the CLI path.
         """
+        tmux_session = "pollypm"
+        try:
+            supervisor = self.router._load_supervisor()
+            tmux_session = supervisor.config.project.tmux_session
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            self.router.tmux.create_window(
+                tmux_session,
+                "pm-upgrade",
+                "pm upgrade; echo; echo '(press enter to close)'; read",
+                detached=False,
+            )
+        except Exception:  # noqa: BLE001
+            try:
+                self.notify(
+                    "Could not open a new tmux window. Run "
+                    "`pm upgrade` directly in a terminal.",
+                    timeout=6,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        self.update_pill.update(
+            "[#e0af68]Upgrading… see window `pm-upgrade`[/]"
+        )
+        self.update_pill.display = True
         try:
             self.notify(
-                "Rail upgrade flow ships with #719. For now, run "
-                "`pm upgrade` in a terminal. See `pm doctor` for the "
-                "currently available version.",
-                timeout=6,
+                "Upgrade started in window `pm-upgrade`. Keep working; "
+                "the rail will tell you when it's done.",
+                timeout=5,
             )
         except Exception:  # noqa: BLE001
             pass
+
+    def _post_upgrade_flag_path(self) -> Path:
+        """Sentinel written by ``pm upgrade`` on success.
+
+        Content is JSON:
+        ``{"from": "0.1.0", "to": "0.2.0", "at": 1234567890.0}``.
+        The rail reads it to update the pill. ``pm upgrade`` writes it
+        atomically (tempfile + rename) so we never see a partial read.
+        Cleanup lives in #720's post-upgrade summary flow — the flag
+        sticks until the user dismisses the summary.
+        """
+        return Path.home() / ".pollypm" / "post-upgrade.flag"
+
+    def _check_post_upgrade_flag(self) -> None:
+        """Swap the pill to "restart to pick up new code" when the
+        sentinel appears.
+
+        Only updates the pill; does NOT delete the flag so a cockpit
+        restart can pick up where we left off.
+        """
+        if self._update_pill_dismissed:
+            return
+        flag = self._post_upgrade_flag_path()
+        if not flag.exists():
+            return
+        try:
+            payload = json.loads(flag.read_text())
+        except (OSError, json.JSONDecodeError):
+            return
+        new_version = str(payload.get("to") or "?")
+        self.update_pill.update(
+            f"[#9ece6a]✓ Upgraded to v{new_version} · "
+            "restart cockpit (ctrl+q) to pick up new code[/]"
+        )
+        self.update_pill.display = True
 
     def action_dismiss_update_pill(self) -> None:
         """Hide the update pill for this cockpit session.

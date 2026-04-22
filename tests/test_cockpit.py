@@ -1870,6 +1870,7 @@ def test_cockpit_rail_ctrl_k_routes_to_settings(monkeypatch, tmp_path: Path) -> 
     class FakeRouter:
         def __init__(self, _config_path: Path) -> None:
             self.calls: list[str] = []
+            self.tmux = None
 
         def selected_key(self) -> str:
             return "polly"

@@ -19,6 +19,21 @@ import typer
 from pollypm.config import DEFAULT_CONFIG_PATH
 
 
+def _enforce_migration_gate(config_path: Path) -> None:
+    """Refuse-start guard (#717). Best-effort — a missing config is not
+    a schema-migration problem and onboarding handles it elsewhere."""
+    from pollypm.store import migrations as _migrations
+
+    if _migrations.bypass_env_is_set():
+        return
+    try:
+        from pollypm.config import load_config
+        config = load_config(config_path)
+    except Exception:  # noqa: BLE001
+        return
+    _migrations.require_no_pending_or_exit(config.project.state_db)
+
+
 def register_ui_commands(app: typer.Typer) -> None:
     @app.command()
     def accounts_ui(
@@ -40,6 +55,7 @@ def register_ui_commands(app: typer.Typer) -> None:
     def cockpit(
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     ) -> None:
+        _enforce_migration_gate(config_path)
         crash_log = config_path.parent / "cockpit_crash.log"
         debug_log = config_path.parent / "cockpit_debug.log"
         try:
@@ -74,6 +90,7 @@ def register_ui_commands(app: typer.Typer) -> None:
             ),
         ),
     ) -> None:
+        _enforce_migration_gate(config_path)
         if kind == "settings" and target:
             from pollypm.cockpit_ui import PollyProjectSettingsApp
 

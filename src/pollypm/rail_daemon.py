@@ -77,8 +77,13 @@ def run(config_path: Path, *, poll_interval: float = 60.0) -> int:
     """
     from pollypm.config import load_config, DEFAULT_CONFIG_PATH
     from pollypm.service_api import PollyPMService
+    from pollypm.store import migrations as _migrations
 
     cfg = load_config(config_path)
+    # Refuse-start gate (#717): the daemon opens the state store and
+    # would silently run migrations otherwise. Exit loudly so the
+    # operator runs ``pm migrate --apply`` from a terminal instead.
+    _migrations.require_no_pending_or_exit(cfg.project.state_db)
     pollypm_home = Path(DEFAULT_CONFIG_PATH).parent
     pid_path = _pid_file(pollypm_home)
     if not _claim_pid_file(pid_path):

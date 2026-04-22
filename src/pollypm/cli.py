@@ -47,6 +47,7 @@ from pollypm.cli_help import help_with_examples
 from pollypm.cli_features.alerts import alert_app, heartbeat_app, session_app
 from pollypm.cli_features.issues import issue_app, itsalive_app, report_app
 from pollypm.cli_features.maintenance import debug_app, register_maintenance_commands
+from pollypm.cli_features.migrate import register_migrate_commands
 from pollypm.cli_features.projects import register_project_commands
 from pollypm.cli_features.session_runtime import register_session_runtime_commands
 from pollypm.cli_features.ui import register_ui_commands
@@ -172,6 +173,7 @@ register_ui_commands(app)
 register_project_commands(app)
 register_maintenance_commands(app)
 register_upgrade_commands(app)
+register_migrate_commands(app)
 register_worker_commands(app)
 register_session_runtime_commands(app, helpers=sys.modules[__name__])
 
@@ -248,6 +250,27 @@ def _load_supervisor(config_path: Path):
     from pollypm.service_api import PollyPMService
 
     return PollyPMService(config_path).load_supervisor()
+
+
+def _enforce_migration_gate(config_path: Path) -> None:
+    """Refuse-start guard: bail out if the workspace state.db is behind (#717).
+
+    Skipped when ``POLLYPM_SKIP_MIGRATION_GATE`` is set — ``pm migrate``
+    turns the bypass on explicitly so the apply path can itself open the
+    store. A config that cannot be loaded is treated as "no gate to
+    enforce yet" so onboarding / first-run paths keep working.
+    """
+    from pollypm.store import migrations as _migrations
+
+    if _migrations.bypass_env_is_set():
+        return
+    try:
+        from pollypm.config import load_config
+        config = load_config(config_path)
+        db_path = config.project.state_db
+    except Exception:  # noqa: BLE001
+        return
+    _migrations.require_no_pending_or_exit(db_path)
 
 
 def _account_label(supervisor, account_name: str) -> str:
@@ -423,6 +446,7 @@ def up(
         typer.echo(f"Config not found at {config_path}. Starting onboarding.")
         onboard(config_path=config_path, force=False)
         return
+    _enforce_migration_gate(config_path)
     supervisor = _load_supervisor(config_path)
     # CoreRail owns startup orchestration — it drives plugin host load,
     # state store readiness, and Supervisor boot (which runs ensure_layout,

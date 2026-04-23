@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import hashlib
 import subprocess
 from dataclasses import dataclass
@@ -21,6 +22,17 @@ class ProjectGuideInfo:
     path: Path
     forked_from: str | None
     body: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectGuideDriftInfo:
+    role: str
+    path: Path
+    forked_from: str | None
+    current_ref: str
+    drifted: bool
+    body: str
+    upstream_body: str
 
 
 def normalize_project_guide_role(role: str) -> str:
@@ -83,6 +95,59 @@ def list_project_guides(project_path: Path) -> list[ProjectGuideInfo]:
     for path in sorted(guide_dir.glob("*.md")):
         guides.append(_read_project_guide_path(path))
     return guides
+
+
+def project_guide_drift_info(
+    project_path: Path,
+    role: str,
+) -> ProjectGuideDriftInfo | None:
+    normalized = validate_project_guide_role(role)
+    target = project_guide_path(project_path, normalized)
+    if not target.exists():
+        return None
+    guide = _read_project_guide_path(target)
+    upstream_body = built_in_guide_text(normalized).strip()
+    current_ref = built_in_guide_fork_ref(
+        normalized,
+        content=upstream_body,
+        source_path=built_in_guide_source_path(normalized),
+    )
+    return ProjectGuideDriftInfo(
+        role=guide.role,
+        path=guide.path,
+        forked_from=guide.forked_from,
+        current_ref=current_ref,
+        drifted=(guide.forked_from != current_ref),
+        body=guide.body,
+        upstream_body=upstream_body,
+    )
+
+
+def list_drifted_project_guides(project_path: Path) -> list[ProjectGuideDriftInfo]:
+    drifted: list[ProjectGuideDriftInfo] = []
+    for guide in list_project_guides(project_path):
+        info = project_guide_drift_info(project_path, guide.role)
+        if info is not None and info.drifted:
+            drifted.append(info)
+    return drifted
+
+
+def render_project_guide_diff(project_path: Path, role: str) -> str:
+    info = project_guide_drift_info(project_path, role)
+    if info is None:
+        raise FileNotFoundError(
+            f"No project-local {validate_project_guide_role(role)} guide exists."
+        )
+    from_label = f"project-local/{info.role}.md (forked_from {info.forked_from or 'unknown'})"
+    to_label = f"built-in/{info.role}.md (current {info.current_ref})"
+    diff = difflib.unified_diff(
+        info.body.splitlines(),
+        info.upstream_body.splitlines(),
+        fromfile=from_label,
+        tofile=to_label,
+        lineterm="",
+    )
+    return "\n".join(diff)
 
 
 def read_project_guide(project_path: Path, role: str) -> ProjectGuideInfo:

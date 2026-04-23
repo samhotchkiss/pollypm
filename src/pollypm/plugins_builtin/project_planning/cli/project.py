@@ -37,7 +37,11 @@ from pollypm.config import (
     load_config,
     resolve_config_path,
 )
-from pollypm.project_guides import init_project_guide, list_project_guides
+from pollypm.project_guides import (
+    init_project_guide,
+    list_project_guides,
+    render_project_guide_diff,
+)
 
 
 project_app = typer.Typer(
@@ -406,6 +410,38 @@ def list_guides_cmd(
     for guide in guides:
         forked = guide.forked_from or "unknown"
         typer.echo(f"- {guide.role}: {guide.path} (forked_from: {forked})")
+
+
+@project_app.command("guide-diff")
+def guide_diff_cmd(
+    role: str = typer.Argument(
+        ...,
+        help="Role guide to diff: architect, reviewer, or worker.",
+    ),
+    project: Optional[str] = typer.Option(
+        None,
+        "--project",
+        help=(
+            "Project key, alias, or path. Defaults to the project whose "
+            "root matches the current directory."
+        ),
+    ),
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path.",
+    ),
+) -> None:
+    """Print a unified diff between the local guide and current built-in."""
+    path = _require_config(config_path)
+    _key, project_path = _resolve_project_key(path, project)
+    try:
+        diff_text = render_project_guide_diff(project_path, role)
+    except (FileExistsError, RuntimeError, ValueError, FileNotFoundError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    if not diff_text:
+        typer.echo("No drift detected; the project-local guide matches the current built-in.")
+        return
+    typer.echo(diff_text)
 
 
 # ---------------------------------------------------------------------------

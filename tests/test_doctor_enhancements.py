@@ -445,6 +445,54 @@ def test_sessions_table_populated_skip_without_db(monkeypatch: pytest.MonkeyPatc
     assert result.passed and result.skipped
 
 
+def test_project_local_guide_drift_pass(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    project_path = tmp_path / "proj-a"
+    project_path.mkdir()
+    fake_project = type("P", (), {"path": project_path, "name": "Project A"})
+    fake_config = type("C", (), {"projects": {"proj-a": fake_project}})
+    monkeypatch.setattr(doctor, "_safe_load_config", lambda: (Path("/tmp/x"), fake_config))
+    monkeypatch.setattr(doctor, "_list_drifted_project_guides", lambda _path: [])
+    result = doctor.check_project_local_guide_drift()
+    assert result.passed
+    assert "no stale project-local guides" in result.status
+
+
+def test_project_local_guide_drift_warns_when_stale(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    project_path = tmp_path / "proj-b"
+    project_path.mkdir()
+    fake_project = type("P", (), {"path": project_path, "name": "Project B"})
+    fake_config = type("C", (), {"projects": {"proj-b": fake_project}})
+    guide_path = project_path / ".pollypm" / "project-guides" / "worker.md"
+    monkeypatch.setattr(doctor, "_safe_load_config", lambda: (Path("/tmp/x"), fake_config))
+    monkeypatch.setattr(
+        doctor,
+        "_list_drifted_project_guides",
+        lambda _path: [
+            {
+                "role": "worker",
+                "path": guide_path,
+                "forked_from": "deadbeef",
+                "current_ref": "cafebabe",
+                "drifted": True,
+            }
+        ],
+    )
+    result = doctor.check_project_local_guide_drift()
+    assert not result.passed
+    assert result.severity == "warning"
+    assert "proj-b:worker" in result.status
+    assert "pm project init-guide worker --project proj-b --force" in result.fix
+    assert result.data["stale"][0]["project"] == "proj-b"
+
+
+def test_project_local_guide_drift_skip_without_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(doctor, "_safe_load_config", lambda: (None, None))
+    result = doctor.check_project_local_guide_drift()
+    assert result.passed and result.skipped
+
+
 # --------------------------------------------------------------------- #
 # Scheduler checks
 # --------------------------------------------------------------------- #
@@ -777,6 +825,14 @@ def test_summary_counts_are_accurate() -> None:
     assert "4 checks · 2 passed · 1 warnings · 1 errors" in text
 
 
+def test_render_human_labels_guide_drift_section() -> None:
+    report = doctor.run_checks([
+        doctor.Check("guide-x", lambda: doctor._ok("ok"), "guides"),
+    ])
+    text = doctor.render_human(report)
+    assert "-- Guide Drift --" in text
+
+
 # --------------------------------------------------------------------- #
 # JSON output validity
 # --------------------------------------------------------------------- #
@@ -788,15 +844,16 @@ def test_json_output_is_valid_for_new_categories() -> None:
 
     report = doctor.run_checks([
         doctor.Check("pipeline-x", _pass, "pipeline"),
+        doctor.Check("guide-x", _pass, "guides"),
         doctor.Check("resource-x", _pass, "resources"),
         doctor.Check("inbox-x", _pass, "inbox"),
     ])
     payload = json.loads(doctor.render_json(report))
     assert payload["ok"] is True
     categories = {c["category"] for c in payload["checks"]}
-    assert categories == {"pipeline", "resources", "inbox"}
-    assert payload["summary"]["total"] == 3
-    assert payload["summary"]["passed"] == 3
+    assert categories == {"pipeline", "guides", "resources", "inbox"}
+    assert payload["summary"]["total"] == 4
+    assert payload["summary"]["passed"] == 4
 
 
 def test_cli_doctor_json_with_new_checks() -> None:
@@ -809,7 +866,7 @@ def test_cli_doctor_json_with_new_checks() -> None:
     payload = json.loads(result.stdout)
     categories = {c["category"] for c in payload["checks"]}
     # Confirm every new category appears.
-    for expected in ("roles", "pipeline", "schedulers", "resources", "inbox", "sessions"):
+    for expected in ("roles", "pipeline", "guides", "schedulers", "resources", "inbox", "sessions"):
         assert expected in categories, f"{expected} missing from {categories}"
 
 

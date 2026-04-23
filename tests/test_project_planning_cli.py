@@ -169,6 +169,59 @@ class TestGuides:
         assert result.exit_code != 0
         assert "Missing argument" in (result.stdout + result.stderr)
 
+    def test_guide_diff_shows_unified_diff_when_upstream_changes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import pollypm.project_guides as project_guides
+
+        repo = _make_project_repo(tmp_path)
+        config_path = _write_minimal_config(tmp_path, projects={"demo": repo})
+
+        result = runner.invoke(
+            project_app,
+            ["init-guide", "worker", "--project", "demo", "--config", str(config_path)],
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+
+        original_text = project_guides.built_in_guide_text
+        original_ref = project_guides.built_in_guide_fork_ref
+        monkeypatch.setattr(
+            "pollypm.project_guides.built_in_guide_text",
+            lambda role: "# Worker Guide\n\nNew upstream guidance\n"
+            if role == "worker"
+            else original_text(role),
+        )
+        monkeypatch.setattr(
+            "pollypm.project_guides.built_in_guide_fork_ref",
+            lambda role, **kwargs: "new-upstream-sha"
+            if role == "worker"
+            else original_ref(role, **kwargs),
+        )
+
+        result = runner.invoke(
+            project_app,
+            ["guide-diff", "worker", "--project", "demo", "--config", str(config_path)],
+        )
+
+        assert result.exit_code == 0, result.stdout + result.stderr
+        assert "--- project-local/worker.md" in result.stdout
+        assert "+++ built-in/worker.md" in result.stdout
+        assert "+New upstream guidance" in result.stdout
+
+    def test_guide_diff_requires_existing_local_guide(self, tmp_path: Path) -> None:
+        repo = _make_project_repo(tmp_path)
+        config_path = _write_minimal_config(tmp_path, projects={"demo": repo})
+
+        result = runner.invoke(
+            project_app,
+            ["guide-diff", "worker", "--project", "demo", "--config", str(config_path)],
+        )
+
+        assert result.exit_code == 1
+        assert "No project-local worker guide exists" in (result.stdout + result.stderr)
+
 
 # ---------------------------------------------------------------------------
 # plan

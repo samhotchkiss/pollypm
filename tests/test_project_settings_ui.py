@@ -55,8 +55,9 @@ def _fake_role_registry() -> Registry:
 
 
 class _FakeProject:
-    def __init__(self, key: str, *, name: str | None = None) -> None:
+    def __init__(self, key: str, *, path: Path, name: str | None = None) -> None:
         self.key = key
+        self.path = path
         self.name = name or key.title()
         self.role_assignments: dict[str, ModelAssignment] = {}
 
@@ -106,9 +107,9 @@ class _FakeUsage:
 
 
 class _FakeConfig:
-    def __init__(self) -> None:
+    def __init__(self, project_path: Path) -> None:
         self.pollypm = _FakePollyPM()
-        self.projects = {"alpha": _FakeProject("alpha", name="Alpha Project")}
+        self.projects = {"alpha": _FakeProject("alpha", path=project_path, name="Alpha Project")}
         self.sessions = {
             "worker-alpha": _FakeSession(
                 "worker-alpha",
@@ -140,7 +141,9 @@ class _FakeService:
 def project_settings_env(tmp_path: Path, monkeypatch):
     config_path = tmp_path / "pollypm.toml"
     config_path.write_text("# test config\n")
-    fake_config = _FakeConfig()
+    project_path = tmp_path / "alpha"
+    project_path.mkdir()
+    fake_config = _FakeConfig(project_path)
     service = _FakeService()
     monkeypatch.setattr(
         "pollypm.cockpit_project_settings.load_config",
@@ -180,6 +183,7 @@ def project_settings_env(tmp_path: Path, monkeypatch):
     return {
         "app": PollyProjectSettingsApp(config_path, "alpha"),
         "config_path": config_path,
+        "project_path": project_path,
         "service": service,
     }
 
@@ -308,7 +312,6 @@ def test_project_settings_buttons_include_inline_key_hints(project_settings_env)
 
     _run(body())
 
-
 def test_project_settings_role_editor_persists_override_custom_and_inherit(
     tmp_path: Path,
     monkeypatch,
@@ -423,6 +426,34 @@ def test_project_settings_role_editor_persists_override_custom_and_inherit(
             assert "architect" not in reloaded.projects["alpha"].role_assignments
             detail = str(app.query_one("#project-role-detail").render())
             assert "inherited global" in detail
+
+    _run(body())
+
+
+def test_project_settings_shows_prompt_drift_badge(project_settings_env, monkeypatch) -> None:
+    app = project_settings_env["app"]
+    guide_path = project_settings_env["project_path"] / ".pollypm" / "project-guides" / "worker.md"
+    guide_path.parent.mkdir(parents=True)
+    guide_path.write_text("---\nforked_from: deadbeef\n---\nlocal worker guide\n")
+    monkeypatch.setattr(
+        "pollypm.cockpit_project_settings._project_guide_drift_info",
+        lambda _project_path, role: {
+            "role": role,
+            "path": guide_path,
+            "forked_from": "deadbeef",
+            "current_ref": "cafebabe",
+            "drifted": role == "worker",
+            "body": "local worker guide\n",
+            "upstream_body": "upstream worker guide\n",
+        },
+    )
+
+    async def body() -> None:
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            guide_info = str(app.query_one("#guide-info").render())
+            assert "worker" in guide_info
+            assert "upstream changed" in guide_info
 
     _run(body())
 

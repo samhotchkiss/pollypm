@@ -40,7 +40,6 @@ from pollypm.role_routing import resolve_role_assignment
 from pollypm.service_api import PollyPMService
 from pollypm.work.sqlite_service import SQLiteWorkService
 
-
 _PROJECT_ROLE_KEYS = ("architect", "worker", "reviewer")
 _ROLE_LABELS = {
     "operator_pm": "Operator PM",
@@ -133,6 +132,41 @@ def _build_project_role_rows(config, project_key: str, registry) -> list[dict]:
         )
     return rows
 
+_PROJECT_GUIDE_ROLES: tuple[str, ...] = ("architect", "worker", "reviewer")
+
+
+def _project_guides_dir(project_path: Path) -> Path:
+    return Path(project_path) / ".pollypm" / "project-guides"
+
+
+def _project_guide_path(project_path: Path, role: str) -> Path:
+    return _project_guides_dir(project_path) / f"{role}.md"
+
+
+def _drift_value(info: object, field: str, default: object = None) -> object:
+    if isinstance(info, dict):
+        return info.get(field, default)
+    return getattr(info, field, default)
+
+
+def _project_guide_drift_info(project_path: Path, role: str) -> object | None:
+    try:
+        from pollypm.project_guides import project_guide_drift_info as helper
+    except Exception:  # noqa: BLE001
+        helper = None
+    if callable(helper):
+        try:
+            return helper(project_path, role)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        from pollypm import doctor as doctor_mod
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        return doctor_mod._project_guide_drift_info(project_path, role)
+    except Exception:  # noqa: BLE001
+        return None
 class PollyProjectSettingsApp(App[None]):
     TITLE = "PollyPM"
     SUB_TITLE = "Project Settings"
@@ -277,6 +311,9 @@ class PollyProjectSettingsApp(App[None]):
         with Vertical(classes="settings-section"):
             yield Static("Recent Tasks", classes="section-label")
             yield Static("", id="task-info")
+        with Vertical(classes="settings-section"):
+            yield Static("Project Guides", classes="section-label")
+            yield Static("", id="guide-info")
         with Vertical(classes="settings-section", id="release-channel-section"):
             yield Static("Release channel", classes="section-label")
             yield Static(
@@ -340,6 +377,8 @@ class PollyProjectSettingsApp(App[None]):
         worker_info = self.query_one("#worker-info", Static)
         model_info = self.query_one("#model-info", Static)
         task_info = self.query_one("#task-info", Static)
+        guide_info = self.query_one("#guide-info", Static)
+        guide_info.update(self._render_project_guides(getattr(project, "path", None)))
 
         if worker is None:
             worker_info.update("No worker session configured.\nPress N in the sidebar to create one.")
@@ -557,6 +596,29 @@ class PollyProjectSettingsApp(App[None]):
                 f"• [b]{task.task_id}[/b] [dim]{status}[/dim] "
                 f"[dim]{task.title}[/dim]"
             )
+        return "\n".join(lines)
+
+    def _render_project_guides(self, project_path: Path | None) -> str:
+        if project_path is None:
+            return "[dim]No project path available.[/dim]"
+        lines: list[str] = []
+        stale_count = 0
+        for role in _PROJECT_GUIDE_ROLES:
+            guide_path = _project_guide_path(project_path, role)
+            if not guide_path.is_file():
+                continue
+            info = _project_guide_drift_info(project_path, role)
+            drifted = bool(_drift_value(info, "drifted", False))
+            if drifted:
+                stale_count += 1
+            badge = " [#d7b75f]↑ upstream changed[/]" if drifted else ""
+            lines.append(
+                f"• [b]{role}[/b] [dim]{guide_path.name}[/dim]{badge}"
+            )
+        if not lines:
+            return "[dim]No project-local guides forked yet.[/dim]"
+        if stale_count:
+            lines.insert(0, f"[dim]{stale_count} guide fork(s) need refresh.[/dim]")
         return "\n".join(lines)
 
     def _build_preview(self, worker, *, account_label: str) -> str:

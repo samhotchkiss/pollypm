@@ -22,6 +22,7 @@ _CATEGORY_LABELS: dict[str, str] = {
     "network": "Network",
     "roles": "Roles",
     "pipeline": "Pipeline",
+    "guides": "Guide Drift",
     "schedulers": "Schedulers",
     "resources": "Resources",
     "inbox": "Inbox",

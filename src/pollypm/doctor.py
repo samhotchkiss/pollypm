@@ -43,6 +43,7 @@ import sys
 import time
 import tomllib
 from dataclasses import dataclass, field
+from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version as _package_version
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -1377,6 +1378,18 @@ _EXPECTED_SCHEDULED_HANDLERS: tuple[str, ...] = (
     "work.progress_sweep",
     "task_assignment.sweep",
 )
+_PROJECT_GUIDE_ROLES: tuple[str, ...] = ("architect", "worker", "reviewer")
+
+
+@dataclass(slots=True, frozen=True)
+class _LocalGuideDriftInfo:
+    role: str
+    path: Path
+    forked_from: str
+    current_ref: str
+    drifted: bool
+    body: str
+    upstream_body: str
 
 
 def _safe_load_config():
@@ -1779,6 +1792,199 @@ def _role_assignment_checks() -> list[Check]:
     return checks
 
 
+def _drift_value(info: object, field: str, default: object = None) -> object:
+    if isinstance(info, dict):
+        return info.get(field, default)
+    return getattr(info, field, default)
+
+
+@lru_cache(maxsize=1)
+def _project_guides_module():
+    try:
+        import pollypm.project_guides as project_guides
+    except Exception:  # noqa: BLE001
+        return None
+    return project_guides
+
+
+def _project_guides_dir(project_path: Path) -> Path:
+    return Path(project_path) / ".pollypm" / "project-guides"
+
+
+def _project_guide_path(project_path: Path, role: str) -> Path:
+    return _project_guides_dir(project_path) / f"{role}.md"
+
+
+def _parse_guide_front_matter(text: str) -> tuple[dict[str, str], str]:
+    normalized = text.replace("\r\n", "\n")
+    if not normalized.startswith("---\n"):
+        return {}, normalized
+    marker = "\n---\n"
+    end = normalized.find(marker, 4)
+    if end == -1:
+        return {}, normalized
+    raw_header = normalized[4:end]
+    body = normalized[end + len(marker):]
+    header: dict[str, str] = {}
+    for line in raw_header.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        header[key.strip()] = value.strip().strip('"').strip("'")
+    return header, body
+
+
+def _guide_source_path(role: str) -> Path | None:
+    here = Path(__file__).resolve().parent
+    if role == "architect":
+        return here / "plugins_builtin" / "project_planning" / "profiles" / "architect.md"
+    if role in {"worker", "reviewer"}:
+        return here / "plugins_builtin" / "core_agent_profiles" / "profiles.py"
+    return None
+
+
+def _looks_like_hash(value: str, *, min_len: int = 7, max_len: int = 64) -> bool:
+    return bool(re.fullmatch(rf"[0-9a-f]{{{min_len},{max_len}}}", value))
+
+
+def _git_last_change_ref(path: Path | None) -> str | None:
+    if path is None or not path.exists():
+        return None
+    rc, out = _run_cmd(
+        ["git", "-C", str(path.parent), "rev-parse", "--show-toplevel"],
+        timeout=1.0,
+    )
+    if rc != 0:
+        return None
+    repo_root = Path(out.strip())
+    try:
+        relative = path.resolve().relative_to(repo_root.resolve())
+    except ValueError:
+        return None
+    rc, out = _run_cmd(
+        ["git", "-C", str(repo_root), "log", "-n", "1", "--format=%H", "--", str(relative)],
+        timeout=1.5,
+    )
+    if rc != 0:
+        return None
+    sha = (out.splitlines() or [""])[0].strip().lower()
+    return sha if _looks_like_hash(sha, min_len=40, max_len=40) else None
+
+
+@lru_cache(maxsize=None)
+def _built_in_guide_body(role: str) -> str:
+    if role == "architect":
+        source = _guide_source_path(role)
+        if source is None:
+            raise ValueError(f"unknown guide role: {role}")
+        return source.read_text(encoding="utf-8")
+    if role == "worker":
+        from pollypm.plugins_builtin.core_agent_profiles.profiles import worker_prompt
+
+        return worker_prompt()
+    if role == "reviewer":
+        from pollypm.plugins_builtin.core_agent_profiles.profiles import reviewer_prompt
+
+        return reviewer_prompt()
+    raise ValueError(f"unknown guide role: {role}")
+
+
+@lru_cache(maxsize=None)
+def _built_in_guide_ref(role: str) -> str:
+    body = _built_in_guide_body(role)
+    git_ref = _git_last_change_ref(_guide_source_path(role))
+    if git_ref:
+        return git_ref
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _reference_aliases(value: str) -> set[str]:
+    cleaned = (value or "").strip().lower()
+    if not cleaned:
+        return set()
+    aliases = {cleaned}
+    if cleaned.startswith("sha256:"):
+        aliases.add(cleaned.split(":", 1)[1])
+    elif _looks_like_hash(cleaned, min_len=64, max_len=64):
+        aliases.add(f"sha256:{cleaned}")
+    return aliases
+
+
+def _forked_from_matches_current(forked_from: str, current_ref: str, *, upstream_body: str) -> bool:
+    left = _reference_aliases(forked_from)
+    right = _reference_aliases(current_ref)
+    digest = hashlib.sha256(upstream_body.encode("utf-8")).hexdigest()
+    right.add(digest)
+    right.add(f"sha256:{digest}")
+    if left & right:
+        return True
+    forked = (forked_from or "").strip().lower()
+    current = (current_ref or "").strip().lower()
+    if _looks_like_hash(forked) and _looks_like_hash(current):
+        return forked.startswith(current) or current.startswith(forked)
+    return False
+
+
+def _fallback_project_guide_drift_info(project_path: Path, role: str) -> _LocalGuideDriftInfo | None:
+    if role not in _PROJECT_GUIDE_ROLES:
+        return None
+    path = _project_guide_path(project_path, role)
+    if not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    header, body = _parse_guide_front_matter(text)
+    upstream_body = _built_in_guide_body(role)
+    current_ref = _built_in_guide_ref(role)
+    forked_from = str(header.get("forked_from") or "").strip()
+    drifted = bool(forked_from) and not _forked_from_matches_current(
+        forked_from,
+        current_ref,
+        upstream_body=upstream_body,
+    )
+    return _LocalGuideDriftInfo(
+        role=role,
+        path=path,
+        forked_from=forked_from,
+        current_ref=current_ref,
+        drifted=drifted,
+        body=body,
+        upstream_body=upstream_body,
+    )
+
+
+def _project_guide_drift_info(project_path: Path, role: str) -> object | None:
+    project_guides = _project_guides_module()
+    if project_guides is not None:
+        helper = getattr(project_guides, "project_guide_drift_info", None)
+        if callable(helper):
+            try:
+                return helper(project_path, role)
+            except Exception:  # noqa: BLE001
+                pass
+    return _fallback_project_guide_drift_info(project_path, role)
+
+
+def _list_drifted_project_guides(project_path: Path) -> list[object]:
+    project_guides = _project_guides_module()
+    if project_guides is not None:
+        helper = getattr(project_guides, "list_drifted_project_guides", None)
+        if callable(helper):
+            try:
+                return list(helper(project_path) or [])
+            except Exception:  # noqa: BLE001
+                pass
+    drifted: list[object] = []
+    for role in _PROJECT_GUIDE_ROLES:
+        info = _fallback_project_guide_drift_info(project_path, role)
+        if info is not None and info.drifted:
+            drifted.append(info)
+    return drifted
+
+
 def _rewrite_planner_enforce_plan(config_path: Path) -> tuple[bool, str]:
     """Flip ``[planner].enforce_plan`` to true in ``config_path``.
 
@@ -1953,6 +2159,70 @@ def check_visual_explainer_skill() -> CheckResult:
     return _ok(
         "visual-explainer skill present",
         data={"path": str(skill_dir)},
+    )
+
+
+def check_project_local_guide_drift() -> CheckResult:
+    """Warn when a project-local role guide has drifted from upstream."""
+    _path, config = _safe_load_config()
+    if config is None:
+        return _skip("project-guide drift check skipped (no config)")
+    projects = getattr(config, "projects", {}) or {}
+    if not projects:
+        return _skip("project-guide drift check skipped (no projects)")
+
+    stale: list[dict[str, object]] = []
+    for project_key, project in projects.items():
+        project_path = getattr(project, "path", None)
+        if project_path is None:
+            continue
+        for info in _list_drifted_project_guides(Path(project_path)):
+            role = str(_drift_value(info, "role") or "")
+            stale.append(
+                {
+                    "project": project_key,
+                    "project_name": getattr(project, "name", None) or project_key,
+                    "role": role,
+                    "path": str(_drift_value(info, "path") or _project_guide_path(Path(project_path), role)),
+                    "forked_from": str(_drift_value(info, "forked_from") or ""),
+                    "current_ref": str(_drift_value(info, "current_ref") or ""),
+                }
+            )
+
+    if not stale:
+        return _ok(
+            "no stale project-local guides detected",
+            data={"count": 0, "projects": 0, "stale": []},
+        )
+
+    projects_with_drift = len({item["project"] for item in stale})
+    sample = ", ".join(
+        f"{item['project']}:{item['role']}"
+        for item in stale[:4]
+    )
+    fix_lines = ["Refresh each stale guide from the current built-in prompt:"]
+    for item in stale[:4]:
+        fix_lines.append(
+            f"  pm project init-guide {item['role']} --project {item['project']} --force"
+        )
+    if len(stale) > 4:
+        fix_lines.append(f"  ... and {len(stale) - 4} more")
+    fix_lines.append("Review local edits before overwriting if needed.")
+    fix_lines.append("Recheck: pm doctor")
+    return _fail(
+        f"{len(stale)} stale project-local guide(s) across {projects_with_drift} project(s): {sample}",
+        why=(
+            "Project-local role guides stop inheriting upstream prompt updates "
+            "after they are forked. Stale guides can launch sessions with "
+            "outdated instructions until they are refreshed."
+        ),
+        fix="\n".join(fix_lines),
+        severity="warning",
+        data={
+            "count": len(stale),
+            "projects": projects_with_drift,
+            "stale": stale,
+        },
     )
 
 
@@ -3021,6 +3291,8 @@ def _registered_checks() -> list[Check]:
         Check("visual-explainer-skill", check_visual_explainer_skill, "pipeline"),
         Check("task-assignment-sweeper-dbs", check_task_assignment_sweeper_dbs, "pipeline", severity="warning"),
         Check("sessions-table-populated", check_sessions_table_populated, "pipeline", severity="warning"),
+        # Guide drift
+        Check("project-guide-drift", check_project_local_guide_drift, "guides", severity="warning"),
         # Schedulers
         Check("scheduler-handlers", check_scheduler_roster_handlers, "schedulers"),
         Check("scheduler-cadence", check_scheduler_last_fired, "schedulers", severity="warning"),

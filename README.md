@@ -173,11 +173,11 @@ pm
 After onboarding:
 
 ```bash
-pm                  # attach to the main cockpit
+pm                  # start or attach to the PollyPM tmux session
 pm cockpit          # open the Textual cockpit explicitly
 pm status           # session and health overview
 pm send operator "Build a weather CLI with current conditions and a 5-day forecast"
-pm down             # stop PollyPM cleanly
+pm reset            # kill all PollyPM tmux sessions (cockpit + storage closet)
 ```
 
 If you want the full first-run walkthrough, use [docs/getting-started.md](docs/getting-started.md).

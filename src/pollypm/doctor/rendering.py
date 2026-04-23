@@ -20,6 +20,7 @@ _CATEGORY_LABELS: dict[str, str] = {
     "filesystem": "Filesystem",
     "tmux": "Tmux",
     "network": "Network",
+    "roles": "Roles",
     "pipeline": "Pipeline",
     "schedulers": "Schedulers",
     "resources": "Resources",

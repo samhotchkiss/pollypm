@@ -109,6 +109,231 @@ def _record_event(db_path: Path, event_type: str, *, age_seconds: int = 0) -> No
         msg_store.close()
 
 
+def _doctor_role_config(tmp_path: Path):
+    from pollypm.models import (
+        AccountConfig,
+        KnownProject,
+        PollyPMConfig,
+        PollyPMSettings,
+        ProjectKind,
+        ProjectSettings,
+        ProviderKind,
+    )
+
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    return PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm" / "logs",
+            snapshots_dir=tmp_path / ".pollypm" / "snapshots",
+            state_db=tmp_path / ".pollypm" / "state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="claude_main"),
+        accounts={
+            "claude_main": AccountConfig(
+                name="claude_main",
+                provider=ProviderKind.CLAUDE,
+                home=tmp_path / ".pollypm" / "homes" / "claude_main",
+            ),
+            "codex_main": AccountConfig(
+                name="codex_main",
+                provider=ProviderKind.CODEX,
+                home=tmp_path / ".pollypm" / "homes" / "codex_main",
+            ),
+        },
+        sessions={},
+        projects={
+            "demo": KnownProject(
+                key="demo",
+                path=project_path,
+                kind=ProjectKind.FOLDER,
+            )
+        },
+    )
+
+
+# --------------------------------------------------------------------- #
+# Roles checks
+# --------------------------------------------------------------------- #
+
+
+def test_role_assignment_checks_skip_without_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(doctor, "_safe_load_config", lambda: (None, None))
+
+    report = doctor.run_checks(doctor._role_assignment_checks())
+
+    assert len(report.results) == 1
+    check, result = report.results[0]
+    assert check.category == "roles"
+    assert result.passed and result.skipped
+
+
+def test_role_assignment_checks_enumerate_global_and_project_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from pollypm.models import ModelAssignment
+
+    config = _doctor_role_config(tmp_path)
+    config.pollypm.role_assignments["architect"] = ModelAssignment(alias="opus-4.7")
+    config.projects["demo"].role_assignments["worker"] = ModelAssignment(
+        provider="codex",
+        model="gpt-5.4",
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_safe_load_config",
+        lambda: (tmp_path / "pollypm.toml", config),
+    )
+
+    calls: list[tuple[str, str, tuple[str, ...]]] = []
+
+    def _probe(project, provider, model, accounts, *, timeout_seconds=0.0):
+        del project, timeout_seconds
+        calls.append((provider, model, tuple(name for name, _account in accounts)))
+        return doctor._RoleModelSmokeResult(ok=True, account_name=accounts[0][0])
+
+    monkeypatch.setattr(doctor, "_probe_role_model_access", _probe)
+
+    report = doctor.run_checks(doctor._role_assignment_checks())
+    text = doctor.render_human(report)
+
+    assert report.ok
+    assert "-- Roles --" in text
+    assert "global.architect" in text
+    assert "project.demo.worker" in text
+    assert "claude/claude-opus-4-7 via alias opus-4.7, source=global, reachable via claude_main" in text
+    assert "codex/gpt-5.4, source=project, reachable via codex_main" in text
+    assert calls == [
+        ("claude", "claude-opus-4-7", ("claude_main",)),
+        ("codex", "gpt-5.4", ("codex_main",)),
+    ]
+
+
+def test_role_assignment_unknown_alias_is_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from pollypm.models import ModelAssignment
+
+    config = _doctor_role_config(tmp_path)
+    config.pollypm.role_assignments["architect"] = ModelAssignment(alias="missing")
+    monkeypatch.setattr(
+        doctor,
+        "_safe_load_config",
+        lambda: (tmp_path / "pollypm.toml", config),
+    )
+
+    report = doctor.run_checks(doctor._role_assignment_checks())
+
+    check, result = report.results[0]
+    assert check.name == "global.architect"
+    assert not result.passed
+    assert result.severity == "error"
+    assert "unknown alias" in result.status
+    assert "fall through" in result.why
+
+
+def test_role_assignment_unknown_provider_is_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from pollypm.models import ModelAssignment
+
+    config = _doctor_role_config(tmp_path)
+    config.pollypm.role_assignments["reviewer"] = ModelAssignment(
+        provider="bogus",
+        model="bogus-1",
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_safe_load_config",
+        lambda: (tmp_path / "pollypm.toml", config),
+    )
+
+    report = doctor.run_checks(doctor._role_assignment_checks())
+
+    check, result = report.results[0]
+    assert check.name == "global.reviewer"
+    assert not result.passed
+    assert result.severity == "error"
+    assert "unknown provider" in result.status
+    assert "bogus" in result.why
+
+
+def test_role_assignment_probe_failure_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from pollypm.models import ModelAssignment
+
+    config = _doctor_role_config(tmp_path)
+    config.pollypm.role_assignments["worker"] = ModelAssignment(
+        provider="codex",
+        model="gpt-5.4",
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_safe_load_config",
+        lambda: (tmp_path / "pollypm.toml", config),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_probe_role_model_access",
+        lambda *args, **kwargs: doctor._RoleModelSmokeResult(
+            ok=False,
+            account_name=None,
+            attempts=("codex_main: provider rejected the model",),
+        ),
+    )
+
+    report = doctor.run_checks(doctor._role_assignment_checks())
+
+    _check, result = report.results[0]
+    assert not result.passed
+    assert result.severity == "error"
+    assert "smoke probe failed" in result.status
+    assert "Probe attempts: codex_main: provider rejected the model" in result.fix
+
+
+def test_role_assignment_advisories_warn_and_smoke_is_cached(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from pollypm.models import ModelAssignment
+
+    config = _doctor_role_config(tmp_path)
+    config.pollypm.role_assignments["architect"] = ModelAssignment(alias="haiku-4.5")
+    config.projects["demo"].role_assignments["reviewer"] = ModelAssignment(alias="haiku-4.5")
+    monkeypatch.setattr(
+        doctor,
+        "_safe_load_config",
+        lambda: (tmp_path / "pollypm.toml", config),
+    )
+
+    calls: list[tuple[str, str]] = []
+
+    def _probe(project, provider, model, accounts, *, timeout_seconds=0.0):
+        del project, accounts, timeout_seconds
+        calls.append((provider, model))
+        return doctor._RoleModelSmokeResult(ok=True, account_name="claude_main")
+
+    monkeypatch.setattr(doctor, "_probe_role_model_access", _probe)
+
+    report = doctor.run_checks(doctor._role_assignment_checks())
+    warnings = [
+        result
+        for _check, result in report.results
+        if not result.passed and result.severity == "warning"
+    ]
+
+    assert len(warnings) == 2
+    assert calls == [("claude", "claude-haiku-4-5-20251001")]
+    assert all("weak_planning" in result.why for result in warnings)
+
+
 # --------------------------------------------------------------------- #
 # Pipeline checks
 # --------------------------------------------------------------------- #
@@ -584,7 +809,7 @@ def test_cli_doctor_json_with_new_checks() -> None:
     payload = json.loads(result.stdout)
     categories = {c["category"] for c in payload["checks"]}
     # Confirm every new category appears.
-    for expected in ("pipeline", "schedulers", "resources", "inbox", "sessions"):
+    for expected in ("roles", "pipeline", "schedulers", "resources", "inbox", "sessions"):
         assert expected in categories, f"{expected} missing from {categories}"
 
 

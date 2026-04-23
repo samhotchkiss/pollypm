@@ -47,6 +47,7 @@ from importlib.metadata import PackageNotFoundError, version as _package_version
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from pollypm.models import AccountConfig, ModelAssignment, PollyPMConfig, ProjectSettings, ProviderKind
 from pollypm.service_api import PollyPMService
 
 # Allow ``pollypm.doctor`` to host internal submodules while keeping the
@@ -1395,6 +1396,389 @@ def _safe_load_config():
     return DEFAULT_CONFIG_PATH, config
 
 
+_ROLE_ASSIGNMENT_ORDER: tuple[str, ...] = (
+    "operator_pm",
+    "architect",
+    "worker",
+    "reviewer",
+)
+_ROLE_MODEL_PROBE_TIMEOUT_SECONDS = 8.0
+_INVALID_ROLE_MODEL_MARKERS: tuple[str, ...] = (
+    "invalid model",
+    "unknown model",
+    "model not found",
+    "unsupported model",
+    "not a valid model",
+    "unrecognized model",
+)
+
+
+@dataclass(slots=True, frozen=True)
+class _RoleAssignmentSpec:
+    check_name: str
+    role: str
+    source: str
+    assignment: ModelAssignment
+    table_label: str
+    project_key: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class _RoleModelSmokeResult:
+    ok: bool
+    account_name: str | None
+    attempts: tuple[str, ...] = ()
+
+
+def _last_lines_text(text: str, *, count: int = 4) -> str:
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    return " | ".join(lines[-count:])
+
+
+def _role_assignment_specs(config: PollyPMConfig) -> list[_RoleAssignmentSpec]:
+    specs: list[_RoleAssignmentSpec] = []
+    for role in _ROLE_ASSIGNMENT_ORDER:
+        assignment = config.pollypm.role_assignments.get(role)
+        if assignment is None:
+            continue
+        specs.append(
+            _RoleAssignmentSpec(
+                check_name=f"global.{role}",
+                role=role,
+                source="global",
+                assignment=assignment,
+                table_label=f"[pollypm.roles.{role}]",
+            )
+        )
+    for project_key in sorted(config.projects):
+        project = config.projects[project_key]
+        for role in _ROLE_ASSIGNMENT_ORDER:
+            assignment = project.role_assignments.get(role)
+            if assignment is None:
+                continue
+            specs.append(
+                _RoleAssignmentSpec(
+                    check_name=f"project.{project_key}.{role}",
+                    role=role,
+                    source="project",
+                    assignment=assignment,
+                    table_label=f"[projects.{project_key}.roles.{role}]",
+                    project_key=project_key,
+                )
+            )
+    return specs
+
+
+def _known_role_providers() -> set[str]:
+    providers = {kind.value for kind in ProviderKind}
+    try:
+        from pollypm.acct import list_providers
+
+        providers.update(list_providers())
+    except Exception:  # noqa: BLE001
+        pass
+    return providers
+
+
+def _resolve_role_model_assignment(
+    assignment: ModelAssignment,
+    *,
+    registry,
+) -> tuple[str, str] | None:
+    if assignment.alias is None:
+        return (assignment.provider or "", assignment.model or "")
+    from pollypm.model_registry import resolve_alias
+
+    resolved = resolve_alias(assignment.alias, registry=registry)
+    if resolved is None:
+        return None
+    return (resolved.provider or "", resolved.model or "")
+
+
+def _role_assignment_descriptor(
+    assignment: ModelAssignment,
+    *,
+    provider: str,
+    model: str,
+) -> str:
+    descriptor = f"{provider}/{model}"
+    if assignment.alias is not None:
+        descriptor += f" via alias {assignment.alias}"
+    return descriptor
+
+
+def _role_model_probe_failure(
+    provider: str,
+    *,
+    returncode: int,
+    output: str,
+) -> str | None:
+    lowered = (output or "").lower()
+    if any(marker in lowered for marker in _INVALID_ROLE_MODEL_MARKERS):
+        return "provider rejected the model"
+    if provider == "claude":
+        if "authentication" in lowered or "not logged" in lowered:
+            return "authentication failed"
+        if returncode != 0:
+            return f"probe exited {returncode}"
+        if "ok" not in lowered:
+            return "probe did not return ok"
+        return None
+    if provider == "codex":
+        if "usage limit" in lowered or "out of credits" in lowered:
+            return "account is out of credits"
+        if "not logged" in lowered or "not authenticated" in lowered:
+            return "authentication failed"
+        if "error:" in lowered:
+            return "probe returned an error"
+        if returncode != 0:
+            return f"probe exited {returncode}"
+        return None
+    if returncode != 0:
+        return f"probe exited {returncode}"
+    return None
+
+
+def _probe_role_model_access(
+    project: ProjectSettings,
+    provider: str,
+    model: str,
+    accounts: tuple[tuple[str, AccountConfig], ...],
+    *,
+    timeout_seconds: float = _ROLE_MODEL_PROBE_TIMEOUT_SECONDS,
+) -> _RoleModelSmokeResult:
+    from pollypm.supervision.probe_runner import ProbeRunner
+
+    runner = ProbeRunner(project)
+    attempts: list[str] = []
+    for account_name, account in accounts:
+        try:
+            probe = runner.run_probe_result(
+                account,
+                model=model,
+                timeout=timeout_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001
+            attempts.append(f"{account_name}: {type(exc).__name__}: {exc}")
+            continue
+        failure = _role_model_probe_failure(
+            provider,
+            returncode=probe.returncode,
+            output=probe.output,
+        )
+        if failure is None:
+            return _RoleModelSmokeResult(
+                ok=True,
+                account_name=account_name,
+                attempts=tuple(attempts),
+            )
+        tail = _last_lines_text(probe.output)
+        detail = f"{account_name}: {failure}"
+        if tail:
+            detail = f"{detail} ({tail})"
+        attempts.append(detail)
+    return _RoleModelSmokeResult(
+        ok=False,
+        account_name=None,
+        attempts=tuple(attempts),
+    )
+
+
+def _role_assignment_check_result(
+    spec: _RoleAssignmentSpec,
+    *,
+    config_path: Path | None,
+    config: PollyPMConfig,
+    registry,
+    known_providers: set[str],
+    accounts_by_provider: dict[str, tuple[tuple[str, AccountConfig], ...]],
+    smoke_cache: dict[tuple[str, str], _RoleModelSmokeResult],
+) -> CheckResult:
+    from pollypm.model_registry import advisories_for
+
+    resolved = _resolve_role_model_assignment(spec.assignment, registry=registry)
+    location_text = spec.table_label
+    if config_path is not None:
+        location_text = f"{spec.table_label} in {config_path}"
+    if spec.assignment.alias is not None and resolved is None:
+        return _fail(
+            f"alias {spec.assignment.alias!r}, source={spec.source}, unknown alias",
+            why=(
+                f"{location_text} references alias {spec.assignment.alias!r}, but "
+                "that alias is not present in the model registry. PollyPM would "
+                "silently fall through to a lower-precedence role assignment."
+            ),
+            fix=(
+                f"Edit {location_text} to use a known alias from "
+                "src/pollypm/model_registry.toml or an explicit provider/model pair.\n"
+                "Recheck: pm doctor"
+            ),
+            data={
+                "role": spec.role,
+                "source": spec.source,
+                "project_key": spec.project_key,
+                "alias": spec.assignment.alias,
+                "table": spec.table_label,
+            },
+        )
+
+    provider, model = resolved or ("", "")
+    descriptor = _role_assignment_descriptor(
+        spec.assignment,
+        provider=provider,
+        model=model,
+    )
+    data = {
+        "role": spec.role,
+        "source": spec.source,
+        "project_key": spec.project_key,
+        "table": spec.table_label,
+        "alias": spec.assignment.alias,
+        "provider": provider,
+        "model": model,
+    }
+
+    if provider not in known_providers:
+        return _fail(
+            f"{descriptor}, source={spec.source}, unknown provider",
+            why=(
+                f"{location_text} resolves to provider {provider!r}, but no "
+                "installed PollyPM provider adapter advertises that name."
+            ),
+            fix=(
+                f"Change {location_text} to a registered provider "
+                f"({', '.join(sorted(known_providers))}) or install the missing "
+                "provider plugin.\n"
+                "Recheck: pm doctor"
+            ),
+            data=data | {"known_providers": sorted(known_providers)},
+        )
+
+    provider_accounts = accounts_by_provider.get(provider, ())
+    if not provider_accounts:
+        return _fail(
+            f"{descriptor}, source={spec.source}, no {provider} account configured",
+            why=(
+                f"{location_text} resolves to {provider}/{model}, but PollyPM has "
+                f"no configured {provider} account to launch or probe that model."
+            ),
+            fix=(
+                f"Add a {provider} account via `pm onboard`, or point "
+                f"{location_text} at a provider with configured accounts.\n"
+                "Recheck: pm doctor"
+            ),
+            data=data | {"accounts": []},
+        )
+
+    smoke = smoke_cache.get((provider, model))
+    if smoke is None:
+        smoke = _probe_role_model_access(
+            config.project,
+            provider,
+            model,
+            provider_accounts,
+        )
+        smoke_cache[(provider, model)] = smoke
+
+    probe_data = {
+        "ok": smoke.ok,
+        "account": smoke.account_name,
+        "attempts": list(smoke.attempts),
+        "accounts": [name for name, _account in provider_accounts],
+    }
+    if not smoke.ok:
+        attempts = "; ".join(smoke.attempts[:3]) or "no configured account succeeded"
+        return _fail(
+            f"{descriptor}, source={spec.source}, smoke probe failed",
+            why=(
+                f"{location_text} resolves to {provider}/{model}, but doctor could "
+                f"not confirm that any configured {provider} account can reach it."
+            ),
+            fix=(
+                f"Re-login a {provider} account or choose a reachable model for "
+                f"{location_text}.\n"
+                f"Probe attempts: {attempts}\n"
+                "Recheck: pm doctor"
+            ),
+            data=data | {"probe": probe_data},
+        )
+
+    advisories = advisories_for(spec.role, spec.assignment, registry=registry)
+    if advisories:
+        return _fail(
+            f"{descriptor}, source={spec.source}, reachable via {smoke.account_name}, advisory",
+            why="; ".join(advisories),
+            fix=(
+                f"Prefer a stronger model for role {spec.role}, or keep "
+                f"{location_text} if the weaker fit is intentional.\n"
+                "Recheck: pm doctor"
+            ),
+            severity="warning",
+            data=data | {"probe": probe_data, "advisories": advisories},
+        )
+
+    return _ok(
+        f"{descriptor}, source={spec.source}, reachable via {smoke.account_name}",
+        data=data | {"probe": probe_data, "advisories": []},
+    )
+
+
+def _role_assignment_checks() -> list[Check]:
+    path, config = _safe_load_config()
+    if config is None:
+        status = (
+            "role-assignment check skipped (config parse error)"
+            if path is not None else
+            "role-assignment check skipped (no config)"
+        )
+        return [Check("role-assignments", lambda status=status: _skip(status), "roles")]
+
+    specs = _role_assignment_specs(config)
+    if not specs:
+        return [
+            Check(
+                "role-assignments",
+                lambda: _ok("no configured global/project role assignments"),
+                "roles",
+            )
+        ]
+
+    from pollypm.model_registry import load_registry
+
+    registry = load_registry()
+    known_providers = _known_role_providers()
+    accounts_by_provider: dict[str, list[tuple[str, AccountConfig]]] = {}
+    for account_name, account in sorted(config.accounts.items()):
+        provider_name = str(getattr(account.provider, "value", account.provider))
+        accounts_by_provider.setdefault(provider_name, []).append((account_name, account))
+    frozen_accounts = {
+        provider: tuple(entries)
+        for provider, entries in accounts_by_provider.items()
+    }
+    smoke_cache: dict[tuple[str, str], _RoleModelSmokeResult] = {}
+
+    checks: list[Check] = []
+    for spec in specs:
+        checks.append(
+            Check(
+                spec.check_name,
+                lambda spec=spec: _role_assignment_check_result(
+                    spec,
+                    config_path=path,
+                    config=config,
+                    registry=registry,
+                    known_providers=known_providers,
+                    accounts_by_provider=frozen_accounts,
+                    smoke_cache=smoke_cache,
+                ),
+                "roles",
+            )
+        )
+    return checks
+
+
 def _rewrite_planner_enforce_plan(config_path: Path) -> tuple[bool, str]:
     """Flip ``[planner].enforce_plan`` to true in ``config_path``.
 
@@ -2629,6 +3013,8 @@ def _registered_checks() -> list[Check]:
         Check("network-github", check_network_github, "network", severity="warning"),
         Check("network-anthropic", check_network_anthropic, "network", severity="warning"),
         Check("network-openai", check_network_openai, "network", severity="warning"),
+        # Roles
+        *_role_assignment_checks(),
         # Pipeline (plan gate, architect bootstrap, sweepers)
         Check("plan-gate", check_plan_presence_gate, "pipeline", severity="warning"),
         Check("architect-profile", check_architect_profile, "pipeline"),

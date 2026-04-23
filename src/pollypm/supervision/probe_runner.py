@@ -22,21 +22,47 @@ from pollypm.providers.base import LaunchCommand
 from pollypm.runtimes import get_runtime
 
 
-def build_controller_probe(account: AccountConfig, project: ProjectSettings) -> LaunchCommand:
-    """Build the provider-native probe command for ``account``."""
+def build_controller_probe(
+    account: AccountConfig,
+    project: ProjectSettings,
+    *,
+    model: str | None = None,
+) -> LaunchCommand:
+    """Build the provider-native probe command for ``account``.
+
+    ``model`` is optional so the controller bootstrap path keeps its
+    historical behavior while doctor can smoke-test specific role
+    assignments against the live provider CLI.
+    """
     if account.provider is ProviderKind.CLAUDE:
+        argv = ["claude", "-p"]
+        if model:
+            argv.extend(["--model", model])
+        argv.append("Reply with ok and nothing else")
         return LaunchCommand(
-            argv=["claude", "-p", "Reply with ok"],
+            argv=argv,
             env=dict(account.env),
             cwd=project.root_dir,
         )
     if account.provider is ProviderKind.CODEX:
+        argv = ["codex", "exec"]
+        if model:
+            argv.extend(["--model", model])
+        argv.extend(["--skip-git-repo-check", "Reply with ok and nothing else"])
         return LaunchCommand(
-            argv=["codex", "exec", "--skip-git-repo-check", "Reply with ok and nothing else"],
+            argv=argv,
             env=dict(account.env),
             cwd=project.root_dir,
         )
     raise RuntimeError(f"Unsupported controller provider: {account.provider.value}")
+
+
+@dataclass(slots=True)
+class ProbeResult:
+    """Raw subprocess outcome for a short-lived provider probe."""
+
+    returncode: int
+    output: str
 
 
 @dataclass(slots=True)
@@ -45,8 +71,14 @@ class ProbeRunner:
 
     project: ProjectSettings
 
-    def run_probe(self, account: AccountConfig) -> str:
-        probe = build_controller_probe(account, self.project)
+    def run_probe_result(
+        self,
+        account: AccountConfig,
+        *,
+        model: str | None = None,
+        timeout: float = 90.0,
+    ) -> ProbeResult:
+        probe = build_controller_probe(account, self.project, model=model)
         runtime = get_runtime(account.runtime, root_dir=self.project.root_dir)
         wrapped = runtime.wrap_command_exec(probe, account, self.project)
         result = subprocess.run(
@@ -55,8 +87,14 @@ class ProbeRunner:
             shell=False,
             text=True,
             capture_output=True,
-            timeout=90,
+            timeout=timeout,
             cwd=wrapped.cwd,
             env=wrapped.env,
         )
-        return "\n".join(part for part in [result.stdout, result.stderr] if part)
+        return ProbeResult(
+            returncode=getattr(result, "returncode", 0),
+            output="\n".join(part for part in [result.stdout, result.stderr] if part),
+        )
+
+    def run_probe(self, account: AccountConfig, *, model: str | None = None) -> str:
+        return self.run_probe_result(account, model=model).output

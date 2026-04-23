@@ -42,9 +42,28 @@ _ALERT_TOAST_SEVERITY_ICONS = {
 # already used in dashboard_data.py:377, cockpit_ui.py:7884, and
 # cockpit.py:172.
 _OPERATIONAL_ALERT_TYPES: frozenset[str] = frozenset({
+    # Heartbeat classification signals.
     "suspected_loop",
     "stabilize_failed",
     "needs_followup",
+    # Window / pane state — the supervisor auto-recovers these without
+    # user intervention (respawn missing window, relaunch dead pane,
+    # handle shell-return). Toasting every one trained the user to
+    # dismiss alerts. See #765 + morning-after follow-up.
+    "missing_window",
+    "pane_dead",
+    "shell_returned",
+    "idle_output",
+    # Heuristic "this session has been quiet too long" escalation. The
+    # reviewer sits idle by design when the queue is empty; an
+    # architect sits idle after emit until a human picks. The alert
+    # was firing on both — neither is actionable to the user.
+    "stuck_session",
+    # no_session used to be user-actionable ("manually pm task claim"),
+    # but auto-claim (#768) now spawns the worker within a sweep tick.
+    # Keep the alert on the activity log for observability but don't
+    # interrupt.
+    "no_session",
 })
 
 # Operational alert *prefixes* — an alert_type whose start matches any
@@ -54,6 +73,10 @@ _OPERATIONAL_ALERT_TYPES: frozenset[str] = frozenset({
 # one trains them to dismiss the toast channel. #765.
 _OPERATIONAL_ALERT_PREFIXES: tuple[str, ...] = (
     "unmanaged_window:",
+    # Per-task no_session alerts (``no_session_for_assignment:demo/1``)
+    # are the task-level equivalent of the sweep-level no_session —
+    # same reasoning.
+    "no_session_for_assignment:",
 )
 
 

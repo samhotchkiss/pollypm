@@ -105,15 +105,16 @@ def classify_stall(ctx: StallContext) -> StallClass:
     if session_name in _CONTROL_SESSION_NAMES:
         return "legitimate_idle"
     if role == "architect":
-        # Architects alternate emit/wait. An idle pane is the default
-        # state between approvals. If the user hasn't approved yet, or
-        # if there's nothing queued for the architect to do, silence is
-        # expected.
-        if not ctx.has_pending_work:
-            return "legitimate_idle"
-        # Pending work + idle could be a real stall — treat as such so
-        # we at least get the remediation ladder, not silence.
-        return "unrecoverable_stall"
+        # Architects are event-driven — they emit once, then wait for
+        # the user (approval / replan). Downstream implementation tasks
+        # being queued / in_progress does NOT mean the architect has
+        # work to do; those belong to workers. So an idle architect is
+        # always ``legitimate_idle`` from the classifier's perspective.
+        # A real "architect stuck mid-plan" case would need richer
+        # signals (e.g. the architect's own plan_project task is at a
+        # non-terminal node) and doesn't belong in the same-snapshot
+        # detector. See morning-after #765 follow-up.
+        return "legitimate_idle"
     if role == "worker":
         if ctx.awaiting_user_action:
             return "legitimate_idle"

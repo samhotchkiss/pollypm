@@ -46,12 +46,19 @@ def test_architect_with_no_pending_work_is_legitimate_idle() -> None:
     assert classify_stall(_ctx(role="architect", has_pending_work=False)) == "legitimate_idle"
 
 
-def test_architect_with_pending_work_is_unrecoverable_stall() -> None:
-    """Architect has queued work but isn't producing output — that's
-    a real signal worth escalating."""
+def test_architect_is_always_legitimate_idle_regardless_of_queue() -> None:
+    """Architects are event-driven: emit, then wait for the user. The
+    project having downstream queued tasks is normal (the architect's
+    own output) — it doesn't mean the architect is stalled. Morning-
+    after #765 refinement: stop toasting the user on architect idle
+    just because the worker queue is non-empty."""
     assert (
         classify_stall(_ctx(role="architect", has_pending_work=True))
-        == "unrecoverable_stall"
+        == "legitimate_idle"
+    )
+    assert (
+        classify_stall(_ctx(role="architect", has_pending_work=False))
+        == "legitimate_idle"
     )
 
 

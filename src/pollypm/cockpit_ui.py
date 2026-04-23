@@ -49,6 +49,7 @@ from textual.widgets import (
     Input,
     ListItem,
     ListView,
+    Select,
     Static,
     TabbedContent,
     TabPane,
@@ -57,7 +58,9 @@ from textual.widgets import (
 from pollypm.approval_notifications import notify_task_approved
 from pollypm.cockpit_formatting import format_event_time
 from pollypm.cockpit_formatting import format_relative_age as _format_relative_age
-from pollypm.models import ProviderKind
+from pollypm.model_registry import advisories_for, load_registry, resolve_alias
+from pollypm.models import ModelAssignment, ProviderKind
+from pollypm.role_routing import resolve_role_assignment
 from pollypm.account_usage_sampler import load_cached_account_usage
 from pollypm.tz import format_time as _fmt_time
 from pollypm.cockpit_activity import (
@@ -87,7 +90,7 @@ from pollypm.cockpit_metrics import (
     _MetricsDrillDownModal,
     _metrics_process_breakdown,
 )
-from pollypm.config import load_config
+from pollypm.config import load_config, write_config
 from pollypm.cockpit_palette import (
     CommandPaletteModal,
     KeyboardHelpModal,
@@ -2197,12 +2200,133 @@ from pollypm.cockpit_tasks import PollyTasksApp as PollyTasksApp  # noqa: E402,F
 _SETTINGS_SECTIONS: tuple[tuple[str, str], ...] = (
     ("accounts", "Accounts"),
     ("projects", "Projects"),
+    ("roles", "Roles"),
     ("heartbeat", "Heartbeat & Recovery"),
     ("plugins", "Plugins"),
     ("planner", "Planner"),
     ("inbox", "Inbox & Notifications"),
     ("about", "About"),
 )
+
+_GLOBAL_SETTINGS_ROLE_KEYS = (
+    "operator_pm",
+    "architect",
+    "worker",
+    "reviewer",
+)
+
+_ROLE_LABELS = {
+    "operator_pm": "Operator PM",
+    "architect": "Architect",
+    "worker": "Worker",
+    "reviewer": "Reviewer",
+}
+
+
+def _role_label(role: str) -> str:
+    return _ROLE_LABELS.get(role, role.replace("_", " ").title())
+
+
+def _role_assignment_summary(
+    assignment: ModelAssignment | None,
+    *,
+    registry,
+    inherited: bool = False,
+) -> str:
+    if assignment is None:
+        return "inherit" if inherited else "fallback"
+    if assignment.alias is not None:
+        if resolve_alias(assignment.alias, registry=registry) is None:
+            return f"alias:{assignment.alias} (missing)"
+        return f"alias:{assignment.alias}"
+    return f"{assignment.provider}/{assignment.model}"
+
+
+def _role_source_text(source: str) -> str:
+    if source == "global":
+        return "global"
+    if source == "project":
+        return "project override"
+    if source == "fallback":
+        return "fallback"
+    return source
+
+
+def _role_source_style(source: str) -> str:
+    return {
+        "project": "#5b8aff",
+        "global": "#3ddc84",
+        "fallback": "#97a6b2",
+    }.get(source, "#97a6b2")
+
+
+def _resolved_assignment_from_row(row: dict) -> ModelAssignment:
+    alias = row.get("resolved_alias")
+    if isinstance(alias, str) and alias:
+        return ModelAssignment(alias=alias)
+    return ModelAssignment(
+        provider=str(row.get("resolved_provider") or ""),
+        model=str(row.get("resolved_model") or ""),
+    )
+
+
+def _build_settings_role_rows(config, registry) -> list[dict]:
+    rows: list[dict] = []
+    assignments = getattr(getattr(config, "pollypm", None), "role_assignments", {}) or {}
+    for role in _GLOBAL_SETTINGS_ROLE_KEYS:
+        configured = assignments.get(role)
+        resolved = resolve_role_assignment(
+            role,
+            config=config,
+            registry=registry,
+        )
+        advisories = advisories_for(
+            role,
+            ModelAssignment(alias=resolved.alias)
+            if resolved.alias is not None
+            else ModelAssignment(provider=resolved.provider, model=resolved.model),
+            registry=registry,
+        )
+        rows.append(
+            {
+                "role": role,
+                "label": _role_label(role),
+                "configured_summary": _role_assignment_summary(
+                    configured,
+                    registry=registry,
+                ),
+                "configured_alias": (
+                    configured.alias if configured is not None else None
+                ),
+                "configured_provider": (
+                    configured.provider if configured is not None else None
+                ),
+                "configured_model": (
+                    configured.model if configured is not None else None
+                ),
+                "configured_kind": (
+                    "alias"
+                    if configured is not None and configured.alias is not None
+                    else "custom"
+                    if configured is not None
+                    else "fallback"
+                ),
+                "configured_missing_alias": bool(
+                    configured is not None
+                    and configured.alias is not None
+                    and resolve_alias(configured.alias, registry=registry) is None
+                ),
+                "resolved_provider": resolved.provider,
+                "resolved_model": resolved.model,
+                "resolved_alias": resolved.alias,
+                "resolved_summary": f"{resolved.provider}/{resolved.model}",
+                "source": resolved.source,
+                "source_label": _role_source_text(resolved.source),
+                "advisories": advisories,
+                "has_override": configured is not None,
+            }
+        )
+    return rows
 
 
 def _settings_status_dot(health: str, logged_in: bool) -> tuple[str, str]:
@@ -2302,6 +2426,7 @@ class SettingsData:
     __slots__ = (
         "accounts",
         "projects",
+        "roles",
         "heartbeat",
         "plugins",
         "planner",
@@ -2315,6 +2440,7 @@ class SettingsData:
         *,
         accounts: list[dict],
         projects: list[dict],
+        roles: list[dict],
         heartbeat: list[tuple[str, str]],
         plugins: list[dict],
         planner: list[tuple[str, str]],
@@ -2324,6 +2450,7 @@ class SettingsData:
     ) -> None:
         self.accounts = accounts
         self.projects = projects
+        self.roles = roles
         self.heartbeat = heartbeat
         self.plugins = plugins
         self.planner = planner
@@ -2521,6 +2648,14 @@ def _gather_settings_data(
         for account in accounts:
             account["recent_tasks"] = []
 
+    roles: list[dict] = []
+    if config is not None:
+        try:
+            registry = load_registry()
+            roles = _build_settings_role_rows(config, registry)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"Role registry unavailable: {exc}")
+
     heartbeat: list[tuple[str, str]] = []
     if pp is not None:
         failover_accounts = getattr(pp, "failover_accounts", []) or []
@@ -2626,6 +2761,7 @@ def _gather_settings_data(
     return SettingsData(
         accounts=accounts,
         projects=projects,
+        roles=roles,
         heartbeat=heartbeat,
         plugins=plugins,
         planner=planner,
@@ -2686,6 +2822,23 @@ class PollySettingsPaneApp(App[None]):
     #settings-account-actions Button {
         margin-right: 1;
     }
+    #settings-role-editor {
+        height: auto;
+        padding-bottom: 1;
+    }
+    #settings-role-editor > * {
+        margin-right: 1;
+    }
+    #settings-role-note {
+        color: #97a6b2;
+        content-align: left middle;
+    }
+    #settings-role-alias {
+        width: 36;
+    }
+    #settings-role-provider, #settings-role-model {
+        width: 24;
+    }
     #settings-account-actions-note {
         color: #97a6b2;
         content-align: left middle;
@@ -2745,7 +2898,7 @@ class PollySettingsPaneApp(App[None]):
     #settings-table-wrap {
         height: 1fr;
     }
-    #accounts, #projects-table, #plugins-table {
+    #accounts, #projects-table, #roles-table, #plugins-table {
         height: 1fr;
         background: #0f1317;
     }
@@ -2821,6 +2974,16 @@ class PollySettingsPaneApp(App[None]):
         super().__init__()
         self.config_path = config_path
         self.service = PollyPMService(config_path)
+        try:
+            role_alias_options = [
+                (
+                    f"{alias} -> {record.provider}/{record.model}",
+                    alias,
+                )
+                for alias, record in sorted(load_registry().aliases.items())
+            ]
+        except Exception:  # noqa: BLE001
+            role_alias_options = []
         # Widgets
         self.topbar = Static("", id="settings-topbar", markup=True)
         self.nav = Vertical(id="settings-nav")
@@ -2830,9 +2993,24 @@ class PollySettingsPaneApp(App[None]):
         self.preview = Static("", id="settings-preview", markup=True)
         self.accounts = DataTable(id="accounts")  # backwards-compat name
         self.projects_table = DataTable(id="projects-table")
+        self.roles_table = DataTable(id="roles-table")
         self.plugins_table = DataTable(id="plugins-table")
         self.kv_static = Static("", id="settings-kv", markup=True)
         self.detail = Static("", id="detail", markup=True)
+        self.role_alias_select = Select(
+            role_alias_options,
+            prompt="Registry alias",
+            allow_blank=True,
+            id="settings-role-alias",
+        )
+        self.role_provider_input = Input(
+            placeholder="provider",
+            id="settings-role-provider",
+        )
+        self.role_model_input = Input(
+            placeholder="model",
+            id="settings-role-model",
+        )
         self.search_input = Input(
             placeholder="Filter \u2026 (Enter to apply, Esc to clear)",
             id="settings-search",
@@ -2846,12 +3024,16 @@ class PollySettingsPaneApp(App[None]):
         self._nav_widgets: dict[str, Static] = {}
         self._selected_account_key: str | None = None
         self._selected_project_key: str | None = None
+        self._selected_role_key: str | None = None
         self._visible_account_rows: list[dict] = []
         self._visible_project_rows: list[dict] = []
+        self._visible_role_rows: list[dict] = []
         self._visible_plugin_rows: list[dict] = []
         self._nav_cursor: int = 0
         self._focus_target: str = "nav"  # nav | table
         self._undo_action: UndoAction | None = None
+        self._syncing_role_editor = False
+        self._suppressed_role_alias_values: list[str] = []
 
     # ------------------------------------------------------------------
     # Layout
@@ -2886,9 +3068,22 @@ class PollySettingsPaneApp(App[None]):
                             "c/o add \u00b7 x remove \u00b7 u undo",
                             id="settings-account-actions-note",
                         )
+                    with Horizontal(id="settings-role-editor"):
+                        yield self.role_alias_select
+                        yield self.role_provider_input
+                        yield self.role_model_input
+                        yield Button(
+                            "Use Fallback",
+                            id="settings-role-fallback",
+                        )
+                        yield Static(
+                            "Pick an alias or type both fields to save a custom pair.",
+                            id="settings-role-note",
+                        )
                     with Vertical(id="settings-table-wrap"):
                         yield self.accounts
                         yield self.projects_table
+                        yield self.roles_table
                         yield self.plugins_table
                         yield self.kv_static
                     yield self.detail
@@ -2906,6 +3101,11 @@ class PollySettingsPaneApp(App[None]):
         self.projects_table.zebra_stripes = True
         self.projects_table.add_columns(
             "", "Key", "Name", "PM", "Path", "Tasks", "Last activity",
+        )
+        self.roles_table.cursor_type = "row"
+        self.roles_table.zebra_stripes = True
+        self.roles_table.add_columns(
+            "Role", "Configured", "Resolved", "Source", "Warn",
         )
         self.plugins_table.cursor_type = "row"
         self.plugins_table.zebra_stripes = True
@@ -2979,6 +3179,7 @@ class PollySettingsPaneApp(App[None]):
         counts = {
             "accounts": len(data.accounts) if data else 0,
             "projects": len(data.projects) if data else 0,
+            "roles": len(data.roles) if data else 0,
             "heartbeat": len(data.heartbeat) if data else 0,
             "plugins": len(data.plugins) if data else 0,
             "planner": len(data.planner) if data else 0,
@@ -3135,6 +3336,9 @@ class PollySettingsPaneApp(App[None]):
         if key == "projects":
             self.preview.update(self._project_preview_text())
             return
+        if key == "roles":
+            self.preview.update(self._role_preview_text())
+            return
         if key == "plugins":
             self.preview.update(
                 "[b]Preview[/b]\n"
@@ -3242,11 +3446,16 @@ class PollySettingsPaneApp(App[None]):
     def _render_section(self, key: str) -> None:
         self.accounts.display = key == "accounts"
         self.projects_table.display = key == "projects"
+        self.roles_table.display = key == "roles"
         self.plugins_table.display = key == "plugins"
         self.kv_static.display = key in {"heartbeat", "planner", "inbox", "about"}
-        self.detail.display = key in {"accounts", "projects", "plugins"}
+        self.detail.display = key in {"accounts", "projects", "roles", "plugins"}
         try:
             self.query_one("#settings-account-actions").display = key == "accounts"
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.query_one("#settings-role-editor").display = key == "roles"
         except Exception:  # noqa: BLE001
             pass
 
@@ -3269,6 +3478,12 @@ class PollySettingsPaneApp(App[None]):
             self._visible_project_rows = rows
             self._render_projects(rows)
             self._render_project_detail(rows)
+        elif key == "roles":
+            rows = self._filtered_roles(data)
+            self._visible_role_rows = rows
+            self._render_roles(rows)
+            self._render_role_detail(rows)
+            self._sync_role_editor()
         elif key == "plugins":
             rows = self._filtered_plugins(data)
             self._visible_plugin_rows = rows
@@ -3531,6 +3746,206 @@ class PollySettingsPaneApp(App[None]):
         except Exception:  # noqa: BLE001
             return None
         return str(row_key.value) if row_key is not None else None
+
+    # ── Roles ───────────────────────────────────────────────────────
+
+    def _filtered_roles(self, data: SettingsData) -> list[dict]:
+        q = self._search_query.strip().lower()
+        if not q:
+            return data.roles
+        return [
+            role
+            for role in data.roles
+            if q in role["role"].lower()
+            or q in role["label"].lower()
+            or q in role["configured_summary"].lower()
+            or q in role["resolved_summary"].lower()
+            or q in role["source_label"].lower()
+            or any(q in warning.lower() for warning in role["advisories"])
+        ]
+
+    def _render_roles(self, rows: list[dict]) -> None:
+        self.roles_table.clear()
+        for row in rows:
+            source_cell = Text(
+                row["source_label"],
+                style=_role_source_style(row["source"]),
+            )
+            warn_cell = Text(
+                "!" if row["advisories"] else "",
+                style="#f0c45a",
+            )
+            self.roles_table.add_row(
+                Text(row["label"]),
+                Text(row["configured_summary"]),
+                Text(row["resolved_summary"], style="dim"),
+                source_cell,
+                warn_cell,
+                key=row["role"],
+            )
+        if self.roles_table.row_count and self._selected_role_key:
+            keys = [row["role"] for row in rows]
+            if self._selected_role_key in keys:
+                try:
+                    self.roles_table.move_cursor(
+                        row=keys.index(self._selected_role_key),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+        elif self.roles_table.row_count and self.roles_table.cursor_row < 0:
+            self.roles_table.move_cursor(row=0)
+
+    def _selected_role_row(self, rows: list[dict] | None = None) -> dict | None:
+        role_rows = self._visible_role_rows if rows is None else rows
+        if not role_rows:
+            return None
+        key = self._selected_role_key or self._current_roles_key() or role_rows[0]["role"]
+        return next((row for row in role_rows if row["role"] == key), role_rows[0])
+
+    def _render_role_detail(self, rows: list[dict]) -> None:
+        selected = self._selected_role_row(rows)
+        if selected is None:
+            self.detail.update("[dim]No roles match the current filter.[/dim]")
+            return
+        lines = [
+            f"[b]{_escape(selected['label'])}[/b]  "
+            f"[{_role_source_style(selected['source'])}]{_escape(selected['source_label'])}[/]",
+            f"[dim]Configured:[/dim] {_escape(selected['configured_summary'])}",
+            f"[dim]Resolved:[/dim]   {_escape(selected['resolved_summary'])}",
+            f"[dim]Alias path:[/dim] {_escape(selected['resolved_alias'] or '-')}",
+            "[dim]Edit:[/dim]       Pick a registry alias, or type both provider and model to save a custom pair.",
+        ]
+        if selected["configured_missing_alias"]:
+            lines.append(
+                "[#f0c45a]Configured alias is missing from the registry; PollyPM is using the next available scope.[/]"
+            )
+        if selected["advisories"]:
+            lines.append("[#f0c45a]Advisories:[/]")
+            lines.extend(f"  {_escape(message)}" for message in selected["advisories"])
+        else:
+            lines.append("[dim]Advisories:[/dim] none.")
+        self.detail.update("\n".join(lines))
+
+    def _role_preview_text(self) -> str:
+        selected = self._selected_role_row()
+        if selected is None:
+            return "[b]Preview[/b]\n[dim]No roles match the current filter.[/dim]"
+        lines = [
+            "[b]Diff preview[/b]",
+            f"Role: [b]{_escape(selected['label'])}[/b]",
+            f"Configured: [b]{_escape(selected['configured_summary'])}[/b]",
+            f"Resolved: [b]{_escape(selected['resolved_summary'])}[/b]",
+            f"Source: [b]{_escape(selected['source_label'])}[/b]",
+        ]
+        if selected["advisories"]:
+            lines.append(f"[#f0c45a]Warning:[/] {_escape(selected['advisories'][0])}")
+        else:
+            lines.append("[dim]No advisories for the current effective assignment.[/dim]")
+        return "\n".join(lines)
+
+    def _current_roles_key(self) -> str | None:
+        if self.roles_table.row_count == 0 or self.roles_table.cursor_row < 0:
+            return None
+        try:
+            row_key = self.roles_table.coordinate_to_cell_key(
+                (self.roles_table.cursor_row, 0),
+            ).row_key
+        except Exception:  # noqa: BLE001
+            return None
+        return str(row_key.value) if row_key is not None else None
+
+    def _sync_role_editor(self) -> None:
+        selected = self._selected_role_row()
+        self._syncing_role_editor = True
+        try:
+            current_alias = selected["configured_alias"] if selected is not None else None
+            missing_alias = bool(selected["configured_missing_alias"]) if selected is not None else False
+            if isinstance(current_alias, str) and current_alias and not missing_alias:
+                self._suppressed_role_alias_values.append(current_alias)
+                self.role_alias_select.value = current_alias
+            else:
+                self.role_alias_select.value = Select.NULL
+            self.role_provider_input.placeholder = (
+                str(selected["resolved_provider"]) if selected is not None else "provider"
+            )
+            self.role_model_input.placeholder = (
+                str(selected["resolved_model"]) if selected is not None else "model"
+            )
+            self.role_provider_input.value = (
+                str(selected["configured_provider"] or "") if selected is not None else ""
+            )
+            self.role_model_input.value = (
+                str(selected["configured_model"] or "") if selected is not None else ""
+            )
+            try:
+                self.query_one("#settings-role-fallback", Button).disabled = not bool(
+                    selected and selected["has_override"]
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            self._syncing_role_editor = False
+
+    def _write_global_role_assignment(
+        self,
+        role: str,
+        assignment: ModelAssignment,
+    ) -> None:
+        try:
+            config = load_config(self.config_path)
+            config.pollypm.role_assignments[role] = assignment
+            write_config(config, self.config_path, force=True)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.notify(f"Role update failed: {exc}", severity="error")
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        self._selected_role_key = role
+        self._refresh()
+        try:
+            self.notify(
+                f"Saved {_role_label(role)} role.",
+                timeout=1.5,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _clear_global_role_assignment(self, role: str) -> None:
+        try:
+            config = load_config(self.config_path)
+            config.pollypm.role_assignments.pop(role, None)
+            write_config(config, self.config_path, force=True)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.notify(f"Role update failed: {exc}", severity="error")
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        self._selected_role_key = role
+        self._refresh()
+        try:
+            self.notify(
+                f"{_role_label(role)} now uses fallback routing.",
+                timeout=1.5,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _persist_role_custom_pair_if_ready(self) -> None:
+        if self._active_section != "roles" or self._syncing_role_editor:
+            return
+        role = self._selected_role_key or self._current_roles_key()
+        if not role:
+            return
+        provider = self.role_provider_input.value.strip()
+        model = self.role_model_input.value.strip()
+        if not provider or not model:
+            return
+        self._write_global_role_assignment(
+            role,
+            ModelAssignment(provider=provider, model=model),
+        )
 
     # ── Plugins ────────────────────────────────────────────────────
 
@@ -3975,6 +4390,8 @@ class PollySettingsPaneApp(App[None]):
             return self.accounts
         if self._active_section == "projects":
             return self.projects_table
+        if self._active_section == "roles":
+            return self.roles_table
         if self._active_section == "plugins":
             return self.plugins_table
         return None
@@ -3995,6 +4412,10 @@ class PollySettingsPaneApp(App[None]):
         elif self._active_section == "projects":
             self._selected_project_key = self._current_projects_key()
             self._render_project_detail(self._visible_project_rows)
+        elif self._active_section == "roles":
+            self._selected_role_key = self._current_roles_key()
+            self._render_role_detail(self._visible_role_rows)
+            self._sync_role_editor()
         elif self._active_section == "plugins":
             self._render_plugin_detail(self._visible_plugin_rows)
         self._render_preview(self._active_section)
@@ -4007,6 +4428,12 @@ class PollySettingsPaneApp(App[None]):
 
     @on(DataTable.RowHighlighted, "#projects-table")
     def on_project_highlighted(
+        self, _event: DataTable.RowHighlighted,
+    ) -> None:
+        self._sync_selection()
+
+    @on(DataTable.RowHighlighted, "#roles-table")
+    def on_role_highlighted(
         self, _event: DataTable.RowHighlighted,
     ) -> None:
         self._sync_selection()
@@ -4037,11 +4464,54 @@ class PollySettingsPaneApp(App[None]):
     def on_remove_account_pressed(self, _event: Button.Pressed) -> None:
         self.action_remove_selected_account()
 
+    @on(Select.Changed, "#settings-role-alias")
+    def on_role_alias_changed(self, event: Select.Changed) -> None:
+        if self._active_section != "roles" or self._syncing_role_editor:
+            return
+        role = self._selected_role_key or self._current_roles_key()
+        if not role:
+            return
+        value = event.value
+        if not isinstance(value, str) or not value:
+            return
+        if value in self._suppressed_role_alias_values:
+            self._suppressed_role_alias_values.remove(value)
+            return
+        self._write_global_role_assignment(
+            role,
+            ModelAssignment(alias=value),
+        )
+
+    @on(Input.Changed, "#settings-role-provider")
+    def on_role_provider_changed(self, _event: Input.Changed) -> None:
+        self._persist_role_custom_pair_if_ready()
+
+    @on(Input.Changed, "#settings-role-model")
+    def on_role_model_changed(self, _event: Input.Changed) -> None:
+        self._persist_role_custom_pair_if_ready()
+
+    @on(Button.Pressed, "#settings-role-fallback")
+    def on_role_fallback_pressed(self, _event: Button.Pressed) -> None:
+        if self._active_section != "roles":
+            return
+        role = self._selected_role_key or self._current_roles_key()
+        if not role:
+            return
+        self._clear_global_role_assignment(role)
+
     @on(DataTable.RowSelected, "#accounts")
     def on_account_selected(self, _event: DataTable.RowSelected) -> None:
         self._selected_account_key = self._current_accounts_key()
         if self.data is not None:
             self._render_account_detail(self._visible_account_rows)
+            self._render_preview(self._active_section)
+
+    @on(DataTable.RowSelected, "#roles-table")
+    def on_role_selected(self, _event: DataTable.RowSelected) -> None:
+        self._selected_role_key = self._current_roles_key()
+        if self.data is not None:
+            self._render_role_detail(self._visible_role_rows)
+            self._sync_role_editor()
             self._render_preview(self._active_section)
 
     def _add_account(self, provider: ProviderKind) -> None:

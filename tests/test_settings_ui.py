@@ -18,7 +18,53 @@ from pathlib import Path
 import pytest
 from textual.widgets import Button
 
-from pollypm.models import ProviderKind
+from pollypm.model_registry import AliasRecord, Registry, RoleRequirements
+from pollypm.models import ModelAssignment, ProviderKind
+
+
+def _fake_role_registry() -> Registry:
+    return Registry(
+        aliases={
+            "codex-gpt-5.4": AliasRecord(
+                provider="codex",
+                model="gpt-5.4",
+                capabilities=("reasoning", "tool_use", "long_context", "strong_planning"),
+            ),
+            "opus-4.7": AliasRecord(
+                provider="claude",
+                model="claude-opus-4-7",
+                capabilities=("reasoning", "tool_use", "long_context", "strong_planning"),
+            ),
+            "sonnet-4.6": AliasRecord(
+                provider="claude",
+                model="claude-sonnet-4-6",
+                capabilities=("reasoning", "tool_use", "long_context"),
+            ),
+            "haiku-4.5": AliasRecord(
+                provider="claude",
+                model="claude-haiku-4-5-20251001",
+                capabilities=("tool_use", "weak_planning"),
+            ),
+        },
+        role_requirements={
+            "operator_pm": RoleRequirements(
+                preferred=("reasoning", "long_context"),
+                discouraged=("weak_planning",),
+            ),
+            "architect": RoleRequirements(
+                preferred=("strong_planning", "reasoning"),
+                discouraged=("weak_planning",),
+            ),
+            "worker": RoleRequirements(
+                preferred=("tool_use", "reasoning"),
+                discouraged=(),
+            ),
+            "reviewer": RoleRequirements(
+                preferred=("reasoning", "long_context"),
+                discouraged=("weak_planning",),
+            ),
+        },
+    )
 
 
 def _fake_status(
@@ -87,6 +133,7 @@ class _FakeProject:
         self.path = Path("/tmp") / "projects" / key
         self.persona_name = None
         self.tracked = tracked
+        self.role_assignments: dict[str, ModelAssignment] = {}
 
     def display_label(self) -> str:
         return self.name or self.key
@@ -109,6 +156,7 @@ class _FakePollyPM:
         self.heartbeat_backend = "local"
         self.scheduler_backend = "inline"
         self.timezone = ""
+        self.role_assignments: dict[str, ModelAssignment] = {}
 
 
 class _FakeProjectSettings:
@@ -280,6 +328,10 @@ def settings_env(tmp_path: Path, monkeypatch):
         ),
     ]
     fake_config = _FakeConfig(tmp_path, projects=projects)
+    fake_config.pollypm.role_assignments = {
+        "architect": ModelAssignment(alias="haiku-4.5"),
+        "worker": ModelAssignment(alias="codex-gpt-5.4"),
+    }
     fake_config.accounts = {
         "claude_demo": _FakeAccount("claude_demo", ProviderKind.CLAUDE, "demo@example.com"),
         "codex_demo": _FakeAccount("codex_demo", ProviderKind.CODEX, "codex@example.com"),
@@ -340,6 +392,7 @@ def settings_env(tmp_path: Path, monkeypatch):
         "pollypm.cockpit_settings_history.Path.home",
         lambda: tmp_path / "home",
     )
+    monkeypatch.setattr("pollypm.cockpit_ui.load_registry", _fake_role_registry)
     service = _FakeService(statuses, fake_config)
 
     from pollypm.cockpit_ui import PollySettingsPaneApp
@@ -373,6 +426,7 @@ def test_settings_mounts_all_sections(settings_env) -> None:
             assert set(app._nav_widgets.keys()) == {
                 "accounts",
                 "projects",
+                "roles",
                 "heartbeat",
                 "plugins",
                 "planner",
@@ -450,6 +504,36 @@ def test_projects_section_lists_registered_projects_and_preview(settings_env) ->
             preview = str(app.preview.render())
             assert "tracked" in preview
             assert "u undo" in preview.lower()
+
+    _run(body())
+
+
+def test_roles_section_lists_resolved_assignments_and_advisories(settings_env) -> None:
+    app = settings_env["app"]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("tab")
+            await pilot.pause()
+            await pilot.press("tab")
+            await pilot.pause()
+            assert app._active_section == "roles"
+            assert app.roles_table.row_count == 4
+            detail = str(app.detail.render())
+            assert "Operator PM" in detail
+            assert "fallback" in detail
+
+            app.roles_table.move_cursor(row=1)
+            app._sync_selection()
+            await pilot.pause()
+            detail = str(app.detail.render())
+            assert "Architect" in detail
+            assert "global" in detail
+            assert "weak_planning" in detail
+            preview = str(app.preview.render())
+            assert "Warning" in preview
+            assert "haiku-4.5" in preview
 
     _run(body())
 
@@ -555,6 +639,142 @@ def test_add_and_remove_account_actions(settings_env, monkeypatch) -> None:
     _run(body())
 
 
+def test_roles_section_persists_alias_and_custom_pair(tmp_path: Path, monkeypatch) -> None:
+    from pollypm.config import load_config, write_config
+    from pollypm.models import (
+        AccountConfig,
+        KnownProject,
+        PollyPMConfig,
+        PollyPMSettings,
+        ProjectKind,
+        ProjectSettings,
+        SessionConfig,
+    )
+
+    config_path = tmp_path / "pollypm.toml"
+    base_dir = tmp_path
+    project_root = tmp_path / "alpha"
+    project_root.mkdir()
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=base_dir,
+            base_dir=base_dir / ".pollypm",
+            logs_dir=base_dir / ".pollypm" / "logs",
+            snapshots_dir=base_dir / ".pollypm" / "snapshots",
+            state_db=base_dir / ".pollypm" / "state.db",
+        ),
+        pollypm=PollyPMSettings(
+            controller_account="claude_primary",
+            role_assignments={
+                "worker": ModelAssignment(alias="codex-gpt-5.4"),
+            },
+        ),
+        accounts={
+            "claude_primary": AccountConfig(
+                name="claude_primary",
+                provider=ProviderKind.CLAUDE,
+                home=base_dir / "homes" / "claude_primary",
+            ),
+            "codex_primary": AccountConfig(
+                name="codex_primary",
+                provider=ProviderKind.CODEX,
+                home=base_dir / "homes" / "codex_primary",
+            ),
+        },
+        sessions={
+            "operator": SessionConfig(
+                name="operator",
+                role="operator-pm",
+                provider=ProviderKind.CLAUDE,
+                account="claude_primary",
+                cwd=base_dir,
+            )
+        },
+        projects={
+            "alpha": KnownProject(
+                key="alpha",
+                path=project_root,
+                kind=ProjectKind.FOLDER,
+            ),
+        },
+    )
+    write_config(config, config_path, force=True)
+
+    monkeypatch.setattr("pollypm.cockpit_ui.load_cached_account_usage", lambda _p: {})
+    monkeypatch.setattr(
+        "pollypm.cockpit_ui._collect_recent_tasks_by_account",
+        lambda _config, _statuses, max_per_account=3: {},
+    )
+    monkeypatch.setattr("pollypm.cockpit_ui.load_registry", _fake_role_registry)
+    monkeypatch.setattr(
+        "pollypm.cockpit_settings_history.Path.home",
+        lambda: tmp_path / "home",
+    )
+
+    from pollypm.cockpit_ui import PollySettingsPaneApp
+
+    app = PollySettingsPaneApp(config_path)
+    app.service = _FakeService(
+        [
+            _fake_status("claude_primary", email="claude@example.com"),
+            _fake_status(
+                "codex_primary",
+                provider=ProviderKind.CODEX,
+                email="codex@example.com",
+            ),
+        ],
+        load_config(config_path),
+    )
+
+    async def body() -> None:
+        async with app.run_test(size=(150, 42)) as pilot:
+            await pilot.pause()
+            await pilot.press("tab")
+            await pilot.pause()
+            await pilot.press("tab")
+            await pilot.pause()
+            assert app._active_section == "roles"
+
+            app.roles_table.move_cursor(row=1)
+            app._sync_selection()
+            await pilot.pause()
+            app._write_global_role_assignment("architect", ModelAssignment(alias="sonnet-4.6"))
+            await pilot.pause()
+            reloaded = load_config(config_path)
+            assert reloaded.pollypm.role_assignments["architect"] == ModelAssignment(
+                alias="sonnet-4.6"
+            )
+
+            app.role_provider_input.value = "codex"
+            await pilot.pause()
+            app.role_model_input.value = "gpt-5.4-custom"
+            app._write_global_role_assignment(
+                "architect",
+                ModelAssignment(provider="codex", model="gpt-5.4-custom"),
+            )
+            await pilot.pause()
+            reloaded = load_config(config_path)
+            assert reloaded.pollypm.role_assignments["architect"] == ModelAssignment(
+                provider="codex",
+                model="gpt-5.4-custom",
+            )
+            detail = str(app.detail.render())
+            assert "codex/gpt-5.4-custom" in detail
+            fallback_button = app.query_one("#settings-role-fallback", Button)
+            assert fallback_button.disabled is False
+
+            app._clear_global_role_assignment("architect")
+            await pilot.pause()
+            reloaded = load_config(config_path)
+            assert "architect" not in reloaded.pollypm.role_assignments
+            detail = str(app.detail.render())
+            assert "fallback" in detail
+            fallback_button = app.query_one("#settings-role-fallback", Button)
+            assert fallback_button.disabled is True
+
+    _run(body())
+
+
 def test_disabled_projects_render_dimmed(settings_env) -> None:
     app = settings_env["app"]
 
@@ -585,7 +805,7 @@ def test_about_section_lists_version_and_disk(settings_env) -> None:
     async def body() -> None:
         async with app.run_test(size=(140, 40)) as pilot:
             await pilot.pause()
-            for _ in range(6):
+            for _ in range(7):
                 await pilot.press("tab")
                 await pilot.pause()
             assert app._active_section == "about"
@@ -665,6 +885,7 @@ def test_mount_perf_budget_for_20_projects_5_accounts(tmp_path: Path, monkeypatc
         "pollypm.cockpit_ui.collect_settings_projects",
         _collect_project_rows,
     )
+    monkeypatch.setattr("pollypm.cockpit_ui.load_registry", _fake_role_registry)
     from pollypm.cockpit_ui import PollySettingsPaneApp
 
     app = PollySettingsPaneApp(config_path)

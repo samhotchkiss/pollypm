@@ -9,13 +9,65 @@ import pytest
 
 from textual.widgets import Button
 
-from pollypm.models import ProviderKind
+from pollypm.model_registry import AliasRecord, Registry, RoleRequirements
+from pollypm.models import ModelAssignment, ProviderKind
+
+
+def _fake_role_registry() -> Registry:
+    return Registry(
+        aliases={
+            "codex-gpt-5.4": AliasRecord(
+                provider="codex",
+                model="gpt-5.4",
+                capabilities=("reasoning", "tool_use", "long_context", "strong_planning"),
+            ),
+            "opus-4.7": AliasRecord(
+                provider="claude",
+                model="claude-opus-4-7",
+                capabilities=("reasoning", "tool_use", "long_context", "strong_planning"),
+            ),
+            "sonnet-4.6": AliasRecord(
+                provider="claude",
+                model="claude-sonnet-4-6",
+                capabilities=("reasoning", "tool_use", "long_context"),
+            ),
+            "haiku-4.5": AliasRecord(
+                provider="claude",
+                model="claude-haiku-4-5-20251001",
+                capabilities=("tool_use", "weak_planning"),
+            ),
+        },
+        role_requirements={
+            "architect": RoleRequirements(
+                preferred=("strong_planning", "reasoning"),
+                discouraged=("weak_planning",),
+            ),
+            "worker": RoleRequirements(
+                preferred=("tool_use", "reasoning"),
+                discouraged=(),
+            ),
+            "reviewer": RoleRequirements(
+                preferred=("reasoning", "long_context"),
+                discouraged=("weak_planning",),
+            ),
+        },
+    )
 
 
 class _FakeProject:
     def __init__(self, key: str, *, name: str | None = None) -> None:
         self.key = key
         self.name = name or key.title()
+        self.role_assignments: dict[str, ModelAssignment] = {}
+
+
+class _FakePollyPM:
+    def __init__(self) -> None:
+        self.release_channel = "stable"
+        self.role_assignments = {
+            "architect": ModelAssignment(alias="haiku-4.5"),
+            "worker": ModelAssignment(alias="codex-gpt-5.4"),
+        }
 
 
 class _FakeSession:
@@ -55,6 +107,7 @@ class _FakeUsage:
 
 class _FakeConfig:
     def __init__(self) -> None:
+        self.pollypm = _FakePollyPM()
         self.projects = {"alpha": _FakeProject("alpha", name="Alpha Project")}
         self.sessions = {
             "worker-alpha": _FakeSession(
@@ -118,6 +171,10 @@ def project_settings_env(tmp_path: Path, monkeypatch):
         "pollypm.cockpit_settings_history.Path.home",
         lambda: tmp_path / "home",
     )
+    monkeypatch.setattr(
+        "pollypm.cockpit_project_settings.load_registry",
+        _fake_role_registry,
+    )
     from pollypm.cockpit_project_settings import PollyProjectSettingsApp
 
     return {
@@ -159,6 +216,21 @@ def test_project_settings_renders_worker_and_account(project_settings_env) -> No
             assert "22% left" in preview
             assert "Codex target" in preview
             assert "Default account" in preview
+
+    _run(body())
+
+
+def test_project_settings_renders_project_role_rows(project_settings_env) -> None:
+    app = project_settings_env["app"]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 36)) as pilot:
+            await pilot.pause()
+            assert app.role_table.row_count == 3
+            detail = str(app.query_one("#project-role-detail").render())
+            assert "Architect" in detail
+            assert "inherited global" in detail
+            assert "weak_planning" in detail
 
     _run(body())
 
@@ -233,6 +305,124 @@ def test_project_settings_buttons_include_inline_key_hints(project_settings_env)
             assert app.query_one("#switch-claude", Button).label.plain == "[C] Switch to Claude"
             assert app.query_one("#switch-codex", Button).label.plain == "[X] Switch to Codex"
             assert app.query_one("#undo", Button).label.plain == "[U] Undo"
+
+    _run(body())
+
+
+def test_project_settings_role_editor_persists_override_custom_and_inherit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from pollypm.config import load_config, write_config
+    from pollypm.models import (
+        AccountConfig,
+        KnownProject,
+        PollyPMConfig,
+        PollyPMSettings,
+        ProjectKind,
+        ProjectSettings,
+        SessionConfig,
+    )
+
+    config_path = tmp_path / "pollypm.toml"
+    project_root = tmp_path / "alpha"
+    project_root.mkdir()
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm" / "logs",
+            snapshots_dir=tmp_path / ".pollypm" / "snapshots",
+            state_db=tmp_path / ".pollypm" / "state.db",
+        ),
+        pollypm=PollyPMSettings(
+            controller_account="claude_primary",
+            role_assignments={
+                "architect": ModelAssignment(alias="opus-4.7"),
+                "worker": ModelAssignment(alias="codex-gpt-5.4"),
+            },
+        ),
+        accounts={
+            "claude_primary": AccountConfig(
+                name="claude_primary",
+                provider=ProviderKind.CLAUDE,
+                home=tmp_path / "homes" / "claude_primary",
+            ),
+            "codex_primary": AccountConfig(
+                name="codex_primary",
+                provider=ProviderKind.CODEX,
+                home=tmp_path / "homes" / "codex_primary",
+            ),
+        },
+        sessions={
+            "worker_alpha": SessionConfig(
+                name="worker_alpha",
+                role="worker",
+                provider=ProviderKind.CLAUDE,
+                account="claude_primary",
+                cwd=project_root,
+                project="alpha",
+            )
+        },
+        projects={
+            "alpha": KnownProject(
+                key="alpha",
+                path=project_root,
+                kind=ProjectKind.FOLDER,
+            ),
+        },
+    )
+    write_config(config, config_path, force=True)
+
+    monkeypatch.setattr(
+        "pollypm.cockpit_project_settings.load_cached_account_usage",
+        lambda _path: {},
+    )
+    monkeypatch.setattr(
+        "pollypm.cockpit_project_settings.load_registry",
+        _fake_role_registry,
+    )
+    monkeypatch.setattr(
+        "pollypm.cockpit_settings_history.Path.home",
+        lambda: tmp_path / "home",
+    )
+
+    from pollypm.cockpit_project_settings import PollyProjectSettingsApp
+
+    app = PollyProjectSettingsApp(config_path, "alpha")
+
+    async def body() -> None:
+        async with app.run_test(size=(150, 38)) as pilot:
+            await pilot.pause()
+            app.role_table.move_cursor(row=0)
+            await pilot.pause()
+            app._save_project_role_assignment("architect", ModelAssignment(alias="sonnet-4.6"))
+            await pilot.pause()
+            reloaded = load_config(config_path)
+            assert reloaded.projects["alpha"].role_assignments["architect"] == ModelAssignment(
+                alias="sonnet-4.6"
+            )
+
+            app.role_provider_input.value = "codex"
+            await pilot.pause()
+            app.role_model_input.value = "gpt-5.4-custom"
+            app._save_project_role_assignment(
+                "architect",
+                ModelAssignment(provider="codex", model="gpt-5.4-custom"),
+            )
+            await pilot.pause()
+            reloaded = load_config(config_path)
+            assert reloaded.projects["alpha"].role_assignments["architect"] == ModelAssignment(
+                provider="codex",
+                model="gpt-5.4-custom",
+            )
+
+            app._clear_project_role_override("architect")
+            await pilot.pause()
+            reloaded = load_config(config_path)
+            assert "architect" not in reloaded.projects["alpha"].role_assignments
+            detail = str(app.query_one("#project-role-detail").render())
+            assert "inherited global" in detail
 
     _run(body())
 
@@ -313,6 +503,10 @@ def test_project_settings_release_channel_picker_persists(tmp_path: Path, monkey
     monkeypatch.setattr(
         "pollypm.cockpit_project_settings.Path.home",
         lambda: fake_home,
+    )
+    monkeypatch.setattr(
+        "pollypm.cockpit_project_settings.load_registry",
+        _fake_role_registry,
     )
 
     from pollypm.cockpit_project_settings import PollyProjectSettingsApp

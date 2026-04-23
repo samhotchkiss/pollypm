@@ -167,10 +167,29 @@ def _resolve_db_path(db: str, project: str | None = None) -> Path:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         return db_path
 
-    # The *project* argument used to route to a per-project DB. Post-#339
-    # it's purely a filter passed into the service layer; it no longer
-    # affects which DB file we open.
-    _ = project
+    # Reviewer regression (tonight): tasks created via the architect's
+    # per-project emit flow live in ``<project>/.pollypm/state.db`` — the
+    # workspace-root default never sees them, so ``pm task get
+    # polly_remote/9`` raises "not found" from Russell's session even
+    # though the task exists. When a ``project`` hint is supplied AND
+    # that project is registered with a real per-project state.db, we
+    # route there. The workspace-root default stays in place for every
+    # non-project command (notify / inbox / etc.).
+    if project:
+        try:
+            from pollypm.config import load_config
+
+            config = load_config()
+            known = getattr(config, "projects", {}) or {}
+            project_cfg = known.get(project)
+            if project_cfg is not None:
+                project_db = (
+                    Path(project_cfg.path) / ".pollypm" / "state.db"
+                )
+                if project_db.exists():
+                    return project_db
+        except Exception:
+            pass
 
     # Default resolution: workspace-root DB. Every `pm notify`/`pm inbox`
     # call without an explicit --db lands here, so items are always

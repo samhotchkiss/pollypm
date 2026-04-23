@@ -382,16 +382,33 @@ def set_bypass(enabled: bool) -> None:
 
 
 def _format_refuse_start_message(status: MigrationStatus) -> str:
-    lines = [
-        "PollyPM cannot start: unapplied schema migrations detected.",
-        f"  DB: {status.db_path}",
-        format_pending_summary(status),
-        "",
-        "Recovery:",
-        "  pm migrate --check    # dry-run the migrations against a DB clone",
-        "  pm migrate --apply    # apply them to the live DB",
+    """Render the refuse-start gate's refusal in the four-field
+    structured shape (#760). Users see the same layout anywhere
+    PollyPM surfaces a user-facing error."""
+    from pollypm.structured_message import StructuredUserMessage
+
+    count = len(status.pending)
+    plural = "s" if count != 1 else ""
+    pending_lines = [
+        f"  [{item.namespace}] v{item.version}: {item.description}"
+        for item in status.pending
     ]
-    return "\n".join(lines)
+    details = "\n".join([
+        f"DB: {status.db_path}",
+        f"{count} pending migration{plural}:",
+        *pending_lines,
+    ])
+    msg = StructuredUserMessage(
+        summary=f"Cannot start — {count} pending schema migration{plural} on state.db.",
+        why=(
+            "Your PollyPM was upgraded since last boot and the database "
+            "needs an update before any session can connect. Running "
+            "without it risks cross-version data corruption."
+        ),
+        next_action="pm migrate --apply",
+        details=details,
+    )
+    return msg.render_cli(show_details=True)
 
 
 def require_no_pending_or_exit(db_path: Path) -> None:

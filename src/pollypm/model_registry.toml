@@ -1,0 +1,35 @@
+[aliases."opus-4.7"]
+provider = "claude"
+model = "claude-opus-4-7"
+capabilities = ["reasoning", "tool_use", "long_context", "strong_planning"]
+
+[aliases."sonnet-4.6"]
+provider = "claude"
+model = "claude-sonnet-4-6"
+capabilities = ["reasoning", "tool_use", "long_context", "balanced_planning"]
+
+[aliases."haiku-4.5"]
+provider = "claude"
+model = "claude-haiku-4-5-20251001"
+capabilities = ["tool_use", "fast", "weak_planning"]
+
+[aliases."codex-gpt-5.4"]
+provider = "codex"
+model = "gpt-5.4"
+capabilities = ["reasoning", "tool_use", "long_context", "strong_planning"]
+
+[role_requirements.operator_pm]
+preferred = ["reasoning", "long_context"]
+discouraged = ["weak_planning"]
+
+[role_requirements.architect]
+preferred = ["strong_planning", "reasoning"]
+discouraged = ["weak_planning"]
+
+[role_requirements.worker]
+preferred = ["tool_use", "reasoning"]
+discouraged = []
+
+[role_requirements.reviewer]
+preferred = ["reasoning", "long_context"]
+discouraged = ["weak_planning"]

@@ -43,6 +43,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 pollypm = [
+  "model_registry.toml",
   "plugins_builtin/*/pollypm-plugin.toml",
   "plugins_builtin/*/profiles/*.md",
   "plugins_builtin/*/flows/*.yaml",

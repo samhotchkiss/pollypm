@@ -563,11 +563,19 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 if stall_class != "unrecoverable_stall":
                     api.clear_alert(context.session_name, "suspected_loop")
                 else:
+                    # #760 — concrete actionable copy: name the role,
+                    # say what's wrong in plain English, give the
+                    # next step as a copy-pasteable command.
                     api.raise_alert(
                         context.session_name,
                         "suspected_loop",
                         "warn",
-                        f"Window {context.window_name} has produced effectively the same snapshot for 3 heartbeats",
+                        (
+                            f"{context.role or 'session'} "
+                            f"{context.session_name} stalled — no new output "
+                            f"for 3 heartbeats with queued work. "
+                            f"Try: pm session restart {context.session_name}"
+                        ),
                     )
                     alerts.append("suspected_loop")
                     # After 5 consecutive identical snapshots, queue a Haiku triage
@@ -592,15 +600,17 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         except Exception:  # noqa: BLE001
             drifted_to = None
         if drifted_to:
+            # #760 — actionable copy: explain what drifted, name the
+            # restart command the user can copy-paste, keep the
+            # observed-identity detail present for context.
             api.raise_alert(
                 context.session_name,
                 "persona_drift_detected",
                 "error",
                 (
-                    f"Session {context.session_name} (role={context.role}) "
-                    f"appears to have drifted — pane shows identity claim "
-                    f"as {drifted_to!r}. Restart the session to reload "
-                    f"the correct role guide."
+                    f"{context.session_name} ({context.role}) identified "
+                    f"itself as {drifted_to!r} mid-session — identity drift. "
+                    f"Try: pm session restart {context.session_name}"
                 ),
             )
             alerts.append("persona_drift_detected")

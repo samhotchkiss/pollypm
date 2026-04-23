@@ -396,6 +396,77 @@ def test_a_keybinding_triggers_view_alerts_action(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 7a. Operational alerts never toast (#765)
+# ---------------------------------------------------------------------------
+
+
+def test_operational_alert_types_are_suppressed_from_toasts(inbox_env, inbox_app) -> None:
+    """Heartbeat classification signals (suspected_loop, stabilize_failed,
+    needs_followup) are operational — they should appear in the activity
+    log / alert list but MUST NOT pop as toasts. Toasts are an
+    interruption primitive reserved for user-actionable events. See #765.
+    """
+    async def body() -> None:
+        async with inbox_app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            notifier = inbox_app._alert_notifier
+            assert notifier is not None
+
+            _install_fake_alerts(notifier, [
+                _FakeAlert(
+                    alert_id=101,
+                    severity="warn",
+                    alert_type="suspected_loop",
+                    message="same snapshot for 3 heartbeats",
+                ),
+                _FakeAlert(
+                    alert_id=102,
+                    severity="warn",
+                    alert_type="stabilize_failed",
+                    message="stabilize step not converging",
+                ),
+                _FakeAlert(
+                    alert_id=103,
+                    severity="warn",
+                    alert_type="needs_followup",
+                    message="follow-up queued",
+                ),
+                # Non-operational alert should still toast — prove the
+                # filter doesn't swallow real action-required signals.
+                _FakeAlert(
+                    alert_id=104,
+                    severity="error",
+                    alert_type="auth_broken",
+                    message="account auth failure",
+                ),
+            ])
+            mounted = notifier.poll_now()
+            await pilot.pause()
+
+            # Only the non-operational alert produced a toast.
+            assert len(mounted) == 1
+            toast = mounted[0]
+            assert "auth failure" in str(toast.render())
+            # Operational alerts were still marked seen (so the next
+            # poll doesn't re-consider them).
+            assert len(notifier._seen_alert_ids) == 4
+    _run(body())
+
+
+def test_is_operational_alert_helper() -> None:
+    """Unit test for the operational-type detector — covers the
+    canonical set plus a couple of negative cases."""
+    from pollypm.cockpit_alerts import _is_operational_alert
+    assert _is_operational_alert("suspected_loop") is True
+    assert _is_operational_alert("stabilize_failed") is True
+    assert _is_operational_alert("needs_followup") is True
+    assert _is_operational_alert("auth_broken") is False
+    assert _is_operational_alert("persona_swap_detected") is False
+    assert _is_operational_alert("") is False
+    assert _is_operational_alert("random_type") is False
+
+
+# ---------------------------------------------------------------------------
 # 7. Esc on a toast dismisses it
 # ---------------------------------------------------------------------------
 

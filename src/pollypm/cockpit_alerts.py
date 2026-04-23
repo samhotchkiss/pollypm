@@ -33,6 +33,25 @@ _ALERT_TOAST_SEVERITY_ICONS = {
     "info": "\U0001f535",
 }
 
+# #765 — Operational alert types never become toasts. They're heartbeat
+# classification signals (the heartbeat noticed the snapshot is stable,
+# a stabilize step didn't converge, a follow-up is queued) that are
+# useful as activity-log / dashboard-list entries but are NOT user-
+# actionable. Toasting them trains the user to dismiss toasts, which
+# then also dismisses the real action-required ones. Matches the filter
+# already used in dashboard_data.py:377, cockpit_ui.py:7884, and
+# cockpit.py:172.
+_OPERATIONAL_ALERT_TYPES: frozenset[str] = frozenset({
+    "suspected_loop",
+    "stabilize_failed",
+    "needs_followup",
+})
+
+
+def _is_operational_alert(alert_type: str) -> bool:
+    return (alert_type or "") in _OPERATIONAL_ALERT_TYPES
+
+
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
@@ -321,7 +340,13 @@ class AlertNotifier:
         return ("sk", session, alert_type, updated)
 
     def poll_now(self) -> list[AlertToast]:
-        """Fetch + mount any new toasts immediately. Returns the new list."""
+        """Fetch + mount any new toasts immediately. Returns the new list.
+
+        Operational alert types (``suspected_loop`` etc.) are filtered
+        out here — they still appear in the alert list and activity
+        feed, but they don't interrupt the user with a toast. See
+        :data:`_OPERATIONAL_ALERT_TYPES` and issue #765.
+        """
         try:
             alerts = self._fetch_alerts()
         except Exception:  # noqa: BLE001
@@ -331,7 +356,12 @@ class AlertNotifier:
             key = self._dedup_key(record)
             if key in self._seen_alert_ids:
                 continue
+            # Dedup even for suppressed types so the same operational
+            # signal doesn't trip the filter again next poll.
             self._seen_alert_ids.add(key)
+            alert_type = getattr(record, "alert_type", "")
+            if _is_operational_alert(alert_type):
+                continue  # activity log / dashboard, never a toast
             toast = self._mount_toast(record)
             if toast is not None:
                 mounted.append(toast)

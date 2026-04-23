@@ -79,6 +79,15 @@ def test_injection_accepts_explicit_guide_text_for_isolation():
     assert "Body goes here." not in out
 
 
+def test_injection_uses_explicit_guide_reference_when_provided():
+    out = build_worker_protocol_injection(
+        session_role="worker",
+        guide_reference="/tmp/project/.pollypm/project-guides/worker.md",
+    )
+    assert "/tmp/project/.pollypm/project-guides/worker.md" in out
+    assert "docs/worker-guide.md" not in out
+
+
 def test_injection_uses_pointer_when_guide_missing():
     """Blank guide text no longer inlines the guide; it still points
     workers at docs/worker-guide.md."""
@@ -214,6 +223,20 @@ def test_tmux_service_injects_worker_protocol_for_worker(tmux_service):
     assert persona in out
     # Protocol appears above the persona.
     assert out.index(WORKER_PROTOCOL_HEADING) < out.index(persona)
+
+
+def test_tmux_service_uses_custom_worker_guide_reference(tmux_service):
+    persona = "You are a worker persona."
+    out = tmux_service._inject_memory_into_prompt(
+        initial_input=persona,
+        session_role="worker",
+        task_title=None,
+        task_description=None,
+        guide_reference="/tmp/project/.pollypm/project-guides/worker.md",
+        user_id="operator",
+    )
+    assert "/tmp/project/.pollypm/project-guides/worker.md" in out
+    assert persona in out
 
 
 @pytest.mark.parametrize("role", ["pm", "reviewer", "supervisor", "triage"])

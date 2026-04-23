@@ -37,15 +37,16 @@ from pollypm.config import (
     load_config,
     resolve_config_path,
 )
+from pollypm.project_guides import init_project_guide, list_project_guides
 
 
 project_app = typer.Typer(
     help=help_with_examples(
-        "Planner-backed project lifecycle (new / plan / replan).",
+        "Planner-backed project lifecycle (new / plan / replan / guides).",
         [
             ("pm project new ~/dev/my-app", "register a project and offer to plan it"),
             ("pm project plan my_app", "queue a fresh planning task"),
-            ("pm project replan my_app", "run the drift-aware planner again"),
+            ("pm project init-guide architect --project my_app", "fork the architect guide into the project"),
         ],
     ),
     no_args_is_help=True,
@@ -336,6 +337,75 @@ def _plan_project_task(
             priority="high",
         )
     return task
+
+
+# ---------------------------------------------------------------------------
+# pm project init-guide / list-guides
+# ---------------------------------------------------------------------------
+
+
+@project_app.command("init-guide")
+def init_guide_cmd(
+    role: str = typer.Argument(
+        ...,
+        help="Role guide to fork: architect, reviewer, or worker.",
+    ),
+    project: Optional[str] = typer.Option(
+        None,
+        "--project",
+        help=(
+            "Project key, alias, or path. Defaults to the project whose "
+            "root matches the current directory."
+        ),
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Overwrite an existing project-local guide.",
+    ),
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path.",
+    ),
+) -> None:
+    """Fork a built-in role guide into ``.pollypm/project-guides``."""
+    path = _require_config(config_path)
+    key, project_path = _resolve_project_key(path, project)
+    try:
+        guide = init_project_guide(project_path, role, force=force)
+    except (FileExistsError, RuntimeError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        f"Wrote project-local {guide.role} guide for '{key}' at "
+        f"{guide.path} (forked_from: {guide.forked_from})."
+    )
+
+
+@project_app.command("list-guides")
+def list_guides_cmd(
+    project: Optional[str] = typer.Option(
+        None,
+        "--project",
+        help=(
+            "Project key, alias, or path. Defaults to the project whose "
+            "root matches the current directory."
+        ),
+    ),
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path.",
+    ),
+) -> None:
+    """List project-local role guides for a project."""
+    path = _require_config(config_path)
+    key, project_path = _resolve_project_key(path, project)
+    guides = list_project_guides(project_path)
+    if not guides:
+        typer.echo(f"No project-local guides for '{key}'.")
+        return
+    typer.echo(f"Project-local guides for '{key}':")
+    for guide in guides:
+        forked = guide.forked_from or "unknown"
+        typer.echo(f"- {guide.role}: {guide.path} (forked_from: {forked})")
 
 
 # ---------------------------------------------------------------------------

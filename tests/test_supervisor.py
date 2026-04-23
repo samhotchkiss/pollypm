@@ -646,6 +646,48 @@ def test_control_sessions_use_agent_profiles_for_prompts(tmp_path: Path) -> None
     assert "heartbeat supervisor" in launches["heartbeat"].session.prompt
 
 
+def test_architect_launch_prefers_project_local_guide(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.sessions["architect"] = SessionConfig(
+        name="architect",
+        role="architect",
+        provider=ProviderKind.CLAUDE,
+        account="claude_controller",
+        cwd=tmp_path,
+        project="pollypm",
+        window_name="architect-pollypm",
+    )
+    guide_path = tmp_path / ".pollypm" / "project-guides" / "architect.md"
+    guide_path.parent.mkdir(parents=True, exist_ok=True)
+    guide_path.write_text("---\nforked_from: test-sha\n---\n\n# Custom architect guide\n")
+
+    supervisor = Supervisor(config)
+    launches = {launch.session.name: launch for launch in supervisor.plan_launches()}
+
+    assert launches["architect"].session.prompt == "# Custom architect guide"
+
+
+def test_reviewer_launch_prefers_project_local_guide(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.sessions["reviewer"] = SessionConfig(
+        name="reviewer",
+        role="reviewer",
+        provider=ProviderKind.CLAUDE,
+        account="claude_controller",
+        cwd=tmp_path,
+        project="pollypm",
+        window_name="reviewer-pollypm",
+    )
+    guide_path = tmp_path / ".pollypm" / "project-guides" / "reviewer.md"
+    guide_path.parent.mkdir(parents=True, exist_ok=True)
+    guide_path.write_text("---\nforked_from: test-sha\n---\n\n# Custom reviewer guide\n")
+
+    supervisor = Supervisor(config)
+    launches = {launch.session.name: launch for launch in supervisor.plan_launches()}
+
+    assert "# Custom reviewer guide" in launches["reviewer"].session.prompt
+
+
 def test_open_permissions_default_can_disable_launch_args(tmp_path: Path) -> None:
     config = _config(tmp_path)
     config.pollypm.open_permissions_by_default = False

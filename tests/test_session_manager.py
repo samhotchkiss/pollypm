@@ -257,6 +257,30 @@ def manager(mock_tmux, mock_svc, tmp_project):
     return SessionManager(mock_tmux, mock_svc, tmp_project)
 
 
+def test_build_task_prompt_points_at_builtin_worker_guide(manager, tmp_project) -> None:
+    prompt = manager._build_task_prompt(
+        "proj/1",
+        tmp_project / ".pollypm" / "worktrees" / "proj-1",
+    )
+
+    assert "## Worker Guide" in prompt
+    assert "docs/worker-guide.md" in prompt
+
+
+def test_build_task_prompt_prefers_project_local_worker_guide(manager, tmp_project) -> None:
+    guide_path = tmp_project / ".pollypm" / "project-guides" / "worker.md"
+    guide_path.parent.mkdir(parents=True, exist_ok=True)
+    guide_path.write_text("---\nforked_from: test-sha\n---\n\n# Custom worker guide\n")
+
+    prompt = manager._build_task_prompt(
+        "proj/1",
+        tmp_project / ".pollypm" / "worktrees" / "proj-1",
+    )
+
+    assert str(guide_path.resolve()) in prompt
+    assert "docs/worker-guide.md" not in prompt
+
+
 def _decode_local_runtime_payload(command: str) -> dict[str, object]:
     outer = shlex.split(command)
     assert outer[:2] == ["sh", "-lc"]

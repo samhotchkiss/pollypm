@@ -22,7 +22,19 @@ class StaticPromptProfile(AgentProfile):
 
     def build_prompt(self, context: AgentProfileContext) -> str | None:
         project_root = _project_root(context)
-        parts: list[str] = [self.prompt]
+        prompt = self.prompt
+        if self.name == "russell":
+            project = context.config.projects.get(context.session.project)
+            if project is not None:
+                from pollypm.project_guides import resolve_project_guide_text
+
+                prompt = resolve_project_guide_text(
+                    project.path,
+                    "reviewer",
+                    fallback_text=prompt,
+                )
+
+        parts: list[str] = [prompt]
 
         # Inject behavioral rules from INSTRUCT.md directly — the agent should
         # never need to "choose" to read them.  Keep reference docs as pointers.

@@ -111,6 +111,7 @@ class TmuxSessionService:
         session_role: str | None = None,
         task_title: str | None = None,
         task_description: str | None = None,
+        guide_reference: str | None = None,
         user_id: str = "operator",
     ) -> SessionHandle:
         wname = window_name or f"session-{name}"
@@ -197,6 +198,7 @@ class TmuxSessionService:
                     session_role=session_role,
                     task_title=task_title,
                     task_description=task_description,
+                    guide_reference=guide_reference,
                     user_id=user_id,
                 )
                 kickoff = self._prepare_initial_input(
@@ -813,6 +815,7 @@ class TmuxSessionService:
         session_role: str | None,
         task_title: str | None,
         task_description: str | None,
+        guide_reference: str | None = None,
         user_id: str,
     ) -> str:
         """Prepend memory recall + (for workers) the worker guide.
@@ -879,6 +882,7 @@ class TmuxSessionService:
         try:
             worker_injection = build_worker_protocol_injection(
                 session_role=session_role,
+                guide_reference=guide_reference,
             )
         except Exception:  # noqa: BLE001
             worker_injection = ""

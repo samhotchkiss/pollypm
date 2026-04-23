@@ -437,6 +437,8 @@ class SessionManager:
         self._kill_stale_task_window(session_name, window_name)
 
         if self._session_service is not None:
+            from pollypm.project_guides import worker_guide_reference
+
             # Use a fresh_launch_marker so SessionService.create() knows
             # to send the kickoff as initial input.
             marker_dir = self._project_path / ".pollypm" / "worker-markers"
@@ -460,6 +462,7 @@ class SessionManager:
                 initial_input=kickoff,
                 fresh_launch_marker=fresh_launch_marker,
                 session_role="worker",
+                guide_reference=worker_guide_reference(self._project_path),
             )
             return handle.pane_id or ""
 
@@ -932,6 +935,8 @@ class SessionManager:
 
     def _build_task_prompt(self, task_id: str, worktree_path: Path) -> str:
         """Build a clear operating prompt for a per-task worker session."""
+        from pollypm.project_guides import worker_guide_reference
+
         # Get task details from the work service
         task_info = ""
         try:
@@ -947,11 +952,16 @@ class SessionManager:
         except Exception:
             task_info = f"## Your Assignment\n\nTask ID: {task_id}\n\n"
 
+        guide_reference = worker_guide_reference(self._project_path)
+
         return (
             f"You are a PollyPM task worker. You have one job: complete the task below.\n\n"
             f"You are working in a git worktree at: {worktree_path}\n"
             f"This is an isolated branch — your changes won't affect other workers.\n\n"
             f"{task_info}"
+            f"## Worker Guide\n\n"
+            f"Read `{guide_reference}` first for the worker playbook. Use the "
+            f"project-local guide when present; otherwise use the built-in one.\n\n"
             f"## How to Work\n\n"
             f"1. Read the task description carefully\n"
             f"2. Implement the work: read code, write code, run tests, commit\n"

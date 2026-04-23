@@ -59,7 +59,18 @@ class MarkdownPromptProfile:
             text = self.path.read_text(encoding="utf-8")
         except OSError:
             return None
-        return text.strip() or None
+        prompt = text.strip()
+        if self.name == "architect" and context is not None:
+            project = context.config.projects.get(context.session.project)
+            if project is not None:
+                from pollypm.project_guides import resolve_project_guide_text
+
+                prompt = resolve_project_guide_text(
+                    project.path,
+                    "architect",
+                    fallback_text=prompt,
+                )
+        return prompt or None
 
 
 def _profile_factory(name: str):

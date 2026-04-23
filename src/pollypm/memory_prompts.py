@@ -345,6 +345,7 @@ def build_worker_protocol_injection(
     *,
     session_role: str | None,
     guide_text: str | None = None,
+    guide_reference: str | None = None,
 ) -> str:
     """Render a short ``## Worker Protocol`` pointer for workers.
 
@@ -354,15 +355,16 @@ def build_worker_protocol_injection(
     existing memory-injection path is a no-op for those sessions.
 
     ``guide_text`` is accepted for compatibility with the old guide-
-    loading implementation, but the rendered prompt now points workers
-    at ``docs/worker-guide.md`` instead of inlining the whole guide.
+    loading implementation, but the rendered prompt points workers at
+    a guide path instead of inlining the whole guide.
     """
     if session_role != "worker":
         return ""
+    guide_ref = guide_reference or "docs/worker-guide.md"
     # Keep the kickoff compact: the full playbook lives in docs/worker-guide.md.
     return (
         f"{WORKER_PROTOCOL_HEADING}\n\n"
-        "Read `docs/worker-guide.md` for the worker playbook, including how to "
+        f"Read `{guide_ref}` for the worker playbook, including how to "
         "claim work, ship it, and recover."
     )
 

@@ -73,6 +73,104 @@ def _write_minimal_config(
 
 
 # ---------------------------------------------------------------------------
+# init-guide / list-guides
+# ---------------------------------------------------------------------------
+
+
+class TestGuides:
+    def test_init_guide_worker_creates_project_local_copy(self, tmp_path: Path) -> None:
+        repo = _make_project_repo(tmp_path)
+        config_path = _write_minimal_config(tmp_path, projects={"demo": repo})
+
+        result = runner.invoke(
+            project_app,
+            ["init-guide", "worker", "--project", "demo", "--config", str(config_path)],
+        )
+
+        assert result.exit_code == 0, result.stdout + result.stderr
+        guide_path = repo / ".pollypm" / "project-guides" / "worker.md"
+        assert guide_path.exists()
+        text = guide_path.read_text()
+        assert "forked_from:" in text
+        assert "# Worker Guide" in text
+        assert "pm task done" in text
+
+    def test_init_guide_force_overwrites_existing_copy(self, tmp_path: Path) -> None:
+        repo = _make_project_repo(tmp_path)
+        config_path = _write_minimal_config(tmp_path, projects={"demo": repo})
+        guide_path = repo / ".pollypm" / "project-guides" / "worker.md"
+        guide_path.parent.mkdir(parents=True, exist_ok=True)
+        guide_path.write_text("custom old body\n")
+
+        result = runner.invoke(
+            project_app,
+            [
+                "init-guide",
+                "worker",
+                "--project",
+                "demo",
+                "--force",
+                "--config",
+                str(config_path),
+            ],
+        )
+
+        assert result.exit_code == 0, result.stdout + result.stderr
+        text = guide_path.read_text()
+        assert "custom old body" not in text
+        assert "forked_from:" in text
+        assert "# Worker Guide" in text
+
+    def test_list_guides_shows_role_path_and_fork_sha(self, tmp_path: Path) -> None:
+        repo = _make_project_repo(tmp_path)
+        config_path = _write_minimal_config(tmp_path, projects={"demo": repo})
+
+        for role in ("architect", "worker"):
+            result = runner.invoke(
+                project_app,
+                ["init-guide", role, "--project", "demo", "--config", str(config_path)],
+            )
+            assert result.exit_code == 0, result.stdout + result.stderr
+
+        result = runner.invoke(
+            project_app,
+            ["list-guides", "--project", "demo", "--config", str(config_path)],
+        )
+
+        assert result.exit_code == 0, result.stdout + result.stderr
+        assert "Project-local guides for 'demo':" in result.stdout
+        assert "architect:" in result.stdout
+        assert "worker:" in result.stdout
+        assert "forked_from:" in result.stdout
+        assert str(repo / ".pollypm" / "project-guides" / "architect.md") in result.stdout
+
+    def test_init_guide_rejects_operator_pm(self, tmp_path: Path) -> None:
+        repo = _make_project_repo(tmp_path)
+        config_path = _write_minimal_config(tmp_path, projects={"demo": repo})
+
+        result = runner.invoke(
+            project_app,
+            ["init-guide", "operator_pm", "--project", "demo", "--config", str(config_path)],
+        )
+
+        assert result.exit_code == 1
+        assert "operator_pm" in (result.stdout + result.stderr)
+        assert "built-in operator guide" in (result.stdout + result.stderr)
+
+    def test_init_guide_requires_role_argument(self, tmp_path: Path) -> None:
+        repo = _make_project_repo(tmp_path)
+        config_path = _write_minimal_config(tmp_path, projects={"demo": repo})
+
+        result = runner.invoke(
+            project_app,
+            ["init-guide", "--project", "demo", "--config", str(config_path)],
+        )
+
+        assert result.exit_code != 0
+        assert "Missing argument" in (result.stdout + result.stderr)
+
+
+# ---------------------------------------------------------------------------
 # plan
 # ---------------------------------------------------------------------------
 

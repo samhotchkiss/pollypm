@@ -5700,6 +5700,12 @@ class PollyInboxApp(App[None]):
             task.task_id for task in tasks if replies_by_task.get(task.task_id)
         }
         self._thread_expanded_task_ids.intersection_update(active_thread_ids)
+        # Prime the signature cache so _background_refresh can cheaply
+        # detect unchanged state on the next poll and skip re-rendering
+        # (#752: eliminates the visible flash every ~8s).
+        self._last_inbox_signature = self._inbox_content_signature(
+            tasks, unread, replies_by_task,
+        )
         self._render_list(select_first=select_first)
 
     def _render_list(self, *, select_first: bool = False) -> None:
@@ -5803,11 +5809,72 @@ class PollyInboxApp(App[None]):
         self.status.update(" \u00b7 ".join(bits))
 
     def _background_refresh(self) -> None:
-        """Periodic re-read; don't stomp the current cursor position."""
+        """Periodic re-read; don't stomp the current cursor position.
+
+        #752: also short-circuits when the inbox data is structurally
+        unchanged since the last tick. The previous code re-rendered
+        the entire ListView every 8s regardless of whether anything
+        changed — the user saw this as a visible flash every tick.
+        Now we compute a cheap content signature and skip the re-render
+        when it matches. Signature invalidates on any change the user
+        would care about: task state, replies, unread set, filter
+        state, filter chips.
+        """
         try:
-            self._refresh_list(select_first=False)
+            tasks, unread, replies_by_task = self._load_inbox()
+        except Exception:  # noqa: BLE001
+            return
+        signature = self._inbox_content_signature(tasks, unread, replies_by_task)
+        if signature == getattr(self, "_last_inbox_signature", None):
+            return
+        self._last_inbox_signature = signature
+        # Seed the cached collections the renderer expects; _render_list
+        # will consume them via self._tasks / self._unread_ids /
+        # self._replies_by_task without re-querying.
+        self._tasks = tasks
+        self._unread_ids = unread
+        self._replies_by_task = replies_by_task
+        active_thread_ids = {
+            task.task_id for task in tasks if replies_by_task.get(task.task_id)
+        }
+        self._thread_expanded_task_ids.intersection_update(active_thread_ids)
+        try:
+            self._render_list(select_first=False)
         except Exception:  # noqa: BLE001
             pass
+
+    @staticmethod
+    def _inbox_content_signature(
+        tasks: list,
+        unread: set,
+        replies_by_task: dict,
+    ) -> tuple:
+        """Cheap signature over the inbox's user-visible state.
+
+        Two ticks with identical signatures render identical lists, so
+        we can skip the full re-render. Any change the user would
+        notice (new task, state change, reply count, unread flip) must
+        perturb the signature; details that don't affect rendering
+        (internal cache timestamps, raw object identity) must not.
+        """
+        task_sig = tuple(
+            (
+                getattr(t, "task_id", ""),
+                getattr(
+                    getattr(t, "work_status", None), "value",
+                    getattr(t, "work_status", ""),
+                ),
+                getattr(t, "current_node_id", "") or "",
+                # updated_at may be datetime or string; coerce to str
+                # so equality works across types.
+                str(getattr(t, "updated_at", "") or ""),
+                # reply count drives the "N replies" decoration
+                len(replies_by_task.get(getattr(t, "task_id", ""), ()) or ()),
+            )
+            for t in tasks
+        )
+        unread_sig = tuple(sorted(unread))
+        return (task_sig, unread_sig)
 
     # ------------------------------------------------------------------
     # Filter / search (#NEW)

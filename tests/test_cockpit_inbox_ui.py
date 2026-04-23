@@ -899,3 +899,88 @@ def test_d_on_rollup_subitem_targets_its_project(tmp_path: Path) -> None:
             # rollup's title).
             assert "Cross-project update" in ctx
     _run(body())
+
+
+# ---------------------------------------------------------------------------
+# #752 — background refresh skips rendering when data unchanged
+# ---------------------------------------------------------------------------
+
+
+def test_background_refresh_skips_when_content_unchanged(inbox_env, inbox_app) -> None:
+    """The visible flash every ~8s was caused by the background refresh
+    calling ListView.clear() and re-appending every row on every tick,
+    regardless of whether anything had changed. Now the inbox computes
+    a content signature and skips the re-render when it matches the
+    previous tick."""
+    import asyncio as _asyncio
+
+    async def body() -> None:
+        async with inbox_app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            # Snapshot the initial signature after the mount render.
+            first_sig = inbox_app._last_inbox_signature
+            assert first_sig is not None, "initial mount should seed the signature"
+
+            # Count how many _render_list calls happen during the next
+            # background refresh. Render should be skipped because data
+            # is unchanged.
+            render_calls: list[None] = []
+            original_render = inbox_app._render_list
+            def _counting_render(*args, **kwargs):
+                render_calls.append(None)
+                return original_render(*args, **kwargs)
+            inbox_app._render_list = _counting_render
+
+            inbox_app._background_refresh()
+            await pilot.pause()
+            assert render_calls == [], (
+                "background refresh must not re-render when inbox content "
+                f"is unchanged (got {len(render_calls)} calls)"
+            )
+    _asyncio.run(body())
+
+
+def test_background_refresh_renders_when_content_changes(inbox_env, inbox_app) -> None:
+    """When a new task lands between polls, the background refresh must
+    notice and re-render — the skip-on-unchanged optimization must not
+    break the happy path."""
+    import asyncio as _asyncio
+
+    async def body() -> None:
+        async with inbox_app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+
+            # Seed a fresh task DIRECTLY into the project DB so the next
+            # _load_inbox sees it.
+            svc = SQLiteWorkService(
+                db_path=inbox_env["project_path"] / ".pollypm" / "state.db",
+                project_path=inbox_env["project_path"],
+            )
+            try:
+                svc.create(
+                    title="Brand new task",
+                    description="body",
+                    type="task",
+                    project="demo",
+                    flow_template="chat",
+                    roles={"requester": "user", "operator": "polly"},
+                    priority="normal",
+                    created_by="polly",
+                )
+            finally:
+                svc.close()
+
+            render_calls: list[None] = []
+            original_render = inbox_app._render_list
+            def _counting_render(*args, **kwargs):
+                render_calls.append(None)
+                return original_render(*args, **kwargs)
+            inbox_app._render_list = _counting_render
+
+            inbox_app._background_refresh()
+            await pilot.pause()
+            assert len(render_calls) == 1, (
+                "background refresh must re-render when the inbox data "
+                f"actually changed (got {len(render_calls)} calls)"
+            )
+    _asyncio.run(body())

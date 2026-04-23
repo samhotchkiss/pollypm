@@ -906,6 +906,42 @@ def test_d_on_rollup_subitem_targets_its_project(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_inbox_list_width_scales_with_terminal_size(inbox_env) -> None:
+    """#753: list width is percentage-based so wide terminals aren't
+    stuck with the old 42-column fixed size. List on a narrow pilot
+    should be notably smaller than on a wide one — confirming the
+    layout responds to viewport size."""
+    if not _load_config_compatible(inbox_env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_ui import PollyInboxApp
+
+    widths: dict[str, int] = {}
+
+    async def measure(size: tuple[int, int], key: str) -> None:
+        app = PollyInboxApp(inbox_env["config_path"])
+        async with app.run_test(size=size) as pilot:
+            await pilot.pause()
+            widths[key] = app.list_view.size.width
+
+    async def body() -> None:
+        await measure((80, 40), "narrow")
+        await measure((200, 40), "wide")
+
+    _run(body())
+
+    # Wide viewport must yield a notably bigger list than narrow.
+    assert widths["wide"] > widths["narrow"], (
+        f"list width did not scale with viewport: "
+        f"narrow={widths['narrow']} wide={widths['wide']}"
+    )
+    # On 200-col terminal, the list should be well above the
+    # historic 42-column cap — that's the whole point of the change.
+    assert widths["wide"] >= 60, (
+        f"list width on wide viewport only {widths['wide']} cols — "
+        "expected at least 60 (40% of 200 - border)"
+    )
+
+
 def test_inbox_detail_includes_inline_review_artifact(tmp_path: Path) -> None:
     """#761: when an inbox item references a task with a review
     artifact on disk (e.g. a plan_review task with

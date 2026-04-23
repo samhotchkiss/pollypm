@@ -5340,7 +5340,13 @@ class PollyInboxApp(App[None]):
         height: 1fr;
     }
     #inbox-list {
-        width: 42;
+        /* #753 — responsive list width. Fixed 42-column list was
+           fine on an iPad but left ~80% of a 34" monitor empty next
+           to the detail pane, and clipped subject lines with no
+           context to spare. Percentage with a min-width floor keeps
+           narrow-terminal ergonomics while letting ultrawide displays
+           breathe. */
+        width: 40%;
         min-width: 32;
         height: 1fr;
         background: #0f1317;

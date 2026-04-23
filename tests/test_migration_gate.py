@@ -271,6 +271,51 @@ def test_cli_migrate_check_outputs_up_to_date(tmp_path: Path) -> None:
     assert "up to date" in result.stdout.lower()
 
 
+def test_cli_migrate_check_renders_failure_in_structured_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#760 adopter: when the dry-run fails, the CLI renders the
+    error in the four-field StructuredUserMessage shape — summary,
+    why, next, details — not a bare free-form line."""
+    db_path = _fresh_state_db(tmp_path / "state.db")
+    config_path = _write_minimal_config(tmp_path)
+    config_path.write_text(
+        "[project]\n"
+        f'base_dir = "{tmp_path}"\n'
+        f'state_db = "{db_path}"\n'
+        f'workspace_root = "{tmp_path}"\n'
+    )
+
+    # Force the clone check to report failure.
+    from pollypm.store import migrations as _mig
+    class _FakeOutcome:
+        ok = False
+        error = "simulated replay error for test"
+    monkeypatch.setattr(
+        _mig, "check_against_clone",
+        lambda _db_path: _FakeOutcome(),
+    )
+    # Ensure inspect() reports pending so _run_check reaches the
+    # check_against_clone path.
+    class _FakeStatus:
+        up_to_date = False
+        pending = [_mig.PendingMigration("state", 99, "synthetic pending")]
+    monkeypatch.setattr(_mig, "inspect", lambda _db_path: _FakeStatus())
+    monkeypatch.setattr(
+        _mig, "format_pending_summary",
+        lambda status: "1 pending migration(s):\n  [state] v99: synthetic pending",
+    )
+
+    app = _build_cli_app()
+    result = runner.invoke(app, ["--check", "--config", str(config_path)])
+    assert result.exit_code == 3, result.output
+    combined = result.stdout + "\n" + (result.stderr or "")
+    # Structured-shape markers:
+    assert "✗ Migration check FAILED" in combined
+    assert "Next:" in combined
+    assert "simulated replay error" in combined
+
+
 def test_cli_migrate_apply_reports_applied(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -97,10 +97,25 @@ def _run_check(db_path: Path) -> None:
 
     outcome = _migrations.check_against_clone(db_path)
     if not outcome.ok:
-        typer.echo(
-            f"Migration check FAILED — live DB untouched.\n  error: {outcome.error}",
-            err=True,
+        # #760 — surface the failure in the canonical four-field shape so
+        # users get a scannable summary + specific next action.
+        from pollypm.structured_message import StructuredUserMessage
+
+        msg = StructuredUserMessage(
+            summary="Migration check FAILED — live DB untouched.",
+            why=(
+                "Replaying pending migrations against a clone of your "
+                "state.db raised an error. Your real DB has not been "
+                "modified, but the migrations can't be applied safely "
+                "until this is resolved."
+            ),
+            next_action=(
+                "Read the error below, fix the underlying cause, then "
+                "re-run `pm migrate --check`."
+            ),
+            details=str(outcome.error or "").strip() or "No error detail reported.",
         )
+        typer.echo(msg.render_cli(show_details=True), err=True)
         raise typer.Exit(code=3)
 
     if outcome.tables_changed:

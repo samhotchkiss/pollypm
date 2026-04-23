@@ -73,6 +73,10 @@ class StructuredUserMessage:
 
             Next: <next_action>
 
+            Options:                                 [if suggested_actions]
+              - <label>
+                  <command>
+
             > details (press d to expand)            [if details + not show_details]
             <details (wrapped)>                       [if details + show_details]
 
@@ -94,6 +98,25 @@ class StructuredUserMessage:
         if self.next_action:
             lines.append("")
             lines.append(f"Next: {self.next_action.strip()}")
+
+        actions = [
+            (label, command)
+            for label, command in self.suggested_actions
+            if (label or "").strip() or (command or "").strip()
+        ]
+        if actions:
+            lines.append("")
+            lines.append("Options:")
+            for label, command in actions:
+                label_txt = (label or "").strip()
+                command_txt = (command or "").strip()
+                if label_txt and command_txt:
+                    lines.append(f"  - {label_txt}")
+                    lines.append(f"      {command_txt}")
+                elif label_txt:
+                    lines.append(f"  - {label_txt}")
+                else:
+                    lines.append(f"      {command_txt}")
 
         if self.details:
             lines.append("")

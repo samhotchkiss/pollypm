@@ -87,3 +87,46 @@ def test_render_cli_preserves_preformatted_details() -> None:
     # Each indented bullet stays on its own line.
     assert "  [work] v5: hot-path indexes" in rendered
     assert "  [state] v7: alerts" in rendered
+
+
+def test_render_cli_renders_suggested_actions_as_options_block() -> None:
+    """Callers that populate ``suggested_actions`` get a labeled
+    Options block with the copy-pasteable command beneath each label.
+    This is the UX used by multi-choice recoveries (e.g. pick one of
+    uv / pip / brew / npm for an upgrade)."""
+    msg = StructuredUserMessage(
+        summary="Could not detect installer.",
+        why="PollyPM isn't sure how you installed it.",
+        next_action="Run the command for whichever tool you used.",
+        suggested_actions=(
+            ("uv", "uv tool upgrade pollypm"),
+            ("pip", "pip install -U pollypm"),
+            ("brew", "brew upgrade pollypm"),
+            ("npm", "npm update -g pollypm"),
+        ),
+    )
+    rendered = msg.render_cli()
+    assert "Options:" in rendered
+    # Labels + commands both present, with commands visibly indented so
+    # the user's eye lands on them as the action.
+    for label, command in [
+        ("- uv", "uv tool upgrade pollypm"),
+        ("- pip", "pip install -U pollypm"),
+        ("- brew", "brew upgrade pollypm"),
+        ("- npm", "npm update -g pollypm"),
+    ]:
+        assert label in rendered
+        assert command in rendered
+    # Options block sits after Next: and before the (absent) details hint.
+    next_pos = rendered.index("Next:")
+    opts_pos = rendered.index("Options:")
+    assert next_pos < opts_pos
+
+
+def test_render_cli_skips_options_when_actions_empty() -> None:
+    msg = StructuredUserMessage(
+        summary="Nothing to choose.",
+        suggested_actions=(("", ""),),  # empty label + command
+    )
+    rendered = msg.render_cli()
+    assert "Options:" not in rendered

@@ -199,10 +199,12 @@ def plan_upgrade(installer: Installer, channel: str) -> UpgradePlan:
 def unsupported_installer_help() -> str:
     """User-facing text shown when no installer is detected.
 
-    Uses the StructuredUserMessage shape (#760) — consistent with
-    other user-facing errors like the migration-gate refusal. The
-    per-tool commands land in the ``details`` block so they're
-    scannable without dominating the message.
+    Uses the StructuredUserMessage shape (#760). The four per-tool
+    commands populate ``suggested_actions`` so the renderer emits a
+    labeled ``Options:`` block — one entry per supported installer
+    with the copy-pasteable command underneath. The pre-release note
+    stays in ``details`` because it's follow-up info, not a primary
+    action.
     """
     from pollypm.structured_message import StructuredUserMessage
 
@@ -214,16 +216,14 @@ def unsupported_installer_help() -> str:
             "the right tool. Your system doesn't show any of the "
             "four we know about (uv, pip, brew, npm)."
         ),
-        next_action=(
-            "Run the command matching how you installed pollypm — "
-            "details below."
+        next_action="Run the command matching how you installed pollypm.",
+        suggested_actions=(
+            ("uv", "uv tool upgrade pollypm"),
+            ("pip", "pip install -U pollypm"),
+            ("brew", "brew upgrade pollypm"),
+            ("npm", "npm update -g pollypm"),
         ),
         details=(
-            "  uv tool upgrade pollypm\n"
-            "  pip install -U pollypm\n"
-            "  brew upgrade pollypm\n"
-            "  npm update -g pollypm\n"
-            "\n"
             "For pre-release builds, add --pre (pip) / --prerelease "
             "allow (uv) / @beta (npm)."
         ),

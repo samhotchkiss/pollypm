@@ -36,9 +36,11 @@ if TYPE_CHECKING:
     from pollypm.tmux.client import TmuxClient
 
 
-_RESUMABLE_CONTROL_ROLES = frozenset(
-    {"heartbeat-supervisor", "operator-pm", "reviewer", "triage"}
-)
+# "Resumable" here is equivalent to the canonical control-role set —
+# these are the long-lived sessions worth re-attaching with
+# ``claude --continue`` / ``--resume`` on kickoff. Share the
+# definition with :data:`pollypm.models.CONTROL_ROLES`.
+from pollypm.models import CONTROL_ROLES as _RESUMABLE_CONTROL_ROLES
 
 
 class ClaudeAdapter(ProviderAdapterBase):

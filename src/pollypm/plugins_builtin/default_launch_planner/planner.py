@@ -33,7 +33,8 @@ if TYPE_CHECKING:
     from pollypm.storage.state import StateStore
 
 
-_CONTROL_ROLES = frozenset({"heartbeat-supervisor", "operator-pm", "triage", "reviewer"})
+from pollypm.models import CONTROL_ROLES as _CONTROL_ROLES
+
 _ROUTED_ROLES = frozenset({"operator-pm", "architect", "worker", "reviewer"})
 _log = logging.getLogger(__name__)
 

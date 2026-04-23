@@ -949,9 +949,11 @@ class CockpitRouter:
         return registry
 
     def _project_session_map(self, launches) -> dict[str, str]:
+        from pollypm.models import CONTROL_ROLES
+
         project_session_map: dict[str, str] = {}
         for launch in launches:
-            if launch.session.role in {"operator-pm", "heartbeat-supervisor", "triage", "reviewer"}:
+            if launch.session.role in CONTROL_ROLES:
                 continue
             project_session_map.setdefault(launch.session.project, launch.session.name)
         return project_session_map

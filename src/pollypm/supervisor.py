@@ -188,8 +188,13 @@ def _prefix_for_owner(owner: str, text: str) -> str:
 _REVIEW_NUDGE_CACHE = _supervisor_alerts._REVIEW_NUDGE_CACHE
 
 
+from pollypm.models import CONTROL_ROLES as _MODULE_CONTROL_ROLES
+
+
 class Supervisor:
-    _CONTROL_ROLES = {"heartbeat-supervisor", "operator-pm", "triage", "reviewer"}
+    # Mirror of :data:`pollypm.models.CONTROL_ROLES` so existing
+    # ``Supervisor._CONTROL_ROLES`` references keep resolving.
+    _CONTROL_ROLES = _MODULE_CONTROL_ROLES
     # Roles that should receive an initial-input prompt on fresh launch.
     # Workers + architects are NOT control-plane sessions (not in
     # _CONTROL_ROLES — they're project-scoped), but they DO need their

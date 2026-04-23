@@ -249,10 +249,12 @@ def _project_rows(ctx: RailContext) -> list[RailRow]:
     selected = _selected_key(ctx)
 
     # Map project -> session name for session_state fallback.
+    from pollypm.models import CONTROL_ROLES
+
     project_session_map: dict[str, str] = {}
     for launch in _launches(ctx):
         role = getattr(launch.session, "role", "")
-        if role in {"operator-pm", "heartbeat-supervisor", "triage", "reviewer"}:
+        if role in CONTROL_ROLES:
             continue
         project_session_map.setdefault(launch.session.project, launch.session.name)
 

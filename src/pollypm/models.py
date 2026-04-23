@@ -21,6 +21,19 @@ class ProjectKind(StrEnum):
     FOLDER = "folder"
 
 
+# Canonical set of "control-plane" session roles — they coordinate the
+# workspace (operator, reviewer, heartbeat supervisor, triage) rather
+# than execute project work (architect, worker). Historically this set
+# was redeclared in ~6 modules; exporting it once here avoids drift
+# when a new control role lands. See #763 / #765 follow-ups.
+CONTROL_ROLES: frozenset[str] = frozenset({
+    "heartbeat-supervisor",
+    "operator-pm",
+    "reviewer",
+    "triage",
+})
+
+
 @dataclass(slots=True)
 class ProjectSettings:
     name: str = "PollyPM"

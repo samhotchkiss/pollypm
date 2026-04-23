@@ -300,13 +300,12 @@ class TestNotifyEscalation:
         assert outcome["outcome"] == "no_session"
         alerts = state_store.open_alerts()
         assert any(a.alert_type == f"no_session_for_assignment:demo/1" for a in alerts)
-        # Message guides the user to the supported fix commands.
-        # The role-correct worker-start hint names the seeded role
-        # (``worker`` here, per _event's default) rather than the old
-        # hardcoded ``architect`` — #760 copy fix.
+        # Message guides the user to the supported fix command.
+        # Worker-role tasks get ``pm task claim`` (pm worker-start
+        # --role=worker is deprecated in favour of per-task workers).
+        # Architect-role tasks get ``pm worker-start --role architect``.
         matching = [a for a in alerts if a.alert_type.endswith(":demo/1")]
         assert any("pm task claim" in a.message for a in matching)
-        assert any("pm worker-start --role worker demo" in a.message for a in matching)
 
 
 # ---------------------------------------------------------------------------

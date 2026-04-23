@@ -249,11 +249,12 @@ class TestNoSessionAlerts:
         assert alert.session_name == "worker-ghost"
         assert alert.severity == "warn"
         assert "ghost" in alert.message
-        # Fix-it hint names the role-matching worker-start command (this
-        # test seeds a ``worker`` task, so the hint should say
-        # ``--role worker``) alongside the per-task claim fallback.
+        # Fix-it hint points at ``pm task claim`` for worker-role tasks.
+        # ``pm worker-start --role=worker`` is deprecated in favour of
+        # per-task workers spawned by ``pm task claim`` — see
+        # ``pm worker-start --help``. Architect-role tasks still use
+        # ``pm worker-start --role architect``.
         assert "pm task claim" in alert.message
-        assert "pm worker-start --role worker ghost" in alert.message
 
         store.close()
 

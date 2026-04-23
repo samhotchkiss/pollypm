@@ -302,6 +302,11 @@ def _escalate_no_session(event: TaskAssignmentEvent, store: Any | None) -> None:
         actor_display = f"the {event.actor_name} role"
         if event.actor_name == "architect":
             try_hint = f"Try: pm worker-start --role architect {event.project}"
+        elif event.actor_name == "worker":
+            # pm worker-start --role=worker is deprecated — pm task
+            # claim spawns a per-task worker, which is the preferred
+            # path. See pm worker-start --help.
+            try_hint = f"Try: pm task claim {event.task_id}"
         else:
             try_hint = (
                 f"Try: pm worker-start --role {event.actor_name} {event.project} "

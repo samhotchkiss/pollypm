@@ -227,9 +227,13 @@ def _emit_no_session_alert(
     # routing-engine language ("no live session for role:worker in
     # project X") which read as machine-to-machine. New phrasing
     # starts with the user-visible effect and names the concrete
-    # command alternatives.
+    # command alternatives, with ``pm task claim`` first for worker-
+    # role tasks (pm worker-start --role=worker is deprecated in
+    # favour of per-task workers — see pm worker-start --help).
     if actor_type is ActorType.ROLE and role == "architect":
         fix_hint = f"Try: pm worker-start --role architect {project}"
+    elif actor_type is ActorType.ROLE and role == "worker":
+        fix_hint = f"Try: pm task claim {example_task_id}"
     elif actor_type is ActorType.ROLE:
         fix_hint = (
             f"Try: pm worker-start --role {role} {project} "

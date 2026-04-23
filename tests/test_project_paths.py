@@ -191,6 +191,65 @@ def test_ensure_project_scaffold_materializes_role_guides(project: Path) -> None
         assert body.startswith("---\nforked_from:")
 
 
+# ---------------------------------------------------------------------------
+# session_control_prompts_dir
+# ---------------------------------------------------------------------------
+
+
+def test_session_control_prompts_dir_resolves_into_session_project(
+    tmp_path: Path,
+) -> None:
+    """#763: a session bound to a known project writes its kickoff
+    prompt into ``<project>/.pollypm/control-prompts/``, not the
+    shared ``~/.pollypm/control-prompts/``. Previously every project's
+    architect / worker kickoffs piled into one directory."""
+    from types import SimpleNamespace
+
+    from pollypm.project_paths import (
+        project_control_prompts_dir,
+        session_control_prompts_dir,
+    )
+
+    project_path = tmp_path / "notesy"
+    project_path.mkdir()
+    global_base = tmp_path / ".pollypm"
+    fake_config = SimpleNamespace(
+        project=SimpleNamespace(base_dir=global_base),
+        sessions={"architect_notesy": SimpleNamespace(project="notesy")},
+        projects={"notesy": SimpleNamespace(path=project_path)},
+    )
+
+    resolved = session_control_prompts_dir(fake_config, "architect_notesy")
+    assert resolved == project_path / ".pollypm" / "control-prompts"
+    assert resolved == project_control_prompts_dir(project_path)
+    # Must NOT be the shared global directory.
+    assert resolved != global_base / "control-prompts"
+
+
+def test_session_control_prompts_dir_falls_back_to_global_for_orphan(
+    tmp_path: Path,
+) -> None:
+    """If a session has no project or the project isn't registered,
+    fall back to the global base_dir / control-prompts so the write
+    still lands somewhere."""
+    from types import SimpleNamespace
+
+    from pollypm.project_paths import session_control_prompts_dir
+
+    global_base = tmp_path / ".pollypm"
+    fake_config = SimpleNamespace(
+        project=SimpleNamespace(base_dir=global_base),
+        sessions={"orphan": SimpleNamespace(project="")},
+        projects={},
+    )
+    resolved = session_control_prompts_dir(fake_config, "orphan")
+    assert resolved == global_base / "control-prompts"
+
+    # Unknown session name: same fallback.
+    resolved = session_control_prompts_dir(fake_config, "ghost")
+    assert resolved == global_base / "control-prompts"
+
+
 def test_ensure_project_scaffold_preserves_existing_forks(project: Path) -> None:
     """If the user has hand-forked a guide (or init-guide did), the
     scaffold helper must NOT overwrite it — idempotent materialization

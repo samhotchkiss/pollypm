@@ -2787,7 +2787,8 @@ class Supervisor:
         self._assert_session_launch_matches(session_name, initial_input)
         if len(initial_input) <= 280:
             return initial_input
-        prompts_dir = self.config.project.base_dir / "control-prompts"
+        from pollypm.project_paths import session_control_prompts_dir
+        prompts_dir = session_control_prompts_dir(self.config, session_name)
         prompts_dir.mkdir(parents=True, exist_ok=True)
         prompt_path = prompts_dir / f"{session_name}.md"
         prompt_path.write_text(initial_input.rstrip() + "\n")

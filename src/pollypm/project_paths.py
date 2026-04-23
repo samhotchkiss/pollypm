@@ -204,8 +204,46 @@ def materialize_role_guides(
     return written
 
 
+def project_control_prompts_dir(project_path: Path) -> Path:
+    """Return the absolute path of ``<project>/.pollypm/control-prompts/``.
+
+    Kickoff prompts for a project's sessions (architect, worker,
+    reviewer) land here so each project's ``.pollypm/`` folder stays
+    self-contained per #763. Writers should call :func:`session_control_prompts_dir`
+    to pick the right project for a given session name.
+    """
+    return Path(project_path) / ".pollypm" / "control-prompts"
+
+
+def session_control_prompts_dir(config, session_name: str) -> Path:
+    """Resolve the control-prompts directory for ``session_name``.
+
+    Returns ``<project>/.pollypm/control-prompts/`` when the session is
+    bound to a known project (the #763 invariant — each project owns
+    its kickoffs). Falls back to ``config.project.base_dir / "control-prompts"``
+    for orphan / unbound sessions so legacy call sites still resolve
+    somewhere writable.
+
+    The ``config`` parameter is typed broadly on purpose — this module
+    is imported early by config-loading code and a concrete type import
+    would be circular. At runtime it's always a :class:`PollyPMConfig`.
+    """
+    session = config.sessions.get(session_name) if hasattr(config, "sessions") else None
+    project_key = getattr(session, "project", None) if session is not None else None
+    if project_key:
+        known_projects = getattr(config, "projects", None) or {}
+        project = known_projects.get(project_key)
+        if project is not None:
+            project_path = getattr(project, "path", None)
+            if project_path is not None:
+                return project_control_prompts_dir(project_path)
+    return config.project.base_dir / "control-prompts"
+
+
 __all__ = [
     "MATERIALIZABLE_ROLES",
     "role_guide_path",
     "materialize_role_guides",
+    "project_control_prompts_dir",
+    "session_control_prompts_dir",
 ]

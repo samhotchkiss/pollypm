@@ -664,6 +664,15 @@ def new_cmd(
             "or work-service rows."
         ),
     ),
+    slug: Optional[str] = typer.Option(
+        None, "--slug",
+        help=(
+            "Explicit project slug (key). When omitted, the slug is "
+            "derived from the repo directory name. Pass this to avoid "
+            "getting stuck with a bad auto-slug (#766). Must be lowercase "
+            "with underscores only."
+        ),
+    ),
     yes: bool = typer.Option(
         False, "--yes", "-y",
         help="Non-interactive: auto-accept the planner prompt.",
@@ -678,7 +687,8 @@ def new_cmd(
     yes). ``--skip-planner`` registers the project without prompting;
     ``--yes`` accepts the prompt non-interactively. ``--skip-plan``
     suppresses the project_planning plugin's auto-fire on the emitted
-    ``project.created`` event (#255).
+    ``project.created`` event (#255). ``--slug`` pins an explicit
+    project slug instead of auto-deriving from the path (#766).
 
     Issue #274: when the target directory already looks like an
     existing project (commits, ``docs/plan/plan.md``, source files, or
@@ -707,10 +717,12 @@ def new_cmd(
     except Exception:  # noqa: BLE001
         was_preexisting = False
 
-    project = register_project(path, repo_path, name=name)
+    project = register_project(path, repo_path, name=name, slug=slug)
     typer.echo(
         f"Registered project {project.name or project.key} at {project.path}"
     )
+    if slug is not None:
+        typer.echo(f"Using explicit slug: {project.key}")
 
     # Issue #274: classify the project directory so we can choose
     # between cold-start and drift-aware replan. Only meaningful when a

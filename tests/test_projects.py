@@ -107,6 +107,87 @@ def test_register_project_accepts_plain_folder_and_can_enable_tracker(tmp_path: 
     assert (project_path / "issues" / ".latest_issue_number").exists()
 
 
+def test_register_project_accepts_explicit_slug_override(tmp_path: Path) -> None:
+    """#766: callers (CLI --slug, cockpit slug picker) can pin the
+    project key instead of relying on auto-derivation."""
+    project_path = tmp_path / "weird-directory-name"
+    project_path.mkdir()
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path, base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account=""),
+        accounts={},
+        sessions={},
+        projects={},
+    )
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path, force=True)
+
+    project = register_project(config_path, project_path, slug="widget_shop")
+    assert project.key == "widget_shop"
+
+
+def test_register_project_rejects_non_canonical_slug(tmp_path: Path) -> None:
+    """Uppercase / hyphens / punctuation in --slug must be rejected
+    with a hint showing the canonical form."""
+    import typer
+    project_path = tmp_path / "whatever"
+    project_path.mkdir()
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path, base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account=""),
+        accounts={},
+        sessions={},
+        projects={},
+    )
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path, force=True)
+
+    with pytest.raises(typer.BadParameter):
+        register_project(config_path, project_path, slug="Widget-Shop")
+
+
+def test_register_project_rejects_duplicate_slug(tmp_path: Path) -> None:
+    """If the requested --slug is already taken, reject with a clean
+    error rather than silently overwriting."""
+    import typer
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path, base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account=""),
+        accounts={},
+        sessions={},
+        projects={
+            "my_slug": KnownProject(
+                key="my_slug", path=existing, name="Existing",
+                kind=ProjectKind.FOLDER,
+            ),
+        },
+    )
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path, force=True)
+
+    with pytest.raises(typer.BadParameter):
+        register_project(config_path, incoming, slug="my_slug")
+
+
 def test_ensure_project_scaffold_copies_project_instructions(tmp_path: Path) -> None:
     project_path = tmp_path / "sample-project"
     project_path.mkdir()

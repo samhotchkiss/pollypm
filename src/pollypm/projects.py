@@ -457,7 +457,21 @@ def _should_skip_dir(parent: Path, name: str) -> bool:
     return candidate.is_symlink()
 
 
-def register_project(config_path: Path, repo_path: Path, *, name: str | None = None) -> KnownProject:
+def register_project(
+    config_path: Path,
+    repo_path: Path,
+    *,
+    name: str | None = None,
+    slug: str | None = None,
+) -> KnownProject:
+    """Register a project under ``config_path``.
+
+    ``slug`` lets callers override the auto-computed project key. The
+    supplied slug is validated (must be canonical per
+    :func:`slugify_project_key`) and checked for uniqueness against
+    existing projects. When not provided, the key is computed from the
+    repo path's last segment — the legacy behavior. See #766.
+    """
     config = load_config(config_path)
     normalized_path = normalize_project_path(repo_path)
     if not normalized_path.exists() or not normalized_path.is_dir():
@@ -467,7 +481,26 @@ def register_project(config_path: Path, repo_path: Path, *, name: str | None = N
         if normalize_project_path(project.path) == normalized_path:
             return project
 
-    key = make_project_key(normalized_path, set(config.projects))
+    if slug is None:
+        key = make_project_key(normalized_path, set(config.projects))
+    else:
+        key = slug.strip()
+        canonical = slugify_project_key(key)
+        if not canonical:
+            raise typer.BadParameter(
+                f"Slug {slug!r} does not yield a valid key "
+                "(at least one alphanumeric character required)."
+            )
+        if canonical != key:
+            raise typer.BadParameter(
+                f"Slug {slug!r} is not in canonical form. "
+                f"Try {canonical!r}."
+            )
+        if key in config.projects:
+            raise typer.BadParameter(
+                f"A project already exists at slug {key!r}. "
+                "Pick a different slug or remove the conflict first."
+            )
     project = KnownProject(
         key=key,
         path=normalized_path,

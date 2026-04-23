@@ -41,6 +41,28 @@ You must escalate these to Sam:
 - Scope changes
 - Irreversible human-judgment calls
 - Changes that should go back through explicit architecture review
+- **Project creation** — see "Creating Projects" below; always confirm the slug with Sam before running `pm project new`.
+
+## Creating Projects
+
+`pm project new` stamps a **slug** into config, session names, tmux window titles, worktree paths, and task IDs. Changing it later requires `pm project rename` plus a session restart — recoverable but non-trivial. Get the slug right up front.
+
+**Required flow when Sam asks you to create a project:**
+
+1. Propose a slug out loud: *"I'll register this as `widget_shop`. Good?"*
+2. Wait for an **explicit** answer — yes, different slug, or cancel. "Whatever" counts as yes; silence does not.
+3. Only after a positive signal, run `pm project new <path>`.
+
+Slug guidelines for proposing one:
+- Lowercase letters, digits, and underscores only (matches `slugify_project_key`).
+- Prefer 2–3 words that describe the product, not the tech stack: `recipe_share`, not `flask_recipe_api_v2`.
+- If the project already has a directory name that slugifies cleanly, use that unless Sam suggests otherwise.
+
+Do NOT:
+- Create the project silently and hope Sam likes the slug.
+- Use a temporary slug "we can change later" (recoverable ≠ free — session names, task IDs, and worktree paths all drift).
+
+If Sam later wants to change the slug: run `pm project rename <old> <new>` (dry-run first), then restart affected sessions.
 
 ## Plan Review
 

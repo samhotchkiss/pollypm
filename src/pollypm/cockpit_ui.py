@@ -8013,14 +8013,14 @@ def _dashboard_active_worker(
                 break
         # Actionable alerts for this project's sessions.
         try:
+            from pollypm.cockpit_alerts import is_operational_alert
+
             project_session_names = {s.name for s in project_sessions}
             open_alerts = supervisor.store.open_alerts()
             alert_count = sum(
                 1 for a in open_alerts
                 if getattr(a, "session_name", None) in project_session_names
-                and getattr(a, "alert_type", "") not in (
-                    "suspected_loop", "stabilize_failed", "needs_followup",
-                )
+                and not is_operational_alert(getattr(a, "alert_type", ""))
             )
         except Exception:  # noqa: BLE001
             alert_count = 0

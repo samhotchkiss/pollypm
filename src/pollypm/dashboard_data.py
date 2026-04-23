@@ -360,6 +360,16 @@ def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
             parts.append(f"{recoveries} session recovery(ies)")
         briefing = "While you were away: " + ", ".join(parts) + "."
 
+    # Late import keeps dashboard_data out of the cockpit_alerts import
+    # graph (cockpit_alerts → cockpit_palette → cockpit, which pulls
+    # dashboard_data in at top level).
+    from pollypm.cockpit_alerts import is_operational_alert
+
+    alert_count = sum(
+        1 for a in store.open_alerts()
+        if not is_operational_alert(a.alert_type)
+    )
+
     return DashboardData(
         active_sessions=active,
         recent_commits=commits,
@@ -372,9 +382,6 @@ def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
         message_count_24h=sum(1 for e in day_events if e.event_type == "send_input"),
         recovery_count_24h=recoveries,
         inbox_count=inbox_count,
-        alert_count=len([
-            a for a in store.open_alerts()
-            if a.alert_type not in ("suspected_loop", "stabilize_failed", "needs_followup")
-        ]),
+        alert_count=alert_count,
         briefing=briefing,
     )

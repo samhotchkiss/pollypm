@@ -134,6 +134,8 @@ def _render_project_dashboard(
     )
 
     # Project-scoped alerts, filtered the same way the legacy renderer did.
+    from pollypm.cockpit_alerts import is_operational_alert
+
     project_alerts: list = []
     try:
         project_alerts = [
@@ -143,8 +145,7 @@ def _render_project_dashboard(
                 and l.session.name == a.session_name
                 for l in supervisor.plan_launches()
             )
-            and a.alert_type
-            not in ("suspected_loop", "stabilize_failed", "needs_followup")
+            and not is_operational_alert(a.alert_type)
         ]
     except Exception:  # noqa: BLE001
         project_alerts = []

@@ -521,11 +521,13 @@ def _build_dashboard(supervisor, config, config_path: Path | None = None) -> str
         open_alerts = supervisor.store.open_alerts()
     except Exception:  # noqa: BLE001
         open_alerts = []
+    from pollypm.cockpit_alerts import is_operational_alert
+
     user_inbox = _count_inbox_tasks_for_label(config)
     actionable_alerts = [
         alert
         for alert in open_alerts
-        if alert.alert_type not in ("suspected_loop", "stabilize_failed", "needs_followup")
+        if not is_operational_alert(alert.alert_type)
     ]
     try:
         recent = supervisor.store.recent_events(limit=300)

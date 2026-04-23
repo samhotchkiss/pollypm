@@ -163,13 +163,17 @@ def _build_cockpit_detail_dispatch(supervisor, config_path: Path, kind: str, tar
             "No active live lane is running for this project.",
             "Select the project in the left rail and press N to start a worker lane.",
         ]
-        # Show alerts for this project's sessions
+        # Show alerts for this project's sessions (operational alerts
+        # like suspected_loop / stabilize_failed / needs_followup stay
+        # on the activity log, not the dashboard — see #765).
+        from pollypm.cockpit_alerts import is_operational_alert
+
         project_alerts = [
             a for a in supervisor.store.open_alerts()
             if any(
                 l.session.project == target and l.session.name == a.session_name
                 for l in supervisor.plan_launches()
-            ) and a.alert_type not in ("suspected_loop", "stabilize_failed", "needs_followup")
+            ) and not is_operational_alert(a.alert_type)
         ]
         if project_alerts:
             lines.extend(["", "⚠ Alerts:"])

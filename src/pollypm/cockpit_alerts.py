@@ -47,9 +47,34 @@ _OPERATIONAL_ALERT_TYPES: frozenset[str] = frozenset({
     "needs_followup",
 })
 
+# Operational alert *prefixes* — an alert_type whose start matches any
+# of these is also treated as operational and filtered from toasts.
+# ``unmanaged_window:<session>:<name>`` falls in this bucket — the
+# user can't act on it beyond "notice it's there", so toasting every
+# one trains them to dismiss the toast channel. #765.
+_OPERATIONAL_ALERT_PREFIXES: tuple[str, ...] = (
+    "unmanaged_window:",
+)
+
 
 def _is_operational_alert(alert_type: str) -> bool:
-    return (alert_type or "") in _OPERATIONAL_ALERT_TYPES
+    """Internal alias — prefer the public :func:`is_operational_alert`."""
+    return is_operational_alert(alert_type)
+
+
+def is_operational_alert(alert_type: str) -> bool:
+    """Return True when ``alert_type`` is heartbeat-internal operational noise.
+
+    Public helper shared by dashboards, rail summaries, project
+    dashboard, and the cockpit alert toaster. Before this existed,
+    five modules each maintained their own inline tuple (``suspected_loop``,
+    ``stabilize_failed``, ``needs_followup``) and drifted independently
+    — adding a new operational alert type meant hunting for them all.
+    """
+    name = alert_type or ""
+    if name in _OPERATIONAL_ALERT_TYPES:
+        return True
+    return any(name.startswith(prefix) for prefix in _OPERATIONAL_ALERT_PREFIXES)
 
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")

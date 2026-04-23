@@ -52,6 +52,7 @@ from pollypm.projects import (
     remove_project,
     set_workspace_root,
 )
+from pollypm.role_routing import RoleRoutingFacade
 from pollypm.schedulers.base import ScheduledJob
 from pollypm.storage.state import AlertRecord, StateStore
 from pollypm.supervisor import Supervisor
@@ -86,6 +87,7 @@ class PollyPMService:
     def __init__(self, config_path: Path) -> None:
         """Bind the service to a config file; all calls use this path."""
         self.config_path = config_path
+        self.role_routing = RoleRoutingFacade(config_path)
 
     def load_supervisor(self, *, readonly_state: bool = False) -> Supervisor:
         """Construct a fresh Supervisor from the bound config (internal helper)."""

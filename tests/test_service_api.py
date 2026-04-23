@@ -4,7 +4,16 @@ from pathlib import Path
 import subprocess
 
 from pollypm.config import write_config
-from pollypm.models import AccountConfig, KnownProject, PollyPMConfig, PollyPMSettings, ProjectKind, ProjectSettings, ProviderKind
+from pollypm.models import (
+    AccountConfig,
+    KnownProject,
+    ModelAssignment,
+    PollyPMConfig,
+    PollyPMSettings,
+    ProjectKind,
+    ProjectSettings,
+    ProviderKind,
+)
 from pollypm.service_api import PollyPMService, render_json
 from pollypm.storage.state import StateStore
 from pollypm.task_backends.github import GitHubTaskBackendValidation
@@ -59,6 +68,41 @@ def test_service_suggest_worker_prompt_uses_worker_api(monkeypatch, tmp_path: Pa
     )
 
     assert service.suggest_worker_prompt(project_key="pollypm") == "Kick off pollypm"
+
+
+def test_service_role_routing_resolves_against_bound_config(tmp_path: Path) -> None:
+    project_root = tmp_path / "demo"
+    project_root.mkdir()
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
+        ),
+        pollypm=PollyPMSettings(
+            controller_account="claude_main",
+            role_assignments={"worker": ModelAssignment(alias="codex-gpt-5.4")},
+        ),
+        accounts={
+            "claude_main": AccountConfig(
+                name="claude_main",
+                provider=ProviderKind.CLAUDE,
+                home=tmp_path / ".pollypm" / "homes" / "claude_main",
+            )
+        },
+        sessions={},
+        projects={"demo": KnownProject(key="demo", path=project_root, kind=ProjectKind.FOLDER)},
+    )
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path, force=True)
+
+    resolved = PollyPMService(config_path).role_routing.resolve("worker", "demo")
+
+    assert resolved.alias == "codex-gpt-5.4"
+    assert resolved.provider == "codex"
+    assert resolved.source == "global"
 
 
 def test_service_focus_and_send_input_use_supervisor(monkeypatch, tmp_path: Path) -> None:

@@ -7624,9 +7624,8 @@ def _escape_body(s: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-_PLAN_FILE_CANDIDATES: tuple[str, ...] = (
-    "docs/plan/plan.md",
-    "docs/project-plan.md",
+from pollypm.plugins_builtin.project_planning.plan_presence import (
+    CANONICAL_PLAN_RELATIVE_PATHS as _PLAN_FILE_CANDIDATES,
 )
 
 # Candidate locations for the plan-review HTML explainer; first hit wins.

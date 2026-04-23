@@ -68,10 +68,11 @@ class TestBuildContextPack:
             include_diffs=False,
         )
         assert isinstance(pack, ContextPack)
-        # The "no plan anchor" text now names both canonical paths,
-        # so either substring alone is sufficient to verify the fallback
-        # message surfaced.
-        assert "no docs/project-plan.md" in pack.plan_text
+        # The "no plan anchor" text names both canonical paths. Order-
+        # agnostic because the canonical-paths tuple lives in
+        # plan_presence and the advisor just consumes it.
+        assert "advisor running without a plan anchor" in pack.plan_text
+        assert "docs/project-plan.md" in pack.plan_text
         assert "docs/plan/plan.md" in pack.plan_text
         assert "## Delta since last advisor run" in pack.markdown
         assert "trajectory" in pack.markdown.lower()

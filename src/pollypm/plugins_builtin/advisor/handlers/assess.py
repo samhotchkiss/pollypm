@@ -55,14 +55,12 @@ logger = logging.getLogger(__name__)
 
 CONTEXT_FILENAME = ".pollypm-advisor-context.md"
 PLAN_RELATIVE_PATH = "docs/project-plan.md"
-# Candidates tried in order by :func:`_read_plan`. Mirrors the
-# plan-presence gate list in
-# :mod:`pollypm.plugins_builtin.project_planning.plan_presence` so the
-# advisor anchors against whichever canonical plan file the project
-# actually uses.
-PLAN_RELATIVE_CANDIDATES: tuple[str, ...] = (
-    PLAN_RELATIVE_PATH,
-    "docs/plan/plan.md",
+# Candidates tried in order by :func:`_read_plan`. Shared with the
+# plan-presence gate, the recovery reconciler, and the cockpit plan-
+# review widget — :data:`~pollypm.plugins_builtin.project_planning.plan_presence.CANONICAL_PLAN_RELATIVE_PATHS`
+# is the authoritative tuple.
+from pollypm.plugins_builtin.project_planning.plan_presence import (
+    CANONICAL_PLAN_RELATIVE_PATHS as PLAN_RELATIVE_CANDIDATES,
 )
 MAX_CONTEXT_CHARS = 20_000
 MAX_PLAN_CHARS = 8_000

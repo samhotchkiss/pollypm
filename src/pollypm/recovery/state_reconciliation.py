@@ -66,12 +66,12 @@ from typing import Any
 MIN_PLAN_SIZE_BYTES = 500
 
 # Candidate plan-file locations scanned in order. The first match wins.
-# Matches the observable reality from the dogfood run: architects have
-# historically written either path depending on which spec revision
-# they were following.
-_PLAN_FILE_CANDIDATES: tuple[str, ...] = (
-    "docs/plan/plan.md",
-    "docs/project-plan.md",
+# Shared with the plan-presence gate, the advisor context pack, and
+# the cockpit plan-review widget — see
+# :data:`pollypm.plugins_builtin.project_planning.plan_presence.CANONICAL_PLAN_RELATIVE_PATHS`
+# for the authoritative tuple.
+from pollypm.plugins_builtin.project_planning.plan_presence import (
+    CANONICAL_PLAN_RELATIVE_PATHS as _PLAN_FILE_CANDIDATES,
 )
 
 # Window for matching a "plan ready" notify against the current sweep.

@@ -76,6 +76,19 @@ _PLANNING_FLOWS = frozenset({"plan_project", "critique_flow"})
 _APPROVAL_NODE = "user_approval"
 
 
+# Canonical relative paths to a project's plan file, in preference
+# order. ``docs/plan/plan.md`` is the original spec path; the
+# architect's approval helper (pollypm.plugins_builtin.project_planning.approval)
+# writes ``docs/project-plan.md`` instead. Both are acceptable plans.
+# Every code path that reads "the plan" — the presence gate, the
+# advisor, the recovery reconciler, the cockpit plan-review view —
+# should scan this tuple rather than inline its own copy. #768.
+CANONICAL_PLAN_RELATIVE_PATHS: tuple[str, ...] = (
+    "docs/plan/plan.md",
+    "docs/project-plan.md",
+)
+
+
 def _candidate_plan_paths(project_path: Path, plan_dir: str) -> list[Path]:
     """Return the plan-file paths the gate accepts, in precedence order.
 
@@ -100,10 +113,12 @@ def _candidate_plan_paths(project_path: Path, plan_dir: str) -> list[Path]:
         # project-relative default.
         return [primary]
     primary = project_path / raw / "plan.md"
-    secondary = project_path / "docs" / "project-plan.md"
-    if primary == secondary:
-        return [primary]
-    return [primary, secondary]
+    paths: list[Path] = [primary]
+    for relative in CANONICAL_PLAN_RELATIVE_PATHS:
+        candidate = project_path / relative
+        if candidate not in paths:
+            paths.append(candidate)
+    return paths
 
 
 def _resolve_plan_path(project_path: Path, plan_dir: str) -> Path:

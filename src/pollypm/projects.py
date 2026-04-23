@@ -259,6 +259,17 @@ def ensure_project_scaffold(project_path: Path) -> Path:
     # Generate system reference docs for agent consumption
     scaffold_docs(normalize_project_path(project_path))
     _ensure_gitignore_entry(normalize_project_path(project_path), ".pollypm/")
+    # #763 — Materialize built-in role guides into
+    # <project>/.pollypm/project-guides/ so every agent in this
+    # project has an in-project absolute path to its role guide.
+    # Idempotent: skips files that already exist (respecting any
+    # forks from `pm project init-guide`).
+    try:
+        from pollypm.project_paths import materialize_role_guides
+        materialize_role_guides(project_path)
+    except Exception:  # noqa: BLE001
+        # Materialization is a convenience — never block scaffold on it.
+        pass
     return pollypm_dir
 
 

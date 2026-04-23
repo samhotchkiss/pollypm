@@ -149,6 +149,19 @@ PollyPM is intentionally built so major seams are replaceable: providers, runtim
 
 ## Install From Source
 
+**Step 1 — preflight.** Before cloning anything, verify your machine has every
+dep PollyPM needs (python 3.11+, uv, tmux, git, at least one of the provider
+CLIs). The preflight script lists missing items with OS-specific install hints
+so you fix them all at once instead of one `command not found` at a time:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/samhotchkiss/pollypm/main/scripts/preflight.sh | bash
+```
+
+(Or, if you already cloned the repo: `bash scripts/preflight.sh`.)
+
+**Step 2 — install.** Once preflight is green:
+
 ```bash
 git clone https://github.com/samhotchkiss/pollypm ~/dev/pollypm
 cd ~/dev/pollypm

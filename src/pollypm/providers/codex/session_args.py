@@ -10,7 +10,12 @@ know about either provider's flag vocabulary.
 from __future__ import annotations
 
 
-def session_args(*, open_permissions: bool = True, role: str = "") -> list[str]:
+def session_args(
+    *,
+    open_permissions: bool = True,
+    role: str = "",
+    model: str | None = None,
+) -> list[str]:
     """Return the Codex CLI argv tail for a session of ``role``.
 
     Behavior:
@@ -26,12 +31,16 @@ def session_args(*, open_permissions: bool = True, role: str = "") -> list[str]:
       default for ad-hoc launches).
     """
     if role in {"heartbeat-supervisor", "operator-pm"}:
-        return ["--sandbox", "read-only", "--ask-for-approval", "never"]
-    if role == "worker":
-        return ["--sandbox", "workspace-write", "--ask-for-approval", "never"]
-    if open_permissions:
-        return ["--dangerously-bypass-approvals-and-sandbox"]
-    return []
+        args = ["--sandbox", "read-only", "--ask-for-approval", "never"]
+    elif role == "worker":
+        args = ["--sandbox", "workspace-write", "--ask-for-approval", "never"]
+    elif open_permissions:
+        args = ["--dangerously-bypass-approvals-and-sandbox"]
+    else:
+        args = []
+    if model:
+        args.extend(["--model", model])
+    return args
 
 
 __all__ = ["session_args"]

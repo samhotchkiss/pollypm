@@ -7,12 +7,16 @@ did, and the Supervisor's public methods correctly delegate to it.
 
 from __future__ import annotations
 
+import base64
+import json
 from pathlib import Path
+import shlex
 
 from pollypm.launch_planner import LaunchPlanner, get_launch_planner
 from pollypm.models import (
     AccountConfig,
     KnownProject,
+    ModelAssignment,
     PollyPMConfig,
     PollyPMSettings,
     ProjectKind,
@@ -25,6 +29,15 @@ from pollypm.plugins_builtin.default_launch_planner.planner import (
     DefaultLaunchPlannerContext,
 )
 from pollypm.supervisor import Supervisor
+
+
+def _decode_launch_payload(command: str) -> dict[str, object]:
+    parts = shlex.split(command)
+    if parts[0] == "sh" and "-lc" in parts:
+        parts = shlex.split(parts[-1])
+    payload = parts[-1]
+    raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+    return json.loads(raw.decode("utf-8"))
 
 
 def _config(tmp_path: Path) -> PollyPMConfig:
@@ -170,6 +183,65 @@ def test_default_planner_controller_override_matches(tmp_path: Path) -> None:
         for l in standalone.plan_launches(controller_account="codex_backup")
     ]
     assert via_standalone == via_supervisor
+
+
+def test_planner_routes_architect_launch_to_project_override(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.projects["pollypm"].role_assignments["architect"] = ModelAssignment(
+        alias="sonnet-4.6"
+    )
+    config.sessions["architect"] = SessionConfig(
+        name="architect",
+        role="architect",
+        provider=ProviderKind.CLAUDE,
+        account="claude_controller",
+        cwd=tmp_path,
+        project="pollypm",
+        window_name="architect-pollypm",
+    )
+    sup = Supervisor(config)
+    sup.ensure_layout()
+
+    launch = next(item for item in sup.plan_launches() if item.session.name == "architect")
+    payload = _decode_launch_payload(launch.command)
+
+    assert launch.session.provider is ProviderKind.CLAUDE
+    assert payload["argv"] == [
+        "claude",
+        "--dangerously-skip-permissions",
+        "--model",
+        "claude-sonnet-4-6",
+    ]
+
+
+def test_planner_routes_operator_to_codex_when_compatible_account_exists(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.pollypm.role_assignments["operator_pm"] = ModelAssignment(
+        alias="codex-gpt-5.4"
+    )
+    config.accounts["codex_backup"] = AccountConfig(
+        name="codex_backup",
+        provider=ProviderKind.CODEX,
+        email="codex@example.com",
+        home=tmp_path / ".pollypm/homes/codex_backup",
+    )
+    sup = Supervisor(config)
+    sup.ensure_layout()
+
+    launch = next(item for item in sup.plan_launches() if item.session.name == "operator")
+    payload = _decode_launch_payload(launch.command)
+
+    assert launch.session.provider is ProviderKind.CODEX
+    assert launch.session.account == "codex_backup"
+    assert payload["argv"] == [
+        "codex",
+        "--sandbox",
+        "read-only",
+        "--ask-for-approval",
+        "never",
+        "--model",
+        "gpt-5.4",
+    ]
 
 
 def test_supervisor_launch_planner_property_returns_default(tmp_path: Path) -> None:

@@ -22,7 +22,12 @@ _NO_WRITE_TOOLS = "Edit,Write,MultiEdit,NotebookEdit"
 _OPERATOR_DISALLOWED = "Agent,Edit,Write,MultiEdit,NotebookEdit"
 
 
-def session_args(*, open_permissions: bool = True, role: str = "") -> list[str]:
+def session_args(
+    *,
+    open_permissions: bool = True,
+    role: str = "",
+    model: str | None = None,
+) -> list[str]:
     """Return the Claude CLI argv tail for a session of ``role``.
 
     Behavior:
@@ -46,6 +51,8 @@ def session_args(*, open_permissions: bool = True, role: str = "") -> list[str]:
     elif role == "operator-pm":
         args.extend(["--allowedTools", _OPERATOR_TOOLS])
         args.extend(["--disallowedTools", _OPERATOR_DISALLOWED])
+    if model:
+        args.extend(["--model", model])
     return args
 
 

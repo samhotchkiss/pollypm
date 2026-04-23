@@ -85,6 +85,26 @@ def _now_dt() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _first_matching_account(
+    accounts: dict[str, object],
+    *,
+    provider: object,
+    preferred_names: list[str],
+) -> tuple[str, object] | tuple[None, None]:
+    ordered: list[str] = []
+    for name in preferred_names:
+        if name and name not in ordered:
+            ordered.append(name)
+    for name in accounts:
+        if name not in ordered:
+            ordered.append(name)
+    for name in ordered:
+        account = accounts.get(name)
+        if account is not None and getattr(account, "provider", None) is provider:
+            return name, account
+    return None, None
+
+
 # ---------------------------------------------------------------------------
 # SessionManager
 # ---------------------------------------------------------------------------
@@ -304,42 +324,81 @@ class SessionManager:
         from pollypm.onboarding import default_session_args
         from pollypm.providers import get_provider
         from pollypm.runtimes import get_runtime
+        from pollypm.role_routing import resolved_provider_kind, resolve_role_assignment
 
         config = self._config
         accounts = getattr(config, "accounts", {}) or {}
-        account_name = (
-            agent_name if agent_name in accounts
-            else getattr(getattr(config, "pollypm", None), "controller_account", "")
-        )
-        account = accounts.get(account_name)
+        routed_assignment = resolve_role_assignment("worker", project, config=config)
+        try:
+            routed_provider = resolved_provider_kind(routed_assignment)
+        except ValueError as exc:
+            raise ProvisionError(
+                f"Worker routing for project {project} resolved an unknown provider "
+                f"{routed_assignment.provider!r}: {exc}"
+            ) from exc
+        preferred_names = [
+            agent_name if agent_name in accounts else "",
+            getattr(getattr(config, "pollypm", None), "controller_account", ""),
+        ]
+        if routed_assignment.source == "fallback":
+            legacy_name = preferred_names[0] or preferred_names[1]
+            account_name = legacy_name
+            account = accounts.get(account_name)
+            if account is None and accounts:
+                account_name, account = next(iter(accounts.items()))
+        else:
+            account_name, account = _first_matching_account(
+                accounts,
+                provider=routed_provider,
+                preferred_names=preferred_names,
+            )
         if account is None:
             if accounts:
-                account_name, account = next(iter(accounts.items()))
-            else:
                 raise ProvisionError(
                     "Could not provision a worker because no configured account "
-                    "is available for provider/runtime launch planning. "
-                    "Why it matters: the worker session has no provider or "
-                    "runtime to start under. "
-                    "Fix: add at least one account to PollyPM config, then "
-                    "retry the claim."
+                    f"is available for routed provider {routed_provider.value}. "
+                    "Why it matters: the worker session has no compatible "
+                    "provider/runtime to start under. "
+                    f"Fix: add at least one {routed_provider.value} account to "
+                    "PollyPM config, then retry the claim."
                 )
+            raise ProvisionError(
+                "Could not provision a worker because no configured account "
+                "is available for provider/runtime launch planning. "
+                "Why it matters: the worker session has no provider or "
+                "runtime to start under. "
+                "Fix: add at least one account to PollyPM config, then "
+                "retry the claim."
+            )
+        session_provider = account.provider
+        session_model: str | None = None
+        if account.provider is routed_provider:
+            session_provider = routed_provider
+            session_model = routed_assignment.model
+            logger.info(
+                "Role routing resolved worker for %s to %s/%s from %s.",
+                project,
+                routed_assignment.provider,
+                routed_assignment.model,
+                routed_assignment.source,
+            )
 
         session = SessionConfig(
             name=window_name,
             role="worker",
-            provider=account.provider,
+            provider=session_provider,
             account=account_name,
             cwd=worktree_path,
             project=project,
             window_name=window_name,
             args=default_session_args(
-                account.provider,
+                session_provider,
                 open_permissions=config.pollypm.open_permissions_by_default,
                 role="worker",
+                model=session_model,
             ),
         )
-        provider = get_provider(account.provider, root_dir=config.project.root_dir)
+        provider = get_provider(session_provider, root_dir=config.project.root_dir)
         runtime = get_runtime(account.runtime, root_dir=config.project.root_dir)
         launch = provider.build_launch_command(session, account)
         command = runtime.wrap_command(launch, account, config.project)

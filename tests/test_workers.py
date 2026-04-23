@@ -5,6 +5,7 @@ from pollypm.models import (
     AccountConfig,
     ProjectKind,
     ProjectSettings,
+    ModelAssignment,
     PollyPMConfig,
     PollyPMSettings,
     ProviderKind,
@@ -17,7 +18,7 @@ from pollypm.plugins_builtin.core_agent_profiles.profiles import heartbeat_promp
 from pollypm.plugins_builtin.core_agent_profiles.profiles import polly_prompt as operator_prompt
 from pollypm.plugins_builtin.core_agent_profiles.profiles import triage_prompt
 from pollypm.plugins_builtin.core_agent_profiles.profiles import reviewer_prompt
-from pollypm.workers import auto_select_worker_account, suggest_worker_prompt
+from pollypm.workers import auto_select_worker_account, create_worker_session, suggest_worker_prompt
 from pollypm.plugins_builtin.core_agent_profiles.profiles import worker_prompt
 
 
@@ -198,6 +199,73 @@ def test_suggest_worker_prompt_returns_empty(tmp_path: Path) -> None:
     prompt = suggest_worker_prompt(config_path, project_key="pollypm")
 
     assert prompt == ""
+
+
+def test_create_worker_session_routes_architect_model_assignment(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config, config_path = _config(tmp_path)
+    config.projects["pollypm"].role_assignments["architect"] = ModelAssignment(
+        alias="sonnet-4.6"
+    )
+    write_config(config, config_path, force=True)
+    monkeypatch.setattr("pollypm.workers.detect_logged_in", lambda account: True)
+    monkeypatch.setattr(
+        "pollypm.workers.ensure_worktree",
+        lambda *args, **kwargs: type(
+            "Worktree",
+            (),
+            {"path": str(tmp_path / "architect-worktree")},
+        )(),
+    )
+
+    session = create_worker_session(
+        config_path,
+        project_key="pollypm",
+        prompt=None,
+        role="architect",
+        agent_profile="architect",
+    )
+
+    assert session.provider is ProviderKind.CLAUDE
+    assert session.args == [
+        "--dangerously-skip-permissions",
+        "--model",
+        "claude-sonnet-4-6",
+    ]
+
+
+def test_create_worker_session_keeps_legacy_selection_when_fallback_provider_has_no_account(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config, config_path = _config(tmp_path)
+    config.accounts = {
+        "claude_controller": config.accounts["claude_controller"],
+    }
+    config.pollypm.failover_enabled = False
+    config.pollypm.failover_accounts = []
+    write_config(config, config_path, force=True)
+    monkeypatch.setattr("pollypm.workers.detect_logged_in", lambda account: True)
+    monkeypatch.setattr(
+        "pollypm.workers.ensure_worktree",
+        lambda *args, **kwargs: type(
+            "Worktree",
+            (),
+            {"path": str(tmp_path / "worker-worktree")},
+        )(),
+    )
+
+    session = create_worker_session(
+        config_path,
+        project_key="pollypm",
+        prompt=None,
+        role="worker",
+    )
+
+    assert session.provider is ProviderKind.CLAUDE
+    assert session.args == ["--dangerously-skip-permissions"]
 
 
 def test_worker_prompt_requires_core_identity() -> None:

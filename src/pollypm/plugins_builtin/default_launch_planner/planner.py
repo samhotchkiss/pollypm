@@ -17,6 +17,7 @@ stays a clean seam we can swap later.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import logging
 from typing import TYPE_CHECKING, Callable
 
 from pollypm.models import AccountConfig, ProviderKind, SessionConfig, SessionLaunchSpec
@@ -24,6 +25,7 @@ from pollypm.projects import ensure_session_lock
 from pollypm.providers import get_provider
 from pollypm.providers.args import sanitize_provider_args
 from pollypm.providers.base import LaunchCommand
+from pollypm.role_routing import resolved_provider_kind, resolve_role_assignment
 from pollypm.runtimes import get_runtime
 
 if TYPE_CHECKING:
@@ -32,6 +34,45 @@ if TYPE_CHECKING:
 
 
 _CONTROL_ROLES = frozenset({"heartbeat-supervisor", "operator-pm", "triage", "reviewer"})
+_ROUTED_ROLES = frozenset({"operator-pm", "architect", "worker", "reviewer"})
+_log = logging.getLogger(__name__)
+
+
+def _preferred_account_names(
+    config: "PollyPMConfig",
+    *,
+    session: SessionConfig,
+    override_account: str | None,
+) -> list[str]:
+    names: list[str] = []
+    for name in (
+        override_account,
+        session.account,
+        config.pollypm.controller_account,
+        *config.pollypm.failover_accounts,
+        *config.accounts,
+    ):
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _first_account_for_provider(
+    config: "PollyPMConfig",
+    *,
+    provider: ProviderKind,
+    session: SessionConfig,
+    override_account: str | None,
+) -> str | None:
+    for name in _preferred_account_names(
+        config,
+        session=session,
+        override_account=override_account,
+    ):
+        account = config.accounts.get(name)
+        if account is not None and account.provider is provider:
+            return name
+    return None
 
 
 @dataclass(slots=True)
@@ -159,6 +200,7 @@ class DefaultLaunchPlanner:
         from pollypm.onboarding import default_control_args, default_session_args
 
         effective = session
+        routed_assignment = None
         try:
             runtime = ctx.store.get_session_runtime(session.name)
         except Exception:  # noqa: BLE001
@@ -182,14 +224,74 @@ class DefaultLaunchPlanner:
                         ctx.store.set_session_runtime(session.name, effective_account="")
                     except Exception:  # noqa: BLE001
                         pass
-        if ctx.readonly_state:
-            return effective
+        if session.role in _ROUTED_ROLES:
+            project_key = None if session.role == "operator-pm" else session.project
+            routed_assignment = resolve_role_assignment(
+                session.role,
+                project_key,
+                config=ctx.config,
+            )
+            try:
+                routed_provider = resolved_provider_kind(routed_assignment)
+            except ValueError:
+                _log.warning(
+                    "Ignoring invalid routed provider %r for %s session %s.",
+                    routed_assignment.provider,
+                    session.role,
+                    session.name,
+                )
+            else:
+                if routed_assignment.source != "fallback":
+                    account_name = _first_account_for_provider(
+                        ctx.config,
+                        provider=routed_provider,
+                        session=effective,
+                        override_account=override_account,
+                    )
+                    if account_name is None:
+                        _log.warning(
+                            "Role routing resolved %s session %s to %s/%s from %s, but no compatible account is configured; "
+                            "keeping the existing provider/account.",
+                            session.role,
+                            session.name,
+                            routed_assignment.provider,
+                            routed_assignment.model,
+                            routed_assignment.source,
+                        )
+                        routed_assignment = None
+                    else:
+                        effective = replace(
+                            effective,
+                            provider=routed_provider,
+                            account=account_name,
+                        )
+                        _log.info(
+                            "Role routing resolved %s session %s to %s/%s from %s.",
+                            session.role,
+                            session.name,
+                            routed_assignment.provider,
+                            routed_assignment.model,
+                            routed_assignment.source,
+                        )
+                elif effective.provider is routed_provider:
+                    _log.info(
+                        "Role routing resolved %s session %s to %s/%s from %s.",
+                        session.role,
+                        session.name,
+                        routed_assignment.provider,
+                        routed_assignment.model,
+                        routed_assignment.source,
+                    )
+                else:
+                    routed_assignment = None
         if effective.account not in ctx.config.accounts:
             # Fall back to controller account if the session's account is missing
             if controller_account and controller_account in ctx.config.accounts:
                 effective = replace(effective, account=controller_account)
             else:
                 return effective
+        if ctx.readonly_state:
+            return effective
         account = ctx.config.accounts[effective.account]
         profile_prompt = ctx.resolve_profile_prompt(effective, account)
         if effective.role in _CONTROL_ROLES:
@@ -200,6 +302,7 @@ class DefaultLaunchPlanner:
                     account.provider,
                     open_permissions=ctx.config.pollypm.open_permissions_by_default,
                     role=effective.role,
+                    model=routed_assignment.model if routed_assignment is not None else None,
                 ),
             )
         else:
@@ -220,6 +323,17 @@ class DefaultLaunchPlanner:
                         account.provider,
                         open_permissions=ctx.config.pollypm.open_permissions_by_default,
                         role=effective.role,
+                        model=routed_assignment.model if routed_assignment is not None else None,
+                    ),
+                )
+            elif routed_assignment is not None:
+                effective = replace(
+                    effective,
+                    args=default_session_args(
+                        account.provider,
+                        open_permissions=ctx.config.pollypm.open_permissions_by_default,
+                        role=effective.role,
+                        model=routed_assignment.model,
                     ),
                 )
             else:

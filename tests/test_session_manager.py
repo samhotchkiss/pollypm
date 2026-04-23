@@ -606,6 +606,8 @@ class TestProvisionWorker:
             "workspace-write",
             "--ask-for-approval",
             "never",
+            "--model",
+            "gpt-5.4",
         ]
 
     def test_provision_worker_aborts_when_prompt_write_fails(

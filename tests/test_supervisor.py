@@ -512,11 +512,24 @@ def test_control_session_args_follow_override_provider(tmp_path: Path) -> None:
     config.sessions["operator"].args = ["--dangerously-skip-permissions"]
     supervisor = Supervisor(config)
 
-    launches = supervisor.plan_launches(controller_account="codex_backup")
+    launches = {launch.session.name: launch for launch in supervisor.plan_launches(controller_account="codex_backup")}
 
-    for launch in launches:
-        assert launch.session.provider is ProviderKind.CODEX
-        assert launch.session.args == ["--sandbox", "read-only", "--ask-for-approval", "never"]
+    assert launches["heartbeat"].session.provider is ProviderKind.CODEX
+    assert launches["heartbeat"].session.args == [
+        "--sandbox",
+        "read-only",
+        "--ask-for-approval",
+        "never",
+    ]
+    assert launches["operator"].session.provider is ProviderKind.CODEX
+    assert launches["operator"].session.args == [
+        "--sandbox",
+        "read-only",
+        "--ask-for-approval",
+        "never",
+        "--model",
+        "gpt-5.4",
+    ]
 
 
 def test_claude_control_sessions_use_original_account_home(tmp_path: Path) -> None:
@@ -657,7 +670,14 @@ def test_open_permissions_default_can_disable_launch_args(tmp_path: Path) -> Non
     assert "--disallowedTools" in launches["operator"].session.args
     assert "--dangerously-skip-permissions" not in launches["heartbeat"].session.args
     assert "--dangerously-skip-permissions" not in launches["operator"].session.args
-    assert launches["worker"].session.args == ["--sandbox", "workspace-write", "--ask-for-approval", "never"]
+    assert launches["worker"].session.args == [
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "never",
+        "--model",
+        "gpt-5.4",
+    ]
 
 
 def test_run_heartbeat_delegates_to_configured_backend(monkeypatch, tmp_path: Path) -> None:
@@ -740,7 +760,15 @@ def test_codex_control_launches_use_agents_md_instead_of_visible_prompt(tmp_path
     argv = decoded["argv"]
     env = decoded["env"]
 
-    assert argv == ["codex", "--sandbox", "read-only", "--ask-for-approval", "never"]
+    assert argv == [
+        "codex",
+        "--sandbox",
+        "read-only",
+        "--ask-for-approval",
+        "never",
+        "--model",
+        "gpt-5.4",
+    ]
     assert "PM_CODEX_HOME_AGENTS_MD" in env
     assert "Polly" in env["PM_CODEX_HOME_AGENTS_MD"]
     assert launch.initial_input is None
@@ -765,7 +793,15 @@ def test_codex_worker_launches_do_not_auto_send_prompt(tmp_path: Path) -> None:
 
     # Worker prompt should NOT be baked into argv
     assert not any("do some work" in arg for arg in decoded["argv"])
-    assert decoded["argv"] == ["codex", "--sandbox", "workspace-write", "--ask-for-approval", "never"]
+    assert decoded["argv"] == [
+        "codex",
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "never",
+        "--model",
+        "gpt-5.4",
+    ]
     shim_path = Path(decoded["env"]["PATH"].split(":")[0])
     assert shim_path.name == "worker"
     assert (shim_path / "tmux").exists()

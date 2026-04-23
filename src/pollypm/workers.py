@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import logging
 from pathlib import Path
 
 import typer
@@ -9,9 +10,13 @@ from pollypm.acct import detect_logged_in
 from pollypm.config import load_config, write_config
 from pollypm.onboarding import default_session_args
 from pollypm.models import ProviderKind, SessionConfig
+from pollypm.role_routing import resolved_provider_kind, resolve_role_assignment
 from pollypm.supervisor import Supervisor
 from pollypm.storage.state import StateStore
 from pollypm.worktrees import ensure_worktree
+
+
+_log = logging.getLogger(__name__)
 
 
 def _effective_control_accounts(config_path: Path) -> set[str]:
@@ -104,15 +109,94 @@ def create_worker_session(
         )
 
     role = (role or "worker").strip() or "worker"
+    routed_assignment = resolve_role_assignment(role, project_key, config=config)
+    routed_provider: ProviderKind | None
+    try:
+        routed_provider = resolved_provider_kind(routed_assignment)
+    except ValueError:
+        _log.warning(
+            "Ignoring invalid routed provider %r for %s on %s.",
+            routed_assignment.provider,
+            role,
+            project_key,
+        )
+        routed_provider = None
 
     if account_name is None:
-        account_name = auto_select_worker_account(config_path, provider=provider)
+        preferred_provider = (
+            routed_provider
+            if routed_provider is not None and routed_assignment.source != "fallback"
+            else provider
+        )
+        try:
+            account_name = auto_select_worker_account(
+                config_path,
+                provider=preferred_provider,
+            )
+        except typer.BadParameter:
+            if (
+                routed_provider is None
+                or provider is not None
+                or routed_assignment.source == "fallback"
+            ):
+                raise
+            _log.warning(
+                "Role routing resolved %s for %s to %s/%s from %s, but no matching account is available; "
+                "falling back to the legacy worker account selection.",
+                role,
+                project_key,
+                routed_assignment.provider,
+                routed_assignment.model,
+                routed_assignment.source,
+            )
+            account_name = auto_select_worker_account(config_path, provider=provider)
     if account_name not in config.accounts:
         raise typer.BadParameter(f"Unknown account: {account_name}")
     account = config.accounts[account_name]
     if provider is not None and account.provider is not provider:
         raise typer.BadParameter(
             f"Account {account_name} uses provider {account.provider.value}, not {provider.value}"
+        )
+    active_provider = account.provider
+    active_model: str | None = None
+    if routed_provider is not None and (
+        routed_assignment.source != "fallback"
+        or account.provider is routed_provider
+    ):
+        if account.provider is not routed_provider:
+            _log.warning(
+                "Role routing resolved %s for %s to %s/%s from %s, but account %s uses %s; "
+                "keeping the session on the account provider.",
+                role,
+                project_key,
+                routed_assignment.provider,
+                routed_assignment.model,
+                routed_assignment.source,
+                account_name,
+                account.provider.value,
+            )
+        else:
+            active_provider = routed_provider
+            active_model = routed_assignment.model
+            _log.info(
+                "Role routing resolved %s for %s to %s/%s from %s.",
+                role,
+                project_key,
+                routed_assignment.provider,
+                routed_assignment.model,
+                routed_assignment.source,
+            )
+    elif routed_provider is not None and routed_assignment.source != "fallback":
+        _log.warning(
+            "Role routing resolved %s for %s to %s/%s from %s, but account %s uses %s; "
+            "keeping the session on the account provider.",
+            role,
+            project_key,
+            routed_assignment.provider,
+            routed_assignment.model,
+            routed_assignment.source,
+            account_name,
+            account.provider.value,
         )
     if not prompt or not prompt.strip():
         prompt = suggest_worker_prompt(config_path, project_key=project_key)
@@ -140,14 +224,19 @@ def create_worker_session(
     worker = SessionConfig(
         name=session_key,
         role=role,
-        provider=account.provider,
+        provider=active_provider,
         account=account_name,
         cwd=Path(worktree.path) if worktree is not None else project.path,
         project=project_key,
         window_name=f"{window_prefix}-{project_key}",
         prompt=prompt,
         agent_profile=agent_profile,
-        args=default_session_args(account.provider, open_permissions=config.pollypm.open_permissions_by_default),
+        args=default_session_args(
+            active_provider,
+            open_permissions=config.pollypm.open_permissions_by_default,
+            role=role,
+            model=active_model,
+        ),
     )
     config.sessions[session_key] = worker
     try:

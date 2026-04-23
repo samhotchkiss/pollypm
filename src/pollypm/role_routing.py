@@ -7,7 +7,7 @@ from typing import Literal
 
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config
 from pollypm.model_registry import Registry, load_registry, resolve_alias
-from pollypm.models import ModelAssignment, PollyPMConfig
+from pollypm.models import ModelAssignment, PollyPMConfig, ProviderKind
 
 
 _log = logging.getLogger(__name__)
@@ -127,8 +127,13 @@ class RoleRoutingFacade:
         )
 
 
+def resolved_provider_kind(resolved: ResolvedAssignment) -> ProviderKind:
+    return ProviderKind(resolved.provider)
+
+
 __all__ = [
     "ResolvedAssignment",
     "RoleRoutingFacade",
+    "resolved_provider_kind",
     "resolve_role_assignment",
 ]

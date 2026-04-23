@@ -83,6 +83,7 @@ def default_session_args(
     *,
     open_permissions: bool = True,
     role: str = "",
+    model: str | None = None,
 ) -> list[str]:
     """Dispatch the role-to-CLI-flag mapping to the provider package.
 
@@ -96,11 +97,19 @@ def default_session_args(
     if provider is ProviderKind.CLAUDE:
         from pollypm.providers.claude.session_args import session_args
 
-        return session_args(open_permissions=open_permissions, role=role)
+        return session_args(
+            open_permissions=open_permissions,
+            role=role,
+            model=model,
+        )
     if provider is ProviderKind.CODEX:
         from pollypm.providers.codex.session_args import session_args
 
-        return session_args(open_permissions=open_permissions, role=role)
+        return session_args(
+            open_permissions=open_permissions,
+            role=role,
+            model=model,
+        )
     return []
 
 
@@ -109,8 +118,14 @@ def default_control_args(
     *,
     open_permissions: bool = True,
     role: str = "",
+    model: str | None = None,
 ) -> list[str]:
-    return default_session_args(provider, open_permissions=open_permissions, role=role)
+    return default_session_args(
+        provider,
+        open_permissions=open_permissions,
+        role=role,
+        model=model,
+    )
 
 
 def _prime_claude_home(home: Path) -> None:

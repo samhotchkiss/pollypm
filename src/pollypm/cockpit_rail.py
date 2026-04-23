@@ -1945,6 +1945,9 @@ class PollyCockpitRail:
             self._write("\x1b[?25l")
             while True:
                 self.router.ensure_cockpit_layout()
+                # #751 — pick up selection changes made by external
+                # routers so the rail highlight tracks them.
+                self._sync_selection_from_router()
                 items = self.router.build_items(spinner_index=self.spinner_index)
                 self._last_items = items
                 self._clamp_selection(items)
@@ -1963,6 +1966,25 @@ class PollyCockpitRail:
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
             self._write("\x1b[0m\x1b[?25h")
+
+    def _sync_selection_from_router(self) -> None:
+        """Pick up selection changes made by external routers (#751).
+
+        The persisted selection at ``~/.pollypm/.cockpit-state.json``
+        is the canonical state — it's updated by every call to
+        ``CockpitRouter.set_selected_key``, including calls from apps
+        running in the right pane (e.g. PollyProjectDashboardApp's
+        jump-to-inbox flow). Without this sync, the rail's in-memory
+        ``selected_key`` only tracked keys pressed on the rail itself,
+        so the user saw the old highlight persist after navigating
+        from elsewhere.
+        """
+        try:
+            external_key = self.router.selected_key()
+        except Exception:  # noqa: BLE001
+            return
+        if external_key and external_key != self.selected_key:
+            self.selected_key = external_key
 
     def _handle_key(self, key: bytes, items: list[CockpitItem]) -> bool:
         if key in {b"q", b"\x03"}:

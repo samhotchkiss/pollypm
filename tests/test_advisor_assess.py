@@ -68,7 +68,11 @@ class TestBuildContextPack:
             include_diffs=False,
         )
         assert isinstance(pack, ContextPack)
+        # The "no plan anchor" text now names both canonical paths,
+        # so either substring alone is sufficient to verify the fallback
+        # message surfaced.
         assert "no docs/project-plan.md" in pack.plan_text
+        assert "docs/plan/plan.md" in pack.plan_text
         assert "## Delta since last advisor run" in pack.markdown
         assert "trajectory" in pack.markdown.lower()
 
@@ -90,6 +94,26 @@ class TestBuildContextPack:
         )
         assert "Pluginify everything." in pack.plan_text
         assert "Pluginify everything." in pack.markdown
+
+    def test_plan_fallback_to_docs_plan_plan_md(self, tmp_path: Path) -> None:
+        """Projects that use the older ``docs/plan/plan.md`` convention
+        (no docs/project-plan.md) still get a plan anchor."""
+        project_path = tmp_path / "proj"
+        (project_path / "docs" / "plan").mkdir(parents=True)
+        (project_path / "docs" / "plan" / "plan.md").write_text(
+            "# Plan\n\nOlder-convention plan content."
+        )
+        base_dir = tmp_path / "state"
+        base_dir.mkdir()
+        report = ChangeReport(project_path=project_path, since=None)
+        pack = build_context_pack(
+            project_key="proj",
+            project_path=project_path,
+            report=report,
+            base_dir=base_dir,
+            include_diffs=False,
+        )
+        assert "Older-convention plan content." in pack.plan_text
 
     def test_plan_truncation(self, tmp_path: Path) -> None:
         project_path = tmp_path / "proj"

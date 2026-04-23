@@ -55,6 +55,15 @@ logger = logging.getLogger(__name__)
 
 CONTEXT_FILENAME = ".pollypm-advisor-context.md"
 PLAN_RELATIVE_PATH = "docs/project-plan.md"
+# Candidates tried in order by :func:`_read_plan`. Mirrors the
+# plan-presence gate list in
+# :mod:`pollypm.plugins_builtin.project_planning.plan_presence` so the
+# advisor anchors against whichever canonical plan file the project
+# actually uses.
+PLAN_RELATIVE_CANDIDATES: tuple[str, ...] = (
+    PLAN_RELATIVE_PATH,
+    "docs/plan/plan.md",
+)
 MAX_CONTEXT_CHARS = 20_000
 MAX_PLAN_CHARS = 8_000
 MAX_PER_FILE_DIFF_LINES = 500
@@ -130,10 +139,21 @@ class AdvisorDecision:
 
 
 def _read_plan(project_path: Path) -> str:
-    """Read docs/project-plan.md (truncated to MAX_PLAN_CHARS)."""
-    plan_path = project_path / PLAN_RELATIVE_PATH
-    if not plan_path.exists():
-        return "(no docs/project-plan.md — advisor running without a plan anchor)"
+    """Read the project plan (truncated to MAX_PLAN_CHARS).
+
+    Tries each entry in :data:`PLAN_RELATIVE_CANDIDATES` in order so
+    projects that use the older ``docs/plan/plan.md`` convention
+    instead of ``docs/project-plan.md`` still get a plan anchor.
+    """
+    plan_path: Path | None = None
+    for relative in PLAN_RELATIVE_CANDIDATES:
+        candidate = project_path / relative
+        if candidate.exists():
+            plan_path = candidate
+            break
+    if plan_path is None:
+        joined = " or ".join(PLAN_RELATIVE_CANDIDATES)
+        return f"(no {joined} — advisor running without a plan anchor)"
     try:
         text = plan_path.read_text(encoding="utf-8")
     except OSError as exc:

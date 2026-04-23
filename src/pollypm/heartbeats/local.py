@@ -543,23 +543,24 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         if not mechanical_only and context.previous_snapshot_hash and context.previous_snapshot_hash == context.snapshot_hash:
             hashes = api.recent_snapshot_hashes(context.session_name, limit=3)
             if len(hashes) == 3 and len(set(hashes)) == 1:
-                # Control-plane sessions (heartbeat / operator / reviewer /
-                # the PollyPM dogfood worker) legitimately idle whenever
-                # the user isn't chatting — their snapshot settles and
-                # stays settled. Firing ``suspected_loop`` on them every
-                # 30s floods the cockpit with false positives that never
-                # represent a real stall. Project-scoped workers still
-                # get checked against ``_has_pending_work``; when they
-                # idle with work queued THAT is a real signal.
-                control_role = context.role in {
-                    "heartbeat-supervisor", "operator-pm", "reviewer",
-                }
-                control_name = context.session_name in {"worker_pollypm"}
-                idle_worker = (
-                    context.role == "worker"
-                    and not self._has_pending_work(api, context)
+                # #765 — run the same-snapshot finding through the
+                # stall classifier. Only ``unrecoverable_stall`` earns
+                # an alert; ``legitimate_idle`` and ``transient`` stay
+                # silent so the cockpit doesn't toast the user for a
+                # session that's behaving correctly (architect awaiting
+                # approval, reviewer idle with empty queue, etc.).
+                from pollypm.heartbeats.stall_classifier import (
+                    StallContext,
+                    classify_stall,
                 )
-                if control_role or control_name or idle_worker:
+
+                stall_ctx = StallContext(
+                    role=context.role or "",
+                    session_name=context.session_name,
+                    has_pending_work=self._has_pending_work(api, context),
+                )
+                stall_class = classify_stall(stall_ctx)
+                if stall_class != "unrecoverable_stall":
                     api.clear_alert(context.session_name, "suspected_loop")
                 else:
                     api.raise_alert(

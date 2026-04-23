@@ -218,11 +218,58 @@ def inbox_reply(
 
 @inbox_app.command("archive")
 def inbox_archive(
-    task_id: str = typer.Argument(..., help="Task ID (project/number)"),
+    task_id: Optional[str] = typer.Argument(
+        None,
+        help=(
+            "Task ID (``project/number``) or message ID (``msg:N``). "
+            "Omit when using ``--match``."
+        ),
+    ),
+    match: Optional[str] = typer.Option(
+        None,
+        "--match",
+        help=(
+            "Glob pattern matched against message titles. "
+            "Archives every open user-recipient message whose title "
+            "matches. Useful for cleaning up test-harness noise like "
+            "``--match 'loop-test-*'`` (#754)."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="With --match: print what would be archived without changing state.",
+    ),
     actor: str = typer.Option("user", "--actor", help="Actor to attribute the archive to."),
     db: str = _DB_OPTION,
 ) -> None:
-    """Archive an inbox task (mirrors the cockpit archive action)."""
+    """Archive an inbox task or message (mirrors the cockpit archive action).
+
+    Three modes:
+
+    - ``pm inbox archive demo/1`` — archive a single work-service task
+      (the original behavior).
+    - ``pm inbox archive msg:628`` — archive a single notify/alert
+      message in the unified messages store.
+    - ``pm inbox archive --match 'loop-test-*'`` — bulk archive every
+      open user-recipient message whose title matches the glob. Add
+      ``--dry-run`` to preview.
+    """
+    if match is not None:
+        _bulk_archive_by_match(db=db, pattern=match, dry_run=dry_run)
+        return
+
+    if task_id is None:
+        typer.echo(
+            "Error: pass a task_id/message-id, OR use --match '<pattern>'.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    # Message IDs (from `pm inbox --json`) use the ``msg:<n>`` prefix.
+    if task_id.startswith("msg:"):
+        _archive_message_by_id(db=db, msg_id_str=task_id)
+        return
+
     project = _project_from_task_id(task_id)
     svc = _svc(db, project=project)
     try:
@@ -231,3 +278,94 @@ def inbox_archive(
         typer.echo(_render_work_service_error(exc, svc.archive_task), err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"{task.task_id} → {task.work_status.value}")
+
+
+def _archive_message_by_id(*, db: str, msg_id_str: str) -> None:
+    """Close a single message row by its ``msg:N`` ID."""
+    try:
+        raw = msg_id_str.split(":", 1)[1]
+        msg_id = int(raw)
+    except (IndexError, ValueError):
+        typer.echo(f"Error: invalid message id {msg_id_str!r}.", err=True)
+        raise typer.Exit(code=2)
+
+    db_path = _resolve_db_path(db, project=None)
+    try:
+        from pollypm.store import SQLAlchemyStore
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"Error: unified store unavailable ({exc}).", err=True)
+        raise typer.Exit(code=1)
+
+    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    try:
+        store.close_message(msg_id)
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"Error: failed to archive msg:{msg_id} ({exc}).", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        store.close()
+    typer.echo(f"msg:{msg_id} → archived")
+
+
+def _bulk_archive_by_match(*, db: str, pattern: str, dry_run: bool) -> None:
+    """Archive every open user-recipient message whose title matches ``pattern``."""
+    import fnmatch
+
+    db_path = _resolve_db_path(db, project=None)
+    try:
+        from pollypm.store import SQLAlchemyStore
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"Error: unified store unavailable ({exc}).", err=True)
+        raise typer.Exit(code=1)
+
+    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    try:
+        rows = store.query_messages(
+            recipient="user", state="open",
+            type=["notify", "inbox_task", "alert"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        store.close()
+        typer.echo(f"Error: query_messages failed ({exc}).", err=True)
+        raise typer.Exit(code=1) from exc
+
+    matches = []
+    for row in rows:
+        subject = row.get("subject") or row.get("title") or ""
+        if fnmatch.fnmatch(subject, pattern):
+            matches.append(row)
+
+    if not matches:
+        store.close()
+        typer.echo(f"No open messages matched {pattern!r}.")
+        return
+
+    if dry_run:
+        typer.echo(f"Would archive {len(matches)} message(s):")
+        for row in matches[:20]:
+            mid = row.get("id") or row.get("message_id")
+            subject = row.get("subject") or row.get("title") or ""
+            typer.echo(f"  msg:{mid}  {subject[:80]}")
+        if len(matches) > 20:
+            typer.echo(f"  … ({len(matches) - 20} more)")
+        store.close()
+        return
+
+    closed = 0
+    failures: list[tuple[int, str]] = []
+    for row in matches:
+        mid = row.get("id") or row.get("message_id")
+        if mid is None:
+            continue
+        try:
+            store.close_message(int(mid))
+            closed += 1
+        except Exception as exc:  # noqa: BLE001
+            failures.append((int(mid), str(exc)))
+    store.close()
+
+    typer.echo(f"Archived {closed} message(s) matching {pattern!r}.")
+    if failures:
+        typer.echo(f"Failed to archive {len(failures)}:", err=True)
+        for mid, reason in failures[:5]:
+            typer.echo(f"  msg:{mid}: {reason}", err=True)

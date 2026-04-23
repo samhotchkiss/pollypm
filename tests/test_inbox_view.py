@@ -344,6 +344,90 @@ class TestInboxCLI:
         assert "Why: project 'proj' does not have task number 9." in result.output
         assert "Fix: run `pm task list --project proj` to see available task ids." in result.output
 
+    # #754 — bulk archive by title glob
+    def _seed_notify(self, db_path: str, subject: str) -> int:
+        from pollypm.store import SQLAlchemyStore
+        store = SQLAlchemyStore(f"sqlite:///{db_path}")
+        try:
+            return store.enqueue_message(
+                type="notify", tier="immediate", scope="inbox",
+                sender="polly", recipient="user",
+                subject=subject, body="body",
+            )
+        finally:
+            store.close()
+
+    def test_archive_match_bulk_archives_by_glob(self, db_path):
+        self._seed_notify(db_path, "loop-test-111")
+        self._seed_notify(db_path, "loop-test-222")
+        self._seed_notify(db_path, "real-action-please-review")
+
+        result = runner.invoke(
+            inbox_app, ["archive", "--match", "*loop-test-*", "--db", db_path],
+        )
+        assert result.exit_code == 0, result.output
+        assert "Archived 2 message(s)" in result.output
+
+        # The non-matching message is still open.
+        from pollypm.store import SQLAlchemyStore
+        store = SQLAlchemyStore(f"sqlite:///{db_path}")
+        try:
+            rows = store.query_messages(recipient="user", state="open")
+            remaining = [r.get("subject") or "" for r in rows]
+        finally:
+            store.close()
+        assert any("real-action" in s for s in remaining)
+        assert not any("loop-test" in s for s in remaining)
+
+    def test_archive_match_dry_run_does_not_change_state(self, db_path):
+        self._seed_notify(db_path, "loop-test-aaa")
+        self._seed_notify(db_path, "loop-test-bbb")
+
+        result = runner.invoke(
+            inbox_app,
+            ["archive", "--match", "*loop-test-*", "--dry-run", "--db", db_path],
+        )
+        assert result.exit_code == 0, result.output
+        assert "Would archive 2 message(s)" in result.output
+        # State unchanged.
+        from pollypm.store import SQLAlchemyStore
+        store = SQLAlchemyStore(f"sqlite:///{db_path}")
+        try:
+            rows = store.query_messages(recipient="user", state="open")
+            assert len(rows) == 2
+        finally:
+            store.close()
+
+    def test_archive_match_empty_result_is_a_clean_no_op(self, db_path):
+        self._seed_notify(db_path, "unrelated")
+        result = runner.invoke(
+            inbox_app, ["archive", "--match", "*nothing-matches*", "--db", db_path],
+        )
+        assert result.exit_code == 0, result.output
+        assert "No open messages matched" in result.output
+
+    def test_archive_single_msg_id(self, db_path):
+        mid = self._seed_notify(db_path, "archive me directly")
+
+        result = runner.invoke(
+            inbox_app, ["archive", f"msg:{mid}", "--db", db_path],
+        )
+        assert result.exit_code == 0, result.output
+        assert f"msg:{mid} → archived" in result.output
+
+        from pollypm.store import SQLAlchemyStore
+        store = SQLAlchemyStore(f"sqlite:///{db_path}")
+        try:
+            open_rows = store.query_messages(recipient="user", state="open")
+            assert len(open_rows) == 0
+        finally:
+            store.close()
+
+    def test_archive_without_arg_and_without_match_errors(self, db_path):
+        result = runner.invoke(inbox_app, ["archive", "--db", db_path])
+        assert result.exit_code == 2, result.output
+        assert "--match" in result.output
+
 
 # ---------------------------------------------------------------------------
 # Cockpit panel rendering with a fake work service

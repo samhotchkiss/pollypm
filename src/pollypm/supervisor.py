@@ -2788,10 +2788,21 @@ class Supervisor:
         if len(initial_input) <= 280:
             return initial_input
         from pollypm.project_paths import session_control_prompts_dir
+        from pollypm.role_banner import prepend_role_banner
         prompts_dir = session_control_prompts_dir(self.config, session_name)
         prompts_dir.mkdir(parents=True, exist_ok=True)
         prompt_path = prompts_dir / f"{session_name}.md"
-        prompt_path.write_text(initial_input.rstrip() + "\n")
+        # #757 — the banner is the very first thing the agent reads and
+        # resists mid-flight identity-change requests. Role comes from
+        # the config so this is cheap and always correct.
+        session_cfg = self.config.sessions.get(session_name)
+        role = getattr(session_cfg, "role", "") if session_cfg is not None else ""
+        content = prepend_role_banner(
+            initial_input.rstrip() + "\n",
+            session_name=session_name,
+            role=role,
+        )
+        prompt_path.write_text(content)
         # Use absolute paths so the kickoff resolves regardless of the
         # worker's cwd (workers run from their worktree, not project root).
         # See issue #263.

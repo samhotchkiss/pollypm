@@ -981,10 +981,21 @@ class TmuxSessionService:
         if len(initial_input) <= 280:
             return initial_input
         from pollypm.project_paths import session_control_prompts_dir
+        from pollypm.role_banner import prepend_role_banner
         prompts_dir = session_control_prompts_dir(self._config, session_name)
         prompts_dir.mkdir(parents=True, exist_ok=True)
         prompt_path = prompts_dir / f"{session_name}.md"
-        prompt_path.write_text(initial_input.rstrip() + "\n")
+        # #757 — canonical role banner at the top of the kickoff file.
+        # session_role is passed by the caller; fall back to config.
+        role = session_role or getattr(
+            self._config.sessions.get(session_name), "role", ""
+        )
+        content = prepend_role_banner(
+            initial_input.rstrip() + "\n",
+            session_name=session_name,
+            role=role or "",
+        )
+        prompt_path.write_text(content)
         # Use absolute paths so the kickoff resolves regardless of the
         # worker's cwd (workers run from their worktree, not project root).
         # See issue #263.

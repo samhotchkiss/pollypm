@@ -7937,6 +7937,7 @@ def _dashboard_status(
     alert_count: int,
     idle_minutes: float | None,
     blocker_count: int = 0,
+    on_hold_count: int = 0,
 ) -> tuple[str, str, str]:
     """Return (dot, colour, label) for the top-bar project status light.
 
@@ -7949,7 +7950,7 @@ def _dashboard_status(
         return ("\u25c6", "#f85149", "blocked")
     if active_worker is not None:
         return ("\u25cf", "#3ddc84", "active")
-    if inbox_count or alert_count:
+    if inbox_count or alert_count or on_hold_count:
         return ("\u25c6", "#f0c45a", "needs attention")
     return ("\u25cb", "#4a5568", "idle")
 
@@ -8645,10 +8646,16 @@ def _gather_project_dashboard(
     active_worker, alert_count = _dashboard_active_worker(
         config_path, project_key,
     )
-    blocker_count = int(counts.get("blocked", 0)) + int(counts.get("on_hold", 0))
+    blocker_count = int(counts.get("blocked", 0))
+    on_hold_count = int(counts.get("on_hold", 0))
 
     status_dot, status_color, status_label = _dashboard_status(
-        active_worker, inbox_count, alert_count, None, blocker_count=blocker_count,
+        active_worker,
+        inbox_count,
+        alert_count,
+        None,
+        blocker_count=blocker_count,
+        on_hold_count=on_hold_count,
     )
 
     return ProjectDashboardData(
@@ -8981,20 +8988,20 @@ class PollyProjectDashboardApp(App[None]):
 
     def _update_action_bar(self, data: ProjectDashboardData) -> None:
         review_count = int(data.task_counts.get("review", 0))
-        blocker_count = int(data.task_counts.get("blocked", 0)) + int(
-            data.task_counts.get("on_hold", 0)
-        )
+        blocker_count = int(data.task_counts.get("blocked", 0))
+        on_hold_count = int(data.task_counts.get("on_hold", 0))
         summary = render_project_action_bar(
             review_count=review_count,
             alert_count=data.alert_count,
             inbox_count=data.inbox_count,
             blocker_count=blocker_count,
+            on_hold_count=on_hold_count,
         )
         self.action_bar.remove_class("-attention")
         self.action_bar.remove_class("-critical")
         if blocker_count or data.alert_count:
             self.action_bar.add_class("-critical")
-        elif review_count or data.inbox_count:
+        elif review_count or data.inbox_count or on_hold_count:
             self.action_bar.add_class("-attention")
         self.action_bar.update(f"[b]{_escape(summary)}[/b]")
 
@@ -9043,6 +9050,8 @@ class PollyProjectDashboardApp(App[None]):
             ("queued", "#6b7a88", "\u25cb"),
             ("in_progress", "#f0c45a", "\u25c6"),
             ("review", "#5b8aff", "\u25c9"),
+            ("blocked", "#f85149", "\u25c6"),
+            ("on_hold", "#f0c45a", "\u23f8"),
             ("done", "#3ddc84", "\u2713"),
         ]
         strip_parts: list[str] = []
@@ -9148,10 +9157,9 @@ class PollyProjectDashboardApp(App[None]):
 
     def _render_inbox_body(self, data: ProjectDashboardData) -> str:
         count = data.inbox_count
-        blocked_total = int(data.task_counts.get("blocked", 0)) + int(
-            data.task_counts.get("on_hold", 0)
-        )
-        if count == 0 and not data.action_items and not blocked_total:
+        blocked_total = int(data.task_counts.get("blocked", 0))
+        on_hold_total = int(data.task_counts.get("on_hold", 0))
+        if count == 0 and not data.action_items and not blocked_total and not on_hold_total:
             return "[dim]Inbox is clear for this project.[/dim]"
         lines: list[str] = []
         action_ids = {
@@ -9184,6 +9192,13 @@ class PollyProjectDashboardApp(App[None]):
             )
             lines.append(
                 "  [dim]Press [b]c[/b] to ask the PM for a blocker summary.[/dim]"
+            )
+            lines.append("")
+        elif on_hold_total:
+            lines.append("[#f0c45a][b]On hold[/b][/]")
+            lines.append(
+                "  [dim]No user inbox action is requested yet. Open Tasks "
+                "for the held work item and resume it when appropriate.[/dim]"
             )
             lines.append("")
 

@@ -968,6 +968,15 @@ def test_render_project_action_bar_summarizes_pending_counts() -> None:
         == "▸ 3 approvals · 1 alert · 5 new in inbox"
     )
     assert (
+        render_project_action_bar(
+            review_count=0,
+            alert_count=0,
+            inbox_count=0,
+            on_hold_count=1,
+        )
+        == "▸ 1 on hold"
+    )
+    assert (
         render_project_action_bar(review_count=0, alert_count=0, inbox_count=0)
         == "▸ Clear · no approvals, alerts, or inbox items"
     )

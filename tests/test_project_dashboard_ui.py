@@ -352,6 +352,44 @@ def test_status_idle_when_nothing_active(
     _run(body())
 
 
+def test_status_yellow_when_task_is_on_hold(
+    dashboard_env, dashboard_app,
+) -> None:
+    """Held work is attention-worthy, but not a red blocker."""
+    db_path = dashboard_env["project_path"] / ".pollypm" / "state.db"
+    with SQLiteWorkService(
+        db_path=db_path, project_path=dashboard_env["project_path"],
+    ) as svc:
+        task = svc.create(
+            title="Paused cleanup",
+            description="Paused until the PM resumes it.",
+            type="task",
+            project="demo",
+            flow_template="standard",
+            roles={"worker": "pete", "reviewer": "russell"},
+            priority="normal",
+            created_by="polly",
+        )
+        svc.queue(task.task_id, "polly")
+        svc.hold(task.task_id, "polly", "paused by PM")
+
+    from pollypm import cockpit_ui as _cockpit_ui
+    _cockpit_ui._PROJECT_DASHBOARD_TASK_CACHE.clear()
+
+    async def body() -> None:
+        async with dashboard_app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            assert dashboard_app.data is not None
+            assert dashboard_app.data.status_label == "needs attention"
+            assert "1 on hold" in str(dashboard_app.action_bar.render())
+            assert "on hold" in str(dashboard_app.pipeline_body.render())
+            rendered = str(dashboard_app.inbox_body.render())
+            assert "On hold" in rendered
+            assert "summary missing" not in rendered.lower()
+
+    _run(body())
+
+
 def test_status_yellow_when_workspace_action_message_exists(
     dashboard_env, dashboard_app,
 ) -> None:

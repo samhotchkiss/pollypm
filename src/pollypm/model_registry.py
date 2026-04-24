@@ -74,6 +74,16 @@ def _fallback_registry() -> Registry:
                     "strong_planning",
                 ),
             ),
+            "codex-gpt-5.5": AliasRecord(
+                provider="codex",
+                model="gpt-5.5",
+                capabilities=(
+                    "reasoning",
+                    "tool_use",
+                    "long_context",
+                    "strong_planning",
+                ),
+            ),
         },
         role_requirements={
             "operator_pm": RoleRequirements(

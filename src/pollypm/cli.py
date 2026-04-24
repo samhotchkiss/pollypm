@@ -642,7 +642,7 @@ def _tick_core_rail_if_available(supervisor) -> None:
     """
     rail_getter = getattr(supervisor, "core_rail", None)
     if rail_getter is None:
-        return
+        return None
     try:
         # CoreRail.start() is idempotent and ensures the HeartbeatRail
         # is booted. This is a transient driver — the worker pool drains
@@ -650,8 +650,68 @@ def _tick_core_rail_if_available(supervisor) -> None:
         rail_getter.start()
         heartbeat_rail = rail_getter.get_heartbeat_rail()
         if heartbeat_rail is None:
-            return
-        heartbeat_rail.tick()
+            return None
+        return heartbeat_rail.tick()
     except Exception:  # noqa: BLE001
         # Non-fatal — session-health sweep already succeeded above.
         logger.debug("pm heartbeat: core rail tick failed", exc_info=True)
+        return None
+
+
+def _drain_and_stop_core_rail_if_available(
+    supervisor,
+    *,
+    tick_result=None,
+    drain_timeout_seconds: float = 5.0,
+    poll_interval_seconds: float = 0.05,
+) -> None:
+    """Best-effort drain + stop for transient CLI-owned HeartbeatRails.
+
+    ``pm heartbeat`` is often invoked from cron as a short-lived
+    process. Starting the CoreRail in that path boots a worker pool and
+    ticker thread; if we don't stop it before exit, the cron process can
+    linger indefinitely and leave duplicate job workers racing the
+    headless daemon/cockpit rail on the same ``state.db``. We therefore
+    drain the jobs enqueued by this tick (up to a small timeout) and
+    then stop the rail before returning to the CLI.
+    """
+    rail_getter = getattr(supervisor, "core_rail", None)
+    if rail_getter is None:
+        return
+    try:
+        heartbeat_rail = rail_getter.get_heartbeat_rail()
+        queue = getattr(heartbeat_rail, "queue", None) if heartbeat_rail is not None else None
+        getter = getattr(queue, "get", None)
+        enqueued = list(getattr(tick_result, "enqueued", ()) or ())
+        if callable(getter) and enqueued:
+            import time as _time
+
+            pending = {
+                getattr(job, "job_id", None)
+                for job in enqueued
+                if getattr(job, "job_id", None) is not None
+            }
+            deadline = _time.monotonic() + max(0.0, drain_timeout_seconds)
+            while pending and _time.monotonic() < deadline:
+                for job_id in tuple(pending):
+                    try:
+                        job = getter(job_id)
+                    except Exception:  # noqa: BLE001
+                        pending.discard(job_id)
+                        continue
+                    if job is None:
+                        pending.discard(job_id)
+                        continue
+                    status = getattr(job, "status", None)
+                    status_value = getattr(status, "value", status)
+                    if status_value not in {"queued", "claimed"}:
+                        pending.discard(job_id)
+                if pending and poll_interval_seconds > 0:
+                    _time.sleep(poll_interval_seconds)
+    except Exception:  # noqa: BLE001
+        logger.debug("pm heartbeat: core rail drain failed", exc_info=True)
+    finally:
+        try:
+            rail_getter.stop()
+        except Exception:  # noqa: BLE001
+            logger.debug("pm heartbeat: core rail stop failed", exc_info=True)

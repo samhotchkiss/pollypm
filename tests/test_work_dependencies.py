@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 
 import pytest
 
-from pollypm.work.models import WorkStatus
+from pollypm.work.models import ExecutionStatus, WorkStatus
 from pollypm.work.sqlite_service import (
     SQLiteWorkService,
     TaskNotFoundError,
@@ -269,6 +269,53 @@ class TestAutoUnblock:
         svc.mark_done(c.task_id, "agent-1")
         b4 = svc.get(b.task_id)
         assert b4.work_status == WorkStatus.QUEUED
+
+    def test_auto_unblocked_review_task_reclaims_same_review_visit(self, svc):
+        blocker = _mk(svc, title="Blocker")
+        review_task = _mk(svc, title="Needs review")
+
+        _queue(svc, review_task.task_id)
+        svc.claim(review_task.task_id, "agent-1")
+        svc.node_done(
+            review_task.task_id,
+            "agent-1",
+            {
+                "type": "code_change",
+                "summary": "Implemented the change",
+                "artifacts": [
+                    {
+                        "kind": "commit",
+                        "description": "feat: initial implementation",
+                        "ref": "abc123",
+                    }
+                ],
+            },
+        )
+        svc.block(review_task.task_id, "pm", blocker.task_id)
+
+        blocked = svc.get(review_task.task_id)
+        assert blocked.work_status == WorkStatus.BLOCKED
+        assert blocked.current_node_id == "code_review"
+
+        review_execs = svc.get_execution(review_task.task_id, node_id="code_review")
+        assert len(review_execs) == 1
+        assert review_execs[0].visit == 1
+        assert review_execs[0].status == ExecutionStatus.BLOCKED
+
+        svc.mark_done(blocker.task_id, "agent-9")
+
+        requeued = svc.get(review_task.task_id)
+        assert requeued.work_status == WorkStatus.QUEUED
+        assert requeued.current_node_id == "code_review"
+
+        reclaimed = svc.claim(review_task.task_id, "agent-2")
+        assert reclaimed.work_status == WorkStatus.REVIEW
+        assert reclaimed.current_node_id == "code_review"
+
+        review_execs = svc.get_execution(review_task.task_id, node_id="code_review")
+        assert len(review_execs) == 1
+        assert review_execs[0].visit == 1
+        assert review_execs[0].status == ExecutionStatus.ACTIVE
 
 
 class TestCrossProjectLink:

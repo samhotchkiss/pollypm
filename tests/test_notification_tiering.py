@@ -274,7 +274,7 @@ class TestNotifyCLITiers:
 
     The classifier behaviour is unchanged — these tests verify the tier
     still drives the stored row's ``tier`` + ``state`` and the CLI's
-    stdout shape (``digest:<id>`` / ``silent`` / bare id).
+    stdout shape (``inbox/<n>`` / ``digest:<id>`` / ``silent``).
     """
 
     def _messages(self, db_path):
@@ -297,14 +297,14 @@ class TestNotifyCLITiers:
             str(db_path), "Deploy blocked", "Needs verification email click.",
         )
         assert result.exit_code == 0, result.output
-        row_id = result.output.strip().splitlines()[-1]
-        assert row_id.isdigit(), row_id
+        task_id = result.output.strip().splitlines()[-1]
+        assert task_id.startswith("inbox/"), task_id
 
         rows = self._messages(db_path)
         assert len(rows) == 1
         assert rows[0]["type"] == "notify"
         assert rows[0]["tier"] == "immediate"
-        assert rows[0]["state"] == "open"
+        assert rows[0]["state"] == "closed"
         assert "Deploy blocked" in rows[0]["subject"]
         assert rows[0]["subject"].startswith("[Action]")
 

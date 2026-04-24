@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from pollypm.store import SQLAlchemyStore
 from pollypm.work.sqlite_service import SQLiteWorkService
 
 
@@ -150,6 +151,33 @@ def _init_git_repo(path: Path) -> None:
         cwd=str(path),
         check=True,
     )
+
+
+def _seed_workspace_message(
+    workspace_root: Path,
+    *,
+    subject: str,
+    body: str,
+    scope: str = "inbox",
+    sender: str = "polly",
+    type: str = "notify",
+    tier: str = "immediate",
+) -> int:
+    db_path = workspace_root / ".pollypm" / "state.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    try:
+        return store.enqueue_message(
+            type=type,
+            tier=tier,
+            recipient="user",
+            sender=sender,
+            subject=subject,
+            body=body,
+            scope=scope,
+        )
+    finally:
+        store.close()
 
 
 @pytest.fixture
@@ -321,6 +349,38 @@ def test_status_idle_when_nothing_active(
             assert dashboard_app.data.inbox_count == 0
             assert dashboard_app.data.active_worker is None
             assert dashboard_app.data.status_label == "idle"
+    _run(body())
+
+
+def test_status_yellow_when_workspace_action_message_exists(
+    dashboard_env, dashboard_app,
+) -> None:
+    """Workspace-root PM notes count as project inbox attention."""
+    workspace_root = dashboard_env["project_path"].parent
+    _seed_workspace_message(
+        workspace_root,
+        subject="[Action] demo/3 — deploy blocked on Fly.io setup",
+        body=(
+            "**Blocker:** Acceptance cannot run without a live Fly.io app, "
+            "org creds, Postgres/Redis provisioned, and a deploy pipeline.\\n\\n"
+            "- Reopen the task with Fly-enabled access\\n"
+            "- Or split deploy acceptance into a follow-up task\n"
+        ),
+    )
+
+    async def body() -> None:
+        async with dashboard_app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            assert dashboard_app.data is not None
+            assert dashboard_app.data.inbox_count >= 1
+            assert dashboard_app.data.action_items
+            assert dashboard_app.data.status_label == "needs attention"
+            rendered = str(dashboard_app.inbox_body.render())
+            assert "Action Required" in rendered
+            assert "Fly.io" in rendered
+            assert "deploy pipeline" in rendered
+            assert "Reopen the task with Fly-enabled access" in rendered
+
     _run(body())
 
 
@@ -582,6 +642,88 @@ def test_inbox_section_click_routes_to_inbox(dashboard_env, dashboard_app) -> No
             if not calls:
                 dashboard_app._route_to_inbox_sync()
             assert calls, "expected click on inbox section to route to inbox"
+    _run(body())
+
+
+def test_blocked_project_calls_out_missing_pm_summary(
+    dashboard_env, dashboard_app,
+) -> None:
+    """Blocked work with no PM note should say the summary is missing."""
+    db_path = dashboard_env["project_path"] / ".pollypm" / "state.db"
+    with SQLiteWorkService(
+        db_path=db_path, project_path=dashboard_env["project_path"],
+    ) as svc:
+        blocker = svc.create(
+            title="Blocker task",
+            description="Upstream dependency.",
+            type="task",
+            project="demo",
+            flow_template="standard",
+            roles={"worker": "pete", "reviewer": "russell"},
+            priority="normal",
+            created_by="polly",
+        )
+        blocked = svc.create(
+            title="Blocked task",
+            description="Waiting on blocker.",
+            type="task",
+            project="demo",
+            flow_template="standard",
+            roles={"worker": "pete", "reviewer": "russell"},
+            priority="normal",
+            created_by="polly",
+        )
+        svc.queue(blocked.task_id, "polly")
+        svc.claim(blocked.task_id, "worker")
+        svc.block(blocked.task_id, "polly", blocker.task_id)
+
+    async def body() -> None:
+        async with dashboard_app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            rendered = str(dashboard_app.inbox_body.render())
+            assert "summary missing" in rendered.lower()
+            assert "ask the PM for a blocker summary" in rendered
+
+    _run(body())
+
+
+def test_project_blocker_summary_lists_required_user_actions(
+    dashboard_env, dashboard_app,
+) -> None:
+    """A PM-authored blocker summary should render concrete unblock steps."""
+    db_path = dashboard_env["project_path"] / ".pollypm" / "state.db"
+    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    try:
+        store.record_event(
+            "demo",
+            "polly",
+            "project.blocker_summary",
+            payload={
+                "event_type": "project_blocker_summary",
+                "project": "demo",
+                "reason": "Relay deployment is waiting on Fly.io setup.",
+                "owner": "user",
+                "required_actions": [
+                    "Create the Fly.io app",
+                    "Add the deploy token",
+                ],
+                "affected_tasks": ["demo/3"],
+                "unblock_condition": "fly deploy can run successfully",
+            },
+        )
+    finally:
+        store.close()
+
+    async def body() -> None:
+        async with dashboard_app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            assert dashboard_app.data is not None
+            rendered = str(dashboard_app.inbox_body.render())
+            assert "Action Required" in rendered
+            assert "Relay deployment is waiting on Fly.io setup" in rendered
+            assert "Create the Fly.io app" in rendered
+            assert "Add the deploy token" in rendered
+
     _run(body())
 
 

@@ -24,6 +24,7 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from pollypm.heartbeat import Roster
@@ -177,16 +178,19 @@ class TestHeartbeatCliFallbackTick:
         from pollypm.cli import _tick_core_rail_if_available
 
         heartbeat_rail = MagicMock()
+        tick_result = object()
+        heartbeat_rail.tick.return_value = tick_result
         core_rail = MagicMock()
         core_rail.get_heartbeat_rail.return_value = heartbeat_rail
 
         supervisor = MagicMock()
         supervisor.core_rail = core_rail
 
-        _tick_core_rail_if_available(supervisor)
+        result = _tick_core_rail_if_available(supervisor)
 
         core_rail.start.assert_called_once()
         heartbeat_rail.tick.assert_called_once()
+        assert result is tick_result
 
     def test_noop_when_supervisor_has_no_core_rail(self) -> None:
         """Legacy / mocked supervisors without ``core_rail`` don't crash."""
@@ -228,3 +232,51 @@ class TestHeartbeatCliFallbackTick:
         # Must not raise — session-health sweep already succeeded upstream.
         _tick_core_rail_if_available(supervisor)
         heartbeat_rail.tick.assert_called_once()
+
+    def test_drain_and_stop_waits_for_enqueued_jobs(self) -> None:
+        from pollypm.cli import _drain_and_stop_core_rail_if_available
+
+        class _Queue:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def get(self, job_id: int):
+                self.calls += 1
+                if self.calls == 1:
+                    return SimpleNamespace(status="claimed")
+                return SimpleNamespace(status="done")
+
+        heartbeat_rail = SimpleNamespace(queue=_Queue())
+        core_rail = MagicMock()
+        core_rail.get_heartbeat_rail.return_value = heartbeat_rail
+
+        supervisor = MagicMock()
+        supervisor.core_rail = core_rail
+        tick_result = SimpleNamespace(enqueued=[SimpleNamespace(job_id=123)])
+
+        _drain_and_stop_core_rail_if_available(
+            supervisor,
+            tick_result=tick_result,
+            drain_timeout_seconds=0.2,
+            poll_interval_seconds=0.0,
+        )
+
+        assert heartbeat_rail.queue.calls >= 2
+        core_rail.stop.assert_called_once()
+
+    def test_drain_and_stop_still_stops_without_jobs(self) -> None:
+        from pollypm.cli import _drain_and_stop_core_rail_if_available
+
+        heartbeat_rail = MagicMock()
+        core_rail = MagicMock()
+        core_rail.get_heartbeat_rail.return_value = heartbeat_rail
+
+        supervisor = MagicMock()
+        supervisor.core_rail = core_rail
+
+        _drain_and_stop_core_rail_if_available(
+            supervisor,
+            tick_result=SimpleNamespace(enqueued=[]),
+        )
+
+        core_rail.stop.assert_called_once()

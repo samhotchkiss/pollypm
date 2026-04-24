@@ -50,6 +50,14 @@ ARCHITECT_PROFILE_PATH = (
     Path(_planning_plugin.__file__).resolve().parent / "profiles" / "architect.md"
 )
 
+EXPECTED_CRITICS = (
+    "critic_simplicity",
+    "critic_maintainability",
+    "critic_user",
+    "critic_operational",
+    "critic_security",
+)
+
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -85,6 +93,19 @@ def _done_output(stage: str, path: str) -> dict:
     }
 
 
+def _critic_output(critic: str) -> dict:
+    return {
+        "type": "document",
+        "summary": f"{critic} structured critique",
+        "artifacts": [
+            {
+                "kind": "note",
+                "description": f"{critic} scored all candidate plans",
+            }
+        ],
+    }
+
+
 def _create_and_claim_plan_task(svc: SQLiteWorkService) -> str:
     """Create a plan_project task, queue + claim it, return its id."""
     task = svc.create(
@@ -99,6 +120,27 @@ def _create_and_claim_plan_task(svc: SQLiteWorkService) -> str:
     svc.queue(task.task_id, "pm")
     svc.claim(task.task_id, "architect")
     return task.task_id
+
+
+def _create_completed_critic_children(
+    svc: SQLiteWorkService,
+    parent_id: str,
+) -> None:
+    for critic in EXPECTED_CRITICS:
+        child = svc.create(
+            title=f"{critic} critique",
+            description="Review all candidate plans.",
+            type="task",
+            project="demo",
+            flow_template="critique_flow",
+            roles={"critic": critic, "requester": "architect"},
+            priority="high",
+            created_by="architect",
+        )
+        svc.link(parent_id, child.task_id, "parent")
+        svc.queue(child.task_id, "architect")
+        svc.claim(child.task_id, "architect")
+        svc.node_done(child.task_id, critic, _critic_output(critic), skip_gates=True)
 
 
 def _advance_to(
@@ -131,6 +173,8 @@ def _advance_to(
                 "# Planning session log\nNarrative of the session.\n",
                 encoding="utf-8",
             )
+        if stage == "critic_panel":
+            _create_completed_critic_children(svc, task_id)
         svc.node_done(task_id, "architect", _done_output(stage, path))
 
 

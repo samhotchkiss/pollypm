@@ -99,7 +99,8 @@ def test_control_tui_cockpit_state_ignores_silent_alerts(tmp_path: Path) -> None
     windows = [FakeWindow()]
 
     assert app._cockpit_state_for_session("worker_demo", launches, windows, [make_alert("needs_followup")]).endswith("live")
-    assert app._cockpit_state_for_session("worker_demo", launches, windows, [make_alert("pane_dead")]) == "! 1"
+    assert app._cockpit_state_for_session("worker_demo", launches, windows, [make_alert("stuck_session")]).endswith("live")
+    assert app._cockpit_state_for_session("worker_demo", launches, windows, [make_alert("auth_broken")]) == "! 1"
 
 
 def test_dashboard_settings_selection_jumps_to_accounts(tmp_path: Path) -> None:

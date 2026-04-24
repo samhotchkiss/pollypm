@@ -81,17 +81,49 @@ def enqueue_advisor_review(
     project_key: str,
     project_path: Path,
     config: Any,
+    work_service: Any | None = None,
 ) -> dict[str, Any]:
     """Create an advisor_review work-service task for a project.
-
-    Stubbed in ad01 — returns ``{"enqueued": False, "reason": "stub"}``.
-    ad03 wires the real work-service ``create()`` call that spawns the
-    short-lived advisor session.
 
     Kept as a module-level callable so unit tests can monkeypatch the
     enqueue path without touching the work service.
     """
-    return {"enqueued": False, "reason": "stub", "project": project_key}
+    close_service = False
+    if work_service is None:
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        db_path = project_path / ".pollypm" / "state.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        work_service = SQLiteWorkService(db_path=db_path, project_path=project_path)
+        close_service = True
+
+    try:
+        task = work_service.create(
+            title=f"Advisor review for {project_key}",
+            description=(
+                "Review recent project trajectory, identify stalls or human "
+                "blockers, and emit a structured advisor decision."
+            ),
+            type="task",
+            project=project_key,
+            flow_template="advisor_review",
+            roles={"advisor": "advisor"},
+            priority="normal",
+            created_by="advisor.tick",
+            labels=["advisor"],
+            requires_human_review=False,
+        )
+        queued = work_service.queue(task.task_id, "advisor.tick")
+        return {
+            "enqueued": True,
+            "project": project_key,
+            "task_id": queued.task_id,
+        }
+    finally:
+        if close_service:
+            close = getattr(work_service, "close", None)
+            if callable(close):
+                close()
 
 
 def has_in_progress_advisor_task(
@@ -134,6 +166,47 @@ def has_in_progress_advisor_task(
     except Exception as exc:  # noqa: BLE001
         logger.debug("advisor: throttle lookup failed for %s: %s", project_key, exc)
         return False
+
+
+def has_project_stagnation_candidate(
+    *,
+    project_key: str,
+    project_path: Path,
+    work_service: Any,
+) -> bool:
+    """Return True when a quiet project still has non-terminal work.
+
+    This is intentionally broad. The advisor LLM decides whether the
+    situation is normal waiting, user-blocked, dependency-blocked, or
+    actually stuck; deterministic code only decides whether the state is
+    worth re-evaluating.
+    """
+    close_service = False
+    if work_service is None:
+        db_path = project_path / ".pollypm" / "state.db"
+        if not db_path.exists():
+            return False
+        try:
+            from pollypm.work.sqlite_service import SQLiteWorkService
+            work_service = SQLiteWorkService(db_path=db_path, project_path=project_path)
+            close_service = True
+        except Exception:  # noqa: BLE001
+            return False
+    try:
+        tasks = work_service.list_tasks(project=project_key)
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        if close_service:
+            close = getattr(work_service, "close", None)
+            if callable(close):
+                close()
+
+    for task in tasks:
+        status = getattr(getattr(task, "work_status", None), "value", None) or getattr(task, "work_status", "")
+        if status not in {"done", "cancelled"}:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -241,12 +314,20 @@ def _should_review(
         return False, "detect-error"
 
     if not changed:
-        return False, "no-changes"
+        if not has_project_stagnation_candidate(
+            project_key=project_key,
+            project_path=project_path,
+            work_service=work_service,
+        ):
+            return False, "no-changes"
+        reason = "stagnation-candidate"
+    else:
+        reason = "ok"
 
     if has_in_progress_advisor_task(project_key=project_key, work_service=work_service):
         return False, "in-progress"
 
-    return True, "ok"
+    return True, reason
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +427,7 @@ def advisor_tick_handler(payload: dict[str, Any]) -> dict[str, Any]:
                     project_key=project_key,
                     project_path=project_path,
                     config=config,
+                    work_service=work_service,
                 )
                 enqueued = bool(outcome.get("enqueued")) if isinstance(outcome, dict) else False
             except Exception as exc:  # noqa: BLE001
@@ -355,10 +437,43 @@ def advisor_tick_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 enqueued = False
                 outcome = {"enqueued": False, "error": str(exc)}
             entry["scheduled"] = enqueued
-            entry["reason"] = "ok" if enqueued else entry["reason"]
+            entry["reason"] = reason if enqueued else entry["reason"]
             entry["enqueue"] = outcome
             if enqueued:
                 enqueued_projects.append(project_key)
+
+        if reason == "stagnation-candidate":
+            try:
+                from pollypm.project_status_summary import (
+                    ProjectMonitorSummary,
+                    record_project_monitor_summary,
+                )
+                from pollypm.store import SQLAlchemyStore
+
+                state_db = getattr(getattr(config, "project", None), "state_db", None)
+                if state_db is not None:
+                    store = SQLAlchemyStore(f"sqlite:///{Path(state_db)}")
+                    try:
+                        record_project_monitor_summary(
+                            store=store,
+                            summary=ProjectMonitorSummary(
+                                project=project_key,
+                                stalled_tasks=[project_key],
+                                automatic_next_actions=[
+                                    "advisor review queued for stagnation classification"
+                                    if entry.get("scheduled")
+                                    else "advisor review considered but not queued"
+                                ],
+                            ),
+                        )
+                    finally:
+                        store.close()
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "advisor: failed to record monitor summary for %s",
+                    project_key,
+                    exc_info=True,
+                )
 
         results.append(entry)
 

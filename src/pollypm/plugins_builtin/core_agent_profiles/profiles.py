@@ -325,11 +325,16 @@ def reviewer_prompt() -> str:
         "If a task raises something outside your rubric — security "
         "concern, architectural drift, a policy question, a scope change "
         "that should have gone back to planning — DO NOT approve and DO "
-        "NOT try to reject your way around it. Escalate to Polly:\n\n"
+        "NOT try to reject your way around it. Escalate to Polly and park "
+        "the task explicitly:\n\n"
+        '  pm task hold <id> --actor russell --reason "Waiting on operator: '
+        '<brief issue>"\n'
         '  pm notify --priority immediate "<subject>" "<body naming '
         'Polly as the operator for this project and describing the '
         'concern>"\n\n'
-        "Then leave the task at `code_review` for Polly to triage.\n"
+        "Then stop. Do not leave the task at `code_review`; it should sit "
+        "in `on_hold` until Polly or Sam decides whether to resume it, "
+        "re-scope it, or spin a follow-up.\n"
         "</escalation>\n\n"
         "<plan_reviews_not_yours>\n"
         "`plan_review` items are a separate surface. They go to Sam (the "

@@ -14,7 +14,9 @@ Coverage matrix:
 * predicate False (plan.md older than latest backlog task) → sweep skips
 * planner's own flow bypasses (plan_project / critique_flow)
 * bypass_plan_gate label bypasses
+* gate only blocks queued delegation, not review / in_progress re-pings
 * repeated sweeps don't duplicate plan_missing alerts
+* once the project is delegable again, stale plan_missing alerts clear
 * result dict exposes both no_session_alerts and plan_missing_alerts
 """
 
@@ -30,6 +32,8 @@ from pollypm.plugins_builtin.project_planning.plan_presence import (
     BYPASS_LABEL,
     MIN_PLAN_SIZE_BYTES,
     has_acceptable_plan,
+    plan_approval_task,
+    plan_blocked_task_ids,
     task_bypasses_plan_gate,
 )
 from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
@@ -108,7 +112,7 @@ def _install_fake_loader(monkeypatch, services_factory):
 
 def _create_queued_impl_task(
     project_path: Path, *, project_key: str, title: str = "Implement thing",
-) -> None:
+) -> str:
     """Create + queue one ``standard`` implementation task."""
     db_path = project_path / ".pollypm" / "state.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -125,6 +129,46 @@ def _create_queued_impl_task(
             priority="normal",
         )
         work.queue(task.task_id, "pm")
+        return task.task_id
+    finally:
+        work.close()
+
+
+def _advance_task_to_review(
+    project_path: Path, *, task_id: str, reviewer: str = "reviewer",
+) -> None:
+    """Move a standard task to the ``code_review`` node."""
+    db_path = project_path / ".pollypm" / "state.db"
+    work = SQLiteWorkService(db_path=db_path, project_path=project_path)
+    try:
+        work.claim(task_id, "worker")
+        work.node_done(
+            task_id,
+            "worker",
+            work_output={
+                "type": "code_change",
+                "summary": "implemented the thing",
+                "artifacts": [
+                    {
+                        "kind": "commit",
+                        "description": "implementation",
+                        "ref": "HEAD",
+                    },
+                ],
+            },
+        )
+        # Keep the reviewer session-name explicit in the task row so
+        # the test doesn't depend on any ambient reviewer naming state.
+        work._conn.execute(
+            "UPDATE work_tasks SET assignee = ? "
+            "WHERE project = ? AND task_number = ?",
+            (
+                reviewer,
+                task_id.rsplit("/", 1)[0],
+                int(task_id.rsplit("/", 1)[1]),
+            ),
+        )
+        work._conn.commit()
     finally:
         work.close()
 
@@ -383,6 +427,91 @@ class TestPredicate:
         work = SQLiteWorkService(db_path=db_path, project_path=proj)
         try:
             assert has_acceptable_plan("proj", proj, work) is True
+        finally:
+            work.close()
+
+    def test_predicate_ignores_chat_feedback_artifacts_created_after_approval(self, tmp_path):
+        """Inbox/chat artifacts created after plan approval are not backlog.
+
+        Notesy hit this when a ``review_feedback`` chat task created from
+        a rejection made the whole project look stale and blocked queued
+        worker tasks behind the plan gate.
+        """
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        _write_plan(proj)
+
+        approved_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        _create_done_approved_plan_task(
+            proj, project_key="proj", approved_at=approved_at,
+        )
+
+        db_path = proj / ".pollypm" / "state.db"
+        work = SQLiteWorkService(db_path=db_path, project_path=proj)
+        try:
+            work.create(
+                title="Rejected proj/7 — Implement thing",
+                description="Returned to rework.",
+                type="task",
+                project="proj",
+                flow_template="chat",
+                roles={"requester": "reviewer", "operator": "user"},
+                priority="high",
+                labels=["review_feedback", "task:proj/7", "project:proj"],
+            )
+
+            assert has_acceptable_plan("proj", proj, work) is True
+        finally:
+            work.close()
+
+    def test_plan_blocked_task_ids_surfaces_queued_gate_vetoes(self, tmp_path):
+        """Display surfaces can derive ``waiting_on_plan`` from the gate."""
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        blocked_task_id = _create_queued_impl_task(proj, project_key="proj")
+
+        db_path = proj / ".pollypm" / "state.db"
+        work = SQLiteWorkService(db_path=db_path, project_path=proj)
+        try:
+            plan_task = work.create(
+                title="Plan proj",
+                description="Planning task awaiting approval.",
+                type="task",
+                project="proj",
+                flow_template="plan_project",
+                roles={"architect": "architect", "operator": "user"},
+                priority="high",
+            )
+            work.queue(plan_task.task_id, "pm")
+            work._conn.execute(
+                "UPDATE work_tasks SET work_status = ?, current_node_id = ? "
+                "WHERE project = ? AND task_number = ?",
+                (
+                    WorkStatus.REVIEW.value,
+                    "user_approval",
+                    "proj",
+                    plan_task.task_number,
+                ),
+            )
+            work._conn.commit()
+
+            assert plan_blocked_task_ids("proj", proj, work) == {blocked_task_id}
+            approval = plan_approval_task(work, "proj")
+            assert approval is not None
+            assert approval.task_id == plan_task.task_id
+            assert approval.current_node_id == "user_approval"
+        finally:
+            work.close()
+
+        _write_plan(proj)
+        _create_done_approved_plan_task(
+            proj,
+            project_key="proj",
+            approved_at=datetime.now(timezone.utc) + timedelta(seconds=1),
+        )
+        work = SQLiteWorkService(db_path=db_path, project_path=proj)
+        try:
+            assert plan_blocked_task_ids("proj", proj, work) == set()
         finally:
             work.close()
 
@@ -843,6 +972,82 @@ class TestSweepHandlerGateIntegration:
         second = [a for a in store.open_alerts() if a.alert_type == "plan_missing"]
         assert len(second) == 1
         assert first[0].alert_id == second[0].alert_id
+
+        store.close()
+
+    def test_plan_missing_alert_clears_once_project_is_delegable(
+        self, tmp_path, monkeypatch,
+    ):
+        """A stale plan-gate alert should close once the queued task is
+        no longer blocked by the gate."""
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        _create_queued_impl_task(proj, project_key="proj")
+
+        store = StateStore(tmp_path / "workspace_state.db")
+        session_svc = FakeSessionService(handles=[FakeHandle("worker-proj")])
+        _install_fake_loader(monkeypatch, _factory_for(
+            store=store, session_svc=session_svc,
+            project_key="proj", project_path=proj,
+        ))
+
+        first = task_assignment_sweep_handler({})
+        assert first["plan_missing_alerts"] == 1
+        alerts = [a for a in store.open_alerts() if a.alert_type == "plan_missing"]
+        assert len(alerts) == 1
+        assert alerts[0].session_name == "plan_gate-proj"
+
+        _write_plan(proj)
+        _create_done_approved_plan_task(
+            proj,
+            project_key="proj",
+            approved_at=datetime.now(timezone.utc) + timedelta(seconds=1),
+        )
+
+        second = task_assignment_sweep_handler({})
+        assert second["plan_missing_alerts"] == 0
+        assert second["by_outcome"].get("sent", 0) == 1
+        assert session_svc.sent and session_svc.sent[-1][0] == "worker-proj"
+        assert [
+            a for a in store.open_alerts() if a.alert_type == "plan_missing"
+        ] == []
+
+        store.close()
+
+    def test_review_reping_bypasses_plan_gate_and_clears_stale_alert(
+        self, tmp_path, monkeypatch,
+    ):
+        """A task already parked in review should still ping the reviewer
+        even if the project has no plan, and any old queued-task alert
+        should be cleared."""
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        task_id = _create_queued_impl_task(proj, project_key="proj")
+
+        store = StateStore(tmp_path / "workspace_state.db")
+        session_svc = FakeSessionService(handles=[FakeHandle("reviewer")])
+        _install_fake_loader(monkeypatch, _factory_for(
+            store=store, session_svc=session_svc,
+            project_key="proj", project_path=proj,
+        ))
+
+        first = task_assignment_sweep_handler({})
+        assert first["plan_missing_alerts"] == 1
+        assert [
+            a for a in store.open_alerts() if a.alert_type == "plan_missing"
+        ]
+
+        _advance_task_to_review(proj, task_id=task_id)
+
+        second = task_assignment_sweep_handler({})
+        assert second["plan_missing_alerts"] == 0
+        assert second["by_outcome"].get("sent", 0) == 1
+        assert session_svc.sent and session_svc.sent[-1][0] == "reviewer"
+        assert "Review needed" in session_svc.sent[-1][1]
+        assert task_id in session_svc.sent[-1][1]
+        assert [
+            a for a in store.open_alerts() if a.alert_type == "plan_missing"
+        ] == []
 
         store.close()
 

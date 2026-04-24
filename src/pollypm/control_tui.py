@@ -27,6 +27,7 @@ from pollypm.accounts import (
     AccountStatus,
 )
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+from pollypm.cockpit_alerts import is_operational_alert
 from pollypm.control_tui_routes import (
     focus_attr_for_tab,
     resolve_button_route,
@@ -287,12 +288,6 @@ class RepoScanModal(ModalScreen[tuple[str, list[Path]]]):
 
 
 class PollyPMApp(App[None]):
-    _SILENT_ALERT_TYPES = frozenset({
-        "suspected_loop",
-        "stabilize_failed",
-        "needs_followup",
-    })
-
     TITLE = "PollyPM"
     SUB_TITLE = "Control Room"
     NAV_TABS = [
@@ -693,7 +688,8 @@ class PollyPMApp(App[None]):
         actionable_alerts = [
             alert
             for alert in alerts
-            if alert.session_name == session_name and alert.alert_type not in self._SILENT_ALERT_TYPES
+            if alert.session_name == session_name
+            and not is_operational_alert(getattr(alert, "alert_type", ""))
         ]
         if actionable_alerts:
             return f"! {len(actionable_alerts)}"

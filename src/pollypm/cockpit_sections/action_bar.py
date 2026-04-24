@@ -8,9 +8,12 @@ def render_project_action_bar(
     review_count: int,
     alert_count: int,
     inbox_count: int,
+    blocker_count: int = 0,
 ) -> str:
     """Return a compact summary of the project's actionable work."""
     bits: list[str] = []
+    if blocker_count:
+        bits.append(f"{blocker_count} blocker{'s' if blocker_count != 1 else ''}")
     if review_count:
         bits.append(f"{review_count} approval{'s' if review_count != 1 else ''}")
     if alert_count:

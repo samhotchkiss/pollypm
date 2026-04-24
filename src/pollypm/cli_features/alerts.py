@@ -23,6 +23,26 @@ from pollypm.cli_help import help_with_examples
 from pollypm.config import DEFAULT_CONFIG_PATH
 
 
+# Alert taxonomy (#788):
+# - "operational" means supervisor-internal noise that should remain in
+#   durable logs but should not interrupt the user with a toast.
+# - "surfaceable operational" means mechanically detected, but user-
+#   actionable. These prefixes must not be folded into operational
+#   suppression; they drive rail/project attention instead.
+# The cockpit toast filter lives in ``pollypm.cockpit_alerts``; keep this
+# CLI-facing note in sync when adding alert types from heartbeat commands.
+SURFACEABLE_OPERATIONAL_ALERT_PREFIXES: tuple[str, ...] = (
+    "stuck_on_task:",
+    "no_session_for_assignment:",
+)
+
+
+def is_surfaceable_operational_alert(alert_type: str) -> bool:
+    """Return True for operationally detected alerts that still need user visibility."""
+    name = alert_type or ""
+    return any(name.startswith(prefix) for prefix in SURFACEABLE_OPERATIONAL_ALERT_PREFIXES)
+
+
 alert_app = typer.Typer(
     help=help_with_examples(
         "Manage durable alerts.",
@@ -78,7 +98,10 @@ def heartbeat(
 
     supervisor = cli_mod._load_supervisor(config_path)
     alerts = supervisor.run_heartbeat(snapshot_lines=snapshot_lines)
-    cli_mod._tick_core_rail_if_available(supervisor)
+    tick_result = cli_mod._tick_core_rail_if_available(supervisor)
+    cli_mod._drain_and_stop_core_rail_if_available(
+        supervisor, tick_result=tick_result,
+    )
     if json_output:
         cli_mod._emit_json({"alerts": alerts})
         return

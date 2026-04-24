@@ -71,6 +71,17 @@ BYPASS_LABEL = "bypass_plan_gate"
 # gated on a plan existing, or the planner could never run.
 _PLANNING_FLOWS = frozenset({"plan_project", "critique_flow"})
 
+# Inbox / artifact tasks live on the chat flow and are not "project
+# backlog" for plan-staleness purposes. Counting them would let a
+# rejection-feedback inbox item (created after review) make an already-
+# approved plan look stale and freeze unrelated worker delegation.
+_NON_BACKLOG_FLOWS = frozenset({"chat"})
+
+# Labels used by structured feedback/inbox artifacts that should never
+# invalidate the project plan. Kept local so the gate does not need to
+# import the higher-level rejection-feedback module.
+_NON_BACKLOG_LABELS = frozenset({"review_feedback"})
+
 # Node name the plan_project flow uses for the single human approval
 # touchpoint. If the flow shape ever changes, update this constant.
 _APPROVAL_NODE = "user_approval"
@@ -303,7 +314,13 @@ def _latest_backlog_created_at(work_service: Any, project_key: str) -> float | N
 
     latest: float | None = None
     for task in tasks:
-        if task.flow_template_id in _PLANNING_FLOWS:
+        flow_id = getattr(task, "flow_template_id", "") or ""
+        if flow_id in _PLANNING_FLOWS:
+            continue
+        if flow_id in _NON_BACKLOG_FLOWS:
+            continue
+        labels = set(getattr(task, "labels", None) or [])
+        if labels & _NON_BACKLOG_LABELS:
             continue
         key = (project_key, getattr(task, "task_number", -1))
         if key in plan_child_keys:
@@ -355,6 +372,109 @@ def has_acceptable_plan(
         if plan_approved_ts < latest_backlog:
             return False
     return True
+
+
+def plan_blocked_task_ids(
+    project_key: str,
+    project_path: Path,
+    work_service: Any,
+    *,
+    plan_dir: str = "docs/plan",
+) -> set[str]:
+    """Return queued task ids currently blocked by the plan gate.
+
+    This is the read-side companion to the sweeper's plan gate. It does
+    not persist a synthetic status; callers can derive
+    ``waiting_on_plan`` for display from the same predicate that blocks
+    pickup pings.
+    """
+    try:
+        acceptable = has_acceptable_plan(
+            project_key,
+            project_path,
+            work_service,
+            plan_dir=plan_dir,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "plan_presence: gate evaluation failed for project %s",
+            project_key,
+            exc_info=True,
+        )
+        acceptable = False
+    if acceptable:
+        return set()
+    try:
+        tasks = work_service.list_tasks(project=project_key)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "plan_presence: list_tasks failed for project %s", project_key,
+            exc_info=True,
+        )
+        return set()
+    blocked: set[str] = set()
+    for task in tasks:
+        status = getattr(getattr(task, "work_status", None), "value", None) or str(
+            getattr(task, "work_status", "") or ""
+        )
+        if status != WorkStatus.QUEUED.value:
+            continue
+        if task_bypasses_plan_gate(task):
+            continue
+        task_id = getattr(task, "task_id", None)
+        if task_id:
+            blocked.add(str(task_id))
+    return blocked
+
+
+def plan_approval_task(work_service: Any, project_key: str) -> Any | None:
+    """Return the best plan task for a user to approve next.
+
+    Preference is given to an active ``plan_project`` task sitting on
+    the canonical ``user_approval`` node. If no such task exists, return
+    the newest non-terminal plan task so display surfaces a concrete
+    place to continue planning instead of a dead-end "missing plan"
+    message.
+    """
+    try:
+        tasks = list(work_service.list_tasks(project=project_key))
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "plan_presence: list_tasks failed for project %s", project_key,
+            exc_info=True,
+        )
+        return None
+    plan_tasks = [
+        task for task in tasks
+        if getattr(task, "flow_template_id", "") == "plan_project"
+    ]
+    if not plan_tasks:
+        return None
+    terminal = {WorkStatus.DONE.value, WorkStatus.CANCELLED.value}
+    open_plan_tasks = [
+        task for task in plan_tasks
+        if (
+            getattr(getattr(task, "work_status", None), "value", None)
+            or str(getattr(task, "work_status", "") or "")
+        ) not in terminal
+    ]
+    if not open_plan_tasks:
+        return None
+
+    def _sort_value(task: Any) -> float:
+        stamp = getattr(task, "updated_at", None) or getattr(task, "created_at", None)
+        if stamp is None:
+            return 0.0
+        try:
+            return float(stamp.timestamp())
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    open_plan_tasks.sort(key=_sort_value, reverse=True)
+    for task in open_plan_tasks:
+        if getattr(task, "current_node_id", None) == _APPROVAL_NODE:
+            return task
+    return open_plan_tasks[0]
 
 
 def task_bypasses_plan_gate(task: Any) -> bool:

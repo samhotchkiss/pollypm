@@ -157,6 +157,8 @@ def _seed_message(
     type_: str = "notify",
     state: str = "open",
     subject: str = "notify title",
+    payload: dict | None = None,
+    labels: list[str] | None = None,
 ) -> int:
     """Seed one user-recipient message directly into the unified store."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -172,6 +174,8 @@ def _seed_message(
             subject=subject,
             body="notify body",
             state=state,
+            payload=payload,
+            labels=labels,
         )
     finally:
         store.close()
@@ -205,6 +209,117 @@ def test_aggregator_skips_non_open_messages(env) -> None:
     count = _count_inbox_tasks_for_label(_load_cfg(env["config_path"]))
     # Only the open notify counts; archived one is excluded.
     assert count == 1, f"expected 1 open notify, got {count}"
+
+
+def test_aggregator_skips_deleted_project_workspace_messages(env) -> None:
+    """Workspace-root messages for untracked projects stay out of the badge."""
+    _seed_message(env["workspace_db"], scope="demo", subject="live project")
+    _seed_message(env["workspace_db"], scope="ghost_proj", subject="deleted project")
+
+    count = _count_inbox_tasks_for_label(_load_cfg(env["config_path"]))
+    assert count == 1, (
+        f"expected only tracked-project messages to count, got {count}"
+    )
+
+
+def test_aggregator_skips_deleted_project_payload_messages(env) -> None:
+    """Workspace-root inbox-scope messages can still point at deleted projects."""
+    _seed_message(
+        env["workspace_db"],
+        scope="inbox",
+        subject="live project payload",
+        payload={"project": "demo"},
+    )
+    _seed_message(
+        env["workspace_db"],
+        scope="inbox",
+        subject="deleted project payload",
+        payload={"project": "ghost_proj"},
+    )
+
+    count = _count_inbox_tasks_for_label(_load_cfg(env["config_path"]))
+    assert count == 1, (
+        f"expected only tracked-project payload messages to count, got {count}"
+    )
+
+
+def test_archive_deleted_project_messages_dry_run_does_not_close(
+    env, monkeypatch,
+) -> None:
+    """Cleanup preview reports stale project refs without mutating rows."""
+    _pin_load_config(monkeypatch, env["config_path"])
+    _seed_message(env["workspace_db"], scope="demo", subject="live project")
+    _seed_message(env["workspace_db"], scope="ghost_proj", subject="deleted scope")
+    _seed_message(
+        env["workspace_db"],
+        scope="inbox",
+        subject="deleted payload",
+        payload={"project": "ghost_payload"},
+    )
+
+    result = runner.invoke(
+        inbox_app,
+        [
+            "archive",
+            "--deleted-projects",
+            "--dry-run",
+            "--db",
+            str(env["workspace_db"]),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Would archive 2 deleted-project message(s)" in result.output
+    from pollypm.store import SQLAlchemyStore
+
+    store = SQLAlchemyStore(f"sqlite:///{env['workspace_db']}")
+    try:
+        assert len(store.query_messages(recipient="user", state="open")) == 3
+    finally:
+        store.close()
+
+
+def test_archive_deleted_project_messages_closes_only_stale_refs(
+    env, monkeypatch,
+) -> None:
+    """Stale raw-store inbox rows get closed, tracked-project rows remain open."""
+    _pin_load_config(monkeypatch, env["config_path"])
+    _seed_message(env["workspace_db"], scope="demo", subject="live project")
+    _seed_message(env["workspace_db"], scope="ghost_proj", subject="deleted scope")
+    _seed_message(
+        env["workspace_db"],
+        scope="inbox",
+        subject="deleted label",
+        labels=["project:ghost_label"],
+    )
+
+    result = runner.invoke(
+        inbox_app,
+        ["archive", "--deleted-projects", "--db", str(env["workspace_db"])],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Archived 2 deleted-project message(s)." in result.output
+    from pollypm.store import SQLAlchemyStore
+
+    store = SQLAlchemyStore(f"sqlite:///{env['workspace_db']}")
+    try:
+        open_subjects = {
+            row["subject"]
+            for row in store.query_messages(recipient="user", state="open")
+        }
+        closed_subjects = {
+            row["subject"]
+            for row in store.query_messages(recipient="user", state="closed")
+        }
+    finally:
+        store.close()
+    assert len(open_subjects) == 1
+    assert next(iter(open_subjects)).endswith("live project")
+    assert {subject.rsplit("] ", 1)[-1] for subject in closed_subjects} == {
+        "deleted scope",
+        "deleted label",
+    }
 
 
 def test_aggregator_skips_dev_channel_messages(env) -> None:

@@ -235,6 +235,7 @@ class FakeConfig:
 class FakeTask:
     labels: list[str]
     work_status: str
+    task_id: str = "proj/1"
 
 
 class FakeWorkService:
@@ -243,6 +244,7 @@ class FakeWorkService:
     def __init__(self) -> None:
         self.tasks: list[tuple[str, FakeTask]] = []
         self.created: list[dict[str, Any]] = []
+        self.queued: list[tuple[str, str]] = []
 
     def add(self, project: str, labels: list[str], work_status: str) -> None:
         self.tasks.append((project, FakeTask(labels=labels, work_status=work_status)))
@@ -256,6 +258,24 @@ class FakeWorkService:
                 continue
             out.append(t)
         return out
+
+    def create(self, **kwargs):
+        self.created.append(kwargs)
+        task = FakeTask(
+            labels=list(kwargs.get("labels", []) or []),
+            work_status="draft",
+            task_id=f"{kwargs['project']}/{len(self.created)}",
+        )
+        self.tasks.append((kwargs["project"], task))
+        return task
+
+    def queue(self, task_id: str, actor: str):
+        self.queued.append((task_id, actor))
+        for _project, task in self.tasks:
+            if task.task_id == task_id:
+                task.work_status = "queued"
+                return task
+        raise KeyError(task_id)
 
 
 @pytest.fixture
@@ -311,9 +331,13 @@ class TestTickHandler:
     def test_no_changes_skips(
         self, advisor_config, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        ws = FakeWorkService()
         monkeypatch.setattr(tick_module, "detect_changes", lambda path, since: False)
         result = advisor_tick_handler(
-            {"config_path": str(advisor_config["config_path"])}
+            {
+                "config_path": str(advisor_config["config_path"]),
+                "work_service": ws,
+            }
         )
         assert result["fired"] is True
         assert result["enqueued"] == []
@@ -324,6 +348,26 @@ class TestTickHandler:
         assert reloaded.get("proj").last_tick_at != ""
         # last_run NOT stamped — that's ad02 bookkeeping, on session complete.
         assert reloaded.get("proj").last_run == ""
+
+    def test_no_changes_with_nonterminal_work_enqueues_stagnation_candidate(
+        self, advisor_config, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ws = FakeWorkService()
+        ws.add("proj", labels=["feature"], work_status="queued")
+
+        monkeypatch.setattr(tick_module, "detect_changes", lambda path, since: False)
+
+        result = advisor_tick_handler(
+            {
+                "config_path": str(advisor_config["config_path"]),
+                "work_service": ws,
+            }
+        )
+
+        assert result["fired"] is True
+        assert result["enqueued"] == ["proj"]
+        assert result["results"][0]["reason"] == "stagnation-candidate"
+        assert ws.created[0]["flow_template"] == "advisor_review"
 
     def test_changes_enqueue_when_no_in_flight(
         self, advisor_config, monkeypatch: pytest.MonkeyPatch
@@ -347,6 +391,32 @@ class TestTickHandler:
         assert result["enqueued"] == ["proj"]
         assert len(ws.created) == 1
         assert ws.created[0]["project_key"] == "proj"
+
+    def test_real_enqueue_creates_and_queues_advisor_task(
+        self, advisor_config, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ws = FakeWorkService()
+
+        monkeypatch.setattr(tick_module, "detect_changes", lambda path, since: True)
+
+        result = advisor_tick_handler(
+            {
+                "config_path": str(advisor_config["config_path"]),
+                "work_service": ws,
+            }
+        )
+
+        assert result["fired"] is True
+        assert result["enqueued"] == ["proj"]
+        assert result["results"][0]["enqueue"] == {
+            "enqueued": True,
+            "project": "proj",
+            "task_id": "proj/1",
+        }
+        assert ws.created[0]["flow_template"] == "advisor_review"
+        assert ws.created[0]["roles"] == {"advisor": "advisor"}
+        assert ws.created[0]["labels"] == ["advisor"]
+        assert ws.queued == [("proj/1", "advisor.tick")]
 
     def test_in_progress_advisor_task_blocks_pile_up(
         self, advisor_config, monkeypatch: pytest.MonkeyPatch

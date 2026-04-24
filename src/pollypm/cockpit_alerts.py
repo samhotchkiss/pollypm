@@ -21,6 +21,7 @@ from textual.binding import Binding
 from textual.containers import Container
 from textual.widgets import Static
 
+from pollypm.cli_features.alerts import is_surfaceable_operational_alert
 from pollypm.config import load_config
 from pollypm.cockpit_palette import _palette_nav
 
@@ -68,27 +69,17 @@ _OPERATIONAL_ALERT_TYPES: frozenset[str] = frozenset({
 
 # Operational alert *prefixes* — an alert_type whose start matches any
 # of these is also treated as operational and filtered from toasts.
-# ``unmanaged_window:<session>:<name>`` falls in this bucket — the
-# user can't act on it beyond "notice it's there", so toasting every
-# one trains them to dismiss the toast channel. #765.
+# Prefixes that describe a user-actionable task stall belong in
+# cli_features.alerts.SURFACEABLE_OPERATIONAL_ALERT_PREFIXES instead,
+# not here. #788.
 _OPERATIONAL_ALERT_PREFIXES: tuple[str, ...] = (
     "unmanaged_window:",
-    # Per-task no_session alerts (``no_session_for_assignment:demo/1``)
-    # are the task-level equivalent of the sweep-level no_session —
-    # same reasoning.
-    "no_session_for_assignment:",
     # ``pane:<pattern>`` alerts are raised by the heartbeat pattern
     # matcher (stuck_on_error / auth_expired / etc.) — all supervisor-
     # internal. Supervisor auto-handles the recovery; toasting every
     # pattern match just tells the user "something's happening
     # mechanically" and trains them to dismiss real alerts.
     "pane:",
-    # ``stuck_on_task:<task_id>`` is the same story — heuristic
-    # 'this session hasn't moved on this task in a while'. When the
-    # heuristic is right, the recovery system nudges/restarts; when
-    # it's wrong (most of the time — architects sit after emit by
-    # design) the user has nothing to act on.
-    "stuck_on_task:",
 )
 
 
@@ -107,6 +98,8 @@ def is_operational_alert(alert_type: str) -> bool:
     — adding a new operational alert type meant hunting for them all.
     """
     name = alert_type or ""
+    if is_surfaceable_operational_alert(name):
+        return False
     if name in _OPERATIONAL_ALERT_TYPES:
         return True
     return any(name.startswith(prefix) for prefix in _OPERATIONAL_ALERT_PREFIXES)

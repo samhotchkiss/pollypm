@@ -57,6 +57,8 @@ class _RuntimeServices:
     # need StateStore-specific APIs (raw ``execute``, ``was_notified_within``,
     # ``record_notification``) keep working.
     msg_store: Any | None = None
+    config: Any | None = None
+    storage_closet_name: str = "pollypm-storage-closet"
     known_projects: tuple[Any, ...] = field(default_factory=tuple)
     enforce_plan: bool = True
     plan_dir: str = "docs/plan"
@@ -143,6 +145,8 @@ def load_runtime_services(
         state_store=store,
         work_service=work_service,
         project_root=config.project.root_dir,
+        config=config,
+        storage_closet_name=f"{config.project.tmux_session}-storage-closet",
         known_projects=known_projects,
         enforce_plan=config.planner.enforce_plan,
         plan_dir=config.planner.plan_dir,

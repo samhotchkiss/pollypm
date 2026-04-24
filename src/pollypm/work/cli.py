@@ -19,6 +19,7 @@ from pollypm.errors import (
     format_task_not_found_error,
     render_cli_error,
 )
+from pollypm.work.readiness import format_readiness_warnings, readiness_warnings
 
 _TASK_APP_HELP = help_with_examples(
     "Manage work tasks.",
@@ -607,9 +608,14 @@ def task_create(
         requires_human_review=requires_human_review,
     )
     if output_json:
-        typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
+        payload = _task_to_dict(task)
+        payload["readiness_warnings"] = readiness_warnings(task)
+        typer.echo(json.dumps(payload, indent=2, default=str))
     else:
         typer.echo(f"Created {task.task_id}")
+        warning = format_readiness_warnings(readiness_warnings(task))
+        if warning:
+            typer.echo(f"Readiness: {warning}")
 
 
 @task_app.command("get")
@@ -723,9 +729,48 @@ def task_queue(
     svc = _svc(db, project=_project_from_task_id(task_id))
     task = _run(svc.queue, task_id, actor, skip_gates=skip_gates)
     if output_json:
-        typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
+        payload = _task_to_dict(task)
+        payload["readiness_warnings"] = readiness_warnings(task)
+        typer.echo(json.dumps(payload, indent=2, default=str))
     else:
         typer.echo(f"Queued {task.task_id}")
+        warnings = readiness_warnings(task)
+        if warnings:
+            svc.add_context(
+                task.task_id,
+                actor,
+                format_readiness_warnings(warnings),
+                entry_type="readiness_warning",
+            )
+            typer.echo(f"Readiness: {format_readiness_warnings(warnings)}")
+
+
+@task_app.command("approve-human-review")
+def task_approve_human_review(
+    task_id: str = typer.Argument(..., help="Task ID (project/number)"),
+    actor: str = typer.Option("user", "--actor", help="Actor approving"),
+    reason: str | None = typer.Option(None, "--reason", help="Approval reason"),
+    fast_track_authorized: bool = typer.Option(
+        False,
+        "--fast-track-authorized",
+        help="Record that the operator has prior authorization to approve.",
+    ),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Approve a requires_human_review task before it enters the queue."""
+    svc = _svc(db, project=_project_from_task_id(task_id))
+    task = _run(
+        svc.approve_human_review,
+        task_id,
+        actor,
+        reason,
+        fast_track_authorized=fast_track_authorized,
+    )
+    if output_json:
+        typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
+    else:
+        typer.echo(f"Approved human review for {task.task_id}")
 
 
 @task_app.command("claim")
@@ -885,12 +930,13 @@ def task_cancel(
 def task_hold(
     task_id: str = typer.Argument(..., help="Task ID (project/number)"),
     actor: str = typer.Option("cli", "--actor", help="Actor"),
+    reason: str | None = typer.Option(None, "--reason", help="Why the task is being held"),
     db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Put a task on hold."""
     svc = _svc(db, project=_project_from_task_id(task_id))
-    task = _run(svc.hold, task_id, actor)
+    task = _run(svc.hold, task_id, actor, reason)
     if output_json:
         typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
     else:
@@ -911,6 +957,91 @@ def task_resume(
         typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
     else:
         typer.echo(f"Resumed {task.task_id}")
+
+
+@task_app.command("repair")
+def task_repair(
+    task_id: str = typer.Argument(..., help="Task ID (project/number)"),
+    repair_case: str = typer.Option(
+        ...,
+        "--case",
+        help="Named repair case. Supported: review-hold.",
+    ),
+    reason: str = typer.Option(
+        ...,
+        "--reason",
+        help="Why this repair is being applied (recorded on the task).",
+    ),
+    actor: str = typer.Option("cli", "--actor", help="Actor applying repair"),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Apply a narrow, audited task-state repair.
+
+    This is not a general SQL escape hatch. Each case validates the broken
+    invariant, uses normal work-service transitions, and records task context.
+    """
+    svc = _svc(db, project=_project_from_task_id(task_id))
+    before = _run(svc.get, task_id)
+    if repair_case != "review-hold":
+        typer.echo(
+            "Unsupported repair case. Supported cases: review-hold.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    from pollypm.work.models import NodeType, WorkStatus
+
+    if before.work_status != WorkStatus.ON_HOLD:
+        typer.echo(
+            f"Cannot apply review-hold repair: {task_id} is "
+            f"'{before.work_status.value}', not 'on_hold'.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    if not before.current_node_id:
+        typer.echo(
+            "Cannot apply review-hold repair: task has no current node.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    flow = svc.get_flow(before.flow_template_id, project=before.project)
+    node = flow.nodes.get(before.current_node_id)
+    if node is None or node.type != NodeType.REVIEW:
+        typer.echo(
+            "Cannot apply review-hold repair: current node is not a review node.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    context = (
+        "repair review-hold: restoring task from on_hold to review. "
+        f"reason={reason}"
+    )
+    _run(svc.add_context, task_id, actor, context)
+    after = _run(svc.resume, task_id, actor)
+    if after.work_status != WorkStatus.REVIEW:
+        typer.echo(
+            f"Repair failed invariant: expected review, got {after.work_status.value}.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    payload = {
+        "task_id": task_id,
+        "case": repair_case,
+        "before": before.work_status.value,
+        "after": after.work_status.value,
+        "node": after.current_node_id,
+        "reason": reason,
+    }
+    if output_json:
+        typer.echo(json.dumps(payload, indent=2, default=str))
+        return
+    typer.echo(
+        f"Repaired {task_id}: {payload['before']} -> {payload['after']} "
+        f"at {payload['node']}"
+    )
 
 
 @task_app.command("link")

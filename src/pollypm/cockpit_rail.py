@@ -43,6 +43,11 @@ from pollypm.cockpit_rail_routes import (
     resolve_project_route,
     resolve_static_view_route,
 )
+from pollypm.cockpit_project_state import (
+    ProjectStateRollup,
+    actionable_alert_task_ids,
+    rollup_project_state,
+)
 from pollypm.config import load_config
 from pollypm.heartbeats.snapshots import read_recent_heartbeat_snapshot
 from pollypm.providers import get_provider
@@ -243,6 +248,17 @@ def _selected_project_key(selected: object) -> str | None:
     if len(parts) < 2:
         return None
     return parts[1] or None
+
+
+def _task_mount_parts(session_name: object) -> tuple[str, str] | None:
+    """Parse ``task-<project>-<number>`` mounted session names."""
+    if not isinstance(session_name, str) or not session_name.startswith("task-"):
+        return None
+    suffix = session_name[len("task-") :]
+    project_key, sep, task_num = suffix.rpartition("-")
+    if not sep or not project_key or not task_num:
+        return None
+    return project_key, task_num
 
 
 def _hidden_rail_items(config: object) -> frozenset[str]:
@@ -654,9 +670,10 @@ class CockpitRouter:
             release_lease = False
             try:
                 supervisor = self._load_supervisor()
-                launches = supervisor.plan_launches()
-                launch = next((l for l in launches if l.session.name == mounted), None)
-                if launch is None or not self._mounted_session_matches_pane(launch, right_pane):
+                if (
+                    self._mounted_window_name(supervisor, mounted) is None
+                    or not self._mounted_session_matches_pane(right_pane)
+                ):
                     state.pop("mounted_session", None)
                     dirty = True
                     release_lease = True
@@ -677,7 +694,7 @@ class CockpitRouter:
         except Exception:  # noqa: BLE001
             return []
 
-    def _mounted_session_matches_pane(self, launch, pane) -> bool:
+    def _mounted_session_matches_pane(self, pane) -> bool:
         if pane is None or getattr(pane, "pane_dead", False):
             return False
         if not self._is_live_provider_pane(pane):
@@ -802,6 +819,7 @@ class CockpitRouter:
         grouped_registrations = self._grouped_rail_registrations(config, registry)
         grouped: dict[str, list[CockpitItem]] = {name: [] for name in RAIL_SECTIONS}
         project_session_map = self._project_session_map(launches)
+        project_rollups = self._project_state_rollups(config, alerts)
 
         for section, registrations in grouped_registrations.items():
             for reg in registrations:
@@ -850,12 +868,14 @@ class CockpitRouter:
                 continue
             items.extend(rows)
 
+        items = self._inject_mounted_task_rows(items, cockpit_state=cockpit_state)
         return self._decorate_project_items(
             items,
             selected_project=_selected_project_key(cockpit_state.get("selected")),
             launches=launches,
             recent_events=recent_events,
             project_session_map=project_session_map,
+            project_rollups=project_rollups,
         )
 
     def _attach_session_metadata(
@@ -966,6 +986,7 @@ class CockpitRouter:
         launches,
         recent_events: list,
         project_session_map: dict[str, str],
+        project_rollups: dict[str, ProjectStateRollup] | None = None,
     ) -> list[CockpitItem]:
         from pollypm.cockpit_sections.base import _iso_to_dt, _spark_bar
 
@@ -989,7 +1010,8 @@ class CockpitRouter:
             _spark_bar=_spark_bar,
         )
 
-        project_blocks: list[tuple[str, list[CockpitItem], bool, bool]] = []
+        rollups = project_rollups or {}
+        project_blocks: list[tuple[str, list[CockpitItem], bool, bool, ProjectStateRollup | None]] = []
         current_key: str | None = None
         current_block: list[CockpitItem] = []
         current_pinned = False
@@ -998,7 +1020,13 @@ class CockpitRouter:
         def flush_block() -> None:
             nonlocal current_key, current_block, current_pinned, current_selected
             if current_key is not None and current_block:
-                project_blocks.append((current_key, current_block, current_pinned, current_selected))
+                project_blocks.append((
+                    current_key,
+                    current_block,
+                    current_pinned,
+                    current_selected,
+                    rollups.get(current_key),
+                ))
             current_key = None
             current_block = []
             current_pinned = False
@@ -1012,7 +1040,13 @@ class CockpitRouter:
                     current_key = parts[1]
                     current_selected = current_key == selected_project
                     current_pinned = self.is_project_pinned(current_key)
-                    current_block = [self._decorate_project_row(item, project_event_spark.get(current_key))]
+                    current_block = [
+                        self._decorate_project_row(
+                            item,
+                            project_event_spark.get(current_key),
+                            rollup=rollups.get(current_key),
+                        )
+                    ]
                     continue
                 if current_key is not None and len(parts) > 2 and parts[1] == current_key:
                     current_block.append(item)
@@ -1031,23 +1065,147 @@ class CockpitRouter:
             pin_rank = {key: idx for idx, key in enumerate(pin_order)}
             project_blocks.sort(
                 key=lambda row: (
-                    not row[2],  # pinned ahead of unpinned
+                    self._project_rollup_sort_rank(row[4]),
+                    not row[2],  # pinned ahead of unpinned within severity
                     pin_rank.get(row[0], 0),  # pinned: by recency
                     not row[3],  # selected ahead of other unpinned
                     row[0].lower(),  # unpinned: alphabetical
                 ),
             )
-            for _key, block, _pinned, _selected in project_blocks:
+            for _key, block, _pinned, _selected, _rollup in project_blocks:
                 project_region.extend(block)
         return [*prefix, *project_region, *suffix]
 
-    def _decorate_project_row(self, item: CockpitItem, sparkline: str | None) -> CockpitItem:
+    def _project_rollup_sort_rank(self, rollup: ProjectStateRollup | None) -> int:
+        if rollup is None:
+            return 4
+        return rollup.sort_rank
+
+    def _decorate_project_row(
+        self,
+        item: CockpitItem,
+        sparkline: str | None,
+        *,
+        rollup: ProjectStateRollup | None = None,
+    ) -> CockpitItem:
         label = item.label
         if self.is_project_pinned(item.key.split(":", 1)[1]):
             label = f"📌 {label}"
+        if rollup is not None and rollup.badge:
+            label = f"{rollup.badge} {label}"
         if sparkline:
             label = f"{label} {sparkline}"
         return replace(item, label=label)
+
+    def _project_state_rollups(
+        self,
+        config: object,
+        alerts: list[object],
+    ) -> dict[str, ProjectStateRollup]:
+        projects = getattr(config, "projects", {}) or {}
+        rollups: dict[str, ProjectStateRollup] = {}
+        for project_key, project in projects.items():
+            tasks, plan_blocked = self._project_tasks_for_rollup(
+                str(project_key),
+                project,
+                config=config,
+            )
+            rollup = rollup_project_state(
+                str(project_key),
+                tasks,
+                plan_blocked=plan_blocked,
+                actionable_task_alert_ids=actionable_alert_task_ids(
+                    alerts,
+                    project_key=str(project_key),
+                ),
+            )
+            rollups[str(project_key)] = rollup
+        return rollups
+
+    def _project_tasks_for_rollup(
+        self,
+        project_key: str,
+        project: object,
+        *,
+        config: object,
+    ) -> tuple[list[object], bool]:
+        project_path = getattr(project, "path", None)
+        if not isinstance(project_path, Path):
+            return [], False
+        db_path = project_path / ".pollypm" / "state.db"
+        if not db_path.exists():
+            return [], False
+        from pollypm.plugins_builtin.project_planning.plan_presence import has_acceptable_plan
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        work = SQLiteWorkService(db_path, project_path=project_path)
+        try:
+            tasks = list(work.list_tasks(project=project_key))
+            planner = getattr(config, "planner", None)
+            plan_dir = str(getattr(planner, "plan_dir", "docs/plan") or "docs/plan")
+            plan_blocked = bool(tasks) and not has_acceptable_plan(
+                project_key,
+                project_path,
+                work,
+                plan_dir=plan_dir,
+            )
+            return tasks, plan_blocked
+        except Exception:  # noqa: BLE001
+            return [], False
+        finally:
+            work.close()
+
+    def _inject_mounted_task_rows(
+        self,
+        items: list[CockpitItem],
+        *,
+        cockpit_state: dict[str, object],
+    ) -> list[CockpitItem]:
+        mounted_task = _task_mount_parts(cockpit_state.get("mounted_session"))
+        if mounted_task is None:
+            return items
+        project_key, task_num = mounted_task
+        selected = cockpit_state.get("selected")
+        if not isinstance(selected, str) or not selected.startswith(f"project:{project_key}"):
+            return items
+        task_key = f"project:{project_key}:task:{task_num}"
+        if any(item.key == task_key for item in items):
+            return items
+        row = CockpitItem(
+            key=task_key,
+            label=f"  ⟳ Task #{task_num}",
+            state="sub",
+        )
+
+        insert_at: int | None = None
+        task_prefix = f"project:{project_key}:task:"
+        for index, item in enumerate(items):
+            if item.key.startswith(task_prefix):
+                insert_at = index + 1
+        if insert_at is None:
+            for fallback_key in (
+                f"project:{project_key}:issues",
+                f"project:{project_key}:session",
+                f"project:{project_key}:dashboard",
+            ):
+                insert_at = next(
+                    (index + 1 for index, item in enumerate(items) if item.key == fallback_key),
+                    None,
+                )
+                if insert_at is not None:
+                    break
+        if insert_at is None:
+            insert_at = next(
+                (
+                    index
+                    for index, item in enumerate(items)
+                    if item.key == f"project:{project_key}:settings"
+                ),
+                None,
+            )
+        if insert_at is None:
+            return items
+        return [*items[:insert_at], row, *items[insert_at:]]
 
     def _project_activity_sparkline(
         self,
@@ -1312,14 +1470,11 @@ class CockpitRouter:
             supervisor = self._load_supervisor()
             mounted = state.get("mounted_session")
             if isinstance(mounted, str) and mounted:
-                launch = next(
-                    (item for item in supervisor.plan_launches() if item.session.name == mounted),
-                    None,
-                )
                 storage_session = supervisor.storage_closet_session_name()
-                if launch is not None and self.tmux.has_session(storage_session):
+                window_name = self._mounted_window_name(supervisor, mounted)
+                if window_name is not None and self.tmux.has_session(storage_session):
                     try:
-                        self.tmux.break_pane(panes[0].pane_id, storage_session, launch.window_name)
+                        self.tmux.break_pane(panes[0].pane_id, storage_session, window_name)
                     except Exception:  # noqa: BLE001
                         pass
             state.pop("right_pane_id", None)
@@ -1531,6 +1686,20 @@ class CockpitRouter:
             return
         self.set_selected_key(f"project:{project_key}:dashboard")
         self._show_static_view(supervisor, window_target, "project", project_key)
+
+    def _project_rollup_for_route(
+        self,
+        supervisor,
+        project_key: str,
+    ) -> ProjectStateRollup | None:
+        try:
+            alerts = supervisor.open_alerts()
+        except Exception:  # noqa: BLE001
+            alerts = []
+        try:
+            return self._project_state_rollups(supervisor.config, alerts).get(project_key)
+        except Exception:  # noqa: BLE001
+            return None
 
     def route_selected(self, key: str) -> None:
         supervisor = self._load_supervisor()
@@ -1798,18 +1967,23 @@ class CockpitRouter:
             self._write_state(state)
             self._release_cockpit_lease(supervisor, mounted_session)
             return
-        launch = next(item for item in supervisor.plan_launches() if item.session.name == mounted_session)
+        window_name = self._mounted_window_name(supervisor, mounted_session)
+        if window_name is None:
+            state.pop("mounted_session", None)
+            self._write_state(state)
+            self._release_cockpit_lease(supervisor, mounted_session)
+            return
         storage_session = supervisor.storage_closet_session_name()
         before = {(window.index, window.name) for window in self.tmux.list_windows(storage_session)}
-        self.tmux.break_pane(right_pane_id, storage_session, launch.window_name)
+        self.tmux.break_pane(right_pane_id, storage_session, window_name)
         after = self.tmux.list_windows(storage_session)
         created = [window for window in after if (window.index, window.name) not in before]
         if created:
-            self.tmux.rename_window(f"{storage_session}:{created[-1].index}", launch.window_name)
+            self.tmux.rename_window(f"{storage_session}:{created[-1].index}", window_name)
         else:
             for window in after:
                 if window.name == self._COCKPIT_WINDOW:
-                    self.tmux.rename_window(f"{storage_session}:{window.index}", launch.window_name)
+                    self.tmux.rename_window(f"{storage_session}:{window.index}", window_name)
                     break
         state.pop("mounted_session", None)
         self._write_state(state)
@@ -1823,6 +1997,17 @@ class CockpitRouter:
     # When CWD is ambiguous (multiple sessions share the same cwd), prefer
     # the session the user is most likely interacting with.
     _MOUNT_PRIORITY = {"operator-pm": 0, "reviewer": 1, "worker": 2}
+
+    def _mounted_window_name(self, supervisor, session_name: str) -> str | None:
+        launch = next(
+            (item for item in supervisor.plan_launches() if item.session.name == session_name),
+            None,
+        )
+        if launch is not None:
+            return launch.window_name
+        if _task_mount_parts(session_name) is not None:
+            return session_name
+        return None
 
     def _mounted_session_name(self, supervisor, window_target: str) -> str | None:
         state = self._load_state()

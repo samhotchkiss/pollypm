@@ -17,10 +17,13 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
+from pollypm.review_notify import notify_requires_review_hold
 from pollypm.work.gates import evaluate_gates, has_hard_failure
 from pollypm.work.models import (
+    ActorType,
     Decision,
     ExecutionStatus,
+    FlowNode,
     LinkKind,
     NodeType,
     Task,
@@ -39,6 +42,20 @@ if TYPE_CHECKING:
     from pollypm.work.sqlite_service import SQLiteWorkService
 
 logger = logging.getLogger(__name__)
+
+
+_AUTO_HOLD_REASON_PREFIX = "Waiting on operator:"
+_EXPECTED_CRITIC_PANEL_ROLES = (
+    "critic_simplicity",
+    "critic_maintainability",
+    "critic_user",
+    "critic_operational",
+    "critic_security",
+)
+
+
+def _format_csv(values: tuple[str, ...] | list[str]) -> str:
+    return ", ".join(values)
 
 
 @dataclass(slots=True)
@@ -79,6 +96,187 @@ class WorkTransitionManager:
             after_sync(result)
         return result
 
+    def _resolve_claim_node(self, task: Task) -> tuple[str, FlowNode]:
+        flow = self.service._load_flow_from_db(
+            task.flow_template_id,
+            task.flow_template_version,
+        )
+        node_id = task.current_node_id or flow.start_node
+        if not node_id:
+            raise InvalidTransitionError(
+                f"Task {task.task_id} has no claimable flow node."
+            )
+        node = flow.nodes.get(node_id)
+        if node is None:
+            raise InvalidTransitionError(
+                f"Current node '{node_id}' not found in flow '{flow.name}'."
+            )
+        if node.type == NodeType.TERMINAL:
+            raise InvalidTransitionError(
+                f"Current node '{node_id}' is terminal and cannot be claimed."
+            )
+        return node_id, node
+
+    def _latest_node_execution(
+        self,
+        task: Task,
+        node_id: str,
+    ):
+        return self.service._conn.execute(
+            "SELECT id, visit, status FROM work_node_executions "
+            "WHERE task_project = ? AND task_number = ? AND node_id = ? "
+            "ORDER BY visit DESC, id DESC LIMIT 1",
+            (task.project, task.task_number, node_id),
+        ).fetchone()
+
+    def _approved_work_integrated(self, task: Task) -> bool:
+        """Return True only when the task branch is merged into a non-task HEAD."""
+        project_path = self.service._resolve_project_path(task.project)
+        if project_path is None or not (project_path / ".git").exists():
+            return False
+
+        task_branch = f"task/{task.project}-{task.task_number}"
+        current_branch = self.service._git_run(
+            project_path,
+            "rev-parse",
+            "--abbrev-ref",
+            "HEAD",
+        )
+        if current_branch.returncode != 0:
+            logger.debug(
+                "could not verify integration state for %s: rev-parse failed",
+                task.task_id,
+            )
+            return False
+
+        current_branch_name = current_branch.stdout.strip()
+        if current_branch_name == task_branch:
+            return False
+
+        merged = self.service._git_run(
+            project_path,
+            "merge-base",
+            "--is-ancestor",
+            task_branch,
+            "HEAD",
+        )
+        return merged.returncode == 0
+
+    @staticmethod
+    def _has_structured_critique_output(task: Task) -> bool:
+        for execution in task.executions:
+            if (
+                execution.node_id != "critique"
+                or execution.status != ExecutionStatus.COMPLETED
+            ):
+                continue
+            output = execution.work_output
+            if (
+                output is not None
+                and output.summary
+                and output.summary.strip()
+                and output.artifacts
+            ):
+                return True
+        return False
+
+    def _validate_critic_panel_children(
+        self,
+        task: Task,
+    ) -> tuple[tuple[str, str], ...]:
+        """Enforce the real 5-critic panel before plan_project can synthesize."""
+        if (
+            task.flow_template_id != "plan_project"
+            or task.current_node_id != "critic_panel"
+        ):
+            return ()
+
+        expected = set(_EXPECTED_CRITIC_PANEL_ROLES)
+        found: dict[str, str] = {}
+        problems: list[str] = []
+
+        if len(task.children) != len(_EXPECTED_CRITIC_PANEL_ROLES):
+            problems.append(
+                "expected exactly five critic child tasks "
+                f"({_format_csv(_EXPECTED_CRITIC_PANEL_ROLES)}), "
+                f"found {len(task.children)}"
+            )
+
+        for project, number in task.children:
+            child_id = f"{project}/{number}"
+            child = self.service.get(child_id)
+            critic_role = child.roles.get("critic")
+
+            if child.flow_template_id != "critique_flow":
+                problems.append(
+                    f"{child_id} uses flow '{child.flow_template_id}', "
+                    "expected 'critique_flow'"
+                )
+
+            if critic_role not in expected:
+                problems.append(
+                    f"{child_id} has unexpected critic role "
+                    f"'{critic_role or '<missing>'}'"
+                )
+            elif critic_role in found:
+                problems.append(
+                    f"{child_id} duplicates critic role '{critic_role}' "
+                    f"already provided by {found[critic_role]}"
+                )
+            else:
+                found[critic_role] = child_id
+
+            if child.work_status != WorkStatus.DONE:
+                problems.append(
+                    f"{child_id} ({critic_role or '<missing>'}) is "
+                    f"'{child.work_status.value}', expected 'done'"
+                )
+
+            if not self._has_structured_critique_output(child):
+                problems.append(
+                    f"{child_id} ({critic_role or '<missing>'}) has no "
+                    "completed structured critique output"
+                )
+
+        missing = [
+            role for role in _EXPECTED_CRITIC_PANEL_ROLES if role not in found
+        ]
+        if missing:
+            problems.append(f"missing critic role(s): {_format_csv(missing)}")
+
+        if problems:
+            raise ValidationError(
+                "Cannot complete critic_panel: " + "; ".join(problems)
+            )
+
+        return tuple((role, found[role]) for role in _EXPECTED_CRITIC_PANEL_ROLES)
+
+    def _record_critic_panel_children(
+        self,
+        task: Task,
+        actor: str,
+        children_by_role: tuple[tuple[str, str], ...],
+        now: str,
+    ) -> None:
+        if not children_by_role:
+            return
+        child_summary = ", ".join(
+            f"{role}={child_id}" for role, child_id in children_by_role
+        )
+        self.service._conn.execute(
+            "INSERT INTO work_context_entries "
+            "(task_project, task_number, actor, text, created_at, entry_type) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                task.project,
+                task.task_number,
+                actor,
+                f"critic_panel children: {child_summary}",
+                now,
+                "critic_panel_children",
+            ),
+        )
+
     def queue(self, task_id: str, actor: str, skip_gates: bool = False) -> Task:
         task = self.service.get(task_id)
 
@@ -89,10 +287,33 @@ class WorkTransitionManager:
             )
 
         if task.requires_human_review and not skip_gates:
-            raise InvalidTransitionError(
-                "Task requires human review before queueing. "
-                "Pass skip_gates=True to bypass this check once approval "
-                "has been obtained out-of-band (inbox integration pending)."
+            if not self.service.has_human_review_approval(task_id):
+                approval_task = self.service.ensure_human_review_request_task(
+                    task_id,
+                    actor,
+                )
+                raise InvalidTransitionError(
+                    "Task requires human review before queueing.\n"
+                    "\n"
+                    "Why: this task is marked requires_human_review, so it "
+                    "must be approved by the user or explicitly fast-tracked "
+                    "by an authorized operator before workers can pick it up.\n"
+                    "\n"
+                    f"Created user inbox task: {approval_task.task_id}\n"
+                    "\n"
+                    "Fix: approve it with "
+                    f"`pm task approve-human-review {task_id} --actor user`, "
+                    "or have the operator use "
+                    f"`pm task approve-human-review {task_id} --actor polly "
+                    "--fast-track-authorized --reason \"...\"`."
+                )
+
+        if task.requires_human_review and skip_gates and not self.service.has_human_review_approval(task_id):
+            self.service.add_context(
+                task_id,
+                actor,
+                "fast-track queue bypass recorded via --skip-gates",
+                entry_type="human_review_approved",
             )
 
         gate_results = evaluate_gates(
@@ -178,30 +399,57 @@ class WorkTransitionManager:
                 f"`pm task unlink`)."
             )
 
-        flow = self.service._load_flow_from_db(
-            task.flow_template_id,
-            task.flow_template_version,
+        node_id, claim_node = self._resolve_claim_node(task)
+        assignee = self.service._resolve_node_assignee(task, claim_node) or actor
+        target_status = (
+            WorkStatus.REVIEW
+            if claim_node.type == NodeType.REVIEW
+            else WorkStatus.IN_PROGRESS
         )
-        start_node = flow.start_node
-        start_node_cfg = flow.nodes.get(start_node)
-        assignee = self.service._resolve_node_assignee(task, start_node_cfg) or actor
+        latest_execution = self._latest_node_execution(task, node_id)
+        resume_blocked_execution = (
+            task.current_node_id is not None
+            and latest_execution is not None
+            and latest_execution["status"] == ExecutionStatus.BLOCKED.value
+        )
+        reuse_active_execution = (
+            task.current_node_id is not None
+            and latest_execution is not None
+            and latest_execution["status"] == ExecutionStatus.ACTIVE.value
+        )
+        next_visit = None
+        if not resume_blocked_execution and not reuse_active_execution:
+            next_visit = self.service._next_visit(
+                task.project,
+                task.task_number,
+                node_id,
+            )
         now = _now()
 
-        self._commit(
-            lambda: (
-                self.service._conn.execute(
-                    "UPDATE work_tasks SET work_status = ?, assignee = ?, "
-                    "current_node_id = ?, updated_at = ? "
-                    "WHERE project = ? AND task_number = ?",
-                    (
-                        WorkStatus.IN_PROGRESS.value,
-                        assignee,
-                        start_node,
-                        now,
-                        task.project,
-                        task.task_number,
-                    ),
+        def _mutate() -> None:
+            self.service._conn.execute(
+                "UPDATE work_tasks SET work_status = ?, assignee = ?, "
+                "current_node_id = ?, updated_at = ? "
+                "WHERE project = ? AND task_number = ?",
+                (
+                    target_status.value,
+                    assignee,
+                    node_id,
+                    now,
+                    task.project,
+                    task.task_number,
                 ),
+            )
+            if resume_blocked_execution:
+                self.service._conn.execute(
+                    "UPDATE work_node_executions SET status = ? "
+                    "WHERE id = ?",
+                    (
+                        ExecutionStatus.ACTIVE.value,
+                        latest_execution["id"],
+                    ),
+                )
+            elif next_visit is not None:
                 self.service._conn.execute(
                     "INSERT INTO work_node_executions "
                     "(task_project, task_number, node_id, visit, status, started_at) "
@@ -209,27 +457,27 @@ class WorkTransitionManager:
                     (
                         task.project,
                         task.task_number,
-                        start_node,
-                        1,
+                        node_id,
+                        next_visit,
                         ExecutionStatus.ACTIVE.value,
                         now,
                     ),
-                ),
-                self.service._record_transition(
-                    task.project,
-                    task.task_number,
-                    WorkStatus.QUEUED.value,
-                    WorkStatus.IN_PROGRESS.value,
-                    actor,
-                ),
+                )
+            self.service._record_transition(
+                task.project,
+                task.task_number,
+                WorkStatus.QUEUED.value,
+                target_status.value,
+                actor,
             )
-        )
+
+        self._commit(_mutate)
 
         def _after_sync(_: Task) -> None:
             self.service.last_provision_error = None
             if self.service._session_mgr is not None:
                 try:
-                    self.service._session_mgr.provision_worker(task_id, actor)
+                    self.service._session_mgr.provision_worker(task_id, assignee)
                 except Exception as exc:  # noqa: BLE001
                     self.service.last_provision_error = str(exc)
                     logger.warning(
@@ -303,11 +551,38 @@ class WorkTransitionManager:
     def hold(self, task_id: str, actor: str, reason: str | None = None) -> Task:
         task = self.service.get(task_id)
 
-        if task.work_status not in (WorkStatus.IN_PROGRESS, WorkStatus.QUEUED):
+        if task.work_status not in (
+            WorkStatus.IN_PROGRESS,
+            WorkStatus.QUEUED,
+            WorkStatus.REVIEW,
+        ):
             raise InvalidTransitionError(
                 f"Cannot hold task in '{task.work_status.value}' state. "
-                f"Task must be in 'in_progress' or 'queued' state."
+                f"Task must be in 'in_progress', 'review', or 'queued' state."
             )
+
+        if task.work_status == WorkStatus.REVIEW:
+            try:
+                _flow, node = self.service._get_current_flow_node(task)
+            except Exception:  # noqa: BLE001
+                node = None
+            if getattr(node, "actor_type", None) == ActorType.HUMAN:
+                raise InvalidTransitionError(
+                    "Cannot hold a task at a human review/approval node. "
+                    "Keep it in 'review' so the human accept/reject path stays visible."
+                )
+
+            reason_text = (reason or "").strip()
+            if reason_text.startswith(_AUTO_HOLD_REASON_PREFIX):
+                notify_subject = reason_text[len(_AUTO_HOLD_REASON_PREFIX):].strip()
+                if notify_subject.startswith("[Action]") and not notify_requires_review_hold(
+                    subject=notify_subject,
+                    body="",
+                ):
+                    raise InvalidTransitionError(
+                        "Cannot auto-hold a review-ready task from a non-blocking "
+                        "operator/reviewer notification."
+                    )
 
         now = _now()
         self._commit(
@@ -347,7 +622,7 @@ class WorkTransitionManager:
                 f"Task must be in 'on_hold' state."
             )
 
-        has_active_execution = False
+        target_status = WorkStatus.QUEUED
         if task.current_node_id:
             row = self.service._conn.execute(
                 "SELECT 1 FROM work_node_executions "
@@ -360,11 +635,13 @@ class WorkTransitionManager:
                     ExecutionStatus.ACTIVE.value,
                 ),
             ).fetchone()
-            has_active_execution = row is not None
-
-        target_status = (
-            WorkStatus.IN_PROGRESS if has_active_execution else WorkStatus.QUEUED
-        )
+            if row is not None:
+                _node_id, node = self._resolve_claim_node(task)
+                target_status = (
+                    WorkStatus.REVIEW
+                    if node.type == NodeType.REVIEW
+                    else WorkStatus.IN_PROGRESS
+                )
         now = _now()
         self._commit(
             lambda: (
@@ -413,6 +690,7 @@ class WorkTransitionManager:
             )
 
         self.service._validate_actor_role(task, node, actor)
+        critic_panel_children = self._validate_critic_panel_children(task)
 
         if node.gates:
             gate_results = evaluate_gates(
@@ -468,6 +746,12 @@ class WorkTransitionManager:
                         task.current_node_id,
                         ExecutionStatus.ACTIVE.value,
                     ),
+                ),
+                self._record_critic_panel_children(
+                    task,
+                    actor,
+                    critic_panel_children,
+                    now,
                 ),
                 self.service._advance_to_node(
                     task,
@@ -627,7 +911,10 @@ class WorkTransitionManager:
         def _after_reload(result: Task) -> None:
             if result.work_status == WorkStatus.DONE:
                 self.service._check_auto_unblock(task_id)
-                if self.service._session_mgr is not None:
+                if (
+                    self.service._session_mgr is not None
+                    and self._approved_work_integrated(result)
+                ):
                     try:
                         self.service._session_mgr.teardown_worker(task_id)
                     except Exception as exc:  # noqa: BLE001

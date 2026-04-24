@@ -151,9 +151,10 @@ wheels = [
 
 [[package]]
 name = "pollypm"
-version = "1.0.0rc1"
+version = "1.0.0rc2"
 source = { editable = "." }
 dependencies = [
+    { name = "packaging" },
     { name = "pyyaml" },
     { name = "sqlalchemy" },
     { name = "textual" },
@@ -167,6 +168,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "packaging", specifier = ">=23.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.4.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "sqlalchemy", specifier = ">=2.0" },

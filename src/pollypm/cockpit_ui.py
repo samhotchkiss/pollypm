@@ -82,8 +82,11 @@ from pollypm.cockpit_inbox import (
     inbox_thread_right_action,
 )
 from pollypm.cockpit_inbox_items import (
+    annotate_inbox_entry,
     is_task_inbox_entry,
     load_inbox_entries,
+    message_row_to_inbox_entry,
+    task_to_inbox_entry,
 )
 from pollypm.cockpit_metrics import (
     PollyMetricsApp,
@@ -138,6 +141,10 @@ _INLINE_BOLD_RE = _re.compile(r"\*\*(.+?)\*\*")
 _INLINE_ITALIC_RE = _re.compile(r"\*(.+?)\*")
 _INLINE_CODE_RE = _re.compile(r"`(.+?)`")
 _ORDERED_LIST_RE = _re.compile(r"\s*\d+\.\s")
+_PROJECT_TASK_REF_RE = _re.compile(
+    r"\b(?P<project>[A-Za-z0-9_][A-Za-z0-9_-]*)/(?P<number>\d+)\b"
+)
+_ACTION_STEP_RE = _re.compile(r"^\s*(?:[-*]\s+|\d+\.\s+)(?P<step>.+\S)\s*$")
 
 
 def _md_to_rich(text: str) -> str:
@@ -4655,10 +4662,16 @@ def _inbox_sort_key(task) -> tuple:
     updated = task.updated_at
     iso = updated.isoformat() if hasattr(updated, "isoformat") else str(updated or "")
     prio = getattr(task.priority, "value", str(task.priority))
-    # Negate updated so newer comes first when sorted ascending; keep
-    # priority as a positive rank so critical (0) wins inside a same-age
-    # bucket.
-    return (-_iso_sort_weight(iso), _INBOX_PRIORITY_RANK.get(prio, 9), task.title)
+    triage_rank = getattr(task, "triage_rank", None)
+    triage_rank = 2 if triage_rank is None else int(triage_rank)
+    # Actionable items sort ahead of informational ones; orphaned
+    # deleted-project rows sort last. Within a bucket, newer still wins.
+    return (
+        triage_rank,
+        -_iso_sort_weight(iso),
+        _INBOX_PRIORITY_RANK.get(prio, 9),
+        task.title,
+    )
 
 
 def _iso_sort_weight(iso: str) -> int:
@@ -4694,6 +4707,42 @@ def _format_sender(task) -> str:
         return task.created_by
     # Last resort — unknown sender. Don't show blank.
     return "polly"
+
+
+def _triage_bucket(task) -> str:
+    return str(getattr(task, "triage_bucket", "info") or "info")
+
+
+def _triage_label(task) -> str:
+    label = getattr(task, "triage_label", None)
+    if label:
+        return str(label)
+    if is_rejection_feedback_task(task):
+        target = feedback_target_task_id(task)
+        if target:
+            return f"review feedback for {target}"
+        return "review feedback"
+    return "update"
+
+
+def _render_inbox_triage_banner(item) -> str | None:
+    bucket = _triage_bucket(item)
+    label = _triage_label(item)
+    project = (getattr(item, "project", "") or "").strip()
+    if bucket == "action":
+        return (
+            f"[b #f0c45a]Action Required[/b #f0c45a]"
+            f"  [dim]· {_escape(label)}[/dim]"
+        )
+    if bucket == "orphaned":
+        detail = f"{project} is no longer a tracked project." if project else "This project is no longer tracked."
+        return (
+            f"[b #97a6b2]Deleted Project[/b #97a6b2]"
+            f"  [dim]· {_escape(detail)}[/dim]"
+        )
+    if label and label != "update":
+        return f"[dim]{_escape(label)}[/dim]"
+    return None
 
 
 def _format_inbox_row(
@@ -4749,11 +4798,7 @@ def _format_inbox_row(
     iso = updated.isoformat() if hasattr(updated, "isoformat") else str(updated or "")
     age = format_relative(iso) if iso else ""
     project = (task.project or "").strip() or "\u2014"
-    meta_bits = [project]
-    if is_rejection_feedback_task(task):
-        target_task = feedback_target_task_id(task)
-        if target_task:
-            meta_bits.append(f"feedback for {target_task}")
+    meta_bits = [_triage_label(task), project]
     if age:
         meta_bits.append(age)
     meta_indent = " " * max(2, len(tree_marker) + 2)
@@ -5307,6 +5352,13 @@ class _InboxListItem(ListItem):
             self.add_class("unread")
         if row.is_task and is_rejection_feedback_task(row.task):
             self.add_class("rejection-feedback")
+        triage_bucket = _triage_bucket(row.task)
+        if triage_bucket == "action":
+            self.add_class("action-required")
+        elif triage_bucket == "orphaned":
+            self.add_class("orphaned")
+        else:
+            self.add_class("informational")
 
     def mark_read(self, row: InboxThreadRow | None = None) -> None:
         """Flip the row to read styling in place (no reflow of the list)."""
@@ -5371,11 +5423,27 @@ class PollyInboxApp(App[None]):
         border-left: thick #ffb454;
         background: #17110d;
     }
+    #inbox-list > .inbox-row.action-required {
+        border-left: thick #f0c45a;
+        background: #171611;
+    }
+    #inbox-list > .inbox-row.orphaned {
+        border-left: thick #586773;
+        background: #11161b;
+        color: #8b98a4;
+    }
     #inbox-list > .inbox-row.-highlight {
         background: #1e2730;
     }
     #inbox-list > .inbox-row.rejection-feedback.-highlight {
         background: #23180f;
+    }
+    #inbox-list > .inbox-row.action-required.-highlight {
+        background: #252013;
+    }
+    #inbox-list > .inbox-row.orphaned.-highlight {
+        background: #17202a;
+        color: #c3ced7;
     }
     #inbox-list:focus > .inbox-row.-highlight {
         background: #253140;
@@ -5384,6 +5452,14 @@ class PollyInboxApp(App[None]):
     #inbox-list:focus > .inbox-row.rejection-feedback.-highlight {
         background: #2d1e10;
         color: #fff3df;
+    }
+    #inbox-list:focus > .inbox-row.action-required.-highlight {
+        background: #312812;
+        color: #fff8df;
+    }
+    #inbox-list:focus > .inbox-row.orphaned.-highlight {
+        background: #1d2732;
+        color: #d0d8de;
     }
     #inbox-detail-wrap {
         height: 1fr;
@@ -5526,6 +5602,7 @@ class PollyInboxApp(App[None]):
         Binding("R", "toggle_filter_recent", "Recent", show=False),
         Binding("l", "toggle_filter_plan_review", "Plan review", show=False),
         Binding("b", "toggle_filter_blocking", "Blocking", show=False),
+        Binding("O", "toggle_filter_orphaned", "Orphaned", show=False),
         Binding("c", "clear_filters", "Clear filters", show=False),
         # Refresh: ``u`` re-bound to filter, so refresh moves to ``ctrl+r``
         # (palette 'session.refresh' still works from any screen).
@@ -5603,6 +5680,7 @@ class PollyInboxApp(App[None]):
         self._filter_recent: bool = False
         self._filter_plan_review: bool = False
         self._filter_blocking: bool = False
+        self._show_orphaned: bool = False
         self._filter_bar_visible: bool = False
         # Rollup state — populated on each rollup render. Index-keyed so
         # the click handler can look up which item was expanded.
@@ -5822,13 +5900,21 @@ class PollyInboxApp(App[None]):
         in that case we omit the "N of M" framing for visual calm.
         """
         unread_n = len(self._unread_ids)
+        actionable_n = sum(1 for item in self._filtered_tasks(self._tasks) if getattr(item, "needs_action", False))
+        hidden_orphaned_n = 0 if self._show_orphaned else sum(
+            1 for item in self._tasks if getattr(item, "is_orphaned", False)
+        )
         bits: list[str] = []
-        if self._has_active_filters() and shown != total:
+        if (self._has_active_filters() or hidden_orphaned_n) and shown != total:
             bits.append(f"{shown} of {total} shown")
         else:
-            bits.append(f"{total} messages")
+            bits.append(f"{shown} messages")
         if unread_n:
             bits.append(f"{unread_n} unread")
+        if actionable_n:
+            bits.append(f"{actionable_n} need action")
+        if hidden_orphaned_n:
+            bits.append(f"{hidden_orphaned_n} orphaned hidden")
         desc = self._describe_filters()
         if desc:
             bits.append(f"filters: {desc}")
@@ -5886,6 +5972,7 @@ class PollyInboxApp(App[None]):
         task_sig = tuple(
             (
                 getattr(t, "task_id", ""),
+                getattr(t, "source", "task"),
                 getattr(
                     getattr(t, "work_status", None), "value",
                     getattr(t, "work_status", ""),
@@ -5894,6 +5981,9 @@ class PollyInboxApp(App[None]):
                 # updated_at may be datetime or string; coerce to str
                 # so equality works across types.
                 str(getattr(t, "updated_at", "") or ""),
+                getattr(t, "project", "") or "",
+                getattr(t, "triage_bucket", "") or "",
+                getattr(t, "triage_label", "") or "",
                 # reply count drives the "N replies" decoration
                 len(replies_by_task.get(getattr(t, "task_id", ""), ()) or ()),
             )
@@ -5914,6 +6004,7 @@ class PollyInboxApp(App[None]):
         self._filter_recent = False
         self._filter_plan_review = False
         self._filter_blocking = False
+        self._show_orphaned = False
         self._filter_bar_visible = False
 
     def _has_active_filters(self) -> bool:
@@ -5925,6 +6016,7 @@ class PollyInboxApp(App[None]):
                 self._filter_recent,
                 self._filter_plan_review,
                 self._filter_blocking,
+                self._show_orphaned,
             )
         )
 
@@ -5934,13 +6026,15 @@ class PollyInboxApp(App[None]):
         Cheap O(N * filters) — the inbox is at most a few hundred rows
         and the chips short-circuit, so we don't need anything fancier.
         """
-        if not self._has_active_filters():
+        if not self._has_active_filters() and self._show_orphaned:
             return list(tasks)
         text_q = self._filter_text.strip().lower()
         proj = self._filter_project
         out: list = []
         recent_cutoff_ts = self._recent_cutoff_timestamp() if self._filter_recent else None
         for t in tasks:
+            if not self._show_orphaned and getattr(t, "is_orphaned", False):
+                continue
             if self._filter_unread_only and t.task_id not in self._unread_ids:
                 continue
             if proj and (t.project or "") != proj:
@@ -5989,6 +6083,8 @@ class PollyInboxApp(App[None]):
             bits.append("plan_review")
         if self._filter_blocking:
             bits.append("blocking_question")
+        if self._show_orphaned:
+            bits.append("show_orphaned")
         if self._filter_text:
             bits.append(f'"{self._filter_text}"')
         return " \u00b7 ".join(bits)
@@ -6015,6 +6111,8 @@ class PollyInboxApp(App[None]):
             chip_bits.append("[on #1e2730] plan_review [/on #1e2730]")
         if self._filter_blocking:
             chip_bits.append("[on #1e2730] blocking_question [/on #1e2730]")
+        if self._show_orphaned:
+            chip_bits.append("[on #1e2730] show orphaned [/on #1e2730]")
         if self._filter_text:
             chip_bits.append(
                 f'[on #1e2730] "{_escape(self._filter_text)}" [/on #1e2730]'
@@ -6062,6 +6160,12 @@ class PollyInboxApp(App[None]):
         if self.reply_input.has_focus or self.filter_input.has_focus:
             return
         self._filter_blocking = not self._filter_blocking
+        self._render_list(select_first=True)
+
+    def action_toggle_filter_orphaned(self) -> None:
+        if self.reply_input.has_focus or self.filter_input.has_focus:
+            return
+        self._show_orphaned = not self._show_orphaned
         self._render_list(select_first=True)
 
     def action_clear_filters(self) -> None:
@@ -6169,6 +6273,9 @@ class PollyInboxApp(App[None]):
         labels = list(getattr(item, "labels", []) or [])
         tags.extend(labels)
         sections.append(f"[dim]{_escape(' · '.join([tag for tag in tags if tag]))}[/dim]")
+        triage_banner = _render_inbox_triage_banner(item)
+        if triage_banner:
+            sections.append(triage_banner)
         sections.append("")
         sections.append(_md_to_rich(_escape_body(item.description or "(no body)")))
         self.detail.update("\n".join(sections))
@@ -6253,6 +6360,9 @@ class PollyInboxApp(App[None]):
         # PM hint — dim, trailing, so it reads as metadata not a heading.
         meta_bits.append(f"[dim #6b7a88]PM: {_escape(pm_label)}[/dim #6b7a88]")
         sections.append("  \u00b7  ".join(meta_bits))
+        triage_banner = _render_inbox_triage_banner(task)
+        if triage_banner:
+            sections.append(triage_banner)
         sections.append("")  # blank line before body
         body = task.description or "(no body)"
         sections.append(_md_to_rich(_escape_body(body)))
@@ -7603,7 +7713,7 @@ def _escape(s: str) -> str:
     """Escape Rich markup brackets in a short span of text."""
     if not s:
         return ""
-    return str(s).replace("[", r"\[").replace("]", r"\]")
+    return str(s).replace("[", r"\[")
 
 
 def _escape_body(s: str) -> str:
@@ -7614,7 +7724,7 @@ def _escape_body(s: str) -> str:
     """
     if not s:
         return ""
-    return str(s).replace("[", r"\[").replace("]", r"\]")
+    return str(s).replace("[", r"\[")
 
 
 # ---------------------------------------------------------------------------
@@ -7784,6 +7894,7 @@ def _dashboard_status(
     inbox_count: int,
     alert_count: int,
     idle_minutes: float | None,
+    blocker_count: int = 0,
 ) -> tuple[str, str, str]:
     """Return (dot, colour, label) for the top-bar project status light.
 
@@ -7792,6 +7903,8 @@ def _dashboard_status(
       project (nothing in flight but attention is required).
     * Dim — idle / no activity.
     """
+    if blocker_count:
+        return ("\u25c6", "#f85149", "blocked")
     if active_worker is not None:
         return ("\u25cf", "#3ddc84", "active")
     if inbox_count or alert_count:
@@ -7832,6 +7945,7 @@ class ProjectDashboardData:
         "activity_entries",
         "inbox_count",
         "inbox_top",
+        "action_items",
         "alert_count",
     )
 
@@ -7861,6 +7975,7 @@ class ProjectDashboardData:
         activity_entries: list[dict],
         inbox_count: int,
         inbox_top: list[dict],
+        action_items: list[dict],
         alert_count: int,
     ) -> None:
         self.project_key = project_key
@@ -7886,6 +8001,7 @@ class ProjectDashboardData:
         self.activity_entries = activity_entries
         self.inbox_count = inbox_count
         self.inbox_top = inbox_top
+        self.action_items = action_items
         self.alert_count = alert_count
 
 
@@ -8033,36 +8149,350 @@ def _dashboard_active_worker(
 
 def _dashboard_inbox(
     config_path: Path, project_key: str, project_path: Path,
-) -> tuple[int, list[dict]]:
-    """Count inbox tasks for this project and return a top-3 preview."""
+) -> tuple[int, list[dict], list[dict]]:
+    """Return project-scoped inbox items + actionable PM blocker notes."""
+    from datetime import datetime
+
     db_path = project_path / ".pollypm" / "state.db"
     if not db_path.exists():
-        return 0, []
+        return 0, [], []
     try:
+        from pollypm.store import SQLAlchemyStore
         from pollypm.work.inbox_view import inbox_tasks
         from pollypm.work.sqlite_service import SQLiteWorkService
+        from pollypm.cockpit_inbox import _row_is_dev_channel
     except Exception:  # noqa: BLE001
-        return 0, []
+        return 0, [], []
+    try:
+        config = load_config(config_path)
+    except Exception:  # noqa: BLE001
+        return 0, [], []
+
+    def _sort_value(value: object) -> float:
+        if not value:
+            return 0.0
+        try:
+            if hasattr(value, "timestamp"):
+                return float(value.timestamp())
+            return float(datetime.fromisoformat(str(value)).timestamp())
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    def _plain_text(value: object | None) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        text = _re.sub(r"[*_`#>\[\]]+", "", text)
+        return " ".join(part.strip() for part in text.splitlines() if part.strip())
+
+    def _message_body(value: object | None) -> str:
+        text = str(value or "")
+        # Some PM handoff notes arrive through shell-escaped paths and
+        # persist literal "\n" sequences. Normalize before extracting
+        # blocker paragraphs and numbered action steps.
+        return text.replace("\\n", "\n")
+
+    def _message_projects(row: dict[str, object]) -> set[str]:
+        projects: set[str] = set()
+        known_projects = set(getattr(config, "projects", {}).keys())
+        payload = row.get("payload") or {}
+        if isinstance(payload, dict):
+            for key in ("project", "task_project"):
+                value = payload.get(key)
+                if isinstance(value, str) and value in known_projects:
+                    projects.add(value)
+        scope = row.get("scope")
+        if isinstance(scope, str) and scope in known_projects:
+            projects.add(scope)
+        text = "\n".join(
+            str(part or "") for part in (row.get("subject"), row.get("body"))
+        )
+        for match in _PROJECT_TASK_REF_RE.finditer(text):
+            project = match.group("project")
+            if project in known_projects:
+                projects.add(project)
+        return projects
+
+    def _trim(text: str, *, limit: int = 220) -> str:
+        text = text.strip()
+        if len(text) <= limit:
+            return text
+        return text[: limit - 1].rstrip() + "…"
+
+    def _summary_from_body(body: str) -> str:
+        paragraphs = [
+            _plain_text(part)
+            for part in body.split("\n\n")
+            if _plain_text(part)
+        ]
+        for paragraph in paragraphs:
+            lower = paragraph.lower()
+            if lower.startswith("blocker:"):
+                return _trim(paragraph[8:].strip())
+        for paragraph in paragraphs:
+            lower = paragraph.lower()
+            if lower.startswith(("task:", "status:")):
+                continue
+            if any(
+                token in lower
+                for token in (
+                    "blocked",
+                    "waiting on",
+                    "without ",
+                    "requires ",
+                    "acceptance gate",
+                    "scope split",
+                    "need your call",
+                    "needs your call",
+                )
+            ):
+                return _trim(paragraph)
+        for paragraph in paragraphs:
+            lower = paragraph.lower()
+            if lower.startswith(("task:", "status:")):
+                continue
+            return _trim(paragraph)
+        return ""
+
+    def _requirement_step(part: str) -> str:
+        cleaned = _plain_text(part).strip(" .,:;")
+        if not cleaned:
+            return ""
+        lower = cleaned.lower()
+        if lower.startswith(("a ", "an ", "the ")):
+            cleaned = cleaned.split(" ", 1)[1]
+            lower = cleaned.lower()
+        if lower.endswith(" provisioned"):
+            cleaned = cleaned[: -len(" provisioned")]
+            lower = cleaned.lower()
+            return f"Provision {cleaned}"
+        if any(token in lower for token in ("cred", "access", "token", "login")):
+            return f"Grant {cleaned}"
+        if any(token in lower for token in ("app", "pipeline", "deploy", "fly.io")):
+            return f"Set up {cleaned}"
+        if any(token in lower for token in ("postgres", "redis", "database")):
+            return f"Provision {cleaned}"
+        if any(lower.startswith(verb) for verb in (
+            "accept",
+            "reopen",
+            "create",
+            "run",
+            "exercise",
+            "verify",
+            "choose",
+            "split",
+        )):
+            return cleaned[:1].upper() + cleaned[1:]
+        return cleaned[:1].upper() + cleaned[1:]
+
+    def _steps_from_body(body: str) -> list[str]:
+        steps: list[str] = []
+        for line in body.splitlines():
+            match = _ACTION_STEP_RE.match(line)
+            if match is not None:
+                step = _plain_text(match.group("step"))
+                if step:
+                    steps.append(step)
+        for paragraph in body.split("\n\n"):
+            plain = _plain_text(paragraph)
+            lower = plain.lower()
+            for marker in ("without ", "requires "):
+                idx = lower.find(marker)
+                if idx < 0:
+                    continue
+                chunk = plain[idx + len(marker):].split(". ", 1)[0]
+                chunk = chunk.replace(", and ", ", ").replace(" and ", ", ")
+                for part in chunk.split(","):
+                    step = _requirement_step(part)
+                    if step:
+                        steps.append(step)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for step in steps:
+            key = step.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(step)
+        return deduped[:4]
+
+    known_projects = set(getattr(config, "projects", {}).keys())
+    items: list[dict] = []
     try:
         with SQLiteWorkService(
             db_path=db_path, project_path=project_path,
         ) as svc:
             tasks = inbox_tasks(svc, project=project_key)
+            for task in tasks:
+                entry = annotate_inbox_entry(
+                    task_to_inbox_entry(task, db_path=db_path),
+                    known_projects=known_projects,
+                )
+                updated_at = getattr(entry, "updated_at", "") or ""
+                if hasattr(updated_at, "isoformat"):
+                    updated_at = updated_at.isoformat()
+                items.append(
+                    {
+                        "task_id": entry.task_id,
+                        "title": getattr(entry, "title", "") or "(untitled)",
+                        "updated_at": updated_at,
+                        "sort_value": _sort_value(updated_at),
+                        "triage_label": getattr(entry, "triage_label", ""),
+                        "triage_rank": int(getattr(entry, "triage_rank", 2) or 2),
+                        "needs_action": bool(getattr(entry, "needs_action", False)),
+                        "source": "task",
+                        "summary": "",
+                        "steps": [],
+                        "primary_ref": getattr(entry, "task_id", None),
+                    }
+                )
     except Exception:  # noqa: BLE001
-        return 0, []
-    top: list[dict] = []
-    for t in tasks[:3]:
-        updated_at = getattr(t, "updated_at", "") or ""
-        if hasattr(updated_at, "isoformat"):
-            updated_at = updated_at.isoformat()
-        top.append(
-            {
-                "task_id": t.task_id,
-                "title": getattr(t, "title", "") or "(untitled)",
-                "updated_at": updated_at,
-            }
+        return 0, [], []
+
+    message_sources: list[tuple[str, Path]] = [(project_key, db_path)]
+    workspace_root = getattr(getattr(config, "project", None), "workspace_root", None)
+    if workspace_root is not None:
+        workspace_db = Path(workspace_root) / ".pollypm" / "state.db"
+        if workspace_db.exists() and workspace_db.resolve() != db_path.resolve():
+            message_sources.append(("__workspace__", workspace_db))
+
+    seen_messages: set[tuple[str, object]] = set()
+    for source_key, source_db in message_sources:
+        try:
+            store = SQLAlchemyStore(f"sqlite:///{source_db}")
+        except Exception:  # noqa: BLE001
+            continue
+        try:
+            try:
+                rows = store.query_messages(
+                    state="open",
+                    type=["notify", "inbox_task", "alert", "event"],
+                    limit=250,
+                )
+            except Exception:  # noqa: BLE001
+                rows = []
+            for row in rows:
+                row_id = row.get("id")
+                message_key = (str(source_db), row_id)
+                if row_id is None or message_key in seen_messages:
+                    continue
+                seen_messages.add(message_key)
+                if _row_is_dev_channel(row.get("labels")):
+                    continue
+                payload = row.get("payload") or {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                is_blocker_summary = (
+                    payload.get("event_type") == "project_blocker_summary"
+                    or row.get("subject") == "project.blocker_summary"
+                )
+                if row.get("type") == "event" and not is_blocker_summary:
+                    continue
+                if project_key not in _message_projects(row):
+                    continue
+                if is_blocker_summary:
+                    updated_at = row.get("updated_at") or row.get("created_at") or ""
+                    if hasattr(updated_at, "isoformat"):
+                        updated_at = updated_at.isoformat()
+                    required_actions = payload.get("required_actions") or []
+                    if not isinstance(required_actions, list):
+                        required_actions = []
+                    owner = str(payload.get("owner") or "").strip().lower()
+                    reason = str(payload.get("reason") or "").strip()
+                    item_id = row.get("id")
+                    items.append(
+                        {
+                            "task_id": f"blocker-summary:{item_id}",
+                            "title": f"Unblock {project_key}",
+                            "updated_at": updated_at,
+                            "sort_value": _sort_value(updated_at),
+                            "triage_label": "project blocker",
+                            "triage_rank": 0,
+                            "needs_action": owner in {"user", "sam", "human"},
+                            "source": "blocker_summary",
+                            "summary": _trim(reason) if reason else "",
+                            "steps": [
+                                _plain_text(step)
+                                for step in required_actions
+                                if _plain_text(step)
+                            ][:4],
+                            "primary_ref": payload.get("task_id")
+                            or f"blocker-summary:{item_id}",
+                        }
+                    )
+                    continue
+                entry = annotate_inbox_entry(
+                    message_row_to_inbox_entry(
+                        row,
+                        source_key=source_key,
+                        db_path=source_db,
+                    ),
+                    known_projects=known_projects,
+                )
+                updated_at = getattr(entry, "updated_at", "") or ""
+                if hasattr(updated_at, "isoformat"):
+                    updated_at = updated_at.isoformat()
+                body = _message_body(row.get("body"))
+                subject = getattr(entry, "title", "") or "(no subject)"
+                task_refs = [
+                    match.group(0)
+                    for match in _PROJECT_TASK_REF_RE.finditer(
+                        "\n".join((subject, body))
+                    )
+                    if match.group("project") == project_key
+                ]
+                items.append(
+                    {
+                        "task_id": entry.task_id,
+                        "title": subject,
+                        "updated_at": updated_at,
+                        "sort_value": _sort_value(updated_at),
+                        "triage_label": getattr(entry, "triage_label", ""),
+                        "triage_rank": int(getattr(entry, "triage_rank", 2) or 2),
+                        "needs_action": bool(getattr(entry, "needs_action", False)),
+                        "source": "message",
+                        "summary": _summary_from_body(body),
+                        "steps": _steps_from_body(body),
+                        "primary_ref": task_refs[0] if task_refs else None,
+                    }
+                )
+        finally:
+            try:
+                store.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    items.sort(
+        key=lambda item: (
+            int(item.get("triage_rank", 2)),
+            0 if item.get("needs_action") else 1,
+            -float(item.get("sort_value", 0.0) or 0.0),
+            str(item.get("title", "")).lower(),
         )
-    return len(tasks), top
+    )
+    top = [
+        {
+            "task_id": item.get("task_id"),
+            "title": item.get("title"),
+            "updated_at": item.get("updated_at"),
+            "triage_label": item.get("triage_label", ""),
+            "source": item.get("source", "task"),
+        }
+        for item in items[:3]
+    ]
+    action_items: list[dict] = []
+    seen_action_refs: set[str] = set()
+    for item in items:
+        if item.get("source") not in {"message", "blocker_summary"} or not item.get("needs_action"):
+            continue
+        dedupe_key = str(item.get("primary_ref") or item.get("title") or "")
+        if dedupe_key in seen_action_refs:
+            continue
+        seen_action_refs.add(dedupe_key)
+        action_items.append(item)
+        if len(action_items) >= 2:
+            break
+    return len(items), top, action_items
 
 
 def _dashboard_activity(
@@ -8130,7 +8560,7 @@ def _gather_project_dashboard(
 
     if exists_on_disk:
         counts, buckets = _dashboard_gather_tasks(project_key, project_path)
-        inbox_count, inbox_top = _dashboard_inbox(
+        inbox_count, inbox_top, action_items = _dashboard_inbox(
             config_path, project_key, project_path,
         )
         plan_path = _dashboard_plan_path(project_path)
@@ -8160,6 +8590,7 @@ def _gather_project_dashboard(
         buckets = {}
         inbox_count = 0
         inbox_top = []
+        action_items = []
         plan_path = None
         plan_sections = []
         plan_explainer = None
@@ -8172,9 +8603,10 @@ def _gather_project_dashboard(
     active_worker, alert_count = _dashboard_active_worker(
         config_path, project_key,
     )
+    blocker_count = int(counts.get("blocked", 0)) + int(counts.get("on_hold", 0))
 
     status_dot, status_color, status_label = _dashboard_status(
-        active_worker, inbox_count, alert_count, None,
+        active_worker, inbox_count, alert_count, None, blocker_count=blocker_count,
     )
 
     return ProjectDashboardData(
@@ -8201,6 +8633,7 @@ def _gather_project_dashboard(
         activity_entries=activity_entries,
         inbox_count=inbox_count,
         inbox_top=inbox_top,
+        action_items=action_items,
         alert_count=alert_count,
     )
 
@@ -8266,6 +8699,7 @@ class PollyProjectDashboardApp(App[None]):
         scrollbar-color: #2a3340;
     }
     .proj-section {
+        height: auto;
         margin-bottom: 1;
         padding: 1 2;
         background: #111820;
@@ -8277,6 +8711,8 @@ class PollyProjectDashboardApp(App[None]):
         padding-bottom: 1;
     }
     .proj-section-body {
+        height: auto;
+        min-height: 1;
         color: #d6dee5;
     }
     .proj-empty {
@@ -8414,6 +8850,9 @@ class PollyProjectDashboardApp(App[None]):
             yield self.status_line
             yield self.action_bar
             with VerticalScroll(id="proj-body"):
+                with Vertical(classes="proj-section", id="proj-inbox-section"):
+                    yield self.inbox_title
+                    yield self.inbox_body
                 with Vertical(classes="proj-section", id="proj-now-section"):
                     yield self.now_title
                     yield self.now_body
@@ -8428,9 +8867,6 @@ class PollyProjectDashboardApp(App[None]):
                 with Vertical(classes="proj-section", id="proj-activity-section"):
                     yield self.activity_title
                     yield self.activity_body
-                with Vertical(classes="proj-section", id="proj-inbox-section"):
-                    yield self.inbox_title
-                    yield self.inbox_body
         yield self.hint
 
     def on_mount(self) -> None:
@@ -8494,20 +8930,27 @@ class PollyProjectDashboardApp(App[None]):
         self.activity_body.update(self._render_activity_body(data))
 
         # ── Inbox ──
+        self.inbox_title.update(
+            "[b]Action Needed[/b]" if data.action_items else "[b]Inbox[/b]"
+        )
         self.inbox_body.update(self._render_inbox_body(data))
 
         self.hint.update(self._DEFAULT_HINT)
 
     def _update_action_bar(self, data: ProjectDashboardData) -> None:
         review_count = int(data.task_counts.get("review", 0))
+        blocker_count = int(data.task_counts.get("blocked", 0)) + int(
+            data.task_counts.get("on_hold", 0)
+        )
         summary = render_project_action_bar(
             review_count=review_count,
             alert_count=data.alert_count,
             inbox_count=data.inbox_count,
+            blocker_count=blocker_count,
         )
         self.action_bar.remove_class("-attention")
         self.action_bar.remove_class("-critical")
-        if data.alert_count:
+        if blocker_count or data.alert_count:
             self.action_bar.add_class("-critical")
         elif review_count or data.inbox_count:
             self.action_bar.add_class("-attention")
@@ -8663,22 +9106,71 @@ class PollyProjectDashboardApp(App[None]):
 
     def _render_inbox_body(self, data: ProjectDashboardData) -> str:
         count = data.inbox_count
-        if count == 0:
-            return "[dim]Inbox is clear for this project.[/dim]"
-        attention_mark = (
-            "[#f0c45a]\u25c6[/#f0c45a] " if count else ""
+        blocked_total = int(data.task_counts.get("blocked", 0)) + int(
+            data.task_counts.get("on_hold", 0)
         )
-        lines = [
-            f"{attention_mark}[b]{count}[/b] "
-            f"[dim]open item{'s' if count != 1 else ''}[/dim]"
+        if count == 0 and not data.action_items and not blocked_total:
+            return "[dim]Inbox is clear for this project.[/dim]"
+        lines: list[str] = []
+        action_ids = {
+            str(item.get("task_id") or "")
+            for item in data.action_items
+            if item.get("task_id")
+        }
+        if data.action_items:
+            lines.append("[#f85149][b]Action Required[/b][/]")
+            for item in data.action_items[:2]:
+                title = _escape(item.get("title") or "")
+                age = _format_relative_age(item.get("updated_at") or "")
+                age_part = f"  [dim]{_escape(age)}[/dim]" if age else ""
+                lines.append(
+                    f"  [#f0c45a]\u25c6[/#f0c45a] [b]{title}[/b]{age_part}"
+                )
+                summary = _escape(item.get("summary") or "")
+                if summary:
+                    lines.append(f"    {summary}")
+                for idx, step in enumerate(item.get("steps") or [], start=1):
+                    lines.append(
+                        f"    [dim]{idx}.[/dim] {_escape(str(step))}"
+                    )
+                lines.append("")
+        elif blocked_total:
+            lines.append("[#f0c45a][b]Blocked, but summary missing[/b][/]")
+            lines.append(
+                "  [dim]This project is blocked, but Polly has not posted "
+                "an unblock note yet.[/dim]"
+            )
+            lines.append(
+                "  [dim]Press [b]c[/b] to ask the PM for a blocker summary.[/dim]"
+            )
+            lines.append("")
+
+        preview_items = [
+            item for item in data.inbox_top
+            if str(item.get("task_id") or "") not in action_ids
         ]
-        for item in data.inbox_top:
-            title = _escape(item.get("title") or "")
-            age = _format_relative_age(item.get("updated_at") or "")
-            age_part = f"  [dim]{_escape(age)}[/dim]" if age else ""
-            lines.append(f"  \u00b7 {title}{age_part}")
-        lines.append("")
-        lines.append("[dim]Press [b]i[/b] to jump to the inbox[/dim]")
+        if count:
+            lines.append(
+                f"[#f0c45a]\u25c6[/#f0c45a] [b]{count}[/b] "
+                f"[dim]open item{'s' if count != 1 else ''}[/dim]"
+            )
+        if preview_items:
+            if data.action_items:
+                lines.append("[dim]Other open items[/dim]")
+            for item in preview_items[:3]:
+                title = _escape(item.get("title") or "")
+                age = _format_relative_age(item.get("updated_at") or "")
+                age_part = f"  [dim]{_escape(age)}[/dim]" if age else ""
+                label = item.get("triage_label") or ""
+                label_part = (
+                    f"  [dim]{_escape(str(label))}[/dim]" if label else ""
+                )
+                lines.append(f"  \u00b7 {title}{label_part}{age_part}")
+        if not count and not preview_items and not data.action_items:
+            lines.append("[dim]No project inbox items are open.[/dim]")
+        if count or preview_items or data.action_items:
+            lines.append("")
+            lines.append("[dim]Press [b]i[/b] to jump to the inbox[/dim]")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------

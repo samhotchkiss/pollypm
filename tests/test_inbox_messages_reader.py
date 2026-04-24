@@ -1,12 +1,8 @@
-"""``pm inbox`` post-#341 shows messages-table rows alongside work-tasks.
+"""``pm inbox`` shows user-assigned task rows created by ``pm notify``.
 
-Issue #340 collapsed ``pm notify`` onto :meth:`Store.enqueue_message`,
-so items written by ``pm notify`` never reach the work_tasks chat flow.
-Issue #341 completes the migration on the reader side: ``pm inbox``
-now UNIONs the messages table (via the legacy bridge) with the
-existing work-service inbox query. This test file pins the
-notify-then-inbox round trip so a regression wouldn't silently hide
-every ``pm notify`` the user makes.
+Actionable inbox items are tasks assigned to the user. Store messages remain
+audit/activity infrastructure and may link back to those tasks, but they are
+not the source of truth for user action.
 
 Run with ``HOME=/tmp/pytest-storage-e uv run pytest -x
 tests/test_inbox_messages_reader.py``.
@@ -50,14 +46,13 @@ class TestNotifyVisibleInInbox:
         assert inbox.exit_code == 0, inbox.output
         payload = json.loads(inbox.output)
         assert payload["assigned_count"] >= 1
-        messages = payload["messages"]
-        assert len(messages) == 1
-        msg = messages[0]
-        assert msg["type"] == "notify"
-        assert "[Action]" in msg["title"]
-        assert "Deploy blocked" in msg["title"]
-        # id is prefixed so it never collides with a project/number task id.
-        assert msg["id"].startswith("msg:")
+        assert payload["messages"] == []
+        tasks = payload["tasks"]
+        assert len(tasks) == 1
+        task = tasks[0]
+        assert task["task_id"] == "inbox/1"
+        assert "Deploy blocked" in task["title"]
+        assert "notify" in task["labels"]
 
     def test_immediate_notify_shows_in_text_inbox(self, db_path):
         result = _invoke_notify(
@@ -67,7 +62,6 @@ class TestNotifyVisibleInInbox:
         inbox = runner.invoke(inbox_app, ["--db", db_path])
         assert inbox.exit_code == 0, inbox.output
         assert "Inbox:" in inbox.output
-        assert "[Action]" in inbox.output
         assert "Ready to review" in inbox.output
 
     def test_digest_notify_does_not_show_until_flushed(self, db_path):
@@ -118,5 +112,6 @@ class TestNotifyVisibleInInbox:
             inbox_app, ["--db", db_path, "--project", "alpha", "--json"],
         )
         payload = json.loads(inbox.output)
-        assert len(payload["messages"]) == 1
-        assert "Subject A" in payload["messages"][0]["title"]
+        assert payload["messages"] == []
+        assert len(payload["tasks"]) == 1
+        assert "Subject A" in payload["tasks"][0]["title"]

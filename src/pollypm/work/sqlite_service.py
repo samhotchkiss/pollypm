@@ -1012,6 +1012,108 @@ class SQLiteWorkService:
             requires_human_review=requires_human_review,
         )
 
+    def has_human_review_approval(self, task_id: str) -> bool:
+        """Return True when a pre-queue human review approval is recorded."""
+        task = self.get(task_id)
+        rows = self.get_context(task_id, entry_type="human_review_approved", limit=1)
+        return bool(rows) or not task.requires_human_review
+
+    def ensure_human_review_request_task(
+        self,
+        task_id: str,
+        actor: str,
+    ) -> Task:
+        """Materialize a user-owned task requesting pre-queue approval."""
+        target = self.get(task_id)
+        label = f"target_task:{target.task_id}"
+        for candidate in self.list_tasks(project=target.project):
+            labels = set(candidate.labels or [])
+            if (
+                "human_review_request" in labels
+                and label in labels
+                and candidate.work_status not in TERMINAL_STATUSES
+            ):
+                return candidate
+
+        description = "\n".join(
+            [
+                f"Review whether `{target.task_id}` should enter the worker queue.",
+                "",
+                f"Task: {target.title}",
+                target.description or "(no description)",
+                "",
+                "Approve if this work is authorized to proceed. Reject or reply "
+                "with clarification if it needs changes before delegation.",
+            ]
+        )
+        return self.create(
+            title=f"Human review required before queueing {target.task_id}",
+            description=description,
+            type="task",
+            project=target.project,
+            flow_template="chat",
+            roles={"requester": "user", "operator": actor or "polly"},
+            priority=target.priority.value,
+            created_by=actor or "system",
+            labels=[
+                "human_review_request",
+                f"project:{target.project}",
+                label,
+            ],
+            requires_human_review=False,
+        )
+
+    def approve_human_review(
+        self,
+        task_id: str,
+        actor: str,
+        reason: str | None = None,
+        *,
+        fast_track_authorized: bool = False,
+    ) -> Task:
+        """Record pre-queue approval for a ``requires_human_review`` task."""
+        task = self.get(task_id)
+        actor_norm = (actor or "").strip().lower()
+        is_user = actor_norm in {"user", "sam", "human"}
+        if not is_user and not fast_track_authorized:
+            raise InvalidTransitionError(
+                "Only the user can approve this review unless the operator "
+                "explicitly records --fast-track-authorized."
+            )
+        detail = reason.strip() if reason else "approved"
+        if fast_track_authorized and not is_user:
+            detail = f"fast-track authorized by {actor}: {detail}"
+        self.add_context(
+            task_id,
+            actor or "user",
+            detail,
+            entry_type="human_review_approved",
+        )
+
+        label = f"target_task:{task.task_id}"
+        for candidate in self.list_tasks(project=task.project):
+            labels = set(candidate.labels or [])
+            if (
+                "human_review_request" in labels
+                and label in labels
+                and candidate.work_status not in TERMINAL_STATUSES
+            ):
+                try:
+                    self.add_context(
+                        candidate.task_id,
+                        actor or "user",
+                        f"approved target {task.task_id}",
+                        entry_type="reply",
+                    )
+                    self.mark_done(candidate.task_id, actor or "user")
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "failed to close human review request %s",
+                        candidate.task_id,
+                        exc_info=True,
+                    )
+        return self.get(task_id)
+
     def set_external_ref(self, task_id: str, key: str, value: str) -> None:
         """Persist one external reference on a task."""
         if not key.strip():
@@ -1088,6 +1190,58 @@ class SQLiteWorkService:
     def resume(self, task_id: str, actor: str) -> Task:
         """Move on_hold back to queued (or in_progress if a flow node is active)."""
         return self._transition_mgr.resume(task_id, actor)
+
+    def release_stale_claim(
+        self,
+        task_id: str,
+        actor: str,
+        reason: str = "worker session missing",
+    ) -> Task:
+        """Return an orphaned in-progress claim to the queued pool.
+
+        Recovery plugins call this only after proving the worker
+        session/window is gone. The work service owns the private SQLite
+        mutation so plugins do not reach into ``_conn`` directly.
+        """
+        task = self.get(task_id)
+        if task.work_status != WorkStatus.IN_PROGRESS:
+            raise InvalidTransitionError(
+                f"Cannot release stale claim in '{task.work_status.value}' state. "
+                "Task must be in 'in_progress' state."
+            )
+        now = _now()
+        try:
+            if task.current_node_id:
+                self._conn.execute(
+                    "DELETE FROM work_node_executions "
+                    "WHERE task_project = ? AND task_number = ? AND node_id = ?",
+                    (task.project, task.task_number, task.current_node_id),
+                )
+            self._record_transition(
+                task.project,
+                task.task_number,
+                WorkStatus.IN_PROGRESS.value,
+                WorkStatus.QUEUED.value,
+                actor,
+                reason,
+            )
+            self._conn.execute(
+                "UPDATE work_tasks SET work_status = ?, assignee = NULL, "
+                "current_node_id = NULL, updated_at = ? "
+                "WHERE project = ? AND task_number = ?",
+                (WorkStatus.QUEUED.value, now, task.project, task.task_number),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        result = self.get(task_id)
+        self._sync_transition(
+            result,
+            WorkStatus.IN_PROGRESS.value,
+            WorkStatus.QUEUED.value,
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Flow progression

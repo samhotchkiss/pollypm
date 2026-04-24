@@ -13,12 +13,72 @@ Contract:
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
 import typer
 
 from pollypm.config import DEFAULT_CONFIG_PATH
+from pollypm.review_notify import notify_requires_review_hold
+
+_TASK_ID_PATTERN = re.compile(r"\b([A-Za-z0-9_.-]+/\d+)\b")
+
+
+def _infer_notify_actor(config_path: Path, actor: str) -> tuple[str, str | None]:
+    """Resolve ``pm notify``'s default actor from the current tmux window.
+
+    ``pm notify`` is frequently run from managed role panes (reviewer,
+    operator, architect). Leaving the default sender as ``polly`` hides
+    who actually raised the escalation. When the caller did not
+    override ``--actor`` and we're running inside a managed tmux window,
+    infer the sender from the matching configured session name.
+    """
+    if (actor or "").strip() != "polly":
+        return actor, None
+    try:
+        from pollypm.config import load_config
+        from pollypm.session_services import create_tmux_client
+
+        tmux = create_tmux_client()
+        tmux_session = tmux.current_session_name()
+        window_index = tmux.current_window_index()
+        if not tmux_session or window_index is None:
+            return actor, None
+        window_name = None
+        for window in tmux.list_windows(tmux_session):
+            if str(getattr(window, "index", "")) == str(window_index):
+                window_name = getattr(window, "name", None)
+                break
+        if not window_name:
+            return actor, None
+        config = load_config(config_path)
+        sessions = getattr(config, "sessions", {}) or {}
+        for session_name, session_cfg in sessions.items():
+            expected = getattr(session_cfg, "window_name", None) or session_name
+            if expected == window_name:
+                return session_name, session_name
+    except Exception:  # noqa: BLE001
+        return actor, None
+    return actor, None
+
+
+def _hold_review_tasks_for_notify(
+    *,
+    actor: str,
+    current_session_name: str | None,
+    priority: str,
+    subject: str,
+    body: str,
+) -> list[str]:
+    """Keep notify-driven review tasks in ``review``.
+
+    The inbox message itself carries the action context. Demoting review
+    tasks to ``on_hold`` hides the accept/reject path and breaks the v1
+    state model, so this helper is intentionally a no-op.
+    """
+    _ = actor, current_session_name, priority, subject, body
+    return []
 
 
 def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
@@ -387,6 +447,11 @@ def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
             )
             raise typer.Exit(code=1)
 
+        resolved_config_path = helpers._discover_config_path(DEFAULT_CONFIG_PATH)
+        actor, current_session_name = _infer_notify_actor(
+            resolved_config_path, actor,
+        )
+
         from pollypm.store.classifier import classify_priority, validate_priority
 
         requested = (priority or "auto").strip().lower()
@@ -446,7 +511,7 @@ def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
                 scope=project,
                 labels=label_list or None,
                 payload=payload,
-                state=tier_state,
+                state="closed" if resolved_priority == "immediate" else tier_state,
             )
         except Exception as exc:  # noqa: BLE001
             typer.echo(f"Failed to enqueue notify message: {exc}", err=True)
@@ -454,9 +519,60 @@ def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
         finally:
             store.close()
 
+        inbox_task_id: str | None = None
+        if resolved_priority == "immediate":
+            from pollypm.work.sqlite_service import SQLiteWorkService
+
+            svc = SQLiteWorkService(
+                db_path=db_path,
+                project_path=db_path.parent.parent,
+            )
+            try:
+                task_labels = [
+                    *label_list,
+                    "notify",
+                    f"notify_message:{message_id}",
+                ]
+                task = svc.create(
+                    title=subject,
+                    description=body,
+                    type="task",
+                    project=project,
+                    flow_template="chat",
+                    roles={
+                        "requester": requester_role,
+                        "operator": actor or "polly",
+                    },
+                    priority="high",
+                    created_by=actor,
+                    labels=task_labels,
+                )
+                inbox_task_id = task.task_id
+                store = SQLAlchemyStore(f"sqlite:///{db_path}")
+                try:
+                    store.update_message(
+                        message_id,
+                        payload={**payload, "task_id": inbox_task_id},
+                    )
+                finally:
+                    store.close()
+            except Exception as exc:  # noqa: BLE001
+                typer.echo(f"Failed to create inbox task: {exc}", err=True)
+                raise typer.Exit(code=1) from exc
+            finally:
+                svc.close()
+
+        _hold_review_tasks_for_notify(
+            actor=actor,
+            current_session_name=current_session_name,
+            priority=resolved_priority,
+            subject=subject,
+            body=body,
+        )
+
         if resolved_priority == "silent":
             typer.echo("silent")
         elif resolved_priority == "digest":
             typer.echo(f"digest:{message_id}")
         else:
-            typer.echo(str(message_id))
+            typer.echo(str(inbox_task_id or message_id))

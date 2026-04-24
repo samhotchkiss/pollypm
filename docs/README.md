@@ -49,6 +49,8 @@ and working design docs. If you are not sure where to start, start here:
 - [Conventions](conventions.md) — coding, testing, and import-boundary rules.
 - [Worker Guide](worker-guide.md) — task lifecycle and handoff expectations for
   implementation work.
+- [Release-Fix Packaging](release-fix-packaging.md) — review and rollback
+  boundaries for release-candidate fixes.
 - [V1 Spec](v1/README.md) — the full chapterized product spec when you need the
   complete model, not just the quick path.
 - [Visuals](visuals/index.html) plus the `docs/project-specs/` examples are

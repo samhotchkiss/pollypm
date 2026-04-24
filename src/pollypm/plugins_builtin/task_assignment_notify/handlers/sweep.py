@@ -27,11 +27,14 @@ a role that has no live session, we emit a single deduped
 worker to the operator instead of silently dropping pings.
 
 #273: project-level plan-presence enforcement. Before emitting a ping
-for any non-planning task, the sweeper consults
+for a queued non-planning task, the sweeper consults
 ``has_acceptable_plan`` — a project without an approved, non-trivial
-``docs/plan/plan.md`` blocks delegation entirely. Blocked projects
-get a single deduped ``plan_missing`` alert per sweep cycle. Planning
-tasks (``plan_project`` / ``critique_flow``) and tasks labelled
+``docs/plan/plan.md`` blocks *new delegation* until planning is done.
+Tasks already in ``review`` / ``in_progress`` keep their recovery
+re-pings even if the plan later goes stale or disappears; the gate is
+only about admitting new queued work. Blocked projects get a single
+deduped ``plan_missing`` alert per sweep cycle. Planning tasks
+(``plan_project`` / ``critique_flow``) and tasks labelled
 ``bypass_plan_gate`` skate past the gate so the planner can always
 run and operators can force delegation when needed.
 """
@@ -39,10 +42,12 @@ run and operators can force delegation when needed.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from pollypm.review_notify import notify_requires_review_hold
 from pollypm.work.models import ActorType, WorkStatus
 from pollypm.work.task_assignment import (
     SessionRoleIndex,
@@ -63,6 +68,8 @@ from pollypm.plugins_builtin.task_assignment_notify.resolver import (
 
 logger = logging.getLogger(__name__)
 
+_TASK_ID_PATTERN = re.compile(r"\b([A-Za-z0-9_.-]+/\d+)\b")
+
 # Work statuses the sweeper cares about — those where a machine actor is
 # the expected next mover. ``in_progress`` is gated on an idleness check
 # (see ``_target_session_is_idle``) so we don't spam an actively-turning
@@ -77,6 +84,12 @@ _SWEEPABLE_STATUSES = ("queued", "review", "in_progress")
 # re-ping when they've gone idle (supervisor restart, Claude relaunched
 # with no context, etc.).
 _IDLE_GATED_STATUSES = frozenset({"in_progress"})
+
+# Per-task context marker written when a recurring sweeper emits (or
+# dedupes) a task assignment notification. Cockpit derives a transient
+# "recently pinged" badge from entries newer than this window.
+SWEEPER_PING_CONTEXT_ENTRY_TYPE = "sweeper_ping"
+RECENT_SWEEPER_PING_SECONDS = 60
 
 
 def _build_event_for_task(work_service: Any, task: Any) -> TaskAssignmentEvent | None:
@@ -275,7 +288,7 @@ def _emit_plan_missing_alert(
     # Alert row is keyed by the project identity — we use a synthetic
     # session_name ``plan_gate-<project>`` so the cockpit's per-session
     # alert view groups it alongside the project's worker alerts.
-    session_name = f"plan_gate-{project}"
+    session_name = _plan_missing_session_name(project)
     # #760 — actionable single-line copy: name the project + the
     # blocked task so the reader knows why it matters, end with a
     # copy-pasteable command. Prior phrasing ("cannot be delegated",
@@ -292,6 +305,54 @@ def _emit_plan_missing_alert(
         logger.debug(
             "task_assignment sweep: upsert_alert(plan_missing) failed for %s",
             session_name, exc_info=True,
+        )
+
+
+def _plan_missing_session_name(project: str) -> str:
+    """Return the synthetic session name used for plan-gate alerts."""
+    return f"plan_gate-{project}"
+
+
+def _clear_plan_missing_alert(services: Any, *, project: str) -> None:
+    """Clear the open ``plan_missing`` alert for ``project`` if present."""
+    store = services.msg_store or services.state_store
+    if store is None:
+        return
+    session_name = _plan_missing_session_name(project)
+    try:
+        store.clear_alert(session_name, "plan_missing")
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "task_assignment sweep: clear_alert(plan_missing) failed for %s",
+            session_name, exc_info=True,
+        )
+
+
+def _record_sweeper_ping(
+    work: Any,
+    task_id: str,
+    *,
+    outcome: str,
+    source: str,
+) -> None:
+    """Stamp ``task_id`` with a recent sweeper-ping marker."""
+    if outcome not in {"sent", "deduped"}:
+        return
+    add_context = getattr(work, "add_context", None)
+    if not callable(add_context):
+        return
+    try:
+        add_context(
+            task_id,
+            "sweeper",
+            f"{source}:{outcome}",
+            entry_type=SWEEPER_PING_CONTEXT_ENTRY_TYPE,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "task_assignment sweep: failed recording sweeper ping for %s",
+            task_id,
+            exc_info=True,
         )
 
 
@@ -384,14 +445,17 @@ def _sweep_work_service(
                     )
                     continue
 
-            # #273: plan-presence gate. The planner's own tasks
-            # bypass; everyone else is blocked until the project has
-            # an approved plan. We only apply the gate for per-project
-            # sweeps (``project_path`` supplied) because workspace-root
-            # tasks have no single project path to anchor to.
+            # #273: plan-presence gate. Only queued delegation is
+            # blocked — review / in_progress items are already in
+            # flight and still need recovery pings if the daemon or
+            # target session restarts later. We only apply the gate
+            # for per-project sweeps (``project_path`` supplied)
+            # because workspace-root tasks have no single project path
+            # to anchor to.
             if (
                 enforce_plan
                 and project_path is not None
+                and status == WorkStatus.QUEUED.value
                 and not task_bypasses_plan_gate(task)
             ):
                 if not _plan_gate_allows(
@@ -419,6 +483,12 @@ def _sweep_work_service(
             )
             outcome = str(result.get("outcome", "unknown"))
             by_outcome[outcome] = by_outcome.get(outcome, 0) + 1
+            _record_sweeper_ping(
+                work,
+                event.task_id,
+                outcome=outcome,
+                source="task_assignment.sweep",
+            )
 
             # #259: when the task can't be routed, also raise a
             # sweep-level ``no_session`` alert keyed by (project, role)
@@ -521,9 +591,9 @@ def _recover_dead_claims(
 
     For each in_progress task with role=worker in this project, verify
     the per-task tmux window still exists. If it doesn't (crashed
-    session, closed window, host reboot), call ``hold`` + ``resume`` to
-    walk the task back through queued so it becomes eligible for
-    auto-claim on the next sweep tick.
+    session, closed window, host reboot), clear the stale claim state
+    and walk the task back through queued so it becomes eligible for
+    auto-claim or a manual ``pm task claim`` on the next sweep tick.
     """
     project_key = getattr(project, "key", None)
     if not project_key:
@@ -547,11 +617,19 @@ def _recover_dead_claims(
         # Window is gone — release the claim back to queued.
         task_id = getattr(task, "task_id", f"{project_key}/{task_number}")
         try:
-            work.hold(task_id, "auto_claim_sweep", reason="worker session missing")
-            work.resume(task_id, "auto_claim_sweep")
+            release = getattr(work, "release_stale_claim", None)
+            if not callable(release):
+                raise RuntimeError(
+                    "work service does not support release_stale_claim"
+                )
+            release(
+                task_id,
+                "auto_claim_sweep",
+                reason="worker session missing",
+            )
         except Exception:  # noqa: BLE001
             logger.debug(
-                "task_auto_claim: recovery hold/resume failed for %s",
+                "task_auto_claim: stale claim release failed for %s",
                 task_id, exc_info=True,
             )
             continue
@@ -675,7 +753,7 @@ def _auto_claim_next(
             pass
 
 
-def _open_project_work_service(project: Any) -> Any | None:
+def _open_project_work_service(project: Any, services: Any) -> Any | None:
     """Open a per-project ``SQLiteWorkService`` if its state.db exists.
 
     Returns ``None`` when the project path has no state.db yet (fresh
@@ -692,13 +770,40 @@ def _open_project_work_service(project: Any) -> Any | None:
     try:
         from pollypm.work.sqlite_service import SQLiteWorkService
 
-        return SQLiteWorkService(db_path=db_path, project_path=Path(project_path))
+        svc = SQLiteWorkService(db_path=db_path, project_path=Path(project_path))
     except Exception:  # noqa: BLE001
         logger.debug(
             "task_assignment sweep: failed to open per-project DB at %s",
             db_path, exc_info=True,
         )
         return None
+
+    try:
+        from pollypm.session_services import create_tmux_client
+        from pollypm.work.session_manager import SessionManager
+
+        project_root = Path(project_path)
+        if project_root.exists() and (project_root / ".git").exists():
+            session_mgr = SessionManager(
+                tmux_client=create_tmux_client(),
+                work_service=svc,
+                project_path=project_root,
+                config=getattr(services, "config", None),
+                session_service=getattr(services, "session_service", None),
+                storage_closet_name=getattr(
+                    services,
+                    "storage_closet_name",
+                    "pollypm-storage-closet",
+                ),
+            )
+            svc.set_session_manager(session_mgr)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "task_assignment sweep: failed to wire session manager for %s",
+            db_path,
+            exc_info=True,
+        )
+    return svc
 
 
 def _close_quietly(svc: Any) -> None:
@@ -708,6 +813,21 @@ def _close_quietly(svc: Any) -> None:
             closer()
         except Exception:  # noqa: BLE001
             pass
+
+
+def _park_review_tasks_waiting_on_notify(
+    work: Any,
+    *,
+    project_key: str,
+    totals: dict[str, Any],
+) -> None:
+    """Keep notify-driven review tasks in ``review``.
+
+    Reviewer/operator notifies are already visible in the inbox; they
+    should not demote a task out of ``review`` because that hides the
+    accept/reject controls and makes the next required action ambiguous.
+    """
+    _ = work, project_key, totals
 
 
 def task_assignment_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
@@ -766,9 +886,12 @@ def task_assignment_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     # closed within the sweep tick so we don't pile up file handles
     # when many projects are registered.
     for project in services.known_projects:
-        project_work = _open_project_work_service(project)
+        project_key = getattr(project, "key", None)
+        project_work = _open_project_work_service(project, services)
         if project_work is None:
             projects_skipped += 1
+            if project_key:
+                _clear_plan_missing_alert(services, project=project_key)
             continue
         try:
             _sweep_work_service(
@@ -787,7 +910,16 @@ def task_assignment_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
             # global flag is disabled.
             if _auto_claim_enabled_for_project(services, project):
                 _recover_dead_claims(services, project_work, project, totals)
+            if project_key:
+                _park_review_tasks_waiting_on_notify(
+                    project_work,
+                    project_key=project_key,
+                    totals=totals,
+                )
+            if _auto_claim_enabled_for_project(services, project):
                 _auto_claim_next(services, project_work, project, totals)
+            if project_key and project_key not in plan_missing_projects:
+                _clear_plan_missing_alert(services, project=project_key)
             projects_scanned += 1
         finally:
             _close_quietly(project_work)

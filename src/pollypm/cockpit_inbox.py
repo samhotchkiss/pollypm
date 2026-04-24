@@ -37,6 +37,7 @@ from pollypm.cockpit_worker_identity import (
     worker_identity,
 )
 from pollypm.heartbeats.snapshots import read_recent_heartbeat_snapshot
+from pollypm.inbox_message_refs import row_project_refs as _row_project_refs
 
 
 def _timestamp_sort_value(value) -> float:
@@ -201,6 +202,7 @@ def _count_inbox_tasks_for_label(config) -> int:
 
     seen_task_ids: set[str] = set()
     seen_message_keys: set[tuple[str, object]] = set()
+    known_projects = set(getattr(config, "projects", {}).keys())
 
     for project_key, db_path, project_path in _inbox_db_sources(config):
         if not db_path.exists():
@@ -247,6 +249,11 @@ def _count_inbox_tasks_for_label(config) -> int:
                     scope = getattr(row, "scope", "") or ""
                     labels_raw = getattr(row, "labels", None)
                 if row_id is None:
+                    continue
+                if scope and scope != "inbox" and scope not in known_projects:
+                    continue
+                refs = _row_project_refs(row)
+                if any(ref not in known_projects for ref in refs):
                     continue
                 # #754 — skip dev-channel messages; those are test /
                 # debug traffic that should never count against the

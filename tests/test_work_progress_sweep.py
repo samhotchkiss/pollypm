@@ -30,6 +30,7 @@ from pollypm.plugins_builtin.task_assignment_notify.resolver import (
 )
 from pollypm.storage.state import StateStore
 from pollypm.work import task_assignment as bus
+from pollypm.work.models import WorkStatus
 from pollypm.work.sqlite_service import SQLiteWorkService
 
 
@@ -48,6 +49,7 @@ class FakeSessionService:
     handles: list[FakeHandle]
     sent: list[tuple[str, str]] = field(default_factory=list)
     busy: set[str] = field(default_factory=set)
+    tmux: object | None = None
 
     def list(self) -> list[FakeHandle]:
         return list(self.handles)
@@ -57,6 +59,23 @@ class FakeSessionService:
 
     def is_turn_active(self, name: str) -> bool:
         return name in self.busy
+
+    def storage_closet_session_name(self) -> str:
+        return "pollypm-storage-closet"
+
+
+@dataclass
+class FakeTmux:
+    windows: list[object] = field(default_factory=list)
+
+    def list_windows(self, session_name: str) -> list[object]:
+        return list(self.windows)
+
+
+@dataclass
+class FakeKnownProject:
+    key: str
+    path: Path
 
 
 def _claim_task(work: SQLiteWorkService, project: str) -> str:
@@ -116,20 +135,31 @@ class TestWorkProgressSweep:
     existing 30-min dedupe table."""
 
     def _patch_resolver_with_factory(
-        self, monkeypatch, tmp_path, svc, store, msg_store=None,
+        self,
+        monkeypatch,
+        tmp_path,
+        svc,
+        store,
+        msg_store=None,
+        *,
+        work_db_name: str | None = "work.db",
+        known_projects=(),
     ):
         """Patch the resolver so each sweep call gets a freshly-opened work
         service — matching the production loader's behaviour (the handler
         closes the service after each sweep)."""
 
         def _fake_loader(*, config_path=None):
-            work = SQLiteWorkService(db_path=tmp_path / "work.db")
+            work = None
+            if work_db_name is not None:
+                work = SQLiteWorkService(db_path=tmp_path / work_db_name)
             return _RuntimeServices(
                 session_service=svc,
                 state_store=store,
                 work_service=work,
                 project_root=tmp_path,
                 msg_store=msg_store,
+                known_projects=tuple(known_projects),
             )
 
         monkeypatch.setattr(
@@ -274,3 +304,43 @@ class TestWorkProgressSweep:
         assert result["skipped_no_session"] == 1
         assert result["pinged"] == 0
         assert len(svc.sent) == 0
+
+    def test_per_project_dead_claim_is_recovered(self, tmp_path, monkeypatch):
+        """#768/#259: per-project DBs get the same dead-claim recovery
+        pass as the assignment sweep."""
+        bus.clear_listeners()
+        project_path = tmp_path / "demo_project"
+        project_path.mkdir()
+        db_path = project_path / ".pollypm" / "state.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        seed = SQLiteWorkService(db_path=db_path, project_path=project_path)
+        task_id = _claim_task(seed, "demo")
+        seed.close()
+
+        store = StateStore(tmp_path / "state.db")
+        svc = FakeSessionService(handles=[], tmux=FakeTmux())
+        self._patch_resolver_with_factory(
+            monkeypatch,
+            tmp_path,
+            svc,
+            store,
+            work_db_name=None,
+            known_projects=(FakeKnownProject(key="demo", path=project_path),),
+        )
+
+        result = work_progress_sweep_handler({})
+        assert result["outcome"] == "swept"
+        assert result["recovered_dead_claims"] == 1
+        assert result["projects_scanned"] == 1
+        assert result["projects_skipped"] == 0
+        assert result["pinged"] == 0
+
+        reopened = SQLiteWorkService(db_path=db_path, project_path=project_path)
+        try:
+            recovered = reopened.get(task_id)
+            assert recovered.work_status == WorkStatus.QUEUED
+            assert recovered.assignee is None
+            assert recovered.current_node_id is None
+        finally:
+            reopened.close()

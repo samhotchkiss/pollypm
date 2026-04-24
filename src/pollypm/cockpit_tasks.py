@@ -4,6 +4,7 @@ import difflib
 import subprocess
 import tomllib
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
 
@@ -33,6 +34,14 @@ from pollypm.cockpit_task_review import (
 from pollypm.cockpit_formatting import format_event_time
 from pollypm.cockpit_formatting import format_relative_age as _format_relative_age
 from pollypm.config import load_config, project_config_path
+from pollypm.plugins_builtin.project_planning.plan_presence import (
+    plan_approval_task,
+    plan_blocked_task_ids,
+)
+from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
+    RECENT_SWEEPER_PING_SECONDS,
+    SWEEPER_PING_CONTEXT_ENTRY_TYPE,
+)
 from pollypm.rejection_feedback import (
     RejectionFeedbackNotice,
     is_rejection_feedback_task,
@@ -44,6 +53,7 @@ from pollypm.tz import format_time as _fmt_time
 _TASK_STATUS_ORDER = {
     "in_progress": 0,
     "review": 1,
+    "waiting_on_plan": 2,
     "queued": 2,
     "blocked": 3,
     "on_hold": 4,
@@ -255,14 +265,25 @@ def _timestamp_sort_value(value) -> float:
         return 0.0
 
 
-def _task_sort_key(task) -> tuple[int, int, float, int]:
-    """Sort tasks by status, then task priority, then newest activity."""
-    status = getattr(getattr(task, "work_status", None), "value", None) or str(
+def _task_status_value(task) -> str:
+    return getattr(getattr(task, "work_status", None), "value", None) or str(
         getattr(task, "work_status", "") or ""
     )
+
+
+def _task_sort_key(
+    task,
+    *,
+    owner: str | None = None,
+    plan_blocked: bool = False,
+) -> tuple[int, int, int, float, int]:
+    """Sort tasks by status, review owner, priority, then newest activity."""
+    status = "waiting_on_plan" if plan_blocked else _task_status_value(task)
     updated = getattr(task, "updated_at", None) or getattr(task, "created_at", None)
+    review_owner_rank = 0 if status != "review" or owner == "human" else 1
     return (
         _TASK_STATUS_ORDER.get(status, 99),
+        review_owner_rank,
         priority_rank(task),
         -_timestamp_sort_value(updated),
         int(getattr(task, "task_number", 0) or 0),
@@ -343,20 +364,30 @@ def _task_pr_number(task) -> str | None:
     return None
 
 
-def _task_counts(tasks: list) -> dict[str, int]:
+def _task_counts(
+    tasks: list,
+    *,
+    plan_blocked_task_ids: set[str] | None = None,
+) -> dict[str, int]:
     counts: dict[str, int] = {}
+    plan_blocked_task_ids = plan_blocked_task_ids or set()
     for task in tasks:
-        status = getattr(getattr(task, "work_status", None), "value", None) or str(
-            getattr(task, "work_status", "") or ""
+        status = (
+            "waiting_on_plan"
+            if task.task_id in plan_blocked_task_ids
+            else _task_status_value(task)
         )
         counts[status] = counts.get(status, 0) + 1
     return counts
 
 
-def _task_matches_status(task, status_filter: str) -> bool:
-    status = getattr(getattr(task, "work_status", None), "value", None) or str(
-        getattr(task, "work_status", "") or ""
-    )
+def _task_matches_status(
+    task,
+    status_filter: str,
+    *,
+    plan_blocked: bool = False,
+) -> bool:
+    status = "waiting_on_plan" if plan_blocked else _task_status_value(task)
     if status_filter == "all":
         return True
     if status_filter == "active":
@@ -364,7 +395,7 @@ def _task_matches_status(task, status_filter: str) -> bool:
     if status_filter == "review":
         return status == "review"
     if status_filter == "blocked":
-        return status in {"blocked", "on_hold"}
+        return status in {"blocked", "on_hold", "waiting_on_plan"}
     if status_filter == "done":
         return status in {"done", "cancelled"}
     return True
@@ -406,7 +437,12 @@ def _plain_english_summary(task) -> str | None:
     return None
 
 
-def _status_label(task, owner: str | None) -> str:
+def _status_label(
+    task,
+    owner: str | None,
+    *,
+    plan_blocked: bool = False,
+) -> str:
     """Render a human-meaningful status chip.
 
     The DB stores a single ``review`` status regardless of whether the
@@ -416,12 +452,42 @@ def _status_label(task, owner: str | None) -> str:
     feedback 2026-04-23: "we need to differentiate between waiting on
     feedback from russell and from human."
     """
+    if plan_blocked:
+        return "waiting_on_plan"
     status = task.work_status.value
     if status != "review":
         return status
     if (owner or "") == "human":
         return "user-review"
     return "autoreview"
+
+
+def _recent_sweeper_ping(task) -> bool:
+    status = _task_status_value(task)
+    if status not in {"queued", "review", "in_progress"}:
+        return False
+    now = datetime.now(timezone.utc)
+    for entry in reversed(list(getattr(task, "context", None) or [])):
+        if getattr(entry, "entry_type", "") != SWEEPER_PING_CONTEXT_ENTRY_TYPE:
+            continue
+        stamp = getattr(entry, "timestamp", None)
+        if stamp is None:
+            return False
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return (now - stamp).total_seconds() <= RECENT_SWEEPER_PING_SECONDS
+    return False
+
+
+def _rejection_feedback_label(
+    rejection_feedback: RejectionFeedbackNotice,
+    *,
+    include_inbox_task_id: bool = True,
+) -> str:
+    label = "Unread rejection feedback"
+    if include_inbox_task_id:
+        label += f" ({rejection_feedback.inbox_task_id})"
+    return label
 
 
 def _render_overview(
@@ -432,8 +498,12 @@ def _render_overview(
     active_session,
     rejection_feedback: RejectionFeedbackNotice | None = None,
     task_index: dict[str, "object"] | None = None,
+    plan_blocked: bool = False,
+    plan_approval_task_id: str | None = None,
+    recently_pinged: bool = False,
 ) -> str:
-    icon = PollyTasksApp._STATUS_ICONS.get(task.work_status.value, "·")
+    status_label = _status_label(task, owner, plan_blocked=plan_blocked)
+    icon = PollyTasksApp._STATUS_ICONS.get(status_label, "·")
     lines = [
         f"{icon} #{task.task_number} {priority_glyph(task)} {task.title}",
     ]
@@ -450,12 +520,27 @@ def _render_overview(
         ])
     lines.extend([
         "",
-        f"Status     {_status_label(task, owner)}",
+        f"Status     {status_label}",
         f"Priority   {priority_label(task)}",
         f"Flow       {task.flow_template_id}",
         f"Stage      {_format_stage_label(task, flow)}",
         f"Owner      {owner or '—'}",
     ])
+    if recently_pinged:
+        lines.append("Sweeper    pinged in the last minute")
+    if plan_blocked:
+        lines.extend([
+            "",
+            "Plan Gate",
+            "",
+            "Waiting   approve the project plan before worker pickup",
+        ])
+        if plan_approval_task_id:
+            lines.append(
+                f"Approve    {plan_approval_task_id} · plan_project/user_approval"
+            )
+        else:
+            lines.append("Approve    start or finish the plan_project flow")
     if task.assignee:
         lines.append(f"Assignee   {task.assignee}")
     if task.roles:
@@ -483,7 +568,7 @@ def _render_overview(
                 "",
                 "Inbox Feedback",
                 "",
-                f"Status     Rejected — feedback in inbox ({rejection_feedback.inbox_task_id})",
+                f"Artifact   {_rejection_feedback_label(rejection_feedback)}",
                 f"Preview    {rejection_feedback.preview}",
             ]
         )
@@ -522,6 +607,8 @@ def _render_context(task) -> str:
         return "No context entries yet."
     lines: list[str] = []
     for entry in task.context:
+        if getattr(entry, "entry_type", "") == SWEEPER_PING_CONTEXT_ENTRY_TYPE:
+            continue
         ts = _format_event_time(getattr(entry, "timestamp", None))
         age = _format_relative_age(getattr(entry, "timestamp", None))
         meta = [getattr(entry, "actor", "") or "system"]
@@ -533,6 +620,8 @@ def _render_context(task) -> str:
         text = getattr(entry, "text", "") or ""
         lines.append(text if text else "(empty)")
         lines.append("")
+    if not lines:
+        return "No context entries yet."
     return "\n".join(lines).rstrip()
 
 
@@ -933,6 +1022,7 @@ class PollyTasksApp(App[None]):
     _STATUS_ICONS = {
         "draft": "◌",
         "queued": "○",
+        "waiting_on_plan": "◇",
         "in_progress": "⟳",
         "blocked": "⊘",
         "on_hold": "⏸",
@@ -948,6 +1038,9 @@ class PollyTasksApp(App[None]):
         self._tasks: list = []
         self._owner_by_task_id: dict[str, str | None] = {}
         self._rejection_feedback_by_task_id: dict[str, RejectionFeedbackNotice] = {}
+        self._plan_blocked_task_ids: set[str] = set()
+        self._plan_approval_task_id: str | None = None
+        self._recent_sweeper_ping_task_ids: set[str] = set()
         self._selected_task_id: str | None = None
         self._status_filter = "active"
         self._search_query = ""
@@ -1089,10 +1182,19 @@ class PollyTasksApp(App[None]):
 
     def _load_tasks(
         self,
-    ) -> tuple[list, dict[str, str | None], dict[str, RejectionFeedbackNotice]]:
+    ) -> tuple[
+        list,
+        dict[str, str | None],
+        dict[str, RejectionFeedbackNotice],
+        set[str],
+        str | None,
+        set[str],
+    ]:
         svc = self._get_svc()
         if svc is None:
-            return [], {}, {}
+            return [], {}, {}, set(), None, set()
+        plan_blocked: set[str] = set()
+        approval_task_id: str | None = None
         try:
             tasks = [
                 task
@@ -1101,15 +1203,49 @@ class PollyTasksApp(App[None]):
             ]
             owners = {task.task_id: svc.derive_owner(task) for task in tasks}
             feedback = unread_rejection_feedback(svc, project=self.project_key)
+            try:
+                config = load_config(self.config_path)
+                project = config.projects.get(self.project_key)
+                if project is not None:
+                    plan_blocked = plan_blocked_task_ids(
+                        self.project_key,
+                        project.path,
+                        svc,
+                        plan_dir=getattr(
+                            getattr(config, "planner", None),
+                            "plan_dir",
+                            "docs/plan",
+                        ),
+                    )
+                    approval_task = plan_approval_task(svc, self.project_key)
+                    if approval_task is not None:
+                        approval_task_id = getattr(approval_task, "task_id", None)
+            except Exception:  # noqa: BLE001
+                plan_blocked = set()
+                approval_task_id = None
+            recent_sweeper_pings = {
+                task.task_id for task in tasks if _recent_sweeper_ping(task)
+            }
         finally:
             svc.close()
-        tasks.sort(key=_task_sort_key)
-        return tasks, owners, feedback
+        tasks.sort(
+            key=lambda task: _task_sort_key(
+                task,
+                owner=owners.get(task.task_id),
+                plan_blocked=task.task_id in plan_blocked,
+            )
+        )
+        return tasks, owners, feedback, plan_blocked, approval_task_id, recent_sweeper_pings
 
     def _filtered_tasks(self) -> list:
         visible: list = []
         for task in self._tasks:
-            if not _task_matches_status(task, self._status_filter):
+            plan_blocked = task.task_id in self._plan_blocked_task_ids
+            if not _task_matches_status(
+                task,
+                self._status_filter,
+                plan_blocked=plan_blocked,
+            ):
                 continue
             owner = self._owner_by_task_id.get(task.task_id)
             if not _task_matches_query(task, owner, self._search_query):
@@ -1118,9 +1254,20 @@ class PollyTasksApp(App[None]):
         return visible
 
     def _summary_text(self, visible: list) -> str:
-        counts = _task_counts(self._tasks)
+        counts = _task_counts(
+            self._tasks,
+            plan_blocked_task_ids=self._plan_blocked_task_ids,
+        )
         parts: list[str] = []
-        for status in ("in_progress", "review", "queued", "blocked", "on_hold", "done"):
+        for status in (
+            "in_progress",
+            "review",
+            "waiting_on_plan",
+            "queued",
+            "blocked",
+            "on_hold",
+            "done",
+        ):
             count = counts.get(status, 0)
             if count:
                 icon = self._STATUS_ICONS.get(status, "·")
@@ -1278,16 +1425,18 @@ class PollyTasksApp(App[None]):
                 getattr(task, "updated_at", None) or getattr(task, "created_at", None)
             )
             feedback = self._rejection_feedback_by_task_id.get(task.task_id)
-            status = _status_label(task, owner)
+            plan_blocked = task.task_id in self._plan_blocked_task_ids
+            recently_pinged = task.task_id in self._recent_sweeper_ping_task_ids
+            status = _status_label(task, owner, plan_blocked=plan_blocked)
             title = f"{priority_glyph(task)} {task.title}"
             stage = task.current_node_id or "—"
             task_number = f"#{task.task_number}"
             if task.task_id in self._selected_task_ids:
                 task_number = f"◉ {task_number}"
+            if recently_pinged:
+                title = f"↻ {title}"
             if feedback is not None:
-                status = f"{status} · feedback"
                 title = f"🔄 {title}"
-                stage = f"{stage} · Rejected"
             self.task_table.add_row(
                 task_number,
                 status,
@@ -1326,9 +1475,14 @@ class PollyTasksApp(App[None]):
         ]
 
     def _refresh_list(self, *, select_first: bool = False) -> None:
-        self._tasks, self._owner_by_task_id, self._rejection_feedback_by_task_id = (
-            self._load_tasks()
-        )
+        (
+            self._tasks,
+            self._owner_by_task_id,
+            self._rejection_feedback_by_task_id,
+            self._plan_blocked_task_ids,
+            self._plan_approval_task_id,
+            self._recent_sweeper_ping_task_ids,
+        ) = self._load_tasks()
         self._render_table(select_first=select_first)
 
     def _render_timeline(self, executions: list) -> None:
@@ -1378,14 +1532,21 @@ class PollyTasksApp(App[None]):
             )
 
     def _render_selected_task(self, task, *, owner: str | None, flow, active_session) -> None:
-        icon = self._STATUS_ICONS.get(task.work_status.value, "·")
         feedback = self._rejection_feedback_by_task_id.get(task.task_id)
+        plan_blocked = task.task_id in self._plan_blocked_task_ids
+        recently_pinged = task.task_id in self._recent_sweeper_ping_task_ids
+        status_label = _status_label(task, owner, plan_blocked=plan_blocked)
+        icon = self._STATUS_ICONS.get(status_label, "·")
         header_bits = [
             f"{'🔄 ' if feedback is not None else ''}{icon} #{task.task_number} {priority_glyph(task)} {task.title}",
-            f"{task.work_status.value} · {_format_relative_age(task.updated_at or task.created_at)}",
+            f"{status_label} · {_format_relative_age(task.updated_at or task.created_at)}",
         ]
+        if recently_pinged:
+            header_bits.append("Sweeper pinged in the last minute")
         if feedback is not None:
-            header_bits.append("Rejected — feedback in inbox")
+            header_bits.append(
+                f"{_rejection_feedback_label(feedback, include_inbox_task_id=False)} in inbox"
+            )
         self.detail_header.update("\n".join(header_bits))
         task_index = {t.task_id: t for t in self._tasks}
         self.detail_overview.update(
@@ -1396,6 +1557,9 @@ class PollyTasksApp(App[None]):
                 active_session=active_session,
                 rejection_feedback=feedback,
                 task_index=task_index,
+                plan_blocked=plan_blocked,
+                plan_approval_task_id=self._plan_approval_task_id,
+                recently_pinged=recently_pinged,
             )
         )
         self.detail_context.update(_render_context(task))

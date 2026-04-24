@@ -26,11 +26,14 @@ from typing import Any
 import pytest
 
 from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
+    SWEEPER_PING_CONTEXT_ENTRY_TYPE,
     task_assignment_sweep_handler,
 )
 from pollypm.plugins_builtin.task_assignment_notify.resolver import _RuntimeServices
+from pollypm.store import SQLAlchemyStore
 from pollypm.storage.state import StateStore
 from pollypm.work import task_assignment as bus
+from pollypm.work.models import WorkStatus
 from pollypm.work.sqlite_service import SQLiteWorkService
 
 
@@ -97,6 +100,39 @@ def _make_project_db(project_path: Path, *, project_key: str) -> Path:
     return db_path
 
 
+def _make_review_task_db(project_path: Path, *, project_key: str) -> tuple[Path, str]:
+    """Create a per-project DB with one task parked in review."""
+    db_dir = project_path / ".pollypm"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "state.db"
+    bus.clear_listeners()
+    work = SQLiteWorkService(db_path=db_path, project_path=project_path)
+    try:
+        task = work.create(
+            title=f"Needs review in {project_key}",
+            description="Review task for notify reconciliation",
+            type="task",
+            project=project_key,
+            flow_template="standard",
+            roles={"worker": "agent-1", "reviewer": "reviewer"},
+            priority="normal",
+        )
+        work.queue(task.task_id, "pm")
+        work.claim(task.task_id, "agent-1")
+        work.node_done(
+            task.task_id,
+            "agent-1",
+            {
+                "type": "code_change",
+                "summary": "Implemented the feature",
+                "artifacts": [{"kind": "commit", "ref": "abc123"}],
+            },
+        )
+        return db_path, task.task_id
+    finally:
+        work.close()
+
+
 def _install_fake_loader(monkeypatch, services_factory):
     """Patch ``load_runtime_services`` used by the sweep handler."""
     monkeypatch.setattr(
@@ -154,6 +190,21 @@ class TestPerProjectFanout:
         recipients = {name for name, _text in session_svc.sent}
         assert recipients == {"worker-alpha", "worker-beta"}
         assert all("New work" in text for _name, text in session_svc.sent)
+
+        work = SQLiteWorkService(
+            db_path=proj_a / ".pollypm" / "state.db",
+            project_path=proj_a,
+        )
+        try:
+            entries = work.get_context(
+                "alpha/1",
+                entry_type=SWEEPER_PING_CONTEXT_ENTRY_TYPE,
+            )
+            assert len(entries) == 1
+            assert entries[0].actor == "sweeper"
+            assert entries[0].text == "task_assignment.sweep:sent"
+        finally:
+            work.close()
 
         store.close()
 
@@ -257,6 +308,116 @@ class TestNoSessionAlerts:
         assert "pm task claim" in alert.message
 
         store.close()
+
+
+class TestReviewNotifyReconciliation:
+    def test_open_notify_about_review_task_keeps_it_in_review(
+        self, tmp_path, monkeypatch,
+    ):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        _db_path, task_id = _make_review_task_db(proj, project_key="ghost")
+
+        workspace_db = tmp_path / "workspace_state.db"
+        notify_store = SQLAlchemyStore(f"sqlite:///{workspace_db}")
+        try:
+            notify_store.enqueue_message(
+                type="notify",
+                tier="immediate",
+                recipient="user",
+                sender="reviewer",
+                subject=f"{task_id} needs operator help",
+                body="Waiting on deploy credentials.",
+                scope="inbox",
+                state="open",
+            )
+        finally:
+            notify_store.close()
+
+        store = StateStore(tmp_path / "alerts_state.db")
+        session_svc = FakeSessionService(handles=[FakeHandle("reviewer")])
+
+        def _factory():
+            return _RuntimeServices(
+                session_service=session_svc,
+                state_store=store,
+                work_service=None,
+                project_root=tmp_path,
+                known_projects=(FakeKnownProject(key="ghost", path=proj),),
+                enforce_plan=False,
+            )
+
+        _install_fake_loader(monkeypatch, _factory)
+        monkeypatch.setattr(
+            "pollypm.work.cli._resolve_db_path",
+            lambda db, project=None: workspace_db if project is None else _db_path,
+        )
+
+        result = task_assignment_sweep_handler({})
+
+        assert result["by_outcome"].get("review_notify_holds", 0) == 0
+
+        work = SQLiteWorkService(db_path=_db_path, project_path=proj)
+        try:
+            task = work.get(task_id)
+            assert task.work_status == WorkStatus.REVIEW
+        finally:
+            work.close()
+            store.close()
+
+    def test_open_non_reviewer_review_ready_notify_does_not_move_it_on_hold(
+        self, tmp_path, monkeypatch,
+    ):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        _db_path, task_id = _make_review_task_db(proj, project_key="ghost")
+
+        workspace_db = tmp_path / "workspace_state.db"
+        notify_store = SQLAlchemyStore(f"sqlite:///{workspace_db}")
+        try:
+            notify_store.enqueue_message(
+                type="notify",
+                tier="immediate",
+                recipient="user",
+                sender="polly",
+                subject=f"Done: {task_id} handed to review",
+                body="Press A to approve.",
+                scope="inbox",
+                state="open",
+            )
+        finally:
+            notify_store.close()
+
+        store = StateStore(tmp_path / "alerts_state.db")
+        session_svc = FakeSessionService(handles=[FakeHandle("reviewer")])
+
+        def _factory():
+            return _RuntimeServices(
+                session_service=session_svc,
+                state_store=store,
+                work_service=None,
+                project_root=tmp_path,
+                known_projects=(FakeKnownProject(key="ghost", path=proj),),
+                enforce_plan=False,
+            )
+
+        _install_fake_loader(monkeypatch, _factory)
+        monkeypatch.setattr(
+            "pollypm.work.cli._resolve_db_path",
+            lambda db, project=None: workspace_db if project is None else _db_path,
+        )
+
+        result = task_assignment_sweep_handler({})
+
+        assert result["by_outcome"].get("review_notify_holds", 0) == 0
+
+        work = SQLiteWorkService(db_path=_db_path, project_path=proj)
+        try:
+            task = work.get(task_id)
+            assert task.work_status == WorkStatus.REVIEW
+        finally:
+            work.close()
+            store.close()
 
     def test_repeated_sweeps_do_not_duplicate_alerts(
         self, tmp_path, monkeypatch,

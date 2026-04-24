@@ -974,14 +974,216 @@ def test_task_app_surfaces_unread_rejection_feedback(env, monkeypatch) -> None:
         async with app.run_test(size=(140, 50)) as pilot:
             await pilot.pause()
             rows = _table_rows(app.query_one("#tasks-table", DataTable))
+            header = str(app.query_one("#task-header", Static).render())
             overview = str(app.query_one("#task-detail", Static).render())
 
             assert len(rows) == 1
-            assert rows[0][1] == "in_progress · feedback"
+            assert rows[0][1] == "in_progress"
             assert rows[0][2] == "🔄 🟠 Ship Notesy visibility"
-            assert rows[0][4] == "synthesize · Rejected"
+            assert rows[0][4] == "synthesize"
+            assert "in_progress" in header
+            assert "Unread rejection feedback in inbox" in header
             assert "Inbox Feedback" in overview
+            assert "Artifact   Unread rejection feedback (demo/99)" in overview
             assert "Need better rollback coverage." in overview
+
+    _run(body())
+
+
+def test_task_app_keeps_autoreview_state_distinct_from_feedback_inbox(
+    env, monkeypatch,
+) -> None:
+    if not _load_config_compatible(env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_tasks import PollyTasksApp
+
+    review_task = _task(
+        node_id="critic_panel",
+        title="Review Notesy visibility",
+        status=WorkStatus.REVIEW,
+    )
+    feedback_task = _task(
+        task_number=99,
+        node_id="chat",
+        title="Rejected demo/1 — Review Notesy visibility",
+        flow_template_id="chat",
+        labels=["review_feedback", "task:demo/1", "project:demo"],
+        description="Need stronger rollout coverage before approval.",
+    )
+    fake_svc = _FakeSvc(
+        tasks_factory=lambda: [review_task, feedback_task],
+        flow=_flow(),
+        owner_by_id={"demo/1": "russell"},
+    )
+
+    monkeypatch.setattr("pollypm.cockpit_tasks.create_tmux_client", lambda: _FakeTmux([]))
+
+    app = PollyTasksApp(env["config_path"], "demo")
+    app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            rows = _table_rows(app.query_one("#tasks-table", DataTable))
+            header = str(app.query_one("#task-header", Static).render())
+            overview = str(app.query_one("#task-detail", Static).render())
+
+            assert len(rows) == 1
+            assert rows[0][1] == "autoreview"
+            assert rows[0][2] == "🔄 🟠 Review Notesy visibility"
+            assert rows[0][4] == "critic_panel"
+            assert "autoreview" in header
+            assert "Unread rejection feedback in inbox" in header
+            assert "Status     autoreview" in overview
+            assert "Artifact   Unread rejection feedback (demo/99)" in overview
+            assert "Need stronger rollout coverage before approval." in overview
+
+    _run(body())
+
+
+def test_task_app_sorts_user_review_before_autoreview(
+    env, monkeypatch,
+) -> None:
+    if not _load_config_compatible(env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_tasks import PollyTasksApp
+
+    human_low = _task(
+        task_number=1,
+        node_id="critic_panel",
+        title="Human low-priority review",
+        status=WorkStatus.REVIEW,
+        priority=Priority.LOW,
+        updated_at=datetime(2026, 4, 20, 16, 0, tzinfo=UTC),
+    )
+    auto_critical = _task(
+        task_number=2,
+        node_id="critic_panel",
+        title="Russell critical autoreview",
+        status=WorkStatus.REVIEW,
+        priority=Priority.CRITICAL,
+        updated_at=datetime(2026, 4, 20, 18, 0, tzinfo=UTC),
+    )
+    human_high = _task(
+        task_number=3,
+        node_id="critic_panel",
+        title="Human high-priority review",
+        status=WorkStatus.REVIEW,
+        priority=Priority.HIGH,
+        updated_at=datetime(2026, 4, 20, 17, 0, tzinfo=UTC),
+    )
+    fake_svc = _FakeSvc(
+        tasks_factory=lambda: [auto_critical, human_low, human_high],
+        flow=_flow(),
+        owner_by_id={
+            "demo/1": "human",
+            "demo/2": "russell",
+            "demo/3": "human",
+        },
+    )
+
+    monkeypatch.setattr("pollypm.cockpit_tasks.create_tmux_client", lambda: _FakeTmux([]))
+
+    app = PollyTasksApp(env["config_path"], "demo")
+    app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            rows = _table_rows(app.query_one("#tasks-table", DataTable))
+
+            assert [row[1] for row in rows] == [
+                "user-review",
+                "user-review",
+                "autoreview",
+            ]
+            assert [row[2] for row in rows] == [
+                "🟠 Human high-priority review",
+                "🟢 Human low-priority review",
+                "🔴 Russell critical autoreview",
+            ]
+
+    _run(body())
+
+
+def test_task_app_surfaces_plan_blocked_queued_tasks(env, monkeypatch) -> None:
+    if not _load_config_compatible(env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_tasks import PollyTasksApp
+
+    work_task = _task(
+        node_id="implement",
+        title="Implement planned child",
+        status=WorkStatus.QUEUED,
+        flow_template_id="standard",
+    )
+    plan_task = _task(
+        task_number=2,
+        node_id="user_approval",
+        title="Approve project plan",
+        status=WorkStatus.QUEUED,
+        flow_template_id="plan_project",
+    )
+    fake_svc = _FakeSvc(
+        tasks_factory=lambda: [work_task, plan_task],
+        flow=_flow(),
+    )
+
+    monkeypatch.setattr("pollypm.cockpit_tasks.create_tmux_client", lambda: _FakeTmux([]))
+
+    app = PollyTasksApp(env["config_path"], "demo")
+    app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            rows = _table_rows(app.query_one("#tasks-table", DataTable))
+            header = str(app.query_one("#task-header", Static).render())
+            overview = str(app.query_one("#task-detail", Static).render())
+
+            assert rows[0][1] == "waiting_on_plan"
+            assert rows[0][2] == "🟠 Implement planned child"
+            assert "waiting_on_plan" in header
+            assert "Plan Gate" in overview
+            assert "Approve    demo/2 · plan_project/user_approval" in overview
+
+    _run(body())
+
+
+def test_task_app_surfaces_recent_sweeper_ping(env, monkeypatch) -> None:
+    if not _load_config_compatible(env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_tasks import PollyTasksApp
+    from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
+        SWEEPER_PING_CONTEXT_ENTRY_TYPE,
+    )
+
+    task = _task(node_id="synthesize", title="Recently swept")
+    task.context = [
+        ContextEntry(
+            actor="sweeper",
+            timestamp=datetime.now(UTC),
+            text="task_assignment.sweep:deduped",
+            entry_type=SWEEPER_PING_CONTEXT_ENTRY_TYPE,
+        )
+    ]
+    fake_svc = _FakeSvc(tasks_factory=lambda: [task], flow=_flow())
+
+    monkeypatch.setattr("pollypm.cockpit_tasks.create_tmux_client", lambda: _FakeTmux([]))
+
+    app = PollyTasksApp(env["config_path"], "demo")
+    app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            rows = _table_rows(app.query_one("#tasks-table", DataTable))
+            header = str(app.query_one("#task-header", Static).render())
+            overview = str(app.query_one("#task-detail", Static).render())
+
+            assert rows[0][2] == "↻ 🟠 Recently swept"
+            assert "Sweeper pinged in the last minute" in header
+            assert "Sweeper    pinged in the last minute" in overview
 
     _run(body())
 

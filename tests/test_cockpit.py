@@ -6,7 +6,9 @@ from types import SimpleNamespace
 import pytest
 
 from pollypm.cockpit import build_cockpit_detail
+from pollypm.cockpit_project_state import ProjectRailState, ProjectStateRollup
 from pollypm.cockpit_rail import CockpitItem, CockpitPresence, CockpitRouter, PALETTE, PollyCockpitRail
+from pollypm.cockpit_rail_routes import ProjectRoute
 from pollypm.cockpit_ui import PollyCockpitApp, PollyDashboardApp, PollySettingsPaneApp, RailItem
 from pollypm.config import write_config
 from pollypm.dashboard_data import DashboardData, SessionActivity
@@ -89,6 +91,94 @@ def test_cockpit_router_build_items_includes_core_entries(monkeypatch, tmp_path:
     project_labels = [i.label for i in items if i.key.startswith("project:")]
     assert "Demo" in project_labels
     assert "PollyPM" in project_labels
+
+
+def test_cockpit_router_build_items_keeps_mounted_task_worker_visible(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    class FakeConfig:
+        class Project:
+            root_dir = tmp_path
+            base_dir = tmp_path / ".pollypm"
+            tmux_session = "pollypm"
+
+        project = Project()
+        projects = {
+            "demo": KnownProject(
+                key="demo",
+                path=tmp_path / "demo",
+                name="Demo",
+                persona_name="Dora",
+                kind=ProjectKind.GIT,
+            ),
+        }
+
+    class FakeLaunch:
+        def __init__(self, name: str, role: str, project: str, window_name: str) -> None:
+            self.window_name = window_name
+            self.session = type(
+                "Session",
+                (),
+                {
+                    "name": name,
+                    "role": role,
+                    "project": project,
+                    "provider": type("P", (), {"value": "claude"})(),
+                },
+            )()
+
+    class FakeWindow:
+        def __init__(self, name: str, pane_dead: bool = False) -> None:
+            self.name = name
+            self.pane_dead = pane_dead
+            self.pane_id = f"%{name}"
+
+    class FakeStore:
+        def recent_events(self, limit: int = 300):
+            return []
+
+        def latest_heartbeat(self, session_name: str):
+            return None
+
+    class FakeSupervisor:
+        config = FakeConfig()
+        store = FakeStore()
+
+        def status(self):
+            launches = [
+                FakeLaunch("worker_demo", "worker", "demo", "worker-demo"),
+            ]
+            windows = [FakeWindow("worker-demo")]
+            return launches, windows, [], [], []
+
+        def storage_closet_session_name(self) -> str:
+            return "pollypm-storage-closet"
+
+    class FakeTmux:
+        def list_windows(self, target: str):
+            assert target == "pollypm-storage-closet"
+            return []
+
+    monkeypatch.setattr("pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 0)
+    (tmp_path / "pollypm.toml").write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+    router = CockpitRouter(tmp_path / "pollypm.toml")
+    router.tmux = FakeTmux()  # type: ignore[assignment]
+    monkeypatch.setattr(router, "_load_supervisor", lambda: FakeSupervisor())
+    router._write_state(
+        {
+            "selected": "project:demo:task:7",
+            "mounted_session": "task-demo-7",
+            "right_pane_id": "%2",
+        }
+    )
+
+    items = router.build_items(spinner_index=0)
+
+    task_item = next(item for item in items if item.key == "project:demo:task:7")
+    assert task_item.label == "  ⟳ Task #7"
+    assert task_item.state == "sub"
 
 
 EXPECTED_SESSION_HEALTH_RENDER_STATES = [
@@ -724,6 +814,73 @@ def test_cockpit_router_decorates_project_items_with_sparkline_and_pin() -> None
     assert decorated[-1].key == "system"
 
 
+def test_cockpit_router_decorates_and_sorts_project_rollup_badges() -> None:
+    router = CockpitRouter.__new__(CockpitRouter)
+    router.is_project_pinned = lambda key: key == "alpha"  # type: ignore[assignment]
+    router.pinned_projects = lambda: ["alpha"]  # type: ignore[assignment]
+
+    items = [
+        CockpitItem(key="project:alpha", label="Alpha", state="idle"),
+        CockpitItem(key="project:beta", label="Beta", state="idle"),
+        CockpitItem(key="project:gamma", label="Gamma", state="idle"),
+        CockpitItem(key="project:delta", label="Delta", state="idle"),
+    ]
+    rollups = {
+        "alpha": ProjectStateRollup(ProjectRailState.NONE, None, 4),
+        "beta": ProjectStateRollup(ProjectRailState.YELLOW, "🟡", 1, "project:beta:issues"),
+        "gamma": ProjectStateRollup(ProjectRailState.WORKING, "⚙️", 3),
+        "delta": ProjectStateRollup(ProjectRailState.RED, "🔴", 0, "project:delta:issues"),
+    }
+
+    decorated = router._decorate_project_items(
+        items,
+        selected_project=None,
+        launches=[],
+        recent_events=[],
+        project_session_map={},
+        project_rollups=rollups,
+    )
+
+    assert [item.key for item in decorated] == [
+        "project:delta",
+        "project:beta",
+        "project:gamma",
+        "project:alpha",
+    ]
+    assert decorated[0].label.startswith("🔴 Delta")
+    assert decorated[1].label.startswith("🟡 Beta")
+    assert decorated[2].label.startswith("⚙️ Gamma")
+    assert decorated[3].label.startswith("📌 Alpha")
+
+
+def test_cockpit_router_routes_project_click_to_dashboard_even_when_actionable() -> None:
+    calls: dict[str, object] = {}
+    router = CockpitRouter.__new__(CockpitRouter)
+    router.set_selected_key = lambda key: calls.setdefault("selected", key)  # type: ignore[assignment]
+    router._show_static_view = (  # type: ignore[assignment]
+        lambda supervisor, window_target, kind, project_key=None: calls.setdefault(
+            "static", (window_target, kind, project_key),
+        )
+    )
+    router._project_rollup_for_route = (  # type: ignore[assignment]
+        lambda supervisor, project_key: ProjectStateRollup(
+            ProjectRailState.GREEN,
+            "🟢",
+            2,
+            "project:demo:issues",
+        )
+    )
+
+    router._route_project_selection(
+        SimpleNamespace(),
+        "pollypm:PollyPM",
+        ProjectRoute(project_key="demo", sub_view=None),
+    )
+
+    assert calls["selected"] == "project:demo:dashboard"
+    assert calls["static"] == ("pollypm:PollyPM", "project", "demo")
+
+
 def test_cockpit_rail_render_includes_event_ticker(monkeypatch) -> None:
     class _Event:
         def __init__(self, event_type: str, session_name: str, created_at) -> None:
@@ -1055,6 +1212,53 @@ def test_cockpit_router_selected_key_clears_dead_right_pane_state(monkeypatch, t
     assert state["selected"] == "project:demo"
     assert "right_pane_id" not in state
     assert "mounted_session" not in state
+
+
+def test_cockpit_router_selected_key_keeps_live_task_mount_state(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+
+    class FakeSupervisor:
+        def ensure_layout(self) -> None:
+            return None
+
+        def plan_launches(self):
+            return []
+
+    class FakePane:
+        def __init__(self, pane_id: str, pane_left: int, command: str, path: Path) -> None:
+            self.pane_id = pane_id
+            self.pane_left = pane_left
+            self.pane_dead = False
+            self.pane_current_command = command
+            self.pane_current_path = str(path)
+
+    class FakeTmux:
+        def list_panes(self, target: str):
+            return [
+                FakePane("%1", 0, "uv", tmp_path),
+                FakePane("%2", 31, "node", tmp_path / "task"),
+            ]
+
+    router = CockpitRouter(config_path)
+    router.tmux = FakeTmux()  # type: ignore[assignment]
+    monkeypatch.setattr(router, "_load_supervisor", lambda fresh=False: FakeSupervisor())
+    router._write_state(
+        {
+            "selected": "project:demo:task:7",
+            "right_pane_id": "%2",
+            "mounted_session": "task-demo-7",
+        }
+    )
+
+    assert router.selected_key() == "project:demo:task:7"
+    state = router._load_state()
+    assert state["mounted_session"] == "task-demo-7"
+    assert state["right_pane_id"] == "%2"
 
 
 def test_cockpit_router_selected_key_clears_stale_mounted_session_only(monkeypatch, tmp_path: Path) -> None:
@@ -1892,6 +2096,71 @@ def test_cockpit_router_releases_lease_when_unmounting_static_view(monkeypatch, 
     state = router._load_state()
     assert "mounted_session" not in state
     assert calls["released"] == ("worker_demo", "cockpit")
+
+
+def test_cockpit_router_parks_mounted_task_worker(monkeypatch, tmp_path: Path) -> None:
+    calls: dict[str, object] = {}
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+
+    class FakeSupervisor:
+        def plan_launches(self):
+            return []
+
+        def storage_closet_session_name(self) -> str:
+            return "pollypm-storage-closet"
+
+        def release_lease(self, session_name: str, expected_owner: str | None = None) -> None:
+            calls["released"] = (session_name, expected_owner)
+
+    class FakeWindow:
+        def __init__(self, index: int, name: str) -> None:
+            self.index = index
+            self.name = name
+
+    class FakePane:
+        def __init__(self, pane_id: str, pane_left: int, command: str) -> None:
+            self.pane_id = pane_id
+            self.pane_left = pane_left
+            self.pane_current_command = command
+            self.pane_dead = False
+
+    class FakeTmux:
+        def __init__(self) -> None:
+            self._window_calls = 0
+
+        def list_panes(self, target: str):
+            return [
+                FakePane("%1", 0, "uv"),
+                FakePane("%2", 30, "node"),
+            ]
+
+        def list_windows(self, target: str):
+            self._window_calls += 1
+            if self._window_calls == 1:
+                return [FakeWindow(1, "worker-demo")]
+            return [FakeWindow(1, "worker-demo"), FakeWindow(2, "PollyPM")]
+
+        def break_pane(self, source: str, target_session: str, window_name: str) -> None:
+            calls["break"] = (source, target_session, window_name)
+
+        def rename_window(self, target: str, name: str) -> None:
+            calls["renamed"] = (target, name)
+
+    router = CockpitRouter(config_path)
+    router.tmux = FakeTmux()  # type: ignore[assignment]
+    monkeypatch.setattr(router, "_load_supervisor", lambda fresh=False: FakeSupervisor())
+    router._write_state({"mounted_session": "task-demo-7", "right_pane_id": "%2"})
+
+    router._park_mounted_session(FakeSupervisor(), "pollypm:PollyPM")
+
+    state = router._load_state()
+    assert "mounted_session" not in state
+    assert calls["break"] == ("%2", "pollypm-storage-closet", "task-demo-7")
+    assert calls["renamed"] == ("pollypm-storage-closet:2", "task-demo-7")
+    assert calls["released"] == ("task-demo-7", "cockpit")
 
 
 def test_cockpit_router_validation_releases_stale_cockpit_lease(monkeypatch, tmp_path: Path) -> None:

@@ -1117,7 +1117,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
 
         Delegates to :func:`pollypm.heartbeats.stall_classifier.has_pending_work_for_session`
         so this path and the supervisor-boundary path
-        (``pollypm.supervisor_alerts._update_alerts``) share one
+        (the supervisor-alert update path) share one
         definition of "is there work". See #765.
         """
         from pollypm.heartbeats.stall_classifier import (

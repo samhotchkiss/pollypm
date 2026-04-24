@@ -17,6 +17,7 @@ from typing import Any, Optional
 import typer
 
 from pollypm.cli_help import help_with_examples
+from pollypm.inbox_message_refs import unknown_project_refs
 from pollypm.work.cli import (
     _DB_OPTION,
     _JSON_OPTION,
@@ -386,9 +387,20 @@ def inbox_archive(
             "``--match 'loop-test-*'`` (#754)."
         ),
     ),
+    deleted_projects: bool = typer.Option(
+        False,
+        "--deleted-projects",
+        help=(
+            "Archive open user-recipient messages whose structured project "
+            "references point at projects no longer registered in config."
+        ),
+    ),
     dry_run: bool = typer.Option(
         False, "--dry-run",
-        help="With --match: print what would be archived without changing state.",
+        help=(
+            "With --match or --deleted-projects: print what would be archived "
+            "without changing state."
+        ),
     ),
     actor: str = typer.Option("user", "--actor", help="Actor to attribute the archive to."),
     db: str = _DB_OPTION,
@@ -404,14 +416,29 @@ def inbox_archive(
     - ``pm inbox archive --match 'loop-test-*'`` — bulk archive every
       open user-recipient message whose title matches the glob. Add
       ``--dry-run`` to preview.
+    - ``pm inbox archive --deleted-projects`` — archive stale messages
+      whose structured project refs no longer exist in the active config.
     """
+    bulk_modes = sum(1 for enabled in (match is not None, deleted_projects) if enabled)
+    if bulk_modes > 1:
+        typer.echo(
+            "Error: use only one bulk archive mode: --match or --deleted-projects.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
     if match is not None:
         _bulk_archive_by_match(db=db, pattern=match, dry_run=dry_run)
         return
 
+    if deleted_projects:
+        _bulk_archive_deleted_project_messages(db=db, dry_run=dry_run)
+        return
+
     if task_id is None:
         typer.echo(
-            "Error: pass a task_id/message-id, OR use --match '<pattern>'.",
+            "Error: pass a task_id/message-id, OR use --match '<pattern>' "
+            "or --deleted-projects.",
             err=True,
         )
         raise typer.Exit(code=2)
@@ -516,6 +543,81 @@ def _bulk_archive_by_match(*, db: str, pattern: str, dry_run: bool) -> None:
     store.close()
 
     typer.echo(f"Archived {closed} message(s) matching {pattern!r}.")
+    if failures:
+        typer.echo(f"Failed to archive {len(failures)}:", err=True)
+        for mid, reason in failures[:5]:
+            typer.echo(f"  msg:{mid}: {reason}", err=True)
+
+
+def _known_project_keys() -> set[str]:
+    try:
+        from pollypm.config import load_config
+
+        config = load_config()
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"Error: failed to load PollyPM config ({exc}).", err=True)
+        raise typer.Exit(code=1) from exc
+    return set((getattr(config, "projects", {}) or {}).keys())
+
+
+def _bulk_archive_deleted_project_messages(*, db: str, dry_run: bool) -> None:
+    """Archive open user-recipient messages for projects removed from config."""
+    known_projects = _known_project_keys()
+    db_path = _resolve_db_path(db, project=None)
+    try:
+        from pollypm.store import SQLAlchemyStore
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"Error: unified store unavailable ({exc}).", err=True)
+        raise typer.Exit(code=1)
+
+    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    try:
+        rows = store.query_messages(
+            recipient="user", state="open",
+            type=["notify", "inbox_task", "alert"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        store.close()
+        typer.echo(f"Error: query_messages failed ({exc}).", err=True)
+        raise typer.Exit(code=1) from exc
+
+    matches: list[tuple[dict[str, Any], set[str]]] = []
+    for row in rows:
+        missing = unknown_project_refs(row, known_projects)
+        if missing:
+            matches.append((row, missing))
+
+    if not matches:
+        store.close()
+        typer.echo("No open messages referenced deleted projects.")
+        return
+
+    if dry_run:
+        typer.echo(f"Would archive {len(matches)} deleted-project message(s):")
+        for row, missing in matches[:20]:
+            mid = row.get("id") or row.get("message_id")
+            subject = row.get("subject") or row.get("title") or ""
+            refs = ", ".join(sorted(missing))
+            typer.echo(f"  msg:{mid}  [{refs}]  {subject[:80]}")
+        if len(matches) > 20:
+            typer.echo(f"  ... ({len(matches) - 20} more)")
+        store.close()
+        return
+
+    closed = 0
+    failures: list[tuple[int, str]] = []
+    for row, _missing in matches:
+        mid = row.get("id") or row.get("message_id")
+        if mid is None:
+            continue
+        try:
+            store.close_message(int(mid))
+            closed += 1
+        except Exception as exc:  # noqa: BLE001
+            failures.append((int(mid), str(exc)))
+    store.close()
+
+    typer.echo(f"Archived {closed} deleted-project message(s).")
     if failures:
         typer.echo(f"Failed to archive {len(failures)}:", err=True)
         for mid, reason in failures[:5]:

@@ -13,12 +13,101 @@ Contract:
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any
 
-from pollypm.cockpit_inbox import _inbox_db_sources
+from pollypm.cockpit_inbox import _inbox_db_sources, _row_is_dev_channel
+from pollypm.rejection_feedback import (
+    feedback_target_task_id,
+    is_rejection_feedback_task,
+)
 from pollypm.store import SQLAlchemyStore
 from pollypm.work.inbox_view import inbox_tasks
 from pollypm.work.sqlite_service import SQLiteWorkService
+
+
+_MARKDOWN_DECORATION_RE = re.compile(r"[*_`#>\[\]]+")
+
+# Regex triage is score-based: every matching rule contributes a candidate,
+# the highest score wins, and exact ties use this documented intent priority.
+_TRIAGE_KIND_PRIORITY = {
+    "decision": 0,
+    "blocker": 1,
+    "action": 2,
+    "review": 3,
+    "completion": 4,
+    "info": 5,
+}
+
+_TRIAGE_PATTERN_REGISTRY = (
+    {
+        "kind": "decision",
+        "bucket": "action",
+        "rank": 0,
+        "label": "decision needed",
+        "score": 3,
+        "pattern": re.compile(
+            r"\b(decision|triage|your call|need Polly's call|need your call|scope escalation)\b",
+            re.IGNORECASE,
+        ),
+    },
+    {
+        "kind": "blocker",
+        "bucket": "action",
+        "rank": 0,
+        "label": "blocked",
+        "score": 3,
+        "pattern": re.compile(
+            r"\b(blocked|blocking|waiting on|on hold|stale review ping)\b",
+            re.IGNORECASE,
+        ),
+    },
+    {
+        "kind": "action",
+        "bucket": "action",
+        "rank": 0,
+        "label": "setup needed",
+        "score": 3,
+        "pattern": re.compile(
+            r"\b(set up|setup|sign in|login|account access|access expired|"
+            r"fly\.io|fly deploy|verification email|email click|click the link)\b",
+            re.IGNORECASE,
+        ),
+    },
+    {
+        "kind": "review",
+        "bucket": "action",
+        "rank": 1,
+        "label": "review needed",
+        "score": 2,
+        "pattern": re.compile(
+            r"\b(review|approve|approval)\b",
+            re.IGNORECASE,
+        ),
+    },
+    {
+        "kind": "completion",
+        "bucket": "info",
+        "rank": 2,
+        "label": "completed update",
+        "score": 2,
+        "pattern": re.compile(
+            r"\b(complete|completed|shipped|done|merged|deliverable)\b",
+            re.IGNORECASE,
+        ),
+    },
+    {
+        "kind": "action",
+        "bucket": "action",
+        "rank": 1,
+        "label": "action required",
+        "score": 1,
+        "pattern": re.compile(
+            r"^\[action\]|\b(action required|needs? your|need your|need Polly|question)\b",
+            re.IGNORECASE,
+        ),
+    },
+)
 
 
 def message_item_id(source_key: str, row_id: object) -> str:
@@ -39,6 +128,75 @@ class InboxEntry:
         if raw is not None:
             return getattr(raw, name)
         raise AttributeError(name)
+
+
+def _plain_text(value: object | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = _MARKDOWN_DECORATION_RE.sub("", text)
+    return " ".join(part.strip() for part in text.splitlines() if part.strip())
+
+
+def _is_orphaned_project(project: str, *, known_projects: set[str]) -> bool:
+    project = (project or "").strip()
+    if not project or project == "inbox":
+        return False
+    return project not in known_projects
+
+
+def _triage_for_entry(
+    item: InboxEntry,
+    *,
+    known_projects: set[str],
+) -> tuple[str, int, str]:
+    labels = {str(label) for label in list(getattr(item, "labels", []) or [])}
+    project = (getattr(item, "project", "") or "").strip()
+    title = _plain_text(getattr(item, "title", ""))
+    body = _plain_text(getattr(item, "description", ""))
+    text = " ".join(part for part in (title, body) if part).strip()
+
+    if _is_orphaned_project(project, known_projects=known_projects):
+        return "orphaned", 3, "deleted project"
+    if "plan_review" in labels:
+        return "action", 0, "plan review"
+    if "blocking_question" in labels:
+        return "action", 0, "worker blocked"
+    if is_rejection_feedback_task(item):
+        target = feedback_target_task_id(item)
+        if target:
+            return "info", 2, f"review feedback for {target}"
+        return "info", 2, "review feedback"
+    matches = [
+        rule
+        for rule in _TRIAGE_PATTERN_REGISTRY
+        if rule["pattern"].search(text)
+    ]
+    if matches:
+        winner = min(
+            matches,
+            key=lambda rule: (
+                -int(rule["score"]),
+                _TRIAGE_KIND_PRIORITY.get(str(rule["kind"]), _TRIAGE_KIND_PRIORITY["info"]),
+            ),
+        )
+        return str(winner["bucket"]), int(winner["rank"]), str(winner["label"])
+    return "info", 2, "update"
+
+
+def annotate_inbox_entry(
+    item: InboxEntry,
+    *,
+    known_projects: set[str],
+) -> InboxEntry:
+    """Attach triage metadata used by the inbox UI."""
+    bucket, rank, label = _triage_for_entry(item, known_projects=known_projects)
+    item.triage_bucket = bucket
+    item.triage_rank = rank
+    item.triage_label = label
+    item.is_orphaned = bucket == "orphaned"
+    item.needs_action = bucket == "action"
+    return item
 
 
 def task_to_inbox_entry(task, *, db_path: Path | None) -> InboxEntry:
@@ -122,6 +280,7 @@ def load_inbox_entries(
     unread: set[str] = set()
     replies_by_task: dict[str, list] = {}
     seen_task_ids: set[str] = set()
+    known_projects = set(getattr(config, "projects", {}).keys())
     for project_key, db_path, project_path in _inbox_db_sources(config):
         if not db_path.exists():
             continue
@@ -141,10 +300,15 @@ def load_inbox_entries(
                 except Exception:  # noqa: BLE001
                     rows = []
                 for row in rows:
-                    item = message_row_to_inbox_entry(
-                        row,
-                        source_key=source_key,
-                        db_path=db_path,
+                    if _row_is_dev_channel(row.get("labels")):
+                        continue
+                    item = annotate_inbox_entry(
+                        message_row_to_inbox_entry(
+                            row,
+                            source_key=source_key,
+                            db_path=db_path,
+                        ),
+                        known_projects=known_projects,
                     )
                     items.append(item)
                     if item.task_id not in session_read_ids:
@@ -167,7 +331,12 @@ def load_inbox_entries(
                 if task.task_id in seen_task_ids:
                     continue
                 seen_task_ids.add(task.task_id)
-                items.append(task_to_inbox_entry(task, db_path=db_path))
+                items.append(
+                    annotate_inbox_entry(
+                        task_to_inbox_entry(task, db_path=db_path),
+                        known_projects=known_projects,
+                    )
+                )
                 try:
                     rows = svc.get_context(task.task_id, entry_type="read", limit=1)
                 except Exception:  # noqa: BLE001

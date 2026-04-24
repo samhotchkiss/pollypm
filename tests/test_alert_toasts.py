@@ -460,6 +460,9 @@ def test_is_operational_alert_helper() -> None:
     assert _is_operational_alert("suspected_loop") is True
     assert _is_operational_alert("stabilize_failed") is True
     assert _is_operational_alert("needs_followup") is True
+    assert _is_operational_alert("pane:auth_expired") is True
+    assert _is_operational_alert("stuck_on_task:demo/1") is False
+    assert _is_operational_alert("no_session_for_assignment:demo/2") is False
     assert _is_operational_alert("auth_broken") is False
     assert _is_operational_alert("persona_swap_detected") is False
     assert _is_operational_alert("") is False

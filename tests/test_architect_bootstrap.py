@@ -367,6 +367,8 @@ def test_architect_session_resolves_architect_control_prompt(
     # prove we're not accidentally getting the worker prompt.
     assert "PollyPM Architect" in prompt
     assert "critic panel" in prompt.lower()
+    assert "Do NOT simulate the five critic voices" in prompt
+    assert "zero children means the panel never ran" in prompt.lower()
     # Worker prompt opens with a different persona; guard against a
     # silent swap by asserting the worker-specific phrasing is absent.
     assert "You are a PollyPM worker" not in prompt

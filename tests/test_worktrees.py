@@ -105,8 +105,12 @@ def test_ensure_worktree_adds_separator_before_path(
     commands: list[list[str]] = []
 
     def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        commands.append(cmd)
-        Path(cmd[8]).mkdir(parents=True, exist_ok=True)
+        if cmd[:3] == ["git", "-C", str(repo)] and cmd[3:5] == [
+            "worktree",
+            "add",
+        ]:
+            commands.append(cmd)
+            Path(cmd[8]).mkdir(parents=True, exist_ok=True)
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr("pollypm.worktrees.load_config", lambda _: config)

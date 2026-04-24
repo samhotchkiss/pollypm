@@ -23,6 +23,7 @@ def test_shipped_registry_includes_minimum_aliases() -> None:
         "sonnet-4.6",
         "haiku-4.5",
         "codex-gpt-5.4",
+        "codex-gpt-5.5",
     }.issubset(registry.aliases)
     shipped_text = resources.files("pollypm").joinpath("model_registry.toml").read_text(
         encoding="utf-8"
@@ -58,6 +59,10 @@ def test_resolve_alias_returns_assignment_and_miss_none() -> None:
     assert resolve_alias("codex-gpt-5.4", registry=registry) == ModelAssignment(
         provider="codex",
         model="gpt-5.4",
+    )
+    assert resolve_alias("codex-gpt-5.5", registry=registry) == ModelAssignment(
+        provider="codex",
+        model="gpt-5.5",
     )
     assert resolve_alias("missing-alias", registry=registry) is None
 

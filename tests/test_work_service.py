@@ -367,6 +367,25 @@ class TestClaim:
         # Breadcrumb cleared because the second provision succeeded.
         assert svc.last_provision_error is None
 
+    def test_claim_provisions_using_resolved_assignee_not_transition_actor(self, svc):
+        """Auto-claim bookkeeping actors should not become session identities."""
+        seen: list[tuple[str, str]] = []
+
+        class _RecordingSessionMgr:
+            def provision_worker(self, task_id, actor):
+                seen.append((task_id, actor))
+                return object()
+
+        svc.set_session_manager(_RecordingSessionMgr())
+
+        task = _create_standard_task(svc, description="Auto-claimed work")
+        svc.queue(task.task_id, "pm")
+        claimed = svc.claim(task.task_id, "auto_claim_sweep")
+
+        assert claimed.work_status == WorkStatus.IN_PROGRESS
+        assert seen == [(task.task_id, task.roles["worker"])]
+        assert seen[0][1] != "auto_claim_sweep"
+
 
 # ---------------------------------------------------------------------------
 # Cancel

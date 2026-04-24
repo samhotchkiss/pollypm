@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,9 +24,11 @@ from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
     _auto_claim_enabled_for_project,
     _auto_claim_next,
     _max_concurrent_for_project,
+    _open_project_work_service,
     _recover_dead_claims,
 )
 from pollypm.plugins_builtin.task_assignment_notify.resolver import _RuntimeServices
+from pollypm.work import task_assignment as bus
 from pollypm.work.models import WorkStatus
 from pollypm.work.sqlite_service import SQLiteWorkService
 
@@ -48,6 +51,22 @@ class _FakeProject:
         self.path = path
         self.auto_claim = auto_claim
         self.max_concurrent_workers = max_concurrent_workers
+
+
+class _FakeTmux:
+    def __init__(self, windows: list[object] | None = None) -> None:
+        self._windows = list(windows or [])
+
+    def list_windows(self, session_name: str) -> list[object]:
+        return list(self._windows)
+
+
+class _FakeSessionService:
+    def __init__(self, windows: list[object] | None = None) -> None:
+        self.tmux = _FakeTmux(windows)
+
+    def storage_closet_session_name(self) -> str:
+        return "pollypm-storage-closet"
 
 
 def _svc_defaults(**overrides) -> _RuntimeServices:
@@ -97,6 +116,51 @@ def test_max_concurrent_floors_at_one() -> None:
     ``auto_claim=false`` is the documented off switch. Floor at 1."""
     svc = _svc_defaults(max_concurrent_per_project=0)
     assert _max_concurrent_for_project(svc, _FakeProject()) == 1
+
+
+def test_open_project_work_service_wires_session_manager(tmp_path: Path, monkeypatch) -> None:
+    """Per-project sweep DBs must provision workers, not only claim in DB."""
+    project_path = tmp_path / "proj"
+    project_path.mkdir()
+    (project_path / ".git").mkdir()
+    db_path = project_path / ".pollypm" / "state.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    seed = SQLiteWorkService(db_path=db_path, project_path=project_path)
+    seed.close()
+
+    wired: dict[str, object] = {}
+
+    class DummySessionManager:
+        def __init__(self, *args, **kwargs) -> None:
+            wired["args"] = args
+            wired["kwargs"] = kwargs
+
+    monkeypatch.setattr(
+        "pollypm.session_services.create_tmux_client",
+        lambda: "tmux-client",
+    )
+    monkeypatch.setattr(
+        "pollypm.work.session_manager.SessionManager",
+        DummySessionManager,
+    )
+
+    services = _svc_defaults(
+        session_service=object(),
+        config=SimpleNamespace(project=SimpleNamespace(tmux_session="pollypm")),
+        storage_closet_name="pollypm-storage-closet",
+    )
+    project = _FakeProject(key="proj", path=project_path)
+
+    svc = _open_project_work_service(project, services)
+    try:
+        assert svc is not None
+        assert type(getattr(svc, "_session_mgr", None)).__name__ == "DummySessionManager"
+        assert wired["kwargs"]["project_path"] == project_path
+        assert wired["kwargs"]["storage_closet_name"] == "pollypm-storage-closet"
+        assert wired["kwargs"]["session_service"] is services.session_service
+    finally:
+        if svc is not None:
+            svc.close()
 
 
 # ---------------------------------------------------------------------------
@@ -263,5 +327,77 @@ def test_auto_claim_skips_when_plan_gate_closed(tmp_path: Path) -> None:
         _auto_claim_next(svc, work, _FakeProject(key="proj", path=project_path), totals)
         assert "auto_claim_spawned" not in totals["by_outcome"]
         assert work.get(task_id).work_status == WorkStatus.QUEUED
+    finally:
+        work.close()
+
+
+def test_auto_claim_ignores_chat_feedback_when_checking_plan_staleness(tmp_path: Path) -> None:
+    """A newer chat-flow rejection artifact must not freeze worker pickup."""
+    project_path = tmp_path / "proj"
+    project_path.mkdir()
+    _write_plan(project_path)
+    _seed_approved_plan(
+        project_path,
+        "proj",
+        approved_at=datetime.now(timezone.utc) - timedelta(hours=1),
+    )
+    task_id = _seed_queued_worker_task(project_path, "proj")
+
+    db_path = project_path / ".pollypm" / "state.db"
+    work = SQLiteWorkService(db_path=db_path, project_path=project_path)
+    try:
+        work.create(
+            title="Rejected proj/1 — Implement thing",
+            description="Returned to rework.",
+            type="task",
+            project="proj",
+            flow_template="chat",
+            roles={"requester": "reviewer", "operator": "user"},
+            priority="high",
+            labels=["review_feedback", "task:proj/1", "project:proj"],
+        )
+
+        svc = _svc_defaults()
+        totals = {"considered": 0, "by_outcome": {}}
+        _auto_claim_next(
+            svc, work, _FakeProject(key="proj", path=project_path), totals,
+        )
+
+        assert totals["by_outcome"].get("auto_claim_spawned", 0) == 1
+        assert work.get(task_id).work_status == WorkStatus.IN_PROGRESS
+    finally:
+        work.close()
+
+
+def test_recover_dead_claims_returns_task_to_claimable_queue(tmp_path: Path) -> None:
+    """#768 regression: a dead worker must leave the task genuinely
+    claimable again, not bounced back to ``in_progress``."""
+    bus.clear_listeners()
+    project_path = tmp_path / "proj"
+    project_path.mkdir()
+    task_id = _seed_queued_worker_task(
+        project_path, "proj", link_to_plan=False,
+    )
+
+    db_path = project_path / ".pollypm" / "state.db"
+    work = SQLiteWorkService(db_path=db_path, project_path=project_path)
+    try:
+        work.claim(task_id, "worker")
+
+        svc = _svc_defaults(session_service=_FakeSessionService())
+        totals = {"considered": 0, "by_outcome": {}}
+        _recover_dead_claims(
+            svc, work, _FakeProject(key="proj", path=project_path), totals,
+        )
+
+        assert totals["by_outcome"].get("auto_claim_recovered", 0) == 1
+        recovered = work.get(task_id)
+        assert recovered.work_status == WorkStatus.QUEUED
+        assert recovered.assignee is None
+        assert recovered.current_node_id is None
+        assert recovered.executions == []
+
+        reclaimed = work.claim(task_id, "worker")
+        assert reclaimed.work_status == WorkStatus.IN_PROGRESS
     finally:
         work.close()

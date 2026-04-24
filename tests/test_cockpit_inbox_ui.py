@@ -167,6 +167,53 @@ def _run(coro):
     asyncio.run(coro)
 
 
+def _visible_titles(app) -> list[str]:
+    from pollypm.cockpit_ui import _InboxListItem
+
+    return [
+        child.task_ref.title
+        for child in app.list_view.children
+        if isinstance(child, _InboxListItem)
+    ]
+
+
+def _triaged_entry(*, title: str, body: str = "", project: str = "demo"):
+    from pollypm.cockpit_inbox_items import InboxEntry, annotate_inbox_entry
+
+    return annotate_inbox_entry(
+        InboxEntry(
+            task_id="msg:test:1",
+            title=title,
+            description=body,
+            project=project,
+            labels=[],
+        ),
+        known_projects={"demo"},
+    )
+
+
+def test_inbox_triage_scores_compound_decision_ahead_of_blocker() -> None:
+    item = _triaged_entry(
+        title="Decision needed",
+        body="Waiting on clarity from upstream before implementation can continue.",
+    )
+
+    assert item.triage_bucket == "action"
+    assert item.triage_rank == 0
+    assert item.triage_label == "decision needed"
+
+
+def test_inbox_triage_completion_beats_generic_action_marker() -> None:
+    item = _triaged_entry(
+        title="[Action] Demo shipped cleanly",
+        body="Shipped to main with tests green.",
+    )
+
+    assert item.triage_bucket == "info"
+    assert item.triage_rank == 2
+    assert item.triage_label == "completed update"
+
+
 def test_inbox_lists_seeded_messages(inbox_env, inbox_app) -> None:
     """On mount, every seeded inbox task shows up in the left list."""
     async def body() -> None:
@@ -263,6 +310,92 @@ def test_selecting_a_row_renders_detail_and_clears_unread(inbox_env, inbox_app) 
             finally:
                 svc.close()
             assert len(reads) == 1
+    _run(body())
+
+
+def test_action_items_sort_ahead_of_completed_updates(
+    inbox_env, inbox_app,
+) -> None:
+    """Action-required rows stay above completion noise even if newer."""
+    workspace_root = inbox_env["project_path"].parent
+    _seed_workspace_message(
+        workspace_root,
+        subject="[Action] Fly.io setup needed for demo",
+        body="Set up Fly.io access so deploy checks can keep running.",
+        scope="demo",
+    )
+    _seed_workspace_message(
+        workspace_root,
+        subject="[Action] Demo shipped cleanly",
+        body="Shipped to main with tests green.",
+        scope="demo",
+    )
+
+    async def body() -> None:
+        async with inbox_app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            titles = _visible_titles(inbox_app)
+            assert "[Action] Fly.io setup needed for demo" in titles
+            assert "[Action] Demo shipped cleanly" in titles
+            assert titles.index("[Action] Fly.io setup needed for demo") < titles.index(
+                "[Action] Demo shipped cleanly"
+            )
+
+    _run(body())
+
+
+def test_orphaned_workspace_messages_hidden_by_default(
+    inbox_env, inbox_app,
+) -> None:
+    """Messages for deleted projects are quarantined unless explicitly shown."""
+    workspace_root = inbox_env["project_path"].parent
+    _seed_workspace_message(
+        workspace_root,
+        subject="[Action] Deleted project still asking for review",
+        body="This should not pollute the active inbox.",
+        scope="ghost_proj",
+    )
+
+    async def body() -> None:
+        async with inbox_app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert "[Action] Deleted project still asking for review" not in _visible_titles(inbox_app)
+            status_text = str(inbox_app.status.render()).lower()
+            assert "orphaned hidden" in status_text
+
+            inbox_app.action_toggle_filter_orphaned()
+            await pilot.pause()
+            assert "[Action] Deleted project still asking for review" in _visible_titles(inbox_app)
+
+    _run(body())
+
+
+def test_action_message_detail_shows_action_required_banner(
+    inbox_env, inbox_app,
+) -> None:
+    """Actionable messages render an explicit banner in the detail pane."""
+    workspace_root = inbox_env["project_path"].parent
+    title = "[Action] Fly.io setup needed for demo"
+    _seed_workspace_message(
+        workspace_root,
+        subject=title,
+        body="Set up Fly.io access so deploy checks can keep running.",
+        scope="demo",
+    )
+
+    async def body() -> None:
+        async with inbox_app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            titles = _visible_titles(inbox_app)
+            assert title in titles
+            row_index = titles.index(title)
+            inbox_app.list_view.index = row_index
+            await pilot.press("enter")
+            await pilot.pause()
+            detail_text = str(inbox_app.detail.render())
+            assert "Action Required" in detail_text
+            assert "setup needed" in detail_text.lower()
+
     _run(body())
 
 

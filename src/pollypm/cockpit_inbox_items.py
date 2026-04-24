@@ -103,7 +103,8 @@ _TRIAGE_PATTERN_REGISTRY = (
         "label": "action required",
         "score": 1,
         "pattern": re.compile(
-            r"^\[action\]|\b(action required|needs? your|need your|need Polly|question)\b",
+            r"^(\[action\]|action)\b|"
+            r"\b(action required|needs? your|need your|need Polly|question)\b",
             re.IGNORECASE,
         ),
     },

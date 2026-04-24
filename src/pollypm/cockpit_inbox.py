@@ -171,14 +171,12 @@ def _row_is_dev_channel(labels_raw: object) -> bool:
 
 
 def _count_inbox_tasks_for_label(config) -> int:
-    """Sum of inbox items across all tracked projects + workspace-root.
+    """Count actionable inbox items across tracked projects + workspace-root.
 
-    **#759: now matches what ``pm inbox`` (and the inbox pane) show.**
-    Previously counted only work-service chat-flow tasks (~13), while
-    the pane showed tasks + open ``notify`` / ``inbox_task`` / ``alert``
-    messages (~166). The rail and the pane disagreed by an order of
-    magnitude. This function now applies the same filter ``pm inbox``
-    uses so both numbers match by construction.
+    The cockpit rail is a notification surface, not an activity feed.
+    It should badge work that requires the user, while completion
+    updates and FYI messages stay discoverable inside the inbox's
+    all-messages lens.
 
     Dedupes:
     - Tasks by ``task_id`` so a task present in more than one DB counts
@@ -192,6 +190,11 @@ def _count_inbox_tasks_for_label(config) -> int:
     try:
         from pollypm.work.inbox_view import inbox_tasks
         from pollypm.work.sqlite_service import SQLiteWorkService
+        from pollypm.cockpit_inbox_items import (
+            annotate_inbox_entry,
+            message_row_to_inbox_entry,
+            task_to_inbox_entry,
+        )
     except Exception:  # noqa: BLE001
         return 0
 
@@ -212,7 +215,12 @@ def _count_inbox_tasks_for_label(config) -> int:
                 db_path=db_path, project_path=project_path,
             ) as svc:
                 for task in inbox_tasks(svc, project=project_key):
-                    seen_task_ids.add(task.task_id)
+                    item = annotate_inbox_entry(
+                        task_to_inbox_entry(task, db_path=db_path),
+                        known_projects=known_projects,
+                    )
+                    if getattr(item, "needs_action", False):
+                        seen_task_ids.add(task.task_id)
         except Exception:  # noqa: BLE001
             pass
 
@@ -260,7 +268,16 @@ def _count_inbox_tasks_for_label(config) -> int:
                 # user-facing inbox badge.
                 if _row_is_dev_channel(labels_raw):
                     continue
-                seen_message_keys.add((str(scope), row_id))
+                item = annotate_inbox_entry(
+                    message_row_to_inbox_entry(
+                        row,
+                        source_key=project_key or "__workspace__",
+                        db_path=db_path,
+                    ),
+                    known_projects=known_projects,
+                )
+                if getattr(item, "needs_action", False):
+                    seen_message_keys.add((str(scope), row_id))
         finally:
             try:
                 store.close()

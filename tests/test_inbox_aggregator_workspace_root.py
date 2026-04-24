@@ -156,7 +156,7 @@ def _seed_message(
     scope: str = "demo",
     type_: str = "notify",
     state: str = "open",
-    subject: str = "notify title",
+    subject: str = "[Action] notify title",
     payload: dict | None = None,
     labels: list[str] | None = None,
 ) -> int:
@@ -181,10 +181,11 @@ def _seed_message(
         store.close()
 
 
-def test_aggregator_counts_open_messages_not_just_tasks(env) -> None:
-    """#759 regression: the rail badge count must include open notify/
-    inbox_task/alert messages, not only work-service chat-flow tasks.
-    Before this fix the rail showed 13 while the inbox pane showed 166.
+def test_aggregator_counts_actionable_messages_not_just_tasks(env) -> None:
+    """The rail badge counts actionable notify/inbox_task/alert messages.
+
+    FYI activity stays discoverable in the inbox all-messages lens, but
+    it must not inflate the rail badge.
     """
     # One work-service task so the task-only path is still exercised.
     _seed(env["project_db"], env["project_path"],
@@ -200,6 +201,14 @@ def test_aggregator_counts_open_messages_not_just_tasks(env) -> None:
     assert count == 4, f"expected 1 task + 3 notifies, got {count}"
 
 
+def test_aggregator_skips_fyi_messages(env) -> None:
+    """Completion/FYI notifications should not inflate the rail badge."""
+    _seed_message(env["workspace_db"], scope="inbox", subject="Demo shipped cleanly")
+
+    count = _count_inbox_tasks_for_label(_load_cfg(env["config_path"]))
+    assert count == 0, f"expected no actionable messages, got {count}"
+
+
 def test_aggregator_skips_non_open_messages(env) -> None:
     """Only state=open messages contribute. Archived / resolved don't."""
     # Seed one open + one archived so we can verify filter.
@@ -213,8 +222,12 @@ def test_aggregator_skips_non_open_messages(env) -> None:
 
 def test_aggregator_skips_deleted_project_workspace_messages(env) -> None:
     """Workspace-root messages for untracked projects stay out of the badge."""
-    _seed_message(env["workspace_db"], scope="demo", subject="live project")
-    _seed_message(env["workspace_db"], scope="ghost_proj", subject="deleted project")
+    _seed_message(env["workspace_db"], scope="demo", subject="[Action] live project")
+    _seed_message(
+        env["workspace_db"],
+        scope="ghost_proj",
+        subject="[Action] deleted project",
+    )
 
     count = _count_inbox_tasks_for_label(_load_cfg(env["config_path"]))
     assert count == 1, (
@@ -227,13 +240,13 @@ def test_aggregator_skips_deleted_project_payload_messages(env) -> None:
     _seed_message(
         env["workspace_db"],
         scope="inbox",
-        subject="live project payload",
+        subject="[Action] live project payload",
         payload={"project": "demo"},
     )
     _seed_message(
         env["workspace_db"],
         scope="inbox",
-        subject="deleted project payload",
+        subject="[Action] deleted project payload",
         payload={"project": "ghost_proj"},
     )
 
@@ -334,7 +347,7 @@ def test_aggregator_skips_dev_channel_messages(env) -> None:
         store.enqueue_message(
             type="notify", tier="immediate", scope="inbox",
             sender="polly", recipient="user",
-            subject="real action", body="body",
+            subject="[Action] real action", body="body",
         )
         # Two dev-channel test notifications.
         for i in range(2):

@@ -181,6 +181,8 @@ def _triage_for_entry(
             ),
         )
         return str(winner["bucket"]), int(winner["rank"]), str(winner["label"])
+    if getattr(item, "source", None) == "task":
+        return "action", 1, "task assigned"
     return "info", 2, "update"
 
 

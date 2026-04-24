@@ -214,6 +214,29 @@ def test_inbox_triage_completion_beats_generic_action_marker() -> None:
     assert item.triage_label == "completed update"
 
 
+def test_task_backed_inbox_entries_default_to_action() -> None:
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_inbox_items import annotate_inbox_entry, task_to_inbox_entry
+
+    task = SimpleNamespace(
+        task_id="demo/1",
+        title="Smoke subject",
+        description="Plain assigned work with no keyword markers.",
+        project="demo",
+        labels=[],
+        roles={},
+    )
+
+    item = annotate_inbox_entry(
+        task_to_inbox_entry(task, db_path=None),
+        known_projects={"demo"},
+    )
+
+    assert item.needs_action is True
+    assert item.triage_label == "task assigned"
+
+
 def test_inbox_lists_seeded_messages(inbox_env, inbox_app) -> None:
     """On mount, every seeded inbox task shows up in the left list."""
     async def body() -> None:
@@ -333,6 +356,15 @@ def test_action_items_sort_ahead_of_completed_updates(
 
     async def body() -> None:
         async with inbox_app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            titles = _visible_titles(inbox_app)
+            assert "[Action] Fly.io setup needed for demo" in titles
+            assert "[Action] Demo shipped cleanly" not in titles
+            status_text = str(inbox_app.status.render())
+            assert "FYI hidden" in status_text
+            assert "m show all" in status_text
+
+            await pilot.press("m")
             await pilot.pause()
             titles = _visible_titles(inbox_app)
             assert "[Action] Fly.io setup needed for demo" in titles
@@ -623,7 +655,17 @@ def test_archive_closes_store_notification_and_removes_row(inbox_env, inbox_app)
             )
             assert message_item is not None
 
-            inbox_app.list_view.index = inbox_app._tasks.index(message_item)
+            await pilot.press("m")
+            await pilot.pause()
+            from pollypm.cockpit_ui import _InboxListItem
+            visible_items = [
+                child for child in inbox_app.list_view.children
+                if isinstance(child, _InboxListItem)
+            ]
+            inbox_app.list_view.index = next(
+                idx for idx, child in enumerate(visible_items)
+                if child.task_ref.message_id == message_id
+            )
             await pilot.press("enter")
             await pilot.pause()
             await pilot.press("a")
@@ -1163,7 +1205,7 @@ def test_inbox_app_honors_initial_project_filter(inbox_env) -> None:
 
 
 def test_inbox_app_without_initial_project_stays_global(inbox_env) -> None:
-    """Legacy path: no initial_project means no filter pre-applied."""
+    """No initial_project means no project scope; default action lens is visible."""
     if not _load_config_compatible(inbox_env["config_path"]):
         pytest.skip("minimal pollypm.toml fixture not supported by loader")
     from pollypm.cockpit_ui import PollyInboxApp
@@ -1174,7 +1216,8 @@ def test_inbox_app_without_initial_project_stays_global(inbox_env) -> None:
         async with app.run_test(size=(140, 40)) as pilot:
             await pilot.pause()
             assert app._filter_project is None
-            assert app.filter_bar.display is False
+            assert app.filter_bar.display is True
+            assert "action needed" in str(app.filter_chips.render())
 
     _run(body())
 

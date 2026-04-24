@@ -5603,6 +5603,7 @@ class PollyInboxApp(App[None]):
         Binding("l", "toggle_filter_plan_review", "Plan review", show=False),
         Binding("b", "toggle_filter_blocking", "Blocking", show=False),
         Binding("O", "toggle_filter_orphaned", "Orphaned", show=False),
+        Binding("m", "toggle_show_all_messages", "All messages", show=False),
         Binding("c", "clear_filters", "Clear filters", show=False),
         # Refresh: ``u`` re-bound to filter, so refresh moves to ``ctrl+r``
         # (palette 'session.refresh' still works from any screen).
@@ -5681,6 +5682,7 @@ class PollyInboxApp(App[None]):
         self._filter_plan_review: bool = False
         self._filter_blocking: bool = False
         self._show_orphaned: bool = False
+        self._show_all_messages: bool = False
         self._filter_bar_visible: bool = False
         # Rollup state — populated on each rollup render. Index-keyed so
         # the click handler can look up which item was expanded.
@@ -5900,19 +5902,27 @@ class PollyInboxApp(App[None]):
         in that case we omit the "N of M" framing for visual calm.
         """
         unread_n = len(self._unread_ids)
-        actionable_n = sum(1 for item in self._filtered_tasks(self._tasks) if getattr(item, "needs_action", False))
+        candidates = self._explicitly_filtered_tasks(self._tasks)
+        using_action_lens = self._uses_action_lens_for(candidates)
+        actionable_n = sum(1 for item in candidates if getattr(item, "needs_action", False))
+        hidden_fyi_n = max(0, len(candidates) - shown) if using_action_lens else 0
         hidden_orphaned_n = 0 if self._show_orphaned else sum(
             1 for item in self._tasks if getattr(item, "is_orphaned", False)
         )
         bits: list[str] = []
-        if (self._has_active_filters() or hidden_orphaned_n) and shown != total:
+        if using_action_lens:
+            bits.append(f"{shown} need action")
+        elif (self._has_active_filters() or hidden_orphaned_n) and shown != total:
             bits.append(f"{shown} of {total} shown")
         else:
             bits.append(f"{shown} messages")
         if unread_n:
             bits.append(f"{unread_n} unread")
-        if actionable_n:
+        if actionable_n and not using_action_lens:
             bits.append(f"{actionable_n} need action")
+        if hidden_fyi_n:
+            bits.append(f"{hidden_fyi_n} FYI hidden")
+            bits.append("m show all")
         if hidden_orphaned_n:
             bits.append(f"{hidden_orphaned_n} orphaned hidden")
         desc = self._describe_filters()
@@ -5997,7 +6007,7 @@ class PollyInboxApp(App[None]):
     # ------------------------------------------------------------------
 
     def _reset_filter_state(self) -> None:
-        """Clear every filter back to the "show everything" baseline."""
+        """Clear filters back to the action-focused inbox baseline."""
         self._filter_text = ""
         self._filter_unread_only = False
         self._filter_project = None
@@ -6005,6 +6015,7 @@ class PollyInboxApp(App[None]):
         self._filter_plan_review = False
         self._filter_blocking = False
         self._show_orphaned = False
+        self._show_all_messages = False
         self._filter_bar_visible = False
 
     def _has_active_filters(self) -> bool:
@@ -6017,6 +6028,7 @@ class PollyInboxApp(App[None]):
                 self._filter_plan_review,
                 self._filter_blocking,
                 self._show_orphaned,
+                self._show_all_messages,
             )
         )
 
@@ -6026,6 +6038,16 @@ class PollyInboxApp(App[None]):
         Cheap O(N * filters) — the inbox is at most a few hundred rows
         and the chips short-circuit, so we don't need anything fancier.
         """
+        candidates = self._explicitly_filtered_tasks(tasks)
+        if self._uses_action_lens_for(candidates):
+            return [
+                item for item in candidates
+                if getattr(item, "needs_action", False)
+            ]
+        return candidates
+
+    def _explicitly_filtered_tasks(self, tasks: list) -> list:
+        """Apply user-selected filters, excluding the default action lens."""
         if not self._has_active_filters() and self._show_orphaned:
             return list(tasks)
         text_q = self._filter_text.strip().lower()
@@ -6054,6 +6076,12 @@ class PollyInboxApp(App[None]):
                     continue
             out.append(t)
         return out
+
+    def _uses_action_lens_for(self, tasks: list) -> bool:
+        """Default inbox view: show actionable work, hide FYI noise."""
+        if self._show_all_messages or self._show_orphaned:
+            return False
+        return any(getattr(item, "needs_action", False) for item in tasks)
 
     def _task_haystack(self, task) -> str:
         """Concatenate searchable fields for fuzzy matching."""
@@ -6085,6 +6113,10 @@ class PollyInboxApp(App[None]):
             bits.append("blocking_question")
         if self._show_orphaned:
             bits.append("show_orphaned")
+        if self._uses_action_lens_for(self._explicitly_filtered_tasks(self._tasks)):
+            bits.append("action_needed")
+        elif self._show_all_messages:
+            bits.append("all_messages")
         if self._filter_text:
             bits.append(f'"{self._filter_text}"')
         return " \u00b7 ".join(bits)
@@ -6113,6 +6145,10 @@ class PollyInboxApp(App[None]):
             chip_bits.append("[on #1e2730] blocking_question [/on #1e2730]")
         if self._show_orphaned:
             chip_bits.append("[on #1e2730] show orphaned [/on #1e2730]")
+        if self._uses_action_lens_for(self._explicitly_filtered_tasks(self._tasks)):
+            chip_bits.append("[on #1e2730] action needed [/on #1e2730]")
+        elif self._show_all_messages:
+            chip_bits.append("[on #1e2730] all messages [/on #1e2730]")
         if self._filter_text:
             chip_bits.append(
                 f'[on #1e2730] "{_escape(self._filter_text)}" [/on #1e2730]'
@@ -6166,6 +6202,12 @@ class PollyInboxApp(App[None]):
         if self.reply_input.has_focus or self.filter_input.has_focus:
             return
         self._show_orphaned = not self._show_orphaned
+        self._render_list(select_first=True)
+
+    def action_toggle_show_all_messages(self) -> None:
+        if self.reply_input.has_focus or self.filter_input.has_focus:
+            return
+        self._show_all_messages = not self._show_all_messages
         self._render_list(select_first=True)
 
     def action_clear_filters(self) -> None:
@@ -7221,11 +7263,11 @@ class PollyInboxApp(App[None]):
 
     _DEFAULT_HINT = (
         "j/k move \u00b7 \u21b5 open \u00b7 r reply \u00b7 a archive "
-        "\u00b7 d discuss \u00b7 / filter \u00b7 c clear \u00b7 q back"
+        "\u00b7 d discuss \u00b7 / filter \u00b7 m all \u00b7 c clear \u00b7 q back"
     )
     _MESSAGE_HINT = (
         "j/k move \u00b7 \u21b5 open \u00b7 a archive "
-        "\u00b7 d discuss \u00b7 / filter \u00b7 c clear \u00b7 q back"
+        "\u00b7 d discuss \u00b7 / filter \u00b7 m all \u00b7 c clear \u00b7 q back"
     )
     _PROPOSAL_HINT = (
         "A accept \u00b7 X reject \u00b7 r reply \u00b7 q back"

@@ -153,7 +153,7 @@ class PollyWorkerRosterApp(App[None]):
     def on_mount(self) -> None:
         self.table.cursor_type = "row"
         self.table.add_columns(
-            "Project", "Session", "Health", "Task", "Node", "Turn", "Last commit",
+            "Project", "Worker", "Health", "Task", "Node", "Turn", "Last commit",
         )
         self._refresh()
         _setup_alert_notifier(self, bind_a=False)

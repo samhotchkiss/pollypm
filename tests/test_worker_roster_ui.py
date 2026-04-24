@@ -154,6 +154,21 @@ def test_status_dots_for_each_category(roster_env, roster_app) -> None:
     _run(body())
 
 
+def test_working_worker_without_heartbeat_explains_tmux_activity() -> None:
+    from pollypm.cockpit_inbox import _worker_health_snapshot
+
+    health, tooltip = _worker_health_snapshot(
+        status="working",
+        last_heartbeat_iso=None,
+        token_total=0,
+        session_name="worker_demo",
+    )
+
+    assert health == "alive"
+    assert "working; heartbeat not recorded" in tooltip
+    assert "session: worker_demo" in tooltip
+
+
 def test_session_column_prefixes_avatar(roster_env, roster_app) -> None:
     async def body() -> None:
         rows = [_make_row(session_name="task-demo-42")]

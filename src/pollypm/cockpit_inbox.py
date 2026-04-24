@@ -743,7 +743,6 @@ def _worker_health_snapshot(
     session_name: str,
 ) -> tuple[str, str]:
     """Map worker state to a health bucket + tooltip."""
-    heartbeat_age = _format_heartbeat_age(last_heartbeat_iso)
     if status in {"stuck", "offline"}:
         health = "unresponsive"
     elif status == "idle":
@@ -757,8 +756,14 @@ def _worker_health_snapshot(
         health = "idle_warn" if idle_long else "alive"
     else:
         health = "alive"
+    if last_heartbeat_iso:
+        heartbeat_part = f"last heartbeat {_format_heartbeat_age(last_heartbeat_iso)}"
+    elif status in {"working", "idle"}:
+        heartbeat_part = f"{status}; heartbeat not recorded"
+    else:
+        heartbeat_part = "last heartbeat unknown"
     tooltip = (
-        f"last heartbeat {heartbeat_age} · {_format_token_total(token_total)} tokens"
+        f"{heartbeat_part} · {_format_token_total(token_total)} tokens"
         f" · session: {session_name}"
     )
     return health, tooltip

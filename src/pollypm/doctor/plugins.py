@@ -38,8 +38,9 @@ def check_builtin_plugin_manifests() -> doctor.CheckResult:
             bad.append((manifest.parent.name, str(exc)))
     if bad:
         summary = ", ".join(f"{n} ({e[:40]})" for n, e in bad)
+        manifest_word = "manifest" if len(bad) == 1 else "manifests"
         return doctor._fail(
-            f"{len(bad)} plugin manifest(s) failed to parse: {summary}",
+            f"{len(bad)} plugin {manifest_word} failed to parse: {summary}",
             why=(
                 "Plugin discovery halts on malformed manifests; affected "
                 "capabilities silently vanish from the host."
@@ -52,7 +53,12 @@ def check_builtin_plugin_manifests() -> doctor.CheckResult:
             ),
             data={"bad": [n for n, _ in bad]},
         )
-    return doctor._ok(f"{seen} builtin plugin manifest(s) parse", data={"count": seen})
+    manifest_word = "manifest" if seen == 1 else "manifests"
+    parse_verb = "parses" if seen == 1 else "parse"
+    return doctor._ok(
+        f"{seen} builtin plugin {manifest_word} {parse_verb}",
+        data={"count": seen},
+    )
 
 
 def check_no_critical_plugin_disabled() -> doctor.CheckResult:
@@ -68,8 +74,9 @@ def check_no_critical_plugin_disabled() -> doctor.CheckResult:
     disabled = set(getattr(getattr(config, "plugins", None), "disabled", ()) or ())
     conflicts = sorted(disabled & set(_CRITICAL_PLUGINS_FOR_BOOT))
     if conflicts:
+        plugin_word = "plugin" if len(conflicts) == 1 else "plugins"
         return doctor._fail(
-            f"critical plugin(s) disabled: {', '.join(conflicts)}",
+            f"critical {plugin_word} disabled: {', '.join(conflicts)}",
             why=(
                 "PollyPM's session lifecycle is driven by the tmux_session_service "
                 "plugin. Disabling it leaves every `pm up`, `pm attach`, and "

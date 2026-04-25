@@ -423,6 +423,10 @@ def test_check_no_critical_plugin_disabled_fails(
     result = doctor.check_no_critical_plugin_disabled()
     assert not result.passed
     assert "tmux_session_service" in result.status
+    # Cycle 74: pluralise per count — single conflict reads ``critical
+    # plugin disabled`` (not ``plugin(s)``).
+    assert "critical plugin disabled:" in result.status
+    assert "plugin(s)" not in result.status
 
 
 def test_check_plugin_capability_shapes_clean() -> None:

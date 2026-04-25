@@ -412,18 +412,29 @@ def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
     recoveries = sum(1 for e in day_events if "recover" in e.event_type)
 
     # Morning briefing: generate if there are overnight results
+    def _plural(count: int, singular: str, plural: str | None = None) -> str:
+        word = singular if count == 1 else (plural or f"{singular}s")
+        return f"{count} {word}"
+
     briefing = ""
     if commits or completed or inbox_count or recoveries:
         parts: list[str] = []
         if commits:
             projects_touched = len({c.project for c in commits})
-            parts.append(f"{len(commits)} commits across {projects_touched} project(s)")
+            parts.append(
+                f"{_plural(len(commits), 'commit')} across "
+                f"{_plural(projects_touched, 'project')}"
+            )
         if completed:
-            parts.append(f"{len(completed)} issue(s) completed")
+            parts.append(f"{_plural(len(completed), 'issue')} completed")
         if inbox_count:
-            parts.append(f"{inbox_count} inbox item(s) waiting for you")
+            parts.append(
+                f"{_plural(inbox_count, 'inbox item')} waiting for you"
+            )
         if recoveries:
-            parts.append(f"{recoveries} session recovery(ies)")
+            parts.append(
+                _plural(recoveries, "session recovery", "session recoveries")
+            )
         briefing = "While you were away: " + ", ".join(parts) + "."
 
     # Late import keeps dashboard_data out of the cockpit_alerts import

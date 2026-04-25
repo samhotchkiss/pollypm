@@ -102,8 +102,9 @@ def check_tracked_project_state_parents() -> doctor.CheckResult:
         if not parent.exists():
             missing.append(parent)
     if missing:
+        path_word = "path" if len(missing) == 1 else "paths"
         return doctor._fail(
-            f"{len(missing)} tracked project path(s) missing",
+            f"{len(missing)} tracked project {path_word} missing",
             why=(
                 "PollyPM tracks projects by filesystem path; a missing path "
                 "means `pm scan-projects` will flag them and every per-task "

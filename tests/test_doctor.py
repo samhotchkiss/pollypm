@@ -636,6 +636,35 @@ def test_tracked_project_paths_missing(monkeypatch: pytest.MonkeyPatch, tmp_path
     monkeypatch.setattr("pollypm.config.load_config", lambda p=cfg_path: fake)
     result = doctor.check_tracked_project_state_parents()
     assert not result.passed
+    # Cycle 72: pluralise per count — single missing path now reads
+    # ``1 tracked project path missing`` (not ``path(s)``).
+    assert "1 tracked project path missing" in result.status
+    assert "path(s)" not in result.status
+
+
+def test_tracked_project_paths_missing_pluralises_at_two(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Two missing paths → ``2 tracked project paths missing``."""
+    from pollypm import config as config_mod
+
+    cfg_path = tmp_path / "pollypm.toml"
+    cfg_path.touch()
+    monkeypatch.setattr(config_mod, "DEFAULT_CONFIG_PATH", cfg_path)
+    fake = type(
+        "C", (),
+        {
+            "projects": {
+                "a": type("P", (), {"tracked": True, "path": tmp_path / "missing_a"})(),
+                "b": type("P", (), {"tracked": True, "path": tmp_path / "missing_b"})(),
+            }
+        },
+    )()
+    monkeypatch.setattr("pollypm.config.load_config", lambda p=cfg_path: fake)
+    result = doctor.check_tracked_project_state_parents()
+    assert not result.passed
+    assert "2 tracked project paths missing" in result.status
+    assert "path(s)" not in result.status
 
 
 def test_disk_space_passes_when_plenty(monkeypatch: pytest.MonkeyPatch) -> None:

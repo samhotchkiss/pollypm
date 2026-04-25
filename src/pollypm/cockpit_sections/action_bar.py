@@ -14,7 +14,10 @@ def render_project_action_bar(
     """Return a compact summary of the project's actionable work."""
     bits: list[str] = []
     if blocker_count:
-        bits.append(f"{blocker_count} blocker{'s' if blocker_count != 1 else ''}")
+        bits.append(
+            f"{blocker_count} waiting on dependenc"
+            f"{'ies' if blocker_count != 1 else 'y'}"
+        )
     if on_hold_count:
         bits.append(f"{on_hold_count} on hold")
     if review_count:
@@ -22,7 +25,7 @@ def render_project_action_bar(
     if alert_count:
         bits.append(f"{alert_count} alert{'s' if alert_count != 1 else ''}")
     if inbox_count:
-        bits.append(f"{inbox_count} new in inbox")
+        bits.append(f"{inbox_count} need action")
     if not bits:
-        return "▸ Clear · no approvals, alerts, or inbox items"
+        return "▸ Clear · no approvals, alerts, or user actions"
     return "▸ " + " · ".join(bits)

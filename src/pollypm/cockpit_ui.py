@@ -144,7 +144,9 @@ _ORDERED_LIST_RE = _re.compile(r"\s*\d+\.\s")
 _PROJECT_TASK_REF_RE = _re.compile(
     r"\b(?P<project>[A-Za-z0-9_][A-Za-z0-9_-]*)/(?P<number>\d+)\b"
 )
-_ACTION_STEP_RE = _re.compile(r"^\s*(?:[-*]\s+|\d+\.\s+)(?P<step>.+\S)\s*$")
+_ACTION_STEP_RE = _re.compile(
+    r"^\s*(?:[-*]\s+|\d+\.\s+|\([a-zA-Z]\)\s+)(?P<step>.+\S)\s*$"
+)
 
 
 def _md_to_rich(text: str) -> str:
@@ -7949,12 +7951,14 @@ def _dashboard_status(
       project (nothing in flight but attention is required).
     * Dim — idle / no activity.
     """
-    if blocker_count:
-        return ("\u25c6", "#f85149", "blocked")
     if active_worker is not None:
         return ("\u25cf", "#3ddc84", "active")
-    if inbox_count or alert_count or on_hold_count:
+    if alert_count:
+        return ("\u25c6", "#f85149", "alert")
+    if inbox_count or on_hold_count:
         return ("\u25c6", "#f0c45a", "needs attention")
+    if blocker_count:
+        return ("\u25cb", "#6b7a88", "waiting on dependencies")
     return ("\u25cb", "#4a5568", "idle")
 
 
@@ -8058,6 +8062,152 @@ class ProjectDashboardData:
 _PROJECT_DASHBOARD_TASK_CACHE: dict[str, tuple[float, dict[str, int], dict[str, list[dict]]]] = {}
 
 
+def _dashboard_plain_text(value: object | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = _re.sub(r"[*_`#>\[\]]+", "", text)
+    text = " ".join(part.strip() for part in text.splitlines() if part.strip())
+    return _re.sub(r"^\([a-zA-Z]\)\s+", "", text)
+
+
+def _dashboard_trim(text: str, *, limit: int = 220) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _dashboard_summary_from_body(body: str) -> str:
+    paragraphs = [
+        _dashboard_plain_text(part)
+        for part in body.replace("\\n", "\n").split("\n\n")
+        if _dashboard_plain_text(part)
+    ]
+    for paragraph in paragraphs:
+        lower = paragraph.lower()
+        if lower.startswith("blocker:"):
+            return _dashboard_trim(paragraph[8:].strip())
+    for paragraph in paragraphs:
+        lower = paragraph.lower()
+        if lower.startswith(("task:", "status:")):
+            continue
+        if any(
+            token in lower
+            for token in (
+                "blocked",
+                "waiting on",
+                "without ",
+                "requires ",
+                "acceptance gate",
+                "scope split",
+                "not achievable",
+                "request one of",
+                "need your call",
+                "needs your call",
+            )
+        ):
+            return _dashboard_trim(paragraph)
+    for paragraph in paragraphs:
+        lower = paragraph.lower()
+        if lower.startswith(("task:", "status:")):
+            continue
+        return _dashboard_trim(paragraph)
+    return ""
+
+
+def _dashboard_requirement_step(part: str) -> str:
+    cleaned = _dashboard_plain_text(part).strip(" .,:;")
+    if not cleaned:
+        return ""
+    lower = cleaned.lower()
+    if lower.startswith(("a ", "an ", "the ")):
+        cleaned = cleaned.split(" ", 1)[1]
+        lower = cleaned.lower()
+    if lower.endswith(" provisioned"):
+        cleaned = cleaned[: -len(" provisioned")]
+        return f"Provision {cleaned}"
+    if any(token in lower for token in ("cred", "access", "token", "login")):
+        return f"Grant {cleaned}"
+    if any(token in lower for token in ("app", "pipeline", "deploy", "fly.io")):
+        return f"Set up {cleaned}"
+    if any(token in lower for token in ("postgres", "redis", "database")):
+        return f"Provision {cleaned}"
+    if any(
+        lower.startswith(verb)
+        for verb in (
+            "accept",
+            "reopen",
+            "create",
+            "run",
+            "exercise",
+            "verify",
+            "choose",
+            "split",
+            "grant",
+        )
+    ):
+        return cleaned[:1].upper() + cleaned[1:]
+    return cleaned[:1].upper() + cleaned[1:]
+
+
+def _dashboard_steps_from_body(body: str) -> list[str]:
+    body = body.replace("\\n", "\n")
+    steps: list[str] = []
+    for line in body.splitlines():
+        match = _ACTION_STEP_RE.match(line)
+        if match is not None:
+            step = _dashboard_plain_text(match.group("step"))
+            if step:
+                steps.append(step)
+    for paragraph in body.split("\n\n"):
+        plain = _dashboard_plain_text(paragraph)
+        lower = plain.lower()
+        for marker in ("without ", "requires "):
+            idx = lower.find(marker)
+            if idx < 0:
+                continue
+            chunk = plain[idx + len(marker):].split(". ", 1)[0]
+            chunk = chunk.replace(", and ", ", ").replace(" and ", ", ")
+            for part in chunk.split(","):
+                step = _dashboard_requirement_step(part)
+                if step:
+                    steps.append(step)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for step in steps:
+        key = step.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(step)
+    return deduped[:4]
+
+
+def _dashboard_task_blocker_body(task: object) -> str:
+    """Pick the clearest human-facing blocker text from a task."""
+    context = list(getattr(task, "context", []) or [])
+    for entry in reversed(context):
+        text = str(getattr(entry, "text", "") or "").strip()
+        lower = text.lower()
+        if not text:
+            continue
+        if any(
+            token in lower
+            for token in (
+                "blocker",
+                "blocked",
+                "scope split",
+                "request one of",
+                "not achievable",
+                "requires",
+                "waiting on",
+            )
+        ):
+            return text
+    return str(getattr(task, "description", "") or "")
+
+
 def _dashboard_gather_tasks(
     project_key: str, project_path: Path,
 ) -> tuple[dict[str, int], dict[str, list[dict]]]:
@@ -8086,6 +8236,7 @@ def _dashboard_gather_tasks(
         "in_progress": [],
         "review": [],
         "blocked": [],
+        "on_hold": [],
         "done": [],
     }
     counts: dict[str, int] = {}
@@ -8102,6 +8253,7 @@ def _dashboard_gather_tasks(
                 # back as datetime from the work-service hydrator.
                 if hasattr(updated_at, "isoformat"):
                     updated_at = updated_at.isoformat()
+                blocker_body = _dashboard_task_blocker_body(t)
                 buckets[status].append(
                     {
                         "task_id": t.task_id,
@@ -8110,6 +8262,12 @@ def _dashboard_gather_tasks(
                         "updated_at": updated_at,
                         "assignee": getattr(t, "assignee", None),
                         "current_node_id": getattr(t, "current_node_id", None),
+                        "summary": _dashboard_summary_from_body(blocker_body),
+                        "steps": _dashboard_steps_from_body(blocker_body),
+                        "blocked_by": [
+                            f"{proj}/{num}"
+                            for proj, num in getattr(t, "blocked_by", [])
+                        ],
                     }
                 )
     except Exception:  # noqa: BLE001
@@ -8229,7 +8387,8 @@ def _dashboard_inbox(
         if not text:
             return ""
         text = _re.sub(r"[*_`#>\[\]]+", "", text)
-        return " ".join(part.strip() for part in text.splitlines() if part.strip())
+        text = " ".join(part.strip() for part in text.splitlines() if part.strip())
+        return _re.sub(r"^\([a-zA-Z]\)\s+", "", text)
 
     def _message_body(value: object | None) -> str:
         text = str(value or "")
@@ -8538,7 +8697,12 @@ def _dashboard_inbox(
         action_items.append(item)
         if len(action_items) >= 2:
             break
-    return len(items), top, action_items
+    task_action_count = sum(
+        1
+        for item in items
+        if item.get("source") == "task" and item.get("needs_action")
+    )
+    return task_action_count + len(action_items), top, action_items
 
 
 def _dashboard_activity(
@@ -9199,10 +9363,34 @@ class PollyProjectDashboardApp(App[None]):
             lines.append("")
         elif on_hold_total:
             lines.append("[#f0c45a][b]On hold[/b][/]")
-            lines.append(
-                "  [dim]No user inbox action is requested yet. Open Tasks "
-                "for the held work item and resume it when appropriate.[/dim]"
-            )
+            on_hold_items = data.task_buckets.get("on_hold", [])[:2]
+            if on_hold_items:
+                lines.append(
+                    "  [dim]These are the root holds keeping downstream "
+                    "work waiting.[/dim]"
+                )
+                for item in on_hold_items:
+                    num = item.get("task_number")
+                    num_part = f"#{num} " if num is not None else ""
+                    title = _escape(item.get("title") or "")
+                    lines.append(f"  [#f0c45a]\u25c6[/#f0c45a] [b]{num_part}{title}[/b]")
+                    summary = _escape(item.get("summary") or "")
+                    if summary:
+                        lines.append(f"    {summary}")
+                    for idx, step in enumerate(item.get("steps") or [], start=1):
+                        lines.append(
+                            f"    [dim]{idx}.[/dim] {_escape(str(step))}"
+                        )
+                lines.append(
+                    "  [dim]Decide whether to approve the scoped code "
+                    "delivery, split operational acceptance, or provide the "
+                    "missing access/credentials.[/dim]"
+                )
+            else:
+                lines.append(
+                    "  [dim]No user inbox action is requested yet. Open Tasks "
+                    "for the held work item and resume it when appropriate.[/dim]"
+                )
             lines.append("")
 
         preview_items = [
@@ -9212,7 +9400,7 @@ class PollyProjectDashboardApp(App[None]):
         if count:
             lines.append(
                 f"[#f0c45a]\u25c6[/#f0c45a] [b]{count}[/b] "
-                f"[dim]open item{'s' if count != 1 else ''}[/dim]"
+                f"[dim]need action[/dim]"
             )
         if preview_items:
             if data.action_items:

@@ -877,7 +877,7 @@ def test_render_project_dashboard_integration(tmp_path: Path):
         assert heading in out, f"missing section: {heading}"
 
     # Content spot-checks.
-    assert "▸ Clear · no approvals, alerts, or inbox items" in out
+    assert "▸ Clear · no approvals, alerts, or user actions" in out
     assert "shortlink-gen" in out
     assert "1 in progress" in out
     assert "1 done" in out
@@ -965,7 +965,7 @@ def test_dashboard_visual_structure_is_stable(tmp_path: Path):
 def test_render_project_action_bar_summarizes_pending_counts() -> None:
     assert (
         render_project_action_bar(review_count=3, alert_count=1, inbox_count=5)
-        == "▸ 3 approvals · 1 alert · 5 new in inbox"
+        == "▸ 3 approvals · 1 alert · 5 need action"
     )
     assert (
         render_project_action_bar(
@@ -978,5 +978,14 @@ def test_render_project_action_bar_summarizes_pending_counts() -> None:
     )
     assert (
         render_project_action_bar(review_count=0, alert_count=0, inbox_count=0)
-        == "▸ Clear · no approvals, alerts, or inbox items"
+        == "▸ Clear · no approvals, alerts, or user actions"
+    )
+    assert (
+        render_project_action_bar(
+            review_count=0,
+            alert_count=0,
+            inbox_count=0,
+            blocker_count=2,
+        )
+        == "▸ 2 waiting on dependencies"
     )

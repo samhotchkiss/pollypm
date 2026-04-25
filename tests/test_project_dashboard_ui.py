@@ -372,6 +372,18 @@ def test_status_yellow_when_task_is_on_hold(
         )
         svc.queue(task.task_id, "polly")
         svc.hold(task.task_id, "polly", "paused by PM")
+        svc.add_context(
+            task.task_id,
+            "worker",
+            (
+                "Acceptance-gate scope split request.\n\n"
+                "The plan requires a live Fly.io app, deploy token, "
+                "Postgres, and Redis.\n\n"
+                "Request one of:\n"
+                "  (a) Split acceptance into a follow-up deploy drill.\n"
+                "  (b) Grant a Fly-enabled session with credentials.\n"
+            ),
+        )
 
     from pollypm import cockpit_ui as _cockpit_ui
     _cockpit_ui._PROJECT_DASHBOARD_TASK_CACHE.clear()
@@ -385,6 +397,9 @@ def test_status_yellow_when_task_is_on_hold(
             assert "on hold" in str(dashboard_app.pipeline_body.render())
             rendered = str(dashboard_app.inbox_body.render())
             assert "On hold" in rendered
+            assert "root holds keeping downstream work waiting" in rendered
+            assert "Split acceptance into a follow-up deploy drill" in rendered
+            assert "Grant a Fly-enabled session with credentials" in rendered
             assert "summary missing" not in rendered.lower()
 
     _run(body())

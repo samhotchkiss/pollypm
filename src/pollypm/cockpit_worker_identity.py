@@ -66,6 +66,11 @@ def _avatar_for_session(session_name: str, lowered: str) -> str:
         return "P"
     if lowered in {"reviewer", "russell"} or lowered.startswith("russell"):
         return "R"
+    # Architect sessions get their own glyph so the worker roster
+    # doesn't render "W architect" — the W avatar reads as a worker
+    # role, which an architect isn't.
+    if lowered == "architect" or lowered.startswith("architect"):
+        return "A"
     match = _TRAILING_DIGITS_RE.search(session_name)
     if match:
         return f"W{match.group(1)}"

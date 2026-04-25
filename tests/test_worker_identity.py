@@ -14,6 +14,11 @@ def test_worker_identity_is_stable_and_role_aware() -> None:
     assert first.avatar == "W42"
     assert worker_identity("polly").avatar == "P"
     assert worker_identity("russell").avatar == "R"
+    # Architect sessions get a dedicated glyph so the worker roster
+    # doesn't render "W architect" (which reads as worker-role).
+    assert worker_identity("architect").avatar == "A"
+    assert worker_identity("architect_booktalk").avatar == "A"
+    assert worker_identity("architect_polly_remote").avatar == "A"
     assert first.color.startswith("#")
     assert len(first.color) == 7
 

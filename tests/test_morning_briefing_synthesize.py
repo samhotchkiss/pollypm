@@ -215,7 +215,12 @@ class TestFallbackDraft:
         )
         assert draft.mode == "fallback"
         assert "without synthesis" in draft.markdown
-        assert "1 commits" in draft.markdown
+        # Cycle 66: pluralise per count — busy snapshot has 1 commit so the
+        # singular form should render.
+        assert "1 commit across" in draft.markdown
+        assert "1 commits" not in draft.markdown
+        assert "1 task completed" in draft.markdown
+        assert "1 approval," in draft.markdown
         assert "alpha" in draft.markdown
         # Watch bullets from blockers + aging approvals.
         assert any("Blocked" in w for w in draft.watch)

@@ -392,12 +392,23 @@ def build_fallback_draft(
         1 for commits in snapshot.commits_by_project.values() if commits
     )
 
+    n_commits = snapshot.total_commits()
+    n_completed = len(completed)
+    n_approved = len(approved)
+    n_insights = len(snapshot.advisor_insights)
+    n_artifacts = len(snapshot.downtime_artifacts)
+
+    def _w(n: int, sing: str, plur: str) -> str:
+        return sing if n == 1 else plur
+
     yesterday_text = (
-        f"Yesterday: {snapshot.total_commits()} commits across "
-        f"{projects_with_commits} project(s), "
-        f"{len(completed)} tasks completed, {len(approved)} approvals, "
-        f"{len(snapshot.advisor_insights)} advisor insights, "
-        f"{len(snapshot.downtime_artifacts)} downtime artifacts awaiting approval."
+        f"Yesterday: {n_commits} {_w(n_commits, 'commit', 'commits')} across "
+        f"{projects_with_commits} {_w(projects_with_commits, 'project', 'projects')}, "
+        f"{n_completed} {_w(n_completed, 'task', 'tasks')} completed, "
+        f"{n_approved} {_w(n_approved, 'approval', 'approvals')}, "
+        f"{n_insights} advisor {_w(n_insights, 'insight', 'insights')}, "
+        f"{n_artifacts} downtime {_w(n_artifacts, 'artifact', 'artifacts')} "
+        f"awaiting approval."
     )
 
     priority_lines: list[PriorityLine] = [

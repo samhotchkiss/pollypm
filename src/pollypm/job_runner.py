@@ -193,7 +193,10 @@ def _run_project_intelligence(supervisor: Supervisor, payload: dict[str, Any]) -
             subject="completed",
             payload={
                 "message": activity_summary(
-                    summary=f"Updated docs for {updated} project(s)",
+                    summary=(
+                        f"Updated docs for {updated} "
+                        f"{'project' if updated == 1 else 'projects'}"
+                    ),
                     severity="routine",
                     verb="updated",
                     subject="project_intelligence",
@@ -224,7 +227,8 @@ def _run_token_ledger_sync(supervisor: Supervisor, payload: dict[str, Any]) -> N
             payload={
                 "message": activity_summary(
                     summary=(
-                        f"Synced {len(samples)} transcript token sample(s)"
+                        f"Synced {len(samples)} transcript token "
+                        f"{'sample' if len(samples) == 1 else 'samples'}"
                     ),
                     severity="routine",
                     verb="synced",

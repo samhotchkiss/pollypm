@@ -366,7 +366,7 @@ class TestInboxCLI:
             inbox_app, ["archive", "--match", "*loop-test-*", "--db", db_path],
         )
         assert result.exit_code == 0, result.output
-        assert "Archived 2 message(s)" in result.output
+        assert "Archived 2 messages" in result.output
 
         # The non-matching message is still open.
         from pollypm.store import SQLAlchemyStore
@@ -388,7 +388,7 @@ class TestInboxCLI:
             ["archive", "--match", "*loop-test-*", "--dry-run", "--db", db_path],
         )
         assert result.exit_code == 0, result.output
-        assert "Would archive 2 message(s)" in result.output
+        assert "Would archive 2 messages" in result.output
         # State unchanged.
         from pollypm.store import SQLAlchemyStore
         store = SQLAlchemyStore(f"sqlite:///{db_path}")

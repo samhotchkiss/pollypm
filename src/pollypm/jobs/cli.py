@@ -298,7 +298,8 @@ def jobs_purge(
             deleted = cursor.rowcount or 0
     finally:
         queue.close()
-    typer.echo(f"Purged {deleted} {parsed.value} job(s).")
+    word = "job" if deleted == 1 else "jobs"
+    typer.echo(f"Purged {deleted} {parsed.value} {word}.")
 
 
 @jobs_app.command("drain")

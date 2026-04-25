@@ -592,7 +592,9 @@ def _bulk_archive_by_match(*, db: str, pattern: str, dry_run: bool) -> None:
         return
 
     if dry_run:
-        typer.echo(f"Would archive {len(matches)} message(s):")
+        n = len(matches)
+        word = "message" if n == 1 else "messages"
+        typer.echo(f"Would archive {n} {word}:")
         for row in matches[:20]:
             mid = row.get("id") or row.get("message_id")
             subject = row.get("subject") or row.get("title") or ""
@@ -615,7 +617,8 @@ def _bulk_archive_by_match(*, db: str, pattern: str, dry_run: bool) -> None:
             failures.append((int(mid), str(exc)))
     store.close()
 
-    typer.echo(f"Archived {closed} message(s) matching {pattern!r}.")
+    word = "message" if closed == 1 else "messages"
+    typer.echo(f"Archived {closed} {word} matching {pattern!r}.")
     if failures:
         typer.echo(f"Failed to archive {len(failures)}:", err=True)
         for mid, reason in failures[:5]:
@@ -666,7 +669,9 @@ def _bulk_archive_deleted_project_messages(*, db: str, dry_run: bool) -> None:
         return
 
     if dry_run:
-        typer.echo(f"Would archive {len(matches)} deleted-project message(s):")
+        n = len(matches)
+        word = "message" if n == 1 else "messages"
+        typer.echo(f"Would archive {n} deleted-project {word}:")
         for row, missing in matches[:20]:
             mid = row.get("id") or row.get("message_id")
             subject = row.get("subject") or row.get("title") or ""
@@ -690,7 +695,8 @@ def _bulk_archive_deleted_project_messages(*, db: str, dry_run: bool) -> None:
             failures.append((int(mid), str(exc)))
     store.close()
 
-    typer.echo(f"Archived {closed} deleted-project message(s).")
+    word = "message" if closed == 1 else "messages"
+    typer.echo(f"Archived {closed} deleted-project {word}.")
     if failures:
         typer.echo(f"Failed to archive {len(failures)}:", err=True)
         for mid, reason in failures[:5]:

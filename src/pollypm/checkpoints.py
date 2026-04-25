@@ -472,8 +472,10 @@ def create_issue_completion_checkpoint(
     ]
     work_completed: list[str] = []
     if files_changed:
+        n = len(files_changed)
+        word = "file" if n == 1 else "files"
         work_completed.append(
-            f"Modified {len(files_changed)} file(s): {', '.join(files_changed[:5])}"
+            f"Modified {n} {word}: {', '.join(files_changed[:5])}"
         )
     if test_files:
         work_completed.append(
@@ -731,7 +733,11 @@ def _extract_l1_heuristic(
     recommended_next_step = ""
 
     if level0.files_changed:
-        work_completed.append(f"Modified {len(level0.files_changed)} file(s): {', '.join(level0.files_changed[:5])}")
+        n = len(level0.files_changed)
+        word = "file" if n == 1 else "files"
+        work_completed.append(
+            f"Modified {n} {word}: {', '.join(level0.files_changed[:5])}"
+        )
     if level0.test_results:
         passed = level0.test_results.get("passed", 0)
         failed = level0.test_results.get("failed", 0)

@@ -282,7 +282,7 @@ def test_archive_deleted_project_messages_dry_run_does_not_close(
     )
 
     assert result.exit_code == 0, result.output
-    assert "Would archive 2 deleted-project message(s)" in result.output
+    assert "Would archive 2 deleted-project messages" in result.output
     from pollypm.store import SQLAlchemyStore
 
     store = SQLAlchemyStore(f"sqlite:///{env['workspace_db']}")
@@ -312,7 +312,7 @@ def test_archive_deleted_project_messages_closes_only_stale_refs(
     )
 
     assert result.exit_code == 0, result.output
-    assert "Archived 2 deleted-project message(s)." in result.output
+    assert "Archived 2 deleted-project messages." in result.output
     from pollypm.store import SQLAlchemyStore
 
     store = SQLAlchemyStore(f"sqlite:///{env['workspace_db']}")

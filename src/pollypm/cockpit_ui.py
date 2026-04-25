@@ -4371,7 +4371,7 @@ def _render_user_prompt_block(payload: object) -> str | None:
         for idx, step in enumerate(steps, start=1):
             lines.append(f"  [dim]{idx}.[/dim] {_escape(step)}")
     if question:
-        lines.append(f"  [b]Decision[/b] {_escape(question)}")
+        lines.append(f"  [b]Decision:[/b] {_escape(question)}")
     return "\n".join(lines)
 
 
@@ -9933,7 +9933,7 @@ class PollyProjectDashboardApp(App[None]):
                     item.get("decision_question")
                     or "Choose how Polly should proceed."
                 )
-                lines.append(f"    [b]Decision[/b] {question}")
+                lines.append(f"    [b]Decision:[/b] {question}")
             # One discoverability hint at the bottom of the stack — was
             # previously per-item, which read as "Click this message
             # to open the source task." repeated verbatim under each

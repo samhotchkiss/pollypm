@@ -937,6 +937,28 @@ def test_format_blocked_dep_truncates_long_titles() -> None:
     assert len(rendered) < len(long_title) + len("polly_remote/12 ()")
 
 
+def test_render_user_prompt_block_uses_decision_colon_label() -> None:
+    """Inline ``[b]Decision[/b]`` without a colon read as the start of
+    a sentence rather than a label. Adding the colon turns it into a
+    parseable inline label so the operator's eye finds the question
+    quickly without having to mentally insert punctuation.
+    """
+    from pollypm.cockpit_ui import _render_user_prompt_block
+
+    payload = {
+        "user_prompt": {
+            "summary": "A full project plan is ready.",
+            "steps": ["Open the plan."],
+            "question": "Approve?",
+        }
+    }
+    rendered = _render_user_prompt_block(payload)
+    assert rendered is not None
+    assert "[b]Decision:[/b]" in rendered
+    # Pre-fix form must be gone.
+    assert "[b]Decision[/b] Approve" not in rendered
+
+
 def test_action_card_click_hint_collapses_per_item_duplication() -> None:
     """Action Needed cards used to repeat
     ``"Click this message to open the source task."`` verbatim

@@ -518,6 +518,36 @@ def test_user_prompt_block_surfaces_summary_steps_and_decision() -> None:
     assert "Approve the work now" in rendered
 
 
+def test_heuristic_action_block_extracts_summary_and_steps_from_body() -> None:
+    """Legacy notifications without a ``user_prompt`` payload still
+    benefit from leading the detail pane with a structured block.
+    Mirrors the dashboard's Action Needed card behaviour: heuristic
+    summary + numbered steps surface at the top, raw body remains
+    below for technical context."""
+    from pollypm.cockpit_ui import _render_heuristic_action_block
+
+    body = (
+        "Blocker: Acceptance cannot run without a live Fly.io app, "
+        "org creds, Postgres/Redis provisioned, and a deploy "
+        "pipeline.\n\n"
+        "Request one of:\n"
+        "  (a) Split deploy acceptance into a follow-up task.\n"
+        "  (b) Grant a Fly-enabled session with credentials.\n"
+    )
+    rendered = _render_heuristic_action_block(body)
+    assert rendered is not None
+    assert "Acceptance cannot run without a live Fly.io app" in rendered
+    assert "What to do" in rendered
+
+
+def test_heuristic_action_block_returns_none_for_empty_body() -> None:
+    from pollypm.cockpit_ui import _render_heuristic_action_block
+
+    assert _render_heuristic_action_block(None) is None
+    assert _render_heuristic_action_block("") is None
+    assert _render_heuristic_action_block("   \n\n  ") is None
+
+
 def test_user_prompt_block_returns_none_without_user_prompt_payload() -> None:
     """Messages without a user_prompt payload fall back to the legacy
     body-only render — the helper signals this by returning None."""

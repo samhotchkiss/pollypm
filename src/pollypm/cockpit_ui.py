@@ -4777,6 +4777,35 @@ def _render_user_prompt_block(payload: object) -> str | None:
     return "\n".join(lines)
 
 
+def _render_heuristic_action_block(body: object) -> str | None:
+    """Heuristic fallback for messages that lack a ``user_prompt``.
+
+    Mirrors the dashboard's Action Needed card: pull a one-paragraph
+    summary out of the body and any numbered "steps" lines, render
+    them as the same yellow-diamond block we use for ``user_prompt``
+    payloads. The full body still renders below for context, but
+    leading with this lifts the operator-visible call to action out
+    of jargon-heavy worker output. Returns ``None`` when nothing
+    usable can be extracted (e.g. an empty body or a body that's all
+    code blocks).
+    """
+    text = str(body or "")
+    if not text.strip():
+        return None
+    summary = _dashboard_summary_from_body(text)
+    steps = _dashboard_steps_from_body(text)[:5]
+    if not (summary or steps):
+        return None
+    lines: list[str] = []
+    if summary:
+        lines.append(f"[#f0c45a]◆[/#f0c45a] {_escape(summary)}")
+    if steps:
+        lines.append("  [b]What to do[/b]")
+        for idx, step in enumerate(steps, start=1):
+            lines.append(f"  [dim]{idx}.[/dim] {_escape(step)}")
+    return "\n".join(lines)
+
+
 def _render_inbox_triage_banner(item) -> str | None:
     bucket = _triage_bucket(item)
     label = _triage_label(item)
@@ -6380,6 +6409,14 @@ class PollyInboxApp(App[None]):
         if triage_banner:
             sections.append(triage_banner)
         prompt_block = _render_user_prompt_block(getattr(item, "payload", None))
+        if not prompt_block and _triage_bucket(item) == "action":
+            # Legacy messages that haven't migrated to the structured
+            # ``user_prompt`` payload still benefit from a heuristic
+            # summary + steps block at the top — that's what the
+            # dashboard's Action Needed card renders for the same
+            # data, and the inbox detail surface should match. The
+            # raw body still renders below for technical context.
+            prompt_block = _render_heuristic_action_block(item.description)
         if prompt_block:
             sections.append("")
             sections.append(prompt_block)

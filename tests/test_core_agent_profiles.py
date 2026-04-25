@@ -68,6 +68,26 @@ def _make_worker_context(tmp_path: Path) -> tuple[AgentProfileContext, Path]:
     return context, project_root
 
 
+def test_worker_prompt_routes_blocking_questions_to_polly_with_label() -> None:
+    """Workers blocking on credentials, ambiguous specs, or environment
+    issues used to ``pm notify`` straight to Sam's inbox by default —
+    raw worker context (commit refs, file paths, test stack traces)
+    arriving as a user-facing alert. Route to Polly with the
+    ``blocking_question`` label so her operator playbook can
+    translate into the user_prompt contract before anything
+    user-facing surfaces."""
+    from pollypm.plugins_builtin.core_agent_profiles.profiles import (
+        worker_prompt,
+    )
+
+    text = worker_prompt()
+    assert "--requester polly" in text
+    assert "--label blocking_question" in text
+    # Voice rule: stop after escalating, don't keep retrying — Polly
+    # owns the response path via ``pm send``.
+    assert "pm send" in text
+
+
 def test_reviewer_prompt_routes_escalations_to_polly_not_user() -> None:
     """Russell's escalations are reviewer-jargon ('security concern',
     'architectural drift') — they belong in Polly's inbox, where she

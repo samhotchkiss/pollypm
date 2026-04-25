@@ -675,8 +675,9 @@ def check_state_migrations() -> CheckResult:
             behind.append((db_path, applied or 0))
     if behind:
         summary = ", ".join(f"{p} (@{v})" for p, v in behind)
+        db_word = "DB" if len(behind) == 1 else "DBs"
         return _fail(
-            f"{len(behind)} state DB(s) behind latest v{latest}: {summary}",
+            f"{len(behind)} state {db_word} behind latest v{latest}: {summary}",
             why=(
                 "A stale state DB leads to missing tables / columns at runtime. "
                 "Migrations run automatically on StateStore open, but only for "
@@ -691,7 +692,11 @@ def check_state_migrations() -> CheckResult:
             ),
             data={"latest": latest, "behind": [str(p) for p, _ in behind]},
         )
-    return _ok(f"state DBs on v{latest}", data={"latest": latest, "count": len(candidates)})
+    db_word = "DB" if len(candidates) == 1 else "DBs"
+    return _ok(
+        f"state {db_word} on v{latest}",
+        data={"latest": latest, "count": len(candidates)},
+    )
 
 
 def check_work_migrations() -> CheckResult:
@@ -711,8 +716,9 @@ def check_work_migrations() -> CheckResult:
             behind.append((db_path, applied or 0))
     if behind:
         summary = ", ".join(f"{p} (@{v})" for p, v in behind)
+        db_word = "DB" if len(behind) == 1 else "DBs"
         return _fail(
-            f"{len(behind)} work DB(s) behind latest v{latest}: {summary}",
+            f"{len(behind)} work {db_word} behind latest v{latest}: {summary}",
             why=(
                 "The work service schema evolves; a DB behind head lacks the "
                 "tables the task CLI writes to. Symptoms: 'no such table' errors "
@@ -725,7 +731,11 @@ def check_work_migrations() -> CheckResult:
             ),
             data={"latest": latest, "behind": [str(p) for p, _ in behind]},
         )
-    return _ok(f"work DBs on v{latest}", data={"latest": latest, "count": len(candidates)})
+    db_word = "DB" if len(candidates) == 1 else "DBs"
+    return _ok(
+        f"work {db_word} on v{latest}",
+        data={"latest": latest, "count": len(candidates)},
+    )
 
 
 # --------------------------------------------------------------------- #

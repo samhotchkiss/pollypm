@@ -495,6 +495,66 @@ def test_work_migrations_detects_missing_table(
     assert not result.passed
 
 
+def test_state_migrations_pluralises_db_word(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Cycle 68: state-migrations status uses ``DB`` / ``DBs`` per count.
+
+    The drift line previously read ``1 state DB(s) behind latest …``
+    and the ok path was unconditionally ``state DBs on v…``. Both
+    flip to the singular ``state DB`` at count=1 — the boundary that
+    fires when the user has exactly one tracked project.
+    """
+    one_behind = tmp_path / "behind.db"
+    conn = sqlite3.connect(one_behind)
+    try:
+        conn.execute("CREATE TABLE schema_version (version INTEGER)")
+        conn.execute("INSERT INTO schema_version VALUES (1)")
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr(doctor, "_state_db_candidates", lambda: [one_behind])
+    monkeypatch.setattr(doctor, "_latest_state_migration_version", lambda: 5)
+    fail = doctor.check_state_migrations()
+    assert not fail.passed
+    assert "1 state DB behind" in fail.status
+    assert "DB(s)" not in fail.status
+
+    one_current = tmp_path / "current.db"
+    conn = sqlite3.connect(one_current)
+    try:
+        conn.execute("CREATE TABLE schema_version (version INTEGER)")
+        conn.execute("INSERT INTO schema_version VALUES (5)")
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr(doctor, "_state_db_candidates", lambda: [one_current])
+    monkeypatch.setattr(doctor, "_latest_state_migration_version", lambda: 5)
+    ok = doctor.check_state_migrations()
+    assert ok.passed
+    assert "state DB on v5" in ok.status
+    assert "state DBs on v5" not in ok.status
+
+
+def test_work_migrations_pluralises_db_word(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Same shape as state-migrations: ``work DB`` / ``work DBs`` per count."""
+    one_behind = tmp_path / "behind.db"
+    conn = sqlite3.connect(one_behind)
+    try:
+        conn.execute("CREATE TABLE other (id INTEGER)")
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr(doctor, "_state_db_candidates", lambda: [one_behind])
+    monkeypatch.setattr(doctor, "_latest_work_migration_version", lambda: 3)
+    fail = doctor.check_work_migrations()
+    assert not fail.passed
+    assert "1 work DB behind" in fail.status
+    assert "DB(s)" not in fail.status
+
+
 # --------------------------------------------------------------------- #
 # Filesystem
 # --------------------------------------------------------------------- #

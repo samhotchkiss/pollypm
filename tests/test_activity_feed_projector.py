@@ -170,6 +170,57 @@ def test_project_inference_skipped_when_payload_already_carries_project(
     ) == "polly_e2e_proj"
 
 
+def test_project_from_actor_extracts_role_prefixed_project_key() -> None:
+    """Per-project agent sessions follow ``<role>_<project_key>``
+    naming — ``worker_pollypm``, ``architect_polly_remote``. When a
+    silent_worker_prompt or send_input event has no body ref to grep
+    for, the actor name is the next-best signal for the Project
+    column.
+    """
+    from pollypm.plugins_builtin.activity_feed.handlers.event_projector import (
+        _project_from_actor,
+    )
+
+    assert _project_from_actor("worker_pollypm") == "pollypm"
+    assert _project_from_actor("architect_polly_remote") == "polly_remote"
+    assert _project_from_actor("architect_booktalk") == "booktalk"
+    assert _project_from_actor("reviewer_demo") == "demo"
+    assert _project_from_actor("operator_pm_demo") == "demo"
+    # Unknown prefix → return None rather than claim the project is
+    # ``assignment``. Generic supervisor senders shouldn't poison the
+    # Project column.
+    assert _project_from_actor("task_assignment") is None
+    assert _project_from_actor("auto_claim_sweep") is None
+    assert _project_from_actor("error_log") is None
+    # Falsy / shapes without a project key.
+    assert _project_from_actor(None) is None
+    assert _project_from_actor("") is None
+    assert _project_from_actor("worker_") is None  # prefix only, no key
+    assert _project_from_actor("worker") is None  # no prefix
+
+
+def test_project_inferred_from_actor_when_body_has_no_ref(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: silent_worker_prompt events from ``worker_pollypm``
+    surface with project=``pollypm`` even though the message body is
+    just the verb name and no payload project field is set.
+    """
+    db = tmp_path / "state.db"
+    store = StateStore(db)
+    _seed_event(
+        store,
+        session="worker_pollypm",
+        event_type="silent_worker_prompt",
+        message="silent_worker_prompt",
+    )
+    store.close()
+
+    entries = EventProjector(db).project(limit=10)
+    assert len(entries) == 1
+    assert entries[0].project == "pollypm"
+
+
 def test_project_reverse_chronological(tmp_path: Path) -> None:
     db = tmp_path / "state.db"
     store = StateStore(db)

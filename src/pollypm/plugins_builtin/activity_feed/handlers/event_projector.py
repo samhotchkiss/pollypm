@@ -56,12 +56,34 @@ _PROJECT_REF_IN_TEXT_RE = re.compile(
     r"\b([a-zA-Z][a-zA-Z0-9_]*)/\d+\b"
 )
 
+# Per-project agent sessions follow ``<role>_<project_key>`` naming —
+# ``worker_pollypm``, ``architect_polly_remote``, etc. When the
+# message body has no task ref and the payload omits ``project``, the
+# actor name is the next-best signal. Anchor on known agent role
+# prefixes so we don't accidentally claim ``task_assignment`` (a
+# generic supervisor sender) is the project ``assignment``.
+_ROLE_ACTOR_PREFIXES = (
+    "worker_",
+    "architect_",
+    "reviewer_",
+    "operator_pm_",
+)
+
 
 def _project_from_text(text: str | None) -> str | None:
     if not text:
         return None
     match = _PROJECT_REF_IN_TEXT_RE.search(text)
     return match.group(1) if match else None
+
+
+def _project_from_actor(actor: str | None) -> str | None:
+    if not actor:
+        return None
+    for prefix in _ROLE_ACTOR_PREFIXES:
+        if actor.startswith(prefix) and len(actor) > len(prefix):
+            return actor[len(prefix):]
+    return None
 
 logger = logging.getLogger(__name__)
 
@@ -308,6 +330,7 @@ class EventProjector:
                 or (payload.get("project") if isinstance(payload, dict) else None)
                 or _project_from_text(summary)
                 or _project_from_text(message)
+                or _project_from_actor(actor)
             )
             verb = parsed.verb or kind
             subject = parsed.subject or (row.get("sender") or None)

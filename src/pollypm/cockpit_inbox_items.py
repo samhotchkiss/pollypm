@@ -183,6 +183,21 @@ def _triage_for_entry(
         )
         return str(winner["bucket"]), int(winner["rank"]), str(winner["label"])
     if getattr(item, "source", None) == "task":
+        # Tasks the user has on their plate triage by work_status so
+        # the inbox label reflects what the task actually needs:
+        # review-stage tasks read "review needed", paused tasks read
+        # "paused", blocked tasks read "blocked by deps". Without this
+        # the operator sees "task assigned" for every task regardless
+        # of state — they can't tell from the inbox whether the task
+        # needs action now or is just sitting in their lane.
+        status_obj = getattr(item, "work_status", None)
+        status = str(getattr(status_obj, "value", status_obj) or "").lower()
+        if status == "review":
+            return "action", 1, "review needed"
+        if status == "on_hold":
+            return "info", 2, "paused"
+        if status == "blocked":
+            return "info", 2, "blocked by deps"
         return "action", 1, "task assigned"
     return "info", 2, "update"
 

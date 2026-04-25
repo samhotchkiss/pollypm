@@ -355,6 +355,53 @@ def test_list_row_renders_title_on_line1_and_project_age_on_line2(
     _run(body())
 
 
+def test_task_inbox_triage_reflects_work_status() -> None:
+    """Task-source inbox items used to triage as the generic
+    'task assigned' regardless of state, so a plan task waiting
+    at user-review and a fresh queued task looked identical in the
+    inbox label column. Triage by work_status so the operator can
+    see at a glance whether the task needs action now or is just
+    parked in their lane."""
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_inbox_items import (
+        InboxEntry,
+        annotate_inbox_entry,
+        task_to_inbox_entry,
+    )
+
+    def _entry(work_status: str) -> InboxEntry:
+        task = SimpleNamespace(
+            task_id="demo/1",
+            title="A task",
+            description="",
+            project="demo",
+            labels=[],
+            roles={},
+            work_status=SimpleNamespace(value=work_status),
+        )
+        return annotate_inbox_entry(
+            task_to_inbox_entry(task, db_path=None),
+            known_projects={"demo"},
+        )
+
+    review = _entry("review")
+    assert review.triage_bucket == "action"
+    assert review.triage_label == "review needed"
+
+    paused = _entry("on_hold")
+    assert paused.triage_bucket == "info"
+    assert paused.triage_label == "paused"
+
+    blocked = _entry("blocked")
+    assert blocked.triage_bucket == "info"
+    assert blocked.triage_label == "blocked by deps"
+
+    queued = _entry("queued")
+    assert queued.triage_bucket == "action"
+    assert queued.triage_label == "task assigned"
+
+
 def test_user_prompt_block_surfaces_summary_steps_and_decision() -> None:
     """When a message carries a structured ``user_prompt`` payload,
     the inbox detail pane should lead with the plain-English summary,

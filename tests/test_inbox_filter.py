@@ -5,7 +5,9 @@ asserts the filter overlay's behaviour: `/` mounts a fuzzy text Input,
 chip-toggle keys narrow by unread / project / recent / type, multiple
 chips AND-combine, ``c`` clears everything, and the friendly
 empty-match copy renders when nothing survives. Filters are
-session-scoped — a remount returns to the full list.
+session-scoped — a remount returns to the action-focused baseline.
+FYI/completion updates remain loaded and searchable, but are hidden
+until the user searches or toggles ``m`` for all messages.
 
 Mirrors ``tests/test_cockpit_inbox_ui.py`` for fixture shape so the two
 suites can share monkeypatches if needed.
@@ -174,7 +176,7 @@ def test_slash_opens_filter_input_and_typing_filters_list(
         async with filter_app.run_test(size=(140, 40)) as pilot:
             await pilot.pause()
             initial = len(_visible_titles(filter_app))
-            assert initial == 5
+            assert initial == 3
 
             await pilot.press("slash")
             await pilot.pause()
@@ -250,8 +252,10 @@ def test_unread_only_filter_chip(filter_env, filter_app) -> None:
 
             assert filter_app._filter_unread_only is True
             visible = _visible_titles(filter_app)
-            # Visible count == unread count.
-            assert len(visible) == initial_unread
+            # Unread combines with the default action lens, so FYI
+            # unread items stay hidden until ``m`` shows all messages.
+            assert len(visible) == 2
+            assert visible == ["Plan review request", "Worker stuck on auth"]
             # The chip strip shows 'unread'.
             assert "unread" in str(filter_app.filter_chips.render()).lower()
     _run(body())
@@ -368,8 +372,8 @@ def test_c_clears_all_filters(filter_env, filter_app) -> None:
             assert filter_app._filter_unread_only is False
             assert filter_app._filter_plan_review is False
             assert filter_app._filter_text == ""
-            # Full list is visible again.
-            assert len(_visible_titles(filter_app)) == 5
+            # Clear returns to the action-focused baseline.
+            assert len(_visible_titles(filter_app)) == 3
     _run(body())
 
 
@@ -425,6 +429,6 @@ def test_filters_session_scoped_across_remounts(filter_env) -> None:
             assert app2._filter_text == ""
             assert app2._filter_project is None
             assert app2._has_active_filters() is False
-            # Full list is visible — nothing has been narrowed.
-            assert len(_visible_titles(app2)) == 5
+            # Fresh mounts return to the action-focused baseline.
+            assert len(_visible_titles(app2)) == 3
     _run(body())

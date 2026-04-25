@@ -6079,7 +6079,7 @@ class PollyInboxApp(App[None]):
 
     def _uses_action_lens_for(self, tasks: list) -> bool:
         """Default inbox view: show actionable work, hide FYI noise."""
-        if self._show_all_messages or self._show_orphaned:
+        if self._show_all_messages or self._show_orphaned or self._filter_text:
             return False
         return any(getattr(item, "needs_action", False) for item in tasks)
 

@@ -23,7 +23,6 @@ import gc
 import json
 import os
 import resource
-from collections import deque
 from pathlib import Path
 import subprocess
 import time
@@ -51,26 +50,20 @@ from textual.widgets import (
     ListView,
     Select,
     Static,
-    TabbedContent,
-    TabPane,
 )
 
 from pollypm.approval_notifications import notify_task_approved
-from pollypm.cockpit_formatting import format_event_time
 from pollypm.cockpit_formatting import format_relative_age as _format_relative_age
 from pollypm.model_registry import advisories_for, load_registry, resolve_alias
 from pollypm.models import ModelAssignment, ProviderKind
 from pollypm.role_routing import resolve_role_assignment
 from pollypm.account_usage_sampler import load_cached_account_usage
 from pollypm.tz import format_time as _fmt_time
-from pollypm.cockpit_activity import (
+from pollypm.cockpit_activity import (  # noqa: F401  (re-exported)
     PollyActivityFeedApp,
     _activity_type_colour,
-    _format_activity_relative,
-    _truncate_summary,
 )
-from pollypm.cockpit_alerts import (
-    AlertNotifier,
+from pollypm.cockpit_alerts import (  # noqa: F401  (AlertToast re-exported)
     AlertToast,
     _action_view_alerts,
     _setup_alert_notifier,
@@ -88,13 +81,12 @@ from pollypm.cockpit_inbox_items import (
     message_row_to_inbox_entry,
     task_to_inbox_entry,
 )
-from pollypm.cockpit_metrics import (
+from pollypm.cockpit_metrics import (  # noqa: F401  (re-exported)
     PollyMetricsApp,
     _MetricsDrillDownModal,
-    _metrics_process_breakdown,
 )
 from pollypm.config import load_config, write_config
-from pollypm.cockpit_palette import (
+from pollypm.cockpit_palette import (  # noqa: F401  (re-exported)
     CommandPaletteModal,
     KeyboardHelpModal,
     _PaletteListItem,
@@ -102,12 +94,12 @@ from pollypm.cockpit_palette import (
     _dispatch_palette_tag,
     _open_command_palette,
     _open_keyboard_help,
-    _palette_nav,
     _palette_history,
+    _palette_nav,
     _record_palette_command,
     _resolve_recent_commands,
 )
-from pollypm.cockpit_project_settings import PollyProjectSettingsApp
+from pollypm.cockpit_project_settings import PollyProjectSettingsApp  # noqa: F401
 from pollypm.cockpit_sections.action_bar import render_project_action_bar
 from pollypm.cockpit_settings_accounts import SETTINGS_ACCOUNT_ACTIONS
 from pollypm.cockpit_settings_history import (
@@ -123,12 +115,11 @@ from pollypm.cockpit_settings_history import (
     undo_expires_text,
 )
 from pollypm.cockpit_settings_projects import collect_settings_projects
-from pollypm.cockpit_workers import PollyWorkerRosterApp
+from pollypm.cockpit_workers import PollyWorkerRosterApp  # noqa: F401
 from pollypm.rejection_feedback import (
     feedback_target_task_id,
     is_rejection_feedback_task,
 )
-from pollypm.session_services import create_tmux_client
 from pollypm.service_api import PollyPMService
 from pollypm.cockpit import build_cockpit_detail
 from pollypm.cockpit_rail import CockpitItem, CockpitPresence, CockpitRouter

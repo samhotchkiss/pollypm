@@ -3023,7 +3023,7 @@ class PollySettingsPaneApp(App[None]):
             f"Budget indicator: [b]{_escape(selected.get('budget_summary') or '-')}[/b] "
             f"([dim]{selected.get('budget_level', 'unknown')}[/dim])",
             f"Rationale: {_escape(selected.get('rationale') or 'No rationale available.')}",
-            f"[dim]Actions:[/] c add Claude · o add Codex · x remove selected",
+            "[dim]Actions:[/] c add Claude · o add Codex · x remove selected",
             "[dim]Keyboard:[/] b permissions · m controller · v failover · u undo",
         ]
         undo_action = self._current_undo_action()
@@ -3258,7 +3258,7 @@ class PollySettingsPaneApp(App[None]):
             [
                 sep,
                 f"[dim]Rationale:[/dim]  {_escape(selected.get('rationale') or 'No rationale available.')}",
-                f"[dim]Actions:[/dim]    c add Claude · o add Codex · x remove selected · u undo",
+                "[dim]Actions:[/dim]    c add Claude · o add Codex · x remove selected · u undo",
             ]
         )
         if selected["usage_raw_text"]:
@@ -9719,8 +9719,8 @@ class PollyProjectDashboardApp(App[None]):
                 # Don't restate the full prompt \u2014 it's already in the
                 # Action Needed card right above; point there instead.
                 lines.append(
-                    f"  [#f0c45a]\u25c6[/#f0c45a] Waiting on your "
-                    f"response \u2014 see [b]Action Needed[/b] above."
+                    "  [#f0c45a]\u25c6[/#f0c45a] Waiting on your "
+                    "response \u2014 see [b]Action Needed[/b] above."
                 )
             return "\n".join(lines)
         if data.action_items:

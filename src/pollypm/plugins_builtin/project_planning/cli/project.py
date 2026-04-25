@@ -502,7 +502,7 @@ def rename_cmd(
             typer.echo(f"  - {warning}")
     if dry_run:
         typer.echo("")
-        typer.echo(f"Re-run without --dry-run to apply.")
+        typer.echo("Re-run without --dry-run to apply.")
 
 
 # ---------------------------------------------------------------------------

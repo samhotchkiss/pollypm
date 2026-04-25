@@ -159,7 +159,7 @@ def synthesize_backlog_entries(
                 description=desc,
                 why_deprioritized=(
                     synthesis_rationale
-                    or f"Not selected by synthesis; see docs/planning-session-log.md."
+                    or "Not selected by synthesis; see docs/planning-session-log.md."
                 ),
                 priority=2,
                 source="planner",

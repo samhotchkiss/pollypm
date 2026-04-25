@@ -38,7 +38,7 @@ class MarkdownDocBackend:
         path = self._docs_dir / f"{name}.md"
 
         # Add timestamp footer if not already present
-        if f"*Last updated:" not in content:
+        if "*Last updated:" not in content:
             full_content = content.rstrip() + f"\n\n*Last updated: {ts}*\n"
         else:
             full_content = content

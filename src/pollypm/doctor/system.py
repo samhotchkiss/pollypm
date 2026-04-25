@@ -164,7 +164,7 @@ def check_gh_installed() -> doctor.CheckResult:
                 "Recheck: pm doctor"
             ),
         )
-    return doctor._ok(f"gh CLI installed", data={"path": path})
+    return doctor._ok("gh CLI installed", data={"path": path})
 
 
 def check_gh_authenticated() -> doctor.CheckResult:

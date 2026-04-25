@@ -24,7 +24,7 @@ def check_pollypm_home_writable() -> doctor.CheckResult:
 
     if not home.exists():
         return doctor._fail(
-            f"~/.pollypm/ does not exist",
+            "~/.pollypm/ does not exist",
             why=(
                 "PollyPM writes global config, plugins, and caches under "
                 "~/.pollypm/. Its absence means every write path fails."
@@ -40,7 +40,7 @@ def check_pollypm_home_writable() -> doctor.CheckResult:
         )
     if not os.access(home, os.W_OK):
         return doctor._fail(
-            f"~/.pollypm/ is not writable",
+            "~/.pollypm/ is not writable",
             why=(
                 "PollyPM must write config, caches, and state under "
                 "~/.pollypm/. A read-only home directory breaks every flow."
@@ -67,7 +67,7 @@ def check_pollypm_plugins_dir() -> doctor.CheckResult:
     if plugins_dir.is_dir():
         return doctor._ok(f"{plugins_dir} exists", data={"path": str(plugins_dir)})
     return doctor._fail(
-        f"~/.pollypm/plugins/ does not exist",
+        "~/.pollypm/plugins/ does not exist",
         why=(
             "User-installed plugins live at ~/.pollypm/plugins/<name>/. "
             "The directory is not required for builtins but its absence "

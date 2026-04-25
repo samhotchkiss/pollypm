@@ -809,9 +809,9 @@ class WorkTransitionManager:
                 )
             elif current == "queued":
                 hint = (
-                    f"Fix: this task is waiting for a worker. Approval "
-                    f"comes after a worker marks it done. Claim + build "
-                    f"first, or wait for a worker to pick it up."
+                    "Fix: this task is waiting for a worker. Approval "
+                    "comes after a worker marks it done. Claim + build "
+                    "first, or wait for a worker to pick it up."
                 )
             else:
                 hint = (

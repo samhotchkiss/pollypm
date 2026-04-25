@@ -75,6 +75,9 @@ def check_no_critical_plugin_disabled() -> doctor.CheckResult:
     conflicts = sorted(disabled & set(_CRITICAL_PLUGINS_FOR_BOOT))
     if conflicts:
         plugin_word = "plugin" if len(conflicts) == 1 else "plugins"
+        name_phrase = (
+            "this name" if len(conflicts) == 1 else "these names"
+        )
         return doctor._fail(
             f"critical {plugin_word} disabled: {', '.join(conflicts)}",
             why=(
@@ -83,7 +86,8 @@ def check_no_critical_plugin_disabled() -> doctor.CheckResult:
                 "worker-start with no session backend."
             ),
             fix=(
-                "Remove these names from [plugins].disabled in ~/.pollypm/pollypm.toml —\n"
+                f"Remove {name_phrase} from [plugins].disabled in "
+                "~/.pollypm/pollypm.toml —\n"
                 f"  {', '.join(conflicts)}\n"
                 "Then: pm doctor"
             ),

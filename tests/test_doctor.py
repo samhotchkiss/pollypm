@@ -427,6 +427,9 @@ def test_check_no_critical_plugin_disabled_fails(
     # plugin disabled`` (not ``plugin(s)``).
     assert "critical plugin disabled:" in result.status
     assert "plugin(s)" not in result.status
+    # Cycle 89: fix-text uses ``this name`` for one conflict (not ``these names``).
+    assert "Remove this name from" in result.fix
+    assert "Remove these names" not in result.fix
 
 
 def test_check_plugin_capability_shapes_clean() -> None:

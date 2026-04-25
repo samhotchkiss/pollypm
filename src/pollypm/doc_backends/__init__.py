@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pollypm.doc_backends.base import DocBackend, DocEntry
+from pollypm.doc_backends.base import DocBackend, DocEntry  # noqa: F401  (DocEntry re-exported as part of the public API)
 from pollypm.doc_backends.markdown import MarkdownDocBackend
 
 

@@ -35,7 +35,6 @@ import logging
 import queue
 import signal
 import threading
-import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 

@@ -11,7 +11,6 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 from pollypm.checkpoints import CheckpointData, load_canonical_checkpoint
 from pollypm.models import PollyPMConfig, ProviderKind

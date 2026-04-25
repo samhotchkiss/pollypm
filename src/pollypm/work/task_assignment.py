@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Iterable
+from typing import Callable
 
 from pollypm.work.models import ActorType, Priority
 

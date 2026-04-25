@@ -6,12 +6,11 @@ work service state. Failures are logged but never raised.
 
 from __future__ import annotations
 
-import json
 import logging
 import subprocess
 
 from pollypm.github_labels import WORK_STATUS_TO_GITHUB_LABEL
-from pollypm.work.models import Task, WorkStatus
+from pollypm.work.models import Task
 
 logger = logging.getLogger(__name__)
 

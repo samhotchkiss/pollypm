@@ -7,12 +7,10 @@ for rendering project dashboards, task details, and session lists.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 
-from rich.text import Text
 
 from textual.app import ComposeResult
-from textual.containers import Container, Horizontal
+from textual.containers import Container
 from textual.message import Message
 from textual.widgets import Static
 

@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 from pollypm.atomic_io import atomic_write_json
 from pollypm.work.flow_engine import resolve_flow
-from pollypm.work.gates import GateRegistry, evaluate_gates, has_hard_failure
+from pollypm.work.gates import GateRegistry, evaluate_gates
 from pollypm.work.models import (
     GateResult,
     ActorType,
@@ -76,7 +76,7 @@ from pollypm.work.service_queries import (
     state_counts as read_state_counts,
     update_task,
 )
-from pollypm.work.service_support import (
+from pollypm.work.service_support import (  # noqa: F401  (re-exported)
     InvalidTransitionError,
     TaskNotFoundError,
     ValidationError,

@@ -4,7 +4,6 @@ import base64
 import json
 import os
 import shlex
-from pathlib import Path
 
 from pollypm.models import AccountConfig, ProjectSettings
 from pollypm.providers.base import LaunchCommand

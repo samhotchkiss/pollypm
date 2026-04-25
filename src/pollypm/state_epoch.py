@@ -8,7 +8,6 @@ Cost: one stat() call per tick. No subprocess. No FD leak.
 """
 from __future__ import annotations
 
-from pathlib import Path
 
 from pollypm.config import GLOBAL_CONFIG_DIR
 

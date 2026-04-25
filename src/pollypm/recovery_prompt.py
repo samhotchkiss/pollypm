@@ -228,6 +228,13 @@ def _pending_inbox_section(config: PollyPMConfig) -> RecoveryPromptSection | Non
         summaries: list[str] = []
         total = 0
         for project_key, project in getattr(config, "projects", {}).items():
+            # Match the doctor's invariant: only tracked projects own
+            # state.db files PollyPM writes to. A registered-but-not-
+            # tracked project might have a stale .pollypm/state.db left
+            # over from a prior tracking run; we don't want stale
+            # inbox tasks from those leaking into the recovery prompt.
+            if not getattr(project, "tracked", False):
+                continue
             db_path = project.path / ".pollypm" / "state.db"
             if not db_path.exists():
                 continue

@@ -294,3 +294,76 @@ class TestTruncation:
         ]
         result = _truncate_sections(sections, 500)
         assert "truncated" in result[0].content.lower()
+
+
+# ---------------------------------------------------------------------------
+# Pending-inbox section
+# ---------------------------------------------------------------------------
+
+
+class TestPendingInboxSection:
+    def test_skips_non_tracked_projects(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Cycle 85: only tracked projects' inbox tasks belong in the
+        recovery prompt. A registered-but-not-tracked project may have
+        a stale ``.pollypm/state.db`` from a prior tracking run; its
+        leftover inbox items must not leak into the resume prompt.
+        """
+        from pollypm.recovery_prompt import _pending_inbox_section
+        from types import SimpleNamespace
+
+        # Tracked project's state.db has a task; non-tracked project's
+        # state.db ALSO has a task. Only the tracked one should land
+        # in the recovery prompt.
+        tracked_path = tmp_path / "tracked"
+        (tracked_path / ".pollypm").mkdir(parents=True)
+        (tracked_path / ".pollypm" / "state.db").write_text("")
+
+        ghost_path = tmp_path / "ghost"
+        (ghost_path / ".pollypm").mkdir(parents=True)
+        (ghost_path / ".pollypm" / "state.db").write_text("")
+
+        tracked_proj = SimpleNamespace(path=tracked_path, tracked=True)
+        ghost_proj = SimpleNamespace(path=ghost_path, tracked=False)
+        config = SimpleNamespace(projects={
+            "tracked": tracked_proj,
+            "ghost": ghost_proj,
+        })
+
+        # Fake the work-service inbox query so we don't need real
+        # state.db schema. inbox_tasks is called with svc + project.
+        fake_task = SimpleNamespace(
+            title="Pending task",
+            work_status=SimpleNamespace(value="review"),
+        )
+        called_with: list[str] = []
+
+        def fake_inbox_tasks(svc, *, project):
+            called_with.append(project)
+            return [fake_task]
+
+        # Lightweight context-manager stand-in for SQLiteWorkService.
+        class _FakeSvc:
+            def __init__(self, *_a, **_kw) -> None:
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                return None
+
+        monkeypatch.setattr(
+            "pollypm.work.inbox_view.inbox_tasks", fake_inbox_tasks,
+        )
+        monkeypatch.setattr(
+            "pollypm.work.sqlite_service.SQLiteWorkService", _FakeSvc,
+        )
+
+        section = _pending_inbox_section(config)
+        assert section is not None
+        # Only the tracked project's inbox was scanned.
+        assert called_with == ["tracked"]
+        assert "[tracked] Pending task" in section.content
+        assert "[ghost]" not in section.content

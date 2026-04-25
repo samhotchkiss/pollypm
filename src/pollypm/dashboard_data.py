@@ -215,6 +215,56 @@ def _count_inbox_tasks(config: PollyPMConfig) -> int:
     return total
 
 
+def _user_waiting_task_ids_across_projects(
+    config: PollyPMConfig,
+) -> frozenset[str]:
+    """Return ``project/N`` ids for every task in a user-waiting state
+    across every tracked project.
+
+    Reads each project's ``state.db`` directly (read-only sqlite) so
+    we don't pay the work-service hydration cost just to filter
+    alerts. Used to suppress ``stuck_on_task:<id>`` alerts that are
+    already covered by the project's user-waiting status.
+    """
+    import sqlite3 as _sqlite3
+
+    out: set[str] = set()
+    for project_key, project in getattr(config, "projects", {}).items():
+        db_path = project.path / ".pollypm" / "state.db"
+        if not db_path.exists():
+            continue
+        try:
+            conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                rows = conn.execute(
+                    "SELECT task_number FROM work_tasks "
+                    "WHERE project = ? "
+                    "AND work_status IN ('blocked','on_hold','waiting_on_user')",
+                    (project_key,),
+                ).fetchall()
+            finally:
+                conn.close()
+        except (_sqlite3.Error, OSError):
+            continue
+        for (number,) in rows:
+            out.add(f"{project_key}/{number}")
+    return frozenset(out)
+
+
+def _stuck_alert_already_user_waiting(
+    alert_type: str, user_waiting_task_ids: frozenset[str],
+) -> bool:
+    """Return True for ``stuck_on_task:<id>`` alerts on a user-
+    waiting task. Mirror of the rail-side helper in
+    ``cockpit_rail._stuck_alert_already_user_waiting``.
+    """
+    prefix = "stuck_on_task:"
+    if not alert_type or not alert_type.startswith(prefix):
+        return False
+    task_id = alert_type[len(prefix):].strip()
+    return bool(task_id) and task_id in user_waiting_task_ids
+
+
 def _inbox_sender(task) -> str:
     roles = getattr(task, "roles", {}) or {}
     operator = roles.get("operator")
@@ -365,9 +415,18 @@ def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
     # dashboard_data in at top level).
     from pollypm.cockpit_alerts import is_operational_alert
 
+    # Drop ``stuck_on_task:<id>`` alerts whose task is already in a
+    # user-waiting state — the session sat idle because the user
+    # hasn't responded, which is the system doing what it should,
+    # not a fault to surface as a separate alert. Mirrors cycles 45
+    # / 53 / 55 dedup at the global polly-dashboard count level.
+    user_waiting = _user_waiting_task_ids_across_projects(config)
     alert_count = sum(
         1 for a in store.open_alerts()
         if not is_operational_alert(a.alert_type)
+        and not _stuck_alert_already_user_waiting(
+            a.alert_type, user_waiting,
+        )
     )
 
     return DashboardData(

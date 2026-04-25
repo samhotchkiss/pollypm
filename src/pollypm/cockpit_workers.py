@@ -312,9 +312,7 @@ class PollyWorkerRosterApp(App[None]):
             self.hint.update(self._DEFAULT_HINT)
             return
         self.hint.update(
-            f"[dim]{_escape(tooltip)}[/dim]  \u00b7  "
-            "R refresh \u00b7 A auto-refresh \u00b7 \u21b5 open project "
-            "\u00b7 d discuss \u00b7 q back"
+            f"[dim]{_escape(tooltip)}[/dim]  \u00b7  {self._DEFAULT_HINT}"
         )
 
     def action_refresh(self) -> None:

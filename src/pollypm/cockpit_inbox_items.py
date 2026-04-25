@@ -37,6 +37,30 @@ _DIGEST_SUBJECT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# System-health / inbox-machinery anomalies emitted by the
+# heartbeat or by Polly's auditor (``Misrouted review ping``,
+# ``Repeated stale review ping``, ``Stale planner tasks``,
+# ``Review requested for missing task``, ``Second bogus review
+# ping``). Producers should route these to ``--requester polly``
+# (operator triage), but until they all migrate, demote them
+# defensively at read time so they don't pile up in the user's
+# action lens. The patterns are deliberately conservative:
+# anchor at the start of the title (post-bracket-strip) and only
+# match phrases that name the system surface, not user decisions
+# that happen to mention "stale" or "missing" in the body.
+_OPS_ANOMALY_SUBJECT_RE = re.compile(
+    r"^\s*(?:[A-Za-z]+\s+)?(?:"
+    r"misrouted\s+review\s+ping"
+    r"|repeated\s+stale\s+review\s+ping"
+    r"|second\s+bogus\s+review\s+ping"
+    r"|bogus\s+review\s+ping"
+    r"|stale\s+planner\s+tasks?"
+    r"|review\s+requested\s+for\s+missing\s+task"
+    r"|review-needed\s+notifications?\s+(?:contain|missing)"
+    r")\b",
+    re.IGNORECASE,
+)
+
 # Regex triage is score-based: every matching rule contributes a candidate,
 # the highest score wins, and exact ties use this documented intent priority.
 _TRIAGE_KIND_PRIORITY = {
@@ -186,6 +210,8 @@ def _triage_for_entry(
     title_lower = title.lower()
     if _DIGEST_SUBJECT_RE.search(title_lower):
         return "info", 2, "digest"
+    if _OPS_ANOMALY_SUBJECT_RE.search(title_lower):
+        return "info", 2, "operations alert"
     matches = [
         rule
         for rule in _TRIAGE_PATTERN_REGISTRY

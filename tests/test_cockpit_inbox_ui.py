@@ -355,6 +355,47 @@ def test_list_row_renders_title_on_line1_and_project_age_on_line2(
     _run(body())
 
 
+def test_ops_anomaly_subjects_route_to_info_bucket() -> None:
+    """System-health / inbox-machinery anomalies (``Misrouted review
+    ping``, ``Repeated stale review ping``, ``Stale planner tasks``,
+    ``Review requested for missing task``, ``Second bogus review
+    ping``) are operator-triage signals — not user decisions. They
+    should not crowd the user's action lens. The producers ought to
+    use ``--requester polly``; until they all migrate, this
+    defensive subject-pattern check demotes them at read time."""
+    cases = [
+        "[Action] Misrouted review ping: proj/1",
+        "[Action] Repeated stale review ping for polly_remote/12",
+        "[Action] Second bogus review ping: proj/1 not found",
+        "[Action] Stale planner tasks at code_review: dice/1 + wordgame/1",
+        "[Action] Review requested for missing task: shortlink-gen/1",
+        "[Action] Review-needed notifications contain stale rows",
+    ]
+    for subject in cases:
+        item = _triaged_entry(
+            title=subject,
+            body="Operator should look at this; not a user decision.",
+        )
+        assert item.triage_bucket == "info", (
+            f"expected info bucket for {subject!r}, got "
+            f"{item.triage_bucket!r}/{item.triage_label!r}"
+        )
+        assert item.triage_label == "operations alert"
+
+
+def test_ops_anomaly_pattern_does_not_swallow_user_actions() -> None:
+    """The subject-pattern check must only fire on the operator
+    metadata phrases. Genuine user-facing items that happen to
+    mention 'stale' or 'review' in passing must NOT get demoted."""
+    item = _triaged_entry(
+        title="[Action] N-RC1 review (polly_remote/12): code solid",
+        body="walkthrough blocked on N7+N1 infra; need your call.",
+    )
+    # Real reviewer escalation routed to user — must stay actionable.
+    assert item.triage_bucket == "action"
+    assert item.triage_label != "operations alert"
+
+
 def test_digest_subject_prefix_routes_to_info_bucket() -> None:
     """Subject lines starting with 'Digest:' are roll-up summaries
     by definition. Producers sometimes mistier them as immediate

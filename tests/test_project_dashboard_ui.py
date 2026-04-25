@@ -674,7 +674,11 @@ def test_current_activity_calls_out_user_decision_when_only_architect_active(
             assert dashboard_app.data.action_items
             assert not dashboard_app.data.task_buckets.get("in_progress")
             rendered = str(dashboard_app.now_body.render())
-            assert "architect_demo" in rendered
+            # The session name "architect_demo" is just role + project
+            # context — both already implicit on this dashboard — so
+            # the row collapses to just the role label.
+            assert "architect" in rendered
+            assert "architect_demo" not in rendered
             # Critically: the section also surfaces the user-facing
             # decision so the operator can see "I have a decision to
             # make" alongside "the architect is online" — but it
@@ -686,6 +690,40 @@ def test_current_activity_calls_out_user_decision_when_only_architect_active(
             # The prompt body must NOT be repeated here; the user can
             # already see it in the Action Needed card.
             assert "deploy work is ready" not in rendered
+
+    _run(body())
+
+
+def test_current_activity_keeps_session_name_when_distinct_from_role(
+    dashboard_env, dashboard_app, monkeypatch,
+) -> None:
+    """When the session name carries information beyond the role
+    (e.g. ``task-demo-7``), keep showing both — the session name
+    isn't a redundant restatement of the role and may help the
+    operator identify which task the worker is on."""
+    from datetime import UTC, datetime
+
+    fake_worker = {
+        "session_name": "task-demo-7",
+        "role": "worker",
+        "last_heartbeat": datetime.now(UTC).isoformat(),
+    }
+
+    def _fake_active_worker(config_path, project_key, *, action_items=None):
+        return fake_worker, 0
+
+    from pollypm import cockpit_ui as _cockpit_ui
+    monkeypatch.setattr(
+        _cockpit_ui, "_dashboard_active_worker", _fake_active_worker,
+    )
+
+    async def body() -> None:
+        async with dashboard_app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            rendered = str(dashboard_app.now_body.render())
+            # Both bits of identity survive when they're distinct.
+            assert "task-demo-7" in rendered
+            assert "worker" in rendered
 
     _run(body())
 

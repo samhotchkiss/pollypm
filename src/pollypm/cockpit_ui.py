@@ -9626,14 +9626,28 @@ class PollyProjectDashboardApp(App[None]):
     def _render_now_body(self, data: ProjectDashboardData) -> str:
         w = data.active_worker
         if w:
-            sess = _escape(w.get("session_name") or "")
-            role = _escape(w.get("role") or "worker")
+            sess_raw = w.get("session_name") or ""
+            role_raw = w.get("role") or "worker"
+            # Collapse "<role>_<project_key>" sessions on their own
+            # project's dashboard down to just the role \u2014 both the
+            # role name and the project context are already implicit
+            # (we're on that project's dashboard), so rendering
+            # ``architect_polly_remote  architect`` repeats info the
+            # operator already has. Leave any session_name with extra
+            # information (task-N, workerN, ad-hoc names) unchanged.
+            if sess_raw in {role_raw, f"{role_raw}_{self.project_key}"}:
+                identity_markup = f"[b]{_escape(role_raw)}[/b]"
+            else:
+                identity_markup = (
+                    f"[b]{_escape(sess_raw)}[/b]  "
+                    f"[dim]{_escape(role_raw)}[/dim]"
+                )
             hb = w.get("last_heartbeat") or ""
             age = _format_relative_age(hb) if hb else ""
             age_part = f"  [dim]{_escape(age)}[/dim]" if age else ""
             lines = [
                 f"[#3ddc84]\u25cf[/#3ddc84] "
-                f"[b]{sess}[/b]  [dim]{role}[/dim]{age_part}",
+                f"{identity_markup}{age_part}",
             ]
             # Surface the top-most in-flight task as context.
             in_flight = data.task_buckets.get("in_progress", [])

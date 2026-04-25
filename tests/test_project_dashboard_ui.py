@@ -842,6 +842,57 @@ def test_action_count_dedupes_review_task_and_matching_message() -> None:
     assert _action_count(items, action_items) == 1
 
 
+def test_format_blocked_dep_attaches_title_when_known() -> None:
+    """Blocked tasks listed dependencies as bare task IDs
+    (``"polly_remote/6, polly_remote/9"``). The user has no idea
+    what those tasks are without drilling in. Surface the title
+    inline so the dashboard answers "what am I waiting on?"
+    without an extra hop.
+    """
+    from pollypm.cockpit_ui import _format_blocked_dep
+
+    title_map = {
+        "polly_remote/6": "Implement N4: notify-api",
+        "polly_remote/9": "Implement N7: pollypm-http-shim",
+    }
+    assert (
+        _format_blocked_dep("polly_remote/6", title_map)
+        == "polly_remote/6 (Implement N4: notify-api)"
+    )
+
+
+def test_format_blocked_dep_falls_back_to_bare_ref_when_unknown() -> None:
+    """Cross-project deps or archived tasks may not appear in the
+    title map for the current project. Render the bare ref instead
+    of a misleading "(Untitled)" — the user can still navigate to
+    it by ID.
+    """
+    from pollypm.cockpit_ui import _format_blocked_dep
+
+    assert _format_blocked_dep("other_proj/12", {}) == "other_proj/12"
+    assert (
+        _format_blocked_dep("polly_remote/99", {"polly_remote/6": "x"})
+        == "polly_remote/99"
+    )
+
+
+def test_format_blocked_dep_truncates_long_titles() -> None:
+    """Some plans produce verbose task titles. Three deps × verbose
+    titles can blow past the dashboard pane width; truncate the
+    title (not the ref) so the line stays scannable.
+    """
+    from pollypm.cockpit_ui import _format_blocked_dep
+
+    long_title = "A really long descriptive task title that keeps going"
+    rendered = _format_blocked_dep(
+        "polly_remote/12", {"polly_remote/12": long_title}
+    )
+    assert rendered.startswith("polly_remote/12 (")
+    assert rendered.endswith("…)")
+    # The rendered fragment must be much shorter than the raw input.
+    assert len(rendered) < len(long_title) + len("polly_remote/12 ()")
+
+
 def test_action_card_click_hint_collapses_per_item_duplication() -> None:
     """Action Needed cards used to repeat
     ``"Click this message to open the source task."`` verbatim

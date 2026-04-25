@@ -8803,6 +8803,24 @@ def _dashboard_inbox(
     return _action_count(items, action_items), top, action_items
 
 
+def _format_blocked_dep(ref: str, title_map: dict[str, str]) -> str:
+    """Render a blocked-by dependency reference with its task title.
+
+    Returns ``"polly_remote/6 (Implement N4: notify-api)"`` when the
+    title is known, falling back to the bare ``ref`` when not (e.g.
+    cross-project dep, archived task). Titles are truncated to keep
+    the multi-dep line from blowing past the pane width.
+    """
+    title = (title_map.get(ref) or "").strip()
+    if not title:
+        return _escape(ref)
+    # ~28 chars keeps three deps + titles fitting at 210-col without
+    # forcing a wrap; longer titles get an ellipsis.
+    if len(title) > 28:
+        title = title[:27].rstrip() + "…"
+    return f"{_escape(ref)} ({_escape(title)})"
+
+
 def _action_card_click_hint(action_items: list[dict]) -> str:
     """Return one line of click-discoverability copy for the Action
     Needed cards.
@@ -9589,6 +9607,19 @@ class PollyProjectDashboardApp(App[None]):
             )
         out = ["  \u00b7  ".join(strip_parts), ""]
 
+        # Build a task_id \u2192 title map across every visible bucket so
+        # the "waiting on:" line for blocked tasks can name what each
+        # upstream dep actually *is*. Without this the user reads
+        # "waiting on: polly_remote/6, polly_remote/9" and has no
+        # signal about whether to wait, escalate, or grab one of the
+        # deps themselves.
+        title_map: dict[str, str] = {}
+        for _bucket_items in buckets.values():
+            for entry in _bucket_items:
+                tid = str(entry.get("task_id") or "")
+                if tid:
+                    title_map[tid] = str(entry.get("title") or "")
+
         for status, _colour, _icon in strip_order:
             items = buckets.get(status, [])[:3]
             if not items:
@@ -9611,7 +9642,10 @@ class PollyProjectDashboardApp(App[None]):
                         str(ref) for ref in (t.get("blocked_by") or []) if ref
                     ]
                     if blocked_by:
-                        joined = ", ".join(_escape(ref) for ref in blocked_by[:3])
+                        joined = ", ".join(
+                            _format_blocked_dep(ref, title_map)
+                            for ref in blocked_by[:3]
+                        )
                         if len(blocked_by) > 3:
                             joined += f" (+{len(blocked_by) - 3} more)"
                         out.append(f"      [dim]waiting on: {joined}[/dim]")

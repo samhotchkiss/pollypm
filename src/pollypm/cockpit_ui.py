@@ -9927,7 +9927,7 @@ class PollyProjectDashboardApp(App[None]):
             ts = _format_relative_age(e.get("timestamp") or "")
             actor = _escape(e.get("actor") or "-")
             verb = e.get("verb") or ""
-            summary = e.get("summary") or ""
+            summary = self._sanitize_activity_summary(e.get("summary") or "")
             kind = e.get("kind") or ""
             ts_part = f"[dim]{ts:>8}[/dim]" if ts else ""
             # Task-transition rows already encode "from → to" in their
@@ -9950,6 +9950,33 @@ class PollyProjectDashboardApp(App[None]):
                 )
             lines.append(line)
         return "\n".join(lines)
+
+    def _sanitize_activity_summary(self, summary: str) -> str:
+        """Trim project-local jargon from a task-transition summary.
+
+        The projector emits ``task <project>/<N>: <from> → <to>`` for
+        every transition; on the per-project dashboard the
+        ``<project>/`` prefix is already implicit, so dropping it
+        ``task #<N>: <from> → <to>`` aligns with the rest of the
+        dashboard's task numbering. Also strip ``[Action]`` routing
+        tags that the architect's notify subjects sometimes leak into
+        transition reasons.
+        """
+        if not summary:
+            return summary
+        text = summary.replace("[Action] ", "").replace("[Action]", "")
+        project_key = getattr(self, "project_key", "") or ""
+        if project_key:
+            prefix = f"{project_key}/"
+            # Replace bare " <project>/<N>" forms with " #<N>". The
+            # leading word boundary keeps us from rewriting paths or
+            # other content that incidentally contains the project key.
+            text = _re.sub(
+                rf"\b{_re.escape(prefix)}(\d+)\b",
+                r"#\1",
+                text,
+            )
+        return text
 
     def _render_inbox_body(self, data: ProjectDashboardData) -> str:
         count = data.inbox_count

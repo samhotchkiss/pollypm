@@ -1910,6 +1910,50 @@ def test_approve_button_warns_when_task_is_not_in_an_approvable_state(
 # ---------------------------------------------------------------------------
 
 
+def test_recent_activity_strips_in_project_task_prefix_and_action_tag(
+    dashboard_env, dashboard_app, monkeypatch,
+) -> None:
+    """Recent activity rows on the per-project dashboard inherit the
+    global feed's ``task <project>/<N>: <from> → <to> (<reason>)``
+    summary. On the project's own dashboard, the ``<project>/`` prefix
+    is implicit and ``[Action]`` tags that leaked into the reason are
+    routing noise. Strip both so the row reads as clean prose.
+    """
+    fake_entries = [
+        {
+            "timestamp": "2026-04-24T10:00:00+00:00",
+            "actor": "pm",
+            "verb": "review->on_hold",
+            "summary": (
+                "task demo/12: review → on_hold "
+                "(Waiting on operator: [Action] demo/12 — same scope as demo/3)"
+            ),
+            "kind": "task_transition",
+        },
+    ]
+
+    def _fake_activity(config_path, project_key, *, limit=10):
+        return fake_entries[:limit]
+
+    from pollypm import cockpit_ui
+    monkeypatch.setattr(cockpit_ui, "_dashboard_activity", _fake_activity)
+
+    async def body() -> None:
+        async with dashboard_app.run_test(size=(160, 60)) as pilot:
+            await pilot.pause()
+            rendered = str(dashboard_app.activity_body.render())
+            # In-project refs collapse to #N form.
+            assert "task #12: review → on_hold" in rendered
+            assert "demo/12" not in rendered
+            # Cross-references in the reason also collapse.
+            assert "#3" in rendered
+            assert "demo/3" not in rendered
+            # [Action] routing tag stripped from the reason.
+            assert "[Action]" not in rendered
+
+    _run(body())
+
+
 def test_recent_activity_drops_verb_when_summary_already_carries_transition() -> None:
     """Task-transition rows came in with verb=``review->done`` and
     summary=``task polly_remote/17: review → done`` — the same

@@ -279,6 +279,11 @@ def _load_checkpoint(project_root: Path) -> dict[str, int]:
         payload = json.loads(path.read_text())
     except Exception:  # noqa: BLE001
         return {}
+    # Defend against a checkpoint corrupted to a non-dict (list, null,
+    # str). Without this the next ``payload.get("files", {})`` call
+    # raises ``AttributeError`` and bubbles up out of the extractor.
+    if not isinstance(payload, dict):
+        return {}
     files = payload.get("files", {})
     if not isinstance(files, dict):
         return {}

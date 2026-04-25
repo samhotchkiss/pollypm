@@ -221,3 +221,28 @@ def test_heuristic_path_delta_fields_all_get_capped() -> None:
     assert delta.decisions == []
     assert delta.risks == []
     assert delta.ideas == []
+
+
+def test_load_checkpoint_handles_corrupt_non_dict_payload(tmp_path) -> None:
+    """Cycle 96: ``_load_checkpoint`` must treat a corrupted checkpoint
+    file (parses to a list, null, or string) as empty. Without the
+    type guard the next ``payload.get(...)`` call raises
+    ``AttributeError`` and bubbles out of the extractor.
+    """
+    from pollypm.knowledge_extract import _checkpoint_path, _load_checkpoint
+
+    path = _checkpoint_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    path.write_text("[1, 2, 3]")
+    assert _load_checkpoint(tmp_path) == {}
+
+    path.write_text("null")
+    assert _load_checkpoint(tmp_path) == {}
+
+    path.write_text('"oops"')
+    assert _load_checkpoint(tmp_path) == {}
+
+    # Sanity check: a well-formed checkpoint still parses correctly.
+    path.write_text('{"files": {"x.json": 100}}')
+    assert _load_checkpoint(tmp_path) == {"x.json": 100}

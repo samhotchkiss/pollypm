@@ -9926,13 +9926,28 @@ class PollyProjectDashboardApp(App[None]):
         for e in data.activity_entries[:10]:
             ts = _format_relative_age(e.get("timestamp") or "")
             actor = _escape(e.get("actor") or "-")
-            verb = _escape(e.get("verb") or "")
-            summary = _escape(e.get("summary") or "")
+            verb = e.get("verb") or ""
+            summary = e.get("summary") or ""
+            kind = e.get("kind") or ""
             ts_part = f"[dim]{ts:>8}[/dim]" if ts else ""
-            line = (
-                f"{ts_part}  [#97a6b2]{actor}[/#97a6b2]  "
-                f"[b]{verb}[/b] {summary}"
-            )
+            # Task-transition rows already encode "from → to" in their
+            # summary ("task X: review → done"), so the verb prefix
+            # ("review->done") just restates the transition. Drop the
+            # verb when it would duplicate; keep it when the kind is
+            # something the summary doesn't otherwise label.
+            if kind == "task_transition" or (
+                verb and "->" in verb
+                and verb.replace("->", " → ") in summary
+            ):
+                line = (
+                    f"{ts_part}  [#97a6b2]{actor}[/#97a6b2]  "
+                    f"{_escape(summary)}"
+                )
+            else:
+                line = (
+                    f"{ts_part}  [#97a6b2]{actor}[/#97a6b2]  "
+                    f"[b]{_escape(verb)}[/b] {_escape(summary)}"
+                )
             lines.append(line)
         return "\n".join(lines)
 

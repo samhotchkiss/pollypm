@@ -1910,6 +1910,43 @@ def test_approve_button_warns_when_task_is_not_in_an_approvable_state(
 # ---------------------------------------------------------------------------
 
 
+def test_recent_activity_drops_verb_when_summary_already_carries_transition() -> None:
+    """Task-transition rows came in with verb=``review->done`` and
+    summary=``task polly_remote/17: review → done`` — the same
+    transition encoded twice. Drop the verb prefix on
+    ``task_transition`` rows so the line reads as one statement of
+    fact instead of two near-duplicate ones.
+    """
+    from types import SimpleNamespace
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    fake_data = SimpleNamespace(
+        activity_entries=[
+            {
+                "timestamp": "2026-04-24T10:00:00+00:00",
+                "actor": "reviewer",
+                "verb": "review->done",
+                "summary": "task polly_remote/17: review → done",
+                "kind": "task_transition",
+            },
+            {
+                "timestamp": "2026-04-24T09:00:00+00:00",
+                "actor": "alerter",
+                "verb": "alerted",
+                "summary": "Disk full on host-A",
+                "kind": "alert",
+            },
+        ],
+    )
+    rendered = app._render_activity_body(fake_data)
+    # Task-transition row shows the summary only — no verb prefix.
+    assert "task polly_remote/17: review → done" in rendered
+    assert "[b]review->done[/b]" not in rendered
+    # Non-transition rows keep the bold verb prefix.
+    assert "[b]alerted[/b] Disk full on host-A" in rendered
+
+
 def test_pipeline_strip_uses_distinct_glyph_for_blocked_vs_in_progress() -> None:
     """Regression: the pipeline strip rendered both ``in_progress`` and
     ``blocked`` with the ◆ glyph, distinguished only by colour. The

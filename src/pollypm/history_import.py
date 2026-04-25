@@ -844,9 +844,15 @@ def load_import_state(project_root: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        return json.loads(path.read_text())
+        parsed = json.loads(path.read_text())
     except Exception:  # noqa: BLE001
         return {}
+    # Defend against a checkpoint corrupted to a non-dict shape (list,
+    # null, string). The function's annotation promises ``dict[str, Any]``
+    # and ``lock_import`` later does ``state["status"] = "locked"`` —
+    # that assignment would raise ``TypeError`` if the parse returned
+    # a list, silently breaking the lock-import flow.
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def save_import_state(project_root: Path, state: dict[str, Any]) -> None:

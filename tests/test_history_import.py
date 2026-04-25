@@ -644,6 +644,31 @@ class TestImportState:
         loaded = load_import_state(tmp_path)
         assert loaded["status"] == "locked"
 
+    def test_load_handles_corrupt_non_dict_checkpoint(self, tmp_path: Path) -> None:
+        """Cycle 95: a checkpoint that parses to a non-dict (list, null,
+        string) must be treated as empty so ``lock_import`` doesn't
+        ``TypeError`` on the subsequent ``state["status"] = "locked"``.
+        """
+        from pollypm.history_import import _import_state_path
+
+        path = _import_state_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("[1, 2, 3]")
+        assert load_import_state(tmp_path) == {}
+
+        path.write_text("null")
+        assert load_import_state(tmp_path) == {}
+
+        path.write_text('"oops"')
+        assert load_import_state(tmp_path) == {}
+
+        # And lock_import should now safely write a dict on top of the
+        # corrupted file rather than raising.
+        path.write_text("[1, 2, 3]")
+        lock_import(tmp_path)
+        loaded = load_import_state(tmp_path)
+        assert loaded == {"status": "locked"}
+
 
 # ---------------------------------------------------------------------------
 # Helpers

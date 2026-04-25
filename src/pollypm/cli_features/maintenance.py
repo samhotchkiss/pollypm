@@ -288,7 +288,8 @@ def register_maintenance_commands(app: typer.Typer) -> None:
     ) -> None:
         service = _service(config_path)
         count = service.sync_token_ledger(account=account)
-        typer.echo(f"Synced {count} transcript token sample(s).")
+        sample_word = "sample" if count == 1 else "samples"
+        typer.echo(f"Synced {count} transcript token {sample_word}.")
 
     @app.command(
         "tokens",
@@ -347,9 +348,10 @@ def register_maintenance_commands(app: typer.Typer) -> None:
             if project and proj_key != project:
                 continue
             cache_str = f" + {cache:,} cached" if cache else ""
+            day_word = "day" if days_active == 1 else "days"
             typer.echo(
                 f"  {proj_key}: {total:,} tokens{cache_str} "
-                f"({days_active} active day(s))"
+                f"({days_active} active {day_word})"
             )
             total_all += total
             cache_all += cache
@@ -501,13 +503,15 @@ def register_maintenance_commands(app: typer.Typer) -> None:
         if not all_problems:
             typer.echo("All projects healthy. No repairs needed.")
             return
-        typer.echo(f"Found {len(all_problems)} problem(s):")
+        problem_word = "problem" if len(all_problems) == 1 else "problems"
+        typer.echo(f"Found {len(all_problems)} {problem_word}:")
         for problem in all_problems:
             typer.echo(f"  - {problem}")
         if check_only:
             typer.echo("\nRun `pm repair` (without --check) to fix.")
             return
-        typer.echo(f"\nApplied {len(all_actions)} fix(es):")
+        fix_word = "fix" if len(all_actions) == 1 else "fixes"
+        typer.echo(f"\nApplied {len(all_actions)} {fix_word}:")
         for action in all_actions:
             typer.echo(f"  + {action}")
 

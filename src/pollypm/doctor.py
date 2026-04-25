@@ -2766,8 +2766,9 @@ def check_session_memory_usage() -> CheckResult:
     if over:
         biggest = max(over, key=lambda t: t[1])
         rss_mb = biggest[1] / 1024
+        over_word = "session" if len(over) == 1 else "sessions"
         return _fail(
-            f"{len(over)} session(s) over 1 GB RSS (largest pid {biggest[0]} = {rss_mb:.0f} MB)",
+            f"{len(over)} {over_word} over 1 GB RSS (largest pid {biggest[0]} = {rss_mb:.0f} MB)",
             why=(
                 "A claude/codex process leaking past 1 GB usually means a "
                 "long-running session has accumulated context the harness "
@@ -2787,8 +2788,9 @@ def check_session_memory_usage() -> CheckResult:
             },
         )
     biggest_rss_mb = max(r for _, r, _ in rows) / 1024 if rows else 0
+    rows_word = "session" if len(rows) == 1 else "sessions"
     return _ok(
-        f"{len(rows)} session(s), largest {biggest_rss_mb:.0f} MB RSS",
+        f"{len(rows)} {rows_word}, largest {biggest_rss_mb:.0f} MB RSS",
         data={"total_sessions": len(rows), "largest_rss_mb": round(biggest_rss_mb, 1)},
     )
 

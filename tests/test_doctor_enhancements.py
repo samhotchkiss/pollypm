@@ -735,6 +735,45 @@ def test_session_memory_skip_when_no_processes(monkeypatch: pytest.MonkeyPatch) 
     assert result.passed and result.skipped
 
 
+def test_session_memory_pluralisation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Singular and plural session counts must not show ``session(s)``.
+
+    Both the warn (``X session(s) over 1 GB RSS``) and ok (``X
+    session(s), largest …``) paths share the count noun. Lock both
+    out at the singular boundary, mirroring cycles 47/48/50 on other
+    doctor checks.
+    """
+    # Single session over the warn threshold.
+    monkeypatch.setattr(
+        doctor, "_ps_claude_rss_kb",
+        lambda: [(7, 1_500_000, "claude --headless")],
+    )
+    warn = doctor.check_session_memory_usage()
+    assert not warn.passed
+    assert "1 session over 1 GB RSS" in warn.status
+    assert "session(s)" not in warn.status
+
+    # Single session under threshold (ok path, count=1).
+    monkeypatch.setattr(
+        doctor, "_ps_claude_rss_kb",
+        lambda: [(7, 50_000, "claude --headless")],
+    )
+    one_ok = doctor.check_session_memory_usage()
+    assert one_ok.passed
+    assert "1 session, largest" in one_ok.status
+    assert "session(s)" not in one_ok.status
+
+    # Plural ok path stays plural.
+    monkeypatch.setattr(
+        doctor, "_ps_claude_rss_kb",
+        lambda: [(1, 50_000, "claude"), (2, 80_000, "codex")],
+    )
+    many_ok = doctor.check_session_memory_usage()
+    assert many_ok.passed
+    assert "2 sessions, largest" in many_ok.status
+    assert "session(s)" not in many_ok.status
+
+
 # --------------------------------------------------------------------- #
 # Inbox checks
 # --------------------------------------------------------------------- #

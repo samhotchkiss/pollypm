@@ -689,7 +689,7 @@ def test_plan_section_reads_h2_headers(dashboard_env, dashboard_app) -> None:
 def test_plan_empty_state_when_no_plan_file(
     dashboard_env, dashboard_app,
 ) -> None:
-    """No plan file → friendly empty-state hint, not blank section."""
+    """No plan file → friendly empty-state hint, not a CLI command dump."""
     async def body() -> None:
         async with dashboard_app.run_test(size=(140, 50)) as pilot:
             await pilot.pause()
@@ -697,9 +697,15 @@ def test_plan_empty_state_when_no_plan_file(
             assert dashboard_app.data.plan_path is None
             assert dashboard_app.data.plan_sections == []
             rendered = str(dashboard_app.plan_body.render())
-            # The empty-state copy mentions the CLI the user should run.
-            assert "pm project plan" in rendered
-            assert "No plan" in rendered
+            # Empty-state copy is plain English: tells the user the PM
+            # will draft a plan when work picks up, and points them at
+            # the chat keybinding to ask now.
+            assert "No plan yet" in rendered
+            assert "PM will draft one" in rendered
+            assert "ask the PM to plan it now" in rendered
+            # No CLI jargon leaking through to the operator surface.
+            assert "pm project plan" not in rendered
+            assert "auto-fire" not in rendered
     _run(body())
 
 

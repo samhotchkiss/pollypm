@@ -9740,8 +9740,9 @@ class PollyProjectDashboardApp(App[None]):
             return "[dim]Virtual project — no plan on disk.[/dim]"
         if data.plan_path is None:
             return (
-                "[dim]No plan yet. Run [b]pm project plan[/b] "
-                "or let it auto-fire.[/dim]"
+                "[dim]No plan yet — the PM will draft one when this "
+                "project picks up work.\n"
+                "Press [b]c[/b] to ask the PM to plan it now.[/dim]"
             )
         lines: list[str] = []
         rel_path = ""

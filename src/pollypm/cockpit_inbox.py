@@ -749,6 +749,13 @@ _HANDOFF_NODES = frozenset({
     # ``user_approval`` in plan_project. Without it the gone session
     # rendered as 🔴 unresponsive instead of ⚪ handed_off.
     "human_review",
+    # ``awaiting_approval`` is the human touchpoint in the downtime
+    # explore flow (``plugins_builtin/downtime/flows/downtime_explore.yaml``).
+    # The explorer hands off there for human review; the session
+    # exits cleanly. Same handoff shape as ``human_review`` /
+    # ``user_approval`` — without this, the post-explore gone session
+    # rendered as 🔴 unresponsive instead of ⚪ handed_off.
+    "awaiting_approval",
 })
 
 

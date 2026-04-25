@@ -212,6 +212,18 @@ def test_offline_at_review_node_classifies_as_handed_off() -> None:
     )
     assert health_hr == "handed_off"
 
+    # awaiting_approval is the human touchpoint in the downtime
+    # explore flow — same handoff shape as user_approval /
+    # human_review (cycle 100).
+    health_aa, _ = _worker_health_snapshot(
+        status="offline",
+        last_heartbeat_iso=None,
+        token_total=0,
+        session_name="worker_demo",
+        current_node="awaiting_approval",
+    )
+    assert health_aa == "handed_off"
+
     # Offline at a non-handoff node still reads as unresponsive (a
     # worker that dropped mid-implement is a real fault).
     health3, _ = _worker_health_snapshot(

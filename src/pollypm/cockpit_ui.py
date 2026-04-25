@@ -9859,6 +9859,30 @@ class PollyProjectDashboardApp(App[None]):
                     reason = str(t.get("hold_reason") or "").strip()
                     if reason:
                         out.append(f"      [dim]paused: {_escape(reason)}[/dim]")
+                # Review rows tell the operator who has the ball:
+                # auto-reviewer (Russell etc.) or a user-approval
+                # node that needs Sam's call. Without this, the user
+                # sees "1 task in review" and can't tell whether to
+                # wait or act.
+                if status == "review":
+                    node_id = str(t.get("current_node_id") or "").lower()
+                    is_user_review = any(
+                        marker in node_id for marker in ("human", "user")
+                    )
+                    if is_user_review:
+                        out.append(
+                            "      [#f0c45a]ready for your approval[/]"
+                        )
+                    else:
+                        assignee = str(t.get("assignee") or "").strip()
+                        node_part = f" @ {_escape(node_id)}" if node_id else ""
+                        if assignee:
+                            out.append(
+                                f"      [dim]reviewing: "
+                                f"{_escape(assignee)}{node_part}[/dim]"
+                            )
+                        elif node_id:
+                            out.append(f"      [dim]@ {_escape(node_id)}[/dim]")
             out.append("")
         # Drop trailing blank for tidy spacing
         while out and out[-1] == "":

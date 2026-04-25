@@ -601,6 +601,69 @@ def test_user_prompt_payload_drives_dashboard_copy_and_buttons(
     _run(body())
 
 
+def test_pipeline_review_section_distinguishes_user_review_from_auto() -> None:
+    """The pipeline's Review section must tell the operator who has
+    the ball — the auto-reviewer (Russell) or a user-approval node
+    that needs the human. Without this signal, ``1 in review`` looks
+    identical whether Sam should wait or act."""
+    from types import SimpleNamespace
+
+    # Build a fake dashboard_app and feed it minimal data with two
+    # review-bucket tasks: one routed to Russell (auto), one parked at
+    # a user-approval node.
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+    fake_data = SimpleNamespace(
+        exists_on_disk=True,
+        task_counts={"review": 2},
+        task_buckets={
+            "queued": [],
+            "in_progress": [],
+            "review": [
+                {
+                    "task_id": "demo/1",
+                    "task_number": 1,
+                    "title": "Auto-reviewed change",
+                    "updated_at": "",
+                    "assignee": "russell",
+                    "current_node_id": "code_review",
+                    "summary": "",
+                    "steps": [],
+                    "blocked_by": [],
+                    "hold_reason": "",
+                },
+                {
+                    "task_id": "demo/2",
+                    "task_number": 2,
+                    "title": "Plan awaiting approval",
+                    "updated_at": "",
+                    "assignee": "user",
+                    "current_node_id": "user_approval",
+                    "summary": "",
+                    "steps": [],
+                    "blocked_by": [],
+                    "hold_reason": "",
+                },
+            ],
+            "blocked": [],
+            "on_hold": [],
+            "done": [],
+        },
+    )
+
+    # _render_pipeline_body is a pure method given data, no app run needed.
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    rendered = app._render_pipeline_body(fake_data)
+
+    # Auto-reviewer row names Russell + the node it's parked at.
+    assert "Auto-reviewed change" in rendered
+    assert "reviewing: russell" in rendered
+    assert "code_review" in rendered
+
+    # User-approval row uses the operator-facing call-to-action copy.
+    assert "Plan awaiting approval" in rendered
+    assert "ready for your approval" in rendered
+
+
 def test_pipeline_on_hold_section_surfaces_reason(
     dashboard_env, dashboard_app,
 ) -> None:

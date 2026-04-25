@@ -1064,6 +1064,79 @@ def test_logs_dir_size_fix_invokes_rotate(
     assert "rotated 1" in message
 
 
+def test_log_rotate_handler_message_pluralisation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``pm doctor --fix`` log-rotate message must not show ``(s)``.
+
+    The fix-function status is shown verbatim to the user. With three
+    counts in one line (rotated/deleted/errors), the original
+    parenthetical-s pluralisation read as ``rotated 1 log(s),
+    deleted 1 old archive(s), 0 error(s)`` — every count was at the
+    awkward singular boundary. Lock the literal out of both the all-
+    singular and all-plural cases.
+    """
+    import pollypm.plugins_builtin.core_recurring.plugin as rec_plugin
+
+    monkeypatch.setattr(
+        rec_plugin,
+        "log_rotate_handler",
+        lambda payload: {"rotated": 1, "deleted": 1, "errors": 1},
+    )
+    success, message = doctor._invoke_log_rotate_handler(tmp_path)
+    assert not success
+    assert "rotated 1 log," in message
+    assert "deleted 1 old archive," in message
+    assert "1 error" in message
+    assert "(s)" not in message
+
+    monkeypatch.setattr(
+        rec_plugin,
+        "log_rotate_handler",
+        lambda payload: {"rotated": 4, "deleted": 2, "errors": 0},
+    )
+    success, message = doctor._invoke_log_rotate_handler(tmp_path)
+    assert success
+    assert "rotated 4 logs," in message
+    assert "deleted 2 old archives," in message
+    assert "0 errors" in message
+    assert "(s)" not in message
+
+
+def test_prune_handler_message_pluralisation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``pm doctor --fix`` worktree-prune message must not show ``(s)``.
+
+    Same shape as the log-rotate fix message: three counts in one
+    line, original prose was ``pruned 1 merged worktree(s), 0 stale
+    unmerged retained, 1 error(s)`` at the singular boundary.
+    """
+    import pollypm.plugins_builtin.core_recurring.plugin as rec_plugin
+
+    monkeypatch.setattr(
+        rec_plugin,
+        "agent_worktree_prune_handler",
+        lambda payload: {"pruned": 1, "warned_stale": 0, "errors": 1},
+    )
+    success, message = doctor._invoke_prune_handler()
+    assert not success
+    assert "pruned 1 merged worktree," in message
+    assert "1 error" in message
+    assert "(s)" not in message
+
+    monkeypatch.setattr(
+        rec_plugin,
+        "agent_worktree_prune_handler",
+        lambda payload: {"pruned": 5, "warned_stale": 0, "errors": 0},
+    )
+    success, message = doctor._invoke_prune_handler()
+    assert success
+    assert "pruned 5 merged worktrees," in message
+    assert "0 errors" in message
+    assert "(s)" not in message
+
+
 def test_plan_gate_fix_rewrites_config_with_backup(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

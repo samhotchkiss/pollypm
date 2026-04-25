@@ -2535,9 +2535,12 @@ def _invoke_prune_handler() -> tuple[bool, str]:
     pruned = int(result.get("pruned", 0)) if isinstance(result, dict) else 0
     errors = int(result.get("errors", 0)) if isinstance(result, dict) else 0
     warned = int(result.get("warned_stale", 0)) if isinstance(result, dict) else 0
+    pruned_word = "worktree" if pruned == 1 else "worktrees"
+    error_word = "error" if errors == 1 else "errors"
     return (
         errors == 0,
-        f"pruned {pruned} merged worktree(s), {warned} stale unmerged retained, {errors} error(s)",
+        f"pruned {pruned} merged {pruned_word}, "
+        f"{warned} stale unmerged retained, {errors} {error_word}",
     )
 
 
@@ -2619,9 +2622,13 @@ def _invoke_log_rotate_handler(logs_dir: Path) -> tuple[bool, str]:
     rotated = int(result.get("rotated", 0)) if isinstance(result, dict) else 0
     deleted = int(result.get("deleted", 0)) if isinstance(result, dict) else 0
     errors = int(result.get("errors", 0)) if isinstance(result, dict) else 0
+    rotated_word = "log" if rotated == 1 else "logs"
+    deleted_word = "old archive" if deleted == 1 else "old archives"
+    error_word = "error" if errors == 1 else "errors"
     return (
         errors == 0,
-        f"rotated {rotated} log(s), deleted {deleted} old archive(s), {errors} error(s)",
+        f"rotated {rotated} {rotated_word}, "
+        f"deleted {deleted} {deleted_word}, {errors} {error_word}",
     )
 
 

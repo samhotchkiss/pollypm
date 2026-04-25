@@ -9828,6 +9828,19 @@ class PollyProjectDashboardApp(App[None]):
                 age = _format_relative_age(t.get("updated_at") or "")
                 age_part = f"  [dim]{_escape(age)}[/dim]" if age else ""
                 out.append(f"  {num_part}{title}{age_part}")
+                # For blocked tasks, name the dependencies the task is
+                # waiting on. Without this the operator sees a list of
+                # blocked titles with no signal about *why* — they have
+                # to drill into each task to find the upstream work.
+                if status == "blocked":
+                    blocked_by = [
+                        str(ref) for ref in (t.get("blocked_by") or []) if ref
+                    ]
+                    if blocked_by:
+                        joined = ", ".join(_escape(ref) for ref in blocked_by[:3])
+                        if len(blocked_by) > 3:
+                            joined += f" (+{len(blocked_by) - 3} more)"
+                        out.append(f"      [dim]waiting on: {joined}[/dim]")
             out.append("")
         # Drop trailing blank for tidy spacing
         while out and out[-1] == "":

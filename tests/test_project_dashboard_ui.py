@@ -601,6 +601,61 @@ def test_user_prompt_payload_drives_dashboard_copy_and_buttons(
     _run(body())
 
 
+def test_pipeline_blocked_section_surfaces_dependencies(
+    dashboard_env, dashboard_app,
+) -> None:
+    """The pipeline's Blocked section used to show only title + age,
+    leaving the operator with no signal about *what* each task is
+    waiting on. Surface the ``blocked_by`` task references so the
+    user can see the upstream work without drilling into each
+    blocked task one by one."""
+    db_path = dashboard_env["project_path"] / ".pollypm" / "state.db"
+    with SQLiteWorkService(
+        db_path=db_path, project_path=dashboard_env["project_path"],
+    ) as svc:
+        upstream = svc.create(
+            title="Upstream task",
+            description="Other work this depends on.",
+            type="task",
+            project="demo",
+            flow_template="standard",
+            roles={"worker": "pete", "reviewer": "russell"},
+            priority="normal",
+            created_by="polly",
+        )
+        svc.queue(upstream.task_id, "polly")
+        downstream = svc.create(
+            title="Blocked downstream feature",
+            description="Cannot start until upstream lands.",
+            type="task",
+            project="demo",
+            flow_template="standard",
+            roles={"worker": "pete", "reviewer": "russell"},
+            priority="normal",
+            created_by="polly",
+        )
+        svc.queue(downstream.task_id, "polly")
+        svc.claim(downstream.task_id, "worker")
+        svc.block(downstream.task_id, "polly", upstream.task_id)
+    from pollypm import cockpit_ui as _cockpit_ui
+    _cockpit_ui._PROJECT_DASHBOARD_TASK_CACHE.clear()
+
+    async def body() -> None:
+        async with dashboard_app.run_test(size=(160, 60)) as pilot:
+            await pilot.pause()
+            assert dashboard_app.data is not None
+            blocked = dashboard_app.data.task_buckets.get("blocked", [])
+            assert any(
+                "Blocked downstream feature" == item.get("title") for item in blocked
+            ), f"expected blocked downstream task in buckets: {blocked!r}"
+            rendered = str(dashboard_app.pipeline_body.render())
+            assert "Blocked downstream feature" in rendered
+            assert "waiting on:" in rendered
+            assert upstream.task_id in rendered
+
+    _run(body())
+
+
 def test_status_pill_prefers_user_attention_over_active_worker(
     dashboard_env, dashboard_app, monkeypatch,
 ) -> None:

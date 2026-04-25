@@ -2837,7 +2837,11 @@ class PollySettingsPaneApp(App[None]):
             f"[dim]projects:[/dim] {len(data.projects)}",
         ]
         if data.errors:
-            bits.append(f"[#ff5f6d]\u25cf {len(data.errors)} error(s)[/]")
+            n_errors = len(data.errors)
+            error_word = "error" if n_errors == 1 else "errors"
+            bits.append(
+                f"[#ff5f6d]\u25cf {n_errors} {error_word}[/]"
+            )
         self.topbar.update("   ".join(bits))
 
     def _render_nav(self) -> None:

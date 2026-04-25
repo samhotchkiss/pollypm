@@ -140,6 +140,12 @@ def _run_session_intelligence_sweep(supervisor: Supervisor, payload: dict[str, A
     if result["sessions_processed"]:
         from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
 
+        n_sessions = result["sessions_processed"]
+        n_entries = result["knowledge_entries"]
+        n_summaries = result["summaries"]
+        sessions_word = "session" if n_sessions == 1 else "sessions"
+        entry_word = "entry" if n_entries == 1 else "entries"
+        summary_word = "summary" if n_summaries == 1 else "summaries"
         supervisor.msg_store.append_event(
             scope="session_intelligence",
             sender="session_intelligence",
@@ -147,9 +153,9 @@ def _run_session_intelligence_sweep(supervisor: Supervisor, payload: dict[str, A
             payload={
                 "message": activity_summary(
                     summary=(
-                        f"Processed {result['sessions_processed']} sessions, "
-                        f"{result['knowledge_entries']} knowledge entries, "
-                        f"{result['summaries']} summaries"
+                        f"Processed {n_sessions} {sessions_word}, "
+                        f"{n_entries} knowledge {entry_word}, "
+                        f"{n_summaries} {summary_word}"
                     ),
                     severity="routine",
                     verb="swept",

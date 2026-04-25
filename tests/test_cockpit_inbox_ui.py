@@ -355,6 +355,53 @@ def test_list_row_renders_title_on_line1_and_project_age_on_line2(
     _run(body())
 
 
+def test_user_prompt_block_surfaces_summary_steps_and_decision() -> None:
+    """When a message carries a structured ``user_prompt`` payload,
+    the inbox detail pane should lead with the plain-English summary,
+    steps, and decision question — not bury them under the raw worker
+    body. Architects already do this work; the renderer must use it."""
+    from pollypm.cockpit_ui import _render_user_prompt_block
+
+    payload = {
+        "user_prompt": {
+            "summary": (
+                "The reachability work is ready, but Polly cannot walk "
+                "through it end to end until the backend deployment exists."
+            ),
+            "steps": [
+                "Make the backend deployment available to Polly.",
+                "Give Polly any access needed to run the walkthrough.",
+            ],
+            "question": (
+                "Approve the work now with a follow-up walkthrough, "
+                "or wait until the live environment is available?"
+            ),
+        }
+    }
+
+    rendered = _render_user_prompt_block(payload)
+    assert rendered is not None
+    assert "reachability work is ready" in rendered
+    assert "What to do" in rendered
+    assert "Make the backend deployment available" in rendered
+    assert "Give Polly any access needed" in rendered
+    assert "Decision" in rendered
+    assert "Approve the work now" in rendered
+
+
+def test_user_prompt_block_returns_none_without_user_prompt_payload() -> None:
+    """Messages without a user_prompt payload fall back to the legacy
+    body-only render — the helper signals this by returning None."""
+    from pollypm.cockpit_ui import _render_user_prompt_block
+
+    assert _render_user_prompt_block(None) is None
+    assert _render_user_prompt_block({}) is None
+    assert _render_user_prompt_block({"user_prompt": None}) is None
+    assert _render_user_prompt_block({"user_prompt": "not a dict"}) is None
+    # An empty user_prompt dict has no fields to render — None as well.
+    assert _render_user_prompt_block({"user_prompt": {}}) is None
+
+
 def test_action_bucket_row_drops_redundant_action_prefix() -> None:
     """The inbox already groups action-needed items under the
     'action needed' header — repeating '[Action]' on every row is

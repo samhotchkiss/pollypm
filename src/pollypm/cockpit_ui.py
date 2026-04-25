@@ -4730,6 +4730,53 @@ def _triage_label(task) -> str:
     return "update"
 
 
+def _render_user_prompt_block(payload: object) -> str | None:
+    """Build the plain-English action block for a message detail pane.
+
+    Architects, reviewers and PMs that send a structured ``user_prompt``
+    in the message payload have already done the work of summarising
+    *what the user should do*. The detail pane should lead with that
+    block — the raw body still renders underneath for technical
+    context, but the operator should not have to parse worker jargon
+    to figure out the decision being asked of them.
+
+    Returns ``None`` when the payload has no ``user_prompt`` dict, so
+    callers can short-circuit and render the legacy body-only layout.
+    """
+    if not isinstance(payload, dict):
+        return None
+    prompt = payload.get("user_prompt")
+    if not isinstance(prompt, dict):
+        return None
+
+    def _plain(value: object | None) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        return " ".join(part.strip() for part in text.splitlines() if part.strip())
+
+    summary = _plain(prompt.get("summary"))
+    question = _plain(prompt.get("question"))
+    raw_steps = prompt.get("steps") or prompt.get("required_actions") or []
+    if not isinstance(raw_steps, list):
+        raw_steps = []
+    steps = [_plain(step) for step in raw_steps if _plain(step)][:5]
+    if not (summary or steps or question):
+        return None
+
+    lines: list[str] = []
+    if summary:
+        lines.append(f"[#f0c45a]◆[/#f0c45a] {_escape(summary)}")
+    heading = _plain(prompt.get("steps_heading")) or "What to do"
+    if steps:
+        lines.append(f"  [b]{_escape(heading)}[/b]")
+        for idx, step in enumerate(steps, start=1):
+            lines.append(f"  [dim]{idx}.[/dim] {_escape(step)}")
+    if question:
+        lines.append(f"  [b]Decision[/b] {_escape(question)}")
+    return "\n".join(lines)
+
+
 def _render_inbox_triage_banner(item) -> str | None:
     bucket = _triage_bucket(item)
     label = _triage_label(item)
@@ -6332,6 +6379,12 @@ class PollyInboxApp(App[None]):
         triage_banner = _render_inbox_triage_banner(item)
         if triage_banner:
             sections.append(triage_banner)
+        prompt_block = _render_user_prompt_block(getattr(item, "payload", None))
+        if prompt_block:
+            sections.append("")
+            sections.append(prompt_block)
+            sections.append("")
+            sections.append("[dim]── details from Polly ──[/dim]")
         sections.append("")
         sections.append(_md_to_rich(_escape_body(item.description or "(no body)")))
         self.detail.update("\n".join(sections))

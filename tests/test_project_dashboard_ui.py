@@ -601,6 +601,49 @@ def test_user_prompt_payload_drives_dashboard_copy_and_buttons(
     _run(body())
 
 
+def test_pipeline_in_progress_section_names_assignee_and_node() -> None:
+    """In-progress rows must tell the operator which worker is
+    carrying the task and which node they're at — without this, the
+    dashboard says '1 in progress' but doesn't tell Sam who to ping
+    when he has a question."""
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    fake_data = SimpleNamespace(
+        exists_on_disk=True,
+        task_counts={"in_progress": 1},
+        task_buckets={
+            "queued": [],
+            "in_progress": [
+                {
+                    "task_id": "demo/1",
+                    "task_number": 1,
+                    "title": "Active feature",
+                    "updated_at": "",
+                    "assignee": "pete",
+                    "current_node_id": "implement",
+                    "summary": "",
+                    "steps": [],
+                    "blocked_by": [],
+                    "hold_reason": "",
+                },
+            ],
+            "review": [],
+            "blocked": [],
+            "on_hold": [],
+            "done": [],
+        },
+    )
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    rendered = app._render_pipeline_body(fake_data)
+
+    assert "Active feature" in rendered
+    assert "pete" in rendered
+    assert "implement" in rendered
+
+
 def test_pipeline_review_section_distinguishes_user_review_from_auto() -> None:
     """The pipeline's Review section must tell the operator who has
     the ball — the auto-reviewer (Russell) or a user-approval node

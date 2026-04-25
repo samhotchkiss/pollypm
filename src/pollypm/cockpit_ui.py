@@ -9859,6 +9859,20 @@ class PollyProjectDashboardApp(App[None]):
                     reason = str(t.get("hold_reason") or "").strip()
                     if reason:
                         out.append(f"      [dim]paused: {_escape(reason)}[/dim]")
+                # In-progress rows tell the operator which worker is
+                # carrying the task and which node they're at right now.
+                # Without this signal, the dashboard says "1 in
+                # progress" but doesn't tell Sam who to message if he
+                # has a question — the assignee is already on the
+                # bucket dict, just unsurfaced.
+                if status == "in_progress":
+                    assignee = str(t.get("assignee") or "").strip()
+                    node_id = str(t.get("current_node_id") or "").strip()
+                    if assignee:
+                        node_part = f" @ {_escape(node_id)}" if node_id else ""
+                        out.append(
+                            f"      [dim]{_escape(assignee)}{node_part}[/dim]"
+                        )
                 # Review rows tell the operator who has the ball:
                 # auto-reviewer (Russell etc.) or a user-approval
                 # node that needs Sam's call. Without this, the user

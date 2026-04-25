@@ -212,10 +212,20 @@ class PollyMetricsApp(App[None]):
             lines: list[str] = []
             for label, value, tone in section.rows:
                 colour = self._tone_colour(tone)
-                lines.append(
-                    f"[{colour}]\u25cf[/{colour}] [dim]{_escape(label)}:[/dim] "
-                    f"[{colour}]{_escape(value)}[/{colour}]"
-                )
+                if value:
+                    lines.append(
+                        f"[{colour}]\u25cf[/{colour}] "
+                        f"[dim]{_escape(label)}:[/dim] "
+                        f"[{colour}]{_escape(value)}[/{colour}]"
+                    )
+                else:
+                    # Narrative-only rows (empty-state messages) drop
+                    # the ``:`` so the line reads as a single sentence
+                    # instead of "label: \u2014".
+                    lines.append(
+                        f"[{colour}]\u25cf[/{colour}] "
+                        f"[dim]{_escape(label)}[/dim]"
+                    )
             body_widget.update("\n".join(lines))
 
         for index, key in enumerate(self._section_order):
@@ -288,10 +298,16 @@ class PollyMetricsApp(App[None]):
             return "\n".join(lines)
         for label, value, tone in section.rows:
             colour = self._tone_colour(tone)
-            lines.append(
-                f"[{colour}]\u25cf[/{colour}]  [b]{_escape(label)}[/b]"
-                f"\n    [dim]{_escape(value)}[/dim]"
-            )
+            if value:
+                lines.append(
+                    f"[{colour}]\u25cf[/{colour}]  [b]{_escape(label)}[/b]"
+                    f"\n    [dim]{_escape(value)}[/dim]"
+                )
+            else:
+                # Narrative-only row \u2014 skip the second value line.
+                lines.append(
+                    f"[{colour}]\u25cf[/{colour}]  [b]{_escape(label)}[/b]"
+                )
             lines.append("")
         if section.key == "resources":
             try:

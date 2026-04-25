@@ -666,7 +666,10 @@ def _scheduler_section(store) -> MetricsSection:
         bucket.setdefault(subject, []).append(getattr(e, "created_at", "") or "")
 
     if not bucket:
-        rows.append(("(no scheduled runs recorded)", "—", "muted"))
+        # Empty value lets the renderer drop the ``:`` separator —
+        # avoids ``(no scheduled runs recorded): —`` reading as a
+        # broken row.
+        rows.append(("No scheduled jobs have run yet.", "", "muted"))
         return MetricsSection(key="schedulers", title="Schedulers", rows=rows)
 
     now = datetime.now(UTC)

@@ -379,6 +379,27 @@ def test_scheduler_section_flags_stale_handler() -> None:
     assert rows["stuck_task_sweep"][1] == "alert"
 
 
+def test_scheduler_section_empty_state_uses_narrative_row() -> None:
+    """When no scheduled events have been recorded, the section
+    previously emitted a row with value=``—`` so the renderer
+    rendered ``● (no scheduled runs recorded): —`` — visually
+    parsed as a broken row. Use an empty value so the renderer can
+    drop the ``:`` separator and surface a clean narrative line.
+    """
+    from pollypm.cockpit import _scheduler_section
+
+    class _Store:
+        def recent_events(self, limit):
+            return []
+
+    sec = _scheduler_section(_Store())
+    assert len(sec.rows) == 1
+    label, value, tone = sec.rows[0]
+    assert "scheduled" in label.lower()
+    assert value == ""
+    assert tone == "muted"
+
+
 # ---------------------------------------------------------------------------
 # 7. R refreshes, A toggles auto-refresh
 # ---------------------------------------------------------------------------

@@ -601,7 +601,7 @@ def _throughput_section(day_events: list) -> MetricsSection:
     return MetricsSection(key="throughput", title="Throughput (24h)", rows=rows)
 
 
-def _failure_section(day_events: list) -> MetricsSection:
+def _failure_section(day_events: list, store=None) -> MetricsSection:
     """Section 4 — failure counts over the last 24h."""
     def _count(pred) -> int:
         return sum(1 for e in day_events if pred(getattr(e, "event_type", "")))
@@ -609,8 +609,43 @@ def _failure_section(day_events: list) -> MetricsSection:
     state_drift = _count(lambda k: k == "state_drift")
     persona_swap = _count(lambda k: k == "persona_swap_detected" or "persona_swap" in (k or ""))
     reprompts = _count(lambda k: k in ("worker_reprompt", "reprompt", "worker_turn_end_reprompt"))
-    no_session = _count(lambda k: "no_session" in (k or ""))
     probe_fail = _count(lambda k: "provider_probe" in (k or "") and "fail" in (k or ""))
+
+    # ``no_session`` alerts go through ``upsert_alert`` (type="alert"
+    # in the unified messages table), not ``record_event`` — counting
+    # them via the events stream always returned 0. Query the alerts
+    # directly when a store is available so the metric reflects real
+    # ``no_session`` raises rather than reading as a permanent zero.
+    # Supports two store shapes: the ``StateStore`` (raw SQL via
+    # ``execute``) used by the cockpit metric pipeline, and any store
+    # exposing ``query_messages`` (SQLAlchemyStore-style).
+    no_session = 0
+    if store is not None:
+        try:
+            from datetime import UTC, datetime, timedelta
+            cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+            if hasattr(store, "execute"):
+                rows = store.execute(
+                    """
+                    SELECT sender FROM messages
+                    WHERE type = 'alert'
+                      AND created_at >= ?
+                      AND sender LIKE 'no_session%'
+                    """,
+                    (cutoff,),
+                ).fetchall()
+                no_session = len(rows)
+            elif hasattr(store, "query_messages"):
+                rows_24h = store.query_messages(
+                    type=["alert"],
+                    since=datetime.fromisoformat(cutoff),
+                )
+                no_session = sum(
+                    1 for row in rows_24h
+                    if "no_session" in str(row.get("sender") or "")
+                )
+        except Exception:  # noqa: BLE001
+            no_session = 0
 
     rows: list[tuple[str, str, str]] = []
     rows.append(("state_drift", str(state_drift), "alert" if state_drift else "ok"))
@@ -790,7 +825,7 @@ def _gather_metrics_snapshot(config) -> MetricsSnapshot:
                 key="throughput", title="Throughput (24h)", rows=[],
             )
         try:
-            failures = _failure_section(day_events)
+            failures = _failure_section(day_events, store=store)
         except Exception:  # noqa: BLE001
             failures = MetricsSection(
                 key="failures", title="Failures (24h)", rows=[],

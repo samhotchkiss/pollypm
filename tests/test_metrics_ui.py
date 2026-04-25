@@ -295,7 +295,13 @@ def test_throughput_section_counts_recent_events() -> None:
 
 
 def test_failure_section_categorises_failures() -> None:
-    """state_drift, persona_swap, reprompts, no_session — all flagged."""
+    """state_drift, persona_swap, reprompts, no_session — all flagged.
+
+    ``no_session`` alerts are emitted via ``upsert_alert`` (type=
+    "alert" in the unified messages table), not via ``record_event``.
+    The metric counts them from a store query, so we pass a fake
+    store that returns the expected alert rows.
+    """
     from pollypm.cockpit import _failure_section
 
     class _E:
@@ -308,10 +314,16 @@ def test_failure_section_categorises_failures() -> None:
         _E("persona_swap_detected"),
         _E("worker_reprompt"),
         _E("worker_reprompt"),
-        _E("no_session_alert"),
         _E("provider_probe_failed"),
     ]
-    sec = _failure_section(events)
+
+    class _Store:
+        def query_messages(self, **filters):
+            # Returns one alert row whose sender contains "no_session"
+            # to exercise the alert-side counter.
+            return [{"sender": "no_session_for_assignment:proj/1"}]
+
+    sec = _failure_section(events, store=_Store())
     rows = {r[0]: (r[1], r[2]) for r in sec.rows}
     assert rows["state_drift"][0] == "2"
     assert rows["state_drift"][1] == "alert"
@@ -322,6 +334,16 @@ def test_failure_section_categorises_failures() -> None:
     assert rows["no_session alerts"][0] == "1"
     assert rows["no_session alerts"][1] == "alert"
     assert rows["Provider probe failures"][0] == "1"
+
+
+def test_failure_section_no_session_metric_is_zero_when_store_omitted() -> None:
+    """Older callers that don't pass a store still get a sensible
+    zero for the no_session counter (no crash, no spurious count)."""
+    from pollypm.cockpit import _failure_section
+
+    sec = _failure_section([])
+    rows = {r[0]: r[1] for r in sec.rows}
+    assert rows["no_session alerts"] == "0"
 
 
 # ---------------------------------------------------------------------------

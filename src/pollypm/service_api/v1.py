@@ -34,6 +34,7 @@ from pollypm.accounts import (
     add_account_via_login,
     list_cached_account_statuses,
     list_account_statuses,
+    probe_account_usage,
     relogin_account,
     remove_account,
     set_controller_account,

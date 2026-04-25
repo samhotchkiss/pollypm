@@ -702,8 +702,8 @@ def new_event_count(
 
 
 __all__ = [
-    "ActivityFeedApp",
-    "ActivityFeedPanel",
+    "ActivityFeedApp",  # noqa: F822 — exported lazily via __getattr__
+    "ActivityFeedPanel",  # noqa: F822 — exported lazily via __getattr__
     "FeedFilter",
     "apply_filter",
     "format_entry_row",

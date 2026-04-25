@@ -89,6 +89,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from pollypm.core import CoreRail
+    from pollypm.providers.base import LaunchCommand
     from pollypm.store.protocol import Store
 
 

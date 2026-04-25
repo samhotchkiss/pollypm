@@ -18,6 +18,7 @@ from pollypm.models import (
     PollyPMConfig,
     PollyPMSettings,
     ProviderKind,
+    RailSettings,
     RuntimeKind,
     SessionConfig,
     StorageSettings,
@@ -389,15 +390,13 @@ def _parse_memory_settings(raw: dict[str, object]) -> MemorySettings:
     return MemorySettings(backend=str(memory_raw.get("backend", "file")))
 
 
-def _parse_rail_settings(raw: dict[str, object]) -> "RailSettings":
+def _parse_rail_settings(raw: dict[str, object]) -> RailSettings:
     """Parse the ``[rail]`` TOML section.
 
     See docs/extensible-rail-spec.md §6. Missing / malformed sections
     fall back to defaults — an invalid entry type never aborts config
     load.
     """
-    from pollypm.models import RailSettings
-
     rail_raw = raw.get("rail", {})
     if not isinstance(rail_raw, dict):
         return RailSettings()

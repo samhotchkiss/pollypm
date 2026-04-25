@@ -685,8 +685,6 @@ def prune_old_staging(
 
 
 __all__ = [
-    "classify_priority",
-    "validate_priority",
     "stage_notification",
     "list_pending",
     "flush_milestone_digest",

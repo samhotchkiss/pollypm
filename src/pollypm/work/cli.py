@@ -40,7 +40,11 @@ _TASK_APP_HELP = help_with_examples(
         "templates and common failure modes."
     ),
 )
-from pollypm.work.service_support import TaskNotFoundError, ValidationError
+from pollypm.work.service_support import (
+    TaskNotFoundError,
+    ValidationError,
+    WorkServiceError,
+)
 
 if TYPE_CHECKING:
     from pollypm.work.sqlite_service import SQLiteWorkService
@@ -127,8 +131,6 @@ def _render_work_service_error(exc: Exception, fn) -> str:
 
 def _run(fn, *args, **kwargs):
     """Call a work service method, catching errors for clean CLI output."""
-    from pollypm.work.sqlite_service import WorkServiceError
-
     try:
         return fn(*args, **kwargs)
     except WorkServiceError as exc:

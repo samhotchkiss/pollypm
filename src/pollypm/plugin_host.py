@@ -24,8 +24,13 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 import tomllib
 import types
+
+if TYPE_CHECKING:
+    from pollypm.heartbeat.roster import Roster
+    from pollypm.jobs.registry import JobHandlerRegistry
 
 from pollypm.plugin_api.v1 import (
     Capability,

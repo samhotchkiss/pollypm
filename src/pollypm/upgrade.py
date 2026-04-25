@@ -24,12 +24,42 @@ touching this module.
 
 from __future__ import annotations
 
+import json
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 import pollypm
+
+
+_POST_UPGRADE_FLAG = Path.home() / ".pollypm" / "post-upgrade.flag"
+
+
+def _write_post_upgrade_flag(old_version: str, new_version: str) -> None:
+    """Drop the cockpit's restart-nudge sentinel.
+
+    The cockpit's ``_check_post_upgrade_flag`` reads this file each
+    tick and swaps the rail's update pill to "✓ Upgraded to v<new> ·
+    restart cockpit (ctrl+q) to pick up new code". Without this write
+    the rail never tells the user the upgrade finished — they're
+    still running the old code in the live cockpit and have no
+    in-band signal that a restart will pick up the new release.
+
+    Best-effort: filesystem errors are swallowed so a write failure
+    doesn't break the otherwise-successful upgrade flow.
+    """
+    payload = {
+        "from": old_version,
+        "to": new_version,
+        "at": time.time(),
+    }
+    try:
+        _POST_UPGRADE_FLAG.parent.mkdir(parents=True, exist_ok=True)
+        _POST_UPGRADE_FLAG.write_text(json.dumps(payload))
+    except OSError:
+        pass
 
 
 Installer = str  # "uv" | "pip" | "brew" | "npm" | "unknown"
@@ -482,6 +512,9 @@ def upgrade(
         # Wired in #720; for now just echo the intent.
         scope = "all" if recycle_all else "idle"
         step(f"recycle ({scope}): deferred to #720")
+
+    _write_post_upgrade_flag(old_version, new_version)
+    step("flagged cockpit for restart nudge")
 
     return UpgradeResult(
         ok=True,

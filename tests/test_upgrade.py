@@ -201,6 +201,95 @@ def test_upgrade_same_version_install_reports_noop(monkeypatch) -> None:
     assert "already up to date" in result.message
 
 
+def test_upgrade_writes_post_upgrade_flag_after_real_version_change(
+    tmp_path, monkeypatch,
+) -> None:
+    """A version-changing upgrade must drop the cockpit's restart-nudge
+    sentinel; without it the rail's pill never says
+    ``✓ Upgraded to v<new> · restart cockpit``."""
+    import json
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    (fake_home / ".pollypm").mkdir()
+    monkeypatch.setattr(
+        upgrade_mod, "_POST_UPGRADE_FLAG",
+        fake_home / ".pollypm" / "post-upgrade.flag",
+    )
+    monkeypatch.setattr(upgrade_mod, "_available_upgrade", lambda channel: None)
+    monkeypatch.setattr(
+        upgrade_mod, "run_migration_check", lambda: (True, "ok"),
+    )
+    monkeypatch.setattr(
+        upgrade_mod.subprocess,
+        "run",
+        lambda *a, **kw: type(
+            "Result",
+            (),
+            {"returncode": 0, "stdout": "", "stderr": ""},
+        )(),
+    )
+    # Force the install to "produce" a different version than the
+    # currently installed one, so the success path is taken.
+    monkeypatch.setattr(upgrade_mod, "_read_new_version", lambda: "9.9.9")
+    monkeypatch.setattr(
+        upgrade_mod, "inject_notice", lambda old, new: (True, "ok"),
+    )
+
+    result = upgrade_mod.upgrade(
+        channel="stable",
+        installer_overrides={"uv": True},
+    )
+    assert result.ok is True
+    assert result.new_version == "9.9.9"
+    flag = fake_home / ".pollypm" / "post-upgrade.flag"
+    assert flag.exists(), "successful upgrade must write the cockpit sentinel"
+    payload = json.loads(flag.read_text())
+    assert payload["to"] == "9.9.9"
+    assert payload["from"] == result.old_version
+    assert isinstance(payload["at"], (int, float))
+
+
+def test_upgrade_skips_post_upgrade_flag_when_version_unchanged(
+    tmp_path, monkeypatch,
+) -> None:
+    """A no-op upgrade (same version after install) must NOT write the
+    cockpit sentinel — there is nothing for the operator to restart
+    into, so the pill must not flash 'Upgraded to vX'."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    (fake_home / ".pollypm").mkdir()
+    flag = fake_home / ".pollypm" / "post-upgrade.flag"
+    monkeypatch.setattr(upgrade_mod, "_POST_UPGRADE_FLAG", flag)
+    monkeypatch.setattr(upgrade_mod, "_available_upgrade", lambda channel: None)
+    monkeypatch.setattr(
+        upgrade_mod, "run_migration_check", lambda: (True, "ok"),
+    )
+    monkeypatch.setattr(
+        upgrade_mod.subprocess,
+        "run",
+        lambda *a, **kw: type(
+            "Result",
+            (),
+            {"returncode": 0, "stdout": "", "stderr": ""},
+        )(),
+    )
+    # Same version after install → no-op path
+    monkeypatch.setattr(
+        upgrade_mod, "_read_new_version", lambda: upgrade_mod.pollypm.__version__,
+    )
+
+    result = upgrade_mod.upgrade(
+        channel="stable",
+        installer_overrides={"uv": True},
+    )
+    assert result.ok is True
+    assert result.old_version == result.new_version
+    assert not flag.exists(), (
+        "no-op upgrade must not write the cockpit restart-nudge sentinel"
+    )
+
+
 def test_upgrade_aborts_when_migration_check_fails(monkeypatch) -> None:
     monkeypatch.setattr(
         upgrade_mod, "run_migration_check",

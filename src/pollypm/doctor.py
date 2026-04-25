@@ -2284,8 +2284,9 @@ def check_scheduler_roster_handlers() -> CheckResult:
         return _skip("scheduler-handlers check skipped (plugin import failed)")
     missing = [h for h in _EXPECTED_SCHEDULED_HANDLERS if h not in declared]
     if missing:
+        handler_word = "handler" if len(missing) == 1 else "handlers"
         return _fail(
-            f"missing scheduled handler(s): {', '.join(missing)}",
+            f"missing scheduled {handler_word}: {', '.join(missing)}",
             why=(
                 "These recurring handlers ship with the builtin recurring "
                 "plugins. Their absence means the roster never enqueues them "
@@ -2299,8 +2300,10 @@ def check_scheduler_roster_handlers() -> CheckResult:
             ),
             data={"missing": missing, "expected": list(_EXPECTED_SCHEDULED_HANDLERS)},
         )
+    n_expected = len(_EXPECTED_SCHEDULED_HANDLERS)
+    handler_word = "handler" if n_expected == 1 else "handlers"
     return _ok(
-        f"all {len(_EXPECTED_SCHEDULED_HANDLERS)} scheduled handler(s) registered",
+        f"all {n_expected} scheduled {handler_word} registered",
         data={"handlers": list(_EXPECTED_SCHEDULED_HANDLERS)},
     )
 
@@ -2400,8 +2403,9 @@ def check_scheduler_last_fired() -> CheckResult:
         summary = ", ".join(
             f"{h} ({gap / 3600:.1f}h ago)" for h, gap in overdue[:4]
         )
+        overdue_word = "handler" if len(overdue) == 1 else "handlers"
         return _fail(
-            f"{len(overdue)} scheduled handler(s) overdue: {summary}",
+            f"{len(overdue)} scheduled {overdue_word} overdue: {summary}",
             why=(
                 "Each handler emits a system event when it runs. A gap "
                 "exceeding the per-handler threshold (2x daily / 3x hourly "
@@ -2422,8 +2426,9 @@ def check_scheduler_last_fired() -> CheckResult:
             "no scheduled-handler events yet (fresh install)",
             data=data,
         )
+    healthy_word = "handler" if len(healthy) == 1 else "handlers"
     return _ok(
-        f"{len(healthy)} scheduled handler(s) within cadence",
+        f"{len(healthy)} scheduled {healthy_word} within cadence",
         data=data,
     )
 

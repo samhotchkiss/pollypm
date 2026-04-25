@@ -562,6 +562,37 @@ def test_scheduler_handlers_warn_when_missing(monkeypatch: pytest.MonkeyPatch) -
     assert "missing scheduled handler" in result.status
 
 
+def test_scheduler_handlers_pluralisation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cycle 69: missing-handler status uses ``handler`` / ``handlers`` per count.
+
+    The previous text was ``missing scheduled handler(s):`` —
+    parenthetical plural. With exactly one handler missing, that
+    reads as a copy bug in the most user-visible doctor surface
+    after a partial install.
+    """
+    # Almost-complete declared set: drop one expected handler so
+    # exactly one is missing.
+    expected = list(doctor._EXPECTED_SCHEDULED_HANDLERS)
+    declared_one_missing = set(expected[1:])  # drop the first
+    monkeypatch.setattr(
+        doctor, "_expected_handlers_from_plugins", lambda: declared_one_missing,
+    )
+    one_missing = doctor.check_scheduler_roster_handlers()
+    assert not one_missing.passed
+    assert "missing scheduled handler:" in one_missing.status
+    assert "handler(s)" not in one_missing.status
+
+    # Two missing → plural.
+    declared_two_missing = set(expected[2:])
+    monkeypatch.setattr(
+        doctor, "_expected_handlers_from_plugins", lambda: declared_two_missing,
+    )
+    two_missing = doctor.check_scheduler_roster_handlers()
+    assert not two_missing.passed
+    assert "missing scheduled handlers:" in two_missing.status
+    assert "handler(s)" not in two_missing.status
+
+
 def test_scheduler_cadence_pass(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     db = _make_state_db(tmp_path / "state.db")
     # Fresh event for every expected handler — all healthy.

@@ -327,6 +327,14 @@ def _render_message_display(row: dict[str, Any]) -> list[str]:
     ]
     if labels:
         lines.append(f"  labels:    {', '.join(str(label) for label in labels)}")
+    payload = row.get("payload") or {}
+    if isinstance(payload, dict):
+        prompt_lines = _render_user_prompt_lines(payload.get("user_prompt"))
+        if prompt_lines:
+            lines.append("")
+            lines.append("  user_prompt:")
+            for prompt_line in prompt_lines:
+                lines.append(f"    {prompt_line}")
     body = (row.get("body") or "").rstrip()
     if body:
         lines.append("")
@@ -334,6 +342,39 @@ def _render_message_display(row: dict[str, Any]) -> list[str]:
         for body_line in body.splitlines():
             lines.append(f"    {body_line}")
     return lines
+
+
+def _render_user_prompt_lines(prompt: object) -> list[str]:
+    """Plain-text rendering of a structured ``user_prompt`` payload.
+
+    Mirrors the cockpit detail-pane block (see
+    ``cockpit_ui._render_user_prompt_block``) so a CLI inspector and
+    the TUI surface the same plain-English summary, steps, and
+    decision question. Without this, ``pm inbox show msg:N`` only
+    prints the raw worker body and the operator never sees the
+    structured copy the architect/PM authored.
+    """
+    if not isinstance(prompt, dict):
+        return []
+    summary = str(prompt.get("summary") or "").strip()
+    question = str(prompt.get("question") or "").strip()
+    raw_steps = prompt.get("steps") or prompt.get("required_actions") or []
+    if not isinstance(raw_steps, list):
+        raw_steps = []
+    steps = [str(step).strip() for step in raw_steps if str(step).strip()][:5]
+    if not (summary or question or steps):
+        return []
+    out: list[str] = []
+    if summary:
+        out.append(f"summary:  {summary}")
+    if steps:
+        heading = str(prompt.get("steps_heading") or "").strip() or "What to do"
+        out.append(f"{heading}:")
+        for idx, step in enumerate(steps, start=1):
+            out.append(f"  {idx}. {step}")
+    if question:
+        out.append(f"decision: {question}")
+    return out
 
 
 # ---------------------------------------------------------------------------

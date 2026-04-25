@@ -91,3 +91,73 @@ def test_inbox_show_msg_invalid_form_exits_nonzero(tmp_path: Path) -> None:
     )
     assert result.exit_code != 0
     assert "invalid message id" in (result.output + (result.stderr or "")).lower()
+
+
+def test_inbox_show_msg_surfaces_user_prompt_block(tmp_path: Path) -> None:
+    """Architect / Polly notifications carrying a structured
+    ``user_prompt`` payload must surface the plain-English summary,
+    steps, and decision question through ``pm inbox show msg:N``,
+    not just the raw body. Without this, an operator running the
+    CLI to inspect an inbox row sees worker jargon and never the
+    structured copy the architect authored."""
+    db_path = tmp_path / "state.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    try:
+        msg_id = store.enqueue_message(
+            type="notify",
+            tier="immediate",
+            recipient="user",
+            sender="architect",
+            subject="Plan ready for review",
+            body=(
+                "Internal worker notes — file paths, commit refs, "
+                "stack traces — should not be the user-facing copy."
+            ),
+            scope="demo",
+            payload={
+                "actor": "architect",
+                "user_prompt": {
+                    "summary": "A full project plan is ready for your review.",
+                    "steps": [
+                        "Open the plan review surface.",
+                        "Approve or send back with feedback.",
+                    ],
+                    "question": (
+                        "Approve the plan or discuss changes with the PM?"
+                    ),
+                },
+            },
+        )
+    finally:
+        store.close()
+
+    result = runner.invoke(
+        inbox_app, ["show", f"msg:{msg_id}", "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    # The structured block leads with the plain-English summary,
+    # numbered steps, and the decision label.
+    assert "user_prompt:" in result.output
+    assert "A full project plan is ready" in result.output
+    assert "Open the plan review surface" in result.output
+    assert "Approve or send back with feedback" in result.output
+    assert "decision:" in result.output
+    assert "Approve the plan or discuss changes" in result.output
+
+
+def test_inbox_show_msg_omits_user_prompt_block_when_absent(
+    tmp_path: Path,
+) -> None:
+    """Legacy notifications without a ``user_prompt`` payload must
+    keep their existing body-only render — no empty
+    ``user_prompt:`` heading on rows that have nothing to put under
+    it."""
+    db_path = tmp_path / "state.db"
+    msg_id = _seed_message(db_path, subject="Legacy notification")
+
+    result = runner.invoke(
+        inbox_app, ["show", f"msg:{msg_id}", "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "user_prompt:" not in result.output

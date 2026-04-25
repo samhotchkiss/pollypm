@@ -8013,12 +8013,19 @@ def _dashboard_status(
       project (nothing in flight but attention is required).
     * Dim — idle / no activity.
     """
-    if active_worker is not None:
-        return ("\u25cf", "#3ddc84", "active")
-    if alert_count:
-        return ("\u25c6", "#f85149", "alert")
+    # Priority mirrors the banner copy in
+    # ``_render_project_state_banner`` so the pill and the banner agree.
+    # User-attention states must outrank an active worker \u2014 saying
+    # "active" green while the banner says "Waiting on you" is the
+    # contradiction the v1 doc called out as a false-positive green
+    # light (architect running in the background \u2260 "nothing for me to
+    # do here").
     if inbox_count or on_hold_count:
         return ("\u25c6", "#f0c45a", "needs attention")
+    if alert_count:
+        return ("\u25c6", "#f85149", "alert")
+    if active_worker is not None:
+        return ("\u25cf", "#3ddc84", "active")
     if blocker_count:
         return ("\u25cb", "#6b7a88", "waiting on dependencies")
     return ("\u25cb", "#4a5568", "idle")

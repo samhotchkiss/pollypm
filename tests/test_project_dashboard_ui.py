@@ -601,6 +601,61 @@ def test_user_prompt_payload_drives_dashboard_copy_and_buttons(
     _run(body())
 
 
+def test_status_pill_prefers_user_attention_over_active_worker(
+    dashboard_env, dashboard_app, monkeypatch,
+) -> None:
+    """When a worker is heartbeat-alive *and* the user has inbox
+    items, the pill must show 'needs attention' (yellow) — not
+    'active' (green). Saying 'active' while the banner says
+    'Waiting on you' was the contradictory false-positive green
+    light the v1 dashboard contract called out: an architect or
+    worker running in the background does not mean 'nothing for the
+    operator to do here.'"""
+    from datetime import UTC, datetime
+
+    fake_worker = {
+        "session_name": "demo-main",
+        "role": "architect",
+        "last_heartbeat": datetime.now(UTC).isoformat(),
+    }
+
+    def _fake_active_worker(config_path, project_key):
+        return fake_worker, 0
+
+    from pollypm import cockpit_ui as _cockpit_ui
+    monkeypatch.setattr(
+        _cockpit_ui, "_dashboard_active_worker", _fake_active_worker,
+    )
+
+    # Seed an inbox-bearing chat task so inbox_count > 0.
+    db_path = dashboard_env["project_path"] / ".pollypm" / "state.db"
+    with SQLiteWorkService(
+        db_path=db_path, project_path=dashboard_env["project_path"],
+    ) as svc:
+        svc.create(
+            title="Hi there",
+            description="Need your call.",
+            type="task",
+            project="demo",
+            flow_template="chat",
+            roles={"requester": "user", "operator": "polly"},
+            priority="normal",
+            created_by="polly",
+        )
+    _cockpit_ui._PROJECT_DASHBOARD_TASK_CACHE.clear()
+
+    async def body() -> None:
+        async with dashboard_app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            assert dashboard_app.data is not None
+            assert dashboard_app.data.active_worker is not None
+            assert dashboard_app.data.inbox_count >= 1
+            # User-attention state outranks the active-worker indicator.
+            assert dashboard_app.data.status_label == "needs attention"
+
+    _run(body())
+
+
 def test_waiting_on_you_banner_drops_redundant_need_action_suffix(
     dashboard_env, dashboard_app,
 ) -> None:

@@ -9722,12 +9722,18 @@ class PollyProjectDashboardApp(App[None]):
         if not counts and not any(buckets.values()):
             return "[dim]No tasks yet. Press N on the rail to start a lane.[/dim]"
 
-        # Compact count strip
+        # Compact count strip. ``in_progress`` and ``blocked`` previously
+        # shared the \u25c6 glyph; the colour distinguishes them but the
+        # shape didn't, which made the pipeline strip ambiguous in
+        # snapshots, screenshots, and any low-colour terminal. Use \u25a3
+        # (squared inner square) for blocked so the "waiting on
+        # dependencies" rows look distinct from the "in flight" rows
+        # at a glance.
         strip_order = [
             ("queued", "#6b7a88", "\u25cb"),
             ("in_progress", "#f0c45a", "\u25c6"),
             ("review", "#5b8aff", "\u25c9"),
-            ("blocked", "#f85149", "\u25c6"),
+            ("blocked", "#f85149", "\u25a3"),
             ("on_hold", "#f0c45a", "\u23f8"),
             ("done", "#3ddc84", "\u2713"),
         ]

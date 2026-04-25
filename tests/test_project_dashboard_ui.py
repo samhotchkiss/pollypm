@@ -1852,6 +1852,42 @@ def test_approve_button_warns_when_task_is_not_in_an_approvable_state(
 # ---------------------------------------------------------------------------
 
 
+def test_pipeline_strip_uses_distinct_glyph_for_blocked_vs_in_progress() -> None:
+    """Regression: the pipeline strip rendered both ``in_progress`` and
+    ``blocked`` with the ◆ glyph, distinguished only by colour. The
+    shape duplication made the strip ambiguous in low-colour terminals
+    and snapshots — switch ``blocked`` to ▣ so the count strip carries
+    six distinct glyphs.
+    """
+    from types import SimpleNamespace
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    fake_data = SimpleNamespace(
+        exists_on_disk=True,
+        task_counts={
+            "queued": 0,
+            "in_progress": 1,
+            "review": 0,
+            "blocked": 5,
+            "on_hold": 0,
+            "done": 3,
+        },
+        task_buckets={
+            "queued": [], "in_progress": [], "review": [],
+            "blocked": [], "on_hold": [], "done": [],
+        },
+    )
+    rendered = app._render_pipeline_body(fake_data)
+    # in_progress keeps ◆ (filled diamond) — visually says "active".
+    assert "◆[/] [b]1[/b] [dim]in progress[/dim]" in rendered
+    # blocked now uses ▣ (squared inner square) — visually says
+    # "wall / dependency" without overlapping the in_progress glyph.
+    assert "▣[/] [b]5[/b] [dim]blocked[/dim]" in rendered
+    # Specifically: blocked must NOT use ◆ anymore.
+    assert "◆[/] [b]5[/b] [dim]blocked[/dim]" not in rendered
+
+
 def test_pipeline_shows_counts_and_titles(
     dashboard_env, dashboard_app,
 ) -> None:

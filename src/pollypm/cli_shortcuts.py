@@ -20,6 +20,7 @@ class ShortcutGroup:
 
 
 _SHORTCUT_GROUPS: tuple[ShortcutGroup, ...] = (
+    ShortcutGroup("Setup", ("pm onboard", "pm projects", "pm doctor")),
     ShortcutGroup("Create", ("pm task create", "pm issue create")),
     ShortcutGroup("Monitor", ("pm activity --follow", "pm cockpit")),
     ShortcutGroup("Review", ("pm inbox", "pm task approve")),

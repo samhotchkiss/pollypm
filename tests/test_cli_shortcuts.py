@@ -3,6 +3,7 @@ from pollypm.cli_shortcuts import render_shortcuts_text, shortcut_rows
 
 def test_shortcut_rows_are_stable_for_shared_surfaces() -> None:
     assert shortcut_rows() == (
+        ("Setup", "pm onboard | pm projects | pm doctor"),
         ("Create", "pm task create | pm issue create"),
         ("Monitor", "pm activity --follow | pm cockpit"),
         ("Review", "pm inbox | pm task approve"),

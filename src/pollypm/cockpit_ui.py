@@ -10003,6 +10003,11 @@ class PollyProjectDashboardApp(App[None]):
         dashboard's task numbering. Also strip ``[Action]`` routing
         tags that the architect's notify subjects sometimes leak into
         transition reasons.
+
+        When the parenthesised reason then names the held task itself
+        (``Waiting on operator: #N — ...`` where #N is the same task
+        the row is about), elide the self-ref to avoid the ``task #N
+        ... #N ...`` echo. Mirrors the cycle 5 hold-reason elision.
         """
         if not summary:
             return summary
@@ -10016,6 +10021,18 @@ class PollyProjectDashboardApp(App[None]):
             text = _re.sub(
                 rf"\b{_re.escape(prefix)}(\d+)\b",
                 r"#\1",
+                text,
+            )
+        # Self-ref elision: when the row already starts with
+        # ``task #N:`` and the parenthesised reason carries
+        # ``<verb>: #N — text``, drop the leading ``#N`` from the
+        # reason so we read ``<verb> — text``.
+        head_match = _re.match(r"task\s+#(\d+):", text)
+        if head_match:
+            self_num = head_match.group(1)
+            text = _re.sub(
+                rf":\s+#{_re.escape(self_num)}\s+(?=[—\-,;])",
+                " ",
                 text,
             )
         return text

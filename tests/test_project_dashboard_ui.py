@@ -1959,6 +1959,50 @@ def test_now_body_idle_when_no_tasks_at_all() -> None:
     assert "no user action needed" in rendered
 
 
+def test_recent_activity_elides_self_reference_in_transition_reason(
+    dashboard_env, dashboard_app, monkeypatch,
+) -> None:
+    """When the projector's transition row says ``task #N: ... → ...``
+    and the parenthesised reason then names the same task again
+    (``Waiting on operator: #N — ...``), the row reads as
+    ``task #N ... #N ...`` — the inner ``#N`` is tautological since
+    the row's prefix already names it. Drop the leading inner ``#N``
+    so the reason reads as standalone prose. Mirrors cycle 5's
+    hold-reason elision applied at the projector summary layer.
+    """
+    fake_entries = [
+        {
+            "timestamp": "2026-04-24T10:00:00+00:00",
+            "actor": "pm",
+            "verb": "review->on_hold",
+            "summary": (
+                "task demo/12: review → on_hold "
+                "(Waiting on operator: demo/12 — same scope as demo/3)"
+            ),
+            "kind": "task_transition",
+        },
+    ]
+
+    def _fake_activity(config_path, project_key, *, limit=10):
+        return fake_entries[:limit]
+
+    from pollypm import cockpit_ui
+    monkeypatch.setattr(cockpit_ui, "_dashboard_activity", _fake_activity)
+
+    async def body() -> None:
+        async with dashboard_app.run_test(size=(160, 60)) as pilot:
+            await pilot.pause()
+            rendered = str(dashboard_app.activity_body.render())
+            # The leading ``task #12:`` survives.
+            assert "task #12: review → on_hold" in rendered
+            # The inner self-reference (``: #12 — ``) is gone.
+            assert "Waiting on operator —" in rendered
+            # And the cross-project reference (#3) still survives.
+            assert "#3" in rendered
+
+    _run(body())
+
+
 def test_recent_activity_strips_in_project_task_prefix_and_action_tag(
     dashboard_env, dashboard_app, monkeypatch,
 ) -> None:

@@ -47,7 +47,15 @@ def _fetch_latest_version() -> str | None:
                 if "refs/tags/" in line and not line.endswith("^{}")
             ]
             if tags:
-                return sorted(tags)[-1]
+                # Sort by semver, not lexicographically — bare ``sorted``
+                # picks ``1.9.0`` over ``1.10.0`` and lets stray non-semver
+                # tags (e.g. ``nightly``) masquerade as latest. Mirrors the
+                # cycle 92 fix in ``cli_features.maintenance``.
+                from pollypm.cli_features.maintenance import (
+                    _semver_sort_key,
+                )
+
+                return sorted(tags, key=_semver_sort_key)[-1]
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 

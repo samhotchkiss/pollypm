@@ -2096,3 +2096,62 @@ def test_other_open_items_skips_duplicates_of_action_cards(
     assert "re-ping" not in other_section
     # A genuinely-different inbox item must still surface.
     assert "Different thing waiting on you" in other_section
+
+
+def test_inbox_preview_splits_action_vs_info_items(dashboard_app) -> None:
+    """Regression: when no Action Needed cards render but the inbox
+    preview holds a mix of ``needs_action`` and informational items,
+    the action items must come first and the informational items must
+    sit under an explicit ``Other open items`` subhead.
+
+    Before: both got listed under the ``2 need action`` count header,
+    so a user reading the dashboard saw three rows under "2 need
+    action" and had to mentally re-derive which two were actionable.
+    After: action items are listed first, then ``Other open items``
+    cleanly separates the FYI rows.
+    """
+    from types import SimpleNamespace
+
+    fake_data = SimpleNamespace(
+        inbox_count=2,
+        task_counts={},
+        task_buckets={},
+        action_items=[],
+        inbox_top=[
+            {
+                "task_id": "demo/1",
+                "primary_ref": "demo/1",
+                "title": "Approve scoped delivery",
+                "updated_at": "",
+                "triage_label": "needs unblock",
+                "source": "task",
+                "needs_action": True,
+            },
+            {
+                "task_id": "demo/2",
+                "primary_ref": "demo/2",
+                "title": "Decide review feedback",
+                "updated_at": "",
+                "triage_label": "needs review",
+                "source": "task",
+                "needs_action": True,
+            },
+            {
+                "task_id": "demo/3",
+                "primary_ref": "demo/3",
+                "title": "Architect status update",
+                "updated_at": "",
+                "triage_label": "fyi",
+                "source": "message",
+                "needs_action": False,
+            },
+        ],
+    )
+    rendered = dashboard_app._render_inbox_body(fake_data)
+    assert "Other open items" in rendered
+    head, _, tail = rendered.partition("Other open items")
+    # Action-needed items appear above the subhead; FYI item below.
+    assert "Approve scoped delivery" in head
+    assert "Decide review feedback" in head
+    assert "Architect status update" not in head
+    assert "Architect status update" in tail

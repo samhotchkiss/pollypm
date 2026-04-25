@@ -9940,18 +9940,40 @@ class PollyProjectDashboardApp(App[None]):
                 f"[#f0c45a]\u25c6[/#f0c45a] [b]{count}[/b] "
                 f"[dim]need action[/dim]"
             )
-        if preview_items:
-            if data.action_items:
+        # Split preview_items into "actually needs action" vs the
+        # rest. With no action cards rendered, lumping a "completed
+        # update" item under a "2 need action" header (because both
+        # happen to be in the top inbox slice) reads as
+        # "wait, which 2?" \u2014 the count says 2 but the list shows 3.
+        # Section the action-needed items first under the count
+        # header, then the remainder under an explicit "Other open
+        # items" subhead.
+        action_previews = [
+            item for item in preview_items
+            if item.get("needs_action")
+        ]
+        info_previews = [
+            item for item in preview_items
+            if not item.get("needs_action")
+        ]
+
+        def _emit_preview_row(item: dict) -> None:
+            title = _escape(item.get("title") or "")
+            age = _format_relative_age(item.get("updated_at") or "")
+            age_part = f"  [dim]{_escape(age)}[/dim]" if age else ""
+            label = item.get("triage_label") or ""
+            label_part = (
+                f"  [dim]{_escape(str(label))}[/dim]" if label else ""
+            )
+            lines.append(f"  \u00b7 {title}{label_part}{age_part}")
+
+        for item in action_previews[:3]:
+            _emit_preview_row(item)
+        if info_previews:
+            if data.action_items or action_previews:
                 lines.append("[dim]Other open items[/dim]")
-            for item in preview_items[:3]:
-                title = _escape(item.get("title") or "")
-                age = _format_relative_age(item.get("updated_at") or "")
-                age_part = f"  [dim]{_escape(age)}[/dim]" if age else ""
-                label = item.get("triage_label") or ""
-                label_part = (
-                    f"  [dim]{_escape(str(label))}[/dim]" if label else ""
-                )
-                lines.append(f"  \u00b7 {title}{label_part}{age_part}")
+            for item in info_previews[:3]:
+                _emit_preview_row(item)
         if not count and not preview_items and not data.action_items:
             lines.append("[dim]No project inbox items are open.[/dim]")
         # Show the "press i" CTA only when the inbox actually has more
@@ -9962,7 +9984,8 @@ class PollyProjectDashboardApp(App[None]):
         # inbox has spillover so the user knows where to look.
         has_spillover = (
             (count and count > displayed_actions)
-            or bool(preview_items)
+            or bool(action_previews)
+            or bool(info_previews)
         )
         if has_spillover:
             lines.append("")

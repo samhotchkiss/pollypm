@@ -67,7 +67,7 @@ def _service(config_path: Path):
     return PollyPMService(config_path)
 
 
-@issue_app.command("list")
+@issue_app.command("list", help="List issues for a project, optionally filtered by tracker state.")
 def issue_list(
     project: str = typer.Option(..., "--project", help="Project key."),
     state: list[str] | None = typer.Option(None, "--state", help="Optional tracker state filter."),
@@ -82,7 +82,7 @@ def issue_list(
         typer.echo(f"{task.task_id} [{task.state}] {task.title}")
 
 
-@issue_app.command("info")
+@issue_app.command("info", help="Show one issue's id, state, and title.")
 def issue_info(
     task_id: str = typer.Argument(..., help="Issue id."),
     project: str = typer.Option(..., "--project", help="Project key."),
@@ -93,7 +93,7 @@ def issue_info(
     typer.echo(f"{task.task_id} [{task.state}] {task.title}")
 
 
-@issue_app.command("next")
+@issue_app.command("next", help="Print the next ready issue an actor could pick up.")
 def issue_next(
     project: str = typer.Option(..., "--project", help="Project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
@@ -106,7 +106,7 @@ def issue_next(
     typer.echo(f"{task.task_id} [{task.state}] {task.title}")
 
 
-@issue_app.command("history")
+@issue_app.command("history", help="Print one issue's transition + comment history.")
 def issue_history(
     task_id: str = typer.Argument(..., help="Issue id."),
     project: str = typer.Option(..., "--project", help="Project key."),
@@ -121,7 +121,10 @@ def issue_history(
         typer.echo(entry)
 
 
-@issue_app.command("create")
+@issue_app.command(
+    "create",
+    help="Create a new issue in a project at a given tracker state.",
+)
 def issue_create(
     project: str = typer.Option(..., "--project", help="Project key."),
     title: str = typer.Option(..., "--title", help="Issue title."),
@@ -134,7 +137,10 @@ def issue_create(
     typer.echo(f"Created issue {task.task_id} [{task.state}] {task.title}")
 
 
-@issue_app.command("transition")
+@issue_app.command(
+    "transition",
+    help="Move one issue to a new tracker state (eg ``in_progress``).",
+)
 def issue_transition(
     task_id: str = typer.Argument(..., help="Issue id."),
     to_state: str = typer.Argument(..., help="Destination tracker state."),
@@ -150,7 +156,7 @@ def issue_transition(
     typer.echo(f"Moved issue {task.task_id} to {task.state}")
 
 
-@issue_app.command("comment")
+@issue_app.command("comment", help="Append a free-text comment to an issue's note file.")
 def issue_comment(
     task_name: str = typer.Argument(..., help="Issue id or note target."),
     text: str = typer.Option(..., "--text", help="Comment text."),
@@ -162,7 +168,13 @@ def issue_comment(
     typer.echo(f"Updated {path}")
 
 
-@issue_app.command("handoff")
+@issue_app.command(
+    "handoff",
+    help=(
+        "Append a structured handoff block to the issue: what was "
+        "done, how to test, branch/PR link, deviations."
+    ),
+)
 def issue_handoff(
     task_name: str = typer.Argument(..., help="Issue id or note target."),
     what_done: str = typer.Option(..., "--done", help="Summary of what was completed."),
@@ -184,7 +196,10 @@ def issue_handoff(
     typer.echo(f"Updated {path}")
 
 
-@issue_app.command("approve")
+@issue_app.command(
+    "approve",
+    help="Mark an issue review-approved with a summary + verification.",
+)
 def issue_approve(
     task_id: str = typer.Argument(..., help="Issue id."),
     summary: str = typer.Option(..., "--summary", help="Review summary."),
@@ -207,7 +222,10 @@ def issue_approve(
     typer.echo(f"Approved issue {task.task_id} to {task.state}")
 
 
-@issue_app.command("request-changes")
+@issue_app.command(
+    "request-changes",
+    help="Return an issue to the worker with requested changes recorded.",
+)
 def issue_request_changes(
     task_id: str = typer.Argument(..., help="Issue id."),
     summary: str = typer.Option(..., "--summary", help="Review summary."),
@@ -232,7 +250,7 @@ def issue_request_changes(
     typer.echo(f"Returned issue {task.task_id} to {task.state}")
 
 
-@issue_app.command("counts")
+@issue_app.command("counts", help="Print issue counts by tracker state for one project.")
 def issue_counts(
     project: str = typer.Option(..., "--project", help="Project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
@@ -243,7 +261,7 @@ def issue_counts(
         typer.echo(f"{state}: {count}")
 
 
-@issue_app.command("report")
+@issue_app.command("report", help="Alias for ``pm issue counts`` — issue counts by state.")
 def issue_report(
     project: str = typer.Option(..., "--project", help="Project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
@@ -251,7 +269,10 @@ def issue_report(
     issue_counts(project=project, config_path=config_path)
 
 
-@report_app.command("status")
+@report_app.command(
+    "status",
+    help="Print issue counts by state — same as ``pm issue counts``.",
+)
 def report_status(
     project: str = typer.Option(..., "--project", help="Project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
@@ -259,7 +280,10 @@ def report_status(
     issue_counts(project=project, config_path=config_path)
 
 
-@itsalive_app.command("deploy")
+@itsalive_app.command(
+    "deploy",
+    help="Publish a project's directory to the itsalive deploy service.",
+)
 def itsalive_deploy(
     project: str = typer.Option(..., "--project", help="Project key."),
     subdomain: str | None = typer.Option(None, "--subdomain", help="itsalive subdomain for first deploy."),
@@ -285,7 +309,10 @@ def itsalive_deploy(
         typer.echo(f"expires_at={outcome.expires_at}")
 
 
-@itsalive_app.command("status")
+@itsalive_app.command(
+    "status",
+    help="List pending itsalive deployments awaiting verification.",
+)
 def itsalive_status(
     project: str = typer.Option(..., "--project", help="Project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
@@ -302,7 +329,10 @@ def itsalive_status(
         )
 
 
-@itsalive_app.command("sweep")
+@itsalive_app.command(
+    "sweep",
+    help="Re-poll itsalive for status updates on pending deployments.",
+)
 def itsalive_sweep(
     project: str = typer.Option(..., "--project", help="Project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
@@ -318,7 +348,10 @@ def itsalive_sweep(
             typer.echo(f"  {outcome.url}")
 
 
-@issue_app.command("validate")
+@issue_app.command(
+    "validate",
+    help="Run the issue-tracker backend validation checks for a project.",
+)
 def issue_validate(
     project: str = typer.Option(..., "--project", help="Project key."),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),

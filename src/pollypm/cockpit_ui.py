@@ -1833,7 +1833,11 @@ _SETTINGS_SECTIONS: tuple[tuple[str, str], ...] = (
     ("heartbeat", "Heartbeat & Recovery"),
     ("plugins", "Plugins"),
     ("planner", "Planner"),
-    ("inbox", "Inbox & Notifications"),
+    # ``Inbox & Notifications`` overflowed the 28-col settings-nav and
+    # rendered as ``Inbox &`` (a dangling conjunction). The shorter
+    # rail label keeps the section discoverable; the right-pane
+    # heading still says "Inbox & notifications" for full clarity.
+    ("inbox", "Notifications"),
     ("about", "About"),
 )
 

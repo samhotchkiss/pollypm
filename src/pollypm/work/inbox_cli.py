@@ -32,6 +32,34 @@ from pollypm.work.cli import (
 from pollypm.work.inbox_view import inbox_tasks
 
 
+def _format_inbox_title(title: str) -> str:
+    """Trim the title for the CLI list view.
+
+    Strips the leading title-contract bracket tag (``[Action]``,
+    ``[FYI]``, ``[Audit]``, ``[Alert]``, ``[Task]``, ``[Note]``) so
+    the dedicated Type / Priority columns aren't restated inside
+    every row. Without this, every row reads ``[Action] …`` and the
+    bracket tag eats the same characters of horizontal space the
+    user actually wants for the subject. Then truncates to fit the
+    column.
+    """
+    text = (title or "").strip()
+    # Match the title-contract grammar: ``[Foo] `` at the very start.
+    # Keeps custom bracketed prefixes the caller chose intact when
+    # they're more than just the tag (e.g. the body starts with
+    # ``[Done] milestone 02``).
+    import re as _re
+    match = _re.match(
+        r"^\s*\[(?:Action|FYI|Audit|Alert|Task|Note)\]\s+",
+        text,
+    )
+    if match:
+        text = text[match.end():]
+    if len(text) > 38:
+        text = text[:37] + "…"
+    return text
+
+
 inbox_app = typer.Typer(
     help=help_with_examples(
         "Work assigned to the user.",
@@ -205,17 +233,13 @@ def inbox_root(
     typer.echo(f"{'ID':<20} {'Type':<10} {'Priority':<10} {'Title'}")
     typer.echo("-" * 70)
     for m in display_messages:
-        title = m["title"]
-        if len(title) > 38:
-            title = title[:37] + "\u2026"
+        title = _format_inbox_title(m["title"])
         typer.echo(
             f"{m['id']:<20} {m['type']:<10} "
             f"{m['priority']:<10} {title}"
         )
     for t in tasks:
-        title = t.title or ""
-        if len(title) > 38:
-            title = title[:37] + "\u2026"
+        title = _format_inbox_title(t.title or "")
         typer.echo(
             f"{t.task_id:<20} {t.work_status.value:<10} "
             f"{t.priority.value:<10} {title}"

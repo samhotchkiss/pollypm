@@ -40,6 +40,41 @@ def _seed_message(db_path: Path, **overrides) -> int:
         store.close()
 
 
+def test_format_inbox_title_strips_contract_bracket_tag() -> None:
+    """``pm inbox`` lists every immediate-tier notify subject as
+    ``[Action] <subject>`` because the title contract tagged it at
+    write time. The CLI list view already shows ``Type · notify``
+    in its own column, so leading every row with ``[Action]`` just
+    eats the column width set aside for the actual subject.
+
+    Strip the title-contract tag for the display copy; preserve
+    custom bracketed prefixes the caller chose.
+    """
+    from pollypm.work.inbox_cli import _format_inbox_title
+
+    assert (
+        _format_inbox_title("[Action] N-RC1 review (polly_remote/12)")
+        == "N-RC1 review (polly_remote/12)"
+    )
+    assert _format_inbox_title("[FYI] CI green") == "CI green"
+    assert _format_inbox_title("[Alert] stuck") == "stuck"
+    assert _format_inbox_title("[Task] do the thing") == "do the thing"
+    assert _format_inbox_title("[Audit] ledger") == "ledger"
+    assert _format_inbox_title("[Note] generic") == "generic"
+    # Custom bracketed content the caller wrote → leave it alone.
+    assert (
+        _format_inbox_title("[Done] milestone 02")
+        == "[Done] milestone 02"
+    )
+    # No tag at all → leave it alone.
+    assert _format_inbox_title("No tag here") == "No tag here"
+    # Truncation still applies after stripping.
+    long = "[Action] " + "x" * 60
+    formatted = _format_inbox_title(long)
+    assert formatted.endswith("…")
+    assert len(formatted) <= 38
+
+
 def test_inbox_show_accepts_msg_id_form(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     msg_id = _seed_message(db_path, subject="Plan ready for review")

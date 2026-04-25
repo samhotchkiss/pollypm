@@ -8803,6 +8803,29 @@ def _dashboard_inbox(
     return _action_count(items, action_items), top, action_items
 
 
+def _clean_hold_reason(reason: str) -> str:
+    """Strip notification-routing artefacts from auto-generated hold
+    reasons before rendering them on the dashboard.
+
+    Auto-holds emit reasons of the shape::
+
+        Waiting on operator: [Action] Done: <subject>
+
+    The ``[Action]`` token is a tier/recipient routing tag from the
+    notification system, not natural language — when it leaks into a
+    hold reason the user reads "[Action]" and has to mentally parse
+    the brackets. Strip it; preserve the rest verbatim so attribution
+    ("Waiting on operator:") and content ("Done: <subject>") survive.
+    """
+    if not reason:
+        return ""
+    # Remove "[Action]" wherever it appears, plus any ":" / "-" / " " left
+    # immediately after — the prefix "[Action] " consistently runs into
+    # the next token without natural-language separation.
+    text = reason.replace("[Action] ", "").replace("[Action]", "")
+    return text.strip()
+
+
 def _stuck_alert_covers_action(
     alert_type: str, covered_task_ids: set[str],
 ) -> bool:
@@ -9561,7 +9584,9 @@ class PollyProjectDashboardApp(App[None]):
                 # this the operator sees "Paused" with no signal about
                 # *why* the work is parked or what would unparked it.
                 if status == "on_hold":
-                    reason = str(t.get("hold_reason") or "").strip()
+                    reason = _clean_hold_reason(
+                        str(t.get("hold_reason") or "")
+                    )
                     if reason:
                         out.append(f"      [dim]paused: {_escape(reason)}[/dim]")
                 # In-progress rows tell the operator which worker is

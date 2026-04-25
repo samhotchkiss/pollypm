@@ -772,6 +772,34 @@ def test_action_count_dedupes_review_task_and_matching_message() -> None:
     assert _action_count(items, action_items) == 1
 
 
+def test_clean_hold_reason_strips_action_routing_tag() -> None:
+    """Auto-holds emit reasons like
+    ``"Waiting on operator: [Action] Done: <subject>"`` because the
+    transition manager copies the notification subject verbatim. The
+    ``[Action]`` token is a routing tag, not natural language —
+    surface the rest of the reason without it.
+    """
+    from pollypm.cockpit_ui import _clean_hold_reason
+
+    assert _clean_hold_reason(
+        "Waiting on operator: [Action] Done: Phase 2 rework resubmitted"
+    ) == "Waiting on operator: Done: Phase 2 rework resubmitted"
+
+    # Multiple [Action] tags get all stripped.
+    assert _clean_hold_reason(
+        "[Action] queued [Action] x"
+    ) == "queued x"
+
+    # No tag → unchanged (modulo strip).
+    assert _clean_hold_reason(
+        "  Manually parked while we wait on legal  "
+    ) == "Manually parked while we wait on legal"
+
+    # Empty → empty.
+    assert _clean_hold_reason("") == ""
+    assert _clean_hold_reason("   ") == ""
+
+
 def test_stuck_alert_covers_action_dedupes_user_waiting_alerts() -> None:
     """A ``stuck_on_task:<id>`` alert is mechanically fired when a
     session sits idle waiting on the user. When the dashboard already

@@ -355,6 +355,25 @@ def test_list_row_renders_title_on_line1_and_project_age_on_line2(
     _run(body())
 
 
+def test_digest_subject_prefix_routes_to_info_bucket() -> None:
+    """Subject lines starting with 'Digest:' are roll-up summaries
+    by definition. Producers sometimes mistier them as immediate
+    (e.g. PMs whose body says 'need your call before I act') so
+    they leak into the action lens. Title-prefix detection routes
+    them to info regardless of body content — the digest is the
+    bound-of-attention surface, not the act-on surface."""
+    item = _triaged_entry(
+        title="[Action] Digest: inbox triage — need your call",
+        body=(
+            "**State of the inbox (157 items):** 2 stale plan reviews; "
+            "8 misrouted review pings; need your call before I act."
+        ),
+    )
+
+    assert item.triage_bucket == "info"
+    assert item.triage_label == "digest"
+
+
 def test_completion_title_wins_over_body_review_keyword() -> None:
     """Completion announcements like ``[Action] X CLI E2E complete``
     must triage as info / completed-update even when the body

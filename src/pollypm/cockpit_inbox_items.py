@@ -28,6 +28,15 @@ from pollypm.work.sqlite_service import SQLiteWorkService
 
 _MARKDOWN_DECORATION_RE = re.compile(r"[*_`#>\[\]]+")
 
+# A subject that begins with ``Digest:`` (or e.g. ``Action Digest:``,
+# ``FYI Digest:`` after _plain_text strips the canonical [Tag]
+# bracket) is a roll-up by definition. Match against the lowercased
+# title — the optional leading word covers the dropped bracket tag.
+_DIGEST_SUBJECT_RE = re.compile(
+    r"^\s*(?:[A-Za-z]+\s+)?digest\b\s*[:—–-]",
+    re.IGNORECASE,
+)
+
 # Regex triage is score-based: every matching rule contributes a candidate,
 # the highest score wins, and exact ties use this documented intent priority.
 _TRIAGE_KIND_PRIORITY = {
@@ -168,6 +177,15 @@ def _triage_for_entry(
         if target:
             return "info", 2, f"review feedback for {target}"
         return "info", 2, "review feedback"
+    # Subject-level "Digest:" prefix means the message is a roll-up
+    # by definition, regardless of whether the body mentions decisions
+    # or blockers. Producers occasionally tier digest messages as
+    # ``immediate`` (e.g. PMs that haven't migrated to the proper
+    # tier yet), so we match the prefix even after the canonical
+    # ``[Action]`` / ``[FYI]`` / ``[Info]`` bracket tag.
+    title_lower = title.lower()
+    if _DIGEST_SUBJECT_RE.search(title_lower):
+        return "info", 2, "digest"
     matches = [
         rule
         for rule in _TRIAGE_PATTERN_REGISTRY

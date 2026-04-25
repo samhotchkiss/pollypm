@@ -8873,6 +8873,37 @@ def _clean_hold_reason(reason: str) -> str:
     return text.strip()
 
 
+def _banner_review_count_after_action_overlap(
+    raw_review_count: int,
+    action_items: list[dict],
+    review_bucket: list[dict],
+) -> int:
+    """Return the review count after subtracting tasks already
+    represented by an Action Needed card.
+
+    The banner suffix shows ``N approval(s)`` to flag review-state
+    tasks. When one of those tasks is the exact subject of an action
+    card (its ``primary_ref`` matches a task in the review bucket),
+    counting it again as a separate "approval" double-states the
+    same work. Drop overlaps; never go negative.
+    """
+    if raw_review_count <= 0 or not action_items:
+        return max(0, raw_review_count)
+    review_ids = {
+        str(item.get("task_id") or "")
+        for item in review_bucket
+        if item.get("task_id")
+    }
+    if not review_ids:
+        return raw_review_count
+    covered = sum(
+        1
+        for item in action_items
+        if str(item.get("primary_ref") or "") in review_ids
+    )
+    return max(0, raw_review_count - covered)
+
+
 def _stuck_alert_covers_action(
     alert_type: str, covered_task_ids: set[str],
 ) -> bool:
@@ -9453,8 +9484,20 @@ class PollyProjectDashboardApp(App[None]):
             # that lede *and* the rendered Action Needed cards. Drop
             # it specifically while keeping the genuinely-different
             # categories (dependencies, on hold, approvals, alerts).
+            #
+            # When an action card's primary_ref points at a review
+            # task, the "N approval(s)" suffix double-counts the same
+            # work — booktalk read "Waiting on you: A full project
+            # plan is ready for your review · 1 on hold · 1 approval"
+            # where the "1 approval" was the very task the prompt
+            # already named. Drop the overlap before formatting.
+            review_count = _banner_review_count_after_action_overlap(
+                int(data.task_counts.get("review", 0)),
+                data.action_items,
+                data.task_buckets.get("review", []),
+            )
             action_only_suffix = render_project_action_bar(
-                review_count=int(data.task_counts.get("review", 0)),
+                review_count=review_count,
                 alert_count=data.alert_count,
                 inbox_count=0,
                 blocker_count=int(data.task_counts.get("blocked", 0)),

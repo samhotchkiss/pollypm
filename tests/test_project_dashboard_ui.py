@@ -842,6 +842,50 @@ def test_action_count_dedupes_review_task_and_matching_message() -> None:
     assert _action_count(items, action_items) == 1
 
 
+def test_banner_review_count_drops_action_overlap() -> None:
+    """Booktalk's banner read::
+
+        Waiting on you: A full project plan is ready for your review.
+            · 1 on hold · 1 approval
+
+    The "1 approval" was the very review task the lede named —
+    counting it separately double-states the same work. Drop any
+    review task from the count when its id is the primary_ref of an
+    action card.
+    """
+    from pollypm.cockpit_ui import _banner_review_count_after_action_overlap
+
+    review_bucket = [{"task_id": "booktalk/3"}]
+    action_items = [{"primary_ref": "booktalk/3"}]
+    assert (
+        _banner_review_count_after_action_overlap(1, action_items, review_bucket)
+        == 0
+    )
+
+
+def test_banner_review_count_keeps_unrelated_reviews() -> None:
+    """Review tasks whose id is *not* the subject of any action card
+    must still be counted — those are genuine extra approvals
+    waiting beyond what the prompt names."""
+    from pollypm.cockpit_ui import _banner_review_count_after_action_overlap
+
+    review_bucket = [
+        {"task_id": "booktalk/3"},
+        {"task_id": "booktalk/7"},
+    ]
+    action_items = [{"primary_ref": "booktalk/3"}]
+    assert (
+        _banner_review_count_after_action_overlap(2, action_items, review_bucket)
+        == 1
+    )
+
+
+def test_banner_review_count_no_action_items_passes_through() -> None:
+    from pollypm.cockpit_ui import _banner_review_count_after_action_overlap
+
+    assert _banner_review_count_after_action_overlap(3, [], []) == 3
+
+
 def test_format_blocked_dep_attaches_title_when_known() -> None:
     """Blocked tasks listed dependencies as bare task IDs
     (``"polly_remote/6, polly_remote/9"``). The user has no idea

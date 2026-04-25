@@ -25,6 +25,21 @@ from pollypm.review_notify import notify_requires_review_hold
 
 _TASK_ID_PATTERN = re.compile(r"\b([A-Za-z0-9_.-]+/\d+)\b")
 
+# Dispatch identifiers the cockpit dashboard's
+# ``_perform_dashboard_action`` knows how to route. Producers that
+# emit user_prompt actions with kinds outside this set hit the
+# generic record-response fallback, which is almost never the
+# intended behaviour. The set lives here so the producer-side
+# validator catches typos before the message lands in the store.
+_USER_PROMPT_ACTION_KINDS: frozenset[str] = frozenset({
+    "review_plan",
+    "open_task",
+    "open_inbox",
+    "discuss_pm",
+    "approve_task",
+    "record_response",
+})
+
 
 def _infer_notify_actor(config_path: Path, actor: str) -> tuple[str, str | None]:
     """Resolve ``pm notify``'s default actor from the current tmux window.
@@ -532,6 +547,34 @@ def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
                     err=True,
                 )
                 raise typer.Exit(code=1)
+            # Each ``action`` must use one of the dispatch identifiers
+            # the dashboard's _perform_dashboard_action understands.
+            # Unknown kinds silently fall through to the generic
+            # record-response path, so the operator clicks a button
+            # labelled 'Approve' and nothing actually approves —
+            # exactly the symptom the v1 doc flagged. Reject at the
+            # producer so typos and outdated kind names surface
+            # immediately.
+            raw_actions = parsed_prompt.get("actions") or []
+            if isinstance(raw_actions, list):
+                for idx, raw_action in enumerate(raw_actions):
+                    if not isinstance(raw_action, dict):
+                        continue
+                    kind_value = str(raw_action.get("kind") or "").strip()
+                    if not kind_value:
+                        continue
+                    if kind_value not in _USER_PROMPT_ACTION_KINDS:
+                        typer.echo(
+                            f"Error: --user-prompt-json action[{idx}] "
+                            f"has unknown kind '{kind_value}'. Supported "
+                            f"kinds: "
+                            f"{', '.join(sorted(_USER_PROMPT_ACTION_KINDS))}. "
+                            f"Custom kinds silently fall back to "
+                            f"record-response in the dashboard, which is "
+                            f"almost never the producer's intent.",
+                            err=True,
+                        )
+                        raise typer.Exit(code=1)
             user_prompt_payload = parsed_prompt
 
         from pollypm.store import SQLAlchemyStore

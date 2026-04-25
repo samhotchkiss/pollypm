@@ -237,6 +237,67 @@ class TestNotifyWritesToMessages:
         assert "steps" in combined
         assert "question" in combined
 
+    def test_user_prompt_json_action_kind_validated(self, db_path):
+        """Unknown action ``kind`` values silently fall through to
+        record-response in the dashboard — the operator clicks a
+        button and nothing happens. Reject at producer time."""
+        prompt = json.dumps(
+            {
+                "summary": "A plan is ready.",
+                "actions": [
+                    {"label": "Review", "kind": "approveTask"},  # camelCase typo
+                ],
+            }
+        )
+        result = _invoke_notify(
+            db_path,
+            "Plan ready",
+            "Review this plan.",
+            "--user-prompt-json", prompt,
+        )
+        assert result.exit_code != 0
+        combined = result.output + (result.stderr or "")
+        assert "unknown kind 'approveTask'" in combined
+        # Error names every supported kind so the producer can pick the
+        # right one without grepping the source.
+        for known in (
+            "approve_task",
+            "review_plan",
+            "open_task",
+            "open_inbox",
+            "discuss_pm",
+            "record_response",
+        ):
+            assert known in combined
+
+    def test_user_prompt_json_known_kinds_pass(self, db_path):
+        """All currently-supported action kinds must pass validation
+        — guards against the kind set drifting from the dashboard's
+        dispatch table."""
+        for kind in (
+            "approve_task",
+            "review_plan",
+            "open_task",
+            "open_inbox",
+            "discuss_pm",
+            "record_response",
+        ):
+            prompt = json.dumps(
+                {
+                    "summary": "A plan is ready.",
+                    "actions": [{"label": "X", "kind": kind}],
+                }
+            )
+            result = _invoke_notify(
+                db_path,
+                "Plan ready",
+                "Review.",
+                "--user-prompt-json", prompt,
+            )
+            assert result.exit_code == 0, (
+                f"kind={kind!r} should validate: {result.output}"
+            )
+
     def test_user_prompt_json_steps_only_passes(self, db_path):
         """Steps alone is enough — the dashboard renders 'What to do'
         from steps even without summary."""

@@ -2966,8 +2966,10 @@ def check_sessions_table_vs_tmux() -> CheckResult:
             except Exception as exc:  # noqa: BLE001
                 return (False, f"repair failed: {exc}")
 
+        window_word = "window" if len(drift) == 1 else "windows"
         return _fail(
-            f"{len(drift)} tmux window(s) without a sessions row: {', '.join(drift[:5])}",
+            f"{len(drift)} tmux {window_word} without a sessions row: "
+            f"{', '.join(drift[:5])}",
             why=(
                 "Every PollyPM-managed tmux window should have a row in the "
                 "sessions table so SessionRoleIndex can resolve it. Drift "
@@ -2989,8 +2991,9 @@ def check_sessions_table_vs_tmux() -> CheckResult:
                 "db_count": len(db_windows),
             },
         )
+    row_word = "row" if len(db_windows) == 1 else "rows"
     return _ok(
-        f"sessions table aligned with tmux ({len(db_windows)} row(s))",
+        f"sessions table aligned with tmux ({len(db_windows)} {row_word})",
         data={"tmux_count": len(tmux_windows), "db_count": len(db_windows)},
     )
 

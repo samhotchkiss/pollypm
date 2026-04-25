@@ -928,6 +928,47 @@ def test_session_drift_skip_without_tmux(monkeypatch: pytest.MonkeyPatch) -> Non
     assert result.passed and result.skipped
 
 
+def test_session_drift_pluralisation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Cycle 73: drift status uses ``window`` / ``windows`` per count.
+
+    Both the warn (``N tmux window(s) without a sessions row``) and
+    ok (``... ({N} row(s))``) paths used parenthetical plurals. The
+    warn path matters most: a single rogue window is the easiest
+    drift to introduce by accident.
+    """
+    db = _make_state_db(tmp_path / "state.db")
+    monkeypatch.setattr(doctor, "_primary_state_db", lambda: db)
+    monkeypatch.setattr(
+        doctor, "_tool_path",
+        lambda name: "/usr/bin/tmux" if name == "tmux" else None,
+    )
+    # One rogue window that the DB doesn't know about.
+    monkeypatch.setattr(
+        doctor, "_run_cmd", lambda cmd, **kw: (0, "polly:worker-rogue"),
+    )
+    fail = doctor.check_sessions_table_vs_tmux()
+    assert not fail.passed
+    assert "1 tmux window without a sessions row" in fail.status
+    assert "window(s)" not in fail.status
+
+    # Single-row aligned DB → singular ok path.
+    db_one = _make_state_db(tmp_path / "state_one.db")
+    conn = sqlite3.connect(db_one)
+    conn.execute(
+        "INSERT INTO sessions (name, role, project, provider, account, cwd, window_name) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("worker-x", "worker", "demo", "claude", "acct", "/tmp", "worker-x"),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(doctor, "_primary_state_db", lambda: db_one)
+    monkeypatch.setattr(doctor, "_run_cmd", lambda cmd, **kw: (0, "polly:worker-x"))
+    ok = doctor.check_sessions_table_vs_tmux()
+    assert ok.passed
+    assert "(1 row)" in ok.status
+    assert "row(s)" not in ok.status
+
+
 def test_persona_swap_defense_pass() -> None:
     # Real-fs assertion — supervisor.py ships with the assertion wired.
     result = doctor.check_persona_swap_defense_wired()

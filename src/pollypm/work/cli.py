@@ -19,6 +19,7 @@ from pollypm.errors import (
     format_task_not_found_error,
     render_cli_error,
 )
+from pollypm.work.models import OutputType
 from pollypm.work.readiness import format_readiness_warnings, readiness_warnings
 
 _TASK_APP_HELP = help_with_examples(
@@ -825,7 +826,57 @@ def task_done(
 ) -> None:
     """Signal that the current work node is complete."""
     svc = _svc(db, project=_project_from_task_id(task_id))
-    wo_dict = json.loads(output)
+    try:
+        wo_dict = json.loads(output)
+    except json.JSONDecodeError as exc:
+        typer.echo(
+            f"Error: --output is not valid JSON: {exc}.\n"
+            "Expected: {\"type\": \"code_change\", \"summary\": \"...\", "
+            "\"artifacts\": [...]}",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+    if not isinstance(wo_dict, dict):
+        typer.echo(
+            "Error: --output must decode to an object with at least "
+            "'type' and 'summary' keys, got "
+            f"{type(wo_dict).__name__}.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    # The work_service is permissive — a missing 'summary' silently
+    # stores an empty string and a missing 'type' silently defaults to
+    # ``code_change``, so producer-side typos slip into the task
+    # history undetected. Catch them at the CLI so the worker sees a
+    # clear contract failure instead of an empty work_output landing
+    # in the dashboard's reviewer pane.
+    raw_type = wo_dict.get("type")
+    if raw_type is not None and not isinstance(raw_type, str):
+        typer.echo(
+            f"Error: --output 'type' must be a string, got "
+            f"{type(raw_type).__name__}.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    if isinstance(raw_type, str):
+        valid_types = {member.value for member in OutputType}
+        if raw_type not in valid_types:
+            typer.echo(
+                f"Error: --output 'type' is {raw_type!r}; expected one "
+                f"of {', '.join(sorted(valid_types))}.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+    summary = wo_dict.get("summary")
+    if not (isinstance(summary, str) and summary.strip()):
+        typer.echo(
+            "Error: --output must include a non-empty 'summary' string. "
+            "The reviewer reads this first when judging whether the "
+            "work is done — leaving it blank kicks the task back for "
+            "rework.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
     # Sync worker commits to task branch before state transition
     _sync_commits_to_task_branch(task_id)
     task = _run(svc.node_done, task_id, actor, wo_dict)

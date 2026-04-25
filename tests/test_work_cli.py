@@ -159,6 +159,97 @@ class TestCliLifecycle:
         assert "Approved proj/1" in result.output
 
 
+class TestCliDoneOutputValidation:
+    """``pm task done --output`` validates the work-output payload.
+
+    The work_service is permissive — missing fields default silently —
+    so producer-side typos used to slip into the task history with an
+    empty work_output. Validate at the CLI so workers see a clear
+    contract failure.
+    """
+
+    def _setup_claimed_task(self, db_path):
+        _create_task(
+            db_path,
+            title="Lifecycle task",
+            roles=["worker=pete", "reviewer=polly"],
+        )
+        runner.invoke(task_app, ["queue", "proj/1", "--db", db_path])
+        runner.invoke(
+            task_app,
+            ["claim", "proj/1", "--actor", "pete", "--db", db_path],
+        )
+
+    def test_done_with_invalid_json_errors(self, db_path):
+        self._setup_claimed_task(db_path)
+        result = runner.invoke(
+            task_app,
+            [
+                "done", "proj/1", "--output", "{not valid",
+                "--actor", "pete", "--db", db_path,
+            ],
+        )
+        assert result.exit_code != 0
+        assert "not valid JSON" in (result.output + (result.stderr or ""))
+
+    def test_done_with_non_object_output_errors(self, db_path):
+        self._setup_claimed_task(db_path)
+        result = runner.invoke(
+            task_app,
+            [
+                "done", "proj/1", "--output", "[]",
+                "--actor", "pete", "--db", db_path,
+            ],
+        )
+        assert result.exit_code != 0
+        combined = result.output + (result.stderr or "")
+        assert "must decode to an object" in combined
+
+    def test_done_without_summary_errors(self, db_path):
+        self._setup_claimed_task(db_path)
+        wo = json.dumps({"type": "code_change", "artifacts": []})
+        result = runner.invoke(
+            task_app,
+            [
+                "done", "proj/1", "--output", wo,
+                "--actor", "pete", "--db", db_path,
+            ],
+        )
+        assert result.exit_code != 0
+        combined = result.output + (result.stderr or "")
+        assert "non-empty 'summary'" in combined
+
+    def test_done_with_empty_summary_errors(self, db_path):
+        self._setup_claimed_task(db_path)
+        wo = json.dumps({"type": "code_change", "summary": "   "})
+        result = runner.invoke(
+            task_app,
+            [
+                "done", "proj/1", "--output", wo,
+                "--actor", "pete", "--db", db_path,
+            ],
+        )
+        assert result.exit_code != 0
+        assert "non-empty 'summary'" in (result.output + (result.stderr or ""))
+
+    def test_done_with_unknown_type_errors(self, db_path):
+        self._setup_claimed_task(db_path)
+        wo = json.dumps({"type": "magic_change", "summary": "Tried something"})
+        result = runner.invoke(
+            task_app,
+            [
+                "done", "proj/1", "--output", wo,
+                "--actor", "pete", "--db", db_path,
+            ],
+        )
+        assert result.exit_code != 0
+        combined = result.output + (result.stderr or "")
+        assert "type" in combined and "magic_change" in combined
+        # Error names every supported type so worker can pick the right one.
+        for known in ("code_change", "action", "document", "mixed"):
+            assert known in combined
+
+
 class TestCliNext:
     def test_cli_next(self, db_path):
         _create_task(db_path, title="High task", priority="high")

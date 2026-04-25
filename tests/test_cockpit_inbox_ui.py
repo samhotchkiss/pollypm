@@ -355,6 +355,40 @@ def test_list_row_renders_title_on_line1_and_project_age_on_line2(
     _run(body())
 
 
+def test_action_bucket_row_drops_redundant_action_prefix() -> None:
+    """The inbox already groups action-needed items under the
+    'action needed' header — repeating '[Action]' on every row is
+    redundant noise that eats list-pane width."""
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import _format_inbox_row
+
+    action_task = SimpleNamespace(
+        task_id="msg:demo:1",
+        title="[Action] Fly.io setup needed for demo",
+        project="demo",
+        updated_at="",
+        triage_bucket="action",
+    )
+    info_task = SimpleNamespace(
+        task_id="msg:demo:2",
+        title="[Action] Demo shipped cleanly",
+        project="demo",
+        updated_at="",
+        triage_bucket="info",
+    )
+
+    action_plain = _format_inbox_row(action_task, is_unread=True).plain
+    info_plain = _format_inbox_row(info_task, is_unread=True).plain
+
+    # Action bucket: prefix dropped, rest of the subject preserved.
+    assert "Fly.io setup needed for demo" in action_plain
+    assert "[Action]" not in action_plain
+    # Non-action bucket (info / completion / orphaned): no strip,
+    # so the original subject still shows.
+    assert "[Action] Demo shipped cleanly" in info_plain
+
+
 def test_inbox_row_marks_rejection_feedback_threads(inbox_env) -> None:
     from pollypm.cockpit_ui import _format_inbox_row
 
@@ -427,6 +461,10 @@ def test_action_items_sort_ahead_of_completed_updates(
     async def body() -> None:
         async with inbox_app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
+            # _visible_titles inspects the underlying task title, so
+            # the "[Action]" prefix is still present at the data layer
+            # — the rendered row drops it (covered by
+            # test_action_bucket_row_drops_redundant_action_prefix).
             titles = _visible_titles(inbox_app)
             assert "[Action] Fly.io setup needed for demo" in titles
             assert "[Action] Demo shipped cleanly" not in titles

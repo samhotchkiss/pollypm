@@ -4781,6 +4781,15 @@ def _format_inbox_row(
         subject_prefix = "🔄 "
         text.append(subject_prefix, style="#ffb454")
     subject = task.title or "(no subject)"
+    # Drop the "[Action]" prefix from action-bucket rows. The inbox
+    # already groups action-needed items under their own header, so
+    # stamping every title with "[Action]" is redundant noise that
+    # eats list-pane width and buries the actual subject.
+    if (
+        getattr(task, "triage_bucket", "") == "action"
+        and subject[:8].lower() == "[action]"
+    ):
+        subject = subject[8:].lstrip(" :-—")
     reply_suffix = ""
     if reply_count:
         noun = "reply" if reply_count == 1 else "replies"

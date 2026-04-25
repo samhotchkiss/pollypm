@@ -9672,7 +9672,28 @@ class PollyProjectDashboardApp(App[None]):
                 or item.get("decision_question")
                 or "This project needs your input."
             ).strip()
-            return f"Waiting on you: {prompt}{count_suffix}"
+            # The banner already leads with "Waiting on you:" — the
+            # tail count "N need action" is redundant noise on top of
+            # that lede *and* the rendered Action Needed cards. Drop
+            # it specifically while keeping the genuinely-different
+            # categories (dependencies, on hold, approvals, alerts).
+            action_only_suffix = render_project_action_bar(
+                review_count=int(data.task_counts.get("review", 0)),
+                alert_count=data.alert_count,
+                inbox_count=0,
+                blocker_count=int(data.task_counts.get("blocked", 0)),
+                on_hold_count=int(data.task_counts.get("on_hold", 0)),
+            )
+            if action_only_suffix.startswith("▸ Clear"):
+                # No other categories to mention — drop the suffix entirely
+                # so the banner stays a single clean sentence.
+                return f"Waiting on you: {prompt}"
+            suffix = (
+                action_only_suffix[2:]
+                if action_only_suffix.startswith("▸ ")
+                else action_only_suffix
+            )
+            return f"Waiting on you: {prompt} · {suffix}"
         if data.alert_count:
             return f"Alert: Polly needs to inspect a project issue{count_suffix}"
         if data.active_worker is not None:

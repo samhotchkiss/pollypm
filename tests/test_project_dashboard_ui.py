@@ -601,6 +601,64 @@ def test_user_prompt_payload_drives_dashboard_copy_and_buttons(
     _run(body())
 
 
+def test_waiting_on_you_banner_drops_redundant_need_action_suffix(
+    dashboard_env, dashboard_app,
+) -> None:
+    """When the dashboard banner already leads with 'Waiting on you:'
+    and the Action Needed cards already enumerate the items, repeating
+    'N need action' in the tail count is redundant noise. Other
+    categories (dependencies, on hold, approvals, alerts) still belong
+    in the suffix because they tell the user about *different* state
+    from the action cards."""
+    db_path = dashboard_env["project_path"] / ".pollypm" / "state.db"
+    in_progress_id = dashboard_env["task_ids"]["in_progress"]
+    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    try:
+        store.enqueue_message(
+            type="notify",
+            tier="immediate",
+            recipient="user",
+            sender="architect",
+            subject=f"Need decision on {in_progress_id}",
+            body="Decision required.",
+            scope="demo",
+            labels=["project:demo"],
+            payload={
+                "actor": "architect",
+                "project": "demo",
+                "task_id": in_progress_id,
+                "user_prompt": {
+                    "summary": "The work is ready for your call.",
+                    "steps": ["Review and decide"],
+                    "question": "Approve or wait?",
+                    "actions": [
+                        {
+                            "label": "Approve it",
+                            "kind": "approve_task",
+                            "task_id": in_progress_id,
+                        },
+                        {"label": "Wait", "kind": "record_response"},
+                    ],
+                },
+            },
+            state="open",
+        )
+    finally:
+        store.close()
+
+    async def body() -> None:
+        async with dashboard_app.run_test(size=(160, 50)) as pilot:
+            await pilot.pause()
+            rendered = str(dashboard_app.action_bar.render())
+            assert "Waiting on you:" in rendered
+            # Redundant tail count must not appear.
+            assert "need action" not in rendered, (
+                f"banner still includes redundant 'need action' suffix: {rendered!r}"
+            )
+
+    _run(body())
+
+
 def test_user_prompt_action_kinds_preserve_underscores(
     dashboard_env, dashboard_app,
 ) -> None:

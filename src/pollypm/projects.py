@@ -212,6 +212,12 @@ def release_session_lock(base_dir: Path, session_id: str | None = None) -> None:
             existing = json.loads(lock_path.read_text())
         except Exception:  # noqa: BLE001
             existing = {}
+        # The try only wraps json.loads — guard the subsequent .get
+        # against a parsed-but-non-dict shape (list/null/string) so a
+        # corrupted lock file doesn't AttributeError out of the
+        # release_session_locks loop.
+        if not isinstance(existing, dict):
+            existing = {}
         existing_session = existing.get("session_id")
         if (
             session_id is not None

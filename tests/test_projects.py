@@ -420,3 +420,28 @@ def test_session_lock_surfaces_infrastructure_errors(
 
     with pytest.raises(RuntimeError, match="Could not create session lock"):
         ensure_session_lock(lock_root, "worker")
+
+
+def test_release_session_lock_handles_corrupt_non_dict_lock(
+    tmp_path: Path,
+) -> None:
+    """Cycle 99: a corrupted lock file (parses to a non-dict shape)
+    must not AttributeError out of ``release_session_lock``. The
+    cleanup loop should still remove the file rather than aborting
+    midway through a multi-lock release.
+    """
+    from pollypm.projects import release_session_lock, session_lock_path
+
+    lock_root = tmp_path / "locks" / "worker"
+    lock_root.mkdir(parents=True)
+    # Seed a corrupted lock and an OK lock side by side.
+    bad_lock = session_lock_path(lock_root, "bad")
+    bad_lock.write_text("[1, 2, 3]")
+    good_lock = session_lock_path(lock_root, "good")
+    good_lock.write_text('{"session_id": "good", "created_at": "2026-04-25T00:00:00+00:00"}')
+
+    # Sweep all locks (session_id=None). Must not raise on the corrupted
+    # one and must still unlink both.
+    release_session_lock(lock_root, None)
+    assert not bad_lock.exists()
+    assert not good_lock.exists()

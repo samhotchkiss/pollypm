@@ -473,3 +473,45 @@ def test_cockpit_dispatch_passes_config_path_to_dashboard_builder(
 
     assert result == "ok"
     assert seen["config_path"] == config_path
+
+
+def test_dashboard_footer_pluralises_project_count(monkeypatch, tmp_path: Path) -> None:
+    """The dashboard footer must read ``1 project`` / ``5 projects``.
+
+    The bottom-of-dashboard line ``  N projects · j/k navigate · S
+    settings`` printed bare-plural ``projects`` at every count. New
+    installs with one tracked project saw ``1 projects`` — a copy
+    bug at the earliest user touchpoint. Mirrors cycles 57/58 on
+    other dashboard surfaces.
+    """
+    monkeypatch.setattr(
+        "pollypm.cockpit_sections.dashboard._dashboard_project_tasks",
+        lambda project_key, project_path: ({}, {}),
+    )
+    monkeypatch.setattr("pollypm.cockpit._count_inbox_tasks_for_label", lambda config: 0)
+
+    base_dir = tmp_path / ".pollypm"
+    supervisor = SimpleNamespace(store=_FakeStore())
+
+    one_proj = SimpleNamespace(
+        project=SimpleNamespace(base_dir=base_dir, root_dir=tmp_path),
+        pollypm=SimpleNamespace(timezone="UTC"),
+        projects={"only": _FakeProject(tmp_path / "only", "Only")},
+        accounts={},
+    )
+    out = _build_dashboard(supervisor, one_proj)
+    assert "1 project  ·  j/k navigate" in out
+    assert "1 projects" not in out
+
+    many_proj = SimpleNamespace(
+        project=SimpleNamespace(base_dir=base_dir, root_dir=tmp_path),
+        pollypm=SimpleNamespace(timezone="UTC"),
+        projects={
+            "a": _FakeProject(tmp_path / "a", "A"),
+            "b": _FakeProject(tmp_path / "b", "B"),
+            "c": _FakeProject(tmp_path / "c", "C"),
+        },
+        accounts={},
+    )
+    out = _build_dashboard(supervisor, many_proj)
+    assert "3 projects  ·  j/k navigate" in out

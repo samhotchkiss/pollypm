@@ -687,6 +687,9 @@ def _build_dashboard(supervisor, config, config_path: Path | None = None) -> str
         lines.append("")
 
     project_count = len(config.projects)
-    lines.append(f"  {project_count} projects  ·  j/k navigate  ·  S settings")
+    project_word = "project" if project_count == 1 else "projects"
+    lines.append(
+        f"  {project_count} {project_word}  ·  j/k navigate  ·  S settings"
+    )
 
     return "\n".join(lines)

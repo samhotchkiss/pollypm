@@ -133,8 +133,9 @@ def check_provider_account_configured() -> doctor.CheckResult:
                 "Recheck: pm doctor"
             ),
         )
+    account_word = "account" if len(accounts) == 1 else "accounts"
     return doctor._ok(
-        f"{len(accounts)} provider account(s) configured",
+        f"{len(accounts)} provider {account_word} configured",
         data={"accounts": sorted(accounts.keys())},
     )
 

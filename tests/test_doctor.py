@@ -297,6 +297,30 @@ def test_check_provider_account_ok(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     )
     result = doctor.check_provider_account_configured()
     assert result.passed
+    # Cycle 55: pluralise the account count rather than ``account(s)``.
+    assert "1 provider account configured" in result.status
+    assert "account(s)" not in result.status
+
+
+def test_check_provider_account_pluralisation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Plural account count must read ``N provider accounts configured``."""
+    from pollypm import config as config_mod
+
+    path = tmp_path / "pollypm.toml"
+    path.touch()
+    monkeypatch.setattr(config_mod, "DEFAULT_CONFIG_PATH", path)
+    monkeypatch.setattr(
+        "pollypm.config.load_config",
+        lambda p=path: type(
+            "C", (), {"accounts": {"alice": object(), "bob": object(), "carol": object()}},
+        )(),
+    )
+    result = doctor.check_provider_account_configured()
+    assert result.passed
+    assert "3 provider accounts configured" in result.status
+    assert "account(s)" not in result.status
 
 
 # --------------------------------------------------------------------- #

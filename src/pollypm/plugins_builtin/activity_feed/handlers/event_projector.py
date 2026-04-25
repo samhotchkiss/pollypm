@@ -39,11 +39,29 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
+
+# Best-effort project inference for events whose alert/notify payload
+# omits an explicit ``project`` key but whose body names a task by
+# ``<project>/<N>`` reference (task_assignment alerts, supervisor
+# noise, etc.). The activity feed's Project column otherwise reads
+# ``—`` for those rows even though the project context is right
+# there in the message body.
+_PROJECT_REF_IN_TEXT_RE = re.compile(
+    r"\b([a-zA-Z][a-zA-Z0-9_]*)/\d+\b"
+)
+
+
+def _project_from_text(text: str | None) -> str | None:
+    if not text:
+        return None
+    match = _PROJECT_REF_IN_TEXT_RE.search(text)
+    return match.group(1) if match else None
 
 logger = logging.getLogger(__name__)
 
@@ -285,7 +303,12 @@ class EventProjector:
                 kind, message, actor,
             )
             severity = parsed.severity or _severity_from_message_row(row)
-            project = parsed.project or (payload.get("project") if isinstance(payload, dict) else None)
+            project = (
+                parsed.project
+                or (payload.get("project") if isinstance(payload, dict) else None)
+                or _project_from_text(summary)
+                or _project_from_text(message)
+            )
             verb = parsed.verb or kind
             subject = parsed.subject or (row.get("sender") or None)
             if parsed.extra:

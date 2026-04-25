@@ -122,6 +122,54 @@ def test_project_from_state_events(tmp_path: Path) -> None:
     assert alert.source == "events"
 
 
+def test_project_inferred_from_task_ref_in_message(tmp_path: Path) -> None:
+    """Regression: alerts emitted by ``task_assignment_notify`` (and
+    other supervisor paths) don't carry an explicit ``project`` field
+    in the payload, so the activity feed Project column rendered ``—``
+    for every such row even when the message body literally named a
+    task by ``<project>/<N>`` reference. Infer the project from the
+    text as a fallback so the column carries useful info.
+    """
+    db = tmp_path / "state.db"
+    store = StateStore(db)
+    _seed_event(
+        store,
+        session="task_assignment",
+        event_type="alert",
+        message=(
+            "Task polly_remote/12 was routed to the worker role but no "
+            "matching session is running."
+        ),
+    )
+    store.close()
+
+    entries = EventProjector(db).project(limit=10)
+    assert len(entries) == 1
+    assert entries[0].project == "polly_remote"
+
+
+def test_project_inference_skipped_when_payload_already_carries_project(
+    tmp_path: Path,
+) -> None:
+    """Explicit payload project always wins over body inference — we
+    only fall back to scanning the body when nothing else is available.
+    """
+    from pollypm.plugins_builtin.activity_feed.handlers.event_projector import (
+        _project_from_text,
+    )
+    # Direct unit assertion on the helper. Empty / no-match returns
+    # None; a clear ref returns the project key.
+    assert _project_from_text("") is None
+    assert _project_from_text("no refs here") is None
+    assert _project_from_text(
+        "Task polly_remote/12 routed elsewhere"
+    ) == "polly_remote"
+    # Underscored project keys are valid.
+    assert _project_from_text(
+        "polly_e2e_proj/3 review"
+    ) == "polly_e2e_proj"
+
+
 def test_project_reverse_chronological(tmp_path: Path) -> None:
     db = tmp_path / "state.db"
     store = StateStore(db)

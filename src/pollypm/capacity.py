@@ -8,11 +8,8 @@ human leases during failover.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path
-from typing import Any
 
 from pollypm.models import PollyPMConfig, ProviderKind
 from pollypm.storage.state import StateStore

@@ -33,14 +33,14 @@ from pollypm.projects import (
 from pollypm.runtime_env import provider_profile_env_for_provider
 from typing import TYPE_CHECKING
 
-from pollypm.onboarding_models import (
+from pollypm.onboarding_models import (  # noqa: F401  (re-exported)
     CliAvailability,
     ConnectedAccount,
     LoginPreferences,
     OnboardingResult,
     ProviderChoice,
 )
-from pollypm.onboarding_ui import (
+from pollypm.onboarding_ui import (  # noqa: F401  (re-exported)
     available_clis as _available_clis,
     provider_choices as _provider_choices,
     render_account_step_intro as _render_account_step_intro,

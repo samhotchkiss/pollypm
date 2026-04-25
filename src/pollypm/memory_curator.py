@@ -29,7 +29,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 from pollypm.atomic_io import atomic_write_text
 from pollypm.memory_backends import MemoryBackend, MemoryEntry, MemoryType

@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
 
 from pollypm.plugin_api.v1 import PollyPMPlugin
 from pollypm.plugin_host import ExtensionHost

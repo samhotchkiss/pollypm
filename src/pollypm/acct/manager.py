@@ -29,7 +29,6 @@ first healthy account in iteration order does; otherwise ``None``.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from pathlib import Path
 
 from pollypm.provider_sdk import ProviderUsageSnapshot
 

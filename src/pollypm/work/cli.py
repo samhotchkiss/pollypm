@@ -1032,6 +1032,16 @@ def task_cancel(
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Cancel a task."""
+    if not reason or not reason.strip():
+        typer.echo(
+            "Error: --reason must be a non-empty string. Cancellation "
+            "is final — the audit trail and the next operator both need "
+            "to know why the task was killed. An empty reason records "
+            "''cancelled' with no context, which is exactly the "
+            "untraceable shutdown the contract was written to prevent.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
     svc = _svc(db, project=_project_from_task_id(task_id))
     task = _run(svc.cancel, task_id, actor, reason)
     if output_json:
@@ -1049,6 +1059,21 @@ def task_hold(
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Put a task on hold."""
+    # ``--reason`` is optional on hold (sometimes a task is parked
+    # without a textual explanation), but if the operator passes
+    # the flag it must carry content — the dashboard's On Hold
+    # section surfaces the reason as ``paused: <reason>`` and an
+    # empty string renders a blank line worse than no reason at
+    # all.
+    if reason is not None and not reason.strip():
+        typer.echo(
+            "Error: --reason was provided but is empty. Either omit "
+            "the flag entirely or supply a non-empty explanation — the "
+            "dashboard On Hold section uses this reason to tell the "
+            "next operator what would unparked the task.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
     svc = _svc(db, project=_project_from_task_id(task_id))
     task = _run(svc.hold, task_id, actor, reason)
     if output_json:

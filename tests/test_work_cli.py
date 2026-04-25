@@ -446,6 +446,122 @@ class TestCliRejectValidation:
         assert "Rejected proj/1" in result.output
 
 
+class TestCliCancelHoldReasonValidation:
+    """``pm task cancel --reason`` and ``pm task hold --reason``
+    enforce non-empty content (mirrors the reject contract from the
+    previous cycle). Cancellation needs an audit trail; hold reasons
+    surface verbatim in the dashboard's On Hold section."""
+
+    def test_cancel_with_empty_reason_errors(self, db_path):
+        _create_task(db_path, title="Doomed task")
+        result = runner.invoke(
+            task_app,
+            [
+                "cancel", "proj/1", "--reason", "",
+                "--db", db_path,
+            ],
+        )
+        assert result.exit_code != 0
+        combined = result.output + (result.stderr or "")
+        assert "non-empty" in combined
+        assert "audit" in combined.lower()
+
+    def test_cancel_with_whitespace_reason_errors(self, db_path):
+        _create_task(db_path, title="Doomed task")
+        result = runner.invoke(
+            task_app,
+            [
+                "cancel", "proj/1", "--reason", "   ",
+                "--db", db_path,
+            ],
+        )
+        assert result.exit_code != 0
+        assert "non-empty" in (result.output + (result.stderr or ""))
+
+    def test_cancel_with_real_reason_passes(self, db_path):
+        _create_task(db_path, title="Doomed task")
+        result = runner.invoke(
+            task_app,
+            [
+                "cancel", "proj/1",
+                "--reason", "Superseded by proj/2",
+                "--db", db_path,
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "Cancelled proj/1" in result.output
+
+    def test_hold_with_explicit_empty_reason_errors(self, db_path):
+        """If the operator passes ``--reason`` it must carry content;
+        otherwise the dashboard On Hold section renders a blank
+        ``paused:`` line."""
+        _create_task(
+            db_path,
+            title="Holdable",
+            roles=["worker=pete", "reviewer=russell"],
+        )
+        runner.invoke(task_app, ["queue", "proj/1", "--db", db_path])
+        runner.invoke(
+            task_app,
+            ["claim", "proj/1", "--actor", "pete", "--db", db_path],
+        )
+        result = runner.invoke(
+            task_app,
+            [
+                "hold", "proj/1", "--reason", "",
+                "--actor", "polly", "--db", db_path,
+            ],
+        )
+        assert result.exit_code != 0
+        combined = result.output + (result.stderr or "")
+        assert "empty" in combined
+        # The error names the dashboard surface that uses the field
+        # so the operator understands the downstream impact.
+        assert "On Hold" in combined or "on hold" in combined
+
+    def test_hold_without_reason_flag_passes(self, db_path):
+        """Reason is optional on hold — omitting the flag entirely is
+        still a valid call."""
+        _create_task(
+            db_path,
+            title="Holdable",
+            roles=["worker=pete", "reviewer=russell"],
+        )
+        runner.invoke(task_app, ["queue", "proj/1", "--db", db_path])
+        runner.invoke(
+            task_app,
+            ["claim", "proj/1", "--actor", "pete", "--db", db_path],
+        )
+        result = runner.invoke(
+            task_app,
+            [
+                "hold", "proj/1", "--actor", "polly", "--db", db_path,
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+    def test_hold_with_real_reason_passes(self, db_path):
+        _create_task(
+            db_path,
+            title="Holdable",
+            roles=["worker=pete", "reviewer=russell"],
+        )
+        runner.invoke(task_app, ["queue", "proj/1", "--db", db_path])
+        runner.invoke(
+            task_app,
+            ["claim", "proj/1", "--actor", "pete", "--db", db_path],
+        )
+        result = runner.invoke(
+            task_app,
+            [
+                "hold", "proj/1",
+                "--reason", "Waiting on Sam to confirm contract",
+                "--actor", "polly", "--db", db_path,
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+
 class TestCliNext:
     def test_cli_next(self, db_path):
         _create_task(db_path, title="High task", priority="high")

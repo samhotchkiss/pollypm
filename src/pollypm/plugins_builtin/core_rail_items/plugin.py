@@ -118,6 +118,12 @@ def _user_waiting_task_ids(ctx: RailContext) -> frozenset[str]:
     out: set[str] = set()
     import sqlite3 as _sqlite3
     for project_key, project in getattr(config, "projects", {}).items():
+        # Same tracked-only invariant as
+        # ``dashboard_data._user_waiting_task_ids_across_projects`` (cycle 86)
+        # and ``recovery_prompt._pending_inbox_section`` (cycle 85). The
+        # docstring above already promises "tracked project's state.db".
+        if not getattr(project, "tracked", False):
+            continue
         db_path = project.path / ".pollypm" / "state.db"
         try:
             mtime = db_path.stat().st_mtime if db_path.exists() else 0.0

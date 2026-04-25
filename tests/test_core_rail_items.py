@@ -372,3 +372,61 @@ def test_rail_registry_items_honour_index_and_section_order() -> None:
         ("workflows", "Z50"),
         ("tools", "Tool0"),
     ]
+
+
+def test_user_waiting_task_ids_skips_non_tracked_projects(tmp_path: Path) -> None:
+    """Cycle 91: ``_user_waiting_task_ids`` (used by core_rail_items to
+    suppress redundant ``stuck_on_task`` rail glyphs) iterates
+    config.projects and opens each project's state.db. Without a
+    tracked filter, a registered-but-not-tracked project's leftover
+    state.db could over-suppress alerts on tasks that share a number
+    with a stale row.
+
+    Same shape as cycles 85/86/87. The function's docstring already
+    promised "tracked project's state.db".
+    """
+    import sqlite3
+
+    from pollypm.plugins_builtin.core_rail_items.plugin import (
+        _user_waiting_task_ids,
+    )
+
+    def _seed(db_path: Path, project: str, number: int) -> None:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(
+                "CREATE TABLE work_tasks ("
+                "project TEXT, task_number INTEGER, work_status TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO work_tasks VALUES (?, ?, ?)",
+                (project, number, "blocked"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    tracked_path = tmp_path / "tracked"
+    _seed(tracked_path / ".pollypm" / "state.db", "tracked", 1)
+
+    ghost_path = tmp_path / "ghost"
+    _seed(ghost_path / ".pollypm" / "state.db", "ghost", 99)
+
+    config = type("C", (), {
+        "projects": {
+            "tracked": KnownProject(
+                key="tracked", path=tracked_path, name="Tracked",
+                kind=ProjectKind.GIT, tracked=True,
+            ),
+            "ghost": KnownProject(
+                key="ghost", path=ghost_path, name="Ghost",
+                kind=ProjectKind.GIT, tracked=False,
+            ),
+        },
+    })()
+
+    ctx = RailContext(extras={"config": config})
+    waiting = _user_waiting_task_ids(ctx)
+    assert "tracked/1" in waiting
+    assert "ghost/99" not in waiting

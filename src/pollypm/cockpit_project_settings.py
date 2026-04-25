@@ -618,7 +618,12 @@ class PollyProjectSettingsApp(App[None]):
         if not lines:
             return "[dim]No project-local guides forked yet.[/dim]"
         if stale_count:
-            lines.insert(0, f"[dim]{stale_count} guide fork(s) need refresh.[/dim]")
+            forks_word = "fork" if stale_count == 1 else "forks"
+            verb = "needs" if stale_count == 1 else "need"
+            lines.insert(
+                0,
+                f"[dim]{stale_count} guide {forks_word} {verb} refresh.[/dim]",
+            )
         return "\n".join(lines)
 
     def _build_preview(self, worker, *, account_label: str) -> str:

@@ -1135,7 +1135,11 @@ class OnboardingApp(App[OnboardingResult | None]):
         self.state.selected_project_paths = list(event.worker.result)
         self.state.scan_complete = True
         if self.state.recent_projects:
-            self._set_message(f"Found {len(self.state.recent_projects)} recently active repo suggestion(s).")
+            n = len(self.state.recent_projects)
+            word = "suggestion" if n == 1 else "suggestions"
+            self._set_message(
+                f"Found {n} recently active repo {word}."
+            )
         else:
             self._set_message(
                 "No recent repos matched your local commit history. You can use the demo repo fallback or add projects later."

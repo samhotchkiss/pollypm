@@ -243,7 +243,11 @@ def _pending_inbox_section(config: PollyPMConfig) -> RecoveryPromptSection | Non
             total += len(tasks)
         if total == 0:
             return None
-        parts = [f"You have {total} task(s) waiting on the user:", *summaries[:10]]
+        word = "task" if total == 1 else "tasks"
+        parts = [
+            f"You have {total} {word} waiting on the user:",
+            *summaries[:10],
+        ]
         parts.append("Check with: pm inbox")
         return RecoveryPromptSection(
             key="pending_inbox",
@@ -506,7 +510,8 @@ def _live_git_state(config: PollyPMConfig, project_key: str) -> str:
     status = _git_output(str(project_root), ["git", "status", "--porcelain"])
     if status:
         changed = len(status.strip().splitlines())
-        parts.append(f"- Uncommitted changes: {changed} file(s)")
+        word = "file" if changed == 1 else "files"
+        parts.append(f"- Uncommitted changes: {changed} {word}")
     else:
         parts.append("- Working tree clean")
 

@@ -1297,7 +1297,7 @@ def test_build_review_nudge_caches_by_db_mtime(monkeypatch, tmp_path: Path) -> N
     # First call: cache is cold, must open one connection per project (4).
     nudge1 = sup._build_review_nudge()
     assert nudge1 is not None
-    assert "4 task(s) waiting" in nudge1
+    assert "4 tasks waiting" in nudge1
     first_opens = len(opens)
     assert first_opens == 4, f"cold pass opened {first_opens} connections (want 4)"
 

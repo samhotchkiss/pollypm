@@ -304,8 +304,10 @@ def _build_review_nudge(supervisor: SupervisorAlertBoundary) -> str | None:
             _REVIEW_NUDGE_CACHE.pop(stale, None)
         if not review_tasks:
             return None
+        n = len(review_tasks)
+        word = "task" if n == 1 else "tasks"
         lines = [
-            f"You have {len(review_tasks)} task(s) waiting for your review:",
+            f"You have {n} {word} waiting for your review:",
             *review_tasks,
             "",
             "Review with: pm task status <id>, then pm task approve <id> --actor russell or pm task reject <id> --actor russell --reason \"...\"",

@@ -702,7 +702,11 @@ class Supervisor:
 
         self.ensure_heartbeat_schedule()
         self.ensure_knowledge_extraction_schedule()
-        _status(f"Reconciled: {created} session(s) created, {len(existing_windows)} already running")
+        _word = "session" if created == 1 else "sessions"
+        _status(
+            f"Reconciled: {created} {_word} created, "
+            f"{len(existing_windows)} already running"
+        )
         return self.config.pollypm.controller_account
 
     def _bootstrap_launches(

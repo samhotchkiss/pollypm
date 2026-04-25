@@ -1975,8 +1975,12 @@ def check_project_local_guide_drift() -> CheckResult:
         fix_lines.append(f"  ... and {len(stale) - 4} more")
     fix_lines.append("Review local edits before overwriting if needed.")
     fix_lines.append("Recheck: pm doctor")
+    n_stale = len(stale)
+    guide_word = "guide" if n_stale == 1 else "guides"
+    project_word = "project" if projects_with_drift == 1 else "projects"
     return _fail(
-        f"{len(stale)} stale project-local guide(s) across {projects_with_drift} project(s): {sample}",
+        f"{n_stale} stale project-local {guide_word} across "
+        f"{projects_with_drift} {project_word}: {sample}",
         why=(
             "Project-local role guides stop inheriting upstream prompt updates "
             "after they are forked. Stale guides can launch sessions with "
@@ -2052,7 +2056,8 @@ def check_task_assignment_sweeper_dbs() -> CheckResult:
                 errors.append(f"{db_path}: {msg}")
         if errors:
             return (initialized > 0, f"initialized {initialized}; errors: {'; '.join(errors[:3])}")
-        return (True, f"initialized {initialized} project state.db file(s)")
+        word = "file" if initialized == 1 else "files"
+        return (True, f"initialized {initialized} project state.db {word}")
 
     if missing and not found:
         return _fail(
@@ -2195,7 +2200,7 @@ def check_sessions_table_populated() -> CheckResult:
         try:
             sup = PollyPMService(DEFAULT_CONFIG_PATH).load_supervisor()
             repaired = sup.repair_sessions_table()
-            return (True, f"repaired {repaired} session(s)")
+            return (True, f"repaired {repaired} {'session' if repaired == 1 else 'sessions'}")
         except Exception as exc:  # noqa: BLE001
             return (False, f"repair failed: {exc}")
 
@@ -2220,7 +2225,7 @@ def check_sessions_table_populated() -> CheckResult:
             data={"count": 0, "db": str(db_path)},
         )
     return _ok(
-        f"sessions table has {count} row(s)",
+        f"sessions table has {count} {'row' if count == 1 else 'rows'}",
         data={"count": count, "db": str(db_path)},
     )
 
@@ -2927,7 +2932,7 @@ def check_sessions_table_vs_tmux() -> CheckResult:
             try:
                 sup = PollyPMService(DEFAULT_CONFIG_PATH).load_supervisor()
                 repaired = sup.repair_sessions_table()
-                return (True, f"repaired {repaired} session(s)")
+                return (True, f"repaired {repaired} {'session' if repaired == 1 else 'sessions'}")
             except Exception as exc:  # noqa: BLE001
                 return (False, f"repair failed: {exc}")
 

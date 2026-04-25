@@ -677,9 +677,15 @@ def test_current_activity_calls_out_user_decision_when_only_architect_active(
             assert "architect_demo" in rendered
             # Critically: the section also surfaces the user-facing
             # decision so the operator can see "I have a decision to
-            # make" alongside "the architect is online".
-            assert "Waiting for your response" in rendered
-            assert "deploy work is ready" in rendered
+            # make" alongside "the architect is online" — but it
+            # points at the Action Needed card instead of restating
+            # the prompt content (which is right above on the same
+            # screen).
+            assert "Waiting on your response" in rendered
+            assert "Action Needed" in rendered
+            # The prompt body must NOT be repeated here; the user can
+            # already see it in the Action Needed card.
+            assert "deploy work is ready" not in rendered
 
     _run(body())
 

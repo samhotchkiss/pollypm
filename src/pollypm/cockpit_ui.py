@@ -9483,15 +9483,11 @@ class PollyProjectDashboardApp(App[None]):
                 # here." Saying just "<architect> active" while the
                 # banner reads "Waiting on you" hides that fact in the
                 # very section meant to explain what's happening now.
-                item = data.action_items[0]
-                prompt = _escape(
-                    item.get("plain_prompt")
-                    or item.get("decision_question")
-                    or "This project is waiting for your response."
-                )
+                # Don't restate the full prompt \u2014 it's already in the
+                # Action Needed card right above; point there instead.
                 lines.append(
-                    f"  [#f0c45a]\u25c6[/#f0c45a] Waiting for your "
-                    f"response.\n    [dim]{prompt}[/dim]"
+                    f"  [#f0c45a]\u25c6[/#f0c45a] Waiting on your "
+                    f"response \u2014 see [b]Action Needed[/b] above."
                 )
             return "\n".join(lines)
         if data.action_items:

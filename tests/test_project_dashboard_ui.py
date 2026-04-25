@@ -1165,6 +1165,27 @@ def test_clean_hold_reason_leaves_unknown_refs_untouched() -> None:
     assert "other_project/9" in out
 
 
+def test_clean_hold_reason_handles_mixed_case_project_keys() -> None:
+    """Cycle 90: the rewrite regex was lowercase-only — a project
+    keyed ``MyProject`` or ``proj-x`` slipped through unrewritten,
+    leaving ``MyProject/12`` raw in the hold reason. Align with
+    ``_PROJECT_TASK_REF_RE`` (case-aware, allows hyphens).
+    """
+    from pollypm.cockpit_ui import _clean_hold_reason
+
+    out = _clean_hold_reason(
+        "Waiting on operator: MyProject/7 — see proj-x/3 for context",
+        {
+            "MyProject/7": "Mixed-case title",
+            "proj-x/3": "Hyphen-keyed title",
+        },
+    )
+    assert "MyProject/7" not in out
+    assert "proj-x/3" not in out
+    assert "#7 (Mixed-case title)" in out
+    assert "#3 (Hyphen-keyed title)" in out
+
+
 def test_clean_hold_reason_elides_self_reference_in_held_row() -> None:
     """When the held task's hold reason names the held task itself,
     repeating ``#N (Title)`` on the row that already shows

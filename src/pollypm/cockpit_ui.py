@@ -9017,7 +9017,10 @@ def _clean_hold_reason(
             if len(title) > 28:
                 title = title[:27].rstrip() + "…"
             return f"#{num} ({title})"
-        text = _re.sub(r"\b[a-z][a-z0-9_]*/\d+\b", _replace, text)
+        # Match the same shape as ``_PROJECT_TASK_REF_RE`` (case-aware,
+        # allows hyphens) so a project keyed ``MyProject`` or ``proj-x``
+        # doesn't slip past the rewrite. Cycle 90 alignment.
+        text = _re.sub(r"\b[A-Za-z0-9_][A-Za-z0-9_-]*/\d+\b", _replace, text)
         if elided_self:
             # Drop the colon glued to the now-elided self-ref (so
             # "operator:  — text" reads "operator — text") and

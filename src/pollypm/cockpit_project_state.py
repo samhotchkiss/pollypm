@@ -120,7 +120,7 @@ def rollup_project_state(
         return _rollup(ProjectRailState.NONE, project_key=project_key)
 
     alert_ids = frozenset(actionable_task_alert_ids)
-    alerted = [
+    alerted_all = [
         task for task in active_tasks
         if task_id_for(task) in alert_ids
     ]
@@ -128,15 +128,28 @@ def rollup_project_state(
         task for task in active_tasks
         if _is_waiting_on_user(task)
     ]
+    # When a task is already in a user-waiting state, the alert that
+    # fired on it (typically ``stuck_on_task:`` because the session
+    # has been idle waiting for the user) is just the same fact in
+    # different words — surfacing it as RED tells the user "something
+    # is broken" when really the system is doing exactly what it
+    # should: waiting on them. Drop those from the RED trigger so
+    # the rail rollup matches the dashboard banner (yellow, not red).
+    user_waiting_ids = {task_id_for(task) for task in user_waiting}
+    alerted = [
+        task for task in alerted_all
+        if task_id_for(task) not in user_waiting_ids
+    ]
     advanceable = [
         task for task in active_tasks
         if _can_independently_advance(task, plan_blocked=plan_blocked)
     ]
 
     # Red is reserved for true operational fault states — a worker
-    # detected as stuck, a missing session for an assignment, etc. A
-    # project where the user simply has decisions to make is *not* a
-    # fault: it is "user attention needed", which is yellow.
+    # detected as stuck on a non-user-waiting task, a missing session
+    # for an assignment, etc. A project where the user simply has
+    # decisions to make is *not* a fault: it is "user attention
+    # needed", which is yellow.
     if alerted:
         return _rollup(
             ProjectRailState.RED,

@@ -66,6 +66,50 @@ def test_rollup_red_only_when_operational_alert_present() -> None:
     assert rollup.reason == "operational alert needs review"
 
 
+def test_rollup_yellow_when_stuck_alert_is_on_a_user_waiting_task() -> None:
+    """A ``stuck_on_task:<id>`` alert fires when a session sits idle
+    waiting for the user. When the underlying task is *already* in a
+    user-waiting state (blocked / on_hold / waiting_on_user), the
+    alert is just the same fact in different words — flagging the
+    rail RED then tells the user "something is broken" when the
+    system is doing exactly what it should: waiting on them.
+
+    Drop the stuck alert from the RED trigger when the task is
+    already user-waiting; let the rollup fall through to YELLOW.
+    """
+    alerts = [SimpleNamespace(alert_type="stuck_on_task:demo/1")]
+    rollup = rollup_project_state(
+        "demo",
+        # Task #1 is already blocked (user-waiting); the stuck alert
+        # on it must not push the rail to RED.
+        [_task(1, "blocked"), _task(2, "in_progress")],
+        actionable_task_alert_ids=actionable_alert_task_ids(
+            alerts, project_key="demo",
+        ),
+    )
+
+    assert rollup.state is ProjectRailState.YELLOW
+    assert rollup.badge == "🟡"
+
+
+def test_rollup_red_when_stuck_alert_is_on_advancing_task() -> None:
+    """When the alerted task is *not* user-waiting (it's mid-flight
+    in_progress, queued, or in autoreview), the stuck signal is a
+    real fault — keep RED."""
+    alerts = [SimpleNamespace(alert_type="stuck_on_task:demo/1")]
+    rollup = rollup_project_state(
+        "demo",
+        # Task #1 is in progress, alerted as stuck → genuinely
+        # broken; rail stays RED.
+        [_task(1, "in_progress"), _task(2, "in_progress")],
+        actionable_task_alert_ids=actionable_alert_task_ids(
+            alerts, project_key="demo",
+        ),
+    )
+
+    assert rollup.state is ProjectRailState.RED
+
+
 def test_rollup_yellow_when_user_wait_is_mixed_with_automated_work() -> None:
     rollup = rollup_project_state(
         "demo",

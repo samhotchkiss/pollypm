@@ -112,6 +112,10 @@ class PollyWorkerRosterApp(App[None]):
     _HEALTH_GLYPHS: dict[str, tuple[str, str]] = {
         "alive": ("\U0001f7e2", "#3ddc84"),
         "idle_warn": ("\U0001f7e1", "#f0c45a"),
+        # ⚪ — worker handed off cleanly (task at a review node, worker
+        # session expected to be gone). Distinct from 🔴 unresponsive,
+        # which means the worker dropped without a handoff.
+        "handed_off": ("⚪", "#97a6b2"),
         "unresponsive": ("\U0001f534", "#ff5f6d"),
     }
 

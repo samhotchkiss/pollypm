@@ -169,6 +169,59 @@ def test_working_worker_without_heartbeat_explains_tmux_activity() -> None:
     assert "session: worker_demo" in tooltip
 
 
+def test_offline_at_review_node_classifies_as_handed_off() -> None:
+    """Regression: when a worker exits cleanly after handing off to a
+    reviewer (task at ``code_review`` / ``user_approval``), the
+    worker pane previously rendered the gone session as 🔴
+    "unresponsive" — same glyph used for crashed workers. That made
+    expected handoffs look like faults. Distinguish the two so the
+    operator can tell ``handed_off`` from ``unresponsive`` at a
+    glance.
+    """
+    from pollypm.cockpit_inbox import _worker_health_snapshot
+
+    health, tooltip = _worker_health_snapshot(
+        status="offline",
+        last_heartbeat_iso=None,
+        token_total=0,
+        session_name="worker_demo",
+        current_node="code_review",
+    )
+    assert health == "handed_off"
+    assert "handed off at code_review" in tooltip
+
+    # user_approval is also a review-style handoff node.
+    health2, _ = _worker_health_snapshot(
+        status="offline",
+        last_heartbeat_iso=None,
+        token_total=0,
+        session_name="worker_demo",
+        current_node="user_approval",
+    )
+    assert health2 == "handed_off"
+
+    # Offline at a non-handoff node still reads as unresponsive (a
+    # worker that dropped mid-implement is a real fault).
+    health3, _ = _worker_health_snapshot(
+        status="offline",
+        last_heartbeat_iso=None,
+        token_total=0,
+        session_name="worker_demo",
+        current_node="implement",
+    )
+    assert health3 == "unresponsive"
+
+    # Without a current_node argument (legacy callers), keep the old
+    # offline → unresponsive mapping.
+    health4, _ = _worker_health_snapshot(
+        status="offline",
+        last_heartbeat_iso=None,
+        token_total=0,
+        session_name="worker_demo",
+    )
+    assert health4 == "unresponsive"
+
+
 def test_session_column_prefixes_avatar(roster_env, roster_app) -> None:
     async def body() -> None:
         rows = [_make_row(session_name="task-demo-42")]

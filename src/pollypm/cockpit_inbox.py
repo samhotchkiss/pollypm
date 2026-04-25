@@ -735,15 +735,29 @@ def _format_token_total(total: int) -> str:
     return f"{total / 1_000_000:.1f}M"
 
 
+_HANDOFF_NODES = frozenset({
+    "code_review", "review", "user_approval", "review_handoff",
+})
+
+
 def _worker_health_snapshot(
     *,
     status: str,
     last_heartbeat_iso: str | None,
     token_total: int,
     session_name: str,
+    current_node: str | None = None,
 ) -> tuple[str, str]:
-    """Map worker state to a health bucket + tooltip."""
-    if status in {"stuck", "offline"}:
+    """Map worker state to a health bucket + tooltip.
+
+    Distinguish "offline because the worker handed off cleanly" (task
+    parked at a review node, worker session naturally gone) from
+    "offline because the worker dropped" — the same red 🔴 glyph for
+    both made expected handoffs look like faults.
+    """
+    if status == "offline" and current_node in _HANDOFF_NODES:
+        health = "handed_off"
+    elif status in {"stuck", "offline"}:
         health = "unresponsive"
     elif status == "idle":
         try:
@@ -756,7 +770,11 @@ def _worker_health_snapshot(
         health = "idle_warn" if idle_long else "alive"
     else:
         health = "alive"
-    if last_heartbeat_iso:
+    if health == "handed_off":
+        heartbeat_part = (
+            f"worker handed off at {current_node} — session ended naturally"
+        )
+    elif last_heartbeat_iso:
         heartbeat_part = f"last heartbeat {_format_heartbeat_age(last_heartbeat_iso)}"
     elif status in {"working", "idle"}:
         heartbeat_part = f"{status}; heartbeat not recorded"
@@ -927,6 +945,7 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
                 last_heartbeat_iso=last_heartbeat_iso,
                 token_total=token_total,
                 session_name=session_name,
+                current_node=current_node,
             )
 
             rows.append(

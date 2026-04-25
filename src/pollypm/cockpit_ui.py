@@ -8803,6 +8803,35 @@ def _dashboard_inbox(
     return _action_count(items, action_items), top, action_items
 
 
+def _action_card_click_hint(action_items: list[dict]) -> str:
+    """Return one line of click-discoverability copy for the Action
+    Needed cards.
+
+    With a single card, "this card" is unambiguous; with multiple, we
+    pluralise. Cards backed by an inbox thread (no project task ref)
+    open the inbox thread instead of a task — call that out so the
+    user isn't confused when the click lands somewhere other than
+    the task pane.
+    """
+    if not action_items:
+        return ""
+    refs = [str(item.get("primary_ref") or "") for item in action_items]
+    has_task = any(_PROJECT_TASK_REF_RE.fullmatch(ref) for ref in refs if ref)
+    has_thread = any(not _PROJECT_TASK_REF_RE.fullmatch(ref) for ref in refs)
+    if len(action_items) == 1:
+        target = (
+            "the source task"
+            if has_task and not has_thread
+            else "the inbox thread"
+        )
+        return f"Click this card to open {target}."
+    if has_task and not has_thread:
+        return "Click any card to open its source task."
+    if has_thread and not has_task:
+        return "Click any card to open its inbox thread."
+    return "Click any card to open its source task or inbox thread."
+
+
 def _clean_hold_reason(reason: str) -> str:
     """Strip notification-routing artefacts from auto-generated hold
     reasons before rendering them on the dashboard.
@@ -9746,14 +9775,14 @@ class PollyProjectDashboardApp(App[None]):
                     or "Choose how Polly should proceed."
                 )
                 lines.append(f"    [b]Decision[/b] {question}")
-                target_copy = (
-                    "the source task"
-                    if _PROJECT_TASK_REF_RE.fullmatch(str(item.get("primary_ref") or ""))
-                    else "the inbox thread"
-                )
-                lines.append(
-                    f"    [dim]Click this message to open {target_copy}.[/dim]"
-                )
+            # One discoverability hint at the bottom of the stack — was
+            # previously per-item, which read as "Click this message
+            # to open the source task." repeated verbatim under each
+            # card. Keep it singular when there's one card, generic
+            # when there are several.
+            click_hint = _action_card_click_hint(data.action_items[:2])
+            if click_hint:
+                lines.append(f"  [dim]{click_hint}[/dim]")
             lines.append("")
         elif blocked_total:
             lines.append("[#f0c45a][b]Blocked, but summary missing[/b][/]")

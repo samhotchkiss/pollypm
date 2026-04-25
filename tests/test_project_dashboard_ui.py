@@ -778,6 +778,48 @@ def test_action_count_dedupes_review_task_and_matching_message() -> None:
     assert _action_count(items, action_items) == 1
 
 
+def test_action_card_click_hint_collapses_per_item_duplication() -> None:
+    """Action Needed cards used to repeat
+    ``"Click this message to open the source task."`` verbatim
+    under every card. With multiple cards open, the user reads the
+    same sentence twice on the same screen for no benefit.
+
+    Render one consolidated hint at the bottom of the action stack
+    instead, with copy that adapts to single vs. multiple cards and
+    to whether each card opens a task or an inbox thread.
+    """
+    from pollypm.cockpit_ui import _action_card_click_hint
+
+    # Empty → no hint.
+    assert _action_card_click_hint([]) == ""
+
+    # Single task-backed card: precise singular.
+    assert _action_card_click_hint(
+        [{"primary_ref": "polly_remote/12"}]
+    ) == "Click this card to open the source task."
+
+    # Single thread-backed card.
+    assert _action_card_click_hint(
+        [{"primary_ref": "blocker-summary:42"}]
+    ) == "Click this card to open the inbox thread."
+
+    # Two task-backed cards: pluralise.
+    assert _action_card_click_hint(
+        [
+            {"primary_ref": "polly_remote/12"},
+            {"primary_ref": "polly_remote/9"},
+        ]
+    ) == "Click any card to open its source task."
+
+    # Mixed: hedge.
+    assert _action_card_click_hint(
+        [
+            {"primary_ref": "polly_remote/12"},
+            {"primary_ref": "blocker-summary:42"},
+        ]
+    ) == "Click any card to open its source task or inbox thread."
+
+
 def test_clean_hold_reason_strips_action_routing_tag() -> None:
     """Auto-holds emit reasons like
     ``"Waiting on operator: [Action] Done: <subject>"`` because the

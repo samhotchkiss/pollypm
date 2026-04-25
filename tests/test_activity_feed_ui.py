@@ -528,6 +528,36 @@ def test_event_type_colour_renders_in_table(
     _run(body())
 
 
+def test_message_column_strips_routing_tag_from_alert_summary(
+    activity_env, activity_app,
+) -> None:
+    """Regression: alert messages enter the feed with subjects like
+    ``[Alert] Additional work remains —``; the bracketed routing
+    label is supervisor-side metadata, not natural-language content.
+    Strip it from the Message column so the row reads as prose.
+    """
+    async def body() -> None:
+        entries = [
+            _make_entry(
+                entry_id="evt:alert",
+                kind="alert",
+                verb="alert",
+                summary="[Alert] Additional work remains — open inbox to triage",
+            ),
+        ]
+        activity_app._gather = lambda: entries  # type: ignore[method-assign]
+        async with activity_app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            assert activity_app.table.row_count == 1
+            row_idx = activity_app.table.get_row_index("evt:alert")
+            message_cell = str(
+                activity_app.table.get_row_at(row_idx)[4]
+            )
+            assert "[Alert]" not in message_cell
+            assert "Additional work remains" in message_cell
+    _run(body())
+
+
 def test_message_column_blank_when_summary_equals_event_verb(
     activity_env, activity_app,
 ) -> None:

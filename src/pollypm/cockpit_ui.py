@@ -8865,19 +8865,26 @@ def _action_card_click_hint(action_items: list[dict]) -> str:
     return "Click any card to open its source task or inbox thread."
 
 
-def _strip_action_subject_prefix(subject: str) -> str:
-    """Drop a leading ``[Action]`` routing tag from an inbox subject.
+_ROUTING_TAG_PREFIXES = ("[action]", "[alert]")
 
-    The ``[Action]`` prefix is a tier/recipient routing label added by
-    the notify CLI; it has no natural-language value for the operator
-    reading the subject. The inbox list rail already strips it for
-    action-bucket rows; the detail pane also needs to, so the focused
-    message header doesn't lead with the routing tag.
+
+def _strip_action_subject_prefix(subject: str) -> str:
+    """Drop a leading routing tag (``[Action]``, ``[Alert]``) from a
+    user-facing subject.
+
+    These bracketed prefixes are tier/recipient routing labels added by
+    the notify CLI and the supervisor's alert path; they have no
+    natural-language value for the operator reading the subject. The
+    inbox list rail already strips ``[Action]`` for action-bucket rows;
+    the detail pane and the activity feed mirror the strip so a focused
+    message or feed row doesn't lead with the routing tag.
     """
     if not subject:
         return subject
-    if subject[:8].lower() == "[action]":
-        return subject[8:].lstrip(" :-—")
+    lowered = subject.lower()
+    for tag in _ROUTING_TAG_PREFIXES:
+        if lowered.startswith(tag):
+            return subject[len(tag):].lstrip(" :-—")
     return subject
 
 

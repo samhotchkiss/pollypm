@@ -496,6 +496,12 @@ class PollyActivityFeedApp(App[None]):
             summary_text = entry.summary or ""
             if summary_text and summary_text == verb_text:
                 summary_text = ""
+            # Strip ``[Action]`` / ``[Alert]`` routing tags from the
+            # head of the message \u2014 they're notify/supervisor
+            # routing labels, not natural-language content, and the
+            # Event column already conveys the kind.
+            from pollypm.cockpit_ui import _strip_action_subject_prefix
+            summary_text = _strip_action_subject_prefix(summary_text)
             self.table.add_row(
                 time_text,
                 project_text,

@@ -1173,6 +1173,27 @@ def test_clean_hold_reason_without_title_map_keeps_legacy_behavior() -> None:
     ) == "Waiting on operator: polly_remote/12 to land"
 
 
+def test_strip_action_subject_prefix_also_strips_alert_routing_tag() -> None:
+    """Alerts emit subjects with an ``[Alert]`` tier prefix from the
+    supervisor — same routing-tag pattern as ``[Action]``. The strip
+    helper must drop both so the activity feed Message column doesn't
+    render ``[Alert] Additional work remains —`` with the bracketed
+    routing label leading the prose.
+    """
+    from pollypm.cockpit_ui import _strip_action_subject_prefix
+
+    assert _strip_action_subject_prefix(
+        "[Alert] Additional work remains — open inbox to triage"
+    ) == "Additional work remains — open inbox to triage"
+    assert _strip_action_subject_prefix(
+        "[ALERT] disk filling"
+    ) == "disk filling"
+    # No tag → unchanged.
+    assert _strip_action_subject_prefix(
+        "Calculator CLI E2E complete"
+    ) == "Calculator CLI E2E complete"
+
+
 def test_strip_action_subject_prefix_drops_routing_tag() -> None:
     """The ``[Action]`` prefix is a tier/recipient routing label added
     by the notify CLI; it must not survive into user-facing subject

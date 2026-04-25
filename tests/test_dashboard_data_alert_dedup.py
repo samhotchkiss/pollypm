@@ -290,3 +290,77 @@ def test_user_waiting_task_ids_skips_non_tracked_projects(
     # blocked task does NOT (would have leaked into stuck-alert dedup).
     assert "tracked/1" in waiting
     assert "ghost/99" not in waiting
+
+
+def test_recent_inbox_messages_skips_non_tracked_projects(
+    tmp_path, monkeypatch,
+) -> None:
+    """``_recent_inbox_messages`` powers the polly-dashboard's
+    ``Recent messages`` preview. Same shape of bug as cycle 86's
+    ``_count_inbox_tasks`` fix: a non-tracked project's leftover
+    ``.pollypm/state.db`` would leak into the preview list.
+
+    The workspace-root source still flows through (``project_key=None``
+    in the helper) — only per-project entries get the tracked filter.
+    """
+    from types import SimpleNamespace
+
+    from pollypm.dashboard_data import _recent_inbox_messages
+
+    tracked_path = tmp_path / "tracked"
+    (tracked_path / ".pollypm").mkdir(parents=True)
+    (tracked_path / ".pollypm" / "state.db").write_text("")
+
+    ghost_path = tmp_path / "ghost"
+    (ghost_path / ".pollypm").mkdir(parents=True)
+    (ghost_path / ".pollypm" / "state.db").write_text("")
+
+    tracked_proj = SimpleNamespace(
+        path=tracked_path, tracked=True, display_label=lambda: "Tracked",
+    )
+    ghost_proj = SimpleNamespace(
+        path=ghost_path, tracked=False, display_label=lambda: "Ghost",
+    )
+    config = SimpleNamespace(
+        projects={"tracked": tracked_proj, "ghost": ghost_proj},
+        project=SimpleNamespace(workspace_root=None),
+    )
+
+    called_with: list[str | None] = []
+
+    fake_task = SimpleNamespace(
+        task_id="tracked/1",
+        title="Pending preview",
+        roles={},
+        created_by="polly",
+        updated_at=None,
+        created_at=None,
+    )
+
+    def fake_inbox_tasks(_svc, *, project):
+        called_with.append(project)
+        return [fake_task]
+
+    class _FakeSvc:
+        def __init__(self, *_a, **_kw) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "pollypm.work.inbox_view.inbox_tasks", fake_inbox_tasks,
+    )
+    monkeypatch.setattr(
+        "pollypm.work.sqlite_service.SQLiteWorkService", _FakeSvc,
+    )
+
+    previews = _recent_inbox_messages(config)
+    # Only the tracked project's source was scanned.
+    assert called_with == ["tracked"]
+    assert len(previews) == 1
+    assert previews[0].project == "Tracked"
+    assert previews[0].task_id == "tracked/1"

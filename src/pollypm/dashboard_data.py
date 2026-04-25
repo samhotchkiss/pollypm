@@ -317,6 +317,11 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
     previews: list[InboxPreview] = []
     sources: list[tuple[str | None, str, Path, Path]] = []
     for project_key, project in getattr(config, "projects", {}).items():
+        # Same tracked-only invariant as _count_inbox_tasks (cycle 86):
+        # a non-tracked project's leftover state.db would leak stale
+        # tasks into the polly-dashboard's "Recent messages" preview.
+        if not getattr(project, "tracked", False):
+            continue
         sources.append((project_key, project.display_label(), project.path / ".pollypm" / "state.db", project.path))
     workspace_root = getattr(getattr(config, "project", None), "workspace_root", None)
     if workspace_root is not None:

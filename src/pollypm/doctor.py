@@ -2851,9 +2851,10 @@ def check_inbox_open_count() -> CheckResult:
         count = _count_inbox_tasks(config)
     except Exception as exc:  # noqa: BLE001
         return _skip(f"inbox-count check skipped ({exc})")
+    item_word = "item" if count == 1 else "items"
     if count > _INBOX_WARN_COUNT:
         return _fail(
-            f"{count} open inbox item(s) (warn at {_INBOX_WARN_COUNT})",
+            f"{count} open inbox {item_word} (warn at {_INBOX_WARN_COUNT})",
             why=(
                 "A large backlog of inbox items signals neglected attention. "
                 "Each item represents a request from Polly or another agent "
@@ -2867,7 +2868,7 @@ def check_inbox_open_count() -> CheckResult:
             severity="warning",
             data={"count": count},
         )
-    return _ok(f"{count} open inbox item(s)", data={"count": count})
+    return _ok(f"{count} open inbox {item_word}", data={"count": count})
 
 
 def check_sessions_table_vs_tmux() -> CheckResult:

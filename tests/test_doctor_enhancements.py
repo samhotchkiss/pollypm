@@ -718,6 +718,30 @@ def test_inbox_open_count_warn(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.severity == "warning"
 
 
+def test_inbox_open_count_pluralisation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Singular and plural inbox counts must not render ``item(s)``.
+
+    ``pm doctor`` runs every install/CI/recovery sweep — the
+    parenthetical-s pluralisation always reads as a copy bug at
+    count=1. Cycle 45 made this fix on 5 other doctor messages; this
+    locks the same shape for the inbox-count check (both pass and
+    warn paths share the word).
+    """
+    fake_config = object()
+    monkeypatch.setattr(doctor, "_safe_load_config", lambda: (Path("/tmp/x"), fake_config))
+    import pollypm.dashboard_data as dd
+
+    monkeypatch.setattr(dd, "_count_inbox_tasks", lambda cfg: 1)
+    one = doctor.check_inbox_open_count()
+    assert "1 open inbox item" in one.status
+    assert "item(s)" not in one.status
+
+    monkeypatch.setattr(dd, "_count_inbox_tasks", lambda cfg: 7)
+    many = doctor.check_inbox_open_count()
+    assert "7 open inbox items" in many.status
+    assert "item(s)" not in many.status
+
+
 # --------------------------------------------------------------------- #
 # Sessions checks
 # --------------------------------------------------------------------- #

@@ -362,6 +362,90 @@ class TestCliDoneOutputValidation:
         assert result.exit_code == 0, result.output
 
 
+class TestCliRejectValidation:
+    """``pm task reject --reason`` enforces Russell's contract.
+
+    The reviewer prompt requires SPECIFIC, actionable rejection
+    reasons. Typer's ``...`` makes ``--reason`` required but allows
+    empty strings — exactly the bad-rejection-message shape the
+    contract warns against. Reject empty/whitespace reasons at the
+    CLI so workers always have actionable feedback to address.
+    """
+
+    def _setup_review_task(self, db_path):
+        _create_task(
+            db_path,
+            title="Review me",
+            roles=["worker=pete", "reviewer=polly"],
+        )
+        runner.invoke(task_app, ["queue", "proj/1", "--db", db_path])
+        runner.invoke(
+            task_app,
+            ["claim", "proj/1", "--actor", "pete", "--db", db_path],
+        )
+        wo = json.dumps(
+            {
+                "type": "code_change",
+                "summary": "Implemented the feature",
+                "artifacts": [
+                    {"kind": "commit", "description": "abc", "ref": "abc"},
+                ],
+            }
+        )
+        runner.invoke(
+            task_app,
+            [
+                "done", "proj/1", "--output", wo,
+                "--actor", "pete", "--db", db_path,
+            ],
+        )
+
+    def test_reject_with_empty_reason_errors(self, db_path):
+        self._setup_review_task(db_path)
+        result = runner.invoke(
+            task_app,
+            [
+                "reject", "proj/1", "--reason", "",
+                "--actor", "polly", "--db", db_path,
+            ],
+        )
+        assert result.exit_code != 0
+        combined = result.output + (result.stderr or "")
+        assert "non-empty string" in combined
+        # The contract's voice rule is named so reviewers reading
+        # the error see what kind of reason is expected.
+        assert "specific" in combined.lower()
+
+    def test_reject_with_whitespace_reason_errors(self, db_path):
+        self._setup_review_task(db_path)
+        result = runner.invoke(
+            task_app,
+            [
+                "reject", "proj/1", "--reason", "   ",
+                "--actor", "polly", "--db", db_path,
+            ],
+        )
+        assert result.exit_code != 0
+        assert "non-empty" in (result.output + (result.stderr or ""))
+
+    def test_reject_with_real_reason_passes(self, db_path):
+        """Regression guard: the validator must not reject valid
+        rejection reasons end-to-end."""
+        self._setup_review_task(db_path)
+        result = runner.invoke(
+            task_app,
+            [
+                "reject", "proj/1",
+                "--reason",
+                "Criterion 3 (CSV export) not verified. Add the export "
+                "subcommand and resubmit.",
+                "--actor", "polly", "--db", db_path,
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "Rejected proj/1" in result.output
+
+
 class TestCliNext:
     def test_cli_next(self, db_path):
         _create_task(db_path, title="High task", priority="high")

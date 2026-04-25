@@ -971,6 +971,23 @@ def task_reject(
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Reject at a review node."""
+    # Russell's reviewer contract (see core_agent_profiles
+    # russell.md / reviewer_prompt) explicitly requires SPECIFIC,
+    # actionable rejection reasons. An empty or whitespace-only
+    # reason still passes Typer's ``required`` check but produces
+    # the exact bad-rejection-message shape the prompt warns
+    # against ("--reason 'needs work'" — no specifics).
+    if not reason or not reason.strip():
+        typer.echo(
+            "Error: --reason must be a non-empty string. The reviewer "
+            "contract requires SPECIFIC, actionable rejection reasons "
+            "— name the criterion, quote the symptom, state the fix. "
+            "Empty rejections leave the worker no information to act "
+            "on and produce the exact rework loop the contract was "
+            "written to prevent.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
     svc = _svc(db, project=_project_from_task_id(task_id))
     task = _run(
         svc.reject,

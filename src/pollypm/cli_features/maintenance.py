@@ -33,6 +33,26 @@ from pollypm.worktrees import list_worktrees as list_project_worktrees
 debug_app = typer.Typer(help="Low-level debugging helpers.")
 
 
+def _semver_sort_key(tag: str):
+    """Return a sort key that orders ``tag`` by semver when possible.
+
+    Used by ``pm upgrade``'s ``git ls-remote`` fallback path to pick
+    the actual newest release rather than the lexicographically last
+    tag (which puts ``1.9.0`` after ``1.10.0``). Tags that don't
+    parse as a valid PEP 440 version sort before any parseable
+    version so a stray non-semver tag (e.g. ``nightly``) never
+    masquerades as the latest release.
+    """
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        return (1, Version(tag), "")
+    except InvalidVersion:
+        # Tuple shape matches the parseable branch so heterogeneous
+        # comparisons don't TypeError on the Version field.
+        return (0, Version("0"), tag)
+
+
 def _service(config_path: Path):
     from pollypm.service_api import PollyPMService
 
@@ -556,7 +576,11 @@ def register_maintenance_commands(app: typer.Typer) -> None:
                         f"Current version: {current}. No releases found on GitHub."
                     )
                     return
-                latest = sorted(tags)[-1]
+                # Sort by semver, not lexicographically — otherwise the
+                # ``git ls-remote`` fallback picks ``1.9.0`` over ``1.10.0``
+                # the moment the project crosses the v1.10 line. The ``gh``
+                # API path above already returns the latest by release time.
+                latest = sorted(tags, key=_semver_sort_key)[-1]
             else:
                 latest = result.stdout.strip().lstrip("v")
         except FileNotFoundError:

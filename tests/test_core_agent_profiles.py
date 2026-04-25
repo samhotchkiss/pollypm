@@ -68,6 +68,45 @@ def _make_worker_context(tmp_path: Path) -> tuple[AgentProfileContext, Path]:
     return context, project_root
 
 
+def test_architect_prompt_documents_user_prompt_json_contract() -> None:
+    """The architect.md profile is the canonical example for the
+    ``--user-prompt-json`` contract — it teaches every other producer
+    (operator, reviewer, worker, ...) what shape to use. A future
+    edit that drops the contract description would silently regress
+    every plan-review notification.
+
+    The other role-prompt regression tests (operator, reviewer,
+    worker) already pin similar contract terms; this is the
+    architect-side counterpart so the four prompts stay in lock-step."""
+    architect_path = (
+        Path(__file__).resolve().parent.parent
+        / "src"
+        / "pollypm"
+        / "plugins_builtin"
+        / "project_planning"
+        / "profiles"
+        / "architect.md"
+    )
+    assert architect_path.exists(), (
+        "architect.md must ship with the project_planning plugin — it's "
+        "the canonical example for the user_prompt-JSON contract"
+    )
+    text = architect_path.read_text(encoding="utf-8")
+
+    # The flag itself must appear so producers grep-find it.
+    assert "--user-prompt-json" in text
+    # And every required key the dashboard renders.
+    for key in ("summary", "steps", "question", "actions"):
+        assert f"`{key}`" in text, (
+            f"architect.md should describe the user_prompt key "
+            f"`{key}` so plan-review producers know the contract shape"
+        )
+    # The voice rules from the v1 dashboard contract — no jargon —
+    # must remain so future edits don't reintroduce raw worker
+    # output as user-facing copy.
+    assert "plain English" in text
+
+
 def test_worker_prompt_routes_blocking_questions_to_polly_with_label() -> None:
     """Workers blocking on credentials, ambiguous specs, or environment
     issues used to ``pm notify`` straight to Sam's inbox by default —

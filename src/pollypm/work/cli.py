@@ -527,7 +527,10 @@ def _sync_commits_to_task_branch(task_id: str) -> None:
                     capture_output=True, text=True, check=False,
                 )
                 if cp.returncode == 0:
-                    typer.echo(f"Cherry-picked {len(hashes)} commit(s) to {task_branch}")
+                    commit_word = "commit" if len(hashes) == 1 else "commits"
+                    typer.echo(
+                        f"Cherry-picked {len(hashes)} {commit_word} to {task_branch}"
+                    )
                 else:
                     typer.echo(f"Warning: could not sync commits to {task_branch}: {cp.stderr.strip()}")
     else:
@@ -1365,7 +1368,10 @@ def task_validate_advance(
             name = r.gate_name or "(unnamed)"
             typer.echo(f"  {mark} {name}{gtype}: {r.reason}")
         if hard_fails:
-            typer.echo(f"Would NOT advance: {len(hard_fails)} hard gate(s) failing.")
+            gate_word = "gate" if len(hard_fails) == 1 else "gates"
+            typer.echo(
+                f"Would NOT advance: {len(hard_fails)} hard {gate_word} failing."
+            )
         else:
             typer.echo("Would advance.")
 

@@ -242,7 +242,10 @@ class WorkTransitionManager:
             role for role in _EXPECTED_CRITIC_PANEL_ROLES if role not in found
         ]
         if missing:
-            problems.append(f"missing critic role(s): {_format_csv(missing)}")
+            role_word = "role" if len(missing) == 1 else "roles"
+            problems.append(
+                f"missing critic {role_word}: {_format_csv(missing)}"
+            )
 
         if problems:
             raise ValidationError(

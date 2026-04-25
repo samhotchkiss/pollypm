@@ -1509,7 +1509,8 @@ class PollyPMApp(App[None]):
                 return
             for repo_path in paths:
                 self.service.register_project(repo_path)
-            self._notify(f"Added {len(paths)} project(s).")
+            project_word = "project" if len(paths) == 1 else "projects"
+            self._notify(f"Added {len(paths)} {project_word}.")
             self.action_refresh_all()
 
         self.push_screen(RepoScanModal(repos), _handle_scan)

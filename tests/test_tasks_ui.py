@@ -242,6 +242,32 @@ def _table_rows(table: DataTable) -> list[list[str]]:
     ]
 
 
+def test_summary_text_pluralises_singular_task_count(env) -> None:
+    """Task pane status bar must read ``1 task`` (not ``1 tasks``).
+
+    Cycle 63: the ``{shown} == {total}`` branch printed ``{total}
+    tasks`` unconditionally. At ``total=1`` it read ``1 tasks``,
+    which is a copy bug at the typical state where one task is
+    selected/loaded. Mirrors the inbox status bar (cycle 57) and
+    the doctor / dashboard plural cleanup batch.
+    """
+    if not _load_config_compatible(env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_tasks import PollyTasksApp
+
+    app = PollyTasksApp(env["config_path"], "demo")
+    one = _task(node_id="research")
+    app._tasks = [one]
+    summary = app._summary_text([one])
+    assert summary.startswith("1 task")
+    assert not summary.startswith("1 tasks")
+
+    two = _task(task_number=2, node_id="research", title="Second task")
+    app._tasks = [one, two]
+    summary = app._summary_text([one, two])
+    assert summary.startswith("2 tasks")
+
+
 def test_task_app_surfaces_stage_timestamps_and_live_session_tabs(env, monkeypatch) -> None:
     if not _load_config_compatible(env["config_path"]):
         pytest.skip("minimal pollypm.toml fixture not supported by loader")

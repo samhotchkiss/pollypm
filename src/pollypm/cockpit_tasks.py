@@ -1281,7 +1281,11 @@ class PollyTasksApp(App[None]):
                 parts.append(f"{icon} {count} {status.replace('_', ' ')}")
         total = len(self._tasks)
         shown = len(visible)
-        prefix = f"{shown} of {total} shown" if shown != total else f"{total} tasks"
+        if shown != total:
+            prefix = f"{shown} of {total} shown"
+        else:
+            task_word = "task" if total == 1 else "tasks"
+            prefix = f"{total} {task_word}"
         return prefix if not parts else prefix + "  ·  " + "  ·  ".join(parts)
 
     def _current_task_key(self) -> str | None:

@@ -30,12 +30,14 @@ class OutputPresent:
             summary_ok = bool(output.summary and output.summary.strip())
             artifacts_ok = bool(output.artifacts)
             if summary_ok and artifacts_ok:
+                n_artifacts = len(output.artifacts)
+                artifact_word = "artifact" if n_artifacts == 1 else "artifacts"
                 return GateResult(
                     passed=True,
                     reason=(
                         f"Work output present on execution "
                         f"{execution.node_id}/visit{execution.visit}: "
-                        f"{len(output.artifacts)} artifact(s)."
+                        f"{n_artifacts} {artifact_word}."
                     ),
                 )
         return GateResult(

@@ -372,6 +372,36 @@ def test_output_present_passes_with_structured_output() -> None:
     task = _make_task(executions=[execution])
     result = gate.check(task)
     assert result.passed is True
+    # Cycle 79: pluralise per count — single artifact reads
+    # ``1 artifact.`` (not ``1 artifact(s).``).
+    assert "1 artifact." in result.reason
+    assert "artifact(s)" not in result.reason
+
+
+def test_output_present_pluralises_at_two_artifacts() -> None:
+    from pollypm.work.gates import GateRegistry
+    from pollypm.work.models import (
+        Artifact, ArtifactKind, FlowNodeExecution, OutputType, WorkOutput,
+    )
+
+    gate = GateRegistry().get("output_present")
+    execution = FlowNodeExecution(
+        task_id="demo/1",
+        node_id="critique",
+        visit=1,
+        work_output=WorkOutput(
+            type=OutputType.DOCUMENT,
+            summary="Multi-artifact critique",
+            artifacts=[
+                Artifact(kind=ArtifactKind.NOTE, description="a"),
+                Artifact(kind=ArtifactKind.NOTE, description="b"),
+            ],
+        ),
+    )
+    task = _make_task(executions=[execution])
+    result = gate.check(task)
+    assert result.passed is True
+    assert "2 artifacts." in result.reason
 
 
 def test_log_present_blocks_when_log_missing(tmp_path: Path) -> None:

@@ -818,10 +818,11 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
                         f"Run `git -C {wt_path} status` to inspect the conflict, "
                         f"then resolve and `git commit` or reassign the task."
                     )
+                    file_word = "file" if len(files) == 1 else "files"
                     body = (
                         f"Worker {agent} hit a merge conflict in {wt_path} while "
                         f"working on task {task_id}.\n\n"
-                        f"{len(files)} conflicted file(s) detected.\n\n"
+                        f"{len(files)} conflicted {file_word} detected.\n\n"
                         f"Fix: {fix_hint}"
                     )
                     if _emit_inbox_task(

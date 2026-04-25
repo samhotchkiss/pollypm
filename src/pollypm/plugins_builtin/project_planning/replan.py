@@ -166,8 +166,10 @@ def render_drift_chat(analysis: DriftAnalysis) -> str:
     """
     lines = ["# Drift analysis", ""]
     if analysis.planned_modules:
+        n_modules = len(analysis.planned_modules)
+        module_word = "module" if n_modules == 1 else "modules"
         lines.append(
-            f"Plan had {len(analysis.planned_modules)} module(s): "
+            f"Plan had {n_modules} {module_word}: "
             + ", ".join(analysis.planned_modules)
             + "."
         )

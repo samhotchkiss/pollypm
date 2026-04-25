@@ -8521,6 +8521,61 @@ def _dashboard_inbox(
             deduped.append(step)
         return deduped[:4]
 
+    def _decision_prompt_from_body(
+        subject: str, body: str, steps: list[str],
+    ) -> str:
+        paragraphs = [
+            _plain_text(part)
+            for part in body.split("\n\n")
+            if _plain_text(part)
+        ]
+        for paragraph in paragraphs:
+            lower = paragraph.lower()
+            if "ruling needed:" in lower:
+                prompt = paragraph.split(":", 1)[1].strip()
+                return _trim(f"Decide: {prompt}", limit=260)
+        if len(steps) >= 2:
+            lower_body = body.lower()
+            lower_subject = subject.lower()
+            if (
+                "options:" in lower_body
+                or "this is your call" in lower_body
+                or "decision" in lower_subject
+                or "scope escalation" in lower_subject
+                or "blocked" in lower_subject
+            ):
+                option_steps: list[str] = []
+                in_options = False
+                for line in body.splitlines():
+                    if "options:" in line.lower():
+                        in_options = True
+                        continue
+                    if not in_options:
+                        continue
+                    if line.strip().startswith("**") and option_steps:
+                        break
+                    match = _ACTION_STEP_RE.match(line)
+                    if match is not None:
+                        step = _plain_text(match.group("step"))
+                        if step:
+                            option_steps.append(step)
+                if len(option_steps) >= 2:
+                    return _trim(
+                        f"Choose one: {option_steps[0]}; or {option_steps[1]}",
+                        limit=260,
+                    )
+                return _trim(
+                    f"Choose one: {steps[0]}; or {steps[1]}",
+                    limit=260,
+                )
+        for paragraph in paragraphs:
+            lower = paragraph.lower()
+            if "your call" in lower or "needs your call" in lower:
+                return _trim(f"Decide: {paragraph}", limit=260)
+        if steps:
+            return _trim(f"Next: {steps[0]}", limit=260)
+        return ""
+
     known_projects = set(getattr(config, "projects", {}).keys())
     items: list[dict] = []
     try:
@@ -8615,15 +8670,26 @@ def _dashboard_inbox(
                             "triage_rank": 0,
                             "needs_action": owner in {"user", "sam", "human"},
                             "source": "blocker_summary",
-                            "summary": _trim(reason) if reason else "",
-                            "steps": [
-                                _plain_text(step)
-                                for step in required_actions
-                                if _plain_text(step)
-                            ][:4],
-                            "primary_ref": payload.get("task_id")
-                            or f"blocker-summary:{item_id}",
-                        }
+                        "summary": _trim(reason) if reason else "",
+                        "steps": [
+                            _plain_text(step)
+                            for step in required_actions
+                            if _plain_text(step)
+                        ][:4],
+                        "next_action": _trim(
+                            (
+                                "Complete: "
+                                + "; ".join(
+                                    _plain_text(step)
+                                    for step in required_actions
+                                    if _plain_text(step)
+                                )
+                            ),
+                            limit=260,
+                        ) if required_actions else "",
+                        "primary_ref": payload.get("task_id")
+                        or f"blocker-summary:{item_id}",
+                    }
                     )
                     continue
                 entry = annotate_inbox_entry(
@@ -8639,6 +8705,7 @@ def _dashboard_inbox(
                     updated_at = updated_at.isoformat()
                 body = _message_body(row.get("body"))
                 subject = getattr(entry, "title", "") or "(no subject)"
+                steps = _steps_from_body(body)
                 task_refs = [
                     match.group(0)
                     for match in _PROJECT_TASK_REF_RE.finditer(
@@ -8657,7 +8724,10 @@ def _dashboard_inbox(
                         "needs_action": bool(getattr(entry, "needs_action", False)),
                         "source": "message",
                         "summary": _summary_from_body(body),
-                        "steps": _steps_from_body(body),
+                        "steps": steps,
+                        "next_action": _decision_prompt_from_body(
+                            subject, body, steps,
+                        ),
                         "primary_ref": task_refs[0] if task_refs else None,
                     }
                 )
@@ -9052,6 +9122,7 @@ class PollyProjectDashboardApp(App[None]):
             self._DEFAULT_HINT, id="proj-hint", markup=True,
         )
         self.data: ProjectDashboardData | None = None
+        self._action_click_task_ids: list[str] = []
         # When True, the plan section takes over the whole body — other
         # sections are hidden via the ``proj-plan-focus`` screen class.
         self._plan_view_mode: bool = False
@@ -9326,6 +9397,11 @@ class PollyProjectDashboardApp(App[None]):
         count = data.inbox_count
         blocked_total = int(data.task_counts.get("blocked", 0))
         on_hold_total = int(data.task_counts.get("on_hold", 0))
+        self._action_click_task_ids = [
+            str(item.get("primary_ref") or "")
+            for item in data.action_items[:2]
+            if _PROJECT_TASK_REF_RE.fullmatch(str(item.get("primary_ref") or ""))
+        ]
         if count == 0 and not data.action_items and not blocked_total and not on_hold_total:
             return "[dim]Inbox is clear for this project.[/dim]"
         lines: list[str] = []
@@ -9335,7 +9411,21 @@ class PollyProjectDashboardApp(App[None]):
             if item.get("task_id")
         }
         if data.action_items:
-            lines.append("[#f85149][b]Action Required[/b][/]")
+            lines.append("[#f85149][b]Action Required: To move this project forward[/b][/]")
+            for item in data.action_items[:2]:
+                title = _escape(item.get("title") or "")
+                next_action = _escape(item.get("next_action") or "")
+                if next_action:
+                    lines.append(
+                        f"  [#f0c45a]\u25c6[/#f0c45a] {next_action}"
+                    )
+                    lines.append(f"    [dim]{title}[/dim]")
+                else:
+                    lines.append(
+                        f"  [#f0c45a]\u25c6[/#f0c45a] [b]{title}[/b]"
+                    )
+            lines.append("")
+            lines.append("[dim]Details[/dim]")
             for item in data.action_items[:2]:
                 title = _escape(item.get("title") or "")
                 age = _format_relative_age(item.get("updated_at") or "")
@@ -9516,6 +9606,35 @@ class PollyProjectDashboardApp(App[None]):
         # scoped static-view route.
         router.route_selected(f"inbox:{self.project_key}")
 
+    def _route_to_task(self, task_id: str) -> None:
+        match = _PROJECT_TASK_REF_RE.fullmatch(task_id)
+        if match is None:
+            self._route_to_inbox()
+            return
+        router = CockpitRouter(self.config_path)
+        router.route_selected(
+            f"project:{match.group('project')}:issues:task:{match.group('number')}"
+        )
+
+    def _action_task_for_click(self, event: events.Click) -> str | None:
+        ids = self._action_click_task_ids
+        if not ids:
+            return None
+        if len(ids) == 1:
+            return ids[0]
+        # The Action Needed card starts with a title row plus the
+        # "To move this project forward" header. First action rows sit
+        # near the top; details/older rows are below. This intentionally
+        # keeps click targeting coarse: task-row clicks jump to the
+        # nearest actionable task, while whitespace still falls through
+        # to the inbox route.
+        y = max(0, int(getattr(event, "y", 0) or 0))
+        if y <= 7:
+            return ids[0]
+        if y <= 12:
+            return ids[1]
+        return None
+
     # ------------------------------------------------------------------
     # Click handlers (#750)
     # ------------------------------------------------------------------
@@ -9529,7 +9648,12 @@ class PollyProjectDashboardApp(App[None]):
         self.action_jump_inbox()
 
     @on(events.Click, "#proj-inbox-section")
-    def on_inbox_section_click(self, _event: events.Click) -> None:
+    def on_inbox_section_click(self, event: events.Click) -> None:
+        task_id = self._action_task_for_click(event)
+        if task_id:
+            event.stop()
+            self._route_to_task(task_id)
+            return
         self.action_jump_inbox()
 
     @on(events.Enter, "#proj-action-bar")

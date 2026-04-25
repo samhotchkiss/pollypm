@@ -38,6 +38,11 @@ def test_resolve_project_route_parses_dashboard_and_task_routes() -> None:
         sub_view="task",
         task_num="7",
     )
+    assert resolve_project_route("project:demo:issues:task:7") == ProjectRoute(
+        project_key="demo",
+        sub_view="issues",
+        task_num="7",
+    )
     assert resolve_project_route("settings") is None
 
 

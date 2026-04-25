@@ -89,5 +89,9 @@ def resolve_project_route(key: str) -> ProjectRoute | None:
         return None
     project_key = parts[1]
     sub_view = parts[2] if len(parts) > 2 else None
-    task_num = parts[3] if sub_view == "task" and len(parts) > 3 else None
+    task_num = None
+    if sub_view == "task" and len(parts) > 3:
+        task_num = parts[3]
+    elif sub_view == "issues" and len(parts) > 4 and parts[3] == "task":
+        task_num = parts[4]
     return ProjectRoute(project_key=project_key, sub_view=sub_view, task_num=task_num)

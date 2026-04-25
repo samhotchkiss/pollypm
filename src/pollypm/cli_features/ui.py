@@ -89,6 +89,11 @@ def register_ui_commands(app: typer.Typer) -> None:
                 "scope the feed to one project)."
             ),
         ),
+        task_id: str | None = typer.Option(
+            None,
+            "--task",
+            help="Preselect a task in task-oriented cockpit panes.",
+        ),
     ) -> None:
         _enforce_migration_gate(config_path)
         if kind == "settings" and target:
@@ -129,7 +134,11 @@ def register_ui_commands(app: typer.Typer) -> None:
         if kind == "issues" and target:
             from pollypm.cockpit_tasks import PollyTasksApp
 
-            PollyTasksApp(config_path, target).run(mouse=True)
+            PollyTasksApp(
+                config_path,
+                target,
+                initial_task_id=task_id,
+            ).run(mouse=True)
             return
         if kind == "activity":
             from pollypm.cockpit_ui import PollyActivityFeedApp

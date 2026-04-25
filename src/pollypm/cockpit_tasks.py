@@ -1031,10 +1031,17 @@ class PollyTasksApp(App[None]):
         "cancelled": "✗",
     }
 
-    def __init__(self, config_path: Path, project_key: str) -> None:
+    def __init__(
+        self,
+        config_path: Path,
+        project_key: str,
+        *,
+        initial_task_id: str | None = None,
+    ) -> None:
         super().__init__()
         self.config_path = config_path
         self.project_key = project_key
+        self._initial_task_id = initial_task_id
         self._tasks: list = []
         self._owner_by_task_id: dict[str, str | None] = {}
         self._rejection_feedback_by_task_id: dict[str, RejectionFeedbackNotice] = {}
@@ -1446,7 +1453,14 @@ class PollyTasksApp(App[None]):
                 updated or "—",
                 key=task.task_id,
             )
-        target_id = previous if any(t.task_id == previous for t in visible) else None
+        target_id = None
+        if self._initial_task_id and any(
+            t.task_id == self._initial_task_id for t in visible
+        ):
+            target_id = self._initial_task_id
+            self._initial_task_id = None
+        if target_id is None:
+            target_id = previous if any(t.task_id == previous for t in visible) else None
         if target_id is None and (select_first or previous is None):
             target_id = visible[0].task_id
         if target_id is None:

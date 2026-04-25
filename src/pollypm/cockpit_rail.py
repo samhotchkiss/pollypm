@@ -1630,7 +1630,18 @@ class CockpitRouter:
             self._show_static_view(supervisor, window_target, "project", project_key)
             return
         if sub_view in ("settings", "issues"):
-            self._show_static_view(supervisor, window_target, sub_view, project_key)
+            task_id = (
+                f"{project_key}/{route.task_num}"
+                if sub_view == "issues" and route.task_num
+                else None
+            )
+            self._show_static_view(
+                supervisor,
+                window_target,
+                sub_view,
+                project_key,
+                task_id=task_id,
+            )
             return
         if sub_view == "task" and route.task_num:
             task_num = route.task_num
@@ -2075,6 +2086,7 @@ class CockpitRouter:
         window_target: str,
         kind: str,
         project_key: str | None = None,
+        task_id: str | None = None,
     ) -> None:
         self._park_mounted_session(supervisor, window_target)
         self._cleanup_extra_panes(window_target)
@@ -2085,13 +2097,16 @@ class CockpitRouter:
         if right_pane_id is None:
             right_pane_id = self.tmux.split_window(
                 left_pane_id,
-                self._right_pane_command(kind, project_key),
+                self._right_pane_command(kind, project_key, task_id=task_id),
                 horizontal=True,
                 detached=True,
                 size=self._right_pane_size(window_target),
             )
         else:
-            self.tmux.respawn_pane(right_pane_id, self._right_pane_command(kind, project_key))
+            self.tmux.respawn_pane(
+                right_pane_id,
+                self._right_pane_command(kind, project_key, task_id=task_id),
+            )
         state = self._load_state()
         state.pop("mounted_session", None)
         state["right_pane_id"] = self._right_pane_id(window_target)
@@ -2128,7 +2143,13 @@ class CockpitRouter:
             return f"activity:{project_key}"
         return kind
 
-    def _right_pane_command(self, kind: str, project_key: str | None = None) -> str:
+    def _right_pane_command(
+        self,
+        kind: str,
+        project_key: str | None = None,
+        *,
+        task_id: str | None = None,
+    ) -> str:
         root = shlex.quote(str(self.config_path.parent.resolve()))
         import shutil
         pm_cmd = "pm" if shutil.which("pm") else "uv run pm"
@@ -2142,6 +2163,8 @@ class CockpitRouter:
                 args.extend(["--project", shlex.quote(project_key)])
             else:
                 args.append(shlex.quote(project_key))
+        if task_id is not None:
+            args.extend(["--task", shlex.quote(task_id)])
         joined = " ".join(args)
         return f"sh -lc 'cd {root} && {joined}'"
 

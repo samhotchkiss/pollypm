@@ -429,10 +429,23 @@ def test_status_yellow_when_workspace_action_message_exists(
             assert dashboard_app.data.action_items
             assert dashboard_app.data.status_label == "needs attention"
             rendered = str(dashboard_app.inbox_body.render())
-            assert "Action Required" in rendered
+            assert "To move this project forward" in rendered
             assert "Fly.io" in rendered
             assert "deploy pipeline" in rendered
+            assert "Choose one:" in rendered
             assert "Reopen the task with Fly-enabled access" in rendered
+
+            routed: list[str] = []
+            dashboard_app._route_to_task = routed.append  # type: ignore[assignment]
+
+            class _Click:
+                y = 4
+
+                def stop(self) -> None:
+                    pass
+
+            dashboard_app.on_inbox_section_click(_Click())  # type: ignore[arg-type]
+            assert routed == ["demo/3"]
 
     _run(body())
 
@@ -772,7 +785,8 @@ def test_project_blocker_summary_lists_required_user_actions(
             await pilot.pause()
             assert dashboard_app.data is not None
             rendered = str(dashboard_app.inbox_body.render())
-            assert "Action Required" in rendered
+            assert "To move this project forward" in rendered
+            assert "Complete: Create the Fly.io app; Add the deploy token" in rendered
             assert "Relay deployment is waiting on Fly.io setup" in rendered
             assert "Create the Fly.io app" in rendered
             assert "Add the deploy token" in rendered

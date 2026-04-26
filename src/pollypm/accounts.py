@@ -620,6 +620,8 @@ def _validate_account_removal(config: PollyPMConfig, account_name: str) -> None:
         )
     session_refs = [session.name for session in config.sessions.values() if session.account == account_name]
     if session_refs:
+        session_word = "session" if len(session_refs) == 1 else "sessions"
         raise typer.BadParameter(
-            f"Account {account_name} is still used by sessions: {', '.join(session_refs)}"
+            f"Account {account_name} is still used by "
+            f"{session_word}: {', '.join(session_refs)}"
         )

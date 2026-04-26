@@ -645,8 +645,10 @@ def remove_project(config_path: Path, project_key: str) -> KnownProject:
         if session.project == project_key and session.enabled
     ]
     if session_refs:
+        session_word = "session" if len(session_refs) == 1 else "sessions"
         raise typer.BadParameter(
-            f"Project {project_key} is still used by sessions: {', '.join(session_refs)}"
+            f"Project {project_key} is still used by "
+            f"{session_word}: {', '.join(session_refs)}"
         )
     del config.projects[project_key]
     write_config(config, config_path, force=True)

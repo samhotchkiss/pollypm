@@ -83,6 +83,27 @@ def _task_worker(task: object) -> str:
     return ""
 
 
+def _task_reviewer(task: object) -> str:
+    """Best-effort name of the reviewer assigned to a review-state task.
+
+    Used by the dashboard's "waiting for X" line. Tries the reviewer
+    role assignment first, then the task assignee, then falls back to
+    an empty string so the caller can render a generic placeholder.
+    Without this helper the line was hardcoded to "waiting for Russell"
+    — the autoreviewer name in the spec — which was misleading for any
+    workspace with a different reviewer persona configured.
+    """
+    roles = getattr(task, "roles", None)
+    if isinstance(roles, dict):
+        reviewer = roles.get("reviewer") or roles.get("autoreviewer")
+        if reviewer and reviewer != "user":
+            return str(reviewer)
+    assignee = getattr(task, "assignee", None)
+    if assignee and assignee not in {"system", "pm"}:
+        return str(assignee)
+    return ""
+
+
 def _task_done_at(task: object):
     last_done = None
     for transition in getattr(task, "transitions", None) or []:
@@ -611,8 +632,14 @@ def _build_dashboard(supervisor, config, config_path: Path | None = None) -> str
             worker = _task_worker(task)
             worker_text = f" · by {worker}{_streak_badge(worker, streaks)}" if worker else ""
             age = _age_from_dt(_iso_to_dt(getattr(task, "updated_at", None)), now=now)
+            reviewer = _task_reviewer(task)
+            reviewer_text = (
+                f"waiting for {reviewer}" if reviewer else "waiting for review"
+            )
             lines.append(f"  ◉ {getattr(task, 'title', '')}")
-            lines.append(f"    {project_label}{worker_text} · waiting for Russell · {age}")
+            lines.append(
+                f"    {project_label}{worker_text} · {reviewer_text} · {age}"
+            )
             lines.append("")
 
     if all_queued:

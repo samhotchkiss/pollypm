@@ -65,41 +65,106 @@ class DashboardData:
     briefing: str = ""  # morning briefing narrative (if user was away)
 
 
+# Per-project git-log cache: ``(project_path, hours) -> (cached_at, rows)``.
+# The polly-dashboard refreshes every 10s and this helper used to spawn
+# one ``git log`` subprocess per project per refresh — at 9 projects ×
+# (up to) 5s timeout that was 9 forks every tick and a 45s worst-case
+# hang on a single slow repo. Cache for 60s: dashboard ticks 6x within
+# the window pay zero subprocess cost. Cache key is the project path so
+# a config edit that drops a project just stops looking it up.
+_COMMIT_CACHE: dict[tuple[str, int], tuple[float, list["_CachedCommitRow"]]] = {}
+_COMMIT_CACHE_TTL_SECONDS = 60.0
+_COMMIT_PER_PROJECT_TIMEOUT_SECONDS = 2.0
+
+
+from dataclasses import dataclass as _dataclass
+
+
+@_dataclass(slots=True, frozen=True)
+class _CachedCommitRow:
+    """git-log row stored in the cache — converted to CommitInfo on read.
+
+    Stored separately so the cached ``age_seconds`` doesn't drift; the
+    consumer recomputes age from ``date_iso`` at the moment of read.
+    """
+    hash7: str
+    message: str
+    author: str
+    date_iso: str
+
+
+def _git_log_rows_cached(project_path: Path, hours: int) -> list[_CachedCommitRow]:
+    """Return cached git-log rows for ``project_path``, refreshing on TTL."""
+    import time as _time
+
+    cache_key = (str(project_path), hours)
+    cached = _COMMIT_CACHE.get(cache_key)
+    now_mono = _time.monotonic()
+    if cached is not None and (now_mono - cached[0]) < _COMMIT_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    git_dir = project_path / ".git"
+    if not git_dir.exists():
+        _COMMIT_CACHE[cache_key] = (now_mono, [])
+        return []
+    try:
+        result = subprocess.run(
+            ["git", "log", f"--since={hours} hours ago", "--format=%H\t%s\t%an\t%aI", "--all"],
+            cwd=project_path,
+            capture_output=True,
+            text=True,
+            timeout=_COMMIT_PER_PROJECT_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        # Cache the empty result too — a slow repo shouldn't be retried
+        # every refresh tick. The TTL still applies, so the next 60s of
+        # ticks return [] instantly instead of re-spawning git.
+        _COMMIT_CACHE[cache_key] = (now_mono, [])
+        return []
+    if result.returncode != 0:
+        _COMMIT_CACHE[cache_key] = (now_mono, [])
+        return []
+
+    rows: list[_CachedCommitRow] = []
+    for line in result.stdout.strip().splitlines():
+        parts = line.split("\t", 3)
+        if len(parts) < 4:
+            continue
+        h, msg, author, date_str = parts
+        rows.append(
+            _CachedCommitRow(hash7=h[:7], message=msg[:80], author=author, date_iso=date_str)
+        )
+    _COMMIT_CACHE[cache_key] = (now_mono, rows)
+    return rows
+
+
 def _recent_commits(config: PollyPMConfig, hours: int = 24) -> list[CommitInfo]:
-    """Get git commits from the last N hours across all projects."""
+    """Get git commits from the last N hours across all projects.
+
+    Backed by a per-project ``git log`` cache (60s TTL) so the
+    dashboard's 10s refresh tick doesn't re-spawn a subprocess per
+    project on every tick.
+    """
     commits: list[CommitInfo] = []
     now = datetime.now(UTC)
     seen: set[str] = set()
 
     for key, project in config.projects.items():
-        git_dir = project.path / ".git"
-        if not git_dir.exists():
-            continue
-        try:
-            result = subprocess.run(
-                ["git", "log", f"--since={hours} hours ago", "--format=%H\t%s\t%an\t%aI", "--all"],
-                cwd=project.path, capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode != 0:
+        for row in _git_log_rows_cached(project.path, hours):
+            if row.hash7 in seen:
                 continue
-            for line in result.stdout.strip().splitlines():
-                parts = line.split("\t", 3)
-                if len(parts) < 4:
-                    continue
-                h, msg, author, date_str = parts
-                if h in seen:
-                    continue
-                seen.add(h)
-                try:
-                    age = (now - datetime.fromisoformat(date_str)).total_seconds()
-                except (ValueError, TypeError):
-                    age = 0
-                commits.append(CommitInfo(
-                    hash=h[:7], message=msg[:80], author=author,
-                    age_seconds=age, project=key,
-                ))
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            continue
+            seen.add(row.hash7)
+            try:
+                age = (now - datetime.fromisoformat(row.date_iso)).total_seconds()
+            except (ValueError, TypeError):
+                age = 0.0
+            commits.append(CommitInfo(
+                hash=row.hash7,
+                message=row.message,
+                author=row.author,
+                age_seconds=age,
+                project=key,
+            ))
 
     commits.sort(key=lambda c: c.age_seconds)
     return commits

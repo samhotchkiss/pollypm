@@ -538,12 +538,17 @@ def build_inbox_summary(result: CuratorResult) -> str:
     """
     if result.total_changes() == 0:
         return ""
+    ttl_word = "entry" if result.ttl_deleted == 1 else "entries"
+    dup_word = (
+        "near-duplicate" if result.duplicates_merged == 1 else "near-duplicates"
+    )
+    decayed_word = "entry" if result.decayed == 1 else "entries"
     lines = [
         "# Memory curator — daily summary",
         "",
-        f"- TTL sweep: {result.ttl_deleted} entries deleted",
-        f"- Dedup: {result.duplicates_merged} near-duplicates merged",
-        f"- Decay: {result.decayed} entries dropped one importance level",
+        f"- TTL sweep: {result.ttl_deleted} {ttl_word} deleted",
+        f"- Dedup: {result.duplicates_merged} {dup_word} merged",
+        f"- Decay: {result.decayed} {decayed_word} dropped one importance level",
         f"- Promotion candidates: {result.promotion_candidates}",
         "",
     ]

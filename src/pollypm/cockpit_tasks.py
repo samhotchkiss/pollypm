@@ -1663,10 +1663,11 @@ class PollyTasksApp(App[None]):
         hidden_lines = review_diff_hidden_line_count(diff_file)
         collapsed = hidden_lines > 0 and not self._review_inline_diff_expanded
         if hidden_lines > 0:
+            line_word = "line" if hidden_lines == 1 else "lines"
             self.review_inline_diff_expand.label = (
                 "Collapse"
                 if self._review_inline_diff_expanded
-                else f"Expand (+{hidden_lines} lines)"
+                else f"Expand (+{hidden_lines} {line_word})"
             )
             self.review_inline_diff_expand.display = True
         else:

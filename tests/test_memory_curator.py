@@ -480,3 +480,37 @@ def test_build_inbox_summary_reports_actions(tmp_path: Path) -> None:
     summary = build_inbox_summary(result)
     assert summary.startswith("# Memory curator")
     assert "TTL sweep: 1" in summary
+
+
+def test_build_inbox_summary_pluralises_each_action_kind() -> None:
+    """Cycle 106 — the daily summary lines used hard-pluralised
+    nouns (``entries deleted``, ``near-duplicates merged``, ``entries
+    dropped``) so a single deletion read ``1 entries deleted``. Match
+    each noun to its count."""
+    from types import SimpleNamespace
+
+    singular = SimpleNamespace(
+        ttl_deleted=1,
+        duplicates_merged=1,
+        decayed=1,
+        promotion_candidates=0,
+        actions=[],
+        total_changes=lambda: 3,
+    )
+    summary = build_inbox_summary(singular)
+    assert "TTL sweep: 1 entry deleted" in summary
+    assert "Dedup: 1 near-duplicate merged" in summary
+    assert "Decay: 1 entry dropped one importance level" in summary
+
+    plural = SimpleNamespace(
+        ttl_deleted=4,
+        duplicates_merged=2,
+        decayed=7,
+        promotion_candidates=0,
+        actions=[],
+        total_changes=lambda: 13,
+    )
+    summary = build_inbox_summary(plural)
+    assert "TTL sweep: 4 entries deleted" in summary
+    assert "Dedup: 2 near-duplicates merged" in summary
+    assert "Decay: 7 entries dropped one importance level" in summary

@@ -263,4 +263,16 @@ def test_legacy_db_gets_hot_query_indexes_and_schema_bump(conn):
     version = conn.execute(
         "SELECT COALESCE(MAX(version), 0) FROM work_schema_version"
     ).fetchone()[0]
-    assert version == 5
+    # Migration 6 (#809) adds ``provider`` + ``provider_home`` columns
+    # to ``work_sessions`` so per-task transcript archival can locate
+    # the right Claude/Codex tree at teardown.
+    assert version == 6
+
+
+def test_migration_6_adds_provider_columns_to_work_sessions(conn):
+    """#809: legacy DBs without the provider columns get them on migrate."""
+    create_work_tables(conn)
+
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(work_sessions)")}
+    assert "provider" in cols
+    assert "provider_home" in cols

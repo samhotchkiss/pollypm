@@ -341,6 +341,9 @@ class TestWorkProgressSweep:
             recovered = reopened.get(task_id)
             assert recovered.work_status == WorkStatus.QUEUED
             assert recovered.assignee is None
-            assert recovered.current_node_id is None
+            # #806: recovery preserves the active node so the next
+            # claim resumes the same node instead of restarting at
+            # ``flow.start_node`` and losing prior visits/history.
+            assert recovered.current_node_id is not None
         finally:
             reopened.close()

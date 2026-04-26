@@ -351,6 +351,22 @@ _WORK_MIGRATIONS: list[tuple[int, str, list[str]]] = [
             """,
         ],
     ),
+    (
+        6,
+        "Persist worker provider + transcript home so per-task archival "
+        "can locate the right Claude/Codex tree at teardown (#809)",
+        [
+            # Provider name (``claude`` / ``codex`` / future). Tied to
+            # ``ProviderKind`` values but stored as text so a new
+            # provider doesn't require another migration.
+            "ALTER TABLE work_sessions ADD COLUMN provider TEXT",
+            # Filesystem root the worker's transcripts/credentials
+            # live under (``CLAUDE_CONFIG_DIR`` for Claude,
+            # ``CODEX_HOME`` for Codex). NULL means "fall back to the
+            # ambient process env" — preserves pre-#809 behaviour.
+            "ALTER TABLE work_sessions ADD COLUMN provider_home TEXT",
+        ],
+    ),
 ]
 
 

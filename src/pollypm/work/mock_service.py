@@ -700,6 +700,8 @@ class MockWorkService:
             total_input_tokens=int(row.get("total_input_tokens", 0)),
             total_output_tokens=int(row.get("total_output_tokens", 0)),
             archive_path=row.get("archive_path"),
+            provider=row.get("provider"),
+            provider_home=row.get("provider_home"),
         )
 
     def upsert_worker_session(
@@ -712,6 +714,8 @@ class MockWorkService:
         worktree_path: str,
         branch_name: str,
         started_at: str,
+        provider: str | None = None,
+        provider_home: str | None = None,
     ) -> None:
         key = (task_project, task_number)
         existing = self._worker_sessions.get(key, {})
@@ -728,6 +732,8 @@ class MockWorkService:
                 "archive_path": None,
                 "total_input_tokens": 0,
                 "total_output_tokens": 0,
+                "provider": provider,
+                "provider_home": provider_home,
             }
         )
         self._worker_sessions[key] = existing

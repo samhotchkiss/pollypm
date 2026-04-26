@@ -142,9 +142,17 @@ def test_upgrade_aborts_on_unknown_installer() -> None:
     assert "uv tool upgrade pollypm" in result.stderr  # help text
 
 
-def test_upgrade_check_only_does_not_install() -> None:
+def test_upgrade_check_only_does_not_install(monkeypatch) -> None:
     """check_only runs the migration gate and reports the plan without
-    ever invoking the real subprocess."""
+    ever invoking the real subprocess.
+
+    Stub the migration check — the test environment's state.db can
+    have legitimately pending migrations that would otherwise abort
+    the upgrade before check-only can return its no-op summary.
+    """
+    monkeypatch.setattr(
+        upgrade_mod, "run_migration_check", lambda: (True, "ok"),
+    )
     result = upgrade_mod.upgrade(
         channel="stable",
         check_only=True,
@@ -158,6 +166,9 @@ def test_upgrade_check_only_does_not_install() -> None:
 def test_upgrade_check_only_skips_when_release_check_current(monkeypatch) -> None:
     monkeypatch.setattr(
         upgrade_mod, "_available_upgrade", lambda channel: ("1.0.0rc2", False),
+    )
+    monkeypatch.setattr(
+        upgrade_mod, "run_migration_check", lambda: (True, "ok"),
     )
     result = upgrade_mod.upgrade(
         channel="stable",
@@ -358,7 +369,18 @@ def test_upgrade_emits_migration_step_lines_only_on_failure(monkeypatch) -> None
 
 
 def test_upgrade_plan_only_stops_before_exec(monkeypatch) -> None:
-    """plan_only is the test seam for composing without running."""
+    """plan_only is the test seam for composing without running.
+
+    The migration gate (#717) is now wired and the workspace state.db
+    used by the test runner can have legitimately pending migrations
+    in flight (e.g. while a new schema bump is landing in another
+    branch). Stub the check so this test covers the plan-only seam,
+    not the gate's pending-migration detection — that's exercised by
+    ``test_upgrade_aborts_on_pending_migrations``.
+    """
+    monkeypatch.setattr(
+        upgrade_mod, "run_migration_check", lambda: (True, "ok"),
+    )
     result = upgrade_mod.upgrade(
         channel="beta",
         plan_only=True,
@@ -390,11 +412,22 @@ def test_upgrade_records_recycle_flags(monkeypatch) -> None:
 # Migration / notice injection stubs
 # --------------------------------------------------------------------------- #
 
-def test_run_migration_check_no_module_is_soft_pass() -> None:
-    """Until #717 lands, the check returns OK with a 'not yet' note."""
+def test_run_migration_check_returns_ok_or_pending_summary() -> None:
+    """The migration gate (#717) is wired now: ``run_migration_check``
+    delegates to :func:`pollypm.store.migrations.check_pending`, which
+    walks the workspace state.db.
+
+    The test environment's state.db can be in either state — fully
+    migrated (``ok=True``) or pending (``ok=False`` with a list of
+    unapplied migrations). Both are valid outcomes, so this test
+    confirms the structural contract: the call returns a
+    ``(bool, str)`` tuple with a non-empty detail string. The
+    abort-on-pending behaviour is exercised by
+    ``test_upgrade_aborts_on_pending_migrations``.
+    """
     ok, detail = upgrade_mod.run_migration_check()
-    assert ok is True  # soft pass — #717 not wired yet
-    assert "not yet implemented" in detail or "ok" in detail
+    assert isinstance(ok, bool)
+    assert isinstance(detail, str) and detail
 
 
 def test_inject_notice_is_default_disabled() -> None:

@@ -551,17 +551,22 @@ def _tmux_window_alive_for_task(
 ) -> bool:
     """Check whether the per-task tmux window for a claim is still alive.
 
-    Window-naming contract: per-task workers land in a window named
-    ``task-<slug>-<N>`` inside the pollypm storage-closet session (see
-    :mod:`pollypm.work.session_manager`). We query the session service
-    for a window whose name matches the expected shape. Any error
-    returns True so we don't incorrectly reap a live worker on a
-    transient query failure.
+    Window-naming contract: per-task workers land in a window whose
+    name comes from :func:`pollypm.work.session_manager.task_window_name`
+    (``task-<project>-<N>``). The recovery check compares against that
+    exact name, not a substring match — a sibling project window like
+    ``task-web_app-7`` was previously accepted as proof that ``app/7``
+    was alive because ``"app" in "task-web_app-7"`` is true (#807).
+
+    Any error returns True so we don't incorrectly reap a live worker
+    on a transient query failure.
     """
+    from pollypm.work.session_manager import task_window_name
+
     session_service = getattr(services, "session_service", None)
     if session_service is None:
         return True
-    expected_suffix = f"-{task_number}"
+    expected_name = task_window_name(project_key, task_number)
     try:
         tmux = getattr(session_service, "tmux", None)
         if tmux is None:
@@ -576,12 +581,7 @@ def _tmux_window_alive_for_task(
         return True
     for window in windows or []:
         name = getattr(window, "name", "") or ""
-        if (
-            name.startswith("task-")
-            and name.endswith(expected_suffix)
-            and project_key in name
-            and not getattr(window, "pane_dead", False)
-        ):
+        if name == expected_name and not getattr(window, "pane_dead", False):
             return True
     return False
 

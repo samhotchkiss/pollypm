@@ -1244,6 +1244,15 @@ class SQLiteWorkService:
         Recovery plugins call this only after proving the worker
         session/window is gone. The work service owns the private SQLite
         mutation so plugins do not reach into ``_conn`` directly.
+
+        Preserves the task's flow position (#806). Earlier behaviour
+        deleted every execution row for the active node and cleared
+        ``current_node_id``, so the next claim restarted from
+        ``flow.start_node`` and lost rejection history, prior review
+        artifacts, and visit counts. Now the active execution row is
+        marked ``ABANDONED`` and ``current_node_id`` is left in place,
+        so the next claim resumes the same node and ``next_visit``
+        keeps incrementing past the abandoned attempt.
         """
         task = self.get(task_id)
         if task.work_status != WorkStatus.IN_PROGRESS:
@@ -1254,10 +1263,24 @@ class SQLiteWorkService:
         now = _now()
         try:
             if task.current_node_id:
+                # Mark only the live ACTIVE execution row as abandoned
+                # — completed prior visits stay intact so the timeline
+                # still reads "v1 rejected → v2 (abandoned by sweep)".
                 self._conn.execute(
-                    "DELETE FROM work_node_executions "
-                    "WHERE task_project = ? AND task_number = ? AND node_id = ?",
-                    (task.project, task.task_number, task.current_node_id),
+                    "UPDATE work_node_executions "
+                    "SET status = ?, completed_at = COALESCE(completed_at, ?) "
+                    "WHERE task_project = ? "
+                    "AND task_number = ? "
+                    "AND node_id = ? "
+                    "AND status = ?",
+                    (
+                        ExecutionStatus.ABANDONED.value,
+                        now,
+                        task.project,
+                        task.task_number,
+                        task.current_node_id,
+                        ExecutionStatus.ACTIVE.value,
+                    ),
                 )
             self._record_transition(
                 task.project,
@@ -1269,7 +1292,7 @@ class SQLiteWorkService:
             )
             self._conn.execute(
                 "UPDATE work_tasks SET work_status = ?, assignee = NULL, "
-                "current_node_id = NULL, updated_at = ? "
+                "updated_at = ? "
                 "WHERE project = ? AND task_number = ?",
                 (WorkStatus.QUEUED.value, now, task.project, task.task_number),
             )
@@ -2451,6 +2474,8 @@ class SQLiteWorkService:
         worktree_path: str,
         branch_name: str,
         started_at: str,
+        provider: str | None = None,
+        provider_home: str | None = None,
     ) -> None:
         self._worker_session_mgr.upsert(
             task_project=task_project,
@@ -2460,6 +2485,8 @@ class SQLiteWorkService:
             worktree_path=worktree_path,
             branch_name=branch_name,
             started_at=started_at,
+            provider=provider,
+            provider_home=provider_home,
         )
 
     def get_worker_session(

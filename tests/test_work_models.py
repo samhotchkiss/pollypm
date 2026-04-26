@@ -77,8 +77,13 @@ class TestOtherEnums:
         }
 
     def test_execution_status_values(self):
+        # ``abandoned`` (#806): a stale ``in_progress`` claim whose
+        # worker session went away. Stale-claim recovery flips the
+        # active execution row to this status instead of deleting it,
+        # so the next claim resumes the same node with full visit
+        # history rather than restarting at ``flow.start_node``.
         assert {e.value for e in ExecutionStatus} == {
-            "pending", "active", "blocked", "completed",
+            "pending", "active", "blocked", "completed", "abandoned",
         }
 
     def test_decision_values(self):

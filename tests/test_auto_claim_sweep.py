@@ -369,9 +369,54 @@ def test_auto_claim_ignores_chat_feedback_when_checking_plan_staleness(tmp_path:
         work.close()
 
 
+def test_dead_claim_check_rejects_sibling_project_windows(tmp_path: Path) -> None:
+    """#807: a sibling project's window must not be accepted as proof
+    that the current task's worker is alive.
+
+    Project ``app`` task 7 has a stale claim and its real worker
+    window is gone. A sibling project's window ``task-web_app-7``
+    contains the substring ``app`` and ends with ``-7``, which the
+    pre-fix check accepted as a live worker for ``app/7``. The fix
+    compares against the exact ``task-<project>-<N>`` shape.
+    """
+    from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
+        _tmux_window_alive_for_task,
+    )
+
+    sibling_window = SimpleNamespace(name="task-web_app-7", pane_dead=False)
+    svc = _svc_defaults(
+        session_service=_FakeSessionService(windows=[sibling_window]),
+    )
+
+    assert _tmux_window_alive_for_task(svc, "app", 7) is False
+
+
+def test_dead_claim_check_accepts_exact_match(tmp_path: Path) -> None:
+    """The check must still accept the exact window name ``task-<project>-<N>``."""
+    from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
+        _tmux_window_alive_for_task,
+    )
+
+    own_window = SimpleNamespace(name="task-app-7", pane_dead=False)
+    svc = _svc_defaults(
+        session_service=_FakeSessionService(windows=[own_window]),
+    )
+
+    assert _tmux_window_alive_for_task(svc, "app", 7) is True
+
+
 def test_recover_dead_claims_returns_task_to_claimable_queue(tmp_path: Path) -> None:
     """#768 regression: a dead worker must leave the task genuinely
-    claimable again, not bounced back to ``in_progress``."""
+    claimable again, not bounced back to ``in_progress``.
+
+    #806: recovery now preserves ``current_node_id`` and the active
+    execution row (marked ``abandoned``) so the timeline keeps the
+    history of attempts on the stranded node. The reclaim resumes on
+    that same node and bumps the visit count rather than starting over
+    from the flow's start node.
+    """
+    from pollypm.work.models import ExecutionStatus
+
     bus.clear_listeners()
     project_path = tmp_path / "proj"
     project_path.mkdir()
@@ -382,7 +427,9 @@ def test_recover_dead_claims_returns_task_to_claimable_queue(tmp_path: Path) -> 
     db_path = project_path / ".pollypm" / "state.db"
     work = SQLiteWorkService(db_path=db_path, project_path=project_path)
     try:
-        work.claim(task_id, "worker")
+        claimed = work.claim(task_id, "worker")
+        original_node_id = claimed.current_node_id
+        assert original_node_id is not None
 
         svc = _svc_defaults(session_service=_FakeSessionService())
         totals = {"considered": 0, "by_outcome": {}}
@@ -394,10 +441,21 @@ def test_recover_dead_claims_returns_task_to_claimable_queue(tmp_path: Path) -> 
         recovered = work.get(task_id)
         assert recovered.work_status == WorkStatus.QUEUED
         assert recovered.assignee is None
-        assert recovered.current_node_id is None
-        assert recovered.executions == []
+        # #806: the node id and execution history must survive recovery.
+        assert recovered.current_node_id == original_node_id
+        statuses = [e.status for e in recovered.executions]
+        assert ExecutionStatus.ABANDONED in statuses
 
         reclaimed = work.claim(task_id, "worker")
         assert reclaimed.work_status == WorkStatus.IN_PROGRESS
+        # Reclaim stays on the stranded node — does not silently
+        # restart at the flow start.
+        assert reclaimed.current_node_id == original_node_id
+        # Visit count incremented past the abandoned attempt.
+        visits_after = [
+            e.visit for e in reclaimed.executions
+            if e.node_id == original_node_id
+        ]
+        assert max(visits_after) > 1
     finally:
         work.close()

@@ -65,6 +65,12 @@ class ExecutionStatus(enum.Enum):
     ACTIVE = "active"
     BLOCKED = "blocked"
     COMPLETED = "completed"
+    # #806: a stale ``in_progress`` claim whose worker session went
+    # away. Recovery marks the active execution as ``ABANDONED`` and
+    # leaves the row + completed prior visits intact, so the next
+    # claim resumes the same node with full visit history (no
+    # silent restart-from-flow-start).
+    ABANDONED = "abandoned"
 
 
 class Decision(enum.Enum):
@@ -345,6 +351,12 @@ class WorkerSessionRecord:
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     archive_path: str | None = None
+    # #809: persisted at launch so per-task transcript archival
+    # at teardown can find the right Claude/Codex tree without
+    # depending on the supervisor process's ambient env. ``None``
+    # means "fall back to ambient env" (legacy / unconfigured).
+    provider: str | None = None
+    provider_home: str | None = None
 
 
 @dataclass(slots=True)

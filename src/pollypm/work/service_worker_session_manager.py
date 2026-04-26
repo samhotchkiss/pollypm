@@ -51,6 +51,8 @@ class WorkSessionManager:
         worktree_path: str,
         branch_name: str,
         started_at: str,
+        provider: str | None = None,
+        provider_home: str | None = None,
     ) -> None:
         upsert_worker_session(
             self.service,
@@ -61,6 +63,8 @@ class WorkSessionManager:
             worktree_path=worktree_path,
             branch_name=branch_name,
             started_at=started_at,
+            provider=provider,
+            provider_home=provider_home,
         )
 
     def get(

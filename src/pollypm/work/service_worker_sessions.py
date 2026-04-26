@@ -32,10 +32,29 @@ CREATE TABLE IF NOT EXISTS work_sessions (
     total_input_tokens INTEGER DEFAULT 0,
     total_output_tokens INTEGER DEFAULT 0,
     archive_path TEXT,
+    -- #809: persisted at launch so per-task transcript archival can
+    -- find the right Claude/Codex tree at teardown without depending
+    -- on the supervisor process's ambient env. NULL means "fall back
+    -- to ambient env" (legacy / unconfigured).
+    provider TEXT,
+    provider_home TEXT,
     PRIMARY KEY (task_project, task_number),
     FOREIGN KEY (task_project, task_number) REFERENCES work_tasks(project, task_number)
 );
 """
+
+
+def _row_get(row, key: str, default=None):
+    """Tolerate fresh DBs (with the column) and pre-#809 rows (without).
+
+    SQLite ``Row`` objects raise ``IndexError`` for unknown columns, so
+    this helper makes the optional ``provider`` / ``provider_home``
+    columns safe to read on a DB that hasn't yet run migration 6.
+    """
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return default
 
 
 def row_to_worker_session_record(row) -> WorkerSessionRecord:
@@ -51,6 +70,8 @@ def row_to_worker_session_record(row) -> WorkerSessionRecord:
         total_input_tokens=int(row["total_input_tokens"] or 0),
         total_output_tokens=int(row["total_output_tokens"] or 0),
         archive_path=row["archive_path"],
+        provider=_row_get(row, "provider"),
+        provider_home=_row_get(row, "provider_home"),
     )
 
 
@@ -68,16 +89,21 @@ def upsert_worker_session(
     worktree_path: str,
     branch_name: str,
     started_at: str,
+    provider: str | None = None,
+    provider_home: str | None = None,
 ) -> None:
     service._conn.execute(
         "INSERT INTO work_sessions "
         "(task_project, task_number, agent_name, pane_id, worktree_path, "
-        "branch_name, started_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "branch_name, started_at, provider, provider_home) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT (task_project, task_number) DO UPDATE SET "
         "pane_id=excluded.pane_id, "
         "worktree_path=excluded.worktree_path, "
         "branch_name=excluded.branch_name, "
         "started_at=excluded.started_at, "
+        "provider=excluded.provider, "
+        "provider_home=excluded.provider_home, "
         "ended_at=NULL, "
         "archive_path=NULL, "
         "total_input_tokens=0, "
@@ -90,6 +116,8 @@ def upsert_worker_session(
             worktree_path,
             branch_name,
             started_at,
+            provider,
+            provider_home,
         ),
     )
     service._conn.commit()

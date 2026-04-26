@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS work_sessions (
     total_input_tokens INTEGER DEFAULT 0,
     total_output_tokens INTEGER DEFAULT 0,
     archive_path TEXT,
+    provider TEXT,
+    provider_home TEXT,
     PRIMARY KEY (task_project, task_number),
     FOREIGN KEY (task_project, task_number) REFERENCES work_tasks(project, task_number)
 );
@@ -67,6 +69,13 @@ class _StubWorkService:
     def _row_to_record(self, row):
         if row is None:
             return None
+
+        def _safe(key):
+            try:
+                return row[key]
+            except (IndexError, KeyError):
+                return None
+
         return WorkerSessionRecord(
             task_project=row["task_project"],
             task_number=int(row["task_number"]),
@@ -79,25 +88,33 @@ class _StubWorkService:
             total_input_tokens=int(row["total_input_tokens"] or 0),
             total_output_tokens=int(row["total_output_tokens"] or 0),
             archive_path=row["archive_path"],
+            provider=_safe("provider"),
+            provider_home=_safe("provider_home"),
         )
 
     def upsert_worker_session(self, *, task_project, task_number, agent_name,
-                              pane_id, worktree_path, branch_name, started_at):
+                              pane_id, worktree_path, branch_name, started_at,
+                              provider=None, provider_home=None):
+        # Stub mirrors the real upsert (see ``service_worker_sessions``)
+        # — the real one carries provider/provider_home (#809).
         self.conn.execute(
             "INSERT INTO work_sessions "
             "(task_project, task_number, agent_name, pane_id, worktree_path, "
-            "branch_name, started_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "branch_name, started_at, provider, provider_home) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (task_project, task_number) DO UPDATE SET "
             "pane_id=excluded.pane_id, "
             "worktree_path=excluded.worktree_path, "
             "branch_name=excluded.branch_name, "
             "started_at=excluded.started_at, "
+            "provider=excluded.provider, "
+            "provider_home=excluded.provider_home, "
             "ended_at=NULL, "
             "archive_path=NULL, "
             "total_input_tokens=0, "
             "total_output_tokens=0",
             (task_project, task_number, agent_name, pane_id, worktree_path,
-             branch_name, started_at),
+             branch_name, started_at, provider, provider_home),
         )
         self.conn.commit()
 
@@ -699,6 +716,62 @@ class TestTeardownWorker:
         with patch("pollypm.work.session_manager.subprocess") as mock_sub:
             mock_sub.run.return_value = MagicMock(returncode=0, stderr="", stdout="")
             return manager.provision_worker(task_id, "agent-1")
+
+    def test_archival_uses_persisted_provider_home_over_ambient_env(
+        self, manager, mock_tmux, tmp_project, tmp_path, monkeypatch,
+    ):
+        """#809: per-task transcript archival must locate the right
+        Claude tree even when the supervisor process's ambient
+        ``CLAUDE_CONFIG_DIR`` differs from the worker's account-isolated
+        home. Pre-#809 the archive scanned ``os.environ`` directly, so
+        an isolated Claude account's transcripts and token totals were
+        silently lost on teardown.
+
+        Drive the persisted-home path directly: the launcher writes
+        ``provider`` + ``provider_home`` onto the worker session row
+        at upsert time; teardown reads them back.
+        """
+        from pollypm.work.session_manager import _encode_claude_cwd
+
+        session = self._provision(manager)
+
+        # Two different homes: ambient (process env) vs the account
+        # the worker actually launched under.
+        ambient_home = tmp_path / "ambient-home"
+        account_home = tmp_path / "account-home"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(ambient_home))
+
+        encoded = _encode_claude_cwd(session.worktree_path.resolve())
+        # Plant the JSONL only under the account-isolated home.
+        proj_dir = account_home / ".claude" / "projects" / encoded
+        proj_dir.mkdir(parents=True)
+        jsonl_file = proj_dir / "session.jsonl"
+        jsonl_file.write_text(
+            '{"type": "token_usage", "input_tokens": 11, "output_tokens": 7}\n'
+        )
+
+        # Re-upsert through the work-service stub so the row carries
+        # provider/provider_home — emulates what the post-#809
+        # SessionManager records at provision time.
+        manager._svc.upsert_worker_session(
+            task_project="proj",
+            task_number=1,
+            agent_name="agent-1",
+            pane_id=session.pane_id or "%0",
+            worktree_path=str(session.worktree_path),
+            branch_name=session.branch_name,
+            started_at=session.started_at.isoformat(),
+            provider="claude",
+            provider_home=str(account_home),
+        )
+
+        with patch("pollypm.work.session_manager.subprocess") as mock_sub:
+            mock_sub.run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+            result = manager.teardown_worker("proj/1")
+
+        assert result.jsonl_archived is True
+        assert result.total_input_tokens == 11
+        assert result.total_output_tokens == 7
 
     def test_teardown_worker_archives_jsonl(self, manager, mock_tmux, tmp_project, tmp_path, monkeypatch):
         session = self._provision(manager)

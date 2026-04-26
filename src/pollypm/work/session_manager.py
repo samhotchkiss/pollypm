@@ -77,6 +77,17 @@ class TeardownResult:
     worktree_removed: bool
 
 
+def task_window_name(project: str, task_number: int) -> str:
+    """Return the canonical tmux window name for a task worker.
+
+    The launcher writes ``task-<project>-<N>`` (see ``provision``); the
+    dead-claim recovery sweep needs the same shape to decide whether a
+    claim's window is still alive. Centralising the construction here
+    keeps launcher and recovery in sync (#807).
+    """
+    return f"task-{project}-{int(task_number)}"
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -167,6 +178,8 @@ class SessionManager:
         # Derive slug from task_id for branch/path naming
         task_slug = f"{project}-{task_number}"
         branch_name = f"task/{task_slug}"
+        # Same shape as ``task_window_name`` — the recovery sweep
+        # depends on this exact name to decide a claim is alive (#807).
 
         # Serialize concurrent provisions of the same task. The lock
         # lives in the worktree's parent directory so both the lock and
@@ -260,7 +273,7 @@ class SessionManager:
             f"commit your work, then run `pm task done {task_id}`."
         )
 
-        pane_id = self._launch_worker_window(
+        pane_id, provider_name, provider_home = self._launch_worker_window(
             session_name=session_name,
             window_name=window_name,
             worktree_path=worktree_path,
@@ -274,6 +287,9 @@ class SessionManager:
         # Store binding through the work service. Upsert so a re-claim
         # after cancel reuses the row (teardown stamps ended_at but
         # doesn't delete) instead of hitting the PK constraint.
+        # ``provider`` + ``provider_home`` (#809) let teardown locate
+        # the right transcript tree without depending on the
+        # supervisor process's ambient env.
         self._svc.upsert_worker_session(
             task_project=project,
             task_number=task_number,
@@ -282,6 +298,8 @@ class SessionManager:
             worktree_path=str(worktree_path),
             branch_name=branch_name,
             started_at=now.isoformat(),
+            provider=provider_name,
+            provider_home=str(provider_home) if provider_home else None,
         )
 
         return WorkerSession(
@@ -304,8 +322,15 @@ class SessionManager:
         agent_name: str,
         window_name: str,
         project: str,
-    ) -> tuple[str, str, str, Path | None]:
-        """Return ``(command, provider_name, account_name, fresh_marker)``.
+    ) -> tuple[str, str, str, Path | None, Path | None]:
+        """Return ``(command, provider_name, account_name, fresh_marker, provider_home)``.
+
+        ``provider_home`` is the account's isolated config root (e.g.
+        ``CLAUDE_CONFIG_DIR`` or ``CODEX_HOME``). Persisted on the
+        worker session row so per-task transcript archival can find
+        the right tree at teardown without depending on the supervisor
+        process's ambient env (#809). ``None`` means the account has
+        no isolated home and the legacy ambient-env fallback applies.
 
         When config is available we route through the configured
         provider/runtime adapter pair so worker launch obeys the same
@@ -318,7 +343,9 @@ class SessionManager:
                 f"cd {_shell_quote(str(worktree_path))} && "
                 f"claude --dangerously-skip-permissions"
             )
-            return legacy_cmd, "claude", agent_name, None
+            # Pre-#809 fallback: no account → no provider_home, so
+            # archival reads ambient env (legacy behaviour).
+            return legacy_cmd, "claude", agent_name, None, None
 
         from pollypm.models import SessionConfig
         from pollypm.onboarding import default_session_args
@@ -402,7 +429,15 @@ class SessionManager:
         runtime = get_runtime(account.runtime, root_dir=config.project.root_dir)
         launch = provider.build_launch_command(session, account)
         command = runtime.wrap_command(launch, account, config.project)
-        return command, account.provider.value, account_name, launch.fresh_launch_marker
+        provider_home = getattr(account, "home", None)
+        provider_home_path = Path(provider_home) if provider_home else None
+        return (
+            command,
+            account.provider.value,
+            account_name,
+            launch.fresh_launch_marker,
+            provider_home_path,
+        )
 
     def _launch_worker_window(
         self,
@@ -413,8 +448,12 @@ class SessionManager:
         agent_name: str,
         project: str,
         kickoff: str,
-    ) -> str:
-        """Launch an interactive Claude window and return its pane id.
+    ) -> tuple[str, str | None, Path | None]:
+        """Launch an interactive Claude window.
+
+        Returns ``(pane_id, provider_name, provider_home)`` so the
+        caller can persist the provider context on the work_session
+        row for #809-aware teardown.
 
         When a ``SessionService`` is configured, route through it so the
         window picks up stabilization, initial-input verification and
@@ -422,13 +461,17 @@ class SessionManager:
         back to raw tmux operations (used by unit tests that inject a
         mock TmuxClient).
         """
-        worker_cmd, provider_name, account_name, fresh_launch_marker = (
-            self._worker_launch_bundle(
-                worktree_path=worktree_path,
-                agent_name=agent_name,
-                window_name=window_name,
-                project=project,
-            )
+        (
+            worker_cmd,
+            provider_name,
+            account_name,
+            fresh_launch_marker,
+            provider_home,
+        ) = self._worker_launch_bundle(
+            worktree_path=worktree_path,
+            agent_name=agent_name,
+            window_name=window_name,
+            project=project,
         )
 
         # Clear any stale window of the same name (e.g. a dead pane from
@@ -464,7 +507,7 @@ class SessionManager:
                 session_role="worker",
                 guide_reference=worker_guide_reference(self._project_path),
             )
-            return handle.pane_id or ""
+            return handle.pane_id or "", provider_name, provider_home
 
         # Fallback: raw tmux client path. Used by tests that construct
         # SessionManager without a session_service.
@@ -514,7 +557,7 @@ class SessionManager:
                 window_name=window_name,
                 windows=self._tmux.list_windows(session_name),
             )
-        return pane_id
+        return pane_id, provider_name, provider_home
 
     def _resolve_worker_pane_id(self, *, session_name: str, window_name: str, windows) -> str:
         """Resolve the pane id for a freshly created worker window.
@@ -619,7 +662,11 @@ class SessionManager:
         if worktree_path is not None:
             try:
                 archive_path, input_tokens, output_tokens = self._archive_jsonl(
-                    task_id, worktree_path
+                    task_id,
+                    worktree_path,
+                    provider=record.provider,
+                    provider_home=Path(record.provider_home)
+                    if record.provider_home else None,
                 )
                 jsonl_archived = archive_path is not None
             except Exception as exc:  # noqa: BLE001
@@ -777,18 +824,36 @@ class SessionManager:
     # ------------------------------------------------------------------
 
     def _archive_jsonl(
-        self, task_id: str, worktree_path: Path
+        self,
+        task_id: str,
+        worktree_path: Path,
+        *,
+        provider: str | None = None,
+        provider_home: Path | None = None,
     ) -> tuple[Path | None, int, int]:
-        """Copy Claude JSONL to archive location. Parse token counts.
+        """Copy provider JSONL transcripts to archive location.
 
         Claude Code writes transcripts to
         ``$CLAUDE_CONFIG_DIR/projects/<encoded-cwd>/*.jsonl`` (default
-        ``~/.claude/projects/...``), not inside the worktree. The cwd
-        is encoded by replacing every ``/`` and ``.`` with ``-``.
+        ``~/.claude/projects/...``). When the worker was launched with
+        an isolated account home, that path is the worker's
+        ``provider_home``, which the supervisor process running
+        teardown does not have in its ambient env. Pre-#809 the
+        archive scan used ``os.environ`` directly, so isolated Claude
+        accounts and Codex workers landed on the wrong tree (or no
+        tree at all) and the archive came back empty.
+
+        Use the provider/home that the launcher persisted on the
+        worker session row when available; fall back to the legacy
+        ambient-env path so old session rows still archive.
 
         Returns (archive_path, input_tokens, output_tokens).
         """
-        jsonl_files = _find_claude_jsonl_files(worktree_path)
+        jsonl_files = _find_provider_jsonl_files(
+            worktree_path,
+            provider=provider,
+            provider_home=provider_home,
+        )
         if not jsonl_files:
             return None, 0, 0
 
@@ -1084,25 +1149,48 @@ def _encode_claude_cwd(cwd: Path) -> str:
     return s.replace("/", "-").replace(".", "-")
 
 
-def _claude_config_dir() -> Path:
+def _claude_config_dir(home: Path | None = None) -> Path:
     """Resolve the Claude config directory.
 
-    Honors ``$CLAUDE_CONFIG_DIR`` (set per-account by the runtime) and
-    falls back to ``~/.claude``.
+    Honors an explicit ``home`` (the account-isolated home persisted
+    on the worker session row, #809), then ``$CLAUDE_CONFIG_DIR`` (set
+    per-account by the runtime), then falls back to ``~/.claude``.
     """
+    if home is not None:
+        # Per ``providers/claude/env.py``, isolated env points
+        # ``CLAUDE_CONFIG_DIR`` at ``<home>/.claude``.
+        return Path(home) / ".claude"
     env_dir = os.environ.get("CLAUDE_CONFIG_DIR")
     if env_dir:
         return Path(env_dir)
     return Path.home() / ".claude"
 
 
-def _find_claude_jsonl_files(worktree_path: Path) -> list[Path]:
+def _codex_home_dir(home: Path | None = None) -> Path:
+    """Resolve the Codex home directory.
+
+    Mirrors :func:`_claude_config_dir`: account-isolated home wins,
+    then ``$CODEX_HOME``, then ``~/.codex``.
+    """
+    if home is not None:
+        return Path(home) / ".codex"
+    env_dir = os.environ.get("CODEX_HOME")
+    if env_dir:
+        return Path(env_dir)
+    return Path.home() / ".codex"
+
+
+def _find_claude_jsonl_files(
+    worktree_path: Path, *, account_home: Path | None = None,
+) -> list[Path]:
     """Return JSONL files Claude wrote for a worktree cwd.
 
-    Looks in ``$CLAUDE_CONFIG_DIR/projects/<encoded-cwd>/*.jsonl``.
-    Returns an empty list if the directory doesn't exist.
+    Looks in ``<config_dir>/projects/<encoded-cwd>/*.jsonl``. When
+    ``account_home`` is supplied it identifies the account-isolated
+    config root (#809); otherwise the resolver falls back to ambient
+    env then ``~/.claude``.
     """
-    projects_root = _claude_config_dir() / "projects"
+    projects_root = _claude_config_dir(home=account_home) / "projects"
     if not projects_root.exists():
         return []
 
@@ -1112,6 +1200,48 @@ def _find_claude_jsonl_files(worktree_path: Path) -> list[Path]:
         return []
 
     return sorted(project_dir.glob("*.jsonl"))
+
+
+def _find_codex_jsonl_files(
+    worktree_path: Path, *, account_home: Path | None = None,
+) -> list[Path]:
+    """Return JSONL files Codex wrote for a worker run.
+
+    Codex writes session transcripts to
+    ``<CODEX_HOME>/sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl``. The
+    layout isn't cwd-bucketed, so this returns everything under
+    ``sessions/`` and lets ``_parse_token_usage`` accumulate across.
+    Best-effort: missing tree returns an empty list.
+    """
+    sessions_root = _codex_home_dir(home=account_home) / "sessions"
+    if not sessions_root.exists():
+        return []
+    # ``rglob`` matches Codex's nested year/month/day layout without
+    # this module having to know the exact shape.
+    return sorted(sessions_root.rglob("*.jsonl"))
+
+
+def _find_provider_jsonl_files(
+    worktree_path: Path,
+    *,
+    provider: str | None,
+    provider_home: Path | None,
+) -> list[Path]:
+    """Return the JSONL transcript files for a worker.
+
+    Dispatches by ``provider`` (#809):
+    * ``claude`` → :func:`_find_claude_jsonl_files`.
+    * ``codex`` → :func:`_find_codex_jsonl_files`.
+    * unknown / missing → fall back to the Claude scan against
+      ambient env, matching pre-#809 behaviour.
+    """
+    if provider == "codex":
+        return _find_codex_jsonl_files(
+            worktree_path, account_home=provider_home,
+        )
+    return _find_claude_jsonl_files(
+        worktree_path, account_home=provider_home,
+    )
 
 
 def _parse_token_usage(jsonl_path: Path) -> tuple[int, int]:

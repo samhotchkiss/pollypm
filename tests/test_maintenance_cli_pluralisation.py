@@ -86,3 +86,47 @@ def test_semver_sort_key_demotes_unparseable_tags() -> None:
 
     tags = ["nightly", "1.0.0", "wip", "1.1.0"]
     assert sorted(tags, key=_semver_sort_key)[-1] == "1.1.0"
+
+
+def test_costs_pluralises_lookback_window(tmp_path: Path) -> None:
+    """Cycle 105 — ``pm costs --days 1`` printed
+    ``Token usage (last 1 days):`` because the window header was
+    hard-pluralised. Agree the noun with the count.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    app = _build_app()
+    runner = CliRunner()
+
+    cfg = tmp_path / "pollypm.toml"
+    cfg.write_text("")
+
+    class _FakeStore:
+        def execute(self, _sql, _params):
+            return SimpleNamespace(
+                fetchall=lambda: [("demo", 1000, 100, 1)]
+            )
+
+        def close(self) -> None:
+            return None
+
+    fake_config = SimpleNamespace(
+        project=SimpleNamespace(state_db=tmp_path / "state.db"),
+    )
+
+    with patch(
+        "pollypm.cli_features.maintenance.load_config",
+        lambda _p: fake_config,
+    ), patch(
+        "pollypm.cli_features.maintenance.StateStore",
+        lambda _db: _FakeStore(),
+    ):
+        out = runner.invoke(app, ["costs", "--days", "1", "--config", str(cfg)])
+        assert out.exit_code == 0, out.output
+        assert "Token usage (last 1 day):" in out.output
+        assert "(last 1 days)" not in out.output
+
+        out = runner.invoke(app, ["costs", "--days", "7", "--config", str(cfg)])
+        assert out.exit_code == 0, out.output
+        assert "Token usage (last 7 days):" in out.output

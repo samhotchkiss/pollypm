@@ -355,7 +355,8 @@ def register_maintenance_commands(app: typer.Typer) -> None:
         if not rows:
             typer.echo("No token usage data.")
             return
-        typer.echo(f"Token usage (last {days} days):\n")
+        days_word = "day" if days == 1 else "days"
+        typer.echo(f"Token usage (last {days} {days_word}):\n")
         total_all = 0
         cache_all = 0
         for row in rows:

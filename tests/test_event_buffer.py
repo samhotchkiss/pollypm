@@ -218,6 +218,31 @@ def test_store_close_flushes_event_buffer(tmp_path: Path) -> None:
         verify.close()
 
 
+def test_reset_store_cache_flushes_event_buffer(tmp_path: Path) -> None:
+    """#810: ``reset_store_cache()`` previously called only ``dispose()``,
+    which on ``SQLAlchemyStore`` skips the lazy event-buffer flush. Any
+    fire-and-forget events queued before shutdown were lost. The
+    registry now prefers ``close()`` when the backend exposes one, so
+    queued events flush and the buffer thread tears down cleanly.
+    """
+    from pollypm.store.registry import get_store_by_url, reset_store_cache
+
+    db_url = _db_url(tmp_path)
+    store = get_store_by_url(db_url)
+    assert isinstance(store, SQLAlchemyStore)
+    # Queue events on the lazy buffer.
+    store.append_event(scope="root", sender="reset-cache", subject="a")
+    store.append_event(scope="root", sender="reset-cache", subject="b")
+
+    reset_store_cache()
+
+    verify = SQLAlchemyStore(db_url)
+    try:
+        assert _row_count(verify) == 2
+    finally:
+        verify.close()
+
+
 # --------------------------------------------------------------------------
 # Validation
 # --------------------------------------------------------------------------

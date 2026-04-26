@@ -171,21 +171,29 @@ def get_store_by_url(url: str, *, backend: str = "sqlite") -> "Store":
 
 
 def reset_store_cache() -> None:
-    """Dispose every cached store and clear the registry.
+    """Tear down every cached store and clear the registry.
 
     Called on process shutdown (CoreRail.stop, test teardown).
     Individual callers should *not* dispose the shared instance —
     use this to drain all backends at once. Idempotent; safe to
     call twice.
+
+    #810: prefer ``close()`` when the backend exposes one — for
+    ``SQLAlchemyStore`` that's the only path that flushes the lazy
+    :class:`EventBuffer` and deregisters its background thread.
+    Calling only ``dispose()`` left queued events in the buffer and
+    leaked a background thread/signal-handler entry. ``dispose()``
+    stays as the fallback for backends that don't implement ``close``.
     """
     with _STORE_LOCK:
         stores = list(_STORES.values())
         _STORES.clear()
     for store in stores:
-        dispose = getattr(store, "dispose", None)
-        if callable(dispose):
+        close = getattr(store, "close", None)
+        teardown = close if callable(close) else getattr(store, "dispose", None)
+        if callable(teardown):
             try:
-                dispose()
+                teardown()
             except Exception:  # noqa: BLE001
                 pass
 

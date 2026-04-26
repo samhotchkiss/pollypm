@@ -94,6 +94,35 @@ def _project_path(project: Any) -> Path | None:
     return path if isinstance(path, Path) else None
 
 
+def _dashboard_body_has_action_copy(body_lower: str) -> bool:
+    """Return True iff the dashboard body shows usable action copy.
+
+    Action copy can land in three shapes today:
+
+    * The canonical "To move this project forward" lead — rendered
+      above the Action Needed cards when at least one message-source
+      action_item exists.
+    * The "summary missing" diagnostic placeholder — emitted when
+      the gather call couldn't produce a body but should have.
+    * The on-hold inbox treatment — "On hold" framing plus a decision
+      question ("Decide whether …", "Decision:", "needs your …") that
+      surfaces when an on_hold task carries a user-facing hold reason
+      but no message-source action_item was emitted upstream. This is
+      what the media project renders today (Sam, 2026-04-26); treating
+      it as missing copy was a false-positive failure of the invariant.
+    """
+    if "to move this project forward" in body_lower:
+        return True
+    if "summary missing" in body_lower:
+        return True
+    on_hold_decision_present = "on hold" in body_lower and (
+        "decide whether" in body_lower
+        or "decision:" in body_lower
+        or "needs your" in body_lower
+    )
+    return on_hold_decision_present
+
+
 def _load_dashboard_body(config_path: Path, project_key: str) -> tuple[str, str]:
     from pollypm.cockpit_ui import PollyProjectDashboardApp, _gather_project_dashboard
 
@@ -228,10 +257,7 @@ def check_project_tasks(
                         f"{project_key}: blocked tasks but dashboard status is {status_label!r}",
                     )
                 )
-            if (
-                "to move this project forward" not in body_lower
-                and "summary missing" not in body_lower
-            ):
+            if not _dashboard_body_has_action_copy(body_lower):
                 findings.append(
                     Finding(
                         "fail",

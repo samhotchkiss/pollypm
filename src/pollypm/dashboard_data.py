@@ -1,6 +1,7 @@
 """Gather dashboard data from git, issues, snapshots, and state."""
 from __future__ import annotations
 
+import re
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -9,6 +10,49 @@ from pathlib import Path
 from pollypm.config import load_config
 from pollypm.config import PollyPMConfig
 from pollypm.storage.state import StateStore
+
+
+# ANSI CSI/OSC escapes plus C0 control chars that can survive in a
+# tmux pane snapshot. ``readyring`` and friends in the cockpit Now
+# panel (#792) are produced when an in-flight render's overlapping
+# fragments make it into the snapshot text — strip the control bytes
+# before parsing the snapshot.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*\x07?)")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _sanitize_snapshot_line(text: str) -> tuple[str, bool]:
+    """Strip ANSI/control bytes from a snapshot line.
+
+    Returns ``(cleaned_text, was_dirty)``. ``was_dirty`` is True when
+    the source line carried ANSI escapes or control chars — those
+    snapshots come from in-flight renders where adjacent fragments
+    can fuse on strip (``ready\x1b[Kring`` → ``readyring``), so the
+    caller should treat such lines as untrustworthy.
+    """
+    had_escape = bool(_ANSI_ESCAPE_RE.search(text) or _CONTROL_CHARS_RE.search(text))
+    cleaned = _ANSI_ESCAPE_RE.sub("", text)
+    cleaned = _CONTROL_CHARS_RE.sub("", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned, had_escape
+
+
+def _truncate_for_now_panel(text: str, *, limit: int = 70) -> str:
+    """Truncate snapshot text at a word boundary, append ``…`` (#792).
+
+    The Now panel previously sliced ``[:70]`` directly, so a status
+    like ``"… is on hold awaiting your Phase A decision."`` rendered
+    as ``"… is on hold awaiting your Phase A decisio"`` — chopped
+    mid-word with no ellipsis to signal the cut.
+    """
+    if len(text) <= limit:
+        return text
+    # Look back from the limit for the last space; fall back to a hard
+    # cut if the word itself is longer than the budget.
+    cut = text.rfind(" ", 0, limit)
+    if cut <= 0 or cut < limit - 20:
+        cut = limit - 1
+    return text[:cut].rstrip() + "…"
 
 
 @dataclass(slots=True)
@@ -214,23 +258,37 @@ def _session_description(status: str, role: str, snapshot_path: str | None) -> s
     if snapshot_path:
         try:
             text = Path(snapshot_path).read_text(errors="ignore")
-            # Check for progress indicators first
-            import re
-            for line in text.strip().splitlines():
-                stripped = line.strip()
+            # Strip ANSI escapes and control bytes up front. Without
+            # this, in-flight Claude renders leak overlapping
+            # fragments like ``ready\x1b[Kring…`` that read as
+            # ``readyring`` in the panel (#792). When a line had
+            # escapes, the cleaned text is unreliable (adjacent
+            # fragments may have fused), so we mark those lines and
+            # only use them as a last-resort fallback.
+            sanitized = [
+                _sanitize_snapshot_line(line)
+                for line in text.splitlines()
+            ]
+            cleaned_lines = [text for text, _dirty in sanitized]
+            clean_lines = [text for text, dirty in sanitized if not dirty]
+            # Check for progress indicators first — only over the
+            # trustworthy (escape-free) lines so we don't echo a
+            # half-rendered status string.
+            for stripped in clean_lines:
                 # pytest: "312 passed in 24.80s" or "collecting ..."
                 if re.search(r"\d+ passed", stripped):
-                    return stripped[:70]
+                    return _truncate_for_now_panel(stripped)
                 # npm/build progress
                 if "building" in stripped.lower() and ("%" in stripped or "/" in stripped):
-                    return stripped[:70]
+                    return _truncate_for_now_panel(stripped)
                 # Working indicator with time
                 m = re.search(r"Working \((\d+[ms]\s?\d*s?)\s*", stripped)
                 if m:
                     return f"working ({m.group(1)})"
-            # Look for meaningful lines in the snapshot
-            for line in reversed(text.strip().splitlines()):
-                line = line.strip()
+            # Look for meaningful lines in the snapshot — restrict to
+            # escape-free lines so a fused render (#792) doesn't end
+            # up as the displayed status.
+            for line in reversed(clean_lines):
                 if not line or len(line) < 10:
                     continue
                 # Skip prompt lines and noise
@@ -254,7 +312,7 @@ def _session_description(status: str, role: str, snapshot_path: str | None) -> s
                     or line.startswith("⏵⏵")
                 ):
                     continue
-                return line[:70]
+                return _truncate_for_now_panel(line)
         except (FileNotFoundError, OSError):
             pass
     if status == "waiting_on_user":

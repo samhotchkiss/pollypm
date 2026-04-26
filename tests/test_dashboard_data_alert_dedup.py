@@ -90,6 +90,44 @@ def test_session_description_falls_through_when_only_tui_lines(
     assert desc == "idle"
 
 
+def test_session_description_strips_ansi_from_snapshot(tmp_path) -> None:
+    """#792: in-flight Claude renders leak overlapping fragments
+    into the snapshot, so a ``ready`` line followed by an erase-
+    sequence and ``ring…`` rendered as ``readyring…`` in the Now
+    panel. Strip ANSI/control bytes before parsing the snapshot.
+    """
+    from pollypm.dashboard_data import _session_description
+
+    snapshot = tmp_path / "snap.txt"
+    snapshot.write_text(
+        # Real-world shape — bold-on, "ready", reset, erase-line, "ring…".
+        "\x1b[1mready\x1b[0m\x1b[Kring…\n"
+    )
+    desc = _session_description("healthy", "worker", str(snapshot))
+    assert "\x1b" not in desc
+    # The cleaned text either becomes a valid line or falls through
+    # to the status default — but it must not be the corrupt fusion.
+    assert "readyring" not in desc
+
+
+def test_session_description_truncates_at_word_boundary(tmp_path) -> None:
+    """#792: ``[:70]`` chopped descriptions mid-word (``Phase A
+    decisio``). Truncate at a word boundary and append ``…``.
+    """
+    from pollypm.dashboard_data import _session_description
+
+    snapshot = tmp_path / "snap.txt"
+    long_status = (
+        "No tasks available. media/1 is on hold awaiting your "
+        "Phase A decision before further sweeps land work."
+    )
+    snapshot.write_text(long_status + "\n")
+    desc = _session_description("healthy", "worker", str(snapshot))
+    assert desc.endswith("…")
+    assert "decisio" not in desc or "decision" in desc
+    assert " " not in desc[-2:]  # ellipsis follows a complete word
+
+
 def test_briefing_pluralizes_counts_correctly(tmp_path) -> None:
     """The morning briefing rendered ``1 project(s)`` / ``1 issue(s)``
     when counts were exactly 1 — awkward parenthetical pluralisation

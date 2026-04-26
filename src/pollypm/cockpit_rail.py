@@ -708,6 +708,7 @@ class CockpitRouter:
             if right_pane is None or getattr(right_pane, "pane_dead", False):
                 state.pop("right_pane_id", None)
                 state.pop("mounted_session", None)
+                state.pop("mounted_identity", None)
                 dirty = True
                 right_pane = None
 
@@ -721,10 +722,12 @@ class CockpitRouter:
                     or not self._mounted_session_matches_pane(right_pane)
                 ):
                     state.pop("mounted_session", None)
+                    state.pop("mounted_identity", None)
                     dirty = True
                     release_lease = True
             except Exception:  # noqa: BLE001
                 state.pop("mounted_session", None)
+                state.pop("mounted_identity", None)
                 dirty = True
                 release_lease = True
             if release_lease:
@@ -1546,6 +1549,7 @@ class CockpitRouter:
                         pass
             state.pop("right_pane_id", None)
             state.pop("mounted_session", None)
+            state.pop("mounted_identity", None)
             self._write_state(state)
             try:
                 panes = self.tmux.list_panes(target)  # structural change (break_pane)
@@ -1848,6 +1852,7 @@ class CockpitRouter:
         state["selected"] = resolved_selected
         state["right_pane_id"] = right_pane_id
         state.pop("mounted_session", None)
+        state.pop("mounted_identity", None)
         self._write_state(state)
         self.tmux.respawn_pane(left_pane_id, supervisor.console_command())
         supervisor.start_cockpit_tui(tmux_session)
@@ -1909,15 +1914,44 @@ class CockpitRouter:
             supervisor.stabilize_launch(launch, target, on_status=on_status)
 
     def _show_live_session(self, supervisor, session_name: str, window_target: str) -> None:
-        mounted_session = self._mounted_session_name(supervisor, window_target)
+        # Mount-time identity check (replaces the legacy bare-string
+        # ``mounted_session == session_name`` early-return). The legacy
+        # check believed cockpit_state.json without verifying it
+        # against tmux, and the CWD fallback in
+        # ``_mounted_session_name`` would write *guesses* back as
+        # ground truth — that's how clicking "Polly" sometimes mounted
+        # Russell. See :mod:`pollypm.cockpit_mount_identity` for the
+        # full design.
+        from pollypm.cockpit_mount_identity import (
+            MountedIdentity,
+            expected_identity_for_session_name,
+            identity_matches,
+            make_mounted_identity,
+            verify_mount_against_tmux,
+        )
+
+        expected = expected_identity_for_session_name(
+            session_name, supervisor.config,
+        )
         launch = next(item for item in supervisor.plan_launches() if item.session.name == session_name)
-        if isinstance(mounted_session, str) and mounted_session == session_name:
-            right_pane_id = self._right_pane_id(window_target)
-            if right_pane_id is not None:
-                panes = self.tmux.list_panes(window_target)
-                right_pane = max(panes, key=self._pane_left)
-                if self._is_live_provider_pane(right_pane):
-                    return
+        if expected is not None:
+            state = self._load_state()
+            persisted = MountedIdentity.from_state_dict(state.get("mounted_identity"))
+            if persisted is not None and identity_matches(persisted, expected):
+                try:
+                    panes = self.tmux.list_panes(window_target)
+                    storage_session = supervisor.storage_closet_session_name()
+                    storage_windows = self.tmux.list_windows(storage_session)
+                except Exception:  # noqa: BLE001
+                    panes = []
+                    storage_windows = []
+                if verify_mount_against_tmux(
+                    persisted,
+                    panes=panes,
+                    storage_windows=storage_windows,
+                ):
+                    return  # tmux confirms the persisted identity
+                # Mismatch — fall through to tear-down + remount fresh.
         self._park_mounted_session(supervisor, window_target)
         self._cleanup_extra_panes(window_target)
         left_pane_id = self._left_pane_id(window_target)
@@ -1937,6 +1971,14 @@ class CockpitRouter:
                     if launch.window_name in storage_windows:
                         if right_pane_id is not None:
                             self.tmux.kill_pane(right_pane_id)
+                        # Look up the freshly-spawned window's index so
+                        # the persisted identity records the
+                        # disambiguating index, not just the name.
+                        live_windows = self.tmux.list_windows(storage_session)
+                        target_window_for_identity = next(
+                            (w for w in live_windows if w.name == launch.window_name),
+                            None,
+                        )
                         source = f"{storage_session}:{launch.window_name}.0"
                         self.tmux.join_pane(source, left_pane_id, horizontal=True)
                         panes = self.tmux.list_panes(window_target)
@@ -1947,6 +1989,17 @@ class CockpitRouter:
                         state = self._load_state()
                         state["mounted_session"] = session_name
                         state["right_pane_id"] = right_pane.pane_id
+                        if expected is not None:
+                            mounted = make_mounted_identity(
+                                expected,
+                                right_pane_id=right_pane.pane_id,
+                                window_index=getattr(
+                                    target_window_for_identity, "index", None,
+                                ),
+                            )
+                            state["mounted_identity"] = mounted.to_state_dict()
+                        else:
+                            state.pop("mounted_identity", None)
                         self._write_state(state)
                         return
                 except Exception:  # noqa: BLE001
@@ -1967,6 +2020,7 @@ class CockpitRouter:
                 self.tmux.respawn_pane(right_pane_id, self._right_pane_command(fallback_kind, fallback_target))
             state = self._load_state()
             state.pop("mounted_session", None)
+            state.pop("mounted_identity", None)
             state["right_pane_id"] = self._right_pane_id(window_target)
             self._write_state(state)
             return
@@ -1989,8 +2043,22 @@ class CockpitRouter:
         right_pane = max(panes, key=self._pane_left)
         self.tmux.set_pane_history_limit(right_pane.pane_id, 200)
         state = self._load_state()
+        # Persist both the legacy bare-string ``mounted_session`` (for
+        # back-compat with code paths that still read it) and the new
+        # typed ``mounted_identity`` record. The typed record is what
+        # the next ``_show_live_session`` will validate against tmux
+        # — see :mod:`pollypm.cockpit_mount_identity`.
         state["mounted_session"] = session_name
         state["right_pane_id"] = right_pane.pane_id
+        if expected is not None:
+            mounted = make_mounted_identity(
+                expected,
+                right_pane_id=right_pane.pane_id,
+                window_index=getattr(target_window, "index", None),
+            )
+            state["mounted_identity"] = mounted.to_state_dict()
+        else:
+            state.pop("mounted_identity", None)
         self._write_state(state)
         # Auto-claim a cockpit lease so the heartbeat won't send
         # nudges while a human is viewing/typing in this session.
@@ -2045,18 +2113,21 @@ class CockpitRouter:
         right_pane_id = self._right_pane_id(window_target)
         if right_pane_id is None:
             state.pop("mounted_session", None)
+            state.pop("mounted_identity", None)
             self._write_state(state)
             self._release_cockpit_lease(supervisor, mounted_session)
             return
         right_pane = max(self.tmux.list_panes(window_target), key=self._pane_left)
         if not self._is_live_provider_pane(right_pane):
             state.pop("mounted_session", None)
+            state.pop("mounted_identity", None)
             self._write_state(state)
             self._release_cockpit_lease(supervisor, mounted_session)
             return
         window_name = self._mounted_window_name(supervisor, mounted_session)
         if window_name is None:
             state.pop("mounted_session", None)
+            state.pop("mounted_identity", None)
             self._write_state(state)
             self._release_cockpit_lease(supervisor, mounted_session)
             return
@@ -2073,6 +2144,7 @@ class CockpitRouter:
                     self.tmux.rename_window(f"{storage_session}:{window.index}", window_name)
                     break
         state.pop("mounted_session", None)
+        state.pop("mounted_identity", None)
         self._write_state(state)
         self._release_cockpit_lease(supervisor, mounted_session)
 
@@ -2097,40 +2169,28 @@ class CockpitRouter:
         return None
 
     def _mounted_session_name(self, supervisor, window_target: str) -> str | None:
+        """Return the session_name currently mounted in the cockpit's right pane.
+
+        Source of truth: the typed ``mounted_identity`` record in
+        ``cockpit_state.json``, falling back to the legacy bare-string
+        ``mounted_session`` for back-compat with state files written
+        by older builds. **Never** guesses from CWD: the prior
+        priority-based CWD fallback (operator > reviewer > worker)
+        used to write its guess back as ground truth, which was the
+        structural cause of the "click Polly, see Russell" persona-
+        binding bug. If the state has nothing to say, return None and
+        let the caller force a fresh mount.
+        """
         state = self._load_state()
+        identity_raw = state.get("mounted_identity")
+        if isinstance(identity_raw, dict):
+            session = identity_raw.get("session_name")
+            if isinstance(session, str) and session:
+                return session
+        # Back-compat: pre-rewrite state files only have the bare string.
         mounted_session = state.get("mounted_session")
         if isinstance(mounted_session, str) and mounted_session:
             return mounted_session
-        if not hasattr(self.tmux, "list_panes"):
-            return None
-        right_pane_id = self._right_pane_id(window_target)
-        if right_pane_id is None:
-            return None
-        panes = self.tmux.list_panes(window_target)
-        if len(panes) < 2:
-            return None
-        right_pane = max(panes, key=self._pane_left)
-        if not self._is_live_provider_pane(right_pane):
-            return None
-        # CWD fallback: find the best matching session, but NEVER guess
-        # heartbeat or triage — those are background roles that should
-        # never be mounted in the cockpit.  When multiple sessions share
-        # a CWD, prefer operator > reviewer > worker.
-        pane_path = str(Path(right_pane.pane_current_path).resolve())
-        best_match: tuple[int, str] | None = None  # (priority, session_name)
-        for launch in supervisor.plan_launches():
-            if launch.session.role in self._NEVER_MOUNT_ROLES:
-                continue
-            session_cwd = str(Path(launch.session.cwd).resolve())
-            if pane_path == session_cwd:
-                priority = self._MOUNT_PRIORITY.get(launch.session.role, 5)
-                if best_match is None or priority < best_match[0]:
-                    best_match = (priority, launch.session.name)
-        if best_match is not None:
-            state["mounted_session"] = best_match[1]
-            state["right_pane_id"] = right_pane.pane_id
-            self._write_state(state)
-            return best_match[1]
         return None
 
     def _is_live_provider_pane(self, pane) -> bool:
@@ -2185,6 +2245,7 @@ class CockpitRouter:
             )
         state = self._load_state()
         state.pop("mounted_session", None)
+        state.pop("mounted_identity", None)
         state["right_pane_id"] = self._right_pane_id(window_target)
         self._write_state(state)
 

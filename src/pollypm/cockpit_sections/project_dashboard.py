@@ -182,10 +182,11 @@ def _render_project_dashboard(
         format_project_health_scorecard(name, counts, tasks),
         "",
     ]
-    velocity_lines = _section_velocity(tasks, tokens)
-    if velocity_lines:
-        out.extend(velocity_lines)
-        out.append("")
+    # ``_section_velocity`` now always returns a divider + body (with
+    # an empty-state placeholder when no shipped tasks), and emits its
+    # own trailing blank line — see audit UX #9. No outer ``if``
+    # gate / extra blank needed.
+    out.extend(_section_velocity(tasks, tokens))
 
     out.extend(_section_you_need_to(review, project_alerts, 0))
     out.extend(_section_in_flight(in_progress, blocked))

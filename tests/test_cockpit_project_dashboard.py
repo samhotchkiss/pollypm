@@ -283,6 +283,17 @@ class TestSectionVelocity:
         lines = _section_velocity([], None)
         assert not any("Tokens" in l for l in lines)
 
+    def test_empty_state_emits_divider_and_placeholder(self):
+        """Audit UX #9 — when there's no data the section must still
+        render its divider + a placeholder so the user can tell the
+        section is *empty* rather than *broken / loading*. Mirrors
+        the contract used by Recent / Insights / Downtime."""
+        lines = _section_velocity([], None)
+        # Divider appears even with no data.
+        assert any("Velocity" in l and "─" in l for l in lines)
+        # Placeholder explains why the body is empty.
+        assert any("(no shipped tasks yet)" in l for l in lines)
+
 
 class TestSectionYouNeedTo:
     def test_empty_shows_nothing_pending(self):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pollypm.cockpit_sections.base import (
     _DASHBOARD_BULLET,
+    _dashboard_divider,
     _format_tokens,
     _iso_to_dt,
     _spark_bar,
@@ -72,10 +73,18 @@ def _cost_delta_label(completed: list, now) -> str:
 
 
 def _section_velocity(tasks: list, tokens: tuple[int, int] | None) -> list[str]:
-    """Velocity + cycle-time + cost sparklines and token aggregation."""
+    """Velocity + cycle-time + cost sparklines and token aggregation.
+
+    Always returns a divider + body. When there's no data yet, emit
+    a "(no shipped tasks yet)" placeholder line so the user can tell
+    the section is *empty* rather than *broken / loading* — matches
+    the empty-state contract used by Recent / Insights / Downtime.
+    Audit UX #9.
+    """
     from datetime import UTC, datetime
 
-    lines: list[str] = []
+    lines: list[str] = [_dashboard_divider("Velocity"), ""]
+    body: list[str] = []
     now = datetime.now(UTC)
 
     # Weekly velocity over the last 7 weeks: count of tasks that hit a
@@ -103,7 +112,7 @@ def _section_velocity(tasks: list, tokens: tuple[int, int] | None) -> list[str]:
             "trending down" if weekly[-1] + 1 < weekly[0] else
             "steady"
         )
-        lines.append(
+        body.append(
             f"{_DASHBOARD_BULLET}Velocity    {_spark_bar(weekly):<8}    "
             f"{per_week} tasks/wk, {trend}"
         )
@@ -118,7 +127,7 @@ def _section_velocity(tasks: list, tokens: tuple[int, int] | None) -> list[str]:
     if cycles:
         avg_min = sum(cycles) // len(cycles)
         cycles_asc = list(reversed(cycles))  # oldest-left, newest-right
-        lines.append(
+        body.append(
             f"{_DASHBOARD_BULLET}Cycle time  {_spark_bar(cycles_asc):<8}    "
             f"{avg_min}m avg"
         )
@@ -136,7 +145,7 @@ def _section_velocity(tasks: list, tokens: tuple[int, int] | None) -> list[str]:
         ]
         delta_label = _cost_delta_label(completed, now)
         suffix = f" · {delta_label}" if delta_label else ""
-        lines.append(
+        body.append(
             f"{_DASHBOARD_BULLET}Cost/task  {_spark_bar(cost_spark_values):<8}    "
             f"avg {_format_usd(avg_cost)}/task{suffix}"
         )
@@ -145,8 +154,15 @@ def _section_velocity(tasks: list, tokens: tuple[int, int] | None) -> list[str]:
     if tokens is not None:
         tin, tout = tokens
         if tin or tout:
-            lines.append(
+            body.append(
                 f"{_DASHBOARD_BULLET}Tokens      "
                 f"{_format_tokens(tin)} in \u00b7 {_format_tokens(tout)} out"
             )
+    if not body:
+        # Empty-state placeholder so the section is visibly skipped
+        # rather than silently absent (matches Recent / Insights /
+        # Downtime contract). Audit UX #9.
+        body.append(f"{_DASHBOARD_BULLET}(no shipped tasks yet)")
+    lines.extend(body)
+    lines.append("")
     return lines

@@ -707,7 +707,35 @@ def _validate_cross_references(
             )
 
 
-_config_cache: dict[Path, tuple[float, "PollyPMConfig"]] = {}
+_config_cache: dict[
+    Path,
+    tuple[float, "PollyPMConfig", dict[Path, float | None]],
+] = {}
+
+
+def _project_local_mtimes(
+    config: "PollyPMConfig",
+) -> dict[Path, float | None]:
+    """Collect mtimes of every registered project's local config.
+
+    The cache validity check below stats these paths on every
+    ``load_config`` call so a project-local edit (e.g. flipping
+    ``[planner].enforce_plan`` in ``<root>/.pollypm/config/project.toml``)
+    invalidates the cached merge — without this, long-running processes
+    (cockpit, sweeper) would silently keep serving the stale config
+    until the global ``pollypm.toml`` is touched.
+
+    Missing files map to ``None`` so a newly-created (or newly-deleted)
+    local config still triggers a reload.
+    """
+    snapshot: dict[Path, float | None] = {}
+    for project in config.projects.values():
+        local_path = project_config_path(project.path)
+        try:
+            snapshot[local_path] = local_path.stat().st_mtime
+        except OSError:
+            snapshot[local_path] = None
+    return snapshot
 
 
 def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
@@ -715,7 +743,11 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
     try:
         mtime = config_path.stat().st_mtime
         cached = _config_cache.get(config_path)
-        if cached is not None and cached[0] == mtime:
+        if (
+            cached is not None
+            and cached[0] == mtime
+            and _project_local_mtimes(cached[1]) == cached[2]
+        ):
             return cached[1]
     except OSError:
         pass
@@ -751,7 +783,11 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
         storage=storage,
     )
     try:
-        _config_cache[config_path] = (config_path.stat().st_mtime, config)
+        _config_cache[config_path] = (
+            config_path.stat().st_mtime,
+            config,
+            _project_local_mtimes(config),
+        )
     except OSError:
         pass
     return config

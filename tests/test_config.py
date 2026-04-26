@@ -418,6 +418,86 @@ path = "wire"
     assert config.planner.enforce_plan is True
 
 
+def test_load_config_invalidates_cache_on_project_local_edit(tmp_path: Path) -> None:
+    """Editing a project-local config invalidates the load_config cache.
+
+    Without this, long-running processes (cockpit, sweeper) keep
+    serving the stale merged config until something touches the global
+    pollypm.toml. Sam's media-project ``[planner].enforce_plan = false``
+    edit hit this exact path — the global mtime was unchanged, so the
+    sweeper kept emitting plan_missing alerts until restart.
+    """
+    project_root = tmp_path / "wire"
+    project_root.mkdir()
+    local_dir = project_root / ".pollypm" / "config"
+    local_dir.mkdir(parents=True)
+    local_path = local_dir / "project.toml"
+    local_path.write_text(
+        """
+[project]
+display_name = "Wire"
+
+[planner]
+enforce_plan = true
+"""
+    )
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        """
+[project]
+name = "PollyPM"
+tmux_session = "pollypm"
+
+[pollypm]
+controller_account = "claude_primary"
+
+[accounts.claude_primary]
+provider = "claude"
+home = ".pollypm/homes/claude_primary"
+
+[sessions.heartbeat]
+role = "heartbeat-supervisor"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[sessions.operator]
+role = "operator-pm"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[projects.wire]
+path = "wire"
+"""
+    )
+
+    first = load_config(config_path)
+    assert first.projects["wire"].enforce_plan is True
+
+    # Bump the project-local file's mtime by writing the override flip.
+    # Use a future mtime so the change is observable even on filesystems
+    # with second-granularity stat() (the test would otherwise race).
+    local_path.write_text(
+        """
+[project]
+display_name = "Wire"
+
+[planner]
+enforce_plan = false
+"""
+    )
+    import os
+    future = local_path.stat().st_mtime + 5
+    os.utime(local_path, (future, future))
+
+    second = load_config(config_path)
+    assert second.projects["wire"].enforce_plan is False, (
+        "load_config returned a stale cached config — the per-project "
+        "edit was not picked up"
+    )
+
+
 def test_write_config_splits_worker_sessions_into_project_local_files(tmp_path: Path) -> None:
     project_root = tmp_path / "wire"
     project_root.mkdir()

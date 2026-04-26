@@ -274,6 +274,12 @@ def _run_prune_state(supervisor: Supervisor, payload: dict[str, Any]) -> None:
     if total > 0:
         from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
 
+        events_count = result["events"]
+        heartbeats_count = result["heartbeats"]
+        events_word = "event" if events_count == 1 else "events"
+        heartbeats_word = (
+            "heartbeat record" if heartbeats_count == 1 else "heartbeat records"
+        )
         supervisor.msg_store.append_event(
             scope="maintenance",
             sender="maintenance",
@@ -281,17 +287,17 @@ def _run_prune_state(supervisor: Supervisor, payload: dict[str, Any]) -> None:
             payload={
                 "message": activity_summary(
                     summary=(
-                        f"Pruned {result['events']} events, "
-                        f"{result['heartbeats']} heartbeat records"
+                        f"Pruned {events_count} {events_word}, "
+                        f"{heartbeats_count} {heartbeats_word}"
                     ),
                     severity="routine",
                     verb="pruned",
                     subject="maintenance",
-                    events=result["events"],
-                    heartbeats=result["heartbeats"],
+                    events=events_count,
+                    heartbeats=heartbeats_count,
                 ),
-                "events": result["events"],
-                "heartbeats": result["heartbeats"],
+                "events": events_count,
+                "heartbeats": heartbeats_count,
             },
         )
 

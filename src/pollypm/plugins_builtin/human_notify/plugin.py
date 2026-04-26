@@ -198,9 +198,12 @@ def _initialize(api: PluginAPI) -> None:
     global _ADAPTERS
     _ADAPTERS = _load_adapters(api)
     _task_assignment_bus.register_listener(_in_process_listener)
+    n_adapters = len(_ADAPTERS)
+    adapter_word = "adapter" if n_adapters == 1 else "adapters"
     logger.info(
-        "human_notify: initialized with %d adapter(s): %s",
-        len(_ADAPTERS),
+        "human_notify: initialized with %d %s: %s",
+        n_adapters,
+        adapter_word,
         ", ".join(getattr(a, "name", "?") for a in _ADAPTERS),
     )
 

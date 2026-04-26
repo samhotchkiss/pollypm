@@ -2011,7 +2011,10 @@ class Supervisor:
                 swept += 1
 
             if swept > 0:
-                logger.info("stale-alert sweep cleared %d orphaned alert(s)", swept)
+                alert_word = "alert" if swept == 1 else "alerts"
+                logger.info(
+                    "stale-alert sweep cleared %d orphaned %s", swept, alert_word,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning("stale-alert sweep skipped: %s", exc)
 

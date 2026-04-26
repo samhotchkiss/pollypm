@@ -132,9 +132,9 @@ class CoreRail:
         # a clear log line instead of at some deep accessor call later.
         self._plugin_host.plugins()
         logger.info("CoreRail.start(): state store ready at %s", self._state_store.path)
-        logger.info(
-            "CoreRail.start(): booting %d subsystem(s)", len(self._subsystems),
-        )
+        n_sub = len(self._subsystems)
+        sub_word = "subsystem" if n_sub == 1 else "subsystems"
+        logger.info("CoreRail.start(): booting %d %s", n_sub, sub_word)
         for subsystem in self._subsystems:
             subsystem.start()
         self._start_heartbeat_rail()
@@ -186,9 +186,9 @@ class CoreRail:
         if not self._started:
             logger.debug("CoreRail.stop() called while not started — skipping")
             return
-        logger.info(
-            "CoreRail.stop(): stopping %d subsystem(s)", len(self._subsystems),
-        )
+        n_sub = len(self._subsystems)
+        sub_word = "subsystem" if n_sub == 1 else "subsystems"
+        logger.info("CoreRail.stop(): stopping %d %s", n_sub, sub_word)
         # HeartbeatRail was booted last; tear it down first so workers
         # stop claiming jobs before subsystems release their resources.
         if self._heartbeat_rail is not None:

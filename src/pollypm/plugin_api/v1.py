@@ -226,13 +226,30 @@ class RailContext:
     ``selected``, ``mounted_session``, ``right_pane_id``). Handlers
     should treat it as read-only; mutations belong to the router.
 
-    The field set is intentionally small and additive so future rails
-    can hang extra hints off the same object without breaking plugins.
+    The frequently-needed runtime data (``launches``, ``windows``,
+    ``alerts``, ``spinner_index``, ``config``, ``router``,
+    ``supervisor``) are exposed as typed optional fields so plugins
+    don't have to reach into a stringly-typed ``extras`` dict to find
+    them (#800). The ``extras`` field stays as the escape hatch for
+    cockpit-internal hints that haven't been promoted to typed fields
+    yet — third-party plugins should program against the typed surface
+    and treat ``extras`` as private.
+
+    The field set is intentionally additive so future rails can hang
+    extra hints off the same object without breaking plugins.
     """
 
     selected_project: str | None = None
     user: str | None = None
     cockpit_state: dict[str, Any] = field(default_factory=dict)
+    # Typed runtime fields — were keys on ``extras`` before #800.
+    config: Any = None
+    router: Any = None
+    supervisor: Any = None
+    launches: list[Any] = field(default_factory=list)
+    windows: list[Any] = field(default_factory=list)
+    alerts: list[Any] = field(default_factory=list)
+    spinner_index: int = 0
     extras: dict[str, Any] = field(default_factory=dict)
 
 

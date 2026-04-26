@@ -1170,10 +1170,10 @@ def test_cockpit_rail_render_includes_event_ticker(monkeypatch) -> None:
 
     rail._render([CockpitItem(key="polly", label="Polly", state="idle"), CockpitItem(key="settings", label="Settings", state="idle")])
 
-    # offset=11//10=1; window_size=min(3, 2)=2; cycled = events[1], events[0]
-    assert rail._event_ticker_text() == (
-        "events · heartbeat:heartbeat · session.started:polly"
-    )
+    # #793: heartbeat events are infrastructure noise and must be
+    # filtered before the ticker is built. Only ``session.started``
+    # survives, so the ticker shows just that.
+    assert rail._event_ticker_text() == "events · session.started:polly"
     assert captured
 
 

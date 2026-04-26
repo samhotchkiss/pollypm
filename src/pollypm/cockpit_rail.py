@@ -852,6 +852,17 @@ class CockpitRouter:
         ctx = RailContext(
             selected_project=_selected_project_key(cockpit_state.get("selected")),
             cockpit_state=dict(cockpit_state),
+            config=config,
+            router=self,
+            supervisor=supervisor,
+            launches=list(launches),
+            windows=list(windows),
+            alerts=list(alerts),
+            spinner_index=spinner_index,
+            # ``extras`` retained as an escape hatch for cockpit-private
+            # hints that haven't been promoted to typed fields (#800).
+            # Mirrored from the typed fields so existing readers keep
+            # working through the deprecation window.
             extras={
                 "router": self,
                 "supervisor": supervisor,
@@ -2553,7 +2564,10 @@ class PollyCockpitRail:
         lines.append(RenderRow(""))
         if ticker_text:
             lines.append(RenderRow(ticker_text[:width], fg=PALETTE["hint"]))
-        hint = f"{pad}j/k move \u00b7 \u21b5 open \u00b7 n new \u00b7 t activity \u00b7 p pin"
+        # Compact hint: full keymap is one ``?`` away (#790). Width
+        # budget is the 30-col rail, so drop everything but the most
+        # frequently-used actions.
+        hint = f"{pad}j/k \u21b5open \u00b7 ? help \u00b7 q quit"
         lines.append(RenderRow(hint[:width], fg=PALETTE["hint"]))
 
         # ── Flush
@@ -2570,6 +2584,10 @@ class PollyCockpitRail:
             else:
                 self._write(clear_line + "\r\n")
 
+    # Heartbeat ticks and token-ledger syncs flood the events stream
+    # but carry no user-facing signal (#793).
+    _TICKER_SUPPRESSED_EVENT_TYPES = frozenset({"heartbeat", "token_ledger"})
+
     def _event_ticker_text(self) -> str:
         # #656 gate: use the router's CockpitPresence so tmux detach
         # actually pauses the ticker. ``sys.stdin.isatty()`` stays True
@@ -2581,9 +2599,13 @@ class PollyCockpitRail:
             pass
         try:
             supervisor = self.router._load_supervisor()
-            events = list(supervisor.store.recent_events(limit=12))
+            raw_events = list(supervisor.store.recent_events(limit=48))
         except Exception:  # noqa: BLE001
             return ""
+        events = [
+            e for e in raw_events
+            if getattr(e, "event_type", "") not in self._TICKER_SUPPRESSED_EVENT_TYPES
+        ]
         if not events:
             return ""
         # #667 acceptance: cycle a window of the 3 newest events.

@@ -49,32 +49,38 @@ def _strict_rail_errors_enabled() -> bool:
 # ---------------------------------------------------------------------------
 
 
+# #800: prefer typed fields on ``RailContext`` and fall back to the
+# legacy ``extras`` dict only when a non-cockpit caller (e.g. ``pm
+# rail list``) constructs a context manually without populating the
+# typed fields. New callers should set the typed fields directly.
+
+
 def _router(ctx: RailContext):
-    return ctx.extras.get("router")
+    return ctx.router or ctx.extras.get("router")
 
 
 def _spinner_index(ctx: RailContext) -> int:
-    return int(ctx.extras.get("spinner_index", 0) or 0)
+    return int(ctx.spinner_index or ctx.extras.get("spinner_index", 0) or 0)
 
 
 def _launches(ctx: RailContext):
-    return ctx.extras.get("launches") or []
+    return ctx.launches or ctx.extras.get("launches") or []
 
 
 def _windows(ctx: RailContext):
-    return ctx.extras.get("windows") or []
+    return ctx.windows or ctx.extras.get("windows") or []
 
 
 def _alerts(ctx: RailContext):
-    return ctx.extras.get("alerts") or []
+    return ctx.alerts or ctx.extras.get("alerts") or []
 
 
 def _supervisor(ctx: RailContext):
-    return ctx.extras.get("supervisor")
+    return ctx.supervisor or ctx.extras.get("supervisor")
 
 
 def _config(ctx: RailContext):
-    return ctx.extras.get("config")
+    return ctx.config or ctx.extras.get("config")
 
 
 # ---------------------------------------------------------------------------

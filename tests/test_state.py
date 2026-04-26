@@ -155,6 +155,38 @@ def test_state_store_readonly_mode_reads_existing_data(tmp_path: Path) -> None:
     assert runtime.status == "idle"
 
 
+def test_memory_entry_tags_survives_corrupt_non_list_value(tmp_path: Path) -> None:
+    """Cycle 109 — ``MemoryEntryRecord.tags`` was decoded with
+    ``tuple(json.loads(row[5] or "[]"))``. A row whose tags column
+    parsed to a dict would yield ``tuple(dict)`` (the keys) and a
+    string would yield the characters — both subtle data-corruption
+    bugs. Defend with ``_safe_tags`` so non-list shapes coerce to
+    ``()``.
+    """
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    record = store.record_memory_entry(
+        scope="demo",
+        kind="note",
+        title="seed",
+        body="b",
+        tags=["a", "b"],
+        source="test",
+        file_path="x",
+        summary_path="y",
+    )
+    # Hand-corrupt the persisted tags column to a dict.
+    store.execute(
+        "UPDATE memory_entries SET tags = ? WHERE id = ?",
+        ('{"oops": 1}', record.entry_id),
+    )
+    fetched = store.get_memory_entry(record.entry_id)
+    assert fetched is not None
+    # Without the fix this would have been ('oops',) — the dict's keys.
+    assert fetched.tags == ()
+    store.close()
+
+
 def test_open_alerts_survives_corrupt_non_dict_payload(tmp_path: Path) -> None:
     """Cycle 108 — ``open_alerts`` did ``json.loads(row[3])`` then
     ``payload.get("severity")``. A messages row whose ``payload_json``

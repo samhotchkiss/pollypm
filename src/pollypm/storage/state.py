@@ -513,6 +513,24 @@ def _safe_payload(raw: object) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _safe_tags(raw: object) -> tuple:
+    """Decode a ``tags`` JSON column into a tuple, defensively.
+
+    Companion to ``_safe_payload`` for ``memory_entries.tags``: producers
+    always serialise a list, but a hand-edited or legacy row could land
+    a dict / string / null. ``tuple(dict)`` would return the keys and
+    ``tuple(str)`` the characters — subtle data-corruption bugs in
+    consumers iterating ``record.tags``. Coerce non-list shapes to ``()``.
+    """
+    if not raw:
+        return ()
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return ()
+    return tuple(parsed) if isinstance(parsed, list) else ()
+
+
 class StateStore:
     def __init__(self, path: Path, *, readonly: bool = False) -> None:
         self.path = path
@@ -2290,7 +2308,7 @@ class StateStore:
             kind=row[2],
             title=row[3],
             body=row[4],
-            tags=tuple(json.loads(row[5] or "[]")),
+            tags=_safe_tags(row[5]),
             source=row[6],
             file_path=row[7],
             summary_path=row[8],
@@ -2345,7 +2363,7 @@ class StateStore:
                 kind=row[2],
                 title=row[3],
                 body=row[4],
-                tags=tuple(json.loads(row[5] or "[]")),
+                tags=_safe_tags(row[5]),
                 source=row[6],
                 file_path=row[7],
                 summary_path=row[8],
@@ -2476,7 +2494,7 @@ class StateStore:
                 kind=row[2],
                 title=row[3],
                 body=row[4],
-                tags=tuple(json.loads(row[5] or "[]")),
+                tags=_safe_tags(row[5]),
                 source=row[6],
                 file_path=row[7],
                 summary_path=row[8],

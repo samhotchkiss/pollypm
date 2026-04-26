@@ -8200,6 +8200,20 @@ def _dashboard_active_worker(
     return worker_info, alert_count
 
 
+# Cache the project-scoped inbox snapshot by (project, db_mtime).
+# The per-project dashboard refreshes every 10s and used to re-open
+# the SQLite Store + WorkService on every tick — even when no inbox
+# write had landed since the last call. Keying on the state.db
+# mtime gives content-addressed invalidation: any new message,
+# task, or context entry bumps the mtime and the cache misses; an
+# idle project pays one stat() per tick instead of two DB opens.
+# Sister to ``_PLAN_STALENESS_CACHE`` (cycle 133).
+_DASHBOARD_INBOX_CACHE: dict[
+    tuple[str, float | None],
+    tuple[int, list[dict], list[dict]],
+] = {}
+
+
 def _dashboard_inbox(
     config_path: Path, project_key: str, project_path: Path,
 ) -> tuple[int, list[dict], list[dict]]:
@@ -8209,6 +8223,18 @@ def _dashboard_inbox(
     db_path = project_path / ".pollypm" / "state.db"
     if not db_path.exists():
         return 0, [], []
+    # Content-addressed cache: an unchanged db_mtime means no inbox
+    # writes since the last call, so the answer is unchanged. The
+    # lone ``stat()`` is essentially free compared to the two DB
+    # opens + queries inside this function.
+    try:
+        db_mtime: float | None = db_path.stat().st_mtime
+    except OSError:
+        db_mtime = None
+    cache_key = (project_key, db_mtime)
+    cached = _DASHBOARD_INBOX_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     try:
         from pollypm.store import SQLAlchemyStore
         from pollypm.work.inbox_view import inbox_tasks
@@ -8918,7 +8944,9 @@ def _dashboard_inbox(
         action_items.append(item)
         if len(action_items) >= 2:
             break
-    return _action_count(items, action_items), top, action_items
+    result = (_action_count(items, action_items), top, action_items)
+    _DASHBOARD_INBOX_CACHE[cache_key] = result
+    return result
 
 
 def _format_blocked_dep(

@@ -1307,16 +1307,18 @@ class Supervisor:
         self._sweep_stale_alerts(window_map=window_map, name_by_window=name_by_window)
 
         current_alerts = self.store.open_alerts()
+        alerts_n = len(current_alerts)
+        alert_word = "alert" if alerts_n == 1 else "alerts"
         self._msg_store.append_event(
             scope="heartbeat",
             sender="heartbeat",
             subject="heartbeat",
             payload={
                 "message": (
-                    f"Heartbeat sweep completed with {len(current_alerts)} "
-                    f"open alerts"
+                    f"Heartbeat sweep completed with {alerts_n} "
+                    f"open {alert_word}"
                 ),
-                "open_alerts": len(current_alerts),
+                "open_alerts": alerts_n,
             },
         )
         return current_alerts

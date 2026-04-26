@@ -355,15 +355,17 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
 
         open_alerts = api.open_alerts()
+        alerts_n = len(open_alerts)
+        alert_word = "alert" if alerts_n == 1 else "alerts"
         api.record_event(
             "heartbeat",
             "heartbeat",
             activity_summary(
-                summary=f"Heartbeat sweep completed with {len(open_alerts)} open alerts",
+                summary=f"Heartbeat sweep completed with {alerts_n} open {alert_word}",
                 severity="recommendation" if open_alerts else "routine",
                 verb="swept",
                 subject="heartbeat",
-                open_alerts=len(open_alerts),
+                open_alerts=alerts_n,
             ),
         )
         return open_alerts

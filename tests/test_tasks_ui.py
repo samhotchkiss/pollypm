@@ -1421,10 +1421,21 @@ def test_task_app_approve_undo_banner_and_auto_merge(env, monkeypatch) -> None:
             assert "APPROVED" in banner
             assert "Undo" in banner
             assert fake_svc.approve_calls == []
+            # #767 — in-place button morph: the Approve button itself
+            # now reads ``Undo (Ns)`` so the click target is at the
+            # user's gaze. Reject button disables to prevent
+            # double-firing while the pending action is in flight.
+            assert "Undo" in str(app.approve_button.label)
+            assert app.approve_button.has_class("-undo")
+            assert app.reject_button.disabled is True
 
             await pilot.press("z")
             await pilot.pause()
             assert fake_svc.approve_calls == []
+            # After undo, buttons restore to their default labels.
+            assert str(app.approve_button.label) == "Approve"
+            assert not app.approve_button.has_class("-undo")
+            assert app.reject_button.disabled is False
 
             await pilot.press("a")
             await asyncio.sleep(0.3)

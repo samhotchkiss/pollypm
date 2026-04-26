@@ -940,6 +940,21 @@ class PollyTasksApp(App[None]):
     #task-actions Button {
         margin-right: 1;
     }
+    /* #767 — when a review action is pending undo, the morphed
+       button gets a strong success tint so the click target reads
+       as "this committed; press again to undo". CSS variable goes
+       through the Textual class system; the runtime adds/removes
+       the class via _morph_review_action_buttons. */
+    #task-actions Button.-undo {
+        background: #1f4d2a;
+        color: #d7f4dd;
+        border: tall #3fb950;
+        text-style: bold;
+    }
+    #task-actions Button.-undo:focus,
+    #task-actions Button.-undo:hover {
+        background: #266a39;
+    }
     #task-review-panel {
         height: 1fr;
     }
@@ -1401,6 +1416,10 @@ class PollyTasksApp(App[None]):
         line_two = progress_bar
         self.banner.update(f"{line_one}\n{line_two}")
         self.banner.display = True
+        # #767 — keep the morphed button label in sync with the
+        # countdown so the click-target affordance ticks down at
+        # the same rhythm as the banner.
+        self._morph_review_action_buttons()
 
     def _set_detail_empty(self, message: str) -> None:
         self._selected_task_id = None
@@ -1867,6 +1886,10 @@ class PollyTasksApp(App[None]):
             self._pending_countdown_timer.stop()
             self._pending_countdown_timer = None
         self._pending_review_action = None
+        # #767 — restore the in-place button morph so the next
+        # review action starts from the regular Approve / Reject
+        # affordance, not the lingering Undo state.
+        self._restore_review_action_buttons()
         self._sync_banner()
 
     def _start_pending_review_action(
@@ -1891,7 +1914,54 @@ class PollyTasksApp(App[None]):
             self._commit_pending_review_action,
         )
         self._pending_countdown_timer = self.set_interval(1, self._sync_banner)
+        # #767 — morph the click target itself: the button the user
+        # just pressed becomes ``Undo (5s)`` in-place, with a tinted
+        # row classifier so the commit is obviously confirmed at the
+        # gaze location instead of relying on the user noticing a
+        # separate banner. The countdown ticks via ``_sync_banner``
+        # which now also refreshes the morphed button label.
+        self._morph_review_action_buttons()
         self._sync_banner()
+
+    def _morph_review_action_buttons(self) -> None:
+        """Replace the active review button with an Undo affordance.
+
+        Approve becomes ``Undo (5s)`` (success-tinted), Reject
+        becomes ``Undo (5s)`` (warning-tinted). The other button
+        disables so the user can't fire two pending actions at once.
+        Called from :meth:`_start_pending_review_action` and
+        :meth:`_sync_banner` (the latter ticks the countdown
+        in-place without re-mounting the widget).
+        """
+        pending = self._pending_review_action
+        if pending is None:
+            return
+        seconds_left = max(
+            0, int(max(0.0, pending.deadline - monotonic()) + 0.999),
+        )
+        undo_label = f"Undo ({seconds_left}s)"
+        if pending.decision == "approve":
+            self.approve_button.label = undo_label
+            self.approve_button.add_class("-undo")
+            self.reject_button.disabled = True
+        else:
+            self.reject_button.label = undo_label
+            self.reject_button.add_class("-undo")
+            self.approve_button.disabled = True
+
+    def _restore_review_action_buttons(self) -> None:
+        """Undo the morph from :meth:`_morph_review_action_buttons`.
+
+        Called when the pending action clears (committed, undone,
+        or pre-empted by another review). Returns both buttons to
+        their default Approve / Reject labels and re-enables them.
+        """
+        self.approve_button.label = "Approve"
+        self.approve_button.remove_class("-undo")
+        self.approve_button.disabled = False
+        self.reject_button.label = "Reject"
+        self.reject_button.remove_class("-undo")
+        self.reject_button.disabled = False
 
     def _merge_task_pr(self, task) -> None:
         pr_number = _task_pr_number(task)
@@ -2140,10 +2210,20 @@ class PollyTasksApp(App[None]):
 
     @on(Button.Pressed, "#task-approve")
     def _on_press_approve(self) -> None:
+        # #767 — when the button has morphed into Undo (a pending
+        # approval is in flight), the same click target now cancels
+        # the pending action instead of starting a new one. Saves
+        # the user a cognitive jump to a different control.
+        if self._pending_review_action is not None and self.approve_button.has_class("-undo"):
+            self.action_undo_pending_review()
+            return
         self.action_approve_task()
 
     @on(Button.Pressed, "#task-reject")
     def _on_press_reject(self) -> None:
+        if self._pending_review_action is not None and self.reject_button.has_class("-undo"):
+            self.action_undo_pending_review()
+            return
         self.action_reject_task()
 
     @on(Button.Pressed, "#task-bulk-approve")

@@ -308,6 +308,76 @@ class TestNotifyWritesToMessages:
         # tripped the validator without re-counting array indices.
         assert "Approve" in combined
 
+    def test_immediate_user_notify_without_user_prompt_warns(self, db_path):
+        """An immediate-priority user-facing notify without ``--user-
+        prompt-json`` is accepted (back-compat for legacy callers) but
+        produces a stderr warning so the operator knows the dashboard
+        will degrade to body heuristics. Pairs with the scan-side
+        ``user_action_message_missing_user_prompt`` invariant — this
+        is the emit-side reminder.
+        """
+        result = _invoke_notify(
+            db_path,
+            "Plan ready",
+            "Review this plan.",
+            "--priority", "immediate",
+        )
+        # Exit 0 — warning, not rejection. Existing scripts keep working.
+        assert result.exit_code == 0, result.output
+        combined = result.output + (result.stderr or "")
+        assert "Warning" in combined
+        assert "--user-prompt-json" in combined
+        assert "Action Needed" in combined or "heuristic" in combined.lower()
+        # Message still landed.
+        rows = _fetch_messages(db_path)
+        assert len(rows) == 1
+        assert rows[0]["tier"] == "immediate"
+
+    def test_immediate_user_notify_with_user_prompt_does_not_warn(self, db_path):
+        """When the producer DOES pass ``--user-prompt-json``, no
+        warning fires — the contract is satisfied."""
+        prompt = json.dumps({"summary": "Plan is ready."})
+        result = _invoke_notify(
+            db_path,
+            "Plan ready",
+            "Review this plan.",
+            "--priority", "immediate",
+            "--user-prompt-json", prompt,
+        )
+        assert result.exit_code == 0, result.output
+        combined = result.output + (result.stderr or "")
+        # No warning about missing user_prompt — contract met.
+        assert "Warning" not in combined or "user-prompt-json" not in combined
+
+    def test_digest_priority_does_not_warn_about_user_prompt(self, db_path):
+        """The user_prompt contract only applies to immediate-tier
+        notifies; digest messages bucket up at flush time and don't
+        render Action Needed cards directly."""
+        result = _invoke_notify(
+            db_path,
+            "FYI: weekly digest",
+            "Body content here.",
+            "--priority", "digest",
+        )
+        assert result.exit_code == 0, result.output
+        combined = result.output + (result.stderr or "")
+        assert "Warning" not in combined or "user-prompt-json" not in combined
+
+    def test_polly_recipient_does_not_warn_about_user_prompt(self, db_path):
+        """The contract targets the user inbox specifically. Polly's
+        own inbox doesn't render Action Needed cards the same way, so
+        skipping the warning here keeps the noise floor down."""
+        result = _invoke_notify(
+            db_path,
+            "Plan ready for fast-track",
+            "Body content here.",
+            "--priority", "immediate",
+            "--requester", "polly",
+        )
+        assert result.exit_code == 0, result.output
+        combined = result.output + (result.stderr or "")
+        assert "Warning" not in combined or "user-prompt-json" not in combined
+
     def test_user_prompt_json_action_must_be_object(self, db_path):
         prompt = json.dumps(
             {

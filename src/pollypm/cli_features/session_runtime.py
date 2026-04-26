@@ -625,6 +625,32 @@ def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
                         raise typer.Exit(code=1)
             user_prompt_payload = parsed_prompt
 
+        # Surface the contract gap at producer time — without this,
+        # operators discover hours later (in the dashboard or via
+        # release_invariants) that the Action Needed card fell back to
+        # heuristic body parsing because no ``--user-prompt-json`` was
+        # passed. The release invariant ``user_action_message_missing_
+        # user_prompt`` is the scan-side companion; this is the
+        # emit-side reminder. We warn (don't reject) so existing
+        # callers in scripts / older role prompts keep working —
+        # tightening to a hard error is a separate decision.
+        if (
+            user_prompt_payload is None
+            and resolved_priority == "immediate"
+            and requester_role == "user"
+            and channel_name == "inbox"
+        ):
+            typer.echo(
+                "Warning: posting an immediate-priority user-facing "
+                "notify without --user-prompt-json. The dashboard's "
+                "Action Needed card will fall back to body heuristics "
+                "and lose structured steps + decision question + "
+                "contextual buttons. Pass --user-prompt-json '{...}' "
+                "with at least one of summary/steps/question for a "
+                "first-class action surface.",
+                err=True,
+            )
+
         from pollypm.store import SQLAlchemyStore
         from pollypm.work.cli import _resolve_db_path
 

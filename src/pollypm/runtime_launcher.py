@@ -51,7 +51,7 @@ def _write_codex_agents_md(codex_home: str | None, content: str | None) -> None:
         return
     target = Path(codex_home) / "AGENTS.md"
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content.rstrip() + "\n")
+    target.write_text(content.rstrip() + "\n", encoding="utf-8")
 
 
 def main(argv: list[str] | None = None) -> int:

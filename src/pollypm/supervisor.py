@@ -1420,7 +1420,11 @@ class Supervisor:
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         snapshot_path = self.config.project.snapshots_dir / f"{window.name}-{stamp}.txt"
         snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-        snapshot_path.write_text(content)
+        # tmux capture-pane returns the visible pane buffer including
+        # whatever Unicode the worker printed (emojis, em-dashes,
+        # CJK in commit messages). Pin UTF-8 so the snapshot survives
+        # Windows CP-1252 / ``LC_ALL=C`` hosts.
+        snapshot_path.write_text(content, encoding="utf-8")
         return snapshot_path, content
 
     def _write_snapshot(self, window: TmuxWindow, snapshot_lines: int) -> tuple[Path, str]:
@@ -2822,7 +2826,7 @@ class Supervisor:
             session_name=session_name,
             role=role,
         )
-        prompt_path.write_text(content)
+        prompt_path.write_text(content, encoding="utf-8")
         # Use absolute paths so the kickoff resolves regardless of the
         # worker's cwd (workers run from their worktree, not project root).
         # See issue #263.

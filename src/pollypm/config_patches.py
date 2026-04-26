@@ -74,13 +74,15 @@ def apply_preference_patch(project_root: Path, text: str) -> PreferencePatch:
         patch.path.write_text(
             "[plugins]\n"
             f'preference = "{_escape(text)}"\n'
-            'source = "project-local override"\n'
+            'source = "project-local override"\n',
+            encoding="utf-8",
         )
         return patch
     patch.path.parent.mkdir(parents=True, exist_ok=True)
     patch.path.write_text(
         "[project]\n"
-        f'preference_note = "{_escape(text)}"\n'
+        f'preference_note = "{_escape(text)}"\n',
+        encoding="utf-8",
     )
     return patch
 
@@ -114,7 +116,7 @@ def _write_rule_override(project_root: Path, rule_name: str, preference: str) ->
     if "test" in preference.lower() and "commit" in preference.lower():
         body += "- Do not require unit tests before every commit unless the change specifically needs them.\n"
         body += "- Preserve integration and user-visible verification before handoff.\n"
-    target.write_text(body)
+    target.write_text(body, encoding="utf-8")
 
 
 def _write_magic_override(project_root: Path, magic_name: str, preference: str) -> None:
@@ -124,7 +126,12 @@ def _write_magic_override(project_root: Path, magic_name: str, preference: str) 
         raise ValueError(f"Unknown magic: {magic_name}")
     target = project_root / ".pollypm" / "magic" / f"{magic_name}.md"
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(source.content.rstrip() + "\n\n## Project Override\n" f"- User preference: {preference.strip()}\n")
+    target.write_text(
+        source.content.rstrip()
+        + "\n\n## Project Override\n"
+        + f"- User preference: {preference.strip()}\n",
+        encoding="utf-8",
+    )
 
 
 def write_plugin_override(project_root: Path, plugin_name: str, body: str) -> Path:
@@ -143,9 +150,10 @@ def write_plugin_override(project_root: Path, plugin_name: str, body: str) -> Pa
                 'description = "Project-local plugin override"',
                 "",
             ]
-        )
+        ),
+        encoding="utf-8",
     )
-    (plugin_dir / "plugin.py").write_text(body)
+    (plugin_dir / "plugin.py").write_text(body, encoding="utf-8")
     # Regenerate docs so reference material reflects the new plugin
     scaffold_docs(project_root, force=True)
     return plugin_dir

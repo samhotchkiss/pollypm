@@ -83,7 +83,10 @@ def init_project_guide(
             f"{target} already exists. Re-run with --force to overwrite."
         )
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(_render_front_matter(forked_from) + built_in.rstrip() + "\n")
+    target.write_text(
+        _render_front_matter(forked_from) + built_in.rstrip() + "\n",
+        encoding="utf-8",
+    )
     return read_project_guide(project_path, normalized)
 
 

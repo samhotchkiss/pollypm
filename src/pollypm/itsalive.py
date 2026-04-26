@@ -445,13 +445,15 @@ def write_itsalive_docs(project_root: Path, domain: str, *, publish_dir: str) ->
             "",
         ]
     )
-    itsalive_path.write_text(content + "\n")
+    itsalive_path.write_text(content + "\n", encoding="utf-8")
     if claude_path.exists():
-        current = claude_path.read_text()
+        current = claude_path.read_text(encoding="utf-8")
         if "ITSALIVE.md" not in current:
-            claude_path.write_text(reference_line + "\n\n" + current)
+            claude_path.write_text(
+                reference_line + "\n\n" + current, encoding="utf-8",
+            )
     else:
-        claude_path.write_text(reference_line + "\n")
+        claude_path.write_text(reference_line + "\n", encoding="utf-8")
 
 
 def api_json(method: str, url: str, *, payload: Any | None = None, headers: dict[str, str] | None = None) -> dict[str, Any]:

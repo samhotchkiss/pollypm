@@ -182,15 +182,19 @@ def _write_checkpoint_files(
     json_path = checkpoint_root / f"{data.checkpoint_id}.json"
     summary_path = checkpoint_root / f"{data.checkpoint_id}.md"
 
-    json_path.write_text(json.dumps(data.to_dict(), indent=2) + "\n")
+    json_path.write_text(
+        json.dumps(data.to_dict(), indent=2) + "\n", encoding="utf-8",
+    )
 
     summary_text = _render_checkpoint_summary(data)
-    summary_path.write_text(summary_text)
+    summary_path.write_text(summary_text, encoding="utf-8")
 
     # Update latest.json as canonical recovery point
     if data.is_canonical:
         latest_path = checkpoint_root / "latest.json"
-        latest_path.write_text(json.dumps(data.to_dict(), indent=2) + "\n")
+        latest_path.write_text(
+            json.dumps(data.to_dict(), indent=2) + "\n", encoding="utf-8",
+        )
 
     return CheckpointArtifact(
         json_path=json_path,

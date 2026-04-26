@@ -293,7 +293,10 @@ def _load_checkpoint(project_root: Path) -> dict[str, int]:
 def _save_checkpoint(project_root: Path, checkpoint: dict[str, int]) -> None:
     path = _checkpoint_path(project_root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"files": checkpoint, "model": HAIKU_MODEL}, indent=2) + "\n")
+    path.write_text(
+        json.dumps({"files": checkpoint, "model": HAIKU_MODEL}, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _read_new_events(project_root: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
@@ -742,7 +745,9 @@ def _append_activity_log(project_root: Path, events: list[dict[str, Any]]) -> in
         entries = entries[:_MAX_LOG_ENTRIES]
     body = "\n## ".join(entries)
 
-    log_path.write_text(ACTIVITY_LOG_HEADER + body.strip() + "\n")
+    log_path.write_text(
+        ACTIVITY_LOG_HEADER + body.strip() + "\n", encoding="utf-8",
+    )
     return 1
 
 

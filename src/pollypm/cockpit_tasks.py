@@ -1214,16 +1214,35 @@ class PollyTasksApp(App[None]):
                 config = load_config(self.config_path)
                 project = config.projects.get(self.project_key)
                 if project is not None:
-                    plan_blocked = plan_blocked_task_ids(
-                        self.project_key,
-                        project.path,
-                        svc,
-                        plan_dir=getattr(
-                            getattr(config, "planner", None),
-                            "plan_dir",
-                            "docs/plan",
-                        ),
+                    # Resolve effective enforce_plan with the same
+                    # project-overrides-global precedence the rail
+                    # rollup and sweeper use. Skipping this here was
+                    # the third (and last) gate site that ignored the
+                    # per-project bypass — Sam saw the task list still
+                    # render ``waiting_on_plan`` even after media's
+                    # bypass shipped because this code path didn't
+                    # check the override.
+                    planner = getattr(config, "planner", None)
+                    global_enforce = bool(
+                        getattr(planner, "enforce_plan", True)
                     )
+                    project_enforce = getattr(project, "enforce_plan", None)
+                    enforce_plan = (
+                        project_enforce
+                        if project_enforce is not None
+                        else global_enforce
+                    )
+                    if enforce_plan:
+                        plan_blocked = plan_blocked_task_ids(
+                            self.project_key,
+                            project.path,
+                            svc,
+                            plan_dir=getattr(
+                                planner,
+                                "plan_dir",
+                                "docs/plan",
+                            ),
+                        )
                     approval_task = plan_approval_task(svc, self.project_key)
                     if approval_task is not None:
                         approval_task_id = getattr(approval_task, "task_id", None)

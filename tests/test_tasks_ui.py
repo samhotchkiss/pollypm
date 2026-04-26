@@ -1176,6 +1176,54 @@ def test_task_app_surfaces_plan_blocked_queued_tasks(env, monkeypatch) -> None:
     _run(body())
 
 
+def test_task_app_honours_per_project_enforce_plan_false(env, monkeypatch) -> None:
+    """Per-project ``enforce_plan=false`` keeps the task list out of waiting_on_plan.
+
+    Sam's media project sets ``[planner].enforce_plan = false`` in its
+    project-local pollypm.toml because there's no project-wide plan to
+    write — it's a one-off cleanup task. Three gate sites used to need
+    fixing for this to take effect end-to-end: rail rollup display,
+    sweeper worker pickup, and (this one) the task list view in
+    cockpit_tasks.PollyTasksApp.
+    """
+    if not _load_config_compatible(env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_tasks import PollyTasksApp
+
+    # Flip the per-project bypass on the demo fixture.
+    local_cfg_dir = env["project_path"] / ".pollypm" / "config"
+    local_cfg_dir.mkdir(parents=True)
+    (local_cfg_dir / "project.toml").write_text(
+        '[project]\ndisplay_name = "Demo"\n\n'
+        "[planner]\nenforce_plan = false\n"
+    )
+
+    work_task = _task(
+        node_id="implement",
+        title="Implement planned child",
+        status=WorkStatus.QUEUED,
+        flow_template_id="standard",
+    )
+    fake_svc = _FakeSvc(tasks_factory=lambda: [work_task], flow=_flow())
+
+    monkeypatch.setattr("pollypm.cockpit_tasks.create_tmux_client", lambda: _FakeTmux([]))
+
+    app = PollyTasksApp(env["config_path"], "demo")
+    app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            rows = _table_rows(app.query_one("#tasks-table", DataTable))
+            # Without bypass this would render "waiting_on_plan" because
+            # the project has no plan.md / approved plan_project task.
+            assert rows[0][1] == "queued", (
+                f"expected 'queued' with per-project bypass, got {rows[0][1]!r}"
+            )
+
+    _run(body())
+
+
 def test_task_app_surfaces_recent_sweeper_ping(env, monkeypatch) -> None:
     if not _load_config_compatible(env["config_path"]):
         pytest.skip("minimal pollypm.toml fixture not supported by loader")

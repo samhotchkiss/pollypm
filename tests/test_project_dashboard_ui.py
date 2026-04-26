@@ -393,7 +393,16 @@ def test_status_yellow_when_task_is_on_hold(
             await pilot.pause()
             assert dashboard_app.data is not None
             assert dashboard_app.data.status_label == "needs attention"
-            assert "1 on hold" in str(dashboard_app.action_bar.render())
+            # Banner promotes on_hold to the lead — "Paused: 1 task is
+            # on hold" — so the user sees the user-attention need
+            # instead of a misleading "Moving now" framing. Either
+            # singular/plural shape satisfies the intent (visible
+            # on-hold count in the banner).
+            action_bar_text = str(dashboard_app.action_bar.render())
+            assert (
+                "1 task is on hold" in action_bar_text
+                or "1 on hold" in action_bar_text
+            )
             assert "on hold" in str(dashboard_app.pipeline_body.render())
             rendered = str(dashboard_app.inbox_body.render())
             assert "On hold" in rendered
@@ -2644,6 +2653,56 @@ def test_inbox_remainder_no_contradiction_with_on_hold(dashboard_app) -> None:
     rendered = dashboard_app._render_inbox_body(fake_data)
     assert "On hold" in rendered
     assert "No project inbox items are open" not in rendered
+
+
+def test_banner_promotes_on_hold_over_active_worker(dashboard_app) -> None:
+    """When a project has on_hold tasks AND an active worker, the banner
+    leads with ``Paused`` instead of ``Moving now``.
+
+    Sam's media project (2026-04-26) had a worker active in the
+    background while task #1 was on_hold awaiting user Phase A
+    approval. The pill correctly read "needs attention" but the
+    banner contradicted that with "Moving now: worker_media is
+    active · 1 on hold" — the actionable hold reason was buried as a
+    tail count. Banner now matches pill priority.
+    """
+    from types import SimpleNamespace
+
+    fake_data = SimpleNamespace(
+        action_items=[],
+        alert_count=0,
+        active_worker={"role": "worker", "session_name": "worker_media"},
+        task_counts={"on_hold": 1},
+        task_buckets={"on_hold": []},
+        inbox_count=0,
+    )
+    counts = "▸ 1 on hold"
+    banner = dashboard_app._render_project_state_banner(fake_data, counts)
+    assert banner.startswith("Paused"), (
+        f"banner should lead with 'Paused', got: {banner!r}"
+    )
+    assert "Moving now" not in banner
+    # The active worker info is preserved as background context.
+    assert "worker_media" in banner
+    assert "active in background" in banner
+    # No "1 on hold" duplicate in the suffix — overlap stripped.
+    assert banner.count("on hold") == 1
+
+
+def test_banner_paused_drops_overlap_when_only_on_hold(dashboard_app) -> None:
+    """A pure on_hold project (no other categories) reads cleanly."""
+    from types import SimpleNamespace
+
+    fake_data = SimpleNamespace(
+        action_items=[],
+        alert_count=0,
+        active_worker=None,
+        task_counts={"on_hold": 2},
+        task_buckets={"on_hold": []},
+        inbox_count=0,
+    )
+    banner = dashboard_app._render_project_state_banner(fake_data, "▸ 2 on hold")
+    assert banner == "Paused: 2 tasks are on hold"
 
 
 def test_plan_body_with_enforce_plan_false_says_plan_not_required(dashboard_app) -> None:

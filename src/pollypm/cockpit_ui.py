@@ -10070,6 +10070,43 @@ class PollyProjectDashboardApp(App[None]):
             return f"Waiting on you: {prompt}{extras_part} · {suffix}"
         if data.alert_count:
             return f"Alert: Polly needs to inspect a project issue{count_suffix}"
+        # On-hold tasks must outrank an active background worker. Today
+        # media renders ``Moving now: worker_media is active · 1 on
+        # hold`` while the pill correctly shows "needs attention" —
+        # the banner contradicts the pill and buries the user-facing
+        # signal as a tail count. The pill priority in
+        # ``_dashboard_status`` already counts on_hold as a needs-
+        # attention state; mirror that here. (Sam, media on
+        # 2026-04-26: on_hold reason "Awaiting user Phase A approval"
+        # was invisible behind a "Moving now" banner.)
+        on_hold_count = int(data.task_counts.get("on_hold", 0))
+        if on_hold_count:
+            label = "task is" if on_hold_count == 1 else "tasks are"
+            lead = f"Paused: {on_hold_count} {label} on hold"
+            # Drop the redundant ``N on hold`` from the suffix — same
+            # trick the action_items branch above uses for inbox/review
+            # overlap. Without this, the banner read "Paused: 1 task
+            # is on hold · 1 on hold".
+            suffix_without_overlap = render_project_action_bar(
+                review_count=int(data.task_counts.get("review", 0)),
+                alert_count=data.alert_count,
+                inbox_count=0,
+                blocker_count=int(data.task_counts.get("blocked", 0)),
+                on_hold_count=0,
+            )
+            if data.active_worker is not None:
+                worker = data.active_worker
+                role = str(worker.get("role") or "worker")
+                session = str(worker.get("session_name") or "a session")
+                lead += f" · {session} ({role}) active in background"
+            if suffix_without_overlap.startswith("▸ Clear"):
+                return lead
+            tail = (
+                suffix_without_overlap[2:]
+                if suffix_without_overlap.startswith("▸ ")
+                else suffix_without_overlap
+            )
+            return f"{lead} · {tail}"
         if data.active_worker is not None:
             worker = data.active_worker
             role = str(worker.get("role") or "worker")
@@ -10084,9 +10121,6 @@ class PollyProjectDashboardApp(App[None]):
         if review_count := int(data.task_counts.get("review", 0)):
             label = "task" if review_count == 1 else "tasks"
             return f"Waiting for review: {review_count} {label} ready for approval{count_suffix}"
-        if on_hold_count := int(data.task_counts.get("on_hold", 0)):
-            label = "task is" if on_hold_count == 1 else "tasks are"
-            return f"Paused: {on_hold_count} {label} on hold{count_suffix}"
         queued_count = int(data.task_counts.get("queued", 0))
         if queued_count:
             label = "task" if queued_count == 1 else "tasks"

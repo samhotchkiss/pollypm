@@ -530,6 +530,24 @@ def upgrade(
     if not mig_ok:
         step("migration check")
         step(f"migration: {mig_detail}")
+        # #760 — render the refusal as a structured user-facing
+        # message instead of a raw debug-dump line. The four-field
+        # shape (summary / why / next / details) makes the command
+        # the user needs to run unmissable, and pushes the raw
+        # migration list under a collapsed details section.
+        from pollypm.user_messages import (
+            StructuredMessage,
+            known_error,
+            render_cli_message,
+        )
+        canned = known_error("migration_pending")
+        msg = StructuredMessage(
+            summary=(canned or StructuredMessage("")).summary or
+                    "Cannot upgrade — pending schema migrations on state.db.",
+            why_it_matters=(canned or StructuredMessage("")).why_it_matters,
+            next_action=(canned or StructuredMessage("")).next_action,
+            details=mig_detail,
+        )
         return UpgradeResult(
             ok=False,
             installer=installer,
@@ -538,7 +556,7 @@ def upgrade(
             migration_checked=True,
             notified=False,
             stdout="",
-            stderr=mig_detail,
+            stderr=render_cli_message(msg),
             message="migration check failed — upgrade aborted",
         )
 

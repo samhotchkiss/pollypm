@@ -313,7 +313,13 @@ def test_upgrade_aborts_when_migration_check_fails(monkeypatch) -> None:
     )
     assert result.ok is False
     assert "migration" in result.message.lower()
-    assert result.stderr == "synthetic failure"
+    # #760 — the refusal is rendered through the structured-message
+    # helper now: summary on line 1, plain-English why, ``Next: pm
+    # migrate --apply``, raw migration detail under ``> details``.
+    assert "schema migrations" in result.stderr
+    assert "Next: run" in result.stderr
+    assert "pm migrate --apply" in result.stderr
+    assert "synthetic failure" in result.stderr  # raw detail still surfaced
     # Never called the installer; version unchanged.
     assert result.old_version == result.new_version
 

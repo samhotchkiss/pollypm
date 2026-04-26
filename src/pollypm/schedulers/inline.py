@@ -156,21 +156,40 @@ class InlineSchedulerBackend(SchedulerBackend):
         with lock.open("r") as lf:
             fcntl.flock(lf, fcntl.LOCK_SH)
             try:
-                raw = json.loads(path.read_text())
+                # Defensive: a corrupt or hand-edited jobs file used to
+                # crash the whole scheduler tick (the Tracebacked
+                # ``json.loads`` happened inside the lock and the list
+                # comprehension downstream expected a list). Treat any
+                # parse error / non-list / non-dict entry as "no jobs
+                # to run this tick" rather than aborting the scheduler.
+                try:
+                    raw = json.loads(path.read_text())
+                except (OSError, ValueError):
+                    raw = []
+                if not isinstance(raw, list):
+                    raw = []
             finally:
                 fcntl.flock(lf, fcntl.LOCK_UN)
-        return [
-            ScheduledJob(
-                job_id=str(item["job_id"]),
-                kind=str(item["kind"]),
-                run_at=datetime.fromisoformat(str(item["run_at"])),
-                payload=dict(item.get("payload", {})),
-                status=str(item.get("status", "pending")),
-                interval_seconds=item.get("interval_seconds"),
-                last_error=item.get("last_error"),
-            )
-            for item in raw
-        ]
+        jobs: list[ScheduledJob] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                jobs.append(
+                    ScheduledJob(
+                        job_id=str(item["job_id"]),
+                        kind=str(item["kind"]),
+                        run_at=datetime.fromisoformat(str(item["run_at"])),
+                        payload=dict(item.get("payload", {})),
+                        status=str(item.get("status", "pending")),
+                        interval_seconds=item.get("interval_seconds"),
+                        last_error=item.get("last_error"),
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                # Skip malformed entries; the rest of the queue is salvageable.
+                continue
+        return jobs
 
     def _save_jobs(self, supervisor, jobs: list[ScheduledJob]) -> None:
         path = self._jobs_path(supervisor)

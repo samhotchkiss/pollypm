@@ -242,32 +242,14 @@ def jobs_retry(
     """
     queue = _open_queue(config_path)
     try:
-        job = queue.get(job_id)
-        if job is None:
+        try:
+            queue.retry_failed(job_id)
+        except LookupError:
             typer.echo(f"Job {job_id} not found.", err=True)
-            raise typer.Exit(code=1)
-        if job.status is not JobStatus.FAILED:
-            typer.echo(
-                f"Job {job_id} is {job.status.value}, not failed — refusing to retry.",
-                err=True,
-            )
-            raise typer.Exit(code=1)
-        # Retry resets attempt count back to zero; document in --help above.
-        with queue._lock:  # noqa: SLF001 — thin wrapper; reuses queue's own lock
-            queue._conn.execute(
-                """
-                UPDATE work_jobs
-                SET status = 'queued',
-                    attempt = 0,
-                    claimed_at = NULL,
-                    claimed_by = NULL,
-                    finished_at = NULL,
-                    last_error = NULL,
-                    run_after = ?
-                WHERE id = ?
-                """,
-                (datetime.now().astimezone().isoformat(), int(job_id)),
-            )
+            raise typer.Exit(code=1) from None
+        except ValueError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=1) from None
         typer.echo(f"Re-queued job {job_id} (attempt reset to 0).")
     finally:
         queue.close()
@@ -290,12 +272,7 @@ def jobs_purge(
         )
     queue = _open_queue(config_path)
     try:
-        with queue._lock:  # noqa: SLF001
-            cursor = queue._conn.execute(
-                "DELETE FROM work_jobs WHERE status = ?",
-                (parsed.value,),
-            )
-            deleted = cursor.rowcount or 0
+        deleted = queue.purge(parsed)
     finally:
         queue.close()
     word = "job" if deleted == 1 else "jobs"
@@ -358,20 +335,13 @@ def jobs_stats(
     queue = _open_queue(config_path)
     try:
         stats = queue.stats()
-        with queue._lock:  # noqa: SLF001
-            rows = queue._conn.execute(
-                """
-                SELECT handler_name, COUNT(*)
-                FROM work_jobs
-                GROUP BY handler_name
-                ORDER BY COUNT(*) DESC
-                LIMIT 10
-                """
-            ).fetchall()
+        handler_counts = queue.handler_counts(limit=10)
     finally:
         queue.close()
 
-    per_handler = [{"handler": row[0], "count": int(row[1])} for row in rows]
+    per_handler = [
+        {"handler": handler, "count": count} for handler, count in handler_counts
+    ]
     payload = {
         "queued": stats.queued,
         "claimed": stats.claimed,

@@ -461,6 +461,76 @@ class JobQueue:
             failed=counts[JobStatus.FAILED],
         )
 
+    def retry_failed(self, job_id: JobId) -> Job:
+        """Reset a failed job to ``queued`` so workers can pick it up.
+
+        Resets the attempt count to zero and clears
+        ``claimed_at``/``claimed_by``/``finished_at``/``last_error``.
+        ``run_after`` is bumped to ``now`` so the job is eligible
+        immediately. Raises ``LookupError`` if the job is missing and
+        ``ValueError`` if it isn't currently in the failed state — the
+        public surface keeps the CLI from poking ``_lock``/``_conn``
+        and centralises the invariant in one place (#803).
+        """
+        job = self.get(job_id)
+        if job is None:
+            raise LookupError(f"Job {job_id} not found")
+        if job.status is not JobStatus.FAILED:
+            raise ValueError(
+                f"Job {job_id} is {job.status.value}, not failed — refusing to retry."
+            )
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE work_jobs
+                SET status = 'queued',
+                    attempt = 0,
+                    claimed_at = NULL,
+                    claimed_by = NULL,
+                    finished_at = NULL,
+                    last_error = NULL,
+                    run_after = ?
+                WHERE id = ?
+                """,
+                (_now_iso(), int(job_id)),
+            )
+        refreshed = self.get(job_id)
+        if refreshed is None:  # pragma: no cover — UPDATE just succeeded
+            raise LookupError(f"Job {job_id} disappeared during retry")
+        return refreshed
+
+    def purge(self, status: JobStatus) -> int:
+        """Bulk-delete jobs in a terminal ``status``. Returns count.
+
+        Only ``done`` and ``failed`` are accepted; non-terminal states
+        raise ``ValueError`` so callers can't accidentally drop live
+        work via the public API.
+        """
+        if status not in (JobStatus.DONE, JobStatus.FAILED):
+            raise ValueError(
+                f"purge only accepts DONE/FAILED, got {status.value}",
+            )
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM work_jobs WHERE status = ?", (status.value,),
+            )
+            return int(cursor.rowcount or 0)
+
+    def handler_counts(self, *, limit: int = 10) -> list[tuple[str, int]]:
+        """Top handlers by current row count, descending. (#803)"""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT handler_name, COUNT(*)
+                FROM work_jobs
+                GROUP BY handler_name
+                ORDER BY COUNT(*) DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [(str(row[0]), int(row[1])) for row in rows]
+
     def list_jobs(
         self,
         *,

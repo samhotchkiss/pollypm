@@ -773,6 +773,104 @@ class TestTeardownWorker:
         assert result.total_input_tokens == 11
         assert result.total_output_tokens == 7
 
+    def test_codex_archival_filters_rollouts_to_task_worktree(
+        self, manager, mock_tmux, tmp_project, tmp_path,
+    ):
+        """#812: Codex stores every rollout under
+        ``CODEX_HOME/.codex/sessions/...`` regardless of cwd, so a
+        single account home contains rollouts for every task that
+        ran under that account. The archival finder must filter to
+        rollouts whose ``session_meta`` / ``turn_context`` cwd
+        matches this task's worktree — otherwise per-task archives
+        get contaminated with unrelated transcripts.
+
+        Plus #813: Codex token data lives in ``event_msg`` rows with
+        ``payload.type=="token_count"`` and counters under
+        ``payload.info.last_token_usage``. The Claude-shaped parser
+        returned ``(0, 0)``; the new parser sums Codex per-turn
+        deltas (input + cached_input, output + reasoning_output).
+        """
+        import json as _json
+
+        session = self._provision(manager)
+        worktree_cwd = str(session.worktree_path.resolve())
+        other_cwd = str((tmp_path / "other-task-worktree").resolve())
+
+        codex_home = tmp_path / "codex-account"
+        sessions_root = codex_home / ".codex" / "sessions" / "2026" / "04" / "26"
+        sessions_root.mkdir(parents=True)
+
+        matching = sessions_root / "rollout-matching.jsonl"
+        with matching.open("w") as fh:
+            fh.write(_json.dumps({
+                "type": "session_meta",
+                "payload": {"id": "match", "cwd": worktree_cwd},
+            }) + "\n")
+            fh.write(_json.dumps({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": 300,
+                            "cached_input_tokens": 20,
+                            "output_tokens": 30,
+                            "reasoning_output_tokens": 5,
+                        },
+                    },
+                },
+            }) + "\n")
+
+        unrelated = sessions_root / "rollout-other.jsonl"
+        with unrelated.open("w") as fh:
+            fh.write(_json.dumps({
+                "type": "session_meta",
+                "payload": {"id": "other", "cwd": other_cwd},
+            }) + "\n")
+            fh.write(_json.dumps({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": 9999,
+                            "output_tokens": 9999,
+                        },
+                    },
+                },
+            }) + "\n")
+
+        manager._svc.upsert_worker_session(
+            task_project="proj",
+            task_number=1,
+            agent_name="agent-1",
+            pane_id=session.pane_id or "%0",
+            worktree_path=str(session.worktree_path),
+            branch_name=session.branch_name,
+            started_at=session.started_at.isoformat(),
+            provider="codex",
+            provider_home=str(codex_home),
+        )
+
+        with patch("pollypm.work.session_manager.subprocess") as mock_sub:
+            mock_sub.run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+            result = manager.teardown_worker("proj/1")
+
+        assert result.jsonl_archived is True
+        # Only the matching rollout's tokens count: 300+20=320 in,
+        # 30+5=35 out. The unrelated rollout's 9999/9999 must not
+        # contribute.
+        assert result.total_input_tokens == 320
+        assert result.total_output_tokens == 35
+        # Archive contains only the matching file. The archival
+        # destination is rooted at the project path (not the
+        # worktree), under ``.pollypm/transcripts/tasks/<task_id>/``.
+        archive_dir = (
+            tmp_project / ".pollypm" / "transcripts" / "tasks" / "proj" / "1"
+        )
+        archived_names = sorted(p.name for p in archive_dir.glob("*.jsonl"))
+        assert archived_names == ["rollout-matching.jsonl"]
+
     def test_teardown_worker_archives_jsonl(self, manager, mock_tmux, tmp_project, tmp_path, monkeypatch):
         session = self._provision(manager)
 

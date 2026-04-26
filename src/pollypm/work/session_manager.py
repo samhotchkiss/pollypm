@@ -1202,23 +1202,72 @@ def _find_claude_jsonl_files(
     return sorted(project_dir.glob("*.jsonl"))
 
 
+def _codex_rollout_cwd(jsonl_path: Path) -> str | None:
+    """Return the cwd a Codex rollout was recorded under, if any.
+
+    Codex writes ``session_meta`` (and per-turn ``turn_context``) rows
+    that carry ``payload.cwd`` — the cwd the rollout actually
+    executed in. The transcript-ledger / transcript-ingest paths
+    already parse this shape; the archival finder needs the same
+    contract so a task's per-task archive only includes that task's
+    rollout (#812). Returns the first cwd seen, or ``None`` if the
+    rollout has no recognisable cwd row.
+    """
+    try:
+        with jsonl_path.open() as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                kind = obj.get("type")
+                if kind not in ("session_meta", "turn_context"):
+                    continue
+                payload = obj.get("payload") or {}
+                if not isinstance(payload, dict):
+                    continue
+                cwd = payload.get("cwd")
+                if isinstance(cwd, str) and cwd:
+                    return cwd
+    except OSError:
+        return None
+    return None
+
+
 def _find_codex_jsonl_files(
     worktree_path: Path, *, account_home: Path | None = None,
 ) -> list[Path]:
-    """Return JSONL files Codex wrote for a worker run.
+    """Return JSONL files Codex wrote for *this* worker run.
 
     Codex writes session transcripts to
     ``<CODEX_HOME>/sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl``. The
-    layout isn't cwd-bucketed, so this returns everything under
-    ``sessions/`` and lets ``_parse_token_usage`` accumulate across.
-    Best-effort: missing tree returns an empty list.
+    layout isn't cwd-bucketed, so a single account home holds
+    rollouts for the operator, the architect, and every task that
+    has ever run under that account. Pre-#812 the finder returned
+    every rollout, which contaminated per-task archives with
+    unrelated transcripts and would over-count tokens once the
+    Codex token parser fixed in #813 lands.
+
+    Filter by reading each rollout's ``session_meta`` /
+    ``turn_context`` cwd and keeping only the rollouts whose cwd
+    matches ``worktree_path.resolve()``. Rollouts that have no
+    parseable cwd row are dropped — without it we can't prove the
+    rollout belongs to this task. Best-effort: missing tree returns
+    an empty list.
     """
     sessions_root = _codex_home_dir(home=account_home) / "sessions"
     if not sessions_root.exists():
         return []
-    # ``rglob`` matches Codex's nested year/month/day layout without
+    # ``rglob`` walks Codex's nested year/month/day layout without
     # this module having to know the exact shape.
-    return sorted(sessions_root.rglob("*.jsonl"))
+    candidates = sorted(sessions_root.rglob("*.jsonl"))
+    target = str(worktree_path.resolve())
+    return [path for path in candidates if _codex_rollout_cwd(path) == target]
 
 
 def _find_provider_jsonl_files(
@@ -1245,10 +1294,23 @@ def _find_provider_jsonl_files(
 
 
 def _parse_token_usage(jsonl_path: Path) -> tuple[int, int]:
-    """Parse token usage from a Claude JSONL file.
+    """Parse token usage from a provider JSONL transcript.
 
-    Looks for lines containing token_usage information.
     Returns (input_tokens, output_tokens).
+
+    Claude shape: rows with ``type=="token_usage"``, or a top-level
+    ``usage`` dict, or ``message.usage``. Counters are
+    ``input_tokens`` / ``output_tokens``.
+
+    Codex shape (#813): ``event_msg`` rows whose payload is
+    ``type=="token_count"`` with token data under
+    ``payload.info.last_token_usage`` (per-turn) or
+    ``total_token_usage`` (cumulative). Codex emits a fresh
+    ``last_token_usage`` per turn, so summing those preserves the
+    Claude-shaped per-turn-accumulation contract. ``input_tokens``
+    is summed with ``cached_input_tokens``; ``output_tokens`` is
+    summed with ``reasoning_output_tokens`` so reasoning-heavy
+    Codex turns don't undercount cost.
     """
     input_tokens = 0
     output_tokens = 0
@@ -1263,23 +1325,12 @@ def _parse_token_usage(jsonl_path: Path) -> tuple[int, int]:
                     data = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(data, dict):
+                    continue
 
-                # Look for usage in message responses
-                usage = None
-                if isinstance(data, dict):
-                    # Direct token_usage event
-                    if data.get("type") == "token_usage":
-                        usage = data
-                    # Nested in message.usage
-                    elif "usage" in data:
-                        usage = data["usage"]
-                    # Nested in message response
-                    elif "message" in data and isinstance(data["message"], dict):
-                        usage = data["message"].get("usage")
-
-                if usage and isinstance(usage, dict):
-                    input_tokens += usage.get("input_tokens", 0)
-                    output_tokens += usage.get("output_tokens", 0)
+                inc_in, inc_out = _extract_token_usage(data)
+                input_tokens += inc_in
+                output_tokens += inc_out
     except OSError as exc:
         logger.warning(
             "Could not read JSONL file %s for token parsing: %s",
@@ -1287,3 +1338,43 @@ def _parse_token_usage(jsonl_path: Path) -> tuple[int, int]:
         )
 
     return input_tokens, output_tokens
+
+
+def _extract_token_usage(data: dict) -> tuple[int, int]:
+    """Pull (input_tokens, output_tokens) from one transcript row.
+
+    Tolerates both Claude- and Codex-shaped rows (#813). Returns
+    ``(0, 0)`` for rows with no recognisable usage data.
+    """
+    # Codex ``event_msg`` rows carry token data under a nested
+    # ``payload.info.last_token_usage`` (per-turn delta) — sum those
+    # so the cumulative across the whole rollout is correct.
+    if data.get("type") == "event_msg":
+        payload = data.get("payload") or {}
+        if isinstance(payload, dict) and payload.get("type") == "token_count":
+            info = payload.get("info") or {}
+            usage = info.get("last_token_usage") if isinstance(info, dict) else None
+            if isinstance(usage, dict):
+                inp = int(usage.get("input_tokens", 0) or 0)
+                inp += int(usage.get("cached_input_tokens", 0) or 0)
+                out = int(usage.get("output_tokens", 0) or 0)
+                out += int(usage.get("reasoning_output_tokens", 0) or 0)
+                return inp, out
+            return 0, 0
+
+    # Claude shapes — direct ``token_usage`` event, top-level ``usage``,
+    # or ``message.usage``.
+    if data.get("type") == "token_usage":
+        usage = data
+    elif "usage" in data:
+        usage = data["usage"]
+    elif "message" in data and isinstance(data["message"], dict):
+        usage = data["message"].get("usage")
+    else:
+        usage = None
+    if isinstance(usage, dict):
+        return (
+            int(usage.get("input_tokens", 0) or 0),
+            int(usage.get("output_tokens", 0) or 0),
+        )
+    return 0, 0

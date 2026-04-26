@@ -472,6 +472,20 @@ def load_inbox_entries(
                 project_tasks = inbox_tasks(svc, project=project_key)
             except Exception:  # noqa: BLE001
                 project_tasks = []
+            # N+1 escape: pre-fetch read-markers and replies for every
+            # task in this project in one query each, then bucket
+            # locally. Was 2 roundtrips per task on the 8s refresh tick.
+            project_for_query = project_key if project_key else "inbox"
+            try:
+                read_marker_numbers = svc.task_numbers_with_context_entry(
+                    project=project_for_query, entry_type="read",
+                )
+            except Exception:  # noqa: BLE001
+                read_marker_numbers = set()
+            try:
+                replies_by_number = svc.bulk_list_replies(project=project_for_query)
+            except Exception:  # noqa: BLE001
+                replies_by_number = {}
             for task in project_tasks:
                 if task.task_id in seen_task_ids:
                     continue
@@ -482,16 +496,9 @@ def load_inbox_entries(
                         known_projects=known_projects,
                     )
                 )
-                try:
-                    rows = svc.get_context(task.task_id, entry_type="read", limit=1)
-                except Exception:  # noqa: BLE001
-                    rows = []
-                if not rows:
+                if task.task_number not in read_marker_numbers:
                     unread.add(task.task_id)
-                try:
-                    replies = svc.list_replies(task.task_id)
-                except Exception:  # noqa: BLE001
-                    replies = []
+                replies = replies_by_number.get(task.task_number, [])
                 if replies:
                     replies_by_task[task.task_id] = replies
         finally:

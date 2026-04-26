@@ -2143,6 +2143,60 @@ class SQLiteWorkService:
         return entries
 
     # ------------------------------------------------------------------
+    # Bulk context queries — N+1 escape hatch for the inbox loader.
+    #
+    # The cockpit inbox loader used to call ``get_context`` and
+    # ``list_replies`` once per inbox task. At ~9 projects × ~10 inbox
+    # tasks each, that was ~180 separate SQLite roundtrips on every 8s
+    # refresh tick. These two methods collapse the per-task pattern
+    # into one query per project.
+    # ------------------------------------------------------------------
+
+    def task_numbers_with_context_entry(
+        self, *, project: str, entry_type: str,
+    ) -> set[int]:
+        """Return task numbers that have at least one context entry of
+        ``entry_type``. Used by the inbox loader's read-marker check —
+        replaces a per-task ``get_context(..., entry_type='read', limit=1)``
+        roundtrip with a single project-wide query.
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT task_number FROM work_context_entries "
+            "WHERE task_project = ? AND entry_type = ?",
+            (project, entry_type),
+        ).fetchall()
+        return {int(r["task_number"]) for r in rows}
+
+    def bulk_list_replies(self, *, project: str) -> dict[int, list[ContextEntry]]:
+        """Return ``task_number -> [reply entries (oldest first)]`` for
+        every task in ``project`` that has at least one reply.
+
+        One query, bucketed in Python. Replaces a per-task
+        ``list_replies`` loop on the inbox loader hot path.
+        """
+        rows = self._conn.execute(
+            "SELECT task_number, actor, created_at, text, entry_type "
+            "FROM work_context_entries "
+            "WHERE task_project = ? AND entry_type = 'reply' "
+            "ORDER BY id ASC",
+            (project,),
+        ).fetchall()
+        out: dict[int, list[ContextEntry]] = {}
+        for r in rows:
+            try:
+                etype = r["entry_type"] or "reply"
+            except (KeyError, IndexError):
+                etype = "reply"
+            entry = ContextEntry(
+                actor=r["actor"],
+                timestamp=datetime.fromisoformat(r["created_at"]),
+                text=r["text"],
+                entry_type=etype,
+            )
+            out.setdefault(int(r["task_number"]), []).append(entry)
+        return out
+
+    # ------------------------------------------------------------------
     # Queries
     # ------------------------------------------------------------------
 

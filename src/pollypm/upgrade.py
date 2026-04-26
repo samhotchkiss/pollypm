@@ -384,11 +384,15 @@ def upgrade(
         )
 
     # Migration check runs for both check-only and full upgrade — even
-    # check-only users want to know if they'd hit a blocker.
-    step("migration check")
+    # check-only users want to know if they'd hit a blocker. Stay silent
+    # on the happy path (no pending migration, nothing for the operator
+    # to act on); only emit step markers when the check actually
+    # surfaced a problem so ``pm upgrade`` doesn't spam migration noise
+    # on every run.
     mig_ok, mig_detail = run_migration_check()
-    step(f"migration: {mig_detail}")
     if not mig_ok:
+        step("migration check")
+        step(f"migration: {mig_detail}")
         return UpgradeResult(
             ok=False,
             installer=installer,

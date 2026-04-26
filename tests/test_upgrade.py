@@ -306,6 +306,57 @@ def test_upgrade_aborts_when_migration_check_fails(monkeypatch) -> None:
     assert result.old_version == result.new_version
 
 
+def test_upgrade_silent_about_migrations_when_none_pending(monkeypatch) -> None:
+    """Happy path: no pending migration → no '[step] migration ...' noise.
+
+    Regression for the user complaint that ``pm upgrade`` always prints
+    migration-check chatter even when there is nothing for the operator
+    to act on. The check still runs (so a real pending migration would
+    abort the upgrade) — only the cosmetic step lines are suppressed.
+    """
+    captured: list[str] = []
+    monkeypatch.setattr(
+        upgrade_mod, "run_migration_check",
+        lambda: (True, "ok: migrations up to date"),
+    )
+    result = upgrade_mod.upgrade(
+        channel="stable",
+        plan_only=True,
+        installer_overrides={"uv": True},
+        emit=captured.append,
+    )
+    assert result.ok is True
+    migration_lines = [line for line in captured if "migration" in line.lower()]
+    assert migration_lines == [], (
+        f"expected no migration step noise, got: {migration_lines}"
+    )
+
+
+def test_upgrade_emits_migration_step_lines_only_on_failure(monkeypatch) -> None:
+    """Failure path: a real pending migration must surface step lines.
+
+    The silent-when-clean fix must not swallow the actionable case —
+    when ``run_migration_check`` reports a problem, the operator needs
+    the ``[step] migration check`` / ``[step] migration: <detail>``
+    breadcrumbs so they can see what blocked the upgrade.
+    """
+    captured: list[str] = []
+    monkeypatch.setattr(
+        upgrade_mod, "run_migration_check",
+        lambda: (False, "1 pending migration: [state] v42: synthetic"),
+    )
+    result = upgrade_mod.upgrade(
+        channel="stable",
+        installer_overrides={"uv": True},
+        emit=captured.append,
+    )
+    assert result.ok is False
+    assert any("[step] migration check" in line for line in captured)
+    assert any(
+        "[step] migration: 1 pending migration" in line for line in captured
+    )
+
+
 def test_upgrade_plan_only_stops_before_exec(monkeypatch) -> None:
     """plan_only is the test seam for composing without running."""
     result = upgrade_mod.upgrade(

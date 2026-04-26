@@ -302,6 +302,14 @@ class AlertNotifier:
 
     POLL_INTERVAL_SECONDS = 5.0
     MAX_VISIBLE = 3
+    # Soft cap on the dedup set. When ``_seen_alert_ids`` exceeds this
+    # we trim it back to only the keys for currently-open alerts —
+    # closed alerts can never re-fire under the same id (each new
+    # alert row has a fresh id), so dropping their keys is safe and
+    # keeps the set from growing unboundedly on long-running cockpits.
+    # 2000 ≈ a couple hundred KB; trimming kicks in after roughly a
+    # week of uptime even with churny operational alerts.
+    MAX_SEEN_ALERT_IDS = 2000
 
     def __init__(
         self,
@@ -405,8 +413,10 @@ class AlertNotifier:
         except Exception:  # noqa: BLE001
             return []
         mounted: list[AlertToast] = []
+        current_keys: set = set()
         for record in alerts:
             key = self._dedup_key(record)
+            current_keys.add(key)
             if key in self._seen_alert_ids:
                 continue
             # Dedup even for suppressed types so the same operational
@@ -418,6 +428,12 @@ class AlertNotifier:
             toast = self._mount_toast(record)
             if toast is not None:
                 mounted.append(toast)
+        # Bound the dedup set: when it grows past MAX_SEEN_ALERT_IDS
+        # (long-running cockpit, churny alerts), drop everything that
+        # isn't still a currently-open alert. Closed alerts can't
+        # re-fire under the same id, so dropping their keys is safe.
+        if len(self._seen_alert_ids) > self.MAX_SEEN_ALERT_IDS:
+            self._seen_alert_ids = set(current_keys)
         return mounted
 
     def _mount_toast(self, record) -> AlertToast | None:

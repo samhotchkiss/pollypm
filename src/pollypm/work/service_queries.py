@@ -290,18 +290,12 @@ def next_task(
         if agent is not None:
             # ``roles`` is producer-controlled and always serialised as a
             # dict, but a hand-edited or legacy DB row could land an
-            # empty string / null / non-dict shape. Coerce defensively
-            # so a single corrupt task row doesn't poison the whole
-            # ``pm task next`` query — same shape as the cycle 107-109
-            # corrupt-payload defenses on the messages table.
-            raw_roles = row["roles"]
-            try:
-                parsed_roles = json.loads(raw_roles) if raw_roles else {}
-            except (TypeError, ValueError):
-                parsed_roles = {}
-            if not isinstance(parsed_roles, dict):
-                parsed_roles = {}
-            if parsed_roles.get("worker") != agent:
+            # empty string / null / non-dict shape. Defer to the shared
+            # ``_safe_json_dict`` helper so the corrupt-payload defense
+            # stays consistent with ``_row_to_task`` / ``_get_flow``
+            # (cycles 107-113).
+            from pollypm.work.sqlite_service import _safe_json_dict
+            if _safe_json_dict(row["roles"]).get("worker") != agent:
                 continue
         return service._row_to_task(row)
     return None

@@ -73,3 +73,33 @@ def test_next_task_skips_row_with_empty_roles(tmp_path: Path) -> None:
         picked = next_task(svc, agent="alice", project="demo")
         assert picked is not None
         assert picked.title == "good"
+
+
+def test_row_to_task_survives_corrupt_labels_and_roles(tmp_path: Path) -> None:
+    """Cycle 113 — ``_row_to_task`` calls ``json.loads`` on
+    ``labels``, ``relevant_files``, ``roles``, and ``external_refs``.
+    A corrupt non-list/non-dict shape used to crash the whole task
+    read (``get_task``, ``list_tasks``). Defend via the shared
+    ``_safe_json_dict`` / ``_safe_json_list`` helpers and verify a
+    corrupt row still hydrates with empty defaults rather than
+    raising.
+    """
+    db = tmp_path / "work.db"
+    project_path = tmp_path / "proj"
+    project_path.mkdir()
+    with SQLiteWorkService(db_path=db, project_path=project_path) as svc:
+        num = _seed_queued_task(svc, title="corrupt")
+        # Hand-corrupt all four JSON columns at once to exercise every
+        # _safe_* coercion in one read.
+        svc._conn.execute(
+            "UPDATE work_tasks SET labels = ?, relevant_files = ?, "
+            "roles = ?, external_refs = ? WHERE project = ? AND task_number = ?",
+            ('"oops"', "null", "[1, 2]", "5", "demo", num),
+        )
+        svc._conn.commit()
+        task = svc.get(f"demo/{num}")
+        # All four default to their empty form rather than raising.
+        assert task.labels == []
+        assert task.relevant_files == []
+        assert task.roles == {}
+        assert task.external_refs == {}

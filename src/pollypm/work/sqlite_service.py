@@ -135,6 +135,45 @@ def first_shipped_at(path: Path | None = None) -> str | None:
     return str(value) if isinstance(value, str) and value else None
 
 
+def _safe_json_dict(raw: object) -> dict:
+    """Decode a JSON column expected to be a dict, defensively.
+
+    Producers always serialise dicts (``json.dumps(template.roles)`` etc.),
+    but a hand-edited or legacy DB row could land an empty string,
+    null, list, or scalar. Downstream callers do ``parsed.get(...)``
+    and would AttributeError on those shapes — propagating the crash
+    out of the caller's loop. Coerce non-dict shapes to ``{}`` so a
+    single corrupt row degrades gracefully.
+
+    Mirrors the ``_safe_payload`` / ``_safe_tags`` helpers in
+    ``pollypm.storage.state`` (cycles 107-109 corrupt-payload defenses).
+    """
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _safe_json_list(raw: object) -> list:
+    """Decode a JSON column expected to be a list, defensively.
+
+    Companion to ``_safe_json_dict`` for ``labels`` / ``relevant_files``
+    / ``gates`` columns. Coerces non-list shapes (dict/string/null/int)
+    back to ``[]`` so consumers iterating the result don't iterate the
+    wrong thing (e.g. a string would yield characters).
+    """
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
 def mark_first_shipped(
     *,
     path: Path | None = None,
@@ -542,7 +581,7 @@ class SQLiteWorkService:
             self._flow_cache[cache_key] = flow
             return flow
 
-        roles = json.loads(row["roles"])
+        roles = _safe_json_dict(row["roles"])
         nodes: dict[str, FlowNode] = {}
         node_rows = self._conn.execute(
             "SELECT * FROM work_flow_nodes "
@@ -564,7 +603,7 @@ class SQLiteWorkService:
                 agent_name=agent_name,
                 next_node_id=nr["next_node_id"],
                 reject_node_id=nr["reject_node_id"],
-                gates=json.loads(nr["gates"]),
+                gates=_safe_json_list(nr["gates"]),
             )
 
         flow = FlowTemplate(
@@ -619,7 +658,7 @@ class SQLiteWorkService:
             task_number=task_number,
             title=row["title"],
             type=TaskType(row["type"]),
-            labels=json.loads(row["labels"]),
+            labels=_safe_json_list(row["labels"]),
             work_status=WorkStatus(row["work_status"]),
             flow_template_id=row["flow_template_id"],
             flow_template_version=row["flow_template_version"],
@@ -630,7 +669,7 @@ class SQLiteWorkService:
             description=row["description"],
             acceptance_criteria=row["acceptance_criteria"],
             constraints=row["constraints"],
-            relevant_files=json.loads(row["relevant_files"]),
+            relevant_files=_safe_json_list(row["relevant_files"]),
             parent_project=row["parent_project"],
             parent_task_number=row["parent_task_number"],
             blocks=rels.get("blocks", []),
@@ -641,8 +680,8 @@ class SQLiteWorkService:
             supersedes_task_number=row["supersedes_task_number"],
             superseded_by_project=rels.get("superseded_by_project"),
             superseded_by_task_number=rels.get("superseded_by_task_number"),
-            roles=json.loads(row["roles"]),
-            external_refs=json.loads(row["external_refs"]),
+            roles=_safe_json_dict(row["roles"]),
+            external_refs=_safe_json_dict(row["external_refs"]),
             created_at=datetime.fromisoformat(row["created_at"]),
             created_by=row["created_by"],
             updated_at=datetime.fromisoformat(row["updated_at"]),

@@ -75,6 +75,27 @@ def test_next_task_skips_row_with_empty_roles(tmp_path: Path) -> None:
         assert picked.title == "good"
 
 
+def test_decode_work_output_survives_unparseable_json(tmp_path: Path) -> None:
+    """Cycle 115 — ``_decode_work_output`` parsed ``work_output`` JSON
+    with a bare ``json.loads`` and only checked the shape after parse.
+    Malformed JSON (e.g. truncated text from a partial write) raised
+    ValueError out of ``_load_executions``, crashing every task read
+    that touched the bad row. Defend by catching the parse error and
+    returning None alongside the existing non-dict guard.
+    """
+    db = tmp_path / "work.db"
+    project_path = tmp_path / "proj"
+    project_path.mkdir()
+    with SQLiteWorkService(db_path=db, project_path=project_path) as svc:
+        # _decode_work_output is the focal helper — exercise the three
+        # crash shapes (malformed, non-dict, empty) directly.
+        assert svc._decode_work_output(None) is None
+        assert svc._decode_work_output("") is None
+        assert svc._decode_work_output("{not valid json") is None
+        assert svc._decode_work_output('"oops"') is None
+        assert svc._decode_work_output('[1, 2]') is None
+
+
 def test_row_to_task_survives_corrupt_labels_and_roles(tmp_path: Path) -> None:
     """Cycle 113 — ``_row_to_task`` calls ``json.loads`` on
     ``labels``, ``relevant_files``, ``roles``, and ``external_refs``.

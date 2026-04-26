@@ -912,7 +912,10 @@ class SQLiteWorkService:
             return None
         wo_dict = self._work_output_cache.get(raw)
         if wo_dict is None:
-            parsed = json.loads(raw)
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError):
+                return None
             if not isinstance(parsed, dict):
                 return None
             wo_dict = parsed

@@ -9738,6 +9738,17 @@ class PollyProjectDashboardApp(App[None]):
         yield self.hint
 
     def on_mount(self) -> None:
+        # Paint a "Loading…" placeholder immediately so the click-to-
+        # visible-pane delay is just the Python + Textual cold-boot
+        # cost, not an additional 1–2s of synchronous DB walks. The
+        # actual gather runs on a worker thread (mirrors the workspace
+        # dashboard's ``_refresh_dashboard_sync`` pattern) and the
+        # first ``_render`` fires when it completes.
+        self.topbar.update(
+            f"[b]{_escape(self.project_key)}[/b]   "
+            f"[dim]loading project dashboard…[/dim]"
+        )
+        self._first_refresh_running = False
         self._refresh()
         self.set_interval(self.REFRESH_INTERVAL_SECONDS, self._refresh)
         # Live alert toasts.
@@ -9751,6 +9762,24 @@ class PollyProjectDashboardApp(App[None]):
     # ------------------------------------------------------------------
 
     def _refresh(self) -> None:
+        # First refresh runs off the UI thread so the placeholder topbar
+        # stays visible until data lands. Subsequent timer-driven
+        # refreshes are cheap (cycle 138/139 caches collapse them to
+        # stat()s when nothing has changed), so we keep them on the
+        # UI thread to avoid worker-thread overhead.
+        if getattr(self, "_first_refresh_running", False):
+            # Worker is still gathering — avoid a parallel sync gather
+            # that would race the worker's call_from_thread completion.
+            return
+        if self.data is None:
+            self._first_refresh_running = True
+            self.run_worker(
+                self._first_refresh_sync,
+                thread=True,
+                exclusive=True,
+                group="proj_dashboard_first_refresh",
+            )
+            return
         try:
             self.data = _gather_project_dashboard(
                 self.config_path, self.project_key,
@@ -9773,6 +9802,32 @@ class PollyProjectDashboardApp(App[None]):
             return
         self._last_render_signature = signature
         self._render()
+
+    def _first_refresh_sync(self) -> None:
+        """Off-thread first-refresh: gather then hand back to the UI
+        thread for render. Keeps the placeholder topbar visible
+        instead of freezing the cockpit pane during cold-boot data
+        load."""
+        try:
+            data = _gather_project_dashboard(
+                self.config_path, self.project_key,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self._first_refresh_failed, str(exc))
+            return
+        self.call_from_thread(self._first_refresh_completed, data)
+
+    def _first_refresh_completed(self, data) -> None:
+        self._first_refresh_running = False
+        self.data = data
+        self._last_render_signature = _project_dashboard_signature(data)
+        self._render()
+
+    def _first_refresh_failed(self, error: str) -> None:
+        self._first_refresh_running = False
+        self.topbar.update(
+            f"[#ff5f6d]Error loading project:[/#ff5f6d] {_escape(error)}"
+        )
 
     def _render(self) -> None:
         data = self.data

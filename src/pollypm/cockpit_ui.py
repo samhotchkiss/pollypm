@@ -6061,7 +6061,14 @@ class PollyInboxApp(App[None]):
             meta_bits.append(f"[#97a6b2]{_escape(when)}[/#97a6b2]")
         if rel:
             meta_bits.append(f"[dim]{_escape(rel)}[/dim]")
-        if item.project and item.project != "inbox":
+        # Workspace-root inbox items get ``project = "inbox"`` as the
+        # default sentinel — previously suppressed so they rendered
+        # with no project label at all and were indistinguishable from
+        # an unlabeled item. Show "[workspace]" so users can tell the
+        # source apart from per-project items. Audit UX #6.
+        if item.project == "inbox":
+            meta_bits.append("[dim]· [workspace][/dim]")
+        elif item.project:
             meta_bits.append(f"[dim]· {_escape(item.project)}[/dim]")
         prio = getattr(item.priority, "value", str(item.priority))
         if prio and prio != "normal":
@@ -6169,7 +6176,12 @@ class PollyInboxApp(App[None]):
             meta_bits.append(f"[#97a6b2]{_escape(when)}[/#97a6b2]")
         if rel:
             meta_bits.append(f"[dim]{_escape(rel)}[/dim]")
-        if task.project and task.project != "inbox":
+        # See note above on the list-rail render: workspace-root
+        # items use ``project == "inbox"`` as the default sentinel;
+        # surface "[workspace]" rather than swallow the label.
+        if task.project == "inbox":
+            meta_bits.append("[dim]\u00b7 [workspace][/dim]")
+        elif task.project:
             meta_bits.append(f"[dim]\u00b7 {_escape(task.project)}[/dim]")
         prio = getattr(task.priority, "value", str(task.priority))
         if prio and prio != "normal":

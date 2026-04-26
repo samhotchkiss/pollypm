@@ -25,7 +25,10 @@ def render_project_action_bar(
     if alert_count:
         bits.append(f"{alert_count} alert{'s' if alert_count != 1 else ''}")
     if inbox_count:
-        bits.append(f"{inbox_count} need action")
+        # Verb agreement: "1 needs action", "2 need action".
+        # Without this guard the singular case read "1 need action".
+        verb = "needs" if inbox_count == 1 else "need"
+        bits.append(f"{inbox_count} {verb} action")
     if not bits:
         return "▸ Clear · no approvals, alerts, or user actions"
     return "▸ " + " · ".join(bits)

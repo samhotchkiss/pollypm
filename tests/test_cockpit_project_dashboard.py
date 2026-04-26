@@ -989,3 +989,19 @@ def test_render_project_action_bar_summarizes_pending_counts() -> None:
         )
         == "▸ 2 waiting on dependencies"
     )
+
+
+def test_render_project_action_bar_uses_needs_for_single_inbox() -> None:
+    """Cycle 117 — when ``inbox_count == 1`` the bar read
+    ``▸ 1 need action``. The verb has to agree with the singular
+    subject: ``▸ 1 needs action``. Sister to the cycle 47-82 plural
+    sweep but for verb agreement, not noun pluralisation.
+    """
+    assert (
+        render_project_action_bar(review_count=0, alert_count=0, inbox_count=1)
+        == "▸ 1 needs action"
+    )
+    assert (
+        render_project_action_bar(review_count=0, alert_count=0, inbox_count=3)
+        == "▸ 3 need action"
+    )

@@ -1315,10 +1315,32 @@ class PollyCockpitApp(App[None]):
             # rather than raising AttributeError on the .get below.
             payload = {}
         new_version = str(payload.get("to") or "?")
-        self.update_pill.update(
-            f"[#9ece6a]✓ Upgraded to v{new_version} · "
-            "restart cockpit (ctrl+q) to pick up new code[/]"
-        )
+        old_version = str(payload.get("from") or "?")
+        # #720 — render the richer post-upgrade summary when the
+        # newer payload fields are present. Old flags written by
+        # pre-#720 builds only carry ``from``/``to``, so fall back
+        # to the legacy "restart to pick up new code" copy when the
+        # counts are missing.
+        notified = payload.get("notified")
+        recycled = payload.get("recycled")
+        pending = payload.get("pending_restart")
+        if any(v is not None for v in (notified, recycled, pending)):
+            parts: list[str] = [
+                f"[#9ece6a]✓ Upgraded v{old_version} → v{new_version}[/]"
+            ]
+            if isinstance(notified, int) and notified:
+                parts.append(f"{notified} notified")
+            if isinstance(pending, int) and pending:
+                parts.append(f"[#d29922]{pending} pending restart[/]")
+            if isinstance(recycled, int) and recycled:
+                parts.append(f"{recycled} recycled")
+            parts.append("[dim]ctrl+q to restart cockpit[/dim]")
+            self.update_pill.update(" · ".join(parts))
+        else:
+            self.update_pill.update(
+                f"[#9ece6a]✓ Upgraded to v{new_version} · "
+                "restart cockpit (ctrl+q) to pick up new code[/]"
+            )
         self.update_pill.display = True
 
     def action_dismiss_update_pill(self) -> None:

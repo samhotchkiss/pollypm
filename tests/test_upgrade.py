@@ -10,6 +10,7 @@ Every test that would otherwise touch the real system uses the
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -391,7 +392,7 @@ def test_upgrade_plan_only_stops_before_exec(monkeypatch) -> None:
 
 
 def test_upgrade_records_recycle_flags(monkeypatch) -> None:
-    """recycle flags are accepted but defer behavior to #720."""
+    """recycle flags are accepted; behavior shipped in #720."""
     captured: list[str] = []
     monkeypatch.setattr(
         upgrade_mod, "run_migration_check",
@@ -406,6 +407,64 @@ def test_upgrade_records_recycle_flags(monkeypatch) -> None:
     )
     # plan_only returns before the recycle step runs, so this is just
     # a no-crash check — the flag plumbing is exercised.
+
+
+def test_post_upgrade_flag_payload_carries_summary_counts(tmp_path, monkeypatch) -> None:
+    """#720 — the post-upgrade flag persists the summary counts the
+    cockpit pill needs (notified / recycled / pending_restart) so the
+    rail can render the richer summary instead of the old "restart to
+    pick up new code" line."""
+    flag_path = tmp_path / "post-upgrade.flag"
+    monkeypatch.setattr(upgrade_mod, "_POST_UPGRADE_FLAG", flag_path)
+
+    upgrade_mod._write_post_upgrade_flag(
+        "1.2.0", "1.3.2",
+        notified=3,
+        recycled=5,
+        pending_restart=2,
+        recycle_scope="idle",
+    )
+    payload = json.loads(flag_path.read_text())
+    assert payload["from"] == "1.2.0"
+    assert payload["to"] == "1.3.2"
+    assert payload["notified"] == 3
+    assert payload["recycled"] == 5
+    assert payload["pending_restart"] == 2
+    assert payload["recycle_scope"] == "idle"
+
+
+def test_post_upgrade_flag_back_compat_with_versions_only(tmp_path, monkeypatch) -> None:
+    """A pre-#720 flag file with only ``from``/``to`` keys must still
+    load (cockpit reads it on startup; users might upgrade FROM a
+    version that wrote the older shape). The new fields default to
+    sensible values when not supplied."""
+    flag_path = tmp_path / "post-upgrade.flag"
+    monkeypatch.setattr(upgrade_mod, "_POST_UPGRADE_FLAG", flag_path)
+
+    # No counts supplied — defaults to 0 / None.
+    upgrade_mod._write_post_upgrade_flag("1.2.0", "1.3.2")
+    payload = json.loads(flag_path.read_text())
+    assert payload["notified"] == 0
+    assert payload["recycled"] == 0
+    assert payload["pending_restart"] == 0
+    assert payload["recycle_scope"] is None
+
+
+def test_perform_recycle_handles_missing_config(monkeypatch) -> None:
+    """When no config is present (fresh install, pre-onboard) the
+    recycle helper must not crash — it returns ``(0, 0)`` so the
+    upgrade flow keeps moving."""
+    from pathlib import Path as _Path
+
+    # Point DEFAULT_CONFIG_PATH at a non-existent file.
+    from pollypm import config as cfg_mod
+    monkeypatch.setattr(
+        cfg_mod, "DEFAULT_CONFIG_PATH",
+        _Path("/nonexistent/no-config.toml"),
+    )
+    recycled, skipped = upgrade_mod._perform_recycle(scope="all")
+    assert recycled == 0
+    assert skipped == 0
 
 
 # --------------------------------------------------------------------------- #

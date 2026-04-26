@@ -271,11 +271,13 @@ class EventBuffer:
         self._thread.join(timeout=timeout)
         if self._thread.is_alive():
             remaining = self._queue.qsize()
+            event_word = "event" if remaining == 1 else "events"
             logger.warning(
                 "event-buffer: drain thread did not exit within %.1fs; "
-                "%d events may be unflushed",
+                "%d %s may be unflushed",
                 timeout,
                 remaining,
+                event_word,
             )
 
         _deregister_buffer_from_signals(self)
@@ -378,8 +380,9 @@ class EventBuffer:
             with self._store.transaction() as conn:
                 conn.execute(insert(messages), rows)
         except Exception:  # pragma: no cover - defensive logging only
+            row_word = "row" if len(rows) == 1 else "rows"
             logger.exception(
-                "event-buffer: flush failed (%d rows dropped)", len(rows)
+                "event-buffer: flush failed (%d %s dropped)", len(rows), row_word,
             )
 
 

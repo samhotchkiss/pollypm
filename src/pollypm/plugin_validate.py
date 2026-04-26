@@ -408,7 +408,11 @@ def validate_all_plugins(host: ExtensionHost) -> ValidationReport:
                 logger.warning("Plugin '%s' validation failed: %s", name, error)
                 host.errors.append(f"Plugin '{name}' disabled: {error}")
         else:
-            logger.debug("Plugin '%s' passed validation (%d checks)", name, len(result.checks))
+            n_checks = len(result.checks)
+            check_word = "check" if n_checks == 1 else "checks"
+            logger.debug(
+                "Plugin '%s' passed validation (%d %s)", name, n_checks, check_word,
+            )
 
     return report
 

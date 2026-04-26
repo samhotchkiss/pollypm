@@ -505,7 +505,11 @@ def _extract_with_llm(
                         ))
                 accumulated[key] = val  # Replace with latest understanding
 
-        logger.info("Chunk %d/%d processed (%d events)", i+1, len(chunks), len(chunk))
+        event_word = "event" if len(chunk) == 1 else "events"
+        logger.info(
+            "Chunk %d/%d processed (%d %s)",
+            i + 1, len(chunks), len(chunk), event_word,
+        )
 
     # Check we got something meaningful
     if not accumulated["overview"]:

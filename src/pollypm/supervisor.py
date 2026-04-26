@@ -393,7 +393,11 @@ class Supervisor:
         try:
             repaired = self.repair_sessions_table()
             if repaired:
-                _log.debug("Supervisor.start(): repaired %d sessions rows", repaired)
+                row_word = "row" if repaired == 1 else "rows"
+                _log.debug(
+                    "Supervisor.start(): repaired %d sessions %s",
+                    repaired, row_word,
+                )
         except Exception:  # noqa: BLE001
             _log.debug("Supervisor.start(): repair_sessions_table failed", exc_info=True)
 

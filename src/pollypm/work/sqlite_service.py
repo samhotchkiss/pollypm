@@ -1239,7 +1239,7 @@ class SQLiteWorkService:
         actor: str,
         reason: str = "worker session missing",
     ) -> Task:
-        """Return an orphaned in-progress claim to the queued pool.
+        """Return an orphaned active worker claim to the queued pool.
 
         Recovery plugins call this only after proving the worker
         session/window is gone. The work service owns the private SQLite
@@ -1255,10 +1255,10 @@ class SQLiteWorkService:
         keeps incrementing past the abandoned attempt.
         """
         task = self.get(task_id)
-        if task.work_status != WorkStatus.IN_PROGRESS:
+        if task.work_status not in (WorkStatus.IN_PROGRESS, WorkStatus.REWORK):
             raise InvalidTransitionError(
                 f"Cannot release stale claim in '{task.work_status.value}' state. "
-                "Task must be in 'in_progress' state."
+                "Task must be in 'in_progress' or 'rework' state."
             )
         now = _now()
         try:
@@ -1285,7 +1285,7 @@ class SQLiteWorkService:
             self._record_transition(
                 task.project,
                 task.task_number,
-                WorkStatus.IN_PROGRESS.value,
+                task.work_status.value,
                 WorkStatus.QUEUED.value,
                 actor,
                 reason,
@@ -1303,7 +1303,7 @@ class SQLiteWorkService:
         result = self.get(task_id)
         self._sync_transition(
             result,
-            WorkStatus.IN_PROGRESS.value,
+            task.work_status.value,
             WorkStatus.QUEUED.value,
         )
         return result

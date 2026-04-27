@@ -29,7 +29,14 @@ from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
 )
 from pollypm.plugins_builtin.task_assignment_notify.resolver import _RuntimeServices
 from pollypm.work import task_assignment as bus
-from pollypm.work.models import WorkStatus
+from pollypm.work.models import (
+    Artifact,
+    ArtifactKind,
+    ExecutionStatus,
+    OutputType,
+    WorkOutput,
+    WorkStatus,
+)
 from pollypm.work.sqlite_service import SQLiteWorkService
 
 
@@ -260,6 +267,26 @@ def _seed_queued_worker_task(
         svc.close()
 
 
+def _valid_work_output() -> WorkOutput:
+    return WorkOutput(
+        type=OutputType.CODE_CHANGE,
+        summary="Implemented the change",
+        artifacts=[
+            Artifact(
+                kind=ArtifactKind.COMMIT,
+                description="implementation",
+                ref="abc123",
+            )
+        ],
+    )
+
+
+def _move_task_to_rework(work: SQLiteWorkService, task_id: str) -> None:
+    work.claim(task_id, "worker")
+    work.node_done(task_id, "worker", _valid_work_output())
+    work.reject(task_id, "reviewer", "needs rework")
+
+
 def test_auto_claim_claims_next_queued_task_when_capacity_available(tmp_path: Path) -> None:
     """The Notesy regression: project has an approved plan + queued
     worker-role task + zero active workers → sweep auto-claims it."""
@@ -308,6 +335,38 @@ def test_auto_claim_respects_capacity_cap(tmp_path: Path) -> None:
         _auto_claim_next(svc, work, _FakeProject(key="proj", path=project_path), totals2)
         assert totals2["by_outcome"].get("auto_claim_spawned", 0) == 0
         assert work.get(task_id_2).work_status == WorkStatus.QUEUED
+    finally:
+        work.close()
+
+
+def test_auto_claim_counts_rework_against_capacity(tmp_path: Path) -> None:
+    """#816: rejected work is still active worker load for capacity."""
+    project_path = tmp_path / "proj"
+    project_path.mkdir()
+    _write_plan(project_path)
+    _seed_approved_plan(project_path, "proj")
+    rework_task_id = _seed_queued_worker_task(
+        project_path, "proj", title="first",
+    )
+    queued_task_id = _seed_queued_worker_task(
+        project_path, "proj", title="second",
+    )
+
+    db_path = project_path / ".pollypm" / "state.db"
+    work = SQLiteWorkService(db_path=db_path, project_path=project_path)
+    try:
+        bus.clear_listeners()
+        _move_task_to_rework(work, rework_task_id)
+        assert work.get(rework_task_id).work_status == WorkStatus.REWORK
+
+        svc = _svc_defaults(max_concurrent_per_project=1)
+        totals = {"considered": 0, "by_outcome": {}}
+        _auto_claim_next(
+            svc, work, _FakeProject(key="proj", path=project_path), totals,
+        )
+
+        assert totals["by_outcome"].get("auto_claim_spawned", 0) == 0
+        assert work.get(queued_task_id).work_status == WorkStatus.QUEUED
     finally:
         work.close()
 
@@ -415,8 +474,6 @@ def test_recover_dead_claims_returns_task_to_claimable_queue(tmp_path: Path) -> 
     that same node and bumps the visit count rather than starting over
     from the flow's start node.
     """
-    from pollypm.work.models import ExecutionStatus
-
     bus.clear_listeners()
     project_path = tmp_path / "proj"
     project_path.mkdir()
@@ -457,5 +514,51 @@ def test_recover_dead_claims_returns_task_to_claimable_queue(tmp_path: Path) -> 
             if e.node_id == original_node_id
         ]
         assert max(visits_after) > 1
+    finally:
+        work.close()
+
+
+def test_recover_dead_claims_returns_rework_task_to_claimable_queue(
+    tmp_path: Path,
+) -> None:
+    """#816: a dead worker on a rejected task must not strand REWORK."""
+    bus.clear_listeners()
+    project_path = tmp_path / "proj"
+    project_path.mkdir()
+    task_id = _seed_queued_worker_task(
+        project_path, "proj", link_to_plan=False,
+    )
+
+    db_path = project_path / ".pollypm" / "state.db"
+    work = SQLiteWorkService(db_path=db_path, project_path=project_path)
+    try:
+        _move_task_to_rework(work, task_id)
+        rework = work.get(task_id)
+        assert rework.work_status == WorkStatus.REWORK
+        original_node_id = rework.current_node_id
+        assert original_node_id is not None
+
+        svc = _svc_defaults(session_service=_FakeSessionService())
+        totals = {"considered": 0, "by_outcome": {}}
+        _recover_dead_claims(
+            svc, work, _FakeProject(key="proj", path=project_path), totals,
+        )
+
+        assert totals["by_outcome"].get("auto_claim_recovered", 0) == 1
+        recovered = work.get(task_id)
+        assert recovered.work_status == WorkStatus.QUEUED
+        assert recovered.assignee is None
+        assert recovered.current_node_id == original_node_id
+        statuses = [e.status for e in recovered.executions]
+        assert ExecutionStatus.ABANDONED in statuses
+
+        reclaimed = work.claim(task_id, "worker")
+        assert reclaimed.work_status == WorkStatus.IN_PROGRESS
+        assert reclaimed.current_node_id == original_node_id
+        visits_after = [
+            e.visit for e in reclaimed.executions
+            if e.node_id == original_node_id
+        ]
+        assert max(visits_after) > 2
     finally:
         work.close()

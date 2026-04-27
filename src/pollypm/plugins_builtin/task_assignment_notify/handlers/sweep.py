@@ -69,19 +69,29 @@ logger = logging.getLogger(__name__)
 _TASK_ID_PATTERN = re.compile(r"\b([A-Za-z0-9_.-]+/\d+)\b")
 
 # Work statuses the sweeper cares about — those where a machine actor is
-# the expected next mover. ``in_progress`` is gated on an idleness check
-# (see ``_target_session_is_idle``) so we don't spam an actively-turning
-# worker; ``queued`` and ``review`` are always safe to re-emit (dedupe
-# handles throttling).
-_SWEEPABLE_STATUSES = ("queued", "review", "in_progress")
+# the expected next mover. ``in_progress`` / ``rework`` are gated on an
+# idleness check (see ``_target_session_is_idle``) so we don't spam an
+# actively-turning worker; ``queued`` and ``review`` are always safe to
+# re-emit (dedupe handles throttling).
+_SWEEPABLE_STATUSES = (
+    WorkStatus.QUEUED.value,
+    WorkStatus.REVIEW.value,
+    WorkStatus.IN_PROGRESS.value,
+    WorkStatus.REWORK.value,
+)
+
+_ACTIVE_WORKER_STATUSES = (
+    WorkStatus.IN_PROGRESS.value,
+    WorkStatus.REWORK.value,
+)
 
 # Statuses where an idle-session gate is required before notifying. The
 # queued / review case is a new-or-pending assignment — pinging a busy
 # session is fine because the ping just surfaces in their queue. The
-# in_progress case means the worker claimed + started work, so only
-# re-ping when they've gone idle (supervisor restart, Claude relaunched
-# with no context, etc.).
-_IDLE_GATED_STATUSES = frozenset({"in_progress"})
+# in_progress/rework cases mean the worker claimed + started work, so
+# only re-ping when they've gone idle (supervisor restart, Claude
+# relaunched with no context, etc.).
+_IDLE_GATED_STATUSES = frozenset(_ACTIVE_WORKER_STATUSES)
 
 # Per-task context marker written when a recurring sweeper emits (or
 # dedupes) a task assignment notification. Cockpit derives a transient
@@ -592,25 +602,25 @@ def _recover_dead_claims(
     project: Any,
     totals: dict[str, Any],
 ) -> None:
-    """Unclaim in_progress worker-role tasks whose tmux window is gone.
+    """Unclaim active worker-role tasks whose tmux window is gone.
 
-    For each in_progress task with role=worker in this project, verify
-    the per-task tmux window still exists. If it doesn't (crashed
-    session, closed window, host reboot), clear the stale claim state
-    and walk the task back through queued so it becomes eligible for
-    auto-claim or a manual ``pm task claim`` on the next sweep tick.
+    For each active worker task (``in_progress`` or ``rework``) in this
+    project, verify the per-task tmux window still exists. If it doesn't
+    (crashed session, closed window, host reboot), clear the stale claim
+    state and walk the task back through queued so it becomes eligible
+    for auto-claim or a manual ``pm task claim`` on the next sweep tick.
     """
     project_key = getattr(project, "key", None)
     if not project_key:
         return
-    try:
-        in_progress = work.list_tasks(
-            project=project_key, work_status=WorkStatus.IN_PROGRESS.value,
-        )
-    except Exception:  # noqa: BLE001
-        return
+    active_tasks: list[Any] = []
+    for status in _ACTIVE_WORKER_STATUSES:
+        try:
+            active_tasks.extend(work.list_tasks(project=project_key, work_status=status))
+        except Exception:  # noqa: BLE001
+            continue
     by_outcome = totals["by_outcome"]
-    for task in in_progress:
+    for task in active_tasks:
         roles = getattr(task, "roles", {}) or {}
         if "worker" not in roles:
             continue
@@ -687,17 +697,17 @@ def _auto_claim_next(
     except Exception:  # noqa: BLE001
         return
 
-    # Capacity check. We count in_progress worker-role tasks rather than
+    # Capacity check. We count active worker-role tasks rather than
     # tmux ``worker_sessions`` rows because the DB claim is the
     # authoritative signal: a claim without a spawned session is still
     # "work in flight" (the recovery helper above will unclaim it if
     # the tmux window never shows up).
-    try:
-        in_progress = work.list_tasks(
-            project=project_key, work_status=WorkStatus.IN_PROGRESS.value,
-        )
-    except Exception:  # noqa: BLE001
-        in_progress = []
+    in_progress: list[Any] = []
+    for status in _ACTIVE_WORKER_STATUSES:
+        try:
+            in_progress.extend(work.list_tasks(project=project_key, work_status=status))
+        except Exception:  # noqa: BLE001
+            continue
     active = [
         task for task in in_progress
         if "worker" in (getattr(task, "roles", {}) or {})

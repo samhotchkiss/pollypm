@@ -134,6 +134,19 @@ def test_polly_dashboard_renders_recent_messages(monkeypatch, tmp_path: Path) ->
     assert "Press i to jump to the inbox" in rendered
 
 
+def test_polly_dashboard_shows_inbox_count_without_recent_messages(tmp_path: Path) -> None:
+    app = PollyDashboardApp(tmp_path / "pollypm.toml")
+    data = _fake_dashboard_data()
+    data.inbox_count = 13
+
+    app._render_dashboard(_fake_config(), data)
+
+    rendered = str(app.messages_body.render())
+    assert "Inbox is clear" not in rendered
+    assert "13 items in the inbox" in rendered
+    assert "Press i to jump to the inbox" in rendered
+
+
 def test_polly_dashboard_i_key_routes_to_inbox(monkeypatch, tmp_path: Path) -> None:
     calls: list[bool] = []
 

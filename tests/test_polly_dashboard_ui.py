@@ -147,6 +147,60 @@ def test_polly_dashboard_shows_inbox_count_without_recent_messages(tmp_path: Pat
     assert "Press i to jump to the inbox" in rendered
 
 
+def test_dashboard_gather_uses_rail_inbox_counter(monkeypatch, tmp_path: Path) -> None:
+    """Home inbox count must match the rail, including untracked projects."""
+    from pollypm.dashboard_data import gather
+
+    config = SimpleNamespace(
+        projects={
+            "ghost": SimpleNamespace(
+                path=tmp_path / "ghost",
+                tracked=False,
+                display_label=lambda: "Ghost",
+            )
+        }
+    )
+
+    class FakeStore:
+        def list_session_runtimes(self):
+            return []
+
+        def recent_events(self, *, limit: int):
+            del limit
+            return []
+
+        def daily_token_usage(self, *, days: int):
+            del days
+            return []
+
+        def open_alerts(self):
+            return []
+
+    seen: list[object] = []
+
+    def fake_rail_count(arg):
+        seen.append(arg)
+        return 13
+
+    monkeypatch.setattr(
+        "pollypm.service_api.plan_launches_readonly",
+        lambda _config, _store: [],
+    )
+    monkeypatch.setattr("pollypm.dashboard_data._recent_commits", lambda *_a, **_kw: [])
+    monkeypatch.setattr("pollypm.dashboard_data._completed_issues", lambda *_a, **_kw: [])
+    monkeypatch.setattr("pollypm.dashboard_data._recent_inbox_messages", lambda *_a, **_kw: [])
+    monkeypatch.setattr(
+        "pollypm.cockpit_inbox._count_inbox_tasks_for_label",
+        fake_rail_count,
+    )
+
+    data = gather(config, FakeStore())
+
+    assert seen == [config]
+    assert data.inbox_count == 13
+    assert "13 inbox items waiting" in data.briefing
+
+
 def test_polly_dashboard_i_key_routes_to_inbox(monkeypatch, tmp_path: Path) -> None:
     calls: list[bool] = []
 

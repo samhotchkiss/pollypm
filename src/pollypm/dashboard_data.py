@@ -403,6 +403,21 @@ def _count_inbox_tasks(config: PollyPMConfig) -> int:
     return total
 
 
+def _count_dashboard_inbox_items(config: PollyPMConfig) -> int:
+    """Return the user-facing inbox count shown on the cockpit home.
+
+    The cockpit home and rail are the same at-a-glance surface, so their
+    inbox counts must come from the same registered-project scan. The
+    older tracked-only helper remains for doctor / recovery checks that
+    intentionally ignore untracked project DBs.
+    """
+    try:
+        from pollypm.cockpit_inbox import _count_inbox_tasks_for_label
+        return int(_count_inbox_tasks_for_label(config) or 0)
+    except Exception:  # noqa: BLE001
+        return _count_inbox_tasks(config)
+
+
 def _user_waiting_task_ids_across_projects(
     config: PollyPMConfig,
 ) -> frozenset[str]:
@@ -587,7 +602,7 @@ def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
 
     commits = _recent_commits(config, hours=24)
     completed = _completed_issues(config, hours=72)
-    inbox_count = _count_inbox_tasks(config)
+    inbox_count = _count_dashboard_inbox_items(config)
     recent_messages = _recent_inbox_messages(config)
     sweeps = sum(1 for e in day_events if e.event_type == "heartbeat")
     recoveries = sum(1 for e in day_events if "recover" in e.event_type)

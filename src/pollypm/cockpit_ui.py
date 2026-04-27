@@ -1383,7 +1383,20 @@ class PollyCockpitApp(App[None]):
             self._last_nav_change = self._tick_count
             self._apply_active_view_to_rows()
 
+    # Right-pane surfaces that carry their own scrollable item list.
+    # While one of these is mounted, j/k forwards from the rail to the
+    # right pane so list navigation works regardless of which tmux pane
+    # holds focus (#856). Rail-level navigation remains available on
+    # Up/Down/g/G/Tab.
+    _LIST_SURFACE_KEYS: frozenset[str] = frozenset({"inbox", "activity"})
+
+    def _on_list_surface(self) -> bool:
+        return self.selected_key in self._LIST_SURFACE_KEYS
+
     def action_cursor_down(self) -> None:
+        if self._on_list_surface():
+            self._send_key_to_right_pane("j")
+            return
         if self.nav.index is None:
             self.nav.index = 0
         else:
@@ -1391,6 +1404,9 @@ class PollyCockpitApp(App[None]):
         self._sync_selected_from_nav()
 
     def action_cursor_up(self) -> None:
+        if self._on_list_surface():
+            self._send_key_to_right_pane("k")
+            return
         if self.nav.index is None:
             self.nav.index = 0
         else:
@@ -5397,17 +5413,28 @@ class PollyInboxApp(App[None]):
         color: #8b98a4;
     }
     #inbox-list > .inbox-row.-highlight {
-        background: #1e2730;
+        /* Unfocused highlight is also visible (#857). The earlier
+           muted ``#1e2730`` was indistinguishable from idle rows on
+           tmux capture and made the focused inbox item invisible
+           when the user opened the inbox via the rail. */
+        background: #2a3a4d;
+        color: #f2f6f8;
+        border-left: thick #5b8aff;
     }
     #inbox-list > .inbox-row.rejection-feedback.-highlight {
-        background: #23180f;
+        background: #3a2614;
+        color: #fff3df;
+        border-left: thick #ffb454;
     }
     #inbox-list > .inbox-row.action-required.-highlight {
-        background: #252013;
+        background: #3a3018;
+        color: #fff8df;
+        border-left: thick #f0c45a;
     }
     #inbox-list > .inbox-row.orphaned.-highlight {
-        background: #17202a;
-        color: #c3ced7;
+        background: #1d2732;
+        color: #d0d8de;
+        border-left: thick #5b8aff;
     }
     #inbox-list:focus > .inbox-row.-highlight {
         background: #253140;

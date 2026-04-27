@@ -3574,6 +3574,48 @@ def test_cockpit_forwards_l_to_right_pane_only_on_project_surface() -> None:
     assert sent == ["l"]
 
 
+def test_cockpit_jk_forwards_to_inbox_when_on_list_surface() -> None:
+    """j/k from rail forwards to right pane on inbox/activity (#856)."""
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    sent: list[str] = []
+    moves: list[str] = []
+    app._send_key_to_right_pane = lambda key: sent.append(key)  # type: ignore[method-assign]
+    app._sync_selected_from_nav = lambda: moves.append("sync")  # type: ignore[method-assign]
+
+    class _Nav:
+        index: int | None = 0
+
+        def action_cursor_down(self) -> None:
+            moves.append("nav_down")
+
+        def action_cursor_up(self) -> None:
+            moves.append("nav_up")
+
+    app.nav = _Nav()  # type: ignore[assignment]
+
+    # On a non-list surface, j/k navigates the rail.
+    app.selected_key = "polly"
+    app.action_cursor_down()
+    assert moves == ["nav_down", "sync"]
+    assert sent == []
+    moves.clear()
+
+    # On inbox, j/k forwards to the right pane and does *not* nav rail.
+    app.selected_key = "inbox"
+    app.action_cursor_down()
+    assert sent == ["j"]
+    assert moves == []
+
+    app.action_cursor_up()
+    assert sent == ["j", "k"]
+    assert moves == []
+
+    # Same on activity.
+    app.selected_key = "activity"
+    app.action_cursor_down()
+    assert sent == ["j", "k", "j"]
+
+
 def test_cockpit_app_binds_action_button_digits_at_priority() -> None:
     """1/2/3 must be priority bindings so the rail does not eat them silently (#862)."""
     bindings = {

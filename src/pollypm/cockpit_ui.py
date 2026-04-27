@@ -5762,6 +5762,19 @@ class PollyInboxApp(App[None]):
         except Exception:  # noqa: BLE001
             return None
 
+    def _project_key_is_unknown(self, project_key: str) -> bool:
+        """True when ``project_key`` is not a registered project.
+
+        Used by the inbox detail fallback (#855) so workspace-scoped
+        items render via the message renderer instead of the red
+        'Could not open project database' error.
+        """
+        try:
+            config = load_config(self.config_path)
+        except Exception:  # noqa: BLE001
+            return True
+        return project_key not in getattr(config, "projects", {})
+
     # ------------------------------------------------------------------
     # List rendering
     # ------------------------------------------------------------------
@@ -6356,7 +6369,25 @@ class PollyInboxApp(App[None]):
         self._set_reply_mode_for_task()
         svc = self._svc_for_task(task_id)
         if svc is None:
-            self.detail.update("[red]Could not open project database for this task.[/red]")
+            # Workspace-scoped tasks (project sentinel "inbox" or task IDs
+            # whose project is not a registered project) have no per-
+            # project database — we can still surface the message body
+            # by falling back to the generic message renderer instead of
+            # parking the user on a red error string (#855).
+            project_key = task_id.split("/", 1)[0] if "/" in task_id else None
+            is_workspace = (
+                project_key is None
+                or project_key in {"inbox", "workspace", "[workspace]"}
+                or self._project_key_is_unknown(project_key)
+            )
+            if is_workspace:
+                self._render_message_detail(item)
+                return
+            self.detail.update(
+                "[#f0c45a]This task lives in a project that is not "
+                "currently registered with PollyPM. Add the project "
+                "with `pm add-project` to load its details here.[/#f0c45a]"
+            )
             self._clear_rollup_items()
             return
         try:

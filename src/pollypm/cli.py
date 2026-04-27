@@ -45,6 +45,12 @@ from pollypm.config import (
 )
 from pollypm.cli_help import help_with_examples
 from pollypm.cli_features.alerts import alert_app, heartbeat_app, session_app
+from pollypm.launch_state import (
+    LaunchAction,
+    LaunchProbe,
+    LaunchState,
+    plan_launch,
+)
 from pollypm.cli_features.issues import issue_app, itsalive_app, report_app
 from pollypm.cli_features.maintenance import debug_app, register_maintenance_commands
 from pollypm.cli_features.migrate import register_migrate_commands
@@ -440,6 +446,69 @@ def onboard(
     typer.echo("Next step: run `pollypm up` or `uv run pm up` to create or attach to the PollyPM tmux session.")
 
 
+def _build_launch_probe(supervisor) -> LaunchProbe:
+    """Build a :class:`LaunchProbe` snapshot from the supervisor.
+
+    The probe reads tmux state through the public ``supervisor.tmux``
+    surface plus the configured session names. Pane-level liveness
+    (console / rail) defaults to ``True`` when the underlying tmux
+    introspection is not available — assuming live is the safer
+    default than triggering a respawn on a stale snapshot.
+
+    The state machine (#884) consumes this and returns the named
+    :class:`LaunchState`. ``up()`` echoes the state name + reason so
+    every launch decision is observable in the CLI output.
+    """
+    project = getattr(getattr(supervisor, "config", None), "project", None)
+    main_name = getattr(project, "tmux_session", "") or ""
+    closet_name = ""
+    closet_getter = getattr(supervisor, "storage_closet_session_name", None)
+    if callable(closet_getter):
+        try:
+            closet_name = closet_getter() or ""
+        except Exception:  # noqa: BLE001 — probe must never raise
+            closet_name = ""
+    # Fallback derivation: the supervisor's canonical convention
+    # is ``<main>-storage-closet``. When a supervisor mock / older
+    # test harness omits the helper, derive the name so the state
+    # machine still has a non-empty closet name to reason about.
+    if not closet_name and main_name:
+        closet_name = f"{main_name}-storage-closet"
+
+    tmux = getattr(supervisor, "tmux", None)
+
+    def _safe(call, *args, default):
+        if tmux is None:
+            return default
+        method = getattr(tmux, call, None)
+        if method is None:
+            return default
+        try:
+            return method(*args)
+        except Exception:  # noqa: BLE001
+            return default
+
+    main_alive = bool(_safe("has_session", main_name, default=False)) if main_name else False
+    closet_alive = (
+        bool(_safe("has_session", closet_name, default=False)) if closet_name else False
+    )
+    current_tmux = _safe("current_session_name", default=None)
+
+    return LaunchProbe(
+        main_session_name=main_name,
+        closet_session_name=closet_name,
+        main_session_alive=main_alive,
+        closet_session_alive=closet_alive,
+        # Console / rail pane liveness probes are best-effort; the
+        # state machine treats "live" as the safer default. Future
+        # PRs can enrich this with TmuxClient.list_panes inspection.
+        console_pane_alive=True,
+        rail_pane_alive=True,
+        rail_pane_running_non_shell=True,
+        current_tmux_session=current_tmux,
+    )
+
+
 @app.command(help=_UP_HELP)
 def up(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
@@ -467,6 +536,17 @@ def up(
     ):
         start_transcript_ingestion(supervisor.config)
     session_name = supervisor.config.project.tmux_session
+
+    # #884 — consult the launch state machine before any tmux
+    # mutation. The plan names the state and explains the
+    # reasoning; UNSUPPORTED is rejected up front with the
+    # plan's actionable message instead of speculatively
+    # mutating ambient tmux state.
+    plan = plan_launch(_build_launch_probe(supervisor))
+    typer.echo(f"[launch] {plan.state.value}: {plan.reason}")
+    if plan.state is LaunchState.UNSUPPORTED:
+        raise typer.BadParameter(plan.reason)
+
     current_tmux = supervisor.tmux.current_session_name()
 
     if not supervisor.tmux.has_session(session_name):

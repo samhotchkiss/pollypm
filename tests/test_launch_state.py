@@ -37,10 +37,12 @@ def _probe(
     upgrade_marker: bool = False,
     persisted: frozenset[str] = frozenset(),
     tmux_windows: frozenset[str] = frozenset(),
+    main_name: str = "pollypm",
+    closet_name: str = "pollypm-storage-closet",
 ) -> LaunchProbe:
     return LaunchProbe(
-        main_session_name="pollypm",
-        closet_session_name="pollypm-storage-closet",
+        main_session_name=main_name,
+        closet_session_name=closet_name,
         main_session_alive=main_alive,
         closet_session_alive=closet_alive,
         console_pane_alive=console_alive,
@@ -77,6 +79,22 @@ def test_first_launch_inside_unrelated_tmux() -> None:
     plan = plan_launch(_probe(current_tmux="otherwork"))
     assert plan.state is LaunchState.FIRST_LAUNCH
     assert plan.context is LaunchContext.INSIDE_UNRELATED_TMUX
+    assert plan.actions[-1] is LaunchAction.SWITCH_CLIENT
+
+
+def test_attach_existing_inside_unrelated_tmux_switches_client() -> None:
+    """Inside an unrelated tmux while Polly is alive: ``tmux
+    switch-client -t pollypm`` is the canonical handoff. Not
+    unsupported — the existing CLI does this today and this
+    test guards the behavior."""
+    plan = plan_launch(
+        _probe(
+            main_alive=True,
+            closet_alive=True,
+            current_tmux="otherwork",
+        )
+    )
+    assert plan.state is LaunchState.ATTACH_EXISTING
     assert plan.actions[-1] is LaunchAction.SWITCH_CLIENT
 
 
@@ -244,32 +262,22 @@ def test_upgrade_marker_ignored_when_main_dead() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_unsupported_fails_closed_with_actionable_message() -> None:
-    """Inside an unrelated tmux while main is alive: nest-tmux is
-    a footgun. Fail closed, give the user the exact command."""
-    plan = plan_launch(
-        _probe(
-            main_alive=True,
-            closet_alive=True,
-            current_tmux="otherwork",
-        )
-    )
+def test_unsupported_fails_closed_when_session_names_missing() -> None:
+    """A probe whose own session names are empty (config did not
+    supply `project.tmux_session`) is the genuinely unsupported
+    case. Refusing here keeps the launcher from speculatively
+    mutating ambient tmux state."""
+    plan = plan_launch(_probe(main_name="", closet_name=""))
     assert plan.state is LaunchState.UNSUPPORTED
     assert plan.actions == (LaunchAction.FAIL_CLOSED,)
-    assert "tmux switch-client" in plan.reason
+    assert "tmux_session" in plan.reason or "names missing" in plan.reason
 
 
 def test_fail_closed_plan_is_terminal() -> None:
     """A fail-closed plan must be a single FAIL_CLOSED action so
     the runtime cannot accidentally run repair steps before the
     refuse-to-act decision."""
-    plan = plan_launch(
-        _probe(
-            main_alive=True,
-            closet_alive=True,
-            current_tmux="otherwork",
-        )
-    )
+    plan = plan_launch(_probe(main_name="", closet_name=""))
     assert len(plan.actions) == 1
 
 
@@ -399,13 +407,7 @@ def test_every_state_is_reachable() -> None:
         ).state
     )  # UPGRADE_RESTART
     seen.add(
-        plan_launch(
-            _probe(
-                main_alive=True,
-                closet_alive=True,
-                current_tmux="otherwork",
-            )
-        ).state
+        plan_launch(_probe(main_name="", closet_name="")).state
     )  # UNSUPPORTED
 
     assert seen == expected, (

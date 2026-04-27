@@ -293,23 +293,28 @@ def plan_launch(probe: LaunchProbe) -> LaunchPlan:
     # UNSUPPORTED: short-circuit for combinations we refuse to handle.
     # ------------------------------------------------------------------
     #
-    # Inside an *unrelated* tmux while the Polly main session is
-    # also alive: we'd have to nest tmux clients. Cleaner to fail
-    # closed with an actionable message than to mutate the user's
-    # session.
-    if (
-        context is LaunchContext.INSIDE_UNRELATED_TMUX
-        and probe.main_session_alive
-    ):
+    # The genuinely unsupported case is a probe whose own
+    # session names are empty — that means the config did not
+    # supply the names the launcher needs, and any further action
+    # would mutate ambient tmux state speculatively. Refuse with
+    # an actionable message instead.
+    #
+    # ``tmux switch-client`` is safe across unrelated tmux
+    # sessions, so being inside an unrelated tmux while Polly is
+    # alive is *not* unsupported — the existing launcher
+    # successfully calls switch_client in that case. The audit's
+    # "fails closed when state is unsupported" rule is about
+    # avoiding speculative pane mutation, not about refusing
+    # legitimate switch-client attaches.
+    if not probe.main_session_name or not probe.closet_session_name:
         return LaunchPlan(
             state=LaunchState.UNSUPPORTED,
             context=context,
             actions=(LaunchAction.FAIL_CLOSED,),
             reason=(
-                "You're inside an unrelated tmux session and Polly is "
-                "already running. Detach (Ctrl+b d) and re-run `pm up`, "
-                "or switch with `tmux switch-client -t "
-                f"{probe.main_session_name}`."
+                "Tmux session names missing from config — set "
+                "`project.tmux_session` in pollypm.toml and re-run "
+                "`pm up`."
             ),
         )
 

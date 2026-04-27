@@ -1386,11 +1386,27 @@ class PollyCockpitApp(App[None]):
         self.call_from_thread(self._refresh_rows)
 
     def action_refresh(self) -> None:
+        self._recover_cockpit_render(force_render=False)
+
+    def on_resize(self, _event: events.Resize) -> None:
+        self.call_after_refresh(self._recover_after_resize)
+
+    def _recover_after_resize(self) -> None:
+        self._recover_cockpit_render(force_render=True)
+
+    def _recover_cockpit_render(self, *, force_render: bool) -> None:
         try:
             self.router.ensure_cockpit_layout()
         except Exception:  # noqa: BLE001
             pass
         self._refresh_rows()
+        if not force_render:
+            return
+        try:
+            self.nav.refresh(layout=True)
+            self.refresh(layout=True)
+        except Exception:  # noqa: BLE001
+            pass
 
     def action_request_quit(self) -> None:
         result = self.router.tmux.run(

@@ -2903,6 +2903,47 @@ def test_cockpit_ui_arrow_and_enter_route_selected(tmp_path: Path) -> None:
     asyncio.run(exercise())
 
 
+def test_cockpit_app_resize_schedules_layout_recovery() -> None:
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    scheduled: list[str] = []
+
+    def _call_after_refresh(callback):
+        scheduled.append(callback.__name__)
+
+    app.call_after_refresh = _call_after_refresh  # type: ignore[method-assign]
+
+    app.on_resize(object())  # type: ignore[arg-type]
+
+    assert scheduled == ["_recover_after_resize"]
+
+
+def test_cockpit_app_resize_recovery_repairs_layout_and_repaints() -> None:
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    calls: list[object] = []
+
+    class _Router:
+        def ensure_cockpit_layout(self) -> None:
+            calls.append("layout")
+
+    class _Nav:
+        def refresh(self, *, layout: bool = False) -> None:
+            calls.append(("nav_refresh", layout))
+
+    app.router = _Router()  # type: ignore[assignment]
+    app.nav = _Nav()  # type: ignore[assignment]
+    app._refresh_rows = lambda: calls.append("rows")  # type: ignore[method-assign]
+    app.refresh = lambda *, layout=False: calls.append(("app_refresh", layout))  # type: ignore[method-assign]
+
+    app._recover_after_resize()
+
+    assert calls == [
+        "layout",
+        "rows",
+        ("nav_refresh", True),
+        ("app_refresh", True),
+    ]
+
+
 def test_cockpit_rail_ctrl_k_routes_to_settings(monkeypatch, tmp_path: Path) -> None:
     class FakeRouter:
         def __init__(self, _config_path: Path) -> None:

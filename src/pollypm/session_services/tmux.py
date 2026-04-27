@@ -1001,12 +1001,20 @@ class TmuxSessionService:
         # See issue #263.
         display_path = prompt_path
         instruct_path = self._config.project.root_dir / ".pollypm" / "docs" / "SYSTEM.md"
+        # Mirror the supervisor framing (#868): tag the bootstrap so a
+        # user who opens the chat sees this is plumbing, not directed
+        # at them.
+        framing_header = (
+            "[PollyPM bootstrap — system message, please ignore on screen]"
+        )
         if instruct_path.exists():
             instruct_display = instruct_path
             return (
+                f"{framing_header}\n"
                 f"Read {instruct_display} for system context, then read {display_path} for your role. "
                 f'Adopt both as your operating instructions, reply only "ready", then wait.'
             )
         return (
+            f"{framing_header}\n"
             f'Read {display_path}, adopt it as your operating instructions, reply only "ready", then wait.'
         )

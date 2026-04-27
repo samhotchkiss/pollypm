@@ -116,6 +116,43 @@ _ROLE_PERSONA_MARKER: dict[str, str] = {
 }
 
 
+# Identity preamble prepended to recovery prompts so the agent does not
+# drift into a different persona while reading the project-context
+# section that follows. Short, present-tense, role-defining (#869).
+_ROLE_IDENTITY_PREAMBLE: dict[str, str] = {
+    "operator-pm": (
+        "You are Polly, the operator. You manage the project workspace "
+        "from the cockpit's operator session — you are not Russell or "
+        "any project's PM."
+    ),
+    "reviewer": (
+        "You are Russell, the code reviewer. You enforce the quality "
+        "bar via approve/reject decisions — you are not Polly the "
+        "operator and not any project's PM."
+    ),
+    "architect": (
+        "You are Archie, the architect. You design plans for projects "
+        "to implement — you are not the worker who executes them."
+    ),
+    "heartbeat-supervisor": (
+        "You are the Heartbeat supervisor. You only check mechanical "
+        "session health — you do not own task work."
+    ),
+}
+
+
+def _identity_preamble_for_role(role: str | None) -> str:
+    """Return an identity preamble for ``role`` (#869).
+
+    Short string the supervisor prepends to the recovery prompt so a
+    role-scoped agent does not slide into a different persona after
+    reading the project-context section.
+    """
+    if not role:
+        return ""
+    return _ROLE_IDENTITY_PREAMBLE.get(role, "")
+
+
 # Phrasings that unambiguously claim a persona identity — e.g.
 # "Standing by as Russell", "I'm Polly", "Holding as Russell". Used
 # by :func:`detect_persona_drift` to decide whether the pane shows
@@ -2315,7 +2352,13 @@ class Supervisor:
                 last_recovered_at=previous_runtime.last_recovered_at if previous_runtime else None,
             )
             raise
-        # Inject recovery prompt so the agent knows what it was doing
+        # Inject recovery prompt so the agent knows what it was doing.
+        # For role-scoped agents (reviewer / heartbeat) prepend an
+        # identity reminder so a recovery that lands inside a noisy
+        # project-context section does not let the agent drift into the
+        # wrong persona (#869: Russell was self-identifying as
+        # 'Polly the operator' after recovering against a project that
+        # heavily mentions Polly).
         try:
             from pollypm.recovery_prompt import build_recovery_prompt
             recovery = build_recovery_prompt(
@@ -2323,6 +2366,11 @@ class Supervisor:
                 provider=launch.session.provider,
             )
             rendered = recovery.render()
+            identity_preamble = _identity_preamble_for_role(
+                launch.session.role,
+            )
+            if identity_preamble and rendered.strip():
+                rendered = f"{identity_preamble}\n\n{rendered}"
             if rendered.strip():
                 target = self._resolve_send_target(launch)
                 self.session_service.tmux.send_keys(target, rendered)
@@ -2844,13 +2892,22 @@ class Supervisor:
         display_path = prompt_path
         # Point to both SYSTEM.md (PollyPM reference) and the control prompt (role)
         instruct_path = self.config.project.root_dir / ".pollypm" / "docs" / "SYSTEM.md"
+        # Frame the bootstrap with an "ignore the next message" header
+        # so when the user opens PM Chat for the first time, they see a
+        # clear marker that the path-laden instruction the agent reads
+        # is plumbing — not something they're meant to act on (#868).
+        framing_header = (
+            "[PollyPM bootstrap — system message, please ignore on screen]"
+        )
         if instruct_path.exists():
             instruct_display = instruct_path
             return (
+                f"{framing_header}\n"
                 f'Read {instruct_display} for system context, then read {display_path} for your role. '
                 f'Adopt both as your operating instructions, reply only "ready", then wait.'
             )
         return (
+            f"{framing_header}\n"
             f'Read {display_path}, adopt it as your operating instructions, reply only "ready", then wait.'
         )
 

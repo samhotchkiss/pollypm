@@ -19,6 +19,23 @@ from pollypm.storage.state import StateStore
 # before parsing the snapshot.
 _ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*\x07?)")
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_BOX_DRAWING_PREFIXES = (
+    "─",
+    "│",
+    "┌",
+    "┐",
+    "└",
+    "┘",
+    "├",
+    "┤",
+    "┬",
+    "┴",
+    "┼",
+    "╭",
+    "╮",
+    "╰",
+    "╯",
+)
 
 
 def _sanitize_snapshot_line(text: str) -> tuple[str, bool]:
@@ -53,6 +70,24 @@ def _truncate_for_now_panel(text: str, *, limit: int = 70) -> str:
     if cut <= 0 or cut < limit - 20:
         cut = limit - 1
     return text[:cut].rstrip() + "…"
+
+
+def _snapshot_activity_status(line: str) -> str | None:
+    """Summarize Claude/Codex status chrome instead of echoing it verbatim."""
+    match = re.search(
+        r"\((?P<age>\d+[smh](?:\s*\d+s)?)\s*·[^)]*\btokens?\b(?P<tail>[^)]*)\)",
+        line,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    age = match.group("age").strip()
+    tail = match.group("tail").lower()
+    if "thinking" in tail:
+        state = "thinking"
+    else:
+        state = "active"
+    return f"{state} ({age})"
 
 
 @dataclass(slots=True)
@@ -292,7 +327,7 @@ def _session_description(status: str, role: str, snapshot_path: str | None) -> s
                 if not line or len(line) < 10:
                     continue
                 # Skip prompt lines and noise
-                if line.startswith(("❯", ">", "$", "%", "─", "│", "┌", "└")):
+                if line.startswith(("❯", ">", "$", "%", *_BOX_DRAWING_PREFIXES)):
                     continue
                 if "gpt-" in line.lower() or "default ·" in line:
                     continue
@@ -304,6 +339,11 @@ def _session_description(status: str, role: str, snapshot_path: str | None) -> s
                 # session isn't *doing* the bypass-permissions thing,
                 # it's idle waiting for input.
                 lower = line.lower()
+                activity_status = _snapshot_activity_status(line)
+                if activity_status is not None:
+                    return activity_status
+                if "readyring" in lower or lower.startswith("readying"):
+                    continue
                 if (
                     "bypass permissions on" in lower
                     or "ctrl+t to hide tasks" in lower

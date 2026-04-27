@@ -110,6 +110,31 @@ def test_session_description_strips_ansi_from_snapshot(tmp_path) -> None:
     assert "readyring" not in desc
 
 
+def test_session_description_summarizes_token_status_chrome(tmp_path) -> None:
+    """Claude status chrome is not useful prose for the home Now panel."""
+    from pollypm.dashboard_data import _session_description
+
+    snapshot = tmp_path / "snap.txt"
+    snapshot.write_text("⏺ readyring… (4s · ↑ 216 tokens · thinking)\n")
+
+    desc = _session_description("healthy", "worker", str(snapshot))
+
+    assert desc == "thinking (4s)"
+    assert "readyring" not in desc
+
+
+def test_session_description_skips_rounded_box_fragments(tmp_path) -> None:
+    """Rounded border fragments from an in-flight pane render are not content."""
+    from pollypm.dashboard_data import _session_description
+
+    snapshot = tmp_path / "snap.txt"
+    snapshot.write_text("╭───────────────────────────────────────────────\n")
+
+    desc = _session_description("healthy", "worker", str(snapshot))
+
+    assert desc == "idle"
+
+
 def test_session_description_truncates_at_word_boundary(tmp_path) -> None:
     """#792: ``[:70]`` chopped descriptions mid-word (``Phase A
     decisio``). Truncate at a word boundary and append ``…``.

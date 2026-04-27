@@ -21,11 +21,25 @@ from typing import Protocol
 
 from pollypm.config import PollyPMConfig
 from pollypm.models import SessionLaunchSpec
+from pollypm.signal_routing import (
+    envelope_for_alert as _envelope_for_alert,
+    register_routed_emitter as _register_routed_emitter,
+    route_signal as _route_signal,
+)
 from pollypm.store.protocol import Store
 from pollypm.storage.state import StateStore
 from pollypm.tmux.client import TmuxWindow
 
 _logger = logging.getLogger(__name__)
+
+
+# #894 — register the supervisor_alerts module as an emitter that
+# routes through SignalEnvelope. The release gate's
+# signal_routing_emitters check inspects ROUTED_EMITTERS for this
+# name; representative migration site is the suspected_loop +
+# stuck_session path that #765 cited as the canonical
+# user-actionable case.
+_register_routed_emitter("supervisor_alerts")
 
 
 class SupervisorAlertBoundary(Protocol):
@@ -159,15 +173,31 @@ def _update_alerts(
                 supervisor.msg_store.clear_alert(session_name, "suspected_loop")
             else:
                 # #760 — action-forward copy matching the heartbeat path.
+                # #894 — route through SignalEnvelope; the helper
+                # ensures supervisor_alerts and the toast tier
+                # classifier (cockpit_alerts.alert_channel) agree
+                # on audience / actionability / dedupe.
+                _suspect_body = (
+                    f"{launch.session.role or 'session'} {session_name} "
+                    f"stalled — no new output for 3 heartbeats with "
+                    f"queued work. Try: pm session restart {session_name}"
+                )
+                _route_signal(
+                    _envelope_for_alert(
+                        source="supervisor_alerts",
+                        alert_type="suspected_loop",
+                        severity_label="warn",
+                        session_name=session_name,
+                        subject=f"{session_name} appears stalled",
+                        body=_suspect_body,
+                        suggested_action=f"pm session restart {session_name}",
+                    )
+                )
                 supervisor.msg_store.upsert_alert(
                     session_name,
                     "suspected_loop",
                     "warn",
-                    (
-                        f"{launch.session.role or 'session'} {session_name} "
-                        f"stalled — no new output for 3 heartbeats with "
-                        f"queued work. Try: pm session restart {session_name}"
-                    ),
+                    _suspect_body,
                 )
                 active_alerts.append("suspected_loop")
                 longer_history = supervisor.store.recent_heartbeats(session_name, limit=5)

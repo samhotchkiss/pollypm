@@ -270,6 +270,17 @@ from pollypm.role_contract import (
     build_remediation_message as _build_canonical_remediation,
     canonical_role as _canonical_role,
 )
+from pollypm.signal_routing import (
+    envelope_for_alert as _envelope_for_alert,
+    register_routed_emitter as _register_routed_emitter,
+    route_signal as _route_signal,
+)
+
+
+# #894 — register the heartbeat as an emitter that routes through
+# SignalEnvelope. The release gate's ``signal_routing_emitters``
+# check inspects ``ROUTED_EMITTERS`` for this name.
+_register_routed_emitter("heartbeat")
 
 
 def _materialize_legacy_table(field: str) -> dict[str, str]:
@@ -699,15 +710,40 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             # ACTION_REQUIRED toast tier (cockpit_alerts.alert_channel
             # — #765). Drift is one of the rare cases where we DO want
             # to interrupt the user.
+            # #894 — route through SignalEnvelope so the canonical
+            # routing policy (audience/actionability/dedupe) is the
+            # source of truth for whether this alert toasts. The
+            # ``raise_alert`` call below is the existing storage
+            # write; SignalEnvelope.route_signal classifies the
+            # delivery surfaces — for ACTION_REQUIRED + USER the
+            # decision includes Toast, which matches the legacy
+            # severity="error" intent of the original site.
+            _drift_subject = (
+                f"{context.session_name} ({context.role}) drifted to "
+                f"{drifted_to!r}"
+            )
+            _drift_body = (
+                f"{context.session_name} ({context.role}) identified "
+                f"itself as {drifted_to!r} mid-session — identity drift. "
+                f"Try: pm session restart {context.session_name}"
+            )
+            _drift_envelope = _envelope_for_alert(
+                source="heartbeat",
+                alert_type="persona_drift_detected",
+                severity_label="error",
+                session_name=context.session_name,
+                subject=_drift_subject,
+                body=_drift_body,
+                suggested_action=(
+                    f"pm session restart {context.session_name}"
+                ),
+            )
+            _route_signal(_drift_envelope)
             api.raise_alert(
                 context.session_name,
                 "persona_drift_detected",
                 "error",
-                (
-                    f"{context.session_name} ({context.role}) identified "
-                    f"itself as {drifted_to!r} mid-session — identity drift. "
-                    f"Try: pm session restart {context.session_name}"
-                ),
+                _drift_body,
             )
             alerts.append("persona_drift_detected")
             # #757 — reactive remediation: send a one-shot re-assertion

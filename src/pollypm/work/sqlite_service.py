@@ -30,6 +30,26 @@ from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
 
+
+# #894 — register the work_service module as an emitter that routes
+# through SignalEnvelope. The release gate's
+# signal_routing_emitters check inspects ROUTED_EMITTERS for this
+# name. Representative migration site: ``maybe_record_first_shipped``
+# below builds a SignalEnvelope before the underlying
+# ``store.enqueue_message`` write, so the canonical routing policy
+# (audience / actionability / dedupe) is exercised on a real path.
+from pollypm.signal_routing import (  # noqa: E402
+    SignalActionability,
+    SignalAudience,
+    SignalEnvelope,
+    SignalSeverity,
+    compute_dedupe_key,
+    register_routed_emitter,
+    route_signal,
+)
+
+register_routed_emitter("work_service")
+
 from pollypm.atomic_io import atomic_write_json
 from pollypm.work.flow_engine import resolve_flow
 from pollypm.work.gates import GateRegistry, evaluate_gates
@@ -310,6 +330,27 @@ def _record_first_shipped_activity(
         "pinned": True,
         "shipped_at": shipped_at,
     }
+    # #894 — route through SignalEnvelope before the legacy
+    # store.enqueue_message write. first_shipped is informational —
+    # it lands on Activity + Inbox without toasting (the user
+    # discovers the celebration in their feed).
+    route_signal(
+        SignalEnvelope(
+            audience=SignalAudience.USER,
+            severity=SignalSeverity.INFO,
+            actionability=SignalActionability.INFORMATIONAL,
+            source="work_service",
+            subject="First PR shipped",
+            body="First PR shipped with Polly 🎉",
+            project=project_key,
+            dedupe_key=compute_dedupe_key(
+                source="work_service",
+                kind="first_shipped",
+                target=project_key,
+            ),
+            payload=payload,
+        )
+    )
     store = SQLAlchemyStore(f"sqlite:///{state_db}")
     try:
         store.enqueue_message(

@@ -101,15 +101,28 @@ def test_cockpit_interaction_audit_gate_passes_on_clean_registry() -> None:
     assert "registered" in result.summary.lower()
 
 
-def test_signal_routing_emitters_gate_is_warning_when_unmigrated() -> None:
-    """Until the high-traffic emitters migrate, the gate is a
-    warning — not a blocking failure — so it does not mask the
-    other gates' signals during the migration."""
+def test_signal_routing_emitters_gate_passes_on_current_tree() -> None:
+    """#894 — the heartbeat / supervisor_alerts / work_service
+    modules register themselves at import time and each routes at
+    least one representative signal site through ``route_signal``.
+    The gate must therefore PASS on the current tree."""
     result = gate_signal_routing_emitters_migrated()
-    # Migration is in progress; gate should be a warning.
-    if not result.passed:
-        assert result.severity is GateSeverity.WARNING
-        assert "migrated" in result.summary or "missing" in result.summary
+    assert result.passed, result.detail
+
+
+def test_signal_routing_emitters_gate_blocks_on_regression(monkeypatch) -> None:
+    """If a registration is removed, the gate flips to BLOCKING.
+    Synthesizes the regression by patching ``missing_routed_emitters``
+    and confirms the resulting GateResult severity."""
+    import pollypm.release_gate as rg
+
+    monkeypatch.setattr(
+        "pollypm.signal_routing.missing_routed_emitters",
+        lambda: frozenset({"heartbeat"}),
+    )
+    result = rg.gate_signal_routing_emitters_migrated()
+    assert result.passed is False
+    assert result.severity is GateSeverity.BLOCKING
 
 
 def test_security_checklist_gate_passes_on_current_tree() -> None:

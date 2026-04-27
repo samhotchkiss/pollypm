@@ -72,6 +72,7 @@ __all__ = [
     "alert_channel",
     "alert_should_toast",
     "compute_dedupe_key",
+    "envelope_for_alert",
     "is_operational_alert",
     "ROUTED_EMITTERS",
     "register_routed_emitter",
@@ -304,6 +305,71 @@ def route_signal(envelope: SignalEnvelope) -> RoutingDecision:
 # ---------------------------------------------------------------------------
 # Dedupe key helper
 # ---------------------------------------------------------------------------
+
+
+_SEVERITY_FROM_ALERT_LEVEL: Mapping[str, SignalSeverity] = {
+    "info": SignalSeverity.INFO,
+    "warn": SignalSeverity.WARN,
+    "warning": SignalSeverity.WARN,
+    "error": SignalSeverity.ERROR,
+    "critical": SignalSeverity.CRITICAL,
+}
+
+
+def envelope_for_alert(
+    *,
+    source: str,
+    alert_type: str,
+    severity_label: str,
+    session_name: str,
+    subject: str,
+    body: str,
+    suggested_action: str | None = None,
+    project: str | None = None,
+) -> SignalEnvelope:
+    """Build a :class:`SignalEnvelope` for a legacy ``upsert_alert``-shape
+    emission.
+
+    The audit (#894) requires high-traffic emitters (heartbeat,
+    supervisor_alerts, work_service) to route through
+    :class:`SignalEnvelope`. ``upsert_alert`` callers already carry
+    every field this helper needs — this is the bridge that lets a
+    site migrate without rewriting its store call.
+
+    The envelope's audience / actionability are derived from the
+    existing :func:`alert_channel` classification so
+    :func:`route_signal` and :func:`alert_channel` agree by
+    construction.
+    """
+    channel = alert_channel(alert_type)
+    if channel is AlertChannel.OPERATIONAL:
+        actionability = SignalActionability.OPERATIONAL
+        audience = SignalAudience.OPERATOR
+    elif channel is AlertChannel.INFORMATIONAL:
+        actionability = SignalActionability.INFORMATIONAL
+        audience = SignalAudience.USER
+    else:
+        actionability = SignalActionability.ACTION_REQUIRED
+        audience = SignalAudience.USER
+
+    return SignalEnvelope(
+        audience=audience,
+        severity=_SEVERITY_FROM_ALERT_LEVEL.get(
+            (severity_label or "").lower(),
+            SignalSeverity.WARN,
+        ),
+        actionability=actionability,
+        source=source,
+        subject=subject,
+        body=body,
+        project=project,
+        dedupe_key=compute_dedupe_key(
+            source=source,
+            kind=alert_type,
+            target=session_name,
+        ),
+        suggested_action=suggested_action,
+    )
 
 
 def compute_dedupe_key(

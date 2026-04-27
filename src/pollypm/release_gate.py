@@ -223,11 +223,28 @@ def gate_signal_routing_emitters_migrated() -> GateResult:
 
     Inspects :data:`pollypm.signal_routing.ROUTED_EMITTERS` for
     every entry in :func:`required_high_traffic_emitters`.
-    Failure is currently a *warning* because the migration is
-    in progress; once the work_service / supervisor_alerts /
-    heartbeat emitters are converted, this becomes blocking.
+
+    #894 — once the heartbeat, supervisor_alerts, and
+    work_service modules registered themselves at import time
+    AND each routed at least one representative signal site
+    through ``route_signal``, the gate flipped to BLOCKING. A
+    regression that drops a registration (or removes the
+    representative call site) blocks v1.
+
+    The gate cannot enforce that *every* emit site in those
+    modules has migrated — that is a follow-up. What it
+    enforces is that the registration is real (the emitter is
+    importable and active) so the migration cannot quietly
+    backslide to scaffolding.
     """
     try:
+        # Importing the emitter modules is what triggers their
+        # ``register_routed_emitter(...)`` call at module load.
+        # Without this side-effect import, the registry is empty
+        # (no other consumer in the gate path imports them).
+        import pollypm.heartbeats.local  # noqa: F401
+        import pollypm.supervisor_alerts  # noqa: F401
+        import pollypm.work.sqlite_service  # noqa: F401
         from pollypm.signal_routing import (
             missing_routed_emitters,
             required_high_traffic_emitters,
@@ -254,11 +271,12 @@ def gate_signal_routing_emitters_migrated() -> GateResult:
     return GateResult(
         name="signal_routing_emitters",
         passed=False,
-        severity=GateSeverity.WARNING,
-        summary=f"{len(missing)} required emitters not yet migrated",
+        severity=GateSeverity.BLOCKING,
+        summary=f"{len(missing)} required emitters not registered",
         detail=(
             "missing: " + ", ".join(sorted(missing)) +
-            "\n(this gate becomes blocking once the migration ships)"
+            "\n(blocking — see docs/signal-routing-spec.md for "
+            "the migration contract)"
         ),
     )
 

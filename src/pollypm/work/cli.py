@@ -70,6 +70,9 @@ _JSON_OPTION = typer.Option(False, "--json", help="Output as JSON.")
 
 _TASK_NOT_FOUND_RE = re.compile(r"Task '([^']+)' not found\.")
 _INVALID_TASK_ID_RE = re.compile(r"Invalid task_id '([^']+)'\.")
+_REQUIRED_ROLE_RE = re.compile(
+    r"Required role '([^']+)' not provided\. Flow '([^']+)' requires: \[(.*)\]"
+)
 
 
 def _nearest_task_id(service: object | None, task_id: str) -> str | None:
@@ -125,6 +128,24 @@ def _render_work_service_error(exc: Exception, fn) -> str:
             else:
                 why = message
             return format_invalid_task_id_error(task_id, why=why)
+        match = _REQUIRED_ROLE_RE.search(message)
+        if match:
+            missing_role = match.group(1)
+            flow_name = match.group(2)
+            required_roles = re.findall(r"'([^']+)'", match.group(3))
+            if not required_roles:
+                required_roles = [missing_role]
+            role_flags = " ".join(
+                f"--role {role}=<agent>" for role in required_roles
+            )
+            return format_cli_error(
+                "Required task roles are missing.",
+                why=(
+                    f"flow '{flow_name}' requires "
+                    f"{', '.join(required_roles)}."
+                ),
+                fix=f"rerun with `{role_flags}`.",
+            )
 
     return render_cli_error(message)
 
@@ -525,7 +546,8 @@ def task_create(
     constraints_text = "\n".join(constraints) if constraints else None
 
     svc = _svc(db, project=project)
-    task = svc.create(
+    task = _run(
+        svc.create,
         title=title,
         description=description,
         type=task_type,

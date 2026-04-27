@@ -144,6 +144,8 @@ def test_mounts_with_global_scope_and_renders_entries(
             topbar_text = str(activity_app.topbar.render())
             assert "Activity" in topbar_text
             assert "project:" not in topbar_text
+            assert "↵ detail" in str(activity_app.hint.render())
+            assert "↵ table" not in str(activity_app.hint.render())
     _run(body())
 
 
@@ -665,11 +667,12 @@ def test_actionable_summary_truncation_preserves_try_command() -> None:
         "Try: pm task claim demo/5"
     )
 
-    rendered = _truncate_summary(summary, width=96)
+    rendered = _truncate_summary(summary)
 
     assert rendered.endswith("Try: pm task claim demo/5")
     assert "Try: pm task" in rendered
     assert not rendered.endswith("Try: pm task")
+    assert len(rendered) <= 96
 
 
 def test_message_column_blank_when_summary_equals_event_verb(

@@ -592,6 +592,27 @@ class TestCliJsonOutput:
 
 
 class TestCliErrors:
+    def test_cli_create_missing_roles_shows_fix_without_traceback(self, db_path):
+        result = runner.invoke(
+            task_app,
+            [
+                "create",
+                "Missing roles",
+                "--project",
+                "proj",
+                "--flow",
+                "standard",
+                "--db",
+                db_path,
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "Traceback" not in result.output
+        assert "✗ Required task roles are missing." in result.output
+        assert "Why: flow 'standard' requires worker, reviewer." in result.output
+        assert "Fix: rerun with `--role worker=<agent> --role reviewer=<agent>`." in result.output
+
     def test_cli_get_missing_task_includes_why_fix_and_suggestion(self, db_path):
         _create_task(db_path, title="Only task")
 

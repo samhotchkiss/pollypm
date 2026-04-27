@@ -90,7 +90,7 @@ def _format_activity_relative(timestamp: str) -> str:
         return timestamp[:16]
 
 
-def _truncate_summary(text: str, *, width: int = 140) -> str:
+def _truncate_summary(text: str, *, width: int = 96) -> str:
     """Tail-truncate a summary line while preserving action hints."""
     if not text:
         return ""
@@ -373,8 +373,8 @@ class PollyActivityFeedApp(App[None]):
         self.table.add_columns("Time", "Project", "Actor", "Event", "Message")
         self.detail.display = False
         self.filter_input.value = self._filter_fuzzy
-        self._refresh()
         self.table.focus()
+        self._refresh()
         _setup_alert_notifier(self, bind_a=False)
 
     def action_show_keyboard_help(self) -> None:

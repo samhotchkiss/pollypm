@@ -549,6 +549,11 @@ _RAIL_GLYPH_HELP: list[tuple[str, str]] = [
     ("✎", "reviewing"),
     ("⚠", "stuck or alerting"),
     ("○", "idle or offline project"),
+    # Project sparkline glyphs (#872). The trailing ``·▁▂▃▄▅▆▇█``
+    # bar-chart on each project row plots event count per bucket over
+    # roughly the last hour — taller bar = busier bucket. Without this
+    # legend the bars read as decorative noise.
+    ("·▁▂…█", "project activity sparkline (busier = taller bar)"),
 ]
 
 

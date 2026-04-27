@@ -278,6 +278,9 @@ def test_modal_includes_cockpit_rail_glyph_legend() -> None:
     assert "⚠" in keys
     assert "writing or working" in descriptions
     assert "current rail selection" in descriptions
+    # #872: the project sparkline glyphs need an on-screen legend.
+    assert any("sparkline" in desc.lower() for desc in
+               (d for _, d in glyph_rows))
 
 
 # ---------------------------------------------------------------------------

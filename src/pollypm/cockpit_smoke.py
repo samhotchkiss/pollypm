@@ -195,22 +195,28 @@ class SmokeHarness:
     # ------------------------------------------------------------------
 
     def snapshot(self) -> SmokeCapture:
-        """Walk the widget tree and capture the rendered text.
+        """Capture the rendered text the user actually sees.
 
-        Walks both the App's primary widget tree *and* the topmost
-        modal screen (if any) so screens pushed by a keystroke (like
-        the ``?`` help overlay) show up in the capture. Without that,
-        a smoke test that drives the help modal would assert against
-        the parent App's text and miss the actual content the user
-        is looking at.
+        #898 — earlier the harness walked ``app.query("*")`` and
+        flattened each widget's ``render()`` through a 200-column
+        ``rich.Console``. That captured pre-layout source text
+        and missed the very class of bugs the audit cares about:
+        text exists in widgets but is clipped / hidden / wrapped
+        differently at the configured terminal size.
+
+        The fix is to read Textual's compositor strips at the
+        configured size. ``compositor.render_strips()`` returns
+        one ``Strip`` per terminal row, post-layout, post-clip.
+        Each Strip's ``.text`` property is exactly what the user
+        would see at that row.
+
+        The harness still walks ``app.query("*")`` to count
+        widgets — the count is used by
+        :meth:`assert_minimum_widget_count` as a silent-compose
+        guard. Visible text comes from the compositor.
         """
-        parts: list[str] = []
-        widgets: int = 0
+        widgets = 0
         seen_widget_ids: set[int] = set()
-
-        # Walk every screen in the stack. Textual's ``screen_stack``
-        # places the active screen last; iterating the full stack
-        # captures both the parent App and any pushed modal.
         screen_stack = list(getattr(self.app, "screen_stack", []) or [])
         if not screen_stack:
             screens = [self.app.screen] if hasattr(self.app, "screen") else []
@@ -224,18 +230,62 @@ class SmokeHarness:
                     continue
                 seen_widget_ids.add(wid)
                 widgets += 1
-                rendered = _safe_render(widget)
-                if rendered:
-                    parts.append(rendered)
 
-        text = "\n".join(parts)
+        # Compositor read — the active (top-of-stack) screen's
+        # compositor is what the user sees. Strips that fail to
+        # render fall back to the legacy widget-walk so a smoke
+        # run never produces an empty capture purely because of
+        # a Textual API change.
+        strip_lines: list[str] = []
+        active_screen = screens[-1] if screens else None
+        compositor = getattr(active_screen, "_compositor", None) if active_screen else None
+        if compositor is not None:
+            try:
+                strips = compositor.render_strips()
+                for strip in strips:
+                    text = getattr(strip, "text", None)
+                    if isinstance(text, str):
+                        strip_lines.append(text)
+            except Exception:  # noqa: BLE001 — fall back to legacy walk
+                strip_lines = []
+
+        if not strip_lines:
+            # Fallback path. Documented and tested explicitly so
+            # callers know the harness can degrade gracefully on
+            # an environment where the compositor is unavailable.
+            # Use a fresh seen-set: the count walk above already
+            # marked every widget, so reusing that set would make
+            # the fallback walk a no-op.
+            strip_lines = self._fallback_widget_walk(screens, set())
+
+        text = "\n".join(strip_lines)
         capture = SmokeCapture(
             rendered_text=text,
             widget_count=widgets,
-            visible_lines=tuple(text.split("\n")),
+            visible_lines=tuple(strip_lines),
         )
         self._captures.append(capture)
         return capture
+
+    def _fallback_widget_walk(
+        self, screens, seen_widget_ids: set[int]
+    ) -> list[str]:
+        """Legacy widget-tree walk used when the compositor is
+        unavailable. Documented as a fallback so tests can assert
+        the path is reachable; production smoke runs use
+        ``render_strips`` (the audit's #898 contract)."""
+        parts: list[str] = []
+        for screen in screens:
+            for widget in screen.query("*"):
+                wid = id(widget)
+                if wid in seen_widget_ids:
+                    continue
+                seen_widget_ids.add(wid)
+                rendered = _safe_render(widget)
+                if rendered:
+                    parts.append(rendered)
+        text = "\n".join(parts)
+        return text.split("\n") if text else []
 
     @property
     def last(self) -> SmokeCapture:

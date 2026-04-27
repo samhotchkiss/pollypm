@@ -9,6 +9,7 @@ from pollypm.release_gate import (
     ReleaseReport,
     closure_comment_complete,
     gate_cockpit_interaction_audit_clean,
+    gate_cockpit_smoke_harness,
     gate_security_checklist,
     gate_signal_routing_emitters_migrated,
     gate_storage_legacy_writers,
@@ -210,6 +211,28 @@ def test_default_gates_include_security_checklist() -> None:
     assert "gate_security_checklist" in names
     assert "gate_storage_legacy_writers" in names
     assert "gate_task_invariant_metadata_complete" in names
+    assert "gate_cockpit_smoke_harness" in names
+
+
+def test_cockpit_smoke_harness_gate_passes_on_current_tree() -> None:
+    """#898 — the smoke matrix shape is a release-blocking
+    invariant. The current tree must pass."""
+    result = gate_cockpit_smoke_harness()
+    assert result.passed, result.detail
+
+
+def test_cockpit_smoke_harness_gate_blocks_on_drift(monkeypatch) -> None:
+    """If the size matrix drifts from the audit's published set,
+    the gate must fail BLOCKING."""
+    import pollypm.release_gate as rg
+
+    monkeypatch.setattr(
+        "pollypm.cockpit_smoke.SMOKE_TERMINAL_SIZES",
+        ((80, 30), (100, 40)),
+    )
+    result = rg.gate_cockpit_smoke_harness()
+    assert result.passed is False
+    assert result.severity is GateSeverity.BLOCKING
 
 
 # ---------------------------------------------------------------------------

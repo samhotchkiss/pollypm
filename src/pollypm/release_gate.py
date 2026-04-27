@@ -281,6 +281,76 @@ def gate_signal_routing_emitters_migrated() -> GateResult:
     )
 
 
+def gate_cockpit_smoke_harness() -> GateResult:
+    """Verify the rendered cockpit smoke matrix is reachable (#882, #898).
+
+    The audit (#898) requires the smoke matrix to be a blocking
+    launch check. The full Pilot-driven matrix is too heavy to
+    run from inside the gate process — it is part of the test
+    suite and is gated by CI. What this gate enforces is that
+    the harness MODULE is importable, the size matrix matches
+    the audit's published list (80x30, 100x40, 169x50, 200x50,
+    210x65), and the universal-assertion API is intact.
+
+    A regression that drops a size or removes an assertion
+    helper trips the gate; the audit's contract is that the
+    smoke matrix shape is itself a release-blocking invariant.
+    """
+    try:
+        from pollypm.cockpit_smoke import (
+            SMOKE_TERMINAL_SIZES,
+            SmokeHarness,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return GateResult(
+            name="cockpit_smoke_harness",
+            passed=False,
+            severity=GateSeverity.BLOCKING,
+            summary="cockpit_smoke not importable",
+            detail=str(exc),
+        )
+
+    expected_sizes = {(80, 30), (100, 40), (169, 50), (200, 50), (210, 65)}
+    if set(SMOKE_TERMINAL_SIZES) != expected_sizes:
+        return GateResult(
+            name="cockpit_smoke_harness",
+            passed=False,
+            severity=GateSeverity.BLOCKING,
+            summary="smoke size matrix drifted from the audit's published set",
+            detail=(
+                f"expected {sorted(expected_sizes)}, "
+                f"got {sorted(SMOKE_TERMINAL_SIZES)}"
+            ),
+        )
+    required_methods = (
+        "snapshot",
+        "assert_no_traceback",
+        "assert_no_bootstrap_prompt",
+        "assert_no_orphan_box_chars",
+        "assert_no_letter_by_letter_wrap",
+        "assert_text_visible",
+        "assert_text_not_visible",
+        "assert_minimum_widget_count",
+        "assert_counts_agree",
+    )
+    missing = [m for m in required_methods if not hasattr(SmokeHarness, m)]
+    if missing:
+        return GateResult(
+            name="cockpit_smoke_harness",
+            passed=False,
+            severity=GateSeverity.BLOCKING,
+            summary=f"smoke harness missing API: {', '.join(missing)}",
+        )
+    return GateResult(
+        name="cockpit_smoke_harness",
+        passed=True,
+        summary=(
+            f"smoke matrix has {len(SMOKE_TERMINAL_SIZES)} sizes; "
+            f"{len(required_methods)} canonical assertions present"
+        ),
+    )
+
+
 def gate_security_checklist() -> GateResult:
     """Run the launch security checklist (#892) and report any
     failing line as a blocking gate failure.
@@ -496,6 +566,7 @@ def gate_main_branch_green() -> GateResult:
 DEFAULT_GATES: tuple[Gate, ...] = (
     gate_main_branch_green,
     gate_cockpit_interaction_audit_clean,
+    gate_cockpit_smoke_harness,
     gate_signal_routing_emitters_migrated,
     gate_security_checklist,
     gate_storage_legacy_writers,

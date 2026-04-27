@@ -263,7 +263,7 @@ def test_probe_detects_dead_console_pane() -> None:
             return None
 
         def list_panes(self, _target: str) -> list[TmuxPane]:
-            # Two panes: dead console on the left, live rail TUI on
+            # Two panes: live rail TUI on the left, dead console on
             # the right. ``pane_left`` is "0" for left, "100" for right.
             return [
                 TmuxPane(
@@ -273,9 +273,9 @@ def test_probe_detects_dead_console_pane() -> None:
                     pane_index="0",
                     pane_id="%1",
                     active=False,
-                    pane_current_command="bash",
+                    pane_current_command="python",
                     pane_current_path="/",
-                    pane_dead=True,  # ← dead shell
+                    pane_dead=False,
                     pane_left="0",
                     pane_width="40",
                 ),
@@ -286,9 +286,9 @@ def test_probe_detects_dead_console_pane() -> None:
                     pane_index="1",
                     pane_id="%2",
                     active=True,
-                    pane_current_command="python",
+                    pane_current_command="bash",
                     pane_current_path="/",
-                    pane_dead=False,
+                    pane_dead=True,  # dead shell / right pane
                     pane_left="100",
                     pane_width="80",
                 ),
@@ -334,9 +334,9 @@ def test_probe_detects_dead_rail_pane() -> None:
                     pane_index="0",
                     pane_id="%1",
                     active=True,
-                    pane_current_command="bash",
+                    pane_current_command="python",
                     pane_current_path="/",
-                    pane_dead=False,
+                    pane_dead=True,  # dead rail
                     pane_left="0",
                     pane_width="40",
                 ),
@@ -347,9 +347,9 @@ def test_probe_detects_dead_rail_pane() -> None:
                     pane_index="1",
                     pane_id="%2",
                     active=False,
-                    pane_current_command="python",
+                    pane_current_command="bash",
                     pane_current_path="/",
-                    pane_dead=True,  # ← dead rail
+                    pane_dead=False,
                     pane_left="100",
                     pane_width="80",
                 ),
@@ -373,7 +373,7 @@ def test_probe_detects_dead_rail_pane() -> None:
     assert plan.state is LaunchState.RECOVER_DEAD_RAIL
 
 
-def test_probe_treats_rail_running_shell_as_attach() -> None:
+def test_probe_treats_rail_running_shell_as_recoverable() -> None:
     """#906 + #841 — a rail pane running a shell (not the TUI)
     means the rail dropped back to its shell. The state machine
     refuses to respawn a *live* non-shell rail; here the rail is
@@ -433,14 +433,10 @@ def test_probe_treats_rail_running_shell_as_attach() -> None:
     assert probe.rail_pane_running_non_shell is False
 
     plan = plan_launch(probe)
-    # Rail pane alive but running a shell — the state machine's
-    # ATTACH_EXISTING happy path requires
-    # rail_pane_running_non_shell=True. Anything else falls through
-    # to the closing default branch (also ATTACH_EXISTING by design;
-    # a future enhancement could promote shell-rail to its own
-    # state, but the contract today is "rail alive enough to
-    # attach"). The asserts above verify the probe field.
-    assert plan.state.value in {"attach_existing"}
+    # Rail pane alive but running a shell means the TUI died back to
+    # the shell prompt; attaching would strand the user in a broken
+    # cockpit, so the planner must recover it before attach.
+    assert plan.state.value in {"recover_dead_rail"}
 
 
 def test_probe_falls_back_when_list_panes_unavailable() -> None:

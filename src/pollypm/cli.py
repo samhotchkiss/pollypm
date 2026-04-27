@@ -562,11 +562,12 @@ def _classify_cockpit_panes(panes) -> tuple[bool, bool, bool]:
     """Classify the cockpit window's pane list into the three
     pane-liveness probe fields.
 
-    Convention: the cockpit window has up to two panes — left
-    (console shell) and right (rail TUI). ``pane_left`` is "0" for
-    the leftmost pane. Returns ``(console_alive, rail_alive,
-    rail_non_shell)``. When only one pane is present, that pane is
-    treated as the console (the rail split is missing).
+    Convention: the cockpit window has up to two panes — left rail TUI
+    and right scoped pane. ``pane_left`` is "0" for the leftmost pane.
+    Returns ``(console_alive, rail_alive, rail_non_shell)``. When only
+    one pane is present, infer whether it is the rail from the command:
+    shell means the rail has not started; non-shell means the right pane
+    is missing.
     """
     left = None
     right = None
@@ -582,20 +583,20 @@ def _classify_cockpit_panes(panes) -> tuple[bool, bool, bool]:
         if right is None or x > right[0]:
             right = (x, pane)
 
-    # Single-pane case: the only pane is the console; rail has not
-    # been split yet (which means rail_pane_alive=False so the state
-    # machine routes through RECOVER_DEAD_RAIL only when the rail is
-    # supposed to exist; with a single pane in the cockpit window
-    # the rail is genuinely missing).
     if left is right and left is not None:
-        console_alive = not bool(getattr(left[1], "pane_dead", False))
-        return (console_alive, False, False)
+        pane = left[1]
+        pane_alive = not bool(getattr(pane, "pane_dead", False))
+        pane_cmd = (getattr(pane, "pane_current_command", "") or "").lower()
+        pane_non_shell = pane_alive and pane_cmd not in _SHELL_COMMANDS
+        if pane_non_shell:
+            return (False, True, True)
+        return (pane_alive, False, False)
 
     if left is None or right is None:
         return (True, True, True)
 
-    console_pane = left[1]
-    rail_pane = right[1]
+    rail_pane = left[1]
+    console_pane = right[1]
     console_alive = not bool(getattr(console_pane, "pane_dead", False))
     rail_alive = not bool(getattr(rail_pane, "pane_dead", False))
     rail_cmd = (getattr(rail_pane, "pane_current_command", "") or "").lower()

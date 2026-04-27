@@ -402,15 +402,19 @@ def plan_launch(probe: LaunchProbe) -> LaunchPlan:
         )
 
     # ------------------------------------------------------------------
-    # RECOVER_DEAD_RAIL: rail pane dead, rail not running non-shell.
+    # RECOVER_DEAD_RAIL: rail pane dead or dropped back to a shell.
     # ------------------------------------------------------------------
     if (
         probe.main_session_alive
         and probe.console_pane_alive
-        and not probe.rail_pane_alive
+        and (
+            not probe.rail_pane_alive
+            or not probe.rail_pane_running_non_shell
+        )
     ):
         # #841: never respawn a *live* non-shell rail. The dead-
-        # rail branch only fires when the rail is genuinely dead.
+        # rail branch only fires when the rail is genuinely dead or
+        # has fallen back to an interactive shell.
         return LaunchPlan(
             state=LaunchState.RECOVER_DEAD_RAIL,
             context=context,
@@ -418,7 +422,7 @@ def plan_launch(probe: LaunchProbe) -> LaunchPlan:
                 LaunchAction.RESPAWN_RAIL,
                 _attach_action(context),
             ),
-            reason="rail pane is dead — respawn the rail",
+            reason="rail pane is not running the cockpit — respawn the rail",
         )
 
     # ------------------------------------------------------------------

@@ -645,6 +645,13 @@ class PollyCockpitApp(App[None]):
         Binding("s", "open_settings", "Settings"),
         Binding("tab", "forward_tab_to_right", "Right Pane", show=False, priority=True),
         Binding("A", "forward_workers_auto_refresh", "Workers Auto", show=False, priority=True),
+        # Forward Action Needed numbered buttons (1/2/3) from the rail
+        # to the right pane (#862). The cards advertise "Use 1/2/3 for
+        # the buttons below"; without this forward, those keystrokes are
+        # silently dropped while the rail tmux pane is the focused pane.
+        Binding("1", "forward_action_button_1", "Action 1", show=False, priority=True),
+        Binding("2", "forward_action_button_2", "Action 2", show=False, priority=True),
+        Binding("3", "forward_action_button_3", "Action 3", show=False, priority=True),
         Binding("u", "trigger_upgrade", "Upgrade", show=False),
         Binding("x", "dismiss_update_pill", "Dismiss Update", show=False),
         Binding("a", "view_alerts", "Alerts", show=False),
@@ -1408,6 +1415,15 @@ class PollyCockpitApp(App[None]):
     def action_forward_workers_auto_refresh(self) -> None:
         if self.selected_key == "workers":
             self._send_key_to_right_pane("A")
+
+    def action_forward_action_button_1(self) -> None:
+        self._send_key_to_right_pane("1")
+
+    def action_forward_action_button_2(self) -> None:
+        self._send_key_to_right_pane("2")
+
+    def action_forward_action_button_3(self) -> None:
+        self._send_key_to_right_pane("3")
 
     def action_toggle_project_pin(self) -> None:
         key = self._selected_row_key()

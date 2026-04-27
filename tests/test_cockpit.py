@@ -3520,3 +3520,30 @@ def test_cockpit_escape_at_home_is_noop() -> None:
     app.action_back_to_home()
 
     assert calls == [], f"expected no-op at home but saw {calls}"
+
+
+def test_cockpit_action_button_digits_forward_from_rail() -> None:
+    """1/2/3 from rail forwards to the right pane so Action Needed buttons fire (#862)."""
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    sent: list[str] = []
+    app._send_key_to_right_pane = lambda key: sent.append(key)  # type: ignore[method-assign]
+
+    app.action_forward_action_button_1()
+    app.action_forward_action_button_2()
+    app.action_forward_action_button_3()
+
+    assert sent == ["1", "2", "3"]
+
+
+def test_cockpit_app_binds_action_button_digits_at_priority() -> None:
+    """1/2/3 must be priority bindings so the rail does not eat them silently (#862)."""
+    bindings = {
+        binding.key: binding
+        for binding in PollyCockpitApp.BINDINGS
+        if binding.key in {"1", "2", "3"}
+    }
+    assert set(bindings) == {"1", "2", "3"}, f"missing digit bindings: {bindings.keys()}"
+    for key, binding in bindings.items():
+        assert getattr(binding, "priority", False), (
+            f"{key!r} must be a priority binding to round-trip from rail"
+        )

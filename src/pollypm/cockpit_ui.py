@@ -11243,14 +11243,23 @@ class PollyProjectDashboardApp(App[None]):
         """Toggle plan-view mode — plan.md takes over the body.
 
         When no plan exists, friendly-notify instead of flipping a mode
-        with nothing to show.
+        with nothing to show. Project-local ``[planner].enforce_plan
+        = false`` projects get a different toast that surfaces the
+        explicit bypass rather than nudging as if a plan is missing.
         """
         data = self.data
         if data is None or data.plan_path is None:
-            self.notify(
-                "No plan file yet for this project.",
-                severity="warning", timeout=2.0,
-            )
+            if data is not None and not getattr(data, "enforce_plan", True):
+                self.notify(
+                    "Plan not required for this project "
+                    "([planner].enforce_plan = false).",
+                    severity="information", timeout=2.0,
+                )
+            else:
+                self.notify(
+                    "No plan file yet for this project.",
+                    severity="warning", timeout=2.0,
+                )
             return
         self._plan_view_mode = not self._plan_view_mode
         other_section_ids = (
@@ -11325,10 +11334,17 @@ class PollyProjectDashboardApp(App[None]):
         """
         data = self.data
         if data is None or data.plan_path is None:
-            self.notify(
-                "No plan file to open.",
-                severity="warning", timeout=2.0,
-            )
+            if data is not None and not getattr(data, "enforce_plan", True):
+                self.notify(
+                    "Plan not required for this project — "
+                    "[planner].enforce_plan = false.",
+                    severity="information", timeout=2.0,
+                )
+            else:
+                self.notify(
+                    "No plan file to open.",
+                    severity="warning", timeout=2.0,
+                )
             return
         try:
             self._open_external(data.plan_path)

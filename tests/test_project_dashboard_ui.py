@@ -564,6 +564,75 @@ def test_plan_review_action_uses_contextual_review_plan_button(
     _run(body())
 
 
+def test_action_open_plan_with_enforce_plan_false_says_bypass(
+    dashboard_app,
+) -> None:
+    """``p`` (open plan view) on a no-plan project with enforce_plan=false
+    surfaces the explicit bypass instead of nudging the user about
+    a missing plan. Same shape as the dashboard Plan section copy
+    (cycle 6).
+    """
+    from types import SimpleNamespace
+
+    dashboard_app.data = SimpleNamespace(
+        plan_path=None,
+        enforce_plan=False,
+    )
+    notifications: list[tuple[str, str]] = []
+    dashboard_app.notify = lambda msg, **kw: notifications.append(  # type: ignore[method-assign]
+        (kw.get("severity", "information"), msg)
+    )
+    dashboard_app.action_open_plan()
+    assert len(notifications) == 1
+    severity, msg = notifications[0]
+    assert "Plan not required" in msg
+    assert "enforce_plan = false" in msg
+    assert severity == "information"
+
+
+def test_action_open_plan_with_enforce_plan_true_warns_about_missing(
+    dashboard_app,
+) -> None:
+    """Default enforce_plan=true keeps the original 'no plan yet' warning."""
+    from types import SimpleNamespace
+
+    dashboard_app.data = SimpleNamespace(
+        plan_path=None,
+        enforce_plan=True,
+    )
+    notifications: list[tuple[str, str]] = []
+    dashboard_app.notify = lambda msg, **kw: notifications.append(  # type: ignore[method-assign]
+        (kw.get("severity", "information"), msg)
+    )
+    dashboard_app.action_open_plan()
+    assert len(notifications) == 1
+    severity, msg = notifications[0]
+    assert "No plan file yet" in msg
+    assert severity == "warning"
+
+
+def test_action_open_editor_with_enforce_plan_false_says_bypass(
+    dashboard_app,
+) -> None:
+    """``e`` (open in editor) honors the bypass identically."""
+    from types import SimpleNamespace
+
+    dashboard_app.data = SimpleNamespace(
+        plan_path=None,
+        enforce_plan=False,
+    )
+    notifications: list[tuple[str, str]] = []
+    dashboard_app.notify = lambda msg, **kw: notifications.append(  # type: ignore[method-assign]
+        (kw.get("severity", "information"), msg)
+    )
+    dashboard_app.action_open_editor()
+    assert len(notifications) == 1
+    severity, msg = notifications[0]
+    assert "Plan not required" in msg
+    assert "enforce_plan = false" in msg
+    assert severity == "information"
+
+
 def test_record_action_response_distinguishes_resume_from_no_op(
     dashboard_app, monkeypatch,
 ) -> None:

@@ -1838,6 +1838,12 @@ class PollyTasksApp(App[None]):
 
     def action_back(self) -> None:
         if self.search_input.has_focus:
+            if self.search_input.value:
+                self.search_input.value = ""
+                self._search_query = ""
+                self._render_table(select_first=True)
+                self.search_input.focus()
+                return
             self.task_table.focus()
             return
         self.exit()
@@ -2075,11 +2081,15 @@ class PollyTasksApp(App[None]):
         )
 
     def action_approve_task(self) -> None:
+        if isinstance(getattr(self, "focused", None), Input):
+            return
         if not self._selected_task_id:
             return
         self._review_task(self._selected_task_id, decision="approve")
 
     def action_toggle_task_selection(self) -> None:
+        if isinstance(getattr(self, "focused", None), Input):
+            return
         task_id = self._current_task_key()
         if task_id is None:
             return
@@ -2105,15 +2115,21 @@ class PollyTasksApp(App[None]):
         )
 
     def action_bulk_approve_selected(self) -> None:
+        if isinstance(getattr(self, "focused", None), Input):
+            return
         self._review_selected_tasks(decision="approve")
 
     def action_bulk_reject_selected(self) -> None:
+        if isinstance(getattr(self, "focused", None), Input):
+            return
         self._review_selected_tasks(
             decision="reject",
             reason="Bulk rejected from task cockpit",
         )
 
     def action_reject_task(self) -> None:
+        if isinstance(getattr(self, "focused", None), Input):
+            return
         if not self._selected_task_id:
             return
         task_id = self._selected_task_id
@@ -2151,8 +2167,12 @@ class PollyTasksApp(App[None]):
 
     @on(Input.Changed, "#tasks-search")
     def _on_search_changed(self, event: Input.Changed) -> None:
+        keep_focus = self.search_input.has_focus
         self._search_query = event.value or ""
         self._render_table(select_first=True)
+        if keep_focus:
+            self.search_input.focus()
+            self.search_input.cursor_position = len(self.search_input.value)
 
     @on(Input.Submitted, "#tasks-search")
     def _on_search_submitted(self) -> None:

@@ -343,6 +343,59 @@ def test_task_app_surfaces_stage_timestamps_and_live_session_tabs(env, monkeypat
     _run(body())
 
 
+def test_task_search_keeps_focus_and_suppresses_review_shortcuts(
+    env, monkeypatch,
+) -> None:
+    if not _load_config_compatible(env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_tasks import PollyTasksApp
+
+    review_task = _task(
+        node_id="critic_panel",
+        title="Review xylophone",
+        status=WorkStatus.REVIEW,
+    )
+    fake_svc = _FakeSvc(tasks_factory=lambda: [review_task], flow=_flow())
+
+    monkeypatch.setattr("pollypm.cockpit_tasks.create_tmux_client", lambda: _FakeTmux([]))
+
+    app = PollyTasksApp(env["config_path"], "demo")
+    app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await pilot.press("/")
+            await pilot.press("x")
+            await pilot.pause()
+
+            assert app.search_input.has_focus
+            assert app.search_input.value == "x"
+            assert app._search_query == "x"
+            assert app._active_reject_modal is None
+            assert fake_svc.approve_calls == []
+            assert fake_svc.reject_calls == []
+
+            await pilot.press("backspace")
+            await pilot.pause()
+            assert app.search_input.has_focus
+            assert app.search_input.value == ""
+            assert app._search_query == ""
+
+            await pilot.press("a")
+            await pilot.pause()
+            assert app.search_input.value == "a"
+            assert fake_svc.approve_calls == []
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.search_input.has_focus
+            assert app.search_input.value == ""
+            assert app._search_query == ""
+
+    _run(body())
+
+
 def test_plan_review_task_surfaces_plan_artifact_and_selects_review_tab(
     env, monkeypatch,
 ) -> None:

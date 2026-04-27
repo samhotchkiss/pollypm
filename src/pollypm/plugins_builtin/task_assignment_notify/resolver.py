@@ -310,11 +310,14 @@ def notify(
                 event.task_id, exc_info=True,
             )
 
-    # #922: stamp the per-execution kickoff marker so the heartbeat
-    # sweep stops force-pushing this kickoff. The flag is keyed by
-    # ``(project, task_number, node, visit)`` — a reject-bounce that
-    # opens a fresh visit gets a NULL stamp and re-delivers correctly.
-    _mark_kickoff_delivered(event, services.work_service)
+    # #923: ``notify()`` deliberately does NOT stamp ``kickoff_sent_at``
+    # any more. The transition-time call site (claim → in_process listener)
+    # races the per-task pane bootstrap: the message can be sent into a
+    # still-loading pane and silently lost while the stamp lands as if
+    # delivery succeeded. The sweep handler is now the sole writer to the
+    # marker — it only stamps after observing a successful send against
+    # an actually-resolvable session, so a lost transition-time push gets
+    # re-delivered on the next sweep tick. See ``handlers/sweep.py``.
 
     return {
         "outcome": "sent",
@@ -351,11 +354,17 @@ def _mark_kickoff_delivered(
 ) -> None:
     """Best-effort: stamp the active execution row's kickoff_sent_at.
 
-    Called from ``notify()`` after a successful send. Silently no-ops
-    when the work service doesn't expose ``mark_kickoff_sent`` (test
-    doubles), when the event isn't a worker kickoff, or when the
-    service raises — the dedupe table still suppresses duplicates so a
-    missing stamp at worst lets the next sweep tick re-fire once.
+    #923: this is now called *only* from the sweep handler, after a
+    confirmed-target send has succeeded. Stamping from the transition-
+    time ``notify()`` was unsafe because the per-task pane is often
+    still bootstrapping at claim time — the keystrokes land in a
+    still-loading shell and are lost while the stamp records as if
+    delivery succeeded.
+
+    Silently no-ops when the work service doesn't expose
+    ``mark_kickoff_sent`` (test doubles), when the event isn't a worker
+    kickoff, or when the service raises — a missing stamp at worst lets
+    the next sweep tick re-fire once.
     """
     if work_service is None:
         return

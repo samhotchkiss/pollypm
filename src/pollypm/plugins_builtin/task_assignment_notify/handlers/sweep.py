@@ -60,6 +60,7 @@ from pollypm.plugins_builtin.project_planning.plan_presence import (
 )
 from pollypm.plugins_builtin.task_assignment_notify.resolver import (
     SWEEPER_COOLDOWN_SECONDS,
+    _mark_kickoff_delivered,
     load_runtime_services,
     notify,
 )
@@ -560,9 +561,8 @@ def _sweep_work_service(
             totals["considered"] += 1
             # #922: when the kickoff hasn't been delivered yet, drop
             # the throttle to 0 so the dedupe table doesn't suppress
-            # the first push. ``notify()`` stamps ``kickoff_sent_at``
-            # on success, after which the next sweep tick falls back
-            # to the normal throttle.
+            # the first push. The stamp landing on success keeps the
+            # next sweep tick on the normal throttle.
             effective_throttle = 0 if kickoff_pending else throttle_override
             result = notify(
                 event, services=services, throttle_seconds=effective_throttle,
@@ -572,6 +572,16 @@ def _sweep_work_service(
                 by_outcome["forced_kickoff"] = (
                     by_outcome.get("forced_kickoff", 0) + 1
                 )
+            # #923: the sweep is the sole writer of ``kickoff_sent_at``.
+            # ``notify()`` no longer stamps from the transition-time
+            # listener (the per-task pane often hasn't finished
+            # bootstrapping when the claim event fires, so the keystrokes
+            # are silently dropped while the stamp lies about delivery).
+            # Stamping here — after a confirmed-target ``sent`` — means
+            # a re-resolved + re-sent ping is what marks the kickoff as
+            # delivered, not an opportunistic transition-time call.
+            if outcome == "sent":
+                _mark_kickoff_delivered(event, work)
             by_outcome[outcome] = by_outcome.get(outcome, 0) + 1
             _record_sweeper_ping(
                 work,

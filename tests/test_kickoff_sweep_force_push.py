@@ -344,20 +344,26 @@ class TestUndeliveredKickoffIsRecoverable:
 
 
 # ---------------------------------------------------------------------------
-# (4) notify() stamps kickoff_sent_at directly when the in-process listener
-#     succeeds (e.g. legacy long-lived worker session is already running).
+# (4) #923: notify() does NOT stamp kickoff_sent_at on its own — only the
+#     sweep handler is allowed to write the marker. This guards against the
+#     transition-time listener firing into a still-bootstrapping per-task
+#     pane and stamping as if delivery succeeded when the keystrokes were
+#     actually dropped by claude's loader.
 # ---------------------------------------------------------------------------
 
 
-class TestNotifyStampsKickoffOnSuccess:
-    def test_successful_worker_kickoff_marks_execution_row(
+class TestNotifyDoesNotStampKickoffMarker:
+    def test_successful_worker_kickoff_via_notify_leaves_marker_unstamped(
         self, tmp_path,
     ):
+        """A direct ``notify()`` call (e.g. transition-time in-process
+        listener) returns ``sent`` for a resolvable session, but must
+        NOT stamp ``kickoff_sent_at``. The sweep is the only writer —
+        if the message landed in a still-loading pane the sweep will
+        re-deliver and stamp on confirmation. (See issue #923.)
+        """
         work, store = _make_environment(tmp_path)
         task = _claim_worker_task(work, project="proj", title="Implement")
-        # Long-lived worker session is already running — the in-process
-        # listener path that succeeds should also stamp kickoff_sent_at
-        # so a later sweep tick doesn't force-push past dedupe.
         svc = _FakeSessionService(handles=[_FakeHandle("worker-proj")])
 
         event = TaskAssignmentEvent(
@@ -385,19 +391,22 @@ class TestNotifyStampsKickoffOnSuccess:
 
         outcome = notify(event, services=services)
         assert outcome["outcome"] == "sent"
-        stamp = work.kickoff_sent_at(
+        # The send was attempted — but the marker stays NULL so a
+        # subsequent sweep tick can force-push if the original send was
+        # eaten by a bootstrapping pane.
+        assert work.kickoff_sent_at(
             task.project, task.task_number, task.current_node_id,
-        )
-        assert stamp, (
-            "notify() must stamp kickoff_sent_at after a successful "
-            "worker kickoff so the sweep stops force-pushing"
+        ) is None, (
+            "notify() must not stamp kickoff_sent_at — only the sweep "
+            "handler is allowed to mark a kickoff as delivered (#923)."
         )
 
     def test_reviewer_kickoff_does_not_stamp_worker_marker(
         self, tmp_path,
     ):
         """Only worker-role kickoffs use the marker — reviewers / agents
-        ride the existing dedupe path."""
+        ride the existing dedupe path. (Same expectation under #923 as
+        before #922 introduced the field.)"""
         work, store = _make_environment(tmp_path)
         task = _claim_worker_task(work, project="proj", title="Implement")
         svc = _FakeSessionService(handles=[_FakeHandle("pm-reviewer")])
@@ -430,3 +439,160 @@ class TestNotifyStampsKickoffOnSuccess:
         assert work.kickoff_sent_at(
             task.project, task.task_number, task.current_node_id,
         ) is None
+
+
+# ---------------------------------------------------------------------------
+# (5) #923 regression: a fresh queued→in_progress transition that fires
+#     ``notify()`` while the per-task pane is still bootstrapping must
+#     leave ``kickoff_sent_at`` NULL so the heartbeat sweep can re-deliver
+#     and stamp once the pane is observable.
+# ---------------------------------------------------------------------------
+
+
+class TestQueuedToInProgressDoesNotPrematurelyStamp:
+    """Reproduces the live #923 failure mode: a manual ``UPDATE … SET
+    kickoff_sent_at = NULL`` followed by a heartbeat sweep is what made
+    the kickoff land. After the fix the transition-time listener never
+    stamps in the first place, so the sweep runs unobstructed.
+    """
+
+    def test_transition_then_sweep_delivers_kickoff_once(
+        self, tmp_path, monkeypatch,
+    ):
+        work, store = _make_environment(tmp_path)
+        task = _claim_worker_task(
+            work, project="blackjack-trainer", title="Smoke #923",
+        )
+        live_window = f"task-{task.project}-{task.task_number}"
+        svc = _FakeSessionService(
+            handles=[_FakeHandle(live_window)],
+            # Pane is bootstrapping — claude bullet trips the busy
+            # heuristic just like in the live repro.
+            busy={live_window},
+        )
+        services = _RuntimeServices(
+            session_service=svc, state_store=store,
+            work_service=work, project_root=tmp_path,
+            msg_store=store,
+        )
+
+        # Step A: simulate the in-process listener firing during claim.
+        # The fake session reports the per-task window as live, so the
+        # send "succeeds" — but in production the keystrokes would land
+        # in a still-loading shell and be lost. We must not stamp.
+        event = TaskAssignmentEvent(
+            task_id=task.task_id,
+            project=task.project,
+            task_number=task.task_number,
+            title=task.title,
+            current_node=task.current_node_id or "implement",
+            current_node_kind="work",
+            actor_type=ActorType.ROLE,
+            actor_name="worker",
+            work_status="in_progress",
+            priority="normal",
+            transitioned_at=task.updated_at,
+            transitioned_by="tester",
+            execution_version=work.current_node_visit(
+                task.project, task.task_number, task.current_node_id,
+            ),
+        )
+        notify(event, services=services)
+        assert work.kickoff_sent_at(
+            task.project, task.task_number, task.current_node_id,
+        ) is None, (
+            "transition-time notify() must not stamp the kickoff "
+            "marker — that's what locked out the sweep in #923"
+        )
+
+        # Step B: the heartbeat sweep is now the writer that stamps.
+        # Hand each tick a fresh DB connection because the handler
+        # closes its work service on completion.
+        def _loader(*, config_path=None):
+            fresh = SQLiteWorkService(db_path=tmp_path / "work.db")
+            return _RuntimeServices(
+                session_service=svc, state_store=store,
+                work_service=fresh, project_root=tmp_path,
+                msg_store=store,
+            )
+
+        monkeypatch.setattr(
+            "pollypm.plugins_builtin.task_assignment_notify.handlers.sweep.load_runtime_services",
+            _loader,
+        )
+        before_sends = len(svc.sent)
+        result = task_assignment_sweep_handler({})
+        assert result["by_outcome"].get("forced_kickoff", 0) == 1
+        assert len(svc.sent) == before_sends + 1
+        target, message = svc.sent[-1]
+        assert target == live_window
+        assert "Resume work" in message
+
+        # The sweep stamped the marker exactly once — a follow-up tick
+        # must NOT re-push.
+        reopened = _reopen_work(tmp_path)
+        try:
+            stamp = reopened.kickoff_sent_at(
+                task.project, task.task_number, task.current_node_id,
+            )
+        finally:
+            reopened.close()
+        assert stamp
+
+        result2 = task_assignment_sweep_handler({})
+        assert result2["by_outcome"].get("forced_kickoff", 0) == 0
+        assert len(svc.sent) == before_sends + 1
+
+
+# ---------------------------------------------------------------------------
+# (6) #923: the sweep is the only writer to kickoff_sent_at, even on the
+#     non-force-push path (already-stamped == False but pane resolves
+#     and is genuinely idle).
+# ---------------------------------------------------------------------------
+
+
+class TestSweepStampsOnNormalSendPath:
+    def test_sweep_stamps_kickoff_after_idle_gated_send(
+        self, tmp_path, monkeypatch,
+    ):
+        """An idle long-lived worker session (legacy ``worker-<project>``)
+        receiving its first kickoff via the sweep's standard path should
+        also land the stamp — the sweep is the sole writer regardless of
+        whether the force-push branch fired.
+        """
+        work, store = _make_environment(tmp_path)
+        task = _claim_worker_task(work, project="proj", title="Implement")
+        # Long-lived worker session, idle (busy=set()).
+        svc = _FakeSessionService(
+            handles=[_FakeHandle("worker-proj")], busy=set(),
+        )
+
+        def _loader(*, config_path=None):
+            fresh = SQLiteWorkService(db_path=tmp_path / "work.db")
+            return _RuntimeServices(
+                session_service=svc, state_store=store,
+                work_service=fresh, project_root=tmp_path,
+                msg_store=store,
+            )
+
+        monkeypatch.setattr(
+            "pollypm.plugins_builtin.task_assignment_notify.handlers.sweep.load_runtime_services",
+            _loader,
+        )
+
+        result = task_assignment_sweep_handler({})
+        # The send went via the normal path (idle + un-stamped → still
+        # force-push branch since kickoff_pending picks it up — but the
+        # stamp lands either way).
+        assert result["by_outcome"].get("sent", 0) >= 1
+        reopened = _reopen_work(tmp_path)
+        try:
+            stamp = reopened.kickoff_sent_at(
+                task.project, task.task_number, task.current_node_id,
+            )
+        finally:
+            reopened.close()
+        assert stamp, (
+            "the sweep must stamp kickoff_sent_at on any successful "
+            "worker-kickoff send — it's the sole writer post-#923"
+        )

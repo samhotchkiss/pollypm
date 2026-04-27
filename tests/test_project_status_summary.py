@@ -82,10 +82,15 @@ def test_compute_project_monitor_summary_buckets_tasks_correctly(tmp_path):
     from pollypm.work.models import WorkStatus
 
     class _FakeTask:
-        def __init__(self, *, task_id, status, updated_at):
+        def __init__(self, *, task_id, status, updated_at, completed_at=None):
             self.task_id = task_id
             self.work_status = WorkStatus(status)
             self.updated_at = updated_at
+            self.transitions = []
+            if completed_at is not None:
+                self.transitions.append(
+                    {"to_state": "done", "timestamp": completed_at}
+                )
 
     now = datetime.now(UTC)
 
@@ -97,6 +102,7 @@ def test_compute_project_monitor_summary_buckets_tasks_correctly(tmp_path):
                 _FakeTask(
                     task_id="demo/1", status="done",
                     updated_at=now - timedelta(minutes=5),
+                    completed_at=now - timedelta(minutes=5),
                 ),
                 # In-progress, last update outside window → stalled.
                 _FakeTask(
@@ -122,6 +128,7 @@ def test_compute_project_monitor_summary_buckets_tasks_correctly(tmp_path):
                 _FakeTask(
                     task_id="demo/6", status="done",
                     updated_at=now - timedelta(hours=12),
+                    completed_at=now - timedelta(hours=12),
                 ),
             ]
 
@@ -136,6 +143,38 @@ def test_compute_project_monitor_summary_buckets_tasks_correctly(tmp_path):
     assert sorted(summary.human_blockers) == ["demo/4", "demo/5"]
     assert summary.zero_completion_window is False
     assert summary.window_started_at is not None
+
+
+def test_compute_project_monitor_summary_uses_done_transition_time(tmp_path):
+    """#818: editing an old done task is not a new completion."""
+    from datetime import UTC, datetime, timedelta
+    from pollypm.project_status_summary import compute_project_monitor_summary
+    from pollypm.work.models import WorkStatus
+
+    now = datetime.now(UTC)
+
+    class _FakeTask:
+        task_id = "demo/1"
+        work_status = WorkStatus.DONE
+        # Fresh edit inside the monitor window.
+        updated_at = now - timedelta(minutes=5)
+        # Actual completion happened yesterday.
+        transitions = [
+            {"to_state": "done", "timestamp": now - timedelta(days=1)}
+        ]
+
+    class _FakeService:
+        def list_tasks(self, *, project):
+            return [_FakeTask()]
+
+    summary = compute_project_monitor_summary(
+        work_service=_FakeService(),
+        project_key="demo",
+        since=now - timedelta(hours=2),
+    )
+
+    assert summary.completed_since_last == []
+    assert summary.zero_completion_window is True
 
 
 def test_compute_project_monitor_summary_flags_zero_completion(tmp_path):

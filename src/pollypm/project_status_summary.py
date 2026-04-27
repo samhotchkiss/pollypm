@@ -47,6 +47,35 @@ class ProjectMonitorSummary:
 _DEFAULT_MONITOR_WINDOW = timedelta(hours=2)
 
 
+def _as_aware_utc(value: Any) -> datetime | None:
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _task_completed_in_window(task: Any, window_started: datetime) -> bool:
+    for transition in getattr(task, "transitions", []) or []:
+        to_state = getattr(transition, "to_state", None)
+        if to_state is None and isinstance(transition, dict):
+            to_state = transition.get("to_state")
+        if to_state != "done":
+            continue
+        timestamp = getattr(transition, "timestamp", None)
+        if timestamp is None and isinstance(transition, dict):
+            timestamp = transition.get("timestamp") or transition.get("created_at")
+        completed_at = _as_aware_utc(timestamp)
+        if completed_at is not None and completed_at >= window_started:
+            return True
+    return False
+
+
 def compute_project_monitor_summary(
     *,
     work_service: Any,
@@ -86,7 +115,7 @@ def compute_project_monitor_summary(
     rather than blowing up the whole record.
     """
     now = datetime.now(UTC)
-    window_started = since or (now - _DEFAULT_MONITOR_WINDOW)
+    window_started = _as_aware_utc(since) or (now - _DEFAULT_MONITOR_WINDOW)
 
     completed: list[str] = []
     stalled: list[str] = []
@@ -101,17 +130,7 @@ def compute_project_monitor_summary(
         try:
             status = getattr(getattr(task, "work_status", None), "value", "")
             task_id = getattr(task, "task_id", None) or ""
-            updated_at = getattr(task, "updated_at", None)
-            if isinstance(updated_at, str):
-                try:
-                    updated_at = datetime.fromisoformat(updated_at)
-                except ValueError:
-                    updated_at = None
-            if (
-                isinstance(updated_at, datetime)
-                and updated_at.tzinfo is None
-            ):
-                updated_at = updated_at.replace(tzinfo=UTC)
+            updated_at = _as_aware_utc(getattr(task, "updated_at", None))
         except Exception:  # noqa: BLE001
             continue
         if not task_id:
@@ -119,7 +138,7 @@ def compute_project_monitor_summary(
         in_window = (
             isinstance(updated_at, datetime) and updated_at >= window_started
         )
-        if status == "done" and in_window:
+        if status == "done" and _task_completed_in_window(task, window_started):
             completed.append(task_id)
         elif status in ("blocked", "on_hold"):
             human_blockers.append(task_id)

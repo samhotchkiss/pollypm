@@ -1273,6 +1273,48 @@ def test_banner_review_count_no_action_items_passes_through() -> None:
     assert _banner_review_count_after_action_overlap(3, [], []) == 3
 
 
+def test_banner_on_hold_count_drops_action_overlap() -> None:
+    """Polly_remote (live, 2026-04-26) had 2 action cards whose
+    primary_refs were the same 2 on_hold tasks. The banner suffix
+    still read ``· 2 on hold`` — the user couldn't tell whether
+    there were 4 things waiting (2 cards + 2 on_hold) or 2 things
+    double-named. Same overlap reduction the review-count helper
+    does, applied to on_hold via the generic
+    ``_banner_count_after_action_overlap``.
+    """
+    from pollypm.cockpit_ui import _banner_count_after_action_overlap
+
+    on_hold_bucket = [
+        {"task_id": "polly_remote/3"},
+        {"task_id": "polly_remote/12"},
+    ]
+    action_items = [
+        {"primary_ref": "polly_remote/12"},
+        {"primary_ref": "polly_remote/3"},
+    ]
+    # Both on_hold tasks are covered by action cards → suffix shows 0.
+    assert (
+        _banner_count_after_action_overlap(2, action_items, on_hold_bucket)
+        == 0
+    )
+
+
+def test_banner_on_hold_count_keeps_extras() -> None:
+    """When SOME on_hold tasks are uncovered by action cards, those
+    extras still count — only overlap subtracts."""
+    from pollypm.cockpit_ui import _banner_count_after_action_overlap
+
+    on_hold_bucket = [
+        {"task_id": "polly_remote/3"},   # covered
+        {"task_id": "polly_remote/99"},  # NOT covered
+    ]
+    action_items = [{"primary_ref": "polly_remote/3"}]
+    assert (
+        _banner_count_after_action_overlap(2, action_items, on_hold_bucket)
+        == 1
+    )
+
+
 def test_format_blocked_dep_attaches_title_when_known() -> None:
     """Blocked tasks listed dependencies as bare task IDs
     (``"polly_remote/6, polly_remote/9"``). The user has no idea

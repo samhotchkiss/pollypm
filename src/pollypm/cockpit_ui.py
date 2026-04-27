@@ -9181,6 +9181,37 @@ def _clean_hold_reason(
     return text.strip()
 
 
+def _banner_count_after_action_overlap(
+    raw_count: int,
+    action_items: list[dict],
+    bucket: list[dict],
+) -> int:
+    """Return ``raw_count`` minus tasks already covered by an Action card.
+
+    Generic helper — matches a task-bucket entry's ``task_id`` against
+    the action items' ``primary_ref`` and subtracts each overlap.
+    Never goes negative. Used by both the review-count and on-hold-
+    count overlap reductions in the banner suffix so the same task
+    isn't double-counted across the action lede and the category
+    tail.
+    """
+    if raw_count <= 0 or not action_items:
+        return max(0, raw_count)
+    bucket_ids = {
+        str(item.get("task_id") or "")
+        for item in bucket
+        if item.get("task_id")
+    }
+    if not bucket_ids:
+        return raw_count
+    covered = sum(
+        1
+        for item in action_items
+        if str(item.get("primary_ref") or "") in bucket_ids
+    )
+    return max(0, raw_count - covered)
+
+
 def _banner_review_count_after_action_overlap(
     raw_review_count: int,
     action_items: list[dict],
@@ -9194,22 +9225,13 @@ def _banner_review_count_after_action_overlap(
     card (its ``primary_ref`` matches a task in the review bucket),
     counting it again as a separate "approval" double-states the
     same work. Drop overlaps; never go negative.
+
+    Thin wrapper over the generic ``_banner_count_after_action_overlap``
+    — kept as a named alias so existing callers + tests stay readable.
     """
-    if raw_review_count <= 0 or not action_items:
-        return max(0, raw_review_count)
-    review_ids = {
-        str(item.get("task_id") or "")
-        for item in review_bucket
-        if item.get("task_id")
-    }
-    if not review_ids:
-        return raw_review_count
-    covered = sum(
-        1
-        for item in action_items
-        if str(item.get("primary_ref") or "") in review_ids
+    return _banner_count_after_action_overlap(
+        raw_review_count, action_items, review_bucket,
     )
-    return max(0, raw_review_count - covered)
 
 
 def _stuck_alert_covers_action(
@@ -10062,12 +10084,23 @@ class PollyProjectDashboardApp(App[None]):
                 data.action_items,
                 data.task_buckets.get("review", []),
             )
+            # Same overlap reduction for on_hold — polly_remote (live,
+            # 2026-04-26) had 2 action cards whose primary_refs were
+            # the same 2 on_hold tasks, but the banner suffix still
+            # read ``· 2 on hold`` so the user couldn't tell whether
+            # there were 4 things waiting (2 cards + 2 on_hold) or
+            # 2 things double-named.
+            on_hold_count = _banner_count_after_action_overlap(
+                int(data.task_counts.get("on_hold", 0)),
+                data.action_items,
+                data.task_buckets.get("on_hold", []),
+            )
             action_only_suffix = render_project_action_bar(
                 review_count=review_count,
                 alert_count=data.alert_count,
                 inbox_count=0,
                 blocker_count=int(data.task_counts.get("blocked", 0)),
-                on_hold_count=int(data.task_counts.get("on_hold", 0)),
+                on_hold_count=on_hold_count,
             )
             # When more than one user-facing action is waiting, the
             # banner prompt only shows the first; surface the rest as

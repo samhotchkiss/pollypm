@@ -1425,20 +1425,16 @@ class PollyCockpitApp(App[None]):
             self._last_nav_change = self._tick_count
             self._apply_active_view_to_rows()
 
-    # Right-pane surfaces that carry their own scrollable item list.
-    # While one of these is mounted, j/k forwards from the rail to the
-    # right pane so list navigation works regardless of which tmux pane
-    # holds focus (#856). Rail-level navigation remains available on
-    # Up/Down/g/G/Tab.
-    _LIST_SURFACE_KEYS: frozenset[str] = frozenset({"inbox", "activity"})
-
-    def _on_list_surface(self) -> bool:
-        return self.selected_key in self._LIST_SURFACE_KEYS
-
+    # j/k always navigate the rail's own item list — including
+    # stepping over the ``── projects ──`` divider (which is a
+    # ``disabled=True`` ListItem so Textual's ListView correctly
+    # skips it) and remaining a no-op once the cursor reaches the
+    # first/last selectable row. The keys are claimed by the rail's
+    # priority binding regardless of cursor position; we never call
+    # ``tmux send-keys`` for j/k, which previously leaked the byte
+    # into whatever process owned the right-pane TTY (#918, reverts
+    # the right-pane forward added in #856).
     def action_cursor_down(self) -> None:
-        if self._on_list_surface():
-            self._send_key_to_right_pane("j")
-            return
         if self.nav.index is None:
             self.nav.index = 0
         else:
@@ -1446,9 +1442,6 @@ class PollyCockpitApp(App[None]):
         self._sync_selected_from_nav()
 
     def action_cursor_up(self) -> None:
-        if self._on_list_surface():
-            self._send_key_to_right_pane("k")
-            return
         if self.nav.index is None:
             self.nav.index = 0
         else:

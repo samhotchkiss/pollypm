@@ -3640,8 +3640,15 @@ def test_cockpit_pin_toggle_round_trips_and_reports_state() -> None:
     )
 
 
-def test_cockpit_jk_forwards_to_inbox_when_on_list_surface() -> None:
-    """j/k from rail forwards to right pane on inbox/activity (#856)."""
+def test_cockpit_jk_navigates_rail_on_inbox_surface() -> None:
+    """j/k always advance the rail cursor — never tmux-forward to right pane (#918).
+
+    Earlier (#856) the rail forwarded ``j``/``k`` to the right pane while
+    on Inbox/Activity so list scrolling worked from the rail. That blindly
+    invoked ``tmux send-keys`` against pane 1, so once the right pane held
+    a Polly/Claude Code chat the bytes ended up typed into the chat box.
+    The fix returns j/k to plain rail navigation across every surface.
+    """
     app = PollyCockpitApp.__new__(PollyCockpitApp)
     sent: list[str] = []
     moves: list[str] = []
@@ -3659,27 +3666,165 @@ def test_cockpit_jk_forwards_to_inbox_when_on_list_surface() -> None:
 
     app.nav = _Nav()  # type: ignore[assignment]
 
-    # On a non-list surface, j/k navigates the rail.
-    app.selected_key = "polly"
-    app.action_cursor_down()
-    assert moves == ["nav_down", "sync"]
-    assert sent == []
-    moves.clear()
+    for surface in ("polly", "inbox", "activity"):
+        app.selected_key = surface
+        moves.clear()
+        sent.clear()
 
-    # On inbox, j/k forwards to the right pane and does *not* nav rail.
+        app.action_cursor_down()
+        assert moves == ["nav_down", "sync"], (
+            f"j on {surface!r} should navigate the rail, got moves={moves}"
+        )
+        assert sent == [], (
+            f"j on {surface!r} must not tmux-forward; sent={sent}"
+        )
+
+        moves.clear()
+        app.action_cursor_up()
+        assert moves == ["nav_up", "sync"]
+        assert sent == []
+
+
+class _StubItem:
+    """Minimal stand-in for a ListItem with a ``disabled`` flag and a
+    cockpit key — used to drive the rail's ``action_cursor_down`` over a
+    realistic node sequence without booting the Textual harness."""
+
+    def __init__(self, cockpit_key: str | None, *, disabled: bool = False) -> None:
+        self.cockpit_key = cockpit_key
+        self.disabled = disabled
+
+
+class _StubNav:
+    """Lightweight ListView-shaped stub that mirrors Textual's
+    ``action_cursor_down``/``_up`` skip-disabled semantics.
+
+    Backed by a plain list so tests can construct a deterministic rail
+    layout (rows + the disabled ``── projects ──`` divider) and assert
+    where ``j`` lands without spinning up the Textual app loop.
+    """
+
+    def __init__(self, items: list[_StubItem]) -> None:
+        self._items = items
+        self.index: int | None = 0 if items else None
+
+    @property
+    def children(self) -> list[_StubItem]:
+        return list(self._items)
+
+    def action_cursor_down(self) -> None:
+        if self.index is None:
+            if self._items:
+                self.index = 0
+            return
+        for i in range(self.index + 1, len(self._items)):
+            if not self._items[i].disabled:
+                self.index = i
+                return
+        # End of list — Textual leaves index pinned to its current row.
+
+    def action_cursor_up(self) -> None:
+        if self.index is None:
+            if self._items:
+                self.index = len(self._items) - 1
+            return
+        for i in range(self.index - 1, -1, -1):
+            if not self._items[i].disabled:
+                self.index = i
+                return
+
+
+def test_cockpit_j_from_inbox_steps_into_first_project() -> None:
+    """Pressing ``j`` from Inbox advances the cursor into the project list,
+    stepping over the disabled ``── projects ──`` divider (#918 facet 1).
+
+    Reproduces the rail layout: Inbox row, then a disabled divider row,
+    then the first project row. ``ListView.action_cursor_down`` skips
+    disabled items, so one ``j`` lands on the project.
+    """
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    items = [
+        _StubItem("inbox"),
+        _StubItem(None, disabled=True),  # ── projects ── divider
+        _StubItem("project:booktalk"),
+        _StubItem("project:blackjack-trainer"),
+    ]
+    nav = _StubNav(items)
+    nav.index = 0  # cursor on Inbox
+    app.nav = nav  # type: ignore[assignment]
     app.selected_key = "inbox"
-    app.action_cursor_down()
-    assert sent == ["j"]
-    assert moves == []
+    app._tick_count = 0
+    app._last_nav_change = -10
+    app._apply_active_view_to_rows = lambda: None  # type: ignore[method-assign]
 
-    app.action_cursor_up()
-    assert sent == ["j", "k"]
-    assert moves == []
+    def _selected_row_key() -> str | None:
+        idx = nav.index
+        if idx is None:
+            return None
+        return items[idx].cockpit_key
 
-    # Same on activity.
-    app.selected_key = "activity"
+    app._selected_row_key = _selected_row_key  # type: ignore[method-assign]
+
+    captured: list[str] = []
+    app._send_key_to_right_pane = lambda key: captured.append(key)  # type: ignore[method-assign]
+
     app.action_cursor_down()
-    assert sent == ["j", "k", "j"]
+
+    assert nav.index == 2, (
+        "j from Inbox must skip the divider and land on the first project; "
+        f"got index={nav.index}"
+    )
+    assert app.selected_key == "project:booktalk"
+    assert captured == [], "j must never be tmux-forwarded to the right pane"
+
+
+def test_cockpit_j_at_last_item_is_silent_noop() -> None:
+    """j past the last selectable rail item leaves the cursor put without
+    raising and without forwarding the key to any sibling widget (#918)."""
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    items = [_StubItem("polly"), _StubItem("metrics")]
+    nav = _StubNav(items)
+    nav.index = 1  # already on last item
+    app.nav = nav  # type: ignore[assignment]
+    app.selected_key = "metrics"
+    app._tick_count = 0
+    app._last_nav_change = -10
+    app._apply_active_view_to_rows = lambda: None  # type: ignore[method-assign]
+    app._selected_row_key = lambda: items[nav.index].cockpit_key if nav.index is not None else None  # type: ignore[method-assign]
+
+    captured: list[str] = []
+    app._send_key_to_right_pane = lambda key: captured.append(key)  # type: ignore[method-assign]
+
+    # Should not raise — pressing j repeatedly past the end is a no-op.
+    app.action_cursor_down()
+    app.action_cursor_down()
+    app.action_cursor_down()
+
+    assert nav.index == 1, "cursor should remain on the last item"
+    assert app.selected_key == "metrics"
+    assert captured == [], (
+        "j at the end of the list must not tmux-forward; "
+        f"captured={captured}"
+    )
+
+
+def test_cockpit_jk_bindings_are_priority_so_textual_consumes_event() -> None:
+    """j/k must be priority bindings on the App so Textual claims the event
+    even at the end of the navigable list — preventing the keystroke from
+    bubbling out to any other widget or pane (#918 facet 2)."""
+    bindings = {
+        binding.key: binding
+        for binding in PollyCockpitApp.BINDINGS
+        if binding.key in {"j,down", "k,up"}
+    }
+    assert set(bindings) == {"j,down", "k,up"}, (
+        f"missing j/k bindings: {bindings.keys()}"
+    )
+    for key, binding in bindings.items():
+        assert getattr(binding, "priority", False), (
+            f"{key!r} must be a priority binding so Textual consumes the "
+            "event regardless of cursor position"
+        )
 
 
 def test_cockpit_app_binds_action_button_digits_at_priority() -> None:

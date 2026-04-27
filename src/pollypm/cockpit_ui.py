@@ -190,110 +190,7 @@ ASCII_POLLY = "\n".join(
     ]
 )
 
-POLLY_SLOGANS = [
-    "Plans first.\nChaos later.",
-    "Inbox clear.\nProjects moving.",
-    "Small steps.\nSharp turns.",
-    "Less thrash.\nMore shipped.",
-    "Watch the drift.\nTrim the waste.",
-    "Keep it modular.\nKeep it moving.",
-    "Fewer heroics.\nMore progress.",
-    "Big picture.\nTight loops.",
-    "Plan clean.\nLand faster.",
-    "Break it down.\nShip it right.",
-    "Stay useful.\nStay honest.",
-    "No mystery.\nJust momentum.",
-    "Steady lanes.\nClean handoffs.",
-    "Less panic.\nMore process.",
-    "Trim the scope.\nRaise the bar.",
-    "One project.\nMany good turns.",
-    "Spot the loop.\nCut the loop.",
-    "Move with proof.\nNot vibes.",
-    "Less flailing.\nMore finish.",
-    "Make it test.\nMake it stick.",
-    "Short chunks.\nLong horizons.",
-    "Good prompts.\nBetter outcomes.",
-    "Less yak.\nMore traction.",
-    "Fewer tabs.\nBetter work.",
-    "Lean plans.\nStrong reviews.",
-    "Stop guessing.\nStart steering.",
-    "Keep the lane.\nKeep the pace.",
-    "Quick checks.\nClear calls.",
-    "Draft less.\nDecide more.",
-    "Tidy queue.\nDirty hands.",
-    "See the north star.\nMiss fewer turns.",
-    "Leave breadcrumbs.\nResume anywhere.",
-    "Build smaller.\nLearn faster.",
-    "Catch drift.\nSave days.",
-    "Queue the next thing.\nFinish this thing.",
-    "Reduce friction.\nIncrease signal.",
-    "Nudge gently.\nCorrect early.",
-    "Own the workflow.\nTrust the craft.",
-    "Tiny slices.\nReal progress.",
-    "Smart defaults.\nHuman override.",
-    "Project calm.\nTerminal alive.",
-    "Good rails.\nBetter velocity.",
-    "Less ceremony.\nMore clarity.",
-    "Aim tighter.\nShip cleaner.",
-    "One click.\nLive session.",
-    "Watch the turns.\nGuard the goal.",
-    "From idea pad\nto finished lane.",
-    "Short feedback.\nLong memory.",
-    "Keep receipts.\nKeep moving.",
-    "Review hard.\nMerge clean.",
-    "Sharp prompts.\nSofter chaos.",
-    "Block less.\nGuide more.",
-    "Trust, but\ntest anyway.",
-    "No death march.\nJust leverage.",
-    "Make the path.\nThen walk it.",
-    "Less spinning.\nMore shipping.",
-    "Keep sessions warm.\nKeep context warmer.",
-    "One rail.\nMany lanes.",
-    "Catch the stall.\nResume the work.",
-    "Progress counts.\nBusy doesn’t.",
-    "Think in chunks.\nLand in commits.",
-    "Inbox first.\nPanic never.",
-    "Good queues.\nGreat sleep.",
-    "Watch costs.\nKeep quality.",
-    "Clean exits.\nFast resumes.",
-    "See the risk.\nCut the waste.",
-    "Polish later.\nStructure now.",
-    "Measure the turn.\nThen decide.",
-    "Right agent.\nRight depth.",
-    "Move the issue.\nNot the goalposts.",
-    "Less prompting.\nMore orchestration.",
-    "Make it reviewable.\nMake it real.",
-    "Clear lanes.\nClear heads.",
-    "Let workers work.\nLet Polly steer.",
-    "Guide the build.\nGuard the vision.",
-    "A little ruthless.\nA lot helpful.",
-    "Catch regressions.\nKeep momentum.",
-    "Small commits.\nBig confidence.",
-    "Hold the thread.\nFinish the stitch.",
-    "Save the state.\nSkip the scramble.",
-    "Slow is smooth.\nSmooth ships.",
-    "Cut the loop.\nKeep the lesson.",
-    "Treat drift early.\nAvoid rewrites.",
-    "Less dashboard.\nMore cockpit.",
-    "State on disk.\nCalm in motion.",
-    "Poke the blocker.\nNot the user.",
-    "Prompt with intent.\nRecover with context.",
-    "Make the queue sing.\nNot sprawl.",
-    "Better defaults.\nFewer excuses.",
-    "Choose the lane.\nOwn the turn.",
-    "See the whole board.\nMove one piece.",
-    "One source of truth.\nMany good views.",
-    "Do the next thing.\nNot all things.",
-    "Structured memory.\nFlexible brains.",
-    "Project first.\nEgo later.",
-    "Real progress.\nVisible proof.",
-    "Keep it humming.\nKeep it human.",
-    "Good systems.\nFewer hero saves.",
-    "Clear eyes.\nLive panes.",
-    "Tight feedback.\nLoose shoulders.",
-    "Fewer surprises.\nBetter launches.",
-    "Guide the chaos.\nShip the value.",
-]
+POLLY_TAGLINE = "Plans first.\nChaos later."
 
 _PALETTE_TIP_MESSAGE = "Tip: press `:` to open the command palette."
 
@@ -787,7 +684,7 @@ class PollyCockpitApp(App[None]):
             id="brand",
             markup=True,
         )
-        self.tagline = Static("\n" + POLLY_SLOGANS[0], id="tagline")
+        self.tagline = Static("\n" + POLLY_TAGLINE, id="tagline")
         self.nav = ListView(id="nav")
         self.settings_row = Static("\u2699 Settings", id="settings-row")
         self.update_pill = Static("", id="update-pill", markup=True)
@@ -798,8 +695,6 @@ class PollyCockpitApp(App[None]):
         # cockpit launch if an update is still available.
         self._update_pill_dismissed = False
         self.spinner_index = 0
-        self.slogan_index = 0
-        self._slogan_tick = 0
         self._ticker_started_at = time.monotonic()
         self.selected_key = "polly"
         self._items: list[CockpitItem] = []
@@ -936,11 +831,6 @@ class PollyCockpitApp(App[None]):
     def _tick(self) -> None:
         self._tick_count += 1
         self.spinner_index = (self.spinner_index + 1) % 4
-        self._slogan_tick += 1
-        if self._slogan_tick >= 75:
-            self._slogan_tick = 0
-            self.slogan_index = (self.slogan_index + 1) % len(POLLY_SLOGANS)
-            self.tagline.update("\n" + POLLY_SLOGANS[self.slogan_index])
         # Periodic GC
         if self._tick_count % self._GC_INTERVAL == 0:
             gc.collect()
@@ -1325,21 +1215,32 @@ class PollyCockpitApp(App[None]):
         recycled = payload.get("recycled")
         pending = payload.get("pending_restart")
         if any(v is not None for v in (notified, recycled, pending)):
-            parts: list[str] = [
-                f"[#9ece6a]✓ Upgraded v{old_version} → v{new_version}[/]"
+            full_parts: list[str] = [
+                f"Upgraded v{old_version} → v{new_version}"
             ]
             if isinstance(notified, int) and notified:
-                parts.append(f"{notified} notified")
+                full_parts.append(f"{notified} notified")
             if isinstance(pending, int) and pending:
-                parts.append(f"[#d29922]{pending} pending restart[/]")
+                full_parts.append(f"{pending} pending restart")
             if isinstance(recycled, int) and recycled:
-                parts.append(f"{recycled} recycled")
-            parts.append("[dim]ctrl+q to restart cockpit[/dim]")
-            self.update_pill.update(" · ".join(parts))
+                full_parts.append(f"{recycled} recycled")
+            full_parts.append("ctrl+q to restart cockpit")
+            self.update_pill.tooltip = " · ".join(full_parts)
+            if isinstance(pending, int) and pending:
+                self.update_pill.update(
+                    f"[#9ece6a]✓ Upgraded[/] · "
+                    f"[#d29922]{pending} pending[/] · [dim]ctrl+q[/dim]"
+                )
+            else:
+                self.update_pill.update(
+                    "[#9ece6a]✓ Upgraded[/] · [dim]ctrl+q restart[/dim]"
+                )
         else:
+            self.update_pill.tooltip = (
+                f"Upgraded to v{new_version} · ctrl+q to restart cockpit"
+            )
             self.update_pill.update(
-                f"[#9ece6a]✓ Upgraded to v{new_version} · "
-                "restart cockpit (ctrl+q) to pick up new code[/]"
+                "[#9ece6a]✓ Upgraded[/] · [dim]ctrl+q restart[/dim]"
             )
         self.update_pill.display = True
 

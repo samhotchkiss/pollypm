@@ -191,7 +191,7 @@ def test_check_post_upgrade_flag_handles_corrupt_non_dict_payload(
 ) -> None:
     """Cycle 97: a corrupted ``post-upgrade.flag`` (parses to list/null/
     string) must not crash the cockpit on startup. The pill should
-    fall back to ``Upgraded to v?`` rather than raising
+    fall back to a short restart hint rather than raising
     ``AttributeError`` on the ``payload.get("to")`` call.
     """
     from pollypm.cockpit_ui import PollyCockpitApp
@@ -206,7 +206,9 @@ def test_check_post_upgrade_flag_handles_corrupt_non_dict_payload(
     # Should not raise.
     app._check_post_upgrade_flag()
     rendered = str(app.update_pill.render())
-    assert "Upgraded to v?" in rendered
+    assert "Upgraded" in rendered
+    assert "ctrl+q restart" in rendered
+    assert "v?" in app.update_pill.tooltip
 
     # Sanity check: a well-formed payload renders the actual version.
     flag.write_text('{"to": "1.2.3", "from": "1.2.2", "at": 0}')
@@ -216,4 +218,29 @@ def test_check_post_upgrade_flag_handles_corrupt_non_dict_payload(
     app.update_pill.display = False
     app._check_post_upgrade_flag()
     rendered = str(app.update_pill.render())
-    assert "Upgraded to v1.2.3" in rendered
+    assert "ctrl+q restart" in rendered
+    assert "v1.2.3" in app.update_pill.tooltip
+
+
+def test_post_upgrade_pill_keeps_restart_hint_inside_rail_width(
+    fake_config, tmp_path, monkeypatch,
+) -> None:
+    from pollypm.cockpit_ui import PollyCockpitApp
+
+    flag_dir = tmp_path / "fake_home" / ".pollypm"
+    flag_dir.mkdir(parents=True)
+    flag = flag_dir / "post-upgrade.flag"
+    flag.write_text(
+        '{"from": "1.0.0rc2", "to": "999.0.0", "at": 0, '
+        '"notified": 3, "pending_restart": 3, "recycled": 0}'
+    )
+    app = PollyCockpitApp(fake_config)
+    monkeypatch.setattr(app, "_post_upgrade_flag_path", lambda: flag)
+
+    app._check_post_upgrade_flag()
+
+    rendered = str(app.update_pill.render())
+    assert "ctrl+q" in rendered
+    assert "3 pending" in rendered
+    assert "999.0.0" not in rendered
+    assert "999.0.0" in app.update_pill.tooltip

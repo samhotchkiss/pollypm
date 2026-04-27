@@ -767,6 +767,32 @@ def test_cockpit_ui_help_legend_mentions_glyph_alphabet() -> None:
     assert "✕" in binding.description
 
 
+def test_cockpit_tagline_is_static_between_ticks(monkeypatch) -> None:
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    app._tick_count = 0
+    app.spinner_index = 0
+    app._last_epoch_mtime = 0.0
+    app._last_refresh_tick = 0
+    app._items = []
+    app._row_widgets = {}
+    updates: list[str] = []
+    app.tagline = type(
+        "Tagline",
+        (),
+        {"update": lambda _self, text: updates.append(text)},
+    )()
+    app._update_ticker = lambda: None
+    app._update_pill_refresh = lambda: None
+    app._check_post_upgrade_flag = lambda: None
+    app._enforce_rail_width = lambda: None
+    monkeypatch.setattr("pollypm.state_epoch.mtime", lambda: 0.0)
+
+    for _ in range(80):
+        app._tick()
+
+    assert updates == []
+
+
 def test_cockpit_router_config_cache_reuses_loaded_config(monkeypatch, tmp_path: Path) -> None:
     class _Config:
         class Project:

@@ -461,6 +461,40 @@ def test_help_modal_binds_jk_for_scroll() -> None:
         assert required in bound, f"help modal missing scroll binding for {required!r}"
 
 
+def test_help_from_rail_includes_right_pane_bindings() -> None:
+    """``?`` on the rail surfaces the right-pane app's bindings (#860)."""
+    from pollypm.cockpit_palette import _collect_keybindings_for_screen
+    from pollypm.cockpit_ui import PollyCockpitApp
+
+    app = PollyCockpitApp(Path("/tmp/nope"))
+
+    # Inbox surface — must include reply/archive/discuss bindings.
+    app.selected_key = "inbox"
+    sections = dict(_collect_keybindings_for_screen(app))
+    inbox_section = next(
+        (rows for name, rows in sections.items() if name.startswith("Right pane")),
+        None,
+    )
+    assert inbox_section is not None, (
+        f"missing right-pane help section for inbox: {list(sections)}"
+    )
+    keys = {key for key, _desc in inbox_section}
+    assert any("r" in k.split(" / ") for k in keys), (
+        f"missing inbox 'r' (reply) binding in {keys}"
+    )
+
+    # Activity surface — different right-pane class, different bindings.
+    app.selected_key = "activity"
+    sections = dict(_collect_keybindings_for_screen(app))
+    activity_section_names = [
+        name for name in sections if name.startswith("Right pane")
+    ]
+    assert activity_section_names, (
+        f"missing right-pane help section for activity: {list(sections)}"
+    )
+    assert "Activity" in activity_section_names[0]
+
+
 def test_help_modal_bindings_are_priority_to_trap_rail_keys() -> None:
     """Modal bindings must run with priority so the rail underneath does
     not eat j/k/Esc before the modal sees them (#861)."""

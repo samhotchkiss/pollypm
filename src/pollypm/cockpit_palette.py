@@ -620,6 +620,86 @@ def _selected_inbox_labels(app: App) -> list[str]:
     return []
 
 
+def _right_pane_help_section_for_cockpit(
+    app: App,
+) -> tuple[str, list[tuple[str, str]]] | None:
+    """Return a help section for whatever the cockpit's right pane is showing.
+
+    Resolves ``selected_key`` to the right-pane App class, walks its
+    ``BINDINGS`` the same way ``_collect_keybindings_for_screen`` does
+    for the host app, and labels the resulting section by surface name
+    so the user can tell which keys belong to the right pane vs the
+    rail (#860).
+    """
+    selected = getattr(app, "selected_key", "") or ""
+
+    # Late imports keep cockpit_palette free of the cockpit_ui import
+    # graph; only matters when the rail-help dialog opens.
+    try:
+        from pollypm.cockpit_ui import (
+            PollyActivityFeedApp,
+            PollyDashboardApp,
+            PollyInboxApp,
+            PollyProjectDashboardApp,
+            PollyProjectSettingsApp,
+            PollySettingsPaneApp,
+            PollyWorkerRosterApp,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+    target_cls = None
+    surface_label = ""
+    if selected == "inbox":
+        target_cls, surface_label = PollyInboxApp, "Inbox"
+    elif selected == "activity":
+        target_cls, surface_label = PollyActivityFeedApp, "Activity feed"
+    elif selected == "settings":
+        target_cls, surface_label = PollySettingsPaneApp, "Settings"
+    elif selected == "workers":
+        target_cls, surface_label = PollyWorkerRosterApp, "Workers"
+    elif selected in {"polly", "dashboard"}:
+        target_cls, surface_label = PollyDashboardApp, "Home dashboard"
+    elif selected.startswith("project:"):
+        # ``project:<key>:settings`` vs ``project:<key>[:dashboard]``.
+        if selected.endswith(":settings"):
+            target_cls, surface_label = (
+                PollyProjectSettingsApp, "Project settings",
+            )
+        else:
+            target_cls, surface_label = (
+                PollyProjectDashboardApp, "Project dashboard",
+            )
+
+    if target_cls is None:
+        return None
+
+    rows: list[tuple[int, int, str, str]] = []
+    for order, binding in enumerate(getattr(target_cls, "BINDINGS", None) or []):
+        key_field = getattr(binding, "key", "") or ""
+        desc = getattr(binding, "description", "") or ""
+        if not key_field:
+            continue
+        norm_keys = {key.strip() for key in key_field.split(",")}
+        if norm_keys & {"question_mark", "colon", "ctrl+k"}:
+            continue
+        rows.append(
+            (
+                _binding_help_priority(norm_keys),
+                order,
+                _format_binding_keys(key_field),
+                desc or "(no description)",
+            )
+        )
+    if not rows:
+        return None
+    rows.sort(key=lambda row: (row[0], row[1]))
+    return (
+        f"Right pane: {surface_label}",
+        [(key, desc) for _priority, _order, key, desc in rows],
+    )
+
+
 def _collect_keybindings_for_screen(
     app: App,
 ) -> list[tuple[str, list[tuple[str, str]]]]:
@@ -651,6 +731,14 @@ def _collect_keybindings_for_screen(
 
     if type(app).__name__ == "PollyCockpitApp":
         sections.append(("Rail glyphs", list(_RAIL_GLYPH_HELP)))
+        # Contextual right-pane bindings (#860). When the user presses
+        # ``?`` from the rail with a sub-surface mounted in the right
+        # pane (Inbox, Activity, Settings, Workers, project Dashboard /
+        # Settings / Tasks), surface that surface's keybindings here so
+        # the help is contextual instead of just rail-only.
+        rail_section = _right_pane_help_section_for_cockpit(app)
+        if rail_section is not None:
+            sections.append(rail_section)
 
     labels = _selected_inbox_labels(app)
     for label_name, rows in _INBOX_LABEL_HELP.items():

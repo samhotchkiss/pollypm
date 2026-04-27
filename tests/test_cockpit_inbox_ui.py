@@ -1043,6 +1043,55 @@ def test_workspace_store_notification_appears_in_inbox(inbox_env, inbox_app) -> 
     _run(body())
 
 
+def test_message_detail_meta_line_has_no_duplicate_separators(
+    inbox_env, inbox_app,
+) -> None:
+    """The inbox detail meta-line joins bits with ``·`` separators —
+    the project bit must not also prepend its own ``· `` or the
+    rendered text reads ``operator · Apr 23 06:53 PM · 3d ago · ·
+    [workspace] · PM: Polly`` (Sam, 2026-04-26 polly_remote inbox).
+    """
+    _seed_workspace_message(
+        inbox_env["project_path"].parent,
+        subject="Workspace heartbeat",
+        body="Some body.",
+    )
+
+    async def body() -> None:
+        async with inbox_app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            message_item = next(
+                (item for item in inbox_app._tasks if item.task_id.startswith("msg:")),
+                None,
+            )
+            assert message_item is not None
+            inbox_app.list_view.index = inbox_app._tasks.index(message_item)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            detail_text = str(inbox_app.detail.render())
+            # No back-to-back separators with empty content between
+            # them — that's the bug shape (`· ·` or `·  ·` in the
+            # rendered text). Allow one in body content but not in
+            # the meta-line at the top.
+            meta_line = ""
+            for line in detail_text.splitlines():
+                # The meta-line is the second non-empty line; the
+                # first is the subject heading.
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if "·" in stripped and "PM:" in stripped:
+                    meta_line = stripped
+                    break
+            assert meta_line, f"meta-line not found in: {detail_text[:200]!r}"
+            assert "·  ·" not in meta_line and "· ·" not in meta_line, (
+                f"duplicate separators in meta-line: {meta_line!r}"
+            )
+
+    _run(body())
+
+
 def test_archive_closes_store_notification_and_removes_row(inbox_env, inbox_app) -> None:
     """Archiving a Store-backed notification closes the message row."""
     message_id = _seed_workspace_message(

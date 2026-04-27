@@ -6145,10 +6145,15 @@ class PollyInboxApp(App[None]):
         # with no project label at all and were indistinguishable from
         # an unlabeled item. Show "[workspace]" so users can tell the
         # source apart from per-project items. Audit UX #6.
+        # NOTE: the inline ``· `` prefix used to live here from a
+        # pre-join era where each bit emitted its own separator. Now
+        # the ``"  ·  ".join(meta_bits)`` below adds the separator,
+        # so the prefix produced a duplicate (``· · [workspace]``)
+        # visible on the polly_remote inbox detail (Sam, 2026-04-26).
         if item.project == "inbox":
-            meta_bits.append("[dim]· [workspace][/dim]")
+            meta_bits.append("[dim]\\[workspace][/dim]")
         elif item.project:
-            meta_bits.append(f"[dim]· {_escape(item.project)}[/dim]")
+            meta_bits.append(f"[dim]{_escape(item.project)}[/dim]")
         prio = getattr(item.priority, "value", str(item.priority))
         if prio and prio != "normal":
             meta_bits.append(f"[#f0c45a]◆ {_escape(prio)}[/#f0c45a]")
@@ -6257,11 +6262,14 @@ class PollyInboxApp(App[None]):
             meta_bits.append(f"[dim]{_escape(rel)}[/dim]")
         # See note above on the list-rail render: workspace-root
         # items use ``project == "inbox"`` as the default sentinel;
-        # surface "[workspace]" rather than swallow the label.
+        # surface "[workspace]" rather than swallow the label. The
+        # ``"  \u00b7  ".join(meta_bits)`` below adds the separator, so
+        # this bit must NOT prepend its own ``\u00b7 `` (mirrors the
+        # message-detail fix on line 6148).
         if task.project == "inbox":
-            meta_bits.append("[dim]\u00b7 [workspace][/dim]")
+            meta_bits.append("[dim]\\[workspace][/dim]")
         elif task.project:
-            meta_bits.append(f"[dim]\u00b7 {_escape(task.project)}[/dim]")
+            meta_bits.append(f"[dim]{_escape(task.project)}[/dim]")
         prio = getattr(task.priority, "value", str(task.priority))
         if prio and prio != "normal":
             meta_bits.append(f"[#f0c45a]\u25c6 {_escape(prio)}[/#f0c45a]")

@@ -264,6 +264,22 @@ def test_modal_shows_global_bindings(single_project_env) -> None:
     _run(body())
 
 
+def test_modal_includes_cockpit_rail_glyph_legend() -> None:
+    from pollypm.cockpit_palette import _collect_keybindings_for_screen
+    from pollypm.cockpit_ui import PollyCockpitApp
+
+    sections = dict(_collect_keybindings_for_screen(PollyCockpitApp(Path("/tmp/nope"))))
+    glyph_rows = sections.get("Rail glyphs")
+
+    assert glyph_rows is not None
+    descriptions = " ".join(desc for _key, desc in glyph_rows)
+    keys = [key for key, _desc in glyph_rows]
+    assert "♥ / ♡" in keys
+    assert "⚠" in keys
+    assert "writing or working" in descriptions
+    assert "current rail selection" in descriptions
+
+
 # ---------------------------------------------------------------------------
 # 4. For inbox screen with selected plan_review item: shows plan_review keys.
 # ---------------------------------------------------------------------------

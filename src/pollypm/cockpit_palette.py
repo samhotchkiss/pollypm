@@ -524,6 +524,16 @@ _INBOX_LABEL_HELP: dict[str, list[tuple[str, str]]] = {
     ],
 }
 
+_RAIL_GLYPH_HELP: list[tuple[str, str]] = [
+    ("▌", "current rail selection"),
+    ("♥ / ♡", "tmux attached / detached session pulse"),
+    ("·", "idle session"),
+    ("… / ◜◝◞◟", "writing or working"),
+    ("✎", "reviewing"),
+    ("⚠", "stuck or alerting"),
+    ("○", "idle or offline project"),
+]
+
 
 def _format_binding_keys(key_field: str) -> str:
     """Render a comma-separated Binding.key into a friendly label."""
@@ -585,6 +595,9 @@ def _collect_keybindings_for_screen(
         )
     if screen_rows:
         sections.append(("This screen", screen_rows))
+
+    if type(app).__name__ == "PollyCockpitApp":
+        sections.append(("Rail glyphs", list(_RAIL_GLYPH_HELP)))
 
     labels = _selected_inbox_labels(app)
     for label_name, rows in _INBOX_LABEL_HELP.items():

@@ -677,6 +677,18 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         except Exception:  # noqa: BLE001
             drifted_to = None
         if drifted_to:
+            # #757/#815 — determine whether this is a newly-opened
+            # drift alert before upserting it. ``raise_alert`` persists
+            # immediately, so checking afterward would always suppress
+            # the one-shot remediation message.
+            try:
+                drift_alert_already_open = any(
+                    getattr(alert, "alert_type", None) == "persona_drift_detected"
+                    for alert in api.open_alerts()
+                    if getattr(alert, "session_name", None) == context.session_name
+                )
+            except Exception:  # noqa: BLE001
+                drift_alert_already_open = True  # err on the side of NOT spamming
             # #760 — actionable copy: explain what drifted, name the
             # restart command the user can copy-paste, keep the
             # observed-identity detail present for context.
@@ -706,15 +718,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             # distinguishable from arbitrary user input in transcript
             # scans, and avoids the ``<system-update>`` tag that
             # tripped prompt-injection defenses (#755).
-            try:
-                already_open = any(
-                    getattr(alert, "alert_type", None) == "persona_drift_detected"
-                    for alert in api.open_alerts()
-                    if getattr(alert, "session_name", None) == context.session_name
-                )
-            except Exception:  # noqa: BLE001
-                already_open = True  # err on the side of NOT spamming
-            if not already_open:
+            if not drift_alert_already_open:
                 try:
                     api.send_session_message(
                         context.session_name,

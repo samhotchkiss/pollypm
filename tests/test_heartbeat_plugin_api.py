@@ -711,6 +711,30 @@ def test_local_heartbeat_backend_raises_alert_for_unfinished_turn() -> None:
     assert "Additional work remains" in api.alerts[key].message
 
 
+def test_local_heartbeat_backend_sends_persona_drift_remediation_once() -> None:
+    context = _context(
+        role="operator-pm",
+        pane_text="I am Russell and I will handle this.",
+        transcript_delta="",
+        previous_snapshot_hash="hash-0",
+        snapshot_hash="hash-1",
+    )
+    api = FakeHeartbeatAPI([context])
+
+    LocalHeartbeatBackend().run(api)
+
+    assert ("worker_pollypm", "persona_drift_detected") in api.alerts
+    assert len(api.messages) == 1
+    session_name, text, owner = api.messages[0]
+    assert session_name == "worker_pollypm"
+    assert "PollyPM persona-drift correction" in text
+    assert owner == "persona-drift-remediation"
+
+    LocalHeartbeatBackend().run(api)
+
+    assert len(api.messages) == 1
+
+
 def test_local_heartbeat_backend_uses_mechanical_checks_only_for_heartbeat_supervisor() -> None:
     api = FakeHeartbeatAPI(
         [

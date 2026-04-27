@@ -686,6 +686,55 @@ def test_action_bucket_row_drops_redundant_action_prefix() -> None:
     assert "[Action] Demo shipped cleanly" in info_plain
 
 
+def test_inbox_row_renders_workspace_label_for_inbox_sentinel() -> None:
+    """Workspace-root inbox messages carry ``project = "inbox"`` as a
+    sentinel. The list rail used to render that literal as the project
+    tag, so polly_remote escalations sent via the workspace inbox showed
+    ``decision needed · inbox · 3d ago`` even though they were clearly
+    about polly_remote. Render ``[workspace]`` instead, matching the
+    detail-pane meta-line treatment from cycle 14.
+    """
+    from types import SimpleNamespace
+    from datetime import UTC, datetime
+    from pollypm.cockpit_ui import _format_inbox_row
+
+    fake_task = SimpleNamespace(
+        title="Workspace announcement",
+        project="inbox",
+        priority=SimpleNamespace(value="normal"),
+        labels=[],
+        triage_bucket="action",
+        triage_label="needs unblock",
+        updated_at=datetime(2026, 4, 23, 18, 53, tzinfo=UTC),
+    )
+    plain = _format_inbox_row(fake_task, is_unread=True).plain.splitlines()
+    # Meta-line is the second line; should show ``[workspace]`` not ``inbox``.
+    assert "[workspace]" in plain[1]
+    assert " inbox " not in plain[1] and not plain[1].endswith(" inbox")
+
+
+def test_inbox_row_renders_real_project_key_unchanged() -> None:
+    """Real project keys (``polly_remote``, ``booktalk``) must still
+    render verbatim — the workspace mapping only fires for the
+    ``inbox`` sentinel."""
+    from types import SimpleNamespace
+    from datetime import UTC, datetime
+    from pollypm.cockpit_ui import _format_inbox_row
+
+    fake_task = SimpleNamespace(
+        title="Plan ready for review",
+        project="booktalk",
+        priority=SimpleNamespace(value="normal"),
+        labels=[],
+        triage_bucket="action",
+        triage_label="plan review",
+        updated_at=datetime(2026, 4, 23, 18, 53, tzinfo=UTC),
+    )
+    plain = _format_inbox_row(fake_task, is_unread=True).plain.splitlines()
+    assert "booktalk" in plain[1]
+    assert "[workspace]" not in plain[1]
+
+
 def test_inbox_row_marks_rejection_feedback_threads(inbox_env) -> None:
     from pollypm.cockpit_ui import _format_inbox_row
 

@@ -4547,7 +4547,15 @@ def _format_inbox_row(
     updated = task.updated_at
     iso = updated.isoformat() if hasattr(updated, "isoformat") else str(updated or "")
     age = format_relative(iso) if iso else ""
-    project = (task.project or "").strip() or "\u2014"
+    raw_project = (task.project or "").strip()
+    # The detail pane surfaces workspace-root sentinel items as
+    # ``[workspace]`` (cycle 14) \u2014 mirror that here so the list-rail
+    # label matches the detail surface instead of leaking the raw
+    # ``inbox`` sentinel string.
+    if raw_project == "inbox":
+        project = "[workspace]"
+    else:
+        project = raw_project or "\u2014"
     meta_bits = [_triage_label(task), project]
     if age:
         meta_bits.append(age)

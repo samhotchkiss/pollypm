@@ -465,6 +465,12 @@ def _initialize(api) -> None:  # noqa: ANN001
     # Top section — Home plus operator/reviewer/inbox. In the legacy layout
     # these all rendered at the top before the projects section, so we keep
     # them in `top` rather than `workflows` to preserve ordering.
+    # Home → static dashboard. Polly / Russell → live operator /
+    # reviewer chat panes. Earlier the rail labelled both 'Polly' and
+    # the dashboard 'Home' without clarifying which surface lived where
+    # (#870), so users routinely opened Polly expecting the dashboard
+    # and got dropped into the live operator session. The chat-pane
+    # labels make the surface explicit.
     rail.register_item(
         section="top",
         index=0,
@@ -476,7 +482,7 @@ def _initialize(api) -> None:  # noqa: ANN001
     rail.register_item(
         section="top",
         index=10,
-        label="Polly",
+        label="Polly · chat",
         handler=_route_handler("polly"),
         key="polly",
         state_provider=_polly_state,
@@ -484,7 +490,7 @@ def _initialize(api) -> None:  # noqa: ANN001
     rail.register_item(
         section="top",
         index=20,
-        label="Russell",
+        label="Russell · chat",
         handler=_route_handler("russell"),
         key="russell",
         state_provider=_russell_state,

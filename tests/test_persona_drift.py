@@ -132,3 +132,64 @@ def test_persona_reassertion_message_names_canonical_persona() -> None:
     assert "Russell" in rev_msg
     assert "russell.md" in rev_msg
     assert "OK Russell" in rev_msg
+
+
+def test_persona_reassertion_architect_omits_invalid_guide_path() -> None:
+    """#897 regression — the legacy heartbeat table cited
+    ``src/.../architect.md`` but no such file exists. Architect
+    persona is built inline (the role contract sets
+    ``guide_path=None``), so the remediation message must omit
+    the guide line rather than emit a stale path the model might
+    hallucinate fill-in content for."""
+    from pollypm.heartbeats.local import _build_persona_reassertion_message
+
+    msg = _build_persona_reassertion_message(
+        role="architect", drifted_to="Polly",
+    )
+    # Canonical fields must still be present.
+    assert "Archie" in msg
+    assert "OK Archie" in msg
+    assert "Polly" in msg
+    # The invalid guide path must NOT appear.
+    assert "architect.md" not in msg
+    assert "Operating guide:" not in msg
+
+
+def test_persona_reassertion_handles_unknown_role() -> None:
+    """An unknown role must produce a generic message rather than
+    raise — the heartbeat is on the hot path (#897)."""
+    from pollypm.heartbeats.local import _build_persona_reassertion_message
+
+    msg = _build_persona_reassertion_message(
+        role="planner", drifted_to="Polly",
+    )
+    assert "planner" in msg
+    assert "Polly" in msg
+    # Generic fallback never tries to cite a guide.
+    assert "Operating guide:" not in msg
+
+
+def test_persona_reassertion_uses_canonical_role_contract() -> None:
+    """#897 — the heartbeat must build remediation through
+    role_contract.build_remediation_message so the canonical
+    wording lives in one place. Verified by patching the canonical
+    helper and confirming the heartbeat picks up the change."""
+    import pollypm.heartbeats.local as hb_local
+
+    captured: list[tuple[str, str]] = []
+
+    def _fake(role: str, drifted_to: str) -> str:
+        captured.append((role, drifted_to))
+        return "FAKE_REMEDIATION"
+
+    real = hb_local._build_canonical_remediation
+    hb_local._build_canonical_remediation = _fake
+    try:
+        out = hb_local._build_persona_reassertion_message(
+            role="operator-pm", drifted_to="Russell",
+        )
+    finally:
+        hb_local._build_canonical_remediation = real
+
+    assert out == "FAKE_REMEDIATION"
+    assert captured == [("operator-pm", "Russell")]

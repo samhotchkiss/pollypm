@@ -150,6 +150,34 @@ def role_guide_paths_exist() -> tuple[str, ...]:
     return tuple(out)
 
 
+def legacy_role_guide_paths_exist() -> tuple[str, ...]:
+    """#897 — verify any legacy ``role -> guide_path`` table the
+    heartbeat still publishes resolves on disk.
+
+    The audit's #897 criterion: *"Add a contract audit that
+    rejects nonexistent guide paths in legacy/runtime tables, not
+    only paths declared by ROLE_REGISTRY."* Today the heartbeat
+    derives its table from the registry, so this check
+    *should* be redundant — but the audit is defensive: a future
+    refactor that re-introduces a hand-maintained legacy table
+    will trip this check immediately if any path is wrong.
+    """
+    out: list[str] = []
+    repo_root = _repo_root()
+    try:
+        from pollypm.heartbeats.local import _ROLE_GUIDE_PATHS
+    except ImportError:
+        return ()
+    for role_key, guide_path in _ROLE_GUIDE_PATHS.items():
+        absolute = (repo_root / guide_path).resolve()
+        if not absolute.exists():
+            out.append(
+                f"legacy heartbeat guide path for {role_key!r} "
+                f"missing on disk: {absolute}"
+            )
+    return tuple(out)
+
+
 # ---------------------------------------------------------------------------
 # Traceback-shape detection (#851)
 # ---------------------------------------------------------------------------

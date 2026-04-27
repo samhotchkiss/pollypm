@@ -258,32 +258,47 @@ def _classify_session_health(signals: SessionSignals) -> SessionHealth:
     return _DEFAULT_POLICY.classify(signals)
 
 
-# Per-role canonical guide path the persona-drift remediation message
-# tells the session to re-read. Worker has no canonical guide here —
-# its role identity is enforced through the per-task prompt the
-# launcher writes, not a free-floating profile, so persona drift on a
-# worker session falls back to a generic re-assertion.
-_ROLE_GUIDE_PATHS: dict[str, str] = {
-    "operator-pm": (
-        "src/pollypm/plugins_builtin/core_agent_profiles/profiles/"
-        "polly-operator-guide.md"
-    ),
-    "reviewer": (
-        "src/pollypm/plugins_builtin/core_agent_profiles/profiles/russell.md"
-    ),
-    "architect": (
-        "src/pollypm/plugins_builtin/core_agent_profiles/profiles/"
-        "architect.md"
-    ),
-}
+# #897 — persona-drift remediation now derives from the canonical
+# role contract (#885) instead of maintaining its own role tables.
+# The legacy module-level dicts below are kept as *derived views*
+# of the canonical registry so any consumer that still imports them
+# (and the legacy-table reconciliation test) keeps working without
+# pinning a stale architect.md path or persona name.
+
+from pollypm.role_contract import (
+    ROLE_REGISTRY as _ROLE_REGISTRY,
+    build_remediation_message as _build_canonical_remediation,
+    canonical_role as _canonical_role,
+)
 
 
-_ROLE_PERSONA_NAMES: dict[str, str] = {
-    "operator-pm": "Polly",
-    "reviewer": "Russell",
-    "architect": "Archie",
-    "heartbeat-supervisor": "Heartbeat",
-}
+def _materialize_legacy_table(field: str) -> dict[str, str]:
+    """Materialize a legacy-shape ``{display_role: value}`` dict
+    from the canonical role registry.
+
+    Heartbeat call sites historically indexed these dicts by the
+    display ("operator-pm") form. Deriving the dicts here keeps
+    those callers working without a separate source of truth.
+    Worker rows are intentionally omitted from the guide table
+    because workers have no standalone profile (per-task prompt).
+    """
+    out: dict[str, str] = {}
+    for key, contract in _ROLE_REGISTRY.items():
+        display_key = key.replace("_", "-")
+        if field == "persona":
+            out[display_key] = contract.persona_name
+        elif field == "guide" and contract.guide_path:
+            out[display_key] = contract.guide_path
+    return out
+
+
+_ROLE_GUIDE_PATHS: dict[str, str] = _materialize_legacy_table("guide")
+"""Derived view of :data:`pollypm.role_contract.ROLE_REGISTRY` for
+legacy callers that still expect the old shape."""
+
+
+_ROLE_PERSONA_NAMES: dict[str, str] = _materialize_legacy_table("persona")
+"""Derived view — same rationale as :data:`_ROLE_GUIDE_PATHS`."""
 
 
 def _build_persona_reassertion_message(
@@ -291,46 +306,33 @@ def _build_persona_reassertion_message(
     role: str,
     drifted_to: str,
 ) -> str:
-    """Build the corrective message the heartbeat sends to a drifted session.
+    """Heartbeat persona-drift remediation message.
 
-    Covers #757's "re-inject the correct role guide via a trusted
-    mechanism (not ``<system-update>``)". The message is delivered
-    through the ``persona-drift-remediation`` owner channel so the
-    session can identify it as a heartbeat-issued correction in its
-    transcript, not arbitrary user input. Avoids the
-    ``<system-update>`` tag that prompt-injection defenses learned to
-    reject in #755.
+    #897 — delegates to
+    :func:`pollypm.role_contract.build_remediation_message`. The
+    canonical wording (no ``<system-update>`` tag — #755), the
+    canonical guide path, and the acknowledgement phrase all come
+    from the role contract so future fixes land in one place.
 
-    Includes:
-
-    * The session's *canonical* role + persona name.
-    * The persona the session drifted into (so the model has context
-      for what just happened).
-    * A path to the role's operating guide for re-anchoring.
-    * The plain-language acknowledgement the model should produce so
-      the operator can verify the drift cleared on the next snapshot.
+    The heartbeat passes the role in display form
+    (``"operator-pm"``); :func:`canonical_role` normalises it. An
+    unknown role falls back to a generic re-anchor message rather
+    than raising — the heartbeat is on the hot path and must not
+    crash on a stale role string.
     """
-    canonical_persona = _ROLE_PERSONA_NAMES.get(role, role or "this session")
-    guide_path = _ROLE_GUIDE_PATHS.get(role)
-    lines = [
-        f"PollyPM persona-drift correction (heartbeat-issued).",
-        "",
-        f"This session is configured as role={role!r}; canonical "
-        f"persona is {canonical_persona}. The pane just identified "
-        f"itself as {drifted_to!r}, which doesn't match.",
-        "",
-        f"Re-anchor: stop, re-read your operating guide, then "
-        f"continue under your canonical persona. Acknowledge with "
-        f"\"OK {canonical_persona}\" before your next action so the "
-        f"operator can confirm the drift cleared.",
-    ]
-    if guide_path:
-        lines.insert(
-            -1,
-            f"Operating guide: {guide_path}",
+    try:
+        return _build_canonical_remediation(role, drifted_to)
+    except ValueError:
+        return (
+            "PollyPM persona-drift correction (heartbeat-issued).\n"
+            "\n"
+            f"This session is configured as role={role!r}. The pane "
+            f"just identified itself as {drifted_to!r}, which "
+            "doesn't match.\n"
+            "\n"
+            "Re-anchor: stop, re-read your operating guide, and "
+            "continue under the canonical role."
         )
-        lines.insert(-1, "")
-    return "\n".join(lines)
 
 
 def _select_intervention(

@@ -14,6 +14,7 @@ from pollypm.contract_audit import (
     find_unmarked_generated_snippets,
     known_actor_names,
     known_role_guide_paths,
+    legacy_role_guide_paths_exist,
     looks_like_rich_traceback,
     role_guide_paths_exist,
 )
@@ -116,6 +117,17 @@ def test_role_guide_paths_resolve_on_disk() -> None:
     point at a renamed file."""
     missing = role_guide_paths_exist()
     assert missing == (), f"missing guides: {missing}"
+
+
+def test_legacy_role_guide_paths_resolve_on_disk() -> None:
+    """#897 — any legacy heartbeat persona table that still
+    publishes a ``role -> guide_path`` mapping must point at
+    files that exist. Today the heartbeat's table is derived
+    from the canonical registry so this check is structurally
+    safe; the audit catches any future refactor that
+    re-introduces a hand-maintained legacy table."""
+    missing = legacy_role_guide_paths_exist()
+    assert missing == (), f"legacy heartbeat tables: {missing}"
 
 
 # ---------------------------------------------------------------------------

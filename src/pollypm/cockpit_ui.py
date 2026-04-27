@@ -652,6 +652,12 @@ class PollyCockpitApp(App[None]):
         Binding("1", "forward_action_button_1", "Action 1", show=False, priority=True),
         Binding("2", "forward_action_button_2", "Action 2", show=False, priority=True),
         Binding("3", "forward_action_button_3", "Action 3", show=False, priority=True),
+        # Forward project-dashboard keys (#863). The Plan card on idle
+        # projects says "Press c to ask the PM to plan it now."; ``l``
+        # jumps to the project log. Both must round-trip from the rail
+        # whenever a project surface is up in the right pane.
+        Binding("c", "forward_project_chat", "Chat PM", show=False, priority=True),
+        Binding("l", "forward_project_log", "Project log", show=False, priority=True),
         Binding("u", "trigger_upgrade", "Upgrade", show=False),
         Binding("x", "dismiss_update_pill", "Dismiss Update", show=False),
         Binding("a", "view_alerts", "Alerts", show=False),
@@ -1424,6 +1430,19 @@ class PollyCockpitApp(App[None]):
 
     def action_forward_action_button_3(self) -> None:
         self._send_key_to_right_pane("3")
+
+    def _on_project_surface(self) -> bool:
+        return isinstance(self.selected_key, str) and self.selected_key.startswith(
+            "project:",
+        )
+
+    def action_forward_project_chat(self) -> None:
+        if self._on_project_surface():
+            self._send_key_to_right_pane("c")
+
+    def action_forward_project_log(self) -> None:
+        if self._on_project_surface():
+            self._send_key_to_right_pane("l")
 
     def action_toggle_project_pin(self) -> None:
         key = self._selected_row_key()
@@ -11190,11 +11209,24 @@ class PollyProjectDashboardApp(App[None]):
         Mirrors :meth:`PollyInboxApp.action_jump_to_pm` — resolves the
         persona via :func:`_resolve_pm_target` and uses the same worker
         dispatch so tests can monkeypatch the same hook.
+
+        When the project has no plan and the Plan card is the only thing
+        the user sees on the dashboard, the chat is seeded with an
+        explicit plan-now request so pressing ``c`` actually does what
+        the card said it would do (#863). Otherwise the chat opens with
+        the generic 'dashboard discussion' context so ad-hoc questions
+        are not pre-loaded with a planning ask.
         """
         cockpit_key, pm_label = _resolve_pm_target(
             self.config_path, self.project_key,
         )
-        context_line = f're: project/{self.project_key} "dashboard discussion"'
+        if self._idle_project_needs_plan():
+            context_line = (
+                f're: project/{self.project_key} '
+                f'"please draft an initial plan for this project"'
+            )
+        else:
+            context_line = f're: project/{self.project_key} "dashboard discussion"'
         self.run_worker(
             lambda: self._dispatch_to_pm_sync(
                 cockpit_key, context_line, pm_label,
@@ -11203,6 +11235,19 @@ class PollyProjectDashboardApp(App[None]):
             exclusive=True,
             group="proj_jump_to_pm",
         )
+
+    def _idle_project_needs_plan(self) -> bool:
+        """True iff the Plan card is showing the 'press c to ask' nudge."""
+        data = getattr(self, "data", None)
+        if data is None:
+            return False
+        if not getattr(data, "exists_on_disk", False):
+            return False
+        if getattr(data, "plan_path", None) is not None:
+            return False
+        if not getattr(data, "enforce_plan", True):
+            return False
+        return True
 
     def _perform_numbered_action(self, key_number: int) -> None:
         index = (key_number - 1) // 3

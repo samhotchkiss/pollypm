@@ -3535,6 +3535,36 @@ def test_cockpit_action_button_digits_forward_from_rail() -> None:
     assert sent == ["1", "2", "3"]
 
 
+def test_cockpit_forwards_c_to_right_pane_only_on_project_surface() -> None:
+    """``c`` from rail forwards to the right pane only on a project (#863)."""
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    sent: list[str] = []
+    app._send_key_to_right_pane = lambda key: sent.append(key)  # type: ignore[method-assign]
+
+    app.selected_key = "polly"
+    app.action_forward_project_chat()
+    assert sent == [], "should not forward c outside of project surfaces"
+
+    app.selected_key = "project:demo"
+    app.action_forward_project_chat()
+    assert sent == ["c"]
+
+
+def test_cockpit_forwards_l_to_right_pane_only_on_project_surface() -> None:
+    """``l`` from rail forwards to the right pane only on a project (#863)."""
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    sent: list[str] = []
+    app._send_key_to_right_pane = lambda key: sent.append(key)  # type: ignore[method-assign]
+
+    app.selected_key = "settings"
+    app.action_forward_project_log()
+    assert sent == []
+
+    app.selected_key = "project:demo:dashboard"
+    app.action_forward_project_log()
+    assert sent == ["l"]
+
+
 def test_cockpit_app_binds_action_button_digits_at_priority() -> None:
     """1/2/3 must be priority bindings so the rail does not eat them silently (#862)."""
     bindings = {

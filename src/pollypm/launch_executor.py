@@ -109,12 +109,15 @@ class LaunchPlanExecutor:
         config_path: Path,
         status_emit: Callable[[str], None] | None = None,
         rail_daemon_spawner: Callable[[Path], None] | None = None,
+        before_attach: Callable[[], None] | None = None,
     ) -> None:
         self.supervisor = supervisor
         self.probe = probe
         self.config_path = config_path
         self._status_emit = status_emit or (lambda _msg: None)
         self._rail_daemon_spawner = rail_daemon_spawner
+        self._before_attach = before_attach
+        self._before_attach_ran = False
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -235,11 +238,10 @@ class LaunchPlanExecutor:
 
     def _on_respawn_rail(self) -> tuple[int | None, list[str]]:
         # The cockpit rail layout owner (CockpitRouter.ensure_
-        # cockpit_layout) is the canonical path to recreate the
-        # rail pane. cli.up() calls it as part of TUI launch;
-        # recording the action here is the observability hook —
-        # tests assert the action was named even when the
-        # downstream layout call is best-effort.
+        # cockpit_layout + Supervisor.start_cockpit_tui) is wired through
+        # the before-attach hook. Run it here as well as at attach time so
+        # RECOVER_DEAD_RAIL is not just an observable no-op.
+        self._run_before_attach_once()
         return (None, [])
 
     def _on_schedule_heartbeat(self) -> tuple[int | None, list[str]]:
@@ -257,39 +259,54 @@ class LaunchPlanExecutor:
         return (None, [])
 
     def _on_attach_session(self) -> tuple[int | None, list[str]]:
+        messages = self._run_before_attach_once()
         tmux = self.supervisor.tmux
         attach = getattr(tmux, "attach_session", None)
         if not callable(attach):
-            return (None, [])
+            return (None, messages)
         return (
             int(attach(self.probe.main_session_name) or 0),
-            [],
+            messages,
         )
 
     def _on_switch_client(self) -> tuple[int | None, list[str]]:
+        messages = self._run_before_attach_once()
         focus = getattr(self.supervisor, "focus_console", None)
         if callable(focus):
             focus()
         tmux = self.supervisor.tmux
         switch = getattr(tmux, "switch_client", None)
         if not callable(switch):
-            return (None, [])
+            return (None, messages)
         return (
             int(switch(self.probe.main_session_name) or 0),
-            [f"Switching to tmux session {self.probe.main_session_name}"],
+            [*messages, f"Switching to tmux session {self.probe.main_session_name}"],
         )
 
     def _on_focus_console(self) -> tuple[int | None, list[str]]:
+        messages = self._run_before_attach_once()
         focus = getattr(self.supervisor, "focus_console", None)
         if callable(focus):
             focus()
         return (
             None,
-            [f"Already inside tmux session {self.probe.main_session_name}"],
+            [*messages, f"Already inside tmux session {self.probe.main_session_name}"],
         )
 
     def _on_fail_closed(self) -> tuple[int | None, list[str]]:
         return (2, ["fail_closed"])
+
+    def _run_before_attach_once(self) -> list[str]:
+        hook = self._before_attach
+        if hook is None or self._before_attach_ran:
+            return []
+        self._before_attach_ran = True
+        try:
+            hook()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("launch executor: before_attach hook failed")
+            return [f"cockpit layout failed before attach: {exc}"]
+        return []
 
     # ------------------------------------------------------------------
     # Dispatch table

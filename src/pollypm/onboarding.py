@@ -1225,10 +1225,18 @@ def _launch_onboarding_experience(result: OnboardingResult) -> bool:
     except Exception:  # noqa: BLE001
         pass
 
+    router = CockpitRouter(result.config_path)
+    try:
+        router.ensure_cockpit_layout()
+        time.sleep(0.3)
+        supervisor.start_cockpit_tui(session_name)
+    except Exception:  # noqa: BLE001
+        pass
+
     route_key = _seeded_demo_route(result)
     if route_key is not None:
         try:
-            CockpitRouter(result.config_path).route_selected(route_key)
+            router.route_selected(route_key)
         except Exception:  # noqa: BLE001
             pass
 

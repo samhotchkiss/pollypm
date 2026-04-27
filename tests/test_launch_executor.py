@@ -109,6 +109,7 @@ def _executor(
     probe: LaunchProbe,
     supervisor: _FakeSupervisor | None = None,
     rail_daemon_calls: list[Path] | None = None,
+    before_attach=None,
 ) -> tuple[LaunchPlanExecutor, _FakeSupervisor]:
     sup = supervisor or _FakeSupervisor()
     spawner = None
@@ -119,6 +120,7 @@ def _executor(
         probe=probe,
         config_path=Path("/tmp/pollypm.toml"),
         rail_daemon_spawner=spawner,
+        before_attach=before_attach,
     )
     return exe, sup
 
@@ -186,6 +188,28 @@ def test_attach_existing_no_bootstrap_no_respawn() -> None:
     assert any(c[0] == "attach_session" for c in sup.tmux.calls)
     assert LaunchAction.RESPAWN_RAIL not in result.actions_run
     assert LaunchAction.RESPAWN_SHELL not in result.actions_run
+
+
+def test_attach_prepares_cockpit_before_blocking_attach() -> None:
+    """Outside-tmux attach must not happen until the cockpit layout/TUI is ready."""
+    probe = _probe(main_session_alive=True, closet_session_alive=True)
+    plan = plan_launch(probe)
+    order: list[str] = []
+    exe, sup = _executor(
+        probe=probe,
+        before_attach=lambda: order.append("prepare"),
+    )
+    original_attach = sup.tmux.attach_session
+
+    def attach(name: str) -> int:
+        order.append("attach")
+        return original_attach(name)
+
+    sup.tmux.attach_session = attach  # type: ignore[method-assign]
+
+    exe.execute(plan)
+
+    assert order == ["prepare", "attach"]
 
 
 def test_attach_existing_inside_polly_uses_focus_not_attach() -> None:

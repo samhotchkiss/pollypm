@@ -645,6 +645,15 @@ def up(
         start_transcript_ingestion(supervisor.config)
     session_name = supervisor.config.project.tmux_session
 
+    def _prepare_cockpit_before_attach() -> None:
+        from pollypm.cockpit_rail import CockpitRouter
+
+        router = CockpitRouter(config_path)
+        router.ensure_cockpit_layout()
+        import time
+        time.sleep(0.3)  # let tmux settle after the split
+        supervisor.start_cockpit_tui(session_name)
+
     # #896 — drive every supervisor / tmux mutation through the
     # state-machine executor so plan.actions is the source of
     # truth for what runs. The executor handles BOOTSTRAP_LAUNCHES,
@@ -656,23 +665,11 @@ def up(
         config_path=config_path,
         status_emit=_cli_status,
         rail_daemon_spawner=_spawn_rail_daemon,
+        before_attach=_prepare_cockpit_before_attach,
     )
     result = executor.execute(plan)
     for message in result.messages:
         typer.echo(message)
-
-    # Cockpit layout (split panes) is best-effort and runs after
-    # the executor's mutations so the layout sees the latest tmux
-    # state.
-    from pollypm.cockpit_rail import CockpitRouter
-    router = CockpitRouter(config_path)
-    try:
-        router.ensure_cockpit_layout()
-        import time
-        time.sleep(0.3)  # let tmux settle after the split
-        supervisor.start_cockpit_tui(session_name)
-    except Exception:  # noqa: BLE001
-        pass  # layout will be fixed on next cockpit launch
 
     if result.exit_code is not None:
         raise typer.Exit(code=result.exit_code)

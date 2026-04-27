@@ -320,6 +320,84 @@ def test_run_onboarding_launches_seeded_demo_experience(monkeypatch, tmp_path: P
     assert launched == [result]
 
 
+def test_launch_onboarding_experience_prepares_cockpit_before_attach(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    from pollypm.onboarding import _launch_onboarding_experience
+
+    order: list[str] = []
+    result = OnboardingResult(config_path=tmp_path / "pollypm.toml", launch_requested=True)
+
+    class FakeTmux:
+        def has_session(self, _name: str) -> bool:
+            return False
+
+        def attach_session(self, _name: str) -> int:
+            order.append("attach")
+            return 0
+
+    class FakeSupervisor:
+        def __init__(self) -> None:
+            self.tmux = FakeTmux()
+            self.config = type(
+                "Config",
+                (),
+                {"project": type("Project", (), {"tmux_session": "pollypm"})()},
+            )()
+
+        def bootstrap_tmux(self, **_kwargs) -> None:
+            order.append("bootstrap")
+
+        def ensure_layout(self) -> None:
+            order.append("ensure_layout")
+
+        def start_cockpit_tui(self, _session_name: str) -> None:
+            order.append("start_tui")
+
+    class FakeService:
+        def __init__(self, _config_path: Path) -> None:
+            pass
+
+        def load_supervisor(self) -> FakeSupervisor:
+            return FakeSupervisor()
+
+    class FakeRouter:
+        def __init__(self, _config_path: Path) -> None:
+            pass
+
+        def ensure_cockpit_layout(self) -> None:
+            order.append("cockpit_layout")
+
+        def route_selected(self, _route_key: str) -> None:
+            order.append("route")
+
+    monkeypatch.setattr(
+        "pollypm.onboarding.PollyPMService", FakeService, raising=False,
+    )
+    monkeypatch.setattr("pollypm.service_api.PollyPMService", FakeService)
+    monkeypatch.setattr("pollypm.cockpit_rail.CockpitRouter", FakeRouter)
+    monkeypatch.setattr(
+        "pollypm.onboarding.start_transcript_ingestion",
+        lambda _config: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "pollypm.transcript_ingest.start_transcript_ingestion",
+        lambda _config: None,
+    )
+    monkeypatch.setattr(
+        "pollypm.onboarding.subprocess.run", lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "pollypm.onboarding.create_tmux_client",
+        lambda: type("Tmux", (), {"current_session_name": lambda self: None})(),
+    )
+    monkeypatch.setattr("pollypm.onboarding.time.sleep", lambda _seconds: None)
+
+    assert _launch_onboarding_experience(result) is True
+    assert order == ["bootstrap", "cockpit_layout", "start_tui", "attach"]
+
+
 def test_seeded_demo_route_parses_project_and_task_number(tmp_path: Path) -> None:
     result = OnboardingResult(
         config_path=tmp_path / "pollypm.toml",

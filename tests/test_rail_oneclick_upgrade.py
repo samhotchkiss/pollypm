@@ -156,7 +156,8 @@ def test_check_flag_switches_pill_to_restart_nudge(fake_config):
 
     rendered = str(app.update_pill.render())
     assert "Upgraded" in rendered
-    assert "v0.2.0" in rendered
+    assert "v0.2.0" not in rendered
+    assert "v0.2.0" in str(app.update_pill.tooltip)
     assert "restart" in rendered.lower()
     assert app.update_pill.display is True
 

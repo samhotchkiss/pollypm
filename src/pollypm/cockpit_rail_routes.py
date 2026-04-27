@@ -42,6 +42,7 @@ _LIVE_SESSION_ROUTES: dict[str, LiveSessionRoute] = {
 }
 
 _STATIC_VIEW_ROUTES: dict[str, StaticViewRoute] = {
+    "dashboard": StaticViewRoute(kind="dashboard", selected_key="dashboard"),
     "inbox": StaticViewRoute(kind="inbox", selected_key="inbox"),
     "workers": StaticViewRoute(kind="workers", selected_key="workers"),
     "metrics": StaticViewRoute(kind="metrics", selected_key="metrics"),

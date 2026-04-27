@@ -76,17 +76,18 @@ def test_cockpit_router_build_items_includes_core_entries(monkeypatch, tmp_path:
     items = router.build_items(spinner_index=2)
 
     keys = [item.key for item in items]
+    assert "dashboard" in keys
     assert "polly" in keys
     assert "russell" in keys
     assert "inbox" in keys
     assert "project:pollypm" in keys
     assert "project:demo" in keys
     assert "settings" in keys
-    assert items[0].key == "polly"
-    assert items[0].state == "ready"
-    assert items[1].key == "russell"
-    assert items[2].key == "inbox"
-    assert items[2].label == "Inbox (1)"
+    by_key = {item.key: item for item in items}
+    assert keys.index("dashboard") < keys.index("polly") < keys.index("inbox")
+    assert by_key["dashboard"].label == "Home"
+    assert by_key["polly"].state == "ready"
+    assert by_key["inbox"].label == "Inbox (1)"
     # Projects are sorted alphabetically; both "Demo" and "PollyPM" should be present
     project_labels = [i.label for i in items if i.key.startswith("project:")]
     assert "Demo" in project_labels
@@ -2119,6 +2120,141 @@ def test_cockpit_router_routes_idle_project_to_detail_pane(monkeypatch, tmp_path
     router.route_selected("project:demo")
 
     assert calls["selected"] == "project:demo"
+    assert calls["respawn"][0] == "%2"
+    assert "cockpit-pane project demo" in calls["respawn"][1]
+
+
+def test_cockpit_router_routes_dashboard_home_to_static_pane(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    calls: dict[str, object] = {}
+    (tmp_path / "pollypm.toml").write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+
+    class FakeTmux:
+        def list_panes(self, target: str):
+            return [
+                type("Pane", (), {"pane_id": "%1", "active": True})(),
+                type("Pane", (), {"pane_id": "%2", "active": False})(),
+            ]
+
+        def respawn_pane(self, target: str, command: str):
+            calls["respawn"] = (target, command)
+
+    class FakeConfig:
+        class Project:
+            root_dir = tmp_path
+            base_dir = tmp_path / ".pollypm"
+            tmux_session = "pollypm"
+
+        project = Project()
+        projects = {}
+
+    class FakeSupervisor:
+        config = FakeConfig()
+
+        def ensure_layout(self):
+            return None
+
+        def plan_launches(self):
+            return []
+
+    router = CockpitRouter(tmp_path / "pollypm.toml")
+    router.tmux = FakeTmux()  # type: ignore[assignment]
+    monkeypatch.setattr(router, "_load_supervisor", lambda: FakeSupervisor())
+    monkeypatch.setattr(router, "set_selected_key", lambda key: calls.setdefault("selected", key))
+    monkeypatch.setattr(router, "ensure_cockpit_layout", lambda: None)
+    monkeypatch.setattr(router, "_right_pane_id", lambda target: "%2")
+
+    router.route_selected("dashboard")
+
+    assert calls["selected"] == "dashboard"
+    assert calls["respawn"][0] == "%2"
+    assert "cockpit-pane dashboard" in calls["respawn"][1]
+
+
+def test_live_session_fallback_does_not_kill_right_pane_before_source_exists(
+    tmp_path: Path,
+) -> None:
+    calls: dict[str, object] = {"kill": []}
+    (tmp_path / "pollypm.toml").write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+
+    class FakePane:
+        def __init__(self, pane_id: str, left: int) -> None:
+            self.pane_id = pane_id
+            self.pane_left = left
+            self.pane_current_command = "uv" if left == 0 else "sh"
+            self.pane_width = 80
+
+    class FakeWindow:
+        def __init__(self, name: str, index: int) -> None:
+            self.name = name
+            self.index = index
+
+    class FakeTmux:
+        def __init__(self) -> None:
+            self.window_calls = 0
+
+        def list_panes(self, target: str):
+            return [FakePane("%1", 0), FakePane("%2", 31)]
+
+        def list_windows(self, target: str):
+            self.window_calls += 1
+            if self.window_calls == 1:
+                return [FakeWindow("worker-demo", 3)]
+            return []
+
+        def kill_pane(self, pane_id: str):
+            calls["kill"].append(pane_id)  # type: ignore[union-attr]
+
+        def respawn_pane(self, target: str, command: str):
+            calls["respawn"] = (target, command)
+
+        def resize_pane_width(self, target: str, width: int):
+            pass
+
+        def run(self, *args, **kwargs):
+            pass
+
+    class FakeSession:
+        name = "worker_demo"
+        role = "worker"
+        project = "demo"
+
+    class FakeLaunch:
+        session = FakeSession()
+        window_name = "worker-demo"
+
+    class FakeConfig:
+        class Project:
+            root_dir = tmp_path
+            base_dir = tmp_path / ".pollypm"
+            tmux_session = "pollypm"
+
+        project = Project()
+        projects = {
+            "demo": KnownProject(key="demo", path=tmp_path / "demo", name="Demo", kind=ProjectKind.GIT),
+        }
+        sessions = {}
+
+    class FakeSupervisor:
+        config = FakeConfig()
+
+        def plan_launches(self):
+            return [FakeLaunch()]
+
+        def storage_closet_session_name(self):
+            return "pollypm-storage-closet"
+
+    router = CockpitRouter(tmp_path / "pollypm.toml")
+    router.tmux = FakeTmux()  # type: ignore[assignment]
+
+    router._show_live_session(FakeSupervisor(), "worker_demo", "pollypm:PollyPM")
+
+    assert calls["kill"] == []
     assert calls["respawn"][0] == "%2"
     assert "cockpit-pane project demo" in calls["respawn"][1]
 

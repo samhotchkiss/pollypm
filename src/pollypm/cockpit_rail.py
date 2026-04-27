@@ -2046,8 +2046,6 @@ class CockpitRouter:
             state["right_pane_id"] = self._right_pane_id(window_target)
             self._write_state(state)
             return
-        if right_pane_id is not None:
-            self.tmux.kill_pane(right_pane_id)
         # Use window index to avoid ambiguity with duplicate window names
         storage_windows = self.tmux.list_windows(storage_session)
         target_window = next(
@@ -2055,8 +2053,12 @@ class CockpitRouter:
             None,
         )
         if target_window is None:
-            self._show_static_view(supervisor, window_target, "polly" if session_name == "operator" else "project")
+            fallback_kind = "polly" if session_name == "operator" else "project"
+            fallback_target = launch.session.project if fallback_kind == "project" else None
+            self._show_static_view(supervisor, window_target, fallback_kind, fallback_target)
             return
+        if right_pane_id is not None:
+            self.tmux.kill_pane(right_pane_id)
         source = f"{storage_session}:{target_window.index}.0"
         self.tmux.join_pane(source, left_pane_id, horizontal=True)
         panes = self.tmux.list_panes(window_target)

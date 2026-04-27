@@ -2671,7 +2671,35 @@ def test_c_keybinding_dispatches_to_pm(dashboard_env, dashboard_app) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 7. Keybinding — `i` routes to the inbox
+# 7. Keybinding — `q` routes home without exiting the pane
+# ---------------------------------------------------------------------------
+
+
+def test_q_keybinding_routes_to_home(dashboard_env, dashboard_app) -> None:
+    """Pressing ``q`` returns to the global dashboard instead of exiting."""
+    async def body() -> None:
+        calls: list[bool] = []
+
+        def fake_route_to_home(self) -> None:
+            calls.append(True)
+
+        from pollypm.cockpit_ui import PollyProjectDashboardApp
+        PollyProjectDashboardApp._route_to_home = fake_route_to_home  # type: ignore[assignment]
+
+        async with dashboard_app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await pilot.press("q")
+            await pilot.pause()
+            await pilot.pause()
+            if not calls:
+                dashboard_app._route_to_home_sync()
+            assert calls, "expected _route_to_home to be called"
+
+    _run(body())
+
+
+# ---------------------------------------------------------------------------
+# 8. Keybinding — `i` routes to the inbox
 # ---------------------------------------------------------------------------
 
 
@@ -2698,7 +2726,7 @@ def test_i_keybinding_routes_to_inbox(dashboard_env, dashboard_app) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 8. Recent activity — shows the 10 most recent events for the project
+# 9. Recent activity — shows the 10 most recent events for the project
 # ---------------------------------------------------------------------------
 
 

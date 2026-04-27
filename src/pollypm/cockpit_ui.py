@@ -9680,7 +9680,7 @@ class PollyProjectDashboardApp(App[None]):
         _open_keyboard_help(self)
 
     _DEFAULT_HINT = (
-        "c chat \u00b7 p plan \u00b7 i inbox \u00b7 l log \u00b7 q close"
+        "c chat \u00b7 p plan \u00b7 i inbox \u00b7 l log \u00b7 q home"
     )
     _PLAN_VIEW_HINT = (
         "j/k scroll \u00b7 g/G top/bottom \u00b7 v explainer "
@@ -11035,7 +11035,24 @@ class PollyProjectDashboardApp(App[None]):
         self._refresh()
 
     def action_back(self) -> None:
-        self.exit()
+        self.run_worker(
+            lambda: self._route_to_home_sync(),
+            thread=True,
+            exclusive=True,
+            group="proj_home",
+        )
+
+    def _route_to_home_sync(self) -> None:
+        try:
+            self._route_to_home()
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(
+                self.notify, f"Return home failed: {exc}", severity="error",
+            )
+
+    def _route_to_home(self) -> None:
+        router = CockpitRouter(self.config_path)
+        router.route_selected("dashboard")
 
     def action_chat_pm(self) -> None:
         """Route the cockpit right-pane to this project's PM session.

@@ -462,12 +462,20 @@ def _project_handler(ctx: RailContext) -> PanelSpec | None:
 def _initialize(api) -> None:  # noqa: ANN001
     rail = api.rail
 
-    # Top section — operator + reviewer + inbox. In the legacy layout these
-    # all rendered at the top before the projects section, so we keep them
-    # in `top` rather than `workflows` to preserve ordering.
+    # Top section — Home plus operator/reviewer/inbox. In the legacy layout
+    # these all rendered at the top before the projects section, so we keep
+    # them in `top` rather than `workflows` to preserve ordering.
     rail.register_item(
         section="top",
         index=0,
+        label="Home",
+        handler=_route_handler("dashboard"),
+        key="dashboard",
+        state_provider=lambda _ctx: "home",
+    )
+    rail.register_item(
+        section="top",
+        index=10,
         label="Polly",
         handler=_route_handler("polly"),
         key="polly",
@@ -475,7 +483,7 @@ def _initialize(api) -> None:  # noqa: ANN001
     )
     rail.register_item(
         section="top",
-        index=10,
+        index=20,
         label="Russell",
         handler=_route_handler("russell"),
         key="russell",
@@ -483,7 +491,7 @@ def _initialize(api) -> None:  # noqa: ANN001
     )
     rail.register_item(
         section="top",
-        index=20,
+        index=30,
         label="Inbox",
         handler=_route_handler("inbox"),
         key="inbox",

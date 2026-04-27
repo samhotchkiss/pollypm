@@ -712,14 +712,21 @@ class KeyboardHelpModal(ModalScreen[None]):
     }
     """
 
+    # Priority bindings so the modal traps input — without ``priority``
+    # the rail underneath has its own priority j/k/g/G/Esc bindings and
+    # eats the keystrokes before this modal sees them, leaving the user
+    # convinced the help dialog is broken (#861).
     BINDINGS = [
-        Binding("escape,q,question_mark", "cancel", "Close"),
-        Binding("j,down", "scroll_down", "Down", show=False),
-        Binding("k,up", "scroll_up", "Up", show=False),
-        Binding("g,home", "scroll_home", "Top", show=False),
-        Binding("G,end", "scroll_end", "Bottom", show=False),
-        Binding("pageup,b", "page_up", "Page up", show=False),
-        Binding("pagedown,space,f", "page_down", "Page down", show=False),
+        Binding("escape,q,question_mark", "cancel", "Close", priority=True),
+        Binding("j,down", "scroll_down", "Down", show=False, priority=True),
+        Binding("k,up", "scroll_up", "Up", show=False, priority=True),
+        Binding("g,home", "scroll_home", "Top", show=False, priority=True),
+        Binding("G,end", "scroll_end", "Bottom", show=False, priority=True),
+        Binding("pageup,b", "page_up", "Page up", show=False, priority=True),
+        Binding(
+            "pagedown,space,f", "page_down", "Page down",
+            show=False, priority=True,
+        ),
     ]
 
     def __init__(

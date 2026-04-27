@@ -459,3 +459,14 @@ def test_help_modal_binds_jk_for_scroll() -> None:
     bound = {key for binding in KeyboardHelpModal.BINDINGS for key in binding.key.split(",")}
     for required in ("j", "k", "down", "up", "g", "G", "home", "end"):
         assert required in bound, f"help modal missing scroll binding for {required!r}"
+
+
+def test_help_modal_bindings_are_priority_to_trap_rail_keys() -> None:
+    """Modal bindings must run with priority so the rail underneath does
+    not eat j/k/Esc before the modal sees them (#861)."""
+    from pollypm.cockpit_ui import KeyboardHelpModal
+
+    for binding in KeyboardHelpModal.BINDINGS:
+        assert getattr(binding, "priority", False), (
+            f"{binding.key!r} must be priority to trap rail bindings"
+        )

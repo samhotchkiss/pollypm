@@ -2767,6 +2767,25 @@ class PollySettingsPaneApp(App[None]):
         padding: 1 1;
         margin-right: 1;
     }
+    /* Narrow-mode placeholder (#865). At terminal widths below ~110
+       cols, the side-by-side nav + content layout collapses into
+       letter-by-letter wrapping. Toggle this overlay so the user
+       sees a clear "needs more space" hint instead of broken
+       rendering. The overlay lives at the outer container so it can
+       cover the entire pane regardless of which inner card is in
+       focus. Toggled from PollySettingsPaneApp.on_resize. */
+    #settings-narrow-overlay {
+        display: none;
+        height: 1fr;
+        content-align: center middle;
+        color: #97a6b2;
+    }
+    #settings-outer.-narrow #settings-body {
+        display: none;
+    }
+    #settings-outer.-narrow #settings-narrow-overlay {
+        display: block;
+    }
     #settings-nav > .nav-item {
         height: 1;
         padding: 0 1;
@@ -2950,6 +2969,16 @@ class PollySettingsPaneApp(App[None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="settings-outer"):
             yield self.topbar
+            # Narrow-mode placeholder (#865). Toggled by on_resize when
+            # the terminal is below the threshold where the side-by-side
+            # nav + content layout starts wrapping letter-by-letter.
+            yield Static(
+                "[b]Settings needs at least 110 cols of width.[/b]\n"
+                "[dim]Resize the terminal or split — current layout would\n"
+                "wrap content letter-by-letter.[/dim]",
+                id="settings-narrow-overlay",
+                markup=True,
+            )
             with Horizontal(id="settings-body"):
                 yield self.nav
                 with Vertical(id="settings-right"):
@@ -3035,6 +3064,26 @@ class PollySettingsPaneApp(App[None]):
         # Live alert toasts. Settings has no ``a`` binding so the toast
         # surfaces the full hint.
         _setup_alert_notifier(self, bind_a=True)
+        self._apply_narrow_class()
+
+    # Threshold below which the side-by-side nav + content layout
+    # collapses into letter-by-letter wrapping (#865). Empirically a
+    # 28-col nav + a content panel that needs ~80 cols itself = 110.
+    _NARROW_THRESHOLD: int = 110
+
+    def _apply_narrow_class(self) -> None:
+        try:
+            outer = self.query_one("#settings-outer", Vertical)
+        except Exception:  # noqa: BLE001
+            return
+        try:
+            width = self.size.width
+        except Exception:  # noqa: BLE001
+            return
+        outer.set_class(width < self._NARROW_THRESHOLD, "-narrow")
+
+    def on_resize(self, _event: events.Resize) -> None:  # type: ignore[override]
+        self._apply_narrow_class()
 
     def action_view_alerts(self) -> None:
         _action_view_alerts(self)

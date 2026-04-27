@@ -3574,6 +3574,41 @@ def test_cockpit_forwards_l_to_right_pane_only_on_project_surface() -> None:
     assert sent == ["l"]
 
 
+def test_cockpit_project_enter_advances_cursor_to_dashboard_subitem() -> None:
+    """Pressing Enter on a project advances the rail cursor to the
+    project's Dashboard sub-item in one stroke (#880).
+
+    Without this, Enter on a project leaves the rail cursor on the
+    project header while sub-items expand below — so the user has to
+    press Enter, then j, then Enter again to reach a sub-item, even
+    though the right pane is already showing the dashboard.
+    """
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    app.hint = _CaptureWidget()
+    app._refresh_rows = lambda: None  # type: ignore[method-assign]
+    app._selected_row_key = lambda: "project:demo"  # type: ignore[method-assign]
+
+    class _Router:
+        last_route: str | None = None
+
+        def route_selected(self, key: str) -> None:
+            self.last_route = key
+
+        def selected_key(self) -> str:
+            # Mirror the production redirect — ``project:demo`` resolves to
+            # the dashboard sub-item.
+            return "project:demo:dashboard"
+
+    app.router = _Router()  # type: ignore[assignment]
+    app.selected_key = "project:demo"
+    app._last_router_selected_key = "polly"
+
+    app.action_open_selected()
+
+    assert app.router.last_route == "project:demo"
+    assert app.selected_key == "project:demo:dashboard"
+
+
 def test_cockpit_pin_toggle_round_trips_and_reports_state() -> None:
     """``p`` toggles the pin AND surfaces a hint about the new state (#858)."""
     app = PollyCockpitApp.__new__(PollyCockpitApp)

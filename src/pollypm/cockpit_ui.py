@@ -2720,6 +2720,10 @@ class PollySettingsPaneApp(App[None]):
     }
     #settings-account-actions Button {
         margin-right: 1;
+        height: 1;
+        min-height: 1;
+        border: none;
+        padding: 0 1;
     }
     #settings-role-editor {
         height: auto;
@@ -2744,6 +2748,10 @@ class PollySettingsPaneApp(App[None]):
     }
     #settings-reload-cockpit {
         min-width: 18;
+        height: 1;
+        min-height: 1;
+        border: none;
+        padding: 0 1;
     }
     #settings-actions-note {
         color: #97a6b2;
@@ -9841,6 +9849,16 @@ class PollyProjectDashboardApp(App[None]):
     }
     .proj-action-controls Button {
         margin-right: 1;
+        /* Compact action buttons (#878). Default Textual Button takes
+           3 rows (top edge / label / bottom edge); on a 65-row laptop
+           that pushes inbox / current activity / pipeline below the
+           fold for even a single Action Needed card. ``height: 1`` +
+           ``border: none`` keeps the label without the decorative
+           ▔▔/▁▁ frames that earned no information. */
+        height: 1;
+        min-height: 1;
+        border: none;
+        padding: 0 1;
     }
     .proj-action-other {
         width: 1fr;

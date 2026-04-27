@@ -10628,6 +10628,43 @@ class PollyProjectDashboardApp(App[None]):
             click_hint = _action_card_click_hint(data.action_items[:2])
             if click_hint:
                 lines.append(f"  [dim]{click_hint}[/dim]")
+            # When the project also has on_hold tasks (booktalk: plan
+            # review action card + #2 on hold), the banner suffix says
+            # "· 1 on hold" but the dashboard previously gave no detail
+            # until the user scrolled to Task pipeline. Surface a
+            # compact one-line summary directly under the action cards
+            # so the user knows what else needs attention without
+            # guessing. Skip when on_hold task IDs are already
+            # represented by an action card (avoid double-counting).
+            if on_hold_total:
+                on_hold_items = data.task_buckets.get("on_hold", [])
+                summary_items = []
+                for item in on_hold_items:
+                    num = item.get("task_number")
+                    if num is None:
+                        continue
+                    ref = f"{self.project_key}/{num}"
+                    if ref in action_ids:
+                        continue
+                    summary_items.append(item)
+                    if len(summary_items) >= 2:
+                        break
+                if summary_items:
+                    lines.append("")
+                    label = (
+                        "Also on hold"
+                        if len(summary_items) == 1
+                        else f"Also on hold ({on_hold_total})"
+                    )
+                    lines.append(f"  [#f0c45a][dim]{label}:[/dim][/]")
+                    for item in summary_items:
+                        num = item.get("task_number")
+                        title = _escape(item.get("title") or "")
+                        if len(title) > 60:
+                            title = title[:57] + "…"
+                        lines.append(
+                            f"  [dim]·[/dim] [b]#{num}[/b] {title}"
+                        )
             lines.append("")
         elif blocked_total:
             lines.append("[#f0c45a][b]Blocked, but summary missing[/b][/]")

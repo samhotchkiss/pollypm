@@ -564,6 +564,108 @@ def test_plan_review_action_uses_contextual_review_plan_button(
     _run(body())
 
 
+def test_inbox_remainder_shows_also_on_hold_summary_under_action_card(
+    dashboard_app,
+) -> None:
+    """When the dashboard renders an Action Needed card AND the project
+    has on_hold tasks, the inbox remainder surfaces a compact ``Also
+    on hold: #N <title>`` line right under the action card.
+
+    Booktalk (live, 2026-04-26): banner read ``Waiting on you: A full
+    project plan is ready for your review. · 1 on hold`` but the
+    dashboard gave no detail on what was on hold until the user
+    scrolled to Task pipeline. The summary line closes that gap.
+    """
+    from types import SimpleNamespace
+
+    fake_data = SimpleNamespace(
+        inbox_count=1,
+        task_counts={"on_hold": 1},
+        task_buckets={
+            "on_hold": [
+                {
+                    "task_number": 2,
+                    "title": "Phase 2: Scraper + SQLite infrastructure",
+                },
+            ],
+        },
+        action_items=[
+            {
+                "task_id": "msg:demo:1",
+                "primary_ref": "demo/3",
+                "title": "Plan ready",
+                "plain_prompt": "A full project plan is ready.",
+                "decision_question": "Approve?",
+                "unblock_steps": ["Open the plan."],
+                "needs_action": True,
+            },
+        ],
+        inbox_top=[],
+    )
+    body = dashboard_app._render_inbox_remainder(fake_data)
+    assert "Also on hold:" in body
+    assert "#2" in body
+    assert "Phase 2" in body
+
+
+def test_inbox_remainder_drops_also_on_hold_when_action_card_already_covers_it(
+    dashboard_app,
+) -> None:
+    """Don't double-list the same task: if the on_hold task IS the
+    action card's primary_ref, the summary line is skipped (the card
+    already covers it)."""
+    from types import SimpleNamespace
+
+    fake_data = SimpleNamespace(
+        inbox_count=1,
+        task_counts={"on_hold": 1},
+        task_buckets={
+            "on_hold": [
+                {"task_number": 3, "title": "Plan project demo"},
+            ],
+        },
+        action_items=[
+            {
+                "task_id": "msg:demo:1",
+                "primary_ref": "demo/3",  # same as the on_hold task
+                "title": "Plan ready",
+                "plain_prompt": "A full project plan is ready.",
+                "decision_question": "Approve?",
+                "unblock_steps": ["Open the plan."],
+                "needs_action": True,
+            },
+        ],
+        inbox_top=[],
+    )
+    body = dashboard_app._render_inbox_remainder(fake_data)
+    assert "Also on hold:" not in body
+
+
+def test_inbox_remainder_skips_also_on_hold_when_no_action_card(
+    dashboard_app,
+) -> None:
+    """The ``Also on hold`` summary is a sibling-to-action-card affordance.
+    Without action_items, the existing ``On hold`` inbox section
+    renders the full detail — no need for the compact summary."""
+    from types import SimpleNamespace
+
+    fake_data = SimpleNamespace(
+        inbox_count=0,
+        task_counts={"on_hold": 1},
+        task_buckets={
+            "on_hold": [
+                {"task_number": 2, "title": "Phase 2"},
+            ],
+        },
+        action_items=[],
+        inbox_top=[],
+    )
+    body = dashboard_app._render_inbox_remainder(fake_data)
+    assert "Also on hold:" not in body
+    # Original on_hold inbox section should still render.
+    assert "On hold" in body
+
+
 def test_action_open_plan_with_enforce_plan_false_says_bypass(
     dashboard_app,
 ) -> None:

@@ -767,6 +767,25 @@ def test_cockpit_ui_help_legend_mentions_glyph_alphabet() -> None:
     assert "✕" in binding.description
 
 
+def test_command_palette_compact_rows_omit_wrapping_descriptions() -> None:
+    from pollypm.cockpit import PaletteCommand
+    from pollypm.cockpit_palette import _PaletteListItem
+
+    command = PaletteCommand(
+        title="Open pollypm.toml in editor",
+        subtitle="/Users/sam/.pollypm/pollypm.toml",
+        category="System",
+        keybind=None,
+        tag="system.edit_config",
+    )
+
+    rendered = _PaletteListItem._render_body(command, compact=True)
+
+    assert "\n" not in rendered
+    assert "System" not in rendered
+    assert "pollypm.toml" in rendered
+
+
 def test_cockpit_tagline_is_static_between_ticks(monkeypatch) -> None:
     app = PollyCockpitApp.__new__(PollyCockpitApp)
     app._tick_count = 0
@@ -1437,6 +1456,22 @@ def test_cockpit_router_marks_palette_tip_seen(tmp_path: Path) -> None:
 
     assert router.should_show_palette_tip() is False
     assert router._load_state()["palette_tip_seen"] is True
+
+
+def test_cockpit_router_selected_key_bumps_epoch(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+    bumps: list[str] = []
+    monkeypatch.setattr("pollypm.state_epoch.bump", lambda: bumps.append("bump"))
+
+    router = CockpitRouter(config_path)
+
+    router.set_selected_key("settings")
+    router.set_selected_key("settings")
+
+    assert bumps == ["bump"]
 
 
 def test_cockpit_router_selected_key_clears_dead_right_pane_state(monkeypatch, tmp_path: Path) -> None:
@@ -2965,6 +3000,83 @@ def test_cockpit_cursor_sync_moves_visible_marker_without_full_refresh() -> None
     assert inbox.updates == 1
 
 
+def test_cockpit_app_adopts_external_router_selection_without_stomping_cursor() -> None:
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    app.selected_key = "project:demo:issues"
+    app._last_router_selected_key = "project:demo:issues"
+
+    class _Router:
+        selected = "dashboard"
+
+        def selected_key(self) -> str:
+            return self.selected
+
+    app.router = _Router()  # type: ignore[assignment]
+
+    app._adopt_router_selection_if_changed()
+    assert app.selected_key == "dashboard"
+    assert app._last_router_selected_key == "dashboard"
+
+    app.selected_key = "inbox"
+    app._adopt_router_selection_if_changed()
+    assert app.selected_key == "inbox"
+
+
+def test_cockpit_app_routes_detail_hint_keys_from_rail() -> None:
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    calls: list[tuple[str, str] | str] = []
+
+    class _Router:
+        selected = "dashboard"
+
+        def route_selected(self, key: str) -> None:
+            calls.append(("route", key))
+            self.selected = key
+
+        def selected_key(self) -> str:
+            return self.selected
+
+        def send_key_to_right_pane(self, key: str) -> None:
+            calls.append(("send", key))
+
+    app.router = _Router()  # type: ignore[assignment]
+    app.selected_key = "dashboard"
+    app._last_router_selected_key = "dashboard"
+    app.hint = _CaptureWidget()
+    app._refresh_rows = lambda: calls.append("refresh")  # type: ignore[method-assign]
+
+    app.action_open_inbox()
+    app.selected_key = "settings"
+    app.action_forward_tab_to_right()
+    app.selected_key = "workers"
+    app.action_forward_workers_auto_refresh()
+
+    assert ("route", "inbox") in calls
+    assert ("send", "Tab") in calls
+    assert ("send", "A") in calls
+
+
+def test_cockpit_settings_row_has_text_cursor_when_active() -> None:
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    app.selected_key = "settings"
+    app._row_widgets = {}  # type: ignore[assignment]
+    updates: list[str] = []
+
+    class _SettingsRow:
+        def set_class(self, enabled: bool, name: str) -> None:
+            assert enabled is True
+            assert name == "active-view"
+
+        def update(self, text: str) -> None:
+            updates.append(text)
+
+    app.settings_row = _SettingsRow()  # type: ignore[assignment]
+
+    app._apply_active_view_to_rows()
+
+    assert updates == ["▌ ⚙ Settings"]
+
+
 def test_cockpit_app_resize_schedules_layout_recovery() -> None:
     app = PollyCockpitApp.__new__(PollyCockpitApp)
     scheduled: list[str] = []
@@ -3030,6 +3142,34 @@ def test_cockpit_rail_ctrl_k_routes_to_settings(monkeypatch, tmp_path: Path) -> 
     assert rail._handle_key(b"\x0b", items) is True
     assert rail.router.calls == ["settings"]
     assert rail.selected_key == "settings"
+
+
+def test_cockpit_rail_forwards_detail_hint_keys(monkeypatch, tmp_path: Path) -> None:
+    class FakeRouter:
+        def __init__(self, _config_path: Path) -> None:
+            self.sent: list[str] = []
+            self.tmux = None
+
+        def selected_key(self) -> str:
+            return "settings"
+
+        def send_key_to_right_pane(self, key: str) -> None:
+            self.sent.append(key)
+
+    monkeypatch.setattr("pollypm.cockpit_rail.CockpitRouter", FakeRouter)
+    from pollypm.cockpit_rail import CockpitItem, PollyCockpitRail
+
+    rail = PollyCockpitRail(tmp_path / "pollypm.toml")
+    items = [
+        CockpitItem("workers", "Workers", "ready"),
+        CockpitItem("settings", "Settings", "config"),
+    ]
+
+    assert rail._handle_key(b"\t", items) is True
+    rail.selected_key = "workers"
+    assert rail._handle_key(b"A", items) is True
+
+    assert rail.router.sent == ["Tab", "A"]
 
 
 def test_cockpit_rail_picks_up_external_selection(monkeypatch, tmp_path: Path) -> None:

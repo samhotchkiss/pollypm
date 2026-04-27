@@ -638,10 +638,13 @@ class PollyCockpitApp(App[None]):
     BINDINGS = [
         Binding("enter,o", "open_selected", "Open"),
         Binding("n", "new_worker", "New Worker"),
+        Binding("i", "open_inbox", "Inbox", show=False, priority=True),
         Binding("t", "open_activity", "Activity"),
         Binding("p", "toggle_project_pin", "Pin Project"),
         Binding("r", "refresh", "Refresh"),
         Binding("s", "open_settings", "Settings"),
+        Binding("tab", "forward_tab_to_right", "Right Pane", show=False, priority=True),
+        Binding("A", "forward_workers_auto_refresh", "Workers Auto", show=False, priority=True),
         Binding("u", "trigger_upgrade", "Upgrade", show=False),
         Binding("x", "dismiss_update_pill", "Dismiss Update", show=False),
         Binding("a", "view_alerts", "Alerts", show=False),
@@ -686,7 +689,7 @@ class PollyCockpitApp(App[None]):
         )
         self.tagline = Static("\n" + POLLY_TAGLINE, id="tagline")
         self.nav = ListView(id="nav")
-        self.settings_row = Static("\u2699 Settings", id="settings-row")
+        self.settings_row = Static("  \u2699 Settings", id="settings-row")
         self.update_pill = Static("", id="update-pill", markup=True)
         self.ticker = Static("", id="ticker")
         self.hint = Static("", id="hint")
@@ -697,6 +700,7 @@ class PollyCockpitApp(App[None]):
         self.spinner_index = 0
         self._ticker_started_at = time.monotonic()
         self.selected_key = "polly"
+        self._last_router_selected_key = "polly"
         self._items: list[CockpitItem] = []
         self._row_widgets: dict[str, RailItem] = {}
         self._section_sep: ListItem | None = None
@@ -725,6 +729,7 @@ class PollyCockpitApp(App[None]):
 
     def on_mount(self) -> None:
         self.selected_key = self.router.selected_key()
+        self._last_router_selected_key = self.selected_key
         self._refresh_rows()
         self._update_ticker()
         self._update_pill_refresh()
@@ -822,6 +827,21 @@ class PollyCockpitApp(App[None]):
         focus_method = getattr(self.router, "focus_right_pane", None)
         if callable(focus_method):
             focus_method()
+
+    def _send_key_to_right_pane(self, key: str) -> None:
+        send_method = getattr(self.router, "send_key_to_right_pane", None)
+        if callable(send_method):
+            send_method(key)
+
+    def _adopt_router_selection_if_changed(self) -> None:
+        try:
+            external_key = self.router.selected_key()
+        except Exception:  # noqa: BLE001
+            return
+        if not external_key or external_key == self._last_router_selected_key:
+            return
+        self._last_router_selected_key = external_key
+        self.selected_key = external_key
 
     # Layout check (pane recovery, rail width) — only every ~30s
     _LAYOUT_CHECK_INTERVAL = 38  # ~30s at 0.8s/tick
@@ -927,6 +947,7 @@ class PollyCockpitApp(App[None]):
         return [item for item in self._items if item.key != "settings"]
 
     def _refresh_rows(self) -> None:
+        self._adopt_router_selection_if_changed()
         try:
             self._items = self.router.build_items(spinner_index=self.spinner_index)
         except Exception:  # noqa: BLE001
@@ -1050,6 +1071,10 @@ class PollyCockpitApp(App[None]):
             row.set_class(active, "active-view")
             row.update_body()
         self.settings_row.set_class(self.selected_key == "settings", "active-view")
+        update_settings = getattr(self.settings_row, "update", None)
+        if callable(update_settings):
+            marker = "\u258c " if self.selected_key == "settings" else "  "
+            update_settings(f"{marker}\u2699 Settings")
 
     # Internal infrastructure events that have no signal value to a
     # user reading the rail's events strip (#793). Heartbeat ticks and
@@ -1347,6 +1372,16 @@ class PollyCockpitApp(App[None]):
         self.selected_key = "settings"
         try:
             self.router.route_selected("settings")
+            self._last_router_selected_key = self.router.selected_key()
+        except Exception as exc:  # noqa: BLE001
+            self.hint.update(f"Error: {exc}"[:60])
+        self._refresh_rows()
+
+    def action_open_inbox(self) -> None:
+        self.selected_key = "inbox"
+        try:
+            self.router.route_selected("inbox")
+            self._last_router_selected_key = self.router.selected_key()
         except Exception as exc:  # noqa: BLE001
             self.hint.update(f"Error: {exc}"[:60])
         self._refresh_rows()
@@ -1355,9 +1390,17 @@ class PollyCockpitApp(App[None]):
         self.selected_key = "activity"
         try:
             self.router.route_selected("activity")
+            self._last_router_selected_key = self.router.selected_key()
         except Exception as exc:  # noqa: BLE001
             self.hint.update(f"Error: {exc}"[:60])
         self._refresh_rows()
+
+    def action_forward_tab_to_right(self) -> None:
+        self._send_key_to_right_pane("Tab")
+
+    def action_forward_workers_auto_refresh(self) -> None:
+        if self.selected_key == "workers":
+            self._send_key_to_right_pane("A")
 
     def action_toggle_project_pin(self) -> None:
         key = self._selected_row_key()

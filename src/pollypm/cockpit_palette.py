@@ -14,6 +14,7 @@ Contract:
 from __future__ import annotations
 
 from collections import deque
+from textwrap import shorten
 
 from textual import on
 from textual.app import App, ComposeResult
@@ -32,13 +33,19 @@ from pollypm.cockpit import (
 class _PaletteListItem(ListItem):
     """A single row inside the ``:`` command palette."""
 
-    def __init__(self, command: PaletteCommand) -> None:
+    def __init__(self, command: PaletteCommand, *, compact: bool = False) -> None:
         self.command = command
-        self.body = Static(self._render_body(command), markup=True)
-        super().__init__(self.body, classes="palette-row")
+        self.body = Static(self._render_body(command, compact=compact), markup=True)
+        classes = "palette-row compact" if compact else "palette-row"
+        super().__init__(self.body, classes=classes)
 
     @staticmethod
-    def _render_body(command: PaletteCommand) -> str:
+    def _render_body(command: PaletteCommand, *, compact: bool = False) -> str:
+        if compact:
+            suffix = f"  [dim]\\[{command.keybind}][/dim]" if command.keybind else ""
+            title_width = max(10, 24 - (len(command.keybind or "") + 4 if command.keybind else 0))
+            title = shorten(command.title, width=title_width, placeholder="…")
+            return f"[b]{title}[/b]{suffix}"
         title = f"[b]{command.title}[/b]"
         if command.keybind:
             title = f"{title}  [dim]\\[{command.keybind}][/dim]"
@@ -104,6 +111,9 @@ class CommandPaletteModal(ModalScreen[str | None]):
         color: #d6dee5;
         background: transparent;
     }
+    #palette-list > .palette-row.compact {
+        height: 1;
+    }
     #palette-list > .palette-row.-highlight {
         background: #1e2730;
     }
@@ -165,6 +175,12 @@ class CommandPaletteModal(ModalScreen[str | None]):
             markup=True,
         )
 
+    def _compact_rows(self) -> bool:
+        try:
+            return self.app.size.width < 50
+        except Exception:  # noqa: BLE001
+            return False
+
     def compose(self) -> ComposeResult:
         with Vertical(id="palette-dialog"):
             yield self.input
@@ -194,20 +210,21 @@ class CommandPaletteModal(ModalScreen[str | None]):
         self.list_view.display = True
 
         first_item_index: int | None = None
+        compact = self._compact_rows()
         if recent:
             self.list_view.append(_PaletteSectionHeader("Recent"))
             self._row_kinds.append("header")
             for cmd in recent:
                 if first_item_index is None:
                     first_item_index = len(self._row_kinds)
-                self.list_view.append(_PaletteListItem(cmd))
+                self.list_view.append(_PaletteListItem(cmd, compact=compact))
                 self._row_kinds.append("item")
             self.list_view.append(_PaletteSectionHeader("All commands"))
             self._row_kinds.append("header")
         for cmd in commands:
             if first_item_index is None:
                 first_item_index = len(self._row_kinds)
-            self.list_view.append(_PaletteListItem(cmd))
+            self.list_view.append(_PaletteListItem(cmd, compact=compact))
             self._row_kinds.append("item")
 
         self.list_view.index = (

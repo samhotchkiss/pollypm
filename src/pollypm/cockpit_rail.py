@@ -585,8 +585,15 @@ class CockpitRouter:
     def set_selected_key(self, key: str) -> None:
         self._validate_state()
         data = self._load_state()
+        if data.get("selected") == key:
+            return
         data["selected"] = key
         self._write_state(data)
+        try:
+            from pollypm.state_epoch import bump
+            bump()
+        except Exception:  # noqa: BLE001
+            pass
 
     def should_show_palette_tip(self) -> bool:
         data = self._load_state()
@@ -1836,6 +1843,14 @@ class CockpitRouter:
         if right_pane is not None:
             self.tmux.select_pane(right_pane)
 
+    def send_key_to_right_pane(self, key: str) -> None:
+        config = self._load_config()
+        window_target = f"{config.project.tmux_session}:{self._COCKPIT_WINDOW}"
+        self.ensure_cockpit_layout()
+        right_pane = self._right_pane_id(window_target)
+        if right_pane is not None:
+            self.tmux.run("send-keys", "-t", right_pane, key, check=False)
+
     def reload_cockpit_shell(
         self,
         *,
@@ -2441,6 +2456,12 @@ class PollyCockpitRail:
         if key in {b"t", b"T"}:
             self.router.route_selected("activity")
             self.selected_key = "activity"
+            return True
+        if key == b"\t":
+            self.router.send_key_to_right_pane("Tab")
+            return True
+        if key == b"A" and self.selected_key == "workers":
+            self.router.send_key_to_right_pane("A")
             return True
         if key in {b"p", b"P"} and self.selected_key.startswith("project:"):
             project_key = self.selected_key.split(":", 2)[1]

@@ -509,12 +509,18 @@ _IDLE_MIN_AGE_SECONDS = 600  # 10 minutes
 
 
 def _project_is_idle(svc, project: str) -> bool:
-    """True when no tasks in the project are queued/in_progress/review/on_hold.
+    """True when no non-terminal task remains in the project.
 
-    Draft tasks don't block idleness — they haven't been picked up yet.
-    Terminal (done/cancelled) tasks are ignored. An empty project
-    (no non-draft tasks at all) also qualifies.
+    Draft tasks don't block idleness — they haven't been picked up
+    yet. The non-terminal set is read from the canonical
+    :func:`pollypm.task_invariants.metadata_for` table so a future
+    addition to ``WorkStatus`` is included automatically. The
+    audit (#899 / #816) cites the pre-migration shape: this site
+    used to hand-list ``QUEUED/IN_PROGRESS/REVIEW/ON_HOLD/BLOCKED``
+    and silently omit ``REWORK``, treating any rework task as if
+    it were terminal.
     """
+    from pollypm.task_invariants import metadata_for
     from pollypm.work.models import WorkStatus
 
     try:
@@ -522,14 +528,14 @@ def _project_is_idle(svc, project: str) -> bool:
     except Exception:  # noqa: BLE001
         return False
     for t in tasks:
-        if t.work_status in (
-            WorkStatus.QUEUED,
-            WorkStatus.IN_PROGRESS,
-            WorkStatus.REVIEW,
-            WorkStatus.ON_HOLD,
-            WorkStatus.BLOCKED,
-        ):
-            return False
+        meta = metadata_for(t.work_status)
+        if meta.is_terminal:
+            continue
+        if t.work_status is WorkStatus.DRAFT:
+            # Draft tasks don't block idleness per the docstring;
+            # they haven't been picked up yet.
+            continue
+        return False
     return True
 
 

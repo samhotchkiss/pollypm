@@ -1074,6 +1074,50 @@ class SQLiteWorkService:
         actor: str,
         reason: str | None = None,
     ) -> None:
+        # #899 — every transition write runs through the canonical
+        # invariant validator (#886). A violation means the
+        # transition is outside the canonical TASK_TRANSITION_TABLE
+        # — either the table needs to grow OR the caller is doing
+        # something unsafe (the audit's #806 deleted-execution-
+        # history shape). Log at WARNING so the drift is visible in
+        # logs and grep-able; raise only when both states resolve
+        # to unknown enum values, since the row would also fail
+        # downstream reads.
+        try:
+            from pollypm.task_invariants import validate_transition
+            from pollypm.work.models import WorkStatus
+
+            try:
+                from_enum = WorkStatus(from_state)
+                to_enum = WorkStatus(to_state)
+            except ValueError:
+                # One side is not a known WorkStatus — log and
+                # proceed; legacy rows can carry custom states the
+                # validator does not know about.
+                logger.warning(
+                    "work transition uses unknown status: %s/%s -> %s/%s "
+                    "(actor=%s)",
+                    project, task_number, from_state, to_state, actor,
+                )
+            else:
+                violation = validate_transition(
+                    task_id=f"{project}/{task_number}",
+                    from_status=from_enum,
+                    to_status=to_enum,
+                )
+                if violation is not None:
+                    logger.warning(
+                        "work transition violates canonical invariant: %s",
+                        violation.summary,
+                    )
+        except Exception:  # noqa: BLE001 — validator must not break writes
+            logger.exception(
+                "work transition validation failed unexpectedly; "
+                "proceeding with the underlying write (project=%s, "
+                "task=%s, %s -> %s)",
+                project, task_number, from_state, to_state,
+            )
+
         self._conn.execute(
             "INSERT INTO work_transitions "
             "(task_project, task_number, from_state, to_state, actor, reason, created_at) "

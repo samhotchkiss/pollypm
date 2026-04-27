@@ -348,6 +348,135 @@ def test_doctor_emits_one_violation_per_kind_per_task() -> None:
     assert ViolationKind.REWORK_OUTSIDE_RECOVERY_LANE in kinds
 
 
+def _seed_task(svc) -> tuple[str, int]:
+    """Create one task on ``svc`` and return ``(project, task_number)``.
+
+    Used by the validator-wiring tests so ``_record_transition``
+    has a real foreign-key target. Returns the task identity
+    instead of the full Task object — the tests only need the
+    project + task_number."""
+    task = svc.create(
+        title="invariant test",
+        description="",
+        type="task",
+        project="demo",
+        flow_template="standard",
+        roles={"requester": "user", "worker": "test", "reviewer": "test"},
+        priority="normal",
+        created_by="test",
+    )
+    return task.project, task.task_number
+
+
+def test_record_transition_validates_against_canonical_table(tmp_path) -> None:
+    """#899 — work-service _record_transition runs the canonical
+    validator and logs a warning on violation. Regression guard
+    so a refactor cannot quietly drop the validator wiring."""
+    import logging
+
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    db_path = tmp_path / "state.db"
+    captured: list[str] = []
+
+    class _CaptureHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record.getMessage())
+
+    handler = _CaptureHandler(level=logging.WARNING)
+    work_logger = logging.getLogger("pollypm.work.sqlite_service")
+    work_logger.addHandler(handler)
+    work_logger.setLevel(logging.WARNING)
+    try:
+        with SQLiteWorkService(db_path=db_path) as svc:
+            project, task_number = _seed_task(svc)
+            # Force a known-invalid transition through the central
+            # write site. ``done -> in_progress`` is forbidden by
+            # the canonical table.
+            svc._record_transition(
+                project=project,
+                task_number=task_number,
+                from_state="done",
+                to_state="in_progress",
+                actor="test",
+            )
+    finally:
+        work_logger.removeHandler(handler)
+
+    assert any(
+        "violates canonical invariant" in msg
+        and "done -> in_progress" in msg
+        for msg in captured
+    )
+
+
+def test_record_transition_swallows_validator_exceptions(
+    monkeypatch, tmp_path,
+) -> None:
+    """#899 — a broken validator must never break a write. The
+    transition completes; an unexpected validator failure logs
+    via logger.exception (visible in tests as an ERROR record)."""
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    def _explode(**_kwargs):
+        raise RuntimeError("synthetic validator failure")
+
+    monkeypatch.setattr(
+        "pollypm.task_invariants.validate_transition",
+        _explode,
+    )
+
+    db_path = tmp_path / "state.db"
+    with SQLiteWorkService(db_path=db_path) as svc:
+        project, task_number = _seed_task(svc)
+        # Must not raise even though the validator does.
+        svc._record_transition(
+            project=project,
+            task_number=task_number,
+            from_state="queued",
+            to_state="in_progress",
+            actor="test",
+        )
+
+        # Row is still written.
+        rows = svc._conn.execute(
+            "SELECT count(*) FROM work_transitions "
+            "WHERE task_project = ? AND task_number = ?",
+            (project, task_number),
+        ).fetchone()
+        assert rows[0] == 1
+
+
+def test_project_idle_uses_canonical_terminal_table() -> None:
+    """#899 / #816 — the ``_project_is_idle`` helper now derives
+    its non-terminal set from the canonical metadata table, so a
+    REWORK task correctly keeps a project non-idle. Earlier the
+    inline list omitted REWORK and quietly broke milestone digest
+    flushing for rejected tasks."""
+    from pollypm.notification_staging import _project_is_idle
+    from pollypm.work.models import WorkStatus
+
+    class _Task:
+        def __init__(self, status: WorkStatus) -> None:
+            self.work_status = status
+
+    class _Svc:
+        def __init__(self, statuses: list[WorkStatus]) -> None:
+            self._tasks = [_Task(s) for s in statuses]
+
+        def list_tasks(self, project: str):
+            return self._tasks
+
+    # REWORK keeps the project non-idle.
+    assert _project_is_idle(_Svc([WorkStatus.REWORK]), "demo") is False
+    # Only terminal states → idle.
+    assert _project_is_idle(_Svc([WorkStatus.DONE, WorkStatus.CANCELLED]), "demo") is True
+    # Empty project → idle (matches docstring contract).
+    assert _project_is_idle(_Svc([]), "demo") is True
+    # Drafts alone → idle (drafts don't block per docstring).
+    assert _project_is_idle(_Svc([WorkStatus.DRAFT]), "demo") is True
+
+
 def test_violation_summary_is_actionable() -> None:
     """The summary is rendered in the cockpit. It must name the
     task id and the violation kind clearly."""

@@ -133,14 +133,28 @@ TASK_TRANSITION_TABLE: Mapping[WorkStatus, StateMetadata] = {
     WorkStatus.DRAFT: StateMetadata(
         status=WorkStatus.DRAFT,
         owner=StateOwner.USER,
-        allowed_next=frozenset({WorkStatus.QUEUED, WorkStatus.CANCELLED}),
+        # ``DRAFT -> DONE`` supports synthetic backfill / migration
+        # paths that record a task already-completed (e.g., legacy
+        # imports). Caught by the runtime validator (#899); the
+        # canonical table now reflects the real production set.
+        allowed_next=frozenset(
+            {WorkStatus.QUEUED, WorkStatus.DONE, WorkStatus.CANCELLED}
+        ),
         visible_in_cockpit_default=False,
     ),
     WorkStatus.QUEUED: StateMetadata(
         status=WorkStatus.QUEUED,
         owner=StateOwner.SYSTEM,
+        # ``QUEUED -> ON_HOLD`` is supported (the user can pause a
+        # queued task without claiming it). Caught by the runtime
+        # validator (#899) when the table omitted it earlier.
         allowed_next=frozenset(
-            {WorkStatus.IN_PROGRESS, WorkStatus.BLOCKED, WorkStatus.CANCELLED}
+            {
+                WorkStatus.IN_PROGRESS,
+                WorkStatus.BLOCKED,
+                WorkStatus.ON_HOLD,
+                WorkStatus.CANCELLED,
+            }
         ),
         consumes_capacity=False,
     ),
@@ -180,11 +194,14 @@ TASK_TRANSITION_TABLE: Mapping[WorkStatus, StateMetadata] = {
     WorkStatus.REVIEW: StateMetadata(
         status=WorkStatus.REVIEW,
         owner=StateOwner.USER,
+        # ``REVIEW -> ON_HOLD`` supports pausing a review (#899
+        # validator caught the live path).
         allowed_next=frozenset(
             {
                 WorkStatus.DONE,
                 WorkStatus.REWORK,
                 WorkStatus.IN_PROGRESS,
+                WorkStatus.ON_HOLD,
                 WorkStatus.CANCELLED,
             }
         ),
@@ -207,10 +224,13 @@ TASK_TRANSITION_TABLE: Mapping[WorkStatus, StateMetadata] = {
     WorkStatus.ON_HOLD: StateMetadata(
         status=WorkStatus.ON_HOLD,
         owner=StateOwner.USER,
+        # ``ON_HOLD -> REVIEW`` resumes a paused review back into
+        # the active review state (#899).
         allowed_next=frozenset(
             {
                 WorkStatus.IN_PROGRESS,
                 WorkStatus.QUEUED,
+                WorkStatus.REVIEW,
                 WorkStatus.CANCELLED,
             }
         ),

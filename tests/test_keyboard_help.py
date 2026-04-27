@@ -375,6 +375,90 @@ def test_esc_dismisses_help_modal(single_project_env) -> None:
     _run(body())
 
 
+@pytest.mark.parametrize("dismiss_key", ["escape", "q", "question_mark"])
+def test_cockpit_rail_dismiss_keys_close_help_modal(
+    single_project_env, dismiss_key,
+) -> None:
+    """``Esc`` / ``q`` / ``?`` close help modal on PollyCockpitApp (#917).
+
+    PollyCockpitApp's BINDINGS make ``q`` (request_quit), ``escape``
+    (back_to_home), and ``?`` (show_keyboard_help) all priority. Textual
+    walks priority bindings App-down, so without an explicit gate the
+    App-level priority binding fires before KeyboardHelpModal sees the
+    keystroke and the modal is unreachable to the user.
+    """
+    if not _load_config_compatible(single_project_env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_ui import PollyCockpitApp
+    app = PollyCockpitApp(single_project_env["config_path"])
+
+    async def body() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("question_mark")
+            await pilot.pause()
+            assert _find_help_modal(app) is not None, (
+                "expected help modal after ? on PollyCockpitApp"
+            )
+            await pilot.press(dismiss_key)
+            await pilot.pause()
+            assert _find_help_modal(app) is None, (
+                f"expected modal dismissed by {dismiss_key!r} on PollyCockpitApp"
+            )
+    _run(body())
+
+
+def test_cockpit_rail_jk_scrolls_help_modal(single_project_env) -> None:
+    """``j``/``k`` scroll the help modal, not the rail (#917).
+
+    The rail's ``j,down`` / ``k,up`` priority bindings would otherwise
+    move the rail cursor underneath the modal — a silent no-op from
+    the user's POV since the rail is hidden by the modal.
+    """
+    if not _load_config_compatible(single_project_env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_ui import KeyboardHelpModal, PollyCockpitApp
+
+    scroll_calls: list[str] = []
+    cursor_calls: list[str] = []
+
+    orig_scroll_down = KeyboardHelpModal.action_scroll_down
+    orig_cursor_down = PollyCockpitApp.action_cursor_down
+
+    def _spy_scroll_down(self):
+        scroll_calls.append("down")
+        return orig_scroll_down(self)
+
+    def _spy_cursor_down(self):
+        cursor_calls.append("down")
+        return orig_cursor_down(self)
+
+    KeyboardHelpModal.action_scroll_down = _spy_scroll_down  # type: ignore[assignment]
+    PollyCockpitApp.action_cursor_down = _spy_cursor_down  # type: ignore[assignment]
+    try:
+        app = PollyCockpitApp(single_project_env["config_path"])
+
+        async def body() -> None:
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                await pilot.press("question_mark")
+                await pilot.pause()
+                assert _find_help_modal(app) is not None
+                await pilot.press("j")
+                await pilot.pause()
+        _run(body())
+    finally:
+        KeyboardHelpModal.action_scroll_down = orig_scroll_down  # type: ignore[assignment]
+        PollyCockpitApp.action_cursor_down = orig_cursor_down  # type: ignore[assignment]
+
+    assert scroll_calls == ["down"], (
+        f"expected modal scroll on j; got scroll={scroll_calls} cursor={cursor_calls}"
+    )
+    assert cursor_calls == [], (
+        f"rail cursor must not move while help modal is open; got {cursor_calls}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 6. Command palette's "Show keyboard shortcuts" dispatches to the modal.
 # ---------------------------------------------------------------------------

@@ -688,6 +688,48 @@ class PollyCockpitApp(App[None]):
     def action_show_keyboard_help(self) -> None:
         _open_keyboard_help(self)
 
+    # Keys the App's BINDINGS treat as priority. When KeyboardHelpModal
+    # is on the screen stack we must yield these to the modal so it can
+    # dismiss / scroll itself (#917). Textual's priority pass walks from
+    # App down, so without this gate the App's priority binding always
+    # wins over the modal's own priority binding for the same key.
+    _HELP_MODAL_GATED_ACTIONS = frozenset({
+        "request_quit",          # q, Q, ctrl+q
+        "back_to_home",          # escape
+        "show_keyboard_help",    # ?  (so reopening on top is suppressed,
+                                 #     letting the modal close itself)
+        "cursor_down",           # j, down
+        "cursor_up",             # k, up
+        "cursor_first",          # g, home
+        "cursor_last",           # G, end
+        "open_inbox",            # i
+        "forward_tab_to_right",  # tab
+        "forward_action_button_1",
+        "forward_action_button_2",
+        "forward_action_button_3",
+        "forward_project_chat",  # c
+        "forward_project_log",   # l
+        "forward_workers_auto_refresh",  # A
+    })
+
+    def check_action(
+        self, action: str, parameters: tuple[object, ...],
+    ) -> bool | None:
+        """Suppress App-level priority bindings while help modal is up.
+
+        Textual checks priority bindings App-down, so without this gate
+        the App's ``q`` / ``escape`` / ``j`` / ``k`` bindings fire before
+        :class:`KeyboardHelpModal` ever sees the keystroke (#917). When
+        the modal is on the screen stack, return ``False`` for the gated
+        actions so :meth:`textual.app.App.run_action` skips the App
+        binding and the chain falls through to the modal's own binding.
+        """
+        if action in self._HELP_MODAL_GATED_ACTIONS:
+            for screen in self.screen_stack:
+                if isinstance(screen, KeyboardHelpModal):
+                    return False
+        return super().check_action(action, parameters)
+
     def __init__(self, config_path: Path) -> None:
         super().__init__()
         self.config_path = config_path

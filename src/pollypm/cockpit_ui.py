@@ -8139,6 +8139,7 @@ def _dashboard_status(
     idle_minutes: float | None,
     blocker_count: int = 0,
     on_hold_count: int = 0,
+    in_progress_count: int = 0,
 ) -> tuple[str, str, str]:
     """Return (dot, colour, label) for the top-bar project status light.
 
@@ -8160,6 +8161,11 @@ def _dashboard_status(
         return ("\u25c6", "#f85149", "alert")
     if active_worker is not None:
         return ("\u25cf", "#3ddc84", "active")
+    # #920 \u2014 a task in ``in_progress`` is claimed work, regardless of
+    # whether a heartbeat has registered yet. Showing "idle" while a
+    # task is in_progress is the lie #920 reproduced.
+    if in_progress_count:
+        return ("\u25c6", "#f0c45a", "in progress")
     if blocker_count:
         return ("\u25cb", "#6b7a88", "waiting on dependencies")
     return ("\u25cb", "#4a5568", "idle")
@@ -8443,6 +8449,45 @@ def _dashboard_task_db_paths(config: object, project_path: Path) -> list[Path]:
     return candidates
 
 
+def _project_storage_aliases(config: object, project_key: str) -> list[str]:
+    """Return every project-name form the work-service may have stored.
+
+    The TOML config key is slugified (``blackjack_trainer``) while the
+    work DB stores tasks under the project's ``name`` (``blackjack-trainer``)
+    or the on-disk directory name. ``list_tasks(project=...)`` and
+    ``state_counts(project=...)`` both do an exact ``project = ?``
+    match, so a dashboard or tasks-pane that only passes the config key
+    silently shows zero tasks for projects whose key and display name
+    differ — issue #920. Return a deduped, ordered list of every form
+    we want to try so callers can union the results.
+    """
+    aliases: list[str] = []
+
+    def _add(value: object) -> None:
+        if not isinstance(value, str):
+            return
+        text = value.strip()
+        if not text or text in aliases:
+            return
+        aliases.append(text)
+
+    _add(project_key)
+    project = (getattr(config, "projects", None) or {}).get(project_key)
+    if project is not None:
+        _add(getattr(project, "name", None))
+        path = getattr(project, "path", None)
+        if path is not None:
+            try:
+                _add(Path(path).name)
+            except TypeError:
+                pass
+    # Hyphen <-> underscore swap covers the common slugify ambiguity
+    # without depending on a config lookup.
+    _add(project_key.replace("_", "-"))
+    _add(project_key.replace("-", "_"))
+    return aliases
+
+
 def _dashboard_gather_tasks(
     config: object, project_key: str, project_path: Path,
 ) -> tuple[dict[str, int], dict[str, list[dict]]]:
@@ -8483,11 +8528,25 @@ def _dashboard_gather_tasks(
         "on_hold": [],
         "done": [],
     }
+    # #920 — work-service stores tasks under the project's display name
+    # (``blackjack-trainer``) but the dashboard receives the slugified
+    # config key (``blackjack_trainer``). ``list_tasks(project=...)``
+    # does an exact match, so query every known alias and union the
+    # results (tasks are deduped by ``task_id`` below).
+    aliases = _project_storage_aliases(config, project_key)
     task_rows: dict[str, tuple[str, dict]] = {}
     for db_path in db_paths:
         try:
             with SQLiteWorkService(db_path=db_path, project_path=project_path) as svc:
-                tasks = svc.list_tasks(project=project_key)
+                tasks: list = []
+                seen_ids: set[str] = set()
+                for alias in aliases:
+                    for found in svc.list_tasks(project=alias):
+                        tid = getattr(found, "task_id", None)
+                        if not tid or tid in seen_ids:
+                            continue
+                        seen_ids.add(tid)
+                        tasks.append(found)
         except Exception:  # noqa: BLE001
             continue
         for t in tasks:
@@ -8592,9 +8651,19 @@ def _dashboard_active_worker(
         # actually has nothing in flight; the genuine signal is
         # whether a worker or architect is alive.
         from pollypm.models import CONTROL_ROLES as _CONTROL_ROLES
+        # #920 — accept any project alias (config key, display name,
+        # path basename, hyphen/underscore swap) so workers launched
+        # under the work-DB form (``blackjack-trainer``) are still
+        # recognised when the dashboard receives the slugified config
+        # key (``blackjack_trainer``).
+        try:
+            _config = load_config(config_path)
+        except Exception:  # noqa: BLE001
+            _config = None
+        _alias_set = set(_project_storage_aliases(_config, project_key))
         project_sessions = [
             launch.session for launch in launches
-            if getattr(launch.session, "project", None) == project_key
+            if getattr(launch.session, "project", None) in _alias_set
             and getattr(launch.session, "role", "") not in _CONTROL_ROLES
         ]
         alive_cutoff = datetime.now(UTC) - timedelta(minutes=5)
@@ -8625,7 +8694,10 @@ def _dashboard_active_worker(
             project_session_names = {
                 s.name for s in project_sessions
             }
-            project_session_names.add(f"plan_gate-{project_key}")
+            # #920 — include the plan_gate session for every project alias
+            # so alert counts stay correct under hyphen/underscore swaps.
+            for _alias in _alias_set:
+                project_session_names.add(f"plan_gate-{_alias}")
             open_alerts_fn = getattr(supervisor, "open_alerts", None)
             if callable(open_alerts_fn):
                 open_alerts = open_alerts_fn()
@@ -9159,7 +9231,19 @@ def _dashboard_inbox(
         with SQLiteWorkService(
             db_path=db_path, project_path=project_path,
         ) as svc:
-            tasks = inbox_tasks(svc, project=project_key)
+            # #920 — query each project alias and dedupe so projects
+            # whose config key (``foo_bar``) and work-DB project name
+            # (``foo-bar``) differ still surface their inbox rows.
+            aliases = _project_storage_aliases(config, project_key)
+            tasks = []
+            seen_ids: set[str] = set()
+            for alias in aliases:
+                for found in inbox_tasks(svc, project=alias):
+                    tid = getattr(found, "task_id", None)
+                    if not tid or tid in seen_ids:
+                        continue
+                    seen_ids.add(tid)
+                    tasks.append(found)
             for task in tasks:
                 entry = annotate_inbox_entry(
                     task_to_inbox_entry(task, db_path=db_path),
@@ -9738,8 +9822,12 @@ def _dashboard_activity(
     projector = build_projector(config)
     if projector is None:
         return []
+    # #920 — pass every alias so projects whose config key (e.g.
+    # ``blackjack_trainer``) differs from the work-DB project name
+    # (``blackjack-trainer``) still surface their activity rows.
+    aliases = _project_storage_aliases(config, project_key)
     try:
-        entries = projector.project(projects=[project_key], limit=limit)
+        entries = projector.project(projects=aliases, limit=limit)
     except Exception:  # noqa: BLE001
         return []
     result = [
@@ -9830,6 +9918,7 @@ def _gather_project_dashboard(
     )
     blocker_count = int(counts.get("blocked", 0))
     on_hold_count = int(counts.get("on_hold", 0))
+    in_progress_count = int(counts.get("in_progress", 0))
 
     status_dot, status_color, status_label = _dashboard_status(
         active_worker,
@@ -9838,6 +9927,7 @@ def _gather_project_dashboard(
         None,
         blocker_count=blocker_count,
         on_hold_count=on_hold_count,
+        in_progress_count=in_progress_count,
     )
 
     # Resolve effective enforce_plan with the same precedence the rail
@@ -10706,6 +10796,22 @@ class PollyProjectDashboardApp(App[None]):
                 "[#f0c45a]\u25c6[/#f0c45a] Waiting for your response.\n"
                 f"  {prompt}"
             )
+        # #920 — a task can be in_progress (claimed by a worker) even
+        # when no heartbeat is alive yet (the worker just claimed and
+        # has not registered yet, or the session is being launched).
+        # Surface that fact instead of falling through to "Idle".
+        in_progress = data.task_buckets.get("in_progress", [])
+        if in_progress:
+            first = in_progress[0]
+            num = first.get("task_number")
+            num_part = f"#{num} " if num is not None else ""
+            title = _escape(first.get("title") or "")
+            assignee = _escape(str(first.get("assignee") or "worker"))
+            return (
+                "[#f0c45a]◆[/#f0c45a] "
+                f"[b]{assignee}[/b] is working on a task.\n"
+                f"  In flight: {num_part}{title}"
+            )
         queued = data.task_buckets.get("queued", [])
         if queued:
             first = queued[0]
@@ -10885,7 +10991,8 @@ class PollyProjectDashboardApp(App[None]):
             return (
                 "[dim]No plan yet — the PM will draft one when this "
                 "project picks up work.\n"
-                "Press [b]c[/b] to ask the PM to plan it now.[/dim]"
+                "Press [b]c[/b] in this pane to chat with the PM and "
+                "ask for a plan now.[/dim]"
             )
         lines: list[str] = []
         rel_path = ""

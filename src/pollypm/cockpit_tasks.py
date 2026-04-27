@@ -80,6 +80,68 @@ _FILTER_LABELS = {
     "done": "Done",
 }
 
+
+def _project_label_and_aliases(
+    config: object, project_key: str,
+) -> tuple[str, list[str]]:
+    """Return ``(display_label, [storage_aliases])`` for a project key.
+
+    The work-service stores tasks under the project's display name
+    (``blackjack-trainer``) but the cockpit receives the slugified
+    config key (``blackjack_trainer``). ``list_tasks(project=...)`` is
+    an exact match, so a Tasks pane that only queries with the config
+    key silently shows zero rows for projects whose key and name
+    differ — issue #920. Build the alias list once so both the label
+    and the queries stay in sync.
+    """
+    project = (getattr(config, "projects", None) or {}).get(project_key)
+    aliases: list[str] = []
+
+    def _add(value: object) -> None:
+        if not isinstance(value, str):
+            return
+        text = value.strip()
+        if not text or text in aliases:
+            return
+        aliases.append(text)
+
+    _add(project_key)
+    if project is not None:
+        _add(getattr(project, "name", None))
+        path = getattr(project, "path", None)
+        if path is not None:
+            try:
+                _add(Path(path).name)
+            except TypeError:
+                pass
+    _add(project_key.replace("_", "-"))
+    _add(project_key.replace("-", "_"))
+
+    label = aliases[0]
+    if project is not None:
+        candidate = (
+            project.display_label()
+            if hasattr(project, "display_label")
+            else (getattr(project, "name", None) or project_key)
+        )
+        if isinstance(candidate, str) and candidate.strip():
+            label = candidate
+    return label, aliases
+
+
+def _dedupe_tasks_by_id(task_lists: list[list]) -> list:
+    """Concatenate ``list_tasks`` results, deduping by ``task_id``."""
+    seen: set[str] = set()
+    out: list = []
+    for tasks in task_lists:
+        for task in tasks:
+            tid = getattr(task, "task_id", None)
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            out.append(task)
+    return out
+
 _PENDING_UNDO_SECONDS = 5.0
 
 
@@ -1133,9 +1195,20 @@ class PollyTasksApp(App[None]):
         self._review_nav_prefix: str | None = None
 
     def compose(self) -> ComposeResult:
+        # #920 — header must use the project's display label
+        # (``blackjack-trainer``), not the slugified config key
+        # (``blackjack_trainer``), so the rail / CLI / Tasks-pane
+        # heading agree on one project name.
+        try:
+            _config = load_config(self.config_path)
+            display_label, _ = _project_label_and_aliases(
+                _config, self.project_key,
+            )
+        except Exception:  # noqa: BLE001
+            display_label = self.project_key
         with Vertical(id="tasks-root"):
             with Horizontal(id="tasks-toolbar"):
-                yield Static(f"Tasks · {self.project_key}", id="tasks-heading")
+                yield Static(f"Tasks · {display_label}", id="tasks-heading")
                 yield self.search_input
                 with Horizontal(id="tasks-filters"):
                     for button in self.filter_buttons.values():
@@ -1202,16 +1275,107 @@ class PollyTasksApp(App[None]):
         self.timeline.add_columns("Stage", "State", "Started", "Completed", "Details")
 
     def _get_svc(self):
+        """Return the work service whose DB actually holds this project's tasks.
+
+        #919 / #920 — tasks may live either in ``<project>/.pollypm/state.db``
+        or in ``<workspace>/.pollypm/state.db`` depending on how they
+        were created. Pick the first candidate DB that has at least
+        one row matching any project alias so detail views (``svc.get``,
+        ``svc.get_context``) hit the same DB ``_load_tasks`` listed
+        from. Fall back to the project-local DB so the legacy contract
+        still holds when neither DB has a row yet.
+        """
         from pollypm.work.sqlite_service import SQLiteWorkService
 
+        try:
+            config = load_config(self.config_path)
+        except Exception:  # noqa: BLE001
+            return None
+        _, aliases = _project_label_and_aliases(config, self.project_key)
+        candidates = self._candidate_dbs()
+        if not candidates:
+            return None
+        for db_path, project_path in candidates:
+            try:
+                svc = SQLiteWorkService(db_path=db_path, project_path=project_path)
+            except Exception:  # noqa: BLE001
+                continue
+            try:
+                for alias in aliases:
+                    try:
+                        rows = svc.list_tasks(project=alias, limit=1)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if rows:
+                        return svc
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+        # No DB has rows yet — fall back to the project-local DB so
+        # the rest of the pane still has a working service handle.
+        first_db, first_project_path = candidates[0]
+        try:
+            return SQLiteWorkService(
+                db_path=first_db, project_path=first_project_path,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _candidate_dbs(self) -> list[tuple[Path, Path]]:
+        """Return ``[(db_path, project_path)]`` for every DB that may
+        hold tasks for this project.
+
+        Mirrors :func:`pollypm.cockpit_ui._dashboard_task_db_paths` so
+        the Tasks pane reads the same set of state databases the
+        dashboard does. Without this, projects whose tasks live in the
+        workspace-root ``.pollypm/state.db`` (the default for tasks
+        created via ``pm task ...`` with no project DB seeded) render
+        with zero rows even though ``pm task counts`` reports them
+        — issue #919/#920.
+        """
         config = load_config(self.config_path)
         project = config.projects.get(self.project_key)
         if not project:
-            return None
-        db_path = project.path / ".pollypm" / "state.db"
-        if not db_path.exists():
-            return None
-        return SQLiteWorkService(db_path=db_path, project_path=project.path)
+            return []
+        candidates: list[tuple[Path, Path]] = []
+        seen: set[Path] = set()
+
+        def _add(path: object) -> None:
+            try:
+                candidate = Path(path)
+            except TypeError:
+                return
+            if candidate in seen or not candidate.exists():
+                return
+            seen.add(candidate)
+            candidates.append((candidate, project.path))
+
+        _add(project.path / ".pollypm" / "state.db")
+        project_settings = getattr(config, "project", None)
+        workspace_root = getattr(project_settings, "workspace_root", None)
+        if workspace_root is not None:
+            _add(Path(workspace_root) / ".pollypm" / "state.db")
+        state_db = getattr(project_settings, "state_db", None)
+        if state_db is not None:
+            _add(state_db)
+        return candidates
+
+    def _open_svcs(self):
+        """Yield work-service handles to query for this project's tasks.
+
+        Routes through :meth:`_get_svc` so existing tests that
+        monkeypatch ``_get_svc`` to return a fake service continue to
+        work. ``_get_svc`` already picks the candidate DB that holds
+        the matching rows (project-local first, then workspace-root)
+        so a single yielded service usually covers every alias.
+        """
+        svc = self._get_svc()
+        if svc is None:
+            return
+        yield svc
 
     def _load_tasks(
         self,
@@ -1223,21 +1387,56 @@ class PollyTasksApp(App[None]):
         str | None,
         set[str],
     ]:
-        svc = self._get_svc()
-        if svc is None:
+        try:
+            config = load_config(self.config_path)
+        except Exception:  # noqa: BLE001
+            return [], {}, {}, set(), None, set()
+        _, aliases = _project_label_and_aliases(config, self.project_key)
+        # Iterate every candidate DB (project-local + workspace-root)
+        # and every alias (config key, display name, hyphen/underscore
+        # swap) so the Tasks pane stays in sync with both the dashboard
+        # and ``pm task counts``. Without this, tasks created via
+        # ``pm task ...`` against the workspace-root state.db never
+        # surface for projects whose key/name differ — issue #920.
+        services = list(self._open_svcs())
+        if not services:
             return [], {}, {}, set(), None, set()
         plan_blocked: set[str] = set()
         approval_task_id: str | None = None
+        owners: dict[str, str | None] = {}
+        feedback: dict[str, RejectionFeedbackNotice] = {}
         try:
-            tasks = [
-                task
-                for task in svc.list_tasks(project=self.project_key)
-                if not is_rejection_feedback_task(task)
-            ]
-            owners = {task.task_id: svc.derive_owner(task) for task in tasks}
-            feedback = unread_rejection_feedback(svc, project=self.project_key)
+            tasks_by_id: dict[str, object] = {}
+            owner_svc: dict[str, object] = {}
+            for svc in services:
+                for alias in aliases:
+                    try:
+                        candidates = svc.list_tasks(project=alias)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    for candidate in candidates:
+                        if is_rejection_feedback_task(candidate):
+                            continue
+                        tid = getattr(candidate, "task_id", None)
+                        if not tid or tid in tasks_by_id:
+                            continue
+                        tasks_by_id[tid] = candidate
+                        owner_svc[tid] = svc
+            tasks = list(tasks_by_id.values())
+            owners = {
+                tid: owner_svc[tid].derive_owner(task)
+                for tid, task in tasks_by_id.items()
+            }
+            for svc in services:
+                for alias in aliases:
+                    try:
+                        more = unread_rejection_feedback(svc, project=alias)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if isinstance(more, dict):
+                        for k, v in more.items():
+                            feedback.setdefault(k, v)
             try:
-                config = load_config(self.config_path)
                 project = config.projects.get(self.project_key)
                 if project is not None:
                     # Resolve effective enforce_plan with the same
@@ -1258,18 +1457,19 @@ class PollyTasksApp(App[None]):
                         if project_enforce is not None
                         else global_enforce
                     )
+                    primary_svc = services[0]
                     if enforce_plan:
                         plan_blocked = plan_blocked_task_ids(
                             self.project_key,
                             project.path,
-                            svc,
+                            primary_svc,
                             plan_dir=getattr(
                                 planner,
                                 "plan_dir",
                                 "docs/plan",
                             ),
                         )
-                    approval_task = plan_approval_task(svc, self.project_key)
+                    approval_task = plan_approval_task(primary_svc, self.project_key)
                     if approval_task is not None:
                         approval_task_id = getattr(approval_task, "task_id", None)
             except Exception:  # noqa: BLE001
@@ -1279,7 +1479,11 @@ class PollyTasksApp(App[None]):
                 task.task_id for task in tasks if _recent_sweeper_ping(task)
             }
         finally:
-            svc.close()
+            for svc in services:
+                try:
+                    svc.close()
+                except Exception:  # noqa: BLE001
+                    pass
         tasks.sort(
             key=lambda task: _task_sort_key(
                 task,

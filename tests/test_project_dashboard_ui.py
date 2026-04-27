@@ -218,6 +218,195 @@ def dashboard_app(dashboard_env):
     )
 
 
+# ---------------------------------------------------------------------------
+# #920 regression — config-key vs work-DB project-name mismatch
+# ---------------------------------------------------------------------------
+
+
+def _write_split_key_config(
+    project_path: Path, config_path: Path,
+) -> None:
+    """Write a config whose TOML key (``blackjack_trainer``) differs from
+    the project ``name`` (``blackjack-trainer``) — the same shape the
+    real CLI emits when ``pm project register`` ingests a hyphenated
+    repo dir.
+    """
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "[project]\n"
+        'tmux_session = "pollypm-test"\n'
+        f'workspace_root = "{project_path.parent}"\n'
+        "\n"
+        "[projects.blackjack_trainer]\n"
+        'key = "blackjack_trainer"\n'
+        'name = "blackjack-trainer"\n'
+        f'path = "{project_path}"\n'
+    )
+
+
+def test_dashboard_finds_tasks_when_config_key_and_project_name_differ(
+    tmp_path: Path,
+) -> None:
+    """#920 — dashboard must report ``in_progress`` tasks even when the
+    config key is the slugified form (``blackjack_trainer``) and the
+    work DB stores tasks under the display name (``blackjack-trainer``).
+
+    Pre-fix: ``state_counts(project=...)`` did an exact match, so the
+    dashboard passed the underscore key and got zero rows back. The
+    counts and pipeline both lied: "○ idle" / "No tasks yet."
+    """
+    project_path = tmp_path / "blackjack-trainer"
+    project_path.mkdir()
+    config_path = tmp_path / "pollypm.toml"
+    _write_split_key_config(project_path, config_path)
+
+    workspace_db = tmp_path / ".pollypm" / "state.db"
+    workspace_db.parent.mkdir(parents=True, exist_ok=True)
+    with SQLiteWorkService(db_path=workspace_db, project_path=tmp_path) as svc:
+        task = svc.create(
+            title="Build Hi-Lo card counting trainer",
+            description="seed",
+            type="task",
+            project="blackjack-trainer",  # hyphen — display-name form
+            flow_template="standard",
+            roles={"worker": "worker", "reviewer": "reviewer"},
+            priority="normal",
+            created_by="polly",
+        )
+        svc.queue(task.task_id, "polly")
+        svc.claim(task.task_id, "worker")
+
+    from pollypm import cockpit_ui as _cockpit_ui
+
+    _cockpit_ui._PROJECT_DASHBOARD_TASK_CACHE.clear()
+    # Dashboard receives the slugified config key, NOT the display name.
+    data = _cockpit_ui._gather_project_dashboard(
+        config_path, "blackjack_trainer",
+    )
+
+    assert data is not None
+    # Counts must surface the in_progress row. Pre-fix this was 0.
+    assert data.task_counts.get("in_progress") == 1
+    assert [row["title"] for row in data.task_buckets.get("in_progress", [])] == [
+        "Build Hi-Lo card counting trainer"
+    ]
+    # Status pill must reflect the in-flight task (yellow, "in progress")
+    # — not "○ idle" as in the bug report.
+    assert data.status_label == "in progress"
+
+
+def test_dashboard_pipeline_body_does_not_say_no_tasks_when_in_progress(
+    tmp_path: Path,
+) -> None:
+    """#920 — pipeline body must not render "No tasks yet" when the
+    project has at least one task in any non-terminal status, even
+    when the config key and DB project name disagree.
+    """
+    project_path = tmp_path / "blackjack-trainer"
+    project_path.mkdir()
+    config_path = tmp_path / "pollypm.toml"
+    _write_split_key_config(project_path, config_path)
+
+    workspace_db = tmp_path / ".pollypm" / "state.db"
+    workspace_db.parent.mkdir(parents=True, exist_ok=True)
+    with SQLiteWorkService(db_path=workspace_db, project_path=tmp_path) as svc:
+        task = svc.create(
+            title="Active feature",
+            description="seed",
+            type="task",
+            project="blackjack-trainer",
+            flow_template="standard",
+            roles={"worker": "worker", "reviewer": "reviewer"},
+            priority="normal",
+            created_by="polly",
+        )
+        svc.queue(task.task_id, "polly")
+        svc.claim(task.task_id, "worker")
+
+    from pollypm import cockpit_ui as _cockpit_ui
+
+    _cockpit_ui._PROJECT_DASHBOARD_TASK_CACHE.clear()
+    data = _cockpit_ui._gather_project_dashboard(
+        config_path, "blackjack_trainer",
+    )
+
+    assert data is not None
+    # Bypass the App so we can call the renderer without a full Pilot.
+    rendered = _cockpit_ui.PollyProjectDashboardApp._render_pipeline_body(
+        None, data,  # type: ignore[arg-type]
+    )
+    assert "No tasks yet" not in rendered
+    assert "in progress" in rendered.lower()
+
+
+def test_dashboard_now_body_acknowledges_in_progress_without_heartbeat(
+    tmp_path: Path,
+) -> None:
+    """#920 — a claimed task with no live heartbeat must still surface
+    in the "Current activity" pane, not fall through to "Idle. No tasks
+    in flight and no user action needed."
+    """
+    project_path = tmp_path / "blackjack-trainer"
+    project_path.mkdir()
+    config_path = tmp_path / "pollypm.toml"
+    _write_split_key_config(project_path, config_path)
+
+    workspace_db = tmp_path / ".pollypm" / "state.db"
+    workspace_db.parent.mkdir(parents=True, exist_ok=True)
+    with SQLiteWorkService(db_path=workspace_db, project_path=tmp_path) as svc:
+        task = svc.create(
+            title="Active feature",
+            description="seed",
+            type="task",
+            project="blackjack-trainer",
+            flow_template="standard",
+            roles={"worker": "worker", "reviewer": "reviewer"},
+            priority="normal",
+            created_by="polly",
+        )
+        svc.queue(task.task_id, "polly")
+        svc.claim(task.task_id, "worker")
+
+    from pollypm import cockpit_ui as _cockpit_ui
+
+    _cockpit_ui._PROJECT_DASHBOARD_TASK_CACHE.clear()
+    data = _cockpit_ui._gather_project_dashboard(
+        config_path, "blackjack_trainer",
+    )
+    assert data is not None
+    # Active worker may be None (no heartbeat yet) — that is precisely
+    # the case the bug reproduced under.
+    rendered = _cockpit_ui.PollyProjectDashboardApp._render_now_body(
+        None, data,  # type: ignore[arg-type]
+    )
+    assert "Idle" not in rendered
+    assert "No tasks in flight" not in rendered
+    assert "In flight" in rendered
+
+
+def test_dashboard_storage_aliases_round_trip() -> None:
+    """``_project_storage_aliases`` must yield every form the work-DB
+    might have stored a project under.
+    """
+    from pollypm.cockpit_ui import _project_storage_aliases
+    from pollypm.models import KnownProject
+
+    cfg = type("_C", (), {})()
+    cfg.projects = {
+        "blackjack_trainer": KnownProject(
+            key="blackjack_trainer",
+            path=Path("/tmp/blackjack-trainer"),
+            name="blackjack-trainer",
+        ),
+    }
+    aliases = _project_storage_aliases(cfg, "blackjack_trainer")
+    assert "blackjack_trainer" in aliases
+    assert "blackjack-trainer" in aliases
+    # Order: config key first, then display name, then path basename,
+    # then explicit hyphen/underscore swaps.
+    assert aliases[0] == "blackjack_trainer"
+
+
 def test_dashboard_reads_workspace_root_tasks_when_project_db_missing(tmp_path: Path) -> None:
     """Tasks created through the default CLI DB still appear on the project dashboard."""
     project_path = tmp_path / "demo"
@@ -375,7 +564,13 @@ def test_status_yellow_when_inbox_has_items(
 def test_status_idle_when_nothing_active(
     dashboard_env, dashboard_app,
 ) -> None:
-    """No worker + no inbox + no alerts → idle state (dim dot)."""
+    """In_progress task with no live worker → ``in progress`` (yellow).
+
+    The fixture seeds one ``in_progress`` task. Before #920, this fell
+    through to ``idle`` because the status pill only checked for a
+    heartbeat-alive worker. The fix surfaces ``in_progress`` count so
+    the pill, banner, and counts strip agree.
+    """
     async def body() -> None:
         async with dashboard_app.run_test(size=(140, 50)) as pilot:
             await pilot.pause()
@@ -383,7 +578,7 @@ def test_status_idle_when_nothing_active(
             # Only non-inbox tasks were seeded; inbox should be zero.
             assert dashboard_app.data.inbox_count == 0
             assert dashboard_app.data.active_worker is None
-            assert dashboard_app.data.status_label == "idle"
+            assert dashboard_app.data.status_label == "in progress"
     _run(body())
 
 
@@ -2728,7 +2923,12 @@ def test_plan_empty_state_when_no_plan_file(
             # the chat keybinding to ask now.
             assert "No plan yet" in rendered
             assert "PM will draft one" in rendered
-            assert "ask the PM to plan it now" in rendered
+            # #920 — the nudge spells out *which pane* to press c in
+            # so the user can act on it from the rail-focused state
+            # without having to discover the pane focus rule.
+            assert "Press" in rendered and "c" in rendered
+            assert "in this pane" in rendered
+            assert "ask for a plan" in rendered
             # No CLI jargon leaking through to the operator surface.
             assert "pm project plan" not in rendered
             assert "auto-fire" not in rendered
@@ -3277,7 +3477,9 @@ def test_plan_body_with_enforce_plan_true_uses_default_nudge(dashboard_app) -> N
         enforce_plan=True,
     )
     body = dashboard_app._render_plan_body(fake_data)
-    assert "ask the PM to plan it now" in body
+    # #920 — copy now spells out which pane to press c in.
+    assert "in this pane" in body
+    assert "ask for a plan" in body
     assert "Plan not required" not in body
 
 

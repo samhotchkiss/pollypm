@@ -242,6 +242,139 @@ def _table_rows(table: DataTable) -> list[list[str]]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# #920 regression — config-key vs work-DB project-name mismatch + workspace DB
+# ---------------------------------------------------------------------------
+
+
+def _write_split_key_config(
+    project_path: Path, config_path: Path,
+) -> None:
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "[project]\n"
+        'tmux_session = "pollypm-test"\n'
+        f'workspace_root = "{project_path.parent}"\n'
+        "\n"
+        "[projects.blackjack_trainer]\n"
+        'key = "blackjack_trainer"\n'
+        'name = "blackjack-trainer"\n'
+        f'path = "{project_path}"\n'
+    )
+
+
+def test_tasks_pane_lists_in_progress_when_config_key_and_name_differ(
+    tmp_path: Path,
+) -> None:
+    """#920 — Tasks pane must include ``in_progress`` rows even when
+    the config key (``blackjack_trainer``) and the work-DB project
+    name (``blackjack-trainer``) disagree.
+
+    Pre-fix: ``svc.list_tasks(project=self.project_key)`` did an exact
+    match against the underscore form and got zero rows back, so the
+    table read ``0 tasks / No tasks match the current filter.`` even
+    though ``pm task counts`` reported ``in_progress=1``.
+    """
+    from pollypm.cockpit_tasks import PollyTasksApp
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    project_path = tmp_path / "blackjack-trainer"
+    project_path.mkdir()
+    (project_path / ".git").mkdir()
+    config_path = tmp_path / "pollypm.toml"
+    _write_split_key_config(project_path, config_path)
+
+    workspace_db = tmp_path / ".pollypm" / "state.db"
+    workspace_db.parent.mkdir(parents=True, exist_ok=True)
+    with SQLiteWorkService(db_path=workspace_db, project_path=tmp_path) as svc:
+        task = svc.create(
+            title="Build Hi-Lo card counting trainer",
+            description="seed",
+            type="task",
+            project="blackjack-trainer",  # hyphen — what `pm task` writes
+            flow_template="standard",
+            roles={"worker": "worker", "reviewer": "reviewer"},
+            priority="normal",
+            created_by="polly",
+        )
+        svc.queue(task.task_id, "polly")
+        svc.claim(task.task_id, "worker")
+
+    app = PollyTasksApp(config_path, "blackjack_trainer")
+    tasks, _, _, _, _, _ = app._load_tasks()
+    titles = [t.title for t in tasks]
+    statuses = [t.work_status.value for t in tasks]
+    assert "Build Hi-Lo card counting trainer" in titles
+    assert "in_progress" in statuses
+
+
+def test_tasks_pane_default_active_filter_includes_in_progress(
+    tmp_path: Path,
+) -> None:
+    """#920 — the default ``Active`` filter must surface in_progress
+    rows. Either the default changes to ``All`` or ``Active`` includes
+    in_progress; both satisfy the user-visible contract.
+    """
+    from pollypm.cockpit_tasks import PollyTasksApp, _task_matches_status
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    project_path = tmp_path / "blackjack-trainer"
+    project_path.mkdir()
+    (project_path / ".git").mkdir()
+    config_path = tmp_path / "pollypm.toml"
+    _write_split_key_config(project_path, config_path)
+
+    workspace_db = tmp_path / ".pollypm" / "state.db"
+    workspace_db.parent.mkdir(parents=True, exist_ok=True)
+    with SQLiteWorkService(db_path=workspace_db, project_path=tmp_path) as svc:
+        t = svc.create(
+            title="Active feature",
+            description="seed",
+            type="task",
+            project="blackjack-trainer",
+            flow_template="standard",
+            roles={"worker": "worker", "reviewer": "reviewer"},
+            priority="normal",
+            created_by="polly",
+        )
+        svc.queue(t.task_id, "polly")
+        svc.claim(t.task_id, "worker")
+
+    app = PollyTasksApp(config_path, "blackjack_trainer")
+    # Default filter is "active" on construction — invariant for the bug.
+    assert app._status_filter in {"active", "all"}
+    tasks, _, _, _, _, _ = app._load_tasks()
+    assert tasks, "load_tasks should return the in_progress task"
+    in_progress_task = next(
+        t for t in tasks if t.work_status.value == "in_progress"
+    )
+    assert _task_matches_status(in_progress_task, app._status_filter)
+
+
+def test_tasks_pane_header_uses_canonical_display_label(tmp_path: Path) -> None:
+    """#920 — Tasks pane header must echo the project's display name
+    (``blackjack-trainer``), not the slugified config key
+    (``blackjack_trainer``). The rail and CLI both use the hyphen
+    form; the cockpit's Tasks header was the only surface that flipped
+    to the underscore form.
+    """
+    from pollypm.cockpit_tasks import _project_label_and_aliases
+    from pollypm.config import load_config
+
+    project_path = tmp_path / "blackjack-trainer"
+    project_path.mkdir()
+    config_path = tmp_path / "pollypm.toml"
+    _write_split_key_config(project_path, config_path)
+
+    config = load_config(config_path)
+    label, aliases = _project_label_and_aliases(config, "blackjack_trainer")
+    assert label == "blackjack-trainer"
+    # Aliases must include both the slug and the display name so the
+    # query layer matches whichever form the DB recorded.
+    assert "blackjack_trainer" in aliases
+    assert "blackjack-trainer" in aliases
+
+
 def test_summary_text_pluralises_singular_task_count(env) -> None:
     """Task pane status bar must read ``1 task`` (not ``1 tasks``).
 

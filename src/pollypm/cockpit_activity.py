@@ -140,13 +140,50 @@ def _entry_search_haystack(entry) -> str:
     return " ".join(bit for bit in bits if bit).lower()
 
 
-_LOW_SIGNAL_ACTIVITY_KINDS = frozenset({"heartbeat", "token_ledger"})
+_LOW_SIGNAL_ACTIVITY_KINDS = frozenset({
+    "heartbeat",
+    "lease",
+    "lease_override",
+    "scheduled",
+    "token_ledger",
+})
+_LOW_SIGNAL_EMPTY_ACTIVITY_KINDS = frozenset({"launch"})
+
+
+def _summary_has_content(entry) -> bool:
+    summary = (getattr(entry, "summary", "") or "").strip().lower()
+    if not summary:
+        return False
+    kind = (getattr(entry, "kind", "") or "").strip().lower()
+    verb = (getattr(entry, "verb", "") or "").strip().lower()
+    actor = (getattr(entry, "actor", "") or "").strip().lower()
+    return summary not in {kind, verb, actor, f"{kind} on {actor}"}
 
 
 def _is_low_signal_activity(entry) -> bool:
     kind = (getattr(entry, "kind", "") or "").lower()
     verb = (getattr(entry, "verb", "") or "").lower()
-    return kind in _LOW_SIGNAL_ACTIVITY_KINDS or verb in _LOW_SIGNAL_ACTIVITY_KINDS
+    if kind in _LOW_SIGNAL_ACTIVITY_KINDS or verb in _LOW_SIGNAL_ACTIVITY_KINDS:
+        return True
+    actor = (getattr(entry, "actor", "") or "").lower()
+    if (
+        actor in {"operator", "scheduler"}
+        and (
+            kind in _LOW_SIGNAL_EMPTY_ACTIVITY_KINDS
+            or verb in _LOW_SIGNAL_EMPTY_ACTIVITY_KINDS
+        )
+        and not _summary_has_content(entry)
+    ):
+        return True
+    return False
+
+
+def _is_noise_type_filter(kind: str | None) -> bool:
+    lowered = (kind or "").lower()
+    return (
+        lowered in _LOW_SIGNAL_ACTIVITY_KINDS
+        or lowered in _LOW_SIGNAL_EMPTY_ACTIVITY_KINDS
+    )
 
 
 def _parse_search_query(query: str) -> tuple[re.Pattern[str] | None, list[str]]:
@@ -414,7 +451,7 @@ class PollyActivityFeedApp(App[None]):
         explicit_noise_request = (
             self._show_system_noise
             or has_search
-            or (kind or "").lower() in _LOW_SIGNAL_ACTIVITY_KINDS
+            or _is_noise_type_filter(kind)
         )
         if not (project or actor or kind or has_search):
             return [
@@ -483,7 +520,7 @@ class PollyActivityFeedApp(App[None]):
         if filter_description:
             chips.append(f"[#97a6b2]filters: {filter_description}[/#97a6b2]")
         if hidden_noise_count:
-            chips.append(f"[dim]{hidden_noise_count} heartbeat/ledger hidden[/dim]")
+            chips.append(f"[dim]{hidden_noise_count} system noise hidden[/dim]")
         chips.append(
             "[#3ddc84]follow on[/#3ddc84]" if self._follow_on else "[dim]follow off[/dim]"
         )

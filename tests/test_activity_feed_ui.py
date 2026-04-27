@@ -174,13 +174,87 @@ def test_default_activity_hides_low_signal_heartbeat_noise(
             await pilot.pause()
             assert len(activity_app._entries) == 3
             assert activity_app.table.row_count == 1
-            assert "2 heartbeat/ledger hidden" in str(activity_app.counters.render())
+            assert "2 system noise hidden" in str(activity_app.counters.render())
 
             await pilot.press("N")
             await pilot.pause()
             assert activity_app.table.row_count == 3
             assert "noise=shown" in str(activity_app.counters.render())
 
+    _run(body())
+
+
+def test_default_activity_hides_internal_scheduler_churn(
+    activity_env, activity_app,
+) -> None:
+    """Operator leases and scheduler bookkeeping stay out of the default feed."""
+    async def body() -> None:
+        entries = [
+            _make_entry(
+                entry_id="evt:real",
+                kind="alert",
+                verb="alert",
+                summary="real alert",
+            ),
+            _make_entry(
+                entry_id="evt:lease",
+                kind="lease",
+                actor="operator",
+                verb="lease",
+                summary="lease",
+            ),
+            _make_entry(
+                entry_id="evt:scheduled",
+                kind="scheduled",
+                actor="scheduler",
+                verb="scheduled",
+                summary="scheduled",
+            ),
+            _make_entry(
+                entry_id="evt:override",
+                kind="lease_override",
+                actor="operator",
+                verb="lease_override",
+                summary="lease_override",
+            ),
+            _make_entry(
+                entry_id="evt:launch-empty",
+                kind="launch",
+                actor="operator",
+                verb="launch",
+                summary="launch",
+            ),
+            _make_entry(
+                entry_id="evt:launch-real",
+                kind="launch",
+                actor="operator",
+                verb="launch",
+                summary="Started worker demo/5",
+            ),
+        ]
+        activity_app._gather = lambda: entries  # type: ignore[method-assign]
+        async with activity_app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            assert activity_app.table.row_count == 2
+            counters_text = str(activity_app.counters.render())
+            assert "4 system noise hidden" in counters_text
+
+            _apply_search(activity_app, "lease")
+            await pilot.pause()
+            assert activity_app.table.row_count == 2
+
+            _apply_search(activity_app, "")
+            activity_app._filter_type = "launch"
+            activity_app._render()
+            await pilot.pause()
+            assert activity_app.table.row_count == 2
+
+            activity_app._filter_type = None
+            activity_app._render()
+            await pilot.pause()
+            await pilot.press("N")
+            await pilot.pause()
+            assert activity_app.table.row_count == 6
     _run(body())
 
 

@@ -2000,6 +2000,33 @@ def test_cockpit_router_ensure_layout_splits_when_missing_right_pane(tmp_path: P
     assert "cockpit-pane polly" in calls["split"][1]
 
 
+def test_cockpit_router_focus_right_shows_return_affordance(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+    calls: list[tuple[str, tuple[str, ...]]] = []
+
+    class FakeTmux:
+        def run(self, *args: str, **_kwargs) -> None:
+            calls.append(("run", args))
+
+        def select_pane(self, target: str) -> None:
+            calls.append(("select", (target,)))
+
+    router = CockpitRouter(config_path)
+    router.tmux = FakeTmux()  # type: ignore[assignment]
+    monkeypatch.setattr(router, "ensure_cockpit_layout", lambda: None)
+    monkeypatch.setattr(router, "_right_pane_id", lambda target: "%2")
+
+    router.focus_right_pane()
+
+    assert calls[0][0] == "run"
+    assert "display-message" in calls[0][1]
+    assert any("Ctrl-b Left returns to the rail." in part for part in calls[0][1])
+    assert calls[1] == ("select", ("%2",))
+
+
 def test_cockpit_router_ensure_layout_resizes_existing_left_pane(tmp_path: Path) -> None:
     calls: dict[str, object] = {}
 
@@ -3054,6 +3081,43 @@ def test_cockpit_app_routes_detail_hint_keys_from_rail() -> None:
     assert ("route", "inbox") in calls
     assert ("send", "Tab") in calls
     assert ("send", "A") in calls
+
+
+def test_cockpit_app_open_live_session_keeps_rail_focus_until_tab() -> None:
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    calls: list[str | tuple[str, str]] = []
+
+    class _Router:
+        def route_selected(self, key: str) -> None:
+            calls.append(("route", key))
+
+        def selected_key(self) -> str:
+            return "russell"
+
+        def _load_state(self) -> dict[str, str]:
+            return {"mounted_session": "reviewer"}
+
+        def focus_right_pane(self) -> None:
+            calls.append("focus")
+
+        def send_key_to_right_pane(self, key: str) -> None:
+            calls.append(("send", key))
+
+    app.router = _Router()  # type: ignore[assignment]
+    app.selected_key = "russell"
+    app._last_router_selected_key = "russell"
+    app._selected_row_key = lambda: "russell"  # type: ignore[method-assign]
+    app.hint = _CaptureWidget()
+    app._refresh_rows = lambda: calls.append("refresh")  # type: ignore[method-assign]
+
+    app.action_open_selected()
+
+    assert calls == [("route", "russell"), "refresh"]
+
+    app.action_forward_tab_to_right()
+
+    assert calls[-1] == "focus"
+    assert ("send", "Tab") not in calls
 
 
 def test_cockpit_settings_row_has_text_cursor_when_active() -> None:

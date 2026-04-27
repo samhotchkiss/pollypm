@@ -1841,6 +1841,13 @@ class CockpitRouter:
         self.ensure_cockpit_layout()
         right_pane = self._right_pane_id(window_target)
         if right_pane is not None:
+            self.tmux.run(
+                "display-message",
+                "-t",
+                window_target,
+                "PollyPM: Ctrl-b Left returns to the rail.",
+                check=False,
+            )
             self.tmux.select_pane(right_pane)
 
     def send_key_to_right_pane(self, key: str) -> None:

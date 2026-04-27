@@ -828,6 +828,13 @@ class PollyCockpitApp(App[None]):
         if callable(focus_method):
             focus_method()
 
+    def _right_pane_has_live_session(self) -> bool:
+        try:
+            state = self.router._load_state()
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(state.get("mounted_session"))
+
     def _send_key_to_right_pane(self, key: str) -> None:
         send_method = getattr(self.router, "send_key_to_right_pane", None)
         if callable(send_method):
@@ -1295,7 +1302,10 @@ class PollyCockpitApp(App[None]):
         # wrapping. Anything beyond j/k/\u21b5/?/q is discoverable via the
         # ``?`` overlay (#790). Width budget is roughly 28 chars after
         # the leading pad applied by Textual.
-        hint_text = "j/k \u21b5open \u00b7 ? help \u00b7 q quit"
+        if self._right_pane_has_live_session():
+            hint_text = "Tab detail \u00b7 j/k \u00b7 ? help"
+        else:
+            hint_text = "j/k \u21b5open \u00b7 ? help \u00b7 q quit"
         try:
             supervisor = self.router._load_supervisor()
             last_hb = supervisor.store.last_heartbeat_at()
@@ -1316,12 +1326,6 @@ class PollyCockpitApp(App[None]):
         except Exception:  # noqa: BLE001
             pass
         self.hint.update(hint_text)
-
-    def _focus_right_if_live(self) -> None:
-        """Focus the right pane only if it shows a live agent session."""
-        state = self.router._load_state()
-        if state.get("mounted_session"):
-            self._focus_right_pane()
 
     def _sync_selected_from_nav(self) -> None:
         """Update selected_key from the current ListView cursor position."""
@@ -1363,7 +1367,6 @@ class PollyCockpitApp(App[None]):
         try:
             self.router.route_selected(key)
             self.selected_key = self.router.selected_key()
-            self._focus_right_if_live()
         except Exception as exc:  # noqa: BLE001
             self.hint.update(f"Error: {exc}"[:60])
         self._refresh_rows()
@@ -1396,6 +1399,9 @@ class PollyCockpitApp(App[None]):
         self._refresh_rows()
 
     def action_forward_tab_to_right(self) -> None:
+        if self._right_pane_has_live_session():
+            self._focus_right_pane()
+            return
         self._send_key_to_right_pane("Tab")
 
     def action_forward_workers_auto_refresh(self) -> None:
@@ -1533,7 +1539,6 @@ class PollyCockpitApp(App[None]):
             # The router may redirect (e.g. project:x → project:x:dashboard),
             # so re-read the selected key to keep the highlight in sync.
             self.selected_key = self.router.selected_key()
-            self._focus_right_if_live()
         except Exception as exc:  # noqa: BLE001
             self.hint.update(f"Error: {exc}"[:60])
         self._refresh_rows()

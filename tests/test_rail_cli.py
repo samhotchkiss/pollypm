@@ -198,8 +198,10 @@ def test_pm_rail_list_json(monkeypatch, tmp_path: Path) -> None:
     assert isinstance(payload, list)
     assert len(payload) > 0
     item_keys = [p["item_key"] for p in payload]
-    # Confirm the core items are present.
-    assert "top.Polly" in item_keys
+    # Confirm the core items are present. Polly's label was renamed to
+    # "Polly · chat" in #870 to disambiguate the live chat pane from
+    # the Home dashboard, so the item_key now carries the suffix.
+    assert "top.Polly · chat" in item_keys
     assert "top.Inbox" in item_keys
     assert "system.Settings" in item_keys
     # Confirm the JSON entries have the expected fields.

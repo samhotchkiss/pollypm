@@ -8460,6 +8460,17 @@ def _project_storage_aliases(config: object, project_key: str) -> list[str]:
     silently shows zero tasks for projects whose key and display name
     differ — issue #920. Return a deduped, ordered list of every form
     we want to try so callers can union the results.
+
+    #915 — also include the canonical pre-override display name (e.g.
+    ``PollyPM`` for the ``pollypm`` key) and lower/title-case variants
+    of every alias. ``_merge_project_local_config`` overwrites
+    ``project.name`` with the per-project ``display_name`` *after*
+    ``_normalize_project_display_name`` has resolved the canonical form,
+    so a project that historically stored tasks under ``PollyPM`` and
+    later set ``display_name = "pollypm"`` would otherwise silently lose
+    its earlier task rows. Casefold variants also cover any task that
+    was created with a casing mismatch (e.g. operator typed
+    ``-p PollyPM`` instead of the slugified key).
     """
     aliases: list[str] = []
 
@@ -8485,7 +8496,89 @@ def _project_storage_aliases(config: object, project_key: str) -> list[str]:
     # without depending on a config lookup.
     _add(project_key.replace("_", "-"))
     _add(project_key.replace("-", "_"))
+
+    # #915 — include the canonical pre-override display name. The local
+    # ``project.toml`` ``display_name`` override clobbers ``project.name``
+    # (so ``project.name`` may now read ``"pollypm"`` even though the
+    # work DB still has rows stored under ``"PollyPM"``). Re-derive the
+    # canonical form so the original casing remains queryable.
+    try:
+        from pollypm.config import _normalize_project_display_name
+        _add(_normalize_project_display_name(project_key, None))
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Add lowercase + title-case variants of every alias gathered so far
+    # so any casing drift between create-time and dashboard-render-time
+    # (operator capitalisation, manual ``-p`` typo, post-rename overrides)
+    # still surfaces the row.
+    for existing in list(aliases):
+        _add(existing.lower())
+        _add(existing.casefold())
+        _add(existing.title())
     return aliases
+
+
+def _dashboard_discover_db_aliases(
+    db_path: Path, aliases: list[str],
+) -> list[str]:
+    """Return DB-stored project labels case-insensitively matching ``aliases``.
+
+    #915 — defends against any casing/slug variant that the static alias
+    list may have missed by inspecting what the work DB actually has.
+    Performs a single ``SELECT DISTINCT project`` scan; returns only the
+    labels that case-fold-match an alias OR slugify to the same key as
+    an alias. Failures are swallowed — the caller falls back to the
+    static alias list.
+    """
+    import sqlite3
+
+    try:
+        from pollypm.projects import slugify_project_key
+    except Exception:  # noqa: BLE001
+        slugify_project_key = None  # type: ignore[assignment]
+
+    folded = {a.casefold() for a in aliases}
+    slugged: set[str] = set()
+    if slugify_project_key is not None:
+        for a in aliases:
+            try:
+                slugged.add(slugify_project_key(a))
+            except Exception:  # noqa: BLE001
+                continue
+
+    discovered: list[str] = []
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except Exception:  # noqa: BLE001
+        return discovered
+    try:
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT project FROM work_tasks",
+            ).fetchall()
+        except Exception:  # noqa: BLE001
+            return discovered
+        for (label,) in rows:
+            if not isinstance(label, str) or not label.strip():
+                continue
+            if label in aliases or label in discovered:
+                continue
+            if label.casefold() in folded:
+                discovered.append(label)
+                continue
+            if slugify_project_key is not None:
+                try:
+                    if slugify_project_key(label) in slugged:
+                        discovered.append(label)
+                except Exception:  # noqa: BLE001
+                    continue
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return discovered
 
 
 def _dashboard_gather_tasks(
@@ -8536,11 +8629,19 @@ def _dashboard_gather_tasks(
     aliases = _project_storage_aliases(config, project_key)
     task_rows: dict[str, tuple[str, dict]] = {}
     for db_path in db_paths:
+        # #915 — extend the static alias list with whatever the DB
+        # actually stores. Catches drift between create-time labels
+        # (e.g. operator typed ``PollyPM``) and the post-override
+        # display name surfaced by ``_project_storage_aliases``.
+        db_aliases = list(aliases)
+        for discovered in _dashboard_discover_db_aliases(db_path, aliases):
+            if discovered not in db_aliases:
+                db_aliases.append(discovered)
         try:
             with SQLiteWorkService(db_path=db_path, project_path=project_path) as svc:
                 tasks: list = []
                 seen_ids: set[str] = set()
-                for alias in aliases:
+                for alias in db_aliases:
                     for found in svc.list_tasks(project=alias):
                         tid = getattr(found, "task_id", None)
                         if not tid or tid in seen_ids:

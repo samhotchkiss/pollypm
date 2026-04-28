@@ -407,6 +407,195 @@ def test_dashboard_storage_aliases_round_trip() -> None:
     assert aliases[0] == "blackjack_trainer"
 
 
+# ---------------------------------------------------------------------------
+# #915 regression — queued task on the canonical ``pollypm`` project must
+# surface even when the per-project ``display_name`` override clobbers
+# the canonical pre-override name (``PollyPM``) that legacy task rows may
+# still be stored under.
+# ---------------------------------------------------------------------------
+
+
+def _write_pollypm_config_with_local_override(
+    project_path: Path, config_path: Path,
+) -> None:
+    """Mirror the production layout where the global config declares
+    ``name = "PollyPM"`` but the project-local ``project.toml`` overrides
+    ``display_name = "pollypm"``. The override pipes through
+    ``_merge_project_local_config`` and clobbers ``project.name``, leaving
+    only the lowercase form on the in-memory ``KnownProject``.
+    """
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "[project]\n"
+        'tmux_session = "pollypm-test"\n'
+        f'workspace_root = "{project_path.parent}"\n'
+        "\n"
+        "[projects.pollypm]\n"
+        'name = "PollyPM"\n'
+        f'path = "{project_path}"\n'
+    )
+    local_dir = project_path / ".pollypm" / "config"
+    local_dir.mkdir(parents=True, exist_ok=True)
+    (local_dir / "project.toml").write_text(
+        "[project]\n"
+        'display_name = "pollypm"\n'
+    )
+
+
+def test_dashboard_storage_aliases_include_canonical_pollypm() -> None:
+    """#915 — ``_project_storage_aliases`` for the ``pollypm`` key must
+    include the canonical ``PollyPM`` form even when the in-memory
+    ``KnownProject.name`` has been overwritten with ``"pollypm"`` by the
+    project-local ``display_name`` override. Otherwise legacy task rows
+    stored under ``PollyPM`` are silently invisible.
+    """
+    from pollypm.cockpit_ui import _project_storage_aliases
+    from pollypm.models import KnownProject
+
+    cfg = type("_C", (), {})()
+    cfg.projects = {
+        "pollypm": KnownProject(
+            key="pollypm",
+            path=Path("/tmp/pollypm"),
+            name="pollypm",  # post-override lowercase
+        ),
+    }
+    aliases = _project_storage_aliases(cfg, "pollypm")
+    assert "pollypm" in aliases
+    assert "PollyPM" in aliases  # canonical pre-override form
+
+
+def test_dashboard_finds_queued_task_on_pollypm_project(tmp_path: Path) -> None:
+    """#915 — a queued task on the canonical ``pollypm`` project must
+    appear in ``_dashboard_gather_tasks``'s output, the ``queued`` count
+    must increment, and the pipeline body must NOT render "No tasks yet."
+
+    Reproduces the exact bug shape reported in #915: Polly creates and
+    queues ``pollypm/1``, ``pm task counts --project pollypm`` confirms
+    it, but the project Dashboard's pipeline panel claims the project
+    is empty.
+    """
+    project_path = tmp_path / "pollypm"
+    project_path.mkdir()
+    config_path = tmp_path / "pollypm.toml"
+    _write_pollypm_config_with_local_override(project_path, config_path)
+
+    db_path = project_path / ".pollypm" / "state.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with SQLiteWorkService(db_path=db_path, project_path=project_path) as svc:
+        task = svc.create(
+            title="Fix #914: 'Open PollyPM' on Step 4 drops user into bash",
+            description="seed",
+            type="task",
+            project="pollypm",
+            flow_template="standard",
+            roles={"worker": "worker", "reviewer": "reviewer"},
+            priority="normal",
+            created_by="polly",
+        )
+        svc.queue(task.task_id, "polly")
+
+    from pollypm import cockpit_ui as _cockpit_ui
+
+    _cockpit_ui._PROJECT_DASHBOARD_TASK_CACHE.clear()
+    data = _cockpit_ui._gather_project_dashboard(config_path, "pollypm")
+
+    assert data is not None
+    # Counts must increment.
+    assert data.task_counts.get("queued") == 1
+    # "In Pipeline" / queued bucket must surface the task.
+    queued_titles = [r["title"] for r in data.task_buckets.get("queued", [])]
+    assert any("Fix #914" in t for t in queued_titles)
+
+    # Pipeline body must NOT degrade to "No tasks yet."
+    rendered = _cockpit_ui.PollyProjectDashboardApp._render_pipeline_body(
+        None, data,  # type: ignore[arg-type]
+    )
+    assert "No tasks yet" not in rendered
+    assert "queued" in rendered.lower()
+    # "Recent activity" / now body must mention the queued task too.
+    now_rendered = _cockpit_ui.PollyProjectDashboardApp._render_now_body(
+        None, data,  # type: ignore[arg-type]
+    )
+    assert "Idle. No tasks in flight" not in now_rendered
+    assert "Next queued task" in now_rendered
+
+
+def test_dashboard_finds_legacy_capitalcased_task_on_pollypm_project(
+    tmp_path: Path,
+) -> None:
+    """#915 — a task stored under the canonical ``PollyPM`` label (created
+    BEFORE the local ``display_name = "pollypm"`` override clobbered the
+    in-memory display name) must still surface on the dashboard. The
+    alias resolver must include the canonical pre-override form so legacy
+    rows aren't silently orphaned.
+    """
+    project_path = tmp_path / "pollypm"
+    project_path.mkdir()
+    config_path = tmp_path / "pollypm.toml"
+    _write_pollypm_config_with_local_override(project_path, config_path)
+
+    db_path = project_path / ".pollypm" / "state.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with SQLiteWorkService(db_path=db_path, project_path=project_path) as svc:
+        task = svc.create(
+            title="Legacy task created when name was PollyPM",
+            description="seed",
+            type="task",
+            project="PollyPM",  # canonical pre-override form
+            flow_template="standard",
+            roles={"worker": "worker", "reviewer": "reviewer"},
+            priority="normal",
+            created_by="polly",
+        )
+        svc.queue(task.task_id, "polly")
+
+    from pollypm import cockpit_ui as _cockpit_ui
+
+    _cockpit_ui._PROJECT_DASHBOARD_TASK_CACHE.clear()
+    data = _cockpit_ui._gather_project_dashboard(config_path, "pollypm")
+
+    assert data is not None
+    assert data.task_counts.get("queued") == 1
+    assert [r["title"] for r in data.task_buckets.get("queued", [])] == [
+        "Legacy task created when name was PollyPM"
+    ]
+
+
+def test_dashboard_db_alias_discovery_finds_uncommon_casing(tmp_path: Path) -> None:
+    """#915 — ``_dashboard_discover_db_aliases`` must surface DB labels
+    that case-insensitively (or via slugify) match a known alias. Catches
+    drift from operator-typed casing variants (``-p Pollypm``,
+    ``-p POLLYPM``, etc.).
+    """
+    project_path = tmp_path / "pollypm"
+    project_path.mkdir()
+
+    db_path = project_path / ".pollypm" / "state.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with SQLiteWorkService(db_path=db_path, project_path=project_path) as svc:
+        for label in ("PollyPM", "pollypm", "POLLYPM"):
+            t = svc.create(
+                title=f"task-{label}",
+                description="seed",
+                type="task",
+                project=label,
+                flow_template="standard",
+                roles={"worker": "w", "reviewer": "r"},
+                priority="normal",
+                created_by="polly",
+            )
+            svc.queue(t.task_id, "polly")
+
+    from pollypm.cockpit_ui import _dashboard_discover_db_aliases
+
+    discovered = _dashboard_discover_db_aliases(db_path, ["pollypm"])
+    # ``POLLYPM`` is neither in the static alias list nor produced by
+    # ``_normalize_project_display_name`` — it must come back from the
+    # DB-discovery scan.
+    assert "POLLYPM" in discovered
+
+
 def test_dashboard_reads_workspace_root_tasks_when_project_db_missing(tmp_path: Path) -> None:
     """Tasks created through the default CLI DB still appear on the project dashboard."""
     project_path = tmp_path / "demo"

@@ -219,9 +219,51 @@ def notify(
     # the original throttle semantics across the upgrade.
     execution_version = int(getattr(event, "execution_version", 0) or 0)
 
-    # Dedupe: don't re-ping the same session about the same task within
-    # the throttle window at the same execution_version.
-    if store is not None and throttle_seconds > 0:
+    message = format_ping_for_role(event)
+
+    # #952: dedupe the slot atomically BEFORE the send, not after.
+    # The legacy flow was [check was_notified_within → send →
+    # record_notification], which left a TOCTOU window: concurrent
+    # sweep ticks all saw "not yet sent" and each fired the same
+    # ``Resume work`` ping before any of them committed the row.
+    # ``claim_notification_slot`` checks + inserts under the connection
+    # lock in one atomic step. The first caller wins (returns a rowid);
+    # losers see the placeholder row and return None → ``deduped``. We
+    # then update the row's ``delivery_status`` once the send finishes.
+    notification_id: int | None = None
+    can_claim = (
+        store is not None
+        and throttle_seconds > 0
+        and hasattr(store, "claim_notification_slot")
+    )
+    if can_claim:
+        try:
+            notification_id = store.claim_notification_slot(
+                session_name=target_name,
+                task_id=event.task_id,
+                window_seconds=throttle_seconds,
+                execution_version=execution_version,
+                project=event.project,
+                message=message,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "task_assignment_notify: claim_notification_slot failed for %s",
+                event.task_id, exc_info=True,
+            )
+            notification_id = None
+        if notification_id is None:
+            return {
+                "outcome": "deduped",
+                "task_id": event.task_id,
+                "session": target_name,
+                "execution_version": execution_version,
+            }
+    elif store is not None and throttle_seconds > 0:
+        # Legacy fallback for stores that don't expose the atomic
+        # claim helper (test doubles, custom backends). Preserves the
+        # old behaviour — racy on concurrent sweeps but correct for
+        # serial callers.
         try:
             if store.was_notified_within(
                 target_name,
@@ -266,8 +308,6 @@ def notify(
                 except Exception:  # noqa: BLE001
                     pass
 
-    message = format_ping_for_role(event)
-
     try:
         session_svc.send(target_name, message)
     except Exception as exc:  # noqa: BLE001
@@ -275,17 +315,27 @@ def notify(
             "task_assignment_notify: send to %s failed: %s", target_name, exc,
         )
         if store is not None:
-            try:
-                store.record_notification(
-                    session_name=target_name,
-                    task_id=event.task_id,
-                    project=event.project,
-                    message=message,
-                    delivery_status=f"failed: {exc}"[:200],
-                    execution_version=execution_version,
-                )
-            except Exception:  # noqa: BLE001
-                pass
+            failure_status = f"failed: {exc}"[:200]
+            if notification_id is not None:
+                try:
+                    store.update_notification_status(
+                        notification_id,
+                        delivery_status=failure_status,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                try:
+                    store.record_notification(
+                        session_name=target_name,
+                        task_id=event.task_id,
+                        project=event.project,
+                        message=message,
+                        delivery_status=failure_status,
+                        execution_version=execution_version,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
         return {
             "outcome": "send_failed",
             "task_id": event.task_id,
@@ -295,20 +345,32 @@ def notify(
         }
 
     if store is not None:
-        try:
-            store.record_notification(
-                session_name=target_name,
-                task_id=event.task_id,
-                project=event.project,
-                message=message,
-                delivery_status="sent",
-                execution_version=execution_version,
-            )
-        except Exception:  # noqa: BLE001
-            logger.debug(
-                "task_assignment_notify: record_notification failed for %s",
-                event.task_id, exc_info=True,
-            )
+        if notification_id is not None:
+            try:
+                store.update_notification_status(
+                    notification_id,
+                    delivery_status="sent",
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "task_assignment_notify: update_notification_status failed for %s",
+                    event.task_id, exc_info=True,
+                )
+        else:
+            try:
+                store.record_notification(
+                    session_name=target_name,
+                    task_id=event.task_id,
+                    project=event.project,
+                    message=message,
+                    delivery_status="sent",
+                    execution_version=execution_version,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "task_assignment_notify: record_notification failed for %s",
+                    event.task_id, exc_info=True,
+                )
 
     # #923: ``notify()`` deliberately does NOT stamp ``kickoff_sent_at``
     # any more. The transition-time call site (claim → in_process listener)

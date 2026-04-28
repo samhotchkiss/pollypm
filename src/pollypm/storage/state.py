@@ -1551,6 +1551,151 @@ class StateStore:
         )
         self.commit()
 
+    def claim_notification_slot(
+        self,
+        *,
+        session_name: str,
+        task_id: str,
+        window_seconds: int,
+        execution_version: int = 0,
+        project: str = "",
+        message: str = "",
+    ) -> int | None:
+        """Atomically claim a dedupe slot for a ``(session, task, version)`` ping.
+
+        Closes the TOCTOU between :meth:`was_notified_within` and
+        :meth:`record_notification` (#952). The bug: the sweeper used to
+        check ``was_notified_within`` (read), then call ``session.send``,
+        then ``record_notification`` (write). Concurrent sweep ticks
+        could all see "not yet sent" and each fire a duplicate ping
+        before any of them committed the row.
+
+        This method does the check + insert under the connection lock in
+        one atomic step:
+
+        * If a row already exists within ``window_seconds`` for the
+          ``(session, task, execution_version)`` tuple, returns ``None``
+          (caller should treat as ``deduped``).
+        * Otherwise inserts a placeholder row with
+          ``delivery_status="pending"`` and returns its rowid. The
+          caller then attempts the send and updates the row's
+          ``delivery_status`` via :meth:`update_notification_status`.
+
+        Concurrent callers are serialised by the StateStore connection
+        lock, so the second caller's check sees the first caller's
+        pending row and returns ``None``. The pending row counts as a
+        "sent" entry for dedupe purposes — if the send ultimately fails
+        the next sweep tick (5 min later) will re-fire as it would have
+        with the legacy sent-row.
+        """
+        from datetime import timedelta
+
+        with self._lock:
+            cutoff = (
+                datetime.now(UTC) - timedelta(seconds=window_seconds)
+            ).isoformat()
+            existing = self._conn.execute(
+                """
+                SELECT 1 FROM messages
+                WHERE type = 'task_notification'
+                  AND scope = ?
+                  AND sender = ?
+                  AND COALESCE(json_extract(payload_json, '$.execution_version'), 0) = ?
+                  AND created_at >= ?
+                LIMIT 1
+                """,
+                (
+                    session_name,
+                    task_id,
+                    int(execution_version),
+                    cutoff,
+                ),
+            ).fetchone()
+            if existing is not None:
+                return None
+            now = datetime.now(UTC).isoformat()
+            cursor = self._conn.execute(
+                """
+                INSERT INTO messages (
+                    scope, type, tier, recipient, sender, state,
+                    subject, body, payload_json, labels, created_at, updated_at
+                )
+                VALUES (?, 'task_notification', 'immediate', ?, ?, 'open', ?, ?, ?, '[]', ?, ?)
+                """,
+                (
+                    session_name,
+                    project,
+                    task_id,
+                    task_id,
+                    message,
+                    json.dumps(
+                        {
+                            "project": project,
+                            "delivery_status": "pending",
+                            "execution_version": int(execution_version),
+                        }
+                    ),
+                    now,
+                    now,
+                ),
+            )
+            self._conn.commit()
+            rowid = int(cursor.lastrowid or 0)
+        # Bump epoch outside the lock — same pattern as :meth:`commit`.
+        try:
+            from pollypm.state_epoch import bump
+            bump()
+        except Exception:  # noqa: BLE001
+            pass
+        return rowid or None
+
+    def update_notification_status(
+        self,
+        notification_id: int,
+        *,
+        delivery_status: str,
+        message: str | None = None,
+    ) -> None:
+        """Update the delivery status / body of a previously-claimed slot.
+
+        Companion to :meth:`claim_notification_slot` — once the send has
+        been attempted, the caller stamps the resulting status (``sent``
+        or ``failed: …``) on the placeholder row. If ``message`` is
+        provided, the body is also updated to the canonical payload.
+        """
+        if not notification_id:
+            return
+        # Patch the JSON status in place. ``json_set`` keeps the rest of
+        # the payload (project, execution_version) untouched.
+        if message is None:
+            self.execute(
+                """
+                UPDATE messages
+                SET payload_json = json_set(
+                        payload_json,
+                        '$.delivery_status', ?
+                    ),
+                    updated_at = ?
+                WHERE id = ? AND type = 'task_notification'
+                """,
+                (delivery_status, self._now(), int(notification_id)),
+            )
+        else:
+            self.execute(
+                """
+                UPDATE messages
+                SET payload_json = json_set(
+                        payload_json,
+                        '$.delivery_status', ?
+                    ),
+                    body = ?,
+                    updated_at = ?
+                WHERE id = ? AND type = 'task_notification'
+                """,
+                (delivery_status, message, self._now(), int(notification_id)),
+            )
+        self.commit()
+
     def was_notified_within(
         self,
         session_name: str,

@@ -1877,3 +1877,110 @@ class TestNotifyRoutesToPerTaskSession:
         assert outcome["outcome"] == "sent"
         open_types = {a.alert_type for a in state_store.open_alerts()}
         assert "no_session" not in open_types
+
+
+# ---------------------------------------------------------------------------
+# #952 — concurrent-sweep dedupe race
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrentSweepDedupeRace:
+    """Two concurrent ``notify()`` calls racing on the same fresh task
+    must result in EXACTLY ONE ``Resume work`` ping reaching the worker
+    pane. The legacy flow (read was_notified_within → send → record)
+    left a TOCTOU window where both callers saw "not yet sent" and each
+    fired a duplicate before either committed the row. The fix claims
+    the dedupe slot atomically before the send, so the second caller
+    observes the placeholder and returns ``deduped``. (#952)
+    """
+
+    def test_serial_back_to_back_sends_dedupe_to_one_message(self, state_store):
+        """Two ``notify()`` calls for the same ``(session, task, version)``
+        deliver the message exactly once, even when the second call
+        arrives before the first call's ``record_notification`` would
+        have landed under the legacy flow. With the atomic-claim fix the
+        second call sees the placeholder and dedupes."""
+        svc = FakeSessionService(handles=[FakeHandle("worker-demo")])
+        services = _RuntimeServices(
+            session_service=svc, state_store=state_store,
+            work_service=None, project_root=Path("."),
+        )
+
+        first = notify(_event(), services=services, throttle_seconds=300)
+        second = notify(_event(), services=services, throttle_seconds=300)
+
+        assert first["outcome"] == "sent"
+        assert second["outcome"] == "deduped"
+        # Worker pane received exactly one ping — the race fix ensures
+        # the second caller's claim returned None before the send fired.
+        assert len(svc.sent) == 1, (
+            f"expected exactly one delivered message, got {svc.sent!r}"
+        )
+
+    def test_threaded_concurrent_notify_sends_exactly_once(self, state_store):
+        """Drive two threads that both call ``notify()`` for the same
+        task simultaneously — modeling two sweep ticks racing on a
+        freshly-claimed worker. Exactly one thread wins the dedupe
+        claim and the other returns ``deduped``; the worker pane sees
+        a single ``Resume work`` payload."""
+        import threading
+
+        # Block the send call until both threads have crossed the
+        # dedupe-claim boundary, so we're actually testing the claim
+        # logic rather than the inherent serialization of the send.
+        send_gate = threading.Event()
+        sent_lock = threading.Lock()
+
+        @dataclass
+        class GatedSession:
+            handles: list[FakeHandle]
+            sent: list[tuple[str, str]] = field(default_factory=list)
+
+            def list(self) -> list[FakeHandle]:
+                return list(self.handles)
+
+            def send(self, name: str, text: str, *, press_enter: bool = True) -> None:
+                # Wait briefly so the second thread's claim attempt
+                # races against the first thread's pending row.
+                send_gate.wait(timeout=2.0)
+                with sent_lock:
+                    self.sent.append((name, text))
+
+            def is_turn_active(self, name: str) -> bool:
+                return False
+
+        svc = GatedSession(handles=[FakeHandle("worker-demo")])
+        services = _RuntimeServices(
+            session_service=svc, state_store=state_store,
+            work_service=None, project_root=Path("."),
+        )
+
+        results: list[dict] = []
+        results_lock = threading.Lock()
+
+        def _worker():
+            outcome = notify(_event(), services=services, throttle_seconds=300)
+            with results_lock:
+                results.append(outcome)
+
+        threads = [threading.Thread(target=_worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        # Brief slack so both threads enter notify() before we let the
+        # send proceed. The atomic claim runs synchronously under the
+        # StateStore lock, so by the time we release the gate one
+        # thread has already won the claim and the other has bailed
+        # out with ``deduped`` — even if the send happens to be slow.
+        import time
+        time.sleep(0.05)
+        send_gate.set()
+        for t in threads:
+            t.join(timeout=5.0)
+
+        outcomes = sorted(r["outcome"] for r in results)
+        assert outcomes == ["deduped", "sent"], (
+            f"expected one sent + one deduped, got {outcomes!r}"
+        )
+        assert len(svc.sent) == 1, (
+            f"expected exactly one delivered message under race, got {svc.sent!r}"
+        )

@@ -193,3 +193,97 @@ def test_persona_reassertion_uses_canonical_role_contract() -> None:
 
     assert out == "FAKE_REMEDIATION"
     assert captured == [("operator-pm", "Russell")]
+
+
+# ---------------------------------------------------------------------------
+# #913 — repo-relative ``src/pollypm/`` paths must not leak
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "role, drifted_to",
+    [
+        ("operator-pm", "Russell"),
+        ("reviewer", "Polly"),
+        ("architect", "Polly"),
+        ("worker", "Polly"),
+        ("heartbeat-supervisor", "Polly"),
+    ],
+)
+def test_remediation_omits_repo_relative_src_path(
+    role: str, drifted_to: str,
+) -> None:
+    """#913 — every persona's heartbeat remediation must avoid the
+    literal substring ``src/pollypm/``.
+
+    The original bug: guide-path constants embedded the repo-
+    relative form ``src/pollypm/plugins_builtin/...``. That string
+    is the source-checkout location, not the install location —
+    once PollyPM is installed (editable or wheel) the path no
+    longer resolves from the recipient session's cwd. This test
+    locks the runtime-emitter contract: regardless of which
+    persona is drifting, no message should hand the agent a
+    string starting with ``src/pollypm/``."""
+    from pollypm.heartbeats.local import _build_persona_reassertion_message
+
+    msg = _build_persona_reassertion_message(role=role, drifted_to=drifted_to)
+    assert "src/pollypm/" not in msg, (
+        f"persona-drift remediation for role={role!r} still emits a "
+        f"repo-relative src/pollypm/ path:\n{msg}"
+    )
+
+
+@pytest.mark.parametrize(
+    "role, drifted_to",
+    [
+        ("operator_pm", "Russell"),
+        ("reviewer", "Polly"),
+        ("architect", "Polly"),
+        ("worker", "Polly"),
+        ("heartbeat_supervisor", "Polly"),
+    ],
+)
+def test_canonical_remediation_omits_repo_relative_src_path(
+    role: str, drifted_to: str,
+) -> None:
+    """#913 — same invariant, exercised at the canonical
+    ``role_contract.build_remediation_message`` layer (the
+    heartbeat delegates to this helper, but other emitters may
+    call it directly). Both layers must satisfy the no-``src/`` rule."""
+    from pollypm.role_contract import build_remediation_message
+
+    msg = build_remediation_message(role, drifted_to)
+    assert "src/pollypm/" not in msg, (
+        f"canonical remediation for role={role!r} still emits a "
+        f"repo-relative src/pollypm/ path:\n{msg}"
+    )
+
+
+def test_role_contract_guide_paths_resolve_on_disk() -> None:
+    """#913 smoke — the new ``importlib.resources``-backed guide
+    paths must point at a real file on disk regardless of install
+    layout.
+
+    The failure shape this test catches: a typo in
+    ``_packaged_guide_path`` or a profile filename rename that
+    breaks the lookup silently. Without this check, the
+    remediation message would emit a stale leaf filename and the
+    runtime resolver (``pm`` / agent reading the file) would 404."""
+    from pathlib import Path
+
+    from pollypm.role_contract import ROLE_REGISTRY
+
+    for contract in ROLE_REGISTRY.values():
+        if contract.guide_path is None:
+            continue
+        # Absolute path required — the whole point of the #913 fix
+        # is to drop repo-relative shapes.
+        path = Path(contract.guide_path)
+        assert path.is_absolute(), (
+            f"role {contract.key!r}: guide_path is not absolute "
+            f"({contract.guide_path!r})"
+        )
+        assert path.is_file(), (
+            f"role {contract.key!r}: guide_path does not resolve to "
+            f"a file ({contract.guide_path!r})"
+        )

@@ -52,6 +52,7 @@ before tagging v1.
 
 from __future__ import annotations
 
+import importlib.resources
 import re
 from dataclasses import dataclass, field
 from typing import Mapping
@@ -79,10 +80,11 @@ class RoleContract:
       the supervisor uses to plan launches.
     * ``persona_name`` — the human-facing name the session
       should identify as (e.g., ``"Polly"`` for ``operator_pm``).
-    * ``guide_path`` — repository-relative path to the role's
-      canonical operating guide. Migrating to a packaged data
-      path is on the work-service-spec roadmap; the path here is
-      the source of truth until then.
+    * ``guide_path`` — absolute on-disk path to the role's
+      canonical operating guide. Resolved through
+      :func:`importlib.resources.files` so the value is valid
+      regardless of whether PollyPM is running from a source
+      checkout or an editable / wheel install (#913).
     * ``identity_markers`` — substrings that, when present in a
       pane snapshot, prove the session is operating as this
       role. Heartbeat drift detection scans for them.
@@ -125,13 +127,31 @@ class RoleContract:
 # ---------------------------------------------------------------------------
 
 
-_OPERATOR_GUIDE = (
-    "src/pollypm/plugins_builtin/core_agent_profiles/profiles/"
-    "polly-operator-guide.md"
-)
-_REVIEWER_GUIDE = (
-    "src/pollypm/plugins_builtin/core_agent_profiles/profiles/russell.md"
-)
+def _packaged_guide_path(filename: str) -> str:
+    """Return the absolute on-disk path of a packaged role-guide.
+
+    #913 — the guide-path constants previously hard-coded the
+    repo-relative ``src/pollypm/plugins_builtin/...`` form. That
+    string is the source location, not the install location: an
+    editable install at ``~/.local/share/uv/tools/pollypm/lib/...``
+    resolves the same module under a different prefix, and a
+    drifted session running with ``cwd != <repo>`` cannot reach
+    the file by following ``src/...``. Resolving through
+    :func:`importlib.resources.files` returns the path actually
+    valid on the running interpreter, regardless of layout.
+
+    The returned string is an absolute path. ``importlib.resources``
+    handles both source layouts (``src/pollypm/...``) and installed
+    distributions transparently — every consumer (heartbeat
+    remediation, contract audit, security checklist) gets a path
+    that resolves from any cwd.
+    """
+    base = importlib.resources.files("pollypm.plugins_builtin.core_agent_profiles")
+    return str(base / "profiles" / filename)
+
+
+_OPERATOR_GUIDE = _packaged_guide_path("polly-operator-guide.md")
+_REVIEWER_GUIDE = _packaged_guide_path("russell.md")
 # The architect role's persona is built inline in
 # ``pollypm.plugins_builtin.core_agent_profiles.profiles`` rather than
 # from a standalone Markdown file. The legacy heartbeat persona-drift
@@ -397,9 +417,24 @@ def build_remediation_message(role: str, drifted_to: str) -> str:
         ),
     ]
     if guide:
+        # #913 — emit a *layout-stable* reference rather than the
+        # raw on-disk path. The contract's ``guide_path`` is now an
+        # absolute path resolved through ``importlib.resources``,
+        # which means it embeds ``src/pollypm/...`` on a source
+        # checkout but ``site-packages/pollypm/...`` on a wheel
+        # install — neither prefix is a string the recipient agent
+        # can paste back as a working path. Emitting the canonical
+        # filename plus its package qualifier gives the agent a
+        # form it can hand back to ``pm`` / Python without
+        # depending on the operator's install layout.
+        guide_filename = guide.rsplit("/", 1)[-1]
         lines += [
             "",
-            f"Operating guide: {guide}",
+            (
+                f"Operating guide: {guide_filename} "
+                f"(packaged under "
+                f"pollypm.plugins_builtin.core_agent_profiles.profiles)"
+            ),
         ]
     lines += [
         "",

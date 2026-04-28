@@ -1569,12 +1569,19 @@ def test_task_bulk_selection_and_batch_review(env, monkeypatch) -> None:
     fake_svc = _FakeSvc(tasks_factory=lambda: [first, second], flow=_flow())
 
     monkeypatch.setattr("pollypm.cockpit_tasks.create_tmux_client", lambda: _FakeTmux([]))
-    monkeypatch.setattr("pollypm.cockpit_tasks._PENDING_UNDO_SECONDS", 0.2)
+    # #955 — keep the undo window generous enough that a busy full-suite
+    # ordering can't race the banner-render against the auto-commit timer
+    # (the 0.2s window was tight enough that the banner could clear before
+    # the test's `pause()` returned). We trigger the commit explicitly
+    # below, so a long window does not slow the test down.
+    monkeypatch.setattr("pollypm.cockpit_tasks._PENDING_UNDO_SECONDS", 5.0)
 
     app = PollyTasksApp(env["config_path"], "demo")
     app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
 
     async def body() -> None:
+        from time import monotonic
+
         async with app.run_test(size=(140, 50)) as pilot:
             await pilot.pause()
             await pilot.press("A")
@@ -1595,8 +1602,16 @@ def test_task_bulk_selection_and_batch_review(env, monkeypatch) -> None:
             assert rows[1][0] == "◉ #2"
 
             await pilot.press("A")
-            await pilot.pause()
-            banner = str(app.query_one("#tasks-banner", Static).render())
+            # #955 — poll for the banner text instead of relying on a
+            # single ``pilot.pause()`` to cover the render. The previous
+            # fixed-pause shape flaked under busy full-suite orderings.
+            deadline = monotonic() + 10.0
+            banner = ""
+            while monotonic() < deadline:
+                await pilot.pause()
+                banner = str(app.query_one("#tasks-banner", Static).render())
+                if "APPROVED" in banner:
+                    break
             # #767 — banner now has a bolder, more visible shape:
             # "APPROVED · 2 tasks   Undo press Z (Ns)".
             assert "APPROVED" in banner
@@ -1604,7 +1619,9 @@ def test_task_bulk_selection_and_batch_review(env, monkeypatch) -> None:
             assert "Undo" in banner
             assert fake_svc.approve_calls == []
 
-            await asyncio.sleep(0.3)
+            # #955 — drive the commit deterministically rather than
+            # waiting on the (now generous) undo timer to fire.
+            app._commit_pending_review_action()
             await pilot.pause()
             assert fake_svc.approve_calls == [
                 ("demo/1", "user", "Approved from task cockpit"),
@@ -1614,7 +1631,9 @@ def test_task_bulk_selection_and_batch_review(env, monkeypatch) -> None:
             await pilot.press("space")
             await pilot.pause()
             await pilot.press("X")
-            await asyncio.sleep(0.3)
+            await pilot.pause()
+            # #955 — same deterministic commit for the reject path.
+            app._commit_pending_review_action()
             await pilot.pause()
             assert fake_svc.reject_calls == [
                 ("demo/2", "user", "Bulk rejected from task cockpit"),

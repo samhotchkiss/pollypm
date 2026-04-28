@@ -935,6 +935,17 @@ def task_approve(
         "--actor",
         help="Actor approving (defaults to the task's bound reviewer/human approver)",
     ),
+    resume: bool = typer.Option(
+        False,
+        "--resume",
+        help=(
+            "Continue an approve after a previous attempt surfaced a "
+            "merge conflict on a non-safelist file. Run after "
+            "hand-resolving the conflict in the project root (or after "
+            "completing the merge manually) and approve will pick up "
+            "from there."
+        ),
+    ),
     db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
@@ -945,6 +956,7 @@ def task_approve(
         task_id,
         _resolve_actor_for_task(svc, task_id, actor),
         reason,
+        resume_merge=resume,
     )
     if output_json:
         typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))

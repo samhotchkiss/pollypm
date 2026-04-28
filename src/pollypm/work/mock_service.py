@@ -431,7 +431,7 @@ class MockWorkService:
         self._advance_to_node(task, flow, node.next_node_id, actor, task.work_status)
         return deepcopy(task)
 
-    def approve(self, task_id: str, actor: str, reason: str | None = None, skip_gates: bool = False) -> Task:
+    def approve(self, task_id: str, actor: str, reason: str | None = None, skip_gates: bool = False, resume_merge: bool = False) -> Task:
         task = self._tasks.get(task_id)
         if task is None:
             raise TaskNotFoundError(f"Task '{task_id}' not found.")

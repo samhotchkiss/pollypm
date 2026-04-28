@@ -154,6 +154,7 @@ class WorkService(Protocol):
         actor: str,
         reason: str | None = None,
         skip_gates: bool = False,
+        resume_merge: bool = False,
     ) -> Task:
         """Approve at a review node.
 
@@ -161,6 +162,9 @@ class WorkService(Protocol):
         becomes ``done``.
 
         ``skip_gates`` bypasses gate evaluation (#796).
+        ``resume_merge`` lets a caller continue after hand-resolving a
+        non-safelist merge conflict raised by a previous approve attempt
+        (#925).
         """
         ...
 

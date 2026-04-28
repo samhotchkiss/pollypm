@@ -265,6 +265,183 @@ class TestApprove:
         assert svc.get(task.task_id).work_status == WorkStatus.REVIEW
         session_mgr.teardown_worker.assert_not_called()
 
+    def _build_addadd_repo(
+        self,
+        tmp_path,
+        rel_path: str,
+        main_text: str,
+        task_text: str,
+    ):
+        """Create a repo where ``rel_path`` is independently added on both
+        main and the task branch (classic add/add conflict)."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "t@example.com"], cwd=repo, check=True
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"], cwd=repo, check=True
+        )
+        subprocess.run(
+            ["git", "config", "commit.gpgsign", "false"], cwd=repo, check=True
+        )
+        (repo / "README.md").write_text("hello\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+
+        svc = SQLiteWorkService(db_path=tmp_path / "work.db", project_path=repo)
+        task = _create_task(svc)
+        _claim_task(svc, task)
+        current_branch = _git_stdout(repo, "rev-parse", "--abbrev-ref", "HEAD")
+        task_branch = f"task/{task.project}-{task.task_number}"
+
+        # Worker branch independently adds rel_path with task_text.
+        subprocess.run(
+            ["git", "-C", str(repo), "checkout", "-q", "-b", task_branch],
+            check=True,
+        )
+        (repo / rel_path).write_text(task_text, encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", rel_path], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-q", "-m", f"feat: add {rel_path}"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "checkout", "-q", current_branch],
+            check=True,
+        )
+
+        # Main branch independently adds rel_path with main_text.
+        (repo / rel_path).write_text(main_text, encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", rel_path], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-q", "-m", f"chore: add {rel_path}"],
+            check=True,
+        )
+
+        svc.node_done(task.task_id, "pete", _valid_work_output())
+        return repo, svc, task, task_branch
+
+    def test_approve_unions_disjoint_gitignore_addadd(self, tmp_path):
+        repo, svc, task, task_branch = self._build_addadd_repo(
+            tmp_path,
+            ".gitignore",
+            ".pollypm/\nnode_modules/\n",
+            "dist/\n.env\n",
+        )
+
+        result = svc.approve(task.task_id, "polly")
+
+        assert result.work_status == WorkStatus.DONE
+        merged_lines = (repo / ".gitignore").read_text(encoding="utf-8").splitlines()
+        # Union of both sides, dedupe-preserving order; ours-first.
+        assert merged_lines == [
+            ".pollypm/",
+            "node_modules/",
+            "dist/",
+            ".env",
+        ]
+        merged = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", task_branch, "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert merged.returncode == 0
+        # Repo must be clean after the merge — no lingering MERGE_HEAD, no
+        # stray conflict markers.
+        assert not (repo / ".git" / "MERGE_HEAD").exists()
+        text = (repo / ".gitignore").read_text(encoding="utf-8")
+        assert "<<<<<<<" not in text and "=======" not in text
+
+    def test_approve_unions_overlapping_gitignore_addadd(self, tmp_path):
+        repo, svc, task, _task_branch = self._build_addadd_repo(
+            tmp_path,
+            ".gitignore",
+            ".pollypm/\nnode_modules/\ndist/\n",
+            "node_modules/\ndist/\n.env\n",
+        )
+
+        result = svc.approve(task.task_id, "polly")
+
+        assert result.work_status == WorkStatus.DONE
+        merged_lines = (repo / ".gitignore").read_text(encoding="utf-8").splitlines()
+        # Each line appears at most once, ours-first ordering.
+        assert merged_lines == [
+            ".pollypm/",
+            "node_modules/",
+            "dist/",
+            ".env",
+        ]
+
+    def test_approve_surfaces_friendly_error_for_unsafe_addadd(self, tmp_path):
+        repo, svc, task, _task_branch = self._build_addadd_repo(
+            tmp_path,
+            "README.md",  # not on the safelist
+            "# Project\n\nMain version.\n",
+            "# Project\n\nWorker version.\n",
+        )
+
+        with pytest.raises(ValidationError) as excinfo:
+            svc.approve(task.task_id, "polly")
+
+        msg = str(excinfo.value)
+        assert "README.md" in msg
+        assert "--resume" in msg
+        # The merge must have been aborted cleanly — no MERGE_HEAD, no
+        # in-tree conflict markers, working tree restored.
+        assert not (repo / ".git" / "MERGE_HEAD").exists()
+        assert (repo / "README.md").read_text(encoding="utf-8") == (
+            "# Project\n\nMain version.\n"
+        )
+        # Status should be back to clean (no UU entries).
+        status = subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert "UU" not in status.stdout
+        # Task is still in review since approve raised before mutation.
+        assert svc.get(task.task_id).work_status == WorkStatus.REVIEW
+
+    def test_approve_resume_after_manual_merge(self, tmp_path):
+        """If the user hand-merges + commits the task branch, then runs
+        approve --resume, approval proceeds without re-attempting the merge."""
+        repo, svc, task, task_branch = self._build_addadd_repo(
+            tmp_path,
+            "README.md",  # not on safelist — first attempt will surface error
+            "# Project\n\nMain version.\n",
+            "# Project\n\nWorker version.\n",
+        )
+
+        # First attempt surfaces the friendly error, aborts cleanly.
+        with pytest.raises(ValidationError):
+            svc.approve(task.task_id, "polly")
+
+        # User completes the merge by hand.
+        subprocess.run(
+            ["git", "-C", str(repo), "merge", "--no-ff", "--no-edit", task_branch],
+            check=False,
+            capture_output=True,
+        )
+        # add/add still conflicts here — resolve manually by taking ours.
+        subprocess.run(
+            ["git", "-C", str(repo), "checkout", "--ours", "README.md"],
+            check=True,
+        )
+        subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "--no-edit", "-q"],
+            check=True,
+        )
+
+        # --resume should detect that task_branch is already an ancestor of
+        # HEAD and let approval proceed.
+        result = svc.approve(task.task_id, "polly", resume_merge=True)
+        assert result.work_status == WorkStatus.DONE
+
     def test_approve_allows_pollypm_import_scaffold_dirt(self, tmp_path):
         repo, svc, task, task_branch = _create_review_task_on_git_repo(tmp_path)
         (repo / ".gitignore").write_text(".pollypm/\n", encoding="utf-8")

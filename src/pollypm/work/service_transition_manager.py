@@ -797,6 +797,7 @@ class WorkTransitionManager:
         actor: str,
         reason: str | None = None,
         skip_gates: bool = False,
+        resume_merge: bool = False,
     ) -> Task:
         task = self.service.get(task_id)
 
@@ -865,7 +866,10 @@ class WorkTransitionManager:
                 )
 
         if task.current_node_id == "code_review" and node.next_node_id == "done":
-            self.service._auto_merge_approved_task_branch(task)
+            self.service._auto_merge_approved_task_branch(
+                task,
+                resume_merge=resume_merge,
+            )
 
         now = _now()
 

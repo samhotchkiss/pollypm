@@ -283,6 +283,34 @@ def _status_is_only_pollypm_scaffold(project_path: Path, status_stdout: str) -> 
     return True
 
 
+def _union_merge_text(ours: str, theirs: str) -> str:
+    """Concatenate two line-oriented texts, dedupe preserving first-seen order.
+
+    Used to resolve add/add conflicts on concat-safe files (.gitignore et al.)
+    where a union of both sides' lines is the correct merge result. Trailing
+    newline is preserved if either input had one.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    needs_trailing_newline = False
+    for source in (ours, theirs):
+        if not source:
+            continue
+        if source.endswith("\n"):
+            needs_trailing_newline = True
+        for line in source.splitlines():
+            if line in seen:
+                continue
+            seen.add(line)
+            out.append(line)
+    if not out:
+        return ""
+    text = "\n".join(out)
+    if needs_trailing_newline:
+        text += "\n"
+    return text
+
+
 def mark_first_shipped(
     *,
     path: Path | None = None,
@@ -1835,14 +1863,21 @@ class SQLiteWorkService:
         actor: str,
         reason: str | None = None,
         skip_gates: bool = False,
+        resume_merge: bool = False,
     ) -> Task:
-        """Approve at a review node."""
+        """Approve at a review node.
+
+        ``resume_merge=True`` lets a caller continue an approve after
+        hand-resolving a non-safelist merge conflict surfaced by a previous
+        attempt; see ``_auto_merge_approved_task_branch``.
+        """
         self.last_first_shipped_created = False
         result = self._transition_mgr.approve(
             task_id,
             actor,
             reason=reason,
             skip_gates=skip_gates,
+            resume_merge=resume_merge,
         )
         if result.work_status == WorkStatus.DONE:
             self.last_first_shipped_created = maybe_record_first_shipped(
@@ -2551,8 +2586,39 @@ class SQLiteWorkService:
 
         return self._project_path
 
-    def _auto_merge_approved_task_branch(self, task: Task) -> None:
-        """Merge an approved task branch into the repo's current branch."""
+    # Files that are safe to merge by concatenating + dedup-preserving-order.
+    # All are line-oriented ignore/attribute lists where union semantics are
+    # the right answer when both sides independently add the file.
+    _UNION_SAFE_MERGE_FILES = frozenset(
+        {
+            ".gitignore",
+            ".dockerignore",
+            ".eslintignore",
+            ".prettierignore",
+            ".npmignore",
+            ".gitattributes",
+        }
+    )
+
+    def _auto_merge_approved_task_branch(
+        self,
+        task: Task,
+        resume_merge: bool = False,
+    ) -> None:
+        """Merge an approved task branch into the repo's current branch.
+
+        When the standard merge produces conflicts only on
+        ``_UNION_SAFE_MERGE_FILES`` (e.g. ``.gitignore``), each conflicting
+        file is resolved by taking the union of both sides' lines (deduped,
+        order-preserving) and the merge is finalized. Conflicts on other
+        files (e.g. ``README.md``) are reported with a friendlier error and
+        the in-progress merge is aborted.
+
+        ``resume_merge=True`` lets a caller continue after a hand-resolved
+        conflict: if the merge has already been completed externally (the
+        task branch is an ancestor of HEAD) or an in-progress merge has
+        every conflict resolved + staged, this commits + returns.
+        """
         project_path = self._resolve_project_path(task.project)
         if project_path is None or not (project_path / ".git").exists():
             return
@@ -2567,6 +2633,66 @@ class SQLiteWorkService:
         )
         if current_branch == task_branch:
             return
+
+        # --resume path: the user (or a previous run) may have hand-resolved
+        # an earlier conflict. Two valid states to detect here.
+        if resume_merge:
+            already_merged = self._git_run(
+                project_path,
+                "merge-base",
+                "--is-ancestor",
+                task_branch,
+                "HEAD",
+            )
+            if already_merged.returncode == 0:
+                return
+
+            merge_head = project_path / ".git" / "MERGE_HEAD"
+            if merge_head.exists():
+                # If unresolved conflicts remain, surface them; otherwise
+                # commit the staged merge.
+                conflicts = self._git_run(
+                    project_path,
+                    "diff",
+                    "--name-only",
+                    "--diff-filter=U",
+                )
+                if (
+                    conflicts.returncode == 0
+                    and conflicts.stdout.strip() == ""
+                ):
+                    commit = self._git_run(
+                        project_path,
+                        "commit",
+                        "--no-edit",
+                    )
+                    if commit.returncode == 0:
+                        return
+                    detail = (
+                        commit.stderr.strip()
+                        or commit.stdout.strip()
+                        or "git commit failed"
+                    )
+                    raise ValidationError(
+                        f"Could not finalize the in-progress merge of "
+                        f"`{task_branch}` into `{current_branch}`. "
+                        f"Git said: {detail}"
+                    )
+                # Conflicts remain unresolved; fall through to the standard
+                # error-surfacing path below.
+                still = (
+                    conflicts.stdout.strip()
+                    if conflicts.returncode == 0
+                    else "(unable to list conflicts)"
+                )
+                raise ValidationError(
+                    f"Cannot resume merge of `{task_branch}` into "
+                    f"`{current_branch}`: unresolved conflicts in:\n"
+                    f"  {still}\n"
+                    f"Resolve them by editing each file, then run "
+                    f"`git -C {project_path} add <file>` and retry "
+                    f"`pm task approve --resume`."
+                )
 
         status = self._git_run(project_path, "status", "--porcelain")
         if status.returncode != 0:
@@ -2610,7 +2736,78 @@ class SQLiteWorkService:
         if merge.returncode == 0:
             return
 
+        # Merge produced conflicts. Inspect them: if every conflict is on a
+        # union-safe file, resolve each via line-union and commit. Otherwise
+        # abort and surface a clearer error.
+        conflicts_result = self._git_run(
+            project_path,
+            "diff",
+            "--name-only",
+            "--diff-filter=U",
+        )
+        conflicted_files = (
+            [
+                line.strip()
+                for line in conflicts_result.stdout.splitlines()
+                if line.strip()
+            ]
+            if conflicts_result.returncode == 0
+            else []
+        )
+
+        unsafe = [
+            f for f in conflicted_files
+            if f not in self._UNION_SAFE_MERGE_FILES
+        ]
+        if conflicted_files and not unsafe:
+            # Every conflict is union-safe — resolve them in place.
+            try:
+                for rel_path in conflicted_files:
+                    self._resolve_union_safe_conflict(project_path, rel_path)
+            except ValidationError:
+                self._git_run(project_path, "merge", "--abort")
+                raise
+
+            commit = self._git_run(
+                project_path,
+                "commit",
+                "--no-edit",
+            )
+            if commit.returncode == 0:
+                return
+            self._git_run(project_path, "merge", "--abort")
+            detail = (
+                commit.stderr.strip()
+                or commit.stdout.strip()
+                or "git commit failed after union resolution"
+            )
+            raise ValidationError(
+                f"Could not finalize the auto-merge of `{task_branch}` "
+                f"into `{current_branch}` after resolving "
+                f"{', '.join(conflicted_files)} via line union. "
+                f"Git said: {detail}"
+            )
+
+        # At least one conflict is on a non-safelist file. Abort the merge
+        # cleanly and tell the user how to recover.
         self._git_run(project_path, "merge", "--abort")
+        if unsafe:
+            files_list = "\n".join(f"  - {f}" for f in unsafe)
+            raise ValidationError(
+                f"Could not auto-merge `{task_branch}` into "
+                f"`{current_branch}`: add/add or content conflict on "
+                f"file(s) that are not safe to merge automatically:\n"
+                f"{files_list}\n"
+                f"\n"
+                f"Resolve in the project root and retry approve:\n"
+                f"  cd {project_path}\n"
+                f"  git merge {task_branch}      # re-attempt the merge\n"
+                f"  # edit each conflicted file, then:\n"
+                f"  git add <file> && git commit\n"
+                f"  pm task approve {task.task_id} --resume"
+            )
+
+        # Fallback: no diagnosable conflict list, surface raw git output.
         detail = (
             merge.stderr.strip()
             or merge.stdout.strip()
@@ -2621,6 +2818,74 @@ class SQLiteWorkService:
             f"Could not auto-merge `{task_branch}` into `{current_branch}`. "
             f"Resolve the repo state and retry approve. Git said: {detail}"
         )
+
+    def _resolve_union_safe_conflict(
+        self,
+        project_path: Path,
+        rel_path: str,
+    ) -> None:
+        """Resolve a single union-safe add/add or content conflict in place.
+
+        Reads the "ours" (stage 2) and "theirs" (stage 3) blobs, concatenates
+        their lines, deduplicates while preserving order, writes the result
+        and stages it. For pure add/add (no merge base) the missing stage
+        is treated as empty.
+        """
+        ls_files = self._git_run(
+            project_path,
+            "ls-files",
+            "-u",
+            "--",
+            rel_path,
+        )
+        if ls_files.returncode != 0:
+            raise ValidationError(
+                f"Could not inspect conflict on `{rel_path}`: "
+                f"{ls_files.stderr.strip() or 'git ls-files failed'}"
+            )
+
+        # ls-files -u format: "<mode> <sha> <stage>\t<path>"
+        stage_blobs: dict[int, str] = {}
+        for line in ls_files.stdout.splitlines():
+            if not line.strip():
+                continue
+            try:
+                meta, _path = line.split("\t", 1)
+                _mode, sha, stage = meta.split()
+                stage_blobs[int(stage)] = sha
+            except ValueError:
+                continue
+
+        ours_text = ""
+        theirs_text = ""
+        if 2 in stage_blobs:
+            ours = self._git_run(project_path, "cat-file", "-p", stage_blobs[2])
+            if ours.returncode != 0:
+                raise ValidationError(
+                    f"Could not read 'ours' side of `{rel_path}`: "
+                    f"{ours.stderr.strip() or 'git cat-file failed'}"
+                )
+            ours_text = ours.stdout
+        if 3 in stage_blobs:
+            theirs = self._git_run(project_path, "cat-file", "-p", stage_blobs[3])
+            if theirs.returncode != 0:
+                raise ValidationError(
+                    f"Could not read 'theirs' side of `{rel_path}`: "
+                    f"{theirs.stderr.strip() or 'git cat-file failed'}"
+                )
+            theirs_text = theirs.stdout
+
+        merged_text = _union_merge_text(ours_text, theirs_text)
+        target = project_path / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(merged_text, encoding="utf-8")
+
+        add = self._git_run(project_path, "add", "--", rel_path)
+        if add.returncode != 0:
+            raise ValidationError(
+                f"Could not stage union-merged `{rel_path}`: "
+                f"{add.stderr.strip() or 'git add failed'}"
+            )
 
     def _git_run(self, project_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

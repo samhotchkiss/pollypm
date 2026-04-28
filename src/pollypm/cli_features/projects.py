@@ -19,6 +19,7 @@ import typer
 from pollypm.cli_help import help_with_examples
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config
 from pollypm.projects import (
+    commit_initial_scaffold,
     enable_tracked_project,
     register_project,
     scan_projects as scan_projects_registry,
@@ -147,6 +148,16 @@ def register_project_commands(app: typer.Typer) -> None:
                 )
 
         if skip_import:
+            # Commit whatever scaffold files we wrote up to this point so
+            # the project root is clean even on the --skip-import path
+            # (#926).
+            try:
+                if commit_initial_scaffold(project.path):
+                    typer.echo("Committed PollyPM scaffolding to the project repo.")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "commit_initial_scaffold failed for %s: %s", project.key, exc,
+                )
             return
         typer.echo("Importing project history (transcripts, git, files)...")
         from pollypm.history_import import import_project_history
@@ -168,6 +179,18 @@ def register_project_commands(app: typer.Typer) -> None:
                 f"The project is registered — rerun `pm import {project.key}` "
                 f"to retry.",
                 err=True,
+            )
+
+        # Commit the scaffolding (#926). Done after history-import so
+        # the generated docs/ files land in the same commit as
+        # .gitignore/issues/. Best-effort — never fail registration on
+        # commit issues.
+        try:
+            if commit_initial_scaffold(project.path):
+                typer.echo("Committed PollyPM scaffolding to the project repo.")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "commit_initial_scaffold failed for %s: %s", project.key, exc,
             )
 
     @app.command("import")

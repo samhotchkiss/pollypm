@@ -26,6 +26,7 @@ from pollypm.models import (
 )
 from pollypm.projects import (
     DEFAULT_WORKSPACE_ROOT,
+    commit_initial_scaffold,
     discover_recent_git_repositories,
     ensure_project_scaffold,
     make_project_key,
@@ -694,6 +695,14 @@ def add_selected_projects(config_path: Path, selected_paths: list[Path]) -> list
         )
         config.projects[project.key] = project
         ensure_project_scaffold(normalized)
+        # Commit the freshly written .gitignore/docs/issues so the
+        # project root is clean before the user runs their first task
+        # (#926). Best-effort: a failure here is logged and the
+        # registration still succeeds.
+        try:
+            commit_initial_scaffold(normalized)
+        except Exception:  # noqa: BLE001
+            pass
         added.append(project)
     if added:
         write_config(config, path=config_path, force=True)

@@ -708,12 +708,176 @@ def _default_add_choice(repo_path: Path, workspace_root: Path) -> bool:
         return False
 
 
+# Default .gitignore template seeded the first time PollyPM scaffolds a
+# project. The leading ``.pollypm/`` line stays first so users grepping
+# the file find PollyPM's marker immediately. The remaining entries
+# cover the common per-language/editor noise that #925 surfaced as
+# add/add merge conflicts when each worker independently appended its
+# own .gitignore patterns. Keep this list conservative — agents can add
+# project-specific entries later.
+DEFAULT_GITIGNORE_LINES: tuple[str, ...] = (
+    ".pollypm/",
+    "",
+    "# Node / JS",
+    "node_modules/",
+    "dist/",
+    "dist-ssr/",
+    "*.local",
+    "tsconfig.tsbuildinfo",
+    "*.tsbuildinfo",
+    "",
+    "# Python",
+    "__pycache__/",
+    "*.pyc",
+    ".pytest_cache/",
+    ".venv/",
+    "",
+    "# Editors / OS",
+    ".DS_Store",
+    ".vscode/*",
+    "!.vscode/extensions.json",
+    ".idea/",
+    "",
+    "# Secrets",
+    ".env",
+)
+
+
 def _ensure_gitignore_entry(project_root: Path, entry: str) -> None:
+    """Make sure ``entry`` is present in the project's ``.gitignore``.
+
+    On first creation, seed the file with :data:`DEFAULT_GITIGNORE_LINES`
+    so workers don't redundantly append their own copies (#925, #926).
+    On subsequent calls, just append ``entry`` if it's missing — we
+    never reorder or rewrite user-edited lines.
+    """
     gitignore_path = normalize_project_path(project_root) / ".gitignore"
-    existing = gitignore_path.read_text().splitlines() if gitignore_path.exists() else []
+    if not gitignore_path.exists():
+        seed_lines = list(DEFAULT_GITIGNORE_LINES)
+        if entry not in seed_lines:
+            if seed_lines and seed_lines[-1] != "":
+                seed_lines.append("")
+            seed_lines.append(entry)
+        gitignore_path.write_text("\n".join(seed_lines).rstrip() + "\n")
+        return
+    existing = gitignore_path.read_text().splitlines()
     if entry in existing:
         return
     if existing and existing[-1] != "":
         existing.append("")
     existing.append(entry)
     gitignore_path.write_text("\n".join(existing).rstrip() + "\n")
+
+
+# Paths inside the project root that PollyPM scaffolds during
+# ``pm add-project``/onboarding. Used by :func:`commit_initial_scaffold`
+# to know which entries are safe to ``git add`` — anything outside this
+# allowlist belongs to the user and must not be swept into PollyPM's
+# initial commit.
+SCAFFOLD_PATHS: tuple[str, ...] = (
+    ".gitignore",
+    "docs",
+    "issues",
+)
+
+
+def _git_run(
+    repo_path: Path, args: list[str], *, check: bool = False
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo_path), *args],
+        check=check,
+        capture_output=True,
+        text=True,
+    )
+
+
+def commit_initial_scaffold(project_path: Path) -> bool:
+    """Stage and commit the PollyPM scaffolding files as one commit.
+
+    Returns True if a commit was created, False otherwise (no scaffold
+    paths needed staging, repo isn't a git repo, ``git`` is missing,
+    user identity is unset, etc.). Failures are logged but never raised
+    — registration must not unwind because of a best-effort commit.
+
+    Only the explicit paths in :data:`SCAFFOLD_PATHS` are staged via
+    ``git add``. Any unrelated dirty user files in the working tree are
+    left untouched, and ``git commit -- <paths>`` is used so that the
+    commit only captures the scaffold files even if other paths are
+    already staged.
+
+    Used by ``pm add-project`` and the onboarding "Add Selected And
+    Finish" flow (#926) so the project root is clean immediately after
+    registration. Without this, the user's first ``pm task approve``
+    aborts with "project root has uncommitted changes".
+    """
+    import logging
+
+    log = logging.getLogger(__name__)
+    if shutil.which("git") is None:
+        return False
+    project_root = normalize_project_path(project_path)
+    if not (project_root / ".git").exists():
+        return False
+
+    # Filter SCAFFOLD_PATHS to those that actually exist and are
+    # untracked or modified vs HEAD. ``git status --porcelain`` works
+    # even on an empty repo (no commits yet) — every scaffold path
+    # shows up as untracked.
+    status = _git_run(project_root, ["status", "--porcelain", "--", *SCAFFOLD_PATHS])
+    if status.returncode != 0:
+        log.debug(
+            "commit_initial_scaffold: git status failed for %s (%s)",
+            project_root, status.stderr.strip(),
+        )
+        return False
+    if not status.stdout.strip():
+        # Nothing scaffold-related to commit (idempotent re-run on a
+        # repo that already has the scaffold committed).
+        return False
+
+    # Stage scaffold paths explicitly. We pass each path even if it
+    # doesn't exist — git silently ignores missing pathspecs when the
+    # ``--pathspec-from-file`` form isn't used, so guard with a
+    # filter.
+    paths_to_stage = [name for name in SCAFFOLD_PATHS if (project_root / name).exists()]
+    if not paths_to_stage:
+        return False
+    add_result = _git_run(project_root, ["add", "--", *paths_to_stage])
+    if add_result.returncode != 0:
+        log.warning(
+            "commit_initial_scaffold: git add failed for %s: %s",
+            project_root, add_result.stderr.strip(),
+        )
+        return False
+
+    # Use ``git commit -- <paths>`` so only the scaffold pathspecs land
+    # in this commit even if the working tree had other staged files
+    # we didn't touch. ``--allow-empty`` is intentionally absent — if
+    # there's nothing to commit, exit silently.
+    message = (
+        "Initialize PollyPM project scaffolding\n"
+        "\n"
+        "Generated by `pm add-project`:\n"
+        "- .gitignore (PollyPM defaults plus common editor/build noise)\n"
+        "- docs/ (architecture, conventions, decisions, history,\n"
+        "  project-overview templates from history-import)\n"
+        "- issues/ (00-not-ready / 01-ready / 02-in-progress /\n"
+        "  03-needs-review / 05-completed phase folders for the\n"
+        "  file-backed task tracker)\n"
+    )
+    commit_result = _git_run(
+        project_root,
+        ["commit", "-m", message, "--", *paths_to_stage],
+    )
+    if commit_result.returncode != 0:
+        # Common failures: no user.name/user.email configured, or the
+        # repo's pre-commit hook bounced us. Surface as a warning and
+        # leave the staging area as-is so the user can finish manually.
+        log.warning(
+            "commit_initial_scaffold: git commit failed for %s: %s",
+            project_root,
+            (commit_result.stderr.strip() or commit_result.stdout.strip()),
+        )
+        return False
+    return True

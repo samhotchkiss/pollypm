@@ -1,3 +1,5 @@
+import shutil
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -7,6 +9,9 @@ import pytest
 from pollypm.task_backends.github import GitHubTaskBackendValidation
 
 from pollypm.projects import (
+    DEFAULT_GITIGNORE_LINES,
+    SCAFFOLD_PATHS,
+    commit_initial_scaffold,
     default_persona_name,
     detect_project_kind,
     discover_git_repositories,
@@ -445,3 +450,264 @@ def test_release_session_lock_handles_corrupt_non_dict_lock(
     release_session_lock(lock_root, None)
     assert not bad_lock.exists()
     assert not good_lock.exists()
+
+
+# ---------------------------------------------------------------------------
+# #926 — commit initial PollyPM scaffolding so the project root is clean
+# ---------------------------------------------------------------------------
+
+
+def _git_init_repo(repo: Path) -> None:
+    """Initialize a fresh git repo with a stable identity for tests."""
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test User"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "commit.gpgsign", "false"],
+        check=True,
+    )
+
+
+def _git_status(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+
+
+def _list_tree(repo: Path, ref: str = "HEAD") -> set[str]:
+    """List files at ``ref`` (defaults to HEAD)."""
+    result = subprocess.run(
+        ["git", "-C", str(repo), "ls-tree", "-r", "--name-only", ref],
+        check=True, capture_output=True, text=True,
+    )
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def test_default_gitignore_template_keeps_pollypm_first_and_covers_common_noise() -> None:
+    """The seeded ``.gitignore`` template must keep ``.pollypm/`` first
+    (#926) and include the common per-language noise patterns (#925)
+    so workers don't redundantly add their own."""
+    assert DEFAULT_GITIGNORE_LINES[0] == ".pollypm/"
+    expected = {
+        "node_modules/", "dist/", "dist-ssr/", "*.local",
+        ".DS_Store", ".vscode/*", "!.vscode/extensions.json", ".idea/",
+        "__pycache__/", "*.pyc", ".pytest_cache/", ".env", ".venv/",
+        "tsconfig.tsbuildinfo", "*.tsbuildinfo",
+    }
+    missing = expected - set(DEFAULT_GITIGNORE_LINES)
+    assert not missing, f"missing default gitignore entries: {missing}"
+
+
+def test_ensure_project_scaffold_seeds_full_gitignore_template_on_fresh_repo(
+    tmp_path: Path,
+) -> None:
+    """The first call to ``ensure_project_scaffold`` writes the full
+    default template, not just ``.pollypm/`` (#925/#926)."""
+    project_path = tmp_path / "fresh"
+    project_path.mkdir()
+    ensure_project_scaffold(project_path)
+    text = (project_path / ".gitignore").read_text()
+    assert text.splitlines()[0] == ".pollypm/"
+    assert "node_modules/" in text
+    assert "__pycache__/" in text
+
+
+def test_ensure_project_scaffold_preserves_existing_gitignore(
+    tmp_path: Path,
+) -> None:
+    """If the user already has a ``.gitignore``, the scaffold must
+    only append the missing ``.pollypm/`` entry — never reorder or
+    rewrite existing lines."""
+    project_path = tmp_path / "with-gitignore"
+    project_path.mkdir()
+    (project_path / ".gitignore").write_text("# user header\nbuild/\n")
+    ensure_project_scaffold(project_path)
+    text = (project_path / ".gitignore").read_text()
+    assert text.startswith("# user header\nbuild/\n")
+    assert ".pollypm/" in text
+    # User-edited template should NOT be replaced with the seeded full
+    # default — node_modules wasn't there before scaffold.
+    assert "node_modules/" not in text
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+def test_commit_initial_scaffold_leaves_clean_status_on_empty_repo(
+    tmp_path: Path,
+) -> None:
+    """#926: after ``pm add-project`` on a fresh empty repo, the
+    project root must be clean. ``commit_initial_scaffold`` runs
+    after ``ensure_project_scaffold`` and must turn an untracked
+    .gitignore + (later) docs/ + issues/ into one committed snapshot
+    so the user's first ``pm task approve`` doesn't bounce on
+    "uncommitted changes"."""
+    repo = tmp_path / "empty-repo"
+    repo.mkdir()
+    _git_init_repo(repo)
+    ensure_project_scaffold(repo)
+    # Add some scaffolded files that history-import would write so the
+    # commit has interesting content beyond the .gitignore.
+    (repo / "docs").mkdir(exist_ok=True)
+    (repo / "docs" / "architecture.md").write_text("# Architecture\n")
+    (repo / "docs" / "project-overview.md").write_text("# Overview\n")
+    (repo / "issues").mkdir(exist_ok=True)
+    for state in ("00-not-ready", "01-ready", "02-in-progress", "03-needs-review", "05-completed"):
+        (repo / "issues" / state).mkdir(exist_ok=True)
+        (repo / "issues" / state / ".gitkeep").write_text("")
+
+    assert commit_initial_scaffold(repo) is True
+    assert _git_status(repo) == "", f"expected clean status, got: {_git_status(repo)!r}"
+    tree = _list_tree(repo)
+    assert ".gitignore" in tree
+    assert "docs/architecture.md" in tree
+    assert "docs/project-overview.md" in tree
+    # All five phase folders present (via .gitkeep).
+    for state in ("00-not-ready", "01-ready", "02-in-progress", "03-needs-review", "05-completed"):
+        assert f"issues/{state}/.gitkeep" in tree
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+def test_commit_initial_scaffold_does_not_sweep_dirty_user_files(
+    tmp_path: Path,
+) -> None:
+    """#926: ``commit_initial_scaffold`` must commit only the explicit
+    PollyPM-scaffold paths, not other dirty user files in the working
+    tree (e.g. an in-progress edit the user already had). The user's
+    untracked ``WIP.md`` must remain untracked after the commit."""
+    repo = tmp_path / "dirty"
+    repo.mkdir()
+    _git_init_repo(repo)
+    # Seed a real first commit so HEAD exists, and add a tracked file
+    # the user is mid-editing. Plus an untracked WIP.md.
+    (repo / "src.py").write_text("print('v1')\n")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "src.py"], check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", "init"], check=True,
+    )
+    # User dirties a tracked file and creates an untracked one.
+    (repo / "src.py").write_text("print('v2-WIP')\n")
+    (repo / "WIP.md").write_text("ongoing notes\n")
+    # PollyPM scaffolds.
+    ensure_project_scaffold(repo)
+    (repo / "docs").mkdir(exist_ok=True)
+    (repo / "docs" / "architecture.md").write_text("# Architecture\n")
+
+    assert commit_initial_scaffold(repo) is True
+    # The user's mid-edit src.py and untracked WIP.md must still be
+    # uncommitted.
+    status = _git_status(repo)
+    assert " M src.py" in status
+    assert "?? WIP.md" in status
+    # And the scaffold commit must NOT include them.
+    tree = _list_tree(repo)
+    assert "WIP.md" not in tree
+    # src.py exists in HEAD but its committed content is the old one.
+    head_src = subprocess.run(
+        ["git", "-C", str(repo), "show", "HEAD:src.py"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert head_src == "print('v1')\n"
+    # The scaffold commit's message follows the issue's suggestion.
+    head_msg = subprocess.run(
+        ["git", "-C", str(repo), "log", "-1", "--format=%s"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert "PollyPM" in head_msg
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+def test_commit_initial_scaffold_is_idempotent(tmp_path: Path) -> None:
+    """Re-running ``commit_initial_scaffold`` after the scaffold has
+    already been committed must be a no-op (returns False), so the
+    onboarding flows are safe to retry."""
+    repo = tmp_path / "idempotent"
+    repo.mkdir()
+    _git_init_repo(repo)
+    ensure_project_scaffold(repo)
+    assert commit_initial_scaffold(repo) is True
+    assert commit_initial_scaffold(repo) is False
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+def test_commit_initial_scaffold_skips_non_git_directories(tmp_path: Path) -> None:
+    """Folder-mode projects (no ``.git``) must not crash — the helper
+    just returns False so registration succeeds for non-repo paths."""
+    folder = tmp_path / "folder-only"
+    folder.mkdir()
+    ensure_project_scaffold(folder)
+    assert commit_initial_scaffold(folder) is False
+
+
+def test_scaffold_paths_covers_user_visible_artifacts() -> None:
+    """The allowlist of paths ``commit_initial_scaffold`` will stage
+    must contain the three user-visible scaffold roots called out in
+    issue #926: ``.gitignore``, ``docs``, ``issues``."""
+    assert ".gitignore" in SCAFFOLD_PATHS
+    assert "docs" in SCAFFOLD_PATHS
+    assert "issues" in SCAFFOLD_PATHS
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+def test_pm_add_project_leaves_git_status_clean_on_fresh_repo(tmp_path: Path) -> None:
+    """End-to-end #926: ``pm add-project --skip-import`` on a real
+    fresh git repo must leave the project root with a clean
+    ``git status``. Previously the CLI dropped untracked
+    ``.gitignore``/``docs/``/``issues/`` artifacts and never committed
+    them, which then bounced the user's first ``pm task approve`` on
+    "uncommitted changes"."""
+    from typer.testing import CliRunner
+    from pollypm.cli import app as root_app
+
+    repo = tmp_path / "fresh-repo"
+    repo.mkdir()
+    _git_init_repo(repo)
+
+    config_path = tmp_path / "pollypm.toml"
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            workspace_root=tmp_path,
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account=""),
+        accounts={},
+        sessions={},
+        projects={},
+    )
+    write_config(config, config_path, force=True)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        root_app,
+        [
+            "add-project", str(repo), "--skip-import", "--skip-plan",
+            "--config", str(config_path), "--name", "fresh-repo",
+        ],
+    )
+    assert result.exit_code == 0, (result.stdout or "") + (result.stderr or "")
+
+    # Working tree must be clean — no untracked .gitignore/docs/issues
+    # left behind for the user to clean up before their first approve.
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert status == "", f"expected clean status after add-project, got: {status!r}"
+
+    # The first commit on main must contain the seeded .gitignore.
+    tree = subprocess.run(
+        ["git", "-C", str(repo), "ls-tree", "-r", "--name-only", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert ".gitignore" in tree

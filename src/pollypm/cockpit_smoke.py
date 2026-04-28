@@ -49,10 +49,11 @@ CI without significant time cost.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import re
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Iterable
+from typing import AsyncIterator, Awaitable, Callable, Iterable
 
 from textual.app import App
 from textual.pilot import Pilot
@@ -525,3 +526,195 @@ def _excerpt(text: str, marker: str, span: int) -> str:
         return text[:span]
     start = max(0, idx - span // 2)
     return text[start : start + span]
+
+
+# ---------------------------------------------------------------------------
+# Smoke scenario registry + runner (#911)
+# ---------------------------------------------------------------------------
+
+
+SmokeScenarioBody = Callable[["SmokeHarness"], Awaitable[None]]
+"""Type alias for the body of a smoke scenario.
+
+The body receives a fully mounted :class:`SmokeHarness`, runs whatever
+keystrokes/assertions it needs, and is expected to raise on any
+rendering or assertion failure. The scenario runner translates
+exceptions into :class:`SmokeFailure` records — it does not swallow
+them silently."""
+
+
+AppFactory = Callable[[], App]
+"""A zero-arg callable that returns a fresh ``textual.app.App``.
+
+Used by :class:`SmokeScenario` so each (scenario, size) cell of the
+matrix gets a fresh App — Textual Apps are not reusable once
+``run_test`` has exited."""
+
+
+@dataclass(frozen=True, slots=True)
+class SmokeScenario:
+    """One scenario in the rendered smoke matrix.
+
+    A scenario is the *minimum unit of rendered coverage* the release
+    gate cares about. Each scenario:
+
+    * names a target App via :attr:`app_factory` (zero-arg builder so
+      every (scenario, size) cell gets a fresh App);
+    * defines a :attr:`body` that mounts assertions on the rendered
+      output;
+    * declares which terminal sizes from the audit matrix it covers
+      via :attr:`sizes` (defaults to the full :data:`SMOKE_TERMINAL_SIZES`).
+
+    The scenario contract is intentionally tiny so the gate can run
+    a representative subset directly inside the gate process. Heavy
+    fixture-driven scenarios (per-screen seeded data, real workspace)
+    live in ``tests/test_cockpit_smoke_render.py`` and run in CI.
+    """
+
+    name: str
+    """Stable identifier (snake_case)."""
+
+    app_factory: AppFactory
+    """Builds a fresh App for each (scenario, size) cell."""
+
+    body: SmokeScenarioBody
+    """Async callable that mounts assertions on the harness."""
+
+    sizes: tuple[tuple[int, int], ...] = SMOKE_TERMINAL_SIZES
+    """Subset of :data:`SMOKE_TERMINAL_SIZES` this scenario covers."""
+
+
+@dataclass(frozen=True, slots=True)
+class SmokeFailure:
+    """One scenario+size cell that did not render cleanly."""
+
+    scenario: str
+    size: tuple[int, int]
+    error_type: str
+    message: str
+
+    def render(self) -> str:
+        return (
+            f"{self.scenario} @ {self.size[0]}x{self.size[1]}: "
+            f"{self.error_type}: {self.message}"
+        )
+
+
+async def _baseline_scenario_body(smoke: "SmokeHarness") -> None:
+    """The default scenario body: mount + universal asserts.
+
+    This is the smallest possible rendered smoke check — it runs the
+    universal assertion bundle on a baseline App. Its purpose is to
+    prove that the gate is actually rendering at the configured size,
+    not just inspecting harness shape.
+    """
+    smoke.snapshot()
+    smoke.assert_no_traceback()
+    smoke.assert_no_bootstrap_prompt()
+    smoke.assert_no_orphan_box_chars()
+    smoke.assert_no_letter_by_letter_wrap()
+    smoke.assert_minimum_widget_count(1)
+    smoke.assert_text_visible("PollyPM smoke baseline")
+
+
+def _build_baseline_app() -> App:
+    """Construct the default baseline smoke App.
+
+    A self-contained Textual App that mounts a single Static widget
+    with a known marker string. Imported lazily inside the function
+    so :mod:`pollypm.cockpit_smoke` does not pay the import cost
+    until a smoke run actually executes.
+    """
+    from textual.app import App as _App, ComposeResult
+    from textual.widgets import Static
+
+    class _BaselineSmokeApp(_App):
+        CSS = "Static { height: 1; }"
+
+        def compose(self) -> ComposeResult:  # type: ignore[override]
+            yield Static("PollyPM smoke baseline", id="smoke-marker")
+
+    return _BaselineSmokeApp()
+
+
+SMOKE_SCENARIOS: tuple[SmokeScenario, ...] = (
+    SmokeScenario(
+        name="baseline_render",
+        app_factory=_build_baseline_app,
+        body=_baseline_scenario_body,
+        # The narrow + the wide bookends are enough to prove the
+        # rendered path executed at both extremes; the full matrix
+        # is exercised by the test-suite parametrization.
+        sizes=((80, 30), (210, 65)),
+    ),
+)
+"""Default set of scenarios the release gate executes.
+
+Kept deliberately small so the gate stays fast and self-contained.
+The deeper matrix (per-screen, seeded data, scrollable overlays)
+lives in ``tests/test_cockpit_smoke_render.py`` and runs in CI."""
+
+
+async def _run_one_cell(
+    scenario: SmokeScenario, size: tuple[int, int]
+) -> SmokeFailure | None:
+    """Mount one (scenario, size) cell and execute the body.
+
+    Returns a :class:`SmokeFailure` on any exception, ``None`` on
+    success. The mount itself is wrapped in the same exception
+    handler so a factory or compose-time crash also surfaces as a
+    cell failure rather than tearing down the whole matrix.
+    """
+    try:
+        app = scenario.app_factory()
+        async with SmokeHarness.mount(app, size=size) as smoke:
+            await scenario.body(smoke)
+    except Exception as exc:  # noqa: BLE001 — record + continue
+        return SmokeFailure(
+            scenario=scenario.name,
+            size=size,
+            error_type=type(exc).__name__,
+            message=str(exc),
+        )
+    return None
+
+
+async def _run_smoke_scenarios_async(
+    scenarios: Iterable[SmokeScenario],
+) -> tuple[SmokeFailure, ...]:
+    """Async core of :func:`run_smoke_matrix`.
+
+    Iterates every (scenario, size) cell sequentially. Sequential
+    execution is intentional: Textual's headless run uses asyncio
+    primitives that do not compose cleanly under
+    :func:`asyncio.gather`, and the matrix is small enough that
+    serial execution finishes in well under the gate's budget.
+    """
+    failures: list[SmokeFailure] = []
+    for scenario in scenarios:
+        for size in scenario.sizes:
+            failure = await _run_one_cell(scenario, size)
+            if failure is not None:
+                failures.append(failure)
+    return tuple(failures)
+
+
+def run_smoke_matrix(
+    scenarios: Iterable[SmokeScenario] | None = None,
+) -> tuple[SmokeFailure, ...]:
+    """Execute the smoke matrix and return any failures.
+
+    The release gate calls this. If ``scenarios`` is None the default
+    :data:`SMOKE_SCENARIOS` registry runs. Tests inject a custom list
+    to prove the gate actually invokes the runner (a stubbed failing
+    scenario must produce a failure record).
+
+    The function uses :func:`asyncio.run` so the gate caller stays
+    sync. If a caller is already inside an event loop (e.g., a test
+    with ``pytest-asyncio``) it should call
+    :func:`_run_smoke_scenarios_async` directly instead.
+    """
+    chosen = tuple(scenarios) if scenarios is not None else SMOKE_SCENARIOS
+    if not chosen:
+        return ()
+    return asyncio.run(_run_smoke_scenarios_async(chosen))

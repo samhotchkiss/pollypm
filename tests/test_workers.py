@@ -303,7 +303,10 @@ def test_operator_prompt_requires_delegation_instructions() -> None:
     assert "<worker_management>" not in prompt
     assert "polly-operator-guide.md" in prompt
     assert "quote the exact name from the canonical artifact" in prompt
-    assert prompt.count("\n") < 40
+    # #936 added a <delegation> section instructing Polly to claim her
+    # queued worker tasks. Cap held at <50 newlines so the prompt stays
+    # tight while leaving room for that block.
+    assert prompt.count("\n") < 50
 
 def test_heartbeat_prompt_describes_recovery_protocol() -> None:
     prompt = heartbeat_prompt()

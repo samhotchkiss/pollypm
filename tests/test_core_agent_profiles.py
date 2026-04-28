@@ -149,6 +149,62 @@ def test_reviewer_prompt_routes_escalations_to_polly_not_user() -> None:
     assert "Polly" in text and "operator" in text
 
 
+def test_polly_prompt_instructs_to_claim_after_queue() -> None:
+    """#936 regression: after ``pm task queue`` Polly must call
+    ``pm task claim`` so the per-task worker actually spawns.
+
+    Before the fix, Polly stopped at "queued" and waited for an external
+    sweeper to pick the task up. The auto-claim sweep skips tasks gated
+    by ``plan_missing`` (correctly, per the #273 plan-presence gate),
+    which leaves ``--skip-plan`` projects stranded in the queue with
+    only no-session warnings to show for it. Polly's prompt now teaches
+    her the canonical happy path: queue, then claim — claim is what
+    provisions the per-task tmux window per #919.
+    """
+    from pollypm.plugins_builtin.core_agent_profiles.profiles import (
+        polly_prompt,
+    )
+
+    text = polly_prompt()
+    # The literal claim instruction must be present so Polly does not
+    # stop at "queued" expecting a sweeper to pick the task up.
+    assert "pm task claim" in text, (
+        "polly prompt must mention `pm task claim` so the operator knows "
+        "to claim her own queued worker tasks"
+    )
+    # The sequence (queue then claim) must appear so the prompt
+    # documents the canonical happy path, not a passing reference.
+    assert "pm task queue" in text
+    # Spell out *why* — provision / per-task — so a future edit doesn't
+    # silently delete the rationale and reintroduce the queued-stall
+    # bug from #936.
+    assert "per-task" in text
+
+
+def test_operator_control_prompt_workspace_copy_documents_claim_step() -> None:
+    """The materialized workspace copy of the operator control prompt
+    must stay aligned with the packaged ``polly_prompt()`` so that
+    operators reading the on-disk file (debugging, manual review) see
+    the same #936 instruction. The supervisor regenerates this file on
+    session launch from ``polly_prompt()``, but tests pin the workspace
+    copy explicitly to catch drift between the two sources."""
+    operator_md = (
+        Path(__file__).resolve().parent.parent
+        / ".pollypm"
+        / "control-prompts"
+        / "operator.md"
+    )
+    if not operator_md.exists():
+        # The workspace copy may not exist in fresh checkouts; the
+        # packaged source is the authoritative target. Skip cleanly.
+        return
+    text = operator_md.read_text(encoding="utf-8")
+    assert "pm task claim" in text, (
+        "control-prompts/operator.md should mention pm task claim so "
+        "Polly does not stall at 'queued' on a worker-role task"
+    )
+
+
 def test_operator_guide_documents_user_prompt_json_contract() -> None:
     """The polly-operator-guide must teach Polly to send escalations
     with the structured ``--user-prompt-json`` contract — that is the

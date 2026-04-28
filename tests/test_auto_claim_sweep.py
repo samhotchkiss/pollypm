@@ -737,6 +737,145 @@ def test_recover_dead_claims_returns_task_to_claimable_queue(tmp_path: Path) -> 
         work.close()
 
 
+# ---------------------------------------------------------------------------
+# #936 — per-task worker auto-spawn regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_auto_claim_spawns_per_task_worker_when_no_live_session(tmp_path: Path) -> None:
+    """#936 regression: queued worker-role task with no live session must
+    auto-claim AND invoke the session manager's per-task ``provision_worker``.
+
+    The bug from #936 was that the cycle stalled at ``queued`` because
+    nothing called ``pm task claim`` automatically. The auto-claim sweep
+    must (a) flip the DB to ``in_progress`` and (b) call the session
+    manager so the per-task tmux window actually spawns. This test
+    asserts both halves so a future regression that drops the spawn
+    side (claim-only) is caught.
+    """
+    bus.clear_listeners()
+    project_path = tmp_path / "proj"
+    project_path.mkdir()
+    _write_plan(project_path)
+    _seed_approved_plan(project_path, "proj")
+    task_id = _seed_queued_worker_task(project_path, "proj")
+
+    db_path = project_path / ".pollypm" / "state.db"
+    work = SQLiteWorkService(db_path=db_path, project_path=project_path)
+
+    provisions: list[tuple[str, str]] = []
+
+    class FakeSessionManager:
+        def provision_worker(self, task_id: str, agent_name: str):
+            provisions.append((task_id, agent_name))
+            return None
+
+        def teardown_worker(self, task_id: str) -> None:
+            return None
+
+    work.set_session_manager(FakeSessionManager())
+
+    try:
+        svc = _svc_defaults(session_service=_FakeSessionService())
+        totals = {"considered": 0, "by_outcome": {}}
+        _auto_claim_next(
+            svc, work, _FakeProject(key="proj", path=project_path), totals,
+        )
+
+        assert totals["by_outcome"].get("auto_claim_spawned", 0) == 1
+        task = work.get(task_id)
+        assert task.work_status == WorkStatus.IN_PROGRESS
+        # Per-task spawn side: provision_worker must have been invoked
+        # with the queued task id. This is what #919 wired in and #936
+        # depends on for the per-task pane to come up.
+        assert provisions == [(task_id, "worker")]
+    finally:
+        work.close()
+
+
+def test_auto_claim_skips_plan_missing_task(tmp_path: Path) -> None:
+    """#936 mandate: plan-gated tasks must NOT auto-claim.
+
+    A worker-role task in a project with no approved plan should stay
+    queued and emit a ``plan_missing`` alert, not silently get claimed.
+    Mirrors :func:`test_auto_claim_skips_when_plan_gate_closed` but
+    pinned with the #936 framing so the contract stays explicit.
+    """
+    project_path = tmp_path / "proj"
+    project_path.mkdir()
+    # No plan file, no approved plan_project task — plan gate is closed.
+    task_id = _seed_queued_worker_task(project_path, "proj")
+
+    db_path = project_path / ".pollypm" / "state.db"
+    work = SQLiteWorkService(db_path=db_path, project_path=project_path)
+    try:
+        svc = _svc_defaults()
+        totals = {"considered": 0, "by_outcome": {}}
+        plan_missing: set[str] = set()
+        _auto_claim_next(
+            svc,
+            work,
+            _FakeProject(key="proj", path=project_path),
+            totals,
+            plan_missing_projects=plan_missing,
+        )
+
+        assert "auto_claim_spawned" not in totals["by_outcome"]
+        assert (
+            totals["by_outcome"].get("auto_claim_skipped_plan_missing", 0) == 1
+        )
+        assert plan_missing == {"proj"}
+        assert work.get(task_id).work_status == WorkStatus.QUEUED
+    finally:
+        work.close()
+
+
+def test_auto_claim_idempotent_under_concurrent_sweeps(tmp_path: Path) -> None:
+    """#936 mandate: concurrent sweeps must not double-claim a task.
+
+    A single queued worker-role task. Two back-to-back ``_auto_claim_next``
+    calls (simulating a heartbeat sweep racing with a manual ``pm
+    heartbeat`` invocation): the first claims, the second sees the
+    task in ``in_progress`` and records ``auto_claim_failed`` (or
+    silently no-ops because there are no longer any queued candidates).
+    Either way the task stays in ``in_progress`` exactly once.
+    """
+    bus.clear_listeners()
+    project_path = tmp_path / "proj"
+    project_path.mkdir()
+    _write_plan(project_path)
+    _seed_approved_plan(project_path, "proj")
+    task_id = _seed_queued_worker_task(project_path, "proj")
+
+    db_path = project_path / ".pollypm" / "state.db"
+    work = SQLiteWorkService(db_path=db_path, project_path=project_path)
+    try:
+        svc = _svc_defaults()
+
+        first_totals = {"considered": 0, "by_outcome": {}}
+        _auto_claim_next(
+            svc, work, _FakeProject(key="proj", path=project_path), first_totals,
+        )
+        assert first_totals["by_outcome"].get("auto_claim_spawned", 0) == 1
+        assert work.get(task_id).work_status == WorkStatus.IN_PROGRESS
+
+        second_totals = {"considered": 0, "by_outcome": {}}
+        _auto_claim_next(
+            svc, work, _FakeProject(key="proj", path=project_path), second_totals,
+        )
+        # Second sweep must not produce another spawn for the same task.
+        assert second_totals["by_outcome"].get("auto_claim_spawned", 0) == 0
+        # Capacity check sees the now-in_progress task as active load,
+        # so no new candidate is even considered (the helper returns
+        # before reaching ``work.claim``). ``auto_claim_failed`` should
+        # therefore stay zero — failures are reserved for genuine
+        # claim-call exceptions, not "nothing to do".
+        assert "auto_claim_failed" not in second_totals["by_outcome"]
+        assert work.get(task_id).work_status == WorkStatus.IN_PROGRESS
+    finally:
+        work.close()
+
+
 def test_recover_dead_claims_returns_rework_task_to_claimable_queue(
     tmp_path: Path,
 ) -> None:

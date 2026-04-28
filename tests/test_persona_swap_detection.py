@@ -454,3 +454,323 @@ def test_role_persona_marker_covers_expected_roles() -> None:
     # Worker and triage intentionally absent — no stable persona.
     assert "worker" not in _ROLE_PERSONA_MARKER
     assert "triage" not in _ROLE_PERSONA_MARKER
+
+
+# ---------------------------------------------------------------------------
+# #933 — Third send-path guard on the persona-verify resend
+# ---------------------------------------------------------------------------
+#
+# #931 (banner) and #932 (target-window) plugged the foreground kickoff
+# paths, but Sam reported the cockpit operator pane STILL receiving a
+# heartbeat bootstrap as its FIRST kickoff message after both fixes
+# landed. The third send path was the background persona-verify resend
+# in ``_schedule_persona_verify`` — it captured a ``target`` 5 s before
+# the resend and then called ``send_keys(target, kickoff)`` without
+# re-checking that ``target`` still resolved to a pane in the launch's
+# window or that the pane wasn't already bootstrapped for another role.
+# When tmux recycled the original heartbeat pane id for a freshly-
+# spawned operator pane (cockpit ``Polly · chat`` flow), the resend
+# silently injected ``Read .../heartbeat.md`` into the operator pane.
+#
+# The fix mirrors #931/#932: re-run ``_target_window_matches_launch``
+# and ``_pane_already_bootstrapped_as_other_role`` immediately before
+# the resend send_keys so all three send sites share one defense.
+
+
+def _make_pane(window_name: str, pane_id: str = "%fake") -> object:
+    """Build a minimal pane stub that exposes window_name + pane_id.
+
+    Mirrors the helper in ``tests.test_supervisor`` — duplicated here to
+    avoid a cross-test-module import.
+    """
+    return type(
+        "Pane", (),
+        {
+            "window_name": window_name,
+            "pane_id": pane_id,
+            "pane_left": 0,
+            "pane_current_command": "claude",
+            "pane_dead": False,
+        },
+    )()
+
+
+def test_persona_verify_resend_refused_when_target_in_other_window(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """#933 — persona-verify resend must not cross windows.
+
+    Reproduces the live failure: the heartbeat persona-verify thread
+    captured ``target=%5`` (heartbeat pane in storage closet) at kickoff
+    time. By the time the 5 s wait expires, that pane id has been
+    recycled by tmux for the operator pane in the cockpit window
+    (``Polly · chat`` spawned a fresh operator). The persona-verify
+    thread then sees an unexpected (operator) marker in pane and tries
+    to resend the heartbeat kickoff into ``%5`` — which is now the
+    operator pane.
+
+    The new guard resolves ``%5`` to its current window
+    (``pm-operator-pm``) and refuses the resend because
+    ``launch.window_name == "pm-heartbeat"``. No heartbeat bootstrap
+    text reaches the operator pane.
+    """
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+
+    heartbeat_launch = supervisor.launch_by_session("heartbeat")
+    heartbeat_launch = replace(
+        heartbeat_launch, initial_input="heartbeat kickoff text",
+    )
+    monkeypatch.setattr(
+        supervisor, "launch_by_session", lambda _name: heartbeat_launch,
+    )
+
+    # The pane currently shows the operator persona marker — the
+    # verify thread's "expected (heartbeat) absent + unexpected (operator)
+    # present" branch is what would have triggered the unguarded resend.
+    sends: list[tuple[str, str]] = []
+    _patch_tmux(
+        monkeypatch,
+        supervisor,
+        pane_text="I am Polly, ready.",
+        sends=sends,
+    )
+    # tmux now reports that the captured target pane lives in the
+    # operator window — the (launch, target) tuple is crossed.
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "list_panes",
+        lambda target: [_make_pane(window_name="pm-operator", pane_id="%5")],
+    )
+    monkeypatch.setattr("pollypm.supervisor.time.sleep", lambda _s: None)
+
+    supervisor._schedule_persona_verify(heartbeat_launch, "%5")
+
+    import threading
+    for t in threading.enumerate():
+        if t.name.startswith("persona-verify-"):
+            t.join(timeout=2)
+
+    assert sends == [], (
+        "heartbeat verify-resend must NOT land in a pane that now lives "
+        "in the operator window — that's the #933 third-site bug"
+    )
+
+
+def test_persona_verify_resend_refused_when_pane_has_other_role_banner(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """#933 — persona-verify resend must not stack on another role's banner.
+
+    Layered defense: even if the target window check passes (target is
+    still in the launch's window per tmux), the pane may carry another
+    role's banner from a prior bootstrap. Refuse there too — same
+    semantics as the #931 banner guard wired into the foreground
+    send path.
+    """
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+
+    heartbeat_launch = supervisor.launch_by_session("heartbeat")
+    heartbeat_launch = replace(
+        heartbeat_launch, initial_input="heartbeat kickoff text",
+    )
+    monkeypatch.setattr(
+        supervisor, "launch_by_session", lambda _name: heartbeat_launch,
+    )
+
+    # Pane reports the heartbeat window (target-window guard passes)
+    # but carries an operator-pm CANONICAL ROLE banner — banner guard
+    # must refuse.
+    sends: list[tuple[str, str]] = []
+    _patch_tmux(
+        monkeypatch,
+        supervisor,
+        pane_text=(
+            "======================================================================\n"
+            "CANONICAL ROLE: operator-pm\n"
+            "SESSION NAME:   operator\n"
+            "======================================================================\n"
+            "I am Polly, ready.\n"
+        ),
+        sends=sends,
+    )
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "list_panes",
+        lambda target: [_make_pane(window_name="pm-heartbeat", pane_id="%hb")],
+    )
+    monkeypatch.setattr("pollypm.supervisor.time.sleep", lambda _s: None)
+
+    supervisor._schedule_persona_verify(heartbeat_launch, "%hb")
+
+    import threading
+    for t in threading.enumerate():
+        if t.name.startswith("persona-verify-"):
+            t.join(timeout=2)
+
+    assert sends == [], (
+        "heartbeat verify-resend must NOT stack on top of an existing "
+        "operator-pm banner — the pane has already been bootstrapped"
+    )
+
+
+def test_persona_verify_resend_proceeds_when_target_window_matches(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """#933 — the legitimate verify-resend path still works.
+
+    The mainline persona-verify case: pane is in the right window and
+    the unexpected marker is genuinely present (no banner stacking).
+    The resend must still go through so a real persona-swap recovery
+    is not regressed.
+    """
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+
+    operator_launch = supervisor.launch_by_session("operator")
+    operator_launch = replace(
+        operator_launch, initial_input="polly kickoff text",
+    )
+    monkeypatch.setattr(
+        supervisor, "launch_by_session", lambda _name: operator_launch,
+    )
+
+    sends: list[tuple[str, str]] = []
+    _patch_tmux(
+        monkeypatch,
+        supervisor,
+        pane_text="I am Russell, ready for review.",
+        sends=sends,
+    )
+    # Target is genuinely in the operator window — guard lets it through.
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "list_panes",
+        lambda target: [_make_pane(window_name="pm-operator", pane_id="%op")],
+    )
+    monkeypatch.setattr("pollypm.supervisor.time.sleep", lambda _s: None)
+
+    supervisor._schedule_persona_verify(operator_launch, "%op")
+
+    import threading
+    for t in threading.enumerate():
+        if t.name.startswith("persona-verify-"):
+            t.join(timeout=2)
+
+    assert len(sends) == 1, (
+        "verify-resend must still fire on a real persona swap when the "
+        "(launch, target) tuple matches"
+    )
+    assert sends[0][0] == "%op"
+
+
+def test_persona_verify_resend_heartbeat_target_in_heartbeat_window_proceeds(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """#933 — heartbeat verify-resend lands cleanly when window matches.
+
+    Confirms the guard isn't biased toward operator panes — every
+    role's verify-resend routes back into its own window. The heartbeat
+    pane in the storage closet remains a legitimate kickoff target for
+    the heartbeat session.
+    """
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+
+    heartbeat_launch = supervisor.launch_by_session("heartbeat")
+    heartbeat_launch = replace(
+        heartbeat_launch, initial_input="heartbeat kickoff text",
+    )
+    monkeypatch.setattr(
+        supervisor, "launch_by_session", lambda _name: heartbeat_launch,
+    )
+
+    sends: list[tuple[str, str]] = []
+    _patch_tmux(
+        monkeypatch,
+        supervisor,
+        pane_text="I am Polly, ready.",
+        sends=sends,
+    )
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "list_panes",
+        lambda target: [
+            _make_pane(window_name="pm-heartbeat", pane_id="%hb"),
+        ],
+    )
+    monkeypatch.setattr("pollypm.supervisor.time.sleep", lambda _s: None)
+
+    supervisor._schedule_persona_verify(heartbeat_launch, "%hb")
+
+    import threading
+    for t in threading.enumerate():
+        if t.name.startswith("persona-verify-"):
+            t.join(timeout=2)
+
+    assert len(sends) == 1, (
+        "heartbeat verify-resend into the heartbeat window must still "
+        "deliver — this is the legitimate recovery path"
+    )
+    assert sends[0][0] == "%hb"
+
+
+def test_persona_verify_resend_per_task_worker_unaffected(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """#933 — per-task workers (post-#919/#921) bypass persona-verify entirely.
+
+    Worker role has no entry in ``_ROLE_PERSONA_MARKER`` so
+    ``_schedule_persona_verify`` short-circuits before spawning the
+    background thread. The new #933 guard therefore can't regress the
+    per-task worker kickoff path — there is no resend to guard. This
+    test pins that contract so future ``_ROLE_PERSONA_MARKER`` edits
+    don't accidentally enrol workers and let the guard fire on a
+    ``task-<project>-<N>`` pane.
+    """
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+
+    launch = supervisor.launch_by_session("operator")
+    worker_launch = replace(
+        launch,
+        session=replace(launch.session, role="worker"),
+        initial_input="task-pollypm-7 kickoff",
+        window_name="task-pollypm-7",
+    )
+
+    sends: list[tuple[str, str]] = []
+    captures: list[str] = []
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "capture_pane",
+        lambda target, lines=50: captures.append(target) or "",
+    )
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "send_keys",
+        lambda target, text, **kw: sends.append((target, text)),
+    )
+    monkeypatch.setattr("pollypm.supervisor.time.sleep", lambda _s: None)
+
+    supervisor._schedule_persona_verify(
+        worker_launch, "pollypm-storage-closet:task-pollypm-7",
+    )
+
+    import threading
+    import time as _time
+    _time.sleep(0.05)
+    for t in threading.enumerate():
+        if t.name.startswith("persona-verify-"):
+            t.join(timeout=0.2)
+
+    assert captures == [], (
+        "worker role has no persona marker — verify thread must not spawn"
+    )
+    assert sends == []

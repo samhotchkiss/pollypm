@@ -3172,6 +3172,27 @@ class Supervisor:
                     initial_input = launch.initial_input
                     if not initial_input:
                         return
+                    # #933 — third send-path guard. Bug #931 (banner) and
+                    # #932 (target window) plugged the foreground kickoff
+                    # paths, but this background resend still called
+                    # ``send_keys(target, kickoff)`` without re-checking
+                    # that ``target`` still resolves to a pane in the
+                    # launch's window. ``target`` is captured 5 s earlier
+                    # at the original kickoff send; in that interval the
+                    # original pane can be killed and its pane-id
+                    # recycled for a different role's pane (e.g. the
+                    # cockpit operator pane spawned when the user clicks
+                    # ``Polly · chat``). Re-run both guards before the
+                    # resend — same helpers used by
+                    # ``_send_initial_input_if_fresh`` and the recovery
+                    # prompt path so all three send sites share one
+                    # crossed-tuple defense.
+                    if not self._target_window_matches_launch(launch, target):
+                        return
+                    if self._pane_already_bootstrapped_as_other_role(
+                        launch.session.role, target,
+                    ):
+                        return
                     try:
                         kickoff = self._prepare_initial_input(
                             launch.session.name, initial_input,

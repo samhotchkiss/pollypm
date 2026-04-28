@@ -851,6 +851,73 @@ class TestApprove:
             repo / "issues" / "03-needs-review" / "0042-task.md"
         ).read_text(encoding="utf-8")
 
+    def test_approve_preserves_untracked_itsalive_when_worker_does_not_commit_it(
+        self, tmp_path
+    ):
+        """#947: ``pm itsalive deploy`` writes ``.itsalive`` to the
+        project root before any worker branch commits it. A subsequent
+        ``pm task approve`` for an unrelated task (worker branch does
+        NOT touch ``.itsalive``) must preserve the file rather than
+        silently deleting the deploy config. The fix stages + commits
+        the file on the current branch before the merge so it ends up
+        tracked on main."""
+        repo = _git_repo(tmp_path)
+        svc = SQLiteWorkService(db_path=tmp_path / "work.db", project_path=repo)
+        task = _create_task(svc)
+        _claim_task(svc, task)
+
+        # Worker branch makes an unrelated change — does NOT commit
+        # ``.itsalive``.
+        current_branch = _git_stdout(repo, "rev-parse", "--abbrev-ref", "HEAD")
+        task_branch = f"task/{task.project}-{task.task_number}"
+        subprocess.run(
+            ["git", "-C", str(repo), "checkout", "-q", "-b", task_branch],
+            check=True,
+        )
+        (repo / "feature.txt").write_text("worker work\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "feature.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-q", "-m", "feat: feature work"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "checkout", "-q", current_branch],
+            check=True,
+        )
+        svc.node_done(task.task_id, "pete", _valid_work_output())
+
+        # Mirror the real-world chord-trainer/1 repro: ``pm itsalive
+        # deploy`` left an untracked ``.itsalive`` at root.
+        deploy_token = json.dumps(
+            {"deployToken": "tok-947", "domain": "ct.itsalive.app"}
+        ) + "\n"
+        (repo / ".itsalive").write_text(deploy_token, encoding="utf-8")
+
+        result = svc.approve(task.task_id, "polly")
+
+        assert result.work_status == WorkStatus.DONE
+        # File still exists on disk with original content.
+        assert (repo / ".itsalive").exists(), (
+            ".itsalive was deleted during approve (#947 regression)"
+        )
+        assert (repo / ".itsalive").read_text(encoding="utf-8") == deploy_token
+        # And it's tracked in the merge result, not just sitting
+        # untracked in the working tree again.
+        ls_files = subprocess.run(
+            ["git", "-C", str(repo), "ls-files", "--", ".itsalive"],
+            check=False, capture_output=True, text=True,
+        )
+        assert ls_files.stdout.strip() == ".itsalive", (
+            ".itsalive should be tracked on the current branch after approve"
+        )
+        # Merge completed cleanly.
+        merged = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", task_branch, "HEAD"],
+            check=False, capture_output=True, text=True,
+        )
+        assert merged.returncode == 0
+        assert not (repo / ".git" / "MERGE_HEAD").exists()
+
 
 # ---------------------------------------------------------------------------
 # reject

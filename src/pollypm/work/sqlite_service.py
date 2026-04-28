@@ -2885,19 +2885,27 @@ class SQLiteWorkService:
         if already_merged.returncode == 0:
             return
 
-        # #946 — clear PollyPM-allowlisted untracked files from the
+        # #946 — handle PollyPM-allowlisted untracked files at the
         # project root before invoking ``git merge``. The dirty-tree
         # gate above lets these files past, but git's merge engine
-        # still refuses to overwrite untracked files. Removing them
-        # lets the merge bring in the worker branch's authoritative
-        # version — the allowlist contract is that every covered path
-        # is exclusively PollyPM-written, so the worker's commit is
-        # the right post-merge truth. Add/add conflicts on tracked
-        # safelisted files (e.g. ``.gitignore``) still flow through
-        # the existing #925 union-strategy logic; non-safelist
-        # conflicts still surface via the existing approve-conflict
-        # path.
-        self._stage_pollypm_untracked_for_merge(project_path, dirty_status)
+        # still refuses to overwrite untracked files.
+        #
+        # #947 — for each allowlisted untracked entry we now check the
+        # worker branch tip: if the worker committed the same path,
+        # the file is removed so the merge can bring in the worker's
+        # authoritative version (allowlist contract: PollyPM-managed,
+        # worker wins). If the worker branch does NOT commit the path
+        # (e.g. ``.itsalive`` written by a separate ``pm itsalive
+        # deploy`` run), we instead stage + commit the file on the
+        # current branch so the merge preserves it on main rather than
+        # silently deleting the deploy-config a worker just produced.
+        # Add/add conflicts on tracked safelisted files (e.g.
+        # ``.gitignore``) still flow through the existing #925
+        # union-strategy logic; non-safelist conflicts still surface
+        # via the existing approve-conflict path.
+        self._stage_pollypm_untracked_for_merge(
+            project_path, dirty_status, task_branch
+        )
 
         ff_only = self._git_run(project_path, "merge", "--ff-only", task_branch)
         if ff_only.returncode == 0:
@@ -3070,8 +3078,9 @@ class SQLiteWorkService:
         self,
         project_path: Path,
         status_stdout: str,
+        task_branch: str,
     ) -> None:
-        """Pre-stage PollyPM-allowlisted untracked files for ``git merge``.
+        """Resolve PollyPM-allowlisted untracked files for ``git merge``.
 
         The approve dirty-tree gate (#930 + #945) lets a known set of
         scaffold files past even when untracked. Git's merge engine,
@@ -3080,14 +3089,22 @@ class SQLiteWorkService:
         the merge aborts with "untracked working tree files would be
         overwritten" (#946).
 
-        Concretely, for each untracked allowlisted entry we delete the
-        working-tree copy. The merge then brings in the worker
-        branch's authoritative content cleanly. This matches the
-        allowlist's contract: every covered path is exclusively
-        PollyPM-written (deployToken JSON, marker-bearing scaffold
-        docs, the issues/ tree, etc.), so the worker's commit is
-        always the right post-merge truth — preferring the worker's
-        side mirrors the issue's "prefer the worker's branch" guidance.
+        For each untracked allowlisted entry we now branch on whether
+        the worker's branch tip commits that path:
+
+        - **Worker branch has the path**: delete the working-tree copy
+          so ``git merge`` can bring in the worker's authoritative
+          content. This matches the allowlist's contract: every
+          covered path is exclusively PollyPM-written (deployToken
+          JSON, marker-bearing scaffold docs, the issues/ tree, etc.),
+          so the worker's commit is the right post-merge truth.
+
+        - **Worker branch does NOT have the path** (#947): stage and
+          commit the file on the current branch *before* the merge so
+          it's preserved through the merge. Without this, an untracked
+          ``.itsalive`` written by a separate ``pm itsalive deploy``
+          run would be silently deleted on every approve — destroying
+          the deploy config the worker just produced.
 
         Only files matching the same allowlist as the dirty-tree gate
         are touched. Modified-but-tracked entries are skipped (they
@@ -3095,6 +3112,7 @@ class SQLiteWorkService:
         the allowlist is left alone — we never blanket-delete user
         content here.
         """
+        preserve_paths: list[str] = []
         for line in status_stdout.splitlines():
             if not line.strip():
                 continue
@@ -3131,6 +3149,17 @@ class SQLiteWorkService:
                         f"commit or remove it before retrying approve."
                     )
 
+            # #947: if the worker branch doesn't commit this path,
+            # stage + commit it on the current branch so the merge
+            # preserves it. Otherwise (worker branch has the path)
+            # fall back to the #946 behavior: remove the working-tree
+            # copy so the worker's version wins through the merge.
+            if not self._worker_branch_has_path(
+                project_path, task_branch, rel_path
+            ):
+                preserve_paths.append(rel_path)
+                continue
+
             try:
                 if target.is_symlink() or target.is_file():
                     target.unlink()
@@ -3148,6 +3177,68 @@ class SQLiteWorkService:
                     f"clear PollyPM scaffold path `{rel_path}` from "
                     f"the working tree before merge: {exc}"
                 ) from exc
+
+        if preserve_paths:
+            # Stage all preserved paths in one ``git add`` and commit
+            # them with a single PollyPM-attributed commit so the
+            # subsequent merge sees them as tracked content on the
+            # current branch.
+            add = self._git_run(
+                project_path, "add", "--", *preserve_paths
+            )
+            if add.returncode != 0:
+                raise ValidationError(
+                    f"Cannot auto-merge approved work: failed to "
+                    f"stage PollyPM scaffold paths "
+                    f"{', '.join(preserve_paths)} for preservation "
+                    f"before merge: "
+                    f"{add.stderr.strip() or 'git add failed'}"
+                )
+            commit = self._git_run(
+                project_path,
+                "commit",
+                "-m",
+                "chore(pollypm): preserve scaffold files through approve merge",
+            )
+            if commit.returncode != 0:
+                raise ValidationError(
+                    f"Cannot auto-merge approved work: failed to "
+                    f"commit PollyPM scaffold paths "
+                    f"{', '.join(preserve_paths)} for preservation "
+                    f"before merge: "
+                    f"{commit.stderr.strip() or commit.stdout.strip() or 'git commit failed'}"
+                )
+
+    def _worker_branch_has_path(
+        self,
+        project_path: Path,
+        task_branch: str,
+        rel_path: str,
+    ) -> bool:
+        """Return True iff ``task_branch`` tip contains ``rel_path``.
+
+        Used by ``_stage_pollypm_untracked_for_merge`` (#947) to decide
+        whether an untracked allowlisted file should be deleted (worker
+        branch has it — worker wins) or staged + committed (worker
+        branch doesn't have it — preserve the local copy through the
+        merge so it isn't silently deleted).
+        """
+        ls_tree = self._git_run(
+            project_path,
+            "ls-tree",
+            "-r",
+            "--name-only",
+            task_branch,
+            "--",
+            rel_path.rstrip("/"),
+        )
+        if ls_tree.returncode != 0:
+            # Conservative fallback: if we can't inspect the branch,
+            # behave like the pre-#947 code (assume worker has it,
+            # delete locally so merge proceeds). This preserves
+            # forward-progress semantics for the existing test cases.
+            return True
+        return bool(ls_tree.stdout.strip())
 
     def _git_run(self, project_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

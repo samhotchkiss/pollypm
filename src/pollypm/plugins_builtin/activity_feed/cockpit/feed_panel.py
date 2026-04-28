@@ -192,36 +192,79 @@ def format_relative_time(
     return f"{days}d ago"
 
 
-def format_entry_row(entry: FeedEntry, *, now: datetime | None = None) -> str:
+def _project_label(entry: FeedEntry) -> str:
+    """Project key as displayed in the feed (``"-"`` for empty).
+
+    Centralised so the auto-fit width math and ``format_entry_row``
+    agree on the same string. Empty / ``None`` falls back to ``"-"``
+    so an unknown project still aligns in the column.
+    """
+    return entry.project or "-"
+
+
+def compute_project_column_width(
+    entries: Iterable[FeedEntry], *, minimum: int = 1,
+) -> int:
+    """Width of the widest project key in ``entries`` (auto-fit).
+
+    Used by :func:`format_entry_row` so the project column expands to
+    fit long keys like ``blackjack-trainer`` while keeping every row
+    aligned. Empty input falls back to ``minimum`` so a header-only
+    render still produces a sane column. See #929.
+    """
+    widest = minimum
+    for entry in entries:
+        widest = max(widest, len(_project_label(entry)))
+    return widest
+
+
+def format_entry_row(
+    entry: FeedEntry,
+    *,
+    now: datetime | None = None,
+    project_width: int | None = None,
+) -> str:
     """Render one FeedEntry as a single plain-text row.
 
     Layout:: ``[rel] [project] [actor] verb summary``. Severity is not
     encoded here — the Textual renderer applies colour; the plain-text
     renderer prefixes a ``!`` on critical entries so `pm activity` can
     stay unstyled but still draw attention.
+
+    ``project_width`` left-pads the project key inside the brackets so
+    multi-row renders align even when project keys differ in length
+    (auto-fit; see :func:`compute_project_column_width` and #929). When
+    ``None`` the column is sized to the project key itself — the
+    single-row default that preserves the historical layout.
     """
     rel = format_relative_time(entry.timestamp, now=now)
-    project = entry.project or "-"
+    project = _project_label(entry)
     actor = entry.actor or "system"
     verb = entry.verb or entry.kind
     prefix = "!" if entry.severity == "critical" else " "
     pin = "📌 " if entry.pinned else ""
-    return f"{prefix} {rel:>8}  [{project}]  [{actor}]  {verb}: {pin}{entry.summary}"
+    width = max(project_width or len(project), len(project))
+    project_cell = f"{project:<{width}}"
+    return f"{prefix} {rel:>8}  [{project_cell}]  [{actor}]  {verb}: {pin}{entry.summary}"
 
 
 def render_entries_as_text(entries: Iterable[FeedEntry]) -> str:
     """Render a list of FeedEntry rows as multi-line plain text.
 
     Empty input renders a friendly placeholder so the cockpit panel
-    doesn't look broken on a brand-new install.
+    doesn't look broken on a brand-new install. The project column
+    auto-fits to the widest key in the batch so long keys like
+    ``blackjack-trainer`` aren't visually clipped (see #929).
     """
-    rows = [format_entry_row(e) for e in entries]
-    if not rows:
+    materialised = list(entries)
+    if not materialised:
         return (
             "No activity yet.\n\n"
             "Events accumulate as sessions start, tasks transition, "
             "and heartbeats fire. Check back after the next sweep."
         )
+    width = compute_project_column_width(materialised)
+    rows = [format_entry_row(e, project_width=width) for e in materialised]
     return "\n".join(rows)
 
 
@@ -505,10 +548,13 @@ def _build_widget_classes():
                     "[dim]Events accumulate as sessions start, tasks "
                     "transition, and heartbeats fire.[/]"
                 )
+            # Auto-fit project column to the widest key so long names
+            # like ``blackjack-trainer`` align with shorter ones (#929).
+            project_width = compute_project_column_width(entries)
             for entry in entries:
                 rel = format_relative_time(entry.timestamp, now=now)
                 style = _severity_style(entry.severity)
-                project = entry.project or "-"
+                project = _project_label(entry)
                 actor = entry.actor or "system"
                 verb = entry.verb or entry.kind
                 marker = "[bold green]\u25cf[/] " if entry.id in new_id_set else "  "
@@ -516,7 +562,8 @@ def _build_widget_classes():
                 # through the tag-safe escaping helper.
                 summary = _rich_escape(entry.summary)
                 verb_s = _rich_escape(verb)
-                proj_s = _rich_escape(project)
+                proj_cell = f"{project:<{project_width}}"
+                proj_s = _rich_escape(proj_cell)
                 actor_s = _rich_escape(actor)
                 lines.append(
                     f"{marker}[dim]{rel:>8}[/]  "
@@ -707,6 +754,7 @@ __all__ = [
     "ActivityFeedPanel",  # noqa: F822 — exported lazily via __getattr__
     "FeedFilter",
     "apply_filter",
+    "compute_project_column_width",
     "format_entry_row",
     "format_relative_time",
     "new_event_count",

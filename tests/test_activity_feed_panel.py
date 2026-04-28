@@ -25,6 +25,7 @@ from pollypm.plugin_api.v1 import (
 )
 from pollypm.plugins_builtin.activity_feed import plugin as activity_plugin
 from pollypm.plugins_builtin.activity_feed.cockpit.feed_panel import (
+    compute_project_column_width,
     format_entry_row,
     format_relative_time,
     new_event_count,
@@ -176,6 +177,98 @@ def test_render_entries_as_text_populated() -> None:
     assert "thing 0" in rendered
     assert "thing 2" in rendered
     assert rendered.count("\n") == 2  # three rows → two newlines
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for #929 — long project keys ("blackjack-trainer") used to
+# render as ``[trainer]`` because the project column wasn't auto-fit and the
+# upstream regex truncated the key. The CLI now auto-fits to the widest active
+# project key so every row aligns and the canonical key survives rendering.
+# ---------------------------------------------------------------------------
+
+
+def _entry(project: str | None, *, idx: int = 0, summary: str = "x") -> FeedEntry:
+    """Compact FeedEntry fixture for column-width tests."""
+    return FeedEntry(
+        id=f"evt:{idx}",
+        timestamp=datetime.now(UTC).isoformat(),
+        project=project,
+        kind="event",
+        actor="actor",
+        subject="subj",
+        verb="happened",
+        summary=summary,
+        severity="routine",
+    )
+
+
+def test_format_entry_row_preserves_full_long_project_key() -> None:
+    """``blackjack-trainer`` must render in full, never as ``trainer`` (#929)."""
+    row = format_entry_row(_entry("blackjack-trainer"))
+    assert "[blackjack-trainer]" in row
+    # The misfire would have produced ``[trainer]`` with no leading text.
+    assert "[trainer]" not in row
+
+
+def test_compute_project_column_width_picks_widest_key() -> None:
+    entries = [
+        _entry("booktalk", idx=0),
+        _entry("polly_remote", idx=1),
+        _entry("blackjack-trainer", idx=2),
+        _entry("russell", idx=3),
+    ]
+    assert compute_project_column_width(entries) == len("blackjack-trainer")
+
+
+def test_compute_project_column_width_handles_empty() -> None:
+    """No entries → minimum width fallback (no crash, sane default)."""
+    assert compute_project_column_width([]) == 1
+
+
+def test_compute_project_column_width_handles_missing_project() -> None:
+    """Empty / None project keys fall back to ``-`` for column math."""
+    assert compute_project_column_width([_entry(None)]) == 1
+    assert compute_project_column_width([_entry("")]) == 1
+
+
+def test_render_entries_as_text_aligns_mixed_length_project_keys() -> None:
+    """Auto-fit: every row shares the same project-column width."""
+    now = datetime.now(UTC)
+    entries = [
+        FeedEntry(
+            id=f"evt:{i}",
+            timestamp=(now - timedelta(minutes=i)).isoformat(),
+            project=key,
+            kind="event",
+            actor="actor",
+            subject="s",
+            verb="v",
+            summary=f"row {i}",
+            severity="routine",
+        )
+        for i, key in enumerate(
+            ["booktalk", "polly_remote", "blackjack-trainer", "russell"]
+        )
+    ]
+    rendered = render_entries_as_text(entries)
+    lines = rendered.splitlines()
+    assert len(lines) == 4
+    # The canonical long key survives in full…
+    assert any("[blackjack-trainer]" in line for line in lines)
+    assert all("[trainer]" not in line for line in lines)
+    # …and every row uses the same column width, so the actor bracket
+    # opens at the same byte offset on every line.
+    actor_offsets = [line.index("[actor]") for line in lines]
+    assert len(set(actor_offsets)) == 1, (
+        f"project column not aligned across rows: {actor_offsets!r}"
+    )
+
+
+def test_render_entries_as_text_empty_project_falls_back_gracefully() -> None:
+    """A row with no project key renders ``[-]`` (padded) and doesn't crash."""
+    rendered = render_entries_as_text([_entry(None, summary="orphan")])
+    assert "orphan" in rendered
+    assert "[-]" in rendered  # single-row width matches the dash placeholder.
 
 
 # ---------------------------------------------------------------------------

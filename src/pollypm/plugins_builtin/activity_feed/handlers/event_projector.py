@@ -52,21 +52,35 @@ from typing import Any, Iterable
 # noise, etc.). The activity feed's Project column otherwise reads
 # ``—`` for those rows even though the project context is right
 # there in the message body.
+#
+# Project keys can include hyphens (``blackjack-trainer``) as well as
+# underscores (``polly_remote``), so the captured group must accept
+# both. Without ``-`` the regex used to truncate ``blackjack-trainer/3``
+# to ``trainer`` because ``\b`` matched after the hyphen — see #929.
+# We anchor with a leading non-word/non-hyphen lookbehind so the match
+# always starts at the true project boundary.
 _PROJECT_REF_IN_TEXT_RE = re.compile(
-    r"\b([a-zA-Z][a-zA-Z0-9_]*)/\d+\b"
+    r"(?<![\w-])([a-zA-Z][a-zA-Z0-9_-]*)/\d+\b"
 )
 
-# Per-project agent sessions follow ``<role>_<project_key>`` naming —
-# ``worker_pollypm``, ``architect_polly_remote``, etc. When the
-# message body has no task ref and the payload omits ``project``, the
-# actor name is the next-best signal. Anchor on known agent role
+# Per-project agent sessions follow ``<role>_<project_key>`` or
+# ``<role>-<project_key>`` naming — ``worker_pollypm``,
+# ``architect_polly_remote``, ``worker-blackjack-trainer``, etc. When
+# the message body has no task ref and the payload omits ``project``,
+# the actor name is the next-best signal. Anchor on known agent role
 # prefixes so we don't accidentally claim ``task_assignment`` (a
 # generic supervisor sender) is the project ``assignment``.
-_ROLE_ACTOR_PREFIXES = (
-    "worker_",
-    "architect_",
-    "reviewer_",
-    "operator_pm_",
+_ROLE_ACTOR_BASES = (
+    "worker",
+    "architect",
+    "reviewer",
+    "operator_pm",
+)
+# Build prefix variants for both ``_`` and ``-`` separators so an
+# actor like ``worker-blackjack-trainer`` resolves to the canonical
+# project key ``blackjack-trainer``.
+_ROLE_ACTOR_PREFIXES = tuple(
+    f"{base}{sep}" for base in _ROLE_ACTOR_BASES for sep in ("_", "-")
 )
 
 

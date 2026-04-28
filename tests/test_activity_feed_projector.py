@@ -168,6 +168,16 @@ def test_project_inference_skipped_when_payload_already_carries_project(
     assert _project_from_text(
         "polly_e2e_proj/3 review"
     ) == "polly_e2e_proj"
+    # #929 regression — hyphenated project keys must round-trip whole.
+    # Before the fix the regex truncated ``blackjack-trainer/3`` to
+    # ``trainer`` because ``\b`` matched after the hyphen, and the
+    # activity feed surfaced a phantom ``[trainer]`` project.
+    assert _project_from_text(
+        "[Alert] Task blackjack-trainer/3 was routed to the worker role"
+    ) == "blackjack-trainer"
+    assert _project_from_text(
+        "blackjack-trainer/12 review"
+    ) == "blackjack-trainer"
 
 
 def test_project_from_actor_extracts_role_prefixed_project_key() -> None:
@@ -186,6 +196,13 @@ def test_project_from_actor_extracts_role_prefixed_project_key() -> None:
     assert _project_from_actor("architect_booktalk") == "booktalk"
     assert _project_from_actor("reviewer_demo") == "demo"
     assert _project_from_actor("operator_pm_demo") == "demo"
+    # #929 — dash-separated session names also occur in the wild
+    # (``worker-blackjack-trainer``); strip the role prefix and keep
+    # the canonical project key intact, hyphens and all.
+    assert (
+        _project_from_actor("worker-blackjack-trainer") == "blackjack-trainer"
+    )
+    assert _project_from_actor("architect-booktalk") == "booktalk"
     # Unknown prefix → return None rather than claim the project is
     # ``assignment``. Generic supervisor senders shouldn't poison the
     # Project column.

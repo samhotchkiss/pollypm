@@ -90,9 +90,14 @@ def parse_duration(raw: str | None) -> timedelta | None:
 
 
 def _entries_as_text(entries: Iterable[FeedEntry]) -> str:
-    from pollypm.plugins_builtin.activity_feed.cockpit.feed_panel import format_entry_row
+    from pollypm.plugins_builtin.activity_feed.cockpit.feed_panel import (
+        compute_project_column_width,
+        format_entry_row,
+    )
 
-    return "\n".join(format_entry_row(e) for e in entries)
+    materialised = list(entries)
+    width = compute_project_column_width(materialised)
+    return "\n".join(format_entry_row(e, project_width=width) for e in materialised)
 
 
 def _entries_as_json_lines(entries: Iterable[FeedEntry]) -> str:

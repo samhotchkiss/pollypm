@@ -307,16 +307,32 @@ class TmuxSessionService:
                         self.tmux, session_role, target,
                     )
                 ):
-                    kickoff = self._prepare_initial_input(
-                        name,
-                        injected_input,
-                        expected_window=wname,
-                        session_role=session_role,
-                    )
-                    time.sleep(0.5)
-                    self.tmux.send_keys(target, kickoff)
-                    self._verify_input_submitted(target, kickoff, provider)
-                    fresh_launch_marker.unlink(missing_ok=True)
+                    try:
+                        # #934 — pass ``target`` so the inner-most guard
+                        # in ``_prepare_initial_input`` can refuse a
+                        # crossed (session_name, target) tuple even if
+                        # the upstream ``_target_window_matches_expected``
+                        # check is bypassed by a future caller.
+                        kickoff = self._prepare_initial_input(
+                            name,
+                            injected_input,
+                            expected_window=wname,
+                            session_role=session_role,
+                            target=target,
+                        )
+                    except RuntimeError as exc:
+                        if "persona_swap_detected" in str(exc):
+                            # Fresh marker stays so the next correct
+                            # send-tuple still bootstraps. The error
+                            # log line above carries the diagnostic.
+                            kickoff = None
+                        else:
+                            raise
+                    if kickoff is not None:
+                        time.sleep(0.5)
+                        self.tmux.send_keys(target, kickoff)
+                        self._verify_input_submitted(target, kickoff, provider)
+                        fresh_launch_marker.unlink(missing_ok=True)
 
         # Write resume marker
         if resume_marker:
@@ -1103,6 +1119,7 @@ class TmuxSessionService:
         *,
         expected_window: str | None = None,
         session_role: str | None = None,
+        target: str | None = None,
     ) -> str:
         # Fail-loud persona-swap guard. The parallel path in
         # ``pollypm.supervisor.Supervisor._prepare_initial_input`` has
@@ -1115,6 +1132,32 @@ class TmuxSessionService:
             expected_window=expected_window,
             session_role=session_role,
         )
+        # #934 — fourth-layer crossing guard. Mirror of the
+        # ``Supervisor._assert_target_window_matches_session`` check so
+        # the bootstrap text for a session simply cannot be written
+        # against a pane that lives in another role's window, even if
+        # a future caller bypasses the upstream
+        # ``_target_window_matches_expected`` check.
+        if target is not None and expected_window:
+            try:
+                panes = self.tmux.list_panes(target)
+            except Exception:  # noqa: BLE001
+                panes = []
+            if panes:
+                observed_window = getattr(panes[0], "window_name", "") or ""
+                if observed_window and observed_window != expected_window:
+                    details = (
+                        f"session_name={session_name!r} target={target!r} "
+                        f"expected_window={expected_window!r} "
+                        f"observed_window={observed_window!r}"
+                    )
+                    logger.error(
+                        "persona_swap_detected (prepare-target): %s — "
+                        "refusing to materialize bootstrap for a crossed "
+                        "(session, target) tuple",
+                        details,
+                    )
+                    raise RuntimeError(f"persona_swap_detected: {details}")
         if len(initial_input) <= 280:
             return initial_input
         from pollypm.project_paths import session_control_prompts_dir

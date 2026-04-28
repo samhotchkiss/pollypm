@@ -2524,14 +2524,31 @@ class Supervisor:
 
         if on_status:
             on_status(f"Creating tmux window for {session_name}...")
+        # #934 — capture the just-created pane's pane_id and target by
+        # pane_id everywhere downstream. Window-name targets like
+        # ``storage:pm-operator`` resolve through tmux at the moment of
+        # the call; if the window is moved (join_pane to cockpit) or
+        # recreated under a name collision the same string can resolve
+        # to a different pane, which is how kickoffs ended up landing
+        # in panes belonging to other roles. pane_ids are stable for
+        # the life of the pane.
+        new_pane_id: str | None = None
         if not self.session_service.tmux.has_session(tmux_session):
-            self.session_service.tmux.create_session(tmux_session, launch.window_name, launch.command)
-            target = f"{tmux_session}:0"
-            self.session_service.tmux.set_window_option(target, "allow-passthrough", "on")
+            new_pane_id = self.session_service.tmux.create_session(tmux_session, launch.window_name, launch.command)
+            window_target = f"{tmux_session}:0"
+            self.session_service.tmux.set_window_option(window_target, "allow-passthrough", "on")
         else:
-            self.session_service.tmux.create_window(tmux_session, launch.window_name, launch.command, detached=True)
-            target = f"{tmux_session}:{launch.window_name}"
-            self.session_service.tmux.set_window_option(target, "allow-passthrough", "on")
+            new_pane_id = self.session_service.tmux.create_window(tmux_session, launch.window_name, launch.command, detached=True)
+            window_target = f"{tmux_session}:{launch.window_name}"
+            self.session_service.tmux.set_window_option(window_target, "allow-passthrough", "on")
+        # Resolve pane_id when create_window/create_session didn't
+        # return one (older tmux build, race with another window of the
+        # same name). Falling back to the window-name target is the
+        # legacy behaviour and is still safe because the downstream
+        # window-match guard refuses crossed sends.
+        if new_pane_id is None:
+            new_pane_id = self._resolve_pane_id(tmux_session, launch.window_name)
+        target = new_pane_id or window_target
         # Cap scrollback to prevent slow pane-switching in the cockpit
         self.session_service.tmux.set_pane_history_limit(target, 200)
         self.session_service.tmux.pipe_pane(target, launch.log_path)
@@ -2828,7 +2845,27 @@ class Supervisor:
             launch.session.role, target,
         ):
             return
-        kickoff = self._prepare_initial_input(launch.session.name, initial_input)
+        # #934 — pass ``target`` and ``expected_window`` so
+        # ``_prepare_initial_input``'s inner guard can refuse a crossed
+        # (session_name, target) tuple even if a future caller path
+        # skips the upstream guards. ``expected_window`` ensures
+        # per-task workers (whose synthesised ``task-<project>-<N>``
+        # window name doesn't match any static config session) pass
+        # through correctly.
+        try:
+            kickoff = self._prepare_initial_input(
+                launch.session.name,
+                initial_input,
+                target=target,
+                expected_window=launch.window_name,
+            )
+        except RuntimeError as exc:
+            if "persona_swap_detected" in str(exc):
+                # The marker stays on disk so the next correct send-tuple
+                # can still bootstrap. Don't raise — the diagnostic event
+                # has already been recorded.
+                return
+            raise
         # Small delay to let Claude Code's input bar fully initialize
         time.sleep(0.5)
         self.session_service.tmux.send_keys(target, kickoff)
@@ -3061,10 +3098,108 @@ class Supervisor:
                 pass
             raise RuntimeError(f"persona_swap_detected: {details}")
 
-    def _prepare_initial_input(self, session_name: str, initial_input: str) -> str:
+    def _assert_target_window_matches_session(
+        self,
+        session_name: str,
+        target: str,
+        *,
+        expected_window: str | None = None,
+    ) -> None:
+        """Raise if ``target``'s pane lives in a different window than the
+        session's configured ``window_name``.
+
+        Mirror of :meth:`_target_window_matches_launch` but raises instead
+        of returning False so the inner-most layer in
+        :meth:`_prepare_initial_input` can refuse a crossed kickoff
+        before any disk write or pane mutation happens. Conservative on
+        every read failure: a transient ``list_panes`` exception
+        returns without raising so legitimate kickoffs aren't blocked
+        on tmux flakiness; the upstream guards already ran.
+
+        ``expected_window`` may be supplied directly (the call sites that
+        already hold the launch pass ``launch.window_name`` so per-task
+        workers — whose planner-synthesised ``task-<project>-<N>`` window
+        differs from any static config session — pass through).
+        """
+        # Prefer the explicitly-supplied window (per-task workers carry
+        # their per-task ``task-<project>-<N>`` window_name on the
+        # launch directly), then fall back to the launch resolved via
+        # session_name, and finally to the static-config window_name.
+        if not expected_window:
+            try:
+                launch = self.launch_by_session(session_name)
+            except Exception:  # noqa: BLE001
+                launch = None
+            if launch is not None:
+                expected_window = launch.window_name
+        if not expected_window:
+            cfg = self.config.sessions.get(session_name)
+            if cfg is not None:
+                expected_window = cfg.window_name or cfg.name
+        if not expected_window:
+            return
+        try:
+            panes = self.session_service.tmux.list_panes(target)
+        except Exception:  # noqa: BLE001
+            return
+        if not panes:
+            return
+        observed_window = getattr(panes[0], "window_name", "") or ""
+        if not observed_window or observed_window == expected_window:
+            return
+        details = (
+            f"session_name={session_name!r} target={target!r} "
+            f"expected_window={expected_window!r} "
+            f"observed_window={observed_window!r}"
+        )
+        logger.error(
+            "persona_swap_detected (prepare-target): %s — refusing to "
+            "materialize bootstrap for a crossed (session, target) tuple",
+            details,
+        )
+        try:
+            self._msg_store.record_event(
+                scope=session_name,
+                sender="pollypm",
+                subject="persona_swap_detected",
+                payload={
+                    "message": (
+                        f"prepare_initial_input target guard refused: {details}"
+                    ),
+                },
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        raise RuntimeError(f"persona_swap_detected: {details}")
+
+    def _prepare_initial_input(
+        self,
+        session_name: str,
+        initial_input: str,
+        *,
+        target: str | None = None,
+        expected_window: str | None = None,
+    ) -> str:
         # Fail-loud persona-swap guard. Raises before we touch disk or
         # the pane when the (launch, target) tuple looks wrong.
         self._assert_session_launch_matches(session_name, initial_input)
+        # #934 — fourth-layer crossing guard. ``_send_initial_input_if_fresh``,
+        # the recovery prompt path, the persona-verify resend, and
+        # ``TmuxSessionService.create`` all check the launch ↔ target
+        # window match before calling here, but a future caller could
+        # easily forget. By re-checking inside ``_prepare_initial_input``
+        # itself, the bootstrap text for ``<session_name>.md`` simply
+        # cannot be materialised against a pane that lives in a
+        # different role's window — even if the upstream guards are
+        # bypassed by a fourth send path. ``target`` is opt-in so older
+        # callers keep working; the guard runs only when the target is
+        # supplied. ``expected_window`` lets callers pass the launch's
+        # window_name directly so per-task workers (whose window name
+        # is synthesised, not in static config) match correctly.
+        if target is not None:
+            self._assert_target_window_matches_session(
+                session_name, target, expected_window=expected_window,
+            )
         if len(initial_input) <= 280:
             return initial_input
         from pollypm.project_paths import session_control_prompts_dir
@@ -3194,8 +3329,14 @@ class Supervisor:
                     ):
                         return
                     try:
+                        # #934 — pass target + expected_window so the
+                        # inner-most guard also fires for the
+                        # persona-verify resend path.
                         kickoff = self._prepare_initial_input(
-                            launch.session.name, initial_input,
+                            launch.session.name,
+                            initial_input,
+                            target=target,
+                            expected_window=launch.window_name,
                         )
                         self.session_service.tmux.send_keys(target, kickoff)
                     except Exception as exc:  # noqa: BLE001

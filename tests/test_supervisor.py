@@ -764,9 +764,14 @@ def test_create_session_window_records_claude_resume_ids(tmp_path: Path, monkeyp
     heartbeat_launch, heartbeat_target = supervisor.create_session_window("heartbeat")
     operator_launch, operator_target = supervisor.create_session_window("operator")
 
-    storage_session = supervisor.storage_closet_session_name()
-    assert heartbeat_target == f"{storage_session}:0"
-    assert operator_target == f"{storage_session}:pm-operator"
+    # #934 — ``create_session_window`` now returns the pane_id as the
+    # target (when ``create_session``/``create_window`` returns one) so
+    # downstream stabilize/kickoff sends address a stable pane id rather
+    # than a window-name target that can resolve through tmux to a
+    # different pane after a join_pane/restart race. The stub returns
+    # ``%1`` from ``create_session`` and ``%2`` from ``create_window``.
+    assert heartbeat_target == "%1"
+    assert operator_target == "%2"
     assert heartbeat_launch.resume_marker is not None
     assert operator_launch.resume_marker is not None
     assert heartbeat_launch.resume_marker.read_text(encoding="utf-8").strip() == "heartbeat-uuid"

@@ -774,3 +774,294 @@ def test_persona_verify_resend_per_task_worker_unaffected(
         "worker role has no persona marker — verify thread must not spawn"
     )
     assert sends == []
+
+
+# ---------------------------------------------------------------------------
+# #934 — fourth-layer crossing guard inside ``_prepare_initial_input``
+# ---------------------------------------------------------------------------
+#
+# The bug: even after the #931/#932/#933 guards, the operator pane in the
+# cockpit was receiving ``Read .../heartbeat.md`` as its first kickoff —
+# i.e. the heartbeat session's bootstrap text was materialised through
+# ``_prepare_initial_input("heartbeat", ...)`` and somehow delivered to
+# the operator pane. The regression tests below exercise the inner-most
+# layer added in #934: a target-window guard inside
+# ``_prepare_initial_input`` itself, so the bootstrap simply cannot be
+# materialised against a pane that lives in another role's window even
+# if a future caller bypasses the upstream guards.
+
+
+def _make_pane(window_name: str, pane_id: str = "%fake") -> object:
+    """Minimal pane stub exposing window_name + pane_id for guards."""
+    return type(
+        "Pane", (),
+        {
+            "window_name": window_name,
+            "pane_id": pane_id,
+            "pane_left": 0,
+            "pane_current_command": "claude",
+            "pane_dead": False,
+        },
+    )()
+
+
+def test_prepare_initial_input_target_guard_refuses_heartbeat_into_operator(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """#934 — bootstrap for ``heartbeat`` cannot be materialized for an
+    operator-window target.
+
+    Reproduces the live failure: ``_prepare_initial_input("heartbeat", ...)``
+    is invoked with a target whose pane lives in the ``pm-operator``
+    window. The fourth-layer guard refuses by raising
+    ``persona_swap_detected`` BEFORE writing ``heartbeat.md`` to disk
+    or returning a kickoff string. This guard fires regardless of which
+    upstream send path the caller used (#931/#932/#933 or any future
+    fourth path).
+    """
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "list_panes",
+        lambda target: [_make_pane(window_name="pm-operator", pane_id="%op")],
+    )
+
+    with pytest.raises(RuntimeError, match="persona_swap_detected"):
+        supervisor._prepare_initial_input(
+            "heartbeat",
+            "long heartbeat prompt " * 30,  # > 280 char to hit materialise path
+            target="%op",
+        )
+
+
+def test_prepare_initial_input_target_guard_allows_matching_window(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """#934 — guard is permissive when target's window matches the launch."""
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "list_panes",
+        lambda target: [_make_pane(window_name="pm-heartbeat", pane_id="%hb")],
+    )
+
+    kickoff = supervisor._prepare_initial_input(
+        "heartbeat",
+        "long heartbeat prompt " * 30,
+        target="%hb",
+    )
+    assert "heartbeat.md" in kickoff
+
+
+def test_prepare_initial_input_target_guard_short_circuits_on_probe_failure(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """#934 — list_panes failure is conservative: don't block legitimate sends.
+
+    A transient tmux probe failure must NOT raise; the upstream guards
+    already validated the (launch, target) tuple so a probe blip
+    inside ``_prepare_initial_input`` should fall through to materialise
+    the kickoff. Suppressing legitimate kickoffs on transient failures
+    would regress user-visible behaviour worse than the cross we're
+    defending against.
+    """
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+
+    def _raise(*_a, **_kw):
+        raise RuntimeError("tmux probe blew up")
+
+    monkeypatch.setattr(
+        supervisor.session_service.tmux, "list_panes", _raise,
+    )
+
+    # Should NOT raise — guard returns conservatively when probe fails.
+    kickoff = supervisor._prepare_initial_input(
+        "operator",
+        "long operator prompt " * 30,
+        target="%anywhere",
+    )
+    assert "operator.md" in kickoff
+
+
+def test_send_initial_input_routes_operator_kickoff_to_operator_md(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """#934 — live-style: cockpit operator-pane kickoff lands operator.md.
+
+    Walk the kickoff path from ``_send_initial_input_if_fresh`` end-to-end
+    with a stubbed tmux that simulates the cockpit-mounted operator
+    flow. Asserts the send-keys log carries ``Read .../operator.md`` and
+    explicitly does NOT carry ``Read .../heartbeat.md`` — the user-visible
+    failure mode #934 is reporting.
+    """
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+
+    operator_launch = supervisor.launch_by_session("operator")
+    # Synthesise the fresh-launch marker so the kickoff path engages.
+    fresh = tmp_path / ".pollypm/markers/operator.fresh"
+    fresh.parent.mkdir(parents=True, exist_ok=True)
+    fresh.write_text("fresh\n")
+    operator_launch = replace(
+        operator_launch,
+        initial_input="long operator prompt " * 30,
+        fresh_launch_marker=fresh,
+    )
+
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "list_panes",
+        lambda target: [_make_pane(window_name="pm-operator", pane_id="%op")],
+    )
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "capture_pane",
+        lambda target, lines=None: "",  # fresh pane, no banner
+    )
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "send_keys",
+        lambda target, text, **kw: sent.append((target, text)),
+    )
+    monkeypatch.setattr(supervisor, "_verify_input_submitted", lambda *a, **kw: None)
+    monkeypatch.setattr("pollypm.supervisor.time.sleep", lambda *_: None)
+
+    supervisor._send_initial_input_if_fresh(operator_launch, "%op")
+
+    assert len(sent) == 1, "operator kickoff must deliver"
+    text = sent[0][1]
+    assert "operator.md" in text, (
+        "operator kickoff must reference operator.md, not another role"
+    )
+    assert "heartbeat.md" not in text, (
+        "#934 — operator pane must NEVER receive heartbeat.md kickoff"
+    )
+
+
+def test_send_initial_input_routes_heartbeat_kickoff_to_heartbeat_md(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """#934 — heartbeat pane receives heartbeat.md, never operator.md.
+
+    Symmetric companion to the operator test: the heartbeat session's
+    kickoff lands on its own pm-heartbeat pane and references
+    ``heartbeat.md``. This is the contractual default the bug breaks.
+    """
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+
+    heartbeat_launch = supervisor.launch_by_session("heartbeat")
+    fresh = tmp_path / ".pollypm/markers/heartbeat.fresh"
+    fresh.parent.mkdir(parents=True, exist_ok=True)
+    fresh.write_text("fresh\n")
+    heartbeat_launch = replace(
+        heartbeat_launch,
+        initial_input="long heartbeat prompt " * 30,
+        fresh_launch_marker=fresh,
+    )
+
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "list_panes",
+        lambda target: [_make_pane(window_name="pm-heartbeat", pane_id="%hb")],
+    )
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "capture_pane",
+        lambda target, lines=None: "",
+    )
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "send_keys",
+        lambda target, text, **kw: sent.append((target, text)),
+    )
+    monkeypatch.setattr(supervisor, "_verify_input_submitted", lambda *a, **kw: None)
+    monkeypatch.setattr("pollypm.supervisor.time.sleep", lambda *_: None)
+
+    supervisor._send_initial_input_if_fresh(heartbeat_launch, "%hb")
+
+    assert len(sent) == 1, "heartbeat kickoff must deliver"
+    text = sent[0][1]
+    assert "heartbeat.md" in text
+    assert "operator.md" not in text, (
+        "heartbeat pane must NEVER receive operator.md kickoff"
+    )
+
+
+def test_send_initial_input_per_task_worker_kickoff_unaffected(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """#934 regression for #919 — per-task worker kickoffs must still deliver.
+
+    Per-task workers (#919) live in synthesised ``task-<project>-<N>``
+    windows whose names don't appear in static config. The #934 inner
+    guard must accept ``launch.window_name`` directly (passed via
+    ``expected_window``) so the per-task path keeps working — this is
+    exactly the regression #934 must avoid.
+    """
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+
+    # Build a per-task worker session manually (the planner synthesises
+    # these in production; here we register one so the launch resolves).
+    per_task_session = SessionConfig(
+        name="task-pollypm-7",
+        role="worker",
+        provider=ProviderKind.CLAUDE,
+        account="claude_controller",
+        cwd=tmp_path,
+        project="pollypm",
+        window_name="task-pollypm-7",
+    )
+    config.sessions[per_task_session.name] = per_task_session
+    fresh = tmp_path / ".pollypm/markers/task-pollypm-7.fresh"
+    fresh.parent.mkdir(parents=True, exist_ok=True)
+    fresh.write_text("fresh\n")
+
+    from pollypm.models import SessionLaunchSpec
+    launch = SessionLaunchSpec(
+        session=per_task_session,
+        account=config.accounts["claude_controller"],
+        window_name="task-pollypm-7",
+        log_path=tmp_path / "logs/task-pollypm-7.log",
+        command="claude",
+        initial_input="task prompt body " * 30,
+        fresh_launch_marker=fresh,
+    )
+
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "list_panes",
+        lambda target: [_make_pane(window_name="task-pollypm-7", pane_id="%task")],
+    )
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "capture_pane",
+        lambda target, lines=None: "",
+    )
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "send_keys",
+        lambda target, text, **kw: sent.append((target, text)),
+    )
+    monkeypatch.setattr(supervisor, "_verify_input_submitted", lambda *a, **kw: None)
+    monkeypatch.setattr("pollypm.supervisor.time.sleep", lambda *_: None)
+
+    supervisor._send_initial_input_if_fresh(launch, "%task")
+
+    assert len(sent) == 1, "per-task worker kickoff must still deliver"
+    assert "task-pollypm-7.md" in sent[0][1] or len(sent[0][1]) <= 280
+

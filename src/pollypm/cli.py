@@ -97,12 +97,17 @@ _STATUS_HELP = help_with_examples(
 )
 
 _SEND_HELP = help_with_examples(
-    "Send input directly into a managed tmux pane.",
+    (
+        "Send input directly into a managed tmux pane.\n\n"
+        "Accepts a config session name (``operator``), a per-task "
+        "worker window (``task-<project>-<N>``), or the ``<project>/<N>`` "
+        "shortcut that resolves to the per-task window."
+    ),
     [
         ('pm send operator "Build a weather CLI"', "ask Polly to start work"),
         (
-            'pm send reviewer "Please rerun the tests" --owner human',
-            "post a human follow-up to the reviewer",
+            'pm send demo/7 "use the new helper" --owner human',
+            "steer a per-task worker mid-flow via the <project>/<N> shortcut",
         ),
         (
             'pm send worker_demo "continue" --force',

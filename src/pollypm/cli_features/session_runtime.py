@@ -24,6 +24,27 @@ from pollypm.config import DEFAULT_CONFIG_PATH
 
 _TASK_ID_PATTERN = re.compile(r"\b([A-Za-z0-9_.-]+/\d+)\b")
 
+# ``<project>/<N>`` matches the canonical task id form. When ``pm send``
+# receives an argument matching this shape we translate it to the
+# per-task worker window name (#924) so the user does not have to know
+# the ``task-<project>-<N>`` convention.
+_TASK_ID_FULL_PATTERN = re.compile(r"^([A-Za-z0-9_.-]+)/(\d+)$")
+
+
+def _resolve_send_target_name(name: str) -> str:
+    """Translate ``<project>/<N>`` to ``task-<project>-<N>``; pass through otherwise.
+
+    The canonical per-task window name comes from
+    :func:`pollypm.work.session_manager.task_window_name`. Mirroring the
+    construction here keeps ``pm send`` independent of an import on the
+    work-service module.
+    """
+    match = _TASK_ID_FULL_PATTERN.match(name)
+    if match is None:
+        return name
+    project, number = match.group(1), match.group(2)
+    return f"task-{project}-{number}"
+
 # Dispatch identifiers the cockpit dashboard's
 # ``_perform_dashboard_action`` knows how to route. Producers that
 # emit user_prompt actions with kinds outside this set hit the
@@ -352,7 +373,15 @@ def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
 
     @app.command(help=helpers._SEND_HELP)
     def send(
-        session_name: str = typer.Argument(..., help="Session name from config."),
+        session_name: str = typer.Argument(
+            ...,
+            help=(
+                "Session name from config (e.g. ``operator``), the "
+                "per-task worker window ``task-<project>-<N>``, or the "
+                "shortcut ``<project>/<N>`` which resolves to the per-task "
+                "window."
+            ),
+        ),
         text: str = typer.Argument(..., help="Text to send into the tmux pane."),
         owner: str = typer.Option("pollypm", "--owner", help="Sender label for lease checks."),
         force: bool = typer.Option(False, "--force", help="Bypass a conflicting lease."),
@@ -361,6 +390,14 @@ def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     ) -> None:
         supervisor = helpers._load_supervisor(config_path)
+        # ``<project>/<N>`` shortcut → per-task worker window (#924). The
+        # canonical window name lives in
+        # :func:`pollypm.work.session_manager.task_window_name`; mirror its
+        # shape here so ``pm send`` users do not have to type the
+        # ``task-<project>-<N>`` form by hand.
+        resolved_name = _resolve_send_target_name(session_name)
+        if resolved_name != session_name:
+            session_name = resolved_name
         session_cfg = supervisor.config.sessions.get(session_name)
         if session_cfg and session_cfg.role == "worker" and not force:
             project = session_cfg.project or session_name.replace("worker_", "", 1)
@@ -385,6 +422,14 @@ def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
             )
         except RuntimeError as exc:
             raise typer.BadParameter(str(exc)) from exc
+        except KeyError as exc:
+            # ``launch_by_session`` raises KeyError when the name is not
+            # a config-defined session and not a per-task worker window
+            # (#924). Surface the friendly message rather than a stack
+            # trace.
+            raise typer.BadParameter(
+                exc.args[0] if exc.args else f"Unknown session: {session_name}"
+            ) from exc
         if json_output:
             helpers._emit_json(
                 {

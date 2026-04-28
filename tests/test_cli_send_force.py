@@ -71,3 +71,44 @@ def test_send_to_unknown_session_is_not_gated() -> None:
         result = runner.invoke(app, ["send", "ghost_session", "hello"])
     assert result.exit_code == 0, result.stdout
     supervisor.send_input.assert_called_once()
+
+
+def test_send_project_slash_number_shortcut_resolves_to_task_window() -> None:
+    """``pm send <project>/<N>`` translates to ``task-<project>-<N>`` (#924).
+
+    The shortcut keeps users from having to type the full per-task
+    window name. The CLI rewrites the argument before passing it on to
+    ``send_input``, which is what reaches the storage closet.
+    """
+    supervisor = _make_supervisor({})
+    with patch("pollypm.cli._load_supervisor", return_value=supervisor):
+        result = runner.invoke(
+            app, ["send", "blackjack-trainer/6", "use the new helper", "--owner", "human"],
+        )
+    assert result.exit_code == 0, result.stdout
+    supervisor.send_input.assert_called_once()
+    args, kwargs = supervisor.send_input.call_args
+    # First positional is the resolved session name.
+    assert args[0] == "task-blackjack-trainer-6"
+    assert args[1] == "use the new helper"
+
+
+def test_send_unknown_session_surfaces_friendly_error() -> None:
+    """A KeyError from ``launch_by_session`` surfaces as a CLI BadParameter (#924).
+
+    Pre-#924 the underlying ``KeyError`` propagated as a stack trace.
+    The CLI now catches it and surfaces the planner's friendly message
+    listing valid configured sessions and pointing at ``pm task next``.
+    """
+    supervisor = _make_supervisor({})
+    supervisor.send_input.side_effect = KeyError(
+        "Unknown session: ghost. Valid configured sessions: operator. "
+        "For per-task workers use ``pm task next``..."
+    )
+    with patch("pollypm.cli._load_supervisor", return_value=supervisor):
+        result = runner.invoke(app, ["send", "ghost", "hello"])
+    assert result.exit_code != 0
+    # Friendly text from the planner is preserved through Typer's
+    # BadParameter wrapper.
+    assert "Unknown session: ghost" in result.stderr or "Unknown session: ghost" in result.stdout
+    assert "pm task next" in result.stderr or "pm task next" in result.stdout

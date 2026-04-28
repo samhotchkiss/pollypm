@@ -362,13 +362,151 @@ class DefaultLaunchPlanner:
     def launch_by_session(self, session_name: str) -> SessionLaunchSpec:
         """Return the ``SessionLaunchSpec`` for ``session_name``.
 
-        Verbatim lift from ``Supervisor.launch_by_session``.
+        Verbatim lift from ``Supervisor.launch_by_session`` plus a
+        per-task fallback (#924). Per-#919 per-task workers live in the
+        storage closet as ``task-<project>-<N>`` windows that are not
+        members of ``plan_launches()``; without the fallback every
+        ``pm send task-<project>-<N> "..."`` raised ``KeyError`` and
+        Phase-6 mid-flow steering had no documented affordance.
         """
         for launch in self.plan_launches():
             if launch.session.name == session_name:
                 return launch
-        raise KeyError(f"Unknown session: {session_name}")
+        synthesized = self._maybe_synthesize_per_task_launch(session_name)
+        if synthesized is not None:
+            return synthesized
+        # Friendlier error: list valid candidate sessions and point at
+        # ``pm task next`` so a user who fat-fingered a name has a path
+        # forward.
+        configured = sorted(
+            launch.session.name for launch in self.plan_launches()
+        )
+        hint = ", ".join(configured) if configured else "(none configured)"
+        raise KeyError(
+            f"Unknown session: {session_name}. "
+            f"Valid configured sessions: {hint}. "
+            f"For per-task workers use ``pm task next`` to find the "
+            f"current task id, then ``pm send task-<project>-<N> \"...\"`` "
+            f"or ``pm send <project>/<N> \"...\"`` (shortcut)."
+        )
 
     def invalidate_cache(self) -> None:
         """Drop the cached launch plan."""
         self._cached_launches = None
+
+    # ── Per-task launch synthesis (#924) ──────────────────────────────────
+
+    def _maybe_synthesize_per_task_launch(
+        self, session_name: str
+    ) -> SessionLaunchSpec | None:
+        """Return a ``SessionLaunchSpec`` for a ``task-<project>-<N>`` name.
+
+        Per-task worker windows are spawned by
+        :class:`pollypm.work.session_manager.SessionManager` directly
+        into the storage closet and are *not* members of
+        ``plan_launches()``. ``send_input`` only needs three things from
+        the spec:
+
+        * ``window_name`` — used by ``_resolve_send_target`` to locate
+          the live tmux window in the storage closet.
+        * ``session.provider`` — the Codex extra-Enter quirk in
+          ``send_input`` checks this field.
+        * ``session.name`` / ``session.project`` — used in error text.
+
+        The synthesized spec carries the worker provider routed for the
+        task's project (matching what ``SessionManager`` would launch
+        against), with a stub account that is never used for launching.
+        """
+        parsed = _parse_task_session_name(session_name)
+        if parsed is None:
+            return None
+        project, _task_number = parsed
+        provider, account_name = self._worker_provider_for_project(project)
+        # Stub account — not used for launching, only for SessionLaunchSpec
+        # field population. send_input does not invoke the runtime/provider
+        # adapters against this account.
+        account = AccountConfig(name=account_name or "", provider=provider)
+        session = SessionConfig(
+            name=session_name,
+            role="worker",
+            provider=provider,
+            account=account_name or "",
+            cwd=self._ctx.config.project.root_dir,
+            project=project,
+            window_name=session_name,
+        )
+        log_path = self._ctx.config.project.logs_dir / session_name / f"{session_name}.log"
+        return SessionLaunchSpec(
+            session=session,
+            account=account,
+            window_name=session_name,
+            log_path=log_path,
+            command="",
+        )
+
+    def _worker_provider_for_project(
+        self, project: str
+    ) -> tuple[ProviderKind, str | None]:
+        """Resolve the provider + an account name for a per-task worker.
+
+        Mirrors the routing done by
+        :meth:`pollypm.work.session_manager.SessionManager._worker_launch_bundle`:
+        consult role routing for ``("worker", project)``, then pick an
+        account whose provider matches. On any failure fall back to the
+        controller account so callers (``pm send``) at least know what
+        provider the storage-closet pane is most likely running.
+        """
+        ctx = self._ctx
+        config = ctx.config
+        accounts = getattr(config, "accounts", {}) or {}
+        controller = config.pollypm.controller_account
+        # Default fallback: controller account's provider.
+        fallback_provider = ProviderKind.CLAUDE
+        if controller and controller in accounts:
+            fallback_provider = accounts[controller].provider
+        try:
+            assignment = resolve_role_assignment(
+                "worker", project, config=config,
+            )
+            provider = resolved_provider_kind(assignment)
+        except Exception:  # noqa: BLE001
+            return fallback_provider, controller or None
+        if assignment.source == "fallback":
+            # No project- or global-routed worker — use the controller's
+            # provider/account.
+            return fallback_provider, controller or None
+        # Pick the first account whose provider matches the routed
+        # worker provider; mirrors SessionManager's preferred-name walk.
+        for name, account in accounts.items():
+            if getattr(account, "provider", None) is provider:
+                return provider, name
+        return provider, controller or None
+
+
+def _parse_task_session_name(name: str) -> tuple[str, int] | None:
+    """Parse ``"task-<project>-<N>"`` into ``(project, N)``.
+
+    Returns ``None`` when the name is not a per-task worker window.
+    The trailing ``<N>`` is an integer; the project may itself contain
+    hyphens (e.g. ``blackjack-trainer``), so we split off the trailing
+    integer rather than splitting on every dash.
+    """
+    if not name.startswith("task-"):
+        return None
+    rest = name[len("task-"):]
+    if not rest:
+        return None
+    sep = rest.rfind("-")
+    if sep <= 0 or sep == len(rest) - 1:
+        return None
+    project = rest[:sep]
+    suffix = rest[sep + 1:]
+    if not suffix.isdigit():
+        return None
+    try:
+        task_number = int(suffix)
+    except ValueError:
+        return None
+    if task_number < 0:
+        return None
+    return project, task_number

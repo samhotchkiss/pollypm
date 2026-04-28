@@ -293,6 +293,151 @@ def test_send_input_raises_when_session_not_found(monkeypatch, tmp_path: Path) -
         supervisor.send_input("operator", "hello", owner="human")
 
 
+# ---------------------------------------------------------------------------
+# #924 — pm send must reach per-task workers (task-<project>-<N> windows)
+# ---------------------------------------------------------------------------
+
+
+def test_send_input_resolves_per_task_worker_window(monkeypatch, tmp_path: Path) -> None:
+    """``pm send task-<project>-<N>`` reaches the per-task pane.
+
+    Per #919 / #921, per-task workers live in the storage closet as
+    ``task-<project>-<N>`` windows that are *not* members of the launch
+    plan. Pre-#924 ``launch_by_session`` raised ``KeyError`` and the
+    only documented mid-flow steering CLI was unreachable.
+    """
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    storage_closet = supervisor.storage_closet_session_name()
+
+    # Make the storage closet present and serve the task window.
+    monkeypatch.setattr(
+        supervisor.tmux, "has_session", lambda name: name == storage_closet,
+    )
+    monkeypatch.setattr(
+        supervisor.tmux,
+        "list_windows",
+        lambda name: [
+            TmuxWindow(
+                session=name,
+                index=3,
+                name="task-blackjack-trainer-6",
+                active=False,
+                pane_id="%99",
+                pane_current_command="claude",
+                pane_current_path=str(tmp_path),
+                pane_dead=False,
+            )
+        ],
+    )
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        supervisor.tmux,
+        "send_keys",
+        lambda target, text, **kw: sent.append((target, text)),
+    )
+
+    supervisor.send_input(
+        "task-blackjack-trainer-6", "use the new helper", owner="human",
+    )
+
+    assert sent == [
+        (f"{storage_closet}:task-blackjack-trainer-6", "use the new helper"),
+    ]
+
+
+def test_send_input_for_config_defined_session_still_works(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """Regression guard — config-defined names keep resolving via the plan.
+
+    The #924 fallback must only kick in for ``task-<project>-<N>`` names
+    that the static plan does not cover. Config-defined sessions
+    (operator, heartbeat, ...) still go through ``plan_launches``.
+    """
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    storage_closet = supervisor.storage_closet_session_name()
+
+    monkeypatch.setattr(
+        supervisor.tmux, "has_session", lambda name: name == storage_closet,
+    )
+    monkeypatch.setattr(
+        supervisor.tmux,
+        "list_windows",
+        lambda name: [
+            TmuxWindow(
+                session=name,
+                index=0,
+                name="pm-operator",
+                active=True,
+                pane_id="%10",
+                pane_current_command="claude",
+                pane_current_path=str(tmp_path),
+                pane_dead=False,
+            )
+        ],
+    )
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        supervisor.tmux,
+        "send_keys",
+        lambda target, text, **kw: sent.append((target, text)),
+    )
+
+    supervisor.send_input("operator", "hello", owner="human")
+
+    assert sent == [(f"{storage_closet}:pm-operator", "hello")]
+
+
+def test_launch_by_session_unknown_name_raises_friendly_keyerror(
+    tmp_path: Path,
+) -> None:
+    """Unknown bogus names get a friendlier message that points at next steps.
+
+    Pre-#924 the bare ``KeyError: 'Unknown session: <name>'`` left the
+    user with no path forward; the new message lists configured sessions
+    and points at ``pm task next`` for per-task workers.
+    """
+    import pytest
+
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+
+    with pytest.raises(KeyError) as excinfo:
+        supervisor.launch_by_session("totally-bogus-name")
+    msg = str(excinfo.value)
+    assert "Unknown session: totally-bogus-name" in msg
+    # Lists at least one of the configured sessions.
+    assert "operator" in msg or "heartbeat" in msg
+    # Points at the per-task discovery path.
+    assert "pm task next" in msg
+
+
+def test_launch_by_session_synthesizes_per_task_spec(tmp_path: Path) -> None:
+    """The planner returns a synthesized spec for ``task-<project>-<N>``.
+
+    The spec must carry enough metadata for ``send_input`` to operate:
+    a ``window_name`` matching the task window, a session whose
+    ``provider`` is set (so the Codex extra-Enter check is meaningful),
+    and a project key parsed from the name.
+    """
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+
+    spec = supervisor.launch_by_session("task-blackjack-trainer-6")
+    assert spec.window_name == "task-blackjack-trainer-6"
+    assert spec.session.name == "task-blackjack-trainer-6"
+    assert spec.session.project == "blackjack-trainer"
+    # Provider must resolve to a real ProviderKind so the codex
+    # extra-enter branch in send_input behaves correctly.
+    assert spec.session.provider in (ProviderKind.CLAUDE, ProviderKind.CODEX)
+
+
 def test_claim_lease_rejects_conflicting_owner(tmp_path: Path) -> None:
     config = _config(tmp_path)
     supervisor = Supervisor(config)

@@ -148,12 +148,21 @@ TASK_TRANSITION_TABLE: Mapping[WorkStatus, StateMetadata] = {
         # ``QUEUED -> ON_HOLD`` is supported (the user can pause a
         # queued task without claiming it). Caught by the runtime
         # validator (#899) when the table omitted it earlier.
+        # ``QUEUED -> DONE`` covers ``mark_done`` on a task that
+        # never claimed (e.g., the inbox archive contract and the
+        # manual fast-complete CLI path); enforced by #909.
+        # ``QUEUED -> REVIEW`` covers re-claim of an auto-unblocked
+        # task whose current node is a review node — the claim
+        # restores REVIEW directly instead of bouncing through
+        # IN_PROGRESS.
         allowed_next=frozenset(
             {
                 WorkStatus.IN_PROGRESS,
+                WorkStatus.REVIEW,
                 WorkStatus.BLOCKED,
                 WorkStatus.ON_HOLD,
                 WorkStatus.CANCELLED,
+                WorkStatus.DONE,
             }
         ),
         consumes_capacity=False,
@@ -161,8 +170,15 @@ TASK_TRANSITION_TABLE: Mapping[WorkStatus, StateMetadata] = {
     WorkStatus.IN_PROGRESS: StateMetadata(
         status=WorkStatus.IN_PROGRESS,
         owner=StateOwner.WORKER,
+        # ``IN_PROGRESS -> IN_PROGRESS`` is the flow-engine
+        # node-hop case: a multi-stage worker flow (architect's
+        # research -> discover -> synthesize) advances the
+        # ``current_node_id`` while the task stays IN_PROGRESS.
+        # Each hop writes a transition row so the audit trail
+        # stays continuous (#909, #295).
         allowed_next=frozenset(
             {
+                WorkStatus.IN_PROGRESS,
                 WorkStatus.REVIEW,
                 WorkStatus.BLOCKED,
                 WorkStatus.ON_HOLD,
@@ -196,12 +212,16 @@ TASK_TRANSITION_TABLE: Mapping[WorkStatus, StateMetadata] = {
         owner=StateOwner.USER,
         # ``REVIEW -> ON_HOLD`` supports pausing a review (#899
         # validator caught the live path).
+        # ``REVIEW -> BLOCKED`` is reachable from ``block()`` —
+        # the production helper accepts both IN_PROGRESS and
+        # REVIEW. Recorded by #909.
         allowed_next=frozenset(
             {
                 WorkStatus.DONE,
                 WorkStatus.REWORK,
                 WorkStatus.IN_PROGRESS,
                 WorkStatus.ON_HOLD,
+                WorkStatus.BLOCKED,
                 WorkStatus.CANCELLED,
             }
         ),

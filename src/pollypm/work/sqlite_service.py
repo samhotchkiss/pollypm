@@ -98,6 +98,7 @@ from pollypm.work.service_queries import (
 )
 from pollypm.work.service_support import (  # noqa: F401  (re-exported)
     InvalidTransitionError,
+    InvariantViolationError,
     TaskNotFoundError,
     ValidationError,
     WorkServiceError,
@@ -1146,16 +1147,36 @@ class SQLiteWorkService:
         to_state: str,
         actor: str,
         reason: str | None = None,
+        *,
+        allow_invariant_violation: bool = False,
     ) -> None:
-        # #899 — every transition write runs through the canonical
-        # invariant validator (#886). A violation means the
-        # transition is outside the canonical TASK_TRANSITION_TABLE
-        # — either the table needs to grow OR the caller is doing
-        # something unsafe (the audit's #806 deleted-execution-
-        # history shape). Log at WARNING so the drift is visible in
-        # logs and grep-able; raise only when both states resolve
-        # to unknown enum values, since the row would also fail
-        # downstream reads.
+        # #899 / #909 — every transition write runs through the
+        # canonical invariant validator (#886). Behavior split:
+        #
+        # * known WorkStatus -> known WorkStatus + violation:
+        #   raise :class:`InvariantViolationError` and DO NOT insert.
+        #   The canonical TASK_TRANSITION_TABLE is the contract;
+        #   bypassing it accumulates impossible task histories
+        #   (the audit's #806 deleted-execution-history shape).
+        # * unknown / legacy status on either side: log a warning
+        #   and still write the row. Legacy databases predate the
+        #   WorkStatus enum so the validator cannot reason about
+        #   them; refusing the write would brick existing installs
+        #   on first read after a migration. Migration writers can
+        #   keep using this branch without ceremony.
+        # * validator itself blew up: log via ``logger.exception``
+        #   and proceed with the write — a broken validator must
+        #   never block a transition that the caller already
+        #   committed to.
+        #
+        # Escape hatch: ``allow_invariant_violation=True`` keeps the
+        # legacy lenient behavior (warn-and-write) for known→known
+        # violations. This is reserved for narrow admin / migration
+        # paths (``pm task repair``-class callers) and must never
+        # be set by normal task-action callsites. Callers that set
+        # it are documenting "yes, I know this is outside the
+        # canonical table; record it anyway because I am repairing
+        # an existing broken row."
         try:
             from pollypm.task_invariants import validate_transition
             from pollypm.work.models import WorkStatus
@@ -1166,7 +1187,8 @@ class SQLiteWorkService:
             except ValueError:
                 # One side is not a known WorkStatus — log and
                 # proceed; legacy rows can carry custom states the
-                # validator does not know about.
+                # validator does not know about. Migration path
+                # only — known→unknown is not enforced.
                 logger.warning(
                     "work transition uses unknown status: %s/%s -> %s/%s "
                     "(actor=%s)",
@@ -1179,10 +1201,24 @@ class SQLiteWorkService:
                     to_status=to_enum,
                 )
                 if violation is not None:
-                    logger.warning(
-                        "work transition violates canonical invariant: %s",
-                        violation.summary,
-                    )
+                    if allow_invariant_violation:
+                        logger.warning(
+                            "work transition violates canonical invariant "
+                            "(allow_invariant_violation=True, recorded "
+                            "anyway): %s",
+                            violation.summary,
+                        )
+                    else:
+                        # #909 — refuse the write. Raise BEFORE
+                        # the INSERT so no row lands in
+                        # work_transitions.
+                        logger.warning(
+                            "work transition violates canonical invariant: %s",
+                            violation.summary,
+                        )
+                        raise InvariantViolationError(violation.summary)
+        except InvariantViolationError:
+            raise
         except Exception:  # noqa: BLE001 — validator must not break writes
             logger.exception(
                 "work transition validation failed unexpectedly; "

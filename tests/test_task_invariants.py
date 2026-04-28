@@ -130,7 +130,11 @@ def test_canonical_transitions_allowed(
     [
         (WorkStatus.DONE, WorkStatus.IN_PROGRESS),
         (WorkStatus.CANCELLED, WorkStatus.QUEUED),
-        (WorkStatus.QUEUED, WorkStatus.DONE),
+        # ``QUEUED -> DONE`` is now a canonical fast-complete /
+        # archive path (#909). The previously-asserted-invalid
+        # case is replaced with ``REVIEW -> DRAFT``, which has
+        # never been a legal transition.
+        (WorkStatus.REVIEW, WorkStatus.DRAFT),
         (WorkStatus.DRAFT, WorkStatus.REVIEW),
     ],
 )
@@ -368,12 +372,14 @@ def _seed_task(svc) -> tuple[str, int]:
     return task.project, task.task_number
 
 
-def test_record_transition_validates_against_canonical_table(tmp_path) -> None:
-    """#899 — work-service _record_transition runs the canonical
-    validator and logs a warning on violation. Regression guard
-    so a refactor cannot quietly drop the validator wiring."""
+def test_record_transition_rejects_known_to_known_violation(tmp_path) -> None:
+    """#899 / #909 — work-service _record_transition runs the
+    canonical validator and now *raises* on a known→known violation
+    instead of silently inserting. Regression guard so a refactor
+    cannot quietly downgrade enforcement back to a warning."""
     import logging
 
+    from pollypm.work.service_support import InvariantViolationError
     from pollypm.work.sqlite_service import SQLiteWorkService
 
     db_path = tmp_path / "state.db"
@@ -393,13 +399,24 @@ def test_record_transition_validates_against_canonical_table(tmp_path) -> None:
             # Force a known-invalid transition through the central
             # write site. ``done -> in_progress`` is forbidden by
             # the canonical table.
-            svc._record_transition(
-                project=project,
-                task_number=task_number,
-                from_state="done",
-                to_state="in_progress",
-                actor="test",
-            )
+            with pytest.raises(InvariantViolationError) as excinfo:
+                svc._record_transition(
+                    project=project,
+                    task_number=task_number,
+                    from_state="done",
+                    to_state="in_progress",
+                    actor="test",
+                )
+            assert "done -> in_progress" in str(excinfo.value)
+
+            # The row must NOT have been inserted.
+            rows = svc._conn.execute(
+                "SELECT count(*) FROM work_transitions "
+                "WHERE task_project = ? AND task_number = ? "
+                "AND from_state = 'done' AND to_state = 'in_progress'",
+                (project, task_number),
+            ).fetchone()
+            assert rows[0] == 0
     finally:
         work_logger.removeHandler(handler)
 
@@ -407,6 +424,82 @@ def test_record_transition_validates_against_canonical_table(tmp_path) -> None:
         "violates canonical invariant" in msg
         and "done -> in_progress" in msg
         for msg in captured
+    )
+
+
+def test_record_transition_known_to_unknown_still_records(tmp_path) -> None:
+    """#909 — known→unknown transitions remain lenient (the
+    migration path). Legacy/custom states can still be written so
+    older databases continue to load. Only the validator-known
+    enum-to-enum case is enforced as a hard error."""
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    db_path = tmp_path / "state.db"
+    with SQLiteWorkService(db_path=db_path) as svc:
+        project, task_number = _seed_task(svc)
+        # ``queued`` is a known WorkStatus; ``legacy_archived`` is
+        # not. The validator cannot reason about it, so the row is
+        # written with a warning rather than rejected.
+        svc._record_transition(
+            project=project,
+            task_number=task_number,
+            from_state="queued",
+            to_state="legacy_archived",
+            actor="migration",
+        )
+        rows = svc._conn.execute(
+            "SELECT count(*) FROM work_transitions "
+            "WHERE task_project = ? AND task_number = ? "
+            "AND to_state = 'legacy_archived'",
+            (project, task_number),
+        ).fetchone()
+        assert rows[0] == 1
+
+
+def test_record_transition_escape_hatch_writes_violation(tmp_path) -> None:
+    """#909 — ``allow_invariant_violation=True`` is the documented
+    admin/migration escape hatch. It restores the legacy lenient
+    behavior so a ``pm task repair``-class caller can record an
+    out-of-table transition while repairing a broken row."""
+    import logging
+
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    db_path = tmp_path / "state.db"
+    captured: list[str] = []
+
+    class _CaptureHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record.getMessage())
+
+    handler = _CaptureHandler(level=logging.WARNING)
+    work_logger = logging.getLogger("pollypm.work.sqlite_service")
+    work_logger.addHandler(handler)
+    work_logger.setLevel(logging.WARNING)
+    try:
+        with SQLiteWorkService(db_path=db_path) as svc:
+            project, task_number = _seed_task(svc)
+            svc._record_transition(
+                project=project,
+                task_number=task_number,
+                from_state="done",
+                to_state="in_progress",
+                actor="admin",
+                reason="repair: backfill missing transition",
+                allow_invariant_violation=True,
+            )
+            rows = svc._conn.execute(
+                "SELECT count(*) FROM work_transitions "
+                "WHERE task_project = ? AND task_number = ? "
+                "AND from_state = 'done' AND to_state = 'in_progress'",
+                (project, task_number),
+            ).fetchone()
+            assert rows[0] == 1
+    finally:
+        work_logger.removeHandler(handler)
+
+    assert any(
+        "allow_invariant_violation=True" in msg for msg in captured
     )
 
 

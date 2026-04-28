@@ -2290,17 +2290,17 @@ class CockpitRouter:
             pass
         # Best-effort event so the operator-visible diagnostic surfaces
         # without the user having to debug from the agent transcript.
+        # Routes through the public ``record_persona_swap_diagnostic``
+        # method (added in #940) — never touch ``supervisor._msg_store``
+        # directly: that violates the Supervisor private-reach-through
+        # boundary enforced by ``tests/test_import_boundary.py``.
         try:
             supervisor = self._load_supervisor()
-            supervisor._msg_store.record_event(
+            supervisor.record_persona_swap_diagnostic(
                 scope=getattr(launch.session, "name", "operator"),
-                sender="pollypm",
-                subject="persona_swap_detected",
-                payload={
-                    "message": (
-                        f"rail-mount source-pane guard refused join: {details}"
-                    ),
-                },
+                message=(
+                    f"rail-mount source-pane guard refused join: {details}"
+                ),
             )
         except Exception:  # noqa: BLE001
             pass

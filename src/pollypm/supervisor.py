@@ -413,6 +413,37 @@ class Supervisor:
         """
         return self._msg_store
 
+    def record_persona_swap_diagnostic(
+        self,
+        scope: str,
+        message: str,
+    ) -> None:
+        """Record a ``persona_swap_detected`` diagnostic event.
+
+        Public surface for the cockpit rail's source-pane guard (#931 /
+        #934) — and any other caller that needs to surface a persona-
+        swap finding to the operator-visible inbox without reaching into
+        Supervisor's private ``_msg_store`` slot (forbidden by the
+        import-boundary guardrail in
+        ``tests/test_import_boundary.py``).
+
+        Behavior-preserving wrapper: persists the same row shape the
+        existing in-Supervisor call sites already write
+        (``sender="pollypm"``, ``subject="persona_swap_detected"``,
+        ``payload={"message": ...}``). Best-effort — store errors are
+        swallowed so a failed diagnostic never stops the guard from
+        refusing the unsafe action.
+        """
+        try:
+            self._msg_store.record_event(
+                scope=scope,
+                sender="pollypm",
+                subject="persona_swap_detected",
+                payload={"message": message},
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
     # ── Startable lifecycle (driven by CoreRail.start()/stop()) ────────────
 
     def start(self) -> None:

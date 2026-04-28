@@ -1322,3 +1322,73 @@ def test_source_pane_role_matches_launch_records_persona_swap_event(
     assert "rail-mount" in payload
     assert "heartbeat-supervisor" in payload
 
+
+# ---------------------------------------------------------------------------
+# #940 — public Supervisor entrypoint for persona-swap diagnostics
+# ---------------------------------------------------------------------------
+
+
+def test_record_persona_swap_diagnostic_persists_canonical_event(
+    tmp_path: Path,
+) -> None:
+    """``Supervisor.record_persona_swap_diagnostic`` must persist a row
+    that matches the canonical ``persona_swap_detected`` event shape:
+    ``sender="pollypm"``, ``subject="persona_swap_detected"``, payload
+    carrying the caller-supplied message under the ``message`` key,
+    scoped to the caller-supplied ``scope``.
+
+    This is the public entrypoint added in #940 so cockpit_rail.py
+    (and any future caller) can record persona-swap diagnostics without
+    reaching into the private ``Supervisor._msg_store`` slot — the
+    boundary enforced by ``test_no_supervisor_private_reach_through``.
+    """
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+
+    detail_message = (
+        "rail-mount source-pane guard refused join: source='%5' "
+        "expected_role='operator-pm' observed_roles=['heartbeat-supervisor']"
+    )
+    supervisor.record_persona_swap_diagnostic(
+        scope="operator",
+        message=detail_message,
+    )
+
+    rows = supervisor.msg_store.query_messages(
+        type="event", scope="operator", limit=20,
+    )
+    matches = [r for r in rows if r.get("subject") == "persona_swap_detected"]
+    assert len(matches) == 1, (
+        "record_persona_swap_diagnostic should persist exactly one "
+        "persona_swap_detected event for the supplied scope"
+    )
+    row = matches[0]
+    assert row.get("sender") == "pollypm"
+    assert row.get("subject") == "persona_swap_detected"
+    assert row.get("scope") == "operator"
+    payload = row.get("payload") or {}
+    assert payload.get("message") == detail_message
+
+
+def test_record_persona_swap_diagnostic_swallows_store_errors(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """The diagnostic helper is best-effort: a Store error must NOT
+    propagate out of ``record_persona_swap_diagnostic``. The guard
+    that calls it has already decided to refuse the unsafe action,
+    and a logging-shaped failure should not unwind that decision.
+    """
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("simulated store outage")
+
+    monkeypatch.setattr(supervisor.msg_store, "record_event", _boom)
+
+    # Should not raise.
+    supervisor.record_persona_swap_diagnostic(
+        scope="operator",
+        message="rail-mount guard fired during a store outage",
+    )
+

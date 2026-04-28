@@ -141,8 +141,13 @@ def deploy_site(
     # subdomain under a previously-verified account skips email
     # verification entirely (#954). Fall back to the legacy single-email
     # ~/.itsalive store for back-compat with installs from before the
-    # per-email map landed.
-    owner_token = owner_token_for_email(request_data.email) or read_owner_token()
+    # per-email map landed — but ONLY when the legacy config's email
+    # matches the requested email (or has no email field at all). An
+    # unconditional fallback would leak a token minted for one account
+    # into a deploy for another (reopening of #954).
+    owner_token = owner_token_for_email(
+        request_data.email
+    ) or legacy_owner_token_for_email(request_data.email)
     payload: dict[str, Any] = {
         "subdomain": request_data.subdomain,
         "email": request_data.email,
@@ -327,13 +332,45 @@ def read_owner_token() -> str | None:
 
     Kept for back-compat with callers that don't know the requesting
     email (``build_deploy_instructions``, the magic plugin's preflight).
-    Per-email lookups should use :func:`owner_token_for_email`.
+    Per-email lookups should use :func:`owner_token_for_email`. Deploy
+    paths that DO know the requesting email must use
+    :func:`legacy_owner_token_for_email` instead so a token minted for
+    one account never leaks into a deploy for another (#954).
     """
     data = read_global_config()
     token = data.get("ownerToken") or data.get("owner_token")
     if isinstance(token, str) and token.strip():
         return token.strip()
     return None
+
+
+def legacy_owner_token_for_email(email: str | None) -> str | None:
+    """Return the legacy ``~/.itsalive`` token only when its email matches.
+
+    The legacy single-email config at :data:`GLOBAL_CONFIG_FILE` predates
+    the per-email map; it stores at most one ``{email, ownerToken}``
+    pair. ``deploy_site`` may consult it as a fallback for installs that
+    haven't migrated to the per-email store yet, but ONLY when the
+    legacy config's email matches the requested email (or has no email
+    field at all — back-compat with even older single-account configs
+    that omitted the email key). Otherwise the caller must send no
+    ``owner_token`` and let the cold verification path run. Email
+    comparison is case-insensitive to match
+    :func:`owner_token_for_email` (#954).
+    """
+    if not email:
+        return None
+    data = read_global_config()
+    token = data.get("ownerToken") or data.get("owner_token")
+    if not (isinstance(token, str) and token.strip()):
+        return None
+    legacy_email = data.get("email")
+    if isinstance(legacy_email, str) and legacy_email.strip():
+        if legacy_email.strip().lower() != email.strip().lower():
+            return None
+    # Either the legacy config has no email field (very old single-
+    # account installs) or it matches the requested email.
+    return token.strip()
 
 
 def read_owner_tokens() -> dict[str, str]:

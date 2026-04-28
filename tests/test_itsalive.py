@@ -708,3 +708,160 @@ def test_read_owner_tokens_tolerates_corrupt_store(
     (tmp_path / "bad.json").write_text("not json {")
     assert itsalive.read_owner_tokens() == {}
     assert itsalive.owner_token_for_email("anyone@example.com") is None
+
+
+# --- #954 reopen: legacy ~/.itsalive must respect email boundary ---------
+
+
+def _write_legacy_global_config(path: Path, payload: dict) -> None:
+    path.write_text(json.dumps(payload))
+
+
+def test_deploy_does_not_leak_legacy_token_across_email_boundary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Reopening of #954: ``deploy_site`` must NOT fall back to the
+    legacy single-email ``~/.itsalive`` token when the legacy config
+    belongs to a different email than the one being deployed under.
+    Sending the wrong account's token would defeat the per-email
+    boundary the workspace store is designed to enforce."""
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "dist" / "index.html").write_text("<h1>ok</h1>")
+    global_path = tmp_path / "global.json"
+    _write_legacy_global_config(
+        global_path, {"email": "old@example.com", "ownerToken": "old-token"}
+    )
+    monkeypatch.setattr(itsalive, "GLOBAL_CONFIG_FILE", global_path)
+    # OWNER_TOKENS_FILE empty via autouse fixture.
+
+    seen: dict[str, object] = {}
+
+    def fake_api(method: str, url: str, *, payload=None, headers=None):
+        assert url.endswith("/deploy/init")
+        seen["init_payload"] = payload
+        return {"deploy_id": "dep_isolated", "pre_verified": False}
+
+    monkeypatch.setattr(itsalive, "api_json", fake_api)
+    monkeypatch.setattr(
+        itsalive, "notify_deploy_verification_required", lambda *a, **k: None
+    )
+
+    outcome = itsalive.deploy_site(
+        tmp_path,
+        subdomain="demo",
+        email="new@example.com",
+        publish_dir="dist",
+    )
+    assert outcome.status == "pending_verification"
+    init_payload = seen["init_payload"]
+    assert isinstance(init_payload, dict)
+    assert init_payload["email"] == "new@example.com"
+    # Critical assertion: the legacy token MUST NOT leak across emails.
+    assert "owner_token" not in init_payload or init_payload.get("owner_token") is None
+
+
+def test_deploy_uses_legacy_token_when_emails_match(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When the legacy ``~/.itsalive`` config's email matches the
+    requested deploy email, the saved owner token IS forwarded — that's
+    the back-compat path for single-account installs that predate the
+    per-email map (#954)."""
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "dist" / "index.html").write_text("<h1>ok</h1>")
+    global_path = tmp_path / "global.json"
+    _write_legacy_global_config(
+        global_path, {"email": "old@example.com", "ownerToken": "old-token"}
+    )
+    monkeypatch.setattr(itsalive, "GLOBAL_CONFIG_FILE", global_path)
+
+    seen: dict[str, object] = {}
+
+    def fake_api(method: str, url: str, *, payload=None, headers=None):
+        if url.endswith("/deploy/init"):
+            seen["init_payload"] = payload
+            return {"deploy_id": "dep_match", "pre_verified": False}
+        raise AssertionError(f"unexpected url {url}")
+
+    monkeypatch.setattr(itsalive, "api_json", fake_api)
+    monkeypatch.setattr(
+        itsalive, "notify_deploy_verification_required", lambda *a, **k: None
+    )
+
+    itsalive.deploy_site(
+        tmp_path,
+        subdomain="demo",
+        email="old@example.com",
+        publish_dir="dist",
+    )
+    init_payload = seen["init_payload"]
+    assert isinstance(init_payload, dict)
+    assert init_payload.get("owner_token") == "old-token"
+
+
+def test_deploy_uses_legacy_token_when_legacy_has_no_email(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Even older single-account ``~/.itsalive`` files may have an
+    ``ownerToken`` but no ``email`` key. Treat that as "applies to any
+    email" — the operator only ever had one account on this machine —
+    and forward the legacy token (#954 back-compat)."""
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "dist" / "index.html").write_text("<h1>ok</h1>")
+    global_path = tmp_path / "global.json"
+    _write_legacy_global_config(global_path, {"ownerToken": "legacy-only-token"})
+    monkeypatch.setattr(itsalive, "GLOBAL_CONFIG_FILE", global_path)
+
+    seen: dict[str, object] = {}
+
+    def fake_api(method: str, url: str, *, payload=None, headers=None):
+        if url.endswith("/deploy/init"):
+            seen["init_payload"] = payload
+            return {"deploy_id": "dep_noemail", "pre_verified": False}
+        raise AssertionError(f"unexpected url {url}")
+
+    monkeypatch.setattr(itsalive, "api_json", fake_api)
+    monkeypatch.setattr(
+        itsalive, "notify_deploy_verification_required", lambda *a, **k: None
+    )
+
+    itsalive.deploy_site(
+        tmp_path,
+        subdomain="demo",
+        email="any@example.com",
+        publish_dir="dist",
+    )
+    init_payload = seen["init_payload"]
+    assert isinstance(init_payload, dict)
+    assert init_payload.get("owner_token") == "legacy-only-token"
+
+
+def test_legacy_owner_token_for_email_respects_email_match(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Direct unit test for the helper: returns the token only when the
+    legacy config has no email or has a matching email; otherwise None."""
+    global_path = tmp_path / "global.json"
+    monkeypatch.setattr(itsalive, "GLOBAL_CONFIG_FILE", global_path)
+
+    # No file at all → None.
+    assert itsalive.legacy_owner_token_for_email("anyone@example.com") is None
+
+    # Mismatched email → None.
+    _write_legacy_global_config(
+        global_path, {"email": "old@example.com", "ownerToken": "tok"}
+    )
+    assert itsalive.legacy_owner_token_for_email("new@example.com") is None
+    # Matching email (case-insensitive) → token.
+    assert itsalive.legacy_owner_token_for_email("OLD@example.com") == "tok"
+
+    # No email field → token (back-compat).
+    _write_legacy_global_config(global_path, {"ownerToken": "tok-no-email"})
+    assert (
+        itsalive.legacy_owner_token_for_email("anyone@example.com")
+        == "tok-no-email"
+    )
+
+    # Empty/None requested email → None (cannot match anything safely).
+    assert itsalive.legacy_owner_token_for_email("") is None
+    assert itsalive.legacy_owner_token_for_email(None) is None

@@ -167,6 +167,132 @@ def test_first_launch_bootstrap_failure_returns_nonzero_exit() -> None:
     assert result.exit_code is not None and result.exit_code != 0
 
 
+def test_bootstrap_failure_short_circuits_subsequent_actions() -> None:
+    """#908 — bootstrap returning non-None exit_code must halt the
+    plan. No ``ensure_main_session`` (create_session), no
+    ``ensure_heartbeat_schedule``, no rail daemon spawn, and no
+    attach/switch/focus may run on top of a half-built cockpit.
+
+    The original fail-closed launch contract (#884) required this;
+    the audit (#908) caught the regression where the executor kept
+    walking ``plan.actions`` after recording the failure."""
+    probe = _probe()  # nothing alive — FIRST_LAUNCH plan
+    plan = plan_launch(probe)
+    assert plan.state is LaunchState.FIRST_LAUNCH
+
+    sup = _FakeSupervisor(bootstrap_raises=RuntimeError("no controllers"))
+    rail_daemon_calls: list[Path] = []
+    exe, _ = _executor(
+        probe=probe,
+        supervisor=sup,
+        rail_daemon_calls=rail_daemon_calls,
+    )
+    result = exe.execute(plan)
+
+    assert result.exit_code is not None and result.exit_code != 0
+
+    # Action ledger: bootstrap is the last action recorded; nothing
+    # after it ran.
+    assert LaunchAction.BOOTSTRAP_LAUNCHES in result.actions_run
+    forbidden_after_bootstrap = {
+        LaunchAction.ENSURE_MAIN_SESSION,
+        LaunchAction.SCHEDULE_HEARTBEAT,
+        LaunchAction.START_RAIL_DAEMON,
+        LaunchAction.ATTACH_SESSION,
+        LaunchAction.SWITCH_CLIENT,
+        LaunchAction.FOCUS_CONSOLE,
+    }
+    for action in forbidden_after_bootstrap:
+        assert action not in result.actions_run, (
+            f"#908: {action.value} ran after bootstrap failure"
+        )
+
+    # Side-effect ledger: every concrete supervisor / tmux call that
+    # would have followed bootstrap must NOT have fired.
+    sup_method_names = [c[0] for c in sup.calls]
+    tmux_method_names = [c[0] for c in sup.tmux.calls]
+    assert "ensure_heartbeat_schedule" not in sup_method_names
+    assert "create_session" not in tmux_method_names
+    assert "set_window_option" not in tmux_method_names
+    assert "attach_session" not in tmux_method_names
+    assert "switch_client" not in tmux_method_names
+    assert "focus_console" not in sup_method_names
+    assert rail_daemon_calls == []
+
+
+def test_first_launch_all_actions_succeed_runs_full_plan() -> None:
+    """#908 regression guard — when no critical action fails, every
+    action in the plan must run as before. The short-circuit guard
+    must not affect the happy path."""
+    probe = _probe()
+    plan = plan_launch(probe)
+    assert plan.state is LaunchState.FIRST_LAUNCH
+
+    rail_daemon_calls: list[Path] = []
+    exe, sup = _executor(probe=probe, rail_daemon_calls=rail_daemon_calls)
+    result = exe.execute(plan)
+
+    assert result.exit_code in (None, 0)
+    # Every action in the plan ran.
+    for action in plan.actions:
+        assert action in result.actions_run, (
+            f"#908: {action.value} skipped on the happy path"
+        )
+    # And the canonical post-bootstrap side effects all fired.
+    sup_method_names = [c[0] for c in sup.calls]
+    tmux_method_names = [c[0] for c in sup.tmux.calls]
+    assert "bootstrap_tmux" in sup_method_names
+    assert "ensure_heartbeat_schedule" in sup_method_names
+    assert "create_session" in tmux_method_names
+    assert "attach_session" in tmux_method_names
+    assert rail_daemon_calls == [Path("/tmp/pollypm.toml")]
+
+
+def test_non_critical_attach_failure_does_not_skip_remaining_actions(
+    monkeypatch,
+) -> None:
+    """#908 — only *critical* actions short-circuit. A non-critical
+    action returning a non-zero exit code records the exit but does
+    not halt the plan.
+
+    Today the only actions that emit a non-zero exit are the
+    terminal attach/switch/focus actions, which sit at the end of
+    every plan, so they cannot strand later actions. This test
+    encodes that contract: forcing a non-critical action mid-plan to
+    fail must NOT short-circuit the executor (regression guard
+    against an over-broad halt rule)."""
+    probe = _probe()
+    plan = plan_launch(probe)
+    assert plan.state is LaunchState.FIRST_LAUNCH
+    assert LaunchAction.ENSURE_STORAGE_CLOSET in plan.actions
+    assert LaunchAction.SCHEDULE_HEARTBEAT in plan.actions
+
+    rail_daemon_calls: list[Path] = []
+    exe, sup = _executor(probe=probe, rail_daemon_calls=rail_daemon_calls)
+
+    # Force a non-critical action (SCHEDULE_HEARTBEAT) to report a
+    # non-zero exit. The fix must keep walking the plan: bootstrap
+    # already succeeded, so attach/daemon should still run.
+    def _heartbeat_fail(_self):
+        return (7, ["heartbeat scheduling failed"])
+
+    monkeypatch.setattr(
+        LaunchPlanExecutor,
+        "_on_schedule_heartbeat",
+        _heartbeat_fail,
+    )
+
+    result = exe.execute(plan)
+
+    # Non-critical exit propagates as the recorded exit_code …
+    assert result.exit_code == 7
+    # … but later actions still ran.
+    assert LaunchAction.START_RAIL_DAEMON in result.actions_run
+    assert LaunchAction.ATTACH_SESSION in result.actions_run
+    assert any(c[0] == "attach_session" for c in sup.tmux.calls)
+    assert rail_daemon_calls == [Path("/tmp/pollypm.toml")]
+
+
 # ---------------------------------------------------------------------------
 # ATTACH_EXISTING
 # ---------------------------------------------------------------------------

@@ -90,6 +90,26 @@ class ExecutionResult:
 # ---------------------------------------------------------------------------
 
 
+#: Actions that must succeed before later mutating actions in the
+#: same plan are allowed to run. ``#908`` audit: a failed bootstrap
+#: was still followed by ``ENSURE_MAIN_SESSION``, ``SCHEDULE_HEARTBEAT``,
+#: ``START_RAIL_DAEMON``, and the attach action — leaving the cockpit
+#: half-built. ``BOOTSTRAP_LAUNCHES`` and ``ENSURE_STORAGE_CLOSET``
+#: are the only critical actions today; the rest are either
+#: idempotent reconciliation no-ops (``ENSURE_CONSOLE_WINDOW``,
+#: ``ENSURE_MAIN_SESSION``), best-effort daemons
+#: (``START_RAIL_DAEMON``), informational respawns
+#: (``RESPAWN_SHELL``, ``RESPAWN_RAIL``), or terminal user-facing
+#: actions whose own non-zero exit code already short-circuits via
+#: the first-non-None capture below.
+_CRITICAL_LAUNCH_ACTIONS: frozenset[LaunchAction] = frozenset(
+    {
+        LaunchAction.BOOTSTRAP_LAUNCHES,
+        LaunchAction.ENSURE_STORAGE_CLOSET,
+    }
+)
+
+
 class LaunchPlanExecutor:
     """Translate a :class:`LaunchPlan` into supervisor calls.
 
@@ -97,8 +117,15 @@ class LaunchPlanExecutor:
     tuple in order; each dispatched handler may return an
     ``int`` exit code (terminal actions like ``ATTACH_SESSION``)
     or ``None`` (non-terminal actions). The first non-None exit
-    code becomes the executor's final result; subsequent
-    actions still run because the action list is declarative.
+    code becomes the executor's final result.
+
+    Failure short-circuit (#908): when a *critical* action — see
+    :data:`_CRITICAL_LAUNCH_ACTIONS` — returns a non-None exit code,
+    the executor halts immediately. Subsequent ``ensure_main_session``,
+    ``schedule_heartbeat``, ``start_rail_daemon``, and attach/switch/
+    focus actions are skipped so a failed first launch cannot leave
+    a partial cockpit running. Non-critical action failures still
+    record their exit code but do not stop the run.
     """
 
     def __init__(
@@ -159,6 +186,28 @@ class LaunchPlanExecutor:
             messages.extend(action_messages)
             if action_exit is not None and exit_code is None:
                 exit_code = action_exit
+            # #908: a failure in a critical action (bootstrap /
+            # storage closet) must halt the plan. Continuing would
+            # let create_session, heartbeat, the rail daemon, and
+            # attach/switch/focus run on top of a half-bootstrapped
+            # cockpit — exactly the partial-state failure the
+            # fail-closed launch contract forbids.
+            if (
+                action_exit is not None
+                and action_exit != 0
+                and action in _CRITICAL_LAUNCH_ACTIONS
+            ):
+                logger.warning(
+                    "launch executor: critical action %s failed "
+                    "(exit=%s) — halting plan",
+                    action.value,
+                    action_exit,
+                )
+                messages.append(
+                    f"halting launch after {action.value} failure "
+                    f"(exit={action_exit})"
+                )
+                break
 
         return ExecutionResult(
             actions_run=tuple(run),

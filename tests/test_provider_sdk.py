@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from pollypm.models import AccountConfig, ProviderKind, SessionConfig
@@ -74,6 +75,35 @@ def test_claude_provider_prefers_recorded_resume_session_id(tmp_path: Path) -> N
     marker = account.home / ".pollypm" / "session-markers" / "operator.resume"
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text("claude-session-123\n", encoding="utf-8")
+    # #935 — ``build_launch_command`` validates the marker by reading
+    # the transcript's first user message and confirming it references
+    # ``/control-prompts/<session_name>.md`` (the supervisor-written
+    # bootstrap). Seed a matching transcript so the resume path is
+    # taken; without it the adapter would unlink the marker as poisoned
+    # and fall through to a fresh launch (``resume_argv = None``).
+    bucket = (
+        account.home
+        / ".claude"
+        / "projects"
+        / str(session.cwd.resolve()).replace("/", "-")
+    )
+    bucket.mkdir(parents=True, exist_ok=True)
+    bootstrap = (
+        f"Read {tmp_path}/.pollypm/control-prompts/{session.name}.md, "
+        "adopt it as your operating instructions, and reply READY."
+    )
+    transcript_records = [
+        {
+            "type": "user",
+            "message": {"role": "user", "content": bootstrap},
+            "uuid": "msg-claude-session-123",
+            "sessionId": "claude-session-123",
+        },
+    ]
+    (bucket / "claude-session-123.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in transcript_records) + "\n",
+        encoding="utf-8",
+    )
 
     launch = adapter.build_launch_command(session, account)
 

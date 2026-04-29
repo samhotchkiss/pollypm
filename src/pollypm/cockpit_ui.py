@@ -148,6 +148,11 @@ _PROJECT_TASK_REF_RE = _re.compile(
 _ACTION_STEP_RE = _re.compile(
     r"^\s*(?:[-*]\s+|\d+\.\s+|\([a-zA-Z]\)\s+)(?P<step>.+\S)\s*$"
 )
+_PLAN_REVIEW_UNAVAILABLE_HINT_RE = _re.compile(
+    r"Press\s+v\s+to\s+open\s+the\s+explainer\s+\(unavailable\),\s*"
+    r"d\s+to\s+discuss\s+with\s+the\s+PM,\s*A\s+to\s+approve\.?",
+    _re.IGNORECASE,
+)
 
 
 def _md_to_rich(text: str) -> str:
@@ -4795,6 +4800,18 @@ def _render_heuristic_action_block(body: object) -> str | None:
     return "\n".join(lines)
 
 
+def _plan_review_message_body_for_display(body: object, meta: dict) -> str:
+    """Remove stale unavailable-explainer instructions from plan review text."""
+    text = str(body or "")
+    if meta.get("explainer_path"):
+        return text
+    return _PLAN_REVIEW_UNAVAILABLE_HINT_RE.sub(
+        "No visual explainer is available for this plan. "
+        "Press d to discuss with the PM or A to approve.",
+        text,
+    )
+
+
 def _render_inbox_triage_banner(item) -> str | None:
     bucket = _triage_bucket(item)
     label = _triage_label(item)
@@ -5297,8 +5314,9 @@ def _build_plan_review_primer(
         "a question\n"
         "\n"
         f"When {pronoun_subject} signs off (says 'approved' or equivalent): "
-        f"call `pm task approve {plan_task_id} --actor "
-        f"{'user' if person == 'Sam' else 'polly'}`\n"
+        f"record approval for plan task {plan_task_id} as "
+        f"{'user' if person == 'Sam' else 'polly'} through the plan-review "
+        "approval flow.\n"
         "Don't create backlog tasks yourself \u2014 emit_backlog fires "
         "after approval.\n"
         "This small-tasks / small-modules bias matters because it's much "
@@ -6402,6 +6420,16 @@ class PollyInboxApp(App[None]):
         if self.reply_input.has_focus:
             self.list_view.focus()
 
+    def _set_reply_mode_for_plan_review_message(self) -> None:
+        self._awaiting_rejection_task_id = None
+        self.reply_input.value = ""
+        self.reply_input.disabled = True
+        self.reply_input.placeholder = (
+            "Plan review — press d to discuss with the PM or A to approve"
+        )
+        if self.reply_input.has_focus:
+            self.list_view.focus()
+
     def _render_message_detail(self, item) -> None:
         from pollypm.tz import format_relative
 
@@ -6449,8 +6477,12 @@ class PollyInboxApp(App[None]):
             meta_bits.append(f"[#f0c45a]◆ {_escape(prio)}[/#f0c45a]")
         meta_bits.append(f"[dim #6b7a88]PM: {_escape(pm_label)}[/dim #6b7a88]")
         sections.append("  ·  ".join(meta_bits))
-        tags = [item.message_type or "notify", item.tier or "immediate"]
         labels = list(getattr(item, "labels", []) or [])
+        is_plan_review = "plan_review" in labels
+        plan_review_meta = (
+            _extract_plan_review_meta(labels) if is_plan_review else {}
+        )
+        tags = [item.message_type or "notify", item.tier or "immediate"]
         tags.extend(labels)
         sections.append(f"[dim]{_escape(' · '.join([tag for tag in tags if tag]))}[/dim]")
         triage_banner = _render_inbox_triage_banner(item)
@@ -6470,16 +6502,33 @@ class PollyInboxApp(App[None]):
             sections.append(prompt_block)
             sections.append("")
             sections.append("[dim]── details from Polly ──[/dim]")
+        body = item.description or "(no body)"
+        if is_plan_review:
+            body = _plan_review_message_body_for_display(body, plan_review_meta)
         sections.append("")
-        sections.append(_md_to_rich(_escape_body(item.description or "(no body)")))
+        sections.append(_md_to_rich(_escape_body(body)))
         self.detail.update("\n".join(sections))
         self._proposal_specs.pop(item.task_id, None)
-        self._plan_review_meta.pop(item.task_id, None)
-        self._plan_review_round_trip.pop(item.task_id, None)
+        if is_plan_review:
+            self._plan_review_meta[item.task_id] = plan_review_meta
+            # Store-backed plan-review notifications do not have a local
+            # reply thread to unlock; the message itself is the handoff.
+            self._plan_review_round_trip[item.task_id] = True
+        else:
+            self._plan_review_meta.pop(item.task_id, None)
+            self._plan_review_round_trip.pop(item.task_id, None)
         self._blocking_question_meta.pop(item.task_id, None)
         self._clear_rollup_items()
-        self._update_hint_for_message()
-        self._set_reply_mode_for_message()
+        if is_plan_review:
+            self._update_hint_for_plan_review(
+                fast_track=bool(plan_review_meta.get("fast_track")),
+                round_trip=True,
+                has_explainer=bool(plan_review_meta.get("explainer_path")),
+            )
+            self._set_reply_mode_for_plan_review_message()
+        else:
+            self._update_hint_for_message()
+            self._set_reply_mode_for_message()
         try:
             self.query_one("#inbox-detail-scroll", VerticalScroll).scroll_home(
                 animate=False,
@@ -7493,7 +7542,7 @@ class PollyInboxApp(App[None]):
             pass
 
     def _update_hint_for_plan_review(
-        self, *, fast_track: bool, round_trip: bool,
+        self, *, fast_track: bool, round_trip: bool, has_explainer: bool = True,
     ) -> None:
         """Render the plan-review hint bar based on state.
 
@@ -7501,12 +7550,15 @@ class PollyInboxApp(App[None]):
         from the first render. User-inbox items are gated until the
         thread has at least one exchange with the PM.
         """
-        if fast_track:
-            text = self._PLAN_REVIEW_HINT_FAST_TRACK
-        elif round_trip:
-            text = self._PLAN_REVIEW_HINT_OPEN
+        if fast_track or round_trip:
+            text = (
+                self._PLAN_REVIEW_HINT_FAST_TRACK
+                if fast_track else self._PLAN_REVIEW_HINT_OPEN
+            )
         else:
             text = self._PLAN_REVIEW_HINT_GATED
+        if not has_explainer:
+            text = text.replace("v open explainer · ", "")
         try:
             self.hint.update(text)
         except Exception:  # noqa: BLE001
@@ -7551,10 +7603,9 @@ class PollyInboxApp(App[None]):
         if task_id is None:
             return
         # Plan-review items (#297) reuse the capital-A keybinding for
-        # approve, but the action is different: we call
-        # ``pm task approve`` against the referenced plan_task, not the
-        # inbox item, and we don't create a follow-on task. Branch here
-        # before the proposal-only guard below.
+        # approve, but the action is different: we approve the referenced
+        # plan_task, not the inbox item, and we don't create a follow-on
+        # task. Branch here before the proposal-only guard below.
         if self._is_plan_review_selected():
             self._approve_plan_review()
             return
@@ -7738,6 +7789,19 @@ class PollyInboxApp(App[None]):
             return None, labels
         return task, labels
 
+    def _selected_plan_review_item(self):
+        """Return the selected inbox item when it carries plan_review."""
+        task_id = self._selected_task_id
+        if task_id is None:
+            return None, []
+        item = self._item_for_id(task_id)
+        if item is None:
+            return None, []
+        labels = list(getattr(item, "labels", []) or [])
+        if "plan_review" not in labels:
+            return None, labels
+        return item, labels
+
     def _is_plan_review_selected(self) -> bool:
         """Fast check for branching inside action handlers."""
         task_id = self._selected_task_id
@@ -7746,6 +7810,9 @@ class PollyInboxApp(App[None]):
         # Prefer the cached meta so we don't hit the DB for a keystroke
         # when the render path just populated it.
         if task_id in self._plan_review_meta:
+            return True
+        item, _labels = self._selected_plan_review_item()
+        if item is not None:
             return True
         task, _labels = self._selected_plan_review_task()
         return task is not None
@@ -7766,11 +7833,13 @@ class PollyInboxApp(App[None]):
         if meta is None:
             task, labels = self._selected_plan_review_task()
             if task is None:
-                self.notify(
-                    "Open explainer only applies to plan_review items.",
-                    severity="warning", timeout=2.0,
-                )
-                return
+                item, labels = self._selected_plan_review_item()
+                if item is None:
+                    self.notify(
+                        "Open explainer only applies to plan_review items.",
+                        severity="warning", timeout=2.0,
+                    )
+                    return
             meta = _extract_plan_review_meta(labels)
             self._plan_review_meta[task_id] = meta
         path = meta.get("explainer_path")
@@ -7801,7 +7870,7 @@ class PollyInboxApp(App[None]):
         subprocess.run([cmd, path], check=False)
 
     def _approve_plan_review(self) -> None:
-        """Call ``pm task approve`` against the plan_task, then archive.
+        """Approve the referenced plan_task, then archive the inbox row.
 
         Gating (user-inbox only): when ``fast_track`` is NOT set, the
         approve keybinding should have been hidden by the hint bar
@@ -7812,8 +7881,19 @@ class PollyInboxApp(App[None]):
         task_id = self._selected_task_id
         if task_id is None:
             return
+        item = self._item_for_id(task_id)
+        is_message_item = item is not None and not is_task_inbox_entry(item)
         task, labels = self._selected_plan_review_task()
         if task is None:
+            selected_item, labels = self._selected_plan_review_item()
+            if selected_item is None:
+                self.notify(
+                    "Approve only applies to plan_review items.",
+                    severity="warning", timeout=2.0,
+                )
+                return
+            item = selected_item
+        if task is None and item is None:
             self.notify(
                 "Approve only applies to plan_review items.",
                 severity="warning", timeout=2.0,
@@ -7831,7 +7911,11 @@ class PollyInboxApp(App[None]):
             return
         fast_track = bool(meta.get("fast_track", False))
         actor_name = "polly" if fast_track else "user"
-        if not fast_track and not self._plan_review_round_trip.get(task_id, False):
+        if (
+            not is_message_item
+            and not fast_track
+            and not self._plan_review_round_trip.get(task_id, False)
+        ):
             self.notify(
                 "Discuss the plan with your PM first (press d). "
                 "Approve unlocks after the first round-trip.",
@@ -7848,8 +7932,22 @@ class PollyInboxApp(App[None]):
                 severity="error",
             )
             return
+        first_shipped_created = False
         try:
             svc.approve(plan_task_id, actor_name, None)
+            first_shipped_created = bool(
+                getattr(svc, "last_first_shipped_created", False)
+            )
+            if is_message_item:
+                try:
+                    svc.add_context(
+                        plan_task_id,
+                        actor=actor_name,
+                        text=f"Plan approved via inbox message {task_id}",
+                        entry_type="plan_review_approved",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception as exc:  # noqa: BLE001
             self.notify(f"Approve failed: {exc}", severity="error")
             return
@@ -7858,26 +7956,38 @@ class PollyInboxApp(App[None]):
                 svc.close()
             except Exception:  # noqa: BLE001
                 pass
-        if getattr(svc, "last_first_shipped_created", False):
+        if first_shipped_created:
             _celebrate_first_shipped(self)
         # Archive the inbox row so it drops out of the list.
-        svc = self._svc_for_task(task_id)
-        if svc is not None:
+        if is_message_item and item is not None:
             try:
-                svc.add_context(
-                    task_id,
-                    actor=actor_name,
-                    text=f"Plan approved \u2192 {plan_task_id}",
-                    entry_type="plan_review_approved",
-                )
-                svc.archive_task(task_id, actor=actor_name)
+                from pollypm.store import SQLAlchemyStore
+
+                store = SQLAlchemyStore(f"sqlite:///{item.db_path}")
+                try:
+                    store.close_message(int(item.message_id))
+                finally:
+                    store.close()
             except Exception:  # noqa: BLE001
                 pass
-            finally:
+        else:
+            svc = self._svc_for_task(task_id)
+            if svc is not None:
                 try:
-                    svc.close()
+                    svc.add_context(
+                        task_id,
+                        actor=actor_name,
+                        text=f"Plan approved \u2192 {plan_task_id}",
+                        entry_type="plan_review_approved",
+                    )
+                    svc.archive_task(task_id, actor=actor_name)
                 except Exception:  # noqa: BLE001
                     pass
+                finally:
+                    try:
+                        svc.close()
+                    except Exception:  # noqa: BLE001
+                        pass
         self._emit_event(
             task_id, "inbox.plan_review.approved",
             f"{actor_name} approved plan {plan_task_id} via {task_id}",
@@ -7888,10 +7998,14 @@ class PollyInboxApp(App[None]):
         )
         self._tasks = [t for t in self._tasks if t.task_id != task_id]
         self._unread_ids.discard(task_id)
+        self._session_read_ids.discard(task_id)
+        self._replies_by_task.pop(task_id, None)
+        self._thread_expanded_task_ids.discard(task_id)
         self._plan_review_meta.pop(task_id, None)
         self._plan_review_round_trip.pop(task_id, None)
         if self._selected_task_id == task_id:
             self._selected_task_id = None
+            self._selected_row_key = None
         self._render_list(select_first=bool(self._tasks))
         self._restore_default_hint()
 
@@ -9638,7 +9752,7 @@ def _action_card_click_hint(action_items: list[dict]) -> str:
         return ""
     visible = action_items[:2]
     key_hint = (
-        "Use 1/2/3 for the buttons below"
+        "Use 1/2/3 for these actions"
         if len(visible) == 1
         else "Use 1-3 for the first card and 4-6 for the second"
     )

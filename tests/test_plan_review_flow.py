@@ -8,7 +8,7 @@ exposes a bespoke keybinding + hint-bar treatment for them:
 * ``v`` opens the HTML explainer (macOS ``open`` / linux ``xdg-open``).
 * ``d`` jumps to the PM with a richer primer (co-refinement brief
   instead of the generic ``re: inbox/N ...`` line).
-* ``A`` approves the referenced plan_task via ``pm task approve`` —
+* ``A`` approves the referenced plan_task through the work service —
   gated by a user/PM round-trip when the item lands in Sam's inbox,
   ungated for fast-tracked items that land in Polly's inbox.
 * No ``X`` path — disagreement happens via the ``d`` conversation.
@@ -22,10 +22,10 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any
 
 import pytest
 
+from pollypm.store import SQLAlchemyStore
 from pollypm.work.sqlite_service import SQLiteWorkService
 
 
@@ -128,6 +128,40 @@ def _seed_plan_task(project_path: Path) -> str:
         svc.close()
 
 
+def _seed_plan_review_message(
+    project_path: Path,
+    *,
+    plan_task_id: str,
+    body: str | None = None,
+    explainer_path: str | None = None,
+) -> str:
+    """Create a Store-backed plan_review notification row."""
+    db_path = project_path / ".pollypm" / "state.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    labels = ["plan_review", "project:demo", f"plan_task:{plan_task_id}"]
+    if explainer_path:
+        labels.append(f"explainer:{explainer_path}")
+    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    try:
+        message_id = store.enqueue_message(
+            type="notify",
+            tier="immediate",
+            recipient="user",
+            sender="architect",
+            subject="Plan ready for review: demo",
+            body=body or (
+                "Plan: docs/project-plan.md\n\n"
+                "Press v to open the explainer (unavailable), "
+                "d to discuss with the PM, A to approve."
+            ),
+            scope="demo",
+            labels=labels,
+        )
+    finally:
+        store.close()
+    return f"msg:demo:{message_id}"
+
+
 @pytest.fixture
 def plan_review_env(tmp_path: Path):
     project_path = tmp_path / "demo"
@@ -152,6 +186,26 @@ def plan_review_env(tmp_path: Path):
         "plan_task_id": plan_task_id,
         "plan_review_id": plan_review_id,
         "explainer_path": explainer,
+    }
+
+
+@pytest.fixture
+def plan_review_message_env(tmp_path: Path):
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    (project_path / ".git").mkdir()
+    config_path = tmp_path / "pollypm.toml"
+    _write_minimal_config(project_path, config_path)
+    plan_task_id = _seed_plan_task(project_path)
+    message_id = _seed_plan_review_message(
+        project_path,
+        plan_task_id=plan_task_id,
+    )
+    return {
+        "config_path": config_path,
+        "project_path": project_path,
+        "plan_task_id": plan_task_id,
+        "message_id": message_id,
     }
 
 
@@ -277,7 +331,8 @@ class TestPlanReviewPrimer:
         assert "/abs/reports/plan-review.html" in primer
         assert "Co-refine the plan with Sam" in primer
         assert "smallest reasonable tasks" in primer
-        assert "pm task approve demo/7 --actor user" in primer
+        assert "record approval for plan task demo/7 as user" in primer
+        assert "pm task approve" not in primer
 
     def test_primer_swaps_to_polly_when_fast_tracked(self) -> None:
         from pollypm.cockpit_ui import _build_plan_review_primer
@@ -290,8 +345,8 @@ class TestPlanReviewPrimer:
         )
         assert "plan review for project: demo" in primer
         assert "Co-refine the plan with Polly" in primer
-        # Fast-track approval is recorded as --actor polly.
-        assert "pm task approve demo/7 --actor polly" in primer
+        assert "record approval for plan task demo/7 as polly" in primer
+        assert "pm task approve" not in primer
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +360,14 @@ def inbox_app(plan_review_env):
         pytest.skip("minimal pollypm.toml fixture not supported by loader")
     from pollypm.cockpit_ui import PollyInboxApp
     return PollyInboxApp(plan_review_env["config_path"])
+
+
+@pytest.fixture
+def plan_review_message_app(plan_review_message_env):
+    if not _load_config_compatible(plan_review_message_env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_ui import PollyInboxApp
+    return PollyInboxApp(plan_review_message_env["config_path"])
 
 
 @pytest.fixture
@@ -487,6 +550,80 @@ def test_fast_track_plan_review_lands_in_polly_inbox_and_approve_is_open(
     _run(body())
 
 
+def test_plan_review_message_uses_plan_review_controls(
+    plan_review_message_env, plan_review_message_app,
+) -> None:
+    """Store-backed plan_review notifications should not render read-only."""
+    async def body() -> None:
+        async with plan_review_message_app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            task_id = plan_review_message_env["message_id"]
+            plan_review_message_app._selected_task_id = task_id
+            plan_review_message_app._render_detail(task_id)
+            await pilot.pause()
+
+            detail_text = str(plan_review_message_app.detail.render())
+            hint_text = str(plan_review_message_app.hint.render())
+
+            assert "Press v to open the explainer (unavailable)" not in detail_text
+            assert "No visual explainer is available for this plan" in detail_text
+            assert "v open explainer" not in hint_text
+            assert "d discuss" in hint_text
+            assert "A approve" in hint_text
+            assert "Notifications are read-only" not in (
+                plan_review_message_app.reply_input.placeholder or ""
+            )
+            assert "press d to discuss" in (
+                plan_review_message_app.reply_input.placeholder or ""
+            )
+
+    _run(body())
+
+
+def test_plan_review_message_approve_archives_notification(
+    plan_review_message_env, plan_review_message_app,
+) -> None:
+    """A on a Store-backed plan_review approves the plan task and closes it."""
+    async def body() -> None:
+        captured: list[tuple[str, str]] = []
+        from pollypm.work.sqlite_service import SQLiteWorkService as _S
+
+        def _fake_approve(self, task_id, actor, reason=None):
+            captured.append((task_id, actor))
+            return self.get(task_id)
+
+        original_approve = _S.approve
+        _S.approve = _fake_approve  # type: ignore[assignment]
+        try:
+            async with plan_review_message_app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                task_id = plan_review_message_env["message_id"]
+                plan_review_message_app._selected_task_id = task_id
+                plan_review_message_app._render_detail(task_id)
+                await pilot.press("A")
+                await pilot.pause()
+
+                assert captured == [
+                    (plan_review_message_env["plan_task_id"], "user"),
+                ]
+                assert all(
+                    item.task_id != task_id for item in plan_review_message_app._tasks
+                )
+        finally:
+            _S.approve = original_approve  # type: ignore[assignment]
+
+        db_path = plan_review_message_env["project_path"] / ".pollypm" / "state.db"
+        store = SQLAlchemyStore(f"sqlite:///{db_path}")
+        try:
+            assert store.query_messages(state="open") == []
+            closed = store.query_messages(state="closed")
+        finally:
+            store.close()
+        assert len(closed) == 1
+
+    _run(body())
+
+
 def test_v_key_opens_explainer_with_path(
     plan_review_env, inbox_app,
 ) -> None:
@@ -560,9 +697,10 @@ def test_d_key_on_plan_review_injects_primer_not_generic_line(
                     plan_review_env["explainer_path"] in context_line
                 )
                 assert (
-                    f"pm task approve {plan_review_env['plan_task_id']}"
-                    in context_line
+                    "record approval for plan task "
+                    f"{plan_review_env['plan_task_id']}" in context_line
                 )
+                assert "pm task approve" not in context_line
         finally:
             PollyInboxApp._perform_pm_dispatch = original  # type: ignore[assignment]
     _run(body())

@@ -19,8 +19,14 @@ from pollypm.errors import (
     format_task_not_found_error,
     render_cli_error,
 )
+from pollypm.work.db_resolver import resolve_work_db_path as _resolve_db_path
 from pollypm.work.models import ArtifactKind, OutputType
 from pollypm.work.readiness import format_readiness_warnings, readiness_warnings
+from pollypm.work.service_support import (
+    TaskNotFoundError,
+    ValidationError,
+    WorkServiceError,
+)
 
 _TASK_APP_HELP = help_with_examples(
     "Manage work tasks.",
@@ -39,11 +45,6 @@ _TASK_APP_HELP = help_with_examples(
         "Run `pm help worker` for the full worker guide with --output payload "
         "templates and common failure modes."
     ),
-)
-from pollypm.work.service_support import (
-    TaskNotFoundError,
-    ValidationError,
-    WorkServiceError,
 )
 
 if TYPE_CHECKING:
@@ -157,13 +158,6 @@ def _run(fn, *args, **kwargs):
     except WorkServiceError as exc:
         typer.echo(_render_work_service_error(exc, fn), err=True)
         raise typer.Exit(code=1) from exc
-
-
-# #804: the resolver lives in ``pollypm.work.db_resolver`` so callers
-# outside the CLI (notably ``supervisor_alerts``) don't have to reach
-# into ``_resolve_db_path``. Keep the underscored alias for callers
-# inside this module that still use the old name.
-from pollypm.work.db_resolver import resolve_work_db_path as _resolve_db_path
 
 
 def _project_from_task_id(task_id: str) -> str | None:
@@ -1400,6 +1394,68 @@ def task_context(
         }, indent=2))
     else:
         typer.echo(f"Added context to {task_id}")
+
+
+@task_app.command("backfill-review-summaries")
+def task_backfill_review_summaries(
+    task_id: Optional[str] = typer.Argument(
+        None,
+        help="Optional task ID (project/number). Omit to scan a project or DB.",
+    ),
+    project: Optional[str] = _PROJECT_OPTION,
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Write a new generated summary even when one already exists.",
+    ),
+    limit: Optional[int] = typer.Option(
+        None,
+        "--limit",
+        min=1,
+        help="Maximum number of summaries to generate.",
+    ),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Generate missing LLM-written plain summaries for review tasks."""
+
+    from pollypm.task_review_summary import backfill_review_plain_summaries
+
+    resolved_project = _project_from_task_id(task_id) if task_id else project
+    svc = _svc(db, project=resolved_project)
+    results = backfill_review_plain_summaries(
+        svc,
+        project=None if task_id else project,
+        task_id=task_id,
+        force=force,
+        limit=limit,
+    )
+    payload = [
+        {
+            "task_id": result.task_id,
+            "status": result.status,
+            "outcome": result.outcome,
+            "message": result.message,
+        }
+        for result in results
+    ]
+    if output_json:
+        typer.echo(json.dumps(payload, indent=2))
+        return
+
+    counts: dict[str, int] = {}
+    for result in results:
+        counts[result.outcome] = counts.get(result.outcome, 0) + 1
+    typer.echo(
+        "Review summaries: "
+        f"generated={counts.get('generated', 0)} "
+        f"skipped={counts.get('skipped', 0)} "
+        f"failed={counts.get('failed', 0)}"
+    )
+    for result in results:
+        if result.outcome in {"generated", "failed"}:
+            detail = f" — {result.message}" if result.message else ""
+            typer.echo(f"{result.outcome}: {result.task_id}{detail}")
 
 
 @task_app.command("status")

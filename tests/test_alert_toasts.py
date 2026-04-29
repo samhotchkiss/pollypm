@@ -260,18 +260,20 @@ def test_dedup_same_alert_id_no_double_toast(inbox_env, inbox_app) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 4. Stacking cap — 3 max; a 4th evicts the oldest
+# 4. Stacking cap — only the newest toast remains visible
 # ---------------------------------------------------------------------------
 
 
-def test_stack_caps_at_three_fourth_evicts_oldest(inbox_env, inbox_app) -> None:
+def test_stack_caps_at_one_newest_evicts_old_toasts(inbox_env, inbox_app) -> None:
     async def body() -> None:
         async with inbox_app.run_test(size=(160, 50)) as pilot:
             await pilot.pause()
             notifier = inbox_app._alert_notifier
             assert notifier is not None
 
-            # Feed three alerts, confirm three live toasts.
+            # Feed three alerts; only the newest remains visible. The
+            # alert list keeps the backlog, but the screen never stacks
+            # toast cards off the bottom edge.
             _install_fake_alerts(notifier, [
                 _FakeAlert(alert_id=1, message="one"),
                 _FakeAlert(alert_id=2, message="two"),
@@ -279,11 +281,10 @@ def test_stack_caps_at_three_fourth_evicts_oldest(inbox_env, inbox_app) -> None:
             ])
             notifier.poll_now()
             await pilot.pause()
-            assert len(notifier.visible_toasts) == 3
-            oldest = notifier.visible_toasts[0]
-            assert "one" in str(oldest.render())
+            assert len(notifier.visible_toasts) == 1
+            assert "three" in str(notifier.visible_toasts[0].render())
 
-            # Fourth alert — oldest evicts.
+            # Fourth alert — previous newest evicts.
             notifier._fetch_alerts = lambda: [
                 _FakeAlert(alert_id=1, message="one"),
                 _FakeAlert(alert_id=2, message="two"),
@@ -293,9 +294,8 @@ def test_stack_caps_at_three_fourth_evicts_oldest(inbox_env, inbox_app) -> None:
             notifier.poll_now()
             await pilot.pause()
             live = notifier.visible_toasts
-            assert len(live) == 3
-            assert all("one" not in str(t.render()) for t in live)
-            assert any("four" in str(t.render()) for t in live)
+            assert len(live) == 1
+            assert "four" in str(live[0].render())
     _run(body())
 
 
@@ -310,6 +310,7 @@ def test_severity_styling_differs_warn_vs_error(inbox_env, inbox_app) -> None:
             await pilot.pause()
             notifier = inbox_app._alert_notifier
             assert notifier is not None
+            notifier.max_visible = 2
 
             _install_fake_alerts(notifier, [
                 _FakeAlert(alert_id=1, severity="warn", message="capacity low"),
@@ -474,6 +475,32 @@ def test_narrow_toast_preserves_trailing_action_hint() -> None:
     assert "Open the project" in body
     assert "pm " not in body
     assert "press [b]a[/b]" in body
+
+
+def test_toast_rewrites_legacy_cli_recovery_hint() -> None:
+    """Persisted pre-fix alerts may still contain ``Try: pm ...`` tails.
+
+    The toast layer must translate those into cockpit actions instead
+    of telling the user to run CLI commands.
+    """
+    from pollypm.cockpit_alerts import AlertToast
+
+    toast = AlertToast(
+        alert_id=1,
+        severity="warn",
+        message=(
+            "[Alert] Task wordgame/1 was routed to the reviewer role but no "
+            "matching session is running. Try: pm task approve wordgame/1 "
+            "--actor reviewer --reason '...' (or pm worker-start --role "
+            "reviewer wordgame to spin up a reviewer)"
+        ),
+    )
+    body = toast._render_body()
+
+    assert "no matching session is running" in body
+    assert "Open Tasks or Inbox and use Approve or Reject." in body
+    assert "pm task approve" not in body
+    assert "pm worker-start" not in body
 
 
 def test_toast_truncation_advertises_press_a_for_full_text() -> None:

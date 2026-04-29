@@ -13,6 +13,7 @@ Contract:
 
 from __future__ import annotations
 
+import enum
 from pathlib import Path
 import re
 
@@ -116,9 +117,6 @@ def is_operational_alert(alert_type: str) -> bool:
 # noise. Encode the policy explicitly so every alert-emitting site
 # can reason about what tier it belongs to.
 
-import enum
-
-
 class AlertChannel(enum.Enum):
     """Where an alert is delivered.
 
@@ -184,6 +182,11 @@ _TRAILING_COMMAND_RE = re.compile(
     r"\b(?:try|run):\s*`?([^`]+?)`?\s*$",
     re.IGNORECASE,
 )
+_CLI_ACTION_TAIL_RE = re.compile(
+    r"\b(?:try|run|then):\s*`?pm\b.*$",
+    re.IGNORECASE,
+)
+_PM_COMMAND_RE = re.compile(r"`?pm\s+[^`.;\n)]*`?", re.IGNORECASE)
 
 
 def _alert_toast_icon(severity: str) -> str:
@@ -204,7 +207,46 @@ def _sanitize_alert_message(message: str) -> str:
     """Strip terminal control sequences and collapse whitespace."""
     text = _ANSI_ESCAPE_RE.sub("", message or "")
     text = "".join(ch for ch in text if ch >= " " or ch in "\n\t")
-    return " ".join(text.split())
+    text = " ".join(text.split())
+    return _rewrite_cli_alert_hint(text)
+
+
+def _rewrite_cli_alert_hint(text: str) -> str:
+    """Keep legacy CLI remediation text out of user-facing alert toasts."""
+
+    if "pm " not in text.lower():
+        return text
+    hint = _cockpit_hint_for_cli_alert(text)
+    rewritten = _CLI_ACTION_TAIL_RE.sub("", text).strip(" .:-—")
+    rewritten = _PM_COMMAND_RE.sub("", rewritten)
+    rewritten = " ".join(rewritten.split()).strip(" .:-—")
+    if hint and hint.lower() not in rewritten.lower():
+        if rewritten:
+            rewritten = f"{rewritten}. {hint}"
+        else:
+            rewritten = hint
+    return rewritten or "Open the relevant cockpit view to continue."
+
+
+def _cockpit_hint_for_cli_alert(text: str) -> str:
+    lower = text.lower()
+    if (
+        "approve" in lower
+        or "reject" in lower
+        or "reviewer" in lower
+        or "review" in lower
+    ):
+        return "Open Tasks or Inbox and use Approve or Reject."
+    if "worker-start" in lower or "architect" in lower:
+        return "Open Workers to start or recover the session."
+    if "task claim" in lower or "worker" in lower:
+        return (
+            "Open Tasks; Polly will claim work when capacity is available, "
+            "or use Workers to start capacity."
+        )
+    if "project plan" in lower or "plan" in lower:
+        return "Open the project and use the planning action."
+    return "Open the relevant cockpit view to continue."
 
 
 class _AlertLikeRecord:
@@ -420,7 +462,10 @@ class AlertNotifier:
     """Background poller that mounts :class:`AlertToast` widgets on an app."""
 
     POLL_INTERVAL_SECONDS = 5.0
-    MAX_VISIBLE = 3
+    # Toasts are interruptions, not a backlog view. Keep one visible and
+    # route the backlog to Metrics/Alerts so stacked cards cannot clip off
+    # the bottom of laptop-height terminals.
+    MAX_VISIBLE = 1
     # Soft cap on the dedup set. When ``_seen_alert_ids`` exceeds this
     # we trim it back to only the keys for currently-open alerts —
     # closed alerts can never re-fire under the same id (each new

@@ -1233,6 +1233,7 @@ def test_task_app_surfaces_unread_rejection_feedback(env, monkeypatch) -> None:
     fake_svc = _FakeSvc(
         tasks_factory=lambda: [work_task, feedback_task],
         flow=_flow(),
+        context_by_id={("demo/1", None): work_task.context},
     )
 
     monkeypatch.setattr("pollypm.cockpit_tasks.create_tmux_client", lambda: _FakeTmux([]))
@@ -1254,8 +1255,8 @@ def test_task_app_surfaces_unread_rejection_feedback(env, monkeypatch) -> None:
             assert "in_progress" in header
             assert "Unread rejection feedback in inbox" in header
             assert overview.index("In plain English") < overview.index("Status")
-            assert "Review needed: the last submission was rejected" in overview
-            assert "Feedback: Need better rollback coverage." in overview
+            assert "This task has unread reviewer feedback in the inbox." in overview
+            assert "The current owner may still be reworking it." in overview
             assert "Inbox Feedback" in overview
             assert "Artifact   Unread rejection feedback (demo/99)" in overview
             assert "Need better rollback coverage." in overview
@@ -1331,6 +1332,21 @@ def test_task_app_leads_on_hold_feedback_with_paused_review_summary(
             ),
         ],
     )
+    work_task.context = [
+        ContextEntry(
+            actor="review_summary",
+            timestamp=datetime(2026, 4, 20, 17, 20, tzinfo=UTC),
+            text=(
+                "You're being asked to approve two deviations from the original plan.\n"
+                "1. Browser requirement: strike browser use from v1 because the "
+                "current path meets the goal without it.\n"
+                "2. Eventbrite: move it to v2 so v1 can get to testing.\n"
+                "Approve if those tradeoffs are acceptable for this version; "
+                "reject if either requirement still needs to be met now."
+            ),
+            entry_type="plain_summary",
+        )
+    ]
     feedback_task = _task(
         task_number=99,
         node_id="chat",
@@ -1344,6 +1360,7 @@ def test_task_app_leads_on_hold_feedback_with_paused_review_summary(
     fake_svc = _FakeSvc(
         tasks_factory=lambda: [work_task, feedback_task],
         flow=_flow(),
+        context_by_id={("demo/1", None): work_task.context},
     )
 
     monkeypatch.setattr("pollypm.cockpit_tasks.create_tmux_client", lambda: _FakeTmux([]))
@@ -1357,15 +1374,11 @@ def test_task_app_leads_on_hold_feedback_with_paused_review_summary(
             overview = str(app.query_one("#task-detail", Static).render())
 
             assert overview.index("In plain English") < overview.index("Status")
-            assert "Review needed: this task is paused" in overview
             assert (
-                'You are deciding whether to approve the latest submission '
-                'for "Scraper infrastructure".'
+                "You're being asked to approve two deviations from the original plan."
             ) in overview
-            assert "Previously rejected for:" in overview
-            assert "needs_real_browser not demonstrated via CLI" in overview
-            assert "eventbrite_embed strategy not implemented" in overview
-            assert "What to approve: approve only if the latest submission fixes" in overview
+            assert "Browser requirement: strike browser use from v1" in overview
+            assert "Eventbrite: move it to v2 so v1 can get to testing" in overview
             assert "Confidence: 6/10" in overview
 
     _run(body())

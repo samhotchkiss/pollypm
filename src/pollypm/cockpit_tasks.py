@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import difflib
-import re
 import subprocess
 import tomllib
 from dataclasses import dataclass
@@ -61,6 +60,7 @@ from pollypm.rejection_feedback import (
     unread_rejection_feedback,
 )
 from pollypm.session_services import create_tmux_client
+from pollypm.task_review_summary import PLAIN_SUMMARY_ENTRY_TYPE, REVIEW_SUMMARY_ACTOR
 from pollypm.tz import format_time as _fmt_time
 
 _TASK_STATUS_ORDER = {
@@ -503,13 +503,37 @@ def _plain_english_summary(task) -> str | None:
     of every view of the task: cockpit overview, inbox, pm task get.
     Returns None when no summary has been stored.
     """
-    entries = getattr(task, "context", None) or []
-    for entry in entries:
-        if getattr(entry, "entry_type", "") == "plain_summary":
-            text = getattr(entry, "text", "") or ""
-            if text.strip():
-                return text.strip()
+    status = _task_status_value(task)
+    candidates = []
+    for index, entry in enumerate(getattr(task, "context", None) or []):
+        if getattr(entry, "entry_type", "") != PLAIN_SUMMARY_ENTRY_TYPE:
+            continue
+        if (
+            getattr(entry, "actor", "") == REVIEW_SUMMARY_ACTOR
+            and status not in {"review", "on_hold"}
+        ):
+            continue
+        text = getattr(entry, "text", "") or ""
+        if text.strip():
+            candidates.append((getattr(entry, "timestamp", None), index, text.strip()))
+    candidates.sort(key=lambda item: (_summary_timestamp_key(item[0]), item[1]), reverse=True)
+    if candidates:
+        return candidates[0][2]
     return None
+
+
+def _summary_timestamp_key(value: object | None) -> float:
+    if value is None:
+        return 0.0
+    try:
+        if hasattr(value, "timestamp"):
+            return float(value.timestamp())
+        parsed = datetime.fromisoformat(str(value))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 def _plain_line(value: object) -> str:
@@ -529,46 +553,6 @@ def _clip_plain_text(text: str, *, limit: int = 220) -> str:
     return clean[:cut].rstrip() + "…"
 
 
-def _decision_value(value: object) -> str:
-    return str(getattr(value, "value", value) or "").strip().lower()
-
-
-def _latest_rejection_reason(task) -> str:
-    for execution in reversed(list(getattr(task, "executions", None) or [])):
-        if _decision_value(getattr(execution, "decision", None)) != "rejected":
-            continue
-        reason = str(getattr(execution, "decision_reason", "") or "").strip()
-        if reason:
-            return reason
-    for transition in reversed(list(getattr(task, "transitions", None) or [])):
-        actor = str(getattr(transition, "actor", "") or "").strip().lower()
-        reason = str(getattr(transition, "reason", "") or "").strip()
-        if actor in {"reviewer", "russell"} and reason:
-            return reason
-    return ""
-
-
-def _rejection_reason_items(text: str, *, limit: int = 3) -> list[str]:
-    """Extract numbered rejection blockers from reviewer feedback."""
-    items: list[str] = []
-    current: list[str] = []
-    for raw_line in (text or "").splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        match = re.match(r"^\d+[.)]\s+(.*)", line)
-        if match:
-            if current:
-                items.append(_clip_plain_text(" ".join(current), limit=260))
-            current = [match.group(1).strip()]
-            continue
-        if current:
-            current.append(line)
-    if current:
-        items.append(_clip_plain_text(" ".join(current), limit=260))
-    return items[:limit]
-
-
 def _review_plain_english_fallback(
     task,
     *,
@@ -584,36 +568,19 @@ def _review_plain_english_fallback(
     and any linked rejection-feedback artifact.
     """
     if rejection_feedback is not None:
-        preview = _clip_plain_text(rejection_feedback.preview, limit=220)
-        full_feedback = (
-            _latest_rejection_reason(task)
-            or getattr(rejection_feedback, "full_text", "")
-            or rejection_feedback.preview
+        if status_label not in {"review", "user-review", "on_hold"}:
+            return (
+                "This task has unread reviewer feedback in the inbox.\n"
+                "The current owner may still be reworking it. Use the Inbox "
+                "Feedback section below for context."
+            )
+        return (
+            "Review needed: the plain-English approval summary has not been "
+            "generated yet.\n"
+            "Use the Review tab and Inbox Feedback below to decide whether "
+            "the current submission matches what you want. Approve only if it "
+            "does; otherwise reject with the specific change needed."
         )
-        blockers = _rejection_reason_items(full_feedback)
-        approving = (
-            f'You are deciding whether to approve the latest submission for "{task.title}".'
-        )
-        reason = (
-            "this task is paused because the last submission was rejected"
-            if status_label == "on_hold"
-            else "the last submission was rejected and needs your attention"
-        )
-        lines = [
-            f"Review needed: {reason}.",
-            approving,
-        ]
-        if blockers:
-            lines.append("Previously rejected for:")
-            lines.extend(f"- {item}" for item in blockers)
-        elif preview:
-            lines.append(f"Feedback: {preview}")
-        lines.append(
-            "What to approve: approve only if the latest submission fixes "
-            "the listed review blockers and still satisfies the task; "
-            "otherwise reject with the specific missing proof or change."
-        )
-        return "\n".join(lines)
 
     if status_label == "user-review":
         if getattr(task, "flow_template_id", "") == "plan_project":

@@ -1550,7 +1550,6 @@ def test_inbox_section_keeps_press_i_hint_when_inbox_has_spillover(
     that's the case where the user needs to know there's more to
     find. Suppressing it then would hide work."""
     db_path = dashboard_env["project_path"] / ".pollypm" / "state.db"
-    in_progress_id = dashboard_env["task_ids"]["in_progress"]
     store = SQLAlchemyStore(f"sqlite:///{db_path}")
     try:
         # Three distinct action-needed notifications. The dashboard
@@ -1924,12 +1923,12 @@ def test_action_card_click_hint_collapses_per_item_duplication() -> None:
     # Single task-backed card: precise singular.
     assert _action_card_click_hint(
         [{"primary_ref": "polly_remote/12"}]
-    ) == "Use 1/2/3 for the buttons below, or click this card to open the source task."
+    ) == "Use 1/2/3 for these actions, or click this card to open the source task."
 
     # Single thread-backed card.
     assert _action_card_click_hint(
         [{"primary_ref": "blocker-summary:42"}]
-    ) == "Use 1/2/3 for the buttons below, or click this card to open the inbox thread."
+    ) == "Use 1/2/3 for these actions, or click this card to open the inbox thread."
 
     # Two task-backed cards: pluralise.
     assert _action_card_click_hint(

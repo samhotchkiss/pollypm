@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 from pollypm.review_notify import notify_requires_review_hold
+from pollypm.task_review_summary import store_review_plain_summary
 from pollypm.work.gates import evaluate_gates, has_hard_failure
 from pollypm.work.models import (
     ActorType,
@@ -71,6 +72,18 @@ class WorkTransitionManager:
         except Exception:
             self.service._conn.rollback()
             raise
+
+    def _write_review_summary_after_transition(self, task: Task) -> None:
+        if task.work_status not in {WorkStatus.REVIEW, WorkStatus.ON_HOLD}:
+            return
+        try:
+            store_review_plain_summary(self.service, task.task_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "review plain summary generation skipped for %s: %s",
+                task.task_id,
+                exc,
+            )
 
     def _finish(
         self,
@@ -757,6 +770,7 @@ class WorkTransitionManager:
             task_id,
             task.work_status.value,
             new_status=WorkStatus.ON_HOLD.value,
+            after_reload=self._write_review_summary_after_transition,
         )
 
     def resume(self, task_id: str, actor: str) -> Task:
@@ -809,6 +823,7 @@ class WorkTransitionManager:
             task_id,
             WorkStatus.ON_HOLD.value,
             new_status=target_status.value,
+            after_reload=self._write_review_summary_after_transition,
         )
 
     def node_done(
@@ -913,6 +928,7 @@ class WorkTransitionManager:
         )
 
         def _before_sync(result: Task) -> None:
+            self._write_review_summary_after_transition(result)
             if result.work_status == WorkStatus.DONE:
                 self.service._check_auto_unblock(task_id)
                 if self.service._session_mgr is not None:

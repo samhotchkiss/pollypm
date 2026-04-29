@@ -151,6 +151,60 @@ def test_codex_provider_exposes_transcript_sources_and_usage_snapshot(tmp_path: 
     assert adapter.build_resume_command(session, account) is not None
 
 
+def test_codex_provider_drives_status_for_new_pane_format(tmp_path: Path) -> None:
+    """Regression for #957.
+
+    Codex 0.125+ no longer prints ``% left`` on the welcome screen — usage
+    is gated behind the ``/status`` slash command. The adapter must
+    drive ``/status`` and parse the resulting ``5h limit`` /
+    ``Weekly limit`` block; otherwise every probe lands with
+    ``usage unavailable`` and the cockpit panel goes blank.
+    """
+    adapter = CodexAdapter()
+    account = AccountConfig(
+        name="codex_primary",
+        provider=ProviderKind.CODEX,
+        home=tmp_path / "home",
+    )
+    session = SessionConfig(
+        name="operator",
+        role="operator-pm",
+        provider=ProviderKind.CODEX,
+        account="codex_primary",
+        cwd=tmp_path,
+        project="pollypm",
+    )
+    welcome_pane = (
+        "OpenAI Codex (v0.125.0)\n"
+        "model: gpt-5.5\n"
+        "› Implement {feature}\n"
+    )
+    status_pane = (
+        "OpenAI Codex (v0.125.0)\n"
+        "/status\n"
+        "  5h limit:    [################----] 80% left (resets 08:59)\n"
+        "  Weekly limit: [###############-----] 75% left "
+        "(resets 10:09 on 5 May)\n"
+        "› Implement {feature}\n"
+    )
+    tmux = _FakeTmux([welcome_pane, status_pane])
+
+    snapshot = adapter.collect_usage_snapshot(
+        tmux, "session:0", account=account, session=session,
+    )
+
+    sent = [text for _target, text, _enter in tmux.sent]
+    assert "/status" in sent, "adapter must drive /status to surface usage"
+    # Weekly bucket is the headline number (matches Claude's weekly summary).
+    assert snapshot.health == "healthy"
+    assert snapshot.used_pct == 25
+    assert snapshot.remaining_pct == 75
+    assert snapshot.period_label == "current week"
+    assert "75% left this week" in (snapshot.summary or "")
+    assert "5h: 80% left" in (snapshot.summary or "")
+    assert snapshot.reset_at == "10:09 on 5 May"
+
+
 def test_codex_provider_uses_cli_prompt_for_fresh_launch(tmp_path: Path) -> None:
     adapter = CodexAdapter()
     account = AccountConfig(

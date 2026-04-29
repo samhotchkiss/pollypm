@@ -7,7 +7,7 @@ from typing import Any
 
 from pollypm.plugin_api.v1 import Capability, JobHandlerAPI, PollyPMPlugin, RosterAPI
 
-from .maintenance import (
+from pollypm.plugins_builtin.core_recurring.maintenance import (
     AUDIT_EVENT_SUBJECTS,
     HIGH_VOLUME_EVENT_SUBJECTS,
     OPERATIONAL_EVENT_SUBJECTS,
@@ -20,7 +20,7 @@ from .maintenance import (
     notification_staging_prune_handler,
     transcript_ingest_handler,
 )
-from .shared import (  # noqa: F401  (re-exported for migration test)
+from pollypm.plugins_builtin.core_recurring.shared import (  # noqa: F401
     _close_msg_store,
     _ephemeral_alert_type,
     _load_config_and_store,
@@ -29,7 +29,7 @@ from .shared import (  # noqa: F401  (re-exported for migration test)
     is_ephemeral_session_name,
     sweep_ephemeral_sessions,
 )
-from .sweeps import (
+from pollypm.plugins_builtin.core_recurring.sweeps import (
     pane_text_classify_handler,
     work_progress_sweep_handler,
     worktree_state_audit_handler,

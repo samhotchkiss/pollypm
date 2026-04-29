@@ -150,6 +150,32 @@ class TestCoreRecurringPlugin:
             "ephemeral_session_dead:"
         )
 
+    def test_plugin_loads_through_extension_host(self, tmp_path: Path) -> None:
+        """Regression for #957.
+
+        ``ExtensionHost`` loads each plugin module via
+        ``importlib.util.spec_from_file_location`` with a synthetic name —
+        which has no parent package, so any ``from .x import y`` inside the
+        plugin entry-point module silently fails to load. When that happens
+        the plugin is dropped from the registry (the error stays on
+        ``host.errors`` but is otherwise non-fatal), and the recurring
+        handlers it owned — including ``account.usage_refresh`` — never run,
+        leaving the cockpit's account-usage panel blank.
+
+        Pin the loader path so reintroducing a relative import in
+        ``core_recurring/plugin.py`` fails this test instead of degrading
+        the cockpit silently.
+        """
+        from pollypm.plugin_host import ExtensionHost
+
+        host = ExtensionHost(tmp_path)
+        plugins = host.plugins()
+        assert "core_recurring" in plugins, host.errors
+        roster = host.build_roster()
+        handler_names = {entry.handler_name for entry in roster.entries}
+        assert "account.usage_refresh" in handler_names
+        assert "capacity.probe" in handler_names
+
 
 def _interval_seconds(entry) -> int:
     """Extract the EverySchedule interval in seconds from a roster entry."""

@@ -101,6 +101,7 @@ class CodexAdapter(ProviderAdapterBase):
     ) -> ProviderUsageSnapshot:
         deadline = time.monotonic() + 20
         text = ""
+        sent_status = False
         while time.monotonic() < deadline:
             text = tmux.capture_pane(target, lines=320)
             lowered = text.lower()
@@ -108,16 +109,75 @@ class CodexAdapter(ProviderAdapterBase):
                 tmux.send_keys(target, "", press_enter=True)
                 time.sleep(1)
                 continue
-            if "openai codex" in lowered and ("›" in lowered or "% left" in lowered):
-                return self._parse_usage_text(text)
+            # Codex 0.125+ surfaces usage only via the /status slash command.
+            # Wait until the prompt is up (›) then drive /status, give it a
+            # beat to render, and parse the response.
+            if "openai codex" in lowered and "›" in lowered:
+                if "% left" in lowered:
+                    return self._parse_usage_text(text)
+                if not sent_status:
+                    tmux.send_keys(target, "/status", press_enter=True)
+                    sent_status = True
+                    time.sleep(3)
+                    continue
             time.sleep(1)
         return self._parse_usage_text(text)
 
     def _parse_usage_text(self, text: str) -> ProviderUsageSnapshot:
-        match = re.search(r"(\d+)% left", text, re.IGNORECASE)
-        if not match:
+        # Codex /status surfaces multiple buckets — typically a 5h limit and a
+        # weekly limit, plus per-model variants. Prefer the weekly bucket as
+        # the headline number (matches the Claude weekly summary), fall back
+        # to the first "% left" found if the labels shift.
+        # Box-drawing decorations (│) and forced wraps mean the "(resets …)"
+        # line can sit one row below the "% left" line; allow up to ~80
+        # filler characters between them.
+        weekly = re.search(
+            r"weekly limit:\s*\[[^\]]*\]\s*(\d+)% left"
+            r"(?:[\s\S]{0,160}?\(?\s*resets ([^)\n]+?)\s*\)?\s*$|"
+            r"[\s\S]{0,160}?resets ([^\n)]+))?",
+            text,
+            re.IGNORECASE | re.MULTILINE,
+        )
+        five_hour = re.search(
+            r"5h limit:\s*\[[^\]]*\]\s*(\d+)% left"
+            r"(?:[\s\S]{0,160}?\(?\s*resets ([^)\n]+?)\s*\)?\s*$|"
+            r"[\s\S]{0,160}?resets ([^\n)]+))?",
+            text,
+            re.IGNORECASE | re.MULTILINE,
+        )
+        generic = re.search(r"(\d+)% left", text, re.IGNORECASE)
+
+        def _reset_for(match: "re.Match[str] | None") -> str | None:
+            if match is None:
+                return None
+            for group in (match.group(2), match.group(3)):
+                if group:
+                    cleaned = re.sub(r"[│┃┆┊╎\s]+", " ", group).strip()
+                    if cleaned:
+                        return cleaned
+            return None
+
+        if weekly is not None:
+            left = int(weekly.group(1))
+            reset_at = _reset_for(weekly)
+            period_label = "current week"
+            summary_extra = ""
+            if five_hour is not None:
+                summary_extra = f" · 5h: {int(five_hour.group(1))}% left"
+            summary = f"{left}% left this week{summary_extra}"
+        elif five_hour is not None:
+            left = int(five_hour.group(1))
+            reset_at = _reset_for(five_hour)
+            period_label = "current 5h window"
+            summary = f"{left}% left in 5h window"
+        elif generic is not None:
+            left = int(generic.group(1))
+            reset_at = None
+            period_label = "current period"
+            summary = f"{left}% left"
+        else:
             return ProviderUsageSnapshot(raw_text=text)
-        left = int(match.group(1))
+
         if left <= 5:
             health = "exhausted"
         elif left <= 20:
@@ -126,11 +186,12 @@ class CodexAdapter(ProviderAdapterBase):
             health = "healthy"
         return ProviderUsageSnapshot(
             health=health,
-            summary=f"{left}% left",
+            summary=summary,
             raw_text=text,
             used_pct=max(0, 100 - left),
             remaining_pct=left,
-            period_label="current period",
+            reset_at=reset_at,
+            period_label=period_label,
         )
 
 

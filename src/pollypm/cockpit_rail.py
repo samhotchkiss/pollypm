@@ -872,6 +872,44 @@ class CockpitRouter:
             self._state_cache_mtime_ns = None
         self._state_dirty_since = None
 
+    _LAYOUT_MUTATION_TOKEN = "_layout_mutation_token"
+    _LAYOUT_MUTATION_UNTIL = "_layout_mutating_until"
+    _LAYOUT_MUTATION_TTL_SECONDS = 30.0
+
+    def _begin_layout_mutation(self) -> str:
+        token = f"{os.getpid()}:{time.monotonic_ns()}"
+        self._active_layout_mutation_token = token
+        state = self._load_state()
+        state[self._LAYOUT_MUTATION_TOKEN] = token
+        state[self._LAYOUT_MUTATION_UNTIL] = time.time() + self._LAYOUT_MUTATION_TTL_SECONDS
+        self._write_state(state)
+        return token
+
+    def _end_layout_mutation(self, token: str) -> None:
+        try:
+            state = self._load_state()
+            if state.get(self._LAYOUT_MUTATION_TOKEN) == token:
+                state.pop(self._LAYOUT_MUTATION_TOKEN, None)
+                state.pop(self._LAYOUT_MUTATION_UNTIL, None)
+                self._write_state(state)
+        finally:
+            if getattr(self, "_active_layout_mutation_token", None) == token:
+                self._active_layout_mutation_token = None
+
+    def _layout_mutation_active_elsewhere(self) -> bool:
+        state = self._load_state()
+        token = state.get(self._LAYOUT_MUTATION_TOKEN)
+        if not isinstance(token, str) or not token:
+            return False
+        if token == getattr(self, "_active_layout_mutation_token", None):
+            return False
+        until = state.get(self._LAYOUT_MUTATION_UNTIL)
+        try:
+            deadline = float(until)
+        except (TypeError, ValueError):
+            return False
+        return deadline > time.time()
+
     def rail_width(self) -> int:
         """Return the persisted rail width, falling back to the default."""
         data = self._load_state()
@@ -914,6 +952,8 @@ class CockpitRouter:
         Returns the list of panes fetched (or the list passed in) so
         callers can avoid re-issuing ``list_panes`` — see #175.
         """
+        if self._layout_mutation_active_elsewhere():
+            return panes if panes is not None else []
         state = self._load_state()
         dirty = False
         if target is None:
@@ -1778,15 +1818,12 @@ class CockpitRouter:
                 seen[window.name] = window.index
 
     def ensure_cockpit_layout(self) -> None:
+        if self._layout_mutation_active_elsewhere():
+            return
         config = self._load_config()
         target = f"{config.project.tmux_session}:{self._COCKPIT_WINDOW}"
-        # Single list-panes baseline shared with ``_validate_state``. See
-        # #175: subsequent list-panes calls only run after a mutation that
-        # invalidates the cached view (split/kill); pure swaps preserve
-        # pane IDs so we update order locally.
         panes = self._safe_list_panes(target)
         self._validate_state(panes=panes, target=target)
-        # Clean up duplicate windows in the storage closet before layout setup
         try:
             supervisor = self._load_supervisor()
             self._cleanup_duplicate_windows(supervisor.storage_closet_session_name())
@@ -1835,8 +1872,23 @@ class CockpitRouter:
             self._write_state(state)
             panes = self.tmux.list_panes(target)  # split added a pane
         elif len(panes) > 2:
-            for pane in panes:
-                if pane.pane_id == panes[0].pane_id:
+            ordered = sorted(panes, key=self._pane_left)
+            left_pane = ordered[0]
+            preferred_right = None
+            if isinstance(right_pane_id, str):
+                preferred_right = next(
+                    (
+                        pane for pane in ordered
+                        if pane.pane_id == right_pane_id
+                        and not getattr(pane, "pane_dead", False)
+                    ),
+                    None,
+                )
+            if preferred_right is None or preferred_right.pane_id == left_pane.pane_id:
+                preferred_right = ordered[-1]
+            keep_ids = {left_pane.pane_id, preferred_right.pane_id}
+            for pane in ordered:
+                if pane.pane_id in keep_ids:
                     continue
                 try:
                     self.tmux.kill_pane(pane.pane_id)
@@ -1896,6 +1948,55 @@ class CockpitRouter:
         except Exception:  # noqa: BLE001
             pass
         return None
+
+    def _join_storage_pane_into_cockpit(
+        self,
+        *,
+        source: str,
+        source_pane_id: str | None,
+        left_pane_id: str,
+        previous_right_pane_id: str | None,
+        window_target: str,
+    ):
+        """Join a storage pane without exposing a one-pane cockpit layout.
+
+        The old sequence killed the static right pane first, then joined the
+        live pane. A concurrent rail layout tick could observe that one-pane
+        gap and split a fresh static dashboard, which then raced the live
+        join. Join first, then remove stale panes while keeping the known
+        source pane.
+        """
+        self.tmux.join_pane(source, left_pane_id, horizontal=True)
+        if (
+            previous_right_pane_id is not None
+            and previous_right_pane_id != source_pane_id
+        ):
+            try:
+                self.tmux.kill_pane(previous_right_pane_id)
+            except Exception:  # noqa: BLE001
+                pass
+        panes = self.tmux.list_panes(window_target)
+        if source_pane_id is not None:
+            keep = {left_pane_id, source_pane_id}
+            for pane in panes:
+                pane_id = getattr(pane, "pane_id", None)
+                if pane_id is None or pane_id in keep:
+                    continue
+                try:
+                    self.tmux.kill_pane(pane_id)
+                except Exception:  # noqa: BLE001
+                    pass
+            panes = self.tmux.list_panes(window_target)
+            right_pane = next(
+                (
+                    pane for pane in panes
+                    if getattr(pane, "pane_id", None) == source_pane_id
+                ),
+                None,
+            )
+            if right_pane is not None:
+                return right_pane
+        return max(panes, key=self._pane_left)
 
     def _normalize_layout(self, target: str, panes) -> None:
         if len(panes) != 2:
@@ -1999,14 +2100,22 @@ class CockpitRouter:
                     self._cleanup_extra_panes(window_target)
                     left_pane = self._left_pane_id(window_target)
                     right_pane_id = self._right_pane_id(window_target)
-                    if right_pane_id is not None:
-                        self.tmux.kill_pane(right_pane_id)
-                    source = f"{storage}:{target_win.index}.0"
-                    self.tmux.join_pane(source, left_pane, horizontal=True)
+                    source_pane_id = getattr(target_win, "pane_id", None)
+                    source = (
+                        source_pane_id
+                        if isinstance(source_pane_id, str) and source_pane_id
+                        else f"{storage}:{target_win.index}.0"
+                    )
+                    right_p = self._join_storage_pane_into_cockpit(
+                        source=source,
+                        source_pane_id=source_pane_id,
+                        left_pane_id=left_pane,
+                        previous_right_pane_id=right_pane_id,
+                        window_target=window_target,
+                    )
                     panes = self.tmux.list_panes(window_target)
                     left_p = min(panes, key=self._pane_left)
                     self._try_resize_rail(left_p.pane_id)
-                    right_p = max(panes, key=self._pane_left)
                     self.tmux.set_pane_history_limit(right_p.pane_id, 200)
                     state = self._load_state()
                     state["mounted_session"] = window_name
@@ -2218,16 +2327,20 @@ class CockpitRouter:
         self._write_state(state)
 
     def route_selected(self, key: str) -> None:
-        supervisor = self._load_supervisor()
-        window_target = f"{supervisor.config.project.tmux_session}:{self._COCKPIT_WINDOW}"
-        self.ensure_cockpit_layout()
-        right_pane = self._right_pane_id(window_target)
-        if right_pane is None:
-            raise RuntimeError("Cockpit right pane is not available.")
+        token = self._begin_layout_mutation()
+        try:
+            supervisor = self._load_supervisor()
+            window_target = f"{supervisor.config.project.tmux_session}:{self._COCKPIT_WINDOW}"
+            self.ensure_cockpit_layout()
+            right_pane = self._right_pane_id(window_target)
+            if right_pane is None:
+                raise RuntimeError("Cockpit right pane is not available.")
 
-        self.set_selected_key(key)
-        plan = resolve_cockpit_content(key, self._content_context(supervisor))
-        self._route_content_plan(supervisor, window_target, plan)
+            self.set_selected_key(key)
+            plan = resolve_cockpit_content(key, self._content_context(supervisor))
+            self._route_content_plan(supervisor, window_target, plan)
+        finally:
+            self._end_layout_mutation(token)
 
     def focus_right_pane(self) -> None:
         config = self._load_config()
@@ -2502,8 +2615,6 @@ class CockpitRouter:
                     supervisor.launch_session(session_name)
                     storage_windows = {w.name for w in self.tmux.list_windows(storage_session)}
                     if launch.window_name in storage_windows:
-                        if right_pane_id is not None:
-                            self.tmux.kill_pane(right_pane_id)
                         # Look up the freshly-spawned window's index so
                         # the persisted identity records the
                         # disambiguating index, not just the name.
@@ -2512,7 +2623,16 @@ class CockpitRouter:
                             (w for w in live_windows if w.name == launch.window_name),
                             None,
                         )
-                        source = f"{storage_session}:{launch.window_name}.0"
+                        source_pane_id = (
+                            getattr(target_window_for_identity, "pane_id", None)
+                            if target_window_for_identity is not None
+                            else None
+                        )
+                        source = (
+                            source_pane_id
+                            if isinstance(source_pane_id, str) and source_pane_id
+                            else f"{storage_session}:{launch.window_name}.0"
+                        )
                         # #934 follow-up — fifth-layer rail-mount guard.
                         # If the source pane already shows another role's
                         # canonical banner (e.g. a long-running rail
@@ -2529,11 +2649,16 @@ class CockpitRouter:
                                 "shows another role's banner — refusing "
                                 "to join into cockpit."
                             )
-                        self.tmux.join_pane(source, left_pane_id, horizontal=True)
+                        right_pane = self._join_storage_pane_into_cockpit(
+                            source=source,
+                            source_pane_id=source_pane_id,
+                            left_pane_id=left_pane_id,
+                            previous_right_pane_id=right_pane_id,
+                            window_target=window_target,
+                        )
                         panes = self.tmux.list_panes(window_target)
                         left_pane = min(panes, key=self._pane_left)
                         self._try_resize_rail(left_pane.pane_id)
-                        right_pane = max(panes, key=self._pane_left)
                         self.tmux.set_pane_history_limit(right_pane.pane_id, 200)
                         state = self._load_state()
                         state["mounted_session"] = session_name
@@ -2584,7 +2709,12 @@ class CockpitRouter:
             fallback_target = launch.session.project if fallback_kind == "project" else None
             self._show_static_view(supervisor, window_target, fallback_kind, fallback_target)
             return
-        source = f"{storage_session}:{target_window.index}.0"
+        source_pane_id = getattr(target_window, "pane_id", None)
+        source = (
+            source_pane_id
+            if isinstance(source_pane_id, str) and source_pane_id
+            else f"{storage_session}:{target_window.index}.0"
+        )
         # #934 follow-up — fifth-layer rail-mount guard. Even after the
         # supervisor's four crossing guards, a stale storage-closet pane
         # can carry another role's banner (e.g. an old rail-daemon
@@ -2599,13 +2729,16 @@ class CockpitRouter:
             fallback_target = launch.session.project if fallback_kind == "project" else None
             self._show_static_view(supervisor, window_target, fallback_kind, fallback_target)
             return
-        if right_pane_id is not None:
-            self.tmux.kill_pane(right_pane_id)
-        self.tmux.join_pane(source, left_pane_id, horizontal=True)
+        right_pane = self._join_storage_pane_into_cockpit(
+            source=source,
+            source_pane_id=source_pane_id,
+            left_pane_id=left_pane_id,
+            previous_right_pane_id=right_pane_id,
+            window_target=window_target,
+        )
         panes = self.tmux.list_panes(window_target)
         left_pane = min(panes, key=self._pane_left)
         self._try_resize_rail(left_pane.pane_id)
-        right_pane = max(panes, key=self._pane_left)
         self.tmux.set_pane_history_limit(right_pane.pane_id, 200)
         state = self._load_state()
         # Persist both the legacy bare-string ``mounted_session`` (for

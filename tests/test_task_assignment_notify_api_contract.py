@@ -60,6 +60,11 @@ _PUBLIC_SURFACE: tuple[tuple[str, object, str], ...] = (
         resolver,
         "clear_alerts_for_cancelled_task",
     ),
+    (
+        "clear_no_session_alert_for_task",
+        resolver,
+        "clear_no_session_alert_for_task",
+    ),
     ("auto_claim_enabled_for_project", sweep, "_auto_claim_enabled_for_project"),
     ("build_event_for_task", sweep, "_build_event_for_task"),
     ("close_quietly", sweep, "_close_quietly"),

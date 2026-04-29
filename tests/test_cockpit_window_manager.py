@@ -271,6 +271,20 @@ def test_classifies_left_right_and_rail_before_repair() -> None:
     assert manager.validate_postcondition().errors == ("rail pane is not leftmost", "content pane is not rightmost")
 
 
+def test_classifies_left_pane_as_rail_when_shell_wrapper_hides_command() -> None:
+    tmux = FakeTmux()
+    window = tmux.add_window("pollypm", "PollyPM", [("bash", 0), ("pm", 100)])
+    manager = _manager(tmux)
+
+    classification = manager.classify_panes()
+
+    assert classification.left_pane == window.panes[0]
+    assert classification.right_pane == window.panes[1]
+    assert classification.rail_pane == window.panes[0]
+    assert classification.content_pane == window.panes[1]
+    assert manager.validate_postcondition().errors == ()
+
+
 def test_ensure_layout_swaps_rail_left_and_validates_postcondition() -> None:
     tmux = FakeTmux()
     window = tmux.add_window("pollypm", "PollyPM", [("bash", 0), ("uv", 100)])
@@ -284,6 +298,25 @@ def test_ensure_layout_swaps_rail_left_and_validates_postcondition() -> None:
     assert f"swap_rail_left:{old_right_id}->{old_left_id}" in result.actions
     assert result.state.right_pane_id == old_left_id
     assert manager.classify_panes().rail_pane.pane_id == old_right_id
+
+
+def test_show_static_does_not_respawn_live_shell_wrapped_rail() -> None:
+    tmux = FakeTmux()
+    window = tmux.add_window("pollypm", "PollyPM", [("bash", 0), ("pm", 100)])
+    left_id = window.panes[0].pane_id
+    right_id = window.panes[1].pane_id
+    manager = _manager(tmux)
+
+    result = manager.show_static(
+        "pm cockpit-pane settings",
+        CockpitWindowState(right_pane_id=right_id),
+    )
+
+    assert result.ok
+    assert result.left_pane_id == left_id
+    assert result.right_pane_id == right_id
+    assert ("respawn_pane", (left_id, "uv run pm rail")) not in tmux.calls
+    assert ("respawn_pane", (right_id, "pm cockpit-pane settings")) in tmux.calls
 
 
 def test_ensure_layout_repairs_missing_content_by_splitting() -> None:
@@ -314,6 +347,30 @@ def test_ensure_layout_repairs_missing_rail_by_respawning_single_pane_then_split
 
     assert result.ok
     assert f"respawn_missing_rail:{original_id}" in result.actions
+    assert any(action.startswith("split_content:%") for action in result.actions)
+    assert result.state.mounted_session is None
+
+
+def test_ensure_layout_keeps_single_shell_wrapped_rail_after_parking_live_pane() -> None:
+    tmux = FakeTmux()
+    window = tmux.add_window("pollypm", "PollyPM", [("bash", 0, 180, False)])
+    left_id = window.panes[0].pane_id
+    manager = _manager(tmux)
+
+    result = manager.ensure_layout(
+        CockpitWindowState(
+            right_pane_id="%old-right",
+            mounted_session="worker_demo",
+            mounted_window_name="worker-demo",
+        )
+    )
+
+    assert result.ok
+    assert f"assume_shell_wrapped_rail:{left_id}" in result.actions
+    assert not any(
+        call == ("respawn_pane", (left_id, "uv run pm rail"))
+        for call in tmux.calls
+    )
     assert any(action.startswith("split_content:%") for action in result.actions)
     assert result.state.mounted_session is None
 

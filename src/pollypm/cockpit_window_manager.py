@@ -223,6 +223,13 @@ class CockpitWindowManager:
         left = live[0] if live else None
         right = live[-1] if live else None
         rail = next((pane for pane in live if self._is_rail_pane(pane)), None)
+        if rail is None and len(live) >= 2:
+            # Real cockpit rail panes may report ``bash`` or ``python`` while
+            # the TUI is running through a shell wrapper. In a normal two-pane
+            # cockpit, position is the stronger signal: left is rail, right is
+            # content. Command matching is only used when it identifies the
+            # rail somewhere else and we need to swap it back left.
+            rail = left
         content: Any | None = None
         if rail is not None:
             content = next((pane for pane in reversed(live) if pane is not rail), None)
@@ -535,6 +542,14 @@ class CockpitWindowManager:
         if self._is_rail_pane(pane):
             return state
         pane_id = _pane_id(pane)
+        if pane_id is not None and pane_id != state.right_pane_id:
+            # After parking a live right pane back to storage, tmux leaves
+            # only the shell-wrapped rail pane in the cockpit window. Its
+            # foreground command may report as ``bash``/``zsh`` rather than
+            # ``uv``. If this lone pane is not the persisted right pane, keep
+            # it as rail and let the caller split a fresh content pane.
+            actions.append(f"assume_shell_wrapped_rail:{pane_id}")
+            return state.cleared_mount().with_right(None)
         if pane_id is not None and self.spec.rail_command is not None:
             self.tmux.respawn_pane(pane_id, self.spec.rail_command)
             actions.append(f"respawn_missing_rail:{pane_id}")

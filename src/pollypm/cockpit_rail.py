@@ -39,9 +39,19 @@ from pollypm.cockpit_rail_routes import (
     LiveSessionRoute,
     ProjectRoute,
     StaticViewRoute,
-    resolve_live_session_route,
-    resolve_project_route,
-    resolve_static_view_route,
+)
+from pollypm.cockpit_content import (
+    CockpitContentContext,
+    ErrorPane,
+    FallbackPane,
+    LiveAgentPane,
+    TextualCommandPane,
+    resolve_cockpit_content,
+)
+from pollypm.cockpit_window_manager import (
+    CockpitWindowManager,
+    CockpitWindowSpec,
+    CockpitWindowState,
 )
 from pollypm.cockpit_project_state import (
     ProjectRailState,
@@ -1244,9 +1254,13 @@ class CockpitRouter:
 
         project_session_map: dict[str, str] = {}
         for launch in launches:
-            if launch.session.role in CONTROL_ROLES:
+            role = getattr(launch.session, "role", "")
+            if role in CONTROL_ROLES:
                 continue
-            project_session_map.setdefault(launch.session.project, launch.session.name)
+            project = getattr(launch.session, "project", None)
+            name = getattr(launch.session, "name", None)
+            if project and name:
+                project_session_map.setdefault(project, name)
         return project_session_map
 
     def _decorate_project_items(
@@ -2051,6 +2065,158 @@ class CockpitRouter:
         except Exception:  # noqa: BLE001
             return None
 
+    def _content_context(self, supervisor) -> CockpitContentContext:
+        """Return data-only facts for the pure right-pane content resolver."""
+        try:
+            launches = supervisor.plan_launches()
+        except Exception:  # noqa: BLE001
+            launches = []
+        try:
+            projects = supervisor.config.projects
+        except Exception:  # noqa: BLE001
+            projects = None
+        return CockpitContentContext.from_projects(
+            projects,
+            project_sessions=self._project_session_map(launches),
+        )
+
+    def _route_content_plan(self, supervisor, window_target: str, plan) -> None:
+        """Materialize a pure content plan using the legacy pane applicators.
+
+        This is the first integration step for the modular cockpit
+        architecture: route decisions now come from ``cockpit_content`` while
+        the still-existing tmux applicators keep live behavior stable.
+        """
+        if isinstance(plan, FallbackPane):
+            self.set_selected_key(plan.selected_key)
+            self._route_content_plan(supervisor, window_target, plan.fallback)
+            return
+
+        if isinstance(plan, TextualCommandPane):
+            self.set_selected_key(plan.selected_key)
+            if plan.task_id is None:
+                self._show_static_view(
+                    supervisor,
+                    window_target,
+                    plan.pane_kind,
+                    plan.project_key,
+                )
+                return
+            self._show_static_view(
+                supervisor,
+                window_target,
+                plan.pane_kind,
+                plan.project_key,
+                task_id=plan.task_id,
+            )
+            return
+
+        if isinstance(plan, LiveAgentPane):
+            self.set_selected_key(plan.selected_key)
+            self._route_live_agent_plan(supervisor, window_target, plan)
+            return
+
+        if isinstance(plan, ErrorPane):
+            self.set_selected_key(plan.selected_key)
+            self._show_message_view(supervisor, window_target, plan.title, plan.message)
+            return
+
+        raise RuntimeError(f"Unsupported cockpit content plan: {plan!r}")
+
+    def _route_live_agent_plan(
+        self,
+        supervisor,
+        window_target: str,
+        plan: LiveAgentPane,
+    ) -> None:
+        fallback_kind = plan.fallback.pane_kind if plan.fallback is not None else "polly"
+        if plan.session_name in {"operator", "reviewer"}:
+            self._route_live_session(
+                supervisor,
+                window_target,
+                LiveSessionRoute(
+                    session_name=plan.session_name,
+                    fallback_kind=fallback_kind,
+                ),
+            )
+            return
+
+        if not self._session_available_for_mount(
+            supervisor,
+            plan.session_name,
+            window_target,
+        ):
+            try:
+                supervisor.launch_session(plan.session_name)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            self._show_live_session(supervisor, plan.session_name, window_target)
+        except Exception:  # noqa: BLE001
+            if plan.fallback is not None:
+                self._route_content_plan(supervisor, window_target, plan.fallback)
+            return
+        if plan.project_key:
+            self._maybe_prime_project_pm_session(
+                supervisor,
+                plan.project_key,
+                plan.session_name,
+                window_target,
+            )
+
+    def _window_manager(self, supervisor) -> CockpitWindowManager:
+        config = getattr(supervisor, "config", None) or self._load_config()
+        tmux_session = config.project.tmux_session
+        try:
+            rail_command = supervisor.console_command()
+        except Exception:  # noqa: BLE001
+            rail_command = None
+        return CockpitWindowManager(
+            CockpitWindowSpec(
+                tmux_session=tmux_session,
+                cockpit_window=self._COCKPIT_WINDOW,
+                rail_width=self.rail_width(),
+                default_content_command=self._right_pane_command("polly"),
+                rail_command=rail_command,
+            ),
+            self.tmux,
+        )
+
+    def _window_state_from_cockpit_state(
+        self,
+        supervisor,
+        state: dict[str, object] | None = None,
+    ) -> CockpitWindowState:
+        state = state or self._load_state()
+        right_pane_id = state.get("right_pane_id")
+        mounted_session = state.get("mounted_session")
+        mounted_window_name = None
+        if isinstance(mounted_session, str) and mounted_session:
+            mounted_window_name = self._mounted_window_name(supervisor, mounted_session)
+        return CockpitWindowState(
+            right_pane_id=right_pane_id if isinstance(right_pane_id, str) else None,
+            mounted_session=mounted_session if isinstance(mounted_session, str) else None,
+            mounted_window_name=mounted_window_name,
+        )
+
+    def _write_window_state(
+        self,
+        window_state: CockpitWindowState,
+        *,
+        base: dict[str, object] | None = None,
+    ) -> None:
+        state = dict(base or self._load_state())
+        if window_state.right_pane_id:
+            state["right_pane_id"] = window_state.right_pane_id
+        else:
+            state.pop("right_pane_id", None)
+        if window_state.mounted_session:
+            state["mounted_session"] = window_state.mounted_session
+        else:
+            state.pop("mounted_session", None)
+            state.pop("mounted_identity", None)
+        self._write_state(state)
+
     def route_selected(self, key: str) -> None:
         supervisor = self._load_supervisor()
         window_target = f"{supervisor.config.project.tmux_session}:{self._COCKPIT_WINDOW}"
@@ -2060,19 +2226,8 @@ class CockpitRouter:
             raise RuntimeError("Cockpit right pane is not available.")
 
         self.set_selected_key(key)
-        live_route = resolve_live_session_route(key)
-        if live_route is not None:
-            self._route_live_session(supervisor, window_target, live_route)
-            return
-        static_route = resolve_static_view_route(key)
-        if static_route is not None:
-            self._route_static_view(supervisor, window_target, static_route)
-            return
-        project_route = resolve_project_route(key)
-        if project_route is not None:
-            self._route_project_selection(supervisor, window_target, project_route)
-            return
-        raise RuntimeError(f"Unknown cockpit item: {key}")
+        plan = resolve_cockpit_content(key, self._content_context(supervisor))
+        self._route_content_plan(supervisor, window_target, plan)
 
     def focus_right_pane(self) -> None:
         config = self._load_config()
@@ -2711,30 +2866,45 @@ class CockpitRouter:
         project_key: str | None = None,
         task_id: str | None = None,
     ) -> None:
+        self._show_command_view(
+            supervisor,
+            window_target,
+            self._right_pane_command(kind, project_key, task_id=task_id),
+        )
+
+    def _show_message_view(
+        self,
+        supervisor,
+        window_target: str,
+        title: str,
+        message: str,
+    ) -> None:
+        body = f"{title}\n\n{message}\n\nSelect another rail item to continue."
+        script = f"printf '%s\\n' {shlex.quote(body)}; while IFS= read -r _; do :; done"
+        self._show_command_view(
+            supervisor,
+            window_target,
+            f"sh -lc {shlex.quote(script)}",
+        )
+
+    def _show_command_view(
+        self,
+        supervisor,
+        window_target: str,
+        command: str,
+    ) -> None:
         self._park_mounted_session(supervisor, window_target)
-        self._cleanup_extra_panes(window_target)
-        left_pane_id = self._left_pane_id(window_target)
-        if left_pane_id is None:
-            raise RuntimeError("Cockpit left pane is not available.")
-        right_pane_id = self._right_pane_id(window_target)
-        if right_pane_id is None:
-            right_pane_id = self.tmux.split_window(
-                left_pane_id,
-                self._right_pane_command(kind, project_key, task_id=task_id),
-                horizontal=True,
-                detached=True,
-                size=self._right_pane_size(window_target),
-            )
-        else:
-            self.tmux.respawn_pane(
-                right_pane_id,
-                self._right_pane_command(kind, project_key, task_id=task_id),
-            )
         state = self._load_state()
-        state.pop("mounted_session", None)
-        state.pop("mounted_identity", None)
-        state["right_pane_id"] = self._right_pane_id(window_target)
-        self._write_state(state)
+        result = self._window_manager(supervisor).show_static(
+            command,
+            self._window_state_from_cockpit_state(supervisor, state),
+        )
+        if not result.ok:
+            raise RuntimeError(
+                "Cockpit pane layout is invalid after static route: "
+                + "; ".join(result.postcondition.errors)
+            )
+        self._write_window_state(result.state, base=state)
 
     def _cleanup_extra_panes(self, window_target: str) -> None:
         """Kill any extra panes beyond the expected 2 (rail + right)."""

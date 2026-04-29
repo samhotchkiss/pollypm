@@ -34,6 +34,40 @@ def _enforce_migration_gate(config_path: Path) -> None:
     _migrations.require_no_pending_or_exit(config.project.state_db)
 
 
+def _warn_on_plugin_load_errors(config_path: Path) -> None:
+    """Emit a stderr WARNING at cockpit boot if any plugin failed to load.
+
+    Closes #960: ``ExtensionHost`` previously recorded plugin load
+    failures on ``host.errors`` but no surface read them, so a broken
+    plugin (e.g. the ``core_recurring`` relative-import bug from #957)
+    silently dropped from the registry — taking its scheduled jobs with
+    it — while the operator saw nothing. Now the cockpit prints a
+    visible warning at startup so the breakage is immediately
+    discoverable. The "broken plugin doesn't crash the cockpit"
+    contract is preserved — this is informational only.
+    """
+    try:
+        from pollypm.service_api import collect_plugin_load_errors
+        errors = collect_plugin_load_errors(config_path)
+    except Exception:  # noqa: BLE001
+        return
+    if not errors:
+        return
+    plugin_names = sorted({entry.get("plugin") or "<host>" for entry in errors})
+    summary = ", ".join(plugin_names)
+    count = len(errors)
+    word = "plugin" if count == 1 else "plugins"
+    typer.echo(
+        f"WARNING: {count} {word} failed to load: {summary}",
+        err=True,
+    )
+    for entry in errors:
+        plugin_name = entry.get("plugin") or "<host>"
+        message = entry.get("message") or ""
+        typer.echo(f"  - {plugin_name}: {message}", err=True)
+    typer.echo("  Run `pm status` for the full list.", err=True)
+
+
 def register_ui_commands(app: typer.Typer) -> None:
     @app.command(help="Launch the standalone Accounts management TUI.")
     def accounts_ui(
@@ -62,6 +96,7 @@ def register_ui_commands(app: typer.Typer) -> None:
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     ) -> None:
         _enforce_migration_gate(config_path)
+        _warn_on_plugin_load_errors(config_path)
         crash_log = config_path.parent / "cockpit_crash.log"
         debug_log = config_path.parent / "cockpit_debug.log"
         try:

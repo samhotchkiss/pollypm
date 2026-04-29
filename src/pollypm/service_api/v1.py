@@ -87,6 +87,45 @@ class StatusSnapshot:
     errors: list[str]
 
 
+def collect_plugin_load_errors(config_path: Path) -> list[dict[str, str]]:
+    """Return plugin-load failures as dicts suitable for JSON / stderr.
+
+    Used by :meth:`PollyPMService.session_status` (rendered by ``pm
+    status``) and by the cockpit boot wrapper to make plugin breakage
+    visible to operators. See #960 — prior to this helper, errors
+    accumulated on ``ExtensionHost.errors`` but no surface read them,
+    so a broken plugin disappeared without a trace.
+
+    Returns an empty list if anything goes wrong constructing the host;
+    we never want surfacing-of-errors to itself raise during ``pm
+    status``.
+    """
+    try:
+        from pollypm.plugin_host import ExtensionHost
+    except Exception:  # noqa: BLE001
+        return []
+    try:
+        config = load_config(config_path)
+    except Exception:  # noqa: BLE001
+        return []
+    disabled = tuple(getattr(getattr(config, "plugins", None), "disabled", ()) or ())
+    try:
+        host = ExtensionHost(config_path.parent, disabled=disabled)
+        records = host.load_errors()
+    except Exception:  # noqa: BLE001
+        return []
+    out: list[dict[str, str]] = []
+    for record in records:
+        out.append(
+            {
+                "plugin": record.plugin or "",
+                "stage": record.stage,
+                "message": record.message,
+            }
+        )
+    return out
+
+
 class PollyPMService:
     """Service facade for PollyPM — the stable surface TUIs and CLIs call."""
 
@@ -113,7 +152,14 @@ class PollyPMService:
         )
 
     def session_status(self, session_name: str | None = None) -> dict[str, object]:
-        """Return session status (one or all) with runtime, lease, and alert counts."""
+        """Return session status (one or all) with runtime, lease, and alert counts.
+
+        The payload also carries ``plugin_errors`` — a list of structured
+        records describing any plugins that failed to load. ``pm status``
+        renders these so a silently-broken plugin (#960) is visible to
+        the operator instead of hiding behind a quiet ``host.errors``
+        accumulation.
+        """
         supervisor = self.load_supervisor(readonly_state=True)
         launches, windows, alerts, leases, errors = supervisor.status()
         window_map = {window.name: window for window in windows}
@@ -147,7 +193,13 @@ class PollyPMService:
                     "lease_note": None if lease is None else lease.note,
                 }
             )
-        return {"config_path": str(self.config_path), "sessions": sessions, "errors": errors}
+        plugin_errors = collect_plugin_load_errors(self.config_path)
+        return {
+            "config_path": str(self.config_path),
+            "sessions": sessions,
+            "errors": errors,
+            "plugin_errors": plugin_errors,
+        }
 
     def list_account_statuses(self) -> list[AccountStatus]:
         """Return live status (logged-in / expired / etc.) for every configured account."""

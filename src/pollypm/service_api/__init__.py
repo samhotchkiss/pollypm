@@ -13,6 +13,7 @@ import-boundary test in ``tests/test_import_boundary.py``.
 from pollypm.service_api.v1 import (
     PollyPMService,
     StatusSnapshot,
+    collect_plugin_load_errors,
     plan_launches_readonly,
     render_json,
 )
@@ -20,6 +21,7 @@ from pollypm.service_api.v1 import (
 __all__ = [
     "PollyPMService",
     "StatusSnapshot",
+    "collect_plugin_load_errors",
     "plan_launches_readonly",
     "render_json",
 ]

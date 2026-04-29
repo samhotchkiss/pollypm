@@ -2770,6 +2770,30 @@ def _gather_settings_data(
                     "degraded_reason": getattr(record, "reason", "") or "",
                 }
             )
+        # Surface plugin load errors in the settings panel so a
+        # silently-broken plugin (#960) is discoverable from inside
+        # the cockpit too — not just at boot. Record one entry per
+        # failing plugin (collapsing repeat errors for the same name).
+        seen_load_failures: set[str] = set()
+        for record in host.load_errors():
+            plugin_name = record.plugin or "<host>"
+            if plugin_name in loaded or plugin_name in host.disabled_plugins:
+                # Already represented above; the load_errors entry is
+                # noise relative to the existing row.
+                continue
+            if plugin_name in seen_load_failures:
+                continue
+            seen_load_failures.add(plugin_name)
+            plugins.append(
+                {
+                    "name": plugin_name,
+                    "version": "",
+                    "description": "",
+                    "source": "-",
+                    "status": "load_failed",
+                    "degraded_reason": record.message,
+                }
+            )
     except Exception as exc:  # noqa: BLE001
         errors.append(f"Plugin host unavailable: {exc}")
 

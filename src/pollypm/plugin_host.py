@@ -148,6 +148,26 @@ class DisabledPluginRecord:
     detail: str = ""
 
 
+@dataclass(slots=True)
+class PluginLoadError:
+    """A structured plugin host error suitable for surfaces (CLI, cockpit).
+
+    ``plugin`` is the plugin name when known (entry-point name, manifest
+    name, or hook owner), or ``None`` for host-level errors that don't
+    bind to a specific plugin (e.g. failure to enumerate entry points).
+    ``stage`` tags where in the lifecycle the failure happened (``load``,
+    ``initialize``, ``manifest``, ``factory``, ``filter``, ``validate``,
+    ``capability``, ``entry_point``, ``host``).
+    ``message`` is the human-readable string already appended to
+    ``ExtensionHost.errors`` — kept identical so the two views stay in
+    sync.
+    """
+
+    message: str
+    plugin: str | None = None
+    stage: str = "load"
+
+
 class ExtensionHost:
     def __init__(
         self,
@@ -157,6 +177,12 @@ class ExtensionHost:
     ) -> None:
         self.root_dir = root_dir.resolve()
         self.errors: list[str] = []
+        # Structured mirror of ``self.errors`` — populated alongside
+        # the legacy string list by ``_record_error``. Surfaces (the
+        # ``pm status`` CLI, the cockpit boot warning, the settings
+        # health panel) read this via :meth:`load_errors` so they
+        # don't have to parse free-form strings. See #960.
+        self._load_errors: list[PluginLoadError] = []
         self._plugins: dict[str, PollyPMPlugin] | None = None
         self._plugin_sources: dict[str, str] = {}
         # Plugins that were discovered but filtered out — keyed by name
@@ -191,6 +217,42 @@ class ExtensionHost:
         if self._plugins is None:
             self.plugins()
         return dict(self._disabled)
+
+    def _record_error(
+        self,
+        message: str,
+        *,
+        plugin: str | None = None,
+        stage: str = "load",
+    ) -> None:
+        """Append to both the legacy string list and the structured
+        :attr:`_load_errors` list so surfaces can read either view."""
+        self.errors.append(message)
+        self._load_errors.append(
+            PluginLoadError(message=message, plugin=plugin, stage=stage)
+        )
+
+    def load_errors(self) -> tuple[PluginLoadError, ...]:
+        """Public, read-only view of plugin load failures.
+
+        Surfaces (``pm status``, cockpit boot warning, cockpit settings
+        health panel) consume this to display plugin load breakage to
+        the operator without depending on host internals. The legacy
+        ``errors`` string list is preserved as a parallel view for
+        backwards compatibility — every entry there has a matching
+        record here.
+
+        See #960 for context: prior to this accessor, ``host.errors``
+        was populated but never read by any surface, so a broken
+        plugin (e.g. relative-import bug in ``core_recurring`` per
+        #957) silently dropped from the registry — taking its
+        scheduled jobs with it — with no operator-visible signal.
+        """
+        # Force discovery if it hasn't run yet so ``host.load_errors()``
+        # is meaningful before the first ``host.plugins()`` call.
+        if self._plugins is None:
+            self.plugins()
+        return tuple(self._load_errors)
 
     def plugin_source(self, name: str) -> str | None:
         """Return the discovery source tag (``builtin``, ``entry_point``,
@@ -327,7 +389,9 @@ class ExtensionHost:
                 plugin.initialize(api)
             except Exception as exc:  # noqa: BLE001
                 reason = f"initialize() raised: {exc}"
-                self.errors.append(f"Plugin {name} {reason}")
+                self._record_error(
+                    f"Plugin {name} {reason}", plugin=name, stage="initialize",
+                )
                 logger.exception("Plugin '%s' initialize() failed", name)
                 degraded[name] = reason
                 self._degraded[name] = reason
@@ -422,8 +486,10 @@ class ExtensionHost:
                 try:
                     out.append((name, factory(**kwargs)))
                 except Exception as exc:  # noqa: BLE001
-                    self.errors.append(
-                        f"Plugin {plugin.name} transcript_source '{name}' factory failed: {exc}"
+                    self._record_error(
+                        f"Plugin {plugin.name} transcript_source '{name}' factory failed: {exc}",
+                        plugin=plugin.name,
+                        stage="factory",
                     )
         return out
 
@@ -451,7 +517,7 @@ class ExtensionHost:
                     hook(api)
                 except Exception as exc:  # noqa: BLE001
                     message = f"Plugin {plugin.name} register_handlers hook failed: {exc}"
-                    self.errors.append(message)
+                    self._record_error(message, plugin=plugin.name, stage="register_handlers")
                     logger.exception(message)
         return self._job_handler_registry
 
@@ -483,7 +549,7 @@ class ExtensionHost:
                 hook(api)
             except Exception as exc:  # noqa: BLE001
                 message = f"Plugin {plugin.name} register_roster hook failed: {exc}"
-                self.errors.append(message)
+                self._record_error(message, plugin=plugin.name, stage="register_roster")
                 logger.exception(message)
         return roster
 
@@ -521,7 +587,11 @@ class ExtensionHost:
             try:
                 return factory(**kwargs)
             except Exception as exc:
-                self.errors.append(f"Plugin factory for {kind} '{name}' crashed: {exc}")
+                self._record_error(
+                    f"Plugin factory for {kind} '{name}' crashed: {exc}",
+                    plugin=sources.get(name),
+                    stage="factory",
+                )
                 raise ValueError(f"Plugin {kind} '{name}' failed to initialize: {exc}") from exc
         raise ValueError(f"Unsupported {kind}: {name}")
 
@@ -534,7 +604,7 @@ class ExtensionHost:
                     observer(context)
                 except Exception as exc:  # noqa: BLE001
                     message = f"{plugin.name} observer {hook_name} failed: {exc}"
-                    self.errors.append(message)
+                    self._record_error(message, plugin=plugin.name, stage="observer")
                     failures.append(message)
         return failures
 
@@ -551,7 +621,11 @@ class ExtensionHost:
                 try:
                     result = filter_handler(context)
                 except Exception as exc:  # noqa: BLE001
-                    self.errors.append(f"{plugin.name} filter {hook_name} failed: {exc}")
+                    self._record_error(
+                        f"{plugin.name} filter {hook_name} failed: {exc}",
+                        plugin=plugin.name,
+                        stage="filter",
+                    )
                     continue
                 if result is None:
                     continue
@@ -583,11 +657,19 @@ class ExtensionHost:
                 result = validate_plugin(plugin)
                 if not result.passed:
                     failures = ", ".join(c.message for c in result.checks if not c.passed)
-                    self.errors.append(f"Plugin {name} failed validation: {failures}")
+                    self._record_error(
+                        f"Plugin {name} failed validation: {failures}",
+                        plugin=name,
+                        stage="validate",
+                    )
                     _mark_disabled(name, source, "load_error", f"validation failed: {failures}")
                     return
             except Exception as exc:  # noqa: BLE001
-                self.errors.append(f"Plugin {name} validation error: {exc}")
+                self._record_error(
+                    f"Plugin {name} validation error: {exc}",
+                    plugin=name,
+                    stage="validate",
+                )
             if name in loaded:
                 logger.warning(
                     "Plugin '%s' from source '%s' overrides earlier registration from source '%s'",
@@ -663,7 +745,11 @@ class ExtensionHost:
                 try:
                     manifests.append(self._read_manifest(manifest_path, source))
                 except Exception as exc:  # noqa: BLE001
-                    self.errors.append(f"Invalid plugin manifest at {manifest_path}: {exc}")
+                    self._record_error(
+                        f"Invalid plugin manifest at {manifest_path}: {exc}",
+                        plugin=plugin_dir.name,
+                        stage="manifest",
+                    )
         return manifests
 
     def _discover_entry_points(self) -> list[tuple[str, PollyPMPlugin, str]]:
@@ -686,7 +772,10 @@ class ExtensionHost:
             except Exception:  # noqa: BLE001
                 return found
         except Exception as exc:  # noqa: BLE001
-            self.errors.append(f"Failed to enumerate pollypm.plugins entry points: {exc}")
+            self._record_error(
+                f"Failed to enumerate pollypm.plugins entry points: {exc}",
+                stage="host",
+            )
             return found
         if eps:
             warn_third_party_extension_trust_once()
@@ -694,21 +783,29 @@ class ExtensionHost:
             try:
                 obj = ep.load()
             except Exception as exc:  # noqa: BLE001
-                self.errors.append(f"Entry-point plugin '{ep.name}' failed to load: {exc}")
+                self._record_error(
+                    f"Entry-point plugin '{ep.name}' failed to load: {exc}",
+                    plugin=ep.name,
+                    stage="entry_point",
+                )
                 continue
             if not isinstance(obj, PollyPMPlugin):
-                self.errors.append(
+                self._record_error(
                     f"Entry-point plugin '{ep.name}' is not a PollyPMPlugin instance "
-                    f"(got {type(obj).__name__})"
+                    f"(got {type(obj).__name__})",
+                    plugin=ep.name,
+                    stage="entry_point",
                 )
                 continue
             plugin_name = obj.name or ep.name
             # Apply the same api_version / requires_api gating that
             # directory plugins get through _load_plugin_from_manifest.
             if obj.api_version != PLUGIN_API_VERSION:
-                self.errors.append(
+                self._record_error(
                     f"Entry-point plugin '{plugin_name}' uses API version {obj.api_version}; "
-                    f"expected {PLUGIN_API_VERSION}"
+                    f"expected {PLUGIN_API_VERSION}",
+                    plugin=plugin_name,
+                    stage="entry_point",
                 )
                 continue
             found.append((plugin_name, obj, "entry_point"))
@@ -856,8 +953,10 @@ class ExtensionHost:
 
     def _load_plugin_from_manifest(self, manifest: PluginManifest) -> PollyPMPlugin | None:
         if manifest.api_version != PLUGIN_API_VERSION:
-            self.errors.append(
-                f"Plugin {manifest.name} uses API version {manifest.api_version}; expected {PLUGIN_API_VERSION}"
+            self._record_error(
+                f"Plugin {manifest.name} uses API version {manifest.api_version}; expected {PLUGIN_API_VERSION}",
+                plugin=manifest.name,
+                stage="api_version",
             )
             return None
         # Plugin-level requires_api (manifest top-level) must include the
@@ -866,24 +965,36 @@ class ExtensionHost:
         if manifest.requires_api:
             try:
                 if not check_requires_api(manifest.requires_api, PLUGIN_API_VERSION):
-                    self.errors.append(
+                    self._record_error(
                         f"Plugin {manifest.name} requires_api '{manifest.requires_api}' excludes current API "
-                        f"version {PLUGIN_API_VERSION}; skipped."
+                        f"version {PLUGIN_API_VERSION}; skipped.",
+                        plugin=manifest.name,
+                        stage="api_version",
                     )
                     return None
             except ValueError as exc:
-                self.errors.append(
-                    f"Plugin {manifest.name} has unparseable requires_api '{manifest.requires_api}': {exc}"
+                self._record_error(
+                    f"Plugin {manifest.name} has unparseable requires_api '{manifest.requires_api}': {exc}",
+                    plugin=manifest.name,
+                    stage="api_version",
                 )
                 return None
         try:
             module = self._load_module(manifest)
             plugin_obj = self._resolve_entrypoint(module, manifest.entrypoint)
         except Exception as exc:  # noqa: BLE001
-            self.errors.append(f"Failed to load plugin {manifest.name}: {exc}")
+            self._record_error(
+                f"Failed to load plugin {manifest.name}: {exc}",
+                plugin=manifest.name,
+                stage="load",
+            )
             return None
         if not isinstance(plugin_obj, PollyPMPlugin):
-            self.errors.append(f"Plugin {manifest.name} entrypoint did not return PollyPMPlugin")
+            self._record_error(
+                f"Plugin {manifest.name} entrypoint did not return PollyPMPlugin",
+                plugin=manifest.name,
+                stage="load",
+            )
             return None
         # If the manifest declared structured capabilities, prefer them
         # over whatever the plugin module set — the manifest is canonical
@@ -901,15 +1012,19 @@ class ExtensionHost:
         for cap in capabilities:
             try:
                 if not check_requires_api(cap.requires_api, PLUGIN_API_VERSION):
-                    self.errors.append(
+                    self._record_error(
                         f"Plugin {plugin_name} capability {cap.kind}:{cap.name} requires_api "
-                        f"'{cap.requires_api}' excludes current API version {PLUGIN_API_VERSION}; dropped."
+                        f"'{cap.requires_api}' excludes current API version {PLUGIN_API_VERSION}; dropped.",
+                        plugin=plugin_name,
+                        stage="capability",
                     )
                     continue
             except ValueError as exc:
-                self.errors.append(
+                self._record_error(
                     f"Plugin {plugin_name} capability {cap.kind}:{cap.name} has unparseable "
-                    f"requires_api '{cap.requires_api}': {exc}; dropped."
+                    f"requires_api '{cap.requires_api}': {exc}; dropped.",
+                    plugin=plugin_name,
+                    stage="capability",
                 )
                 continue
             kept.append(cap)

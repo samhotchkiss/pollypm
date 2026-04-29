@@ -218,20 +218,35 @@ def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
         if json_output:
             helpers._emit_json(payload)
             return
+        plugin_errors = payload.get("plugin_errors") or []
         if not sessions:
             typer.echo("No sessions configured.")
-            return
-        typer.echo(f"Config: {payload['config_path']}")
-        for item in sessions:
-            typer.echo(
-                f"- {item['name']}: status={item['status']} running={'yes' if item['running'] else 'no'} "
-                f"alerts={item['alert_count']} lease={item['lease_owner'] or '-'} "
-                f"project={item['project']} role={item['role']}"
-            )
-            if item["last_failure_message"]:
-                typer.echo(f"  reason={item['last_failure_message']}")
-        for error in payload["errors"]:
-            typer.echo(f"- error: {error}")
+        else:
+            typer.echo(f"Config: {payload['config_path']}")
+            for item in sessions:
+                typer.echo(
+                    f"- {item['name']}: status={item['status']} running={'yes' if item['running'] else 'no'} "
+                    f"alerts={item['alert_count']} lease={item['lease_owner'] or '-'} "
+                    f"project={item['project']} role={item['role']}"
+                )
+                if item["last_failure_message"]:
+                    typer.echo(f"  reason={item['last_failure_message']}")
+            for error in payload["errors"]:
+                typer.echo(f"- error: {error}")
+        # Plugin load errors — surfaced so a silently-broken plugin
+        # (e.g. #957's relative-import bug in core_recurring, which
+        # disappeared two scheduled jobs without warning) is visible
+        # to the operator. See #960. Always render this section even
+        # when there are no sessions configured — broken plugins are
+        # equally invisible in that state.
+        if plugin_errors:
+            typer.echo("")
+            typer.echo(f"Plugin load errors ({len(plugin_errors)}):")
+            for entry in plugin_errors:
+                plugin_name = entry.get("plugin") or "<host>"
+                stage = entry.get("stage") or "load"
+                message = entry.get("message") or ""
+                typer.echo(f"- {plugin_name} [{stage}]: {message}")
 
     @app.command(
         help=(

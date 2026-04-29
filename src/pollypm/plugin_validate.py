@@ -406,7 +406,11 @@ def validate_all_plugins(host: ExtensionHost) -> ValidationReport:
             host.remove_plugin(name)
             for error in result.errors:
                 logger.warning("Plugin '%s' validation failed: %s", name, error)
-                host.errors.append(f"Plugin '{name}' disabled: {error}")
+                host._record_error(
+                    f"Plugin '{name}' disabled: {error}",
+                    plugin=name,
+                    stage="validate",
+                )
         else:
             n_checks = len(result.checks)
             check_word = "check" if n_checks == 1 else "checks"

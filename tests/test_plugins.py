@@ -104,6 +104,115 @@ def test_extension_host_rejects_wrong_api_version(tmp_path: Path) -> None:
     assert any("API version 99" in item for item in host.errors)
 
 
+def test_extension_host_load_errors_capture_broken_plugin(tmp_path: Path) -> None:
+    """#960: a plugin that fails to import must show up on the public
+    :meth:`ExtensionHost.load_errors` accessor with structured fields
+    (plugin name, stage, message) so surfaces don't have to parse the
+    free-form string list to render the failure."""
+    broken = tmp_path / ".pollypm" / "plugins" / "broken_imports"
+    _write_plugin(
+        broken,
+        name="broken_imports",
+        body=(
+            "from .nonexistent_module import something  # bad relative import\n"
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "plugin = PollyPMPlugin(name='broken_imports')\n"
+        ),
+    )
+
+    host = ExtensionHost(tmp_path)
+    plugins = host.plugins()
+    assert "broken_imports" not in plugins, (
+        "broken plugin should not register; the contract is graceful drop"
+    )
+
+    errors = host.load_errors()
+    matching = [e for e in errors if e.plugin == "broken_imports"]
+    assert matching, f"expected a load_errors entry for broken_imports, got {errors!r}"
+    record = matching[0]
+    assert record.stage == "load"
+    assert "Failed to load plugin broken_imports" in record.message
+    # Both views must stay in sync — the structured record's message
+    # is identical to the legacy host.errors string.
+    assert record.message in host.errors
+
+
+def test_pm_status_surface_renders_plugin_load_errors(tmp_path: Path) -> None:
+    """#960: ``pm status`` (via the service-API session_status payload)
+    must include plugin load errors so a silently-broken plugin is
+    visible to the operator."""
+    broken = tmp_path / ".pollypm" / "plugins" / "broken_imports_status"
+    _write_plugin(
+        broken,
+        name="broken_imports_status",
+        body=(
+            "from .nonexistent_module import something\n"
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "plugin = PollyPMPlugin(name='broken_imports_status')\n"
+        ),
+    )
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        '[project]\nname = "sample"\n\n[pollypm]\ncontroller_account = ""\n'
+    )
+
+    from pollypm.service_api import PollyPMService, collect_plugin_load_errors
+
+    payload = PollyPMService(config_path).session_status()
+    plugin_errors = payload.get("plugin_errors") or []
+    assert any(
+        entry.get("plugin") == "broken_imports_status"
+        and "Failed to load plugin" in entry.get("message", "")
+        for entry in plugin_errors
+    ), f"pm status payload missing broken plugin entry; got {plugin_errors!r}"
+
+    # The standalone helper used by the cockpit boot warning must
+    # return the same shape so both surfaces stay aligned.
+    direct = collect_plugin_load_errors(config_path)
+    assert any(
+        entry.get("plugin") == "broken_imports_status" for entry in direct
+    )
+
+
+def test_cockpit_boot_warns_on_plugin_load_errors(tmp_path: Path, capsys) -> None:
+    """#960: ``pm cockpit`` must print a stderr WARNING at startup when
+    any plugin failed to load. We exercise the helper directly so the
+    test doesn't have to spin up a Textual app."""
+    broken = tmp_path / ".pollypm" / "plugins" / "broken_imports_cockpit"
+    _write_plugin(
+        broken,
+        name="broken_imports_cockpit",
+        body=(
+            "from .nonexistent_module import something\n"
+            "from pollypm.plugin_api.v1 import PollyPMPlugin\n"
+            "plugin = PollyPMPlugin(name='broken_imports_cockpit')\n"
+        ),
+    )
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        '[project]\nname = "sample"\n\n[pollypm]\ncontroller_account = ""\n'
+    )
+
+    from pollypm.cli_features.ui import _warn_on_plugin_load_errors
+
+    _warn_on_plugin_load_errors(config_path)
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err
+    assert "broken_imports_cockpit" in captured.err
+    assert "failed to load" in captured.err
+    # Stdout stays clean — boot warnings go to stderr so log redirects
+    # don't swallow them.
+    assert "WARNING" not in captured.out
+
+    # No false positive: with the plugin removed, the helper is silent.
+    import shutil as _shutil
+    _shutil.rmtree(broken)
+    _warn_on_plugin_load_errors(config_path)
+    clean = capsys.readouterr()
+    assert "WARNING" not in clean.err
+    assert "broken_imports_cockpit" not in clean.err
+
+
 @pytest.mark.parametrize("plugin_name", ["../escape", "BadName"])
 def test_extension_host_rejects_invalid_plugin_name_at_manifest_boundary(
     tmp_path: Path, plugin_name: str,

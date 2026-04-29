@@ -63,11 +63,7 @@ from pollypm.cockpit_activity import (  # noqa: F401  (re-exported)
     PollyActivityFeedApp,
     _activity_type_colour,
 )
-from pollypm.cockpit_alerts import (  # noqa: F401  (AlertToast re-exported)
-    AlertToast,
-    _action_view_alerts,
-    _setup_alert_notifier,
-)
+from pollypm.cockpit_alerts import _action_view_alerts
 from pollypm.cockpit_inbox import (
     InboxThreadRow,
     build_inbox_thread_rows,
@@ -813,10 +809,8 @@ class PollyCockpitApp(App[None]):
         # Failures here are non-fatal — the TUI still works, just
         # without autonomous sweeps. See issue #268 Gap A.
         self._start_core_rail()
-        # Do not mount alert toasts in the 30-column rail. Even compact
-        # action alerts wrap into unreadable, cut-off cards there; the rail
-        # already shows alert badges and keeps `a` bound to the alert view.
-        # Wider detail panes still attach `_setup_alert_notifier`.
+        # Alert toast surface removed in #956 — the rail still shows
+        # alert badges and ``a`` still opens the alert list.
         self.call_after_refresh(self._show_palette_tip_once)
 
     def action_view_alerts(self) -> None:
@@ -1472,40 +1466,171 @@ class PollyCockpitApp(App[None]):
         key = self._selected_row_key()
         if key is None:
             return
-        self.selected_key = key
-        try:
-            self.router.route_selected(key)
-            self.selected_key = self.router.selected_key()
-        except Exception as exc:  # noqa: BLE001
-            self.hint.update(f"Error: {exc}"[:60])
-        self._refresh_rows()
+        self._schedule_route_selected(key, label=key)
 
     def action_open_settings(self) -> None:
-        self.selected_key = "settings"
-        try:
-            self.router.route_selected("settings")
-            self._last_router_selected_key = self.router.selected_key()
-        except Exception as exc:  # noqa: BLE001
-            self.hint.update(f"Error: {exc}"[:60])
-        self._refresh_rows()
+        self._schedule_route_selected("settings", label="Settings")
 
     def action_open_inbox(self) -> None:
-        self.selected_key = "inbox"
-        try:
-            self.router.route_selected("inbox")
-            self._last_router_selected_key = self.router.selected_key()
-        except Exception as exc:  # noqa: BLE001
-            self.hint.update(f"Error: {exc}"[:60])
-        self._refresh_rows()
+        self._schedule_route_selected("inbox", label="Inbox")
 
     def action_open_activity(self) -> None:
-        self.selected_key = "activity"
+        self._schedule_route_selected("activity", label="Activity")
+
+    # ------------------------------------------------------------------
+    # Async routing (#959)
+    #
+    # Every cockpit click that fans out to ``CockpitRouter.route_selected``
+    # goes through :meth:`_schedule_route_selected` so the click registers
+    # immediately (optimistic highlight + "Connecting…" hint) and the
+    # blocking work (tmux respawn, supervisor load, session attach) runs
+    # off the UI thread. A single bad attach can no longer wedge the rail
+    # because the next click lands on a fresh worker.
+    # ------------------------------------------------------------------
+
+    _ROUTE_SELECT_TIMEOUT_SECONDS: float = 20.0
+
+    def _schedule_route_selected(
+        self,
+        key: str,
+        *,
+        label: str | None = None,
+    ) -> None:
+        """Render-then-load: record the click, dispatch route work async.
+
+        Inputs: the cockpit key the user clicked, optional human label
+        for the loading hint.
+        Outputs: ``None``.
+        Side effects: updates ``selected_key`` / hint synchronously so
+        the click is visible, then spawns a worker that calls
+        :meth:`CockpitRouter.route_selected`. On worker completion the
+        UI is updated via :meth:`call_from_thread` to swap the loading
+        state for the real selection.
+        Invariant: this method MUST return promptly — no I/O, no tmux,
+        no supervisor load on the UI thread.
+        """
+        # Optimistic UI: stamp the click into ``selected_key`` so the
+        # rail highlight tracks the user's intent before the route work
+        # even starts. The router may correct this once it knows the
+        # canonical selection (e.g. ``project:x`` → ``project:x:dashboard``).
+        self.selected_key = key
         try:
-            self.router.route_selected("activity")
-            self._last_router_selected_key = self.router.selected_key()
+            display = label or key
+            self.hint.update(f"Connecting to {display}…"[:60])
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._refresh_rows()
+        except Exception:  # noqa: BLE001
+            pass
+        self._dispatch_route_in_worker(key)
+
+    def _dispatch_route_in_worker(self, key: str) -> None:
+        """Spawn the route worker. Falls back to inline execution when
+        Textual's worker pool is unavailable (e.g. unit tests that
+        bypass ``App.__init__`` and have no running event loop)."""
+        try:
+            self.run_worker(
+                lambda: self._route_selected_worker(key),
+                thread=True,
+                exclusive=True,
+                group="route_select",
+            )
+        except Exception:  # noqa: BLE001
+            # No event loop — execute inline so unit tests still see
+            # ``route_selected`` invoked. Production always has a loop.
+            self._route_selected_worker(key)
+
+    def _route_selected_worker(self, key: str) -> None:
+        """Worker-thread body: run ``route_selected`` with a deadline.
+
+        The deadline is enforced by running the route call in a
+        ``ThreadPoolExecutor`` task and waiting with a timeout. On
+        timeout the loading hint is replaced with a clear error and the
+        worker returns — the user can click another rail item without
+        the failed attach blocking the next click (each new click runs
+        in a new ``exclusive`` worker which Textual cancels the prior
+        task on).
+        """
+        import concurrent.futures as _cf
+
+        def _do_route() -> str:
+            self.router.route_selected(key)
+            return self.router.selected_key()
+
+        executor: _cf.ThreadPoolExecutor | None
+        try:
+            executor = _cf.ThreadPoolExecutor(max_workers=1)
+        except Exception:  # noqa: BLE001
+            executor = None
+        try:
+            if executor is None:
+                resolved = _do_route()
+            else:
+                future = executor.submit(_do_route)
+                try:
+                    resolved = future.result(
+                        timeout=self._ROUTE_SELECT_TIMEOUT_SECONDS,
+                    )
+                except _cf.TimeoutError:
+                    self._post_route_error(
+                        key, f"Routing to {key} timed out — try again.",
+                    )
+                    # Best-effort cancel; the underlying router call may
+                    # still finish in the executor but its result is
+                    # ignored. The next click spawns a fresh worker.
+                    future.cancel()
+                    return
         except Exception as exc:  # noqa: BLE001
-            self.hint.update(f"Error: {exc}"[:60])
-        self._refresh_rows()
+            self._post_route_error(key, f"Error: {exc}")
+            return
+        finally:
+            if executor is not None:
+                try:
+                    executor.shutdown(wait=False)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        self._post_route_success(key, resolved)
+
+    def _post_route_success(self, key: str, resolved: str) -> None:
+        """UI update after a route completes. Safe to call from a worker."""
+        def _apply() -> None:
+            # The router may have rewritten the selection (e.g.
+            # ``project:x`` → ``project:x:dashboard``); re-sync.
+            self.selected_key = resolved or key
+            self._last_router_selected_key = resolved or key
+            try:
+                self.hint.update("")
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._refresh_rows()
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            self.call_from_thread(_apply)
+        except Exception:  # noqa: BLE001
+            # No running app (unit tests) — apply directly.
+            _apply()
+
+    def _post_route_error(self, key: str, message: str) -> None:
+        """UI update after a route fails. Safe to call from a worker."""
+        def _apply() -> None:
+            try:
+                self.hint.update(message[:60])
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._refresh_rows()
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            self.call_from_thread(_apply)
+        except Exception:  # noqa: BLE001
+            _apply()
 
     def action_forward_tab_to_right(self) -> None:
         if self._right_pane_has_live_session():
@@ -1622,14 +1747,7 @@ class PollyCockpitApp(App[None]):
 
     def _navigate_home(self) -> bool:
         """Switch to the Home (dashboard / polly) surface. Return True on success."""
-        try:
-            self.router.route_selected("polly")
-            self.selected_key = "polly"
-            self._last_router_selected_key = self.router.selected_key()
-        except Exception as exc:  # noqa: BLE001
-            self.hint.update(f"Error: {exc}"[:60])
-            return False
-        self._refresh_rows()
+        self._schedule_route_selected("polly", label="Home")
         return True
 
     def action_back_to_home(self) -> None:
@@ -1663,15 +1781,13 @@ class PollyCockpitApp(App[None]):
     @on(events.Click, "#brand")
     @on(events.Click, "#tagline")
     def on_brand_click(self, event: events.Click) -> None:
-        """Clicking the Polly logo/tagline returns to the dashboard."""
-        try:
-            self.router._show_static_view(
-                self.router._load_supervisor(),
-                f"{self.router._load_supervisor().config.project.tmux_session}:{self.router._COCKPIT_WINDOW}",
-                "dashboard",
-            )
-        except Exception:  # noqa: BLE001
-            pass
+        """Clicking the Polly logo/tagline returns to the dashboard.
+
+        Routed through the same render-then-load pipeline as the rail
+        selections (#959) so a slow supervisor load can never block the
+        click handler / freeze cockpit input.
+        """
+        self._schedule_route_selected("polly", label="Home")
 
     def action_detach(self) -> None:
         self.router.tmux.run("detach-client", check=False)
@@ -1707,16 +1823,15 @@ class PollyCockpitApp(App[None]):
         row = event.item
         if not isinstance(row, RailItem):
             return
-        self.selected_key = row.cockpit_key
         self._unread_keys.discard(row.cockpit_key)
-        try:
-            self.router.route_selected(row.cockpit_key)
-            # The router may redirect (e.g. project:x → project:x:dashboard),
-            # so re-read the selected key to keep the highlight in sync.
-            self.selected_key = self.router.selected_key()
-        except Exception as exc:  # noqa: BLE001
-            self.hint.update(f"Error: {exc}"[:60])
-        self._refresh_rows()
+        # #959 — render-then-load: the click registers immediately
+        # (loading hint + optimistic highlight) and the actual
+        # ``route_selected`` work runs on a worker thread. A slow
+        # PM-attach (blackjack-trainer, pomodoro) can no longer wedge
+        # the rail because the next click cancels the in-flight worker
+        # and starts a new one.
+        label = getattr(getattr(row, "item", None), "label", None) or row.cockpit_key
+        self._schedule_route_selected(row.cockpit_key, label=label)
 
     @on(events.Click, "#settings-row")
     def on_settings_click(self, _event: events.Click) -> None:
@@ -3106,9 +3221,8 @@ class PollySettingsPaneApp(App[None]):
 
         self._refresh()
         self._show_section(self._active_section)
-        # Live alert toasts. Settings has no ``a`` binding so the toast
-        # surfaces the full hint.
-        _setup_alert_notifier(self, bind_a=True)
+        # Alert toast surface removed in #956 — alerts still raise/clear
+        # via the data layer; ``a`` opens the alert list in Metrics.
         self._apply_narrow_class()
 
     # Threshold below which the side-by-side nav + content layout
@@ -5866,9 +5980,9 @@ class PollyInboxApp(App[None]):
         self._refresh_list(select_first=True)
         self.set_interval(self.REFRESH_INTERVAL_SECONDS, self._background_refresh)
         self.list_view.focus()
-        # Live alert toasts. Inbox already claims ``a`` for archive so the
-        # toast advertises "esc/click to dismiss" instead of the ``a`` hint.
-        _setup_alert_notifier(self, bind_a=False)
+        # Alert toast surface removed in #956 — alerts still appear in
+        # this inbox via the message store; the floating toast cards
+        # that used to mount on top of the list are gone.
 
     # ------------------------------------------------------------------
     # Data loading
@@ -10622,8 +10736,8 @@ class PollyProjectDashboardApp(App[None]):
         self._first_refresh_running = False
         self._refresh()
         self.set_interval(self.REFRESH_INTERVAL_SECONDS, self._refresh)
-        # Live alert toasts.
-        _setup_alert_notifier(self, bind_a=True)
+        # Alert toast surface removed in #956 — ``a`` still opens the
+        # alert list (Metrics drill-down).
 
     def action_view_alerts(self) -> None:
         _action_view_alerts(self)

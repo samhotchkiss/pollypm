@@ -71,7 +71,7 @@ def test_polly_dashboard_refresh_runs_in_worker_thread(monkeypatch, tmp_path: Pa
         return _fake_config(), _fake_dashboard_data()
 
     monkeypatch.setattr("pollypm.dashboard_data.load_dashboard", fake_load_dashboard)
-    monkeypatch.setattr("pollypm.cockpit_ui._setup_alert_notifier", lambda *args, **kwargs: None)
+    # Alert toast notifier was removed in #956; nothing to silence.
 
     async def body() -> None:
         app = PollyDashboardApp(tmp_path / "pollypm.toml")
@@ -208,7 +208,7 @@ def test_polly_dashboard_i_key_routes_to_inbox(monkeypatch, tmp_path: Path) -> N
         calls.append(True)
 
     monkeypatch.setattr(PollyDashboardApp, "_route_to_inbox", fake_route)
-    monkeypatch.setattr("pollypm.cockpit_ui._setup_alert_notifier", lambda *args, **kwargs: None)
+    # Alert toast notifier was removed in #956; nothing to silence.
 
     async def body() -> None:
         app = PollyDashboardApp(tmp_path / "pollypm.toml")

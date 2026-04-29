@@ -21,7 +21,6 @@ from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Static
 
-from pollypm.cockpit_alerts import _setup_alert_notifier
 from pollypm.cockpit_palette import _open_command_palette, _open_keyboard_help
 from pollypm.config import load_config
 
@@ -147,7 +146,8 @@ class PollyMetricsApp(App[None]):
 
     def on_mount(self) -> None:
         self._refresh()
-        _setup_alert_notifier(self, bind_a=False)
+        # Alert toast surface removed in #956 — the alert list still
+        # renders inside this metrics pane via the drill-down modal.
 
     def action_open_command_palette(self) -> None:
         _open_command_palette(self)

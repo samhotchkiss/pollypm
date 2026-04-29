@@ -24,7 +24,7 @@ from textual.binding import Binding
 from textual.containers import Vertical
 from textual.widgets import DataTable, Input, Static
 
-from pollypm.cockpit_alerts import _action_view_alerts, _setup_alert_notifier
+from pollypm.cockpit_alerts import _action_view_alerts
 from pollypm.cockpit_palette import _open_keyboard_help
 from pollypm.config import load_config
 
@@ -375,7 +375,8 @@ class PollyActivityFeedApp(App[None]):
         self.filter_input.value = self._filter_fuzzy
         self.table.focus()
         self._refresh()
-        _setup_alert_notifier(self, bind_a=False)
+        # Alert toast surface removed in #956 — alerts already appear
+        # as activity rows in the table below.
 
     def action_show_keyboard_help(self) -> None:
         _open_keyboard_help(self)

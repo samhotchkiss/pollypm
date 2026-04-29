@@ -24,7 +24,6 @@ from textual.containers import Vertical
 from textual.widgets import DataTable, Static
 
 from pollypm.cockpit_rail import CockpitRouter
-from pollypm.cockpit_alerts import _setup_alert_notifier
 from pollypm.cockpit_palette import _open_command_palette, _open_keyboard_help
 from pollypm.cockpit_worker_identity import (
     load_worker_color_overrides,
@@ -160,7 +159,8 @@ class PollyWorkerRosterApp(App[None]):
             "Project", "Worker", "Health", "Task", "Node", "Turn", "Last commit",
         )
         self._refresh()
-        _setup_alert_notifier(self, bind_a=False)
+        # Alert toast surface removed in #956 — the worker roster no
+        # longer mounts floating alert cards over the table.
 
     def action_open_command_palette(self) -> None:
         _open_command_palette(self)

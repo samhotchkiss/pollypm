@@ -20,6 +20,7 @@ Contract:
 from __future__ import annotations
 
 import gc
+import asyncio
 import json
 import os
 import resource
@@ -128,6 +129,17 @@ from pollypm.rejection_feedback import (
 if TYPE_CHECKING:
     from pollypm.service_api import PollyPMService  # noqa: F401
 from pollypm.cockpit import build_cockpit_detail
+from pollypm.cockpit_navigation import (
+    InMemoryNavigationStateStore,
+    NavigationContent,
+    NavigationController,
+    NavigationRequest,
+)
+from pollypm.cockpit_navigation_client import (
+    FileCockpitNavigationQueue,
+    cockpit_navigation_queue_path,
+    file_navigation_client,
+)
 from pollypm.cockpit_rail import CockpitItem, CockpitPresence, CockpitRouter
 
 
@@ -149,6 +161,25 @@ _PLAN_REVIEW_UNAVAILABLE_HINT_RE = _re.compile(
     r"d\s+to\s+discuss\s+with\s+the\s+PM,\s*A\s+to\s+approve\.?",
     _re.IGNORECASE,
 )
+
+
+class _CockpitRouteContentResolver:
+    """Navigation resolver for the root cockpit rail.
+
+    The router still owns full content resolution during this integration
+    step; the navigation controller owns acknowledgement/cancellation state.
+    """
+
+    def resolve(self, request: NavigationRequest) -> NavigationContent:
+        return NavigationContent(request.key)
+
+
+class _CockpitRouteWindowApplier:
+    def __init__(self, app: "PollyCockpitApp") -> None:
+        self._app = app
+
+    def apply(self, request: NavigationRequest, _content: object) -> str:
+        return self._app._route_selected_with_deadline(request.key)
 
 
 def _md_to_rich(text: str) -> str:
@@ -836,6 +867,12 @@ class PollyCockpitApp(App[None]):
         # (heartbeats + token samples commit ~10/sec) don't cause the
         # visible row flash Sam reported on 2026-04-20.
         self._last_refresh_tick = -10
+        self._navigation_store = InMemoryNavigationStateStore()
+        self._navigation_controller = NavigationController(
+            state_store=self._navigation_store,
+            content_resolver=_CockpitRouteContentResolver(),
+            window_manager=_CockpitRouteWindowApplier(self),
+        )
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -972,6 +1009,34 @@ class PollyCockpitApp(App[None]):
         self._last_router_selected_key = external_key
         self.selected_key = external_key
 
+    def _cockpit_navigation_queue(self) -> FileCockpitNavigationQueue:
+        queue = getattr(self, "_navigation_queue", None)
+        if queue is not None:
+            return queue
+        queue = FileCockpitNavigationQueue(
+            cockpit_navigation_queue_path(self.config_path),
+        )
+        self._navigation_queue = queue
+        return queue
+
+    def _drain_cockpit_navigation_queue(self) -> None:
+        try:
+            queue = self._cockpit_navigation_queue()
+            pending = queue.pending()
+        except Exception:  # noqa: BLE001
+            return
+        if not pending:
+            return
+        try:
+            queue.clear()
+        except Exception:  # noqa: BLE001
+            pass
+        latest = pending[-1]
+        self._schedule_route_selected(
+            latest.selected_key,
+            label=latest.selected_key,
+        )
+
     # Layout check (pane recovery, rail width) — only every ~30s
     _LAYOUT_CHECK_INTERVAL = 38  # ~30s at 0.8s/tick
     # Force GC every ~2 minutes
@@ -980,6 +1045,7 @@ class PollyCockpitApp(App[None]):
     def _tick(self) -> None:
         self._tick_count += 1
         self.spinner_index = (self.spinner_index + 1) % 4
+        self._drain_cockpit_navigation_queue()
         # Periodic GC
         if self._tick_count % self._GC_INTERVAL == 0:
             gc.collect()
@@ -1551,6 +1617,36 @@ class PollyCockpitApp(App[None]):
 
     _ROUTE_SELECT_TIMEOUT_SECONDS: float = 20.0
 
+    # Monotonically-increasing click counter (#967). Each click bumps
+    # this; the value at click time is captured by the worker thread
+    # and re-checked before any post-route UI update is applied. A
+    # stale worker (whose value lags ``_route_click_seq``) is ignored
+    # so its late completion can't bounce ``selected_key`` back to the
+    # previous click.
+    #
+    # Why a counter and not Textual's ``exclusive=True`` cancellation
+    # alone: ``run_worker(thread=True, exclusive=True)`` cancels the
+    # *asyncio task* representing the worker, but the underlying OS
+    # thread is not asyncio-aware and runs to completion regardless.
+    # The thread then calls ``_post_route_success`` and overwrites
+    # ``selected_key`` with the OLD click's resolved key — which is the
+    # bounce reported in #967. The seq guard short-circuits that path.
+    _route_click_seq: int = 0
+
+    def _ensure_navigation_controller(self) -> NavigationController:
+        controller = getattr(self, "_navigation_controller", None)
+        if controller is not None:
+            return controller
+        store = InMemoryNavigationStateStore()
+        controller = NavigationController(
+            state_store=store,
+            content_resolver=_CockpitRouteContentResolver(),
+            window_manager=_CockpitRouteWindowApplier(self),
+        )
+        self._navigation_store = store
+        self._navigation_controller = controller
+        return controller
+
     def _schedule_route_selected(
         self,
         key: str,
@@ -1575,6 +1671,9 @@ class PollyCockpitApp(App[None]):
         # even starts. The router may correct this once it knows the
         # canonical selection (e.g. ``project:x`` → ``project:x:dashboard``).
         self.selected_key = key
+        request = self._ensure_navigation_controller().accept(key)
+        seq = request.request_id
+        self._route_click_seq = seq
         try:
             display = label or key
             self.hint.update(f"Connecting to {display}…"[:60])
@@ -1584,15 +1683,15 @@ class PollyCockpitApp(App[None]):
             self._refresh_rows()
         except Exception:  # noqa: BLE001
             pass
-        self._dispatch_route_in_worker(key)
+        self._dispatch_route_in_worker(key, seq)
 
-    def _dispatch_route_in_worker(self, key: str) -> None:
+    def _dispatch_route_in_worker(self, key: str, seq: int = 0) -> None:
         """Spawn the route worker. Falls back to inline execution when
         Textual's worker pool is unavailable (e.g. unit tests that
         bypass ``App.__init__`` and have no running event loop)."""
         try:
             self.run_worker(
-                lambda: self._route_selected_worker(key),
+                lambda: self._route_selected_worker(key, seq),
                 thread=True,
                 exclusive=True,
                 group="route_select",
@@ -1600,19 +1699,9 @@ class PollyCockpitApp(App[None]):
         except Exception:  # noqa: BLE001
             # No event loop — execute inline so unit tests still see
             # ``route_selected`` invoked. Production always has a loop.
-            self._route_selected_worker(key)
+            self._route_selected_worker(key, seq)
 
-    def _route_selected_worker(self, key: str) -> None:
-        """Worker-thread body: run ``route_selected`` with a deadline.
-
-        The deadline is enforced by running the route call in a
-        ``ThreadPoolExecutor`` task and waiting with a timeout. On
-        timeout the loading hint is replaced with a clear error and the
-        worker returns — the user can click another rail item without
-        the failed attach blocking the next click (each new click runs
-        in a new ``exclusive`` worker which Textual cancels the prior
-        task on).
-        """
+    def _route_selected_with_deadline(self, key: str) -> str:
         import concurrent.futures as _cf
 
         def _do_route() -> str:
@@ -1626,25 +1715,14 @@ class PollyCockpitApp(App[None]):
             executor = None
         try:
             if executor is None:
-                resolved = _do_route()
+                return _do_route()
             else:
                 future = executor.submit(_do_route)
                 try:
-                    resolved = future.result(
-                        timeout=self._ROUTE_SELECT_TIMEOUT_SECONDS,
-                    )
+                    return future.result(timeout=self._ROUTE_SELECT_TIMEOUT_SECONDS)
                 except _cf.TimeoutError:
-                    self._post_route_error(
-                        key, f"Routing to {key} timed out — try again.",
-                    )
-                    # Best-effort cancel; the underlying router call may
-                    # still finish in the executor but its result is
-                    # ignored. The next click spawns a fresh worker.
                     future.cancel()
-                    return
-        except Exception as exc:  # noqa: BLE001
-            self._post_route_error(key, f"Error: {exc}")
-            return
+                    raise TimeoutError(f"Routing to {key} timed out.") from None
         finally:
             if executor is not None:
                 try:
@@ -1652,11 +1730,50 @@ class PollyCockpitApp(App[None]):
                 except Exception:  # noqa: BLE001
                     pass
 
-        self._post_route_success(key, resolved)
+    def _route_selected_worker(self, key: str, seq: int = 0) -> None:
+        """Worker-thread body: run ``route_selected`` through the
+        navigation controller with the existing route deadline."""
+        controller = self._ensure_navigation_controller()
+        if not seq or controller.current_request_id != seq:
+            request = controller.accept(key)
+            seq = request.request_id
+            self._route_click_seq = seq
+        else:
+            request = NavigationRequest(seq, key)
 
-    def _post_route_success(self, key: str, resolved: str) -> None:
-        """UI update after a route completes. Safe to call from a worker."""
+        try:
+            result = asyncio.run(controller.resolve_and_apply(request))
+        except Exception as exc:  # noqa: BLE001
+            self._post_route_error(key, f"Error: {exc}", seq)
+            return
+
+        if result.state == "applied":
+            resolved = str(result.window_result or result.destination_key or key)
+            self._post_route_success(key, resolved, seq)
+        elif result.state == "timed_out":
+            self._post_route_error(key, f"Routing to {key} timed out — try again.", seq)
+        elif result.state == "failed":
+            self._post_route_error(key, f"Error: {result.error or result.message}", seq)
+
+    def _post_route_success(
+        self, key: str, resolved: str, seq: int = 0,
+    ) -> None:
+        """UI update after a route completes. Safe to call from a worker.
+
+        ``seq`` is the click-sequence value captured when the worker was
+        scheduled. When a newer click has bumped ``_route_click_seq``
+        past ``seq`` this update is dropped so a stale (cancelled or
+        late-completing) worker can't overwrite the user's most-recent
+        intent — see #967 for the symptom this guards against.
+        """
         def _apply() -> None:
+            # Drop late updates from superseded clicks (#967). The
+            # check runs on the UI thread (inside ``call_from_thread``)
+            # so it races nothing — by the time we read
+            # ``_route_click_seq`` here, every preceding click's
+            # synchronous bump has happened.
+            if seq and seq != self._route_click_seq:
+                return
             # The router may have rewritten the selection (e.g.
             # ``project:x`` → ``project:x:dashboard``); re-sync.
             self.selected_key = resolved or key
@@ -1676,9 +1793,19 @@ class PollyCockpitApp(App[None]):
             # No running app (unit tests) — apply directly.
             _apply()
 
-    def _post_route_error(self, key: str, message: str) -> None:
-        """UI update after a route fails. Safe to call from a worker."""
+    def _post_route_error(
+        self, key: str, message: str, seq: int = 0,
+    ) -> None:
+        """UI update after a route fails. Safe to call from a worker.
+
+        ``seq`` is the click-sequence value captured when the worker
+        was scheduled. Stale errors (a worker whose click was already
+        superseded) are dropped so the loading hint of a newer in-flight
+        click isn't clobbered with a stale error message (#967).
+        """
         def _apply() -> None:
+            if seq and seq != self._route_click_seq:
+                return
             try:
                 self.hint.update(message[:60])
             except Exception:  # noqa: BLE001
@@ -2266,8 +2393,10 @@ class PollyDashboardApp(App[None]):
             )
 
     def _route_to_inbox(self) -> None:
-        router = CockpitRouter(self.config_path)
-        router.route_selected("inbox")
+        file_navigation_client(
+            self.config_path,
+            client_id="polly-dashboard",
+        ).jump_to_inbox()
 
 
 class PollyCockpitPaneApp(App[None]):
@@ -12033,8 +12162,10 @@ class PollyProjectDashboardApp(App[None]):
             )
 
     def _route_to_home(self) -> None:
-        router = CockpitRouter(self.config_path)
-        router.route_selected("dashboard")
+        file_navigation_client(
+            self.config_path,
+            client_id="project-dashboard",
+        ).navigate("dashboard")
 
     def action_chat_pm(self) -> None:
         """Route the cockpit right-pane to this project's PM session.
@@ -12176,26 +12307,34 @@ class PollyProjectDashboardApp(App[None]):
             )
 
     def _route_to_inbox(self) -> None:
-        router = CockpitRouter(self.config_path)
         # #751 — scope the inbox to the current project on jump so the
         # user doesn't land in the global feed when they came from a
         # specific project. Router resolves ``inbox:<key>`` to a
         # scoped static-view route.
-        router.route_selected(f"inbox:{self.project_key}")
+        file_navigation_client(
+            self.config_path,
+            client_id="project-dashboard",
+        ).jump_to_inbox(self.project_key)
 
     def _route_to_task(self, task_id: str) -> None:
         match = _PROJECT_TASK_REF_RE.fullmatch(task_id)
         if match is None:
             self._route_to_inbox()
             return
-        router = CockpitRouter(self.config_path)
-        router.route_selected(
-            f"project:{match.group('project')}:issues:task:{match.group('number')}"
+        file_navigation_client(
+            self.config_path,
+            client_id="project-dashboard",
+        ).jump_to_project(
+            match.group("project"),
+            view="issues",
+            task_number=match.group("number"),
         )
 
     def _route_to_tasks(self) -> None:
-        router = CockpitRouter(self.config_path)
-        router.route_selected(f"project:{self.project_key}:issues")
+        file_navigation_client(
+            self.config_path,
+            client_id="project-dashboard",
+        ).jump_to_project(self.project_key, view="issues")
 
     def _route_to_current_activity(self) -> None:
         data = self.data
@@ -12367,8 +12506,10 @@ class PollyProjectDashboardApp(App[None]):
         filter through ``pm cockpit-pane activity --project <key>`` so
         the user lands on a scoped view, not the global firehose.
         """
-        router = CockpitRouter(self.config_path)
-        router.route_selected(f"activity:{self.project_key}")
+        file_navigation_client(
+            self.config_path,
+            client_id="project-dashboard",
+        ).jump_to_activity(self.project_key)
 
     def action_open_plan(self) -> None:
         """Toggle plan-view mode — plan.md takes over the body.

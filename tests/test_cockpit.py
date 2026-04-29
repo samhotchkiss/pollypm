@@ -2688,12 +2688,15 @@ def test_cockpit_router_routes_idle_project_to_detail_pane(monkeypatch, tmp_path
     class FakeTmux:
         def list_panes(self, target: str):
             return [
-                type("Pane", (), {"pane_id": "%1", "active": True})(),
-                type("Pane", (), {"pane_id": "%2", "active": False})(),
+                type("Pane", (), {"pane_id": "%1", "active": True, "pane_left": 0, "pane_current_command": "uv"})(),
+                type("Pane", (), {"pane_id": "%2", "active": False, "pane_left": 30, "pane_current_command": "sh"})(),
             ]
 
         def respawn_pane(self, target: str, command: str):
             calls["respawn"] = (target, command)
+
+        def resize_pane_width(self, target: str, width: int):
+            calls["resize"] = (target, width)
 
     class FakeConfig:
         class Project:
@@ -2740,12 +2743,15 @@ def test_cockpit_router_routes_dashboard_home_to_static_pane(
     class FakeTmux:
         def list_panes(self, target: str):
             return [
-                type("Pane", (), {"pane_id": "%1", "active": True})(),
-                type("Pane", (), {"pane_id": "%2", "active": False})(),
+                type("Pane", (), {"pane_id": "%1", "active": True, "pane_left": 0, "pane_current_command": "uv"})(),
+                type("Pane", (), {"pane_id": "%2", "active": False, "pane_left": 30, "pane_current_command": "sh"})(),
             ]
 
         def respawn_pane(self, target: str, command: str):
             calls["respawn"] = (target, command)
+
+        def resize_pane_width(self, target: str, width: int):
+            calls["resize"] = (target, width)
 
     class FakeConfig:
         class Project:
@@ -3549,6 +3555,34 @@ def test_cockpit_app_adopts_external_router_selection_without_stomping_cursor() 
     app.selected_key = "inbox"
     app._adopt_router_selection_if_changed()
     assert app.selected_key == "inbox"
+
+
+def test_cockpit_app_drains_right_pane_navigation_queue_to_latest_request() -> None:
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    scheduled: list[tuple[str, str | None]] = []
+
+    class _Queue:
+        cleared = False
+
+        def pending(self):
+            return (
+                SimpleNamespace(sequence=1, selected_key="inbox:demo"),
+                SimpleNamespace(sequence=2, selected_key="activity:demo"),
+            )
+
+        def clear(self) -> None:
+            self.cleared = True
+
+    queue = _Queue()
+    app._cockpit_navigation_queue = lambda: queue  # type: ignore[method-assign]
+    app._schedule_route_selected = (  # type: ignore[method-assign]
+        lambda key, *, label=None: scheduled.append((key, label))
+    )
+
+    app._drain_cockpit_navigation_queue()
+
+    assert queue.cleared is True
+    assert scheduled == [("activity:demo", "activity:demo")]
 
 
 def test_cockpit_app_routes_detail_hint_keys_from_rail() -> None:
@@ -4408,7 +4442,7 @@ def test_async_click_dispatches_via_run_worker_when_available() -> None:
     app, events = _make_async_click_app()
     dispatched: list[str] = []
 
-    def _spy_dispatch(key: str) -> None:
+    def _spy_dispatch(key: str, seq: int = 0) -> None:
         dispatched.append(key)
 
     app._dispatch_route_in_worker = _spy_dispatch  # type: ignore[assignment]
@@ -4488,3 +4522,131 @@ def test_async_click_resyncs_selected_key_from_router() -> None:
 
     assert app.selected_key == "project:demo:dashboard"
     assert app._last_router_selected_key == "project:demo:dashboard"
+
+
+# ── #967: rail click stability — second click must NOT bounce back ────────────
+
+def test_rapid_double_click_does_not_bounce_back_to_first_target() -> None:
+    """#967 — every rail click flashed the target then bounced to Home.
+
+    Root cause: ``_route_selected_worker`` runs on a thread spawned via
+    ``run_worker(thread=True, exclusive=True, group="route_select")``.
+    Textual cancels the *asyncio* task when a newer click arrives, but the
+    thread itself continues running to completion (Python threads are not
+    asyncio-aware). When the stale thread eventually returned, it called
+    ``_post_route_success`` which unconditionally overwrote
+    ``selected_key`` with the OLD click's resolved key — bouncing the
+    user back to wherever the first click had gone.
+
+    Repro: click ``project:demo`` then immediately click ``polly``. The
+    ``project:demo`` worker is still running in its executor when the
+    ``polly`` worker fires. After both complete, ``selected_key`` MUST
+    reflect ``polly`` — the user's most-recent intent — not the stale
+    ``project:demo:dashboard`` the first worker resolved.
+    """
+    import threading
+
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+
+    project_started = threading.Event()
+    project_unblock = threading.Event()
+
+    class _RaceRouter:
+        selected = "polly"
+
+        def route_selected(self, key: str) -> None:
+            if key == "project:demo":
+                # Simulate the slow PM-attach: signal we've entered the
+                # router, then block until the test releases us. While
+                # we're parked here, the second click will fire.
+                project_started.set()
+                project_unblock.wait(timeout=2.0)
+                self.selected = "project:demo:dashboard"
+            else:
+                self.selected = key
+
+        def selected_key(self) -> str:
+            return self.selected
+
+    class _Hint:
+        def update(self, _msg: str) -> None:
+            pass
+
+    app.router = _RaceRouter()  # type: ignore[assignment]
+    app.selected_key = "polly"
+    app._last_router_selected_key = "polly"
+    app._route_click_seq = 0
+    app.hint = _Hint()  # type: ignore[assignment]
+    app._unread_keys = set()
+    app._refresh_rows = lambda: None  # type: ignore[method-assign]
+    app._selected_row_key = lambda: app.selected_key  # type: ignore[method-assign]
+
+    # First click — manually drive the same sequence that
+    # ``_schedule_route_selected`` would: bump the click seq and run
+    # the worker on a real thread (so we can race a second click).
+    app.selected_key = "project:demo"
+    app._route_click_seq += 1
+    first_seq = app._route_click_seq
+    first = threading.Thread(
+        target=lambda: app._route_selected_worker("project:demo", first_seq),
+        daemon=True,
+    )
+    first.start()
+    assert project_started.wait(timeout=2.0), "first router never entered"
+
+    # Second click — registers optimistic state for ``polly`` and runs
+    # the (fast) ``polly`` worker inline (no event loop in tests). After
+    # this returns the user's intent is unambiguously ``polly``.
+    app._schedule_route_selected("polly", label="Home")
+    assert app.selected_key == "polly"
+
+    # Release the stalled first worker. It will now finish and call
+    # ``_post_route_success`` for ``project:demo``. Without the #967 fix,
+    # this overwrites ``selected_key`` back to ``project:demo:dashboard``.
+    project_unblock.set()
+    first.join(timeout=2.0)
+    assert not first.is_alive(), "stalled router never returned"
+
+    # The user's most-recent click must win.
+    assert app.selected_key == "polly", (
+        "stale route worker bounced selected_key back to the previous "
+        f"click; got {app.selected_key!r}"
+    )
+    assert app._last_router_selected_key == "polly"
+
+
+def test_rail_click_is_stable_across_multiple_targets() -> None:
+    """#967 — clicking each rail entry in succession must leave the
+    cockpit on the LAST clicked target, not on whatever earlier click
+    happened to win the post-route race.
+    """
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+
+    class _Router:
+        selected = "polly"
+
+        def route_selected(self, key: str) -> None:
+            self.selected = key
+
+        def selected_key(self) -> str:
+            return self.selected
+
+    class _Hint:
+        def update(self, _msg: str) -> None:
+            pass
+
+    app.router = _Router()  # type: ignore[assignment]
+    app.selected_key = "polly"
+    app._last_router_selected_key = "polly"
+    app._route_click_seq = 0
+    app.hint = _Hint()  # type: ignore[assignment]
+    app._unread_keys = set()
+    app._refresh_rows = lambda: None  # type: ignore[method-assign]
+    app._selected_row_key = lambda: app.selected_key  # type: ignore[method-assign]
+
+    targets = ["inbox", "polly", "workers", "project:demo", "metrics"]
+    for target in targets:
+        app._schedule_route_selected(target, label=target)
+        assert app.selected_key == target, (
+            f"click on {target!r} did not stick (got {app.selected_key!r})"
+        )

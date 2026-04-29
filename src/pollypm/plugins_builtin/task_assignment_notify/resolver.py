@@ -629,39 +629,42 @@ def _escalate_no_session(event: TaskAssignmentEvent, store: Any | None) -> None:
     if store is None:
         return
     # #760 — action-forward single-line copy. Names the actor in plain
-    # English, picks the role-correct worker-start hint instead of the
-    # old always-architect default.
+    # English and keeps the recovery path inside the cockpit instead of
+    # pushing the user to remember CLI commands.
     from pollypm.work.models import ActorType
 
     if event.actor_type is ActorType.ROLE:
         actor_display = f"the {event.actor_name} role"
         if event.actor_name == "architect":
-            try_hint = f"Try: pm worker-start --role architect {event.project}"
+            action_hint = (
+                f"Open project '{event.project}' and use Workers to start or "
+                "recover the architect."
+            )
         elif event.actor_name == "worker":
-            # pm worker-start --role=worker is deprecated — pm task
-            # claim spawns a per-task worker, which is the preferred
-            # path. See pm worker-start --help.
-            try_hint = f"Try: pm task claim {event.task_id}"
+            action_hint = (
+                "Open the task in Tasks; Polly will claim it when worker "
+                "capacity is available, or use Workers to start capacity now."
+            )
         elif event.actor_name == "reviewer":
-            # #953 — CLI approve is the canonical path for human review;
-            # surface it first. Spinning up a reviewer worker session is
-            # a valid alternative but rarely what users actually want.
-            try_hint = (
-                f"Try: pm task approve {event.task_id} --actor {event.actor_name} --reason \"...\" "
-                f"(or pm worker-start --role {event.actor_name} {event.project} to spin up a reviewer session) "
-                f"(or pm task claim {event.task_id} for a per-task worker)"
+            # #953 — human review is the canonical path; surface the
+            # in-cockpit Approve/Reject decision before session recovery.
+            action_hint = (
+                "Open the task in Tasks or Inbox and use Approve or Reject."
             )
         else:
-            try_hint = (
-                f"Try: pm worker-start --role {event.actor_name} {event.project} "
-                f"(or pm task claim {event.task_id} for a per-task worker)"
+            action_hint = (
+                f"Open project '{event.project}' and use Workers to start or "
+                f"recover the {event.actor_name} role."
             )
     else:
         actor_display = event.actor_name or event.actor_type.value
-        try_hint = f"Try: pm task claim {event.task_id}"
+        action_hint = (
+            "Open the task in Tasks; Polly will claim it when a matching "
+            "worker is available."
+        )
     message = (
         f"Task {event.task_id} was routed to {actor_display} but no "
-        f"matching session is running. {try_hint}"
+        f"matching session is running. {action_hint}"
     )
     try:
         store.upsert_alert(

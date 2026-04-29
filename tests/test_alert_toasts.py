@@ -443,20 +443,20 @@ def test_toast_renders_full_message_under_220_chars() -> None:
     from pollypm.cockpit_alerts import AlertToast
 
     msg = (
-        "[Alert] Project 'media' has no .pollypm/state.db — register it "
-        "with `pm project add /path/to/media` before clicking it in the rail."
+        "[Alert] Project 'media' has no .pollypm/state.db — add it from "
+        "the project picker before clicking it in the rail."
     )
     toast = AlertToast(alert_id=1, severity="warn", message=msg)
     body = toast._render_body()
     # Full message survives — the actionable detail isn't clipped.
-    assert "register it with `pm project add" in body
+    assert "add it from the project picker" in body
     assert "before clicking it in the rail." in body
     # No truncation hint is appended (the message fit within the cap).
     assert "(truncated" not in body
 
 
-def test_narrow_toast_preserves_trailing_try_command() -> None:
-    """Rail-width toasts must not clip the recovery command."""
+def test_narrow_toast_preserves_trailing_action_hint() -> None:
+    """Rail-width toasts must not clip the recovery action hint."""
     from pollypm.cockpit_alerts import AlertToast
 
     toast = AlertToast(
@@ -464,16 +464,16 @@ def test_narrow_toast_preserves_trailing_try_command() -> None:
         severity="warn",
         message=(
             "[Alert] Project 'booktalk' needs planning. "
-            "Try: pm project plan booktalk"
+            "Open the project and press c to ask the PM to plan it."
         ),
         width_chars=28,
     )
     body = toast._render_body()
 
     assert "Project 'booktalk' needs planning" in body
-    assert "Try:" in body
-    assert "pm project plan booktalk" in body
-    assert "press [b]a[/b] for full text" in body
+    assert "Open the project" in body
+    assert "pm " not in body
+    assert "press [b]a[/b]" in body
 
 
 def test_toast_truncation_advertises_press_a_for_full_text() -> None:

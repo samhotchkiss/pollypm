@@ -237,7 +237,7 @@ def banner_text(check: ReleaseCheck) -> str:
     channel_label = f" ({check.channel} channel)" if check.channel != "stable" else ""
     return (
         f"↑ PollyPM v{check.current} → v{check.latest} available"
-        f"{channel_label}. Run: pm upgrade"
+        f"{channel_label}. Open Settings to upgrade"
     )
 
 

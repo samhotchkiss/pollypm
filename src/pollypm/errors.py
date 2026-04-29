@@ -98,9 +98,9 @@ def format_config_not_found_error(path: Path) -> str:
     """
     return (
         f"No PollyPM config at {path}.\n\n"
-        f"Fix: run `pm onboard` for first-time setup, `pm init` to write a "
-        f"blank config, or pass `--config <path>` if your config lives "
-        f"elsewhere."
+        "Fix: open Polly setup for first-time configuration, create a "
+        "blank config from Settings, or choose a different config path if "
+        "your config lives elsewhere."
     )
 
 
@@ -128,7 +128,7 @@ def format_probe_failure(
       available; it's inserted verbatim between the summary and the
       Fix: line.
     * ``fix`` is the next-action sentence. If omitted, a generic
-      ``pm relogin <account>`` hint is used.
+      Settings > Accounts reconnect hint is used.
     """
     email_suffix = f" ({account_email})" if account_email else ""
     summary = (
@@ -147,8 +147,8 @@ def format_probe_failure(
         parts.append(f"Fix: {fix}")
     else:
         parts.append(
-            f"Fix: run `pm accounts` to check login state, then "
-            f"`pm relogin {account_name}` if the session expired."
+            "Fix: open Settings > Accounts to check login state, then "
+            f"reconnect '{account_name}' if the session expired."
         )
     return "\n".join(parts)
 

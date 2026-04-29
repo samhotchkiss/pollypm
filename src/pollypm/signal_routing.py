@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import enum
 import hashlib
+import re
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping
 
@@ -166,6 +167,19 @@ class SignalSurface(enum.Enum):
     ACTION_REQUIRED with USER audience."""
 
 
+_CLI_SUGGESTION_RE = re.compile(
+    r"(?:^|[`\"'\s])(?:uv\s+run\s+)?pm\s+[A-Za-z0-9_.:-]+",
+    re.IGNORECASE,
+)
+
+
+def _product_safe_suggested_action(action: str) -> str:
+    """Keep signal actions in-product before they hit Inbox/Activity."""
+    if _CLI_SUGGESTION_RE.search(action):
+        return "Open Polly and use the relevant cockpit action."
+    return action
+
+
 # ---------------------------------------------------------------------------
 # Envelope
 # ---------------------------------------------------------------------------
@@ -191,8 +205,8 @@ class SignalEnvelope:
     * ``project`` — optional project key to scope the signal.
     * ``subject`` / ``body`` — short rendered text for inbox /
       toast. Required.
-    * ``suggested_action`` — optional one-line CLI suggestion
-      (e.g., ``"pm task claim demo/5"``). Inbox and Activity
+    * ``suggested_action`` — optional one-line product action
+      (e.g., ``"Open Tasks and claim demo/5"``). Inbox and Activity
       both render this when present.
     * ``payload`` — free-form structured data carried alongside
       the signal for future inspection. Not required to follow
@@ -209,6 +223,14 @@ class SignalEnvelope:
     dedupe_key: str | None = None
     suggested_action: str | None = None
     payload: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.suggested_action:
+            object.__setattr__(
+                self,
+                "suggested_action",
+                _product_safe_suggested_action(self.suggested_action),
+            )
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-friendly dict for storage / wire transport."""

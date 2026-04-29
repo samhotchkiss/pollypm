@@ -183,7 +183,7 @@ def test_trigger_upgrade_emits_notification(fake_config, monkeypatch):
     monkeypatch.setattr(app, "notify", _capture)
     app.action_trigger_upgrade()
     assert len(notices) == 1
-    assert "pm upgrade" in notices[0]
+    assert "Settings" in notices[0]
 
 
 def test_check_post_upgrade_flag_handles_corrupt_non_dict_payload(

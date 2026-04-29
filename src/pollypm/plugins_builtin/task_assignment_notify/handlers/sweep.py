@@ -331,22 +331,21 @@ def _emit_no_session_alert(
     expected_name = candidates[0] if candidates else f"{role}-{project}"
     # #760 — actionable single-line copy. Old phrasing started with
     # routing-engine language ("no live session for role:worker in
-    # project X") which read as machine-to-machine. New phrasing
-    # starts with the user-visible effect and names the concrete
-    # command alternatives, with ``pm task claim`` first for worker-
-    # role tasks (pm worker-start --role=worker is deprecated in
-    # favour of per-task workers — see pm worker-start --help).
+    # project X") which read as machine-to-machine. Keep the fix path
+    # inside the cockpit so alerts do not turn into CLI instructions.
     if actor_type is ActorType.ROLE and role == "architect":
-        fix_hint = f"Try: pm worker-start --role architect {project}"
+        fix_hint = "Open Workers and start or recover the architect."
     elif actor_type is ActorType.ROLE and role == "worker":
-        fix_hint = f"Try: pm task claim {example_task_id}"
-    elif actor_type is ActorType.ROLE:
         fix_hint = (
-            f"Try: pm worker-start --role {role} {project} "
-            f"(or pm task claim {example_task_id} for a per-task worker)"
+            "Open Tasks to inspect the queue; Polly will claim it when "
+            "worker capacity is available, or use Workers to start capacity."
         )
+    elif actor_type is ActorType.ROLE and role == "reviewer":
+        fix_hint = "Open Tasks or Inbox and use Approve or Reject."
+    elif actor_type is ActorType.ROLE:
+        fix_hint = f"Open Workers and start or recover the {role} role."
     else:
-        fix_hint = f"Try: pm task claim {example_task_id}"
+        fix_hint = "Open Tasks; Polly will claim it when a matching worker is available."
     message = (
         f"No worker is running for the {role} role on '{project}' — "
         f"task {example_task_id} is stuck in the queue. {fix_hint}"

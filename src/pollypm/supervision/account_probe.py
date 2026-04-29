@@ -69,8 +69,8 @@ class ControllerProbeService:
                     ),
                     pane_tail=pane_tail,
                     fix=(
-                        f"run `pm accounts` to check login state, then "
-                        f"`pm relogin {account_name}` if the session expired."
+                        "open Settings > Accounts to check login state, then "
+                        f"reconnect '{account_name}' if the session expired."
                     ),
                 )
             )
@@ -84,10 +84,9 @@ class ControllerProbeService:
                         reason="the account is out of credits",
                         pane_tail=pane_tail,
                         fix=(
-                            f"switch the controller to a different account "
-                            f"with `pm failover` (see `pm accounts` for "
-                            f"current state), or top up '{account_name}' "
-                            f"and rerun `pm up`."
+                            "open Settings > Accounts to switch the controller "
+                            f"to a healthy account, or top up '{account_name}' "
+                            "and restart Polly."
                         ),
                     )
                 )
@@ -100,8 +99,8 @@ class ControllerProbeService:
                         reason="the account is not authenticated",
                         pane_tail=pane_tail,
                         fix=(
-                            f"run `pm relogin {account_name}` and retry "
-                            f"`pm up`."
+                            f"reconnect '{account_name}' in Settings > Accounts "
+                            "and restart Polly."
                         ),
                     )
                 )
@@ -117,9 +116,9 @@ class ControllerProbeService:
                         ),
                         pane_tail=pane_tail,
                         fix=(
-                            f"`pm relogin {account_name}` usually clears "
-                            f"this. If it persists, run the probe command "
-                            f"manually to see the raw output."
+                            f"reconnecting '{account_name}' in Settings > Accounts "
+                            "usually clears this. If it persists, open the "
+                            "account detail and inspect the raw provider output."
                         ),
                     )
                 )

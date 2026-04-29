@@ -300,12 +300,10 @@ class TestNoSessionAlerts:
         assert alert.session_name == "worker-ghost"
         assert alert.severity == "warn"
         assert "ghost" in alert.message
-        # Fix-it hint points at ``pm task claim`` for worker-role tasks.
-        # ``pm worker-start --role=worker`` is deprecated in favour of
-        # per-task workers spawned by ``pm task claim`` — see
-        # ``pm worker-start --help``. Architect-role tasks still use
-        # ``pm worker-start --role architect``.
-        assert "pm task claim" in alert.message
+        # Fix-it hint stays inside the cockpit instead of telling the
+        # user to run a shell command.
+        assert "Open Tasks" in alert.message
+        assert "pm " not in alert.message
 
         store.close()
 

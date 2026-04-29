@@ -171,8 +171,8 @@ def _on_project_created(context) -> None:
             log.warning(
                 "project_planning: new project '%s' was registered but "
                 "auto-planning is disabled ([planner] auto_on_project_created=false). "
-                "Run `pm project plan %s` to design the architecture.",
-                project_key, project_key,
+                "Open the project and use the Plan action to design the architecture.",
+                project_key,
             )
             return
 

@@ -153,7 +153,7 @@ def _build_cockpit_detail_dispatch(supervisor, config_path: Path, kind: str, tar
             f"Open permissions by default: {'on' if config.pollypm.open_permissions_by_default else 'off'}",
             "",
             "This pane is read-only for now.",
-            "Use Polly or the legacy `pm ui` surface for deeper account/runtime changes.",
+            "Use Polly for deeper account/runtime changes.",
         ]
         if recent_usage:
             lines.extend(["", "Recent token usage:"])
@@ -166,7 +166,7 @@ def _build_cockpit_detail_dispatch(supervisor, config_path: Path, kind: str, tar
     if kind == "project" and target:
         project = config.projects.get(target)
         if project is None:
-            return f"Project '{target}' not found in config.\n\nIt may not have been saved. Try `pm add-project <path>` or check ~/.pollypm/pollypm.toml."
+            return f"Project '{target}' not found in config.\n\nIt may not have been saved. Open the project picker and add it again, or check ~/.pollypm/pollypm.toml."
         ensure_project_scaffold(project.path)
 
         # Try work service dashboard first
@@ -230,7 +230,7 @@ def _build_cockpit_detail_dispatch(supervisor, config_path: Path, kind: str, tar
             pass
         task_backend = get_task_backend(project.path)
         if not task_backend.exists():
-            return f"{project.name or project.key} · Issues\n\nNo issue tracker initialized.\nUse `pm init-tracker {target}` to create one."
+            return f"{project.name or project.key} · Issues\n\nNo issue tracker initialized.\nOpen project settings to create one."
         state_counts = task_backend.state_counts()
         lines = [f"{project.name or project.key} · Issues", ""]
         for state_name in ["01-ready", "02-in-progress", "03-needs-review", "04-in-review", "05-completed"]:
@@ -1114,7 +1114,7 @@ def build_palette_commands(
         ))
         commands.append(PaletteCommand(
             title=f"Queue next task in {name}",
-            subtitle=f"Run pm task next --project {project_key}",
+            subtitle="Ask Polly to pick up the next ready task",
             category="Task",
             keybind=None,
             tag=f"task.queue_next:{project_key}",
@@ -1122,7 +1122,7 @@ def build_palette_commands(
 
     # Inbox commands.
     commands.append(PaletteCommand(
-        title="Run pm notify",
+        title="Send an inbox notification",
         subtitle="Send a notification into the inbox",
         category="Inbox",
         keybind=None,
@@ -1165,7 +1165,7 @@ def build_palette_commands(
     # going from inside the cockpit.
     commands.append(PaletteCommand(
         title="Add a project to PollyPM",
-        subtitle="Run pm add-project <path> in a terminal",
+        subtitle="Add a repository from inside the cockpit",
         category="Project",
         keybind=None,
         tag="project.add",
@@ -1179,7 +1179,7 @@ def build_palette_commands(
     ))
     commands.append(PaletteCommand(
         title="Send Polly a request",
-        subtitle="Hand a job to the operator via pm send operator",
+        subtitle="Hand a job to Polly from the cockpit",
         category="Project",
         keybind=None,
         tag="project.send_operator",
@@ -1187,7 +1187,7 @@ def build_palette_commands(
 
     # System.
     commands.append(PaletteCommand(
-        title="Run pm doctor",
+        title="Run diagnostics",
         subtitle="Stream doctor checks into the palette",
         category="System",
         keybind=None,

@@ -962,7 +962,7 @@ def test_missing_window_alert_routes_through_signal_envelope(monkeypatch) -> Non
     env = matching[0]
     assert env.source == "heartbeat"
     assert env.severity.value == "error"
-    assert env.suggested_action == "pm session restart worker_pollypm"
+    assert env.suggested_action == "Open Workers and restart the missing session."
     # And the legacy persistence still runs.
     assert ("worker_pollypm", "missing_window") in api.alerts
 
@@ -1146,5 +1146,4 @@ def test_heartbeat_unmanaged_window_event_routes_through_signal_envelope(
     # Legacy persistence path still records the event.
     persisted_subjects = {event_type for (_session, event_type, _msg) in api.events}
     assert "unmanaged_window" in persisted_subjects
-
 

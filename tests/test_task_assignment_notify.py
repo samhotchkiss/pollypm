@@ -350,18 +350,15 @@ class TestNotifyEscalation:
         assert outcome["outcome"] == "no_session"
         alerts = state_store.open_alerts()
         assert any(a.alert_type == "no_session_for_assignment:demo/1" for a in alerts)
-        # Message guides the user to the supported fix command.
-        # Worker-role tasks get ``pm task claim`` (pm worker-start
-        # --role=worker is deprecated in favour of per-task workers).
-        # Architect-role tasks get ``pm worker-start --role architect``.
+        # Message guides the user to the cockpit surface, not to a CLI command.
         matching = [a for a in alerts if a.alert_type.endswith(":demo/1")]
-        assert any("pm task claim" in a.message for a in matching)
+        assert any("Open the task in Tasks" in a.message for a in matching)
+        assert all("pm " not in a.message for a in matching)
 
-    def test_reviewer_no_session_hint_lists_approve_first(self, state_store):
-        """#953 — reviewer-role no-session alerts must surface ``pm task
-        approve`` as the canonical path, BEFORE the worker-start /
-        claim alternatives. The old hint pushed users toward spinning
-        up a reviewer worker, which is rarely what they want."""
+    def test_reviewer_no_session_hint_points_to_review_ui(self, state_store):
+        """#953 — reviewer-role no-session alerts must surface human
+        Approve/Reject as the canonical path, without telling the user
+        to run recovery commands."""
         svc = FakeSessionService(handles=[])  # nobody live
         services = _RuntimeServices(
             session_service=svc, state_store=state_store,
@@ -377,21 +374,9 @@ class TestNotifyEscalation:
         matching = [a for a in alerts if a.alert_type.endswith(":demo/1")]
         assert matching, "expected a per-task no_session_for_assignment alert"
         message = matching[0].message
-        # CLI approve must appear first, with the dynamic task id and
-        # reviewer actor name substituted.
-        assert "pm task approve demo/1 --actor reviewer" in message
-        approve_idx = message.find("pm task approve")
-        worker_start_idx = message.find("pm worker-start")
-        claim_idx = message.find("pm task claim")
-        assert approve_idx != -1, "expected `pm task approve` in hint"
-        assert worker_start_idx != -1, "expected worker-start alternative"
-        assert claim_idx != -1, "expected pm task claim alternative"
-        assert approve_idx < worker_start_idx, (
-            "pm task approve must appear BEFORE pm worker-start in reviewer hint"
-        )
-        assert approve_idx < claim_idx, (
-            "pm task approve must appear BEFORE pm task claim in reviewer hint"
-        )
+        assert "Open the task in Tasks or Inbox" in message
+        assert "Approve or Reject" in message
+        assert "pm " not in message
 
 
 # ---------------------------------------------------------------------------

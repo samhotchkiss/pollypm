@@ -681,7 +681,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 ),
                 subject=f"{context.session_name} missing tmux window",
                 suggested_action=(
-                    f"pm session restart {context.session_name}"
+                    "Open Workers and restart the missing session."
                 ),
             )
             self._set_session_status(
@@ -720,7 +720,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 ),
                 subject=f"{context.session_name} pane exited",
                 suggested_action=(
-                    f"pm session restart {context.session_name}"
+                    "Open Workers and restart the exited session."
                 ),
             )
             self._set_session_status(api, context, "recovering", reason="Pane exited")
@@ -746,7 +746,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 ),
                 subject=f"{context.session_name} returned to shell",
                 suggested_action=(
-                    f"pm session restart {context.session_name}"
+                    "Open Workers and restart the session."
                 ),
             )
             alerts.append("shell_returned")
@@ -781,8 +781,8 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     api.clear_alert(context.session_name, "suspected_loop")
                 else:
                     # #760 — concrete actionable copy: name the role,
-                    # say what's wrong in plain English, give the
-                    # next step as a copy-pasteable command.
+                    # say what's wrong in plain English, and keep the
+                    # next step in the cockpit.
                     _emit_routed_alert(
                         api,
                         session_name=context.session_name,
@@ -792,13 +792,13 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                             f"{context.role or 'session'} "
                             f"{context.session_name} stalled — no new output "
                             f"for 3 heartbeats with queued work. "
-                            f"Try: pm session restart {context.session_name}"
+                            "Open Workers and restart the stalled session."
                         ),
                         subject=(
                             f"{context.session_name} appears stalled"
                         ),
                         suggested_action=(
-                            f"pm session restart {context.session_name}"
+                            "Open Workers and restart the stalled session."
                         ),
                     )
                     alerts.append("suspected_loop")
@@ -859,7 +859,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             _drift_body = (
                 f"{context.session_name} ({context.role}) identified "
                 f"itself as {drifted_to!r} mid-session — identity drift. "
-                f"Try: pm session restart {context.session_name}"
+                "Open Workers and restart the drifted session."
             )
             # #910 — consolidated through the same routed-emit helper
             # used by every other heartbeat alert. The helper is the
@@ -877,7 +877,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 message=_drift_body,
                 subject=_drift_subject,
                 suggested_action=(
-                    f"pm session restart {context.session_name}"
+                    "Open Workers and restart the drifted session."
                 ),
             )
             alerts.append("persona_drift_detected")
@@ -923,7 +923,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 ),
                 subject=f"{context.session_name} authentication failure",
                 suggested_action=(
-                    f"pm session restart {context.session_name}"
+                    "Open Settings to fix the account, then restart the session from Workers."
                 ),
             )
             api.mark_account_auth_broken(
@@ -1200,7 +1200,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 ),
                 subject=f"{context.session_name} needs attention",
                 suggested_action=(
-                    f"pm session restart {context.session_name}"
+                    "Open Workers and restart the stalled session."
                 ),
             )
             from pollypm.plugins_builtin.activity_feed.summaries import (
@@ -1376,7 +1376,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                             f"{context.session_name} unresponsive to nudge"
                         ),
                         suggested_action=(
-                            f"pm session restart {context.session_name}"
+                            "Open Workers and restart the stalled session."
                         ),
                     )
                     api.supervisor.msg_store.append_event(

@@ -116,8 +116,7 @@ def test_trigger_upgrade_handles_tmux_failure(fake_config, monkeypatch):
     app.action_trigger_upgrade()
 
     assert len(notices) == 1
-    assert "pm upgrade" in notices[0]
-    assert "terminal" in notices[0]
+    assert "Settings" in notices[0]
 
 
 def test_trigger_upgrade_falls_back_when_supervisor_missing(fake_config, monkeypatch):

@@ -157,7 +157,7 @@ def test_routing_decision_is_immutable() -> None:
 def test_envelope_to_dict_includes_all_fields() -> None:
     """The dict form must round-trip every field for storage."""
     env = _envelope(
-        suggested_action="pm task claim demo/5",
+        suggested_action="Open Tasks and claim demo/5",
         dedupe_key="work:plan_ready:demo/5",
         project="demo",
     )
@@ -165,9 +165,18 @@ def test_envelope_to_dict_includes_all_fields() -> None:
     assert payload["audience"] == "user"
     assert payload["actionability"] == "action_required"
     assert payload["source"] == "test"
-    assert payload["suggested_action"] == "pm task claim demo/5"
+    assert payload["suggested_action"] == "Open Tasks and claim demo/5"
     assert payload["dedupe_key"] == "work:plan_ready:demo/5"
     assert payload["project"] == "demo"
+
+
+def test_signal_envelope_replaces_cli_suggested_action() -> None:
+    env = _envelope(suggested_action="pm task claim demo/5")
+
+    assert env.suggested_action == "Open Polly and use the relevant cockpit action."
+    assert env.to_dict()["suggested_action"] == (
+        "Open Polly and use the relevant cockpit action."
+    )
 
 
 # ---------------------------------------------------------------------------

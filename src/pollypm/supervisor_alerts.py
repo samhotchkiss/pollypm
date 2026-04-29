@@ -235,7 +235,7 @@ def _update_alerts(
                 _suspect_body = (
                     f"{launch.session.role or 'session'} {session_name} "
                     f"stalled — no new output for 3 heartbeats with "
-                    f"queued work. Try: pm session restart {session_name}"
+                    "queued work. Open Workers and restart the stalled session."
                 )
                 _route_signal(
                     _envelope_for_alert(
@@ -245,7 +245,7 @@ def _update_alerts(
                         session_name=session_name,
                         subject=f"{session_name} appears stalled",
                         body=_suspect_body,
-                        suggested_action=f"pm session restart {session_name}",
+                        suggested_action="Open Workers and restart the stalled session.",
                     )
                 )
                 supervisor.msg_store.upsert_alert(
@@ -424,7 +424,7 @@ def _build_review_nudge(supervisor: SupervisorAlertBoundary) -> str | None:
         f"You have {n} {word} waiting for your review:",
         *review_tasks,
         "",
-        "Review with: pm task status <id>, then pm task approve <id> --actor russell or pm task reject <id> --actor russell --reason \"...\"",
+        "Open Tasks or Inbox, inspect each review, then use Approve or Reject.",
     ]
     return "\n".join(lines)
 
@@ -453,7 +453,7 @@ def _build_task_nudge(supervisor: SupervisorAlertBoundary, launch: SessionLaunch
             return (
                 f"You have work waiting. Task {task.task_id} — \"{task.title}\" "
                 f"is queued for your project. "
-                f"Claim it: pm task claim {task.task_id}"
+                "Open Tasks to review the queue; Polly will claim it when worker capacity is available."
             )
     except Exception:
         return None

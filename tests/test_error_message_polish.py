@@ -44,14 +44,14 @@ class TestFormatConfigNotFoundError:
 
         assert str(target) in msg
 
-    def test_includes_pm_onboard_hint(self, tmp_path: Path) -> None:
+    def test_includes_in_product_setup_hint(self, tmp_path: Path) -> None:
         msg = format_config_not_found_error(tmp_path / "x.toml")
 
-        # All three recovery paths must be named in the Fix block so the
-        # user (or scripted caller) can copy-paste any of them.
-        assert "pm onboard" in msg
-        assert "pm init" in msg
-        assert "--config" in msg
+        # Recovery paths should point at product surfaces rather than asking
+        # the user to memorize CLI commands.
+        assert "Polly setup" in msg
+        assert "Settings" in msg
+        assert "config path" in msg
 
     def test_ends_with_fix_prefix(self, tmp_path: Path) -> None:
         msg = format_config_not_found_error(tmp_path / "x.toml")
@@ -93,7 +93,7 @@ class TestFormatProbeFailure:
         assert "None" not in msg
         assert "()" not in msg
 
-    def test_default_fix_references_pm_relogin(self) -> None:
+    def test_default_fix_references_account_settings(self) -> None:
         msg = format_probe_failure(
             provider="Claude",
             account_name="primary",
@@ -101,7 +101,8 @@ class TestFormatProbeFailure:
             reason="failed",
         )
 
-        assert "pm relogin primary" in msg
+        assert "Settings > Accounts" in msg
+        assert "primary" in msg
         assert "Fix:" in msg
 
     def test_custom_fix_appears_verbatim(self) -> None:
@@ -110,13 +111,13 @@ class TestFormatProbeFailure:
             account_name="cx",
             account_email=None,
             reason="bust",
-            fix="switch the controller with `pm failover`.",
+            fix="switch the controller in Settings > Accounts.",
         )
 
-        assert "pm failover" in msg
-        # The default pm relogin hint must NOT appear when fix is
+        assert "Settings > Accounts" in msg
+        # The default reconnect hint must NOT appear when fix is
         # provided — otherwise both would show and confuse the user.
-        assert "pm relogin" not in msg
+        assert "reconnect 'cx'" not in msg
 
     def test_pane_tail_is_included_verbatim(self) -> None:
         tail = "ERROR: credits exhausted\ngive up, old man"
@@ -248,7 +249,8 @@ class TestSupervisorProbeErrors:
         msg = str(excinfo.value)
         assert "claude_main" in msg
         assert "sam@example.com" in msg
-        assert "pm relogin claude_main" in msg
+        assert "Settings > Accounts" in msg
+        assert "claude_main" in msg
         assert "Fix:" in msg
         # Pane tail context — last 5 non-empty lines must appear verbatim.
         assert "try again later" in msg
@@ -269,7 +271,7 @@ class TestSupervisorProbeErrors:
         msg = str(excinfo.value)
         assert "codex_backup" in msg
         assert "out of credits" in msg
-        assert "pm failover" in msg or "pm accounts" in msg
+        assert "Settings > Accounts" in msg
 
     def test_codex_not_authenticated_names_account_and_relogin(
         self, tmp_path: Path, monkeypatch
@@ -286,7 +288,7 @@ class TestSupervisorProbeErrors:
 
         msg = str(excinfo.value)
         assert "codex_backup" in msg
-        assert "pm relogin codex_backup" in msg
+        assert "Settings > Accounts" in msg
         assert "not authenticated" in msg
 
 
@@ -572,8 +574,8 @@ class TestConfigNotFoundHelperConsumers:
 
         combined = (result.stdout or "") + (result.stderr or "")
         assert "No PollyPM config at" in combined
-        assert "pm onboard" in combined
-        assert "pm init" in combined
+        assert "Polly setup" in combined
+        assert "Settings" in combined
         assert result.exit_code != 0
 
     def test_cli_reset_uses_helper(self, tmp_path: Path) -> None:
@@ -587,5 +589,5 @@ class TestConfigNotFoundHelperConsumers:
 
         combined = (result.stdout or "") + (result.stderr or "")
         assert "No PollyPM config at" in combined
-        assert "pm onboard" in combined
+        assert "Polly setup" in combined
         assert result.exit_code != 0

@@ -103,7 +103,7 @@ def notify_deploy_expired(project_root: Path, *, subdomain: str, expires_at: str
         severity="warn",
         message=(
             f"Deploy for {subdomain}.itsalive.co expired at {expires_at}. "
-            "Run `pm itsalive deploy` again to retry."
+            "Open the deploy panel and retry the deploy."
         ),
         event="deploy_expired",
     )

@@ -342,7 +342,7 @@ def _dispatch_palette_tag(app: App, tag: str | None) -> None:
         if tag == "inbox.notify":
             _palette_notify(
                 app,
-                "Run `pm notify` from a shell \u2014 palette prompt landing in a follow-up.",
+                "Inbox notification composer is not wired yet. Use Polly chat to send the update.",
             )
             return
         if tag == "inbox.archive_read":
@@ -352,7 +352,7 @@ def _dispatch_palette_tag(app: App, tag: str | None) -> None:
             )
             return
         if tag == "system.doctor":
-            _palette_notify(app, "Run `pm doctor` from a shell for now.")
+            _palette_notify(app, "Diagnostics are not wired into the palette yet.")
             return
         if tag == "system.edit_config":
             _palette_notify(
@@ -364,40 +364,35 @@ def _dispatch_palette_tag(app: App, tag: str | None) -> None:
             project_key = tag.split(":", 1)[1]
             _palette_notify(
                 app,
-                f"Create task in {project_key}: run `pm task create --project {project_key}`.",
+                f"Create task in {project_key}: open Tasks and use the create action.",
             )
             return
         if tag.startswith("task.queue_next:"):
             project_key = tag.split(":", 1)[1]
             _palette_notify(
                 app,
-                f"Queue next: run `pm task next --project {project_key}`.",
+                f"Queue next in {project_key}: ask Polly to pick up the next ready task.",
             )
             return
         # Project lifecycle commands (#875). Each surfaces a clear
         # next-step instruction so the user is not stuck wondering how
-        # to add or activate a project from inside the cockpit. The
-        # cockpit can't fork a CLI prompt, so we point the user at the
-        # exact command and clipboard-friendly form.
+        # to add or activate a project from inside the cockpit.
         if tag == "project.add":
             _palette_notify(
                 app,
-                "Add project: run `pm add-project <path-to-repo>` in a shell, "
-                "then re-open the cockpit.",
+                "Project add is not wired here yet. Open the project picker and choose Add Project.",
             )
             return
         if tag == "project.scan":
             _palette_notify(
                 app,
-                "Scan for projects: run `pm scan-projects <root>` to walk a "
-                "directory tree for git repos PollyPM doesn't track yet.",
+                "Project scan is not wired here yet. Open the project picker and choose Scan.",
             )
             return
         if tag == "project.send_operator":
             _palette_notify(
                 app,
-                'Send Polly a request: run `pm send operator "<your task>"` '
-                "from a shell — Polly the operator will pick it up.",
+                "Open Polly chat and describe the job you want handled.",
             )
             return
     except Exception as exc:  # noqa: BLE001

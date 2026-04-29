@@ -918,9 +918,8 @@ class TmuxSessionService:
                         reason="the account is out of credits",
                         pane_tail=_last_lines(pane, n=5),
                         fix=(
-                            f"switch the controller to a different account "
-                            f"with `pm failover` (see `pm accounts`), or top "
-                            f"up '{who}' and rerun `pm up`."
+                            "open Settings > Accounts to switch the controller "
+                            f"to a healthy account, or top up '{who}' and restart Polly."
                         ),
                     )
                 )

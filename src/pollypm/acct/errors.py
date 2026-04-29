@@ -64,8 +64,8 @@ class AccountNotFound(AcctError):
             f"Why: account operations look up accounts by their config "
             f"name or email address; the identifier did not match any "
             f"of the configured accounts.\n\n"
-            f"Fix: run `pm accounts list` to see configured accounts, "
-            f"or add the missing one with `pm accounts add`. Configured "
+            f"Fix: open Settings > Accounts to see configured accounts, "
+            f"or add the missing one there. Configured "
             f"accounts: {available_str}."
         )
 

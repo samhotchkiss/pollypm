@@ -97,9 +97,9 @@ def _truncate_summary(text: str, *, width: int = 96) -> str:
     cleaned = text.replace("\n", " ").strip()
     if len(cleaned) <= width:
         return cleaned
-    try_index = cleaned.find("Try:")
-    if try_index >= 0:
-        action_hint = cleaned[try_index:].strip()
+    match = re.search(r"\bOpen (?:Tasks|Workers|Settings|Polly|Inbox)\b", cleaned)
+    if match is not None:
+        action_hint = cleaned[match.start():].strip()
         if len(action_hint) < width - 5:
             head_budget = width - len(action_hint) - 3
             if head_budget >= 12:

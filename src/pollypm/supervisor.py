@@ -1668,9 +1668,8 @@ class Supervisor:
         raise RuntimeError(
             f"Session '{launch.session.name}' (window '{launch.window_name}') not found in "
             f"storage closet or cockpit. The worker may have crashed or been decommissioned. "
-            f"For an architect: `pm worker-start --role architect {launch.session.project}`. "
-            f"For a per-task worker: `pm task claim <task_id>` — claiming a task provisions "
-            f"a fresh worker session."
+            "Open Workers to restart an architect, or open Tasks so Polly can "
+            "claim queued work with fresh worker capacity."
         )
 
     def send_input(
@@ -2270,7 +2269,7 @@ class Supervisor:
             if attempts >= self._RECOVERY_HARD_LIMIT:
                 msg = (
                     f"Automatic recovery STOPPED after {attempts} total failures. "
-                    f"Session requires manual intervention (pm up or account re-auth)."
+                    "Session requires manual intervention from Workers or account repair in Settings."
                 )
             self._msg_store.upsert_alert(
                 launch.session.name,
@@ -3585,9 +3584,8 @@ class Supervisor:
                         reason="the account is out of credits",
                         pane_tail=_last_lines(pane, n=5),
                         fix=(
-                            f"switch the controller to a different account "
-                            f"with `pm failover` (see `pm accounts`), or top "
-                            f"up '{account_name}' and rerun `pm up`."
+                            "open Settings > Accounts to switch the controller "
+                            f"to a healthy account, or top up '{account_name}' and restart Polly."
                         ),
                     )
                 )

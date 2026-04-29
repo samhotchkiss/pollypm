@@ -216,9 +216,9 @@ class SupervisorHeartbeatAPI:
                 "operator",
                 (
                     f"H: Heartbeat alert for {session_name}. {reason}. "
-                    f"Options: (1) check task status with `pm task list -p {session_name.replace('worker_', '', 1)}`, "
-                    f"(2) for a per-task worker: cancel + re-queue + re-claim (`pm task cancel <id>` then `pm task claim <id>`); for an architect: `pm worker-start --role architect {session_name.replace('worker_', '', 1)}`, "
-                    f"(3) create a new task if the session needs work."
+                    "Options: (1) inspect the task list in the cockpit, "
+                    "(2) restart the session from Workers if it is wedged, "
+                    "(3) create a new task if the session needs work."
                 ),
                 owner="heartbeat",
             )

@@ -1287,8 +1287,7 @@ class PollyCockpitApp(App[None]):
         except Exception:  # noqa: BLE001
             try:
                 self.notify(
-                    "Could not open a new tmux window. Run "
-                    "`pm upgrade` directly in a terminal.",
+                    "Could not open a new tmux window. Use Settings to retry the upgrade.",
                     timeout=6,
                 )
             except Exception:  # noqa: BLE001
@@ -1417,7 +1416,7 @@ class PollyCockpitApp(App[None]):
                 elapsed = (datetime.now(UTC) - parsed).total_seconds()
                 if elapsed > self._HEARTBEAT_STALE_SECONDS:
                     mins = int(elapsed // 60)
-                    hint_text = f"\u26a0 Heartbeat offline ({mins}m) \u2014 run `pm heartbeat install`"
+                    hint_text = f"\u26a0 Heartbeat offline ({mins}m) \u2014 open Settings to repair recovery"
         except Exception:  # noqa: BLE001
             pass
         self.hint.update(hint_text)
@@ -6516,8 +6515,8 @@ class PollyInboxApp(App[None]):
                 return
             self.detail.update(
                 "[#f0c45a]This task lives in a project that is not "
-                "currently registered with PollyPM. Add the project "
-                "with `pm add-project` to load its details here.[/#f0c45a]"
+                "currently registered with PollyPM. Add the project from "
+                "the project picker to load its details here.[/#f0c45a]"
             )
             self._clear_rollup_items()
             return
@@ -10595,7 +10594,7 @@ class PollyProjectDashboardApp(App[None]):
             self.topbar.update(
                 f"[b]{_escape(self.project_key)}[/b]   "
                 f"[dim]is not a tracked project — "
-                f"check ``pm projects`` for the list.[/dim]"
+                f"open the project picker to choose a tracked project.[/dim]"
             )
             return
 

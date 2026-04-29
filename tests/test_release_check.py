@@ -200,7 +200,7 @@ def test_banner_text_stable_channel(tmp_path, monkeypatch):
     text = release_check.banner_text(check)
     assert "0.1.0" in text
     assert "0.2.0" in text
-    assert "pm upgrade" in text
+    assert "Open Settings to upgrade" in text
     # Stable channel omits the channel label to keep the banner terse.
     assert "channel" not in text
 
@@ -239,7 +239,7 @@ def test_update_banner_line_shows_when_upgrade(tmp_path, monkeypatch):
         channel="stable",
         network_fetch=_fixed_fetch([_release("v0.2.0")]),
     )
-    assert "pm upgrade" in line
+    assert "Open Settings to upgrade" in line
     assert "0.2.0" in line
 
 

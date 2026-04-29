@@ -87,14 +87,17 @@ class TestCreateWindowIdempotent:
         monkeypatch.setattr(client, "list_windows", lambda name: [_make_window(name="other-win")])
 
         client.create_window("test-sess", "new-win", "bash")
-        # #963 — two-phase launch: new-window opens an empty pane, then
-        # send-keys delivers the launch command. Both calls are issued.
-        assert len(calls) == 2, "Should issue new-window then send-keys"
+        # #963/#966 — two-phase launch: new-window opens an empty pane,
+        # then ``respawn-pane`` (argv form) hands the launch command to
+        # the new pane. Both calls are issued; no ``send-keys`` typing
+        # layer (the abandoned #963 mechanism that broke in #966).
+        assert len(calls) == 2, "Should issue new-window then respawn-pane"
         assert calls[0][0] == "new-window"
         assert "bash" not in calls[0], "new-window must not carry the command"
-        assert calls[1][0] == "send-keys"
+        assert calls[1][0] == "respawn-pane"
         assert "bash" in calls[1]
-        assert "Enter" in calls[1]
+        assert "-k" in calls[1]
+        assert "send-keys" not in calls[1]
 
 
 class TestKillSessionIdempotent:

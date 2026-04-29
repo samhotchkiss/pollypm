@@ -162,10 +162,10 @@ def test_run_check_true_still_raises_on_timeout(monkeypatch) -> None:
 
 
 def test_create_window_two_phase_default_omits_command(monkeypatch) -> None:
-    """#963 — ``create_window`` opens an empty pane (no command) by default,
-    then sends the launch command via ``send-keys``. The user sees a
-    default shell prompt instantly and watches the command appear before
-    the agent CLI loads.
+    """#963/#966 — ``create_window`` opens an empty pane (no command) by
+    default, then hands the launch command to the pane via tmux
+    ``respawn-pane``. The user sees a pane appear instantly; the agent
+    CLI takes over a moment later without any ``send-keys`` typing.
     """
     captured: list[list[str]] = []
 
@@ -188,14 +188,19 @@ def test_create_window_two_phase_default_omits_command(monkeypatch) -> None:
     pane_id = client.create_window("storage", "task-foo-1", "claude --resume xyz")
 
     assert pane_id == "%42"
-    # Two tmux invocations: new-window WITHOUT the command, then send-keys.
+    # Two tmux invocations: new-window WITHOUT the command, then respawn-pane.
     new_window = next(c for c in captured if "new-window" in c)
-    send_keys = next(c for c in captured if "send-keys" in c)
+    respawn = next(c for c in captured if "respawn-pane" in c)
     assert "claude --resume xyz" not in new_window, (
         "new-window must not carry the launch command in two-phase mode"
     )
-    assert "claude --resume xyz" in send_keys
-    assert "Enter" in send_keys
+    # Argv tokens land as separate positional args.
+    assert "claude" in respawn
+    assert "--resume" in respawn
+    assert "xyz" in respawn
+    assert "-k" in respawn  # respawn-pane kills the empty Phase-1 shell
+    # No send-keys path — that was the #966 regression vector.
+    assert not any("send-keys" in c for c in captured)
 
 
 def test_create_window_two_phase_false_inlines_command(monkeypatch) -> None:
@@ -223,11 +228,14 @@ def test_create_window_two_phase_false_inlines_command(monkeypatch) -> None:
     new_window = next(c for c in captured if "new-window" in c)
     assert "echo hi" in new_window
     assert not any("send-keys" in c for c in captured)
+    assert not any("respawn-pane" in c for c in captured)
 
 
 def test_create_session_two_phase_default_omits_command(monkeypatch) -> None:
-    """#963 — same two-phase guarantee on ``create_session``: new-session
-    opens an empty pane, then send-keys delivers the launch command."""
+    """#963/#966 — same two-phase guarantee on ``create_session``:
+    new-session opens an empty pane, then ``respawn-pane`` (argv form)
+    hands the launch command to the new pane without any ``send-keys``
+    typing layer."""
     captured: list[list[str]] = []
 
     def fake_run(args, **kwargs):
@@ -248,20 +256,23 @@ def test_create_session_two_phase_default_omits_command(monkeypatch) -> None:
 
     assert pane_id == "%9"
     new_session = next(c for c in captured if "new-session" in c)
-    send_keys = next(c for c in captured if "send-keys" in c)
+    respawn = next(c for c in captured if "respawn-pane" in c)
     assert "codex --resume abc" not in new_session, (
         "new-session must not carry the launch command in two-phase mode"
     )
-    assert "codex --resume abc" in send_keys
-    assert "Enter" in send_keys
-    # send-keys should target the pane_id we just got back from new-session,
+    assert "codex" in respawn
+    assert "--resume" in respawn
+    assert "abc" in respawn
+    # respawn-pane should target the pane_id we just got back from new-session,
     # not the session:window string — pane_ids are stable across renames.
-    assert "%9" in send_keys
+    assert "%9" in respawn
+    # No send-keys path — that was the #966 regression vector.
+    assert not any("send-keys" in c for c in captured)
 
 
 def test_create_session_two_phase_skips_send_when_session_exists(monkeypatch) -> None:
     """The idempotency contract holds: if the session already exists,
-    ``create_session`` returns None and never sends keys."""
+    ``create_session`` returns None and never respawns the pane."""
     captured: list[list[str]] = []
 
     def fake_run(args, **kwargs):
@@ -280,13 +291,14 @@ def test_create_session_two_phase_skips_send_when_session_exists(monkeypatch) ->
 
     result = client.create_session("storage", "main", "claude --resume xyz")
     assert result is None
+    assert not any("respawn-pane" in c for c in captured)
     assert not any("send-keys" in c for c in captured)
     assert not any("new-session" in c for c in captured)
 
 
 def test_create_window_two_phase_skips_send_when_window_exists(monkeypatch) -> None:
     """If the window already exists, ``create_window`` is a no-op — no
-    new-window, no send-keys."""
+    new-window, no respawn-pane, no send-keys."""
     from pollypm.tmux.client import TmuxWindow
 
     captured: list[list[str]] = []
@@ -316,5 +328,6 @@ def test_create_window_two_phase_skips_send_when_window_exists(monkeypatch) -> N
 
     result = client.create_window("storage", "task-foo-1", "claude --resume xyz")
     assert result is None
+    assert not any("respawn-pane" in c for c in captured)
     assert not any("send-keys" in c for c in captured)
     assert not any("new-window" in c for c in captured)

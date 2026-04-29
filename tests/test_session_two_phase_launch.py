@@ -1,14 +1,20 @@
-"""Tests for the issue #963 two-phase tmux session launch contract.
+"""Tests for the issues #963 / #966 two-phase tmux session launch contract.
 
-Old flow: ``tmux new-window -d 'claude --resume X'`` — pane materializes
-already running the slow agent CLI bootstrap, leaving the user staring
-at a blank pane for several seconds.
+Original (pre-#963) flow: ``tmux new-window -d 'claude --resume X'`` —
+pane materializes already running the slow agent CLI bootstrap, leaving
+the user staring at a blank pane for several seconds.
 
-New flow:
-1. ``tmux new-window -d`` (no command) — pane shows a normal shell
-   prompt instantly.
-2. ``tmux send-keys -t <pane> '<launch cmd>' Enter`` — the user sees
-   the launch command typed into the prompt and the agent CLI come up.
+#963 flow (broken — see #966): open an empty pane via ``new-window``,
+then deliver the launch command via ``send-keys '<huge sh -lc ...>'
+Enter``. The very long single-quoted argument never survived the
+typing path: zsh stayed in ``quote>`` continuation forever and the
+agent CLI never started.
+
+Current flow (#966):
+1. ``tmux new-window -d`` (no command) — pane materializes empty so the
+   user's click feels instant.
+2. ``tmux respawn-pane -k -t <pane> <argv tokens>`` — tmux spawns the
+   launcher directly via ``execvp``, with no shell-quoting roundtrip.
 
 These tests pin down both phases at the ``TmuxClient`` boundary and
 through ``TmuxSessionService.create`` (the path used by the per-task
@@ -94,24 +100,31 @@ def test_phase1_create_session_does_not_carry_command(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 — launch command delivered via send-keys
+# Phase 2 — launch command delivered via respawn-pane (#966)
 # ---------------------------------------------------------------------------
 
 
-def test_phase2_send_keys_delivers_launch_command(monkeypatch) -> None:
-    """Phase 2: the launch command is typed via ``send-keys`` and Enter."""
+def test_phase2_respawn_pane_delivers_launch_command(monkeypatch) -> None:
+    """Phase 2: the launch command is handed to ``respawn-pane`` (argv
+    form). No ``send-keys`` step — that path was abandoned in #966."""
     captured = _capture_run(monkeypatch)
     client = TmuxClient()
     monkeypatch.setattr(client, "has_session", lambda name: False)
 
     client.create_window("storage", "task-acme-7", "claude --resume long-id")
 
-    send_keys_calls = [c for c in captured if "send-keys" in c]
-    assert len(send_keys_calls) == 1
-    send_keys = send_keys_calls[0]
-    assert "claude --resume long-id" in send_keys
-    # Enter must be the last argument so the command actually runs.
-    assert send_keys[-1] == "Enter"
+    respawn_calls = [c for c in captured if "respawn-pane" in c]
+    assert len(respawn_calls) == 1
+    respawn = respawn_calls[0]
+    # ``-k`` (kill the empty Phase-1 shell) and the launch tokens must
+    # all be present as separate argv entries.
+    assert "-k" in respawn
+    assert "claude" in respawn
+    assert "--resume" in respawn
+    assert "long-id" in respawn
+    # No ``send-keys`` anywhere in the launch path — that was the #966
+    # regression vector.
+    assert not any("send-keys" in c for c in captured)
 
 
 def test_phase2_targets_pane_id_when_available(monkeypatch) -> None:
@@ -129,17 +142,17 @@ def test_phase2_targets_pane_id_when_available(monkeypatch) -> None:
     pane_id = client.create_window("storage", "task-foo-1", "claude --resume X")
     assert pane_id == "%77"
 
-    send_keys = next(c for c in captured if "send-keys" in c)
+    respawn = next(c for c in captured if "respawn-pane" in c)
     # ``-t %77`` must appear: the pane_id is the target, not "storage:task-foo-1".
-    assert "-t" in send_keys
-    target_idx = send_keys.index("-t")
-    assert send_keys[target_idx + 1] == "%77"
+    assert "-t" in respawn
+    target_idx = respawn.index("-t")
+    assert respawn[target_idx + 1] == "%77"
 
 
 def test_phase2_skipped_when_window_already_exists(monkeypatch) -> None:
     """Idempotency guard: re-running ``create_window`` for an existing
-    window must NOT re-send the launch command (otherwise we'd type a
-    second ``claude --resume`` into an already-bootstrapped pane).
+    window must NOT re-respawn the launch command (otherwise we'd
+    clobber an already-running agent CLI).
     """
     from pollypm.tmux.client import TmuxWindow
 
@@ -158,6 +171,7 @@ def test_phase2_skipped_when_window_already_exists(monkeypatch) -> None:
 
     result = client.create_window("storage", "task-foo-1", "claude --resume X")
     assert result is None
+    assert not any("respawn-pane" in c for c in captured)
     assert not any("send-keys" in c for c in captured)
     assert not any("new-window" in c for c in captured)
 
@@ -170,8 +184,90 @@ def test_phase2_skipped_when_session_already_exists(monkeypatch) -> None:
 
     result = client.create_session("storage", "main", "claude --resume X")
     assert result is None
+    assert not any("respawn-pane" in c for c in captured)
     assert not any("send-keys" in c for c in captured)
     assert not any("new-session" in c for c in captured)
+
+
+def test_phase2_does_not_use_send_keys_for_huge_payloads(monkeypatch) -> None:
+    """#966 — the regression vector was a ``sh -lc '<huge base64>'``
+    string typed at zsh via ``send-keys``. The closing single-quote
+    never made it across the typing layer, so zsh stayed in
+    ``quote>`` continuation forever and the agent CLI never started.
+
+    Contract: the launch path must not call ``send-keys`` for ANY
+    payload — short, long, or base64-shaped.
+    """
+    huge_b64 = "A" * 1500  # mimic real runtime_launcher payload size
+    huge_command = f"sh -lc 'exec /opt/python -m pollypm.runtime_launcher {huge_b64}'"
+
+    captured = _capture_run(monkeypatch)
+    client = TmuxClient()
+    monkeypatch.setattr(client, "has_session", lambda name: False)
+
+    client.create_window("storage", "task-payload", huge_command)
+
+    assert not any("send-keys" in c for c in captured), (
+        "launch path must never use send-keys (#966)"
+    )
+    respawn = next(c for c in captured if "respawn-pane" in c)
+    # The huge payload must arrive as a single argv element (it's the
+    # third positional argument to ``sh -lc``), not chopped up.
+    assert huge_b64 in " ".join(respawn)
+    # And the wrapper tokens are individual argv entries.
+    assert "sh" in respawn
+    assert "-lc" in respawn
+
+
+def test_phase2_handles_shell_special_characters(monkeypatch) -> None:
+    """Single-quotes, double-quotes, newlines, and backticks inside the
+    launch command would all break a ``send-keys`` path. The argv form
+    of ``respawn-pane`` doesn't re-parse through a shell, so these
+    characters must survive verbatim in the tokenized argv.
+    """
+    nasty = (
+        "sh -lc 'exec /bin/echo \"hello\\nworld\" `date` $foo' "
+    )
+    captured = _capture_run(monkeypatch)
+    client = TmuxClient()
+    monkeypatch.setattr(client, "has_session", lambda name: False)
+
+    client.create_window("storage", "task-nasty", nasty)
+
+    respawn = next(c for c in captured if "respawn-pane" in c)
+    # The inner ``sh -lc`` body lives as a single argv element; whatever
+    # tokenization happens must preserve the embedded characters.
+    assert any("hello" in tok and "world" in tok for tok in respawn), respawn
+    assert any("`date`" in tok for tok in respawn), respawn
+    # And there must be no ``send-keys`` typing layer that could choke
+    # on the backticks or quotes.
+    assert not any("send-keys" in c for c in captured)
+
+
+def test_phase2_argv_first_token_is_binary(monkeypatch) -> None:
+    """``respawn-pane`` argv form: tmux execs argv[0] directly. The
+    first token after ``-t <target>`` must be the binary, with each
+    subsequent argument as its own positional arg — not a single
+    shell-quoted blob."""
+    captured = _capture_run(monkeypatch)
+    client = TmuxClient()
+    monkeypatch.setattr(client, "has_session", lambda name: False)
+
+    client.create_window(
+        "storage",
+        "task-direct",
+        "sh -lc 'exec /usr/bin/python -m pollypm.runtime_launcher PAYLOAD'",
+    )
+
+    respawn = next(c for c in captured if "respawn-pane" in c)
+    # Find ``-t <target>`` then assert the next token is the binary.
+    target_idx = respawn.index("-t")
+    assert respawn[target_idx + 2] == "sh"
+    assert respawn[target_idx + 3] == "-lc"
+    # The fourth element is the inner shell command body — a single
+    # positional argv entry, not split.
+    inner = respawn[target_idx + 4]
+    assert "exec /usr/bin/python -m pollypm.runtime_launcher PAYLOAD" in inner
 
 
 # ---------------------------------------------------------------------------
@@ -283,12 +379,17 @@ def test_session_service_create_uses_two_phase(monkeypatch, tmp_path) -> None:
 
     # The two phases must be present in the recorded subprocess calls.
     new_window_calls = [c for c in captured if "new-window" in c]
-    send_keys_calls = [c for c in captured if "send-keys" in c]
+    respawn_calls = [c for c in captured if "respawn-pane" in c]
     assert new_window_calls, "expected a new-window call from TmuxClient.create_window"
-    assert send_keys_calls, "expected a send-keys call delivering the launch command"
+    assert respawn_calls, (
+        "expected a respawn-pane call delivering the launch command (#966)"
+    )
     # Phase 1: launch command must not appear in new-window.
     assert "claude --resume xyz" not in new_window_calls[0]
-    # Phase 2: launch command + Enter must appear in send-keys.
-    sk = send_keys_calls[0]
-    assert "claude --resume xyz" in sk
-    assert sk[-1] == "Enter"
+    # Phase 2: launch tokens must appear as separate argv entries in respawn-pane.
+    rp = respawn_calls[0]
+    assert "claude" in rp
+    assert "--resume" in rp
+    assert "xyz" in rp
+    # And the launch path must not fall back to send-keys.
+    assert not any("send-keys" in c for c in captured)

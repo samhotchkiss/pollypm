@@ -152,11 +152,12 @@ class TmuxClient:
     ) -> str | None:
         """Create a tmux session. Returns pane ID of the first window, or None if already exists.
 
-        When ``two_phase`` is True (default — issue #963), the session is
-        created with NO startup command — the pane materializes running the
-        user's default shell, returning ~instantly. The launch ``command``
-        is then sent via ``send-keys`` so the user sees the prompt → command
-        → command-running sequence. When False, the legacy single-call
+        When ``two_phase`` is True (default — issues #963/#966), the session
+        is created with NO startup command — the pane materializes running
+        the user's default shell, returning ~instantly. The launch
+        ``command`` is then handed to tmux ``respawn-pane`` (argv form) so
+        the agent CLI takes over the pane without any ``send-keys`` /
+        shell-quoting roundtrip. When False, the legacy single-call
         ``new-session -d <command>`` form is used (kept for callers that
         cannot tolerate a shell parent — currently none of the agent-session
         paths).
@@ -208,9 +209,10 @@ class TmuxClient:
     ) -> str | None:
         """Create a window in a session. Returns pane ID or None if already exists.
 
-        When ``two_phase`` is True (default — issue #963), the window opens
-        empty (default shell) and the launch ``command`` is sent via
-        ``send-keys`` afterwards. See :meth:`create_session` for rationale.
+        When ``two_phase`` is True (default — issues #963/#966), the window
+        opens empty (default shell) and the launch ``command`` is delivered
+        to the new pane via tmux ``respawn-pane`` afterwards. See
+        :meth:`create_session` for rationale.
         """
         self._validate_name(window_name, "window name")
         # Check if window already exists in this session
@@ -236,12 +238,27 @@ class TmuxClient:
         return resolved_pane
 
     def _send_launch_command(self, target: str, command: str) -> None:
-        """Type a launch command into ``target`` and press Enter.
+        """Hand a launch ``command`` to the freshly opened pane at ``target``.
 
         Used by the two-phase ``create_session`` / ``create_window`` flow
-        (#963) so newly created panes start as a default shell prompt and
-        only then receive the agent CLI command. Returns as soon as the
-        keys are queued — does NOT wait for the agent CLI to be ready.
+        (#963/#966): Phase 1 opens an empty pane (instant click-feedback)
+        and Phase 2 hands the agent CLI off to that pane.
+
+        We deliberately do NOT use ``send-keys`` here — issue #966 showed
+        that piping the full ``sh -lc '<huge base64 payload>'`` line
+        through ``send-keys`` left zsh stuck in a ``quote>`` continuation
+        prompt because the very long single-quoted argument never made it
+        through the typing path intact. Subsequent priming text then
+        leaked into the open quote.
+
+        Instead, we use ``tmux respawn-pane -k -t <target> argv...`` which
+        replaces the pane's running command directly via tmux's internal
+        spawn — there is no ``send-keys`` typing layer, no zsh parser, and
+        no quoting. The launch ``command`` is split with :func:`shlex.split`
+        so it arrives at tmux as a positional ``argv`` array; tmux passes
+        the elements to the OS directly. Embedded quotes, newlines,
+        backticks, and base64 noise in the inner payload survive
+        unchanged.
         """
         if not command:
             return
@@ -250,12 +267,30 @@ class TmuxClient:
         except ValueError:
             logger.warning("send_launch_command: invalid target %r", target)
             return
-        # Use send-keys with the literal command followed by an explicit
-        # Enter. We avoid ``send_keys()`` here because that helper has a
-        # paste-buffer fast path for long text and a dead-pane probe; for
-        # a fresh empty pane we want the user to see the command typed in
-        # the input bar, then submitted.
-        self.run("send-keys", "-t", resolved, command, "Enter")
+        try:
+            argv = shlex.split(command)
+        except ValueError as exc:
+            # ``shlex.split`` raises on unterminated quotes — if a caller
+            # ever hands us a malformed command we'd rather log and bail
+            # than fall back to a fragile ``send-keys`` path.
+            logger.error(
+                "send_launch_command: cannot tokenize command %r (%s); pane will stay empty",
+                command,
+                exc,
+            )
+            return
+        if not argv:
+            return
+        # ``respawn-pane -k`` kills the existing pane process (the empty
+        # default shell from Phase 1) and starts a new one with the given
+        # argv. Pass argv tokens as separate positional args to tmux so it
+        # invokes them via ``execvp`` rather than re-parsing through a
+        # shell — this is the key property that fixes #966.
+        logger.debug(
+            "send_launch_command: respawn-pane -t %s argv0=%r argc=%d",
+            resolved, argv[0], len(argv),
+        )
+        self.run("respawn-pane", "-k", "-t", resolved, *argv)
 
     def split_window(
         self,

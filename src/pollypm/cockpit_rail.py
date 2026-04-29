@@ -390,6 +390,105 @@ def _visibility_passes(reg, ctx) -> bool:
     return True
 
 
+def _build_project_pm_primer(supervisor, project_key: str) -> str | None:
+    """Return a project-context priming message for a per-project PM session.
+
+    The cockpit attaches a project's PM Chat to the project's worker
+    session (``project:<key>:session``). The launch-time profile prompt
+    primes the agent with project context, but a long-running
+    conversation can drift the agent off-identity (#958 — booktalk's PM
+    answered "I'm Codex" instead of "I'm booktalk's PM"). This helper
+    renders a short re-anchoring brief the cockpit injects on attach so
+    the agent recovers project identity without the user having to
+    manually re-prime.
+
+    The primer covers the four signals the issue calls out: project
+    name + root path, current task summary, plan status, active issue
+    count. Failures in any individual lookup are swallowed so a missing
+    state.db never blocks the mount.
+    """
+    project = supervisor.config.projects.get(project_key)
+    if project is None:
+        return None
+    persona = getattr(project, "persona_name", None) or "Polly"
+    project_name = project.name or project_key
+    project_path = str(project.path)
+
+    queued = in_progress = review = done_recent = 0
+    plan_status = "unknown"
+    inbox_titles: list[str] = []
+    inbox_total = 0
+    try:
+        from pollypm.work.inbox_view import inbox_tasks
+        from pollypm.work.models import WorkStatus
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        db_path = project.path / ".pollypm" / "state.db"
+        if db_path.exists():
+            with SQLiteWorkService(
+                db_path=db_path, project_path=project.path,
+            ) as svc:
+                tasks = list(svc.list_tasks(project=project_key))
+                for task in tasks:
+                    status = task.work_status
+                    if status == WorkStatus.QUEUED:
+                        queued += 1
+                    elif status == WorkStatus.IN_PROGRESS:
+                        in_progress += 1
+                    elif status == WorkStatus.REVIEW:
+                        review += 1
+                    elif status == WorkStatus.DONE:
+                        done_recent += 1
+                inbox_items = inbox_tasks(svc, project=project_key)
+                inbox_total = len(inbox_items)
+                for task in inbox_items[:3]:
+                    title = (task.title or "").strip()
+                    if title:
+                        inbox_titles.append(f"{task.task_id}: {title}")
+                # Plan status — look for a plan_review or plan_approved
+                # marker in the task list. A project with at least one
+                # done plan task counts as approved; otherwise the plan
+                # is missing.
+                has_plan_done = any(
+                    "plan" in (t.labels or [])
+                    and t.work_status == WorkStatus.DONE
+                    for t in tasks
+                )
+                has_plan_open = any(
+                    "plan_review" in (t.labels or [])
+                    or "plan" in (t.labels or [])
+                    for t in tasks
+                )
+                if has_plan_done:
+                    plan_status = "approved"
+                elif has_plan_open:
+                    plan_status = "in review"
+                else:
+                    plan_status = "missing"
+    except Exception:  # noqa: BLE001 — primer is best-effort
+        pass
+
+    lines = [
+        f"You are {persona}, the PM for project '{project_name}' "
+        f"(key: {project_key}). Re-anchor on this identity for the "
+        "rest of this session.",
+        f"Project root: {project_path}",
+        (
+            f"Tasks: {queued} queued, {in_progress} in progress, "
+            f"{review} in review, {done_recent} done"
+        ),
+        f"Plan: {plan_status}",
+        f"Active inbox: {inbox_total} item(s)",
+    ]
+    if inbox_titles:
+        lines.append("Recent inbox:")
+        lines.extend(f"  - {title}" for title in inbox_titles)
+    lines.append(
+        "Acknowledge briefly and stand by for the next instruction."
+    )
+    return "\n".join(lines)
+
+
 def _rows_for_registration(reg, ctx) -> list:
     """Produce the list of :class:`RailRow` a registration renders to.
 
@@ -1832,6 +1931,15 @@ class CockpitRouter:
                 except Exception:  # noqa: BLE001
                     self.set_selected_key(f"project:{project_key}:dashboard")
                     self._show_static_view(supervisor, window_target, "project", project_key)
+                else:
+                    # #958 — re-anchor project identity on attach. Long
+                    # conversations drift workers off-persona; a one-shot
+                    # primer per session brings the agent back to the
+                    # right project context without the user having to
+                    # manually retype "you are the PM for X".
+                    self._maybe_prime_project_pm_session(
+                        supervisor, project_key, session_name, window_target,
+                    )
             else:
                 try:
                     self.create_worker_and_route(project_key)
@@ -2000,6 +2108,46 @@ class CockpitRouter:
                 if item.session.name == session_name
             )
             supervisor.stabilize_launch(launch, target, on_status=on_status)
+
+    def _maybe_prime_project_pm_session(
+        self,
+        supervisor,
+        project_key: str,
+        session_name: str,
+        window_target: str,
+    ) -> None:
+        """Send a project-context primer the first time a per-project PM
+        session is mounted in the cockpit (#958).
+
+        The primer is sent once per ``(cockpit-process, session_name)``
+        pair, tracked in ``cockpit_state["pm_primed_sessions"]``. Idempotent
+        across re-mounts so clicking PM Chat twice does not spam the agent.
+        Failures are best-effort — the mount has already succeeded; a
+        primer that does not land does not roll back attachment.
+        """
+        try:
+            state = self._load_state()
+            primed_raw = state.get("pm_primed_sessions")
+            if isinstance(primed_raw, list):
+                primed = set(primed_raw)
+            else:
+                primed = set()
+            if session_name in primed:
+                return
+            primer = _build_project_pm_primer(supervisor, project_key)
+            if not primer:
+                return
+            right_pane_id = self._right_pane_id(window_target)
+            target = right_pane_id if right_pane_id else window_target
+            try:
+                self.tmux.send_keys(target, primer, press_enter=True)
+            except Exception:  # noqa: BLE001
+                return
+            primed.add(session_name)
+            state["pm_primed_sessions"] = sorted(primed)
+            self._write_state(state)
+        except Exception:  # noqa: BLE001
+            return
 
     def _show_live_session(self, supervisor, session_name: str, window_target: str) -> None:
         # Mount-time identity check (replaces the legacy bare-string

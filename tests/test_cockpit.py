@@ -1291,6 +1291,96 @@ def test_cockpit_router_routes_project_click_to_dashboard_even_when_actionable()
     assert calls["static"] == ("pollypm:PollyPM", "project", "demo")
 
 
+def test_cockpit_router_primes_per_project_pm_session_distinctly() -> None:
+    """Opening different projects' PM Chat should send distinct,
+    project-aware priming messages so each session re-anchors on its
+    own project identity (#958).
+    """
+    sent: list[tuple[str, str]] = []
+    primed_state: dict[str, object] = {}
+
+    class _FakeTmux:
+        def send_keys(self, target, text, press_enter=True):  # noqa: ARG002
+            sent.append((target, text))
+
+    class _Project:
+        def __init__(self, key: str, name: str) -> None:
+            self.key = key
+            self.name = name
+            self.path = Path(f"/tmp/{key}")
+            self.persona_name = None
+
+    class _FakeConfig:
+        projects = {
+            "alpha": _Project("alpha", "Alpha"),
+            "beta": _Project("beta", "Beta"),
+        }
+
+    class _FakeSupervisor:
+        config = _FakeConfig()
+
+        def plan_launches(self):
+            class _Sess:
+                def __init__(self, name, role, project):
+                    self.name = name
+                    self.role = role
+                    self.project = project
+            class _L:
+                def __init__(self, name, role, project):
+                    self.session = _Sess(name, role, project)
+            return [
+                _L("worker_alpha", "worker", "alpha"),
+                _L("worker_beta", "worker", "beta"),
+            ]
+
+    router = CockpitRouter.__new__(CockpitRouter)
+    router.tmux = _FakeTmux()
+    router._right_pane_id = lambda window_target: "%right"  # type: ignore[assignment]
+    router._load_state = lambda: dict(primed_state)  # type: ignore[assignment]
+    def _write(data):
+        primed_state.clear()
+        primed_state.update(data)
+    router._write_state = _write  # type: ignore[assignment]
+    router.set_selected_key = lambda key: None  # type: ignore[assignment]
+    router._show_static_view = lambda *a, **k: None  # type: ignore[assignment]
+    router._session_available_for_mount = lambda *a, **k: True  # type: ignore[assignment]
+    router._show_live_session = lambda *a, **k: None  # type: ignore[assignment]
+
+    supervisor = _FakeSupervisor()
+
+    router._route_project_selection(
+        supervisor,
+        "pollypm:PollyPM",
+        ProjectRoute(project_key="alpha", sub_view="session"),
+    )
+    router._route_project_selection(
+        supervisor,
+        "pollypm:PollyPM",
+        ProjectRoute(project_key="beta", sub_view="session"),
+    )
+
+    # Each project got its own primer, sent to the right pane.
+    assert len(sent) == 2, sent
+    alpha_target, alpha_text = sent[0]
+    beta_target, beta_text = sent[1]
+    assert alpha_target == "%right"
+    assert beta_target == "%right"
+    assert "alpha" in alpha_text.lower() and "Alpha" in alpha_text
+    assert "beta" in beta_text.lower() and "Beta" in beta_text
+    assert alpha_text != beta_text
+    # State persisted both session names so a re-mount won't re-prime.
+    assert "worker_alpha" in primed_state.get("pm_primed_sessions", [])
+    assert "worker_beta" in primed_state.get("pm_primed_sessions", [])
+
+    # Re-mounting alpha should NOT send a second primer.
+    router._route_project_selection(
+        supervisor,
+        "pollypm:PollyPM",
+        ProjectRoute(project_key="alpha", sub_view="session"),
+    )
+    assert len(sent) == 2  # unchanged
+
+
 def test_cockpit_rail_render_includes_event_ticker(monkeypatch) -> None:
     class _Event:
         def __init__(self, event_type: str, session_name: str, created_at) -> None:

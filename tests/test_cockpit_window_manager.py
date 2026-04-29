@@ -211,6 +211,8 @@ class FakeTmux:
         raise KeyError(pane_id)
 
     def _find_source_pane(self, source: str) -> tuple[FakeWindow, FakePane]:
+        if source.startswith("%"):
+            return self._find_pane(source)
         session, rest = source.split(":", 1)
         raw_window, raw_pane = rest.split(".", 1)
         window_index = int(raw_window)
@@ -397,6 +399,37 @@ def test_ensure_layout_respawns_dead_right_and_kills_extra_panes() -> None:
     }
 
 
+def test_ensure_layout_keeps_persisted_live_right_when_extra_static_pane_appears() -> None:
+    tmux = FakeTmux()
+    window = tmux.add_window(
+        "pollypm",
+        "PollyPM",
+        [("bash", 0, 30, False), ("pm", 40, 80, False), ("2.1.123", 130, 80, False)],
+    )
+    left_id = window.panes[0].pane_id
+    static_extra_id = window.panes[1].pane_id
+    live_right_id = window.panes[2].pane_id
+    manager = _manager(tmux)
+
+    result = manager.ensure_layout(
+        CockpitWindowState(
+            right_pane_id=live_right_id,
+            mounted_session="operator",
+            mounted_window_name="pm-operator",
+        )
+    )
+
+    assert result.ok
+    assert f"kill_extra:{static_extra_id}" in result.actions
+    assert ("kill_pane", (live_right_id,)) not in tmux.calls
+    assert {pane.pane_id for pane in tmux.list_panes("pollypm:PollyPM")} == {
+        left_id,
+        live_right_id,
+    }
+    assert result.state.right_pane_id == live_right_id
+    assert result.state.mounted_session == "operator"
+
+
 def test_show_static_respawns_right_and_clears_mounted_state() -> None:
     tmux = FakeTmux()
     window = tmux.add_window("pollypm", "PollyPM", [("uv", 0), ("node", 100)])
@@ -423,7 +456,8 @@ def test_join_live_from_storage_uses_window_index_and_sets_mount_state() -> None
     cockpit = tmux.add_window("pollypm", "PollyPM", [("uv", 0), ("pm", 100)])
     left_id = cockpit.panes[0].pane_id
     static_right_id = cockpit.panes[1].pane_id
-    tmux.add_window("pollypm-storage-closet", "worker-demo", [("codex", 0)], index=7)
+    source_window = tmux.add_window("pollypm-storage-closet", "worker-demo", [("codex", 0)], index=7)
+    source_pane_id = source_window.pane_id
     manager = _manager(tmux)
 
     result = manager.join_live_from_storage(
@@ -437,7 +471,7 @@ def test_join_live_from_storage_uses_window_index_and_sets_mount_state() -> None
 
     assert result.ok
     assert f"kill_static_right:{static_right_id}" in result.actions
-    assert f"join_live:pollypm-storage-closet:7.0->{left_id}" in result.actions
+    assert f"join_live:{source_pane_id}->{left_id}" in result.actions
     assert result.state.mounted_session == "worker_demo"
     assert result.state.mounted_window_name == "worker-demo"
     assert tmux.list_windows("pollypm-storage-closet") == []

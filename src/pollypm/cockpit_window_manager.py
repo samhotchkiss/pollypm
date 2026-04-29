@@ -378,17 +378,38 @@ class CockpitWindowManager:
         right_id = _pane_id(right)
         if left_id is None:
             return self._result(state, actions)
-        if right_id is not None:
-            self.tmux.kill_pane(right_id)
-            actions.append(f"kill_static_right:{right_id}")
 
-        source = f"{live.storage_session}:{getattr(source_window, 'index')}.0"
+        source_id = _pane_id(source_window)
+        source = source_id or f"{live.storage_session}:{getattr(source_window, 'index')}.0"
         self.tmux.join_pane(source, left_id, horizontal=True)
         actions.append(f"join_live:{source}->{left_id}")
+        if right_id is not None and right_id != source_id:
+            self.tmux.kill_pane(right_id)
+            actions.append(f"kill_static_right:{right_id}")
         panes = self.tmux.list_panes(self.spec.window_target)
         classification = self.classify_panes(panes)
+        if source_id is not None:
+            keep_ids = {left_id, source_id}
+            for pane in classification.live_panes:
+                pane_id = _pane_id(pane)
+                if pane_id is None or pane_id in keep_ids:
+                    continue
+                self.tmux.kill_pane(pane_id)
+                actions.append(f"kill_extra:{pane_id}")
+            panes = self.tmux.list_panes(self.spec.window_target)
+            classification = self.classify_panes(panes)
         self._resize_rail(classification, actions)
-        right = self._right_pane()
+        right = (
+            next(
+                (
+                    pane for pane in classification.live_panes
+                    if _pane_id(pane) == source_id
+                ),
+                None,
+            )
+            if source_id is not None
+            else self._right_pane()
+        )
         right_id = _pane_id(right)
         if right_id is not None:
             limit = live.history_limit or self.spec.mounted_history_limit

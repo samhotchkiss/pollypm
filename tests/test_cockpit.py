@@ -2584,6 +2584,58 @@ def test_cockpit_router_ensure_layout_resizes_existing_left_pane(tmp_path: Path)
     assert calls["resize"] == ("%1", router._LEFT_PANE_WIDTH)
 
 
+def test_cockpit_router_ensure_layout_keeps_persisted_right_when_extra_pane_appears(tmp_path: Path) -> None:
+    class FakePane:
+        def __init__(self, pane_id: str, pane_left: int, command: str, pane_width: int = 80) -> None:
+            self.pane_id = pane_id
+            self.pane_left = pane_left
+            self.pane_current_command = command
+            self.pane_width = pane_width
+            self.active = True
+
+    class FakeTmux:
+        def __init__(self) -> None:
+            self.panes = [
+                FakePane("%1", 0, "zsh", pane_width=30),
+                FakePane("%2", 31, "bash", pane_width=80),
+                FakePane("%3", 112, "2.1.123", pane_width=100),
+            ]
+            self.killed: list[str] = []
+
+        def list_panes(self, target: str):
+            return list(self.panes)
+
+        def kill_pane(self, target: str) -> None:
+            self.killed.append(target)
+            self.panes = [pane for pane in self.panes if pane.pane_id != target]
+
+        def resize_pane_width(self, target: str, width: int):
+            pass
+
+        def run(self, *args, **kwargs):
+            pass
+
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+    router = CockpitRouter(config_path)
+    tmux = FakeTmux()
+    router.tmux = tmux  # type: ignore[assignment]
+    router._write_state(
+        {
+            "right_pane_id": "%3",
+        }
+    )
+
+    router.ensure_cockpit_layout()
+
+    assert tmux.killed == ["%2"]
+    assert {pane.pane_id for pane in tmux.panes} == {"%1", "%3"}
+    state = router._load_state()
+    assert state["right_pane_id"] == "%3"
+
+
 def test_cockpit_router_ensure_layout_steady_state_issues_one_list_panes(tmp_path: Path) -> None:
     """Steady-state ``ensure_cockpit_layout`` must invoke ``list_panes`` once (#175).
 
@@ -2944,6 +2996,35 @@ def test_cockpit_router_reload_shell_respawns_rail_and_settings(
     state = router._load_state()
     assert state["selected"] == "settings"
     assert state["right_pane_id"] == "%2"
+
+
+def test_cockpit_router_layout_repair_skips_during_external_route(tmp_path: Path) -> None:
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+
+    class FakeTmux:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def list_panes(self, target: str):
+            self.calls.append(f"list_panes:{target}")
+            return []
+
+    router = CockpitRouter(config_path)
+    tmux = FakeTmux()
+    router.tmux = tmux  # type: ignore[assignment]
+    router._write_state(
+        {
+            "_layout_mutation_token": "other-process",
+            "_layout_mutating_until": 9_999_999_999.0,
+        }
+    )
+
+    router.ensure_cockpit_layout()
+
+    assert tmux.calls == []
 
 
 def test_cockpit_router_joins_session_from_storage(monkeypatch, tmp_path: Path) -> None:

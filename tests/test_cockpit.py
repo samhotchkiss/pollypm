@@ -1611,6 +1611,112 @@ def test_missing_worker_pm_chat_route_creates_worker_from_modular_plan() -> None
     ]
 
 
+def test_live_agent_plan_auto_focuses_right_pane_after_mount() -> None:
+    """#987 regression: clicking a chat session in the rail should land
+    keyboard focus in the right pane so the user can start typing into
+    the agent CLI immediately.
+
+    Static views (Inbox, Workers, Metrics, project dashboards) keep rail
+    focus — only ``LiveAgentPane`` plans transfer focus. The Ctrl-h
+    rail-recovery affordance from #985 is still the way back.
+    """
+    from pollypm.cockpit_content import LiveAgentPane, TextualCommandPane
+
+    calls: list[tuple[str, object]] = []
+
+    class _FakeTmux:
+        def run(self, *args, **kwargs) -> None:
+            calls.append(("run", args))
+
+        def select_pane(self, target: str) -> None:
+            calls.append(("select", target))
+
+    fallback = TextualCommandPane(
+        route_key="project:demo:session",
+        selected_key="project:demo:dashboard",
+        pane_kind="project",
+        command_args=("cockpit-pane", "project", "demo"),
+        project_key="demo",
+    )
+    plan = LiveAgentPane(
+        route_key="project:demo:session",
+        selected_key="project:demo:session",
+        session_name="worker_demo",
+        project_key="demo",
+        fallback=fallback,
+    )
+
+    router = CockpitRouter.__new__(CockpitRouter)
+    router.tmux = _FakeTmux()
+    router.set_selected_key = lambda key: calls.append(("selected", key))  # type: ignore[assignment]
+    router._session_available_for_mount = (  # type: ignore[assignment]
+        lambda supervisor, session_name, target: True
+    )
+    router._show_live_session = (  # type: ignore[assignment]
+        lambda supervisor, session_name, target: calls.append(("mount", session_name))
+    )
+    router._maybe_prime_project_pm_session = (  # type: ignore[assignment]
+        lambda *args, **kwargs: None
+    )
+    router._right_pane_id = lambda target: "%2"  # type: ignore[assignment]
+
+    router._route_content_plan(SimpleNamespace(), "pollypm:PollyPM", plan)
+
+    # Mount happened, then auto-focus moved keyboard focus to the right
+    # pane. The display-message hint (the same one ``focus_right_pane``
+    # uses) must be sent before ``select-pane`` so the user sees how to
+    # come back.
+    select_calls = [entry for entry in calls if entry[0] == "select"]
+    run_calls = [entry for entry in calls if entry[0] == "run"]
+    assert select_calls == [("select", "%2")], calls
+    assert any(
+        "display-message" in entry[1]
+        and any("Ctrl-b Left returns to the rail." in part for part in entry[1])
+        for entry in run_calls
+    ), run_calls
+    # Ordering: mount before focus transfer.
+    mount_index = next(i for i, c in enumerate(calls) if c[0] == "mount")
+    focus_index = next(i for i, c in enumerate(calls) if c[0] == "select")
+    assert mount_index < focus_index
+
+
+def test_static_command_plan_does_not_auto_focus_right_pane() -> None:
+    """#987 negative case: rail-stays-focused for static views. Clicking
+    the project dashboard, Inbox, or any non-live-agent target must NOT
+    call ``select-pane`` on the right pane — those views are read-mostly
+    and users navigate further from the rail.
+    """
+    from pollypm.cockpit_content import TextualCommandPane
+
+    calls: list[tuple[str, object]] = []
+
+    class _FakeTmux:
+        def run(self, *args, **kwargs) -> None:
+            calls.append(("run", args))
+
+        def select_pane(self, target: str) -> None:
+            calls.append(("select", target))
+
+    plan = TextualCommandPane(
+        route_key="project:demo:dashboard",
+        selected_key="project:demo:dashboard",
+        pane_kind="project",
+        command_args=("cockpit-pane", "project", "demo"),
+        project_key="demo",
+    )
+
+    router = CockpitRouter.__new__(CockpitRouter)
+    router.tmux = _FakeTmux()
+    router.set_selected_key = lambda key: calls.append(("selected", key))  # type: ignore[assignment]
+    router._show_static_view = (  # type: ignore[assignment]
+        lambda *args, **kwargs: calls.append(("static", args[2]))
+    )
+
+    router._route_content_plan(SimpleNamespace(), "pollypm:PollyPM", plan)
+
+    assert not any(entry[0] == "select" for entry in calls), calls
+
+
 def test_rail_listview_swallows_value_error_for_orphan_clicks() -> None:
     """#964 regression: the rail's :class:`ListView` subclass guards
     against the boot-time ``_on_list_item__child_clicked`` ValueError

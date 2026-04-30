@@ -2069,6 +2069,12 @@ class CockpitRouter:
         # a project PM, this one anchors the workspace-level operator.
         if route.session_name == "operator":
             self._maybe_prime_operator_session(supervisor, window_target)
+        # #987 — clicking a chat session in the rail should leave focus
+        # on the right pane so the user can start typing immediately.
+        # Static views (Inbox, Workers, Metrics, project dashboards) keep
+        # rail focus; only live agent mounts auto-focus. The Ctrl-h
+        # rail-recovery path from #985 still returns focus to the rail.
+        self._auto_focus_right_after_live_mount(window_target)
 
     def _route_static_view(
         self,
@@ -2296,6 +2302,10 @@ class CockpitRouter:
                 plan.session_name,
                 window_target,
             )
+        # #987 — see :meth:`_route_live_session` for the rationale.
+        # Project PM Chat (Persona) also mounts a typing-primary live
+        # agent CLI, so auto-focus the right pane after mount.
+        self._auto_focus_right_after_live_mount(window_target)
 
     def _window_manager(self, supervisor) -> CockpitWindowManager:
         config = getattr(supervisor, "config", None) or self._load_config()
@@ -2393,6 +2403,42 @@ class CockpitRouter:
                 check=False,
             )
             self.tmux.select_pane(right_pane)
+
+    def _auto_focus_right_after_live_mount(self, window_target: str) -> None:
+        """Move tmux focus to the right pane after a live agent mount (#987).
+
+        Called only from the live-agent dispatch paths in
+        :meth:`_route_live_session` and :meth:`_route_live_agent_plan` —
+        static views (project dashboards, Inbox, Workers, Metrics) keep
+        rail focus on click. The Ctrl-h rail-recovery affordance from
+        #985 (:meth:`focus_rail_pane`) still returns focus to the rail
+        when the user wants to navigate further.
+        Side effects: tmux ``select-pane`` to the right pane and a
+        one-line ``display-message`` reminder for the recovery path.
+        Layout is assumed already validated by the caller — we don't
+        re-run ``ensure_cockpit_layout`` to keep this cheap and avoid
+        re-entering the layout-mutation guard ``route_selected`` holds.
+        """
+        try:
+            right_pane = self._right_pane_id(window_target)
+        except Exception:  # noqa: BLE001
+            return
+        if right_pane is None:
+            return
+        try:
+            self.tmux.run(
+                "display-message",
+                "-t",
+                window_target,
+                "PollyPM: Ctrl-b Left returns to the rail.",
+                check=False,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.tmux.select_pane(right_pane)
+        except Exception:  # noqa: BLE001
+            pass
 
     def focus_rail_pane(self) -> None:
         """Hand tmux focus back to the cockpit rail pane (#985).

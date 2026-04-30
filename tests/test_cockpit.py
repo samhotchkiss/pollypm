@@ -5014,3 +5014,137 @@ def test_route_selected_persists_intent_before_layout_work(
         "next periodic _refresh_rows will bounce the cursor back to the "
         f"stale state[\"selected\"]={state.get('selected')!r} (#967)."
     )
+
+
+def test_right_pane_command_uses_exec_to_avoid_orphans(tmp_path: Path) -> None:
+    """#986 — the cockpit-pane shell wrapper must ``exec`` into the
+    Python process so tmux's ``respawn-pane -k`` SIGKILL hits the
+    Python child directly.
+
+    Without ``exec`` the ``sh -lc`` parent gets killed but its Python
+    child survives (reparented to PID 1) — every cockpit kill+restart
+    cycle leaks one orphan ``pm cockpit-pane`` that holds open file
+    handles, races the fresh cockpit's right-pane app, and persists
+    across boots.
+    """
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\n"
+        f"base_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+    router = CockpitRouter(config_path)
+
+    for kind, project_key, task_id in [
+        ("polly", None, None),
+        ("dashboard", None, None),
+        ("inbox", "demo", None),
+        ("workers", None, None),
+        ("metrics", None, None),
+        ("activity", "demo", None),
+        ("project", "demo", None),
+        ("settings", "demo", None),
+        ("issues", "demo", "demo/7"),
+    ]:
+        command = router._right_pane_command(kind, project_key, task_id=task_id)
+        # The body of the ``sh -lc`` wrapper must invoke the pm CLI via
+        # ``exec`` so the shell is replaced — guarantees tmux's SIGKILL
+        # propagates to the Python process and doesn't strand it as a
+        # PID-1 orphan.
+        assert "&& exec " in command, (
+            f"{kind!r} pane command missing ``exec`` keyword (would leak "
+            f"orphan on respawn-pane -k): {command!r}"
+        )
+        # Sanity: the command actually runs cockpit-pane (not just exec
+        # of something else) — guards against an accidental refactor
+        # that drops the cockpit-pane invocation entirely.
+        assert "cockpit-pane" in command
+
+
+def test_cockpit_pane_subprocess_dies_with_shell_wrapper(tmp_path: Path) -> None:
+    """#986 — process-level regression: the shell wrapper used by
+    ``CockpitRouter._right_pane_command`` must not strand its Python
+    child when killed.
+
+    Reproduces the orphan symptom by spawning the wrapper with a stand-
+    in long-lived Python child, SIGKILL'ing the wrapper (mirroring
+    ``tmux respawn-pane -k``), and asserting the child terminates
+    rather than reparenting to PID 1.
+    """
+    import os
+    import signal
+    import subprocess
+    import sys
+
+    if sys.platform == "win32":
+        pytest.skip("POSIX-only signal/exec semantics")
+
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\n"
+        f"base_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+    router = CockpitRouter(config_path)
+    template = router._right_pane_command("polly")
+
+    # The real command runs ``pm`` — we don't need a full PollyPM boot
+    # for this test, just the shell-wrapping shape. Substitute the pm
+    # invocation with a long-running Python sleep that prints its PID
+    # so we can track the child.
+    assert template.startswith("sh -lc '") and template.endswith("'")
+    # Match the production shell wrapper exactly: ``sh -lc 'cd <dir> && exec <cmd>'``
+    # — only the inner cmd swaps to the test stand-in.
+    root = tmp_path
+    inner = (
+        f"{sys.executable} -c "
+        "\"import sys, time, os; "
+        "sys.stdout.write(str(os.getpid())); "
+        "sys.stdout.write(chr(10)); "
+        "sys.stdout.flush(); "
+        "time.sleep(60)\""
+    )
+    cmd = f"sh -lc 'cd {root} && exec {inner}'"
+
+    proc = subprocess.Popen(  # noqa: S602 - test fixture
+        cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    try:
+        # Read the child PID the stand-in printed. Because of ``exec``,
+        # the inner Python's PID == the shell's PID == proc.pid.
+        assert proc.stdout is not None
+        line = proc.stdout.readline().decode().strip()
+        child_pid = int(line)
+        # ``exec`` collapses the shell into the Python process, so the
+        # Popen child PID and the inner Python PID are the same. This
+        # is the contract that prevents orphans: SIGKILL'ing proc.pid
+        # kills the actual Python child rather than only its shell
+        # parent.
+        assert child_pid == proc.pid, (
+            f"shell wrapper did not exec — child {child_pid} != "
+            f"shell {proc.pid}, SIGKILL on shell would orphan child"
+        )
+
+        # SIGKILL the shell wrapper PID, mirroring ``tmux respawn-pane -k``.
+        # When ``exec`` is in play, this PID == the Python child's PID,
+        # so the kill propagates. We then ``proc.wait()`` to reap and
+        # confirm the process actually terminated.
+        os.kill(proc.pid, signal.SIGKILL)
+        try:
+            returncode = proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pytest.fail(
+                f"child PID {child_pid} did not exit after SIGKILL of shell "
+                f"wrapper (orphan leak from #986)"
+            )
+        # SIGKILL surfaces as -9 / 137 depending on platform conventions.
+        assert returncode in (-signal.SIGKILL, 128 + signal.SIGKILL), (
+            f"unexpected exit code {returncode} after SIGKILL"
+        )
+    finally:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass

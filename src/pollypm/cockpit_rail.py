@@ -3192,7 +3192,14 @@ class CockpitRouter:
         if task_id is not None:
             args.extend(["--task", shlex.quote(task_id)])
         joined = " ".join(args)
-        return f"sh -lc 'cd {root} && {joined}'"
+        # #986 — ``exec`` replaces the shell with the ``pm`` process so
+        # tmux's ``respawn-pane -k`` SIGKILL hits the Python child
+        # directly. Without ``exec`` the shell parent is killed but its
+        # Python child survives, reparenting to PID 1 across cockpit
+        # kill+restart cycles. Each respawn would then leak one
+        # cockpit-pane orphan that holds open file handles, races the
+        # fresh cockpit's right-pane app, and persists across boots.
+        return f"sh -lc 'cd {root} && exec {joined}'"
 
 
 def focus_cockpit_rail_pane(config_path: Path) -> bool:

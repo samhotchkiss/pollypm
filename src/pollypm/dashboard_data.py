@@ -72,6 +72,32 @@ def _truncate_for_now_panel(text: str, *, limit: int = 70) -> str:
     return text[:cut].rstrip() + "…"
 
 
+# Known rotating placeholder hints the Codex CLI shows in an empty
+# input box when the agent is idle. These are NOT activity — they're
+# UI suggestion chrome — but the dashboard's pane-snapshot scrape used
+# to surface them as "what the session is doing" (#994). The list is
+# intentionally a defensive net behind the leading-``›`` prompt-arrow
+# skip; if Codex ships new suggestions, the arrow filter still catches
+# them, but verified-known strings get an additional safety check that
+# matches even when the leading glyph is lost in translation.
+_CODEX_IDLE_PLACEHOLDERS = (
+    "run /review on my current changes",
+    "explain this codebase",
+    "write tests for @filename",
+    "summarize recent commits",
+    "use /skills to list available skills",
+    "find and fix a bug in @filename",
+)
+
+
+def _is_codex_idle_placeholder(line: str) -> bool:
+    """True if ``line`` looks like a Codex idle-input placeholder hint."""
+    text = line.strip().lstrip("›").strip().lower()
+    if not text:
+        return False
+    return any(text.startswith(hint) for hint in _CODEX_IDLE_PLACEHOLDERS)
+
+
 def _snapshot_activity_status(line: str) -> str | None:
     """Summarize Claude/Codex status chrome instead of echoing it verbatim."""
     match = re.search(
@@ -326,8 +352,16 @@ def _session_description(status: str, role: str, snapshot_path: str | None) -> s
             for line in reversed(clean_lines):
                 if not line or len(line) < 10:
                     continue
-                # Skip prompt lines and noise
-                if line.startswith(("❯", ">", "$", "%", *_BOX_DRAWING_PREFIXES)):
+                # Skip prompt lines and noise. ``›`` (U+203A) is the
+                # Codex CLI's idle prompt arrow; when Codex is sitting
+                # at an empty input box it renders rotating placeholder
+                # hints prefixed with ``›`` ("› Run /review on my
+                # current changes", "› Explain this codebase", etc).
+                # Those are NOT the agent's activity — they're the
+                # CLI's grey suggestion text — so treat the line the
+                # same as Claude's ``❯`` idle prompt and fall through
+                # to the status-based default (#994).
+                if line.startswith(("❯", "›", ">", "$", "%", *_BOX_DRAWING_PREFIXES)):
                     continue
                 if "gpt-" in line.lower() or "default ·" in line:
                     continue
@@ -351,6 +385,13 @@ def _session_description(status: str, role: str, snapshot_path: str | None) -> s
                     or "shift+tab to cycle" in lower
                     or line.startswith("⏵⏵")
                 ):
+                    continue
+                # Codex idle-input placeholder hints — defensive net in
+                # case the ``›`` prompt arrow gets stripped during pane
+                # capture but the suggestion text survives. These are
+                # the rotating greys that Codex shows in an empty input
+                # box (#994).
+                if _is_codex_idle_placeholder(line):
                     continue
                 return _truncate_for_now_panel(line)
         except (FileNotFoundError, OSError):

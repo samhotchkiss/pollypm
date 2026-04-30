@@ -135,6 +135,90 @@ def test_session_description_skips_rounded_box_fragments(tmp_path) -> None:
     assert desc == "idle"
 
 
+def test_session_description_skips_codex_idle_prompt_arrow(tmp_path) -> None:
+    """#994: An idle Codex CLI session renders rotating placeholder
+    hints in its empty input box, prefixed with the ``›`` prompt
+    arrow ("› Run /review on my current changes", "› Explain this
+    codebase", etc). The dashboard "Now" panel was scraping those
+    lines as the worker's activity description, so users saw idle
+    sessions captioned with Codex CLI suggestion text instead of an
+    "idle" indicator. The leading ``›`` is the Codex prompt — treat
+    it the same as Claude's ``❯`` and fall through to the status
+    default.
+    """
+    from pollypm.dashboard_data import _session_description
+
+    placeholder_hints = (
+        "› Run /review on my current changes",
+        "› Explain this codebase",
+        "› Write tests for @filename",
+        "› Summarize recent commits",
+        "› Use /skills to list available skills",
+        "› Find and fix a bug in @filename",
+    )
+    for hint in placeholder_hints:
+        snapshot = tmp_path / "snap.txt"
+        # Bare placeholder line — the failure mode in the issue: with
+        # nothing else on the pane, the ``›`` line was the description.
+        snapshot.write_text(f"{hint}\n")
+        desc = _session_description("healthy", "worker", str(snapshot))
+        # The leading prompt arrow (Codex CLI, U+203A) must not leak.
+        assert "›" not in desc, f"prompt arrow leaked for {hint!r}: {desc!r}"
+        # None of the placeholder text should bubble up either.
+        for token in (
+            "run /review",
+            "explain this",
+            "write tests",
+            "summarize recent",
+            "/skills to list",
+            "find and fix",
+        ):
+            assert token not in desc.lower(), (
+                f"placeholder {token!r} leaked for hint {hint!r}: {desc!r}"
+            )
+        # Healthy + no real content => the status-based default.
+        assert desc == "idle", (
+            f"expected idle fallthrough for {hint!r}, got {desc!r}"
+        )
+
+
+def test_session_description_skips_codex_idle_placeholder_without_arrow(
+    tmp_path,
+) -> None:
+    """#994 defensive: if the leading ``›`` glyph is dropped during
+    pane capture but the suggestion text survives, the line still
+    must not be reported as activity. The known-placeholder substring
+    filter is the safety net behind the prompt-arrow filter.
+    """
+    from pollypm.dashboard_data import _session_description
+
+    snapshot = tmp_path / "snap.txt"
+    snapshot.write_text("  Find and fix a bug in @filename\n")
+    desc = _session_description("healthy", "worker", str(snapshot))
+    assert "find and fix" not in desc.lower()
+    assert desc == "idle"
+
+
+def test_session_description_keeps_real_codex_working_status(tmp_path) -> None:
+    """#994 negative: the fix must not regress working-session
+    rendering. A pane snapshot showing Codex actively working (the
+    universal ``Working (Nm Ns)`` indicator) should still surface as
+    ``working (Nm Ns)`` — not get swallowed by the new placeholder
+    filter.
+    """
+    from pollypm.dashboard_data import _session_description
+
+    snapshot = tmp_path / "snap.txt"
+    snapshot.write_text(
+        "OpenAI Codex (research preview)\n"
+        "\n"
+        "⏺ Working (3m 12s · 4.2k tokens · esc to interrupt)\n"
+    )
+    desc = _session_description("healthy", "worker", str(snapshot))
+    assert "working" in desc.lower()
+    assert "3m" in desc
+
+
 def test_session_description_truncates_at_word_boundary(tmp_path) -> None:
     """#792: ``[:70]`` chopped descriptions mid-word (``Phase A
     decisio``). Truncate at a word boundary and append ``…``.

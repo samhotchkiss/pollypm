@@ -8,6 +8,12 @@ Added, Changed, and Removed.
 
 ## [Unreleased]
 
+### Changed
+- Cockpit Home dashboard header relabels the curated alert count from
+  "N alerts" to "N needs action" so it no longer disagrees with `pm
+  alerts`, which lists every open alert (including operational
+  heartbeat noise the dashboard intentionally filters out). #999.
+
 ## [1.0.0] - 2026-04-20
 
 ### Added

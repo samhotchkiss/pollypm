@@ -2756,8 +2756,19 @@ class PollyDashboardApp(App[None]):
         if data.inbox_count:
             parts.append(f"[#d29922][b]{data.inbox_count}[/b] inbox[/#d29922]")
         if data.alert_count:
-            alert_word = "alert" if data.alert_count == 1 else "alerts"
-            parts.append(f"[#f85149][b]{data.alert_count}[/b] {alert_word}[/#f85149]")
+            # ``alert_count`` is a *curated* subset of open alerts —
+            # operational/heartbeat noise (``pane:*``, ``no_session``,
+            # ``stuck_session`` …) and ``stuck_on_task`` alerts whose
+            # task is already in a user-waiting state are filtered out
+            # so the header only shows what the user can act on. ``pm
+            # alerts`` lists *every* open alert (including operational
+            # ones), so the two counts disagreed without explanation
+            # (#999). Label the curated count "needs action" so users
+            # who reach for ``pm alerts`` to drill in aren't surprised
+            # by a higher number.
+            parts.append(
+                f"[#f85149][b]{data.alert_count}[/b] needs action[/#f85149]"
+            )
         header_text = "  " + "  \u00b7  ".join(parts)
         if data.briefing:
             header_text += f"\n\n  [#58a6ff]{data.briefing}[/#58a6ff]"

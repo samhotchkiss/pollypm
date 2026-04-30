@@ -372,13 +372,18 @@ def test_dashboard_done_body_pluralises_singular_counts(tmp_path: Path) -> None:
 
 
 def test_dashboard_header_pluralises_projects_agents_alerts(tmp_path: Path) -> None:
-    """Header line must read ``1 project · 1 agent · 1 alert`` at count=1.
+    """Header line must read ``1 project · 1 agent · 1 needs action`` at count=1.
 
     The very first line of the polly-dashboard header used bare-plural
     ``projects`` / ``agents`` / ``alerts``. A new install with one
     project + one worker + one open alert read ``1 projects · 1 agents
     · … · 1 alerts`` — three copy bugs on the most-seen line in the
     cockpit. Mirrors cycles 57/58/59 across the same surface.
+
+    The ``alerts`` slot was renamed to ``needs action`` in #999 — see
+    :func:`test_dashboard_header_alert_slot_labelled_needs_action` for
+    the rationale; the project/agent pluralisation invariant from this
+    test still holds and is what we're guarding here.
     """
     app = PollyDashboardApp(tmp_path / "pollypm.toml")
     app.header_w = _CaptureWidget()
@@ -411,8 +416,6 @@ def test_dashboard_header_pluralises_projects_agents_alerts(tmp_path: Path) -> N
     assert "[/b] projects" not in header
     assert "[/b] agent " in header
     assert "[/b] agents" not in header
-    assert "[/b] alert[/" in header
-    assert "[/b] alerts[/" not in header
 
     # Path B: plural cases stay plural.
     config = SimpleNamespace(
@@ -438,7 +441,67 @@ def test_dashboard_header_pluralises_projects_agents_alerts(tmp_path: Path) -> N
     header = app.header_w.value
     assert "[/b] projects" in header
     assert "[/b] agents" in header
-    assert "[/b] alerts[/" in header
+
+
+def test_dashboard_header_alert_slot_labelled_needs_action(tmp_path: Path) -> None:
+    """Curated alert count must render as ``N needs action``, not ``N alerts``.
+
+    ``DashboardData.alert_count`` filters out operational/heartbeat
+    alerts (``pane:*``, ``no_session``, ``stuck_session`` …) and
+    already-user-waiting ``stuck_on_task`` alerts. ``pm alerts`` lists
+    every open alert, including the operational ones. With the old
+    label the dashboard read ``4 alerts`` while ``pm alerts`` returned
+    13 entries — two views of the same workspace, two different
+    numbers, no signal that they meant different things (#999).
+
+    Renaming the curated count to ``needs action`` is the contract we
+    rely on so users reaching for ``pm alerts`` to drill in are not
+    surprised by a higher count.
+    """
+    app = PollyDashboardApp(tmp_path / "pollypm.toml")
+    app.header_w = _CaptureWidget()
+    app.now_body = _CaptureWidget()
+    app.messages_body = _CaptureWidget()
+    app.done_body = _CaptureWidget()
+    app.chart_body = _CaptureWidget()
+    app.footer_w = _CaptureWidget()
+
+    config = SimpleNamespace(
+        projects={"a": object(), "b": object()},
+        sessions={"w": object()},
+    )
+    data = DashboardData(
+        active_sessions=[],
+        recent_commits=[],
+        completed_items=[],
+        recent_messages=[],
+        daily_tokens=[],
+        today_tokens=0,
+        total_tokens=0,
+        sweep_count_24h=0,
+        message_count_24h=0,
+        recovery_count_24h=0,
+        inbox_count=0,
+        alert_count=4,
+        briefing="",
+    )
+    app._render_dashboard(config, data)
+    header = app.header_w.value
+
+    # Curated label appears with the count.
+    assert "[/b] needs action[/" in header
+    assert "[b]4[/b] needs action" in header
+    # Legacy ``alerts`` / ``alert`` literal must not leak back in.
+    assert "[/b] alerts[/" not in header
+    assert "[/b] alert[/" not in header
+
+    # And — at count=1 — ``needs action`` does NOT pluralise (it's a
+    # phrase, not a noun-with-count).
+    data.alert_count = 1
+    app._render_dashboard(config, data)
+    header = app.header_w.value
+    assert "[b]1[/b] needs action" in header
+    assert "needs actions" not in header
 
 
 def test_cockpit_router_session_state_ignores_silent_alerts(tmp_path: Path) -> None:

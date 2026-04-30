@@ -3,9 +3,10 @@
 When ``stuck_on_task:<id>`` fires because the architect session sat
 idle waiting for the user to respond and the task is already in a
 user-waiting status, the alert is the same fact in different words.
-The polly dashboard's ``alert_count`` is what drives "1 alerts" in
-the top stats line; counting redundant stuck alerts there inflates
-the badge for non-faults the user already sees as yellow.
+The polly dashboard's ``alert_count`` is what drives the
+"N needs action" cell in the top stats line (renamed from "N alerts"
+in #999); counting redundant stuck alerts there inflates the badge
+for non-faults the user already sees as yellow.
 """
 
 from __future__ import annotations

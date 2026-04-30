@@ -21,6 +21,7 @@ dict ``{handler_name: HandlerSpec}`` is fine.
 from __future__ import annotations
 
 import logging
+import sqlite3
 import threading
 import time
 import traceback
@@ -35,6 +36,29 @@ __all__ = [
     "PoolMetrics",
     "WorkerMetrics",
 ]
+
+
+# Marker text for the SQLite ProgrammingError raised when an operation runs
+# against a connection that's already been closed. Matched by substring so a
+# future Python release that retunes the wording (or wraps it in a different
+# subclass) still trips the defensive branch.
+_CLOSED_DB_MARKER = "Cannot operate on a closed database"
+
+
+def _is_closed_db_error(exc: BaseException) -> bool:
+    """True iff ``exc`` looks like SQLite's closed-connection error.
+
+    The cockpit hits this whenever some other code path closes the
+    JobQueue's connection underneath a live worker — the canonical
+    cause is ``pm migrate --apply`` archiving a per-project DB the
+    cockpit was still pointing at (#1006). Treating the symptom as a
+    clean-shutdown signal stops the worker pool tight-looping on
+    full-traceback log spam, which is what was actually killing
+    rail_daemon in the production trace.
+    """
+    if not isinstance(exc, sqlite3.ProgrammingError):
+        return False
+    return _CLOSED_DB_MARKER in str(exc)
 
 
 logger = logging.getLogger(__name__)
@@ -217,6 +241,9 @@ class JobWorkerPool:
             try:
                 batch = self.queue.claim(worker_id, limit=1)
             except Exception as exc:  # noqa: BLE001
+                if _is_closed_db_error(exc):
+                    self._handle_closed_db(worker_id, "claim")
+                    break
                 logger.exception("JobWorkerPool: claim failed for %s: %s", worker_id, exc)
                 if self._stop_event.wait(self.poll_interval):
                     break
@@ -229,8 +256,35 @@ class JobWorkerPool:
 
             for job in batch:
                 self._run_one(job)
+                if self._stop_event.is_set():
+                    break
 
         logger.debug("JobWorkerPool: worker %s stopping", worker_id)
+
+    def _handle_closed_db(self, worker_id: str, operation: str) -> None:
+        """Log once and trip the stop event when the DB connection is gone.
+
+        Called when claim/complete/fail raises ``sqlite3.ProgrammingError:
+        Cannot operate on a closed database``. Workers that hit this can
+        never make progress against the dead connection — re-raising on
+        every poll burns CPU and floods ``errors.log`` with full
+        tracebacks (see #1006). Setting ``_stop_event`` lets sibling
+        workers exit on their next short-poll without waiting for the
+        join timeout to lapse.
+        """
+        # Best-effort: only the first worker to notice gets the warning,
+        # so we don't print N copies of the same line. Any worker setting
+        # the event is sufficient — Event.set() is idempotent.
+        already_signalled = self._stop_event.is_set()
+        self._stop_event.set()
+        if not already_signalled:
+            logger.warning(
+                "JobWorkerPool: %s by %s hit closed-DB; stopping pool. "
+                "Likely cause: another process (e.g. `pm migrate --apply`) "
+                "closed the queue connection underneath us. Restart the "
+                "cockpit to recover.",
+                operation, worker_id,
+            )
 
     def _lookup_handler(self, name: str) -> HandlerSpec | None:
         if isinstance(self._registry, dict):
@@ -241,11 +295,17 @@ class JobWorkerPool:
         spec = self._lookup_handler(job.handler_name)
         if spec is None:
             # No handler — fail permanently with a clear message.
-            self.queue.fail(
-                job.id,
-                f"No handler registered for '{job.handler_name}'",
-                retry=False,
-            )
+            try:
+                self.queue.fail(
+                    job.id,
+                    f"No handler registered for '{job.handler_name}'",
+                    retry=False,
+                )
+            except Exception as exc:  # noqa: BLE001
+                if _is_closed_db_error(exc):
+                    self._handle_closed_db("worker", "fail")
+                    return
+                raise
             with self._metrics_lock:
                 self._metrics.for_handler(job.handler_name).record_outcome(
                     success=False, duration_ms=0.0
@@ -304,14 +364,23 @@ class JobWorkerPool:
 
         except Exception as exc:  # noqa: BLE001
             # Defensive — bookkeeping or queue interaction failed.
+            if _is_closed_db_error(exc):
+                # Don't log a full traceback — closed-DB errors are
+                # operational, not programming bugs, and four workers
+                # spamming tracebacks each poll is what zombied
+                # rail_daemon in #1006.
+                self._handle_closed_db("worker", "complete/fail")
+                return
             logger.exception(
                 "JobWorkerPool: unexpected error running job %s (%s): %s",
                 job.id, job.handler_name, exc,
             )
             try:
                 self.queue.fail(job.id, traceback.format_exc(), retry=True)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as fail_exc:  # noqa: BLE001
+                if _is_closed_db_error(fail_exc):
+                    self._handle_closed_db("worker", "fail")
+                    return
             elapsed_ms = (time.monotonic() - start) * 1000
             with self._metrics_lock:
                 self._metrics.for_handler(job.handler_name).record_outcome(

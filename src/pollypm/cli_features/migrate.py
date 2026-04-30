@@ -6,12 +6,18 @@ Contract:
   exactly like every other ``pm`` command.
 - Outputs: human-readable progress lines on stdout, diagnostics on
   stderr, standard exit codes (0 on success, 2 when a pending migration
-  would block, 3 on dry-run failure).
+  would block, 3 on dry-run failure, 4 when ``--apply`` would race a
+  live cockpit/rail_daemon — see #1006).
 - Side effects (``--check``): copies the workspace state.db to
   ``~/.pollypm/migration-check.db`` and applies pending migrations
   against the clone.
 - Side effects (``--apply``): opens the live state.db and runs pending
-  migrations atomically per-migration.
+  migrations atomically per-migration. Refuses when ``rail_daemon`` is
+  alive (#1006) — running migrations underneath a live JobWorkerPool
+  closes per-project DB handles the pool is still using and triggers a
+  ``Cannot operate on a closed database`` cascade that zombies the
+  cockpit. Pass ``--force`` to override (only safe if you're certain no
+  worker is mid-flight).
 - Invariants: never mutates the live DB during ``--check``. Sets
   ``POLLYPM_SKIP_MIGRATION_GATE`` before opening the store so the gate
   in ``pm up`` cannot loop on itself.
@@ -19,12 +25,19 @@ Contract:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import typer
 
 from pollypm.cli_help import help_with_examples
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config, resolve_config_path
+
+
+# Exit code for "refused because something else is alive". Distinct from
+# 2 (pending migration blocks) and 3 (dry-run failed) so scripts can tell
+# the failure modes apart.
+_EXIT_LIVE_PROCESS = 4
 
 
 _MIGRATE_HELP = help_with_examples(
@@ -61,6 +74,16 @@ def register_migrate_commands(app: typer.Typer) -> None:
         apply: bool = typer.Option(
             False, "--apply", help="Apply pending migrations to the live DB."
         ),
+        force: bool = typer.Option(
+            False,
+            "--force",
+            help=(
+                "Skip the live-process safety check (rail_daemon detection). "
+                "Only safe when no cockpit, rail_daemon, or job-worker is "
+                "currently running — otherwise migration may close DB "
+                "handles that running workers still hold (#1006)."
+            ),
+        ),
         config_path: Path = typer.Option(
             DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."
         ),
@@ -81,7 +104,7 @@ def register_migrate_commands(app: typer.Typer) -> None:
         if check:
             _run_check(db_path)
         else:
-            _run_apply(db_path)
+            _run_apply(db_path, force=force)
 
 
 def _run_check(db_path: Path) -> None:
@@ -129,8 +152,80 @@ def _run_check(db_path: Path) -> None:
     typer.echo("Migration check OK. Run `pm migrate --apply` to upgrade the live DB.")
 
 
-def _run_apply(db_path: Path) -> None:
+def _live_pollypm_processes() -> list[tuple[str, int, Path]]:
+    """Return ``[(label, pid, pidfile)]`` for any live PollyPM process.
+
+    Currently only inspects the rail_daemon PID file (the cockpit's
+    own HeartbeatRail piggybacks on the same daemon when both are
+    running, and has no separate PID file). The returned list is empty
+    when nothing is running. Stale PID files (process gone) are
+    filtered out so a clean machine never trips the guard.
+    """
+    home = Path(DEFAULT_CONFIG_PATH).parent
+    candidates = (("rail_daemon", home / "rail_daemon.pid"),)
+    live: list[tuple[str, int, Path]] = []
+    for label, pidfile in candidates:
+        if not pidfile.exists():
+            continue
+        try:
+            pid = int(pidfile.read_text().strip())
+        except (OSError, ValueError):
+            continue
+        if pid <= 0 or not _pid_alive(pid):
+            continue
+        live.append((label, pid, pidfile))
+    return live
+
+
+def _pid_alive(pid: int) -> bool:
+    """True iff ``pid`` names a currently-running process."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Another user owns the pid — treat as alive from our POV
+        # rather than try to migrate over the top of someone else.
+        return True
+    return True
+
+
+def _refuse_live_processes(live: list[tuple[str, int, Path]]) -> None:
+    """Render a structured refusal and exit when live processes block --apply."""
+    from pollypm.structured_message import StructuredUserMessage
+
+    bullets = "\n".join(
+        f"  - {label} (pid {pid}, pidfile {pidfile})"
+        for label, pid, pidfile in live
+    )
+    msg = StructuredUserMessage(
+        summary="Refusing to apply migrations — live PollyPM process detected.",
+        why=(
+            "Running migrations while the cockpit / rail_daemon / "
+            "job-worker pool is alive can close per-project DB handles "
+            "the pool is still holding, triggering a 'Cannot operate "
+            "on a closed database' cascade that zombies the cockpit "
+            "(#1006). Stop them first so the migration runs on a "
+            "quiescent system."
+        ),
+        next_action=(
+            "Stop the live processes, then re-run `pm migrate --apply`. "
+            "If you are certain no worker is mid-flight, pass `--force` "
+            "to override."
+        ),
+        details=f"Live processes:\n{bullets}",
+    )
+    typer.echo(msg.render_cli(show_details=True), err=True)
+    raise typer.Exit(code=_EXIT_LIVE_PROCESS)
+
+
+def _run_apply(db_path: Path, *, force: bool = False) -> None:
     from pollypm.store import migrations as _migrations
+
+    if not force:
+        live = _live_pollypm_processes()
+        if live:
+            _refuse_live_processes(live)
 
     outcome = _migrations.apply(db_path)
     if outcome.already_up_to_date:

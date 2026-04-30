@@ -301,6 +301,86 @@ def test_stop_waits_for_in_flight_job(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_pool_drains_when_db_connection_closed_under_workers(tmp_path: Path) -> None:
+    """#1006: closed-DB errors must not zombie the pool.
+
+    Reproduces the production death sequence: ``pm migrate --apply``
+    archives a per-project DB the cockpit's ``JobQueue`` was still
+    pointing at. The next ``complete()`` / ``claim()`` raises
+    ``sqlite3.ProgrammingError: Cannot operate on a closed database``.
+    Pre-fix, every worker thread tight-looped that traceback into
+    ``errors.log`` until ``pool.stop()``'s join timeout lapsed and
+    rail_daemon was zombied. The fix trips the stop event so all
+    workers exit on their next short-poll.
+
+    We trigger the failure by acquiring the queue's lock, closing the
+    underlying connection, and releasing — racing a bare
+    ``conn.close()`` against an in-flight ``execute()`` is undefined
+    behaviour in Python 3.14's sqlite3 binding (segfaults), so we go
+    through the lock the queue itself uses to serialize access.
+    """
+    import sqlite3 as _sqlite3
+
+    db_path = tmp_path / "jobs.db"
+    conn = _sqlite3.connect(
+        str(db_path), check_same_thread=False, isolation_level=None,
+    )
+    conn.execute("PRAGMA journal_mode=WAL")
+    q = JobQueue(connection=conn)
+
+    drained = threading.Event()
+    enqueue_lock = threading.Lock()
+    completed = [0]
+
+    def quick(payload: dict) -> None:
+        # No-op handler — finishes fast so the worker reaches complete().
+        with enqueue_lock:
+            completed[0] += 1
+            if completed[0] >= 1:
+                drained.set()
+
+    registry = {"h": HandlerSpec("h", quick, timeout_seconds=5)}
+    pool = JobWorkerPool(q, registry=registry, poll_interval=0.02)
+    pool.start(concurrency=4)
+    try:
+        # Push enough work that workers are actively polling, then wait
+        # for at least one to drain so we know the pool is live.
+        for _ in range(2):
+            q.enqueue("h")
+        assert drained.wait(timeout=3), "no job ever completed"
+
+        # Yank the connection through the queue's own lock — this is
+        # what production hits when a sibling closes the connection
+        # under the pool. No race against an in-flight execute().
+        with q._lock:
+            q._conn.close()
+
+        # Ask for stop. The fix is: workers detect closed-DB on their
+        # next claim() and bail out fast. ``stop()`` returning quickly
+        # *and* every worker thread being gone is the success signal.
+        t0 = time.monotonic()
+        pool.stop(timeout=3.0)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 1.5, (
+            f"pool.stop took {elapsed:.2f}s — workers tight-looped on "
+            "closed-DB instead of exiting cleanly"
+        )
+    finally:
+        # Defensive: don't leave threads behind if assertions fail.
+        pool.stop(timeout=1.0)
+
+    # Only count main pool worker threads (``pollypm-jobworker-N``),
+    # not the per-handler invocation threads (``...-handler-N``) that
+    # the pool spawns daemon-style and never joins on stop. The
+    # production failure mode was the *worker* threads zombying.
+    alive = [
+        t for t in threading.enumerate()
+        if t.name.startswith("pollypm-jobworker-")
+        and "handler" not in t.name
+    ]
+    assert not alive, f"workers still alive after stop: {[t.name for t in alive]}"
+
+
 def test_metrics_track_per_handler_counts_and_duration(tmp_path: Path) -> None:
     q = _make_queue(tmp_path)
 

@@ -392,3 +392,128 @@ def test_cli_migrate_apply_reports_applied(
     # makes the DB self-bootstrap earlier. Both are acceptable; failure
     # would be a non-zero exit.
     assert "Applied" in combined or "up to date" in combined
+
+
+# ---------------------------------------------------------------------------
+# #1006: --apply refuses while live processes hold DB connections
+# ---------------------------------------------------------------------------
+
+
+def test_pm_migrate_apply_refuses_when_rail_daemon_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1006: ``--apply`` must refuse when ``rail_daemon`` is alive.
+
+    Running migrations underneath a live JobWorkerPool closes per-
+    project DB handles the pool is still using. Pre-fix the cockpit
+    cascaded ``Cannot operate on a closed database`` errors and
+    zombied. The CLI now bails with structured guidance and a
+    non-zero exit so the user stops the daemon first.
+    """
+    import os
+    from pollypm.cli_features import migrate as _migrate_mod
+
+    # Point ``DEFAULT_CONFIG_PATH.parent`` at a tmp home so we don't
+    # poke the developer's real ``~/.pollypm/`` PID file.
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(
+        _migrate_mod, "DEFAULT_CONFIG_PATH", fake_home / "config.toml",
+    )
+
+    pidfile = fake_home / "rail_daemon.pid"
+    # Use our own PID so ``os.kill(pid, 0)`` returns truthfully alive.
+    pidfile.write_text(str(os.getpid()))
+
+    config_path = _write_minimal_config(tmp_path)
+    db_path = _fresh_state_db(tmp_path / "state.db")
+    config_path.write_text(
+        "[project]\n"
+        f'base_dir = "{tmp_path}"\n'
+        f'state_db = "{db_path}"\n'
+        f'workspace_root = "{tmp_path}"\n'
+    )
+
+    app = _build_cli_app()
+    result = runner.invoke(app, ["--apply", "--config", str(config_path)])
+    assert result.exit_code == _migrate_mod._EXIT_LIVE_PROCESS, result.output
+    combined = result.stdout + "\n" + (result.stderr or "")
+    assert "Refusing to apply migrations" in combined
+    assert "rail_daemon" in combined
+    assert "--force" in combined
+
+
+def test_pm_migrate_apply_force_overrides_live_process_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--force`` skips the rail_daemon guard for emergencies."""
+    import os
+    from pollypm.cli_features import migrate as _migrate_mod
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(
+        _migrate_mod, "DEFAULT_CONFIG_PATH", fake_home / "config.toml",
+    )
+    pidfile = fake_home / "rail_daemon.pid"
+    pidfile.write_text(str(os.getpid()))
+
+    config_path = _write_minimal_config(tmp_path)
+    db_path = _fresh_state_db(tmp_path / "state.db")
+    config_path.write_text(
+        "[project]\n"
+        f'base_dir = "{tmp_path}"\n'
+        f'state_db = "{db_path}"\n'
+        f'workspace_root = "{tmp_path}"\n'
+    )
+
+    app = _build_cli_app()
+    result = runner.invoke(
+        app, ["--apply", "--force", "--config", str(config_path)]
+    )
+    assert result.exit_code == 0, result.output
+
+
+def test_pm_migrate_apply_ignores_stale_pidfile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pidfile pointing at a dead PID does not block ``--apply``."""
+    from pollypm.cli_features import migrate as _migrate_mod
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(
+        _migrate_mod, "DEFAULT_CONFIG_PATH", fake_home / "config.toml",
+    )
+    # PID 0 is invalid + the helper rejects pid<=0; using a high pid
+    # that almost certainly does not exist also exercises
+    # ProcessLookupError — pick PID 0 since the helper short-circuits.
+    pidfile = fake_home / "rail_daemon.pid"
+    pidfile.write_text("0")
+
+    config_path = _write_minimal_config(tmp_path)
+    db_path = _fresh_state_db(tmp_path / "state.db")
+    config_path.write_text(
+        "[project]\n"
+        f'base_dir = "{tmp_path}"\n'
+        f'state_db = "{db_path}"\n'
+        f'workspace_root = "{tmp_path}"\n'
+    )
+
+    app = _build_cli_app()
+    result = runner.invoke(app, ["--apply", "--config", str(config_path)])
+    assert result.exit_code == 0, result.output
+
+
+def test_live_pollypm_processes_returns_empty_when_no_pidfile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_live_pollypm_processes`` is empty on a clean machine."""
+    from pollypm.cli_features import migrate as _migrate_mod
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(
+        _migrate_mod, "DEFAULT_CONFIG_PATH", fake_home / "config.toml",
+    )
+    assert _migrate_mod._live_pollypm_processes() == []

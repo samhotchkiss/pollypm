@@ -8687,6 +8687,20 @@ def _dashboard_status(
     if alert_count:
         return ("\u25c6", "#f85149", "alert")
     if active_worker is not None:
+        # #990 \u2014 the green "active" pill must reflect actual progress,
+        # not just heartbeat liveness. An architect that emitted a
+        # plan and is "standing by" still has an alive heartbeat, but
+        # claiming "active" there contradicts the Tasks view and the
+        # pane self-report. Honour the activity classifier from
+        # ``_dashboard_active_worker``.
+        activity = str((active_worker or {}).get("activity") or "working")
+        if activity == "awaiting_user":
+            return ("\u25c6", "#f0c45a", "waiting on input")
+        if activity == "idle":
+            # Still want a softer pill than full-grey idle so the
+            # user can tell a session exists, but don't promise work
+            # is happening.
+            return ("\u25cb", "#6b7a88", "standing by")
         return ("\u25cf", "#3ddc84", "active")
     # #920 \u2014 a task in ``in_progress`` is claimed work, regardless of
     # whether a heartbeat has registered yet. Showing "idle" while a
@@ -9236,6 +9250,104 @@ def _dashboard_gather_tasks(
     return counts, buckets
 
 
+def _classify_worker_activity(
+    supervisor,
+    session_name: str,
+    role: str,
+    project_aliases: set[str],
+    project_path: Path | None,
+    has_pane_permission_alert: bool,
+) -> str:
+    """Return ``"working" | "idle" | "awaiting_user"`` for a live session.
+
+    ``"alive"`` (heartbeat within the cutoff) is necessary but not
+    sufficient to claim a session is in action — a session can have a
+    fresh heartbeat and still be doing nothing (architect just emitted
+    "standing by", worker with no claimed task, anything blocked at a
+    permission prompt). #990 reproduced this: bikepath had an alive
+    architect heartbeat and the dashboard read "architect is in action"
+    while the pane self-reported "standing by" and no task existed for
+    the architect to act on.
+
+    Signals:
+
+    * ``awaiting_user`` — a ``pane:permission_prompt`` alert is open on
+      this session, so the agent is blocked waiting for the operator.
+    * ``working`` — the session owns a task in ``in_progress`` AND the
+      pane has produced output between the two most-recent heartbeats
+      (snapshot_hash differs). Either alone is weaker; together they
+      mean "claimed work + the pane is moving."
+    * ``idle`` — heartbeat is alive but neither of the above. Architect
+      that emitted a plan and is standing by, worker that finished its
+      queue and is parked, etc.
+
+    Returns conservatively: when in doubt prefer ``idle`` over
+    ``working`` so the dashboard doesn't overclaim activity.
+    """
+    if has_pane_permission_alert:
+        return "awaiting_user"
+
+    pane_changed = False
+    try:
+        recent = supervisor.store.recent_heartbeats(session_name, limit=2)
+    except Exception:  # noqa: BLE001
+        recent = []
+    if len(recent) >= 2:
+        h0 = getattr(recent[0], "snapshot_hash", None) or ""
+        h1 = getattr(recent[1], "snapshot_hash", None) or ""
+        if h0 and h1 and h0 != h1:
+            pane_changed = True
+    elif len(recent) == 1:
+        # Only one heartbeat on record — we can't compare. Treat as
+        # ambiguous but lean toward idle: a session with a single
+        # heartbeat hasn't yet shown movement.
+        pane_changed = False
+
+    has_owned_task = False
+    if project_path is not None:
+        try:
+            from pollypm.work.sqlite_service import SQLiteWorkService
+
+            db_path = project_path / ".pollypm" / "state.db"
+            if db_path.exists():
+                with SQLiteWorkService(
+                    db_path=db_path, project_path=project_path,
+                ) as svc:
+                    for alias in project_aliases:
+                        try:
+                            tasks = svc.list_tasks(project=alias)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        for t in tasks:
+                            status = getattr(
+                                getattr(t, "work_status", None), "value", "",
+                            )
+                            assignee = getattr(t, "assignee", None) or ""
+                            # The session may own the task either by
+                            # assignee match (modern path) or by being
+                            # the role's session for the project.
+                            if status == "in_progress" and (
+                                assignee == session_name
+                                or assignee == role
+                            ):
+                                has_owned_task = True
+                                break
+                        if has_owned_task:
+                            break
+        except Exception:  # noqa: BLE001
+            has_owned_task = False
+
+    if has_owned_task and pane_changed:
+        return "working"
+    # Architects almost never "own" a task in the worker sense — they
+    # plan, then stand by. So an architect with pane_changed but no
+    # owned task is still considered working: the pane is moving, which
+    # is what the user sees on the dashboard.
+    if pane_changed and role == "architect":
+        return "working"
+    return "idle"
+
+
 def _dashboard_active_worker(
     config_path: Path,
     project_key: str,
@@ -9249,6 +9361,14 @@ def _dashboard_active_worker(
     counts actionable alerts scoped to this project's sessions so the
     top bar can render the yellow "needs attention" light even when the
     worker is idle.
+
+    When a worker is found, ``worker_info["activity"]`` carries the
+    classifier result from :func:`_classify_worker_activity`:
+    ``"working"`` (claimed task + pane moving), ``"idle"`` (alive but
+    standing by), or ``"awaiting_user"`` (blocked at a permission
+    prompt). The banner / now-section / pill all read this field so the
+    dashboard does not claim "in action" for a session that is alive
+    but not progressing work (#990).
 
     When ``action_items`` is supplied, ``stuck_on_task:<task_id>``
     alerts whose task is already represented by an Action Needed card
@@ -9294,6 +9414,18 @@ def _dashboard_active_worker(
             if getattr(launch.session, "project", None) in _alias_set
             and getattr(launch.session, "role", "") not in _CONTROL_ROLES
         ]
+        # Resolve the project's on-disk path so the activity classifier
+        # can open its work-service DB and check task ownership. The
+        # config form keyed by ``project_key`` is canonical; aliases
+        # are only used for matching session.project.
+        _project_path: Path | None = None
+        try:
+            if _config is not None:
+                _proj = (_config.projects or {}).get(project_key)
+                if _proj is not None:
+                    _project_path = getattr(_proj, "path", None)
+        except Exception:  # noqa: BLE001
+            _project_path = None
         alive_cutoff = datetime.now(UTC) - timedelta(minutes=5)
         for sess in project_sessions:
             try:
@@ -9316,6 +9448,7 @@ def _dashboard_active_worker(
                 }
                 break
         # Actionable alerts for this project's sessions.
+        open_alerts: list = []
         try:
             from pollypm.cockpit_alerts import is_operational_alert
 
@@ -9328,9 +9461,9 @@ def _dashboard_active_worker(
                 project_session_names.add(f"plan_gate-{_alias}")
             open_alerts_fn = getattr(supervisor, "open_alerts", None)
             if callable(open_alerts_fn):
-                open_alerts = open_alerts_fn()
+                open_alerts = list(open_alerts_fn())
             else:
-                open_alerts = supervisor.store.open_alerts()
+                open_alerts = list(supervisor.store.open_alerts())
             covered_task_ids = {
                 str(item.get("primary_ref"))
                 for item in (action_items or [])
@@ -9346,6 +9479,37 @@ def _dashboard_active_worker(
             )
         except Exception:  # noqa: BLE001
             alert_count = 0
+        # #990 — classify the worker's actual activity. Heartbeat-alive
+        # alone is not enough to claim "in action"; the dashboard must
+        # also see either a claimed task with pane movement or, for an
+        # architect, pane movement on its own. An alive but quiet
+        # session is reported as ``idle`` so the banner / now-section
+        # / pill don't overclaim.
+        if worker_info is not None:
+            has_perm_alert = False
+            try:
+                for a in open_alerts:
+                    if (
+                        getattr(a, "session_name", None)
+                        == worker_info["session_name"]
+                        and getattr(a, "alert_type", "")
+                        == "pane:permission_prompt"
+                    ):
+                        has_perm_alert = True
+                        break
+            except Exception:  # noqa: BLE001
+                has_perm_alert = False
+            try:
+                worker_info["activity"] = _classify_worker_activity(
+                    supervisor,
+                    worker_info["session_name"],
+                    worker_info["role"],
+                    _alias_set,
+                    _project_path,
+                    has_perm_alert,
+                )
+            except Exception:  # noqa: BLE001
+                worker_info["activity"] = "idle"
     finally:
         try:
             supervisor.store.close()
@@ -10630,6 +10794,9 @@ def _project_dashboard_signature(
         worker.get("session_name"),
         worker.get("role"),
         worker.get("last_heartbeat"),
+        # #990 — activity classification (working / idle / awaiting_user)
+        # gates banner copy and pill colour, so re-render when it shifts.
+        worker.get("activity"),
         # Task pipeline.
         tuple(sorted((data.task_counts or {}).items())),
         # Action / inbox / alerts.
@@ -11332,7 +11499,13 @@ class PollyProjectDashboardApp(App[None]):
                 worker = data.active_worker
                 role = str(worker.get("role") or "worker")
                 session = str(worker.get("session_name") or "a session")
-                lead += f" · {session} ({role}) active in background"
+                activity = str(worker.get("activity") or "working")
+                if activity == "working":
+                    lead += (
+                        f" · {session} ({role}) active in background"
+                    )
+                # idle / awaiting_user → don't claim background work
+                # while a hold is the user-facing lead.
             if suffix_without_overlap.startswith("▸ Clear"):
                 return lead
             tail = (
@@ -11345,7 +11518,41 @@ class PollyProjectDashboardApp(App[None]):
             worker = data.active_worker
             role = str(worker.get("role") or "worker")
             session = str(worker.get("session_name") or "a session")
-            return f"Moving now: {session} ({role}) is active{count_suffix}"
+            activity = str(worker.get("activity") or "working")
+            # #990 — only claim "is active" when the agent is genuinely
+            # progressing work. ``idle`` means the session is alive but
+            # standing by (e.g. architect emitted a plan and is waiting
+            # for the user); claiming "is active" there contradicts the
+            # Tasks view ("no active worker is attached") and the pane
+            # itself ("standing by"). ``awaiting_user`` shifts the
+            # banner to surface that the operator is the blocker.
+            if activity == "awaiting_user":
+                return (
+                    f"Waiting on you: {session} ({role}) is at a "
+                    f"permission prompt{count_suffix}"
+                )
+            if activity == "idle":
+                # Surface the standby state, but defer to category
+                # tails (queued / blocked / review) below by falling
+                # through when there's other work to highlight. Keep
+                # the in-line idle banner only when nothing else is
+                # waiting — that's the pure "alive but not progressing"
+                # state #990 was about.
+                queued = int(data.task_counts.get("queued", 0))
+                blocked = int(data.task_counts.get("blocked", 0))
+                review = int(data.task_counts.get("review", 0))
+                if not (queued or blocked or review):
+                    return (
+                        f"{session} ({role}) is alive but standing by "
+                        f"— no task in flight{count_suffix}"
+                    )
+                # Fall through to queued/blocked/review banners below
+                # so the user-facing category leads.
+            else:
+                return (
+                    f"Moving now: {session} ({role}) is active"
+                    f"{count_suffix}"
+                )
         if blocker_count := int(data.task_counts.get("blocked", 0)):
             label = "task is" if blocker_count == 1 else "tasks are"
             return (
@@ -11371,6 +11578,7 @@ class PollyProjectDashboardApp(App[None]):
         if w:
             sess_raw = w.get("session_name") or ""
             role_raw = w.get("role") or "worker"
+            activity = str(w.get("activity") or "working")
             # Collapse "<role>_<project_key>" sessions on their own
             # project's dashboard down to just the role \u2014 both the
             # role name and the project context are already implicit
@@ -11388,9 +11596,22 @@ class PollyProjectDashboardApp(App[None]):
             hb = w.get("last_heartbeat") or ""
             age = _format_relative_age(hb) if hb else ""
             age_part = f"  [dim]{_escape(age)}[/dim]" if age else ""
+            # #990 \u2014 colour the dot by activity, not just "alive". A
+            # green \u25cf for a session that self-reports "standing by"
+            # is the false-positive the issue called out. Yellow \u25c6
+            # marks "alive but not progressing" \u2014 same shape the
+            # pipeline uses for in-flight-but-needs-attention rows.
+            if activity == "working":
+                dot_markup = "[#3ddc84]\u25cf[/#3ddc84]"
+                state_tail = ""
+            elif activity == "awaiting_user":
+                dot_markup = "[#f0c45a]\u25c6[/#f0c45a]"
+                state_tail = "  [dim]waiting on input[/dim]"
+            else:  # idle
+                dot_markup = "[#6b7a88]\u25cb[/#6b7a88]"
+                state_tail = "  [dim]standing by[/dim]"
             lines = [
-                f"[#3ddc84]\u25cf[/#3ddc84] "
-                f"{identity_markup}{age_part}",
+                f"{dot_markup} {identity_markup}{age_part}{state_tail}",
             ]
             # Surface the top-most in-flight task as context.
             in_flight = data.task_buckets.get("in_progress", [])
@@ -11415,6 +11636,23 @@ class PollyProjectDashboardApp(App[None]):
                 lines.append(
                     "  [#f0c45a]\u25c6[/#f0c45a] Waiting on your "
                     "response \u2014 see [b]Action Needed[/b] above."
+                )
+            elif activity == "idle":
+                # No task, no action card, but the session is alive
+                # and standing by. #990: bikepath's architect was
+                # exactly here \u2014 heartbeat-alive, "Re-anchored as Bea
+                # \u2026 standing by." The dashboard had no way to show
+                # this, so it implied work was happening. Spell out
+                # the actual state instead.
+                lines.append(
+                    "  [dim]No task in flight. The session is alive "
+                    "but not progressing work \u2014 it will pick up the "
+                    "next queued task or wait for instructions.[/dim]"
+                )
+            elif activity == "awaiting_user":
+                lines.append(
+                    "  [#f0c45a]\u25c6[/#f0c45a] Waiting on your "
+                    "response \u2014 a permission prompt is open."
                 )
             return "\n".join(lines)
         if data.action_items:

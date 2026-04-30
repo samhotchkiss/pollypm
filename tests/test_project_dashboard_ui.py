@@ -2853,6 +2853,283 @@ def test_now_body_idle_when_no_tasks_at_all() -> None:
     assert "no user action needed" in rendered
 
 
+# ---------------------------------------------------------------------------
+# #990 — Dashboard activity classifier: heartbeat-alive does NOT mean the
+# session is doing work. The bikepath repro had an architect with a fresh
+# heartbeat self-reporting "standing by" while the dashboard banner read
+# "architect is in action" — factually wrong. The classifier returns
+# ``working / idle / awaiting_user`` and the banner / now-section / pill
+# read it.
+# ---------------------------------------------------------------------------
+
+
+def test_now_body_says_standing_by_for_idle_worker() -> None:
+    """An alive but idle worker (no claimed task, no pane movement)
+    must NOT be rendered as ``in action``. The dashboard renders the
+    standby state explicitly so the user knows the session is alive
+    but not progressing work (#990).
+    """
+    from types import SimpleNamespace
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    app.project_key = "bikepath"
+    fake_data = SimpleNamespace(
+        active_worker={
+            "session_name": "architect_bikepath",
+            "role": "architect",
+            "last_heartbeat": "2026-04-29T22:30:00+00:00",
+            "activity": "idle",
+        },
+        action_items=[],
+        task_buckets={
+            "queued": [], "in_progress": [], "review": [],
+            "blocked": [], "on_hold": [], "done": [],
+        },
+        task_counts={},
+    )
+    rendered = app._render_now_body(fake_data)
+    assert "standing by" in rendered
+    # Yellow/grey dot, NOT the green ● that signals "active".
+    assert "[#3ddc84]●[/#3ddc84]" not in rendered
+    assert "not progressing" in rendered
+
+
+def test_now_body_says_waiting_on_input_for_permission_prompt() -> None:
+    """An alive worker blocked on a permission prompt is rendered as
+    ``waiting on input``, not as active work. Closes the loop with
+    the ``pane:permission_prompt`` alert flow (#989, #990)."""
+    from types import SimpleNamespace
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    app.project_key = "bikepath"
+    fake_data = SimpleNamespace(
+        active_worker={
+            "session_name": "architect_bikepath",
+            "role": "architect",
+            "last_heartbeat": "2026-04-29T22:30:00+00:00",
+            "activity": "awaiting_user",
+        },
+        action_items=[],
+        task_buckets={
+            "queued": [], "in_progress": [], "review": [],
+            "blocked": [], "on_hold": [], "done": [],
+        },
+        task_counts={},
+    )
+    rendered = app._render_now_body(fake_data)
+    assert "waiting on input" in rendered
+    assert "permission prompt" in rendered
+
+
+def test_now_body_keeps_in_action_for_working_worker() -> None:
+    """A worker classified as ``working`` (claimed task + pane moving)
+    keeps the green ● and the in-flight task line. Regression guard
+    so the #990 fix doesn't over-correct and erase the genuine
+    activity signal."""
+    from types import SimpleNamespace
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    app.project_key = "demo"
+    fake_data = SimpleNamespace(
+        active_worker={
+            "session_name": "worker_demo",
+            "role": "worker",
+            "last_heartbeat": "2026-04-29T22:30:00+00:00",
+            "activity": "working",
+        },
+        action_items=[],
+        task_buckets={
+            "queued": [],
+            "in_progress": [
+                {"task_number": 7, "title": "Add foo", "current_node_id": None}
+            ],
+            "review": [], "blocked": [], "on_hold": [], "done": [],
+        },
+        task_counts={"in_progress": 1},
+    )
+    rendered = app._render_now_body(fake_data)
+    assert "[#3ddc84]●[/#3ddc84]" in rendered
+    assert "Add foo" in rendered
+    assert "standing by" not in rendered
+
+
+def test_status_pill_uses_activity_classification() -> None:
+    """The pill colour / label reads the classifier, not just liveness.
+
+    * ``working`` → green ● ``active``
+    * ``idle`` → grey ○ ``standing by``
+    * ``awaiting_user`` → yellow ◆ ``waiting on input``
+
+    A naive "heartbeat alive ⇒ green active" pill is exactly what
+    #990 reproduced on bikepath.
+    """
+    from pollypm.cockpit_ui import _dashboard_status
+
+    working = {"session_name": "w", "role": "worker", "activity": "working"}
+    idle = {"session_name": "w", "role": "architect", "activity": "idle"}
+    blocked = {
+        "session_name": "w", "role": "architect", "activity": "awaiting_user",
+    }
+
+    dot, _, label = _dashboard_status(working, 0, 0, None)
+    assert label == "active"
+    assert dot == "●"
+
+    dot, _, label = _dashboard_status(idle, 0, 0, None)
+    assert label == "standing by"
+    assert dot == "○"
+
+    dot, _, label = _dashboard_status(blocked, 0, 0, None)
+    assert label == "waiting on input"
+    assert dot == "◆"
+
+
+def test_banner_does_not_claim_in_action_for_idle_worker() -> None:
+    """The banner under "Moving now" must not claim an idle worker
+    is active. #990 banner read ``Moving now: architect_bikepath
+    (architect) is active`` while the architect was self-reporting
+    "standing by." The fix routes ``idle`` to a standby banner and
+    falls through to category banners (queued/blocked/review) when
+    other work is waiting.
+    """
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    fake_data = SimpleNamespace(
+        action_items=[],
+        alert_count=0,
+        active_worker={
+            "session_name": "architect_bikepath",
+            "role": "architect",
+            "activity": "idle",
+        },
+        task_counts={},
+        task_buckets={"on_hold": []},
+        inbox_count=0,
+    )
+    banner = app._render_project_state_banner(fake_data, "▸ Clear")
+    assert "Moving now" not in banner
+    assert "is active" not in banner
+    assert "standing by" in banner
+
+
+def test_banner_says_waiting_on_you_for_permission_prompt() -> None:
+    """A worker at a permission prompt elevates the banner to
+    ``Waiting on you``, putting the operator-required action front
+    and centre instead of pretending the agent is making progress.
+    """
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    fake_data = SimpleNamespace(
+        action_items=[],
+        alert_count=0,
+        active_worker={
+            "session_name": "architect_bikepath",
+            "role": "architect",
+            "activity": "awaiting_user",
+        },
+        task_counts={},
+        task_buckets={"on_hold": []},
+        inbox_count=0,
+    )
+    banner = app._render_project_state_banner(fake_data, "▸ Clear")
+    assert "Waiting on you" in banner
+    assert "permission prompt" in banner
+
+
+def test_classify_worker_activity_idle_when_pane_unchanged_and_no_task(
+    tmp_path,
+) -> None:
+    """Direct unit test of the classifier. With matching snapshot
+    hashes (pane unchanged) and no claimed task, the classifier
+    returns ``idle`` — exactly the bikepath state on #990 repro.
+    """
+    from types import SimpleNamespace
+    from pollypm.cockpit_ui import _classify_worker_activity
+
+    class _FakeStore:
+        def recent_heartbeats(self, name, *, limit=2):
+            # Same hash twice → pane has not moved.
+            return [
+                SimpleNamespace(snapshot_hash="abc"),
+                SimpleNamespace(snapshot_hash="abc"),
+            ]
+
+    sup = SimpleNamespace(store=_FakeStore())
+    state = _classify_worker_activity(
+        sup,
+        session_name="architect_bikepath",
+        role="architect",
+        project_aliases={"bikepath"},
+        project_path=None,
+        has_pane_permission_alert=False,
+    )
+    assert state == "idle"
+
+
+def test_classify_worker_activity_awaiting_user_short_circuits() -> None:
+    """A live ``pane:permission_prompt`` alert wins over any pane /
+    task signal — the agent is blocked on the operator regardless of
+    whether the pane has moved."""
+    from types import SimpleNamespace
+    from pollypm.cockpit_ui import _classify_worker_activity
+
+    class _FakeStore:
+        def recent_heartbeats(self, name, *, limit=2):
+            # Even with the pane changing, a permission prompt blocks
+            # the session — classifier should still return awaiting_user.
+            return [
+                SimpleNamespace(snapshot_hash="abc"),
+                SimpleNamespace(snapshot_hash="def"),
+            ]
+
+    sup = SimpleNamespace(store=_FakeStore())
+    state = _classify_worker_activity(
+        sup,
+        session_name="worker_demo",
+        role="worker",
+        project_aliases={"demo"},
+        project_path=None,
+        has_pane_permission_alert=True,
+    )
+    assert state == "awaiting_user"
+
+
+def test_classify_worker_activity_working_when_architect_pane_moves() -> None:
+    """An architect with no claimed task but a moving pane is still
+    ``working`` — architects don't claim tasks the way workers do, so
+    pane movement on its own is the activity signal for them.
+    """
+    from types import SimpleNamespace
+    from pollypm.cockpit_ui import _classify_worker_activity
+
+    class _FakeStore:
+        def recent_heartbeats(self, name, *, limit=2):
+            return [
+                SimpleNamespace(snapshot_hash="hash1"),
+                SimpleNamespace(snapshot_hash="hash2"),
+            ]
+
+    sup = SimpleNamespace(store=_FakeStore())
+    state = _classify_worker_activity(
+        sup,
+        session_name="architect_demo",
+        role="architect",
+        project_aliases={"demo"},
+        project_path=None,
+        has_pane_permission_alert=False,
+    )
+    assert state == "working"
+
+
 def test_recent_activity_elides_self_reference_in_transition_reason(
     dashboard_env, dashboard_app, monkeypatch,
 ) -> None:

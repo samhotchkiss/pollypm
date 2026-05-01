@@ -1108,9 +1108,79 @@ def test_codex_control_launches_use_agents_md_instead_of_visible_prompt(tmp_path
         "--model",
         "gpt-5.4",
     ]
-    assert "PM_CODEX_HOME_AGENTS_MD" in env
-    assert "Polly" in env["PM_CODEX_HOME_AGENTS_MD"]
+    # #1011 — the profile prompt is no longer round-tripped through
+    # ``PM_CODEX_HOME_AGENTS_MD`` (which exploded the wrapped argv past
+    # tmux's ``respawn-pane`` command-buffer limit for ~20KB reviewer
+    # prompts). The planner now writes ``AGENTS.md`` directly to the
+    # session's effective codex_home (the per-session control-home, see
+    # ``ControlHomes.effective_account``) before the launch fires.
+    assert "PM_CODEX_HOME_AGENTS_MD" not in env
     assert launch.initial_input is None
+    agents_md = launch.account.home / ".codex" / "AGENTS.md"
+    assert agents_md.exists(), f"expected AGENTS.md at {agents_md}"
+    contents = agents_md.read_text()
+    assert "Polly" in contents
+
+
+def test_codex_control_launches_keep_wrapped_argv_below_tmux_command_limit(
+    tmp_path: Path,
+) -> None:
+    """Regression for #1011 — the wrapped launch argv must stay short
+    enough that tmux ``respawn-pane`` accepts it.
+
+    The auto-recovery path (#1005) for ``reviewer/no_session`` calls
+    ``pm worker-start --role reviewer <project>``, which builds a
+    Codex control launch carrying the full Russell reviewer profile
+    prompt (~20KB). Pre-fix the planner stuffed that prompt into
+    ``PM_CODEX_HOME_AGENTS_MD`` for the runtime launcher to materialise
+    on disk; the resulting base64 payload made the wrapped ``sh -lc
+    'exec ... <payload>'`` argv exceed tmux's ~17KB ``respawn-pane``
+    command-buffer limit (tmux 3.6: ``command too long``), so the
+    spawn silently failed and left the pane at zsh.
+
+    Cap-budget the wrapped command at 14KB — comfortably under tmux's
+    limit on every release we care about — and require the AGENTS.md
+    payload survives via the on-disk file path instead.
+    """
+    config = _config(tmp_path)
+    huge_prompt = "Russell the reviewer\n" + ("verbose criterion checklist\n" * 600)
+    assert len(huge_prompt) > 16000  # well past tmux's command-buffer limit
+    # Use ``triage`` because it's a control role (so the env-var-vs-
+    # disk packaging branch fires) but the planner doesn't replace
+    # the session prompt with a shipped profile prompt for it. That
+    # means the test's ``huge_prompt`` actually drives the launch
+    # payload size.
+    config.sessions["triage"] = SessionConfig(
+        name="triage",
+        role="triage",
+        provider=ProviderKind.CODEX,
+        account="codex_backup",
+        cwd=tmp_path,
+        project="pollypm",
+        prompt=huge_prompt,
+        window_name="pm-triage",
+    )
+    supervisor = Supervisor(config)
+
+    launches = list(supervisor.plan_launches())
+    launch = next(item for item in launches if item.session.name == "triage")
+
+    assert len(launch.command) < 14000, (
+        f"wrapped launch command is {len(launch.command)} bytes — tmux "
+        "respawn-pane will reject it as 'command too long'"
+    )
+    decoded = _decode_launch_payload(launch.command)
+    assert "PM_CODEX_HOME_AGENTS_MD" not in decoded["env"]
+    agents_md = launch.account.home / ".codex" / "AGENTS.md"
+    assert agents_md.exists()
+    contents = agents_md.read_text()
+    # Prompt content lands on disk regardless of whether the planner
+    # substituted a shipped profile prompt or kept the session's own.
+    assert (
+        "Russell the reviewer" in contents
+        or "verbose criterion checklist" in contents
+        or "Polly" in contents
+    )
 
 
 def test_codex_worker_launches_do_not_auto_send_prompt(tmp_path: Path) -> None:

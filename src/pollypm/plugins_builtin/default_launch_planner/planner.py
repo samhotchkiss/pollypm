@@ -26,6 +26,7 @@ from pollypm.providers import get_provider
 from pollypm.providers.args import sanitize_provider_args
 from pollypm.providers.base import LaunchCommand
 from pollypm.role_routing import resolved_provider_kind, resolve_role_assignment
+from pollypm.runtime_env import codex_home_dir
 from pollypm.runtimes import get_runtime
 
 if TYPE_CHECKING:
@@ -37,6 +38,32 @@ from pollypm.models import CONTROL_ROLES as _CONTROL_ROLES
 
 _ROUTED_ROLES = frozenset({"operator-pm", "architect", "worker", "reviewer"})
 _log = logging.getLogger(__name__)
+
+
+def _write_codex_agents_md_to_disk(account: AccountConfig, content: str) -> None:
+    """Materialise the Codex profile prompt as ``AGENTS.md`` on disk.
+
+    Pre-#1011 the planner stuffed the prompt into the
+    ``PM_CODEX_HOME_AGENTS_MD`` env var so that
+    :mod:`pollypm.runtime_launcher` could write the file just before
+    exec'ing codex. That worked for short prompts, but the reviewer's
+    ~20KB Russell profile blew past tmux's ``respawn-pane`` command
+    buffer (~17KB on tmux 3.6) and the launch silently failed with the
+    pane stranded at zsh — see #1011. Writing the file directly from
+    the planner side keeps the wrapped launch argv small (it now
+    carries only the codex argv + a few small env vars) so tmux can
+    always materialise the pane, regardless of profile-prompt size.
+
+    The runtime launcher's ``_write_codex_agents_md`` helper stays in
+    place as a no-op for back-compat with any external callers that
+    still set ``PM_CODEX_HOME_AGENTS_MD`` — the planner just doesn't
+    populate that env var any more.
+    """
+    if not content or account.home is None:
+        return
+    target = codex_home_dir(account.home) / "AGENTS.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content.rstrip() + "\n", encoding="utf-8")
 
 
 def _preferred_account_names(
@@ -162,9 +189,22 @@ class DefaultLaunchPlanner:
                     )
                     launch = replace(launch, argv=new_argv)
             if effective.provider is ProviderKind.CODEX and effective.role in _CONTROL_ROLES and launch.initial_input:
-                env = dict(launch.env)
-                env["PM_CODEX_HOME_AGENTS_MD"] = launch.initial_input
-                launch = replace(launch, env=env, initial_input=None)
+                # #1011 — pre-write ``AGENTS.md`` directly into the
+                # account's codex_home instead of stuffing the prompt
+                # into ``PM_CODEX_HOME_AGENTS_MD`` for the runtime
+                # launcher to materialise. The env-var path serialised
+                # the (potentially ~20KB+) reviewer/operator profile
+                # prompt into the base64 payload that ``runtime_launcher``
+                # decodes; tmux ``respawn-pane`` rejects "command too
+                # long" once the wrapped argv crosses ~17KB, so the
+                # auto-recovery launch (#1005) for Russell's reviewer
+                # profile silently failed and left the tmux pane on its
+                # default zsh prompt while reporting ``ok=False`` in the
+                # spawn-attempt history. Writing the file from the
+                # planner side keeps the launch payload small and lets
+                # the runtime launcher just exec codex.
+                _write_codex_agents_md_to_disk(account, launch.initial_input)
+                launch = replace(launch, initial_input=None)
             runtime = get_runtime(account.runtime, root_dir=ctx.config.project.root_dir)
             window_name = effective.window_name or effective.name
             log_dir = ctx.config.project.logs_dir / effective.name

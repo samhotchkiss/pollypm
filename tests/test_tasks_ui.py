@@ -2232,3 +2232,214 @@ def test_task_filter_chips_reflect_active_filters_and_clear_them(env, monkeypatc
             assert not chips.display
 
     _run(body())
+
+
+# ---------------------------------------------------------------------------
+# #1017 — within-pane click responsiveness (parallel of #974 rail responsiveness)
+# ---------------------------------------------------------------------------
+
+
+def test_task_click_paints_placeholder_immediately_when_load_is_slow(
+    env, monkeypatch,
+) -> None:
+    """#1017 — clicking a task row must update the highlight + paint a
+    "Loading…" placeholder *before* the slow DB / review-artifact load
+    completes.
+
+    Pre-fix: ``_show_detail`` did every ``svc.get`` / context / flow /
+    worker-session / review-artifact / git-diff fetch synchronously on
+    the UI thread. A typical click stalled 60ms-1s; the cold first
+    click was ~1s thanks to gate-plugin discovery in the work-service
+    constructor. Post-fix: the click handler bumps a request id, sets
+    ``_selected_task_id``, paints a placeholder header, and dispatches
+    the load to a worker thread.
+
+    This test simulates a ~250ms slow svc by blocking ``_FakeSvc.get``,
+    then asserts the click is acknowledged in the UI before the load
+    finishes.
+    """
+
+    if not _load_config_compatible(env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_tasks import PollyTasksApp
+
+    one = _task(node_id="research", title="First click target")
+    two = _task(task_number=2, node_id="research", title="Slow click target")
+
+    import threading
+    import time as _time
+
+    release = threading.Event()
+    get_started = threading.Event()
+
+    class _SlowSvc(_FakeSvc):
+        def get(self, task_id):  # type: ignore[override]
+            # Only stall the *second* task so the first click can fall
+            # through to a normal render and we can deterministically
+            # observe a pending second click before its load completes.
+            if task_id == two.task_id:
+                get_started.set()
+                # Bound the wait so a runaway test still terminates.
+                if not release.wait(timeout=5.0):
+                    raise AssertionError("test never released slow svc.get")
+            return super().get(task_id)
+
+    fake_svc = _SlowSvc(tasks_factory=lambda: [one, two], flow=_flow())
+
+    monkeypatch.setattr("pollypm.cockpit_tasks.create_tmux_client", lambda: _FakeTmux([]))
+
+    app = PollyTasksApp(env["config_path"], "demo")
+    app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            table = app.query_one("#tasks-table", DataTable)
+            assert table.row_count == 2
+            # First row was auto-selected on mount; its detail should
+            # already be loaded (no slow path hit). Sanity check.
+            assert app._selected_task_id == one.task_id
+            seq_before = app._detail_request_seq
+
+            # Move cursor to the second row — this is the within-pane
+            # "click" the regression in #1017 covers. The row select
+            # event triggers ``_show_detail``.
+            t0 = _time.perf_counter()
+            table.move_cursor(row=1, column=0, animate=False)
+            # ``move_cursor`` posts a RowHighlighted message; pump it.
+            await pilot.pause()
+            ack_elapsed_ms = (_time.perf_counter() - t0) * 1000
+
+            # The placeholder must appear *before* the slow load
+            # finishes — assert the worker hasn't returned yet.
+            assert get_started.wait(timeout=2.0), (
+                "_get_svc/get should have been dispatched to a worker"
+            )
+
+            # Click acknowledgement: highlight tracks the new row,
+            # the request id has been bumped, and the detail header
+            # carries a "Loading…" hint so the user sees their click
+            # land. Allow a generous bound — the assertion is not
+            # "render finished in 100ms" but "click was acknowledged
+            # before the slow data load completed".
+            assert app._selected_task_id == two.task_id
+            assert app._detail_request_seq == seq_before + 1
+            header_now = str(app.detail_header.render())
+            assert "Loading" in header_now, header_now
+            # The header should reference the clicked task, not the
+            # previously-selected one.
+            assert "Slow click target" in header_now
+            # And, critically, the click hand-off itself must be
+            # responsive: the event-loop pump should return well under
+            # the simulated svc latency.
+            assert ack_elapsed_ms < 250, (
+                f"click acknowledgement took {ack_elapsed_ms:.0f}ms, "
+                "should be well under the simulated load latency"
+            )
+
+            # Release the slow load and let the real detail render.
+            release.set()
+            # Wait for the worker to finish and apply the result.
+            deadline = _time.perf_counter() + 5.0
+            while _time.perf_counter() < deadline:
+                await pilot.pause()
+                if "Slow click target" in str(app.detail_header.render()) and (
+                    "Loading" not in str(app.detail_header.render())
+                ):
+                    break
+            assert "Loading" not in str(app.detail_header.render())
+            assert "Slow click target" in str(app.detail_header.render())
+
+    _run(body())
+
+
+def test_rapid_task_clicks_drop_stale_loads(env, monkeypatch) -> None:
+    """#1017 — a click during an in-flight slow load must not be
+    clobbered by the older load completing.
+
+    Mirrors the rail-click ``_route_click_seq`` guard from #974 / #967:
+    every click bumps ``_detail_request_seq`` synchronously, and the
+    worker-thread completion checks the seq before applying the result.
+    A stale (superseded) load is silently dropped.
+    """
+
+    if not _load_config_compatible(env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_tasks import PollyTasksApp
+
+    one = _task(node_id="research", title="First click target")
+    two = _task(task_number=2, node_id="research", title="Second click target")
+    three = _task(task_number=3, node_id="research", title="Final click target")
+
+    import threading
+
+    release_first = threading.Event()
+    release_second = threading.Event()
+    second_started = threading.Event()
+
+    class _GatedSvc(_FakeSvc):
+        def get(self, task_id):  # type: ignore[override]
+            if task_id == two.task_id:
+                second_started.set()
+                if not release_first.wait(timeout=5.0):
+                    raise AssertionError("test never released first slow get")
+            elif task_id == three.task_id:
+                if not release_second.wait(timeout=5.0):
+                    raise AssertionError("test never released second slow get")
+            return super().get(task_id)
+
+    fake_svc = _GatedSvc(tasks_factory=lambda: [one, two, three], flow=_flow())
+
+    monkeypatch.setattr("pollypm.cockpit_tasks.create_tmux_client", lambda: _FakeTmux([]))
+
+    app = PollyTasksApp(env["config_path"], "demo")
+    app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            table = app.query_one("#tasks-table", DataTable)
+            assert table.row_count == 3
+
+            # Click row 2 (slow), then immediately click row 3 (also
+            # slow) before row 2's load returns. Row 3 is the user's
+            # intended final destination.
+            table.move_cursor(row=1, column=0, animate=False)
+            await pilot.pause()
+            assert second_started.wait(timeout=2.0)
+
+            table.move_cursor(row=2, column=0, animate=False)
+            await pilot.pause()
+
+            # Highlight already tracks row 3.
+            assert app._selected_task_id == three.task_id
+
+            # Now release row 2's load. Its `_apply_detail_result`
+            # must be dropped because the seq has moved on — so the
+            # selected_task_id and header must continue tracking row 3.
+            release_first.set()
+            # Pump events; the dropped result should produce no
+            # observable header swap.
+            for _ in range(5):
+                await pilot.pause()
+            assert app._selected_task_id == three.task_id
+            assert "Final click target" in str(app.detail_header.render())
+
+            # Now release row 3's load; it should win.
+            release_second.set()
+            from time import perf_counter as _pc
+
+            deadline = _pc() + 5.0
+            while _pc() < deadline:
+                await pilot.pause()
+                header_text = str(app.detail_header.render())
+                if (
+                    "Final click target" in header_text
+                    and "Loading" not in header_text
+                ):
+                    break
+            header_text = str(app.detail_header.render())
+            assert "Final click target" in header_text
+            assert "Loading" not in header_text
+
+    _run(body())

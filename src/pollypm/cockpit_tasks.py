@@ -1333,6 +1333,15 @@ class PollyTasksApp(App[None]):
         self._review_inline_diff_file_index = 0
         self._review_inline_diff_expanded = False
         self._review_nav_prefix: str | None = None
+        # #1017 — within-pane click responsiveness mirrors the rail
+        # responsiveness machinery from #974: bump a request id on every
+        # click, paint the row highlight + a placeholder header
+        # synchronously, and let the slow DB / review-artifact load
+        # happen in a worker thread. ``_apply_detail_result`` is gated
+        # on this seq so a click during a still-loading prior click
+        # cannot get clobbered when the older load finally returns.
+        self._detail_request_seq: int = 0
+        self._pending_detail_task_id: str | None = None
 
     def compose(self) -> ComposeResult:
         # #920 — header must use the project's display label
@@ -2134,11 +2143,127 @@ class PollyTasksApp(App[None]):
         return getattr(project, "path", None)
 
     def _show_detail(self, task_id: str) -> None:
+        """Synchronously acknowledge a task click; load detail off the UI thread.
+
+        #1017 — clicking a row used to do every DB read, review-artifact
+        scan, and git-diff resolution synchronously on the UI thread.
+        That left the click feeling unresponsive: profiling on a real
+        bikepath/8 click measured 60ms-1s of stalling on a typical
+        click and ~1s on the cold first click thanks to gate plugin
+        discovery in :class:`SQLiteWorkService`'s constructor.
+
+        The fix mirrors the #974 rail-click pattern:
+
+        1. Bump :attr:`_detail_request_seq` so any in-flight prior load
+           is logically superseded.
+        2. Stamp ``_selected_task_id`` and paint a "Loading…"
+           placeholder synchronously so the click is visibly
+           acknowledged.
+        3. Hand the slow work to a worker thread; the worker calls back
+           via ``call_from_thread`` to apply the rendered detail, but
+           only if its captured seq still matches.
+        """
+
         previous_task_id = self._selected_task_id
+        self._detail_request_seq += 1
+        seq = self._detail_request_seq
+        self._pending_detail_task_id = task_id
+
+        # Optimistic UI: stamp the selected row immediately so cursor
+        # highlight, button-disabled state, and downstream actions
+        # (``approve_task`` etc.) all point at what the user clicked
+        # even before the DB load finishes.
+        self._selected_task_id = task_id
+
+        if task_id != previous_task_id:
+            self._set_live_tail_paused(False)
+            self._show_resubmission_diff = False
+            self._review_inline_diff_file_index = 0
+            self._review_inline_diff_expanded = False
+
+        # Render a fast placeholder so the user sees their click
+        # land. Use any cached row data we already have from
+        # ``_tasks`` so the loading hint is more than a bare task id.
+        cached = next(
+            (t for t in self._tasks if t.task_id == task_id),
+            None,
+        )
+        if cached is not None:
+            placeholder = (
+                f"#{cached.task_number} {priority_glyph(cached)} {cached.title}"
+                f"\n[dim]Loading…[/dim]"
+            )
+        else:
+            placeholder = f"[dim]Loading task {task_id}…[/dim]"
+        self.detail_header.update(placeholder)
+
+        self._dispatch_detail_load(task_id, seq, previous_task_id)
+
+    def _dispatch_detail_load(
+        self,
+        task_id: str,
+        seq: int,
+        previous_task_id: str | None,
+    ) -> None:
+        """Run :meth:`_load_detail_data` on a worker thread.
+
+        Falls back to inline execution when Textual's worker pool is
+        unavailable (e.g. unit tests that bypass ``App.__init__`` and
+        have no running event loop). Production always has a loop.
+        """
+
+        try:
+            self.run_worker(
+                lambda: self._detail_worker(task_id, seq, previous_task_id),
+                thread=True,
+                exclusive=True,
+                group="task_detail_load",
+            )
+        except Exception:  # noqa: BLE001
+            # No loop — execute inline so unit tests still see the
+            # detail rendered. Production always has a loop.
+            self._detail_worker(task_id, seq, previous_task_id)
+
+    def _detail_worker(
+        self,
+        task_id: str,
+        seq: int,
+        previous_task_id: str | None,
+    ) -> None:
+        """Worker-thread body: load detail, then apply on the UI thread.
+
+        #1017 — gated on ``seq`` so a slow load whose click was already
+        superseded by a newer click cannot overwrite the user's most
+        recent intent when it eventually returns.
+        """
+
+        if seq != self._detail_request_seq:
+            return
+        result = self._load_detail_data(task_id)
+
+        def _apply() -> None:
+            if seq != self._detail_request_seq:
+                return
+            self._apply_detail_result(task_id, previous_task_id, result)
+
+        try:
+            self.call_from_thread(_apply)
+        except Exception:  # noqa: BLE001
+            # No running app (unit tests) — apply directly.
+            _apply()
+
+    def _load_detail_data(self, task_id: str) -> dict:
+        """Pure data-fetch step: run on a worker thread.
+
+        Returns a dict the UI thread consumes — ``error`` is set when
+        the work-service handle could not be opened or when ``svc.get``
+        raised. The UI thread translates that into a
+        ``_set_detail_empty`` call without itself touching the DB.
+        """
+
         svc = self._get_svc()
         if svc is None:
-            self._set_detail_empty("Could not open the project work service.")
-            return
+            return {"error": "Could not open the project work service."}
         try:
             task = svc.get(task_id)
             task.context = svc.get_context(task_id, limit=15)
@@ -2157,28 +2282,56 @@ class PollyTasksApp(App[None]):
             except Exception:  # noqa: BLE001
                 active_session = None
         except Exception as exc:  # noqa: BLE001
-            self._set_detail_empty(f"Error loading task: {exc}")
-            return
-        finally:
             try:
                 svc.close()
             except Exception:  # noqa: BLE001
                 pass
-        self._selected_task_id = task_id
-        self._owner_by_task_id[task.task_id] = owner
+            return {"error": f"Error loading task: {exc}"}
+        try:
+            svc.close()
+        except Exception:  # noqa: BLE001
+            pass
         project_path = self._project_path()
         review_artifact = load_task_review_artifact(task, project_path)
-        if task_id != previous_task_id:
-            self._set_live_tail_paused(False)
-            self._show_resubmission_diff = False
-            self._review_inline_diff_file_index = 0
-            self._review_inline_diff_expanded = False
         review_diff_bundle = load_task_review_diff(
             task,
             project_path,
             review_artifact=review_artifact,
             active_branch=getattr(active_session, "branch_name", None),
         )
+        return {
+            "task": task,
+            "owner": owner,
+            "flow": flow,
+            "active_session": active_session,
+            "review_artifact": review_artifact,
+            "review_diff_bundle": review_diff_bundle,
+        }
+
+    def _apply_detail_result(
+        self,
+        task_id: str,
+        previous_task_id: str | None,
+        result: dict,
+    ) -> None:
+        """Render the loaded detail. Runs on the UI thread.
+
+        Caller (`_detail_worker`) has already verified the seq is
+        still current, so this method is free to mutate widget state
+        without re-checking.
+        """
+
+        if "error" in result:
+            self._set_detail_empty(str(result["error"]))
+            return
+        task = result["task"]
+        owner = result["owner"]
+        flow = result["flow"]
+        active_session = result["active_session"]
+        review_artifact = result["review_artifact"]
+        review_diff_bundle = result["review_diff_bundle"]
+
+        self._owner_by_task_id[task.task_id] = owner
         if review_diff_bundle is None:
             self._review_inline_diff_file_index = 0
             self._review_inline_diff_expanded = False
@@ -2192,8 +2345,11 @@ class PollyTasksApp(App[None]):
             active_session=active_session,
         )
         self._sync_review_panel(task, review_artifact, review_diff_bundle)
-        tabs = self.query_one("#task-tabs", TabbedContent)
-        if task_id != previous_task_id:
+        try:
+            tabs = self.query_one("#task-tabs", TabbedContent)
+        except Exception:  # noqa: BLE001
+            tabs = None
+        if tabs is not None and task_id != previous_task_id:
             tabs.active = (
                 "task-tab-review"
                 if task.work_status.value == "review"
@@ -2201,7 +2357,10 @@ class PollyTasksApp(App[None]):
                 else "task-tab-overview"
             )
         if active_session is not None and not self._live_tail_paused:
-            self.call_after_refresh(self._tail_live_scroll_to_end)
+            try:
+                self.call_after_refresh(self._tail_live_scroll_to_end)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _background_refresh(self) -> None:
         try:

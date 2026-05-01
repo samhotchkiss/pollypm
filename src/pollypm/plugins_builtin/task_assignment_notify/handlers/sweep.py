@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -70,8 +70,26 @@ from pollypm.work.task_assignment import (
 # a ``worker-<project>/spawn_failed_persistent`` error so the user
 # sees an actionable blocker rather than a silent grow-the-history
 # loop.
-MAX_CONSECUTIVE_ABANDONMENTS = 5
+#
+# #1014 (Bug A) — lowered from 5 to 3 because the live ``bikepath/8``
+# repro showed 91 wasted spawns get through despite #1012's streak
+# breaker. We still bound the wasted retries even when the consecutive
+# streak counter races with node-bouncing reject rounds: the rate
+# breaker (see :data:`RATE_BREAKER_WINDOW_SECONDS` /
+# :data:`RATE_BREAKER_MAX_ABANDONMENTS`) trips on N abandons in M
+# minutes regardless of node transitions.
+MAX_CONSECUTIVE_ABANDONMENTS = 3
 SPAWN_FAILED_PERSISTENT_ALERT_TYPE = "spawn_failed_persistent"
+
+# #1014 (Bug A) — rate-based companion to the consecutive-streak
+# breaker. A spinning auto-claim loop fires roughly one ABANDONED row
+# per 50s sweep tick. ``RATE_BREAKER_MAX_ABANDONMENTS`` abandons inside
+# ``RATE_BREAKER_WINDOW_SECONDS`` seconds is enough signal to stop
+# regardless of which node each visit landed on, so reject-bounces
+# (which walk the task back and forth between build and review nodes)
+# can't silently reset the streak counter and let the loop run forever.
+RATE_BREAKER_WINDOW_SECONDS = 600  # 10 minutes
+RATE_BREAKER_MAX_ABANDONMENTS = 5
 
 from pollypm.plugins_builtin.project_planning.plan_presence import (
     has_acceptable_plan,
@@ -927,6 +945,72 @@ def _consecutive_abandonments_at_active_node(task: Any) -> int:
     return streak
 
 
+def _abandonments_within_window(
+    task: Any,
+    *,
+    window_seconds: int = RATE_BREAKER_WINDOW_SECONDS,
+    now: datetime | None = None,
+) -> int:
+    """Return the count of ABANDONED executions inside the rate window.
+
+    #1014 (Bug A) — companion to
+    :func:`_consecutive_abandonments_at_active_node`. The streak
+    counter only catches consecutive abandons at the *current* node;
+    a reject bounce that walks the task back through the review node
+    silently resets it. The rate counter is node-agnostic — any
+    abandoned execution within ``window_seconds`` counts — so a
+    spinning loop that ping-pongs between build and review can't slip
+    past the breaker.
+
+    Falls back to 0 on any parse / sort error so the breaker degrades
+    closed (i.e. doesn't accidentally trip on a malformed row). The
+    streak breaker stays as the primary guard; this one only adds a
+    second tripwire that's robust to node transitions.
+    """
+    executions = list(getattr(task, "executions", []) or [])
+    if not executions:
+        return 0
+    if now is None:
+        now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=window_seconds)
+    abandoned_value = ExecutionStatus.ABANDONED.value
+    count = 0
+    for execution in executions:
+        status = getattr(execution, "status", None)
+        status_value = getattr(status, "value", status)
+        if status_value != abandoned_value:
+            continue
+        ts_raw = (
+            getattr(execution, "completed_at", None)
+            or getattr(execution, "started_at", None)
+        )
+        if ts_raw is None:
+            continue
+        ts = _parse_execution_timestamp(ts_raw)
+        if ts is None:
+            continue
+        if ts >= cutoff:
+            count += 1
+    return count
+
+
+def _parse_execution_timestamp(value: Any) -> datetime | None:
+    """Coerce an execution-row timestamp into a tz-aware datetime."""
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+    if isinstance(value, str) and value:
+        try:
+            ts = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts
+    return None
+
+
 def _emit_spawn_failed_persistent_alert(
     services: Any,
     *,
@@ -1015,12 +1099,27 @@ def _recover_dead_claims(
         # Window is gone — release the claim back to queued.
         task_id = getattr(task, "task_id", f"{project_key}/{task_number}")
 
-        # #1012 — circuit breaker. Refuse to release the claim once
-        # the streak hits the cap; releasing would just enqueue another
-        # auto-claim attempt that fails the same way and racks up
-        # another abandoned execution.
+        # #1012 / #1014 (Bug A) — circuit breaker. Refuse to release the
+        # claim once either tripwire fires:
+        #
+        # 1. ``streak >= MAX_CONSECUTIVE_ABANDONMENTS`` — the original
+        #    #1012 guard. Strict consecutive count at the current node.
+        # 2. ``rate_count >= RATE_BREAKER_MAX_ABANDONMENTS`` — added in
+        #    #1014. Counts ABANDONED visits across all nodes within
+        #    ``RATE_BREAKER_WINDOW_SECONDS``. Catches the case where a
+        #    reject-bounce silently resets the streak counter (or where
+        #    the streak counter is unexpectedly zeroed by a stray
+        #    completed visit between failures).
+        #
+        # Either tripwire produces the same end state: the task stays
+        # ``in_progress`` with a dead assignee, and a
+        # ``spawn_failed_persistent`` error alert escalates the project's
+        # silent grow-the-history loop into a visible blocker.
         streak = _consecutive_abandonments_at_active_node(task)
-        if streak >= MAX_CONSECUTIVE_ABANDONMENTS:
+        rate_count = _abandonments_within_window(task)
+        streak_tripped = streak >= MAX_CONSECUTIVE_ABANDONMENTS
+        rate_tripped = rate_count >= RATE_BREAKER_MAX_ABANDONMENTS
+        if streak_tripped or rate_tripped:
             by_outcome["auto_claim_circuit_breaker"] = (
                 by_outcome.get("auto_claim_circuit_breaker", 0) + 1
             )
@@ -1028,14 +1127,15 @@ def _recover_dead_claims(
                 services,
                 project=project_key,
                 task_id=task_id,
-                streak=streak,
+                streak=max(streak, rate_count),
             )
             logger.warning(
                 "task_auto_claim: circuit-breaker tripped for %s "
-                "(%d consecutive abandonments at node %r); refusing to "
-                "release stale claim until the underlying spawn failure "
-                "is resolved (#1012)",
+                "(streak=%d at node %r, rate=%d in last %ds); refusing "
+                "to release stale claim until the underlying spawn "
+                "failure is resolved (#1012/#1014)",
                 task_id, streak, getattr(task, "current_node_id", None),
+                rate_count, RATE_BREAKER_WINDOW_SECONDS,
             )
             continue
 

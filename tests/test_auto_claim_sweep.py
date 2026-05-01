@@ -827,6 +827,177 @@ def test_recover_dead_claims_streak_counts_only_active_node(tmp_path: Path) -> N
     assert _consecutive_abandonments_at_active_node(task) == 2
 
 
+def test_circuit_breaker_max_consecutive_lowered_to_three(tmp_path: Path) -> None:
+    """#1014 (Bug A): ``MAX_CONSECUTIVE_ABANDONMENTS`` is 3 (was 5).
+
+    The live ``bikepath/8`` repro for #1014 saw 91 wasted spawn cycles
+    get through the streak breaker. Lowering the cap from 5 to 3 caps
+    the wasted spend at 3 cycles while the rate-based breaker (added
+    in #1014 alongside) provides a second tripwire that's robust to
+    node-bouncing reject rounds. The exact constant is part of the
+    user-facing SLO ("at most ~3 silent retries before a visible
+    blocker") and a regression to a higher value would push the cost
+    of a misconfigured account back into the user's wallet.
+    """
+    from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
+        MAX_CONSECUTIVE_ABANDONMENTS,
+    )
+
+    assert MAX_CONSECUTIVE_ABANDONMENTS == 3, (
+        "lowering this back without also lowering "
+        "RATE_BREAKER_MAX_ABANDONMENTS will let spawn-loops go silent "
+        "again — see #1014 (Bug A)"
+    )
+
+
+def test_recover_dead_claims_rate_breaker_trips_across_node_bounces(
+    tmp_path: Path,
+) -> None:
+    """#1014 (Bug A): the rate-based breaker trips even when the
+    consecutive streak counter at the current node is short.
+
+    The streak breaker only counts ABANDONED visits at the task's
+    *current* node. A spinning loop that ping-pongs between build and
+    review nodes (e.g. a buggy reject path that flips the task back
+    and forth) silently resets the streak counter on every node
+    change. The rate breaker counts ABANDONED visits across *all*
+    nodes inside the rate window, so the trip still fires regardless
+    of node transitions.
+    """
+    from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
+        RATE_BREAKER_MAX_ABANDONMENTS,
+        SPAWN_FAILED_PERSISTENT_ALERT_TYPE,
+        _recover_dead_claims,
+    )
+    from types import SimpleNamespace as _NS
+
+    # Hand-fabricate a task with abandons spread across multiple nodes
+    # inside the rate window. The streak count at the current node is
+    # only 1 (well below the streak cap of 3), but the rate count of
+    # 5 abandoned visits within the window crosses the rate cap.
+    recent = datetime.now(timezone.utc) - timedelta(seconds=60)
+    fake_task = _NS(
+        task_id="proj/1",
+        project="proj",
+        task_number=1,
+        current_node_id="build",
+        assignee="worker",
+        roles={"worker": "worker"},
+        work_status=WorkStatus.IN_PROGRESS,
+        executions=[
+            _NS(
+                node_id="build", visit=1, status=ExecutionStatus.ABANDONED,
+                completed_at=recent, started_at=recent,
+            ),
+            _NS(
+                node_id="review_handoff", visit=1,
+                status=ExecutionStatus.ABANDONED,
+                completed_at=recent, started_at=recent,
+            ),
+            _NS(
+                node_id="build", visit=2, status=ExecutionStatus.COMPLETED,
+                completed_at=recent, started_at=recent,
+            ),
+            _NS(
+                node_id="review_handoff", visit=2,
+                status=ExecutionStatus.ABANDONED,
+                completed_at=recent, started_at=recent,
+            ),
+            _NS(
+                node_id="build", visit=3, status=ExecutionStatus.COMPLETED,
+                completed_at=recent, started_at=recent,
+            ),
+            _NS(
+                node_id="review_handoff", visit=3,
+                status=ExecutionStatus.ABANDONED,
+                completed_at=recent, started_at=recent,
+            ),
+            _NS(
+                node_id="build", visit=4, status=ExecutionStatus.COMPLETED,
+                completed_at=recent, started_at=recent,
+            ),
+            _NS(
+                node_id="build", visit=5, status=ExecutionStatus.ABANDONED,
+                completed_at=recent, started_at=recent,
+            ),
+        ],
+    )
+
+    # Sanity-check the assumed scoring before we drive the breaker.
+    from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
+        _abandonments_within_window,
+        _consecutive_abandonments_at_active_node,
+    )
+    streak_count = _consecutive_abandonments_at_active_node(fake_task)
+    rate_count = _abandonments_within_window(fake_task)
+    assert streak_count < 3, (
+        "streak should be short — the rate breaker is what's exercised here"
+    )
+    assert rate_count >= RATE_BREAKER_MAX_ABANDONMENTS
+
+    store = _RecordingStore()
+    svc = _svc_defaults(
+        session_service=_FakeSessionService(),
+        state_store=store,
+        msg_store=store,
+    )
+
+    called = {"release": 0}
+
+    def fake_release(_task_id, _actor, reason="worker session missing"):
+        called["release"] += 1
+        return fake_task
+
+    fake_work = _NS(
+        list_tasks=lambda *, project, work_status: (
+            [fake_task] if work_status == WorkStatus.IN_PROGRESS.value else []
+        ),
+        release_stale_claim=fake_release,
+    )
+
+    totals = {"considered": 0, "by_outcome": {}}
+    _recover_dead_claims(
+        svc, fake_work, _FakeProject(key="proj", path=tmp_path), totals,
+    )
+
+    # Rate breaker tripped → release was NOT called this tick.
+    assert called["release"] == 0
+    assert totals["by_outcome"].get("auto_claim_circuit_breaker", 0) == 1
+    assert totals["by_outcome"].get("auto_claim_recovered", 0) == 0
+    spawn_failed = [
+        entry for entry in store.alerts
+        if entry[1] == SPAWN_FAILED_PERSISTENT_ALERT_TYPE
+    ]
+    assert spawn_failed, "expected spawn_failed_persistent alert"
+
+
+def test_rate_breaker_ignores_old_abandonments(tmp_path: Path) -> None:
+    """#1014 (Bug A): the rate window is bounded — abandons older than
+    ``RATE_BREAKER_WINDOW_SECONDS`` don't keep the breaker tripped
+    forever. Otherwise a project with one historical bad day could
+    never run again.
+    """
+    from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
+        RATE_BREAKER_WINDOW_SECONDS,
+        _abandonments_within_window,
+    )
+    from types import SimpleNamespace as _NS
+
+    now = datetime.now(timezone.utc)
+    long_ago = now - timedelta(seconds=RATE_BREAKER_WINDOW_SECONDS * 4)
+    fake_task = _NS(
+        current_node_id="build",
+        executions=[
+            _NS(
+                node_id="build", visit=i, status=ExecutionStatus.ABANDONED,
+                completed_at=long_ago, started_at=long_ago,
+            )
+            for i in range(1, 11)  # 10 ancient abandons
+        ],
+    )
+    assert _abandonments_within_window(fake_task) == 0
+
+
 def test_recover_dead_claims_returns_task_to_claimable_queue(tmp_path: Path) -> None:
     """#768 regression: a dead worker must leave the task genuinely
     claimable again, not bounced back to ``in_progress``.

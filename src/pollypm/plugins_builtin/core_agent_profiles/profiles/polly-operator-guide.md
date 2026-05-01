@@ -105,6 +105,32 @@ When a worker lands a `blocking_question` in your inbox:
 2. Reply with `pm send <worker_session> "answer" --force`.
 3. Use `--force` only for sanctioned unblock messages, not general task routing.
 
+### Blocker Summary Requests (#1015)
+
+When Sam asks for a project blocker summary (e.g. via the dashboard's
+`c` keybinding):
+
+1. **Check the inbox first.** Run
+   `pm inbox --project <project> --type event` and look for an existing
+   `project.blocker_summary` event or any open `notify`/`inbox_task`
+   item that already names the blocker. If one exists, point Sam at it
+   (`see inbox/<id>`) and stop — do NOT recompose.
+2. **Then check task state, read-only.** `pm task list -p <project>`
+   shows on-hold/blocked tasks; `pm task get <project>/<n>` shows
+   reasons and context. These are read-only inspections; if any of
+   them stall on a permission prompt, you have invoked the wrong tool
+   for a summary request — back out and use the read-only listing
+   commands instead.
+3. **Aggregate task-level reasons.** If individual tasks already have
+   `hold_reason` / blocker notes, your "summary" is "task #N is paused
+   on <reason>; task #M is blocked by <ref>". You do not need user
+   permission to read those — never trigger a permission prompt for a
+   read-only blocker summary.
+4. **Only file a new summary when nothing exists.** Use
+   `pm project blocker-summary <project> --reason ... --owner ...`.
+   Authoring a duplicate summary on top of an existing one creates the
+   exact noise #1015 is fixing.
+
 ## Escalation
 
 When Sam needs a decision, the dashboard renders the **`user_prompt`

@@ -9499,6 +9499,25 @@ def _dashboard_steps_from_body(body: str) -> list[str]:
 
 def _dashboard_task_blocker_body(task: object) -> str:
     """Pick the clearest human-facing blocker text from a task."""
+    body, _ = _dashboard_task_blocker_body_with_kind(task)
+    return body
+
+
+def _dashboard_task_blocker_body_with_kind(task: object) -> tuple[str, str]:
+    """Pick the clearest human-facing blocker text from a task.
+
+    Returns ``(body, kind)`` where ``kind`` is ``"context"`` if the
+    body came from a task context entry that explicitly named a
+    blocker token, or ``"description"`` if it fell back to the
+    task description, or ``""`` if no body could be derived.
+
+    #1015 — the dashboard's "Blocked, but summary missing" predicate
+    needs to distinguish between an *explicit* blocker note and a
+    bare description fallback. A task with a 1-line generic
+    description should not silently suppress the nag — only an
+    actual blocker note (or hold reason / project blocker_summary)
+    should.
+    """
     context = list(getattr(task, "context", []) or [])
     for entry in reversed(context):
         text = str(getattr(entry, "text", "") or "").strip()
@@ -9517,8 +9536,11 @@ def _dashboard_task_blocker_body(task: object) -> str:
                 "waiting on",
             )
         ):
-            return text
-    return str(getattr(task, "description", "") or "")
+            return text, "context"
+    description = str(getattr(task, "description", "") or "")
+    if description:
+        return description, "description"
+    return "", ""
 
 
 def _dashboard_task_db_paths(config: object, project_path: Path) -> list[Path]:
@@ -9757,7 +9779,9 @@ def _dashboard_gather_tasks(
             # back as datetime from the work-service hydrator.
             if hasattr(updated_at, "isoformat"):
                 updated_at = updated_at.isoformat()
-            blocker_body = _dashboard_task_blocker_body(t)
+            blocker_body, blocker_body_kind = (
+                _dashboard_task_blocker_body_with_kind(t)
+            )
             hold_reason = ""
             if status == "on_hold":
                 # Surface the most recent on_hold transition's
@@ -9776,6 +9800,7 @@ def _dashboard_gather_tasks(
                 "current_node_id": getattr(t, "current_node_id", None),
                 "summary": _dashboard_summary_from_body(blocker_body),
                 "steps": _dashboard_steps_from_body(blocker_body),
+                "blocker_explicit": blocker_body_kind == "context",
                 "hold_reason": hold_reason,
                 "blocked_by": [
                     f"{proj}/{num}"
@@ -11029,6 +11054,92 @@ def _project_hold_failure_summary(data: object) -> str:
         task_label = f"task #{num}" if num is not None else "an on-hold task"
         return f"{task_label} worker pane could not be provisioned; heartbeat is retrying"
     return ""
+
+
+def _existing_blocker_context(data: object) -> dict | None:
+    """Return a pointer to existing blocker context, if any.
+
+    Issue #1015: the Inbox panel used to render
+    "Blocked, but summary missing" whenever ``blocked_total > 0`` and no
+    Action Needed cards rendered, even when:
+
+      (a) an on-hold task already carried a populated ``hold_reason``;
+      (b) any blocked task already had a non-empty blocker note in its
+          derived ``summary`` field; OR
+      (c) a project-level ``blocker_summary`` inbox item was on file.
+
+    All three are valid blocker context. The Inbox panel should not
+    claim "summary missing" when ANY of them is present, and the ``c``
+    keybinding should route to the existing context instead of
+    burning tokens asking the PM to recompose it.
+
+    Returns a dict describing the best surfaceable context, or ``None``
+    when no context exists. Shape::
+
+        {"kind": "blocker_summary", "task_id": "blocker-summary:<id>"}
+        {"kind": "on_hold", "task_number": 8,
+         "task_id": "<project>/8", "reason": "..."}
+        {"kind": "blocked_note", "task_number": 3,
+         "task_id": "<project>/3", "summary": "..."}
+    """
+    buckets = getattr(data, "task_buckets", {}) or {}
+    inbox_top = getattr(data, "inbox_top", []) or []
+    project_key = getattr(data, "project_key", "") or ""
+
+    # Prefer project-level blocker summary when present — that's the
+    # canonical artefact and is what Polly would have authored.
+    for item in inbox_top:
+        if not isinstance(item, dict):
+            continue
+        if item.get("source") == "blocker_summary":
+            return {
+                "kind": "blocker_summary",
+                "task_id": str(item.get("task_id") or ""),
+                "primary_ref": str(item.get("primary_ref") or ""),
+                "summary": str(item.get("summary") or ""),
+            }
+
+    # Fall back to a task-level on-hold reason — this is what the
+    # bikepath repro looked like (#1015): on_hold #8 carried the
+    # complete operator-facing reason, but the Inbox panel ignored it.
+    for item in buckets.get("on_hold", []) or []:
+        if not isinstance(item, dict):
+            continue
+        reason = str(item.get("hold_reason") or "").strip()
+        if not reason:
+            continue
+        num = item.get("task_number")
+        task_id = f"{project_key}/{num}" if (project_key and num is not None) else ""
+        return {
+            "kind": "on_hold",
+            "task_number": num,
+            "task_id": task_id,
+            "reason": reason,
+        }
+
+    # And finally a blocked task with an *explicit* blocker note. We
+    # require ``blocker_explicit`` here so a bare description fallback
+    # (the test fixture's ``description="Waiting on blocker."``) does
+    # NOT pretend to be a real summary — only a context entry that
+    # actually mentions a blocker/scope split/etc. counts.
+    for item in buckets.get("blocked", []) or []:
+        if not isinstance(item, dict):
+            continue
+        if not item.get("blocker_explicit"):
+            continue
+        summary = str(item.get("summary") or "").strip()
+        if not summary:
+            continue
+        num = item.get("task_number")
+        task_id = f"{project_key}/{num}" if (project_key and num is not None) else ""
+        return {
+            "kind": "blocked_note",
+            "task_number": num,
+            "task_id": task_id,
+            "summary": summary,
+        }
+
+    return None
 
 
 def _banner_count_after_action_overlap(
@@ -12691,15 +12802,39 @@ class PollyProjectDashboardApp(App[None]):
                         )
             lines.append("")
         elif blocked_total:
-            lines.append("[#f0c45a][b]Blocked, but summary missing[/b][/]")
-            lines.append(
-                "  [dim]This project is blocked, but Polly has not posted "
-                "an unblock note yet.[/dim]"
-            )
-            lines.append(
-                "  [dim]Press [b]c[/b] to ask the PM for a blocker summary.[/dim]"
-            )
-            lines.append("")
+            # #1015 — only nag about a missing summary when no blocker
+            # context exists anywhere (no on-hold reason, no blocker
+            # note on a blocked task, no project-level blocker_summary
+            # inbox item). When ANY of those exist, the user already
+            # has the answer on screen and the nag is wrong.
+            existing_blocker = _existing_blocker_context(data)
+            if existing_blocker is None:
+                lines.append("[#f0c45a][b]Blocked, but summary missing[/b][/]")
+                lines.append(
+                    "  [dim]This project is blocked, but Polly has not posted "
+                    "an unblock note yet.[/dim]"
+                )
+                lines.append(
+                    "  [dim]Press [b]c[/b] to ask the PM for a blocker summary.[/dim]"
+                )
+                lines.append("")
+            else:
+                kind = existing_blocker.get("kind")
+                if kind == "blocker_summary":
+                    lines.append("[#f0c45a][b]Blocked[/b][/]")
+                    lines.append(
+                        "  [dim]Polly's blocker summary is in the inbox below — "
+                        "press [b]i[/b] to open it.[/dim]"
+                    )
+                else:
+                    num = existing_blocker.get("task_number")
+                    num_part = f" #{num}" if num is not None else ""
+                    lines.append("[#f0c45a][b]Blocked[/b][/]")
+                    lines.append(
+                        f"  [dim]The blocker reason is on task{num_part} "
+                        "in Task pipeline below.[/dim]"
+                    )
+                lines.append("")
         elif on_hold_total:
             lines.append("[#f0c45a][b]On hold[/b][/]")
             on_hold_items = data.task_buckets.get("on_hold", [])[:2]
@@ -13063,6 +13198,13 @@ class PollyProjectDashboardApp(App[None]):
         the card said it would do (#863). Otherwise the chat opens with
         the generic 'dashboard discussion' context so ad-hoc questions
         are not pre-loaded with a planning ask.
+
+        #1015 — when the dashboard is showing "Blocked" context (the
+        old "summary missing" nag fired) and a blocker context already
+        exists on screen (project-level blocker_summary, an on-hold
+        ``hold_reason``, or a blocker note on a blocked task), do NOT
+        spin up a new PM chat that re-investigates from scratch and
+        wastes tokens. Route to the existing context instead.
         """
         cockpit_key, pm_label = _resolve_pm_target(
             self.config_path, self.project_key,
@@ -13072,6 +13214,8 @@ class PollyProjectDashboardApp(App[None]):
                 f're: project/{self.project_key} '
                 f'"please draft an initial plan for this project"'
             )
+        elif self._route_existing_blocker_context_if_any():
+            return
         else:
             context_line = f're: project/{self.project_key} "dashboard discussion"'
         self.run_worker(
@@ -13082,6 +13226,62 @@ class PollyProjectDashboardApp(App[None]):
             exclusive=True,
             group="proj_jump_to_pm",
         )
+
+    def _route_existing_blocker_context_if_any(self) -> bool:
+        """Route to existing blocker context when it's already on screen.
+
+        Returns ``True`` when ``c`` was handled by routing to existing
+        context (and the caller should NOT also dispatch to PM). Returns
+        ``False`` when no blocker context exists, so the caller should
+        fall back to its normal handling.
+
+        Implements concern #2 of issue #1015: pressing ``c`` when the
+        blocker info is already visible should highlight it, not open
+        a fresh PM chat that burns tokens re-investigating.
+        """
+        data = getattr(self, "data", None)
+        if data is None:
+            return False
+        blocked_total = int((data.task_counts or {}).get("blocked", 0))
+        if blocked_total <= 0:
+            # The "summary missing" nag only fires when blocked_total >
+            # 0, so the inverted "go look at the existing summary"
+            # short-circuit only applies in that branch. Other ``c``
+            # invocations (idle plan ask, casual chat) route normally.
+            return False
+        existing = _existing_blocker_context(data)
+        if existing is None:
+            return False
+        kind = existing.get("kind")
+        try:
+            if kind == "blocker_summary":
+                self.notify(
+                    "Blocker summary is already in the inbox — opening it.",
+                    severity="information",
+                    timeout=3.0,
+                )
+                self.run_worker(
+                    lambda: self._route_to_inbox_sync(),
+                    thread=True,
+                    exclusive=True,
+                    group="proj_inbox",
+                )
+                return True
+            task_id = str(existing.get("task_id") or "")
+            if task_id and _PROJECT_TASK_REF_RE.fullmatch(task_id):
+                where = (
+                    "on-hold task" if kind == "on_hold" else "blocked task"
+                )
+                self.notify(
+                    f"Blocker reason is already on the {where} — opening it.",
+                    severity="information",
+                    timeout=3.0,
+                )
+                self._route_to_task(task_id)
+                return True
+        except Exception:  # noqa: BLE001
+            return False
+        return False
 
     def _idle_project_needs_plan(self) -> bool:
         """True iff the Plan card is showing the 'press c to ask' nudge."""

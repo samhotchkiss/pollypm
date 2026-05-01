@@ -3631,6 +3631,296 @@ def test_blocked_project_calls_out_missing_pm_summary(
     _run(body())
 
 
+# ---------------------------------------------------------------------------
+# #1015 — "Blocked, but summary missing" predicate refinements
+# ---------------------------------------------------------------------------
+
+
+def test_existing_blocker_context_returns_none_with_no_signal() -> None:
+    """No on-hold reason, no explicit blocked note, no inbox summary →
+    nag is correct."""
+    from types import SimpleNamespace
+    from pollypm.cockpit_ui import _existing_blocker_context
+
+    data = SimpleNamespace(
+        project_key="demo",
+        task_buckets={
+            "blocked": [
+                {
+                    "task_id": "demo/3",
+                    "task_number": 3,
+                    "summary": "Waiting on blocker.",
+                    "blocker_explicit": False,  # description fallback only
+                    "hold_reason": "",
+                },
+            ],
+            "on_hold": [],
+        },
+        inbox_top=[],
+    )
+    assert _existing_blocker_context(data) is None
+
+
+def test_existing_blocker_context_picks_on_hold_reason() -> None:
+    """An on-hold task with a populated ``hold_reason`` is the bikepath
+    case the user repro'd: the answer is on screen, suppress the nag."""
+    from types import SimpleNamespace
+    from pollypm.cockpit_ui import _existing_blocker_context
+
+    data = SimpleNamespace(
+        project_key="bikepath",
+        task_buckets={
+            "blocked": [],
+            "on_hold": [
+                {
+                    "task_id": "bikepath/8",
+                    "task_number": 8,
+                    "hold_reason": "Waiting on operator: code review passed.",
+                },
+            ],
+        },
+        inbox_top=[],
+    )
+    ctx = _existing_blocker_context(data)
+    assert ctx is not None
+    assert ctx["kind"] == "on_hold"
+    assert ctx["task_number"] == 8
+    assert ctx["task_id"] == "bikepath/8"
+
+
+def test_existing_blocker_context_picks_inbox_blocker_summary() -> None:
+    """A project-level ``blocker_summary`` inbox item is the canonical
+    artefact — pressing ``c`` should route there, not recompose."""
+    from types import SimpleNamespace
+    from pollypm.cockpit_ui import _existing_blocker_context
+
+    data = SimpleNamespace(
+        project_key="demo",
+        task_buckets={"blocked": [], "on_hold": []},
+        inbox_top=[
+            {
+                "task_id": "blocker-summary:42",
+                "primary_ref": "demo/3",
+                "source": "blocker_summary",
+                "summary": "Plan needs Phase A approval.",
+            },
+        ],
+    )
+    ctx = _existing_blocker_context(data)
+    assert ctx is not None
+    assert ctx["kind"] == "blocker_summary"
+    assert ctx["primary_ref"] == "demo/3"
+
+
+def test_existing_blocker_context_picks_explicit_blocked_note() -> None:
+    """A blocked task whose blocker text came from a real context entry
+    (not a description fallback) counts as a summary."""
+    from types import SimpleNamespace
+    from pollypm.cockpit_ui import _existing_blocker_context
+
+    data = SimpleNamespace(
+        project_key="demo",
+        task_buckets={
+            "blocked": [
+                {
+                    "task_id": "demo/9",
+                    "task_number": 9,
+                    "summary": "Blocked: vendor API down — awaiting reply.",
+                    "blocker_explicit": True,
+                    "hold_reason": "",
+                },
+            ],
+            "on_hold": [],
+        },
+        inbox_top=[],
+    )
+    ctx = _existing_blocker_context(data)
+    assert ctx is not None
+    assert ctx["kind"] == "blocked_note"
+    assert ctx["task_number"] == 9
+
+
+def test_inbox_remainder_suppresses_nag_when_on_hold_reason_exists(
+    dashboard_app,
+) -> None:
+    """Bikepath repro: 6 blocked + 1 on hold with a populated reason.
+    The Inbox panel should not claim "summary missing" — it should
+    point the user at the on-hold task in Task pipeline below."""
+    from types import SimpleNamespace
+
+    fake_data = SimpleNamespace(
+        project_key="bikepath",
+        inbox_count=0,
+        task_counts={"blocked": 6, "on_hold": 1},
+        task_buckets={
+            "blocked": [],
+            "on_hold": [
+                {
+                    "task_id": "bikepath/8",
+                    "task_number": 8,
+                    "title": "Implement module 1",
+                    "hold_reason": (
+                        "Waiting on operator: code review passed, but pm "
+                        "task approve cannot auto-merge because project "
+                        "root has uncommitted .gitignore."
+                    ),
+                },
+            ],
+        },
+        action_items=[],
+        inbox_top=[],
+    )
+    body = dashboard_app._render_inbox_remainder(fake_data)
+    assert "summary missing" not in body.lower()
+    assert "Blocked" in body
+    assert "task #8" in body
+
+
+def test_inbox_remainder_suppresses_nag_when_blocker_summary_inbox_item() -> None:
+    """A ``project.blocker_summary`` inbox item routes the user to it
+    rather than firing the nag."""
+    from types import SimpleNamespace
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    # Use SimpleNamespace + the unbound method so we don't need a
+    # mounted app instance.
+    fake_data = SimpleNamespace(
+        project_key="demo",
+        inbox_count=1,
+        task_counts={"blocked": 2, "on_hold": 0},
+        task_buckets={"blocked": [], "on_hold": []},
+        action_items=[],
+        inbox_top=[
+            {
+                "task_id": "blocker-summary:42",
+                "primary_ref": "demo/3",
+                "source": "blocker_summary",
+                "summary": "Plan needs Phase A approval.",
+                "needs_action": False,
+                "updated_at": "2026-05-01T17:00:00",
+            },
+        ],
+    )
+
+    class _FakeApp:
+        project_key = "demo"
+        _action_click_task_ids: list[str] = []
+
+    body = PollyProjectDashboardApp._render_inbox_remainder(
+        _FakeApp(), fake_data,
+    )
+    assert "summary missing" not in body.lower()
+    assert "Polly's blocker summary is in the inbox below" in body
+
+
+def test_inbox_remainder_keeps_nag_with_no_blocker_signal(
+    dashboard_app,
+) -> None:
+    """When nothing carries a blocker note, the nag is still correct."""
+    from types import SimpleNamespace
+
+    fake_data = SimpleNamespace(
+        project_key="demo",
+        inbox_count=0,
+        task_counts={"blocked": 1, "on_hold": 0},
+        task_buckets={
+            "blocked": [
+                {
+                    "task_id": "demo/3",
+                    "task_number": 3,
+                    "summary": "",
+                    "blocker_explicit": False,
+                    "hold_reason": "",
+                },
+            ],
+            "on_hold": [],
+        },
+        action_items=[],
+        inbox_top=[],
+    )
+    body = dashboard_app._render_inbox_remainder(fake_data)
+    assert "summary missing" in body.lower()
+    assert "ask the PM for a blocker summary" in body
+
+
+def test_action_chat_pm_routes_to_existing_on_hold_task(
+    dashboard_app,
+) -> None:
+    """#1015 concern #2: pressing ``c`` when an on-hold task already
+    carries a populated reason should route to the task, not open a
+    fresh PM chat that wastes tokens."""
+    from types import SimpleNamespace
+
+    dashboard_app.data = SimpleNamespace(
+        project_key="bikepath",
+        plan_path=object(),  # idle_project_needs_plan → False
+        exists_on_disk=True,
+        enforce_plan=True,
+        task_counts={"blocked": 6, "on_hold": 1},
+        task_buckets={
+            "blocked": [],
+            "on_hold": [
+                {
+                    "task_id": "bikepath/8",
+                    "task_number": 8,
+                    "hold_reason": "Waiting on operator: dirty project root.",
+                },
+            ],
+        },
+        inbox_top=[],
+    )
+    routed: list[str] = []
+    dashboard_app._route_to_task = lambda task_id: routed.append(task_id)  # type: ignore[method-assign]
+    notifications: list[str] = []
+    dashboard_app.notify = lambda msg, **_kw: notifications.append(msg)  # type: ignore[method-assign]
+    dispatched: list[tuple] = []
+    dashboard_app._dispatch_to_pm_sync = lambda *a, **kw: dispatched.append((a, kw))  # type: ignore[method-assign]
+
+    dashboard_app.action_chat_pm()
+
+    assert routed == ["bikepath/8"], (
+        "expected route to on-hold task, not PM dispatch"
+    )
+    assert dispatched == [], "PM should not be invoked when context exists"
+    assert any("on-hold task" in msg for msg in notifications)
+
+
+def test_action_chat_pm_falls_through_when_no_blocker_context(
+    dashboard_app,
+) -> None:
+    """When nothing carries blocker context (or the project isn't even
+    blocked), ``c`` falls through to the regular PM dispatch path."""
+    from types import SimpleNamespace
+
+    dashboard_app.data = SimpleNamespace(
+        project_key="demo",
+        plan_path=object(),
+        exists_on_disk=True,
+        enforce_plan=True,
+        task_counts={"blocked": 0, "on_hold": 0},
+        task_buckets={"blocked": [], "on_hold": []},
+        inbox_top=[],
+    )
+    routed: list[str] = []
+    dashboard_app._route_to_task = lambda task_id: routed.append(task_id)  # type: ignore[method-assign]
+
+    fake_dispatch_calls: list[tuple] = []
+
+    def fake_run_worker(fn, **_kw):
+        # Execute synchronously so the test stays deterministic.
+        fn()
+
+    dashboard_app.run_worker = fake_run_worker  # type: ignore[method-assign]
+    dashboard_app._dispatch_to_pm_sync = (  # type: ignore[method-assign]
+        lambda *a, **kw: fake_dispatch_calls.append((a, kw))
+    )
+
+    dashboard_app.action_chat_pm()
+
+    assert routed == [], "no blocker context → no task route"
+    assert fake_dispatch_calls, "fall-through to PM dispatch expected"
+
+
 def test_project_blocker_summary_lists_required_user_actions(
     dashboard_env, dashboard_app,
 ) -> None:

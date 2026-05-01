@@ -257,6 +257,290 @@ def test_supervisor_alerts_emit_routed_event_routes_through_signal_envelope(
     assert persisted["scope"] == "worker"
 
 
+# ---------------------------------------------------------------------------
+# #1008 — recovery_limit / stuck_session auto-clear after healthy streak
+# ---------------------------------------------------------------------------
+
+
+def _backdate_alert(
+    supervisor: Supervisor, session_name: str, alert_type: str, seconds_ago: float,
+) -> None:
+    """Backdate an open alert's ``created_at`` / ``updated_at`` so the
+    streak math has runway.
+
+    ``upsert_alert`` timestamps with ``now()`` and ``Store.update_message``
+    auto-stamps ``updated_at = now()`` on every patch — so to push the
+    timestamps into the past we reach through the engine directly, the
+    same pattern used by other timestamp-sensitive tests in the suite.
+    """
+    from datetime import datetime, timedelta, timezone
+    from sqlalchemy import update
+
+    from pollypm.store.schema import messages
+
+    target = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+    engine = supervisor._msg_store._write_engine  # type: ignore[attr-defined]
+    with engine.begin() as conn:
+        conn.execute(
+            update(messages)
+            .where(messages.c.scope == session_name)
+            .where(messages.c.sender == alert_type)
+            .where(messages.c.state == "open")
+            .values(created_at=target, updated_at=target)
+        )
+
+
+def test_recovery_alert_auto_clear_clears_recovery_limit_after_debounce(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """Healthy session + open ``recovery_limit`` alert older than the
+    debounce window → the heartbeat sweep clears it and resets the
+    recovery counter.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    launch = next(item for item in supervisor.plan_launches() if item.session.name == "worker")
+
+    # Raise a recovery_limit alert and a recovery_attempts counter.
+    supervisor._msg_store.upsert_alert(
+        launch.session.name, "recovery_limit", "error",
+        "Automatic recovery paused after 5 rapid failures",
+    )
+    supervisor.store.upsert_session_runtime(
+        session_name=launch.session.name,
+        status="degraded",
+        recovery_attempts=5,
+        recovery_window_started_at=datetime.now(UTC).isoformat(),
+    )
+    # Backdate the alert past the debounce window.
+    _backdate_alert(supervisor, launch.session.name, "recovery_limit", 200)
+
+    # Stub the window state — pretend the session's expected window is
+    # alive and the launch plan still includes it. The sweep reads
+    # ``window_map`` (window_name → TmuxWindow) and ``name_by_window``
+    # (window_name → session_name) directly, so we can hand it
+    # synthetic dicts without touching tmux.
+    window_map = {launch.window_name: object()}
+    name_by_window = {launch.window_name: launch.session.name}
+
+    supervisor._sweep_recovered_recovery_alerts(
+        window_map=window_map, name_by_window=name_by_window,
+    )
+
+    open_pairs = [
+        (a.session_name, a.alert_type) for a in supervisor.open_alerts()
+    ]
+    assert (launch.session.name, "recovery_limit") not in open_pairs, (
+        f"recovery_limit must auto-clear after debounce; saw {open_pairs!r}"
+    )
+    runtime = supervisor.store.get_session_runtime(launch.session.name)
+    assert runtime is not None
+    assert runtime.recovery_attempts == 0, (
+        "recovery_attempts must reset after auto-clear so a subsequent "
+        "failure gets the full retry budget again"
+    )
+    assert runtime.recovery_window_started_at is None
+
+
+def test_recovery_alert_auto_clear_clears_stuck_session_after_debounce(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """``stuck_session`` is on the same auto-clear path — covered separately
+    so a regression that only handles ``recovery_limit`` doesn't slip
+    through.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    launch = next(item for item in supervisor.plan_launches() if item.session.name == "worker")
+
+    supervisor._msg_store.upsert_alert(
+        launch.session.name, "stuck_session", "warn",
+        f"{launch.session.name} needs attention: persistently idle",
+    )
+    _backdate_alert(supervisor, launch.session.name, "stuck_session", 200)
+
+    window_map = {launch.window_name: object()}
+    name_by_window = {launch.window_name: launch.session.name}
+
+    supervisor._sweep_recovered_recovery_alerts(
+        window_map=window_map, name_by_window=name_by_window,
+    )
+
+    open_pairs = [
+        (a.session_name, a.alert_type) for a in supervisor.open_alerts()
+    ]
+    assert (launch.session.name, "stuck_session") not in open_pairs
+
+
+def test_recovery_alert_auto_clear_holds_alert_within_debounce(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """Session healthy this tick but the alert is younger than the
+    debounce window → leave the alert open. Prevents clearing during a
+    flap.
+    """
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    launch = next(item for item in supervisor.plan_launches() if item.session.name == "worker")
+
+    # Default debounce is 90s — the just-raised alert is well inside it.
+    supervisor._msg_store.upsert_alert(
+        launch.session.name, "recovery_limit", "error",
+        "Automatic recovery paused after 5 rapid failures",
+    )
+
+    window_map = {launch.window_name: object()}
+    name_by_window = {launch.window_name: launch.session.name}
+
+    supervisor._sweep_recovered_recovery_alerts(
+        window_map=window_map, name_by_window=name_by_window,
+    )
+
+    open_pairs = [
+        (a.session_name, a.alert_type) for a in supervisor.open_alerts()
+    ]
+    assert (launch.session.name, "recovery_limit") in open_pairs, (
+        "fresh alerts must NOT auto-clear during the debounce window"
+    )
+
+
+def test_recovery_alert_auto_clear_resets_streak_when_window_missing(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """If the session's window is gone *during* the streak, the next
+    healthy tick must restart the debounce — a single unhealthy tick in
+    the middle of an otherwise-long streak should NOT trigger a clear.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    launch = next(item for item in supervisor.plan_launches() if item.session.name == "worker")
+
+    supervisor._msg_store.upsert_alert(
+        launch.session.name, "recovery_limit", "error",
+        "Automatic recovery paused after 5 rapid failures",
+    )
+    _backdate_alert(supervisor, launch.session.name, "recovery_limit", 200)
+
+    # Tick 1: window MISSING → unhealthy observation recorded.
+    window_map_missing: dict = {}
+    name_by_window = {launch.window_name: launch.session.name}
+    supervisor._sweep_recovered_recovery_alerts(
+        window_map=window_map_missing, name_by_window=name_by_window,
+    )
+
+    # Tick 2: window BACK + immediately past debounce on the alert
+    # timestamp — but the unhealthy observation in tick 1 should
+    # restart the streak, so the alert must remain open.
+    window_map = {launch.window_name: object()}
+    supervisor._sweep_recovered_recovery_alerts(
+        window_map=window_map, name_by_window=name_by_window,
+    )
+
+    open_pairs = [
+        (a.session_name, a.alert_type) for a in supervisor.open_alerts()
+    ]
+    assert (launch.session.name, "recovery_limit") in open_pairs, (
+        "an unhealthy tick mid-streak must reset the debounce"
+    )
+
+
+def test_recovery_alert_auto_clear_skips_untracked_sessions(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """A ``recovery_limit`` whose session isn't in the launch plan is
+    handled by ``_sweep_stale_alerts``, not the auto-clear path. Skip
+    so we don't fight the orphan policy.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+
+    # Untracked session name — not in ``config.sessions``.
+    supervisor._msg_store.upsert_alert(
+        "ghost-session", "recovery_limit", "error",
+        "Automatic recovery paused after 5 rapid failures",
+    )
+    _backdate_alert(supervisor, "ghost-session", "recovery_limit", 200)
+
+    window_map: dict = {}
+    name_by_window: dict = {}
+    supervisor._sweep_recovered_recovery_alerts(
+        window_map=window_map, name_by_window=name_by_window,
+    )
+
+    open_pairs = [
+        (a.session_name, a.alert_type) for a in supervisor.open_alerts()
+    ]
+    assert ("ghost-session", "recovery_limit") in open_pairs, (
+        "auto-clear sweep must not touch untracked sessions; "
+        "_sweep_stale_alerts owns that path"
+    )
+
+
+def test_recovery_alert_auto_clear_full_lifecycle(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """End-to-end: raise alert, observe healthy across tick, advance
+    past debounce, alert clears. Mirrors the issue #1008 acceptance
+    flow (raise → confirm healthy → tick past debounce → cleared).
+    """
+    from datetime import UTC, datetime, timedelta
+
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    launch = next(item for item in supervisor.plan_launches() if item.session.name == "worker")
+
+    # Step (a) — raise recovery_limit, just like the supervisor would
+    # after exhausting the auto-recovery budget.
+    supervisor._msg_store.upsert_alert(
+        launch.session.name, "recovery_limit", "error",
+        "Automatic recovery paused after 5 rapid failures",
+    )
+    open_pairs = {
+        (a.session_name, a.alert_type) for a in supervisor.open_alerts()
+    }
+    assert (launch.session.name, "recovery_limit") in open_pairs
+
+    # Step (b) — first healthy tick BEFORE debounce → alert holds.
+    window_map = {launch.window_name: object()}
+    name_by_window = {launch.window_name: launch.session.name}
+    supervisor._sweep_recovered_recovery_alerts(
+        window_map=window_map, name_by_window=name_by_window,
+    )
+    open_pairs = {
+        (a.session_name, a.alert_type) for a in supervisor.open_alerts()
+    }
+    assert (launch.session.name, "recovery_limit") in open_pairs
+
+    # Step (c) — advance the alert timestamp past the debounce, observe
+    # again → alert clears.
+    _backdate_alert(
+        supervisor, launch.session.name, "recovery_limit",
+        Supervisor._RECOVERY_ALERT_AUTO_CLEAR_DEBOUNCE_SECONDS + 30,
+    )
+    supervisor._sweep_recovered_recovery_alerts(
+        window_map=window_map, name_by_window=name_by_window,
+    )
+
+    open_pairs = {
+        (a.session_name, a.alert_type) for a in supervisor.open_alerts()
+    }
+    assert (launch.session.name, "recovery_limit") not in open_pairs
+
+
 def test_supervisor_alerts_heartbeat_nudge_skipped_path_routes_through_funnel(
     monkeypatch, tmp_path: Path,
 ) -> None:

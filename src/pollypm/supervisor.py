@@ -156,6 +156,32 @@ _ROLE_IDENTITY_PREAMBLE: dict[str, str] = {
 }
 
 
+def _parse_supervisor_iso(value: object) -> datetime | None:
+    """Coerce a timestamp into a UTC ``datetime``.
+
+    Mirrors :func:`pollypm.recovery.no_session_spawn._parse_iso` so the
+    #1008 auto-clear sweep tolerates the same legacy / unified store
+    timestamp shapes (ISO-8601 string with or without trailing ``Z``,
+    SQLite naive ``YYYY-MM-DD HH:MM:SS[.ffffff]`` form, or already a
+    ``datetime``). Naive datetimes are treated as UTC, matching the
+    writer convention on both stores.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        normalised = value
+        if normalised.endswith("Z"):
+            normalised = normalised[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(normalised)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
 def _identity_preamble_for_role(role: str | None) -> str:
     """Return an identity preamble for ``role`` (#869).
 
@@ -1425,6 +1451,17 @@ class Supervisor:
         # decorative junk alerts across sessions of operator work.
         self._sweep_stale_alerts(window_map=window_map, name_by_window=name_by_window)
 
+        # #1008 — recovery-alert auto-clear: walk open
+        # ``recovery_limit`` / ``stuck_session`` alerts whose session is
+        # currently tracked + window-alive, and clear them once the
+        # session has been observed healthy continuously for the
+        # debounce window. Sister to the orphan sweep above — that one
+        # clears alerts for *gone* sessions, this one clears alerts
+        # for *recovered* sessions.
+        self._sweep_recovered_recovery_alerts(
+            window_map=window_map, name_by_window=name_by_window,
+        )
+
         current_alerts = self.store.open_alerts()
         alerts_n = len(current_alerts)
         alert_word = "alert" if alerts_n == 1 else "alerts"
@@ -2156,6 +2193,244 @@ class Supervisor:
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("stale-alert sweep skipped: %s", exc)
+
+    # ------------------------------------------------------------------
+    # #1008 — auto-clear ``recovery_limit`` / ``stuck_session`` alerts
+    # ------------------------------------------------------------------
+    #
+    # Same lifecycle category as the auto-clear shipped in #953
+    # (``no_session_for_assignment``) and #1001 (ghost-project alerts).
+    # When auto-recovery's failure budget exhausts, the supervisor raises
+    # ``<role>/recovery_limit`` (and the heartbeat path raises
+    # ``<role>/stuck_session``). Pre-#1008 these alerts NEVER cleared on
+    # their own — even after the cockpit was restarted and the session
+    # came back to a healthy state. The user expectation is "the
+    # heartbeat is fixing these automatically"; honour it by sweeping
+    # tracked-and-healthy sessions on each tick and clearing the alert
+    # once the session has been observed healthy continuously for
+    # ``_RECOVERY_ALERT_AUTO_CLEAR_DEBOUNCE_SECONDS``.
+    #
+    # Debounce window default: 90s (six 15s ticks). Long enough to ride
+    # through a brief auth-handshake or pane-respawn flap without
+    # clearing the alert prematurely; short enough that the user feels
+    # the auto-clear instead of waiting minutes. The class attribute is
+    # overridable per-instance for tests + for operator override.
+
+    _RECOVERY_ALERT_AUTO_CLEAR_DEBOUNCE_SECONDS: float = 90.0
+    _AUTO_CLEAR_ALERT_TYPES: frozenset[str] = frozenset({
+        "recovery_limit", "stuck_session",
+    })
+    _RECOVERY_HEALTH_OBSERVED_EVENT = "recovery_alert_health_observed"
+    _RECOVERY_UNHEALTHY_OBSERVED_EVENT = "recovery_alert_unhealthy_observed"
+
+    def _sweep_recovered_recovery_alerts(
+        self,
+        *,
+        window_map: dict,
+        name_by_window: dict,
+    ) -> None:
+        """Clear ``recovery_limit`` / ``stuck_session`` alerts after a healthy streak.
+
+        Walks the open alert set, filters to the auto-clear-eligible
+        families (``recovery_limit``, ``stuck_session``), and for each:
+
+        1. Confirms the alert's session is currently tracked
+           (configured + enabled) and its expected tmux window is alive.
+           Sessions that are not tracked / not present are left to
+           ``_sweep_stale_alerts`` — that path owns the orphan-clear
+           policy and we mustn't fight it.
+        2. Records a ``recovery_alert_health_observed`` event for the
+           session this tick.
+        3. Reads the most-recent ``recovery_alert_unhealthy_observed``
+           event for the same session. The healthy streak starts at
+           the more-recent of (alert.updated_at, last unhealthy event).
+        4. When the streak duration is at least the debounce window,
+           clears the alert and resets the recovery counter so a
+           subsequent failure gets the full ``_RECOVERY_LIMIT`` retries
+           again — matching the manual ``Resume auto-recovery`` button.
+
+        Best-effort: any failure inside is logged and swallowed so a
+        flaky clear can't break the heartbeat sweep for unrelated
+        sessions.
+        """
+        try:
+            tracked = {launch.session.name for launch in self.plan_launches()}
+            live_window_names = set(window_map.keys())
+            expected_window = {v: k for k, v in name_by_window.items()}
+
+            now = datetime.now(UTC)
+            debounce = timedelta(
+                seconds=float(self._RECOVERY_ALERT_AUTO_CLEAR_DEBOUNCE_SECONDS),
+            )
+
+            cleared = 0
+            for alert in self.open_alerts():
+                alert_type = alert.alert_type or ""
+                if alert_type not in self._AUTO_CLEAR_ALERT_TYPES:
+                    continue
+                session_name = alert.session_name
+                if session_name not in tracked:
+                    # Untracked → ``_sweep_stale_alerts`` owns the
+                    # orphan-clear path. Leave alone.
+                    continue
+                window_name = expected_window.get(session_name)
+                if not window_name or window_name not in live_window_names:
+                    # Window missing — session is NOT healthy. Record an
+                    # unhealthy observation so a brief flap resets the
+                    # streak even if the next tick finds the window back.
+                    self._record_recovery_health_event(
+                        session_name,
+                        subject=self._RECOVERY_UNHEALTHY_OBSERVED_EVENT,
+                        alert_type=alert_type,
+                    )
+                    continue
+                # Tracked + window alive → healthy this tick. Record
+                # the observation and check the streak duration.
+                self._record_recovery_health_event(
+                    session_name,
+                    subject=self._RECOVERY_HEALTH_OBSERVED_EVENT,
+                    alert_type=alert_type,
+                )
+                streak_start = self._recovery_alert_streak_start(
+                    session_name=session_name, alert=alert,
+                )
+                if streak_start is None:
+                    continue
+                if (now - streak_start) < debounce:
+                    continue
+                # Past the debounce window — clear the alert and reset
+                # the recovery counter so a subsequent failure gets the
+                # full ``_RECOVERY_LIMIT`` retries again. Mirrors the
+                # manual ``Resume auto-recovery`` button in
+                # ``cockpit_ui.py:_alert_action_resume_recovery``.
+                try:
+                    self._msg_store.clear_alert(session_name, alert_type)
+                    if alert_type == "recovery_limit":
+                        self.store.upsert_session_runtime(
+                            session_name=session_name,
+                            status="idle",
+                            recovery_attempts=0,
+                            recovery_window_started_at=None,
+                        )
+                    cleared += 1
+                    self._msg_store.append_event(
+                        scope=session_name,
+                        sender="heartbeat",
+                        subject="recovery_alert_auto_cleared",
+                        payload={
+                            "message": (
+                                f"Auto-cleared {alert_type} for "
+                                f"{session_name} after "
+                                f"{int((now - streak_start).total_seconds())}s "
+                                "of continuous healthy observations"
+                            ),
+                            "alert_type": alert_type,
+                            "streak_seconds": int(
+                                (now - streak_start).total_seconds(),
+                            ),
+                        },
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "recovery-alert auto-clear failed for %s/%s",
+                        session_name, alert_type, exc_info=True,
+                    )
+
+            if cleared:
+                alert_word = "alert" if cleared == 1 else "alerts"
+                logger.info(
+                    "recovery-alert auto-clear cleared %d recovered %s",
+                    cleared, alert_word,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("recovery-alert auto-clear skipped: %s", exc)
+
+    def _record_recovery_health_event(
+        self,
+        session_name: str,
+        *,
+        subject: str,
+        alert_type: str,
+    ) -> None:
+        """Record a per-tick observation event for the auto-clear sweep.
+
+        Uses synchronous :meth:`Store.record_event` rather than the
+        buffered ``append_event`` so the observation is visible to the
+        very next read in the same tick — the streak-start lookup
+        queries unhealthy-observation events and would race the
+        background drain otherwise.
+        """
+        try:
+            self._msg_store.record_event(
+                scope=session_name,
+                sender="heartbeat",
+                subject=subject,
+                payload={"alert_type": alert_type},
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "recovery-alert observation event failed for %s/%s",
+                session_name, alert_type, exc_info=True,
+            )
+
+    def _recovery_alert_streak_start(
+        self,
+        *,
+        session_name: str,
+        alert: AlertRecord,
+    ) -> datetime | None:
+        """Return the start of the current healthy streak, or ``None``.
+
+        Streak start = the most recent of:
+          * the alert's ``updated_at`` (when it was last raised /
+            re-upserted by the failure path), and
+          * the most recent ``recovery_alert_unhealthy_observed`` event
+            recorded for this session.
+
+        Returns ``None`` when the alert timestamp is unparseable — keep
+        the alert open rather than clearing on a bad clock value.
+        """
+        alert_ts = _parse_supervisor_iso(alert.updated_at) or _parse_supervisor_iso(alert.created_at)
+        if alert_ts is None:
+            return None
+        unhealthy_ts = self._latest_recovery_unhealthy_observation(session_name)
+        if unhealthy_ts is None:
+            return alert_ts
+        return max(alert_ts, unhealthy_ts)
+
+    def _latest_recovery_unhealthy_observation(
+        self, session_name: str,
+    ) -> datetime | None:
+        """Return the most recent unhealthy-observation event timestamp."""
+        query = getattr(self._msg_store, "query_messages", None)
+        if not callable(query):
+            return None
+        try:
+            rows = query(
+                type="event",
+                scope=session_name,
+                sender="heartbeat",
+                limit=50,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "recovery-alert query_messages failed for %s",
+                session_name, exc_info=True,
+            )
+            return None
+        latest: datetime | None = None
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            subject = str(row.get("subject") or "")
+            if subject != self._RECOVERY_UNHEALTHY_OBSERVED_EVENT:
+                continue
+            ts = _parse_supervisor_iso(row.get("created_at"))
+            if ts is None:
+                continue
+            if latest is None or ts > latest:
+                latest = ts
+        return latest
 
     def _maybe_close_idle_architect(
         self,

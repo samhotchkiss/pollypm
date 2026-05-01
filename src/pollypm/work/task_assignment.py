@@ -148,7 +148,17 @@ def role_candidate_names(
     ``<role>-<project>`` and ``<role>_<project>`` — we accept either
     convention so drift between docs and shipping code doesn't break
     lookup. Process-wide singletons (reviewer / operator / heartbeat /
-    triage) map to their fixed session names via ``_ROLE_STATIC_NAMES``.
+    triage) map to their fixed session names via ``_ROLE_STATIC_NAMES``,
+    BUT when a non-empty ``project`` is supplied we also include the
+    per-project session form (``<role>_<project>``, ``<role>-<project>``)
+    *before* the singleton fallback. ``pm worker-start --role reviewer
+    <project>`` (and #1005's auto-recovery dispatch that mirrors it)
+    creates a per-project ``reviewer_<project>`` session; without the
+    per-project candidate the resolver only sees the singleton form and
+    keeps reporting ``no_session`` even after the spawn lands. The
+    singleton candidates stay in the list so workspaces that still run
+    a singleton ``reviewer``/``operator`` session keep resolving via
+    the legacy fallback. (#1011)
 
     When ``task_number`` is supplied for the ``worker`` role (#921), the
     canonical per-task window name (``task-<project>-<N>``, written by
@@ -173,7 +183,20 @@ def role_candidate_names(
         # Planner-spawned per-task critic sessions carry the role name
         # verbatim. Pass through so exact-name lookup picks them up.
         return [role]
-    return list(_ROLE_STATIC_NAMES.get(key, ()))
+    static = list(_ROLE_STATIC_NAMES.get(key, ()))
+    if not static:
+        return static
+    # #1011 — singleton-named control roles (reviewer/operator/triage/
+    # heartbeat) can ALSO ship as per-project sessions when the auto-
+    # recovery sweep dispatches ``pm worker-start --role <role>
+    # <project>``. Prepend the per-project candidates so the resolver
+    # finds the spawned session; keep the singleton form as a fallback
+    # for workspaces that still run a singleton.
+    project_key = (project or "").strip()
+    if not project_key:
+        return static
+    project_scoped = [f"{key}_{project_key}", f"{key}-{project_key}"]
+    return project_scoped + static
 
 
 def agent_candidate_names(agent_name: str) -> list[str]:

@@ -114,20 +114,44 @@ class TestRoleCandidates:
             "worker-demo", "worker_demo",
         ]
 
-    def test_reviewer_pins_to_pm_reviewer(self):
-        # Returns both session-config key and window name (#272).
-        assert role_candidate_names("reviewer", "ignored") == ["reviewer", "pm-reviewer"]
+    def test_reviewer_with_project_prepends_per_project(self):
+        # #1011 — when a project is supplied the per-project candidates
+        # come first so the resolver sees a ``reviewer_<project>``
+        # session spawned by ``pm worker-start --role reviewer <project>``.
+        # Singleton form stays as the fallback (#272).
+        assert role_candidate_names("reviewer", "bikepath") == [
+            "reviewer_bikepath", "reviewer-bikepath", "reviewer", "pm-reviewer",
+        ]
 
-    def test_operator_pins_to_pm_operator(self):
-        assert role_candidate_names("operator", "x") == ["operator", "pm-operator"]
+    def test_reviewer_without_project_pins_to_singleton(self):
+        # Empty project key → singleton-only (legacy behaviour).
+        assert role_candidate_names("reviewer", "") == ["reviewer", "pm-reviewer"]
+
+    def test_operator_with_project_prepends_per_project(self):
+        # #1011 — same as reviewer; singleton form is the fallback.
+        assert role_candidate_names("operator", "x") == [
+            "operator_x", "operator-x", "operator", "pm-operator",
+        ]
 
     def test_heartbeat_supervisor_pins_to_pm_heartbeat(self):
-        assert role_candidate_names("heartbeat-supervisor", "x") == ["heartbeat", "pm-heartbeat"]
+        # #1011 — heartbeat is the per-workspace supervisor; per-project
+        # candidates are still emitted for symmetry, but in practice
+        # ``no_session`` never opens for heartbeat (it's bootstrapped by
+        # the supervisor, not the auto-recovery sweep).
+        assert role_candidate_names("heartbeat-supervisor", "x") == [
+            "heartbeat-supervisor_x", "heartbeat-supervisor-x",
+            "heartbeat", "pm-heartbeat",
+        ]
         # alias
-        assert role_candidate_names("heartbeat", "x") == ["heartbeat", "pm-heartbeat"]
+        assert role_candidate_names("heartbeat", "x") == [
+            "heartbeat_x", "heartbeat-x", "heartbeat", "pm-heartbeat",
+        ]
 
-    def test_triage(self):
-        assert role_candidate_names("triage", "x") == ["triage", "pm-triage"]
+    def test_triage_with_project_prepends_per_project(self):
+        # #1011.
+        assert role_candidate_names("triage", "x") == [
+            "triage_x", "triage-x", "triage", "pm-triage",
+        ]
 
     def test_critic_passes_through(self):
         assert role_candidate_names("critic_simplicity", "x") == ["critic_simplicity"]

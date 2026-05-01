@@ -486,3 +486,62 @@ def test_auto_recovery_no_op_when_store_missing() -> None:
         services, config_path=Path("/tmp/cfg.toml"),
     )
     assert decisions == []
+
+
+# ---------------------------------------------------------------------------
+# #1011 — resolver matches the per-project session the spawn creates
+# ---------------------------------------------------------------------------
+
+
+def test_role_candidate_names_includes_per_project_for_reviewer() -> None:
+    """Regression for #1011 Defect A.
+
+    ``pm worker-start --role reviewer <project>`` (the same dispatch
+    used by #1005's auto-recovery) creates a per-project
+    ``reviewer_<project>`` session. Pre-fix ``role_candidate_names``
+    returned only the workspace-singleton ``["reviewer", "pm-reviewer"]``
+    list, so the resolver never matched the spawned session and the
+    ``no_session`` alert kept re-firing — leading to orphan
+    ``reviewer-<project>`` windows and an exhausted recovery budget.
+
+    The post-fix list MUST include ``reviewer_<project>`` (and
+    ``reviewer-<project>`` for naming-drift tolerance) BEFORE the
+    singleton candidates, so the next sweep tick after a successful
+    spawn finds the new session and the alert clears.
+    """
+    from pollypm.work.task_assignment import role_candidate_names
+
+    candidates = role_candidate_names("reviewer", "bikepath")
+    # Per-project candidates first so the spawned session resolves
+    # before the legacy singleton names.
+    assert candidates[0] == "reviewer_bikepath"
+    assert "reviewer-bikepath" in candidates
+    # Singleton fallback retained — workspaces with a singleton
+    # ``reviewer`` session still resolve.
+    assert "reviewer" in candidates
+    assert "pm-reviewer" in candidates
+
+
+def test_role_candidate_names_per_project_resolves_spawned_session() -> None:
+    """End-to-end resolver check: a live ``reviewer_<project>`` session
+    (the shape ``pm worker-start --role reviewer <project>`` creates)
+    is found by ``SessionRoleIndex.resolve`` for the canonical
+    ``role:reviewer`` lookup when a project key is supplied. Pre-#1011
+    the resolver returned ``None`` because the candidate list was
+    singleton-only.
+    """
+    from pollypm.work.models import ActorType
+    from pollypm.work.task_assignment import SessionRoleIndex
+
+    @dataclass
+    class _Handle:
+        name: str
+
+    class _SessionService:
+        def list(self) -> list[_Handle]:
+            return [_Handle(name="reviewer_bikepath")]
+
+    index = SessionRoleIndex(_SessionService())
+    handle = index.resolve(ActorType.ROLE, "reviewer", "bikepath")
+    assert handle is not None
+    assert handle.name == "reviewer_bikepath"

@@ -579,3 +579,232 @@ def test_supervisor_alerts_heartbeat_nudge_skipped_path_routes_through_funnel(
     env = matching[0]
     assert env.source == "supervisor_alerts"
     assert env.actionability is SignalActionability.OPERATIONAL
+
+
+# ---------------------------------------------------------------------------
+# #1010 — idle-placeholder detection in the session-health classifier
+# ---------------------------------------------------------------------------
+
+
+def test_codex_idle_placeholder_pane_classifies_as_legitimate_idle() -> None:
+    """A Codex pane sitting at the rotating ``› <suggestion>`` placeholder
+    must classify as ``legitimate_idle`` even when the worker has pending
+    work — that's the alive-but-idle case (#1010), NOT a stall.
+    """
+    from pollypm.heartbeats.stall_classifier import StallContext, classify_stall
+    from pollypm.idle_placeholders import pane_is_idle_placeholder
+
+    pane_text = "\n".join([
+        "• Ran pm task next -p booktalk",
+        "  └ No tasks available.",
+        "",
+        "──────────────────────────────────────────────────────",
+        "",
+        "› Improve documentation in @filename",
+        "",
+        "  gpt-5.4 default · ~/dev/booktalk/.pollypm/worktrees/worker_booktalk",
+    ])
+
+    assert pane_is_idle_placeholder(pane_text) is True
+
+    ctx = StallContext(
+        role="worker",
+        session_name="worker_booktalk",
+        has_pending_work=True,  # Worker has queued work.
+        pane_is_idle_placeholder=True,
+    )
+    assert classify_stall(ctx) == "legitimate_idle"
+
+
+def test_claude_empty_prompt_pane_classifies_as_legitimate_idle() -> None:
+    """The operator (Claude CLI) sitting at an empty ``❯`` prompt with no
+    recent assistant output is the same alive-but-idle case as the Codex
+    placeholder — not a stall (#1010 — operator/recovery_limit was one of
+    the live alerts that needed this fix to auto-clear).
+    """
+    from pollypm.heartbeats.stall_classifier import StallContext, classify_stall
+    from pollypm.idle_placeholders import pane_is_idle_placeholder
+
+    pane_text = "\n".join([
+        "  state was operator-pm.",
+        "  Your previous session was interrupted and has been restarted.",
+        "",
+        "⏺ Batching. Standing by.",
+        "",
+        "✻ Cogitated for 1s",
+        "",
+        "──────────────────────────────────────────────────────",
+        "❯ ",
+        "──────────────────────────────────────────────────────",
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+    ])
+
+    assert pane_is_idle_placeholder(pane_text) is True
+
+    ctx = StallContext(
+        role="operator-pm",
+        session_name="operator",
+        has_pending_work=False,
+        pane_is_idle_placeholder=True,
+    )
+    assert classify_stall(ctx) == "legitimate_idle"
+
+
+def test_default_recovery_policy_classifies_placeholder_pane_as_healthy(
+    tmp_path: Path,
+) -> None:
+    """Wired end-to-end through the recovery policy: a Codex pane with
+    the placeholder hint short-circuits to ``HEALTHY`` even when the
+    other signals (``snapshot_repeated``, ``output_stale``) would
+    otherwise classify it as STUCK / LOOPING / IDLE — preventing the
+    heartbeat from re-bumping ``stuck_session`` against a placeholder
+    pane and blocking #1008's auto-clear streak.
+    """
+    from pollypm.recovery.base import SessionHealth, SessionSignals
+    from pollypm.recovery.default import DefaultRecoveryPolicy
+
+    policy = DefaultRecoveryPolicy()
+
+    placeholder_signals = SessionSignals(
+        session_name="worker_booktalk",
+        window_present=True,
+        pane_dead=False,
+        output_stale=True,
+        snapshot_repeated=5,  # Would classify as LOOPING without the gate.
+        idle_cycles=5,
+        session_role="worker",
+        pane_is_idle_placeholder=True,
+    )
+    assert policy.classify(placeholder_signals) == SessionHealth.HEALTHY
+
+    # Without the placeholder flag the same signal stack returns LOOPING,
+    # confirming the short-circuit is what flips the verdict.
+    no_placeholder = SessionSignals(
+        session_name="worker_booktalk",
+        window_present=True,
+        pane_dead=False,
+        output_stale=True,
+        snapshot_repeated=5,
+        idle_cycles=5,
+        session_role="worker",
+        pane_is_idle_placeholder=False,
+    )
+    assert policy.classify(no_placeholder) == SessionHealth.LOOPING
+
+
+def test_default_policy_placeholder_does_not_mask_real_failures(
+    tmp_path: Path,
+) -> None:
+    """A pane carrying the idle placeholder text on top of a real
+    mechanical failure (pane_dead, auth_failure, missing window) must
+    still classify as the failure — the placeholder gate is for the
+    alive-but-idle case, not a blanket "always healthy" override.
+    """
+    from pollypm.recovery.base import SessionHealth, SessionSignals
+    from pollypm.recovery.default import DefaultRecoveryPolicy
+
+    policy = DefaultRecoveryPolicy()
+
+    # window gone → EXITED, not HEALTHY
+    assert policy.classify(SessionSignals(
+        session_name="x", window_present=False,
+        pane_is_idle_placeholder=True,
+    )) == SessionHealth.EXITED
+
+    # pane dead → EXITED, not HEALTHY
+    assert policy.classify(SessionSignals(
+        session_name="x", pane_dead=True,
+        pane_is_idle_placeholder=True,
+    )) == SessionHealth.EXITED
+
+    # auth broken → AUTH_BROKEN, not HEALTHY
+    assert policy.classify(SessionSignals(
+        session_name="x", auth_failure=True,
+        pane_is_idle_placeholder=True,
+    )) == SessionHealth.AUTH_BROKEN
+
+
+def test_recovery_alert_auto_clear_works_for_placeholder_pane(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """End-to-end #1010 contract: an alive Codex pane showing the
+    placeholder hint, with an open ``recovery_limit`` alert past the
+    debounce window, must auto-clear via the same sweep #1008 wired in.
+
+    Pre-#1010 the issue was twofold: (a) the sweep wasn't actually
+    invoked from the live heartbeat path, and (b) the heartbeat kept
+    re-bumping ``stuck_session.updated_at`` on placeholder-showing
+    panes because the classifier flagged them as unhealthy. This test
+    pins (b) — the classifier no longer flags placeholder panes — by
+    exercising the sweep directly with a tracked + window-alive
+    session whose pane shows the Codex idle placeholder.
+    """
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    launch = next(item for item in supervisor.plan_launches() if item.session.name == "worker")
+
+    supervisor._msg_store.upsert_alert(
+        launch.session.name, "recovery_limit", "error",
+        "Automatic recovery paused after 5 rapid failures",
+    )
+    _backdate_alert(
+        supervisor, launch.session.name, "recovery_limit",
+        Supervisor._RECOVERY_ALERT_AUTO_CLEAR_DEBOUNCE_SECONDS + 30,
+    )
+
+    window_map = {launch.window_name: object()}
+    name_by_window = {launch.window_name: launch.session.name}
+    supervisor._sweep_recovered_recovery_alerts(
+        window_map=window_map, name_by_window=name_by_window,
+    )
+
+    open_pairs = [
+        (a.session_name, a.alert_type) for a in supervisor.open_alerts()
+    ]
+    assert (launch.session.name, "recovery_limit") not in open_pairs, (
+        "alive-but-idle Codex pane showing the rotating placeholder hint "
+        "must auto-clear recovery_limit after the debounce window"
+    )
+
+
+def test_run_heartbeat_invokes_recovery_alert_auto_clear_sweep(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """#1010 — the auto-clear sweep is now wired into ``run_heartbeat``,
+    not the dead ``_run_heartbeat_local`` method that #1008 originally
+    targeted. Pin the wiring so a future refactor doesn't silently
+    sever it again.
+    """
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+
+    invoked: list[dict] = []
+
+    def _spy(*, window_map, name_by_window):
+        invoked.append({"window_map": window_map, "name_by_window": name_by_window})
+
+    monkeypatch.setattr(
+        supervisor, "_sweep_recovered_recovery_alerts", _spy,
+    )
+    # Stub backend.run + scheduling so run_heartbeat doesn't try to
+    # touch tmux / the recurring-job scheduler in the test process.
+    monkeypatch.setattr(
+        "pollypm.supervisor.get_heartbeat_backend",
+        lambda name, root_dir=None: type(
+            "_Backend", (), {"run": staticmethod(lambda api, snapshot_lines=200: [])},
+        )(),
+    )
+    monkeypatch.setattr(supervisor, "ensure_heartbeat_schedule", lambda: None)
+    monkeypatch.setattr(
+        "pollypm.supervisor.sync_token_ledger_for_config",
+        lambda config: [],
+    )
+
+    supervisor.run_heartbeat()
+
+    assert invoked, (
+        "_sweep_recovered_recovery_alerts must be invoked from run_heartbeat "
+        "(post-#1010 wiring); pre-fix it lived only on dead _run_heartbeat_local"
+    )

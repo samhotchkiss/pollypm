@@ -214,6 +214,9 @@ def _update_alerts(
             from pollypm.heartbeats.stall_classifier import (
                 has_pending_work_for_session,
             )
+            from pollypm.idle_placeholders import (
+                pane_is_idle_placeholder as _pane_is_idle_placeholder,
+            )
 
             stall_class = classify_stall(
                 StallContext(
@@ -221,6 +224,9 @@ def _update_alerts(
                     session_name=session_name,
                     has_pending_work=has_pending_work_for_session(
                         supervisor.config, session_name,
+                    ),
+                    pane_is_idle_placeholder=_pane_is_idle_placeholder(
+                        pane_text or "",
                     ),
                 )
             )

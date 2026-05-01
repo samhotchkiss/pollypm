@@ -86,6 +86,14 @@ class StallContext:
     #: pause — so it gets the ``transient`` bucket instead of
     #: ``unrecoverable_stall``.
     turn_in_flight: bool = False
+    #: ``True`` when the pane is showing a known idle-placeholder UI
+    #: state — Codex's rotating ``› <suggestion>`` hint, or Claude's
+    #: empty ``❯`` prompt. Same-snapshot detection on a placeholder
+    #: pane is the alive-but-idle case (#1010): the agent is waiting
+    #: for input, not stuck. Always classifies as ``legitimate_idle``,
+    #: regardless of ``has_pending_work`` — work is queued behind the
+    #: agent's input cycle, not behind a pane that needs unsticking.
+    pane_is_idle_placeholder: bool = False
 
 
 def classify_stall(ctx: StallContext) -> StallClass:
@@ -115,6 +123,16 @@ def classify_stall(ctx: StallContext) -> StallClass:
     """
     role = (ctx.role or "").strip()
     session_name = (ctx.session_name or "").strip()
+
+    # #1010 — placeholder-showing pane is alive-but-idle. The Codex
+    # rotating-suggestion hint and the Claude empty-``❯`` prompt are
+    # both "agent is waiting for input" signals, not stalls. Same-
+    # snapshot ticks on these panes are baseline (the placeholder
+    # text doesn't always rotate within a 3-tick window), so promote
+    # to ``legitimate_idle`` before the role / pending-work ladder
+    # can fire ``unrecoverable_stall``.
+    if ctx.pane_is_idle_placeholder:
+        return "legitimate_idle"
 
     if role in _EVENT_DRIVEN_ROLES:
         return "legitimate_idle"

@@ -72,30 +72,15 @@ def _truncate_for_now_panel(text: str, *, limit: int = 70) -> str:
     return text[:cut].rstrip() + "…"
 
 
-# Known rotating placeholder hints the Codex CLI shows in an empty
-# input box when the agent is idle. These are NOT activity — they're
-# UI suggestion chrome — but the dashboard's pane-snapshot scrape used
-# to surface them as "what the session is doing" (#994). The list is
-# intentionally a defensive net behind the leading-``›`` prompt-arrow
-# skip; if Codex ships new suggestions, the arrow filter still catches
-# them, but verified-known strings get an additional safety check that
-# matches even when the leading glyph is lost in translation.
-_CODEX_IDLE_PLACEHOLDERS = (
-    "run /review on my current changes",
-    "explain this codebase",
-    "write tests for @filename",
-    "summarize recent commits",
-    "use /skills to list available skills",
-    "find and fix a bug in @filename",
+# Codex idle-input placeholder detection lives in
+# :mod:`pollypm.idle_placeholders` (#1010 extraction) so the dashboard
+# renderer here and the heartbeat session-health classifier share one
+# definition. Re-export under the legacy name for backward compat with
+# any external callers / tests pinning the old symbol.
+from pollypm.idle_placeholders import (
+    CODEX_IDLE_PLACEHOLDERS as _CODEX_IDLE_PLACEHOLDERS,
+    is_codex_idle_placeholder as _is_codex_idle_placeholder,
 )
-
-
-def _is_codex_idle_placeholder(line: str) -> bool:
-    """True if ``line`` looks like a Codex idle-input placeholder hint."""
-    text = line.strip().lstrip("›").strip().lower()
-    if not text:
-        return False
-    return any(text.startswith(hint) for hint in _CODEX_IDLE_PLACEHOLDERS)
 
 
 def _snapshot_activity_status(line: str) -> str | None:

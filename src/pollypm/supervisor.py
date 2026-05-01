@@ -1265,6 +1265,29 @@ class Supervisor:
         api = SupervisorHeartbeatAPI(self, snapshot_lines=snapshot_lines)
         alerts = backend.run(api, snapshot_lines=snapshot_lines)
 
+        # #1010 — wire the orphan-clear (#1001) and recovered-recovery
+        # (#1008) sweeps into the live heartbeat path. Both were
+        # historically attached to the legacy ``_run_heartbeat_local``
+        # method, but post-#184 the heartbeat dispatches through
+        # ``backend.run`` instead, so neither sweep was actually
+        # invoked in production. Wiring them here matches the
+        # commit-message contract for #1001 + #1008 ("called from the
+        # heartbeat after backend.run") and unblocks the auto-clear
+        # streak from accumulating on healthy sessions.
+        try:
+            window_map = self._window_map()
+            name_by_window = self._session_name_by_window()
+            self._sweep_stale_alerts(
+                window_map=window_map, name_by_window=name_by_window,
+            )
+            self._sweep_recovered_recovery_alerts(
+                window_map=window_map, name_by_window=name_by_window,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "post-heartbeat alert sweeps skipped", exc_info=True,
+            )
+
         # Re-arm the heartbeat schedule so the next sweep is always queued.
         # Without this, the scheduler permanently stops if the heartbeat
         # session enters an interactive conversation and misses a sweep

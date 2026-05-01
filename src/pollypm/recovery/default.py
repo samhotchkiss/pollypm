@@ -58,6 +58,19 @@ class DefaultRecoveryPolicy(RecoveryPolicy):
         if signals.last_verdict == "blocked":
             return SessionHealth.WAITING_ON_USER
 
+        # #1010 — pane is showing a known idle-placeholder UI state
+        # (Codex's rotating ``› <suggestion>`` hint, or Claude's empty
+        # ``❯`` prompt). The agent is alive and waiting for input, NOT
+        # stuck. Returning ``HEALTHY`` here short-circuits the
+        # SILENT_WORKER / IDLE / STUCK / LOOPING ladders that would
+        # otherwise keep raising ``stuck_session`` / ``silent_worker``
+        # interventions and block #1008's 90s auto-clear streak.
+        # Evaluated AFTER the hard mechanical failures (window gone,
+        # pane dead, auth broken, capacity exhausted) so a placeholder
+        # showing on top of a real failure doesn't mask it.
+        if signals.pane_is_idle_placeholder:
+            return SessionHealth.HEALTHY
+
         # Work-service-aware: the session is alive but hasn't made
         # progress on its claimed task for too long. Gate on turn_active
         # so a session actively generating output doesn't get flagged.

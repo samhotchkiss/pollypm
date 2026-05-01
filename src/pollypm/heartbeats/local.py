@@ -770,11 +770,17 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     StallContext,
                     classify_stall,
                 )
+                from pollypm.idle_placeholders import (
+                    pane_is_idle_placeholder as _pane_is_idle_placeholder,
+                )
 
                 stall_ctx = StallContext(
                     role=context.role or "",
                     session_name=context.session_name,
                     has_pending_work=self._has_pending_work(api, context),
+                    pane_is_idle_placeholder=_pane_is_idle_placeholder(
+                        context.pane_text or "",
+                    ),
                 )
                 stall_class = classify_stall(stall_ctx)
                 if stall_class != "unrecoverable_stall":
@@ -1241,6 +1247,18 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         # pre-existing mechanical ladder.
         work_signals = _collect_work_service_signals(api, context)
 
+        # #1010 — detect Codex rotating-placeholder / Claude empty-prompt
+        # idle UI so the classifier can short-circuit alive-but-idle
+        # panes to HEALTHY instead of cycling through SILENT_WORKER /
+        # STUCK / LOOPING (which keeps re-raising stuck_session and
+        # blocks #1008's 90s auto-clear streak).
+        try:
+            from pollypm.idle_placeholders import pane_is_idle_placeholder
+
+            placeholder_idle = pane_is_idle_placeholder(context.pane_text or "")
+        except Exception:  # noqa: BLE001
+            placeholder_idle = False
+
         return SessionSignals(
             session_name=context.session_name,
             window_present=context.window_present,
@@ -1260,6 +1278,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             claim_age_seconds=work_signals.get("claim_age_seconds"),
             last_event_seconds_ago=work_signals.get("last_event_seconds_ago"),
             last_commit_seconds_ago=work_signals.get("last_commit_seconds_ago"),
+            pane_is_idle_placeholder=placeholder_idle,
         )
 
     # Rate limit nudges: max once per session per 10 minutes

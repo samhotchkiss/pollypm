@@ -108,6 +108,14 @@ class SessionSignals:
     # heuristics. Type is ``ReconciliationAction | None`` — typed as
     # ``Any`` here to avoid a cycle with ``state_reconciliation``.
     drift_action: Any | None = None
+    # #1010 — the pane is showing a known idle-placeholder UI state
+    # (Codex rotating-suggestion hint or Claude empty ``❯`` prompt).
+    # That's an alive-but-idle agent waiting for input, NOT a stuck
+    # session — the classifier short-circuits to ``HEALTHY`` so the
+    # heartbeat doesn't keep raising ``stuck_session`` /
+    # ``silent_worker`` interventions against placeholder-showing
+    # panes (which would block #1008's auto-clear streak).
+    pane_is_idle_placeholder: bool = False
 
 
 @dataclass(slots=True)

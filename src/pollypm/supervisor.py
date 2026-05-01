@@ -1288,6 +1288,17 @@ class Supervisor:
                 "post-heartbeat alert sweeps skipped", exc_info=True,
             )
 
+        # #1013 — age-based archive of stale ``notify`` rows. Without
+        # this the inbox accumulates "X E2E complete" / "Y emitted"
+        # announcements indefinitely (verified at 27 stale notifies in
+        # a 59-item inbox, signal-to-noise <5%). Default retention is
+        # 14 days; tunable via POLLYPM_NOTIFY_RETENTION_DAYS.
+        try:
+            from pollypm.inbox_sweep import sweep_stale_notifies
+            sweep_stale_notifies(self._msg_store)
+        except Exception:  # noqa: BLE001
+            logger.warning("notify-sweep skipped", exc_info=True)
+
         # Re-arm the heartbeat schedule so the next sweep is always queued.
         # Without this, the scheduler permanently stops if the heartbeat
         # session enters an interactive conversation and misses a sweep

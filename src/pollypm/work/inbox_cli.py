@@ -499,11 +499,20 @@ def inbox_archive(
             "references point at projects no longer registered in config."
         ),
     ),
+    read: bool = typer.Option(
+        False,
+        "--read",
+        help=(
+            "Bulk \"mark all read\" — archive every open user-recipient "
+            "notify message in scope. Pinned notifies (label ``pinned``) "
+            "are exempt. Use ``--dry-run`` to preview. (#1013)"
+        ),
+    ),
     dry_run: bool = typer.Option(
         False, "--dry-run",
         help=(
-            "With --match or --deleted-projects: print what would be archived "
-            "without changing state."
+            "With --match / --deleted-projects / --read: print what would "
+            "be archived without changing state."
         ),
     ),
     actor: str = typer.Option("user", "--actor", help="Actor to attribute the archive to."),
@@ -523,10 +532,13 @@ def inbox_archive(
     - ``pm inbox archive --deleted-projects`` — archive stale messages
       whose structured project refs no longer exist in the active config.
     """
-    bulk_modes = sum(1 for enabled in (match is not None, deleted_projects) if enabled)
+    bulk_modes = sum(
+        1 for enabled in (match is not None, deleted_projects, read) if enabled
+    )
     if bulk_modes > 1:
         typer.echo(
-            "Error: use only one bulk archive mode: --match or --deleted-projects.",
+            "Error: use only one bulk archive mode: --match, "
+            "--deleted-projects, or --read.",
             err=True,
         )
         raise typer.Exit(code=2)
@@ -539,10 +551,14 @@ def inbox_archive(
         _bulk_archive_deleted_project_messages(db=db, dry_run=dry_run)
         return
 
+    if read:
+        _bulk_archive_all_notifies(db=db, dry_run=dry_run)
+        return
+
     if task_id is None:
         typer.echo(
-            "Error: pass a task_id/message-id, OR use --match '<pattern>' "
-            "or --deleted-projects.",
+            "Error: pass a task_id/message-id, OR use --match '<pattern>', "
+            "--deleted-projects, or --read.",
             err=True,
         )
         raise typer.Exit(code=2)
@@ -650,6 +666,83 @@ def _bulk_archive_by_match(*, db: str, pattern: str, dry_run: bool) -> None:
 
     word = "message" if closed == 1 else "messages"
     typer.echo(f"Archived {closed} {word} matching {pattern!r}.")
+    if failures:
+        typer.echo(f"Failed to archive {len(failures)}:", err=True)
+        for mid, reason in failures[:5]:
+            typer.echo(f"  msg:{mid}: {reason}", err=True)
+
+
+def _bulk_archive_all_notifies(*, db: str, dry_run: bool) -> None:
+    """Archive every open user-recipient notify message — bulk \"mark all read\".
+
+    The companion to :func:`pollypm.inbox_sweep.sweep_stale_notifies`,
+    which runs automatically from the heartbeat tick. This is the
+    operator-facing escape hatch for the case the user just wants
+    inbox zero now: ``pm inbox archive --read``. Pinned notifies
+    (label ``pinned``) are exempt so the operator can flag a notify
+    that should survive bulk cleanup. (#1013)
+    """
+    db_path = _resolve_db_path(db, project=None)
+    try:
+        from pollypm.store import SQLAlchemyStore
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"Error: unified store unavailable ({exc}).", err=True)
+        raise typer.Exit(code=1)
+
+    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    try:
+        rows = store.query_messages(
+            type="notify", state="open", recipient="user",
+        )
+    except Exception as exc:  # noqa: BLE001
+        store.close()
+        typer.echo(f"Error: query_messages failed ({exc}).", err=True)
+        raise typer.Exit(code=1) from exc
+
+    # Skip pinned items so the operator's explicit save survives the
+    # bulk sweep. The pinning convention is a string label literal
+    # (kept consistent with the heartbeat sweep helper).
+    matches = []
+    for row in rows:
+        labels_raw = row.get("labels") or []
+        labels = labels_raw if isinstance(labels_raw, list) else []
+        if "pinned" in labels:
+            continue
+        matches.append(row)
+
+    if not matches:
+        store.close()
+        typer.echo("No open notifies to archive.")
+        return
+
+    if dry_run:
+        n = len(matches)
+        word = "notify" if n == 1 else "notifies"
+        typer.echo(f"Would archive {n} {word}:")
+        for row in matches[:20]:
+            mid = row.get("id") or row.get("message_id")
+            subject = row.get("subject") or row.get("title") or ""
+            typer.echo(f"  msg:{mid}  {subject[:80]}")
+        if len(matches) > 20:
+            typer.echo(f"  … ({len(matches) - 20} more)")
+        store.close()
+        return
+
+    closed = 0
+    failures: list[tuple[int, str]] = []
+    for row in matches:
+        mid = row.get("id") or row.get("message_id")
+        if mid is None:
+            continue
+        try:
+            store.close_message(int(mid))
+            closed += 1
+        except Exception as exc:  # noqa: BLE001
+            failures.append((int(mid), str(exc)))
+    store.close()
+
+    word = "notify" if closed == 1 else "notifies"
+    typer.echo(f"Archived {closed} open {word}.")
     if failures:
         typer.echo(f"Failed to archive {len(failures)}:", err=True)
         for mid, reason in failures[:5]:

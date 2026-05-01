@@ -2549,7 +2549,41 @@ class SQLiteWorkService:
         except Exception:  # noqa: BLE001
             # Unblock cascading is best-effort — never let it break archive.
             logger.debug("auto_unblock after archive failed", exc_info=True)
+        # #1013 — close any open ``notify`` whose payload references
+        # this task. The architect's plan_review handoff (and other
+        # ``pm notify --priority immediate`` rows) carry
+        # ``payload.task_id`` pointing at the chat-flow task they
+        # materialised; once the task is archived the announcement
+        # is stale and shouldn't keep appearing in ``pm inbox``.
+        try:
+            self._sweep_related_notifies(task_id)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "related-notify sweep after archive failed", exc_info=True,
+            )
         return self.get(task_id)
+
+    def _sweep_related_notifies(self, task_id: str) -> None:
+        """Close any open notify whose ``payload.task_id`` matches.
+
+        Best-effort — the unified messages store may live in a different
+        SQLite file than this work-service connection, so we open it
+        on the project's state.db (same path the work-service uses) and
+        let the sweep helper drive ``query_messages`` / ``close_message``.
+        """
+        if not getattr(self, "_db_path", None):
+            return
+        try:
+            from pollypm.store import SQLAlchemyStore
+        except Exception:  # noqa: BLE001
+            return
+        from pollypm.inbox_sweep import sweep_notifies_for_done_task
+
+        store = SQLAlchemyStore(f"sqlite:///{self._db_path}")
+        try:
+            sweep_notifies_for_done_task(store, task_id)
+        finally:
+            store.close()
 
     def mark_read(self, task_id: str, actor: str = "user") -> bool:
         """Record a read-marker on an inbox task if one isn't already present.

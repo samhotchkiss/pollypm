@@ -13,6 +13,7 @@ Contract:
 from __future__ import annotations
 
 import logging
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,11 @@ from pollypm.session_services import create_tmux_client
 from pollypm.storage.state import AccountUsageRecord, StateStore
 
 logger = logging.getLogger(__name__)
+
+# Session-name prefix for the throwaway tmux sessions this module spawns.
+# Boot-time orphan sweeps and the per-probe cleanup both pivot on this
+# prefix — keep them in sync. (#1009)
+USAGE_PROBE_SESSION_PREFIX = "pm-usage-"
 
 
 @dataclass(slots=True)
@@ -133,7 +139,7 @@ def collect_account_usage_sample(
     account = config.accounts[account_name]
     session = _probe_session_spec(config.project.root_dir, account_name, account.provider)
     tmux = tmux_client or create_tmux_client()
-    probe_session = f"pm-usage-{account_name}-{int(time.time())}"
+    probe_session = f"{USAGE_PROBE_SESSION_PREFIX}{account_name}-{int(time.time())}"
     try:
         tmux.create_session(
             probe_session,
@@ -159,8 +165,107 @@ def collect_account_usage_sample(
             period_label=snapshot.period_label,
         )
     finally:
-        if tmux.has_session(probe_session):
-            tmux.kill_session(probe_session)
+        # Per-probe cleanup. Belt-and-suspenders for #1009 — first try the
+        # wrapped client (lets fakes track the kill in tests); if THAT
+        # raises, fall through to ``tmux kill-session`` directly so a
+        # broken client wrapper can't leak the session. Either way the
+        # ``=`` exact-target prefix prevents accidentally killing
+        # something whose name starts with our probe prefix.
+        _kill_probe_session(probe_session, tmux=tmux)
+
+
+def _kill_probe_session(name: str, *, tmux=None) -> None:
+    """Kill a single ``pm-usage-*`` session, swallowing any error."""
+    if tmux is not None:
+        try:
+            if tmux.has_session(name):
+                tmux.kill_session(name)
+                return
+            # Session already gone — nothing to clean up.
+            return
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "account_usage_sampler: wrapped tmux client failed to kill "
+                "probe session %r; falling back to direct subprocess",
+                name,
+                exc_info=True,
+            )
+    try:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", f"={name}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "account_usage_sampler: direct tmux kill-session failed for %r; "
+            "boot-time orphan sweep will catch this on next supervisor start",
+            name,
+            exc_info=True,
+        )
+
+
+def sweep_orphan_usage_sessions() -> int:
+    """Kill every leaked ``pm-usage-*`` tmux session.
+
+    Defense-in-depth for #1009 — even with a per-probe ``try/finally`` in
+    :func:`collect_account_usage_sample`, a probe whose parent process is
+    killed (cockpit restart, OS signal, scheduler timeout) leaves the
+    tmux session behind. The supervisor calls this on boot to reap
+    anything left from the previous lifetime.
+
+    Returns the number of sessions killed (0 if tmux isn't running or no
+    orphans exist). Never raises — failures fall through to ``debug``
+    logging so a busted tmux server can't keep the supervisor from
+    starting.
+    """
+    try:
+        listing = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "account_usage_sampler.sweep: tmux list-sessions failed",
+            exc_info=True,
+        )
+        return 0
+    if listing.returncode != 0:
+        # ``no server running`` exits non-zero; nothing to sweep.
+        return 0
+    killed = 0
+    for raw in listing.stdout.splitlines():
+        name = raw.strip()
+        if not name.startswith(USAGE_PROBE_SESSION_PREFIX):
+            continue
+        try:
+            result = subprocess.run(
+                ["tmux", "kill-session", "-t", f"={name}"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "account_usage_sampler.sweep: kill-session failed for %r",
+                name, exc_info=True,
+            )
+            continue
+        if result.returncode == 0:
+            killed += 1
+    if killed:
+        logger.info(
+            "account_usage_sampler.sweep: reaped %d orphan pm-usage-* "
+            "session(s) on supervisor boot",
+            killed,
+        )
+    return killed
 
 
 def persist_account_usage_sample(config_path: Path, sample: AccountUsageSample) -> None:
@@ -216,9 +321,11 @@ def _build_probe_command(config, account, session: SessionConfig) -> str:
 
 __all__ = [
     "AccountUsageSample",
+    "USAGE_PROBE_SESSION_PREFIX",
     "collect_account_usage_sample",
     "load_cached_account_usage",
     "persist_account_usage_sample",
     "refresh_account_usage",
     "refresh_all_account_usage",
+    "sweep_orphan_usage_sessions",
 ]

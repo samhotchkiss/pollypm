@@ -529,6 +529,23 @@ class Supervisor:
                 )
         except Exception:  # noqa: BLE001
             _log.debug("Supervisor.start(): repair_sessions_table failed", exc_info=True)
+        # #1009: Reap any ``pm-usage-*`` tmux sessions left behind by a
+        # previous cockpit lifetime. The per-probe ``try/finally`` in
+        # ``account_usage_sampler.collect_account_usage_sample`` handles
+        # the in-process happy/error paths; this catches the case where
+        # the parent died before ``finally`` could run (handler timeout,
+        # SIGKILL, cockpit crash).
+        try:
+            from pollypm.account_usage_sampler import sweep_orphan_usage_sessions
+            reaped = sweep_orphan_usage_sessions()
+            if reaped:
+                _log.info(
+                    "Supervisor.start(): swept %d orphan pm-usage-* tmux "
+                    "session(s) from previous lifetime",
+                    reaped,
+                )
+        except Exception:  # noqa: BLE001
+            _log.debug("Supervisor.start(): pm-usage-* sweep failed", exc_info=True)
 
     def stop(self) -> None:
         """Gracefully release Supervisor-owned resources.

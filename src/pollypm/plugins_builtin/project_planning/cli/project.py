@@ -250,7 +250,12 @@ def _has_work_tasks(
     try:
         import sqlite3
 
+        from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas
+
         with sqlite3.connect(str(db_path)) as conn:
+            # #1018 — short busy_timeout so a planner probe doesn't
+            # race the heartbeat writer holding the same workspace DB.
+            apply_workspace_pragmas(conn)
             cur = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' "
                 "AND name='work_tasks' LIMIT 1"

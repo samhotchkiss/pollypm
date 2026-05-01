@@ -299,6 +299,16 @@ def _task_is_terminal_or_missing(supervisor: Any, name: str) -> bool:
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         except sqlite3.Error:
             continue
+        # #1018 — read-only probe during ``session.health_sweep`` itself;
+        # busy_timeout lets us ride out a writer's commit instead of
+        # raising ``database is locked`` mid-sweep (escalates to
+        # ``critical_error`` via JobWorkerPool — see #67108).
+        try:
+            from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas
+
+            apply_workspace_pragmas(conn, readonly=True)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             try:
                 row = conn.execute(

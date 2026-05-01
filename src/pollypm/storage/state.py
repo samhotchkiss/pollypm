@@ -30,6 +30,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from pollypm.storage.fts_query import normalize_fts_query
+from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas
 
 
 SCHEMA = """
@@ -543,12 +544,19 @@ class StateStore:
         db_target = f"file:{path}?mode=ro&immutable=1" if use_readonly_uri else str(path)
         self._conn = sqlite3.connect(db_target, check_same_thread=False, uri=use_readonly_uri)
         with self._lock:
-            self.execute("PRAGMA busy_timeout=30000")
+            # #1018: centralised WAL + busy_timeout. We keep StateStore's
+            # historically-longer 30 s timeout because alert upserts hold
+            # the writer through several queries — the workspace default
+            # of 5 s would surface contention at the wrong layer.
+            apply_workspace_pragmas(
+                self._conn,
+                readonly=use_readonly_uri,
+                busy_timeout_ms=30000,
+            )
             if not use_readonly_uri:
                 # Apply schema for new or writable databases — even in
                 # "readonly" mode we may have just created an empty DB
                 # (when the file didn't exist before connect).
-                self.execute("PRAGMA journal_mode=WAL")
                 # auto_vacuum=INCREMENTAL lets us reclaim freelist space on
                 # demand via ``PRAGMA incremental_vacuum``. This pragma must
                 # run BEFORE any tables are created to take effect on a

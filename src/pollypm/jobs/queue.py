@@ -39,6 +39,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
+from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas
+
 
 __all__ = [
     "Job",
@@ -175,8 +177,11 @@ class JobQueue:
                 str(path), check_same_thread=False, isolation_level=None
             )
             with self._lock:
-                self._conn.execute("PRAGMA journal_mode=WAL")
-                self._conn.execute("PRAGMA busy_timeout=30000")
+                # #1018: same WAL + busy_timeout treatment as StateStore.
+                # JobQueue is one of the heaviest writers (claim+complete
+                # per job) so we keep the historical 30 s timeout instead
+                # of the 5 s workspace default.
+                apply_workspace_pragmas(self._conn, busy_timeout_ms=30000)
         self._ensure_schema()
         self.default_max_attempts = default_max_attempts
         self.retry_policy = retry_policy or exponential_backoff()

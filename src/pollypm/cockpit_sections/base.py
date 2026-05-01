@@ -180,6 +180,13 @@ def _aggregate_project_tokens(
     try:
         conn = sqlite3.connect(str(db_path))
         try:
+            # #1018 — cockpit reader runs alongside JobWorkerPool +
+            # heartbeat writers on the same workspace DB. Apply a short
+            # busy_timeout so a transient lock during a writer's commit
+            # doesn't bubble up as "(n/a)" tokens in the rail.
+            from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas
+
+            apply_workspace_pragmas(conn)
             row = conn.execute(
                 "SELECT COALESCE(SUM(total_input_tokens), 0), "
                 "       COALESCE(SUM(total_output_tokens), 0) "

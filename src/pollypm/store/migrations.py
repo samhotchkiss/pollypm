@@ -191,6 +191,12 @@ def _table_set(db_path: Path) -> set[str]:
         conn = sqlite3.connect(str(db_path), timeout=5.0)
     except sqlite3.Error:
         return set()
+    # #1018 — read-only probe, but the workspace DB is held by the live
+    # writers; ``busy_timeout`` lets us ride out a checkpoint without
+    # racing the migration gate's tight 5 s connect window.
+    from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas
+
+    apply_workspace_pragmas(conn)
     try:
         rows = conn.execute(
             "SELECT name FROM sqlite_master "
@@ -294,6 +300,12 @@ def _record_schema_migrations(db_path: Path) -> None:
     already-applied migration.
     """
     conn = sqlite3.connect(str(db_path), timeout=5.0)
+    # #1018 — schema-audit writer; flip into WAL + 5 s busy_timeout so
+    # an ``INSERT OR IGNORE`` doesn't race the heartbeat alert upserts
+    # holding the writer briefly.
+    from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas
+
+    apply_workspace_pragmas(conn)
     try:
         conn.execute(_SCHEMA_MIGRATIONS_DDL)
         now = datetime.now(UTC).isoformat()

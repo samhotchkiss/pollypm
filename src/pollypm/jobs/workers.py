@@ -35,6 +35,7 @@ __all__ = [
     "JobWorkerPool",
     "PoolMetrics",
     "WorkerMetrics",
+    "_is_database_locked_error",
 ]
 
 
@@ -59,6 +60,37 @@ def _is_closed_db_error(exc: BaseException) -> bool:
     if not isinstance(exc, sqlite3.ProgrammingError):
         return False
     return _CLOSED_DB_MARKER in str(exc)
+
+
+def _is_database_locked_error(exc: BaseException) -> bool:
+    """True iff ``exc`` is SQLite's transient ``database is locked``.
+
+    Different from :func:`_is_closed_db_error` (#1006) — that one is a
+    permanent ``ProgrammingError: Cannot operate on a closed database``
+    and there is nothing to retry. ``database is locked`` is
+    ``OperationalError`` and means the DB was busy past the
+    ``busy_timeout`` window: the operation has not been performed but
+    the connection is still alive and the next attempt will likely
+    succeed once the contending writer commits.
+
+    Symptom is alert ``#67108 critical error_log/critical_error:
+    JobWorkerPool: unexpected error running job ... (session.health_sweep):
+    database is locked``. We retry the handler invocation a small
+    number of times before falling through to the regular ``fail()``
+    path — far less disruptive than escalating every transient lock
+    to a critical alert.
+    """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    msg = str(exc).lower()
+    return "database is locked" in msg or "database is busy" in msg
+
+
+# #1018 — exponential backoff for the database-locked retry. Three
+# attempts at 0.1 s / 0.5 s / 2.0 s (total ~2.6 s ceiling) gives the
+# competing writer time to commit, while keeping the worker thread
+# from stalling past the next @every 10 s sweep window.
+_DB_LOCK_RETRY_BACKOFF: tuple[float, ...] = (0.1, 0.5, 2.0)
 
 
 logger = logging.getLogger(__name__)
@@ -244,6 +276,20 @@ class JobWorkerPool:
                 if _is_closed_db_error(exc):
                     self._handle_closed_db(worker_id, "claim")
                     break
+                if _is_database_locked_error(exc):
+                    # #1018 — transient WAL contention on claim; back
+                    # off briefly and retry on the next poll. Don't log
+                    # a full traceback (would spam ``errors.log`` and,
+                    # via the heartbeat alert pipeline, raise a
+                    # ``critical_error`` for a recoverable condition).
+                    logger.debug(
+                        "JobWorkerPool: claim hit transient lock for %s; "
+                        "backing off",
+                        worker_id,
+                    )
+                    if self._stop_event.wait(self.poll_interval):
+                        break
+                    continue
                 logger.exception("JobWorkerPool: claim failed for %s: %s", worker_id, exc)
                 if self._stop_event.wait(self.poll_interval):
                     break
@@ -314,23 +360,58 @@ class JobWorkerPool:
 
         start = time.monotonic()
         try:
+            # #1018 — retry-on-lock loop. SQLite ``database is locked``
+            # is a transient WAL contention, not a programming bug, so
+            # we re-invoke the handler with exponential backoff before
+            # falling through to the regular ``fail()`` path. Without
+            # this, every transient lock during ``session.health_sweep``
+            # bubbled up as a ``critical_error`` alert (#67108).
+            attempts = 1 + len(_DB_LOCK_RETRY_BACKOFF)
             result_holder: dict[str, Any] = {}
             exc_holder: dict[str, BaseException] = {}
+            timed_out = False
+            for attempt_index in range(attempts):
+                result_holder = {}
+                exc_holder = {}
 
-            def _invoke() -> None:
-                try:
-                    result_holder["value"] = spec.handler(dict(job.payload))
-                except BaseException as e:  # noqa: BLE001
-                    exc_holder["err"] = e
+                def _invoke() -> None:
+                    try:
+                        result_holder["value"] = spec.handler(dict(job.payload))
+                    except BaseException as e:  # noqa: BLE001
+                        exc_holder["err"] = e
 
-            t = threading.Thread(
-                target=_invoke,
-                name=f"{self.worker_name_prefix}-handler-{job.id}",
-                daemon=True,
-            )
-            t.start()
-            t.join(timeout=spec.timeout_seconds)
-            if t.is_alive():
+                t = threading.Thread(
+                    target=_invoke,
+                    name=f"{self.worker_name_prefix}-handler-{job.id}",
+                    daemon=True,
+                )
+                t.start()
+                t.join(timeout=spec.timeout_seconds)
+                if t.is_alive():
+                    timed_out = True
+                    break
+
+                err = exc_holder.get("err")
+                if err is None or not _is_database_locked_error(err):
+                    break
+
+                # Lock-retry path. Last attempt falls through with the
+                # error preserved so the regular fail() route runs.
+                if attempt_index >= len(_DB_LOCK_RETRY_BACKOFF):
+                    break
+                backoff_seconds = _DB_LOCK_RETRY_BACKOFF[attempt_index]
+                logger.debug(
+                    "JobWorkerPool: job %s (%s) hit database-locked "
+                    "(attempt %d/%d); retrying after %.2fs",
+                    job.id, job.handler_name,
+                    attempt_index + 1, attempts, backoff_seconds,
+                )
+                # ``Event.wait`` returns True if stop_event was set —
+                # honour shutdown by breaking out before the next try.
+                if self._stop_event.wait(backoff_seconds):
+                    break
+
+            if timed_out:
                 # Timeout — mark failed (with retry) and move on.
                 elapsed_ms = (time.monotonic() - start) * 1000
                 self.queue.fail(
@@ -348,6 +429,17 @@ class JobWorkerPool:
                 err = exc_holder["err"]
                 tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
                 elapsed_ms = (time.monotonic() - start) * 1000
+                # #1018 — log lock-exhaustion at WARNING (not ERROR /
+                # critical_error). The job is queued for a normal retry;
+                # the operator sees one warn line per exhaustion, not a
+                # full traceback escalated to a critical alert.
+                if _is_database_locked_error(err):
+                    logger.warning(
+                        "JobWorkerPool: job %s (%s) gave up after "
+                        "%d database-locked retries — queue.fail with "
+                        "retry=True for the regular backoff path",
+                        job.id, job.handler_name, attempts,
+                    )
                 self.queue.fail(job.id, tb, retry=True)
                 with self._metrics_lock:
                     self._metrics.for_handler(spec.name).record_outcome(
@@ -370,6 +462,22 @@ class JobWorkerPool:
                 # spamming tracebacks each poll is what zombied
                 # rail_daemon in #1006.
                 self._handle_closed_db("worker", "complete/fail")
+                return
+            if _is_database_locked_error(exc):
+                # #1018 — queue.complete()/fail() lost the WAL race.
+                # Log at warning (not exception) so the heartbeat
+                # alert pipeline does not escalate the transient
+                # contention to a ``critical_error`` alert.
+                logger.warning(
+                    "JobWorkerPool: queue bookkeeping for job %s (%s) "
+                    "hit transient database-locked: %s",
+                    job.id, job.handler_name, exc,
+                )
+                elapsed_ms = (time.monotonic() - start) * 1000
+                with self._metrics_lock:
+                    self._metrics.for_handler(job.handler_name).record_outcome(
+                        success=False, duration_ms=elapsed_ms
+                    )
                 return
             logger.exception(
                 "JobWorkerPool: unexpected error running job %s (%s): %s",

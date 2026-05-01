@@ -555,12 +555,14 @@ class SQLiteWorkService:
         self._session_mgr = session_manager
         self._conn = sqlite3.connect(str(db_path), timeout=30.0)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        # #1018: centralised WAL + busy_timeout. Wait up to 30 s for
+        # busy locks before raising — prevents the Textual inbox UI
+        # from erroring when the heartbeat or other writers hold the
+        # DB briefly.
+        from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas
+
+        apply_workspace_pragmas(self._conn, busy_timeout_ms=30000)
         self._conn.execute("PRAGMA foreign_keys=ON")
-        # Wait up to 30s for busy locks before raising — prevents the
-        # Textual inbox UI from erroring when the heartbeat or other
-        # writers hold the DB briefly.
-        self._conn.execute("PRAGMA busy_timeout=30000")
         create_work_tables(self._conn)
         self._gate_registry = GateRegistry(project_path=project_path)
         self._flow_cache: dict[tuple[str, int], FlowTemplate] = {}

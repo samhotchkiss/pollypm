@@ -116,6 +116,7 @@ from pollypm.cockpit_settings_history import (
 )
 from pollypm.cockpit_settings_projects import collect_settings_projects
 from pollypm.cockpit_workers import PollyWorkerRosterApp  # noqa: F401
+from pollypm.notify_task import is_notify_inbox_task
 from pollypm.rejection_feedback import (
     feedback_target_task_id,
     is_rejection_feedback_task,
@@ -9785,6 +9786,15 @@ def _dashboard_gather_tasks(
                     for found in svc.list_tasks(project=alias):
                         tid = getattr(found, "task_id", None)
                         if not tid or tid in seen_ids:
+                            continue
+                        # #1020 — notification-shaped tasks (rejection
+                        # feedback, plan-review handoff, supervisor
+                        # alerts, …) carry ``roles.operator = "user"``
+                        # and have no node-level transition affordance.
+                        # Hide them from the project-dashboard task
+                        # pipeline so they don't pad the queued/blocked
+                        # buckets next to genuinely actionable work.
+                        if is_notify_inbox_task(found):
                             continue
                         seen_ids.add(tid)
                         tasks.append(found)

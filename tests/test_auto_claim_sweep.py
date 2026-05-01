@@ -683,6 +683,150 @@ def test_dead_claim_check_accepts_exact_match(tmp_path: Path) -> None:
     assert _tmux_window_alive_for_task(svc, "app", 7) is True
 
 
+class _RecordingStore:
+    """Tiny alert/event store double for circuit-breaker tests (#1012)."""
+
+    def __init__(self) -> None:
+        self.alerts: list[tuple[str, str, str, str]] = []
+        self.events: list[dict[str, object]] = []
+
+    def upsert_alert(
+        self, scope: str, alert_type: str, severity: str, message: str,
+    ) -> None:
+        self.alerts.append((scope, alert_type, severity, message))
+
+    def append_event(
+        self,
+        *,
+        scope: str,
+        sender: str,
+        subject: str,
+        payload: dict[str, object] | None = None,
+    ) -> None:
+        self.events.append(
+            {
+                "scope": scope,
+                "sender": sender,
+                "subject": subject,
+                "payload": payload or {},
+            }
+        )
+
+
+def test_recover_dead_claims_circuit_breaker_after_consecutive_abandonments(
+    tmp_path: Path,
+) -> None:
+    """#1012: after MAX_CONSECUTIVE_ABANDONMENTS abandoned executions on
+    the active node, the recovery sweep must stop releasing the stale
+    claim and escalate to a ``spawn_failed_persistent`` error alert.
+
+    Pre-fix the loop was unbounded: ``release_stale_claim`` → re-queue
+    → auto-claim → ``provision_worker`` short-circuited on the orphan
+    row → no tmux window → next tick repeats. ``bikepath/8`` racked up
+    60+ ``build vN abandoned`` rows in ~7h.
+    """
+    from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
+        MAX_CONSECUTIVE_ABANDONMENTS,
+        SPAWN_FAILED_PERSISTENT_ALERT_TYPE,
+    )
+
+    bus.clear_listeners()
+    project_path = tmp_path / "proj"
+    project_path.mkdir()
+    task_id = _seed_queued_worker_task(
+        project_path, "proj", link_to_plan=False,
+    )
+
+    db_path = project_path / ".pollypm" / "state.db"
+    work = SQLiteWorkService(db_path=db_path, project_path=project_path)
+    try:
+        # Replay MAX_CONSECUTIVE_ABANDONMENTS spawn-fail cycles by
+        # hand: each iteration claims (creates an active execution),
+        # then release_stale_claim marks it abandoned + returns the
+        # task to queued. After enough cycles the streak hits the cap.
+        store = _RecordingStore()
+        svc = _svc_defaults(
+            session_service=_FakeSessionService(),
+            state_store=store,
+            msg_store=store,
+        )
+        totals = {"considered": 0, "by_outcome": {}}
+
+        for _ in range(MAX_CONSECUTIVE_ABANDONMENTS):
+            work.claim(task_id, "worker")
+            _recover_dead_claims(
+                svc, work, _FakeProject(key="proj", path=project_path), totals,
+            )
+
+        assert totals["by_outcome"].get("auto_claim_recovered", 0) == (
+            MAX_CONSECUTIVE_ABANDONMENTS
+        )
+
+        # One more claim attempt — this is the cycle that should trip
+        # the circuit breaker.
+        work.claim(task_id, "worker")
+        _recover_dead_claims(
+            svc, work, _FakeProject(key="proj", path=project_path), totals,
+        )
+
+        # Circuit breaker tripped: no fresh release this tick.
+        assert totals["by_outcome"].get("auto_claim_circuit_breaker", 0) == 1
+        assert totals["by_outcome"].get("auto_claim_recovered", 0) == (
+            MAX_CONSECUTIVE_ABANDONMENTS
+        )
+
+        # The task stays in_progress with the dead claim — we deliberately
+        # do NOT re-queue it on a tripped breaker.
+        latest = work.get(task_id)
+        assert latest.work_status == WorkStatus.IN_PROGRESS
+
+        # An error-severity ``spawn_failed_persistent`` alert was raised
+        # against the canonical worker-session candidate.
+        spawn_failed = [
+            entry for entry in store.alerts
+            if entry[1] == SPAWN_FAILED_PERSISTENT_ALERT_TYPE
+        ]
+        assert spawn_failed, "expected spawn_failed_persistent alert"
+        scope, _alert_type, severity, message = spawn_failed[-1]
+        assert severity == "error"
+        assert task_id in message
+        # Alert is keyed by the canonical worker-session candidate.
+        assert scope.startswith("worker") and "proj" in scope
+    finally:
+        work.close()
+
+
+def test_recover_dead_claims_streak_counts_only_active_node(tmp_path: Path) -> None:
+    """#1012: a successful turn between failures resets the streak.
+
+    The breaker must only react to the *current* node's recent
+    abandonments. A reject-bounce that walks the task back through the
+    review node before re-entering build still counts each visit at
+    the build node, but a completed build between two failures should
+    reset the streak — that's a working worker, not a broken spawn.
+    """
+    from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
+        _consecutive_abandonments_at_active_node,
+    )
+
+    # Hand-rolled task double — we just need ``current_node_id`` and
+    # ``executions`` shaped like ``FlowNodeExecution`` rows.
+    task = SimpleNamespace(
+        current_node_id="build",
+        executions=[
+            SimpleNamespace(node_id="build", visit=1, status=ExecutionStatus.ABANDONED),
+            # A completed visit must reset the streak — the worker did
+            # real work between failures, so the spawn pipeline isn't
+            # persistently broken.
+            SimpleNamespace(node_id="build", visit=2, status=ExecutionStatus.COMPLETED),
+            SimpleNamespace(node_id="build", visit=3, status=ExecutionStatus.ABANDONED),
+            SimpleNamespace(node_id="build", visit=4, status=ExecutionStatus.ABANDONED),
+        ],
+    )
+
+    assert _consecutive_abandonments_at_active_node(task) == 2
+
+
 def test_recover_dead_claims_returns_task_to_claimable_queue(tmp_path: Path) -> None:
     """#768 regression: a dead worker must leave the task genuinely
     claimable again, not bounced back to ``in_progress``.

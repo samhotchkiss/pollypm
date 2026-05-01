@@ -47,12 +47,31 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from pollypm.work.models import ActorType, WorkStatus
+from pollypm.work.models import ActorType, ExecutionStatus, WorkStatus
 from pollypm.work.task_assignment import (
     SessionRoleIndex,
     TaskAssignmentEvent,
     role_candidate_names,
 )
+
+
+# #1012 — auto-claim circuit breaker.
+#
+# When a task's per-task worker spawn fails repeatedly (no live tmux
+# window after each ``release_stale_claim`` → re-claim cycle), the
+# sweep used to keep retrying forever, accumulating one ``build vN
+# abandoned`` row per cycle (~50s apart). ``bikepath/8`` racked up
+# 60+ rows in ~7h before the user noticed.
+#
+# After ``MAX_CONSECUTIVE_ABANDONMENTS`` consecutive abandoned rows on
+# the active node, ``_recover_dead_claims`` stops releasing the stale
+# claim — the task stays ``in_progress`` with a dead assignee, and the
+# project's ``worker-<project>/no_session`` warn alert is escalated to
+# a ``worker-<project>/spawn_failed_persistent`` error so the user
+# sees an actionable blocker rather than a silent grow-the-history
+# loop.
+MAX_CONSECUTIVE_ABANDONMENTS = 5
+SPAWN_FAILED_PERSISTENT_ALERT_TYPE = "spawn_failed_persistent"
 
 from pollypm.plugins_builtin.project_planning.plan_presence import (
     has_acceptable_plan,
@@ -860,6 +879,98 @@ def _tmux_window_alive_for_task(
     return False
 
 
+def _consecutive_abandonments_at_active_node(task: Any) -> int:
+    """Return the count of consecutive ``ABANDONED`` executions at the
+    task's current node, walking backwards from the most recent visit.
+
+    #1012 — used by the circuit breaker. Stops counting at the first
+    non-ABANDONED status so a successful run between two failures
+    resets the streak (matching the user's mental model of "how many
+    spawn attempts in a row have failed since the last useful turn").
+    Walks across nodes are ignored because a failing per-task spawn
+    bounces against a single ``build`` (or whichever worker) node;
+    tracking only that node avoids confusing rejection bounces (which
+    visit the build node from the review node) with spawn failures.
+    """
+    current_node = getattr(task, "current_node_id", None)
+    if not current_node:
+        return 0
+    executions = list(getattr(task, "executions", []) or [])
+    # Sort newest-first by visit so we can walk backwards.
+    try:
+        executions.sort(
+            key=lambda e: int(getattr(e, "visit", 0) or 0),
+            reverse=True,
+        )
+    except Exception:  # noqa: BLE001
+        return 0
+    streak = 0
+    abandoned_value = ExecutionStatus.ABANDONED.value
+    for execution in executions:
+        if getattr(execution, "node_id", None) != current_node:
+            continue
+        status = getattr(execution, "status", None)
+        status_value = getattr(status, "value", status)
+        if status_value == abandoned_value:
+            streak += 1
+            continue
+        if status_value == ExecutionStatus.ACTIVE.value:
+            # The currently-active execution has not finished yet —
+            # don't count it but also don't reset the streak. The
+            # caller is invoked before ``release_stale_claim`` on the
+            # tick that's about to abandon this row, so the streak we
+            # care about is the one from prior visits.
+            continue
+        # Any completed visit (success / blocked / etc.) resets the
+        # streak — the worker did real work between failures.
+        break
+    return streak
+
+
+def _emit_spawn_failed_persistent_alert(
+    services: Any,
+    *,
+    project: str,
+    task_id: str,
+    streak: int,
+) -> None:
+    """Escalate the project's ``worker/no_session`` to error severity.
+
+    #1012 — fires once the abandonment streak has crossed
+    :data:`MAX_CONSECUTIVE_ABANDONMENTS`. The alert is keyed by the
+    canonical worker-session candidate (``worker-<project>``) so the
+    cockpit's per-session alert view groups it next to the warn-level
+    ``no_session`` row that's still firing in parallel until the next
+    sweep clears it. ``upsert_alert`` dedupes on ``(scope,
+    alert_type, status='open')`` so repeat ticks just refresh the row
+    rather than stacking duplicates.
+    """
+    store = getattr(services, "msg_store", None) or getattr(services, "state_store", None)
+    if store is None:
+        return
+    candidates = role_candidate_names("worker", project)
+    expected_name = candidates[0] if candidates else f"worker-{project}"
+    message = (
+        f"Auto-spawn for task {task_id} has failed {streak} times in a row "
+        "— manual intervention required. The per-task worker session never "
+        "materialised after the auto-claim sweep tried to spawn it. "
+        f"Try `pm task claim {task_id}` from a clean shell, or check the "
+        "supervisor logs for the underlying launch failure."
+    )
+    try:
+        store.upsert_alert(
+            expected_name,
+            SPAWN_FAILED_PERSISTENT_ALERT_TYPE,
+            "error",
+            message,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "task_auto_claim: spawn_failed_persistent upsert_alert failed for %s",
+            expected_name, exc_info=True,
+        )
+
+
 def _recover_dead_claims(
     services: Any,
     work: Any,
@@ -873,6 +984,14 @@ def _recover_dead_claims(
     (crashed session, closed window, host reboot), clear the stale claim
     state and walk the task back through queued so it becomes eligible
     for auto-claim or a manual ``pm task claim`` on the next sweep tick.
+
+    #1012 — circuit breaker: when the same task has accumulated
+    :data:`MAX_CONSECUTIVE_ABANDONMENTS` consecutive abandoned
+    executions on its active node without producing a working session,
+    we stop releasing fresh visits. The task stays ``in_progress`` and
+    a ``spawn_failed_persistent`` (error) alert is raised so the user
+    sees an actionable blocker instead of a silent forever-loop that
+    only manifests as a slow-growing execution history.
     """
     project_key = getattr(project, "key", None)
     if not project_key:
@@ -895,6 +1014,31 @@ def _recover_dead_claims(
             continue
         # Window is gone — release the claim back to queued.
         task_id = getattr(task, "task_id", f"{project_key}/{task_number}")
+
+        # #1012 — circuit breaker. Refuse to release the claim once
+        # the streak hits the cap; releasing would just enqueue another
+        # auto-claim attempt that fails the same way and racks up
+        # another abandoned execution.
+        streak = _consecutive_abandonments_at_active_node(task)
+        if streak >= MAX_CONSECUTIVE_ABANDONMENTS:
+            by_outcome["auto_claim_circuit_breaker"] = (
+                by_outcome.get("auto_claim_circuit_breaker", 0) + 1
+            )
+            _emit_spawn_failed_persistent_alert(
+                services,
+                project=project_key,
+                task_id=task_id,
+                streak=streak,
+            )
+            logger.warning(
+                "task_auto_claim: circuit-breaker tripped for %s "
+                "(%d consecutive abandonments at node %r); refusing to "
+                "release stale claim until the underlying spawn failure "
+                "is resolved (#1012)",
+                task_id, streak, getattr(task, "current_node_id", None),
+            )
+            continue
+
         try:
             release = getattr(work, "release_stale_claim", None)
             if not callable(release):

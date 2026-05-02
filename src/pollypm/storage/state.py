@@ -1258,25 +1258,46 @@ class StateStore:
         ).fetchall()
         return [EventRecord(*row) for row in rows]
 
-    def prune_old_data(self, *, event_days: int = 7, heartbeat_hours: int = 24) -> dict[str, int]:
-        """Remove old events and heartbeat observations. Returns counts of pruned rows."""
+    def prune_old_data(
+        self,
+        *,
+        event_days: int | None = 7,
+        heartbeat_hours: int = 24,
+    ) -> dict[str, int]:
+        """Remove old events and heartbeat observations. Returns counts of pruned rows.
+
+        ``event_days=None`` skips the events prune entirely (the
+        ``events_retention_sweep_handler`` owns tiered retention; this
+        path is kept only for the legacy heartbeat prune). Passing a
+        sentinel like ``10**6`` used to overflow Python's ``datetime``
+        when subtracted from ``now()`` (#1047) — pass ``None`` instead
+        when "effectively never prune events" is the intent.
+        """
         from datetime import timedelta
         now = datetime.now(UTC)
-        event_cutoff = (now - timedelta(days=event_days)).isoformat()
         heartbeat_cutoff = (now - timedelta(hours=heartbeat_hours)).isoformat()
         with self._lock:
-            e_cursor = self._conn.execute(
-                "DELETE FROM messages "
-                "WHERE type = 'event' AND created_at < ? "
-                "AND COALESCE(json_extract(payload_json, '$.pinned'), 0) != 1",
-                (event_cutoff,),
-            )
-            events_pruned = e_cursor.rowcount
+            if event_days is None:
+                events_pruned = 0
+            else:
+                event_cutoff = (now - timedelta(days=event_days)).isoformat()
+                e_cursor = self._conn.execute(
+                    "DELETE FROM messages "
+                    "WHERE type = 'event' AND created_at < ? "
+                    "AND COALESCE(json_extract(payload_json, '$.pinned'), 0) != 1",
+                    (event_cutoff,),
+                )
+                events_pruned = e_cursor.rowcount
             h_cursor = self._conn.execute("DELETE FROM heartbeats WHERE created_at < ?", (heartbeat_cutoff,))
             heartbeats_pruned = h_cursor.rowcount
+            # Commit the DELETEs BEFORE the WAL checkpoint — the
+            # checkpoint can't run while a writer transaction is open
+            # (it raises ``database table is locked``). Running commit
+            # first releases the write lock so the checkpoint can
+            # truncate the WAL successfully.
+            self._conn.commit()
             # WAL checkpoint to reclaim disk space
             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            self._conn.commit()
         return {"events": events_pruned, "heartbeats": heartbeats_pruned}
 
     def record_heartbeat(

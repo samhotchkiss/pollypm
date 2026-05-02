@@ -83,7 +83,11 @@ def alerts_gc_handler(payload: dict[str, Any]) -> dict[str, Any]:
 
         supervisor = Supervisor(config)
         released = supervisor.release_expired_leases()
-        pruned = store.prune_old_data(event_days=10**6)
+        # ``event_days=None`` skips the events prune — tiered retention
+        # is handled by ``events_retention_sweep_handler``. Passing a
+        # large sentinel like ``10**6`` used to overflow ``datetime``
+        # when subtracted from ``now()`` (#1047).
+        pruned = store.prune_old_data(event_days=None)
         return {
             "leases_released": len(released),
             "events_pruned": int(pruned.get("events", 0)),

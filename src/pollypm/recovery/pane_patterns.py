@@ -145,18 +145,51 @@ def _match_stuck_on_error(pane_text: str) -> bool:
 
 
 # Permission prompt. Claude Code renders these as a framed yes/no
-# prompt with ``Do you want to proceed?`` on a line of its own, plus
-# a numbered ``1. Yes`` / ``2. No`` footer. Codex uses
-# ``Do you approve?``. We match either the question or the
-# ``permissions`` chrome because the latter survives ANSI stripping
-# even when the former scrolls off the top of the capture.
+# prompt with a natural-language question (``Do you want to
+# proceed?``, ``Do you want to allow this?``, ``Do you want to make
+# this edit?``) on a line of its own, plus a numbered ``1. Yes`` /
+# ``2. No`` footer. Codex uses ``Do you approve?``.
+#
+# Issue #1058: an earlier version of this regex matched bare
+# ``Allow once`` and a bare ``1. Yes`` / ``2. No`` pair, which fired
+# on idle architect/worker panes whenever those phrases appeared in
+# transcripts, issue bodies, or mid-sentence prose. Three+ false-
+# positive ``pane:permission_prompt`` alerts per tick trained users
+# to ignore the alert class entirely. We now require either:
+#
+#   1. a natural-language permission cue (``Do you want to ...``,
+#      ``Do you approve?``), OR
+#   2. the numbered Yes/No menu *together with* one of the prompt-
+#      only cues that never appear in idle chrome (``and tell
+#      Claude``, ``don't ask again``, ``esc to interrupt``,
+#      ``esc and tell``).
+#
+# The literal ⎔ permissions chrome is still accepted because it's a
+# unicode-specific marker that survives ANSI stripping. The bare ``›``
+# Claude Code idle indicator must NOT match — it appears on every
+# healthy session waiting for input.
 _PERMISSION_RE = re.compile(
     r"(?:"
-    r"Do\s+you\s+want\s+to\s+proceed\?"
+    # Natural-language permission question — the strongest single
+    # signal. Covers Claude's "Do you want to {proceed,allow,approve,
+    # make this edit,run this,continue}?" plus Codex's "Do you approve?".
+    r"Do\s+you\s+want\s+to\s+"
+    r"(?:proceed|allow|approve|make\s+this\s+edit|run\s+this|continue)"
     r"|Do\s+you\s+approve\?"
     r"|\u2394\s*permissions?\s+prompt"            # ⎔ permissions prompt
-    r"|\bAllow\s+once\b"
-    r"|\b1\.\s*Yes\b[^\n]*\n[^\n]*\b2\.\s*No\b"   # 1. Yes / 2. No menu
+    # Numbered ``1. Yes`` / ``2. No`` menu — only counts when
+    # accompanied by one of the prompt-only cues that never appear in
+    # idle pane chrome ("and tell Claude" / "don't ask again" /
+    # "esc to interrupt" / "esc and tell"). Bare ``1. Yes`` /
+    # ``2. No`` lines can appear in code, transcripts, or issue text
+    # without being a real framed prompt — issue #1058. The earlier
+    # ``\bAllow\s+once\b`` alternative was also removed in #1058
+    # because mid-sentence prose ("we should allow once they confirm")
+    # tripped it on idle architect panes.
+    r"|\b1\.\s*Yes\b[^\n]{0,80}\n(?:[^\n]*\n){0,4}?\s*2\.\s*No"
+    r"[\s\S]{0,200}?"
+    r"(?:and\s+tell\s+Claude|don['’]t\s+ask\s+again"
+    r"|esc\s+to\s+interrupt|esc\s+and\s+tell)"
     r")",
     re.IGNORECASE,
 )

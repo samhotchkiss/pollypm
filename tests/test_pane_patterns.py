@@ -87,12 +87,103 @@ Bash command:
 
 Do you want to proceed?
 1. Yes
-2. No
+2. No, and tell Claude what to do differently (esc)
 """
 
 PERMISSION_PROMPT_NEGATIVE = """
 The user asked me to clean the cache. I'll plan the steps and check
 in before doing anything destructive — no permission prompt yet.
+"""
+
+# Real Claude Code "Do you want to make this edit?" framed prompt — must match.
+PERMISSION_PROMPT_EDIT_POSITIVE = """
+Edit src/pollypm/recovery/pane_patterns.py:
+
+Do you want to make this edit to pane_patterns.py?
+
+1. Yes
+2. No, and tell Claude what to do differently (esc)
+"""
+
+# Real Claude Code "Do you want to allow this?" framed prompt — must match.
+PERMISSION_PROMPT_ALLOW_POSITIVE = """
+Run command: rm -rf build/
+
+Do you want to allow this?
+
+1. Yes
+2. Yes, and don't ask again for rm
+3. No, and tell Claude what to do differently (esc)
+"""
+
+# Codex "Do you approve?" framed prompt — must match.
+PERMISSION_PROMPT_CODEX_POSITIVE = """
+Apply patch to src/main.py?
+
+Do you approve?
+
+1. Yes
+2. No, and tell me what to do
+"""
+
+# Issue #1058 false positives — idle / finished / thinking panes that
+# show the bare ``›`` Claude Code idle indicator MUST NOT match.
+
+# Codex idle pane (the canonical false-positive trigger from #1058).
+PERMISSION_PROMPT_IDLE_CODEX_NEGATIVE = """
+OpenAI Codex
+
+› Improve documentation in @filename
+
+  gpt-5.5 default · ~/dev/russell/...
+"""
+
+# Claude Code idle pane with the bypass-permissions footer chrome.
+PERMISSION_PROMPT_IDLE_CLAUDE_NEGATIVE = """
+> What would you like to do next?
+
+  Opus 4.6 (1M context) · Claude Max
+  ⏵⏵ bypass permissions on (shift+tab to cycle)                                     22038 tokens
+"""
+
+# Pane that just finished a turn and is sitting at the idle ``›``
+# prompt with a "Sautéed for ..." completion line above.
+PERMISSION_PROMPT_FINISHED_TURN_NEGATIVE = """
+✓ Sautéed for 2m 26s · esc to clear
+
+›
+
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+"""
+
+# Pane mid-thinking — the spinner / token count line above the ``›``
+# indicator. Real prompts never appear while a turn is in progress.
+PERMISSION_PROMPT_THINKING_NEGATIVE = """
+* Working… ~12.8k tokens · esc to interrupt
+
+›
+
+  Opus 4.6 (1M context) · Claude Max
+"""
+
+# Prose mentioning "allow once" mid-sentence (e.g. transcribed issue
+# body, code review discussion). Pre-#1058 the bare ``\\bAllow\\s+once\\b``
+# alternative tripped on this. MUST NOT match.
+PERMISSION_PROMPT_ALLOW_ONCE_PROSE_NEGATIVE = """
+The user said: we should allow once they confirm.
+
+Reviewing the diff in src/pollypm/recovery/pane_patterns.py — the
+allow-once semantics live in cockpit_alert_actions.py.
+"""
+
+# Bare numbered list (1. Yes / 2. No) appearing in code or docs
+# without the prompt-only cues. Pre-#1058 this matched. MUST NOT match.
+PERMISSION_PROMPT_BARE_MENU_NEGATIVE = """
+The spec lists two options:
+1. Yes, ship the feature behind a flag
+2. No, hold for the next release
+
+Both are reasonable; let's discuss in the meeting.
 """
 
 
@@ -151,6 +242,70 @@ class TestClassifyPane:
     def test_permission_prompt_negative(self) -> None:
         assert "permission_prompt" not in classify_pane(
             PERMISSION_PROMPT_NEGATIVE,
+        )
+
+    # Issue #1058 — natural-language permission cues for the modern
+    # Claude Code prompts ("make this edit", "allow this") and the
+    # Codex equivalent ("Do you approve?") must all match.
+
+    def test_permission_prompt_make_this_edit_positive(self) -> None:
+        assert "permission_prompt" in classify_pane(
+            PERMISSION_PROMPT_EDIT_POSITIVE,
+        )
+
+    def test_permission_prompt_allow_this_positive(self) -> None:
+        assert "permission_prompt" in classify_pane(
+            PERMISSION_PROMPT_ALLOW_POSITIVE,
+        )
+
+    def test_permission_prompt_codex_approve_positive(self) -> None:
+        assert "permission_prompt" in classify_pane(
+            PERMISSION_PROMPT_CODEX_POSITIVE,
+        )
+
+    # Issue #1058 — the bare ``›`` Claude Code idle indicator and the
+    # phrases that historically tripped the broad regex (``Allow
+    # once``, bare ``1. Yes`` / ``2. No`` menus) must NOT match. These
+    # were emitting 3+ false-positive ``pane:permission_prompt`` alerts
+    # per tick on healthy idle architects, training users to ignore
+    # the alert class entirely.
+
+    def test_permission_prompt_idle_codex_pane_negative(self) -> None:
+        # Canonical false-positive from #1058: a Codex pane sitting at
+        # the default ``› Improve documentation in @filename`` prompt
+        # is idle, not asking for permission.
+        assert "permission_prompt" not in classify_pane(
+            PERMISSION_PROMPT_IDLE_CODEX_NEGATIVE,
+        )
+
+    def test_permission_prompt_idle_claude_pane_negative(self) -> None:
+        assert "permission_prompt" not in classify_pane(
+            PERMISSION_PROMPT_IDLE_CLAUDE_NEGATIVE,
+        )
+
+    def test_permission_prompt_finished_turn_pane_negative(self) -> None:
+        assert "permission_prompt" not in classify_pane(
+            PERMISSION_PROMPT_FINISHED_TURN_NEGATIVE,
+        )
+
+    def test_permission_prompt_thinking_pane_negative(self) -> None:
+        assert "permission_prompt" not in classify_pane(
+            PERMISSION_PROMPT_THINKING_NEGATIVE,
+        )
+
+    def test_permission_prompt_allow_once_prose_negative(self) -> None:
+        # Pre-#1058 the bare ``\\bAllow\\s+once\\b`` alternative
+        # tripped on prose mentioning the phrase mid-sentence.
+        assert "permission_prompt" not in classify_pane(
+            PERMISSION_PROMPT_ALLOW_ONCE_PROSE_NEGATIVE,
+        )
+
+    def test_permission_prompt_bare_menu_negative(self) -> None:
+        # Pre-#1058 a bare ``1. Yes`` / ``2. No`` pair in code or docs
+        # tripped the regex. We now require an accompanying prompt-
+        # only cue ("and tell Claude" / "esc to interrupt" / etc.).
+        assert "permission_prompt" not in classify_pane(
+            PERMISSION_PROMPT_BARE_MENU_NEGATIVE,
         )
 
     def test_theme_trust_modal_positive_theme(self) -> None:

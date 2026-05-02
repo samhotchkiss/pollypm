@@ -527,6 +527,21 @@ def status_cmd(
         base_dir, since=since, project=project_key, decision="emit",
     )
 
+    # #1037: production passes ``work_service=None`` to the tick handler
+    # and ``enqueue_advisor_review`` no-ops on a None service — the real
+    # enqueue path lands in ad03. Until then, ticks fire and the path
+    # probe (post-#1037 fix) finds tracked activity, but no review task
+    # is created and no history row gets written. Surface the planned-
+    # gap explicitly when ``last_run`` is still empty + the plugin is
+    # active, so users don't chase it as a bug.
+    in_stub_mode = (
+        not proj_state.last_run
+        and bool(proj_state.last_tick_at)
+        and settings.enabled
+        and proj_state.enabled
+        and not paused
+    )
+
     payload: dict[str, Any] = {
         "project": project_key,
         "plugin_enabled": settings.enabled,
@@ -538,6 +553,7 @@ def status_cmd(
         "last_tick_at": proj_state.last_tick_at or None,
         "next_tick": _next_scheduled(settings.cadence, now_utc=now_utc),
         "emits_24h": len(emit_window),
+        "stub_mode": in_stub_mode,
         "now_utc": now_utc.isoformat(),
     }
 
@@ -552,7 +568,14 @@ def status_cmd(
     typer.echo(f"paused:           {'yes' if payload['paused'] else 'no'}")
     if payload["pause_until"]:
         typer.echo(f"pause until:      {payload['pause_until']}")
-    typer.echo(f"last run:         {payload['last_run'] or '(never)'}")
+    if payload["last_run"]:
+        typer.echo(f"last run:         {payload['last_run']}")
+    elif in_stub_mode:
+        typer.echo(
+            "last run:         (advisor in stub-mode — production enqueue lands in ad03)"
+        )
+    else:
+        typer.echo("last run:         (never)")
     typer.echo(f"last tick:        {payload['last_tick_at'] or '(never)'}")
     typer.echo(f"next tick:        {payload['next_tick']}")
     typer.echo(f"emits in last 24h: {payload['emits_24h']}")

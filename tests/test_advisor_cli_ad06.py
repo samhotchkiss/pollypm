@@ -323,6 +323,91 @@ class TestStatus:
         assert "cadence:" in result.output
         assert "emits in last 24h:" in result.output
 
+    def test_status_stub_mode_when_tick_ran_without_run(self, env) -> None:
+        """#1037: tick has fired (last_tick_at set) but last_run is empty.
+
+        Production passes ``work_service=None`` to the tick handler and
+        the enqueue stub silently no-ops (real path lands in ad03), so
+        ``last_run`` stays ``(never)`` even when ticks fire on cadence.
+        Status must call this out as the planned-not-yet-shipped state
+        rather than the bare ``(never)`` that reads as a bug.
+        """
+        state = load_state(env["base_dir"])
+        proj = state.get("proj")
+        proj.last_tick_at = datetime.now(UTC).isoformat()
+        proj.last_run = ""
+        save_state(env["base_dir"], state)
+
+        result = runner.invoke(
+            advisor_app,
+            ["status", "--project", "proj", "--config", str(env["config_path"])],
+        )
+        assert result.exit_code == 0, result.output
+        assert "stub-mode" in result.output
+        assert "ad03" in result.output
+
+    def test_status_stub_mode_flag_in_json(self, env) -> None:
+        state = load_state(env["base_dir"])
+        proj = state.get("proj")
+        proj.last_tick_at = datetime.now(UTC).isoformat()
+        proj.last_run = ""
+        save_state(env["base_dir"], state)
+
+        result = runner.invoke(
+            advisor_app,
+            ["status", "--project", "proj",
+             "--config", str(env["config_path"]), "--json"],
+        )
+        payload = json.loads(result.output)
+        assert payload["stub_mode"] is True
+        assert payload["last_run"] is None
+
+    def test_status_no_stub_message_before_first_tick(self, env) -> None:
+        """A fresh project (no last_tick_at) shows ``(never)``, not stub-mode.
+
+        We only surface the stub-mode hint once the cadence has actually
+        fired at least once — otherwise the user has no breadcrumb that
+        would tell them whether it's a real schedule problem.
+        """
+        result = runner.invoke(
+            advisor_app,
+            ["status", "--project", "proj", "--config", str(env["config_path"])],
+        )
+        assert result.exit_code == 0, result.output
+        assert "(never)" in result.output
+        assert "stub-mode" not in result.output
+
+    def test_status_no_stub_message_when_run_recorded(self, env) -> None:
+        """Once ``mark_last_run`` stamps last_run, stub-mode goes away."""
+        state = load_state(env["base_dir"])
+        proj = state.get("proj")
+        proj.last_tick_at = datetime.now(UTC).isoformat()
+        proj.last_run = datetime.now(UTC).isoformat()
+        save_state(env["base_dir"], state)
+
+        result = runner.invoke(
+            advisor_app,
+            ["status", "--project", "proj", "--config", str(env["config_path"])],
+        )
+        assert "stub-mode" not in result.output
+
+    def test_status_no_stub_message_when_paused(self, env) -> None:
+        """Paused projects shouldn't claim to be in stub-mode — pause is
+        the correct explanation, surface that instead."""
+        state = load_state(env["base_dir"])
+        proj = state.get("proj")
+        proj.last_tick_at = datetime.now(UTC).isoformat()
+        proj.last_run = ""
+        proj.pause_until = (datetime.now(UTC) + timedelta(hours=2)).isoformat()
+        save_state(env["base_dir"], state)
+
+        result = runner.invoke(
+            advisor_app,
+            ["status", "--project", "proj", "--config", str(env["config_path"])],
+        )
+        assert "stub-mode" not in result.output
+        assert "(never)" in result.output
+
 
 # ---------------------------------------------------------------------------
 # [advisor] config — parse + load.

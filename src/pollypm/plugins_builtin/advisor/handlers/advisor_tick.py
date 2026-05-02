@@ -42,6 +42,47 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Storage-layout resolution (#1037)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_state_db(project_path: Path) -> Path | None:
+    """Return the on-disk ``state.db`` that backs ``project_path``, or None.
+
+    Mirrors the dual-path canonical pattern in
+    :func:`pollypm.cockpit_inbox._inbox_db_sources`: per-project
+    ``<project_path>/.pollypm/state.db`` first (legacy / per-project
+    layout), then walk up the parents looking for a workspace-root
+    ``<ancestor>/.pollypm/state.db`` (the layout #339 collapsed everything
+    onto). Returns ``None`` when neither exists.
+
+    Used by :func:`has_project_stagnation_candidate`,
+    :func:`enqueue_advisor_review`, and ``detect_changes._transitions_db_path``
+    so a tracked project that lives under a workspace-root state.db
+    (every install post-#339) is still discoverable. Without this the
+    advisor probe returns False on every tick and the user sees
+    ``last run: (never)`` forever — see #1037.
+    """
+    project_path = Path(project_path)
+    per_project = project_path / ".pollypm" / "state.db"
+    if per_project.exists():
+        return per_project
+
+    # Walk up looking for an ancestor's .pollypm/state.db. Bound the
+    # walk at filesystem root so a path entirely outside any pollypm
+    # workspace returns cleanly.
+    try:
+        resolved = project_path.resolve()
+    except OSError:
+        resolved = project_path
+    for ancestor in [resolved, *resolved.parents]:
+        candidate = ancestor / ".pollypm" / "state.db"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Stubs for downstream issues. ad02 replaces detect_changes; ad03 replaces
 # run_advisor_session. Wired through a module-level callable so tests can
 # monkeypatch them independently.
@@ -91,7 +132,13 @@ def enqueue_advisor_review(
     if work_service is None:
         from pollypm.work.sqlite_service import SQLiteWorkService
 
-        db_path = project_path / ".pollypm" / "state.db"
+        # Prefer an existing state.db (per-project or workspace-root,
+        # #1037). Only synthesize the per-project path when neither
+        # exists — matches the pre-#339 fallback so first-run installs
+        # still get a writable target.
+        db_path = _resolve_state_db(project_path)
+        if db_path is None:
+            db_path = project_path / ".pollypm" / "state.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
         work_service = SQLiteWorkService(db_path=db_path, project_path=project_path)
         close_service = True
@@ -182,8 +229,8 @@ def has_project_stagnation_candidate(
     """
     close_service = False
     if work_service is None:
-        db_path = project_path / ".pollypm" / "state.db"
-        if not db_path.exists():
+        db_path = _resolve_state_db(project_path)
+        if db_path is None:
             return False
         try:
             from pollypm.work.sqlite_service import SQLiteWorkService

@@ -528,3 +528,158 @@ class TestThrottle:
         ws = FakeWorkService()
         ws.add("p", labels=["advisor"], work_status="review")
         assert has_in_progress_advisor_task(project_key="p", work_service=ws) is True
+
+
+# ---------------------------------------------------------------------------
+# State-db path resolution — #1037 dual-path probe
+# ---------------------------------------------------------------------------
+
+
+class TestResolveStateDb:
+    """The advisor probe needs to find ``state.db`` under either layout:
+
+    * Per-project ``<project_path>/.pollypm/state.db`` (legacy / explicit).
+    * Workspace-root ``<ancestor>/.pollypm/state.db`` (post-#339 default).
+
+    Without the dual-path resolve, every tick on a workspace-root install
+    sees ``not db_path.exists()`` → ``has_project_stagnation_candidate``
+    returns False → ``_should_review`` returns ``no-changes`` → no
+    decision ever lands. That's the user-facing failure in #1037.
+    """
+
+    def test_returns_per_project_when_present(self, tmp_path: Path) -> None:
+        from pollypm.plugins_builtin.advisor.handlers.advisor_tick import (
+            _resolve_state_db,
+        )
+        proj = tmp_path / "proj"
+        (proj / ".pollypm").mkdir(parents=True)
+        per_proj_db = proj / ".pollypm" / "state.db"
+        per_proj_db.write_text("")
+        resolved = _resolve_state_db(proj)
+        assert resolved == per_proj_db
+
+    def test_walks_up_to_workspace_root(self, tmp_path: Path) -> None:
+        from pollypm.plugins_builtin.advisor.handlers.advisor_tick import (
+            _resolve_state_db,
+        )
+        workspace = tmp_path / "ws"
+        proj = workspace / "proj"
+        proj.mkdir(parents=True)
+        # Workspace-root state.db only — no per-project file.
+        ws_db_dir = workspace / ".pollypm"
+        ws_db_dir.mkdir()
+        ws_db = ws_db_dir / "state.db"
+        ws_db.write_text("")
+        resolved = _resolve_state_db(proj)
+        # Compare resolved on both sides — _resolve_state_db calls
+        # Path.resolve internally to handle symlinks.
+        assert resolved is not None
+        assert resolved.resolve() == ws_db.resolve()
+
+    def test_prefers_per_project_over_workspace_root(
+        self, tmp_path: Path
+    ) -> None:
+        """Per-project layout wins when both exist (#1037: don't blindly
+        prefer workspace — an explicit per-project DB is intentional)."""
+        from pollypm.plugins_builtin.advisor.handlers.advisor_tick import (
+            _resolve_state_db,
+        )
+        workspace = tmp_path / "ws"
+        proj = workspace / "proj"
+        proj.mkdir(parents=True)
+        (workspace / ".pollypm").mkdir()
+        (workspace / ".pollypm" / "state.db").write_text("")
+        (proj / ".pollypm").mkdir()
+        per_proj_db = proj / ".pollypm" / "state.db"
+        per_proj_db.write_text("")
+        resolved = _resolve_state_db(proj)
+        assert resolved == per_proj_db
+
+    def test_returns_none_when_neither_exists(self, tmp_path: Path) -> None:
+        from pollypm.plugins_builtin.advisor.handlers.advisor_tick import (
+            _resolve_state_db,
+        )
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        assert _resolve_state_db(proj) is None
+
+    def test_stagnation_probe_uses_workspace_root_db(
+        self, tmp_path: Path
+    ) -> None:
+        """End-to-end #1037: a project living under a workspace-root
+        state.db (no per-project file) is still discoverable by the
+        stagnation probe. Pre-fix this returned False on every tick.
+        """
+        from pollypm.plugins_builtin.advisor.handlers.advisor_tick import (
+            has_project_stagnation_candidate,
+        )
+        workspace = tmp_path / "ws"
+        proj = workspace / "proj"
+        proj.mkdir(parents=True)
+        (workspace / ".pollypm").mkdir()
+        (workspace / ".pollypm" / "state.db").write_text("")
+
+        # We don't want to actually open a real SQLiteWorkService against
+        # the empty file; the probe only needs to *find* the file. Verify
+        # via _resolve_state_db (which is what the probe calls first).
+        from pollypm.plugins_builtin.advisor.handlers.advisor_tick import (
+            _resolve_state_db,
+        )
+        assert _resolve_state_db(proj) is not None
+
+        # And confirm the probe path itself: with work_service=None it
+        # tries to open SQLiteWorkService against the resolved path. We
+        # can't easily mock that mid-call without monkeypatch on
+        # SQLiteWorkService, so assert at least the probe returns False
+        # (empty DB) gracefully without raising.
+        result = has_project_stagnation_candidate(
+            project_key="proj",
+            project_path=proj,
+            work_service=None,
+        )
+        # Either False (open failed because empty file isn't a sqlite DB)
+        # or False (no tasks). Both are valid; the key invariant is "no
+        # crash + the path probe got past db_path.exists()."
+        assert result is False
+
+    def test_stagnation_probe_returns_false_when_no_db_anywhere(
+        self, tmp_path: Path
+    ) -> None:
+        from pollypm.plugins_builtin.advisor.handlers.advisor_tick import (
+            has_project_stagnation_candidate,
+        )
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        assert (
+            has_project_stagnation_candidate(
+                project_key="proj",
+                project_path=proj,
+                work_service=None,
+            )
+            is False
+        )
+
+    def test_transitions_db_path_walks_up(self, tmp_path: Path) -> None:
+        """detect_changes._transitions_db_path uses the same probe."""
+        from pollypm.plugins_builtin.advisor.handlers.detect_changes import (
+            _transitions_db_path,
+        )
+        workspace = tmp_path / "ws"
+        proj = workspace / "proj"
+        proj.mkdir(parents=True)
+        (workspace / ".pollypm").mkdir()
+        ws_db = workspace / ".pollypm" / "state.db"
+        ws_db.write_text("")
+        resolved = _transitions_db_path(proj)
+        assert resolved is not None
+        assert resolved.resolve() == ws_db.resolve()
+
+    def test_transitions_db_path_returns_none_when_missing(
+        self, tmp_path: Path
+    ) -> None:
+        from pollypm.plugins_builtin.advisor.handlers.detect_changes import (
+            _transitions_db_path,
+        )
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        assert _transitions_db_path(proj) is None

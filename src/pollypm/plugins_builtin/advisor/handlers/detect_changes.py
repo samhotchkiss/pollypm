@@ -241,13 +241,23 @@ _TRANSITION_SQL = (
 )
 
 
-def _transitions_db_path(project_path: Path) -> Path:
+def _transitions_db_path(project_path: Path) -> Path | None:
     """Resolve the read-only work-service DB path for a project.
 
-    Matches the briefing gather_yesterday logic — per-project
-    ``.pollypm/state.db``.
+    Tries the per-project ``<project_path>/.pollypm/state.db`` first
+    (legacy / per-project layout) then walks up to the workspace-root
+    ``<ancestor>/.pollypm/state.db`` (the layout #339 collapsed onto).
+    Returns ``None`` when no state.db is reachable — callers treat that
+    as "no transitions this window," same as a missing per-project file.
+
+    See :func:`pollypm.plugins_builtin.advisor.handlers.advisor_tick._resolve_state_db`
+    for the canonical helper; we re-import it instead of duplicating
+    the walk so the two probes stay in lockstep (#1037).
     """
-    return project_path / ".pollypm" / "state.db"
+    from pollypm.plugins_builtin.advisor.handlers.advisor_tick import (
+        _resolve_state_db,
+    )
+    return _resolve_state_db(project_path)
 
 
 def _gather_task_transitions(
@@ -278,7 +288,7 @@ def _gather_task_transitions(
             return list(rows)
 
     db_path = _transitions_db_path(project_path)
-    if not db_path.exists():
+    if db_path is None or not db_path.exists():
         return []
 
     try:

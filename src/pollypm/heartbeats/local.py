@@ -1577,13 +1577,27 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         text = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", delta)
         snippet = _select_snippet(text)
         lowered = text.lower()
-        if any(pattern in lowered for pattern in self._WAITING_PATTERNS):
+        # #1043 — workers polling ``pm task next -p <project>`` for new work
+        # would trip the ``\bnext\b`` regex below and the classifier would
+        # mislabel idle polling as ``needs_followup``. Strip the command
+        # literal (and the matching idle-poll output / "before next poll"
+        # idle-loop language) before pattern matching so classification
+        # reflects worker state, not the command name. The original
+        # ``text`` is preserved for snippet rendering.
+        text_for_classify = re.sub(r"pm task next(?:\s+-p\s+\S+)?", " ", lowered)
+        text_for_classify = re.sub(r"no tasks available\.?", " ", text_for_classify)
+        text_for_classify = re.sub(
+            r"\bbefore\s+next\s+(?:poll|tick|run|loop|check)\b",
+            " ",
+            text_for_classify,
+        )
+        if any(pattern in text_for_classify for pattern in self._WAITING_PATTERNS):
             return "blocked", f"Waiting on operator input — {snippet}"
-        if any(pattern in lowered for pattern in self._FOLLOWUP_PATTERNS):
+        if any(pattern in text_for_classify for pattern in self._FOLLOWUP_PATTERNS):
             return "needs_followup", f"Additional work remains — {snippet}"
-        if any(pattern in lowered for pattern in self._DONE_PATTERNS):
+        if any(pattern in text_for_classify for pattern in self._DONE_PATTERNS):
             return "done", f"Last turn appears complete — {snippet}"
-        if re.search(r"\b(next|remaining|follow-up|follow up|still need)\b", lowered):
+        if re.search(r"\b(next|remaining|follow-up|follow up|still need)\b", text_for_classify):
             return "needs_followup", f"Additional work remains — {snippet}"
         if lowered.endswith("?"):
             return "blocked", f"Last turn ended with a question — {snippet}"

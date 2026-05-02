@@ -7,6 +7,7 @@ from pathlib import Path
 
 from pollypm.config import load_config
 from pollypm.models import AccountConfig, ProviderKind
+from pollypm.projects import slugify_project_key
 from pollypm.providers import get_provider
 from pollypm.storage.state import StateStore, TokenUsageHourlyRecord
 
@@ -52,10 +53,19 @@ def _mtime_timestamp(path: Path) -> datetime:
 
 
 def _project_key_for_cwd(config, cwd: str | None) -> str:
+    # #1042 — every fallback path used to return ``config.project.name``,
+    # which is the *display name* (e.g. ``"PollyPM"``) — not the slug
+    # (``"pollypm"``) that the registered ``config.projects`` keys use.
+    # That meant any cwd that didn't resolve to a registered project (or
+    # was missing) wrote ``project_key="PollyPM"`` while cwd-resolved
+    # samples wrote ``project_key="pollypm"``, and ``pm costs`` reported
+    # the same project on two rows. Canonicalize the fallback to a slug
+    # so all writers agree on case.
+    fallback = slugify_project_key(config.project.name)
     if not cwd:
-        return config.project.name
+        return fallback
     current = Path(cwd).resolve()
-    best_key = config.project.name
+    best_key = fallback
     best_len = -1
     for key, project in config.projects.items():
         project_path = project.path.resolve()
@@ -71,10 +81,10 @@ def _project_key_for_cwd(config, cwd: str | None) -> str:
         return best_key
     try:
         if current == config.project.root_dir.resolve() or current.is_relative_to(config.project.root_dir.resolve()):
-            return config.project.name
+            return fallback
     except ValueError:
         pass
-    return config.project.name
+    return fallback
 
 
 def _scan_claude_transcript(path: Path, account_name: str, account: AccountConfig, config) -> TranscriptScanResult | None:

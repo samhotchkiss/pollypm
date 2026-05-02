@@ -339,14 +339,20 @@ def register_maintenance_commands(app: typer.Typer) -> None:
         """Show token usage by project for the last N days."""
         config = load_config(config_path)
         store = StateStore(config.project.state_db)
+        # #1042 — group on ``LOWER(project_key)`` so historical writers
+        # that emitted both ``"pollypm"`` and ``"PollyPM"`` (the display
+        # name leaked through ``_project_key_for_cwd`` fallback in older
+        # versions) collapse into one row. Defense-in-depth on top of
+        # the writer-side normalization in ``transcript_ledger``.
         rows = store.execute(
             """
-            SELECT project_key, SUM(tokens_used) as total,
+            SELECT LOWER(project_key) AS project_key,
+                   SUM(tokens_used) as total,
                    SUM(cache_read_tokens) as cache_total,
                    COUNT(DISTINCT substr(hour_bucket, 1, 10)) as days_active
             FROM token_usage_hourly
             WHERE hour_bucket >= date('now', ?)
-            GROUP BY project_key
+            GROUP BY LOWER(project_key)
             ORDER BY total DESC
             """,
             (f"-{days} days",),
@@ -366,7 +372,10 @@ def register_maintenance_commands(app: typer.Typer) -> None:
                 int(row[2] or 0),
                 int(row[3]),
             )
-            if project and proj_key != project:
+            # #1042 — proj_key is already lowercased by the SQL above;
+            # case-fold the user's filter so ``--project PollyPM`` and
+            # ``--project pollypm`` both match a single canonical row.
+            if project and proj_key != project.lower():
                 continue
             cache_str = f" + {cache:,} cached" if cache else ""
             day_word = "day" if days_active == 1 else "days"

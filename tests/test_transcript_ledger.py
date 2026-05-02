@@ -302,3 +302,35 @@ def test_sync_token_ledger_does_not_leak_file_descriptors(tmp_path: Path) -> Non
     finally:
         if gc_was_enabled:
             gc.enable()
+
+
+def test_project_key_for_cwd_falls_back_to_slug_not_display_name(tmp_path: Path) -> None:
+    """Issue #1042 — when the cwd doesn't resolve to a registered project
+    (or is empty), ``_project_key_for_cwd`` used to fall back to
+    ``config.project.name``, which is the *display name* (``"PollyPM"``).
+    That capitalised slug landed in ``token_usage_hourly`` alongside the
+    cwd-resolved lowercase key, splitting one project across two rows
+    in ``pm costs``. The fallback now slugifies the display name so all
+    writers agree on case.
+    """
+    from types import SimpleNamespace
+
+    from pollypm.transcript_ledger import _project_key_for_cwd
+
+    fake_config = SimpleNamespace(
+        project=SimpleNamespace(
+            name="PollyPM",  # display-name form, capitalized
+            root_dir=tmp_path / "no-such-root",
+        ),
+        projects={},  # no registered projects to match cwd against
+    )
+
+    # Empty cwd hits the first fallback.
+    assert _project_key_for_cwd(fake_config, None) == "pollypm"
+    assert _project_key_for_cwd(fake_config, "") == "pollypm"
+
+    # cwd that doesn't match any project + isn't under root_dir hits the
+    # final fallback.
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    assert _project_key_for_cwd(fake_config, str(unrelated)) == "pollypm"

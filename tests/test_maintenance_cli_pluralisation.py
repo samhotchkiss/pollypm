@@ -130,3 +130,82 @@ def test_costs_pluralises_lookback_window(tmp_path: Path) -> None:
         out = runner.invoke(app, ["costs", "--days", "7", "--config", str(cfg)])
         assert out.exit_code == 0, out.output
         assert "Token usage (last 7 days):" in out.output
+
+
+def test_costs_collapses_case_variant_project_keys(tmp_path: Path) -> None:
+    """Issue #1042 — ``pm costs`` was grouping on the raw ``project_key``
+    column, so a writer that emitted ``"PollyPM"`` (display name leaked
+    via ``_project_key_for_cwd`` fallback) and a writer that emitted
+    ``"pollypm"`` (cwd-resolved slug) showed up as two separate rows for
+    one logical project. Group on ``LOWER(project_key)`` so a single
+    row absorbs both cases.
+    """
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from pollypm.storage.state import StateStore, TokenUsageHourlyRecord
+
+    app = _build_app()
+    runner = CliRunner()
+
+    cfg = tmp_path / "pollypm.toml"
+    cfg.write_text("")
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    now_iso = datetime.now(UTC).isoformat()
+    bucket = datetime.now(UTC).replace(minute=0, second=0, microsecond=0).isoformat()
+    store.replace_token_usage_hourly(
+        [
+            TokenUsageHourlyRecord(
+                hour_bucket=bucket,
+                account_name="claude_primary",
+                provider="claude",
+                model_name="claude-opus-4-7",
+                project_key="PollyPM",
+                tokens_used=1_000_000,
+                updated_at=now_iso,
+            ),
+            TokenUsageHourlyRecord(
+                hour_bucket=bucket,
+                account_name="claude_primary",
+                provider="claude",
+                model_name="claude-haiku-4-5",
+                project_key="pollypm",
+                tokens_used=2_500_000,
+                updated_at=now_iso,
+            ),
+        ]
+    )
+    store.close()
+
+    fake_config = SimpleNamespace(
+        project=SimpleNamespace(state_db=db_path),
+    )
+
+    with patch(
+        "pollypm.cli_features.maintenance.load_config",
+        lambda _p: fake_config,
+    ):
+        out = runner.invoke(app, ["costs", "--days", "7", "--config", str(cfg)])
+    assert out.exit_code == 0, out.output
+
+    # One canonical lowercase row — neither the capitalized form nor a
+    # second duplicate row should surface.
+    assert "  pollypm: 3,500,000 tokens" in out.output, out.output
+    assert "PollyPM" not in out.output, out.output
+    # And the trailing total reflects the union, not just one variant.
+    assert "Total: 3,500,000 tokens" in out.output, out.output
+
+    # ``--project`` filter should canonicalize too: passing the
+    # capitalized form must still match the lowercased aggregate row.
+    with patch(
+        "pollypm.cli_features.maintenance.load_config",
+        lambda _p: fake_config,
+    ):
+        filtered = runner.invoke(
+            app,
+            ["costs", "--days", "7", "--project", "PollyPM", "--config", str(cfg)],
+        )
+    assert filtered.exit_code == 0, filtered.output
+    assert "  pollypm: 3,500,000 tokens" in filtered.output, filtered.output

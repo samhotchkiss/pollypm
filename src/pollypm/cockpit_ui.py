@@ -9821,6 +9821,23 @@ def _dashboard_gather_tasks(
                     if getattr(transition, "to_state", "") == "on_hold":
                         hold_reason = (getattr(transition, "reason", "") or "").strip()
                         break
+            # #1025 — classify review tasks as user-pending vs
+            # auto-handled (e.g. Russell mid-review). The action bar
+            # uses this to drop auto-handled approvals from the
+            # "N approval" suffix and to label genuinely-pending ones
+            # by task title.
+            review_kind = ""
+            if status == "review":
+                try:
+                    from pollypm.cockpit_project_state import (
+                        _is_user_review as _is_user_review_state,
+                    )
+                    if _is_user_review_state(t):
+                        review_kind = "user"
+                    else:
+                        review_kind = "auto"
+                except Exception:  # noqa: BLE001
+                    review_kind = ""
             row = {
                 "task_id": t.task_id,
                 "task_number": getattr(t, "task_number", None),
@@ -9836,6 +9853,7 @@ def _dashboard_gather_tasks(
                     f"{proj}/{num}"
                     for proj, num in getattr(t, "blocked_by", [])
                 ],
+                "review_kind": review_kind,
                 "source_db": str(db_path),
             }
             existing = task_rows.get(t.task_id)
@@ -10039,6 +10057,12 @@ def _dashboard_active_worker(
         except Exception:  # noqa: BLE001
             _project_path = None
         alive_cutoff = datetime.now(UTC) - timedelta(minutes=5)
+        # #1025 — collect every alive session first, then rank by
+        # actual activity. The previous behaviour broke on the first
+        # alive heartbeat, which could pin an idle architect to the
+        # "Current activity" panel while a worker was the genuinely
+        # progressing agent on a different task.
+        alive_sessions: list[tuple[object, str]] = []
         for sess in project_sessions:
             try:
                 hb = supervisor.store.latest_heartbeat(sess.name)
@@ -10053,12 +10077,7 @@ def _dashboard_active_worker(
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=UTC)
             if dt > alive_cutoff and not getattr(hb, "pane_dead", False):
-                worker_info = {
-                    "session_name": sess.name,
-                    "role": getattr(sess, "role", "worker"),
-                    "last_heartbeat": hb.created_at,
-                }
-                break
+                alive_sessions.append((sess, hb.created_at))
         # Actionable alerts for this project's sessions.
         open_alerts: list = []
         try:
@@ -10097,31 +10116,62 @@ def _dashboard_active_worker(
         # architect, pane movement on its own. An alive but quiet
         # session is reported as ``idle`` so the banner / now-section
         # / pill don't overclaim.
-        if worker_info is not None:
-            has_perm_alert = False
+        # #1025 — classify EVERY alive session and pick the one with
+        # the most-progressing activity (working > awaiting_user >
+        # idle), tiebroken by heartbeat recency. Without this, a
+        # project with multiple agents (architect + worker) reads
+        # whichever heartbeat happened to come first as the lead, and
+        # an idle architect routinely upstaged a busy worker.
+        permission_prompt_sessions: set[str] = set()
+        try:
+            for a in open_alerts:
+                if getattr(a, "alert_type", "") == "pane:permission_prompt":
+                    name = getattr(a, "session_name", None)
+                    if name:
+                        permission_prompt_sessions.add(str(name))
+        except Exception:  # noqa: BLE001
+            permission_prompt_sessions = set()
+
+        _ACTIVITY_RANK = {"working": 0, "awaiting_user": 1, "idle": 2}
+        candidates: list[dict] = []
+        for sess, hb_created_at in alive_sessions:
+            session_name = sess.name
+            role = getattr(sess, "role", "worker")
+            has_perm_alert = session_name in permission_prompt_sessions
             try:
-                for a in open_alerts:
-                    if (
-                        getattr(a, "session_name", None)
-                        == worker_info["session_name"]
-                        and getattr(a, "alert_type", "")
-                        == "pane:permission_prompt"
-                    ):
-                        has_perm_alert = True
-                        break
-            except Exception:  # noqa: BLE001
-                has_perm_alert = False
-            try:
-                worker_info["activity"] = _classify_worker_activity(
+                activity = _classify_worker_activity(
                     supervisor,
-                    worker_info["session_name"],
-                    worker_info["role"],
+                    session_name,
+                    role,
                     _alias_set,
                     _project_path,
                     has_perm_alert,
                 )
             except Exception:  # noqa: BLE001
-                worker_info["activity"] = "idle"
+                activity = "idle"
+            candidates.append({
+                "session_name": session_name,
+                "role": role,
+                "last_heartbeat": hb_created_at,
+                "activity": activity,
+            })
+
+        if candidates:
+            # Stable sort: first by descending heartbeat (newest wins
+            # ties), then by activity rank ascending (working before
+            # awaiting_user before idle). Python's sort is stable, so
+            # the heartbeat order is preserved within each activity
+            # bucket after the second sort.
+            candidates.sort(
+                key=lambda info: str(info.get("last_heartbeat") or ""),
+                reverse=True,
+            )
+            candidates.sort(
+                key=lambda info: _ACTIVITY_RANK.get(
+                    info.get("activity", "idle"), 2,
+                ),
+            )
+            worker_info = candidates[0]
     finally:
         try:
             supervisor.store.close()
@@ -11084,6 +11134,102 @@ def _project_hold_failure_summary(data: object) -> str:
         task_label = f"task #{num}" if num is not None else "an on-hold task"
         return f"{task_label} worker pane could not be provisioned; heartbeat is retrying"
     return ""
+
+
+def _user_pending_review_count(data: object) -> int:
+    """Return the number of review tasks that need a user decision.
+
+    #1025: ``review`` rows that are auto-handled (Russell mid-review)
+    are not user-actionable. The banner / action bar's
+    ``N approval(s)`` suffix should count only user-pending reviews so
+    a freshly-handed-off-to-Russell task doesn't look like
+    something the operator must act on.
+
+    Falls back to the raw ``task_counts['review']`` when the bucket
+    rows lack the ``review_kind`` classification (older/test paths).
+    """
+    buckets = getattr(data, "task_buckets", {}) or {}
+    review_bucket = buckets.get("review", []) or []
+    counts = getattr(data, "task_counts", {}) or {}
+    if not review_bucket:
+        return int(counts.get("review", 0) or 0)
+    classified = [
+        row for row in review_bucket
+        if isinstance(row, dict) and row.get("review_kind")
+    ]
+    if not classified:
+        return int(counts.get("review", 0) or 0)
+    return sum(1 for row in classified if row.get("review_kind") == "user")
+
+
+def _user_pending_review_title(data: object) -> str:
+    """Return the title of the lone user-pending review task, if any."""
+    buckets = getattr(data, "task_buckets", {}) or {}
+    review_bucket = buckets.get("review", []) or []
+    user_rows = [
+        row for row in review_bucket
+        if isinstance(row, dict) and row.get("review_kind") == "user"
+    ]
+    if len(user_rows) != 1:
+        return ""
+    return str(user_rows[0].get("title") or "").strip()
+
+
+def _blocked_only_on_progressing_deps(data: object) -> bool:
+    """Return True when every blocked task is waiting on a dep that is
+    actively progressing (in_progress / review), with no genuinely-stuck
+    predecessor.
+
+    #1025: the Inbox panel used to fire "Blocked, but summary missing"
+    whenever ``blocked_total > 0``. Bikepath had three blocked tasks
+    (#11/12/14) waiting on #10 (review) and #13 (in_progress) — a
+    correct dependency wait, not a project-level halt. Suppress the
+    nag in this case; the user already has the picture (other tasks
+    are moving).
+
+    Returns False if any blocked task has no recorded ``blocked_by``
+    edges, OR if any of its blocker IDs resolve to a task that is
+    NOT in_progress / review (anything blocked-on-on-hold,
+    blocked-on-blocked, blocked-on-queued, missing predecessor, etc).
+    """
+    buckets = getattr(data, "task_buckets", {}) or {}
+    blocked_items = buckets.get("blocked", []) or []
+    if not blocked_items:
+        return False
+
+    # Build an id → status map from every bucket so we can look up a
+    # blocker's current state without re-querying the work service.
+    status_by_task_id: dict[str, str] = {}
+    for status, rows in buckets.items():
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            task_id = str(row.get("task_id") or "")
+            if task_id:
+                status_by_task_id[task_id] = status
+
+    progressing = {"in_progress", "review"}
+    for item in blocked_items:
+        if not isinstance(item, dict):
+            return False
+        blocker_refs = item.get("blocked_by") or []
+        if not blocker_refs:
+            # Blocked but no recorded predecessor — that's the genuine
+            # "needs explanation" case. Don't suppress.
+            return False
+        # Every recorded predecessor must resolve to a progressing
+        # status. A single non-progressing edge means the wait is
+        # ambiguous and the nag is useful.
+        for ref in blocker_refs:
+            ref_id = str(ref or "")
+            if not ref_id:
+                return False
+            blocker_status = status_by_task_id.get(ref_id)
+            if blocker_status not in progressing:
+                return False
+    return True
 
 
 def _existing_blocker_context(data: object) -> dict | None:
@@ -12082,7 +12228,24 @@ class PollyProjectDashboardApp(App[None]):
         self.hint.update(hint)
 
     def _update_action_bar(self, data: ProjectDashboardData) -> None:
-        review_count = int(data.task_counts.get("review", 0))
+        # #1025 — only count review tasks that genuinely need a user
+        # decision. ``review`` rows that are auto-handled (Russell
+        # mid-review) are not actionable for the operator; counting
+        # them as "1 approval" misled the user into clicking through
+        # to find the work already complete.
+        review_bucket = data.task_buckets.get("review", []) or []
+        review_count = sum(
+            1 for row in review_bucket
+            if isinstance(row, dict) and row.get("review_kind") == "user"
+        )
+        # If the bucket carries no review_kind classification (older
+        # data path / legacy callers), fall back to the raw count so
+        # we don't silently hide approvals.
+        if not review_bucket or all(
+            isinstance(row, dict) and not row.get("review_kind")
+            for row in review_bucket
+        ):
+            review_count = int(data.task_counts.get("review", 0))
         blocker_count = int(data.task_counts.get("blocked", 0))
         on_hold_count = int(data.task_counts.get("on_hold", 0))
         counts = render_project_action_bar(
@@ -12127,8 +12290,10 @@ class PollyProjectDashboardApp(App[None]):
             # plan is ready for your review · 1 on hold · 1 approval"
             # where the "1 approval" was the very task the prompt
             # already named. Drop the overlap before formatting.
+            # #1025 — count only user-pending reviews; auto-handled
+            # ones (Russell mid-review) shouldn't show as "approval".
             review_count = _banner_review_count_after_action_overlap(
-                int(data.task_counts.get("review", 0)),
+                _user_pending_review_count(data),
                 data.action_items,
                 data.task_buckets.get("review", []),
             )
@@ -12191,7 +12356,7 @@ class PollyProjectDashboardApp(App[None]):
             # overlap. Without this, the banner read "Paused: 1 task
             # is on hold · 1 on hold".
             suffix_without_overlap = render_project_action_bar(
-                review_count=int(data.task_counts.get("review", 0)),
+                review_count=_user_pending_review_count(data),
                 alert_count=data.alert_count,
                 inbox_count=0,
                 blocker_count=int(data.task_counts.get("blocked", 0)),
@@ -12261,9 +12426,43 @@ class PollyProjectDashboardApp(App[None]):
                 f"Waiting on dependencies: {blocker_count} {label} blocked, "
                 f"but no user action is currently requested{count_suffix}"
             )
-        if review_count := int(data.task_counts.get("review", 0)):
-            label = "task" if review_count == 1 else "tasks"
-            return f"Waiting for review: {review_count} {label} ready for approval{count_suffix}"
+        # #1025 — surface the specific approval target when there's
+        # exactly one user-pending review task; otherwise count
+        # user-pending reviews only (auto-handled ones aren't a user
+        # call-to-action). When zero user-pending reviews remain (only
+        # auto-handled left), fall through to the queued / clear
+        # branches instead of claiming "ready for approval".
+        user_pending_review = _user_pending_review_count(data)
+        if user_pending_review:
+            label = "task" if user_pending_review == 1 else "tasks"
+            specific_title = _user_pending_review_title(data)
+            # Drop the redundant ``· N approval`` from the suffix when
+            # the banner lede already names the same approval(s).
+            suffix_without_review = render_project_action_bar(
+                review_count=0,
+                alert_count=data.alert_count,
+                inbox_count=0,
+                blocker_count=int(data.task_counts.get("blocked", 0)),
+                on_hold_count=int(data.task_counts.get("on_hold", 0)),
+            )
+            if suffix_without_review.startswith("▸ Clear"):
+                tail_suffix = ""
+            else:
+                tail = (
+                    suffix_without_review[2:]
+                    if suffix_without_review.startswith("▸ ")
+                    else suffix_without_review
+                )
+                tail_suffix = f" · {tail}"
+            if user_pending_review == 1 and specific_title:
+                return (
+                    f"Waiting for your approval: "
+                    f"“{specific_title}”{tail_suffix}"
+                )
+            return (
+                f"Waiting for review: {user_pending_review} {label} "
+                f"ready for approval{tail_suffix}"
+            )
         queued_count = int(data.task_counts.get("queued", 0))
         if queued_count:
             label = "task" if queued_count == 1 else "tasks"
@@ -12326,7 +12525,27 @@ class PollyProjectDashboardApp(App[None]):
                 node_part = (
                     f"  [dim]@ {_escape(str(node))}[/dim]" if node else ""
                 )
-                lines.append(f"  {num_part}{title}{node_part}")
+                # #1025 — when the active session is idle but a task is
+                # in-flight, the task is being progressed by its
+                # assignee, NOT the idle session. Naming the assignee
+                # avoids implying the idle agent is responsible for
+                # the in-flight task (the bikepath repro was an idle
+                # architect pinned to a worker's task).
+                assignee_raw = str(t.get("assignee") or "").strip()
+                if (
+                    activity == "idle"
+                    and assignee_raw
+                    and assignee_raw != sess_raw
+                    and assignee_raw != role_raw
+                ):
+                    assignee_tail = (
+                        f"  [dim]· {_escape(assignee_raw)} is on it[/dim]"
+                    )
+                else:
+                    assignee_tail = ""
+                lines.append(
+                    f"  {num_part}{title}{node_part}{assignee_tail}"
+                )
             elif data.action_items:
                 # No task in flight but the user has decisions waiting:
                 # the operator-facing reality is "I have something to do
@@ -12903,8 +13122,17 @@ class PollyProjectDashboardApp(App[None]):
             # note on a blocked task, no project-level blocker_summary
             # inbox item). When ANY of those exist, the user already
             # has the answer on screen and the nag is wrong.
+            # #1025 — also suppress when every blocked task is waiting
+            # on a dependency that is actively progressing (in_progress
+            # or review). Bikepath's #11/#12/#14 were correctly queued
+            # behind #10 (review) and #13 (in_progress); the project
+            # is moving, not halted. Don't claim "summary missing" for
+            # what is actually healthy dep ordering.
             existing_blocker = _existing_blocker_context(data)
-            if existing_blocker is None:
+            if (
+                existing_blocker is None
+                and not _blocked_only_on_progressing_deps(data)
+            ):
                 lines.append("[#f0c45a][b]Blocked, but summary missing[/b][/]")
                 lines.append(
                     "  [dim]This project is blocked, but Polly has not posted "
@@ -12912,6 +13140,18 @@ class PollyProjectDashboardApp(App[None]):
                 )
                 lines.append(
                     "  [dim]Press [b]c[/b] to ask the PM for a blocker summary.[/dim]"
+                )
+                lines.append("")
+            elif existing_blocker is None:
+                # All blocked tasks are waiting on progressing deps —
+                # render a short "queued behind" line instead of the
+                # missing-summary nag. The user gets a coherent story
+                # and no false alarm.
+                lines.append("[#3ddc84][b]Blocked on progressing dependencies[/b][/]")
+                lines.append(
+                    "  [dim]Each blocked task is queued behind another task "
+                    "that is currently in progress or in review — no action "
+                    "needed.[/dim]"
                 )
                 lines.append("")
             else:

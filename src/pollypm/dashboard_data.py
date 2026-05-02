@@ -290,6 +290,67 @@ def _completed_issues(config: PollyPMConfig, hours: int = 72) -> list[CompletedI
     return items[:10]
 
 
+# #1025 — recognized event signatures the Home "Now" feed should
+# prefer over whatever the agent's cursor happens to land on. Patterns
+# are checked against the trailing slice of the pane snapshot
+# (most-recent activity wins). Each pattern matches a line that is
+# safe to echo verbatim into the panel.
+_NOW_EVENT_SIGNATURES: tuple[re.Pattern[str], ...] = (
+    # Test summaries — pytest, jest, mocha, go test, cargo test, etc.
+    re.compile(r"\b\d+\s+(?:passed|failed|errored?|skipped)\b", re.IGNORECASE),
+    re.compile(r"\bTests?:\s+\d+", re.IGNORECASE),
+    re.compile(r"\bok\s+\d+\s+tests?\b", re.IGNORECASE),
+    # Commit / push events.
+    re.compile(r"^\s*\[[^\]]+\s+[0-9a-f]{7,}\]"),  # `[main abc1234] msg`
+    re.compile(r"\bCommitted\b", re.IGNORECASE),
+    re.compile(r"\b\d+ files? changed", re.IGNORECASE),
+    re.compile(r"\bTo (?:github\.com|gitlab\.com|bitbucket\.org|git@)"),
+    # Build / lint / type check completion.
+    re.compile(r"\bBuild (?:succeeded|failed|complete)\b", re.IGNORECASE),
+    re.compile(r"\bcompiled successfully\b", re.IGNORECASE),
+    re.compile(r"\bno (?:errors|issues)\b", re.IGNORECASE),
+    # Status / state transitions surfaced by the agent.
+    re.compile(r"\bStatus:\s+", re.IGNORECASE),
+    re.compile(r"\b(?:queued|in_progress|review|done|blocked|on_hold)\s+→\s+"),
+    # Alerts / warnings the agent emitted.
+    re.compile(r"^\s*(?:Alert|Warning|ERROR):\s+", re.IGNORECASE),
+)
+
+
+def _scan_for_event_signature(clean_lines: list[str]) -> str | None:
+    """Return the most-recent line matching a recognized event
+    signature, or None if no such line exists in the trailing window.
+
+    The Home dashboard's "Now" feed used to fall back to
+    last-line-of-pane when no progress indicator matched. Last-line is
+    routinely mid-sentence noise (the cursor position when capture
+    ran), while a real event ("312 passed in 24.80s", "Committed
+    abc1234", "Status: review") that the agent emitted three lines
+    back is the user-meaningful signal. Scan the bottom half of the
+    pane (the most-recent activity) for any of the recognized event
+    patterns; return the latest match.
+    """
+    if not clean_lines:
+        return None
+    # Look at the last ~40 lines — wide enough to catch a multi-line
+    # commit / test-summary block, narrow enough to stay biased to
+    # recent activity. The "Now" feed is about *current* state, not
+    # archaeological reconstruction.
+    window = clean_lines[-40:]
+    for line in reversed(window):
+        stripped = line.strip()
+        if not stripped or len(stripped) < 5:
+            continue
+        # Skip lines that the existing fall-through filter would
+        # already drop — same prompt prefixes, same TUI chrome.
+        if stripped.startswith(("❯", "›", ">", "$", "%", *_BOX_DRAWING_PREFIXES)):
+            continue
+        for pattern in _NOW_EVENT_SIGNATURES:
+            if pattern.search(stripped):
+                return stripped
+    return None
+
+
 def _session_description(status: str, role: str, snapshot_path: str | None) -> str:
     """Build a human-readable description of what a session is doing."""
     if role == "operator-pm":
@@ -331,6 +392,16 @@ def _session_description(status: str, role: str, snapshot_path: str | None) -> s
                 m = re.search(r"Working \((\d+[ms]\s?\d*s?)\s*", stripped)
                 if m:
                     return f"working ({m.group(1)})"
+            # #1025 (Home dashboard "Now" feed) — when the visible
+            # last-line of pane is mid-sentence noise, prefer a
+            # recognized event signature picked from the most-recent
+            # half of the pane. This catches "X failed", "Committed",
+            # "Status: …", and "Alert:" lines that an agent emitted a
+            # few lines back but which are far more meaningful than
+            # whatever the cursor happens to be sitting on right now.
+            event_match = _scan_for_event_signature(clean_lines)
+            if event_match:
+                return _truncate_for_now_panel(event_match)
             # Look for meaningful lines in the snapshot — restrict to
             # escape-free lines so a fused render (#792) doesn't end
             # up as the displayed status.

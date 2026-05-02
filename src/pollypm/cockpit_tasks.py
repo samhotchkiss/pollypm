@@ -783,20 +783,50 @@ def _render_overview(
     # surface WHY they were blocked. Render blocked_by with task
     # titles and statuses so the user can see the dependency chain
     # without running a separate query.
+    #
+    # #1024 — when the task itself is no longer blocked, the heading
+    # "Blocked by" lies (in_progress + done dependencies). Switch the
+    # label to "Depends on" and tag resolved edges with a check so the
+    # dep graph stays visible without contradicting the status row.
     blocked_by = list(getattr(task, "blocked_by", None) or [])
     if blocked_by:
-        lines.extend(["", "Blocked by", ""])
+        own_status = getattr(getattr(task, "work_status", None), "value", "") or ""
+        is_currently_blocked = own_status == "blocked"
+        resolved_statuses = {"done", "accepted", "cancelled", "canceled"}
+        if is_currently_blocked:
+            heading = "Blocked by"
+        else:
+            heading = "Depends on"
+        rendered_rows: list[str] = []
         for project_key, number in blocked_by:
             blocker_task_id = f"{project_key}/{number}"
             sibling = (task_index or {}).get(blocker_task_id)
             if sibling is None:
-                lines.append(f"- {blocker_task_id}")
+                # Without a sibling lookup we can't tell whether the dep
+                # is resolved. When the task isn't blocked, render the
+                # row plainly under "Depends on"; when blocked, keep the
+                # bare ID under "Blocked by" (best effort).
+                rendered_rows.append(f"- {blocker_task_id}")
                 continue
             title = getattr(sibling, "title", "") or ""
             status_enum = getattr(sibling, "work_status", None)
             status = getattr(status_enum, "value", "") if status_enum else ""
+            is_resolved = status in resolved_statuses
+            if is_currently_blocked and is_resolved:
+                # The task is blocked but THIS edge is resolved — skip
+                # it. "Blocked by" should only list un-resolved edges.
+                continue
+            if not is_currently_blocked and is_resolved:
+                check = "✓ "
+            else:
+                check = ""
             status_suffix = f" [{status}]" if status else ""
-            lines.append(f"- {blocker_task_id} — {title}{status_suffix}")
+            rendered_rows.append(
+                f"- {check}{blocker_task_id} — {title}{status_suffix}"
+            )
+        if rendered_rows:
+            lines.extend(["", heading, ""])
+            lines.extend(rendered_rows)
     if task.description:
         lines.extend(["", "Description", "", task.description])
     if task.acceptance_criteria:

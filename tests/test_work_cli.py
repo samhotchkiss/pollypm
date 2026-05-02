@@ -698,6 +698,208 @@ class TestCliContext:
         assert "Hello context" in result.output
 
 
+class TestCliSweeperContextFiltering:
+    """``pm task get`` / ``pm task status`` should hide infrastructure
+    sweeper-ping context rows by default — they drown user-visible
+    signal like review summaries (#1035). ``--show-internal`` opts in.
+    """
+
+    def _seed_mixed_context(self, db_path: str) -> None:
+        """Insert a realistic mix: 5 sweeper pings around 1 review summary,
+        mirroring the bikepath/13 pattern from the issue body.
+        """
+        from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
+            SWEEPER_PING_CONTEXT_ENTRY_TYPE,
+        )
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        svc = SQLiteWorkService(db_path=db_path)
+        try:
+            # Older sweeper churn.
+            for _ in range(3):
+                svc.add_context(
+                    "proj/1", "sweeper",
+                    "task_assignment.sweep:deduped",
+                    entry_type=SWEEPER_PING_CONTEXT_ENTRY_TYPE,
+                )
+            # The one row a user actually wants to see.
+            svc.add_context(
+                "proj/1", "review_summary",
+                "Approve if quality is acceptable; 16 specs pass.",
+                entry_type="note",
+            )
+            # Newer sweeper churn bracketing the useful row.
+            for _ in range(2):
+                svc.add_context(
+                    "proj/1", "sweeper",
+                    "task_assignment.sweep:sent",
+                    entry_type=SWEEPER_PING_CONTEXT_ENTRY_TYPE,
+                )
+        finally:
+            svc.close()
+
+    def test_task_get_hides_sweeper_pings_by_default(self, db_path):
+        _create_task(db_path, title="Bikepath-style task")
+        self._seed_mixed_context(db_path)
+
+        result = runner.invoke(task_app, ["get", "proj/1", "--db", db_path])
+        assert result.exit_code == 0, result.output
+        # Useful row surfaces.
+        assert "Approve if quality is acceptable" in result.output
+        # Sweeper noise hidden.
+        assert "task_assignment.sweep:sent" not in result.output
+        assert "task_assignment.sweep:deduped" not in result.output
+        # Hidden-count breadcrumb tells the user noise was filtered.
+        assert "5 internal sweeper entries hidden" in result.output
+
+    def test_task_get_show_internal_resurfaces_pings(self, db_path):
+        _create_task(db_path, title="Bikepath-style task")
+        self._seed_mixed_context(db_path)
+
+        result = runner.invoke(
+            task_app, ["get", "proj/1", "--show-internal", "--db", db_path],
+        )
+        assert result.exit_code == 0, result.output
+        assert "task_assignment.sweep:sent" in result.output
+        assert "task_assignment.sweep:deduped" in result.output
+        assert "Approve if quality is acceptable" in result.output
+        # No "hidden" footer when nothing was filtered.
+        assert "hidden" not in result.output
+
+    def test_task_get_json_filters_context_by_default(self, db_path):
+        _create_task(db_path, title="JSON sweeper")
+        self._seed_mixed_context(db_path)
+
+        result = runner.invoke(
+            task_app, ["get", "proj/1", "--db", db_path, "--json"],
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        # Filtered context only contains the user-visible row.
+        texts = [c["text"] for c in data.get("context", [])]
+        assert any("Approve if quality" in t for t in texts)
+        assert not any("task_assignment.sweep" in t for t in texts)
+        assert data.get("hidden_internal_context_count") == 5
+
+    def test_task_get_json_show_internal_returns_all(self, db_path):
+        _create_task(db_path, title="JSON show-internal")
+        self._seed_mixed_context(db_path)
+
+        result = runner.invoke(
+            task_app,
+            ["get", "proj/1", "--show-internal", "--db", db_path, "--json"],
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        texts = [c["text"] for c in data.get("context", [])]
+        assert sum(1 for t in texts if "task_assignment.sweep" in t) == 5
+        assert any("Approve if quality" in t for t in texts)
+        # No hidden-count key when nothing was filtered.
+        assert "hidden_internal_context_count" not in data
+
+    def test_task_status_hides_sweeper_pings_and_overfetches(self, db_path):
+        """The pre-fix bug: ``task_status`` fetched only the last 5 rows,
+        so a task with >=5 trailing sweeper pings would show *zero*
+        useful context. The fix over-fetches before filtering."""
+        _create_task(db_path, title="Status sweeper")
+        self._seed_mixed_context(db_path)
+
+        result = runner.invoke(task_app, ["status", "proj/1", "--db", db_path])
+        assert result.exit_code == 0, result.output
+        assert "Recent context:" in result.output
+        # The actually-useful row makes it through, even though it sits
+        # behind 2 newer sweeper pings (would be filtered out of a raw
+        # last-5 window).
+        assert "Approve if quality is acceptable" in result.output
+        assert "task_assignment.sweep" not in result.output
+
+    def test_task_status_show_internal_returns_literal_recent_5(self, db_path):
+        """``--show-internal`` opts back into the historic last-5 window —
+        no over-fetch, no filtering."""
+        _create_task(db_path, title="Status show-internal")
+        self._seed_mixed_context(db_path)
+
+        result = runner.invoke(
+            task_app,
+            ["status", "proj/1", "--show-internal", "--db", db_path],
+        )
+        assert result.exit_code == 0, result.output
+        assert "task_assignment.sweep" in result.output
+
+    def test_legacy_sweeper_rows_without_typed_marker_still_filtered(self, db_path):
+        """Older DBs predate ``entry_type='sweeper_ping'`` and write the
+        sweeper row with the default ``"note"`` type. The fallback
+        actor+text sniff in ``_is_sweeper_internal`` keeps them hidden.
+        """
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        _create_task(db_path, title="Legacy sweeper rows")
+        svc = SQLiteWorkService(db_path=db_path)
+        try:
+            # Legacy: actor="sweeper", text matches sweep ping shape, but
+            # entry_type is the default "note".
+            svc.add_context(
+                "proj/1", "sweeper", "task_assignment.sweep:sent",
+            )
+            svc.add_context(
+                "proj/1", "review_summary",
+                "Real signal that should survive the filter.",
+            )
+        finally:
+            svc.close()
+
+        result = runner.invoke(task_app, ["get", "proj/1", "--db", db_path])
+        assert result.exit_code == 0, result.output
+        assert "Real signal that should survive" in result.output
+        assert "task_assignment.sweep:sent" not in result.output
+
+    def test_is_sweeper_internal_predicate(self):
+        """Direct unit test on the predicate so future refactors of the
+        rendering layer can't silently break the contract."""
+        from datetime import UTC, datetime
+
+        from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
+            SWEEPER_PING_CONTEXT_ENTRY_TYPE,
+        )
+        from pollypm.work.cli import _is_sweeper_internal
+        from pollypm.work.models import ContextEntry
+
+        ts = datetime.now(UTC)
+        sweeper_typed = ContextEntry(
+            actor="sweeper", timestamp=ts,
+            text="task_assignment.sweep:sent",
+            entry_type=SWEEPER_PING_CONTEXT_ENTRY_TYPE,
+        )
+        sweeper_legacy = ContextEntry(
+            actor="sweeper", timestamp=ts,
+            text="task_assignment.sweep:deduped",
+            entry_type="note",
+        )
+        review = ContextEntry(
+            actor="review_summary", timestamp=ts,
+            text="Approve if quality is acceptable.",
+            entry_type="note",
+        )
+        worker_note = ContextEntry(
+            actor="worker", timestamp=ts,
+            text="Started implementation.",
+            entry_type="note",
+        )
+        # Worker writes "sent" in a normal note — must NOT be filtered
+        # (different actor than "sweeper").
+        worker_with_colon_sent = ContextEntry(
+            actor="worker", timestamp=ts,
+            text="email:sent",
+            entry_type="note",
+        )
+
+        assert _is_sweeper_internal(sweeper_typed) is True
+        assert _is_sweeper_internal(sweeper_legacy) is True
+        assert _is_sweeper_internal(review) is False
+        assert _is_sweeper_internal(worker_note) is False
+        assert _is_sweeper_internal(worker_with_colon_sent) is False
+
+
 class TestCliCounts:
     def test_cli_counts(self, db_path):
         _create_task(db_path, title="Task 1")

@@ -280,10 +280,72 @@ def _resolve_actor_for_task(
     return svc.derive_owner(task) or "cli"
 
 
-def _print_task(task, as_json: bool = False) -> None:
-    """Print a single task."""
+# Context-entry types written by infrastructure background loops rather
+# than user / worker actors. Hidden by default in ``pm task get`` /
+# ``pm task status`` because they drown user-visible signal (#1035) — a
+# completed task can collect dozens of ``sweeper_ping`` rows bracketing
+# one ``review_summary`` line. Use ``--show-internal`` to surface them.
+_INTERNAL_CONTEXT_ENTRY_TYPES = frozenset({
+    "sweeper_ping",
+})
+
+
+def _is_sweeper_internal(entry) -> bool:
+    """Return True for context entries that are infrastructure noise.
+
+    Centralised here so both the text and JSON renderings filter on
+    the same predicate. Matches by ``entry_type`` (the sealed contract
+    written by ``_record_sweeper_ping``); falls back to actor + text
+    sniff for legacy rows that predate the typed marker.
+    """
+    etype = getattr(entry, "entry_type", None)
+    if etype in _INTERNAL_CONTEXT_ENTRY_TYPES:
+        return True
+    # Defensive fallback for legacy rows: actor is "sweeper" and the
+    # text matches the sweep ping shape ``<source>:sent`` / ``:deduped``.
+    actor = getattr(entry, "actor", None)
+    text = getattr(entry, "text", "") or ""
+    if actor == "sweeper" and (
+        text.endswith(":sent") or text.endswith(":deduped")
+    ):
+        return True
+    return False
+
+
+def _filter_visible_context(entries, *, show_internal: bool):
+    """Drop sweeper / infrastructure entries unless explicitly requested."""
+    if show_internal:
+        return list(entries)
+    return [e for e in entries if not _is_sweeper_internal(e)]
+
+
+def _print_task(task, as_json: bool = False, show_internal: bool = False) -> None:
+    """Print a single task.
+
+    ``show_internal=False`` (default) hides infrastructure context
+    entries (sweeper pings, etc.) so the user-visible signal isn't
+    drowned by housekeeping breadcrumbs (#1035).
+    """
+    visible_context = _filter_visible_context(
+        task.context or [], show_internal=show_internal,
+    )
+    hidden_count = len(task.context or []) - len(visible_context)
     if as_json:
-        typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
+        payload = _task_to_dict(task)
+        # Replace context with the filtered view so JSON consumers see
+        # the same default surface as the text rendering.
+        payload["context"] = [
+            {
+                "actor": c.actor,
+                "text": c.text,
+                "timestamp": str(c.timestamp),
+                "entry_type": c.entry_type,
+            }
+            for c in visible_context
+        ]
+        if hidden_count:
+            payload["hidden_internal_context_count"] = hidden_count
+        typer.echo(json.dumps(payload, indent=2, default=str))
     else:
         typer.echo(f"ID:       {task.task_id}")
         typer.echo(f"Title:    {task.title}")
@@ -314,10 +376,16 @@ def _print_task(task, as_json: bool = False) -> None:
                     dec = ex.decision.value if hasattr(ex.decision, "value") else ex.decision
                     line += f" ({dec})"
                 typer.echo(line)
-        if task.context:
+        if visible_context:
             typer.echo("Context:")
-            for c in task.context:
+            for c in visible_context:
                 typer.echo(f"  [{c.actor}] {c.text}")
+        if hidden_count and not show_internal:
+            typer.echo(
+                f"  ({hidden_count} internal sweeper "
+                f"{'entry' if hidden_count == 1 else 'entries'} "
+                f"hidden — pass --show-internal to see)"
+            )
 
 
 def _task_to_dict(task) -> dict:
@@ -610,6 +678,15 @@ def task_create(
 @task_app.command("get")
 def task_get(
     task_id: str = typer.Argument(..., help="Task ID (project/number)"),
+    show_internal: bool = typer.Option(
+        False,
+        "--show-internal",
+        help=(
+            "Include infrastructure context entries (sweeper pings, etc.) "
+            "in the Context section. Hidden by default because they drown "
+            "user-visible signal like review summaries (#1035)."
+        ),
+    ),
     db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
@@ -618,7 +695,7 @@ def task_get(
     task = _run(svc.get, task_id)
     # Also load context
     task.context = svc.get_context(task_id)
-    _print_task(task, as_json=output_json)
+    _print_task(task, as_json=output_json, show_internal=show_internal)
 
 
 @task_app.command("list")
@@ -1475,13 +1552,33 @@ def task_backfill_review_summaries(
 @task_app.command("status")
 def task_status(
     task_id: str = typer.Argument(..., help="Task ID (project/number)"),
+    show_internal: bool = typer.Option(
+        False,
+        "--show-internal",
+        help=(
+            "Include infrastructure context entries (sweeper pings, etc.) "
+            "in the Recent context section. Hidden by default because they "
+            "drown user-visible signal like review summaries (#1035)."
+        ),
+    ),
     db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Pretty-printed summary: node, owner, status, context, executions."""
     svc = _svc(db, project=_project_from_task_id(task_id))
     task = _run(svc.get, task_id)
-    task.context = svc.get_context(task_id, limit=5)
+    # #1035: when filtering sweeper pings, fetch a wider window so we
+    # still surface 5 user-visible rows on tasks where sweeper churn
+    # would otherwise dominate. The DB-level limit is the only knob, so
+    # over-fetch and slice after filtering. ``--show-internal`` keeps
+    # the historic behaviour (literal last 5 rows of any kind).
+    fetch_limit = 5 if show_internal else 50
+    raw_context = svc.get_context(task_id, limit=fetch_limit)
+    visible_context = _filter_visible_context(
+        raw_context, show_internal=show_internal,
+    )[:5]
+    hidden_count = len(raw_context) - len(visible_context) if not show_internal else 0
+    task.context = visible_context
     owner = svc.derive_owner(task)
 
     if output_json:
@@ -1489,8 +1586,10 @@ def task_status(
         d["owner"] = owner
         d["recent_context"] = [
             {"actor": c.actor, "text": c.text, "timestamp": str(c.timestamp)}
-            for c in task.context
+            for c in visible_context
         ]
+        if hidden_count:
+            d["hidden_internal_context_count"] = hidden_count
         typer.echo(json.dumps(d, indent=2, default=str))
     else:
         typer.echo(f"Task:   {task.task_id} — {task.title}")
@@ -1506,10 +1605,16 @@ def task_status(
                     dec = ex.decision.value if hasattr(ex.decision, "value") else ex.decision
                     line += f" ({dec})"
                 typer.echo(line)
-        if task.context:
+        if visible_context:
             typer.echo("Recent context:")
-            for c in task.context:
+            for c in visible_context:
                 typer.echo(f"  [{c.actor}] {c.text}")
+        if hidden_count and not show_internal:
+            typer.echo(
+                f"  ({hidden_count} internal sweeper "
+                f"{'entry' if hidden_count == 1 else 'entries'} "
+                f"hidden — pass --show-internal to see)"
+            )
 
 
 @task_app.command("counts")

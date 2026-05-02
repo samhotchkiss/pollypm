@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo
 from pollypm.models import KnownProject
 from pollypm.plugins_builtin.morning_briefing.handlers.gather_yesterday import (
     iter_tracked_projects,
+    project_state_db_paths,
 )
 
 
@@ -136,54 +137,65 @@ def _gather_top_tasks_for_project(
     *,
     now_utc: datetime,
     limit: int,
+    config=None,
 ) -> list[PriorityEntry]:
     """Query the top candidates from one project's state.db.
 
     We pull more rows than the eventual cap so the global sort across
     projects has enough to rank from. ``limit * 2`` is the safety margin.
-    """
-    db_path = project.path / ".pollypm" / "state.db"
-    conn = _open_readonly(db_path)
-    if conn is None:
-        return []
-    try:
-        try:
-            rows = conn.execute(
-                "SELECT project, task_number, title, priority, work_status, "
-                "       COALESCE(assignee, '') AS assignee, created_at, updated_at "
-                "FROM work_tasks "
-                "WHERE work_status IN (?, ?, ?, ?) "
-                "ORDER BY "
-                "  CASE priority "
-                "    WHEN 'critical' THEN 0 "
-                "    WHEN 'high' THEN 1 "
-                "    WHEN 'normal' THEN 2 "
-                "    WHEN 'low' THEN 3 ELSE 4 END ASC, "
-                "  updated_at ASC "
-                "LIMIT ?",
-                (*_OPEN_STATUSES, max(1, limit) * 4),
-            ).fetchall()
-        except sqlite3.Error as exc:
-            logger.debug("briefing: top-tasks SQL failed for %s: %s", project.key, exc)
-            return []
-    finally:
-        conn.close()
 
+    Tries per-project then workspace-root state.db (post-#339), filtering
+    by ``project = project.key`` so a shared workspace DB only surfaces
+    this project's rows. Duplicate ``(project, task_number)`` pairs from
+    overlapping DBs are deduped (per-project DB wins on ordering).
+    """
     out: list[PriorityEntry] = []
-    for r in rows:
-        proj = r["project"]
-        num = r["task_number"]
-        out.append(
-            PriorityEntry(
-                project=proj,
-                task_id=f"{proj}/{num}",
-                title=r["title"] or "",
-                priority=(r["priority"] or "normal").lower(),
-                state=r["work_status"] or "",
-                assignee=r["assignee"] or "",
-                age_seconds=_age_seconds(r, now_utc=now_utc),
+    seen_ids: set[tuple[str, int]] = set()
+    for db_path in project_state_db_paths(project, config):
+        conn = _open_readonly(db_path)
+        if conn is None:
+            continue
+        try:
+            try:
+                rows = conn.execute(
+                    "SELECT project, task_number, title, priority, work_status, "
+                    "       COALESCE(assignee, '') AS assignee, created_at, updated_at "
+                    "FROM work_tasks "
+                    "WHERE project = ? AND work_status IN (?, ?, ?, ?) "
+                    "ORDER BY "
+                    "  CASE priority "
+                    "    WHEN 'critical' THEN 0 "
+                    "    WHEN 'high' THEN 1 "
+                    "    WHEN 'normal' THEN 2 "
+                    "    WHEN 'low' THEN 3 ELSE 4 END ASC, "
+                    "  updated_at ASC "
+                    "LIMIT ?",
+                    (project.key, *_OPEN_STATUSES, max(1, limit) * 4),
+                ).fetchall()
+            except sqlite3.Error as exc:
+                logger.debug("briefing: top-tasks SQL failed for %s: %s", project.key, exc)
+                continue
+        finally:
+            conn.close()
+
+        for r in rows:
+            proj = r["project"]
+            num = r["task_number"]
+            dedupe_key = (proj, num)
+            if dedupe_key in seen_ids:
+                continue
+            seen_ids.add(dedupe_key)
+            out.append(
+                PriorityEntry(
+                    project=proj,
+                    task_id=f"{proj}/{num}",
+                    title=r["title"] or "",
+                    priority=(r["priority"] or "normal").lower(),
+                    state=r["work_status"] or "",
+                    assignee=r["assignee"] or "",
+                    age_seconds=_age_seconds(r, now_utc=now_utc),
+                )
             )
-        )
     return out
 
 
@@ -192,59 +204,75 @@ def _gather_top_tasks_for_project(
 # ---------------------------------------------------------------------------
 
 
-def _gather_blockers_for_project(project: KnownProject) -> list[BlockerEntry]:
-    """Tasks in ``blocked`` state with their blocker links."""
-    db_path = project.path / ".pollypm" / "state.db"
-    conn = _open_readonly(db_path)
-    if conn is None:
-        return []
-    try:
+def _gather_blockers_for_project(
+    project: KnownProject,
+    *,
+    config=None,
+) -> list[BlockerEntry]:
+    """Tasks in ``blocked`` state with their blocker links.
+
+    Tries per-project then workspace-root state.db (post-#339), filtering
+    by ``project = project.key`` so a shared workspace DB only surfaces
+    this project's blocked tasks. Duplicate ``(project, task_number)``
+    pairs from overlapping DBs are deduped.
+    """
+    results: list[BlockerEntry] = []
+    seen_ids: set[tuple[str, int]] = set()
+    for db_path in project_state_db_paths(project, config):
+        conn = _open_readonly(db_path)
+        if conn is None:
+            continue
         try:
-            rows = conn.execute(
-                "SELECT project, task_number, title "
-                "FROM work_tasks "
-                "WHERE work_status = 'blocked' "
-                "ORDER BY updated_at ASC",
-            ).fetchall()
-        except sqlite3.Error:
-            return []
-        results: list[BlockerEntry] = []
-        for r in rows:
-            proj = r["project"]
-            num = r["task_number"]
             try:
-                dep_rows = conn.execute(
-                    "SELECT d.to_project AS to_project, d.to_task_number AS to_task_number, "
-                    "       COALESCE(t.work_status, '') AS blocker_status "
-                    "FROM work_task_dependencies d "
-                    "LEFT JOIN work_tasks t "
-                    "  ON t.project = d.to_project AND t.task_number = d.to_task_number "
-                    "WHERE d.from_project = ? AND d.from_task_number = ? "
-                    "  AND d.kind = 'blocks' ",
-                    (proj, num),
+                rows = conn.execute(
+                    "SELECT project, task_number, title "
+                    "FROM work_tasks "
+                    "WHERE project = ? AND work_status = 'blocked' "
+                    "ORDER BY updated_at ASC",
+                    (project.key,),
                 ).fetchall()
             except sqlite3.Error:
-                dep_rows = []
-            blocked_by: list[str] = []
-            unresolved: list[str] = []
-            for d in dep_rows:
-                blocker_id = f"{d['to_project']}/{d['to_task_number']}"
-                blocked_by.append(blocker_id)
-                status = (d["blocker_status"] or "").lower()
-                if status and status not in ("done", "cancelled"):
-                    unresolved.append(blocker_id)
-            results.append(
-                BlockerEntry(
-                    project=proj,
-                    task_id=f"{proj}/{num}",
-                    title=r["title"] or "",
-                    blocked_by=blocked_by,
-                    unresolved_blockers=unresolved,
+                continue
+            for r in rows:
+                proj = r["project"]
+                num = r["task_number"]
+                dedupe_key = (proj, num)
+                if dedupe_key in seen_ids:
+                    continue
+                seen_ids.add(dedupe_key)
+                try:
+                    dep_rows = conn.execute(
+                        "SELECT d.to_project AS to_project, d.to_task_number AS to_task_number, "
+                        "       COALESCE(t.work_status, '') AS blocker_status "
+                        "FROM work_task_dependencies d "
+                        "LEFT JOIN work_tasks t "
+                        "  ON t.project = d.to_project AND t.task_number = d.to_task_number "
+                        "WHERE d.from_project = ? AND d.from_task_number = ? "
+                        "  AND d.kind = 'blocks' ",
+                        (proj, num),
+                    ).fetchall()
+                except sqlite3.Error:
+                    dep_rows = []
+                blocked_by: list[str] = []
+                unresolved: list[str] = []
+                for d in dep_rows:
+                    blocker_id = f"{d['to_project']}/{d['to_task_number']}"
+                    blocked_by.append(blocker_id)
+                    status = (d["blocker_status"] or "").lower()
+                    if status and status not in ("done", "cancelled"):
+                        unresolved.append(blocker_id)
+                results.append(
+                    BlockerEntry(
+                        project=proj,
+                        task_id=f"{proj}/{num}",
+                        title=r["title"] or "",
+                        blocked_by=blocked_by,
+                        unresolved_blockers=unresolved,
+                    )
                 )
-            )
-        return results
-    finally:
-        conn.close()
+        finally:
+            conn.close()
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -356,12 +384,13 @@ def identify_priorities(
             candidates.extend(
                 _gather_top_tasks_for_project(
                     project, now_utc=now_utc, limit=priorities_count,
+                    config=config,
                 )
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("briefing: top-tasks failed for %s: %s", project.key, exc)
         try:
-            blockers.extend(_gather_blockers_for_project(project))
+            blockers.extend(_gather_blockers_for_project(project, config=config))
         except Exception as exc:  # noqa: BLE001
             logger.debug("briefing: blockers failed for %s: %s", project.key, exc)
 

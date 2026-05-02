@@ -22,6 +22,7 @@ from pollypm.plugins_builtin.morning_briefing.handlers.gather_yesterday import (
     _gather_advisor_insights,
     gather_yesterday,
     iter_tracked_projects,
+    project_state_db_paths,
     yesterday_window,
 )
 from pollypm.plugins_builtin.morning_briefing.handlers.identify_priorities import (
@@ -42,11 +43,16 @@ NY = ZoneInfo("America/New_York")
 # ---------------------------------------------------------------------------
 
 
-def _make_empty_config(project_root: Path) -> PollyPMConfig:
+def _make_empty_config(
+    project_root: Path,
+    *,
+    workspace_root: Path | None = None,
+) -> PollyPMConfig:
     return PollyPMConfig(
         project=ProjectSettings(
             name="Fixture",
             root_dir=project_root,
+            workspace_root=workspace_root if workspace_root is not None else project_root,
             base_dir=project_root / ".pollypm",
             logs_dir=project_root / ".pollypm" / "logs",
             snapshots_dir=project_root / ".pollypm" / "snapshots",
@@ -104,6 +110,7 @@ def _base_git_env() -> dict[str, str]:
 
 def _init_work_db(project_path: Path) -> Path:
     db_path = project_path / ".pollypm" / "state.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
     svc = SQLiteWorkService(db_path=db_path, project_path=project_path)
     svc.close()
     return db_path
@@ -664,3 +671,290 @@ class TestPerfBudget:
         assert elapsed < 2.0, f"gather+priorities took {elapsed:.2f}s"
         assert len(snapshot.task_transitions) == 50
         assert len(priorities.top_tasks) == 5
+
+
+# ---------------------------------------------------------------------------
+# Post-#339 dual-path resolution (#1036)
+#
+# After #339, briefing reads must fall back to the workspace-root
+# state.db when the per-project ``<project>/.pollypm/state.db`` is
+# absent. These tests pin that behavior so a regression to a
+# single-path probe is caught loudly.
+# ---------------------------------------------------------------------------
+
+
+class TestProjectStateDbPaths:
+    def test_per_project_only(self, tmp_path: Path) -> None:
+        project_path = _make_project(tmp_path, "alpha")
+        _init_work_db(project_path)
+        project = KnownProject(key="alpha", path=project_path, tracked=True)
+        config = _make_empty_config(tmp_path / "ws-no-db", workspace_root=tmp_path / "ws-no-db")
+        (tmp_path / "ws-no-db").mkdir()
+
+        paths = project_state_db_paths(project, config)
+        assert len(paths) == 1
+        assert paths[0] == project_path / ".pollypm" / "state.db"
+
+    def test_workspace_only_post_339(self, tmp_path: Path) -> None:
+        # Project directory exists but has no per-project state.db.
+        project_path = tmp_path / "alpha"
+        project_path.mkdir()
+        # Workspace root holds the canonical post-#339 DB.
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        ws_db = _init_work_db(ws)
+        project = KnownProject(key="alpha", path=project_path, tracked=True)
+        config = _make_empty_config(ws, workspace_root=ws)
+
+        paths = project_state_db_paths(project, config)
+        assert paths == [ws_db]
+
+    def test_both_present_returns_both_deduped(self, tmp_path: Path) -> None:
+        project_path = _make_project(tmp_path, "alpha")
+        per_db = _init_work_db(project_path)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        ws_db = _init_work_db(ws)
+        project = KnownProject(key="alpha", path=project_path, tracked=True)
+        config = _make_empty_config(ws, workspace_root=ws)
+
+        paths = project_state_db_paths(project, config)
+        assert per_db in paths
+        assert ws_db in paths
+        # Dedupe: per-project first, workspace second.
+        assert paths.index(per_db) < paths.index(ws_db)
+        # Resolved-path dedupe: no duplicates.
+        resolved = [p.resolve() for p in paths]
+        assert len(resolved) == len(set(resolved))
+
+    def test_project_path_equals_workspace_dedupes(self, tmp_path: Path) -> None:
+        # Single-project install where project path == workspace root.
+        # Should scan once.
+        ws = _make_project(tmp_path, "solo")
+        _init_work_db(ws)
+        project = KnownProject(key="solo", path=ws, tracked=True)
+        config = _make_empty_config(ws, workspace_root=ws)
+
+        paths = project_state_db_paths(project, config)
+        assert len(paths) == 1
+
+
+class TestPost339WorkspaceLayoutGather:
+    """gather_yesterday must surface activity living in the workspace DB."""
+
+    def test_transitions_resolved_from_workspace_db(self, tmp_path: Path) -> None:
+        # Per-project state.db is ABSENT. The workspace state.db holds
+        # the rows. This is exactly the install layout that triggered #1036.
+        project_path = tmp_path / "alpha"
+        project_path.mkdir()
+        # NOTE: no .pollypm/state.db inside project_path.
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        ws_db = _init_work_db(ws)
+        _raw_insert_task(
+            ws_db, project="alpha", task_number=1, title="alpha task",
+            work_status="done",
+        )
+        yesterday_ts = "2026-04-15T14:00:00"
+        _raw_insert_transition(
+            ws_db, project="alpha", task_number=1,
+            from_state="review", to_state="done", created_at=yesterday_ts,
+        )
+
+        project = KnownProject(key="alpha", path=project_path, tracked=True)
+        config = _make_empty_config(ws, workspace_root=ws)
+
+        rows = _gather_transitions_for_project(
+            project,
+            since_iso="2026-04-15T00:00:00",
+            until_iso="2026-04-16T00:00:00",
+            config=config,
+        )
+        assert len(rows) == 1
+        assert rows[0].task_id == "alpha/1"
+        assert rows[0].task_title == "alpha task"
+
+    def test_workspace_db_filtered_by_project_key(self, tmp_path: Path) -> None:
+        # A shared workspace DB holds rows for many projects.
+        # Each project's gather must only see its own rows.
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        ws_db = _init_work_db(ws)
+        _raw_insert_task(ws_db, project="alpha", task_number=1, title="A", work_status="done")
+        _raw_insert_task(ws_db, project="beta", task_number=2, title="B", work_status="done")
+        _raw_insert_transition(
+            ws_db, project="alpha", task_number=1,
+            from_state="review", to_state="done", created_at="2026-04-15T14:00:00",
+        )
+        _raw_insert_transition(
+            ws_db, project="beta", task_number=2,
+            from_state="review", to_state="done", created_at="2026-04-15T15:00:00",
+        )
+
+        alpha_path = tmp_path / "alpha"
+        alpha_path.mkdir()
+        project_alpha = KnownProject(key="alpha", path=alpha_path, tracked=True)
+        config = _make_empty_config(ws, workspace_root=ws)
+
+        rows = _gather_transitions_for_project(
+            project_alpha,
+            since_iso="2026-04-15T00:00:00",
+            until_iso="2026-04-16T00:00:00",
+            config=config,
+        )
+        ids = {r.task_id for r in rows}
+        assert ids == {"alpha/1"}
+
+    def test_downtime_artifacts_resolved_from_workspace_db(self, tmp_path: Path) -> None:
+        project_path = tmp_path / "alpha"
+        project_path.mkdir()
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        ws_db = _init_work_db(ws)
+        _raw_insert_task(
+            ws_db, project="alpha", task_number=1, title="downtime task",
+            labels=["downtime"], work_status="review",
+        )
+        _raw_insert_transition(
+            ws_db, project="alpha", task_number=1,
+            from_state="in_progress", to_state="awaiting_approval",
+            created_at="2026-04-15T14:00:00",
+        )
+
+        project = KnownProject(key="alpha", path=project_path, tracked=True)
+        config = _make_empty_config(ws, workspace_root=ws)
+
+        artifacts = _gather_downtime_artifacts(
+            project,
+            since_iso="2026-04-15T00:00:00",
+            until_iso="2026-04-16T00:00:00",
+            config=config,
+        )
+        assert len(artifacts) == 1
+        assert artifacts[0].task_id == "alpha/1"
+
+    def test_gather_yesterday_end_to_end_workspace_db(self, tmp_path: Path) -> None:
+        # End-to-end repro of #1036: tracked project with no per-project
+        # state.db, all activity in the workspace DB. Snapshot must be
+        # non-empty (failure mode in #1036 was: snapshot.is_empty == True).
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        ws_db = _init_work_db(ws)
+        _raw_insert_task(
+            ws_db, project="alpha", task_number=1, title="alpha task",
+            work_status="done",
+        )
+        _raw_insert_transition(
+            ws_db, project="alpha", task_number=1,
+            from_state="review", to_state="done",
+            created_at="2026-04-15T14:00:00",
+        )
+
+        alpha_path = tmp_path / "alpha"
+        alpha_path.mkdir()
+        config = _make_empty_config(ws, workspace_root=ws)
+        config.projects = {
+            "alpha": KnownProject(key="alpha", path=alpha_path, tracked=True),
+        }
+
+        now_local = datetime(2026, 4, 16, 6, 0, tzinfo=UTC)
+        snapshot = gather_yesterday(config, now_local=now_local)
+        # Pre-fix this would have been is_empty == True.
+        assert not snapshot.is_empty
+        ids = {r.task_id for r in snapshot.task_transitions}
+        assert "alpha/1" in ids
+
+
+class TestPost339WorkspaceLayoutPriorities:
+    """identify_priorities must surface tasks living in the workspace DB."""
+
+    def test_top_tasks_resolved_from_workspace_db(self, tmp_path: Path) -> None:
+        project_path = tmp_path / "alpha"
+        project_path.mkdir()
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        ws_db = _init_work_db(ws)
+        _raw_insert_task(
+            ws_db, project="alpha", task_number=1, title="open task",
+            priority="high", work_status="queued",
+        )
+
+        project = KnownProject(key="alpha", path=project_path, tracked=True)
+        config = _make_empty_config(ws, workspace_root=ws)
+        now = datetime(2026, 4, 16, 6, 0, tzinfo=UTC)
+
+        from pollypm.plugins_builtin.morning_briefing.handlers.identify_priorities import (
+            _gather_top_tasks_for_project,
+        )
+        rows = _gather_top_tasks_for_project(
+            project, now_utc=now, limit=5, config=config,
+        )
+        ids = {r.task_id for r in rows}
+        assert ids == {"alpha/1"}
+
+    def test_top_tasks_filtered_by_project_key(self, tmp_path: Path) -> None:
+        # Shared workspace DB with multi-project rows.
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        ws_db = _init_work_db(ws)
+        _raw_insert_task(ws_db, project="alpha", task_number=1, title="A", work_status="queued")
+        _raw_insert_task(ws_db, project="beta", task_number=2, title="B", work_status="queued")
+
+        alpha_path = tmp_path / "alpha"
+        alpha_path.mkdir()
+        project_alpha = KnownProject(key="alpha", path=alpha_path, tracked=True)
+        config = _make_empty_config(ws, workspace_root=ws)
+        now = datetime(2026, 4, 16, 6, 0, tzinfo=UTC)
+
+        from pollypm.plugins_builtin.morning_briefing.handlers.identify_priorities import (
+            _gather_top_tasks_for_project,
+        )
+        rows = _gather_top_tasks_for_project(
+            project_alpha, now_utc=now, limit=5, config=config,
+        )
+        ids = {r.task_id for r in rows}
+        assert ids == {"alpha/1"}
+
+    def test_blockers_resolved_from_workspace_db(self, tmp_path: Path) -> None:
+        project_path = tmp_path / "alpha"
+        project_path.mkdir()
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        ws_db = _init_work_db(ws)
+        _raw_insert_task(ws_db, project="alpha", task_number=1, title="A", work_status="blocked")
+        _raw_insert_task(ws_db, project="alpha", task_number=2, title="B", work_status="in_progress")
+        _raw_insert_dep(
+            ws_db, from_project="alpha", from_task_number=1,
+            to_project="alpha", to_task_number=2,
+        )
+
+        project = KnownProject(key="alpha", path=project_path, tracked=True)
+        config = _make_empty_config(ws, workspace_root=ws)
+        blockers = _gather_blockers_for_project(project, config=config)
+        assert len(blockers) == 1
+        assert blockers[0].task_id == "alpha/1"
+        assert blockers[0].blocked_by == ["alpha/2"]
+
+    def test_identify_priorities_end_to_end_workspace_db(self, tmp_path: Path) -> None:
+        # End-to-end: priorities must be non-empty for an active workspace
+        # whose only DB lives at the workspace root.
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        ws_db = _init_work_db(ws)
+        _raw_insert_task(
+            ws_db, project="alpha", task_number=1, title="open task",
+            priority="critical", work_status="queued",
+        )
+
+        alpha_path = tmp_path / "alpha"
+        alpha_path.mkdir()
+        config = _make_empty_config(ws, workspace_root=ws)
+        config.projects = {
+            "alpha": KnownProject(key="alpha", path=alpha_path, tracked=True),
+        }
+
+        now_local = datetime(2026, 4, 16, 6, 0, tzinfo=UTC)
+        priorities = identify_priorities(config, now_local=now_local, priorities_count=5)
+        ids = {t.task_id for t in priorities.top_tasks}
+        assert "alpha/1" in ids

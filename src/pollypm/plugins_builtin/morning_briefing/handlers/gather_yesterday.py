@@ -180,6 +180,51 @@ def iter_tracked_projects(config) -> list[KnownProject]:
     return projects
 
 
+def project_state_db_paths(project: KnownProject, config=None) -> list[Path]:
+    """Return existing state.db paths to read for ``project``.
+
+    Post-#339 the canonical layout collapsed per-project ``state.db``
+    files into a workspace-scoped store at
+    ``<workspace_root>/.pollypm/state.db``. Briefing reads were left on
+    the per-project path and silently failed-open on every install with
+    #339 shipped (#1036).
+
+    The dual-path resolution mirrors :func:`pollypm.cockpit_inbox._inbox_db_sources`:
+
+    1. Try ``<project_path>/.pollypm/state.db`` first (legacy /
+       per-project layout still in use on some installs).
+    2. Fall back to ``<workspace_root>/.pollypm/state.db`` when the
+       per-project DB is absent.
+
+    Both are returned (deduped by resolved path) when both exist, so a
+    workspace whose project path equals the workspace root scans once,
+    and a project sitting under a workspace with a shared DB still
+    surfaces its rows.
+    """
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    per_project = project.path / ".pollypm" / "state.db"
+    if per_project.exists():
+        resolved = per_project.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            candidates.append(per_project)
+
+    workspace_root = None
+    if config is not None:
+        workspace_root = getattr(getattr(config, "project", None), "workspace_root", None)
+    if workspace_root is not None:
+        ws_db = Path(workspace_root) / ".pollypm" / "state.db"
+        if ws_db.exists():
+            resolved = ws_db.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                candidates.append(ws_db)
+
+    return candidates
+
+
 # ---------------------------------------------------------------------------
 # Git log gathering
 # ---------------------------------------------------------------------------
@@ -263,7 +308,8 @@ _TRANSITION_SQL = (
     "FROM work_transitions t "
     "LEFT JOIN work_tasks w "
     "  ON w.project = t.task_project AND w.task_number = t.task_number "
-    "WHERE t.created_at >= ? AND t.created_at < ? "
+    "WHERE t.task_project = ? "
+    "  AND t.created_at >= ? AND t.created_at < ? "
     "ORDER BY t.created_at ASC"
 )
 
@@ -273,42 +319,54 @@ def _gather_transitions_for_project(
     *,
     since_iso: str,
     until_iso: str,
+    config=None,
 ) -> list[TransitionRecord]:
-    """Read work_transitions from the project's state.db in the window."""
-    db_path = project.path / ".pollypm" / "state.db"
-    if not db_path.exists():
-        return []
-    try:
-        uri = f"file:{db_path}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True)
-    except sqlite3.Error as exc:
-        logger.debug("briefing: cannot open %s: %s", db_path, exc)
-        return []
-    try:
-        conn.row_factory = sqlite3.Row
-        try:
-            rows = conn.execute(_TRANSITION_SQL, (since_iso, until_iso)).fetchall()
-        except sqlite3.Error as exc:
-            logger.debug("briefing: transitions SQL failed for %s: %s", project.key, exc)
-            return []
-    finally:
-        conn.close()
+    """Read work_transitions from the project's state.db in the window.
 
+    Tries per-project then workspace-root (post-#339) DBs. Rows are
+    filtered by ``task_project = project.key`` because a shared
+    workspace DB holds rows for many projects.
+    """
     out: list[TransitionRecord] = []
-    for r in rows:
-        proj = r["project"]
-        num = r["task_number"]
-        out.append(
-            TransitionRecord(
-                project=proj,
-                task_id=f"{proj}/{num}",
-                task_title=r["title"] or "",
-                from_state=r["from_state"] or "",
-                to_state=r["to_state"] or "",
-                actor=r["actor"] or "",
-                timestamp=r["created_at"] or "",
+    seen_keys: set[tuple[str, int, str]] = set()
+    for db_path in project_state_db_paths(project, config):
+        try:
+            uri = f"file:{db_path}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True)
+        except sqlite3.Error as exc:
+            logger.debug("briefing: cannot open %s: %s", db_path, exc)
+            continue
+        try:
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    _TRANSITION_SQL, (project.key, since_iso, until_iso),
+                ).fetchall()
+            except sqlite3.Error as exc:
+                logger.debug("briefing: transitions SQL failed for %s: %s", project.key, exc)
+                continue
+        finally:
+            conn.close()
+
+        for r in rows:
+            proj = r["project"]
+            num = r["task_number"]
+            ts = r["created_at"] or ""
+            dedupe_key = (proj, num, ts)
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            out.append(
+                TransitionRecord(
+                    project=proj,
+                    task_id=f"{proj}/{num}",
+                    task_title=r["title"] or "",
+                    from_state=r["from_state"] or "",
+                    to_state=r["to_state"] or "",
+                    actor=r["actor"] or "",
+                    timestamp=ts,
+                )
             )
-        )
     return out
 
 
@@ -379,6 +437,7 @@ def _gather_downtime_artifacts(
     *,
     since_iso: str,
     until_iso: str,
+    config=None,
 ) -> list[DowntimeArtifactSummary]:
     """Return downtime tasks that reached ``awaiting_approval`` yesterday.
 
@@ -387,48 +446,57 @@ def _gather_downtime_artifacts(
     labelled with ``downtime`` in ``work_tasks.labels``. The label
     column stores JSON, so we match substring — good enough for the
     briefing's purposes.
+
+    Tries per-project then workspace-root state.db (post-#339), filtering
+    by ``task_project = project.key`` so a shared workspace DB only
+    surfaces this project's rows.
     """
-    db_path = project.path / ".pollypm" / "state.db"
-    if not db_path.exists():
-        return []
-    try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    except sqlite3.Error:
-        return []
-    try:
-        conn.row_factory = sqlite3.Row
-        try:
-            rows = conn.execute(
-                "SELECT t.task_project AS project, t.task_number AS task_number, "
-                "       COALESCE(w.title, '') AS title, t.created_at AS created_at, "
-                "       COALESCE(w.labels, '[]') AS labels "
-                "FROM work_transitions t "
-                "LEFT JOIN work_tasks w "
-                "  ON w.project = t.task_project AND w.task_number = t.task_number "
-                "WHERE t.to_state = 'awaiting_approval' "
-                "  AND t.created_at >= ? AND t.created_at < ? "
-                "ORDER BY t.created_at ASC",
-                (since_iso, until_iso),
-            ).fetchall()
-        except sqlite3.Error:
-            return []
-    finally:
-        conn.close()
     out: list[DowntimeArtifactSummary] = []
-    for r in rows:
-        labels_raw = r["labels"] or "[]"
-        if "downtime" not in labels_raw.lower():
+    seen_keys: set[tuple[str, int, str]] = set()
+    for db_path in project_state_db_paths(project, config):
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        except sqlite3.Error:
             continue
-        proj = r["project"]
-        num = r["task_number"]
-        out.append(
-            DowntimeArtifactSummary(
-                project=proj,
-                task_id=f"{proj}/{num}",
-                title=r["title"] or "",
-                reached_at=r["created_at"] or "",
+        try:
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    "SELECT t.task_project AS project, t.task_number AS task_number, "
+                    "       COALESCE(w.title, '') AS title, t.created_at AS created_at, "
+                    "       COALESCE(w.labels, '[]') AS labels "
+                    "FROM work_transitions t "
+                    "LEFT JOIN work_tasks w "
+                    "  ON w.project = t.task_project AND w.task_number = t.task_number "
+                    "WHERE t.task_project = ? "
+                    "  AND t.to_state = 'awaiting_approval' "
+                    "  AND t.created_at >= ? AND t.created_at < ? "
+                    "ORDER BY t.created_at ASC",
+                    (project.key, since_iso, until_iso),
+                ).fetchall()
+            except sqlite3.Error:
+                continue
+        finally:
+            conn.close()
+        for r in rows:
+            labels_raw = r["labels"] or "[]"
+            if "downtime" not in labels_raw.lower():
+                continue
+            proj = r["project"]
+            num = r["task_number"]
+            ts = r["created_at"] or ""
+            dedupe_key = (proj, num, ts)
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            out.append(
+                DowntimeArtifactSummary(
+                    project=proj,
+                    task_id=f"{proj}/{num}",
+                    title=r["title"] or "",
+                    reached_at=ts,
+                )
             )
-        )
     return out
 
 
@@ -482,6 +550,7 @@ def gather_yesterday(
             snapshot.task_transitions.extend(
                 _gather_transitions_for_project(
                     project, since_iso=since_iso, until_iso=until_iso,
+                    config=config,
                 )
             )
         except Exception as exc:  # noqa: BLE001
@@ -491,6 +560,7 @@ def gather_yesterday(
             snapshot.downtime_artifacts.extend(
                 _gather_downtime_artifacts(
                     project, since_iso=since_iso, until_iso=until_iso,
+                    config=config,
                 )
             )
         except Exception as exc:  # noqa: BLE001

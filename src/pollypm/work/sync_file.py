@@ -78,10 +78,12 @@ def _render_markdown(task: Task) -> str:
     return "\n".join(lines)
 
 
-def _autocommit_issues(project_root: Path, message: str) -> None:
+def _autocommit_issues(project_root: Path, message: str) -> bool:
     """Stage ``issues/`` and commit if anything changed there.
 
-    Issue #1022. Best-effort; never raises. No-ops cleanly when:
+    Issue #1022. Best-effort; never raises. Returns ``True`` if a commit
+    was created, ``False`` for any clean no-op or failure path. No-ops
+    cleanly when:
 
     - the project is not a git repo (tests use bare temp dirs);
     - a merge is in progress (``.git/MERGE_HEAD`` exists) — committing
@@ -92,11 +94,17 @@ def _autocommit_issues(project_root: Path, message: str) -> None:
     Uses inline ``-c user.name=...`` / ``-c user.email=...`` so the commit
     works in CI / fresh-checkout environments where the user identity
     isn't configured globally.
+
+    Issue #1046. Failures are now surfaced at ``WARNING`` (not ``DEBUG``)
+    so a regression like the one observed in #1046 — auto-commit
+    silently failing and leaving ``issues/`` dirty across many project
+    roots — is visible in operator logs immediately. Clean no-ops (no
+    git repo, merge in progress, nothing to commit) stay at ``DEBUG``.
     """
     try:
         git_dir = project_root / ".git"
         if not git_dir.exists():
-            return
+            return False
         # `.git` may be a file (worktree pointer); both forms are valid
         # repo markers. The MERGE_HEAD check below assumes a directory
         # layout — if `.git` is a file, skip the merge-in-progress
@@ -107,11 +115,11 @@ def _autocommit_issues(project_root: Path, message: str) -> None:
                 "Skipping issues/ auto-commit: merge in progress at %s",
                 project_root,
             )
-            return
+            return False
 
         issues_dir = project_root / "issues"
         if not issues_dir.exists():
-            return
+            return False
 
         base_cmd = [
             "git",
@@ -130,11 +138,15 @@ def _autocommit_issues(project_root: Path, message: str) -> None:
             text=True,
         )
         if add.returncode != 0:
-            logger.debug(
-                "issues/ auto-commit: git add failed: %s",
+            # #1046 — promoted from DEBUG. A failed ``git add`` here
+            # means the lifecycle move / scaffold won't be captured and
+            # the project root will stay dirty. Operator needs to see.
+            logger.warning(
+                "issues/ auto-commit: git add failed at %s: %s",
+                project_root,
                 add.stderr.strip() or add.stdout.strip(),
             )
-            return
+            return False
 
         # If nothing is staged for issues/, skip the commit. Using
         # ``--quiet`` means a non-zero exit means "there is something
@@ -147,7 +159,7 @@ def _autocommit_issues(project_root: Path, message: str) -> None:
         )
         if diff.returncode == 0:
             # No staged changes under issues/ — nothing to commit.
-            return
+            return False
 
         commit = subprocess.run(
             [*base_cmd, "commit", "-m", message, "--only", "--", "issues"],
@@ -156,20 +168,31 @@ def _autocommit_issues(project_root: Path, message: str) -> None:
             text=True,
         )
         if commit.returncode != 0:
-            logger.debug(
-                "issues/ auto-commit: git commit failed: %s",
+            # #1046 — promoted from DEBUG. ``git commit`` failure here
+            # is exactly the silent-regression mode that #1046 calls
+            # out: the rename has happened on disk but never landed in
+            # a commit, so the working tree stays dirty.
+            logger.warning(
+                "issues/ auto-commit: git commit failed at %s: %s",
+                project_root,
                 commit.stderr.strip() or commit.stdout.strip(),
             )
-            return
+            return False
         logger.info(
             "issues/ auto-commit: %s (root=%s)",
             message,
             project_root,
         )
+        return True
     except Exception as exc:  # noqa: BLE001
-        # Never let a sync-side commit propagate. Worst case: we log
-        # the failure and fall back to today's "dirty root" behaviour.
-        logger.debug("issues/ auto-commit suppressed: %s", exc)
+        # Never let a sync-side commit propagate. #1046 — promoted from
+        # DEBUG so operators see the regression that this guard hides.
+        logger.warning(
+            "issues/ auto-commit suppressed at %s: %s",
+            project_root,
+            exc,
+        )
+        return False
 
 
 class FileSyncAdapter:

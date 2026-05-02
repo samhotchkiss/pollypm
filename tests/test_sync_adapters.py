@@ -284,6 +284,165 @@ class TestFileSyncAutoCommit:
         ).stdout.strip()
         assert "pollypm@local" in author
 
+    def test_on_transition_commits_under_busy_db_simulation(self, svc, project_repo, caplog):
+        """#1046 — lifecycle moves must commit even when the work-service
+        DB is contended. ``_autocommit_issues`` does not touch SQLite, so
+        a simulated db-locked condition on adjacent code paths must not
+        prevent the issues/ commit from landing. This is the "fix
+        forward" half of #1046's failure mode A: prove the auto-commit
+        path itself is robust regardless of upstream lock contention."""
+        adapter = FileSyncAdapter(issues_root=project_repo / "issues")
+        task = _make_task(svc)
+        adapter.on_create(task)
+
+        task = svc.queue(task.task_id, "tester")
+        # Patch the SQLite work service connection to *raise* on every
+        # call — simulates the worst-case #1030 contention. The adapter
+        # must still commit the move because it doesn't touch the DB.
+        from unittest.mock import patch
+
+        with patch.object(
+            svc, "get", side_effect=Exception("database is locked")
+        ):
+            with caplog.at_level(logging.WARNING):
+                adapter.on_transition(task, "draft", "queued")
+
+        # Move was captured by git despite the db-lock simulation.
+        assert self._porcelain(project_repo) == ""
+        subjects = self._log_subjects(project_repo)
+        assert any("draft -> queued" in s for s in subjects), subjects
+
+    def test_failure_logged_at_warning(self, svc, project_repo, caplog):
+        """#1046 — a swallowed auto-commit failure must surface at
+        WARNING (not DEBUG) so the silent-regression in #1046's failure
+        mode A can never repeat without operator visibility."""
+        adapter = FileSyncAdapter(issues_root=project_repo / "issues")
+        task = _make_task(svc)
+        adapter.on_create(task)
+
+        # Force the next git invocation to fail by writing junk into
+        # ``.git/index.lock`` so the next ``git add`` errors out.
+        lock = project_repo / ".git" / "index.lock"
+        lock.write_text("locked\n")
+
+        try:
+            with caplog.at_level(logging.WARNING):
+                task2 = _make_task(svc, title="Second task")
+                adapter.on_create(task2)
+        finally:
+            if lock.exists():
+                lock.unlink()
+
+        # Failure must surface at WARNING, not buried at DEBUG.
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and "issues/ auto-commit" in r.getMessage()
+        ]
+        assert warning_records, (
+            "Expected a WARNING-level log for the failed auto-commit; "
+            f"got: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+
+    def test_returns_true_on_commit_false_on_noop(self, svc, project_repo):
+        """#1046 — return value lets callers like scaffold_issue_tracker
+        and future loud-alert plumbing distinguish "commit landed" from
+        "nothing to do"."""
+        from pollypm.work.sync_file import _autocommit_issues
+
+        # No issues/ tree yet -> returns False.
+        assert _autocommit_issues(project_repo, "noop") is False
+
+        # Scaffold the tree and check that the commit is reported.
+        (project_repo / "issues" / "00-not-ready").mkdir(parents=True)
+        (project_repo / "issues" / "notes.md").write_text("# notes\n")
+        assert _autocommit_issues(project_repo, "first") is True
+
+        # Re-running with no churn returns False.
+        assert _autocommit_issues(project_repo, "noop again") is False
+
+
+class TestScaffoldIssueTrackerAutoCommit:
+    """#1046 failure mode B: scaffolding ``issues/`` for the first time
+    must land as the first auto-commit, even if the project never sees a
+    lifecycle transition. Without this, projects sit with a fully-
+    untracked ``issues/`` tree forever (camptown, coin-flip, pomodoro,
+    russell, smoketest in the original repro)."""
+
+    @staticmethod
+    def _git(args, cwd):
+        return subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    @pytest.fixture
+    def project_repo(self, tmp_path):
+        repo = tmp_path / "proj"
+        repo.mkdir()
+        self._git(["init", "-q", "-b", "main"], cwd=repo)
+        self._git(["config", "user.email", "seed@local"], cwd=repo)
+        self._git(["config", "user.name", "Seed"], cwd=repo)
+        (repo / "README.md").write_text("# project\n")
+        self._git(["add", "README.md"], cwd=repo)
+        self._git(["commit", "-q", "-m", "seed"], cwd=repo)
+        return repo
+
+    def _porcelain(self, repo):
+        return self._git(["status", "--porcelain"], cwd=repo).stdout
+
+    def _log_subjects(self, repo):
+        out = self._git(["log", "--format=%s"], cwd=repo).stdout
+        return [line for line in out.splitlines() if line]
+
+    def test_initial_scaffold_is_committed(self, project_repo):
+        """#1046 — first scaffold of issues/ produces a commit even
+        when no tasks are ever created (failure mode B)."""
+        from pollypm.projects import scaffold_issue_tracker
+
+        scaffold_issue_tracker(project_repo)
+
+        # No issues/ files left dangling — the scaffold landed in a commit.
+        porcelain = self._porcelain(project_repo)
+        assert "issues/" not in porcelain, (
+            f"expected issues/ committed, got dirty status: {porcelain!r}"
+        )
+        subjects = self._log_subjects(project_repo)
+        assert any(
+            "chore(issues): scaffold" in s for s in subjects
+        ), subjects
+
+    def test_scaffold_does_not_gitignore_issues(self, project_repo):
+        """#1046 — ``issues/`` must NOT be in ``.gitignore`` after
+        scaffolding. The legacy ``_ensure_gitignore_entry`` call
+        contradicted #1022 and silently disabled every subsequent
+        auto-commit because ``git add -- issues`` no-ops on ignored
+        paths."""
+        from pollypm.projects import scaffold_issue_tracker
+
+        scaffold_issue_tracker(project_repo)
+
+        gitignore = project_repo / ".gitignore"
+        if gitignore.exists():
+            text = gitignore.read_text()
+            assert "issues/" not in text.splitlines(), (
+                f"issues/ must not be gitignored after scaffold; got:\n{text}"
+            )
+
+    def test_scaffold_idempotent_no_redundant_commit(self, project_repo):
+        """Calling scaffold twice must not create a second empty commit."""
+        from pollypm.projects import scaffold_issue_tracker
+
+        scaffold_issue_tracker(project_repo)
+        first_subjects = self._log_subjects(project_repo)
+
+        scaffold_issue_tracker(project_repo)
+        second_subjects = self._log_subjects(project_repo)
+
+        # Same number of commits — second call was a clean no-op.
+        assert first_subjects == second_subjects, (first_subjects, second_subjects)
+
 
 # ---------------------------------------------------------------------------
 # GitHub Adapter Tests

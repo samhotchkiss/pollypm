@@ -295,7 +295,31 @@ def scaffold_issue_tracker(project_path: Path) -> Path:
         instructions_target = issues_dir / "instructions.md"
         if TRACKER_TEMPLATE.exists() and not instructions_target.exists():
             shutil.copyfile(TRACKER_TEMPLATE, instructions_target)
-        _ensure_gitignore_entry(project_root, "issues/")
+        # #1046 — guarantee the initial scaffold lands as a commit even
+        # when the project never sees a lifecycle transition. Without
+        # this, projects that scaffolded ``issues/`` but had no tasks
+        # promoted yet (camptown, coin-flip, pomodoro, russell,
+        # smoketest) sat with an entirely-untracked ``issues/`` tree
+        # forever — see #1046 failure mode B. We piggy-back on the
+        # existing ``_autocommit_issues`` plumbing so the message
+        # format and identity stay consistent with subsequent
+        # lifecycle commits. NOTE: the legacy
+        # ``_ensure_gitignore_entry(project_root, "issues/")`` call was
+        # removed here — adding ``issues/`` to ``.gitignore`` directly
+        # contradicts #1022's contract that every lifecycle move
+        # auto-commits, since ``git add -- issues`` silently no-ops on
+        # ignored paths and the auto-commit then has nothing to capture.
+        try:
+            from pollypm.work.sync_file import _autocommit_issues
+
+            _autocommit_issues(
+                project_root,
+                "chore(issues): scaffold issue tracker",
+            )
+        except Exception:  # noqa: BLE001
+            # Best-effort, identical posture to the lifecycle path —
+            # never block scaffold registration on a commit hiccup.
+            pass
     return issues_dir
 
 

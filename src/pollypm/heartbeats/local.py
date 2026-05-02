@@ -446,6 +446,42 @@ def _select_intervention(
     return _DEFAULT_POLICY.select_intervention(health, signals, history)
 
 
+# Characters that comprise pure visual dividers / formatting leaders. A
+# transcript line composed solely of these (plus whitespace) carries no
+# information for the alert reader, so the snippet selector skips it.
+_DIVIDER_CHARS = frozenset("─━═-_=•└├")
+_LEADER_STRIP_CHARS = "•└├-*  \t"
+
+
+def _select_snippet(text: str, *, max_len: int = 120) -> str:
+    """Pick the last *informative* line of ``text`` for an alert snippet.
+
+    Walks lines from the end toward the start and returns the first one
+    that is not empty, not a pure divider/box-drawing run, and not just a
+    bullet leader. The chosen line has its leading bullets/leaders stripped
+    and is truncated to ``max_len``. When nothing informative is found,
+    returns a stable fallback string instead of leaking a bare trailing dash.
+    """
+
+    if not text:
+        return "(continuing without a clear summary line)"
+
+    for raw in reversed(text.splitlines()):
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        # Drop lines composed entirely of divider / leader characters and
+        # whitespace — these are visual chrome, not content.
+        if all(ch in _DIVIDER_CHARS or ch.isspace() for ch in stripped):
+            continue
+        cleaned = stripped.lstrip(_LEADER_STRIP_CHARS).strip()
+        if not cleaned:
+            continue
+        return cleaned[:max_len]
+
+    return "(continuing without a clear summary line)"
+
+
 class LocalHeartbeatBackend(HeartbeatBackend):
     name = "local"
     _UNMANAGED_WINDOW_ALERT_PREFIX = "unmanaged_window:"
@@ -1535,9 +1571,11 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         delta = (context.transcript_delta or "").strip()
         if not delta:
             return "unclear", "No new transcript output since last heartbeat"
-        text = delta
-        # Extract a useful snippet from the tail of the text for the reason
-        snippet = text.strip().splitlines()[-1][:120] if text.strip() else ""
+        # Strip ANSI escape sequences before any further processing so
+        # truncated cursor-movement codes (``[2``, ``[4``) cannot leak into
+        # the user-facing snippet.
+        text = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", delta)
+        snippet = _select_snippet(text)
         lowered = text.lower()
         if any(pattern in lowered for pattern in self._WAITING_PATTERNS):
             return "blocked", f"Waiting on operator input — {snippet}"

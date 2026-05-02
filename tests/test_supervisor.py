@@ -1736,6 +1736,157 @@ def test_build_review_nudge_evicts_dropped_projects(monkeypatch, tmp_path: Path)
 
 
 # ---------------------------------------------------------------------------
+# #1023 — fresh-context contract for re-review tasks
+# ---------------------------------------------------------------------------
+
+
+def _build_re_review_config(tmp_path: Path) -> PollyPMConfig:
+    """Configure one project with a single task that has been rejected once.
+
+    The task lands at ``code_review`` for visit 2 — i.e. the worker's
+    rebuild has already pushed the task back through review. This is the
+    bikepath/8 shape from #1023: a clean rebuild whose reviewer pane
+    still has round-1 rejection notes in scrollback.
+    """
+    from pollypm.work.models import (
+        Artifact as _Artifact,
+        ArtifactKind as _ArtifactKind,
+        OutputType as _OutputType,
+        WorkOutput as _WorkOutput,
+    )
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    config = _config(tmp_path)
+    config.project.workspace_root = tmp_path
+    config.projects.clear()
+    workspace_db = tmp_path / ".pollypm" / "state.db"
+    workspace_db.parent.mkdir(parents=True, exist_ok=True)
+
+    proj_root = tmp_path / "rerev"
+    (proj_root / ".pollypm").mkdir(parents=True, exist_ok=True)
+    config.projects["rerev"] = KnownProject(
+        key="rerev", path=proj_root, name="rerev", kind=ProjectKind.FOLDER,
+    )
+
+    work_output = _WorkOutput(
+        type=_OutputType.CODE_CHANGE,
+        summary="round 1 build",
+        artifacts=[
+            _Artifact(
+                kind=_ArtifactKind.COMMIT,
+                description="feat",
+                ref="deadbee1",
+            ),
+        ],
+    )
+    work_output_2 = _WorkOutput(
+        type=_OutputType.CODE_CHANGE,
+        summary="round 2 rebuild",
+        artifacts=[
+            _Artifact(
+                kind=_ArtifactKind.COMMIT,
+                description="feat fix",
+                ref="deadbee2",
+            ),
+        ],
+    )
+
+    with SQLiteWorkService(db_path=workspace_db) as svc:
+        task = svc.create(
+            title="re-review task",
+            description="d",
+            type="task",
+            project="rerev",
+            flow_template="standard",
+            roles={"worker": "alice", "reviewer": "russell"},
+            priority="normal",
+            created_by="tester",
+        )
+        svc.queue(task.task_id, "pm")
+        svc.claim(task.task_id, "alice")
+        svc.node_done(task.task_id, "alice", work_output)
+        # First-round rejection — bounces task back to ``implement``.
+        svc.reject(task.task_id, "russell", "stale: localhost on README:11")
+        # Worker rebuilds and signals done — task lands at code_review v2.
+        svc.node_done(task.task_id, "alice", work_output_2)
+    return config
+
+
+def test_build_review_nudge_first_review_does_not_carry_fresh_context(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """Sanity check #1023: a project with no prior rejections gets the
+    short nudge without the fresh-context contract. Otherwise we'd
+    spam the reviewer with re-verification copy on every first review.
+    """
+    from pollypm import supervisor as _supervisor_module
+
+    config = _configure_review_nudge_projects(tmp_path, n_projects=1)
+    _pin_load_config(monkeypatch, config)
+    sup = Supervisor(config)
+
+    _supervisor_module._REVIEW_NUDGE_CACHE.clear()
+    nudge = sup._build_review_nudge()
+    assert nudge is not None
+    assert "FRESH-CONTEXT REVIEW" not in nudge
+    assert "re-review after rebuild" not in nudge
+
+
+def test_build_review_nudge_re_review_prepends_fresh_context_contract(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """#1023 — when a task is back through review after a rebuild, the
+    nudge must prepend a fresh-context contract so the reviewer pane
+    re-verifies against the live worktree instead of repeating the
+    prior rejection from scrollback.
+    """
+    from pollypm import supervisor as _supervisor_module
+
+    config = _build_re_review_config(tmp_path)
+    _pin_load_config(monkeypatch, config)
+    sup = Supervisor(config)
+
+    _supervisor_module._REVIEW_NUDGE_CACHE.clear()
+    nudge = sup._build_review_nudge()
+    assert nudge is not None
+    # The contract must lead the nudge so the live-disk discipline
+    # appears before the reviewer scans the task list.
+    assert nudge.startswith("FRESH-CONTEXT REVIEW")
+    # The task line tags this as a re-review so Russell knows which
+    # task triggered the contract.
+    assert "re-review after rebuild" in nudge
+    # The prior rejection's complaint must not be quoted into the
+    # nudge — that would feed scrollback from a different angle.
+    assert "localhost on README" not in nudge
+
+
+def test_review_tasks_for_project_caches_re_review_count(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """Cache shape gained a third element (``re_review_count``) in #1023.
+    Confirm warm reads still serve from cache and report the count.
+    """
+    from pollypm import supervisor as _supervisor_module
+    from pollypm.supervisor_alerts import _review_tasks_for_project
+
+    config = _build_re_review_config(tmp_path)
+    _pin_load_config(monkeypatch, config)
+    _supervisor_module._REVIEW_NUDGE_CACHE.clear()
+
+    workspace_db = tmp_path / ".pollypm" / "state.db"
+    entries, count = _review_tasks_for_project("rerev", workspace_db)
+    assert count == 1
+    assert any("re-review after rebuild" in line for line in entries)
+
+    # Warm read returns the same tuple.
+    entries2, count2 = _review_tasks_for_project("rerev", workspace_db)
+    assert (entries, count) == (entries2, count2)
+    cached = _supervisor_module._REVIEW_NUDGE_CACHE["rerev"]
+    assert cached[1] == entries
+    assert cached[2] == count
+
+
+# ---------------------------------------------------------------------------
 # _send_initial_input_if_fresh — role gating (Issue #260)
 # ---------------------------------------------------------------------------
 

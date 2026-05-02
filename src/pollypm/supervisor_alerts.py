@@ -70,7 +70,14 @@ class SupervisorAlertBoundary(Protocol):
     def pane_has_provider_outage(self, lowered_pane: str) -> bool: ...
 
 
-_REVIEW_NUDGE_CACHE: dict[str, tuple[float, list[str]]] = {}
+# Per-project review-nudge cache. Values are
+# ``(db_mtime, entry_lines, re_review_count)`` tuples. ``re_review_count``
+# tracks tasks whose current review node already has at least one
+# completed-and-rejected execution row — i.e. the task came back through
+# review after a rebuild. #1023 uses this to prepend a fresh-context
+# contract to the nudge so the reviewer doesn't re-cite the prior
+# rejection's complaints from scrollback.
+_REVIEW_NUDGE_CACHE: dict[str, tuple[float, list[str], int]] = {}
 
 
 def _emit_routed_event(
@@ -123,32 +130,69 @@ def _emit_routed_event(
     )
 
 
-def _review_tasks_for_project(project_key: str, db_path: Path) -> list[str]:
-    """Return nudge lines for a project's review-queue tasks."""
+def _task_is_re_review(task: object) -> bool:
+    """True when this task has been rejected from its current review node before.
+
+    #1023 — a task whose ``executions`` list contains at least one
+    completed row at the current review node with ``decision=REJECTED``
+    is on a *re-review* pass. The reviewer pane that already sat through
+    the prior round still has those complaints in scrollback, so the
+    nudge needs to tell Russell explicitly to re-verify against live
+    disk instead of repeating last round's rejection from memory.
+    """
+    from pollypm.work.models import Decision
+
+    current_node = getattr(task, "current_node_id", None)
+    if not current_node:
+        return False
+    for execution in getattr(task, "executions", None) or []:
+        if getattr(execution, "node_id", None) != current_node:
+            continue
+        if getattr(execution, "decision", None) == Decision.REJECTED:
+            return True
+    return False
+
+
+def _review_tasks_for_project(
+    project_key: str, db_path: Path,
+) -> tuple[list[str], int]:
+    """Return nudge lines + re-review count for a project's review-queue tasks.
+
+    The second element of the tuple is the number of tasks whose current
+    review node has at least one prior rejection — see :func:`_task_is_re_review`.
+    Used by :func:`_build_review_nudge` to gate the fresh-context contract.
+    """
     try:
         db_mtime = db_path.stat().st_mtime
     except OSError:
         _REVIEW_NUDGE_CACHE.pop(project_key, None)
-        return []
+        return [], 0
     cached = _REVIEW_NUDGE_CACHE.get(project_key)
     if cached is not None and cached[0] == db_mtime:
-        return cached[1]
+        return cached[1], cached[2]
 
     from pollypm.work.sqlite_service import SQLiteWorkService
 
     entries: list[str] = []
+    re_review_count = 0
     try:
         with SQLiteWorkService(db_path=db_path) as svc:
             tasks = svc.list_tasks(work_status="review", project=project_key)
             for task in tasks:
                 if task.current_node_id and "human" in task.current_node_id:
                     continue
-                entries.append(f"  - {task.task_id}: {task.title}")
+                if _task_is_re_review(task):
+                    entries.append(
+                        f"  - {task.task_id}: {task.title} (re-review after rebuild)"
+                    )
+                    re_review_count += 1
+                else:
+                    entries.append(f"  - {task.task_id}: {task.title}")
     except Exception:  # noqa: BLE001
-        return []
+        return [], 0
 
-    _REVIEW_NUDGE_CACHE[project_key] = (db_mtime, entries)
-    return entries
+    _REVIEW_NUDGE_CACHE[project_key] = (db_mtime, entries, re_review_count)
+    return entries, re_review_count
 
 
 def _update_alerts(
@@ -382,6 +426,24 @@ def _maybe_nudge_reviewer_review(
         pass
 
 
+_FRESH_CONTEXT_CONTRACT = (
+    "FRESH-CONTEXT REVIEW (one or more tasks below are re-reviews after "
+    "a rebuild). Do NOT reuse your prior rejection notes from earlier in "
+    "this conversation — the worker's commit on disk is the source of "
+    "truth, not your scrollback. For each re-review task:\n"
+    "  1. `cd` into the worktree path printed in `pm task status <id>`.\n"
+    "  2. Run `git log --oneline -5` and `git status --porcelain` so you "
+    "see the live commit and the live worktree state, not a cached one.\n"
+    "  3. Re-read every file you cited last round — confirm the symptom "
+    "is still present before you re-cite it. If it is gone, the previous "
+    "rejection is resolved, even if your memory says otherwise.\n"
+    "  4. When you decide, your `--reason` MUST quote a live `path:line` "
+    "or a live command output (not a remembered one). If you cannot "
+    "produce a live citation, you have not actually re-checked — go "
+    "re-check before calling reject.\n"
+)
+
+
 def _build_review_nudge(supervisor: SupervisorAlertBoundary) -> str | None:
     """Check all projects for tasks in review state."""
     # #804: route through the public ``pollypm.work.db_resolver`` so
@@ -392,6 +454,7 @@ def _build_review_nudge(supervisor: SupervisorAlertBoundary) -> str | None:
     from pollypm.work.db_resolver import resolve_work_db_path
 
     review_tasks: list[str] = []
+    re_review_total = 0
     live_keys: set[str] = set()
     for project_key in supervisor.config.projects:
         live_keys.add(project_key)
@@ -412,7 +475,9 @@ def _build_review_nudge(supervisor: SupervisorAlertBoundary) -> str | None:
             _REVIEW_NUDGE_CACHE.pop(project_key, None)
             continue
         try:
-            entries = _review_tasks_for_project(project_key, db_path)
+            entries, re_review_count = _review_tasks_for_project(
+                project_key, db_path,
+            )
         except Exception:  # noqa: BLE001
             _logger.exception(
                 "supervisor_alerts: review nudge query failed for %s",
@@ -420,18 +485,33 @@ def _build_review_nudge(supervisor: SupervisorAlertBoundary) -> str | None:
             )
             continue
         review_tasks.extend(entries)
+        re_review_total += re_review_count
     for stale in set(_REVIEW_NUDGE_CACHE) - live_keys:
         _REVIEW_NUDGE_CACHE.pop(stale, None)
     if not review_tasks:
         return None
     n = len(review_tasks)
     word = "task" if n == 1 else "tasks"
-    lines = [
-        f"You have {n} {word} waiting for your review:",
-        *review_tasks,
-        "",
-        "Open Tasks or Inbox, inspect each review, then use Approve or Reject.",
-    ]
+    lines: list[str] = []
+    # #1023 — prepend the fresh-context contract whenever any task is
+    # back through review after a rebuild. The reviewer pane is the
+    # same conversation that rejected last round, so without an
+    # explicit instruction to ignore scrollback Russell tends to
+    # re-emit the prior rejection verbatim instead of re-verifying
+    # against the live worktree. The contract is gated on
+    # ``re_review_total`` so a project whose review queue is all
+    # first-pass tasks gets the original short nudge.
+    if re_review_total > 0:
+        lines.append(_FRESH_CONTEXT_CONTRACT)
+        lines.append("")
+    lines.extend(
+        [
+            f"You have {n} {word} waiting for your review:",
+            *review_tasks,
+            "",
+            "Open Tasks or Inbox, inspect each review, then use Approve or Reject.",
+        ]
+    )
     return "\n".join(lines)
 
 

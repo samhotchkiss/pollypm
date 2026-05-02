@@ -259,3 +259,131 @@ def test_invalid_batch_size_raises(tmp_path: Path) -> None:
             EventBuffer(store, capacity=0, install_signal_handlers=False)
     finally:
         store.close()
+
+
+# --------------------------------------------------------------------------
+# #1050 — retry-on-locked
+# --------------------------------------------------------------------------
+
+
+def test_flush_retries_on_transient_db_lock(tmp_path: Path) -> None:
+    """#1050: a transient ``database is locked`` flake within the retry
+    budget must not drop audit rows. Simulates two consecutive lock
+    errors followed by a successful flush — the rows should persist.
+    """
+    import sqlite3
+
+    store = SQLAlchemyStore(_db_url(tmp_path))
+    buffer = EventBuffer(
+        store,
+        batch_size=10,
+        flush_interval=5.0,  # long — we drive flush manually
+        install_signal_handlers=False,
+    )
+    try:
+        # Stop the background drain so we can drive _flush_batch ourselves
+        # without racing the thread.
+        buffer.close(timeout=2.0)
+        # Re-open the buffer for direct flush testing — close() set
+        # ``_closed`` but left ``_store`` intact; we'll call _flush_batch
+        # directly with a fresh batch.
+        buffer._closed = False  # type: ignore[attr-defined]
+
+        from pollypm.store.event_buffer import _PendingEvent
+
+        batch = [
+            _PendingEvent(
+                scope="root",
+                sender="retry-test",
+                subject=f"transient-{i}",
+                payload_json="{}",
+            )
+            for i in range(3)
+        ]
+
+        # Patch the store's transaction so the first two attempts raise
+        # ``database is locked`` and the third succeeds.
+        original_transaction = store.transaction
+        call_count = {"n": 0}
+
+        def flaky_transaction(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] <= 2:
+                raise sqlite3.OperationalError("database is locked")
+            return original_transaction(*args, **kwargs)
+
+        store.transaction = flaky_transaction  # type: ignore[method-assign]
+        try:
+            buffer._flush_batch(batch)
+        finally:
+            store.transaction = original_transaction  # type: ignore[method-assign]
+
+        # All three rows should have landed despite two transient locks.
+        assert call_count["n"] == 3
+        assert _row_count(store) == 3
+    finally:
+        store.close()
+
+
+def test_flush_drops_on_sustained_db_lock(tmp_path: Path, caplog) -> None:
+    """#1050: when contention persists past the retry budget, the existing
+    drop-and-log behavior is preserved (no spool-to-disk yet — that's a
+    follow-up). The log line must still fire so operators can see the
+    audit gap.
+    """
+    import logging
+    import sqlite3
+
+    store = SQLAlchemyStore(_db_url(tmp_path))
+    buffer = EventBuffer(
+        store,
+        batch_size=10,
+        flush_interval=5.0,
+        install_signal_handlers=False,
+    )
+    try:
+        buffer.close(timeout=2.0)
+        buffer._closed = False  # type: ignore[attr-defined]
+
+        from pollypm.store.event_buffer import _PendingEvent
+
+        batch = [
+            _PendingEvent(
+                scope="root",
+                sender="sustained-test",
+                subject="never-lands",
+                payload_json="{}",
+            )
+        ]
+
+        # Patch the retry sleep so the test runs instantly instead of
+        # paying the full ~2.6 s backoff ladder.
+        from pollypm.store import event_buffer as event_buffer_mod
+        from pollypm.storage import sqlite_pragmas
+
+        original_retry = sqlite_pragmas.retry_on_database_locked
+
+        def fast_retry(fn, *, backoff=(0.0, 0.0, 0.0), **kw):
+            return original_retry(fn, backoff=backoff, sleep=lambda _s: None, **kw)
+
+        # Always raise locked — the retry helper should exhaust and re-raise.
+        def always_locked(*args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        store.transaction = always_locked  # type: ignore[method-assign]
+        event_buffer_mod.retry_on_database_locked = fast_retry  # type: ignore[assignment]
+        try:
+            with caplog.at_level(logging.ERROR, logger="pollypm.store.event_buffer"):
+                buffer._flush_batch(batch)
+        finally:
+            event_buffer_mod.retry_on_database_locked = original_retry  # type: ignore[assignment]
+
+        # No rows persisted — sustained contention drops, same as today.
+        assert _row_count(store) == 0
+        # The drop-log fires so operators can see the gap.
+        assert any(
+            "event-buffer: flush failed" in rec.getMessage()
+            for rec in caplog.records
+        )
+    finally:
+        store.close()

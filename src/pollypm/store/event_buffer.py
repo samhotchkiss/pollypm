@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import insert
 
+from pollypm.storage.sqlite_pragmas import retry_on_database_locked
 from pollypm.store.schema import messages
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard
@@ -376,10 +377,22 @@ class EventBuffer:
         ]
         if not rows:
             return
-        try:
+
+        # #1050 — wrap the flush in ``retry_on_database_locked`` so the
+        # common case (transient WAL contention from a competing writer)
+        # doesn't drop audit rows on the floor. The shared retry ladder
+        # is the same one #1021 added to ``queue.enqueue`` / ``queue.fail``;
+        # it sleeps 0.1 s / 0.5 s / 2.0 s between attempts and re-raises
+        # the final lock error if contention is sustained. Sustained
+        # contention still drops (same behaviour as before this fix) —
+        # spool-to-disk fallback is tracked as a follow-up.
+        def _do_flush() -> None:
             with self._store.transaction() as conn:
                 conn.execute(insert(messages), rows)
-        except Exception:  # pragma: no cover - defensive logging only
+
+        try:
+            retry_on_database_locked(_do_flush, label="event_buffer.flush")
+        except Exception:
             row_word = "row" if len(rows) == 1 else "rows"
             logger.exception(
                 "event-buffer: flush failed (%d %s dropped)", len(rows), row_word,

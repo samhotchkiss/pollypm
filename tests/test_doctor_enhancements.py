@@ -1760,3 +1760,281 @@ def test_planned_and_manual_fix_lists_treat_supported_auto_fix_as_runnable() -> 
     report = doctor.run_checks([doctor.Check("tmux", _fail, "system")])
     assert doctor.planned_fixes(report) == [("tmux", "Install tmux")]
     assert doctor.manual_fixes(report) == []
+
+
+# --------------------------------------------------------------------- #
+# #1034 — post-#339 storage layout
+# --------------------------------------------------------------------- #
+
+
+def _write_minimal_state_db(path: Path) -> Path:
+    """Create a tiny SQLite file at ``path`` so ``is_file`` succeeds.
+
+    We don't need the schema: every #1034 regression test points the
+    workspace / user helpers at this path and asserts the candidates
+    list resolves it. Migration / size / sessions checks are exercised
+    elsewhere with proper fixtures.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("CREATE TABLE _probe (id INTEGER)")
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def _patch_workspace_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    workspace_db: Path | None,
+    user_db: Path | None,
+    config=None,
+) -> None:
+    """Pin the #339 helpers so tests don't read the dev machine's real DBs."""
+    monkeypatch.setattr(doctor, "_workspace_state_db_path", lambda *a, **kw: workspace_db)
+    monkeypatch.setattr(doctor, "_user_state_db_path", lambda: user_db or Path("/nonexistent/user.db"))
+    if config is not None:
+        monkeypatch.setattr(doctor, "_safe_load_config", lambda: (Path("/tmp/x"), config))
+
+
+def test_state_db_candidates_includes_workspace_db_post_339(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Regression for #1034: workspace-scope state.db must be a candidate.
+
+    Pre-#1034, ``_state_db_candidates`` only walked tracked-project
+    paths probing ``<project>/.pollypm/state.db``. Post-#339 those
+    files don't exist on healthy installs — the canonical DB lives at
+    ``<workspace_root>/.pollypm/state.db``. The candidates list must
+    return the workspace DB even with zero tracked projects.
+    """
+    workspace_db = _write_minimal_state_db(tmp_path / "ws" / ".pollypm" / "state.db")
+    fake_config = type("C", (), {"projects": {}, "project": type("P", (), {"workspace_root": tmp_path / "ws"})})
+    from pollypm import config as config_mod
+
+    monkeypatch.setattr(config_mod, "DEFAULT_CONFIG_PATH", tmp_path / "absent.toml")
+    _patch_workspace_layout(monkeypatch, workspace_db=workspace_db, user_db=None, config=fake_config)
+    candidates = doctor._state_db_candidates()
+    assert workspace_db in candidates
+
+
+def test_state_db_candidates_includes_user_db_post_339(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``~/.pollypm/state.db`` must be a candidate too — cross-project state.
+
+    Even with no config and no workspace DB, the user-scope DB at
+    ``~/.pollypm/state.db`` should be probed when present. This is
+    what was missing in the #1034 symptom output: with both DBs
+    actively in use, the migration / size / drift checks all skipped.
+    """
+    user_db = _write_minimal_state_db(tmp_path / "home" / ".pollypm" / "state.db")
+    from pollypm import config as config_mod
+
+    monkeypatch.setattr(config_mod, "DEFAULT_CONFIG_PATH", tmp_path / "missing.toml")
+    _patch_workspace_layout(monkeypatch, workspace_db=None, user_db=user_db)
+    candidates = doctor._state_db_candidates()
+    assert user_db in candidates
+
+
+def test_state_db_candidates_dedupes_workspace_and_legacy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """When the workspace DB and a legacy per-project DB resolve to the
+    same file (e.g. the project root *is* the workspace root on a
+    pre-#339 layout), don't return it twice — migration / size checks
+    multiply-count it otherwise."""
+    workspace_root = tmp_path / "shared"
+    workspace_root.mkdir()
+    db = _write_minimal_state_db(workspace_root / ".pollypm" / "state.db")
+
+    fake_project = type("P", (), {"path": workspace_root, "tracked": True})
+    fake_config = type(
+        "C", (),
+        {
+            "projects": {"shared": fake_project},
+            "project": type("P", (), {"workspace_root": workspace_root}),
+        },
+    )
+    from pollypm import config as config_mod
+
+    monkeypatch.setattr(config_mod, "DEFAULT_CONFIG_PATH", tmp_path / "missing.toml")
+    _patch_workspace_layout(monkeypatch, workspace_db=db, user_db=None, config=fake_config)
+    candidates = doctor._state_db_candidates()
+    assert candidates.count(db) == 1
+
+
+def test_state_db_candidates_skips_missing_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Non-existent paths must be filtered out — `is_file()` is the gate."""
+    workspace_db = tmp_path / "ws" / ".pollypm" / "state.db"  # never created
+    from pollypm import config as config_mod
+
+    monkeypatch.setattr(config_mod, "DEFAULT_CONFIG_PATH", tmp_path / "missing.toml")
+    _patch_workspace_layout(monkeypatch, workspace_db=workspace_db, user_db=None)
+    assert doctor._state_db_candidates() == []
+
+
+def test_workspace_state_db_path_uses_workspace_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Helper must mirror :func:`pollypm.work.db_resolver.resolve_work_db_path`."""
+    fake_config = type("C", (), {"project": type("P", (), {"workspace_root": tmp_path / "abc"})})
+    resolved = doctor._workspace_state_db_path(fake_config)
+    assert resolved == tmp_path / "abc" / ".pollypm" / "state.db"
+
+
+def test_workspace_state_db_path_returns_none_without_workspace_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_config = type("C", (), {"project": type("P", (), {"workspace_root": None})})
+    assert doctor._workspace_state_db_path(fake_config) is None
+
+
+def test_task_assignment_sweeper_dbs_pass_via_workspace_db(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Post-#1034: a tracked project with no per-project DB but a present
+    workspace DB is reachable. The pre-fix code returned ``found=0``
+    here and skipped/passed with ``0 tracked projects have reachable
+    state.db`` — the contradiction documented in #1034.
+    """
+    project_path = tmp_path / "proj-c"
+    project_path.mkdir()
+    workspace_root = tmp_path / "ws"
+    workspace_db = _write_minimal_state_db(workspace_root / ".pollypm" / "state.db")
+    fake_project = type("P", (), {"path": project_path, "tracked": True})
+    fake_config = type(
+        "C", (),
+        {
+            "projects": {"proj-c": fake_project},
+            "project": type("P", (), {"workspace_root": workspace_root}),
+        },
+    )
+    monkeypatch.setattr(doctor, "_safe_load_config", lambda: (Path("/tmp/x"), fake_config))
+    monkeypatch.setattr(doctor, "_workspace_state_db_path", lambda *a, **kw: workspace_db)
+    result = doctor.check_task_assignment_sweeper_dbs()
+    assert result.passed
+    assert "1 tracked project has reachable state.db" in result.status
+
+
+def test_task_assignment_sweeper_dbs_zero_reachable_fails_not_passes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """#1034 explicit ask: a ✓ status reporting "0 reachable" is a
+    contradiction. When zero tracked projects have a reachable DB
+    (workspace or per-project), the check must FAIL with ✗.
+    """
+    project_path = tmp_path / "proj-d"
+    project_path.mkdir()  # no per-project state.db
+    workspace_root = tmp_path / "ws"  # workspace DB does NOT exist
+    fake_project = type("P", (), {"path": project_path, "tracked": True})
+    fake_config = type(
+        "C", (),
+        {
+            "projects": {"proj-d": fake_project},
+            "project": type("P", (), {"workspace_root": workspace_root}),
+        },
+    )
+    monkeypatch.setattr(doctor, "_safe_load_config", lambda: (Path("/tmp/x"), fake_config))
+    monkeypatch.setattr(
+        doctor,
+        "_workspace_state_db_path",
+        lambda *a, **kw: workspace_root / ".pollypm" / "state.db",
+    )
+    result = doctor.check_task_assignment_sweeper_dbs()
+    assert not result.passed
+    assert result.severity == "warning"
+    assert "no tracked project" in result.status
+    assert "reachable" in result.status
+
+
+def test_task_assignment_sweeper_dbs_skips_when_no_tracked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """All projects untracked → skip rather than passing with ``0 reachable``."""
+    fake_project = type("P", (), {"path": tmp_path / "p", "tracked": False})
+    fake_config = type(
+        "C", (),
+        {
+            "projects": {"p": fake_project},
+            "project": type("P", (), {"workspace_root": tmp_path / "ws"}),
+        },
+    )
+    monkeypatch.setattr(doctor, "_safe_load_config", lambda: (Path("/tmp/x"), fake_config))
+    monkeypatch.setattr(
+        doctor,
+        "_workspace_state_db_path",
+        lambda *a, **kw: tmp_path / "ws" / ".pollypm" / "state.db",
+    )
+    result = doctor.check_task_assignment_sweeper_dbs()
+    assert result.skipped
+    assert "no tracked projects" in result.status
+
+
+def test_task_assignment_sweeper_dbs_fix_initializes_workspace_db(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """When the workspace DB is the missing piece, --fix initializes
+    just that file rather than scaffolding per-project DBs."""
+    project_path = tmp_path / "proj-e"
+    project_path.mkdir()
+    workspace_root = tmp_path / "ws"
+    workspace_db = workspace_root / ".pollypm" / "state.db"
+    fake_project = type("P", (), {"path": project_path, "tracked": True})
+    fake_config = type(
+        "C", (),
+        {
+            "projects": {"proj-e": fake_project},
+            "project": type("P", (), {"workspace_root": workspace_root}),
+        },
+    )
+    monkeypatch.setattr(doctor, "_safe_load_config", lambda: (Path("/tmp/x"), fake_config))
+    monkeypatch.setattr(doctor, "_workspace_state_db_path", lambda *a, **kw: workspace_db)
+    result = doctor.check_task_assignment_sweeper_dbs()
+    assert not result.passed
+    assert result.fixable
+    assert callable(result.fix_fn)
+    ok, msg = result.fix_fn()
+    assert ok, msg
+    assert workspace_db.is_file()
+    assert "workspace" in msg
+
+
+def test_state_migrations_finds_workspace_db_post_339(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """End-to-end: after #1034 the migration check sees the workspace DB
+    even on a config with zero tracked projects (the very symptom in
+    the #1034 issue body)."""
+    workspace_db = tmp_path / "ws" / ".pollypm" / "state.db"
+    workspace_db.parent.mkdir(parents=True)
+    conn = sqlite3.connect(workspace_db)
+    try:
+        conn.execute(
+            "CREATE TABLE schema_version (version INTEGER, description TEXT, applied_at TEXT)"
+        )
+        conn.execute("INSERT INTO schema_version VALUES (1, 'old', '2020-01-01')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    from pollypm import config as config_mod
+
+    monkeypatch.setattr(config_mod, "DEFAULT_CONFIG_PATH", tmp_path / "missing.toml")
+    _patch_workspace_layout(
+        monkeypatch,
+        workspace_db=workspace_db,
+        user_db=None,
+        config=type(
+            "C", (),
+            {"projects": {}, "project": type("P", (), {"workspace_root": tmp_path / "ws"})},
+        ),
+    )
+    monkeypatch.setattr(doctor, "_latest_state_migration_version", lambda: 99)
+    result = doctor.check_state_migrations()
+    assert not result.skipped
+    assert "behind" in result.status

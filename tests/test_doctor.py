@@ -462,6 +462,10 @@ def test_state_migrations_skipped_with_no_config(
     from pollypm import config as config_mod
 
     monkeypatch.setattr(config_mod, "DEFAULT_CONFIG_PATH", tmp_path / "missing.toml")
+    # Post-#1034 the candidates list also probes ``~/.pollypm/state.db``
+    # — point the user-scope helper at a tmp path so the dev machine's
+    # real DB (or its absence) doesn't sway the assertion.
+    monkeypatch.setattr(doctor, "_user_state_db_path", lambda: tmp_path / "absent.db")
     result = doctor.check_state_migrations()
     assert result.skipped
 

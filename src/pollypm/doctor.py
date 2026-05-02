@@ -637,27 +637,105 @@ def _applied_version_from_sqlite(db_path: Path, table: str) -> int | None:
         conn.close()
 
 
+def _workspace_state_db_path(config: PollyPMConfig | None = None) -> Path | None:
+    """Return ``<workspace_root>/.pollypm/state.db`` per the post-#339 layout.
+
+    Resolves the workspace state.db using the same source of truth as
+    :func:`pollypm.work.db_resolver.resolve_work_db_path` — the
+    ``[project].workspace_root`` setting in ``~/.pollypm/pollypm.toml``.
+    Returns ``None`` only when no config can be loaded; the file
+    itself is not required to exist (callers gate on ``is_file``).
+    """
+    if config is None:
+        from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+
+        if not DEFAULT_CONFIG_PATH.exists():
+            return None
+        try:
+            config = load_config(DEFAULT_CONFIG_PATH)
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        workspace_root = getattr(config.project, "workspace_root", None)
+    except Exception:  # noqa: BLE001
+        return None
+    if workspace_root is None:
+        return None
+    return Path(workspace_root) / ".pollypm" / "state.db"
+
+
+def _user_state_db_path() -> Path:
+    """Return ``~/.pollypm/state.db`` — the user-scope DB post-#339.
+
+    This is always the same path regardless of config; callers gate on
+    ``is_file``. The user-scope DB holds cross-project state (account
+    lists, global memory dossiers) while the workspace DB holds the
+    work_tasks / messages / sessions tables.
+    """
+    return Path.home() / ".pollypm" / "state.db"
+
+
 def _state_db_candidates() -> list[Path]:
     """Best-effort list of state DB paths to probe.
 
-    Fresh install: no config → nothing to probe, caller skips.
-    Otherwise returns the tracked projects' state DB paths.
+    Post-#339 layout (per :mod:`pollypm.work.db_resolver`) collapses
+    storage to two scopes:
+
+    * ``<workspace_root>/.pollypm/state.db`` — workspace scope (the
+      canonical reader/writer for work_tasks / messages / sessions).
+    * ``~/.pollypm/state.db`` — user scope (cross-project state).
+
+    Pre-#339 deployments may still have legacy ``<project>/.pollypm/
+    state.db`` files; we include them when present so migration /
+    size / schema-version checks see them and can complain. Caller
+    deduplicates against same canonical path.
+
+    Fresh install: no config → returns ``[]`` only if neither scope
+    DB exists on disk. The pure ``~/.pollypm/state.db`` lookup does
+    not require config so a configless probe of the user DB is still
+    valid.
     """
+    out: list[Path] = []
+    seen: set[Path] = set()
+
+    def _add(candidate: Path | None) -> None:
+        if candidate is None:
+            return
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        if resolved in seen:
+            return
+        if not candidate.is_file():
+            return
+        seen.add(resolved)
+        out.append(candidate)
+
     from pollypm.config import DEFAULT_CONFIG_PATH, load_config
 
-    if not DEFAULT_CONFIG_PATH.exists():
-        return []
-    try:
-        config = load_config(DEFAULT_CONFIG_PATH)
-    except Exception:  # noqa: BLE001
-        return []
-    out: list[Path] = []
-    for project in (getattr(config, "projects", {}) or {}).values():
-        if not getattr(project, "tracked", False):
-            continue
-        candidate = project.path / ".pollypm" / "state.db"
-        if candidate.is_file():
-            out.append(candidate)
+    config: PollyPMConfig | None = None
+    if DEFAULT_CONFIG_PATH.exists():
+        try:
+            config = load_config(DEFAULT_CONFIG_PATH)
+        except Exception:  # noqa: BLE001
+            config = None
+
+    # Workspace-scope DB first: this is the canonical reader/writer
+    # post-#339, the same one ``pm task list``, ``pm notify``, ``pm
+    # inbox``, the cockpit, and the supervisor open.
+    _add(_workspace_state_db_path(config))
+
+    # User-scope DB: cross-project state.
+    _add(_user_state_db_path())
+
+    # Legacy per-project DBs — if any survive the migration to #339
+    # we still want migration / size checks to see them.
+    if config is not None:
+        for project in (getattr(config, "projects", {}) or {}).values():
+            if not getattr(project, "tracked", False):
+                continue
+            _add(project.path / ".pollypm" / "state.db")
     return out
 
 
@@ -2041,28 +2119,59 @@ def _initialize_project_state_db(db_path: Path) -> tuple[bool, str]:
 
 
 def check_task_assignment_sweeper_dbs() -> CheckResult:
-    """Each tracked project must expose a state.db the sweeper can find."""
+    """Each tracked project must expose a state.db the sweeper can find.
+
+    Post-#339 layout (per :mod:`pollypm.work.db_resolver`): the sweeper
+    opens ``<workspace_root>/.pollypm/state.db`` and queries the
+    ``work_tasks`` table filtered by ``project``. A tracked project is
+    "reachable" when *either* the workspace DB exists *or* a legacy
+    per-project DB still survives (we treat both as a successful probe
+    so the cockpit's pattern A — try per-project, fall back to
+    workspace — keeps passing during the deprecation window).
+    """
     _path, config = _safe_load_config()
     if config is None:
         return _skip("task-assignment sweeper check skipped (no config)")
     projects = getattr(config, "projects", {}) or {}
     if not projects:
         return _skip("task-assignment sweeper check skipped (no projects)")
+
+    workspace_db = _workspace_state_db_path(config)
+    workspace_db_exists = workspace_db is not None and workspace_db.is_file()
+
+    tracked_total = 0
     missing: list[str] = []
     missing_paths: list[Path] = []
     found = 0
     for key, project in projects.items():
         if not getattr(project, "tracked", False):
             continue
-        db_path = project.path / ".pollypm" / "state.db"
-        if db_path.is_file():
+        tracked_total += 1
+        per_project_db = project.path / ".pollypm" / "state.db"
+        # Pattern A from the #1034 audit: a project is reachable when
+        # *either* the workspace DB (post-#339 canonical) OR the legacy
+        # per-project DB exists. Probing only the per-project file
+        # produces "0 reachable" against a healthy, fully-migrated
+        # install — the symptom #1034 documents.
+        if workspace_db_exists or per_project_db.is_file():
             found += 1
         else:
-            missing.append(f"{key} ({db_path})")
+            missing.append(f"{key} ({per_project_db})")
             if project.path.exists():
-                missing_paths.append(db_path)
+                missing_paths.append(per_project_db)
+
+    if tracked_total == 0:
+        return _skip("task-assignment sweeper check skipped (no tracked projects)")
 
     def _fix() -> tuple[bool, str]:
+        # When the workspace DB is the source of truth, init it once
+        # and every tracked project becomes reachable. Otherwise fall
+        # back to the legacy per-project init.
+        if workspace_db is not None and not workspace_db_exists:
+            ok, msg = _initialize_project_state_db(workspace_db)
+            if ok:
+                return (True, f"initialized workspace state.db at {workspace_db}")
+            return (False, f"workspace init failed: {msg}")
         if not missing_paths:
             return (False, "no writable project paths to initialize")
         initialized = 0
@@ -2078,25 +2187,31 @@ def check_task_assignment_sweeper_dbs() -> CheckResult:
         word = "file" if initialized == 1 else "files"
         return (True, f"initialized {initialized} project state.db {word}")
 
+    fixable = bool(missing_paths) or (workspace_db is not None and not workspace_db_exists)
+
     if missing and not found:
+        # #1034: a ✓ status that reports "0 reachable" is a contradiction.
+        # Fall through to ✗ when nothing is reachable so the user sees
+        # the actual problem rather than a falsely-green check.
         return _fail(
-            f"no tracked project has a state.db on disk ({len(missing)} missing)",
+            f"no tracked project has a reachable state.db ({len(missing)} missing)",
             why=(
-                "task_assignment.sweep iterates registered projects and opens "
-                "each one's state.db to look for queued tasks. Zero DBs means "
-                "the sweeper has nothing to do — usually because no project "
-                "has been booted with `pm up` yet."
+                "task_assignment.sweep reads from <workspace_root>/.pollypm/"
+                "state.db (post-#339) and falls back to <project>/.pollypm/"
+                "state.db on legacy installs. Zero reachable DBs means the "
+                "sweeper has nothing to scan — usually because the workspace "
+                "has never been booted with `pm up`."
             ),
             fix=(
-                "Boot at least one project to materialize its state.db —\n"
-                "  cd <project> && pm up\n"
-                "Or run:  pm doctor --fix   # initializes empty state.db for each\n"
+                "Boot the workspace to materialize state.db —\n"
+                "  pm up\n"
+                "Or run:  pm doctor --fix   # initializes the workspace state.db\n"
                 "Recheck: pm doctor"
             ),
             severity="warning",
-            fixable=bool(missing_paths),
-            fix_fn=_fix if missing_paths else None,
-            data={"missing": missing},
+            fixable=fixable,
+            fix_fn=_fix if fixable else None,
+            data={"missing": missing, "workspace_db": str(workspace_db) if workspace_db else None},
         )
     if missing:
         missing_word = "project" if len(missing) == 1 else "projects"
@@ -2108,22 +2223,26 @@ def check_task_assignment_sweeper_dbs() -> CheckResult:
                 "will never get delegated."
             ),
             fix=(
-                "Boot each project once to create its state.db —\n"
-                "  cd <project> && pm up\n"
-                "Or run:  pm doctor --fix   # initializes empty state.db for each\n"
+                "Boot the workspace to create the state.db —\n"
+                "  pm up\n"
+                "Or run:  pm doctor --fix   # initializes the workspace state.db\n"
                 "Or remove the [projects.*] entry from ~/.pollypm/pollypm.toml.\n"
                 "Recheck: pm doctor"
             ),
             severity="warning",
-            fixable=bool(missing_paths),
-            fix_fn=_fix if missing_paths else None,
-            data={"found": found, "missing": missing},
+            fixable=fixable,
+            fix_fn=_fix if fixable else None,
+            data={
+                "found": found,
+                "missing": missing,
+                "workspace_db": str(workspace_db) if workspace_db else None,
+            },
         )
     found_word = "project" if found == 1 else "projects"
     have_word = "has" if found == 1 else "have"
     return _ok(
         f"{found} tracked {found_word} {have_word} reachable state.db",
-        data={"count": found},
+        data={"count": found, "workspace_db": str(workspace_db) if workspace_db else None},
     )
 
 

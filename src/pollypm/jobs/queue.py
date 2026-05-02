@@ -39,7 +39,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
-from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas
+from pollypm.storage.sqlite_pragmas import (
+    apply_workspace_pragmas,
+    retry_on_database_locked,
+)
 
 
 __all__ = [
@@ -257,46 +260,55 @@ class JobQueue:
         max_att = max_attempts if max_attempts is not None else self.default_max_attempts
         now = _now_iso()
 
-        with self._lock:
-            if dedupe_key is not None:
-                existing = self._conn.execute(
-                    """
-                    SELECT id FROM work_jobs
-                    WHERE dedupe_key = ? AND status IN ('queued', 'claimed')
-                    LIMIT 1
-                    """,
-                    (dedupe_key,),
-                ).fetchone()
-                if existing is not None:
-                    return int(existing[0])
+        # #1021 — retry-on-lock at the public surface. ``HeartbeatRail.tick``
+        # is the canonical caller and crashed the heartbeat ticker every
+        # time the dedupe SELECT or the INSERT raced past ``busy_timeout``.
+        # Wrapping the whole locked body keeps the dedupe + insert pair
+        # atomic across retries and lets callers (tick, plugin handlers)
+        # stay oblivious to transient WAL contention.
+        def _do_enqueue() -> JobId:
+            with self._lock:
+                if dedupe_key is not None:
+                    existing = self._conn.execute(
+                        """
+                        SELECT id FROM work_jobs
+                        WHERE dedupe_key = ? AND status IN ('queued', 'claimed')
+                        LIMIT 1
+                        """,
+                        (dedupe_key,),
+                    ).fetchone()
+                    if existing is not None:
+                        return int(existing[0])
 
-            try:
-                cursor = self._conn.execute(
-                    """
-                    INSERT INTO work_jobs (
-                        handler_name, payload_json, status, attempt, max_attempts,
-                        dedupe_key, enqueued_at, run_after
+                try:
+                    cursor = self._conn.execute(
+                        """
+                        INSERT INTO work_jobs (
+                            handler_name, payload_json, status, attempt, max_attempts,
+                            dedupe_key, enqueued_at, run_after
+                        )
+                        VALUES (?, ?, 'queued', 0, ?, ?, ?, ?)
+                        """,
+                        (handler_name, payload_json, max_att, dedupe_key, now, run_after_iso),
                     )
-                    VALUES (?, ?, 'queued', 0, ?, ?, ?, ?)
-                    """,
-                    (handler_name, payload_json, max_att, dedupe_key, now, run_after_iso),
-                )
-            except sqlite3.IntegrityError:
-                # Raced with another enqueue on the same dedupe_key — look up.
-                if dedupe_key is None:
-                    raise
-                existing = self._conn.execute(
-                    """
-                    SELECT id FROM work_jobs
-                    WHERE dedupe_key = ? AND status IN ('queued', 'claimed')
-                    LIMIT 1
-                    """,
-                    (dedupe_key,),
-                ).fetchone()
-                if existing is None:
-                    raise
-                return int(existing[0])
-            return int(cursor.lastrowid)
+                except sqlite3.IntegrityError:
+                    # Raced with another enqueue on the same dedupe_key — look up.
+                    if dedupe_key is None:
+                        raise
+                    existing = self._conn.execute(
+                        """
+                        SELECT id FROM work_jobs
+                        WHERE dedupe_key = ? AND status IN ('queued', 'claimed')
+                        LIMIT 1
+                        """,
+                        (dedupe_key,),
+                    ).fetchone()
+                    if existing is None:
+                        raise
+                    return int(existing[0])
+                return int(cursor.lastrowid)
+
+        return retry_on_database_locked(_do_enqueue, label="JobQueue.enqueue")
 
     # ------------------------------------------------------------------
     # Claim / complete / fail
@@ -376,40 +388,49 @@ class JobQueue:
         """
         error_text = (error or "")[:8192]
         now_dt = datetime.now(UTC)
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT attempt, max_attempts FROM work_jobs WHERE id = ?",
-                (int(job_id),),
-            ).fetchone()
-            if row is None:
-                return
-            attempt, max_attempts = int(row[0]), int(row[1])
 
-            if not retry or attempt >= max_attempts:
+        # #1021 — retry-on-lock so the failure-record write itself can
+        # ride out a transient WAL contention. Pre-fix, ``workers.py:336
+        # → queue.py:396 (UPDATE ... WHERE id = ?)`` propagated
+        # ``database is locked`` straight back into ``JobWorkerPool``,
+        # which logged the traceback and tripped a critical alert.
+        def _do_fail() -> None:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT attempt, max_attempts FROM work_jobs WHERE id = ?",
+                    (int(job_id),),
+                ).fetchone()
+                if row is None:
+                    return
+                attempt, max_attempts = int(row[0]), int(row[1])
+
+                if not retry or attempt >= max_attempts:
+                    self._conn.execute(
+                        """
+                        UPDATE work_jobs
+                        SET status = 'failed', finished_at = ?, last_error = ?
+                        WHERE id = ?
+                        """,
+                        (now_dt.isoformat(), error_text, int(job_id)),
+                    )
+                    return
+
+                delay = self.retry_policy(attempt)
+                next_run = (now_dt + delay).isoformat()
                 self._conn.execute(
                     """
                     UPDATE work_jobs
-                    SET status = 'failed', finished_at = ?, last_error = ?
+                    SET status = 'queued',
+                        run_after = ?,
+                        last_error = ?,
+                        claimed_at = NULL,
+                        claimed_by = NULL
                     WHERE id = ?
                     """,
-                    (now_dt.isoformat(), error_text, int(job_id)),
+                    (next_run, error_text, int(job_id)),
                 )
-                return
 
-            delay = self.retry_policy(attempt)
-            next_run = (now_dt + delay).isoformat()
-            self._conn.execute(
-                """
-                UPDATE work_jobs
-                SET status = 'queued',
-                    run_after = ?,
-                    last_error = ?,
-                    claimed_at = NULL,
-                    claimed_by = NULL
-                WHERE id = ?
-                """,
-                (next_run, error_text, int(job_id)),
-            )
+        retry_on_database_locked(_do_fail, label="JobQueue.fail")
 
     # ------------------------------------------------------------------
     # Introspection

@@ -30,6 +30,7 @@ from typing import Any
 
 from pollypm.heartbeat import Heartbeat, Roster
 from pollypm.jobs import JobQueue, JobWorkerPool
+from pollypm.storage.sqlite_pragmas import retry_on_database_locked
 
 
 __all__ = ["HeartbeatRail", "WorkerSettings", "load_worker_settings"]
@@ -272,8 +273,23 @@ class HeartbeatRail:
             self.queue.close()
 
     def tick(self, now: datetime | None = None):
-        """Run one heartbeat tick — enqueue jobs for due roster entries."""
-        return self.heartbeat.tick(now or datetime.now(UTC))
+        """Run one heartbeat tick — enqueue jobs for due roster entries.
+
+        #1021 — defense-in-depth retry-on-lock at the top level. The
+        callees (``Heartbeat.tick`` -> ``JobQueue.enqueue``) also retry
+        individually, but if a future caller (e.g. a plugin) injects a
+        queue that does not retry, we still don't want a transient WAL
+        contention to bubble up here and crash the heartbeat ticker.
+        Without this, every locked tick was logged via
+        ``logger.exception`` in ``_tick_loop`` and surfaced as a
+        ``critical_error`` heartbeat alert (#1021 evidence:
+        ``boot.py:258 -> tick.py:143 -> queue.py:269``).
+        """
+        resolved = now or datetime.now(UTC)
+        return retry_on_database_locked(
+            lambda: self.heartbeat.tick(resolved),
+            label="HeartbeatRail.tick",
+        )
 
     # Context manager sugar — mostly useful for tests.
     def __enter__(self) -> "HeartbeatRail":

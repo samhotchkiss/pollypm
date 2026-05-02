@@ -28,6 +28,8 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.pool import QueuePool
 
+from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas
+
 
 # --------------------------------------------------------------------------
 # Public helpers
@@ -107,10 +109,15 @@ def make_engines(url: str) -> tuple[Engine, Engine]:
 # SQLite pragma hook
 # --------------------------------------------------------------------------
 
+# 30s busy_timeout for the SQLAlchemy pool: this engine fronts the heaviest
+# writers (alert upserts, ``messages`` updates from the supervisor) and the
+# 5s workspace default proved too tight under #1018 / #1021 contention.
+_SQLALCHEMY_BUSY_TIMEOUT_MS = 30000
 
-_SQLITE_PRAGMAS: tuple[tuple[str, str], ...] = (
-    ("journal_mode", "WAL"),
-    ("busy_timeout", "30000"),
+# Engine-only pragmas — :func:`apply_workspace_pragmas` covers
+# ``journal_mode=WAL`` + ``busy_timeout``; we still need ``synchronous``
+# and ``foreign_keys`` here.
+_SQLITE_EXTRA_PRAGMAS: tuple[tuple[str, str], ...] = (
     ("synchronous", "NORMAL"),
     ("foreign_keys", "ON"),
 )
@@ -122,6 +129,15 @@ def _install_sqlite_pragmas(engine: Engine) -> None:
     Called once per engine at construction time. SQLAlchemy invokes the
     listener on every new physical connection the pool opens, so reused
     pooled connections keep the pragmas they were initialized with.
+
+    #1021 — routes through :func:`apply_workspace_pragmas` so the
+    SQLAlchemy pool gets the same WAL + ``busy_timeout`` policy as the
+    raw ``sqlite3.connect`` callers (StateStore, JobQueue, etc.). Pre-fix,
+    #1018's helper only covered the stdlib path; the SQLAlchemy supervisor
+    writers ran on a separately-tuned pragma set, and any drift between the
+    two became a future-bug. ``synchronous`` and ``foreign_keys`` stay
+    inline because they're SQLAlchemy-only knobs (the stdlib writers don't
+    enforce FKs).
     """
 
     @event.listens_for(engine, "connect")
@@ -133,9 +149,14 @@ def _install_sqlite_pragmas(engine: Engine) -> None:
         # primary guard; this is defense in depth.
         if not isinstance(dbapi_connection, sqlite3.Connection):
             return
+        # Centralised WAL + busy_timeout (#1021) — same helper the
+        # stdlib sqlite3.connect callers use.
+        apply_workspace_pragmas(
+            dbapi_connection, busy_timeout_ms=_SQLALCHEMY_BUSY_TIMEOUT_MS,
+        )
         cursor = dbapi_connection.cursor()
         try:
-            for name, value in _SQLITE_PRAGMAS:
+            for name, value in _SQLITE_EXTRA_PRAGMAS:
                 cursor.execute(f"PRAGMA {name}={value}")
         finally:
             cursor.close()

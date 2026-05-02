@@ -334,3 +334,225 @@ def test_pool_gives_up_after_exhausting_lock_retries(
 
     # 1 initial + len(_DB_LOCK_RETRY_BACKOFF) retries
     assert invocations["n"] == 1 + len(original)
+
+
+# ---------------------------------------------------------------------------
+# #1021 — shared retry helper + queue.enqueue / queue.fail / tick coverage
+# ---------------------------------------------------------------------------
+
+
+def test_is_database_locked_error_helper_in_sqlite_pragmas() -> None:
+    """Public predicate exposed alongside ``apply_workspace_pragmas``."""
+
+    from pollypm.storage.sqlite_pragmas import is_database_locked_error
+
+    assert is_database_locked_error(sqlite3.OperationalError("database is locked"))
+    assert is_database_locked_error(sqlite3.OperationalError("database is busy"))
+    assert not is_database_locked_error(sqlite3.OperationalError("syntax error"))
+    assert not is_database_locked_error(
+        sqlite3.ProgrammingError("Cannot operate on a closed database")
+    )
+
+    # SQLAlchemy-style wrapper detection: a fake exception class named
+    # ``OperationalError`` should match by class name (the real wrapper
+    # lives in ``sqlalchemy.exc`` and we don't want to import it from
+    # the low-level helper).
+    class OperationalError(Exception):
+        pass
+
+    assert is_database_locked_error(OperationalError("(...) database is locked (...)"))
+
+
+def test_retry_on_database_locked_succeeds_after_one_lock(monkeypatch) -> None:
+    from pollypm.storage import sqlite_pragmas as sp
+
+    calls = {"n": 0}
+    sleeps: list[float] = []
+
+    def flaky() -> str:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return "ok"
+
+    result = sp.retry_on_database_locked(
+        flaky, label="test", sleep=sleeps.append,
+    )
+    assert result == "ok"
+    assert calls["n"] == 2
+    # First retry uses backoff[0].
+    assert sleeps == [sp.DB_LOCK_RETRY_BACKOFF[0]]
+
+
+def test_retry_on_database_locked_propagates_non_lock_errors() -> None:
+    from pollypm.storage import sqlite_pragmas as sp
+
+    def boom() -> None:
+        raise sqlite3.OperationalError("syntax error")
+
+    with pytest.raises(sqlite3.OperationalError, match="syntax error"):
+        sp.retry_on_database_locked(boom, label="test", sleep=lambda _s: None)
+
+
+def test_retry_on_database_locked_exhausts_then_raises() -> None:
+    from pollypm.storage import sqlite_pragmas as sp
+
+    calls = {"n": 0}
+
+    def stuck() -> None:
+        calls["n"] += 1
+        raise sqlite3.OperationalError("database is locked")
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        sp.retry_on_database_locked(stuck, label="test", sleep=lambda _s: None)
+
+    # 1 initial + 3 retries = 4 attempts.
+    assert calls["n"] == 1 + len(sp.DB_LOCK_RETRY_BACKOFF)
+
+
+class _OneShotLockingConnection:
+    """Wrapper that injects a single ``database is locked`` on a matched SQL prefix.
+
+    Wrapping the connection lets us proxy through every method JobQueue
+    uses (``execute``, ``executescript``, ``commit``, ``__enter__``, etc.)
+    while only intercepting the first ``execute`` whose SQL starts with
+    a target verb. ``sqlite3.Connection`` exposes its slots read-only,
+    so we can't monkey-patch ``execute`` directly.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, target_prefix: str) -> None:
+        self._conn = conn
+        self._target = target_prefix.upper()
+        self.fired = False
+
+    def execute(self, sql, *args, **kwargs):
+        if not self.fired and sql.lstrip().upper().startswith(self._target):
+            self.fired = True
+            raise sqlite3.OperationalError("database is locked")
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        # Anything we don't override (executescript, close, commit, ...)
+        # passes straight through to the wrapped connection.
+        return getattr(self._conn, name)
+
+
+def test_queue_enqueue_retries_on_database_locked(tmp_path: Path) -> None:
+    """``queue.enqueue`` must retry transient locks (#1021 path 1)."""
+
+    from pollypm.storage import sqlite_pragmas as sp
+
+    q = JobQueue(db_path=tmp_path / "jobs.db")
+    try:
+        wrapper = _OneShotLockingConnection(q._conn, "INSERT")
+        original_conn = q._conn
+        original_backoff = sp.DB_LOCK_RETRY_BACKOFF
+        sp.DB_LOCK_RETRY_BACKOFF = (0.001, 0.001, 0.001)
+        q._conn = wrapper  # type: ignore[assignment]
+        try:
+            jid = q.enqueue("noop", {"x": 1})
+        finally:
+            q._conn = original_conn
+            sp.DB_LOCK_RETRY_BACKOFF = original_backoff
+
+        assert isinstance(jid, int) and jid > 0
+        assert wrapper.fired, "test did not trigger the lock branch"
+        # Job actually landed in the table.
+        assert q.stats().queued == 1
+    finally:
+        q.close()
+
+
+def test_queue_fail_retries_on_database_locked(tmp_path: Path) -> None:
+    """``queue.fail`` must retry transient locks (#1021 path 2)."""
+
+    from pollypm.storage import sqlite_pragmas as sp
+
+    q = JobQueue(db_path=tmp_path / "jobs.db")
+    try:
+        # Real job to fail.
+        jid = q.enqueue("noop")
+        # Move it to claimed so ``fail()`` follows the realistic path.
+        q.claim("worker-test", limit=1)
+
+        wrapper = _OneShotLockingConnection(q._conn, "UPDATE")
+        original_conn = q._conn
+        original_backoff = sp.DB_LOCK_RETRY_BACKOFF
+        sp.DB_LOCK_RETRY_BACKOFF = (0.001, 0.001, 0.001)
+        q._conn = wrapper  # type: ignore[assignment]
+        try:
+            q.fail(jid, "boom", retry=False)
+        finally:
+            q._conn = original_conn
+            sp.DB_LOCK_RETRY_BACKOFF = original_backoff
+
+        assert wrapper.fired, "test did not trigger the lock branch"
+        # Failure landed: job is in failed state.
+        assert q.stats().failed == 1
+    finally:
+        q.close()
+
+
+def test_heartbeatrail_tick_swallows_transient_lock(tmp_path: Path) -> None:
+    """``HeartbeatRail.tick`` retries on lock (#1021 path 3 — defense-in-depth).
+
+    Builds a minimal ``HeartbeatRail`` and stubs the inner ``Heartbeat.tick``
+    to raise ``database is locked`` once. The wrapper should retry, succeed
+    on the second attempt, and never raise.
+    """
+
+    from pollypm.heartbeat.boot import HeartbeatRail
+    from pollypm.storage import sqlite_pragmas as sp
+
+    # Construct a HeartbeatRail without going through ``from_config`` —
+    # we just need the ``tick`` method, not a live worker pool.
+    rail = HeartbeatRail.__new__(HeartbeatRail)
+
+    calls = {"n": 0}
+
+    class _StubHeartbeat:
+        def tick(self, _now):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return "tick-result"
+
+    rail.heartbeat = _StubHeartbeat()  # type: ignore[attr-defined]
+
+    original_backoff = sp.DB_LOCK_RETRY_BACKOFF
+    sp.DB_LOCK_RETRY_BACKOFF = (0.001, 0.001, 0.001)
+    try:
+        result = rail.tick()
+    finally:
+        sp.DB_LOCK_RETRY_BACKOFF = original_backoff
+
+    assert result == "tick-result"
+    assert calls["n"] == 2
+
+
+def test_sqlalchemy_engine_applies_wal_and_busy_timeout(tmp_path: Path) -> None:
+    """Engine pool's ``connect`` listener routes through ``apply_workspace_pragmas``.
+
+    #1021 path 3 — ensures the SQLAlchemy supervisor writer pool gets WAL +
+    busy_timeout on every fresh pooled connection. Pre-#1021, the engine
+    applied pragmas inline; post-#1021 it routes through the shared helper
+    so the pool stays in lockstep with the stdlib ``sqlite3.connect`` callers.
+    """
+
+    from pollypm.store.engine import make_engines
+
+    db = tmp_path / "messages.db"
+    write_engine, read_engine = make_engines(f"sqlite:///{db}")
+    try:
+        with write_engine.connect() as conn:
+            mode = conn.exec_driver_sql("PRAGMA journal_mode").scalar()
+            timeout = conn.exec_driver_sql("PRAGMA busy_timeout").scalar()
+        assert str(mode).lower() == "wal"
+        assert int(timeout) >= DEFAULT_BUSY_TIMEOUT_MS
+
+        with read_engine.connect() as conn:
+            timeout = conn.exec_driver_sql("PRAGMA busy_timeout").scalar()
+        assert int(timeout) >= DEFAULT_BUSY_TIMEOUT_MS
+    finally:
+        write_engine.dispose()
+        read_engine.dispose()

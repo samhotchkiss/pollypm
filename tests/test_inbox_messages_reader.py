@@ -229,3 +229,110 @@ class TestNotifyHiddenWithoutOptIn:
         payload = json.loads(inbox.output)
         titles = [t["title"] for t in payload["tasks"]]
         assert "Real chat task" in titles
+
+
+class TestNotifyMessagesHiddenByDefault:
+    """#1027 — ``pm inbox`` text listing default-hides ``notify``-type
+    messages so completion announcements / heartbeat alerts don't bury
+    the single actionable row the user needs to look at. JSON output
+    keeps the canonical full surface for tooling consumers; only the
+    text rendering applies the lens.
+    """
+
+    def _seed_notify_message(self, db_path: str, *, subject: str) -> None:
+        from pollypm.store import SQLAlchemyStore
+
+        store = SQLAlchemyStore(f"sqlite:///{db_path}")
+        try:
+            store.enqueue_message(
+                type="notify",
+                tier="immediate",
+                recipient="user",
+                sender="polly",
+                subject=subject,
+                body="background FYI",
+                scope="inbox",
+            )
+        finally:
+            store.close()
+
+    def _seed_alert_message(self, db_path: str, *, subject: str) -> None:
+        from pollypm.store import SQLAlchemyStore
+
+        store = SQLAlchemyStore(f"sqlite:///{db_path}")
+        try:
+            store.enqueue_message(
+                type="alert",
+                tier="immediate",
+                recipient="user",
+                sender="supervisor",
+                subject=subject,
+                body="actionable supervisor alert",
+                scope="inbox",
+            )
+        finally:
+            store.close()
+
+    def test_default_text_inbox_hides_notify_messages(self, db_path):
+        """``Done:`` style notify rows must not appear in the default text view."""
+        self._seed_notify_message(db_path, subject="Done: Phase 2 rework resubmitted")
+        inbox = runner.invoke(inbox_app, ["--db", db_path])
+        assert inbox.exit_code == 0, inbox.output
+        # Title was hidden behind the toggle.
+        assert "Done: Phase 2 rework" not in inbox.output
+        # Footer announces the hidden count + opt-in flag.
+        assert "1 notification hidden" in inbox.output
+        assert "--all" in inbox.output
+
+    def test_default_text_inbox_keeps_alerts_visible(self, db_path):
+        """Actionable ``alert`` rows stay visible — only ``notify`` is hidden."""
+        self._seed_alert_message(db_path, subject="Worker stuck in bikepath/3")
+        inbox = runner.invoke(inbox_app, ["--db", db_path])
+        assert inbox.exit_code == 0, inbox.output
+        assert "Worker stuck in bikepath/3" in inbox.output
+        # No hidden-count footer when nothing is hidden.
+        assert "notification hidden" not in inbox.output
+
+    def test_all_flag_resurfaces_notify_messages(self, db_path):
+        """``--all`` opts back in to the historical full listing."""
+        self._seed_notify_message(db_path, subject="Done: Phase 2 rework resubmitted")
+        inbox = runner.invoke(inbox_app, ["--db", db_path, "--all"])
+        assert inbox.exit_code == 0, inbox.output
+        assert "Done: Phase 2 rework" in inbox.output
+        # No hidden-count footer when the user has explicitly opted in.
+        assert "notification hidden" not in inbox.output
+
+    def test_default_json_inbox_keeps_full_surface(self, db_path):
+        """JSON consumers (cockpit, scripts) need the canonical merged
+        list regardless of the text-rendering lens."""
+        self._seed_notify_message(db_path, subject="Done: shipped")
+        inbox = runner.invoke(inbox_app, ["--db", db_path, "--json"])
+        assert inbox.exit_code == 0, inbox.output
+        payload = json.loads(inbox.output)
+        titles = [m["title"] for m in payload["messages"]]
+        # Notify producers normalize the subject with an ``[Action]`` /
+        # ``[FYI]`` prefix; assert by substring so the test is robust
+        # to that contract without re-implementing it.
+        assert any("Done: shipped" in t for t in titles)
+
+    def test_pluralisation_when_multiple_hidden(self, db_path):
+        """Footer copy uses the plural ``notifications`` for >1 hidden."""
+        self._seed_notify_message(db_path, subject="Done: A")
+        self._seed_notify_message(db_path, subject="Done: B")
+        inbox = runner.invoke(inbox_app, ["--db", db_path])
+        assert inbox.exit_code == 0, inbox.output
+        assert "2 notifications hidden" in inbox.output
+        assert "--all" in inbox.output
+
+    def test_only_notifications_renders_footer_alone(self, db_path):
+        """When EVERY row is a hidden notification, the table is replaced
+        by the footer line so the user still knows there's something
+        behind ``--all``.
+        """
+        self._seed_notify_message(db_path, subject="Done: nothing actionable")
+        inbox = runner.invoke(inbox_app, ["--db", db_path])
+        assert inbox.exit_code == 0, inbox.output
+        assert "Inbox: 0 items" in inbox.output
+        assert "1 notification hidden" in inbox.output
+        # The column header is omitted because there's nothing to render.
+        assert "ID" not in inbox.output.split("Inbox:")[1].splitlines()[0]

@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from pollypm.notify_task import NOTIFY_LABEL, is_notify_inbox_task
+from pollypm.notify_task import (
+    NOTIFY_LABEL,
+    is_notify_inbox_task,
+    is_notify_only_inbox_entry,
+)
 from pollypm.work.models import Priority, Task, TaskType, WorkStatus
 
 
@@ -201,3 +205,89 @@ class TestIsNotifyInboxTask:
             title = "Plan ready for review: demo"
 
         assert is_notify_inbox_task(_BadRolesTask()) is True
+
+
+class TestIsNotifyOnlyInboxEntry:
+    """#1027 — predicate that decides whether a row is a default-hide FYI.
+
+    Backs both the cockpit Inbox panel's ``n``-toggle and the ``pm
+    inbox`` CLI's ``--all`` opt-in. Returns True for the bulk of
+    completion / heartbeat noise (``msg:639  notify  Done: …``,
+    ``msg:633  notify  Repeated stale review ping``) so they stay
+    behind the toggle while real action items, alerts, and tasks
+    surface immediately.
+    """
+
+    @staticmethod
+    def _entry(**values):
+        # Plain object instead of the InboxEntry adapter so the test
+        # stays independent of the cockpit module — the predicate
+        # only reads attributes via getattr.
+        class _E:
+            pass
+
+        e = _E()
+        for key, value in values.items():
+            setattr(e, key, value)
+        return e
+
+    def test_notify_message_is_notify_only(self) -> None:
+        """``type=notify`` message rows are the canonical FYI surface."""
+        entry = self._entry(
+            source="message",
+            message_type="notify",
+            title="Done: Phase 2 rework resubmitted",
+            labels=[],
+        )
+        assert is_notify_only_inbox_entry(entry) is True
+
+    def test_alert_message_stays_visible(self) -> None:
+        """``type=alert`` messages carry actionable supervisor / heartbeat
+        signals; they must not be hidden by the default lens.
+        """
+        entry = self._entry(
+            source="message",
+            message_type="alert",
+            title="Worker bikepath/3 stuck for 30m",
+            labels=[],
+        )
+        assert is_notify_only_inbox_entry(entry) is False
+
+    def test_inbox_task_message_stays_visible(self) -> None:
+        """``type=inbox_task`` messages are a structured action surface
+        and must remain visible by default.
+        """
+        entry = self._entry(
+            source="message",
+            message_type="inbox_task",
+            title="Review changes for bikepath/4",
+            labels=[],
+        )
+        assert is_notify_only_inbox_entry(entry) is False
+
+    def test_uppercase_message_type_is_normalised(self) -> None:
+        """The store may surface the type in any case; predicate is
+        case-insensitive so a row tagged ``NOTIFY`` still hides.
+        """
+        entry = self._entry(
+            source="message",
+            message_type="NOTIFY",
+            title="Done: shipped",
+            labels=[],
+        )
+        assert is_notify_only_inbox_entry(entry) is True
+
+    def test_real_work_task_is_not_notify_only(self) -> None:
+        """A normal work-service task must remain visible by default."""
+        task = _make_task(
+            title="Implement module 3",
+            labels=["project:demo"],
+            flow_template_id="plan_project",
+            roles={"worker": "worker", "reviewer": "reviewer", "requester": "architect"},
+        )
+        assert is_notify_only_inbox_entry(task) is False
+
+    def test_notify_stub_task_is_notify_only(self) -> None:
+        """Notify-stub tasks (label / title) defer to is_notify_inbox_task."""
+        task = _make_task(labels=[NOTIFY_LABEL])
+        assert is_notify_only_inbox_entry(task) is True

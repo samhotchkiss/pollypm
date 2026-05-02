@@ -295,7 +295,10 @@ class TestPmInboxRendersDedup:
         finally:
             store.close()
 
-        result = runner.invoke(inbox_app, ["--db", db_path])
+        # #1027 — pure ``notify`` rows are hidden by default; this dedup
+        # test seeds a notify row, so opt back in with ``--all`` to keep
+        # exercising the rendering branch.
+        result = runner.invoke(inbox_app, ["--db", db_path, "--all"])
         assert result.exit_code == 0, result.output
         assert "Repeating alert" in result.output
         assert "3x" in result.output

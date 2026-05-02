@@ -167,6 +167,19 @@ def inbox_root(
             "(#1013, mirrors the ``pm task list`` opt-in shipped in #1003.)"
         ),
     ),
+    show_all: bool = typer.Option(
+        False,
+        "--all",
+        help=(
+            "Show every inbox row including pure-FYI ``notify``-type "
+            "messages (completion announcements, heartbeat alerts, etc.) "
+            "that are hidden by default. The default listing surfaces "
+            "actionable rows only (reviews, alerts, inbox tasks); "
+            "everything else is collapsed behind a footer count so the "
+            "single thing that needs your attention doesn't get buried. "
+            "(#1027.)"
+        ),
+    ),
 ) -> None:
     """Show messages + tasks waiting on the user.
 
@@ -244,7 +257,26 @@ def inbox_root(
         from pollypm.notify_task import is_notify_inbox_task
         tasks = [task for task in tasks if not is_notify_inbox_task(task)]
 
+    # #1027 — default-hide pure ``notify``-type messages (completion
+    # announcements, heartbeat alerts, "Done:" / "Repeated stale review
+    # ping" rows) so the single actionable row the user needs to act on
+    # isn't buried under 30 historical FYIs. ``--all`` opts back in.
+    # Counted before split so the footer can announce how many were
+    # collapsed.
+    notification_messages: list[dict[str, Any]] = []
+    actionable_messages: list[dict[str, Any]] = display_messages
+    if not show_all:
+        actionable_messages = []
+        for m in display_messages:
+            if (m.get("type") or "").lower() == "notify":
+                notification_messages.append(m)
+            else:
+                actionable_messages.append(m)
+
     if output_json:
+        # JSON consumers need the canonical "everything we know about"
+        # surface, so the full list ships regardless of ``--all``. The
+        # default-hide behaviour is a CLI-rendering concern only.
         typer.echo(
             json.dumps(
                 {
@@ -258,16 +290,26 @@ def inbox_root(
         )
         return
 
-    total = len(tasks) + len(display_messages)
-    item_word = "item" if total == 1 else "items"
-    typer.echo(f"Inbox: {total} {item_word}")
-    if total == 0:
+    total_visible = len(tasks) + len(actionable_messages)
+    total_all = len(tasks) + len(display_messages)
+    item_word = "item" if total_visible == 1 else "items"
+    typer.echo(f"Inbox: {total_visible} {item_word}")
+    if total_all == 0:
         typer.echo("No messages waiting for you.")
+        return
+    if total_visible == 0:
+        # Every row in scope is a hidden notification; announce the
+        # footer alone so the user knows how to surface them.
+        hidden_n = len(notification_messages)
+        word = "notification" if hidden_n == 1 else "notifications"
+        typer.echo(
+            f"… {hidden_n} {word} hidden. Use --all to show."
+        )
         return
 
     typer.echo(f"{'ID':<20} {'Type':<10} {'Priority':<10} {'Title'}")
     typer.echo("-" * 70)
-    for m in display_messages:
+    for m in actionable_messages:
         title = _format_inbox_title(m["title"])
         # #1013 — append "9x - last seen 2d ago" when the row has
         # dedup state (count > 1). Empty suffix is the no-op default
@@ -284,6 +326,13 @@ def inbox_root(
         typer.echo(
             f"{t.task_id:<20} {t.work_status.value:<10} "
             f"{t.priority.value:<10} {title}"
+        )
+
+    if notification_messages:
+        hidden_n = len(notification_messages)
+        word = "notification" if hidden_n == 1 else "notifications"
+        typer.echo(
+            f"… {hidden_n} {word} hidden. Use --all to show."
         )
 
 

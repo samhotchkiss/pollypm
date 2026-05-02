@@ -815,8 +815,14 @@ def test_action_items_sort_ahead_of_completed_updates(
             assert "[Action] Fly.io setup needed for demo" in titles
             assert "[Action] Demo shipped cleanly" not in titles
             status_text = str(inbox_app.status.render())
-            assert "FYI hidden" in status_text
-            assert "m show all" in status_text
+            # #1027 — pure-FYI notify rows (Demo shipped cleanly) are
+            # now hidden behind the ``Show notifications (N) — n``
+            # toggle instead of the older ``FYI hidden · m show all``
+            # framing. The user-facing behaviour is the same: the
+            # actionable row stays visible while the completion FYI
+            # waits behind a one-keystroke reveal.
+            assert "Show notification" in status_text
+            assert "n" in status_text
 
             await pilot.press("m")
             await pilot.pause()
@@ -852,6 +858,125 @@ def test_orphaned_workspace_messages_hidden_by_default(
             inbox_app.action_toggle_filter_orphaned()
             await pilot.pause()
             assert "[Action] Deleted project still asking for review" in _visible_titles(inbox_app)
+
+    _run(body())
+
+
+def _has_title_substring(titles: list[str], substring: str) -> bool:
+    """Helper: notify producers prepend ``[Action]``/``[FYI]`` tags, so
+    tests assert by substring match instead of exact equality."""
+    return any(substring in t for t in titles)
+
+
+def test_notify_messages_hidden_by_default_cockpit_inbox(
+    inbox_env, inbox_app,
+) -> None:
+    """#1027 — completion / heartbeat ``notify`` rows are hidden by default.
+
+    Mirror of the issue's screenshot: the bulk of inbox traffic is
+    pure FYI (``Done: …``, ``Repeated stale review ping``) and buries
+    the single actionable row. The cockpit Inbox panel collapses
+    those behind a ``Show notifications (N) — n`` footer hint until
+    the user presses ``n``.
+    """
+    workspace_root = inbox_env["project_path"].parent
+    _seed_workspace_message(
+        workspace_root,
+        subject="Done: Phase 2 rework resubmitted",
+        body="background completion FYI",
+        scope="demo",
+    )
+    _seed_workspace_message(
+        workspace_root,
+        subject="Repeated stale review ping for bikepath/3",
+        body="heartbeat noise",
+        scope="demo",
+    )
+
+    async def body() -> None:
+        async with inbox_app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            titles = _visible_titles(inbox_app)
+            # Both notify rows are default-hidden behind the toggle.
+            assert not _has_title_substring(titles, "Done: Phase 2 rework resubmitted")
+            assert not _has_title_substring(
+                titles, "Repeated stale review ping for bikepath/3",
+            )
+            # Status bar surfaces the count + ``n`` keystroke hint.
+            status_text = str(inbox_app.status.render())
+            assert "Show notifications (2)" in status_text
+            assert " n" in status_text  # the keystroke hint
+
+    _run(body())
+
+
+def test_n_keypress_toggles_notifications_visible(
+    inbox_env, inbox_app,
+) -> None:
+    """#1027 — pressing ``n`` reveals the hidden notify rows + flips again to re-hide."""
+    workspace_root = inbox_env["project_path"].parent
+    _seed_workspace_message(
+        workspace_root,
+        subject="Done: Phase 2 rework resubmitted",
+        body="background completion FYI",
+        scope="demo",
+    )
+
+    async def body() -> None:
+        async with inbox_app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert not _has_title_substring(
+                _visible_titles(inbox_app),
+                "Done: Phase 2 rework resubmitted",
+            )
+
+            await pilot.press("n")
+            await pilot.pause()
+            assert _has_title_substring(
+                _visible_titles(inbox_app),
+                "Done: Phase 2 rework resubmitted",
+            )
+            # After opt-in there's nothing hidden, so the footer hint clears.
+            status_text = str(inbox_app.status.render())
+            assert "Show notifications" not in status_text
+
+            # Toggle off — back to the actionable lens.
+            await pilot.press("n")
+            await pilot.pause()
+            assert not _has_title_substring(
+                _visible_titles(inbox_app),
+                "Done: Phase 2 rework resubmitted",
+            )
+
+    _run(body())
+
+
+def test_action_tagged_notify_message_stays_visible(
+    inbox_env, inbox_app,
+) -> None:
+    """``[Action]`` notify rows are actionable and stay visible by default.
+
+    The ``n``-toggle uses :func:`is_notify_only_inbox_entry` plus the
+    existing triage classifier — only rows triage marks as info bury
+    behind the toggle. An ``[Action] Fly.io setup`` notify still
+    surfaces immediately even though its raw type is ``notify``.
+    """
+    workspace_root = inbox_env["project_path"].parent
+    _seed_workspace_message(
+        workspace_root,
+        subject="[Action] Fly.io setup needed for demo",
+        body="Set up Fly.io access so deploy checks can keep running.",
+        scope="demo",
+    )
+
+    async def body() -> None:
+        async with inbox_app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert "[Action] Fly.io setup needed for demo" in _visible_titles(inbox_app)
+            # No hidden-count footer — the row was actionable so
+            # nothing got swept behind the toggle.
+            status_text = str(inbox_app.status.render())
+            assert "Show notifications" not in status_text
 
     _run(body())
 

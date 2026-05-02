@@ -118,4 +118,42 @@ def is_notify_inbox_task(task) -> bool:
     return False
 
 
-__all__ = ["NOTIFY_LABEL", "is_notify_inbox_task"]
+def is_notify_only_inbox_entry(item) -> bool:
+    """True when ``item`` is a notify-only (FYI) inbox entry, not actionable.
+
+    Used by ``pm inbox`` (CLI) and the cockpit Inbox panel (#1027) to
+    default-hide the bulk of pure-FYI notifications — completion
+    announcements ("Done: …"), heartbeat alerts ("Repeated stale review
+    ping"), debug-style drafts — so the single actionable item the user
+    needs to act on doesn't get buried.
+
+    Treated as notify-only:
+
+    * **Message rows** (``source == "message"``) with ``message_type ==
+      "notify"``. The unified messages-store ``notify`` type is the
+      canonical FYI surface; the alert/inbox_task types are kept visible.
+    * **Task rows** that satisfy :func:`is_notify_inbox_task` — the
+      legacy notify-stub predicate (label-based, role-based, or title
+      prefix). These are announcement stubs the cockpit inbox surfaces
+      via its specialised actions but the CLI listing has nothing to do
+      with.
+
+    Anything else — work-service tasks, ``alert``-type messages,
+    ``inbox_task``-type messages — is treated as actionable and stays
+    visible by default.
+    """
+    source = getattr(item, "source", "task")
+    if source == "message":
+        message_type = (getattr(item, "message_type", None) or "").lower()
+        # Only the bare ``notify`` type is hidden by default; alerts and
+        # inbox_tasks remain visible because they carry the actionable
+        # supervisor / user-prompt payloads.
+        return message_type == "notify"
+    return is_notify_inbox_task(item)
+
+
+__all__ = [
+    "NOTIFY_LABEL",
+    "is_notify_inbox_task",
+    "is_notify_only_inbox_entry",
+]

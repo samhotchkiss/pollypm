@@ -6660,6 +6660,11 @@ class PollyInboxApp(App[None]):
         Binding("b", "toggle_filter_blocking", "Blocking", show=False),
         Binding("O", "toggle_filter_orphaned", "Orphaned", show=False),
         Binding("m", "toggle_show_all_messages", "All messages", show=False),
+        # #1027 — ``n`` toggles the default-hide of pure ``notify``-type
+        # messages (completion announcements, heartbeat alerts) so the
+        # single actionable row the user needs to act on doesn't get
+        # buried under 30 historical FYIs.
+        Binding("n", "toggle_show_notifications", "Show notifications", show=False),
         Binding("c", "clear_filters", "Clear filters", show=False),
         # Refresh: ``u`` re-bound to filter, so refresh moves to ``ctrl+r``
         # (palette 'session.refresh' still works from any screen).
@@ -6758,6 +6763,11 @@ class PollyInboxApp(App[None]):
         self._filter_blocking: bool = False
         self._show_orphaned: bool = False
         self._show_all_messages: bool = False
+        # #1027 — pure-``notify`` messages (completion announcements,
+        # heartbeat alerts) are default-hidden so the actionable rows
+        # don't get buried. Press ``n`` to surface them; the footer
+        # announces the hidden count whenever any are present.
+        self._show_notifications: bool = False
         self._filter_bar_visible: bool = False
         # Rollup state — populated on each rollup render. Index-keyed so
         # the click handler can look up which item was expanded.
@@ -6997,6 +7007,11 @@ class PollyInboxApp(App[None]):
         hidden_orphaned_n = 0 if self._show_orphaned else sum(
             1 for item in self._tasks if getattr(item, "is_orphaned", False)
         )
+        # #1027 \u2014 count notify-only FYI rows the default lens hid so the
+        # status line can offer the ``n`` toggle. Already zero when the
+        # user has opted in via ``_show_notifications`` /
+        # ``_show_all_messages``.
+        hidden_notification_n = self._hidden_notification_count()
         bits: list[str] = []
         if using_action_lens:
             verb = "needs" if shown == 1 else "need"
@@ -7014,6 +7029,9 @@ class PollyInboxApp(App[None]):
         if hidden_fyi_n:
             bits.append(f"{hidden_fyi_n} FYI hidden")
             bits.append("m show all")
+        if hidden_notification_n:
+            word = "notification" if hidden_notification_n == 1 else "notifications"
+            bits.append(f"Show {word} ({hidden_notification_n}) \u2014 n")
         if hidden_orphaned_n:
             bits.append(f"{hidden_orphaned_n} orphaned hidden")
         desc = self._describe_filters()
@@ -7107,6 +7125,9 @@ class PollyInboxApp(App[None]):
         self._filter_blocking = False
         self._show_orphaned = False
         self._show_all_messages = False
+        # #1027 — notifications stay hidden on filter reset; the
+        # default surface is the actionable lens.
+        self._show_notifications = False
         self._filter_bar_visible = False
 
     def _has_active_filters(self) -> bool:
@@ -7120,7 +7141,34 @@ class PollyInboxApp(App[None]):
                 self._filter_blocking,
                 self._show_orphaned,
                 self._show_all_messages,
+                # #1027 — surfacing notifications is an explicit
+                # opt-in lens, so it counts as an active filter for
+                # chip / status-line bookkeeping.
+                self._show_notifications,
             )
+        )
+
+    def _hidden_notification_count(self) -> int:
+        """Count notify-only entries hidden by the default lens (#1027).
+
+        Returned independent of any other filter so the footer can
+        announce ``Show notifications (N)`` even when the user has
+        narrowed the list with text or project filters. Returns ``0``
+        when the user has explicitly opted in to seeing notifications.
+        Mirrors the predicate in :meth:`_explicitly_filtered_tasks` so
+        the count matches what the toggle would actually surface — a
+        notify-shaped row that triages as ``needs_action`` (e.g. an
+        ``[Action]`` notify) stays visible by default and shouldn't
+        inflate the hidden count.
+        """
+        from pollypm.notify_task import is_notify_only_inbox_entry
+
+        if self._show_notifications or self._show_all_messages:
+            return 0
+        return sum(
+            1 for item in self._tasks
+            if is_notify_only_inbox_entry(item)
+            and not getattr(item, "needs_action", False)
         )
 
     def _filtered_tasks(self, tasks: list) -> list:
@@ -7139,6 +7187,8 @@ class PollyInboxApp(App[None]):
 
     def _explicitly_filtered_tasks(self, tasks: list) -> list:
         """Apply user-selected filters, excluding the default action lens."""
+        from pollypm.notify_task import is_notify_only_inbox_entry
+
         if not self._has_active_filters() and self._show_orphaned:
             return list(tasks)
         text_q = self._filter_text.strip().lower()
@@ -7147,6 +7197,24 @@ class PollyInboxApp(App[None]):
         recent_cutoff_ts = self._recent_cutoff_timestamp() if self._filter_recent else None
         for t in tasks:
             if not self._show_orphaned and getattr(t, "is_orphaned", False):
+                continue
+            # #1027 — pure ``notify``-type FYI rows (completion
+            # announcements, heartbeat alerts) bury actionable items;
+            # default-hide them unless the user asks via ``n``. We only
+            # hide rows triage already classified as info — an
+            # ``[Action] Fly.io setup`` row sent through the notify
+            # channel still triages as ``needs_action`` and stays
+            # visible. ``--show all messages``, an active text filter,
+            # or the orphaned lens also reveal them so the user's
+            # explicit search isn't silently truncated.
+            if (
+                not self._show_notifications
+                and not self._show_all_messages
+                and not self._show_orphaned
+                and not text_q
+                and is_notify_only_inbox_entry(t)
+                and not getattr(t, "needs_action", False)
+            ):
                 continue
             if self._filter_unread_only and t.task_id not in self._unread_ids:
                 continue
@@ -7170,7 +7238,15 @@ class PollyInboxApp(App[None]):
 
     def _uses_action_lens_for(self, tasks: list) -> bool:
         """Default inbox view: show actionable work, hide FYI noise."""
-        if self._show_all_messages or self._show_orphaned or self._filter_text:
+        if (
+            self._show_all_messages
+            or self._show_orphaned
+            or self._filter_text
+            # #1027 — when the user opts in to notifications they want
+            # to see them, not have the action-lens triage hide them
+            # again under "FYI hidden".
+            or self._show_notifications
+        ):
             return False
         return any(getattr(item, "needs_action", False) for item in tasks)
 
@@ -7204,6 +7280,8 @@ class PollyInboxApp(App[None]):
             bits.append("blocking_question")
         if self._show_orphaned:
             bits.append("show_orphaned")
+        if self._show_notifications:
+            bits.append("notifications")
         if self._uses_action_lens_for(self._explicitly_filtered_tasks(self._tasks)):
             bits.append("action_needed")
         elif self._show_all_messages:
@@ -7236,6 +7314,8 @@ class PollyInboxApp(App[None]):
             chip_bits.append("[on #1e2730] blocking_question [/on #1e2730]")
         if self._show_orphaned:
             chip_bits.append("[on #1e2730] show orphaned [/on #1e2730]")
+        if self._show_notifications:
+            chip_bits.append("[on #1e2730] notifications [/on #1e2730]")
         if self._uses_action_lens_for(self._explicitly_filtered_tasks(self._tasks)):
             chip_bits.append("[on #1e2730] action needed [/on #1e2730]")
         elif self._show_all_messages:
@@ -7304,6 +7384,20 @@ class PollyInboxApp(App[None]):
         if self.reply_input.has_focus or self.filter_input.has_focus:
             return
         self._show_all_messages = not self._show_all_messages
+        self._render_list(select_first=True)
+
+    def action_toggle_show_notifications(self) -> None:
+        """``n`` — surface (or re-hide) pure-notify FYI rows (#1027).
+
+        The default inbox lens hides ``notify``-type messages so
+        completion announcements and heartbeat alerts don't bury the
+        single actionable row the user needs to act on. Pressing ``n``
+        flips the toggle so the user can scan the historical FYI
+        traffic when they want to.
+        """
+        if self.reply_input.has_focus or self.filter_input.has_focus:
+            return
+        self._show_notifications = not self._show_notifications
         self._render_list(select_first=True)
 
     def action_clear_filters(self) -> None:
@@ -8484,11 +8578,13 @@ class PollyInboxApp(App[None]):
 
     _DEFAULT_HINT = (
         "j/k move \u00b7 \u21b5 open \u00b7 r reply \u00b7 a archive "
-        "\u00b7 d discuss \u00b7 / filter \u00b7 m all \u00b7 c clear \u00b7 q close"
+        "\u00b7 d discuss \u00b7 / filter \u00b7 n notifications "
+        "\u00b7 m all \u00b7 c clear \u00b7 q close"
     )
     _MESSAGE_HINT = (
         "j/k move \u00b7 \u21b5 open \u00b7 a archive "
-        "\u00b7 d discuss \u00b7 / filter \u00b7 m all \u00b7 c clear \u00b7 q close"
+        "\u00b7 d discuss \u00b7 / filter \u00b7 n notifications "
+        "\u00b7 m all \u00b7 c clear \u00b7 q close"
     )
     _PROPOSAL_HINT = (
         "A accept \u00b7 X reject \u00b7 r reply \u00b7 q close"

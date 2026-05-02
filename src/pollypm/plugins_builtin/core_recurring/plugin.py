@@ -18,6 +18,7 @@ from pollypm.plugins_builtin.core_recurring.maintenance import (
     log_rotate_handler,
     memory_ttl_sweep_handler,
     notification_staging_prune_handler,
+    stuck_claims_sweep_handler,
     transcript_ingest_handler,
 )
 from pollypm.plugins_builtin.core_recurring.shared import (  # noqa: F401
@@ -305,6 +306,14 @@ def _register_handlers(api: JobHandlerAPI) -> None:
         "worktree.state_audit", worktree_state_audit_handler,
         max_attempts=1, timeout_seconds=120.0,
     )
+    # #1049 — periodic recovery for jobs orphaned in 'claimed' when the
+    # watchdog's queue.fail call exhausted under sustained WAL contention.
+    # Idempotent; cheap (one indexed query). Floor of 600 s before
+    # force-failing keeps it well clear of any normal handler runtime.
+    api.register_handler(
+        "stuck_claims.sweep", stuck_claims_sweep_handler,
+        max_attempts=1, timeout_seconds=120.0,
+    )
 
 
 def _register_roster(api: RosterAPI) -> None:
@@ -336,6 +345,11 @@ def _register_roster(api: RosterAPI) -> None:
         dedupe_key="log.rotate",
     )
     api.register_recurring("@every 10m", "worktree.state_audit", {})
+    # #1049 — every 5 min sweep recovers jobs orphaned in 'claimed' state.
+    api.register_recurring(
+        "@every 5m", "stuck_claims.sweep", {},
+        dedupe_key="stuck_claims.sweep",
+    )
 
 
 plugin = PollyPMPlugin(
@@ -363,6 +377,7 @@ plugin = PollyPMPlugin(
         Capability(kind="job_handler", name="agent_worktree.prune"),
         Capability(kind="job_handler", name="log.rotate"),
         Capability(kind="job_handler", name="worktree.state_audit"),
+        Capability(kind="job_handler", name="stuck_claims.sweep"),
         Capability(kind="roster_entry", name="core_recurring"),
     ),
     register_handlers=_register_handlers,

@@ -84,6 +84,151 @@ def db_vacuum_handler(payload: dict[str, Any]) -> dict[str, Any]:
         return {"bytes_reclaimed": bytes_reclaimed, "mb_reclaimed": mb_reclaimed}
 
 
+# Handlers without a registered timeout (or whose registry isn't reachable
+# from the recurring sweep) get this safety floor before the 2× multiplier
+# is applied. 600 s is generous — it's longer than every default-registered
+# handler timeout, so we're never aggressive on an unknown handler.
+_STUCK_CLAIMS_DEFAULT_TIMEOUT_SECONDS: float = 300.0
+_STUCK_CLAIMS_FLOOR_SECONDS: float = 600.0
+
+
+def _resolve_handler_timeouts() -> dict[str, float]:
+    """Best-effort handler-name -> timeout_seconds map for the running host.
+
+    Returns ``{}`` when the plugin host isn't reachable (e.g. in an
+    isolated test that constructs a queue but no extension host). The
+    sweep falls back to the 600 s safety floor in that case.
+    """
+    try:
+        from pollypm.config import DEFAULT_CONFIG_PATH, resolve_config_path
+        from pollypm.plugin_host import extension_host_for_root
+    except Exception:  # noqa: BLE001
+        return {}
+    try:
+        config_path = resolve_config_path(DEFAULT_CONFIG_PATH)
+        # The cached host is keyed on the project root_dir. Use the
+        # config's parent as a stable key so a per-project sweep finds
+        # the same registry as boot.
+        host = extension_host_for_root(str(config_path.parent))
+        registry = host.job_handler_registry()
+    except Exception:  # noqa: BLE001
+        return {}
+    try:
+        snapshot = registry.snapshot()
+    except Exception:  # noqa: BLE001
+        return {}
+    result: dict[str, float] = {}
+    for name, spec in snapshot.items():
+        timeout = getattr(spec, "timeout_seconds", None)
+        if isinstance(timeout, (int, float)) and timeout > 0:
+            result[name] = float(timeout)
+    return result
+
+
+def stuck_claims_sweep_handler(
+    payload: dict[str, Any],
+    *,
+    queue: Any | None = None,
+    handler_timeouts: dict[str, float] | None = None,
+    now: Any | None = None,
+) -> dict[str, Any]:
+    """Force-fail claimed jobs whose claim is past the per-handler cutoff (#1049).
+
+    Cutoff = ``claimed_at + max(handler_timeout_seconds * 2, 600s)``. The
+    2× factor accounts for the watchdog's existing handler-timeout
+    window plus the lock-retry budget; the 600 s floor handles handlers
+    without a registered spec (e.g. a stale row from a removed plugin).
+
+    Idempotent — running twice in quick succession only re-fails jobs
+    that are still past the cutoff. Jobs already moved back to
+    ``queued`` (or to terminal ``failed``) by the first pass are
+    invisible to the second.
+
+    The ``queue`` / ``handler_timeouts`` / ``now`` keyword arguments
+    are test seams — production callers pass only ``payload``.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from pollypm.jobs import JobQueue
+
+    resolved_now = now if isinstance(now, datetime) else datetime.now(UTC)
+    if resolved_now.tzinfo is None:
+        resolved_now = resolved_now.replace(tzinfo=UTC)
+
+    timeouts = (
+        dict(handler_timeouts)
+        if handler_timeouts is not None
+        else _resolve_handler_timeouts()
+    )
+
+    summary = {
+        "scanned": 0,
+        "recovered": 0,
+        "failed_terminal": 0,
+        "skipped_recent": 0,
+        "errors": 0,
+    }
+
+    def _do_sweep(q: Any) -> dict[str, Any]:
+        try:
+            stuck = q.find_stuck_claims()
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "stuck_claims.sweep: find_stuck_claims failed",
+                exc_info=True,
+            )
+            return summary
+
+        for job in stuck:
+            summary["scanned"] += 1
+            claimed_at = getattr(job, "claimed_at", None)
+            if claimed_at is None:
+                continue
+            if claimed_at.tzinfo is None:
+                claimed_at = claimed_at.replace(tzinfo=UTC)
+
+            timeout = timeouts.get(
+                job.handler_name, _STUCK_CLAIMS_DEFAULT_TIMEOUT_SECONDS,
+            )
+            cutoff_seconds = max(
+                float(timeout) * 2.0, _STUCK_CLAIMS_FLOOR_SECONDS,
+            )
+            cutoff = claimed_at + timedelta(seconds=cutoff_seconds)
+            if resolved_now < cutoff:
+                summary["skipped_recent"] += 1
+                continue
+
+            terminal = job.attempt >= job.max_attempts
+            try:
+                q.fail(
+                    job.id,
+                    "auto-recovered stuck claim",
+                    retry=True,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "stuck_claims.sweep: fail(%s) raised",
+                    job.id, exc_info=True,
+                )
+                summary["errors"] += 1
+                continue
+
+            if terminal:
+                summary["failed_terminal"] += 1
+            else:
+                summary["recovered"] += 1
+
+        return summary
+
+    if queue is not None:
+        return _do_sweep(queue)
+
+    config = _load_config(payload)
+    state_db = config.project.state_db
+    with JobQueue(db_path=state_db) as q:
+        return _do_sweep(q)
+
+
 AUDIT_EVENT_SUBJECTS: frozenset[str] = frozenset({
     "task.approved", "task.rejected", "task.done", "task.claimed",
     "task.queued", "plan.approved", "inbox.message.created", "launch",

@@ -557,6 +557,47 @@ class JobQueue:
             ).fetchall()
         return [(str(row[0]), int(row[1])) for row in rows]
 
+    def find_stuck_claims(self, *, limit: int = 1000) -> list[Job]:
+        """Return all claimed jobs with a non-null ``claimed_at`` (#1049).
+
+        The caller decides what "stuck" means by comparing ``claimed_at``
+        against a per-handler cutoff — the queue itself doesn't know
+        handler timeouts. Returned newest-claimed-first so a bounded
+        ``limit`` still surfaces the actively-blocking entries.
+
+        Used by the ``stuck_claims.sweep`` recurring handler to recover
+        jobs orphaned when the watchdog's ``queue.fail`` call exhausted
+        its retry budget under sustained WAL contention.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, handler_name, payload_json, attempt, max_attempts,
+                       dedupe_key, enqueued_at, run_after, claimed_at, claimed_by, status
+                FROM work_jobs
+                WHERE status = 'claimed' AND claimed_at IS NOT NULL
+                ORDER BY claimed_at ASC, id ASC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [
+            Job(
+                id=int(row[0]),
+                handler_name=row[1],
+                payload=json.loads(row[2] or "{}"),
+                attempt=int(row[3]),
+                max_attempts=int(row[4]),
+                dedupe_key=row[5],
+                enqueued_at=_parse_ts(row[6]) or datetime.now(UTC),
+                run_after=_parse_ts(row[7]) or datetime.now(UTC),
+                claimed_at=_parse_ts(row[8]),
+                claimed_by=row[9],
+                status=JobStatus(row[10]),
+            )
+            for row in rows
+        ]
+
     def list_jobs(
         self,
         *,

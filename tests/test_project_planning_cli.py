@@ -805,6 +805,69 @@ class TestAddProjectAutoFire:
             f"re-add should not double-fire; got {len(plan_tasks)} plan tasks"
         )
 
+    # -----------------------------------------------------------------
+    # Issue #1031 — pm add-project must surface the planner outcome to
+    # stdout so users have a positive end-to-end confirmation that
+    # auto-bootstrap planning engaged.
+    # -----------------------------------------------------------------
+
+    def test_add_project_default_emits_auto_fire_status_to_stdout(
+        self, tmp_path: Path
+    ) -> None:
+        """Default config success branch: stdout names the auto-fired
+        plan_project task and its queued status (#1031).
+        """
+        repo = _make_project_repo(tmp_path, name="fresh")
+        config_path = _write_minimal_config(tmp_path)
+
+        result = self._invoke_add_project(repo=repo, config_path=config_path)
+        assert result.exit_code == 0, result.stdout + result.stderr
+        assert "Auto-fired plan_project task" in result.stdout, result.stdout
+        # Task IDs are rendered as ``<project>/<n>``.
+        assert "fresh/" in result.stdout, result.stdout
+        # The queued status should round-trip through to the user (the
+        # observer flips draft->queued at the end).
+        assert "status=queued" in result.stdout, result.stdout
+        assert "pm cockpit" in result.stdout, result.stdout
+        assert "pm task list --project fresh" in result.stdout, result.stdout
+
+    def test_add_project_skip_plan_emits_skip_hint(
+        self, tmp_path: Path
+    ) -> None:
+        """``--skip-plan`` branch surfaces a one-line opt-in hint
+        instead of claiming auto-fire happened (#1031).
+        """
+        repo = _make_project_repo(tmp_path, name="fresh")
+        config_path = _write_minimal_config(tmp_path)
+
+        result = self._invoke_add_project(
+            repo=repo, config_path=config_path,
+            extra_args=["--skip-plan"],
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        assert "Auto-planning skipped" in result.stdout, result.stdout
+        assert "--skip-plan" in result.stdout, result.stdout
+        assert "pm project plan fresh" in result.stdout, result.stdout
+        # And we must NOT have lied about an auto-fire.
+        assert "Auto-fired plan_project task" not in result.stdout, result.stdout
+
+    def test_add_project_config_disabled_emits_global_hint(
+        self, tmp_path: Path
+    ) -> None:
+        """``[planner] auto_on_project_created=false`` branch: stdout
+        explains the global suppression and points at the manual verb
+        (#1031).
+        """
+        repo = _make_project_repo(tmp_path, name="fresh")
+        config_path = _disable_auto_plan_config(tmp_path)
+
+        result = self._invoke_add_project(repo=repo, config_path=config_path)
+        assert result.exit_code == 0, result.stdout + result.stderr
+        assert "Auto-planning is disabled globally" in result.stdout, result.stdout
+        assert "auto_on_project_created=false" in result.stdout, result.stdout
+        assert "pm project plan fresh" in result.stdout, result.stdout
+        assert "Auto-fired plan_project task" not in result.stdout, result.stdout
+
 
 # ---------------------------------------------------------------------------
 # Issue #255 — PlannerSettings config roundtrip

@@ -28,6 +28,118 @@ from pollypm.projects import (
 logger = logging.getLogger(__name__)
 
 
+def _emit_auto_plan_status(
+    *,
+    project_key: str,
+    project_path: Path,
+    config_path: Path,
+    skip_plan: bool,
+) -> None:
+    """Print a positive-confirmation line about auto-bootstrap planning.
+
+    Mirrors the suppression precedence inside
+    ``project_planning._on_project_created`` so the stdout summary
+    matches what the observer actually did. See issue #1031: the
+    observer's return value (``list[str]`` of failure messages) does
+    not say which branch ran, so we re-derive it here.
+
+    Branches:
+
+    * ``skip_plan`` flag → "auto-planning skipped" hint.
+    * ``[planner] auto_on_project_created=false`` → globally disabled
+      hint.
+    * Otherwise → look up the auto-fired ``plan_project`` task in the
+      project's work DB and surface its ``task_id`` + ``status``. If
+      the lookup fails (DB never opened, schema error, etc.) emit a
+      degraded note pointing at ``pm project plan``.
+    """
+    if skip_plan:
+        typer.echo(
+            f"Auto-planning skipped (--skip-plan). Run "
+            f"`pm project plan {project_key}` when ready."
+        )
+        return
+
+    auto_fire = True
+    workspace_db_path: Path | None = None
+    try:
+        cfg = load_config(config_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "auto-plan status: config read failed (%s); assuming auto_fire=True",
+            exc,
+        )
+        cfg = None
+    if cfg is not None:
+        try:
+            auto_fire = bool(cfg.planner.auto_on_project_created)
+        except Exception:  # noqa: BLE001
+            auto_fire = True
+        workspace_root = getattr(getattr(cfg, "project", None), "workspace_root", None)
+        if workspace_root is not None:
+            workspace_db_path = Path(workspace_root) / ".pollypm" / "state.db"
+
+    if not auto_fire:
+        typer.echo(
+            "Auto-planning is disabled globally "
+            "([planner] auto_on_project_created=false in pollypm.toml).\n"
+            f"Run `pm project plan {project_key}` to plan this project manually."
+        )
+        return
+
+    db_path = workspace_db_path or (project_path / ".pollypm" / "state.db")
+    task_id: str | None = None
+    status: str | None = None
+    if db_path.exists():
+        try:
+            from pollypm.work.sqlite_service import SQLiteWorkService
+
+            with SQLiteWorkService(
+                db_path=db_path, project_path=project_path,
+            ) as svc:
+                tasks = svc.list_tasks(project=project_key)
+            plan_tasks = [
+                t for t in tasks if getattr(t, "flow_template_id", None) == "plan_project"
+            ]
+            if plan_tasks:
+                # Newest match wins. ``list_tasks`` returns ``created_at
+                # ASC``, so the last entry is the freshest plan task.
+                latest = plan_tasks[-1]
+                task_id = getattr(latest, "task_id", None)
+                work_status = getattr(latest, "work_status", None)
+                # ``work_status`` is a ``WorkStatus`` enum; render its
+                # ``.value`` so users see ``queued`` not
+                # ``WorkStatus.QUEUED``.
+                if work_status is not None:
+                    status = getattr(work_status, "value", str(work_status))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "auto-plan status: work-DB lookup failed for %s (%s)",
+                project_key, exc,
+            )
+
+    if task_id is not None:
+        status_str = status or "unknown"
+        typer.echo(
+            f"Auto-fired plan_project task {task_id} (status={status_str}).\n"
+            "The architect will engage on the next assignment sweep.\n"
+            f"Watch progress: pm cockpit, or pm task list --project {project_key}."
+        )
+        return
+
+    # Best-effort fallback: observer ran without raising, but we can't
+    # find a plan_project task. Either the work DB never opened (the
+    # auto-fire silently bailed in the observer's inner try-blocks) or
+    # the task was never created. Don't claim success.
+    typer.echo(
+        "Auto-planning was attempted but no plan_project task could be "
+        f"confirmed for {project_key}. Run `pm task list --project "
+        f"{project_key}` to inspect, or `pm project plan {project_key}` "
+        "to plan manually.",
+        err=True,
+    )
+
+
 def register_project_commands(app: typer.Typer) -> None:
     @app.command(
         help=help_with_examples(
@@ -118,6 +230,7 @@ def register_project_commands(app: typer.Typer) -> None:
         typer.echo(f"Registered project {project.name or project.key} at {project.path}")
 
         if not was_preexisting:
+            observer_ran = False
             try:
                 from pollypm.plugin_host import extension_host_for_root
 
@@ -134,6 +247,7 @@ def register_project_commands(app: typer.Typer) -> None:
                         "config_path": str(config_path),
                     },
                 )
+                observer_ran = True
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "project.created observer failed for %s: %s",
@@ -145,6 +259,29 @@ def register_project_commands(app: typer.Typer) -> None:
                     f"is registered, but the planner auto-fire did not run. Run "
                     f"`pm project plan {project.key}` to start planning manually.",
                     err=True,
+                )
+
+            # #1031: surface positive end-to-end confirmation that the
+            # auto-bootstrap planning chain engaged. The observer return
+            # value is just a list of failure strings, so we re-derive the
+            # branch the planner observer took:
+            #
+            #   1. ``--skip-plan`` flag → user opted out for this run.
+            #   2. ``[planner] auto_on_project_created=false`` → globally
+            #      disabled; the user has to run ``pm project plan`` by
+            #      hand.
+            #   3. Otherwise the planner *should* have auto-fired a
+            #      ``plan_project`` task. We confirm by querying the
+            #      project's work DB for the most-recent matching task
+            #      and report its task_id + status. If that lookup
+            #      fails we degrade to a best-effort note rather than
+            #      claiming success that didn't happen.
+            if observer_ran:
+                _emit_auto_plan_status(
+                    project_key=project.key,
+                    project_path=project.path,
+                    config_path=config_path,
+                    skip_plan=bool(skip_plan),
                 )
 
         if skip_import:

@@ -427,14 +427,18 @@ def _emit_plan_missing_alert(
     # alert view groups it alongside the project's worker alerts.
     session_name = _plan_missing_session_name(project)
     # #760 — actionable single-line copy: name the project + the
-    # blocked task so the reader knows why it matters. The earlier
-    # tail "Try: pm project plan <name>" pushed the user out of the
-    # cockpit to a shell — replaced with the in-cockpit affordance
-    # since c is now wired on the project Plan card (#866, #863).
+    # blocked task so the reader knows why it matters. #1029 — restore
+    # the ``pm project plan <X>`` CLI verb as the lower-friction path
+    # for users reading ``pm alerts`` cold; keep the cockpit affordance
+    # (press ``c`` on the project Plan card, #866/#863) for users who
+    # are already there. Spelling out "left rail" + "dashboard" makes
+    # the keystroke context unambiguous.
     message = (
         f"Project '{project}' has no approved plan yet — "
-        f"queued task {example_task_id} is waiting on it. "
-        f"Open the project and press c to ask the PM to plan it."
+        f"queued task {example_task_id} is waiting. "
+        f"Run `pm project plan {project}` to queue planning, or open "
+        f"the cockpit, focus '{project}' in the left rail, and press "
+        f"`c` on its dashboard."
     )
     try:
         store.upsert_alert(session_name, "plan_missing", "warn", message)

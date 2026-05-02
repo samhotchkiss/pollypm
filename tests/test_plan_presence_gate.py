@@ -781,9 +781,13 @@ class TestSweepHandlerGateIntegration:
         alerts = [a for a in store.open_alerts() if a.alert_type == "plan_missing"]
         assert len(alerts) == 1
         assert alerts[0].session_name == "plan_gate-proj"
-        # #866: alert text now points users at the in-cockpit affordance
-        # (press ``c`` on the project Plan card) instead of a CLI command.
-        assert "press c to ask" in alerts[0].message.lower()
+        # #866 + #1029: alert text surfaces both the ``pm project plan``
+        # CLI verb (lower-friction path for users reading ``pm alerts``
+        # cold) and the in-cockpit affordance (press ``c`` on the
+        # project Plan card). Both must be present so future edits
+        # can't silently drop either.
+        assert "pm project plan" in alerts[0].message
+        assert "press" in alerts[0].message.lower()
 
         store.close()
 

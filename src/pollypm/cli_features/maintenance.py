@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import typer
@@ -29,6 +31,159 @@ from pollypm.errors import format_config_not_found_error
 from pollypm.models import ProviderKind
 from pollypm.storage.state import StateStore
 from pollypm.worktrees import list_worktrees as list_project_worktrees
+
+
+@dataclass(frozen=True)
+class RepairProblem:
+    """A single problem found by ``pm repair``.
+
+    ``project`` is the project key (or ``"global"`` for global config).
+    ``klass`` is one of ``missing``, ``outdated``, ``config`` — the
+    aggregation key alongside ``group``. ``path`` is the literal target
+    path (relative to the project root) for messaging; ``group`` is the
+    aggregation bucket — usually equal to ``path`` but the per-doc
+    ``.pollypm/docs/reference/<file>.md`` problems collapse to a single
+    family ``.pollypm/docs/reference/``.
+    """
+
+    project: str
+    klass: str
+    path: str
+    group: str
+
+
+@dataclass
+class _Bucket:
+    klass: str
+    group: str
+    paths: set[str] = field(default_factory=set)
+    projects: list[str] = field(default_factory=list)
+    project_set: set[str] = field(default_factory=set)
+    count: int = 0
+
+    def add(self, problem: RepairProblem) -> None:
+        self.paths.add(problem.path)
+        self.count += 1
+        if problem.project not in self.project_set:
+            self.project_set.add(problem.project)
+            self.projects.append(problem.project)
+
+
+def _aggregate_problems(
+    problems: list[RepairProblem],
+) -> "OrderedDict[tuple[str, str], _Bucket]":
+    """Group problems by ``(klass, group)`` preserving insertion order."""
+    buckets: OrderedDict[tuple[str, str], _Bucket] = OrderedDict()
+    for problem in problems:
+        key = (problem.klass, problem.group)
+        bucket = buckets.get(key)
+        if bucket is None:
+            bucket = _Bucket(klass=problem.klass, group=problem.group)
+            buckets[key] = bucket
+        bucket.add(problem)
+    return buckets
+
+
+def _format_aggregated_report(
+    problems: list[RepairProblem],
+    *,
+    sample_limit: int = 3,
+) -> list[str]:
+    """Render the aggregated, doctor-styled ``pm repair --check`` block.
+
+    Returns a list of lines. The caller adds the trailing summary +
+    next-action hints so dry-run / check / fix paths can vary the
+    final stanza.
+    """
+    buckets = _aggregate_problems(problems)
+    distinct_projects: set[str] = set()
+    for bucket in buckets.values():
+        distinct_projects.update(bucket.project_set)
+    distinct_projects.discard("global")
+    project_count = len(distinct_projects)
+    total = len(problems)
+    project_word = "project" if project_count == 1 else "projects"
+    problem_word = "problem" if total == 1 else "problems"
+
+    lines: list[str] = [
+        f"Found {total} {problem_word} across {project_count} {project_word}:"
+    ]
+
+    label_width = 56
+    for bucket in buckets.values():
+        if (
+            bucket.klass == "outdated"
+            and bucket.group == ".pollypm/docs/reference/"
+        ):
+            doc_count = len(bucket.paths)
+            doc_word = "doc" if doc_count == 1 else "docs"
+            label = (
+                f"  [outdated] .pollypm/docs/reference/"
+                f"<{doc_count} {doc_word} each>"
+            )
+        else:
+            label = f"  [{bucket.klass}] {bucket.group}"
+        n_projects = len(bucket.project_set)
+        proj_word = "project" if n_projects == 1 else "projects"
+        if bucket.count == n_projects:
+            right = f"{n_projects} {proj_word}"
+        else:
+            right = f"{bucket.count} / {n_projects} {proj_word}"
+        padding = max(1, label_width - len(label))
+        lines.append(f"{label}{' ' * padding}{right}")
+
+        sample = bucket.projects[:sample_limit]
+        more = len(bucket.projects) - len(sample)
+        sample_str = ", ".join(sample)
+        if more > 0:
+            sample_str = f"{sample_str} (+{more} more)"
+        lines.append(f"    {sample_str}")
+
+    return lines
+
+
+def _format_summary_line(problems: list[RepairProblem]) -> str:
+    """Build the trailing one-line summary."""
+    buckets = _aggregate_problems(problems)
+    distinct_projects: set[str] = set()
+    for bucket in buckets.values():
+        distinct_projects.update(bucket.project_set)
+    distinct_projects.discard("global")
+    project_count = len(distinct_projects)
+    n_classes = len(buckets)
+    total = len(problems)
+    problem_word = "problem" if total == 1 else "problems"
+    project_word = "project" if project_count == 1 else "projects"
+    class_word = "class" if n_classes == 1 else "classes"
+    return (
+        f"Summary: {total} {problem_word} across {project_count} "
+        f"{project_word} ({n_classes} {class_word}, all auto-fixable)"
+    )
+
+
+def _problem_group(klass: str, path: str) -> str:
+    """Aggregation key for a problem.
+
+    Reference docs collapse into one ``.pollypm/docs/reference/`` family;
+    everything else groups by its literal path.
+    """
+    if path.startswith(".pollypm/docs/reference/"):
+        return ".pollypm/docs/reference/"
+    return path
+
+
+def _split_doc_problem(message: str) -> tuple[str, str]:
+    """Parse a ``verify_docs`` message of the form ``"<klass> <path>"``.
+
+    ``verify_docs`` returns strings like ``"missing .pollypm/docs/SYSTEM.md"``
+    or ``"outdated .pollypm/docs/reference/sessions.md"``. Falls back to
+    a ``("config", message)`` tuple if the prefix doesn't match — defensive
+    against any future verifier additions.
+    """
+    for prefix in ("missing ", "outdated "):
+        if message.startswith(prefix):
+            return prefix.strip(), message[len(prefix):]
+    return "config", message
 
 debug_app = typer.Typer(help="Low-level debugging helpers.")
 
@@ -508,23 +663,47 @@ def register_maintenance_commands(app: typer.Typer) -> None:
     def repair(
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
         check_only: bool = typer.Option(False, "--check", help="Report problems without fixing."),
+        dry_run: bool = typer.Option(
+            False,
+            "--dry-run",
+            help="Show what `pm repair` WOULD write, without mutating anything.",
+        ),
     ) -> None:
         """Check and repair PollyPM project scaffolding, docs, and state."""
         from pollypm import cli as cli_mod
+
+        if check_only and dry_run:
+            typer.echo(
+                "--check and --dry-run are mutually exclusive: --check reports "
+                "problems, --dry-run previews fixes.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
 
         config_path = cli_mod._discover_config_path(config_path)
         if not config_path.exists():
             typer.echo(format_config_not_found_error(config_path), err=True)
             raise typer.Exit(code=1)
         config = load_config(config_path)
-        all_problems: list[str] = []
+        all_problems: list[RepairProblem] = []
         all_actions: list[str] = []
+        # ``apply`` is False for both --check and --dry-run; the difference
+        # is only in the trailing message.
+        apply = not (check_only or dry_run)
 
         global_problems = verify_docs(GLOBAL_CONFIG_DIR)
         if global_problems:
             for problem in global_problems:
-                all_problems.append(f"[global] {problem}")
-            if not check_only:
+                klass, path = _split_doc_problem(problem)
+                all_problems.append(
+                    RepairProblem(
+                        project="global",
+                        klass=klass,
+                        path=path,
+                        group=_problem_group(klass, path),
+                    )
+                )
+            if apply:
                 actions = repair_docs(GLOBAL_CONFIG_DIR)
                 for action in actions:
                     all_actions.append(f"[global] {action}")
@@ -532,8 +711,14 @@ def register_maintenance_commands(app: typer.Typer) -> None:
         for key, project in config.projects.items():
             project_root = project.path
             if not project_root.exists():
+                msg = f"project path does not exist: {project_root}"
                 all_problems.append(
-                    f"[{key}] project path does not exist: {project_root}"
+                    RepairProblem(
+                        project=key,
+                        klass="config",
+                        path=msg,
+                        group=_problem_group("config", msg),
+                    )
                 )
                 continue
 
@@ -550,19 +735,31 @@ def register_maintenance_commands(app: typer.Typer) -> None:
                 target = state_dir / subdir
                 if target.exists():
                     continue
+                rel = str(target.relative_to(project_root))
                 all_problems.append(
-                    f"[{key}] missing {target.relative_to(project_root)}"
-                )
-                if not check_only:
-                    target.mkdir(parents=True, exist_ok=True)
-                    all_actions.append(
-                        f"[{key}] created {target.relative_to(project_root)}"
+                    RepairProblem(
+                        project=key,
+                        klass="missing",
+                        path=rel,
+                        group=_problem_group("missing", rel),
                     )
+                )
+                if apply:
+                    target.mkdir(parents=True, exist_ok=True)
+                    all_actions.append(f"[{key}] created {rel}")
 
             doc_problems = verify_docs(project_root)
             for problem in doc_problems:
-                all_problems.append(f"[{key}] {problem}")
-            if not check_only and doc_problems:
+                klass, path = _split_doc_problem(problem)
+                all_problems.append(
+                    RepairProblem(
+                        project=key,
+                        klass=klass,
+                        path=path,
+                        group=_problem_group(klass, path),
+                    )
+                )
+            if apply and doc_problems:
                 actions = repair_docs(project_root)
                 for action in actions:
                     all_actions.append(f"[{key}] {action}")
@@ -571,10 +768,16 @@ def register_maintenance_commands(app: typer.Typer) -> None:
             if gitignore.exists():
                 content = gitignore.read_text()
                 if ".pollypm/" not in content:
+                    rel = ".gitignore missing .pollypm/ entry"
                     all_problems.append(
-                        f"[{key}] .gitignore missing .pollypm/ entry"
+                        RepairProblem(
+                            project=key,
+                            klass="config",
+                            path=rel,
+                            group=_problem_group("config", rel),
+                        )
                     )
-                    if not check_only:
+                    if apply:
                         with gitignore.open("a") as handle:
                             if not content.endswith("\n"):
                                 handle.write("\n")
@@ -586,17 +789,35 @@ def register_maintenance_commands(app: typer.Typer) -> None:
         if not all_problems:
             typer.echo("All projects healthy. No repairs needed.")
             return
-        problem_word = "problem" if len(all_problems) == 1 else "problems"
-        typer.echo(f"Found {len(all_problems)} {problem_word}:")
-        for problem in all_problems:
-            typer.echo(f"  - {problem}")
+
+        for line in _format_aggregated_report(all_problems):
+            typer.echo(line)
+
         if check_only:
-            typer.echo("\nRun `pm repair` (without --check) to fix.")
+            typer.echo("")
+            typer.echo(
+                "Run `pm repair` to fix all (safe; rewrites scaffolding only)."
+            )
+            typer.echo("Run `pm repair --dry-run` to preview writes.")
+            typer.echo("")
+            typer.echo(_format_summary_line(all_problems))
             return
+
+        if dry_run:
+            typer.echo("")
+            typer.echo("Dry-run; no writes performed.")
+            typer.echo("Run `pm repair` to apply.")
+            typer.echo("")
+            typer.echo(_format_summary_line(all_problems))
+            return
+
         fix_word = "fix" if len(all_actions) == 1 else "fixes"
-        typer.echo(f"\nApplied {len(all_actions)} {fix_word}:")
+        typer.echo("")
+        typer.echo(f"Applied {len(all_actions)} {fix_word}:")
         for action in all_actions:
             typer.echo(f"  + {action}")
+        typer.echo("")
+        typer.echo(_format_summary_line(all_problems))
 
     @app.command()
     def upgrade(

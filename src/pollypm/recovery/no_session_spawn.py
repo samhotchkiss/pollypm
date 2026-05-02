@@ -80,6 +80,13 @@ DEFAULT_BACKOFF_CAP_SECONDS = 600
 
 SPAWN_ATTEMPT_EVENT_TYPE = "no_session_spawn_attempt"
 SPAWN_FAILED_ALERT_TYPE = "no_session_spawn_failed"
+# #1028 — heartbeat marker recorded when the auto-clear sweep observes a
+# previously-failing session as healthy and closes the
+# ``no_session_spawn_failed`` alert. Acts as the "since" floor for
+# :func:`_attempt_history` so the breaker has its full attempt budget
+# available again on the next legitimate ``no_session`` episode rather
+# than starting tripped on stale attempts from the cleared episode.
+SPAWN_BREAKER_RESET_EVENT_TYPE = "no_session_spawn_breaker_reset"
 
 
 @dataclass(slots=True)
@@ -154,6 +161,49 @@ def _parse_iso(value: Any) -> datetime | None:
         return None
 
 
+def _latest_breaker_reset(
+    store: Any, session_name: str, *, limit: int = 50,
+) -> datetime | None:
+    """Return the most recent breaker-reset marker timestamp, or ``None``.
+
+    The auto-clear sweep records a ``no_session_spawn_breaker_reset``
+    event when it closes a ``no_session_spawn_failed`` alert after a
+    healthy streak (#1028). :func:`_attempt_history` treats that
+    timestamp as a floor on the attempt window so the breaker resets to
+    its full ``DEFAULT_MAX_ATTEMPTS`` budget for the next legitimate
+    ``no_session`` episode — without it, stale attempts from the cleared
+    episode would push the new alert straight into immediate escalation.
+    """
+    query = getattr(store, "query_messages", None)
+    if not callable(query):
+        return None
+    try:
+        rows = query(type="event", scope=session_name, limit=limit)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "no_session_spawn: query_messages(reset) failed for %s",
+            session_name, exc_info=True,
+        )
+        return None
+    latest: datetime | None = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        sender = str(row.get("sender") or "")
+        subject = str(row.get("subject") or "")
+        if (
+            sender != SPAWN_BREAKER_RESET_EVENT_TYPE
+            and subject != SPAWN_BREAKER_RESET_EVENT_TYPE
+        ):
+            continue
+        ts = _parse_iso(row.get("created_at"))
+        if ts is None:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
+
+
 def _attempt_history(
     store: Any,
     session_name: str,
@@ -189,6 +239,19 @@ def _attempt_history(
     ``SPAWN_ATTEMPT_EVENT_TYPE`` and any cross-talk would require a
     foreign producer to use the same literal).
     """
+    # #1028 — the most recent breaker-reset marker acts as a floor on
+    # the attempt window. When the auto-clear sweep closes a
+    # ``no_session_spawn_failed`` alert after a healthy streak, it
+    # records the marker so stale attempts from the cleared episode
+    # don't push a fresh ``no_session`` alert into immediate escalation.
+    reset_floor = _latest_breaker_reset(store, session_name)
+    effective_since = since
+    if reset_floor is not None:
+        effective_since = (
+            reset_floor if effective_since is None
+            else max(effective_since, reset_floor)
+        )
+
     out: list[datetime] = []
     query = getattr(store, "query_messages", None)
     if callable(query):
@@ -215,7 +278,7 @@ def _attempt_history(
             ts = _parse_iso(row.get("created_at"))
             if ts is None:
                 continue
-            if since is not None and ts < since:
+            if effective_since is not None and ts < effective_since:
                 continue
             out.append(ts)
         if out:
@@ -239,7 +302,7 @@ def _attempt_history(
         ts = _parse_iso(getattr(event, "created_at", None))
         if ts is None:
             continue
-        if since is not None and ts < since:
+        if effective_since is not None and ts < effective_since:
             continue
         out.append(ts)
     return out
@@ -364,6 +427,33 @@ def _record_attempt(store: Any, session_name: str, message: str) -> None:
     except Exception:  # noqa: BLE001
         logger.debug(
             "no_session_spawn: record_event failed for %s",
+            session_name, exc_info=True,
+        )
+
+
+def record_breaker_reset(store: Any, session_name: str, message: str = "") -> None:
+    """Record a marker that resets the spawn-attempt counter to zero.
+
+    Called from the heartbeat's auto-clear sweep when it observes a
+    previously-failing session as healthy and closes the corresponding
+    ``no_session_spawn_failed`` alert (#1028). The marker's timestamp
+    becomes the floor for :func:`_attempt_history`'s effective ``since``,
+    so any attempts recorded before the reset are no longer counted.
+    The result: future ``no_session`` episodes start with the full
+    ``DEFAULT_MAX_ATTEMPTS`` budget instead of inheriting the tripped
+    state from the cleared episode.
+
+    Best-effort: silently swallows store errors so a flaky write can't
+    block the auto-clear path for unrelated alerts.
+    """
+    record = getattr(store, "record_event", None)
+    if not callable(record):
+        return
+    try:
+        record(session_name, SPAWN_BREAKER_RESET_EVENT_TYPE, message)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "no_session_spawn: record_event(breaker_reset) failed for %s",
             session_name, exc_info=True,
         )
 
@@ -647,8 +737,10 @@ __all__ = [
     "DEFAULT_MAX_ATTEMPTS",
     "DEFAULT_THRESHOLD_SECONDS",
     "SPAWN_ATTEMPT_EVENT_TYPE",
+    "SPAWN_BREAKER_RESET_EVENT_TYPE",
     "SPAWN_FAILED_ALERT_TYPE",
     "SpawnDecision",
     "auto_recover_no_session_alerts",
+    "record_breaker_reset",
     "summarize_decisions",
 ]

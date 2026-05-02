@@ -2326,8 +2326,21 @@ class Supervisor:
     # overridable per-instance for tests + for operator override.
 
     _RECOVERY_ALERT_AUTO_CLEAR_DEBOUNCE_SECONDS: float = 90.0
+    # #1028 — extended to cover the spawn-failure family raised by the
+    # ``no_session`` auto-recovery path (#1005) and the auto-claim
+    # circuit-breaker (#1012/#1014). Without these in the set, a tripped
+    # breaker stuck the alert open even after the underlying session
+    # came back to a healthy state, mirroring the gap #1008 fixed for
+    # ``recovery_limit``.
     _AUTO_CLEAR_ALERT_TYPES: frozenset[str] = frozenset({
-        "recovery_limit", "stuck_session",
+        "recovery_limit",
+        "stuck_session",
+        "no_session_spawn_failed",
+        "spawn_failed_persistent",
+    })
+    _SPAWN_FAILURE_ALERT_TYPES: frozenset[str] = frozenset({
+        "no_session_spawn_failed",
+        "spawn_failed_persistent",
     })
     _RECOVERY_HEALTH_OBSERVED_EVENT = "recovery_alert_health_observed"
     _RECOVERY_UNHEALTHY_OBSERVED_EVENT = "recovery_alert_unhealthy_observed"
@@ -2338,10 +2351,12 @@ class Supervisor:
         window_map: dict,
         name_by_window: dict,
     ) -> None:
-        """Clear ``recovery_limit`` / ``stuck_session`` alerts after a healthy streak.
+        """Clear recovered alerts after a healthy streak.
 
         Walks the open alert set, filters to the auto-clear-eligible
-        families (``recovery_limit``, ``stuck_session``), and for each:
+        families (``recovery_limit`` / ``stuck_session`` from #1008,
+        plus ``no_session_spawn_failed`` / ``spawn_failed_persistent``
+        from #1028), and for each:
 
         1. Confirms the alert's session is currently tracked
            (configured + enabled) and its expected tmux window is alive.
@@ -2421,6 +2436,37 @@ class Supervisor:
                             recovery_attempts=0,
                             recovery_window_started_at=None,
                         )
+                    elif alert_type in self._SPAWN_FAILURE_ALERT_TYPES:
+                        # #1028 — reset the spawn-attempt counter so a
+                        # later failure gets the full retry budget
+                        # again rather than starting at the tripped
+                        # state. We also clear any still-open
+                        # ``no_session`` warn alert keyed by the same
+                        # session — once the session is healthy, the
+                        # warn row is misleading.
+                        from pollypm.recovery.no_session_spawn import (
+                            record_breaker_reset,
+                        )
+
+                        record_breaker_reset(
+                            self._msg_store,
+                            session_name,
+                            (
+                                f"auto-cleared {alert_type} after "
+                                f"{int((now - streak_start).total_seconds())}s "
+                                "of continuous healthy observations"
+                            ),
+                        )
+                        try:
+                            self._msg_store.clear_alert(
+                                session_name, "no_session",
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.debug(
+                                "recovery-alert auto-clear: "
+                                "clear no_session failed for %s",
+                                session_name, exc_info=True,
+                            )
                     cleared += 1
                     self._msg_store.append_event(
                         scope=session_name,

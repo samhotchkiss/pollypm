@@ -541,6 +541,189 @@ def test_recovery_alert_auto_clear_full_lifecycle(
     assert (launch.session.name, "recovery_limit") not in open_pairs
 
 
+# ---------------------------------------------------------------------------
+# #1028 — no_session_spawn_failed auto-clear + breaker reset on heartbeat success
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_alert_auto_clear_clears_no_session_spawn_failed_after_debounce(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """Healthy session + open ``no_session_spawn_failed`` alert older
+    than the debounce window → the heartbeat sweep clears it AND records
+    a breaker-reset marker so the next ``no_session`` episode starts
+    with a fresh attempt budget rather than the tripped state.
+    """
+    from pollypm.recovery.no_session_spawn import (
+        SPAWN_ATTEMPT_EVENT_TYPE,
+        SPAWN_BREAKER_RESET_EVENT_TYPE,
+        _attempt_history,
+        _latest_breaker_reset,
+    )
+
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    launch = next(
+        item for item in supervisor.plan_launches()
+        if item.session.name == "worker"
+    )
+
+    # Trip the breaker — record 3 prior spawn attempts (backdated 5
+    # minutes so they predate the reset marker by a clear margin; the
+    # store's created_at column is second-precision and a same-second
+    # reset+attempt would not be cleanly separable) and raise the
+    # spawn_failed escalation alert just like
+    # ``no_session_spawn._escalate_failure`` would.
+    from datetime import datetime, timedelta, timezone
+    from sqlalchemy import update
+
+    from pollypm.store.schema import messages
+
+    for index in range(3):
+        supervisor._msg_store.record_event(
+            scope=launch.session.name,
+            sender=SPAWN_ATTEMPT_EVENT_TYPE,
+            subject=f"attempt {index + 1}",
+        )
+    # Backdate the spawn-attempt rows so the post-reset filter has clear
+    # second-precision separation.
+    backdated = datetime.now(timezone.utc) - timedelta(seconds=300)
+    engine = supervisor._msg_store._write_engine  # type: ignore[attr-defined]
+    with engine.begin() as conn:
+        conn.execute(
+            update(messages)
+            .where(messages.c.scope == launch.session.name)
+            .where(messages.c.sender == SPAWN_ATTEMPT_EVENT_TYPE)
+            .values(created_at=backdated, updated_at=backdated)
+        )
+    supervisor._msg_store.upsert_alert(
+        launch.session.name, "no_session_spawn_failed", "error",
+        f"Auto-recovery for worker/{launch.session.project} failed after "
+        "3 spawn attempts. Run `pm worker-start --role worker "
+        f"{launch.session.project}` manually and check logs for the "
+        "underlying error.",
+    )
+    # Sanity: history reads as 3 (no reset yet).
+    assert len(
+        _attempt_history(supervisor._msg_store, launch.session.name)
+    ) == 3
+    # Backdate the alert past the debounce window so the sweep clears it.
+    _backdate_alert(
+        supervisor, launch.session.name, "no_session_spawn_failed", 200,
+    )
+
+    window_map = {launch.window_name: object()}
+    name_by_window = {launch.window_name: launch.session.name}
+
+    supervisor._sweep_recovered_recovery_alerts(
+        window_map=window_map, name_by_window=name_by_window,
+    )
+
+    open_pairs = [
+        (a.session_name, a.alert_type) for a in supervisor.open_alerts()
+    ]
+    assert (
+        launch.session.name, "no_session_spawn_failed",
+    ) not in open_pairs, (
+        "no_session_spawn_failed must auto-clear after debounce; "
+        f"saw {open_pairs!r}"
+    )
+
+    # The breaker-reset marker is now the floor for ``_attempt_history``,
+    # so the historical attempts no longer count → the next episode has
+    # the full budget.
+    reset_ts = _latest_breaker_reset(
+        supervisor._msg_store, launch.session.name,
+    )
+    assert reset_ts is not None, (
+        f"breaker reset marker ({SPAWN_BREAKER_RESET_EVENT_TYPE}) must be "
+        "recorded when the auto-clear sweep closes a "
+        "no_session_spawn_failed alert"
+    )
+    assert _attempt_history(
+        supervisor._msg_store, launch.session.name,
+    ) == [], (
+        "spawn-attempt counter must reset to zero after auto-clear so a "
+        "subsequent failure gets the full retry budget"
+    )
+
+
+def test_recovery_alert_auto_clear_clears_spawn_failed_persistent(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """The #1014 ``spawn_failed_persistent`` variant is on the same
+    auto-clear path. Covered separately so a regression that only handles
+    ``no_session_spawn_failed`` can't slip through.
+    """
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    launch = next(
+        item for item in supervisor.plan_launches()
+        if item.session.name == "worker"
+    )
+
+    supervisor._msg_store.upsert_alert(
+        launch.session.name, "spawn_failed_persistent", "error",
+        "Auto-spawn for task pollypm/1 has failed 5 times in a row",
+    )
+    _backdate_alert(
+        supervisor, launch.session.name, "spawn_failed_persistent", 200,
+    )
+
+    window_map = {launch.window_name: object()}
+    name_by_window = {launch.window_name: launch.session.name}
+
+    supervisor._sweep_recovered_recovery_alerts(
+        window_map=window_map, name_by_window=name_by_window,
+    )
+
+    open_pairs = [
+        (a.session_name, a.alert_type) for a in supervisor.open_alerts()
+    ]
+    assert (
+        launch.session.name, "spawn_failed_persistent",
+    ) not in open_pairs
+
+
+def test_recovery_alert_auto_clear_holds_spawn_failed_within_debounce(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """A just-raised ``no_session_spawn_failed`` must NOT clear during
+    the debounce window — protect against clearing during a spawn flap.
+    """
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    launch = next(
+        item for item in supervisor.plan_launches()
+        if item.session.name == "worker"
+    )
+
+    supervisor._msg_store.upsert_alert(
+        launch.session.name, "no_session_spawn_failed", "error",
+        "Auto-recovery failed after 3 spawn attempts",
+    )
+
+    window_map = {launch.window_name: object()}
+    name_by_window = {launch.window_name: launch.session.name}
+
+    supervisor._sweep_recovered_recovery_alerts(
+        window_map=window_map, name_by_window=name_by_window,
+    )
+
+    open_pairs = [
+        (a.session_name, a.alert_type) for a in supervisor.open_alerts()
+    ]
+    assert (
+        launch.session.name, "no_session_spawn_failed",
+    ) in open_pairs, (
+        "fresh spawn_failed alerts must NOT auto-clear during the "
+        "debounce window"
+    )
+
+
 def test_supervisor_alerts_heartbeat_nudge_skipped_path_routes_through_funnel(
     monkeypatch, tmp_path: Path,
 ) -> None:

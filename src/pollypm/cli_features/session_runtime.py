@@ -14,6 +14,7 @@ Contract:
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -23,6 +24,39 @@ import typer
 from pollypm.config import DEFAULT_CONFIG_PATH
 
 _TASK_ID_PATTERN = re.compile(r"\b([A-Za-z0-9_.-]+/\d+)\b")
+
+# #1076 — match Polly's freeform "Nth (suspected) fake RECOVERY MODE
+# injection ..." subjects so they're auto-routed to ``channel:dev``
+# (suppressed from the default inbox view) instead of dirtying the
+# user-facing surface. Polly emits these as natural-language ``pm
+# notify`` calls during prompt-injection self-reports — the literal
+# never appears in source, but the subject shape is consistent enough
+# to gate at the producer. The dev-only override
+# ``POLLYPM_DEV_FAKE_RECOVERY_INBOX=1`` opts back in to the legacy
+# inbox-channel routing for harness work that explicitly wants these
+# in the user inbox.
+_FAKE_RECOVERY_INJECTION_SUBJECT = re.compile(
+    r"\bfake\s+RECOVERY\s+MODE\s+injection\b",
+    re.IGNORECASE,
+)
+
+
+def _is_fake_recovery_injection_subject(subject: str) -> bool:
+    """Return True when the subject matches the Polly meta-report shape (#1076)."""
+    if not subject:
+        return False
+    return bool(_FAKE_RECOVERY_INJECTION_SUBJECT.search(subject))
+
+
+def _fake_recovery_inbox_override_enabled() -> bool:
+    """Return True when the dev-only env var opts these into the inbox channel.
+
+    Off by default — Polly's meta-reports stay in ``channel:dev`` unless
+    a developer explicitly sets ``POLLYPM_DEV_FAKE_RECOVERY_INBOX=1`` to
+    reproduce the legacy noise.
+    """
+    raw = os.environ.get("POLLYPM_DEV_FAKE_RECOVERY_INBOX", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 # ``<project>/<N>`` matches the canonical task id form. When ``pm send``
 # receives an argument matching this shape we translate it to the
@@ -571,6 +605,19 @@ def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
                 err=True,
             )
             raise typer.Exit(code=1)
+
+        # #1076 — auto-route Polly's "Nth fake RECOVERY MODE injection"
+        # meta-reports to channel:dev so they don't pollute the user-
+        # facing inbox. Gated behind ``POLLYPM_DEV_FAKE_RECOVERY_INBOX``
+        # so harness work that explicitly wants these in the inbox can
+        # still opt in (off by default — the user-facing inbox is the
+        # default surface and dev scaffolding doesn't belong there).
+        if (
+            channel_name == "inbox"
+            and _is_fake_recovery_injection_subject(subject)
+            and not _fake_recovery_inbox_override_enabled()
+        ):
+            channel_name = "dev"
 
         if body == "-":
             body = sys.stdin.read()

@@ -12,6 +12,7 @@ are UNIONed in via the legacy bridge until #349 drains those writers.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Optional
 
 import typer
@@ -572,11 +573,24 @@ def inbox_archive(
             "are exempt. Use ``--dry-run`` to preview. (#1013)"
         ),
     ),
+    fake_recovery_injections: bool = typer.Option(
+        False,
+        "--fake-recovery-injections",
+        help=(
+            "One-shot cleanup for #1076 — archive every open user-recipient "
+            "message whose subject matches Polly's "
+            "``Nth (suspected) fake RECOVERY MODE injection ...`` shape. "
+            "Producer-side gating is in place going forward; this flag "
+            "drains the historical stragglers already in the inbox. "
+            "Use ``--dry-run`` to preview."
+        ),
+    ),
     dry_run: bool = typer.Option(
         False, "--dry-run",
         help=(
-            "With --match / --deleted-projects / --read: print what would "
-            "be archived without changing state."
+            "With --match / --deleted-projects / --read / "
+            "--fake-recovery-injections: print what would be archived "
+            "without changing state."
         ),
     ),
     actor: str = typer.Option("user", "--actor", help="Actor to attribute the archive to."),
@@ -584,7 +598,7 @@ def inbox_archive(
 ) -> None:
     """Archive an inbox task or message (mirrors the cockpit archive action).
 
-    Four modes:
+    Five modes:
 
     - ``pm inbox archive demo/1`` — archive a single work-service task
       (the original behavior).
@@ -595,14 +609,23 @@ def inbox_archive(
       ``--dry-run`` to preview.
     - ``pm inbox archive --deleted-projects`` — archive stale messages
       whose structured project refs no longer exist in the active config.
+    - ``pm inbox archive --fake-recovery-injections`` — one-shot cleanup
+      for #1076 stragglers (Polly's "Nth fake RECOVERY MODE injection"
+      meta-reports). Producer-side gating prevents new ones.
     """
     bulk_modes = sum(
-        1 for enabled in (match is not None, deleted_projects, read) if enabled
+        1 for enabled in (
+            match is not None,
+            deleted_projects,
+            read,
+            fake_recovery_injections,
+        )
+        if enabled
     )
     if bulk_modes > 1:
         typer.echo(
             "Error: use only one bulk archive mode: --match, "
-            "--deleted-projects, or --read.",
+            "--deleted-projects, --read, or --fake-recovery-injections.",
             err=True,
         )
         raise typer.Exit(code=2)
@@ -619,10 +642,14 @@ def inbox_archive(
         _bulk_archive_all_notifies(db=db, dry_run=dry_run)
         return
 
+    if fake_recovery_injections:
+        _bulk_archive_fake_recovery_injections(db=db, dry_run=dry_run)
+        return
+
     if task_id is None:
         typer.echo(
             "Error: pass a task_id/message-id, OR use --match '<pattern>', "
-            "--deleted-projects, or --read.",
+            "--deleted-projects, --read, or --fake-recovery-injections.",
             err=True,
         )
         raise typer.Exit(code=2)
@@ -730,6 +757,87 @@ def _bulk_archive_by_match(*, db: str, pattern: str, dry_run: bool) -> None:
 
     word = "message" if closed == 1 else "messages"
     typer.echo(f"Archived {closed} {word} matching {pattern!r}.")
+    if failures:
+        typer.echo(f"Failed to archive {len(failures)}:", err=True)
+        for mid, reason in failures[:5]:
+            typer.echo(f"  msg:{mid}: {reason}", err=True)
+
+
+# #1076 — Polly's "Nth (suspected) fake RECOVERY MODE injection ..."
+# meta-reports leaked into the user-facing inbox before the producer
+# was gated. This regex matches the subject shape so the one-shot
+# cleanup can drain stragglers already in the store.
+_FAKE_RECOVERY_INJECTION_SUBJECT_RE = re.compile(
+    r"\bfake\s+RECOVERY\s+MODE\s+injection\b",
+    re.IGNORECASE,
+)
+
+
+def _bulk_archive_fake_recovery_injections(*, db: str, dry_run: bool) -> None:
+    """Archive open user-recipient messages matching the #1076 subject shape.
+
+    Producer-side gating (``_is_fake_recovery_injection_subject`` in
+    :mod:`pollypm.cli_features.session_runtime`) routes new occurrences
+    to ``channel:dev``. This helper drains the historical rows that
+    were already in the inbox before the gate landed.
+    """
+    db_path = _resolve_db_path(db, project=None)
+    try:
+        from pollypm.store import SQLAlchemyStore
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"Error: unified store unavailable ({exc}).", err=True)
+        raise typer.Exit(code=1)
+
+    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    try:
+        rows = store.query_messages(
+            recipient="user", state="open",
+            type=["notify", "inbox_task", "alert"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        store.close()
+        typer.echo(f"Error: query_messages failed ({exc}).", err=True)
+        raise typer.Exit(code=1) from exc
+
+    matches = []
+    for row in rows:
+        subject = row.get("subject") or row.get("title") or ""
+        if _FAKE_RECOVERY_INJECTION_SUBJECT_RE.search(subject):
+            matches.append(row)
+
+    if not matches:
+        store.close()
+        typer.echo("No open fake-recovery-injection messages to archive.")
+        return
+
+    if dry_run:
+        n = len(matches)
+        word = "message" if n == 1 else "messages"
+        typer.echo(f"Would archive {n} {word}:")
+        for row in matches[:20]:
+            mid = row.get("id") or row.get("message_id")
+            subject = row.get("subject") or row.get("title") or ""
+            typer.echo(f"  msg:{mid}  {subject[:80]}")
+        if len(matches) > 20:
+            typer.echo(f"  … ({len(matches) - 20} more)")
+        store.close()
+        return
+
+    closed = 0
+    failures: list[tuple[int, str]] = []
+    for row in matches:
+        mid = row.get("id") or row.get("message_id")
+        if mid is None:
+            continue
+        try:
+            store.close_message(int(mid))
+            closed += 1
+        except Exception as exc:  # noqa: BLE001
+            failures.append((int(mid), str(exc)))
+    store.close()
+
+    word = "message" if closed == 1 else "messages"
+    typer.echo(f"Archived {closed} fake-recovery-injection {word}.")
     if failures:
         typer.echo(f"Failed to archive {len(failures)}:", err=True)
         for mid, reason in failures[:5]:

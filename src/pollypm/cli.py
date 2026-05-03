@@ -332,10 +332,27 @@ def _first_run_setup_and_launch(config_path: Path) -> None:
     up(config_path=path)
 
 
+def _print_version_and_exit(value: bool) -> None:
+    """Eager ``--version`` callback — prints and exits without running the app."""
+    if not value:
+        return
+    from pollypm import __version__ as _pm_version
+
+    typer.echo(f"pollypm {_pm_version}")
+    raise typer.Exit()
+
+
 @app.callback()
 def main(
     ctx: typer.Context,
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+    _version: bool = typer.Option(
+        False,
+        "--version",
+        help="Show the installed PollyPM version and exit.",
+        is_eager=True,
+        callback=_print_version_and_exit,
+    ),
 ) -> None:
     config_path = _discover_config_path(config_path)
     if ctx.invoked_subcommand is None:

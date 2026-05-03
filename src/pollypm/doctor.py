@@ -2584,7 +2584,7 @@ def check_scheduler_last_fired() -> CheckResult:
             fix=(
                 "Boot the cockpit (or schedule the rail cron) —\n"
                 "  pm up\n"
-                "Or run a one-off rail tick:  pm rail tick\n"
+                "Or run:  pm doctor --fix   # invokes the overdue handlers\n"
                 "Recheck: pm doctor"
             ),
             severity="warning",
@@ -2613,7 +2613,7 @@ _SESSION_RSS_WARN_BYTES = 1024 * 1024 * 1024
 
 
 def check_state_db_size() -> CheckResult:
-    """Warn at 500 MB, error at 2 GB. Recommends ``pm db vacuum``."""
+    """Warn at 500 MB, error at 2 GB. Recommends ``pm doctor --fix``."""
     candidates = _state_db_candidates()
     if not candidates:
         return _skip("state.db size check skipped (no tracked DBs)")
@@ -2649,8 +2649,8 @@ def check_state_db_size() -> CheckResult:
             ),
             fix=(
                 "Reclaim space —\n"
-                "  pm db vacuum\n"
-                "Or run:  pm doctor --fix\n"
+                "  pm doctor --fix   # runs incremental_vacuum on the state.db\n"
+                f"Or manually:  sqlite3 {biggest} 'VACUUM'\n"
                 f"Path: {biggest}\n"
                 "Recheck: pm doctor"
             ),
@@ -2668,7 +2668,8 @@ def check_state_db_size() -> CheckResult:
             ),
             fix=(
                 "Reclaim freelist pages —\n"
-                "  pm db vacuum\n"
+                f"  sqlite3 {biggest} 'VACUUM'\n"
+                "Or boot the cockpit so the daily db.vacuum handler runs:  pm up\n"
                 f"Path: {biggest}\n"
                 "Recheck: pm doctor"
             ),
@@ -2746,8 +2747,7 @@ def check_agent_worktree_count() -> CheckResult:
             ),
             fix=(
                 "Trigger a one-off prune —\n"
-                "  pm rail tick   # forces the next scheduled tick\n"
-                "Or run:  pm doctor --fix   # runs the prune handler immediately\n"
+                "  pm doctor --fix   # runs the prune handler immediately\n"
                 "Or manually:  git worktree prune && git worktree list\n"
                 "Recheck: pm doctor"
             ),
@@ -2846,8 +2846,7 @@ def check_logs_dir_size() -> CheckResult:
             ),
             fix=(
                 "Trigger a one-off rotation —\n"
-                "  pm rail tick\n"
-                "Or run:  pm doctor --fix   # runs log.rotate handler immediately\n"
+                "  pm doctor --fix   # runs log.rotate handler immediately\n"
                 f"Path: {biggest_dir}\n"
                 "Recheck: pm doctor"
             ),

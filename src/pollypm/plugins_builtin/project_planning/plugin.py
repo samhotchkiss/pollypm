@@ -33,6 +33,15 @@ PROFILE_NAMES: tuple[str, ...] = (
 )
 
 
+# Issue #1077: ``project.created`` can fire multiple times for the same
+# project key within seconds (cockpit refresh sweeps, retries, etc.) and
+# the auto-disabled WARNING was being emitted every time. Dedupe via an
+# in-process TTL map keyed by project so a fresh registration logs once
+# per hour.
+_AUTO_DISABLED_TTL_SECONDS = 3600.0
+_AUTO_DISABLED_LAST_EMIT: dict[str, float] = {}
+
+
 class MarkdownPromptProfile:
     """Agent profile that reads a markdown prompt file at build time.
 
@@ -168,12 +177,29 @@ def _on_project_created(context) -> None:
             # find the project and opt in manually. We emit a WARNING
             # so it shows up in the default log handler; a future
             # iteration can route this to the inbox service directly.
-            log.warning(
-                "project_planning: new project '%s' was registered but "
-                "auto-planning is disabled ([planner] auto_on_project_created=false). "
-                "Open the project and use the Plan action to design the architecture.",
-                project_key,
-            )
+            #
+            # Issue #1077: dedupe identical warnings inside a short TTL
+            # window so repeated ``project.created`` emissions for the
+            # same project (sweeps, cockpit refresh, retries) only log
+            # once per hour.
+            import time as _time
+
+            now = _time.monotonic()
+            last = _AUTO_DISABLED_LAST_EMIT.get(project_key)
+            if last is None or (now - last) >= _AUTO_DISABLED_TTL_SECONDS:
+                _AUTO_DISABLED_LAST_EMIT[project_key] = now
+                log.warning(
+                    "project_planning: new project '%s' was registered but "
+                    "auto-planning is disabled ([planner] auto_on_project_created=false). "
+                    "Open the project and use the Plan action to design the architecture.",
+                    project_key,
+                )
+            else:
+                log.debug(
+                    "project_planning: suppressing duplicate auto-disabled "
+                    "warning for '%s' (last emitted %.1fs ago, TTL=%.0fs).",
+                    project_key, now - last, _AUTO_DISABLED_TTL_SECONDS,
+                )
             return
 
         # Auto-fire: create a plan_project task on the project's work

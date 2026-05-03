@@ -1664,6 +1664,103 @@ def test_fix_cli_does_not_lie_when_handler_noops(
     assert "liar" in result.stdout
 
 
+def test_verify_fix_results_demotes_missing_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #1064: when the post-fix report lacks a check entry,
+    ``verify_fix_results`` must NOT trust the handler's self-report.
+
+    The pre-fix code path returned ``(name, ok, message)`` unchanged
+    when the check was missing — i.e. it fell back to trusting the
+    handler. That's the same trust model that caused #1063. If
+    ``_registered_checks()`` ever drifts mid-run, demote to unverified
+    so the user knows manual confirmation is required.
+    """
+    raw = [("ghost-check", True, "handler says it worked")]
+    empty_report = doctor.DoctorReport(results=[])
+
+    verified = doctor.verify_fix_results(raw, empty_report)
+
+    assert len(verified) == 1
+    name, ok, message = verified[0]
+    assert name == "ghost-check"
+    assert ok is False, "missing post-check must demote to unverified"
+    assert "unavailable to verify" in message
+
+
+def test_fix_cli_real_handlers_no_op_surfaces_unverified(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Issue #1064: --fix must stay honest when the *real* builtin
+    handlers run but no-op (the empirical bug in #1064).
+
+    The #1063 regression test used a synthetic ``(True, "did nothing")``
+    fix_fn. That covered the verification path, but it didn't exercise
+    the actual handler invocation chain (check_fn → fix_fn → builtin
+    handler module → check re-run). This test wires up the *real*
+    ``check_agent_worktree_count`` + ``check_logs_dir_size`` against a
+    state where the real prune / log-rotate handlers report 0 work, and
+    asserts the CLI says "ran but checks still failing" rather than
+    "Applied".
+    """
+    # Pin the worktree dir enumeration above the warn threshold so the
+    # real check fails before AND after the fix — the prune handler
+    # mock will report 0 pruned, mimicking the #1064 empirical case.
+    fake_worktrees = [tmp_path / f"agent-{i:04x}" for i in range(80)]
+    for wt in fake_worktrees:
+        wt.mkdir()
+    monkeypatch.setattr(doctor, "_agent_worktree_dirs", lambda: fake_worktrees)
+
+    # Logs dir over the size threshold; the real log_rotate handler
+    # will be replaced with a no-op stub so we don't depend on the
+    # plugin host or real archive logic.
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    big = logs_dir / "agent.log"
+    big.write_bytes(b"x" * (doctor._LOGS_WARN_BYTES + 1))
+    monkeypatch.setattr(doctor, "_logs_dir_candidates", lambda: [logs_dir])
+
+    import pollypm.plugins_builtin.core_recurring.plugin as plugin_mod
+
+    monkeypatch.setattr(
+        plugin_mod, "agent_worktree_prune_handler",
+        lambda payload: {"pruned": 0, "errors": 0, "warned_stale": 0},
+    )
+    monkeypatch.setattr(
+        plugin_mod, "log_rotate_handler",
+        lambda payload: {"rotated": 0, "deleted": 0, "errors": 0},
+    )
+
+    monkeypatch.setattr(
+        doctor, "_registered_checks",
+        lambda: [
+            doctor.Check(
+                "agent-worktree-count",
+                doctor.check_agent_worktree_count,
+                "resources",
+                severity="warning",
+            ),
+            doctor.Check(
+                "logs-dir-size",
+                doctor.check_logs_dir_size,
+                "resources",
+                severity="warning",
+            ),
+        ],
+    )
+
+    import pollypm.cli as cli_mod
+
+    runner = CliRunner()
+    result = runner.invoke(cli_mod.app, ["doctor", "--fix"])
+    assert result.exit_code == 0, result.stdout
+    # Both real handlers ran and reported zero work. The CLI must
+    # demote them and say so, not lie about applying.
+    assert "Applied 0 fixes" in result.stdout
+    assert "Applied 2 fixes" not in result.stdout
+    assert "ran but checks still failing" in result.stdout
+    assert "agent-worktree-count" in result.stdout
+    assert "logs-dir-size" in result.stdout
+
+
 def test_manual_fixes_excludes_skipped_and_passing() -> None:
     """manual_fixes only lists failures that cannot auto-run."""
     def _pass() -> doctor.CheckResult:

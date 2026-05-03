@@ -3386,9 +3386,12 @@ def verify_fix_results(
     - If the fix's check now passes → ``(name, True, original_message)``
     - If the fix's check still fails → ``(name, False, "fix ran but
       check still failing: <original message>")``
-    - If the check is no longer present in the post-report (rare —
-      registered checks shouldn't disappear mid-run), the original
-      ``fix_fn`` verdict is preserved.
+    - If the check is missing from the post-report (issue #1064: this
+      should not happen — ``_registered_checks()`` is deterministic
+      across calls — but if it does, treat the fix as unverified rather
+      than trusting the handler's self-report. Trusting the handler
+      here is exactly what allowed the original lying behavior in the
+      pre-#1063 code path.)
     """
     post_results: dict[str, CheckResult] = {
         check.name: result for check, result in post_report.results
@@ -3397,7 +3400,16 @@ def verify_fix_results(
     for name, ok, message in fix_results:
         post = post_results.get(name)
         if post is None:
-            verified.append((name, ok, message))
+            # Issue #1064: never trust the handler's self-report when
+            # we can't independently verify via a fresh check. Demote
+            # to unverified so the user knows manual confirmation is
+            # required.
+            if ok:
+                verified.append(
+                    (name, False, f"fix ran but check unavailable to verify: {message}")
+                )
+            else:
+                verified.append((name, False, message))
             continue
         if post.passed or post.skipped:
             verified.append((name, True, message))

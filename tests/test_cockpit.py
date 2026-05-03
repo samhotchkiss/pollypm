@@ -4875,6 +4875,121 @@ def test_cockpit_j_at_last_item_is_silent_noop() -> None:
     )
 
 
+class _SettingsRowStub:
+    """Stand-in for the ``#settings-row`` Static below the nav list.
+
+    Only needs to absorb the ``set_class`` / ``update`` calls
+    ``_apply_active_view_to_rows`` makes — none of which we exercise
+    in these unit tests; the rail's ``_apply_active_view_to_rows`` is
+    monkeypatched out below.
+    """
+
+
+def _make_rail_app_with_settings(
+    items: list[_StubItem], *, items_keys: list[str], selected_key: str = "polly",
+):
+    """Build a bare ``PollyCockpitApp`` whose ``self._items`` includes a
+    ``settings`` entry — i.e. the gear row is visible — and whose nav
+    children sequence is ``items``. Returns ``(app, nav)``.
+    """
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    nav = _StubNav(items)
+    app.nav = nav  # type: ignore[assignment]
+    app.selected_key = selected_key
+    app._tick_count = 0
+    app._last_nav_change = -10
+    app._apply_active_view_to_rows = lambda: None  # type: ignore[method-assign]
+
+    class _Item:
+        def __init__(self, key: str) -> None:
+            self.key = key
+
+    app._items = [_Item(k) for k in items_keys]  # type: ignore[attr-defined]
+
+    def _selected_row_key() -> str | None:
+        idx = nav.index
+        if idx is None:
+            return None
+        return items[idx].cockpit_key
+
+    app._selected_row_key = _selected_row_key  # type: ignore[method-assign]
+    return app, nav
+
+
+def test_cockpit_j_at_last_nav_row_steps_onto_settings() -> None:
+    """j on the last nav row (Activity) lands on Settings when the gear
+    row is visible — the blank gap between Activity and Settings must
+    not block navigation (#1080)."""
+    items = [_StubItem("polly"), _StubItem("activity")]
+    app, nav = _make_rail_app_with_settings(
+        items,
+        items_keys=["polly", "activity", "settings"],
+        selected_key="activity",
+    )
+    nav.index = 1  # cursor on Activity (last nav row)
+
+    app.action_cursor_down()
+    assert app.selected_key == "settings", (
+        f"j from Activity should land on Settings; got {app.selected_key!r}"
+    )
+
+    # Repeat j on Settings is a no-op (nothing below).
+    app.action_cursor_down()
+    assert app.selected_key == "settings"
+
+
+def test_cockpit_k_off_settings_returns_to_last_nav_row() -> None:
+    """k from the virtual Settings row lands on the last selectable nav
+    row so the round-trip is symmetric (#1080)."""
+    items = [_StubItem("polly"), _StubItem("activity")]
+    app, nav = _make_rail_app_with_settings(
+        items,
+        items_keys=["polly", "activity", "settings"],
+        selected_key="settings",
+    )
+    nav.index = 0  # cursor parked anywhere; k uses last_nav_index
+
+    app.action_cursor_up()
+    assert app.selected_key == "activity", (
+        f"k from Settings should land on Activity; got {app.selected_key!r}"
+    )
+    assert nav.index == 1
+
+
+def test_cockpit_G_lands_on_settings_when_visible() -> None:
+    """G/End jumps to Settings (the literal last rail item) instead of
+    stalling on Activity (#1080)."""
+    items = [_StubItem("polly"), _StubItem("activity")]
+    app, nav = _make_rail_app_with_settings(
+        items,
+        items_keys=["polly", "activity", "settings"],
+        selected_key="polly",
+    )
+    nav.index = 0
+
+    app.action_cursor_last()
+    assert app.selected_key == "settings", (
+        f"G should land on Settings; got {app.selected_key!r}"
+    )
+
+
+def test_cockpit_G_falls_back_to_last_nav_row_without_settings() -> None:
+    """When Settings isn't part of ``self._items`` (e.g. headless rail
+    contexts), G/End behaves exactly as before — pinning to the last
+    nav row (#1080)."""
+    items = [_StubItem("polly"), _StubItem("activity")]
+    app, nav = _make_rail_app_with_settings(
+        items,
+        items_keys=["polly", "activity"],  # no settings
+        selected_key="polly",
+    )
+    nav.index = 0
+
+    app.action_cursor_last()
+    assert nav.index == 1
+    assert app.selected_key == "activity"
+
+
 def test_cockpit_jk_bindings_are_priority_so_textual_consumes_event() -> None:
     """j/k must be priority bindings on the App so Textual claims the event
     even at the end of the navigable list — preventing the keystroke from

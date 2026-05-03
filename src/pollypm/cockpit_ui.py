@@ -2164,7 +2164,53 @@ class PollyCockpitApp(App[None]):
     # ``tmux send-keys`` for j/k, which previously leaked the byte
     # into whatever process owned the right-pane TTY (#918, reverts
     # the right-pane forward added in #856).
+    #
+    # ``⚙ Settings`` lives in a separate ``Static`` widget below the
+    # nav ``ListView`` (so a long project list can scroll while the
+    # gear stays pinned to the bottom). The actions below treat
+    # Settings as a virtual "last row" so j/Down/G/End reach it and
+    # k/Up/g/Home leave it cleanly (#1080).
+    def _settings_visible(self) -> bool:
+        items = getattr(self, "_items", None) or []
+        return any(getattr(item, "key", None) == "settings" for item in items)
+
+    def _last_nav_index(self) -> int | None:
+        """Highest selectable index in the nav ListView, or None."""
+        try:
+            children = list(self.nav.children)
+        except AttributeError:
+            return None
+        for i in range(len(children) - 1, -1, -1):
+            child = children[i]
+            if getattr(child, "disabled", False):
+                continue
+            # Allow RailItem in production, or anything with a non-None
+            # ``cockpit_key`` for test stubs (#1080).
+            if isinstance(child, RailItem):
+                return i
+            if getattr(child, "cockpit_key", None) is not None:
+                return i
+        return None
+
+    def _select_settings_row(self) -> None:
+        self.selected_key = "settings"
+        self._last_nav_change = self._tick_count
+        self._apply_active_view_to_rows()
+
     def action_cursor_down(self) -> None:
+        # Already on the virtual Settings row — nothing below it.
+        if self.selected_key == "settings":
+            return
+        last_idx = self._last_nav_index()
+        # On the last selectable nav row + Settings is visible → step
+        # down onto Settings instead of stalling at Activity (#1080).
+        if (
+            self._settings_visible()
+            and last_idx is not None
+            and self.nav.index == last_idx
+        ):
+            self._select_settings_row()
+            return
         if self.nav.index is None:
             self.nav.index = 0
         else:
@@ -2172,6 +2218,14 @@ class PollyCockpitApp(App[None]):
         self._sync_selected_from_nav()
 
     def action_cursor_up(self) -> None:
+        # Step up off the virtual Settings row onto the last
+        # selectable nav row (#1080).
+        if self.selected_key == "settings":
+            last_idx = self._last_nav_index()
+            if last_idx is not None:
+                self.nav.index = last_idx
+                self._sync_selected_from_nav()
+            return
         if self.nav.index is None:
             self.nav.index = 0
         else:
@@ -2183,6 +2237,12 @@ class PollyCockpitApp(App[None]):
         self._sync_selected_from_nav()
 
     def action_cursor_last(self) -> None:
+        # G/End lands on Settings when it's visible — that matches
+        # the user's mental model of "go to the bottom of the rail"
+        # (#1080). Falls back to the last nav row otherwise.
+        if self._settings_visible():
+            self._select_settings_row()
+            return
         children = list(self.nav.children)
         if children:
             self.nav.index = len(children) - 1

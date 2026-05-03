@@ -215,7 +215,7 @@ class HeartbeatRail:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def start(self) -> None:
+    def start(self, *, start_workers: bool = True) -> None:
         """Start the worker pool and the background ticker. Idempotent.
 
         Spawns a daemon thread that calls :meth:`tick` every
@@ -224,13 +224,25 @@ class HeartbeatRail:
         daemons) without requiring callers to wire their own clock.
         Calling ``start()`` again while already running is a silent
         no-op — a second ticker thread is never spawned.
+
+        ``start_workers=False`` boots the rail in tick-only mode: the
+        queue and heartbeat are ready for :meth:`tick` to enqueue jobs,
+        but no JobWorkerPool or ticker thread is spawned. Used by the
+        short-lived ``pm heartbeat`` cron path (#1060), which only
+        needs to enqueue — the long-lived ``rail_daemon`` / cockpit
+        rail drains the queue. Avoids the "thread did not stop within
+        timeout" warning that fires when the cron process tears down a
+        pool whose workers are mid-handler.
         """
         if self.pool.is_running:
             return
-        self.pool.start(concurrency=self._concurrency)
+        if start_workers:
+            self.pool.start(concurrency=self._concurrency)
         # Reset the stop event in case ``stop()`` + ``start()`` is called
         # on the same rail (the pool is re-startable).
         self._tick_stop.clear()
+        if not start_workers:
+            return
         thread = self._tick_thread
         if thread is not None and thread.is_alive():
             # Defensive: should be unreachable because pool.is_running

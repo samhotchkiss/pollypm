@@ -108,7 +108,7 @@ class CoreRail:
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
-    def start(self) -> None:
+    def start(self, *, start_workers: bool = True) -> None:
         """Drive the rail boot sequence.
 
         Order is fixed and documented:
@@ -123,6 +123,13 @@ class CoreRail:
              the first tick.
 
         Idempotent: a second call while already started is a no-op.
+
+        ``start_workers=False`` boots the rail in tick-only mode (#1060):
+        the HeartbeatRail's queue + heartbeat are ready for an
+        ephemeral tick that enqueues jobs, but no JobWorkerPool /
+        ticker thread is spawned. Used by short-lived CLI helpers
+        (``pm heartbeat`` from cron) that only enqueue and rely on
+        the long-lived ``rail_daemon`` / cockpit rail to drain.
         """
         if self._started:
             logger.debug("CoreRail.start() called while already started — skipping")
@@ -137,11 +144,11 @@ class CoreRail:
         logger.info("CoreRail.start(): booting %d %s", n_sub, sub_word)
         for subsystem in self._subsystems:
             subsystem.start()
-        self._start_heartbeat_rail()
+        self._start_heartbeat_rail(start_workers=start_workers)
         self._started = True
         logger.info("CoreRail.start(): boot complete")
 
-    def _start_heartbeat_rail(self) -> None:
+    def _start_heartbeat_rail(self, *, start_workers: bool = True) -> None:
         """Construct and boot the HeartbeatRail.
 
         Called from :meth:`start` after subsystem boot. Failures here are
@@ -159,12 +166,13 @@ class CoreRail:
                 state_db=self._config.project.state_db,
                 plugin_host=self._plugin_host,
             )
-            rail.start()
+            rail.start(start_workers=start_workers)
             self._heartbeat_rail = rail
             logger.info(
                 "CoreRail.start(): HeartbeatRail booted "
-                "(%d roster entries, worker pool running)",
+                "(%d roster entries, worker pool %s)",
                 len(rail.roster.entries),
+                "running" if start_workers else "skipped (tick-only)",
             )
         except Exception:  # noqa: BLE001
             logger.exception(

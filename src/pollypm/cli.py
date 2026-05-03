@@ -794,9 +794,25 @@ def _tick_core_rail_if_available(supervisor) -> None:
         return None
     try:
         # CoreRail.start() is idempotent and ensures the HeartbeatRail
-        # is booted. This is a transient driver — the worker pool drains
-        # anything we enqueue synchronously over the next few seconds.
-        rail_getter.start()
+        # is booted. #1060 — boot in tick-only mode: this CLI helper is
+        # the ``pm heartbeat`` cron path, which only needs to enqueue
+        # roster-due jobs. Skipping the JobWorkerPool / ticker avoids
+        # the "thread did not stop within timeout" warnings that fired
+        # 8.3k times in errors.log because workers couldn't honour the
+        # 10s pool.stop deadline mid-handler. The long-lived
+        # ``rail_daemon`` / cockpit rail drains the enqueued jobs.
+        # Mocked supervisors in tests pass ``start_workers`` as a kwarg
+        # transparently (MagicMock accepts any signature), so the
+        # existing ``core_rail.start.assert_called_once()`` contract
+        # still holds.
+        try:
+            rail_getter.start(start_workers=False)
+        except TypeError:
+            # Back-compat: a CoreRail/mock without the new kwarg falls
+            # back to the legacy boot. Worst case we re-emit the
+            # original warning, but tests with MagicMock supervisors
+            # accept any kwarg so this branch is dead in production.
+            rail_getter.start()
         heartbeat_rail = rail_getter.get_heartbeat_rail()
         if heartbeat_rail is None:
             return None
@@ -817,12 +833,12 @@ def _drain_and_stop_core_rail_if_available(
     """Best-effort drain + stop for transient CLI-owned HeartbeatRails.
 
     ``pm heartbeat`` is often invoked from cron as a short-lived
-    process. Starting the CoreRail in that path boots a worker pool and
-    ticker thread; if we don't stop it before exit, the cron process can
-    linger indefinitely and leave duplicate job workers racing the
-    headless daemon/cockpit rail on the same ``state.db``. We therefore
-    drain the jobs enqueued by this tick (up to a small timeout) and
-    then stop the rail before returning to the CLI.
+    process. Starting the CoreRail in that path used to boot a worker
+    pool and ticker thread; #1060 switched the cron path to tick-only
+    mode (``start_workers=False``) so jobs are enqueued and drained by
+    the long-lived ``rail_daemon`` / cockpit rail instead. The drain
+    poll below is a no-op when the pool isn't running — we skip
+    straight to ``stop()`` to keep cron exits crisp.
     """
     rail_getter = getattr(supervisor, "core_rail", None)
     if rail_getter is None:
@@ -832,7 +848,18 @@ def _drain_and_stop_core_rail_if_available(
         queue = getattr(heartbeat_rail, "queue", None) if heartbeat_rail is not None else None
         getter = getattr(queue, "get", None)
         enqueued = list(getattr(tick_result, "enqueued", ()) or ())
-        if callable(getter) and enqueued:
+        # If the rail booted in tick-only mode the pool is not running,
+        # so no worker will move enqueued jobs out of ``queued`` —
+        # polling would just burn the drain budget. Skip straight to
+        # stop(); the rail_daemon picks them up on its next short-poll.
+        # Only treat a *known* not-running pool as a skip signal —
+        # callers without a ``pool`` attribute (legacy test mocks) keep
+        # the original drain semantics.
+        pool = getattr(heartbeat_rail, "pool", None) if heartbeat_rail is not None else None
+        pool_known_idle = pool is not None and not bool(
+            getattr(pool, "is_running", True)
+        )
+        if callable(getter) and enqueued and not pool_known_idle:
             import time as _time
 
             pending = {

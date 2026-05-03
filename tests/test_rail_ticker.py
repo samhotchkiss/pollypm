@@ -280,3 +280,63 @@ class TestHeartbeatCliFallbackTick:
         )
 
         core_rail.stop.assert_called_once()
+
+    def test_tick_boots_rail_in_tick_only_mode(self) -> None:
+        """#1060 — ``pm heartbeat`` cron must boot the rail without
+        starting the JobWorkerPool. Otherwise the cron process tears
+        down a pool whose workers are mid-handler and pollutes
+        ``errors.log`` with "thread did not stop within timeout"
+        warnings on every invocation.
+        """
+        from pollypm.cli import _tick_core_rail_if_available
+
+        heartbeat_rail = MagicMock()
+        core_rail = MagicMock()
+        core_rail.get_heartbeat_rail.return_value = heartbeat_rail
+
+        supervisor = MagicMock()
+        supervisor.core_rail = core_rail
+
+        _tick_core_rail_if_available(supervisor)
+
+        # The CLI helper must request tick-only boot; passing a positive
+        # ``start_workers`` would re-introduce #1060.
+        core_rail.start.assert_called_once_with(start_workers=False)
+
+    def test_drain_skips_polling_when_pool_idle(self) -> None:
+        """#1060 — when the rail booted in tick-only mode the pool is
+        not running; ``_drain_and_stop_core_rail_if_available`` must
+        skip the drain poll (workers can never move jobs out of
+        ``queued``) and go straight to ``stop()``. Otherwise the cron
+        exit waits the full drain budget for nothing.
+        """
+        from pollypm.cli import _drain_and_stop_core_rail_if_available
+
+        class _Queue:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def get(self, job_id: int):
+                self.calls += 1
+                return SimpleNamespace(status="queued")
+
+        idle_pool = SimpleNamespace(is_running=False)
+        heartbeat_rail = SimpleNamespace(queue=_Queue(), pool=idle_pool)
+        core_rail = MagicMock()
+        core_rail.get_heartbeat_rail.return_value = heartbeat_rail
+
+        supervisor = MagicMock()
+        supervisor.core_rail = core_rail
+        tick_result = SimpleNamespace(enqueued=[SimpleNamespace(job_id=123)])
+
+        _drain_and_stop_core_rail_if_available(
+            supervisor,
+            tick_result=tick_result,
+            drain_timeout_seconds=2.0,
+            poll_interval_seconds=0.0,
+        )
+
+        assert heartbeat_rail.queue.calls == 0, (
+            "queue.get must not be polled when pool is idle"
+        )
+        core_rail.stop.assert_called_once()

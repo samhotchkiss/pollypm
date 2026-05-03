@@ -2265,6 +2265,39 @@ def _primary_state_db() -> Path | None:
     return candidates[0] if candidates else None
 
 
+def _supervisor_state_db() -> Path | None:
+    """Return the path the running Supervisor opens via ``StateStore``.
+
+    The supervisor's :class:`~pollypm.storage.state.StateStore` writes
+    sessions, session_runtime, heartbeats, leases, etc. to
+    ``config.project.state_db`` (typically ``~/.pollypm/state.db``).
+    That is *not* always the same path as :func:`_workspace_state_db_path`
+    (``<workspace_root>/.pollypm/state.db``) — when the user's
+    ``~/.pollypm/pollypm.toml`` keeps ``state_db = "state.db"`` and
+    ``base_dir = "."`` the supervisor opens the user-scope DB while the
+    workspace-scope DB sits empty.
+
+    The sessions-table doctor checks (``sessions-table-populated`` and
+    ``session-drift``) must read from the supervisor's DB or
+    ``repair_sessions_table`` will write rows that the check never sees,
+    making the fix a silent no-op (#1066). Returns ``None`` when no
+    config can be loaded or when the resolved file does not yet exist.
+    """
+    from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+
+    if not DEFAULT_CONFIG_PATH.exists():
+        return None
+    try:
+        config = load_config(DEFAULT_CONFIG_PATH)
+    except Exception:  # noqa: BLE001
+        return None
+    db_path = getattr(config.project, "state_db", None)
+    if db_path is None:
+        return None
+    db_path = Path(db_path)
+    return db_path if db_path.is_file() else None
+
+
 def _parse_iso_or_epoch(value: Any) -> float:
     """Coerce a timestamp string / number / datetime into a POSIX epoch float.
 
@@ -2314,8 +2347,16 @@ def check_sessions_table_populated() -> CheckResult:
     ``repair_sessions_table()`` which back-fills a row for every live
     tmux window. A zero-count after boot means the repair path didn't
     fire and SessionRoleIndex resolution will degrade.
+
+    Reads from :func:`_supervisor_state_db` (``config.project.state_db``)
+    rather than :func:`_primary_state_db` (workspace-root scope). When
+    the user's config keeps ``state_db`` at the default user-scope path,
+    the supervisor's :meth:`repair_sessions_table` writes rows there —
+    not into the workspace DB. Reading the wrong file made
+    ``pm doctor --fix`` look like a no-op even though the repair
+    succeeded (#1066).
     """
-    db_path = _primary_state_db()
+    db_path = _supervisor_state_db() or _primary_state_db()
     if db_path is None:
         return _skip("sessions-table check skipped (no state.db)")
     conn = _open_state_db_ro(db_path)
@@ -3050,7 +3091,10 @@ def check_sessions_table_vs_tmux() -> CheckResult:
             tmux_windows.add(window)
     if not tmux_windows:
         return _skip("session-drift check skipped (no tmux windows)")
-    db_path = _primary_state_db()
+    # #1066: read from the supervisor's StateStore (``config.project.state_db``),
+    # not the workspace-scope DB. ``repair_sessions_table`` writes to the
+    # former; reading the latter made the fix appear to do nothing.
+    db_path = _supervisor_state_db() or _primary_state_db()
     if db_path is None:
         return _skip("session-drift check skipped (no state.db)")
     conn = _open_state_db_ro(db_path)

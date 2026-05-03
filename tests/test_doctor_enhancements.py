@@ -473,6 +473,10 @@ def test_task_assignment_sweeper_dbs_pluralisation(
 
 def test_sessions_table_populated_pass(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     db = _make_state_db(tmp_path / "state.db", sessions=3)
+    # #1066: the check now reads from ``_supervisor_state_db`` (the path
+    # the supervisor actually writes to). Patch both helpers so the test
+    # is robust against the fallback ordering.
+    monkeypatch.setattr(doctor, "_supervisor_state_db", lambda: db)
     monkeypatch.setattr(doctor, "_primary_state_db", lambda: db)
     result = doctor.check_sessions_table_populated()
     assert result.passed
@@ -481,6 +485,7 @@ def test_sessions_table_populated_pass(monkeypatch: pytest.MonkeyPatch, tmp_path
 
 def test_sessions_table_populated_warn_when_empty(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     db = _make_state_db(tmp_path / "state.db", sessions=0)
+    monkeypatch.setattr(doctor, "_supervisor_state_db", lambda: db)
     monkeypatch.setattr(doctor, "_primary_state_db", lambda: db)
     result = doctor.check_sessions_table_populated()
     assert not result.passed
@@ -490,9 +495,89 @@ def test_sessions_table_populated_warn_when_empty(monkeypatch: pytest.MonkeyPatc
 
 
 def test_sessions_table_populated_skip_without_db(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(doctor, "_supervisor_state_db", lambda: None)
     monkeypatch.setattr(doctor, "_primary_state_db", lambda: None)
     result = doctor.check_sessions_table_populated()
     assert result.passed and result.skipped
+
+
+def test_sessions_table_populated_reads_supervisor_db_not_workspace_db(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Regression: #1066. ``check_sessions_table_populated`` must read from
+    the path the supervisor's ``StateStore`` writes to (typically
+    ``config.project.state_db`` = ``~/.pollypm/state.db``), not the
+    workspace-scope DB at ``<workspace_root>/.pollypm/state.db``.
+
+    Pre-fix, ``_primary_state_db()`` returned the workspace DB. The
+    supervisor's ``repair_sessions_table`` upserted into the
+    user-scope DB, so the doctor check kept reporting "sessions table
+    empty" even after ``--fix`` succeeded — the canonical "fix ran but
+    check still failing" symptom of the umbrella issue.
+    """
+    supervisor_db = _make_state_db(tmp_path / "supervisor.db", sessions=4)
+    workspace_db = _make_state_db(tmp_path / "workspace.db", sessions=0)
+
+    monkeypatch.setattr(doctor, "_supervisor_state_db", lambda: supervisor_db)
+    monkeypatch.setattr(doctor, "_primary_state_db", lambda: workspace_db)
+
+    result = doctor.check_sessions_table_populated()
+    assert result.passed
+    assert "4 row" in result.status
+    # The check reports which DB it consulted — must be the supervisor's,
+    # never the (empty) workspace DB.
+    assert result.data["db"] == str(supervisor_db)
+
+
+def test_repair_sessions_table_populates_empty_table(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Regression: #1066. The handler must actually upsert rows when
+    given an empty sessions table and live tmux windows that match the
+    configured launch plan. A row count of zero before and zero after is
+    the silent-no-op shape the umbrella issue calls out.
+    """
+    from pollypm.tmux.client import TmuxWindow
+
+    from tests.test_sessions_registration import _config  # reuse fixture
+
+    config = _config(tmp_path)
+    from pollypm.supervisor import Supervisor
+    supervisor = Supervisor(config)
+
+    # Precondition: empty sessions table.
+    assert supervisor.store.list_sessions() == []
+
+    storage = supervisor.storage_closet_session_name()
+    live_names = ["pm-heartbeat", "pm-operator", "pm-reviewer"]
+    monkeypatch.setattr(supervisor.tmux, "has_session", lambda n: n == storage)
+    monkeypatch.setattr(
+        supervisor.tmux,
+        "list_windows",
+        lambda n: [
+            TmuxWindow(
+                session=storage,
+                index=i,
+                name=w,
+                active=(i == 0),
+                pane_id=f"%{i + 50}",
+                pane_current_command="claude",
+                pane_current_path=str(tmp_path),
+                pane_dead=False,
+            )
+            for i, w in enumerate(live_names)
+        ] if n == storage else [],
+    )
+
+    upserted = supervisor.repair_sessions_table()
+    assert upserted == 3, "expected three rows upserted, got " + str(upserted)
+    assert len(supervisor.store.list_sessions()) == 3
+
+    # Idempotence: rerunning on a populated table is a non-destructive
+    # no-op (no duplicates, no rows lost).
+    rerun = supervisor.repair_sessions_table()
+    assert rerun == 3
+    assert len(supervisor.store.list_sessions()) == 3
 
 
 def test_project_local_guide_drift_pass(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -947,6 +1032,8 @@ def test_session_drift_pass(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     )
     conn.commit()
     conn.close()
+    # #1066: drift check now reads from the supervisor's state.db.
+    monkeypatch.setattr(doctor, "_supervisor_state_db", lambda: db)
     monkeypatch.setattr(doctor, "_primary_state_db", lambda: db)
     monkeypatch.setattr(doctor, "_tool_path", lambda name: "/usr/bin/tmux" if name == "tmux" else None)
     monkeypatch.setattr(doctor, "_run_cmd", lambda cmd, **kw: (0, "polly:worker-x"))
@@ -956,6 +1043,7 @@ def test_session_drift_pass(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
 
 def test_session_drift_warn(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     db = _make_state_db(tmp_path / "state.db")  # no sessions rows
+    monkeypatch.setattr(doctor, "_supervisor_state_db", lambda: db)
     monkeypatch.setattr(doctor, "_primary_state_db", lambda: db)
     monkeypatch.setattr(doctor, "_tool_path", lambda name: "/usr/bin/tmux" if name == "tmux" else None)
     # tmux reports a worker window the DB doesn't know about.
@@ -981,6 +1069,7 @@ def test_session_drift_pluralisation(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     drift to introduce by accident.
     """
     db = _make_state_db(tmp_path / "state.db")
+    monkeypatch.setattr(doctor, "_supervisor_state_db", lambda: db)
     monkeypatch.setattr(doctor, "_primary_state_db", lambda: db)
     monkeypatch.setattr(
         doctor, "_tool_path",
@@ -1005,6 +1094,7 @@ def test_session_drift_pluralisation(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     )
     conn.commit()
     conn.close()
+    monkeypatch.setattr(doctor, "_supervisor_state_db", lambda: db_one)
     monkeypatch.setattr(doctor, "_primary_state_db", lambda: db_one)
     monkeypatch.setattr(doctor, "_run_cmd", lambda cmd, **kw: (0, "polly:worker-x"))
     ok = doctor.check_sessions_table_vs_tmux()
@@ -1431,6 +1521,7 @@ def test_session_drift_fix_invokes_repair(
 ) -> None:
     """--fix on session drift calls Supervisor.repair_sessions_table()."""
     db = _make_state_db(tmp_path / "state.db")
+    monkeypatch.setattr(doctor, "_supervisor_state_db", lambda: db)
     monkeypatch.setattr(doctor, "_primary_state_db", lambda: db)
     monkeypatch.setattr(doctor, "_tool_path", lambda name: "/usr/bin/tmux" if name == "tmux" else None)
     monkeypatch.setattr(doctor, "_run_cmd", lambda cmd, **kw: (0, "polly:worker-rogue"))

@@ -143,6 +143,56 @@ def test_dedupe_key_allows_reenqueue_after_failed(tmp_path: Path) -> None:
     assert jid2 != jid1
 
 
+def test_recover_orphaned_claims_resets_status_and_frees_dedupe(
+    tmp_path: Path,
+) -> None:
+    """#1071 — orphaned claimed rows must be requeued so dedupe slot frees.
+
+    A previous rail_daemon process claimed a job via ``dedupe_key`` and
+    then crashed before completing it. The dedupe unique index covers
+    ``status IN ('queued', 'claimed')``, so the orphan permanently
+    blocks any future ``enqueue(dedupe_key=...)`` from inserting a
+    fresh row — silently breaking every cadence handler that uses that
+    key (``task_assignment.sweep``, ``session.health_sweep``, etc).
+    """
+    q = JobQueue(db_path=tmp_path / "q.db")
+    jid1 = q.enqueue("sweep", dedupe_key="sweep:a")
+    (job,) = q.claim("crashed-worker")
+    assert job.attempt == 1
+
+    # Pre-recovery: dedupe slot is held by the claimed orphan, so a
+    # fresh enqueue short-circuits to the orphan's id.
+    jid2 = q.enqueue("sweep", dedupe_key="sweep:a")
+    assert jid2 == jid1
+
+    # Recover orphaned claims (simulates rail_daemon startup).
+    recovered = q.recover_orphaned_claims()
+    assert recovered == 1
+
+    stored = q.get(jid1)
+    assert stored is not None
+    assert stored.status is JobStatus.QUEUED
+    assert stored.claimed_at is None
+    assert stored.claimed_by is None
+    # Attempt is rewound — the orphan never ran a handler body.
+    assert stored.attempt == 0
+
+    # Post-recovery: a fresh enqueue with a different payload still
+    # dedupes onto the same key (slot is now held by the requeued
+    # row, not the orphan), but the row is claimable again.
+    claimed = q.claim("worker-2")
+    assert len(claimed) == 1
+    assert claimed[0].id == jid1
+
+
+def test_recover_orphaned_claims_returns_zero_when_none_claimed(
+    tmp_path: Path,
+) -> None:
+    q = JobQueue(db_path=tmp_path / "q.db")
+    q.enqueue("sweep")
+    assert q.recover_orphaned_claims() == 0
+
+
 def test_null_dedupe_key_does_not_deduplicate(tmp_path: Path) -> None:
     q = JobQueue(db_path=tmp_path / "q.db")
     jid1 = q.enqueue("sweep", {"p": "a"})

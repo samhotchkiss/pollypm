@@ -237,6 +237,42 @@ class HeartbeatRail:
         if self.pool.is_running:
             return
         if start_workers:
+            # #1071 — recover any orphaned ``claimed`` rows from a
+            # previous process before the worker pool starts. The
+            # dedupe unique index covers status IN ('queued','claimed'),
+            # so an orphan claimed row keeps its dedupe_key reserved
+            # forever, silently blocking every cadence handler that
+            # uses that key (e.g. ``task_assignment.sweep``,
+            # ``session.health_sweep``, ``stuck_claims.sweep`` itself).
+            try:
+                recovered = self.queue.recover_orphaned_claims()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "HeartbeatRail.start(): orphaned-claim recovery failed",
+                )
+            else:
+                if recovered:
+                    logger.info(
+                        "HeartbeatRail.start(): recovered %d orphaned "
+                        "claimed job(s) from a prior process — dedupe "
+                        "slots freed",
+                        recovered,
+                    )
+            # Log the cadence-handler roster so operators can verify
+            # at a glance that registration landed all entries (#1071).
+            try:
+                entries = self.roster.entries
+                logger.info(
+                    "HeartbeatRail.start(): %d cadence handlers "
+                    "registered: %s",
+                    len(entries),
+                    ", ".join(sorted({e.handler_name for e in entries})),
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "HeartbeatRail.start(): cadence-handler summary failed",
+                    exc_info=True,
+                )
             self.pool.start(concurrency=self._concurrency)
         # Reset the stop event in case ``stop()`` + ``start()`` is called
         # on the same rail (the pool is re-startable).

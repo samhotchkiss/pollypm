@@ -432,6 +432,43 @@ class JobQueue:
 
         retry_on_database_locked(_do_fail, label="JobQueue.fail")
 
+    def recover_orphaned_claims(self) -> int:
+        """Reset every ``claimed`` row back to ``queued`` (#1071).
+
+        Called once at rail-daemon startup. The new daemon owns no
+        in-flight claims, so any row still in ``claimed`` was abandoned
+        by a previous process that crashed or was killed mid-handler.
+        Without this, the dedupe unique index (which covers
+        ``status IN ('queued','claimed')``) keeps the orphan's
+        dedupe_key permanently reserved, and every subsequent
+        ``enqueue(dedupe_key=...)`` short-circuits to the orphan's id —
+        silently blocking the cadence handler from ever firing again.
+        ``stuck_claims.sweep`` is supposed to clean these up, but the
+        bootstrap problem is that ``stuck_claims.sweep`` itself uses a
+        ``dedupe_key``, so a single orphaned ``stuck_claims.sweep`` row
+        is enough to disable the recovery loop entirely.
+
+        Returns the number of rows recovered. We rewind ``attempt`` by
+        one so the recovered job gets the same attempt budget it had
+        before — the previous claim never ran a handler body, so it
+        shouldn't count against the retry limit.
+        """
+        def _do_recover() -> int:
+            with self._lock:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE work_jobs
+                    SET status = 'queued',
+                        claimed_at = NULL,
+                        claimed_by = NULL,
+                        attempt = CASE WHEN attempt > 0 THEN attempt - 1 ELSE 0 END
+                    WHERE status = 'claimed'
+                    """,
+                )
+                return int(cursor.rowcount or 0)
+
+        return retry_on_database_locked(_do_recover, label="JobQueue.recover_orphaned_claims")
+
     # ------------------------------------------------------------------
     # Introspection
     # ------------------------------------------------------------------

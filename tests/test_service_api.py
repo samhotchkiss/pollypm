@@ -809,3 +809,100 @@ def test_service_move_task_rejects_direct_completion_without_review(tmp_path: Pa
         assert "must pass through 04-in-review before completion" in str(exc)
     else:
         raise AssertionError("Expected direct completion to fail")
+
+
+def test_session_status_surfaces_per_task_workers(monkeypatch, tmp_path: Path) -> None:
+    """#1061 — ``pm status`` (via ``session_status``) must include
+    per-task ``task-<project>-<N>`` windows even though the launch
+    planner doesn't enumerate them in ``plan_launches()``. Without
+    this, a fresh ``pm task claim`` looks like a silent failure to
+    the user."""
+    from pollypm.tmux.client import TmuxWindow
+
+    service = PollyPMService(tmp_path / "pollypm.toml")
+
+    task_window = TmuxWindow(
+        session="pollypm-storage-closet",
+        index=15,
+        name="task-smoketest-8",
+        active=False,
+        pane_id="%99",
+        pane_current_command="claude",
+        pane_current_path=str(tmp_path),
+        pane_dead=False,
+    )
+
+    class FakeStore:
+        def get_session_runtime(self, session_name: str):
+            return None
+
+    class FakeSupervisor:
+        store = FakeStore()
+
+        def status(self):
+            # No configured launches; only a per-task window in tmux.
+            return ([], [task_window], [], [], [])
+
+    monkeypatch.setattr(
+        service, "load_supervisor", lambda *, readonly_state=False: FakeSupervisor(),
+    )
+    # Plugin error collection is unrelated; short-circuit it for this test.
+    monkeypatch.setattr(
+        "pollypm.service_api.v1.collect_plugin_load_errors",
+        lambda config_path: [],
+    )
+
+    payload = service.session_status()
+    sessions = payload["sessions"]
+    assert len(sessions) == 1, f"expected per-task worker entry, got {sessions!r}"
+    item = sessions[0]
+    assert item["name"] == "task-smoketest-8"
+    assert item["project"] == "smoketest"
+    assert item["role"] == "worker"
+    assert item["running"] is True
+    assert item["status"] == "healthy"
+    assert item["kind"] == "per_task"
+
+
+def test_session_status_filter_by_per_task_window_name(monkeypatch, tmp_path: Path) -> None:
+    """#1061 — ``pm status task-<project>-<N>`` filters to a single
+    per-task worker, mirroring the configured-session filter."""
+    from pollypm.tmux.client import TmuxWindow
+
+    service = PollyPMService(tmp_path / "pollypm.toml")
+
+    windows = [
+        TmuxWindow(
+            session="pollypm-storage-closet",
+            index=i,
+            name=name,
+            active=False,
+            pane_id=f"%{i}",
+            pane_current_command="claude",
+            pane_current_path=str(tmp_path),
+            pane_dead=False,
+        )
+        for i, name in enumerate(["task-smoketest-8", "task-other-3"])
+    ]
+
+    class FakeStore:
+        def get_session_runtime(self, session_name: str):
+            return None
+
+    class FakeSupervisor:
+        store = FakeStore()
+
+        def status(self):
+            return ([], windows, [], [], [])
+
+    monkeypatch.setattr(
+        service, "load_supervisor", lambda *, readonly_state=False: FakeSupervisor(),
+    )
+    monkeypatch.setattr(
+        "pollypm.service_api.v1.collect_plugin_load_errors",
+        lambda config_path: [],
+    )
+
+    payload = service.session_status(session_name="task-smoketest-8")
+    sessions = payload["sessions"]
+    assert [s["name"] for s in sessions] == ["task-smoketest-8"]

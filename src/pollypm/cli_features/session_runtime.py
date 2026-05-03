@@ -224,10 +224,15 @@ def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
         else:
             typer.echo(f"Config: {payload['config_path']}")
             for item in sessions:
+                # Per-task workers (#1061) are tagged ``per_task`` by the
+                # service layer so the user can tell at a glance which
+                # rows came from the post-#1059 per-task-claim flow vs.
+                # the long-lived configured sessions.
+                suffix = " (per-task)" if item.get("kind") == "per_task" else ""
                 typer.echo(
                     f"- {item['name']}: status={item['status']} running={'yes' if item['running'] else 'no'} "
                     f"alerts={item['alert_count']} lease={item['lease_owner'] or '-'} "
-                    f"project={item['project']} role={item['role']}"
+                    f"project={item['project']} role={item['role']}{suffix}"
                 )
                 if item["last_failure_message"]:
                     typer.echo(f"  reason={item['last_failure_message']}")

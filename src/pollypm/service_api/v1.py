@@ -76,6 +76,24 @@ from pollypm.workers import (
 )
 
 
+def _parse_task_window_name(name: str) -> tuple[str, int] | None:
+    """Parse ``task-<project>-<N>`` into ``(project, N)``; return None on miss.
+
+    Mirrors :func:`pollypm.work.session_manager.task_window_name` (the
+    canonical construction). Used by :meth:`PollyPMService.session_status`
+    (#1061) to recognise per-task worker windows that the launch
+    planner synthesises on demand rather than enumerating in
+    ``plan_launches()``.
+    """
+    if not name.startswith("task-"):
+        return None
+    suffix = name[len("task-"):]
+    project, sep, number = suffix.rpartition("-")
+    if not sep or not project or not number.isdigit():
+        return None
+    return project, int(number)
+
+
 @dataclass(slots=True)
 class StatusSnapshot:
     """Point-in-time read of launches, tmux windows, alerts, leases, and errors."""
@@ -159,6 +177,14 @@ class PollyPMService:
         renders these so a silently-broken plugin (#960) is visible to
         the operator instead of hiding behind a quiet ``host.errors``
         accumulation.
+
+        Per-task workers (#1061) — windows of the form ``task-<project>-<N>``
+        spawned by the post-#1059 per-task-claim flow are *not* in
+        ``plan_launches()`` (the planner synthesises specs for them on
+        demand). Without surfacing them here, ``pm status`` shows nothing
+        after a ``pm task claim`` and the user concludes the claim
+        silently failed. Append a synthesised entry for each live
+        ``task-*`` window so operators can see their per-task workers.
         """
         supervisor = self.load_supervisor(readonly_state=True)
         launches, windows, alerts, leases, errors = supervisor.status()
@@ -169,7 +195,9 @@ class PollyPMService:
         lease_map = {lease.session_name: lease for lease in leases}
 
         sessions: list[dict[str, object]] = []
+        configured_window_names: set[str] = set()
         for launch in launches:
+            configured_window_names.add(launch.window_name)
             if session_name is not None and launch.session.name != session_name:
                 continue
             runtime = supervisor.store.get_session_runtime(launch.session.name)
@@ -191,6 +219,41 @@ class PollyPMService:
                     "alert_count": alert_counts.get(launch.session.name, 0),
                     "lease_owner": None if lease is None else lease.owner,
                     "lease_note": None if lease is None else lease.note,
+                    "kind": "configured",
+                }
+            )
+
+        # #1061 — surface per-task workers (``task-<project>-<N>`` windows)
+        # so a fresh ``pm task claim`` shows up in ``pm status``. Filter by
+        # ``session_name`` exactly as the configured loop does.
+        for window in windows:
+            parsed = _parse_task_window_name(window.name)
+            if parsed is None:
+                continue
+            if window.name in configured_window_names:
+                continue
+            project, _task_number = parsed
+            if session_name is not None and window.name != session_name:
+                continue
+            runtime = supervisor.store.get_session_runtime(window.name)
+            lease = lease_map.get(window.name)
+            sessions.append(
+                {
+                    "name": window.name,
+                    "role": "worker",
+                    "project": project,
+                    "provider": "",
+                    "account": "",
+                    "window_name": window.name,
+                    "running": True,
+                    "pane_dead": window.pane_dead,
+                    "pane_command": window.pane_current_command,
+                    "status": runtime.status if runtime else "healthy",
+                    "last_failure_message": runtime.last_failure_message if runtime else None,
+                    "alert_count": alert_counts.get(window.name, 0),
+                    "lease_owner": None if lease is None else lease.owner,
+                    "lease_note": None if lease is None else lease.note,
+                    "kind": "per_task",
                 }
             )
         plugin_errors = collect_plugin_load_errors(self.config_path)

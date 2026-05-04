@@ -7124,6 +7124,50 @@ class PollyInboxApp(App[None]):
         except Exception:  # noqa: BLE001
             return None
 
+    def _resolve_inbox_svc(self, item, task_id: str):
+        """Best-effort resolve a SQLiteWorkService for a cockpit inbox row.
+
+        First tries :meth:`_svc_for_task` (the project-key path), then
+        falls back to opening the work-service directly at the inbox
+        entry's ``db_path`` — this is the unified resolver that fixes
+        the family of "Could not open project database" toast bugs
+        (#1087, #1091, #1099, #1101) where the task row's project key
+        doesn't match the registered key (e.g. ``polly_remote`` vs.
+        ``polly-remote``) but the entry was loaded from a known DB.
+
+        Returns the open svc on success (caller owns lifecycle) or
+        ``None`` after logging a structured warning identifying the
+        unresolved row so future regressions surface a clear signal
+        instead of a silent yellow fallback.
+        """
+        svc = self._svc_for_task(task_id)
+        if svc is not None:
+            return svc
+        db_path = getattr(item, "db_path", None) if item is not None else None
+        if db_path is not None:
+            try:
+                from pollypm.work.sqlite_service import SQLiteWorkService
+
+                svc = SQLiteWorkService(
+                    db_path=db_path, project_path=db_path.parent.parent,
+                )
+            except Exception:  # noqa: BLE001
+                svc = None
+        if svc is None:
+            try:  # noqa: SIM105
+                log = logging.getLogger(__name__)
+                log.warning(
+                    "cockpit inbox: svc unresolved for task_id=%s "
+                    "project_name=%r scope=%r db_path=%r",
+                    task_id,
+                    getattr(item, "project", None) if item is not None else None,
+                    getattr(item, "scope", None) if item is not None else None,
+                    getattr(item, "db_path", None) if item is not None else None,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        return svc
+
     def _project_key_is_unknown(self, project_key: str) -> bool:
         """True when ``project_key`` is not a registered project.
 
@@ -7844,64 +7888,28 @@ class PollyInboxApp(App[None]):
             self._render_message_detail(item)
             return
         self._set_reply_mode_for_task()
-        svc = self._svc_for_task(task_id)
+        # #1101: route through the unified ``_resolve_inbox_svc`` helper so
+        # the project-key-mismatch fallback is consistent with the action
+        # handlers (archive / approve / discuss / reply). Workspace-scoped
+        # tasks still short-circuit to the message renderer per #855.
+        project_key = task_id.split("/", 1)[0] if "/" in task_id else None
+        is_workspace = (
+            project_key is None
+            or project_key in {"inbox", "workspace", "[workspace]"}
+            or self._project_key_is_unknown(project_key)
+        )
+        svc = self._resolve_inbox_svc(item, task_id)
         if svc is None:
-            # Workspace-scoped tasks (project sentinel "inbox" or task IDs
-            # whose project is not a registered project) have no per-
-            # project database — we can still surface the message body
-            # by falling back to the generic message renderer instead of
-            # parking the user on a red error string (#855).
-            project_key = task_id.split("/", 1)[0] if "/" in task_id else None
-            is_workspace = (
-                project_key is None
-                or project_key in {"inbox", "workspace", "[workspace]"}
-                or self._project_key_is_unknown(project_key)
-            )
             if is_workspace:
                 self._render_message_detail(item)
                 return
-            # #1099: the task's project is registered (per the rail) but
-            # ``_svc_for_task`` couldn't open the per-project DB — usually
-            # because the project key in the task row (e.g.
-            # ``polly_remote``) doesn't match the registered project key
-            # (``polly-remote``). The inbox loader stamped the entry with
-            # the actual ``db_path`` it was read from (see
-            # ``task_to_inbox_entry`` / ``_inbox_db_sources``); reuse it
-            # the same way ``action_archive_selected`` does post-#1087
-            # instead of stranding the user on the yellow fallback.
-            db_path = getattr(item, "db_path", None)
-            if db_path is not None:
-                try:
-                    from pollypm.work.sqlite_service import SQLiteWorkService
-
-                    svc = SQLiteWorkService(
-                        db_path=db_path, project_path=db_path.parent.parent,
-                    )
-                except Exception:  # noqa: BLE001
-                    svc = None
-            if svc is None:
-                # Residual unresolved branch — log identifying fields so a
-                # future regression has a clear signal instead of a silent
-                # yellow fallback (per #1099 plan).
-                try:  # noqa: SIM105
-                    log = logging.getLogger(__name__)
-                    log.warning(
-                        "cockpit inbox detail: svc unresolved for task_id=%s "
-                        "project_name=%r session_name=%r db_path=%r",
-                        task_id,
-                        getattr(item, "project", None),
-                        getattr(item, "scope", None),
-                        getattr(item, "db_path", None),
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-                self.detail.update(
-                    "[#f0c45a]This task lives in a project that is not "
-                    "currently registered with PollyPM. Add the project from "
-                    "the project picker to load its details here.[/#f0c45a]"
-                )
-                self._clear_rollup_items()
-                return
+            self.detail.update(
+                "[#f0c45a]This task lives in a project that is not "
+                "currently registered with PollyPM. Add the project from "
+                "the project picker to load its details here.[/#f0c45a]"
+            )
+            self._clear_rollup_items()
+            return
         try:
             task = svc.get(task_id)
             replies = svc.list_replies(task_id)
@@ -8403,7 +8411,10 @@ class PollyInboxApp(App[None]):
             except Exception:  # noqa: BLE001
                 pass
             return
-        svc = self._svc_for_task(task_id)
+        # #1101: unified resolver so mark-read persists even on
+        # tracked-project rows where the task's project key prefix
+        # doesn't match the registered project key.
+        svc = self._resolve_inbox_svc(item, task_id)
         if svc is None:
             return
         wrote = False
@@ -8476,41 +8487,18 @@ class PollyInboxApp(App[None]):
                 severity="warning", timeout=3.0,
             )
             return
-        svc = self._svc_for_task(task_id)
+        # #1101: unified resolver — falls back to the entry's ``db_path``
+        # when ``_svc_for_task`` can't open the per-project DB (e.g.
+        # workspace-scoped items per #1087, or project-key-mismatch
+        # tracked-project rows per #1099/#1101).
+        svc = self._resolve_inbox_svc(item, task_id)
         if svc is None:
-            # Workspace-scoped task entries (project sentinel "inbox" or
-            # task IDs whose project is not a registered project) have
-            # no per-project database. Fall back to opening the
-            # work-service directly at the entry's source ``db_path``
-            # (which load_inbox_entries set to the workspace-root
-            # state.db for these items) instead of stranding the user
-            # on a red error toast (#1087, mirroring #855's detail-pane
-            # fallback).
-            project_key = task_id.split("/", 1)[0] if "/" in task_id else None
-            is_workspace = (
-                project_key is None
-                or project_key in {"inbox", "workspace", "[workspace]", "root"}
-                or self._project_key_is_unknown(project_key)
+            self.notify(
+                "Could not open project database "
+                "(workspace-scoped item — try `pm inbox archive`).",
+                severity="error",
             )
-            db_path = getattr(item, "db_path", None)
-            if is_workspace and db_path is not None:
-                try:
-                    from pollypm.work.sqlite_service import SQLiteWorkService
-                    svc = SQLiteWorkService(
-                        db_path=db_path, project_path=db_path.parent.parent,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    self.notify(
-                        f"Archive failed: {exc}", severity="error",
-                    )
-                    return
-            else:
-                self.notify(
-                    "Could not open project database "
-                    "(workspace-scoped item — try `pm inbox archive`).",
-                    severity="error",
-                )
-                return
+            return
         try:
             svc.archive_task(task_id, actor="user")
         except Exception as exc:  # noqa: BLE001
@@ -8578,7 +8566,9 @@ class PollyInboxApp(App[None]):
         if item is None:
             return
         if is_task_inbox_entry(item):
-            svc = self._svc_for_task(task_id)
+            # #1101: unified resolver handles project-key-mismatch via
+            # the inbox entry's ``db_path`` fallback.
+            svc = self._resolve_inbox_svc(item, task_id)
             if svc is None:
                 self.notify("Could not open project database.", severity="error")
                 return
@@ -8847,7 +8837,10 @@ class PollyInboxApp(App[None]):
             self.reply_input.value = ""
             self.list_view.focus()
             return
-        svc = self._svc_for_task(task_id)
+        # #1101: unified resolver — fixes "Could not open project database"
+        # on tracked-project plan-reviews where the task row's project key
+        # doesn't match the registered key.
+        svc = self._resolve_inbox_svc(item, task_id)
         if svc is None:
             self.notify("Could not open project database.", severity="error")
             self.reply_input.value = ""
@@ -8985,7 +8978,9 @@ class PollyInboxApp(App[None]):
         item = self._item_for_id(task_id)
         if item is None or not is_task_inbox_entry(item):
             return None, []
-        svc = self._svc_for_task(task_id)
+        # #1101: unified resolver so proposal-label detection works on
+        # tracked projects with key-mismatched task rows.
+        svc = self._resolve_inbox_svc(item, task_id)
         if svc is None:
             return None, []
         try:
@@ -9030,7 +9025,9 @@ class PollyInboxApp(App[None]):
         from pollypm.plugins_builtin.project_planning.proposals import (
             accept_proposal as _accept_helper,
         )
-        svc = self._svc_for_task(task_id)
+        # #1101: unified resolver.
+        item = self._item_for_id(task_id)
+        svc = self._resolve_inbox_svc(item, task_id)
         if svc is None:
             self.notify("Could not open project database.", severity="error")
             return
@@ -9122,7 +9119,9 @@ class PollyInboxApp(App[None]):
             self.notify(f"Reject memory failed: {exc}", severity="error")
             # Still try to archive so the user isn't stuck looking at
             # the rejected proposal.
-        svc = self._svc_for_task(task_id)
+        # #1101: unified resolver.
+        item = self._item_for_id(task_id)
+        svc = self._resolve_inbox_svc(item, task_id)
         if svc is None:
             self.notify("Could not open project database.", severity="error")
             self.reply_input.value = ""
@@ -9179,7 +9178,9 @@ class PollyInboxApp(App[None]):
         item = self._item_for_id(task_id)
         if item is None or not is_task_inbox_entry(item):
             return None, []
-        svc = self._svc_for_task(task_id)
+        # #1101: unified resolver so plan-review label detection works on
+        # tracked projects with key-mismatched task rows.
+        svc = self._resolve_inbox_svc(item, task_id)
         if svc is None:
             return None, []
         try:
@@ -9332,7 +9333,11 @@ class PollyInboxApp(App[None]):
         # Route through the work-service approve path directly — the
         # CLI entry point is just sugar over ``svc.approve``, and we
         # already hold the project context.
-        svc = self._svc_for_task(plan_task_id)
+        # #1101: unified resolver — pass the inbox ``item`` so the
+        # ``db_path`` fallback can resolve the project even when the
+        # plan_task_id's project key prefix differs from the registered
+        # key (e.g. ``polly_remote`` vs. ``polly-remote``).
+        svc = self._resolve_inbox_svc(item, plan_task_id)
         if svc is None:
             self.notify(
                 "Could not open project database for plan task.",
@@ -9378,7 +9383,9 @@ class PollyInboxApp(App[None]):
             except Exception:  # noqa: BLE001
                 pass
         else:
-            svc = self._svc_for_task(task_id)
+            # #1101: unified resolver here too so the inbox-row archive
+            # succeeds for tracked projects with mismatched keys.
+            svc = self._resolve_inbox_svc(item, task_id)
             if svc is not None:
                 try:
                     svc.add_context(

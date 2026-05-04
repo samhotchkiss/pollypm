@@ -208,6 +208,11 @@ def test_up_surfaces_bootstrap_failure_cleanly(monkeypatch, tmp_path: Path) -> N
         def bootstrap_tmux(self, *, skip_probe: bool = False, on_status=None) -> str:
             raise RuntimeError("PollyPM could not launch any controller account: claude_demo: probe failed")
 
+        def start_cockpit_tui(self, _session_name: str) -> None:
+            # #1085 — fakes must honour the cockpit hook surface so the
+            # before_attach path is exercised without AttributeError.
+            return None
+
     monkeypatch.setattr(cli, "_load_supervisor", lambda path: FakeSupervisor())
 
     runner = CliRunner()
@@ -250,6 +255,11 @@ def test_up_ensures_heartbeat_schedule_for_existing_session(monkeypatch, tmp_pat
 
         def focus_console(self) -> None:
             calls.append("focus")
+
+        def start_cockpit_tui(self, _session_name: str) -> None:
+            # #1085 — fakes must honour the cockpit hook surface so the
+            # before_attach path is exercised without AttributeError.
+            return None
 
     monkeypatch.setattr(cli, "_load_supervisor", lambda path: FakeSupervisor())
 
@@ -295,6 +305,11 @@ def test_up_switches_current_tmux_client_to_polly_session(monkeypatch, tmp_path:
 
         def focus_console(self) -> None:
             calls.append("focus")
+
+        def start_cockpit_tui(self, _session_name: str) -> None:
+            # #1085 — fakes must honour the cockpit hook surface so the
+            # before_attach path is exercised without AttributeError.
+            return None
 
     monkeypatch.setattr(cli, "_load_supervisor", lambda path: FakeSupervisor())
 

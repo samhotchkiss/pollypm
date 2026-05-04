@@ -457,6 +457,11 @@ def test_up_starts_transcript_ingestion(monkeypatch, tmp_path: Path) -> None:
         def focus_console(self) -> None:
             return None
 
+        def start_cockpit_tui(self, _session_name: str) -> None:
+            # #1085 — fakes must honour the cockpit hook surface so the
+            # before_attach path is exercised without AttributeError.
+            return None
+
     monkeypatch.setattr(cli, "_load_supervisor", lambda path: FakeSupervisor())
     monkeypatch.setattr(cli, "start_transcript_ingestion", lambda config: calls.append(str(config.project.base_dir)))
 

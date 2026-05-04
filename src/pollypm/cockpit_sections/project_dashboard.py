@@ -133,19 +133,31 @@ def _render_project_dashboard(
         reverse=True,
     )
 
-    # Project-scoped alerts, filtered the same way the legacy renderer did.
+    # Project-scoped alerts. Match the rail's session-name candidate
+    # set (cockpit_rail._alert_session_candidates) so the dashboard and
+    # rail badge agree on what counts as a project alert; the previous
+    # implementation joined open_alerts against plan_launches, which
+    # silently dropped alerts whose session names weren't represented
+    # in the planner's current launch set (#1083).
     from pollypm.cockpit_alerts import is_operational_alert
 
+    alias = project_key.replace("-", "_")
+    candidate_sessions = frozenset({
+        f"worker_{project_key}",
+        f"architect_{project_key}",
+        f"plan_gate-{project_key}",
+        f"reviewer_{project_key}",
+        f"worker_{alias}",
+        f"architect_{alias}",
+        f"plan_gate-{alias}",
+        f"reviewer_{alias}",
+    })
     project_alerts: list = []
     try:
         project_alerts = [
             a for a in supervisor.store.open_alerts()
-            if any(
-                launch.session.project == project_key
-                and launch.session.name == a.session_name
-                for launch in supervisor.plan_launches()
-            )
-            and not is_operational_alert(a.alert_type)
+            if (getattr(a, "session_name", "") or "") in candidate_sessions
+            and not is_operational_alert(getattr(a, "alert_type", "") or "")
         ]
     except Exception:  # noqa: BLE001
         project_alerts = []

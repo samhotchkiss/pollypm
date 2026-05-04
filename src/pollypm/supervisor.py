@@ -1442,6 +1442,18 @@ class Supervisor:
             session_key = launch.session.name
             tmux_session = self._tmux_session_for_launch(launch)
             if window is None:
+                # #1094 — log the gap so silent session loss leaves a
+                # trail in ``~/.pollypm/errors.log`` (or wherever the
+                # logger routes). Alerts on their own only surface in
+                # the cockpit messages store; a warning line here means
+                # post-hoc investigations can grep the rotating log
+                # for "missing from tmux" without replaying alert state.
+                logger.warning(
+                    "expected session %s window %s missing from tmux session %s",
+                    session_key,
+                    launch.window_name,
+                    tmux_session,
+                )
                 self._msg_store.upsert_alert(
                     session_key,
                     "missing_window",
@@ -1544,6 +1556,16 @@ class Supervisor:
         for window_name, session_key in name_by_window.items():
             if window_name in window_map:
                 continue
+            # #1094 — same gap-logging as the per-launch branch above:
+            # a registered session whose tmux window has vanished
+            # writes a warning to the rotating log so the loss leaves
+            # a trail beyond the cockpit messages store.
+            logger.warning(
+                "expected session %s window %s missing from tmux session %s",
+                session_key,
+                window_name,
+                self._tmux_session_for_session(session_key),
+            )
             self._msg_store.upsert_alert(
                 session_key,
                 "missing_window",

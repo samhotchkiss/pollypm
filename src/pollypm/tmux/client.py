@@ -43,6 +43,15 @@ import re as _re
 _NAME_RE = _re.compile(r"^[a-zA-Z0-9_.-]+$")
 # Safe characters for tmux targets (session:window.pane or %pane_id)
 _TARGET_RE = _re.compile(r"^[a-zA-Z0-9_:.%-]+$")
+_SPAWN_ENV_VARS = (
+    "HOME",
+    "PATH",
+    "POLLYPM_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+)
 
 
 class DeadPaneError(RuntimeError):
@@ -116,6 +125,15 @@ class TmuxClient:
         result = self.run("has-session", "-t", self._exact_target(name), check=False)
         return result.returncode == 0
 
+    def _spawn_env_args(self) -> list[str]:
+        args: list[str] = []
+        for name in _SPAWN_ENV_VARS:
+            value = os.environ.get(name)
+            if value is None:
+                continue
+            args.extend(["-e", f"{name}={value}"])
+        return args
+
     def current_session_name(self) -> str | None:
         if not self._inside_tmux():
             return None
@@ -171,11 +189,13 @@ class TmuxClient:
             # Phase 1: empty pane (default shell). Resolves immediately.
             result = self.run(
                 "new-session", "-d", "-P", "-F", "#{pane_id}",
+                *self._spawn_env_args(),
                 "-s", name, "-n", window_name,
             )
         else:
             result = self.run(
                 "new-session", "-d", "-P", "-F", "#{pane_id}",
+                *self._spawn_env_args(),
                 "-s", name, "-n", window_name, command,
             )
         pane_id = result.stdout.strip()
@@ -224,7 +244,17 @@ class TmuxClient:
                     return None
             except subprocess.CalledProcessError:
                 pass  # Session may have vanished; proceed with creation attempt
-        args = ["new-window", "-P", "-F", "#{pane_id}", "-t", self._exact_target(name), "-n", window_name]
+        args = [
+            "new-window",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            *self._spawn_env_args(),
+            "-t",
+            self._exact_target(name),
+            "-n",
+            window_name,
+        ]
         if detached:
             args.append("-d")
         if not two_phase:
@@ -290,7 +320,7 @@ class TmuxClient:
             "send_launch_command: respawn-pane -t %s argv0=%r argc=%d",
             resolved, argv[0], len(argv),
         )
-        self.run("respawn-pane", "-k", "-t", resolved, *argv)
+        self.run("respawn-pane", "-k", *self._spawn_env_args(), "-t", resolved, *argv)
 
     def split_window(
         self,
@@ -302,7 +332,15 @@ class TmuxClient:
         percent: int | None = None,
         size: int | None = None,
     ) -> str:
-        args = ["split-window", "-P", "-F", "#{pane_id}", "-t", self._exact_target(target)]
+        args = [
+            "split-window",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            *self._spawn_env_args(),
+            "-t",
+            self._exact_target(target),
+        ]
         args.append("-h" if horizontal else "-v")
         if detached:
             args.append("-d")
@@ -480,7 +518,14 @@ class TmuxClient:
         self.run("rename-window", "-t", self._exact_target(target), new_name)
 
     def respawn_pane(self, target: str, command: str) -> None:
-        self.run("respawn-pane", "-k", "-t", self._exact_target(target), command)
+        self.run(
+            "respawn-pane",
+            "-k",
+            *self._spawn_env_args(),
+            "-t",
+            self._exact_target(target),
+            command,
+        )
 
     def set_option(self, target: str, option: str, value: str) -> None:
         normalized = target if ":" in target or target.startswith(("=", "%", "@")) else f"{target}:"

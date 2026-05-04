@@ -283,7 +283,22 @@ class LaunchPlanExecutor:
         # console window with the standard window options.
         if self.probe.main_session_alive:
             return (None, [])
+        # #1098 — RESTORE_FROM_CLOSET now also runs BOOTSTRAP_LAUNCHES
+        # earlier in the plan, which calls ``_reconcile_existing`` —
+        # that path already creates the main session as a side effect.
+        # The probe is captured before the plan executes, so its
+        # ``main_session_alive`` is still False even when the live
+        # tmux session is now present. Check live state to avoid a
+        # redundant ``create_session`` call that would raise
+        # "session already exists" and get swallowed silently.
         tmux = self.supervisor.tmux
+        has_session = getattr(tmux, "has_session", None)
+        if callable(has_session):
+            try:
+                if has_session(self.probe.main_session_name):
+                    return (None, [])
+            except Exception:  # noqa: BLE001
+                pass
         try:
             console_command = getattr(self.supervisor, "console_command", None)
             command = console_command() if callable(console_command) else "$SHELL"

@@ -356,10 +356,23 @@ def plan_launch(probe: LaunchProbe) -> LaunchPlan:
     # RESTORE_FROM_CLOSET: closet alive, main session gone.
     # ------------------------------------------------------------------
     if not probe.main_session_alive and probe.closet_session_alive:
+        # #1098 — the closet may be "alive" but stripped down to just
+        # ``pm-heartbeat`` (after ``pm reset --force`` killed both
+        # sessions and a stray heartbeat tick re-created the closet
+        # before ``pm up`` ran). Including BOOTSTRAP_LAUNCHES routes
+        # through ``Supervisor.bootstrap_tmux`` → ``_reconcile_existing``
+        # which is idempotent: it skips windows that already exist
+        # and bulk-spawns the missing storage-closet windows
+        # (architect/reviewer/operator/etc.) in a single ``pm up``
+        # invocation. Reconcile also recreates the main session on
+        # its own, so ENSURE_MAIN_SESSION is no longer required —
+        # but we keep it for defensiveness and because its handler
+        # is a no-op once the session exists.
         return LaunchPlan(
             state=LaunchState.RESTORE_FROM_CLOSET,
             context=context,
             actions=(
+                LaunchAction.BOOTSTRAP_LAUNCHES,
                 LaunchAction.ENSURE_MAIN_SESSION,
                 LaunchAction.SCHEDULE_HEARTBEAT,
                 LaunchAction.START_RAIL_DAEMON,
@@ -367,7 +380,7 @@ def plan_launch(probe: LaunchProbe) -> LaunchPlan:
             ),
             reason=(
                 "main session vanished but storage closet is alive — "
-                "rebuild only the cockpit window"
+                "reconcile missing windows and rebuild the cockpit"
             ),
         )
 

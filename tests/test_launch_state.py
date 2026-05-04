@@ -162,10 +162,20 @@ def test_attach_existing_does_not_respawn_live_rail() -> None:
 
 
 def test_restore_when_main_gone_but_closet_alive() -> None:
-    """Closet survived a cockpit crash; main session vanished."""
+    """Closet survived a cockpit crash; main session vanished.
+
+    #1098 — the closet-alive probe used to skip BOOTSTRAP_LAUNCHES
+    on the assumption that an alive closet was a fully-populated
+    closet. After ``pm reset --force``, a stray heartbeat tick can
+    re-create the closet with only ``pm-heartbeat``, leaving the
+    architect/reviewer/operator/worker windows missing. Including
+    BOOTSTRAP_LAUNCHES routes through ``_reconcile_existing`` which
+    is idempotent — already-present windows are skipped, missing
+    ones are bulk-spawned in a single ``pm up`` invocation.
+    """
     plan = plan_launch(_probe(main_alive=False, closet_alive=True))
     assert plan.state is LaunchState.RESTORE_FROM_CLOSET
-    assert LaunchAction.BOOTSTRAP_LAUNCHES not in plan.actions
+    assert LaunchAction.BOOTSTRAP_LAUNCHES in plan.actions
     assert LaunchAction.ENSURE_MAIN_SESSION in plan.actions
 
 

@@ -386,8 +386,13 @@ def test_attach_existing_inside_unrelated_tmux_switches() -> None:
 
 def test_restore_from_closet_recreates_main_session() -> None:
     """Closet alive, main gone: ENSURE_MAIN_SESSION must call
-    create_session + the standard window options. Must NOT
-    bootstrap (closet is alive)."""
+    create_session + the standard window options. #1098 — must
+    ALSO bootstrap so a closet that was stripped to just
+    ``pm-heartbeat`` (after ``pm reset --force``) gets its
+    architect/reviewer/operator/worker windows back in a single
+    ``pm up`` invocation. ``bootstrap_tmux`` is idempotent —
+    already-present windows are skipped via ``_reconcile_existing``.
+    """
     probe = _probe(closet_session_alive=True)
     plan = plan_launch(probe)
     assert plan.state is LaunchState.RESTORE_FROM_CLOSET
@@ -399,7 +404,8 @@ def test_restore_from_closet_recreates_main_session() -> None:
     sup_methods = [c[0] for c in sup.calls]
     assert "create_session" in tmux_methods
     assert "set_window_option" in tmux_methods
-    assert "bootstrap_tmux" not in sup_methods
+    assert "bootstrap_tmux" in sup_methods
+    assert LaunchAction.BOOTSTRAP_LAUNCHES in result.actions_run
     assert LaunchAction.ENSURE_MAIN_SESSION in result.actions_run
 
 

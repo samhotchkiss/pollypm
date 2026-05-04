@@ -1656,6 +1656,22 @@ class PollyCockpitApp(App[None]):
         if callable(send_method):
             send_method(key)
 
+    def _send_key_to_settings_pane(self, key: str) -> None:
+        delivered = None
+        try:
+            from pollypm.cockpit_input_bridge import send_key_to_first_live
+            delivered = send_key_to_first_live(
+                self.config_path, key, kind="settings", timeout=0.2,
+            )
+        except Exception:  # noqa: BLE001
+            delivered = None
+        if delivered is not None:
+            return
+        try:
+            self._send_key_to_right_pane(key)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _cancel_pending_route_selection(self) -> None:
         controller = getattr(self, "_navigation_controller", None)
         current_id = getattr(controller, "current_request_id", None)
@@ -2233,15 +2249,14 @@ class PollyCockpitApp(App[None]):
             self._last_nav_change = self._tick_count
             self._apply_active_view_to_rows()
 
-    # j/k always navigate the rail's own item list — including
+    # j/k normally navigate the rail's own item list — including
     # stepping over the ``── projects ──`` divider (which is a
     # ``disabled=True`` ListItem so Textual's ListView correctly
     # skips it) and remaining a no-op once the cursor reaches the
-    # first/last selectable row. The keys are claimed by the rail's
-    # priority binding regardless of cursor position; we never call
-    # ``tmux send-keys`` for j/k, which previously leaked the byte
-    # into whatever process owned the right-pane TTY (#918, reverts
-    # the right-pane forward added in #856).
+    # first/last selectable row. The one exception is Settings: its
+    # pane advertises j/k section browsing, so while Settings is active
+    # these keys are delivered to that pane instead of moving the rail
+    # cursor (#1130).
     #
     # ``⚙ Settings`` lives in a separate ``Static`` widget below the
     # nav ``ListView`` (so a long project list can scroll while the
@@ -2277,8 +2292,8 @@ class PollyCockpitApp(App[None]):
         self._apply_active_view_to_rows()
 
     def action_cursor_down(self) -> None:
-        # Already on the virtual Settings row — nothing below it.
         if self.selected_key == "settings":
+            self._send_key_to_settings_pane("j")
             return
         last_idx = self._last_nav_index()
         # On the last selectable nav row + Settings is visible → step
@@ -2297,14 +2312,11 @@ class PollyCockpitApp(App[None]):
         self._sync_selected_from_nav()
 
     def action_cursor_up(self) -> None:
+        if self.selected_key == "settings":
+            self._send_key_to_settings_pane("k")
+            return
         # Step up off the virtual Settings row onto the last
         # selectable nav row (#1080).
-        if self.selected_key == "settings":
-            last_idx = self._last_nav_index()
-            if last_idx is not None:
-                self.nav.index = last_idx
-                self._sync_selected_from_nav()
-            return
         if self.nav.index is None:
             self.nav.index = 0
         else:
@@ -4303,6 +4315,21 @@ class PollySettingsPaneApp(App[None]):
         # Alert toast surface removed in #956 — alerts still raise/clear
         # via the data layer; ``a`` opens the alert list in Metrics.
         self._apply_narrow_class()
+        try:
+            from pollypm.cockpit_input_bridge import start_input_bridge
+            self._input_bridge_handle = start_input_bridge(
+                self, kind="settings", config_path=self.config_path,
+            )
+        except Exception:  # noqa: BLE001
+            self._input_bridge_handle = None
+
+    def on_unmount(self) -> None:
+        bridge = getattr(self, "_input_bridge_handle", None)
+        if bridge is not None:
+            try:
+                bridge.stop()
+            except Exception:  # noqa: BLE001
+                pass
 
     # Threshold below which the side-by-side nav + content layout
     # collapses into letter-by-letter wrapping (#865). Empirically a

@@ -439,6 +439,35 @@ def test_settings_mounts_all_sections(settings_env) -> None:
     _run(body())
 
 
+def test_settings_pane_registers_input_bridge(settings_env, monkeypatch) -> None:
+    app = settings_env["app"]
+    calls: list[tuple[str, Path]] = []
+    stopped: list[bool] = []
+
+    class _Handle:
+        def stop(self) -> None:
+            stopped.append(True)
+
+    def _start_input_bridge(app_arg, *, kind: str, config_path: Path):  # noqa: ANN001
+        assert app_arg is app
+        calls.append((kind, config_path))
+        return _Handle()
+
+    monkeypatch.setattr(
+        "pollypm.cockpit_input_bridge.start_input_bridge",
+        _start_input_bridge,
+    )
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+
+    _run(body())
+
+    assert calls == [("settings", settings_env["config_path"])]
+    assert stopped == [True]
+
+
 def test_accounts_section_lists_configured_accounts(settings_env) -> None:
     app = settings_env["app"]
 

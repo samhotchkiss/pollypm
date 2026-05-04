@@ -268,7 +268,12 @@ def test_supervisor_heartbeat_api_persists_cursor_and_reads_incremental_delta(tm
         pane_current_path=str(tmp_path),
         pane_dead=False,
     )
-    monkeypatch.setattr(supervisor, "window_map", lambda: {launch.window_name: window})
+    # #1096 — window_map keys by (tmux_session, window_name) tuple.
+    monkeypatch.setattr(
+        supervisor,
+        "window_map",
+        lambda: {(window.session, launch.window_name): window},
+    )
     monkeypatch.setattr(supervisor, "write_snapshot", lambda _window, _lines: (snapshot_path, "snapshot\n"))
 
     api = SupervisorHeartbeatAPI(supervisor)
@@ -328,13 +333,14 @@ def test_supervisor_heartbeat_api_lists_unmanaged_windows(tmp_path: Path, monkey
         pane_current_path=str(tmp_path / "sandbox"),
         pane_dead=False,
     )
+    # #1096 — window_map keys by (tmux_session, window_name) tuple.
     monkeypatch.setattr(
         supervisor,
         "window_map",
         lambda: {
-            managed_window.name: managed_window,
-            console_window.name: console_window,
-            unmanaged_window.name: unmanaged_window,
+            (managed_window.session, managed_window.name): managed_window,
+            (console_window.session, console_window.name): console_window,
+            (unmanaged_window.session, unmanaged_window.name): unmanaged_window,
         },
     )
 
@@ -409,13 +415,14 @@ def test_supervisor_heartbeat_api_skips_hyphen_underscore_drift(
         pane_current_path=str(tmp_path),
         pane_dead=False,
     )
+    # #1096 — window_map keys by (tmux_session, window_name) tuple.
     monkeypatch.setattr(
         supervisor,
         "window_map",
         lambda: {
-            managed_window.name: managed_window,
-            console_window.name: console_window,
-            architect_window.name: architect_window,
+            (managed_window.session, managed_window.name): managed_window,
+            (console_window.session, console_window.name): console_window,
+            (architect_window.session, architect_window.name): architect_window,
         },
     )
 
@@ -480,13 +487,14 @@ def test_supervisor_heartbeat_api_normalizes_session_name_to_window(
         pane_current_path=str(tmp_path),
         pane_dead=False,
     )
+    # #1096 — window_map keys by (tmux_session, window_name) tuple.
     monkeypatch.setattr(
         supervisor,
         "window_map",
         lambda: {
-            managed_window.name: managed_window,
-            console_window.name: console_window,
-            architect_window.name: architect_window,
+            (managed_window.session, managed_window.name): managed_window,
+            (console_window.session, console_window.name): console_window,
+            (architect_window.session, architect_window.name): architect_window,
         },
     )
 
@@ -533,13 +541,14 @@ def test_supervisor_heartbeat_api_skips_pm_upgrade_window(tmp_path: Path, monkey
         pane_current_path=str(tmp_path),
         pane_dead=False,
     )
+    # #1096 — window_map keys by (tmux_session, window_name) tuple.
     monkeypatch.setattr(
         supervisor,
         "window_map",
         lambda: {
-            managed_window.name: managed_window,
-            console_window.name: console_window,
-            pm_upgrade_window.name: pm_upgrade_window,
+            (managed_window.session, managed_window.name): managed_window,
+            (console_window.session, console_window.name): console_window,
+            (pm_upgrade_window.session, pm_upgrade_window.name): pm_upgrade_window,
         },
     )
 

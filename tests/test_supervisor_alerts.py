@@ -323,7 +323,8 @@ def test_recovery_alert_auto_clear_clears_recovery_limit_after_debounce(
     # ``window_map`` (window_name → TmuxWindow) and ``name_by_window``
     # (window_name → session_name) directly, so we can hand it
     # synthetic dicts without touching tmux.
-    window_map = {launch.window_name: object()}
+    # #1096 — sweeps now key by (tmux_session, window_name) tuples.
+    window_map = {(supervisor._tmux_session_for_launch(launch), launch.window_name): object()}
     name_by_window = {launch.window_name: launch.session.name}
 
     supervisor._sweep_recovered_recovery_alerts(
@@ -365,7 +366,8 @@ def test_recovery_alert_auto_clear_clears_stuck_session_after_debounce(
     )
     _backdate_alert(supervisor, launch.session.name, "stuck_session", 200)
 
-    window_map = {launch.window_name: object()}
+    # #1096 — sweeps now key by (tmux_session, window_name) tuples.
+    window_map = {(supervisor._tmux_session_for_launch(launch), launch.window_name): object()}
     name_by_window = {launch.window_name: launch.session.name}
 
     supervisor._sweep_recovered_recovery_alerts(
@@ -396,7 +398,8 @@ def test_recovery_alert_auto_clear_holds_alert_within_debounce(
         "Automatic recovery paused after 5 rapid failures",
     )
 
-    window_map = {launch.window_name: object()}
+    # #1096 — sweeps now key by (tmux_session, window_name) tuples.
+    window_map = {(supervisor._tmux_session_for_launch(launch), launch.window_name): object()}
     name_by_window = {launch.window_name: launch.session.name}
 
     supervisor._sweep_recovered_recovery_alerts(
@@ -441,7 +444,8 @@ def test_recovery_alert_auto_clear_resets_streak_when_window_missing(
     # Tick 2: window BACK + immediately past debounce on the alert
     # timestamp — but the unhealthy observation in tick 1 should
     # restart the streak, so the alert must remain open.
-    window_map = {launch.window_name: object()}
+    # #1096 — sweeps now key by (tmux_session, window_name) tuples.
+    window_map = {(supervisor._tmux_session_for_launch(launch), launch.window_name): object()}
     supervisor._sweep_recovered_recovery_alerts(
         window_map=window_map, name_by_window=name_by_window,
     )
@@ -515,7 +519,8 @@ def test_recovery_alert_auto_clear_full_lifecycle(
     assert (launch.session.name, "recovery_limit") in open_pairs
 
     # Step (b) — first healthy tick BEFORE debounce → alert holds.
-    window_map = {launch.window_name: object()}
+    # #1096 — sweeps now key by (tmux_session, window_name) tuples.
+    window_map = {(supervisor._tmux_session_for_launch(launch), launch.window_name): object()}
     name_by_window = {launch.window_name: launch.session.name}
     supervisor._sweep_recovered_recovery_alerts(
         window_map=window_map, name_by_window=name_by_window,
@@ -613,7 +618,8 @@ def test_recovery_alert_auto_clear_clears_no_session_spawn_failed_after_debounce
         supervisor, launch.session.name, "no_session_spawn_failed", 200,
     )
 
-    window_map = {launch.window_name: object()}
+    # #1096 — sweeps now key by (tmux_session, window_name) tuples.
+    window_map = {(supervisor._tmux_session_for_launch(launch), launch.window_name): object()}
     name_by_window = {launch.window_name: launch.session.name}
 
     supervisor._sweep_recovered_recovery_alerts(
@@ -672,7 +678,8 @@ def test_recovery_alert_auto_clear_clears_spawn_failed_persistent(
         supervisor, launch.session.name, "spawn_failed_persistent", 200,
     )
 
-    window_map = {launch.window_name: object()}
+    # #1096 — sweeps now key by (tmux_session, window_name) tuples.
+    window_map = {(supervisor._tmux_session_for_launch(launch), launch.window_name): object()}
     name_by_window = {launch.window_name: launch.session.name}
 
     supervisor._sweep_recovered_recovery_alerts(
@@ -706,7 +713,8 @@ def test_recovery_alert_auto_clear_holds_spawn_failed_within_debounce(
         "Auto-recovery failed after 3 spawn attempts",
     )
 
-    window_map = {launch.window_name: object()}
+    # #1096 — sweeps now key by (tmux_session, window_name) tuples.
+    window_map = {(supervisor._tmux_session_for_launch(launch), launch.window_name): object()}
     name_by_window = {launch.window_name: launch.session.name}
 
     supervisor._sweep_recovered_recovery_alerts(
@@ -1017,7 +1025,8 @@ def test_recovery_alert_auto_clear_works_for_placeholder_pane(
         Supervisor._RECOVERY_ALERT_AUTO_CLEAR_DEBOUNCE_SECONDS + 30,
     )
 
-    window_map = {launch.window_name: object()}
+    # #1096 — sweeps now key by (tmux_session, window_name) tuples.
+    window_map = {(supervisor._tmux_session_for_launch(launch), launch.window_name): object()}
     name_by_window = {launch.window_name: launch.session.name}
     supervisor._sweep_recovered_recovery_alerts(
         window_map=window_map, name_by_window=name_by_window,

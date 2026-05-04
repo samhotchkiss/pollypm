@@ -1505,7 +1505,8 @@ def test_create_worker_and_route_targets_pm_chat_session_when_worker_exists() ->
             return "pollypm-storage-closet"
 
         def window_map(self):
-            return {"worker-demo": "0"}
+            # #1096 — keyed by (tmux_session, window_name) tuple.
+            return {("pollypm-storage-closet", "worker-demo"): "0"}
 
     class _FakeTmux:
         def list_windows(self, target: str):

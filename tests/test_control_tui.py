@@ -230,8 +230,9 @@ def test_session_detail_uses_role_specific_tmux_session(tmp_path: Path) -> None:
         def tmux_session_for_launch(self, _launch: SessionLaunchSpec) -> str:
             return "pollypm-storage-closet"
 
-        def window_map(self) -> dict[str, FakeWindow]:
-            return {"pm-heartbeat": FakeWindow()}
+        def window_map(self) -> dict[tuple[str, str], FakeWindow]:
+            # #1096 — keyed by (tmux_session, window_name) tuple.
+            return {("pollypm-storage-closet", "pm-heartbeat"): FakeWindow()}
 
     supervisor = FakeSupervisor()
     detail = app._session_detail(supervisor, "heartbeat")

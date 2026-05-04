@@ -1212,7 +1212,8 @@ class PollyPMApp(App[None]):
         if not supervisor.tmux.has_session(tmux_session):
             return f"tmux session {tmux_session} is not running."
         window_map = supervisor.window_map()
-        window = window_map.get(launch.window_name)
+        # #1096 — keys are (tmux_session, window_name); look up by tuple.
+        window = window_map.get((tmux_session, launch.window_name))
         if window is None:
             return "Window is not running."
         preview = supervisor.tmux.capture_pane(

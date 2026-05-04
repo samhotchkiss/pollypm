@@ -366,7 +366,9 @@ def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
         for launch in launches:
             if session is not None and launch.session.name != session:
                 continue
-            window = windows.get(launch.window_name)
+            # #1096 — window_map keys by (tmux_session, window_name).
+            tmux_session = supervisor.tmux_session_for_launch(launch)
+            window = windows.get((tmux_session, launch.window_name))
             if window is None:
                 state = "not running"
             elif window.pane_dead:

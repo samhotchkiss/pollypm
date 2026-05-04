@@ -1073,24 +1073,41 @@ class Supervisor:
             assignments.setdefault(launch.session.project, []).append(launch)
         return assignments
 
-    def window_map(self) -> dict[str, TmuxWindow]:
-        """Return ``{window_name: TmuxWindow}`` for every PollyPM-owned window.
+    def window_map(self) -> dict[tuple[str, str], TmuxWindow]:
+        """Return ``{(tmux_session, window_name): TmuxWindow}`` for every PollyPM-owned window.
 
         Inputs: none (reads live tmux state plus the cockpit mount override).
-        Output: a dict keyed by window name containing ``TmuxWindow`` entries
-        for the project and storage-closet sessions, plus any mounted window.
+        Output: a dict keyed by ``(tmux_session, window_name)`` tuples containing
+        ``TmuxWindow`` entries for the project and storage-closet sessions, plus
+        any mounted window.
+
+        #1096 — keying by ``(tmux_session, window_name)`` instead of plain
+        ``window_name`` prevents same-named windows in different tmux sessions
+        (e.g. ``pm-operator`` in both ``pollypm`` and ``pollypm-storage-closet``)
+        from collapsing to a single last-write-wins entry, which produced
+        crossed wiring at lookup time.
         """
         our_sessions = set(self._all_tmux_session_names())
-        windows: dict[str, TmuxWindow] = {}
+        windows: dict[tuple[str, str], TmuxWindow] = {}
         for window in self.session_service.tmux.list_all_windows():
             if window.session in our_sessions:
-                windows[window.name] = window
+                windows[(window.session, window.name)] = window
         mounted = self._mounted_window_override()
         if mounted is not None:
-            windows[mounted.name] = mounted
+            windows[(mounted.session, mounted.name)] = mounted
         return windows
 
-    def _window_map(self) -> dict[str, TmuxWindow]:
+    def window_for_launch(self, launch: SessionLaunchSpec) -> TmuxWindow | None:
+        """Return the live ``TmuxWindow`` for ``launch`` or ``None`` if missing.
+
+        #1096 — convenience helper that consults :meth:`window_map` with the
+        correct ``(tmux_session, window_name)`` tuple, sparing callers from
+        having to assemble the key themselves.
+        """
+        tmux_session = self._tmux_session_for_launch(launch)
+        return self.window_map().get((tmux_session, launch.window_name))
+
+    def _window_map(self) -> dict[tuple[str, str], TmuxWindow]:
         return self.window_map()
 
     def _mounted_window_override(self) -> TmuxWindow | None:
@@ -1438,9 +1455,12 @@ class Supervisor:
         name_by_window = self._session_name_by_window()
 
         for launch in self.plan_launches():
-            window = window_map.get(launch.window_name)
             session_key = launch.session.name
             tmux_session = self._tmux_session_for_launch(launch)
+            # #1096 — key by (tmux_session, window_name) so same-named
+            # windows across sessions can't collapse and hand back the
+            # wrong pane.
+            window = window_map.get((tmux_session, launch.window_name))
             if window is None:
                 # #1094 — log the gap so silent session loss leaves a
                 # trail in ``~/.pollypm/errors.log`` (or wherever the
@@ -1553,8 +1573,12 @@ class Supervisor:
                 # ``manager.architect_launch_cmd``.
                 self._maybe_close_idle_architect(launch, window, current_snapshot_hash)
 
+        # #1096 — window_map keys are (tmux_session, window_name) tuples;
+        # check membership against the expected pair so a co-tenant
+        # session's same-named window doesn't make us skip alerting.
         for window_name, session_key in name_by_window.items():
-            if window_name in window_map:
+            expected_tmux_session = self._tmux_session_for_session(session_key)
+            if (expected_tmux_session, window_name) in window_map:
                 continue
             # #1094 — same gap-logging as the per-launch branch above:
             # a registered session whose tmux window has vanished
@@ -2295,13 +2319,21 @@ class Supervisor:
             # Sessions we're actively tracking this sweep — from the
             # configured launch plan. Alerts keyed on anything outside
             # this set are candidates for sweep.
-            tracked = {launch.session.name for launch in self.plan_launches()}
-            # Windows that currently exist (keyed by window name).
-            live_window_names = set(window_map.keys())
-            # Reverse map: session_name -> expected window_name for
-            # tracked sessions, so we can tell "has window" vs "missing".
-            expected_window = {
-                v: k for k, v in name_by_window.items()
+            launches = self.plan_launches()
+            tracked = {launch.session.name for launch in launches}
+            # #1096 — windows live keyed by (tmux_session, window_name);
+            # we need the matching tuple per launch to verify presence
+            # rather than collapsing across sessions by name alone.
+            live_window_keys = set(window_map.keys())
+            # session_name -> (tmux_session, window_name) for tracked
+            # sessions, so we can tell "has window" vs "missing" without
+            # being fooled by a same-named window in another session.
+            expected_window_key: dict[str, tuple[str, str]] = {
+                launch.session.name: (
+                    self._tmux_session_for_launch(launch),
+                    launch.window_name,
+                )
+                for launch in launches
             }
 
             swept = 0
@@ -2335,8 +2367,8 @@ class Supervisor:
                 ):
                     continue
                 if session_name in tracked:
-                    window_name = expected_window.get(session_name)
-                    if window_name and window_name in live_window_names:
+                    window_key = expected_window_key.get(session_name)
+                    if window_key and window_key in live_window_keys:
                         # Session is live; leave alert alone.
                         continue
                     # Tracked but window is missing — the missing_window
@@ -2432,9 +2464,20 @@ class Supervisor:
         sessions.
         """
         try:
-            tracked = {launch.session.name for launch in self.plan_launches()}
-            live_window_names = set(window_map.keys())
-            expected_window = {v: k for k, v in name_by_window.items()}
+            launches = self.plan_launches()
+            tracked = {launch.session.name for launch in launches}
+            # #1096 — keys are (tmux_session, window_name) tuples; build
+            # the per-session expected key from the launch plan so we
+            # don't mistake a co-tenant session's same-named window for
+            # this session being healthy.
+            live_window_keys = set(window_map.keys())
+            expected_window_key: dict[str, tuple[str, str]] = {
+                launch.session.name: (
+                    self._tmux_session_for_launch(launch),
+                    launch.window_name,
+                )
+                for launch in launches
+            }
 
             now = datetime.now(UTC)
             debounce = timedelta(
@@ -2451,8 +2494,8 @@ class Supervisor:
                     # Untracked → ``_sweep_stale_alerts`` owns the
                     # orphan-clear path. Leave alone.
                     continue
-                window_name = expected_window.get(session_name)
-                if not window_name or window_name not in live_window_names:
+                window_key = expected_window_key.get(session_name)
+                if not window_key or window_key not in live_window_keys:
                     # Window missing — session is NOT healthy. Record an
                     # unhealthy observation so a brief flap resets the
                     # streak even if the next tick finds the window back.
@@ -2897,7 +2940,9 @@ class Supervisor:
         previous_runtime = self.store.get_session_runtime(session_name)
         if self.session_service.tmux.has_session(tmux_session):
             window_map = self._window_map()
-            if launch.window_name in window_map:
+            # #1096 — key includes the tmux_session so we don't mistake
+            # a co-tenant session's same-named window for ours.
+            if (tmux_session, launch.window_name) in window_map:
                 self.session_service.tmux.kill_window(f"{tmux_session}:{launch.window_name}")
         account = self.config.accounts[account_name]
         self.store.upsert_session_runtime(
@@ -3088,7 +3133,8 @@ class Supervisor:
         launch = self._launch_by_session(session_name)
         tmux_session = self._tmux_session_for_launch(launch)
         window_map = self._window_map()
-        if launch.window_name in window_map:
+        # #1096 — scope existence-check to the launch's tmux_session.
+        if (tmux_session, launch.window_name) in window_map:
             return launch, None
         existing_claude_ids: set[str] | None = None
         if (
@@ -3153,7 +3199,8 @@ class Supervisor:
         if not self.session_service.tmux.has_session(tmux_session):
             return
         window_map = self._window_map()
-        if launch.window_name not in window_map:
+        # #1096 — scope existence-check to the launch's tmux_session.
+        if (tmux_session, launch.window_name) not in window_map:
             return
         self.session_service.tmux.kill_window(f"{tmux_session}:{launch.window_name}")
         self._release_session_locks(launch)

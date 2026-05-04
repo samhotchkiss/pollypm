@@ -298,7 +298,10 @@ class SupervisorHeartbeatAPI:
             except (FileNotFoundError, OSError):
                 source_bytes = 0
             transcript_delta = self._read_transcript_delta(source_path, cursor.last_offset if cursor else 0)
-            window = window_map.get(launch.window_name)
+            # #1096 — window_map keys by (tmux_session, window_name) so
+            # same-named windows in co-tenant sessions can't collide.
+            tmux_session = self.supervisor.tmux_session_for_launch(launch)
+            window = window_map.get((tmux_session, launch.window_name))
             snapshot_path: str | None = None
             pane_text = ""
             current_snapshot_hash = ""

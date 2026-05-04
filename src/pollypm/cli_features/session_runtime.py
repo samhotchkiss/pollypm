@@ -156,7 +156,11 @@ def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
     def launch(
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     ) -> None:
-        helpers.up(config_path=config_path)
+        # #1111 — pass phantom_client=False explicitly. Calling the
+        # Typer-decorated up() directly leaves OptionInfo sentinels for
+        # unsupplied params, which are truthy and would spawn the
+        # phantom client unintentionally.
+        helpers.up(config_path=config_path, phantom_client=False)
 
     @app.command("rail-daemon")
     def rail_daemon(

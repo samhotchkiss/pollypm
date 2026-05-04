@@ -343,7 +343,11 @@ def _first_run_setup_and_launch(config_path: Path) -> None:
     from pollypm.onboarding import run_onboarding
     path = run_onboarding(config_path=config_path, force=False)
     _install_global_pollypm(path.parent)
-    up(config_path=path)
+    # #1111 — pass phantom_client=False explicitly. Calling the
+    # Typer-decorated up() as a plain function leaves Option defaults
+    # as truthy OptionInfo objects; spelling the value out keeps the
+    # phantom_client gate False.
+    up(config_path=path, phantom_client=False)
 
 
 def _print_version_and_exit(value: bool) -> None:
@@ -375,7 +379,11 @@ def main(
                 return
             _first_run_setup_and_launch(config_path=config_path)
             return
-        up(config_path=config_path)
+        # #1111 — use ctx.invoke so Typer applies Option defaults
+        # (e.g. phantom_client=False). Calling up() directly leaves
+        # OptionInfo sentinels in place, which are truthy and trip the
+        # phantom-client launch path on bare `pm`.
+        ctx.invoke(up, config_path=config_path)
 
 
 @app.command(help="Write the example PollyPM config to disk to bootstrap a new install.")

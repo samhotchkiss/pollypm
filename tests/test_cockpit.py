@@ -5081,27 +5081,30 @@ def test_cockpit_j_at_last_nav_row_steps_onto_settings() -> None:
         f"j from Activity should land on Settings; got {app.selected_key!r}"
     )
 
-    # Repeat j on Settings is a no-op (nothing below).
+    # Repeat j on Settings belongs to the Settings pane's own nav.
+    sent: list[str] = []
+    app._send_key_to_settings_pane = lambda key: sent.append(key)  # type: ignore[method-assign]
     app.action_cursor_down()
     assert app.selected_key == "settings"
+    assert sent == ["j"]
 
 
-def test_cockpit_k_off_settings_returns_to_last_nav_row() -> None:
-    """k from the virtual Settings row lands on the last selectable nav
-    row so the round-trip is symmetric (#1080)."""
+def test_cockpit_k_on_settings_forwards_to_settings_pane() -> None:
+    """k from Settings belongs to the Settings pane's own nav (#1130)."""
     items = [_StubItem("polly"), _StubItem("activity")]
     app, nav = _make_rail_app_with_settings(
         items,
         items_keys=["polly", "activity", "settings"],
         selected_key="settings",
     )
-    nav.index = 0  # cursor parked anywhere; k uses last_nav_index
+    nav.index = 0
+    sent: list[str] = []
+    app._send_key_to_settings_pane = lambda key: sent.append(key)  # type: ignore[method-assign]
 
     app.action_cursor_up()
-    assert app.selected_key == "activity", (
-        f"k from Settings should land on Activity; got {app.selected_key!r}"
-    )
-    assert nav.index == 1
+    assert app.selected_key == "settings"
+    assert nav.index == 0
+    assert sent == ["k"]
 
 
 def test_cockpit_G_lands_on_settings_when_visible() -> None:

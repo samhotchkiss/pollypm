@@ -1656,6 +1656,20 @@ class PollyCockpitApp(App[None]):
         if callable(send_method):
             send_method(key)
 
+    def _cancel_pending_route_selection(self) -> None:
+        controller = getattr(self, "_navigation_controller", None)
+        current_id = getattr(controller, "current_request_id", None)
+        if controller is None or current_id is None:
+            return
+        try:
+            controller.cancel(current_id)
+        except Exception:  # noqa: BLE001
+            pass
+        self._route_click_seq = max(
+            getattr(self, "_route_click_seq", 0),
+            int(current_id) + 1,
+        )
+
     def _adopt_router_selection_if_changed(self) -> None:
         try:
             external_key = self.router.selected_key()
@@ -1816,11 +1830,16 @@ class PollyCockpitApp(App[None]):
                 item.state = "unread"
         nav_items = self._nav_items()
         previous_key = self._selected_row_key()
-        selected_key = None if self.selected_key == "settings" else (previous_key or self.selected_key)
         # #797: keep selected_key valid against the visible items so
         # the focus marker doesn't drop off when a previously-selected
         # row (e.g. an expanded project sub-row) leaves the list.
         keys = [item.key for item in nav_items]
+        if self.selected_key == "settings":
+            selected_key = None
+        elif self.selected_key in keys:
+            selected_key = self.selected_key
+        else:
+            selected_key = previous_key or self.selected_key
         if self.selected_key not in keys and self.selected_key != "settings":
             for item in nav_items:
                 if item.selectable:
@@ -2209,6 +2228,7 @@ class PollyCockpitApp(App[None]):
         """Update selected_key from the current ListView cursor position."""
         key = self._selected_row_key()
         if key is not None:
+            self._cancel_pending_route_selection()
             self.selected_key = key
             self._last_nav_change = self._tick_count
             self._apply_active_view_to_rows()
@@ -2251,6 +2271,7 @@ class PollyCockpitApp(App[None]):
         return None
 
     def _select_settings_row(self) -> None:
+        self._cancel_pending_route_selection()
         self.selected_key = "settings"
         self._last_nav_change = self._tick_count
         self._apply_active_view_to_rows()

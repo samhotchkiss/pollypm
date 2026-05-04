@@ -4031,6 +4031,76 @@ def test_cockpit_ui_arrow_and_enter_route_selected(tmp_path: Path) -> None:
     asyncio.run(exercise())
 
 
+def test_cockpit_send_key_inbox_shortcut_keeps_nav_cursor_on_inbox(tmp_path: Path) -> None:
+    """#1122: after global ``I``, bridge-delivered Down starts from Inbox."""
+
+    class FakeRouter:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self._selected = "polly"
+
+        @property
+        def tmux(self):
+            class _Tmux:
+                pass
+
+            return _Tmux()
+
+        def selected_key(self) -> str:
+            return self._selected
+
+        def _load_state(self) -> dict:
+            return {}
+
+        def build_items(self, *, spinner_index: int = 0):
+            from pollypm.cockpit_rail import CockpitItem
+
+            return [
+                CockpitItem("dashboard", "Home", "home"),
+                CockpitItem("polly", "Polly", "ready"),
+                CockpitItem("workers", "Workers", "idle"),
+                CockpitItem("metrics", "Metrics", "watch"),
+                CockpitItem("inbox", "Inbox (33)", "ready"),
+                CockpitItem("activity", "Activity", "ready"),
+                CockpitItem("project:demo", "demo", "idle"),
+                CockpitItem("settings", "Settings", "config"),
+            ]
+
+        def route_selected(self, key: str) -> None:
+            self.calls.append(key)
+            self._selected = key
+
+        def create_worker_and_route(self, project_key: str) -> None:
+            self.calls.append(f"new:{project_key}")
+
+    app = PollyCockpitApp(tmp_path / "pollypm.toml")
+    app.router = FakeRouter()  # type: ignore[assignment]
+    app._start_core_rail = lambda: None  # type: ignore[method-assign]
+    app._show_palette_tip_once = lambda: None  # type: ignore[method-assign]
+    app._enforce_rail_width_once = lambda: None  # type: ignore[method-assign]
+
+    async def exercise() -> None:
+        from pollypm.cockpit_input_bridge import send_key
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(0.2)
+            assert app._selected_row_key() == "polly"
+
+            handle = getattr(app, "_input_bridge_handle", None)
+            assert handle is not None
+            send_key(handle.socket_path, "I")
+            await pilot.pause(0.4)
+            assert app.selected_key == "inbox"
+            assert app._selected_row_key() == "inbox"
+
+            send_key(handle.socket_path, "<down>")
+            await pilot.pause(0.4)
+            assert app.selected_key == "activity"
+            assert app._selected_row_key() == "activity"
+
+    asyncio.run(exercise())
+
+
 def test_cockpit_cursor_sync_moves_visible_marker_without_full_refresh() -> None:
     app = PollyCockpitApp.__new__(PollyCockpitApp)
     app.selected_key = "polly"

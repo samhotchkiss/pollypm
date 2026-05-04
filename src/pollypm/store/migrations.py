@@ -516,15 +516,17 @@ def require_no_pending_or_exit(db_path: Path) -> None:
     Skipped when ``POLLYPM_SKIP_MIGRATION_GATE`` is set — ``pm migrate``
     sets this internally so the apply path can itself open the store.
 
-    A missing DB file is NOT a gate violation: it's the legitimate
-    first-boot path where ``StateStore``/``SQLiteWorkService`` will
-    create the file and apply every migration from scratch. The gate
-    protects against the "installed new code, forgot to migrate" case,
-    which by definition requires an existing older DB.
+    A missing DB file is the legitimate first-boot path. Bootstrap it
+    fully here so startup cannot create only the ``StateStore`` half of
+    the shared database and leave work-service migrations pending for
+    the next launch. The gate protects against the "installed new code,
+    forgot to migrate" case, which by definition requires an existing
+    older DB.
     """
     if bypass_env_is_set():
         return
     if not db_path.is_file():
+        _apply_all(db_path)
         return
     try:
         status = inspect(db_path)

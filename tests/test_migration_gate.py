@@ -311,6 +311,31 @@ def test_migration_gate_skipped_when_bypass_env_set(
     mig_mod.require_no_pending_or_exit(db_path)
 
 
+def test_refuse_start_gate_bootstraps_missing_db_fully(tmp_path: Path) -> None:
+    """Fresh startup must not leave only work migrations pending (#1142).
+
+    ``pm init`` writes config but no DB. The first bare ``pm`` reaches
+    the migration gate before Supervisor/StateStore startup. If the gate
+    simply returns, Supervisor can create a state-migrated DB without
+    opening the work service; the second ``pm`` then refuses to start on
+    pending ``[work]`` migrations.
+    """
+    db_path = tmp_path / "state.db"
+
+    mig_mod.require_no_pending_or_exit(db_path)
+
+    status = mig_mod.inspect(db_path)
+    assert status.up_to_date
+    assert (
+        status.applied[mig_mod.NAMESPACE_STATE]
+        == status.latest[mig_mod.NAMESPACE_STATE]
+    )
+    assert (
+        status.applied[mig_mod.NAMESPACE_WORK]
+        == status.latest[mig_mod.NAMESPACE_WORK]
+    )
+
+
 def test_up_enforces_migration_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

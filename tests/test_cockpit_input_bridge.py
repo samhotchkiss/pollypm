@@ -4,21 +4,24 @@ The bridge is the recovery path when the cockpit's Textual ``LinuxDriver``
 stops processing keystrokes after the tmux session loses its attached
 client. Spinning a real Textual ``App`` in a unit test is overkill — we
 substitute a tiny stub that records ``simulate_key`` invocations and
-implements ``call_from_thread`` as a synchronous dispatch.
+tracks accidental ``call_from_thread`` use.
 """
 
 from __future__ import annotations
 
+import os
+import shutil
 import socket
 import threading
 import time
+import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Callable
 
 import pytest
 
 from pollypm.cockpit_input_bridge import (
-    BridgeHandle,
     list_bridge_sockets,
     send_key,
     send_key_to_first_live,
@@ -29,21 +32,25 @@ from pollypm.cockpit_input_bridge import (
 class _FakeApp:
     """Minimal stand-in for ``textual.app.App``.
 
-    The bridge only needs ``simulate_key`` (called via ``call_from_thread``)
-    and ``call_from_thread`` itself. We make the latter synchronous so the
-    tests can assert on key arrival without sleeping for an event loop.
+    The bridge only needs ``simulate_key``. ``call_from_thread`` remains on
+    the fake so tests can assert the accept loop is not blocking on it.
     """
 
     def __init__(self) -> None:
         self.keys: list[str] = []
         self._lock = threading.Lock()
         self.raise_runtime_error = False
+        self.raise_simulate_error = False
+        self.call_from_thread_calls = 0
 
     def simulate_key(self, key: str) -> None:
+        if self.raise_simulate_error:
+            raise RuntimeError("simulate failed")
         with self._lock:
             self.keys.append(key)
 
     def call_from_thread(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        self.call_from_thread_calls += 1
         if self.raise_runtime_error:
             raise RuntimeError("App is not running")
         return fn(*args, **kwargs)
@@ -59,15 +66,20 @@ def _wait_for(predicate: Callable[[], bool], timeout: float = 2.0) -> bool:
 
 
 @pytest.fixture()
-def fake_config(tmp_path: Path) -> Path:
+def fake_config() -> Iterator[Path]:
     """A fake config_path whose ``parent`` is the test's tmp dir.
 
     The bridge drops sockets in ``config_path.parent / 'cockpit_inputs'``,
     matching how it co-locates with ``cockpit_debug.log``.
     """
-    config = tmp_path / "config.toml"
+    root = Path("/tmp") / f"pb-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    root.mkdir(parents=True, exist_ok=False)
+    config = root / "config.toml"
     config.write_text("# fake\n")
-    return config
+    try:
+        yield config
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_start_input_bridge_creates_socket(fake_config: Path) -> None:
@@ -196,20 +208,53 @@ def test_send_key_to_first_live_returns_none_when_no_bridge(fake_config: Path) -
     assert delivered is None
 
 
-def test_bridge_handles_app_runtime_error_gracefully(fake_config: Path) -> None:
-    """When the app stops mid-connection, the bridge logs and bails."""
+def test_bridge_dispatch_does_not_block_on_call_from_thread(fake_config: Path) -> None:
     app = _FakeApp()
     app.raise_runtime_error = True
     handle = start_input_bridge(app, kind="cockpit", config_path=fake_config)
     assert handle is not None
     try:
-        # Should not crash even though call_from_thread raises.
         send_key(handle.socket_path, "I")
-        # Give the listener a moment to process and bail.
-        time.sleep(0.2)
-        assert app.keys == []
+        assert _wait_for(lambda: app.keys == ["I"])
+        assert app.call_from_thread_calls == 0
     finally:
         handle.stop()
+
+
+def test_bridge_handles_simulate_key_error_gracefully(fake_config: Path) -> None:
+    app = _FakeApp()
+    app.raise_simulate_error = True
+    handle = start_input_bridge(app, kind="cockpit", config_path=fake_config)
+    assert handle is not None
+    try:
+        send_key(handle.socket_path, "I")
+        time.sleep(0.2)
+        assert app.keys == []
+        app.raise_simulate_error = False
+        send_key(handle.socket_path, "J")
+        assert _wait_for(lambda: app.keys == ["J"])
+    finally:
+        handle.stop()
+
+
+def test_send_key_to_first_live_keeps_refused_socket_when_owner_pid_alive(
+    fake_config: Path,
+) -> None:
+    bridge_dir = fake_config.parent / "cockpit_inputs"
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    refused = bridge_dir / f"cockpit-{os.getpid()}.sock"
+    stale_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale_sock.bind(str(refused))
+    stale_sock.close()
+    try:
+        delivered = send_key_to_first_live(fake_config, "I", kind="cockpit")
+        assert delivered is None
+        assert refused.exists()
+    finally:
+        try:
+            refused.unlink()
+        except OSError:
+            pass
 
 
 def test_bridge_returns_handle_with_correct_filename_pattern(fake_config: Path) -> None:

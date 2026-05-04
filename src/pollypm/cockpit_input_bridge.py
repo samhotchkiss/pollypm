@@ -24,9 +24,9 @@ at all:
    socket under ``$POLLYPM_HOME/cockpit_inputs/<pid>.sock``. A worker
    thread accepts connections and reads newline-delimited key tokens.
    Each token is dispatched via ``App.simulate_key`` (which calls
-   ``post_message`` — thread-safe per Textual's own docstring) so the
-   key reaches the focused widget exactly as if a real terminal had
-   produced it.
+   ``post_message`` — thread-safe across threads in Textual) so the key
+   reaches the focused widget exactly as if a real terminal had produced
+   it.
 
 2. Caller-side (``send_key``): a thin client connects to the most recent
    bridge socket for a given pane "kind" and writes the key token.
@@ -62,6 +62,8 @@ if TYPE_CHECKING:  # pragma: no cover - type-only
     from textual.app import App
 
 logger = logging.getLogger(__name__)
+
+_LISTEN_BACKLOG = 64
 
 # Newline-delimited key tokens. A line that is exactly ``"<bs>"`` is the
 # special ``backspace`` key, ``"<cr>"`` is ``enter``, etc. Anything else
@@ -166,6 +168,36 @@ def _socket_filename(kind: str, pid: int) -> str:
     return f"{safe_kind}-{pid}.sock"
 
 
+def _socket_owner_pid(socket_path: Path) -> int | None:
+    stem = socket_path.name.removesuffix(".sock")
+    _, separator, pid_text = stem.rpartition("-")
+    if not separator:
+        return None
+    try:
+        return int(pid_text)
+    except ValueError:
+        return None
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _socket_owner_pid_alive(socket_path: Path) -> bool:
+    pid = _socket_owner_pid(socket_path)
+    return pid is not None and _pid_is_alive(pid)
+
+
 def start_input_bridge(
     app: "App",
     *,
@@ -221,7 +253,7 @@ def start_input_bridge(
             pass
         return None
 
-    server_sock.listen(4)
+    server_sock.listen(_LISTEN_BACKLOG)
     # Short accept timeout so the listener thread can poll the stop
     # flag without blocking shutdown indefinitely.
     server_sock.settimeout(0.5)
@@ -229,10 +261,10 @@ def start_input_bridge(
     stop_flag = threading.Event()
 
     def _dispatch_key(key_token: str) -> None:
-        # Runs *on the app's thread* (we got here via call_from_thread).
-        # ``simulate_key`` is a thin wrapper around ``post_message`` and
-        # is documented as the supported "press a key as if a user did"
-        # entry point.
+        # ``simulate_key`` is a thin wrapper around ``post_message``.
+        # Textual routes cross-thread ``post_message`` calls through the
+        # app loop, so the bridge accept loop does not have to block on
+        # synchronous ``call_from_thread`` for every queued key.
         try:
             app.simulate_key(key_token)
         except Exception as exc:  # noqa: BLE001
@@ -254,16 +286,7 @@ def start_input_bridge(
                         token = _normalize_token(line)
                         if token is None:
                             continue
-                        try:
-                            app.call_from_thread(_dispatch_key, token)
-                        except RuntimeError as exc:
-                            # App has stopped — abort this connection.
-                            logger.info(
-                                "cockpit_input_bridge: app no longer running, dropping key: %s",
-                                exc,
-                            )
-                            stop_flag.set()
-                            break
+                        _dispatch_key(token)
             except (OSError, socket.timeout):
                 pass
             finally:
@@ -371,9 +394,21 @@ def send_key_to_first_live(
         try:
             send_key(candidate, key, timeout=timeout)
             return candidate
-        except (ConnectionRefusedError, FileNotFoundError) as exc:
+        except FileNotFoundError as exc:
             last_error = exc
-            # Stale socket — best-effort unlink so it stops cluttering.
+            continue
+        except ConnectionRefusedError as exc:
+            last_error = exc
+            # ECONNREFUSED can be transient if the bridge accept backlog is
+            # momentarily full. Only unlink when the PID encoded in the
+            # filename is no longer alive; otherwise a rapid key burst can
+            # delete the live cockpit's only discoverable socket.
+            if _socket_owner_pid_alive(candidate):
+                logger.info(
+                    "cockpit_input_bridge: keeping refused socket for live pid: %s",
+                    candidate,
+                )
+                continue
             try:
                 candidate.unlink()
             except OSError:

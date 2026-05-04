@@ -203,6 +203,58 @@ def test_create_window_two_phase_default_omits_command(monkeypatch) -> None:
     assert not any("send-keys" in c for c in captured)
 
 
+def test_spawn_commands_propagate_launcher_workspace_env(monkeypatch) -> None:
+    """#1143: tmux pane processes must honor the launcher's HOME/PATH.
+
+    An existing tmux server keeps its own global environment. Without
+    explicit per-spawn env, ``HOME=/tmp/isolated pm up`` can still spawn
+    cockpit panes with the server's canonical HOME.
+    """
+    captured: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        captured.append(list(args))
+
+        class Result:
+            returncode = 0
+            stdout = "%42"
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setenv("HOME", "/tmp/polly-empty-state")
+    monkeypatch.setenv("PATH", "/tmp/polly-bin:/usr/bin:/bin")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/tmp/polly-empty-state/.config")
+    monkeypatch.setenv("UNRELATED_SECRET", "do-not-forward")
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    client = TmuxClient()
+    monkeypatch.setattr(client, "has_session", lambda name: False)
+
+    client.create_session("storage", "main", "codex --resume abc")
+    client.create_window("storage", "task-foo-1", "claude --resume xyz")
+    client.split_window("pollypm:PollyPM", "pm cockpit-pane polly")
+    client.respawn_pane("%42", "pm cockpit")
+
+    spawn_calls = [
+        call
+        for call in captured
+        if len(call) > 1
+        and call[1] in {"new-session", "new-window", "split-window", "respawn-pane"}
+    ]
+    assert spawn_calls
+    for call in spawn_calls:
+        env_values = [
+            call[index + 1]
+            for index, arg in enumerate(call)
+            if arg == "-e" and index + 1 < len(call)
+        ]
+        assert "HOME=/tmp/polly-empty-state" in env_values
+        assert "PATH=/tmp/polly-bin:/usr/bin:/bin" in env_values
+        assert "XDG_CONFIG_HOME=/tmp/polly-empty-state/.config" in env_values
+        assert "UNRELATED_SECRET=do-not-forward" not in env_values
+
+
 def test_create_window_two_phase_false_inlines_command(monkeypatch) -> None:
     """The legacy single-call form is preserved behind ``two_phase=False``
     for callers that need it (none currently — but keeps the door open

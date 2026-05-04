@@ -3926,20 +3926,24 @@ class PollySettingsPaneApp(App[None]):
         padding: 1 1;
         margin-right: 1;
     }
-    /* Narrow-mode placeholder (#865). At terminal widths below ~110
-       cols, the side-by-side nav + content layout collapses into
-       letter-by-letter wrapping. Toggle this overlay so the user
-       sees a clear "needs more space" hint instead of broken
-       rendering. The overlay lives at the outer container so it can
-       cover the entire pane regardless of which inner card is in
-       focus. Toggled from PollySettingsPaneApp.on_resize. */
+    /* Narrow-mode placeholder (#865, #1104). At terminal widths
+       below ~110 cols, the side-by-side nav + content layout
+       collapses into letter-by-letter wrapping. In narrow mode we
+       hide the right-pane content and show this hint in its place,
+       while keeping the nav visible so j/k navigation through
+       section names still works. Toggled from
+       PollySettingsPaneApp.on_resize. */
     #settings-narrow-overlay {
         display: none;
+        width: 1fr;
         height: 1fr;
+        border: round #1e2730;
+        background: #0f1317;
+        padding: 1 2;
         content-align: center middle;
         color: #97a6b2;
     }
-    #settings-outer.-narrow #settings-body {
+    #settings-outer.-narrow #settings-right {
         display: none;
     }
     #settings-outer.-narrow #settings-narrow-overlay {
@@ -4128,18 +4132,19 @@ class PollySettingsPaneApp(App[None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="settings-outer"):
             yield self.topbar
-            # Narrow-mode placeholder (#865). Toggled by on_resize when
-            # the terminal is below the threshold where the side-by-side
-            # nav + content layout starts wrapping letter-by-letter.
-            yield Static(
-                "[b]Settings needs at least 110 cols of width.[/b]\n"
-                "[dim]Resize the terminal or split — current layout would\n"
-                "wrap content letter-by-letter.[/dim]",
-                id="settings-narrow-overlay",
-                markup=True,
-            )
             with Horizontal(id="settings-body"):
                 yield self.nav
+                # Narrow-mode placeholder (#865, #1104). In narrow mode
+                # the side-by-side nav + content layout would wrap
+                # content letter-by-letter, so we hide the right pane
+                # and show this hint instead. The nav stays visible so
+                # users can still navigate section names with j/k and
+                # see what settings exist.
+                yield Static(
+                    "",
+                    id="settings-narrow-overlay",
+                    markup=True,
+                )
                 with Vertical(id="settings-right"):
                     with Horizontal(id="settings-actions"):
                         yield Button(
@@ -4238,7 +4243,28 @@ class PollySettingsPaneApp(App[None]):
             width = self.size.width
         except Exception:  # noqa: BLE001
             return
-        outer.set_class(width < self._NARROW_THRESHOLD, "-narrow")
+        narrow = width < self._NARROW_THRESHOLD
+        outer.set_class(narrow, "-narrow")
+        if narrow:
+            self._render_narrow_overlay()
+
+    def _render_narrow_overlay(self) -> None:
+        try:
+            overlay = self.query_one("#settings-narrow-overlay", Static)
+        except Exception:  # noqa: BLE001
+            return
+        # Show the section under the nav cursor (not just the active
+        # one) so j/k feedback is immediate in narrow mode.
+        try:
+            cursor_key, cursor_label = _SETTINGS_SECTIONS[self._nav_cursor]
+        except IndexError:
+            cursor_key, cursor_label = _SETTINGS_SECTIONS[0]
+        overlay.update(
+            f"[b]{_escape(cursor_label)}[/b]\n\n"
+            "[dim]Narrow mode (<110 cols).[/dim]\n"
+            "[dim]Use j/k to browse section names in the nav.[/dim]\n"
+            "[dim]Press Enter to select; resize to >=110 cols for the full view.[/dim]"
+        )
 
     def on_resize(self, _event: events.Resize) -> None:  # type: ignore[override]
         self._apply_narrow_class()
@@ -4561,6 +4587,13 @@ class PollySettingsPaneApp(App[None]):
         self._render_nav()
         self._render_section(key)
         self._render_preview(key)
+        # Keep the narrow-mode overlay's section title in sync.
+        try:
+            outer = self.query_one("#settings-outer", Vertical)
+        except Exception:  # noqa: BLE001
+            outer = None
+        if outer is not None and outer.has_class("-narrow"):
+            self._render_narrow_overlay()
 
     def _render_section(self, key: str) -> None:
         self.accounts.display = key == "accounts"
@@ -5165,6 +5198,7 @@ class PollySettingsPaneApp(App[None]):
                 self._nav_cursor + 1
             ) % len(_SETTINGS_SECTIONS)
             self._render_nav()
+            self._refresh_narrow_overlay_if_active()
         else:
             table = self._active_table()
             if table is not None and table.row_count:
@@ -5178,12 +5212,21 @@ class PollySettingsPaneApp(App[None]):
                 self._nav_cursor - 1
             ) % len(_SETTINGS_SECTIONS)
             self._render_nav()
+            self._refresh_narrow_overlay_if_active()
         else:
             table = self._active_table()
             if table is not None and table.row_count:
                 new = max(table.cursor_row - 1, 0)
                 table.move_cursor(row=new)
                 self._sync_selection()
+
+    def _refresh_narrow_overlay_if_active(self) -> None:
+        try:
+            outer = self.query_one("#settings-outer", Vertical)
+        except Exception:  # noqa: BLE001
+            return
+        if outer.has_class("-narrow"):
+            self._render_narrow_overlay()
 
     def action_section_next(self) -> None:
         idx = next(

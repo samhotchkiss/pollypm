@@ -1240,6 +1240,17 @@ class PollyCockpitApp(App[None]):
         self.set_interval(0.8, self._tick)
         self.set_interval(self.SCHEDULER_POLL_INTERVAL_SECONDS, self._tick_scheduler)
         self.nav.focus()
+        # #1109 follow-up — open the TTY-less keystroke bridge so
+        # automation (and `pm cockpit-send-key`) can drive the cockpit
+        # even when no tmux client is attached. Best-effort; never
+        # blocks boot.
+        try:
+            from pollypm.cockpit_input_bridge import start_input_bridge
+            self._input_bridge_handle = start_input_bridge(
+                self, kind="cockpit", config_path=self.config_path,
+            )
+        except Exception:  # noqa: BLE001
+            self._input_bridge_handle = None
         # Textual's first render after mount reflows panes and can stretch the
         # rail past the persisted width. Re-enforce the rail width on a short
         # one-shot timer (no split — pure resize, SIGWINCH-safe), instead of
@@ -2749,6 +2760,15 @@ class PollyCockpitApp(App[None]):
 
     def on_unmount(self) -> None:
         """Clean up resources on exit — close store, release leases."""
+        # Tear down the keystroke bridge first so its accept loop stops
+        # touching ``app.call_from_thread`` while the event loop is
+        # winding down.
+        bridge = getattr(self, "_input_bridge_handle", None)
+        if bridge is not None:
+            try:
+                bridge.stop()
+            except Exception:  # noqa: BLE001
+                pass
         try:
             sup = self.router._supervisor
             if sup is not None:
@@ -2876,6 +2896,23 @@ class PollyDashboardApp(App[None]):
     def on_mount(self) -> None:
         self._refresh()
         self.set_interval(10, self._refresh)
+        # #1109 follow-up — TTY-less keystroke bridge. See
+        # ``cockpit_input_bridge`` module docstring for rationale.
+        try:
+            from pollypm.cockpit_input_bridge import start_input_bridge
+            self._input_bridge_handle = start_input_bridge(
+                self, kind="dashboard", config_path=self.config_path,
+            )
+        except Exception:  # noqa: BLE001
+            self._input_bridge_handle = None
+
+    def on_unmount(self) -> None:
+        bridge = getattr(self, "_input_bridge_handle", None)
+        if bridge is not None:
+            try:
+                bridge.stop()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _age_str(self, seconds: float) -> str:
         if seconds < 60:
@@ -3213,6 +3250,23 @@ class PollyCockpitPaneApp(App[None]):
     def on_mount(self) -> None:
         self._refresh()
         self.set_interval(5, self._refresh)
+        # #1109 follow-up — TTY-less keystroke bridge.
+        try:
+            from pollypm.cockpit_input_bridge import start_input_bridge
+            bridge_kind = f"pane-{self.kind}"
+            self._input_bridge_handle = start_input_bridge(
+                self, kind=bridge_kind, config_path=self.config_path,
+            )
+        except Exception:  # noqa: BLE001
+            self._input_bridge_handle = None
+
+    def on_unmount(self) -> None:
+        bridge = getattr(self, "_input_bridge_handle", None)
+        if bridge is not None:
+            try:
+                bridge.stop()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _refresh(self) -> None:
         self.body.update(build_cockpit_detail(self.config_path, self.kind, self.target))

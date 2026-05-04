@@ -248,3 +248,50 @@ def register_ui_commands(app: typer.Typer) -> None:
         from pollypm.cockpit_ui import PollyCockpitPaneApp
 
         PollyCockpitPaneApp(config_path, kind, target).run(mouse=True)
+
+    @app.command(
+        "cockpit-send-key",
+        help=(
+            "Send a keystroke to the running cockpit via its TTY-less "
+            "input bridge (#1109 follow-up). Works even when no tmux "
+            "client is attached. Pass single chars (`I`, `j`) or "
+            "tokens (`<bs>`, `<cr>`, `<esc>`, `<tab>`, `<space>`, "
+            "`<up>`, `<down>`, `<left>`, `<right>`, `<pgup>`, `<pgdn>`,"
+            " `<home>`, `<end>`)."
+        ),
+    )
+    def cockpit_send_key(
+        key: str = typer.Argument(
+            ...,
+            help=(
+                "Keystroke token. Single chars (`I`) pass through; "
+                "use `<bs>` etc. for special keys. Modifiers like "
+                "`ctrl+x` are forwarded verbatim to Textual."
+            ),
+        ),
+        config_path: Path = typer.Option(
+            DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."
+        ),
+        kind: str | None = typer.Option(
+            None,
+            "--kind",
+            "-k",
+            help=(
+                "Restrict delivery to a specific cockpit surface "
+                "(`cockpit`, `dashboard`, `pane-inbox`, …). Omit to "
+                "target the most recently bound bridge socket."
+            ),
+        ),
+    ) -> None:
+        from pollypm.cockpit_input_bridge import send_key_to_first_live
+
+        delivered_to = send_key_to_first_live(config_path, key, kind=kind)
+        if delivered_to is None:
+            typer.echo(
+                "No live cockpit input bridge found. Either no cockpit "
+                "is running, or it predates the #1109 follow-up "
+                "(restart the cockpit to pick up the bridge).",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        typer.echo(f"Delivered {key!r} via {delivered_to}")

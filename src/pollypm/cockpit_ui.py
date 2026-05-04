@@ -8685,12 +8685,56 @@ class PollyInboxApp(App[None]):
                 self.notify, f"Jump to PM failed: {exc}", severity="error",
             )
             return
+        # #1102 \u2014 once the right pane is "borrowed" by the PM session,
+        # tmux focus moves there and the user's keystrokes land in the
+        # PM's CLI (typically Codex). ``Esc``/``q``/``Backspace`` all
+        # become input characters; the user gets stranded with no
+        # visible path back to the inbox to press ``A``. Surface a
+        # tmux-level ``display-message`` (visible regardless of which
+        # pane has focus) advertising the route home, and extend the
+        # Textual toast for users glancing at the rail.
+        self._surface_back_to_inbox_hint()
         self.call_from_thread(
             self.notify,
-            f"Jumped to {pm_label} \u2014 finish your message and hit Enter.",
+            (
+                f"Jumped to {pm_label} \u2014 finish your message and hit Enter. "
+                f"Ctrl-b \u2190 then I returns to inbox."
+            ),
             severity="information",
-            timeout=3.0,
+            timeout=5.0,
         )
+
+    def _surface_back_to_inbox_hint(self) -> None:
+        """Fire a tmux ``display-message`` after a discuss-jump (#1102).
+
+        Inputs: none (reads ``self.config_path``).
+        Outputs: ``None``.
+        Side effects: best-effort ``tmux display-message`` against the
+        cockpit window. Renders in tmux's status line so the user sees
+        the back-keystroke even when their tmux focus has been moved
+        into the PM's pane (Codex captures bytes otherwise).
+        Invariants: never raises (callers wrap in try if they care);
+        no-op when the cockpit window can't be resolved.
+        """
+        try:
+            router = CockpitRouter(self.config_path)
+            supervisor = router._load_supervisor()
+            window_target = (
+                f"{supervisor.config.project.tmux_session}:"
+                f"{router._COCKPIT_WINDOW}"
+            )
+            router.tmux.run(
+                "display-message",
+                "-t",
+                window_target,
+                (
+                    "PollyPM: Ctrl-b \u2190 then I returns to inbox. "
+                    "Ctrl-b Left returns to the rail."
+                ),
+                check=False,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _dispatch_to_worker_sync(
         self, worker_name: str, context_line: str,

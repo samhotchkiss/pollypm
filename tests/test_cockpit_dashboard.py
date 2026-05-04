@@ -7,11 +7,14 @@ from types import SimpleNamespace
 
 from pollypm.cockpit import _build_cockpit_detail_dispatch
 from pollypm.cockpit_sections.dashboard import (
+    DashboardAccountUsage,
     DashboardBriefingBanner,
     _briefing_banner,
+    _build_account_usage_rows,
     _build_dashboard,
     _build_token_gauge,
     _rank_dashboard_suggestions,
+    _render_account_usage_lines,
     _render_token_gauge,
     _shipper_streaks,
 )
@@ -111,8 +114,12 @@ def _make_config(tmp_path: Path):
             "docs": _FakeProject(tmp_path / "docs", "Docs"),
         },
         accounts={
-            "claude_main": SimpleNamespace(provider="claude"),
-            "codex_main": SimpleNamespace(provider="codex"),
+            "claude_main": SimpleNamespace(
+                provider="claude", email="claude@swh.me",
+            ),
+            "codex_main": SimpleNamespace(
+                provider="codex", email="",
+            ),
         },
     )
 
@@ -301,6 +308,154 @@ def test_build_token_gauge_picks_hottest_account_and_estimates_eta(tmp_path: Pat
     assert "left @" in rendered
 
 
+def test_build_account_usage_rows_one_row_per_account_with_severity(
+    tmp_path: Path,
+) -> None:
+    """#1093: per-account quota rows with threshold severity."""
+    config = _make_config(tmp_path)
+    store = _FakeStore(
+        account_usage={
+            "claude_main": AccountUsageRecord(
+                account_name="claude_main",
+                provider="claude",
+                plan="max",
+                health="near-limit",
+                usage_summary="21% left this week",
+                raw_text="",
+                updated_at="2026-04-21T14:10:00+00:00",
+                used_pct=79,
+                remaining_pct=21,
+                reset_at="Apr 24 01:00",
+                period_label="current week",
+            ),
+            "codex_main": AccountUsageRecord(
+                account_name="codex_main",
+                provider="codex",
+                plan="default",
+                health="healthy",
+                usage_summary="",
+                raw_text="",
+                updated_at="2026-04-21T14:10:00+00:00",
+                used_pct=None,
+                remaining_pct=None,
+                reset_at=None,
+                period_label=None,
+            ),
+        },
+    )
+    supervisor = SimpleNamespace(store=store)
+
+    rows = _build_account_usage_rows(supervisor, config, now=NOW)
+
+    assert [row.account_name for row in rows] == ["claude_main", "codex_main"]
+    claude_row = rows[0]
+    assert claude_row.provider == "Anthropic"
+    assert claude_row.email == "claude@swh.me"
+    assert claude_row.used_pct == 79
+    assert claude_row.severity == "ok"  # 79 < 80
+    codex_row = rows[1]
+    assert codex_row.provider == "OpenAI"
+    assert codex_row.used_pct is None
+    assert codex_row.severity == "unknown"
+
+
+def test_build_account_usage_rows_dedupes_by_email(tmp_path: Path) -> None:
+    """Two PollyPM accounts pointing at the same Anthropic identity
+    collapse to a single row — quota is shared at the account level
+    (Sam's #1093 scope refinement).
+    """
+    config = _make_config(tmp_path)
+    config.accounts = {
+        "polly_claude": SimpleNamespace(
+            provider="claude", email="claude@swh.me",
+        ),
+        "reviewer_claude": SimpleNamespace(
+            provider="claude", email="claude@swh.me",
+        ),
+    }
+    store = _FakeStore(
+        account_usage={
+            "polly_claude": AccountUsageRecord(
+                account_name="polly_claude",
+                provider="claude",
+                plan="max",
+                health="near-limit",
+                usage_summary="",
+                raw_text="",
+                updated_at="2026-04-21T14:10:00+00:00",
+                used_pct=82,
+                remaining_pct=18,
+                reset_at="Apr 24 01:00",
+                period_label="current week",
+            ),
+        },
+    )
+    supervisor = SimpleNamespace(store=store)
+
+    rows = _build_account_usage_rows(supervisor, config, now=NOW)
+
+    assert len(rows) == 1
+    assert rows[0].account_name == "polly_claude"
+    assert rows[0].used_pct == 82
+    assert rows[0].severity == "warning"  # 80 <= 82 < 95
+
+
+def test_render_account_usage_lines_uses_threshold_markers() -> None:
+    """◆ at 80%+, ▲ at 95%+, · otherwise (#1093)."""
+    rows = [
+        DashboardAccountUsage(
+            account_name="claude_main",
+            provider="Anthropic",
+            email="claude@swh.me",
+            used_pct=97,
+            summary="97% of weekly limit",
+            severity="critical",
+            reset_at="Apr 24 01:00",
+        ),
+        DashboardAccountUsage(
+            account_name="claude_alt",
+            provider="Anthropic",
+            email="alt@swh.me",
+            used_pct=82,
+            summary="82% of weekly limit",
+            severity="warning",
+            reset_at="Apr 24 01:00",
+        ),
+        DashboardAccountUsage(
+            account_name="claude_low",
+            provider="Anthropic",
+            email="low@swh.me",
+            used_pct=12,
+            summary="12% of weekly limit",
+            severity="ok",
+        ),
+        DashboardAccountUsage(
+            account_name="codex_main",
+            provider="OpenAI",
+            email="",
+            used_pct=None,
+            summary="no signal yet",
+            severity="unknown",
+        ),
+    ]
+
+    rendered = "\n".join(_render_account_usage_lines(rows))
+
+    assert "Accounts" in rendered
+    assert "▲ Anthropic (claude@swh.me)" in rendered
+    assert "97% of weekly limit" in rendered
+    assert "over weekly limit" in rendered
+    assert "◆ Anthropic (alt@swh.me)" in rendered
+    assert "approaching ceiling" in rendered
+    assert "· Anthropic (low@swh.me)" in rendered
+    assert "? OpenAI" in rendered  # unknown signal marker
+    assert "no signal yet" in rendered
+
+
+def test_render_account_usage_lines_empty_when_no_accounts() -> None:
+    assert _render_account_usage_lines([]) == []
+
+
 def test_briefing_banner_does_not_fire_briefing_during_render(
     tmp_path: Path,
 ) -> None:
@@ -461,6 +616,15 @@ def test_build_dashboard_renders_new_header_and_suggestions(
     assert "Morning briefing available" in output
     assert "What's next?" in output
     assert "Approve demo/5" in output
+
+    # #1093: per-account quota surface — Accounts section is rendered
+    # near the top and shows one row per LLM account regardless of
+    # how many sessions share the account.
+    assert "Accounts" in output
+    assert "Anthropic (claude@swh.me)" in output
+    # claude_main usage is 84% → ◆ warning marker + approaching-ceiling tag.
+    assert "◆" in output
+    assert "approaching ceiling" in output
 
     # Cycle 132: ``review`` count appears once on the attention bar
     # ("◉ N awaiting review") and must NOT also appear on the

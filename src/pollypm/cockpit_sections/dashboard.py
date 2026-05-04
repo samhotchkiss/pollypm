@@ -47,6 +47,28 @@ class DashboardTokenGauge:
 
 
 @dataclass(slots=True)
+class DashboardAccountUsage:
+    """One row in the Home dashboard's "Accounts" section (#1093).
+
+    Sibling to :class:`DashboardTokenGauge` but represents the
+    *per-account* surface — one row per LLM account, regardless of
+    how many sessions share the account. Quota is account-level
+    (Sam's scope refinement on #1093): multiple Claude Code sessions
+    on the same Anthropic Max account share a single weekly bucket,
+    so the dashboard shows one row per account, not per session.
+    """
+
+    account_name: str
+    provider: str
+    email: str
+    used_pct: int | None
+    summary: str
+    severity: str  # "ok" / "warning" / "critical" / "unknown"
+    reset_at: str = ""
+    health: str = ""
+
+
+@dataclass(slots=True)
 class DashboardBriefingBanner:
     text: str
     date_local: str = ""
@@ -325,6 +347,157 @@ def _render_token_gauge(gauge: DashboardTokenGauge) -> str:
     return line
 
 
+def _account_severity(used_pct: int | None) -> str:
+    """Bucket used_pct into ok / warning / critical / unknown (#1093)."""
+    if used_pct is None:
+        return "unknown"
+    if used_pct >= 95:
+        return "critical"
+    if used_pct >= 80:
+        return "warning"
+    return "ok"
+
+
+def _account_marker(severity: str) -> str:
+    """Threshold marker per #1093 spec: ▲ at 95%+, ◆ at 80%+, · otherwise."""
+    if severity == "critical":
+        return "▲"  # ▲
+    if severity == "warning":
+        return "◆"  # ◆
+    if severity == "unknown":
+        return "?"
+    return "·"  # ·
+
+
+def _provider_label(provider: object) -> str:
+    raw = getattr(provider, "value", provider)
+    text = str(raw or "").strip().lower()
+    if text in {"claude", "anthropic"}:
+        return "Anthropic"
+    if text == "codex":
+        return "OpenAI"
+    if not text:
+        return ""
+    return text.capitalize()
+
+
+def _build_account_usage_rows(
+    supervisor, config, *, now: datetime,
+) -> list[DashboardAccountUsage]:
+    """Return one :class:`DashboardAccountUsage` per configured account.
+
+    Reads cached rows from ``account_usage`` (populated by the
+    ``account.usage_refresh`` recurring sweep in
+    :mod:`pollypm.account_usage_sampler`). Accounts with no cached row
+    yet still surface — with ``used_pct=None`` and a "no signal"
+    summary — so the user knows the account exists and the probe
+    hasn't reported yet.
+
+    De-dupes by email so multiple PollyPM accounts pointing at the
+    same Anthropic identity collapse to a single row (Sam's scope
+    refinement on #1093: quota is account-level, not session-level
+    or per-PollyPM-account-config).
+    """
+    del now  # reserved for future "stale signal" badge
+    accounts = getattr(config, "accounts", None) or {}
+    if not accounts:
+        return []
+
+    rows: list[DashboardAccountUsage] = []
+    seen_emails: set[str] = set()
+    for account_name, account in accounts.items():
+        email = (getattr(account, "email", None) or "").strip()
+        # Dedup by email when present — same Anthropic identity used
+        # by Polly + reviewer-* PollyPM accounts shares one weekly
+        # quota, so we only show it once.
+        if email:
+            if email in seen_emails:
+                continue
+            seen_emails.add(email)
+
+        try:
+            usage = supervisor.store.get_account_usage(account_name)
+        except Exception:  # noqa: BLE001
+            usage = None
+
+        provider_value = _enum_value(getattr(account, "provider", "")) or (
+            getattr(usage, "provider", "") if usage is not None else ""
+        )
+        provider_label = _provider_label(provider_value)
+
+        if usage is None:
+            rows.append(
+                DashboardAccountUsage(
+                    account_name=account_name,
+                    provider=provider_label,
+                    email=email,
+                    used_pct=None,
+                    summary="no signal yet",
+                    severity="unknown",
+                    health="unknown",
+                )
+            )
+            continue
+
+        used_pct = usage.used_pct
+        severity = _account_severity(used_pct)
+        if used_pct is not None:
+            summary = f"{used_pct}% of weekly limit"
+        else:
+            summary = str(getattr(usage, "usage_summary", "") or "no signal yet")
+        rows.append(
+            DashboardAccountUsage(
+                account_name=account_name,
+                provider=provider_label,
+                email=email,
+                used_pct=used_pct,
+                summary=summary,
+                severity=severity,
+                reset_at=str(getattr(usage, "reset_at", "") or ""),
+                health=str(getattr(usage, "health", "") or ""),
+            )
+        )
+
+    rows.sort(
+        key=lambda row: (
+            -(row.used_pct if row.used_pct is not None else -1),
+            row.provider.lower(),
+            row.account_name,
+        )
+    )
+    return rows
+
+
+def _render_account_usage_lines(rows: list[DashboardAccountUsage]) -> list[str]:
+    """Render the "Accounts" section block.
+
+    Layout (#1093, per Sam's scope refinement):
+
+        ─ Accounts ──────────────────────────────────────────────
+          ◆ Anthropic (claude@swh.me)  79% of weekly limit · approaching ceiling
+          · OpenAI                       no signal yet
+    """
+    if not rows:
+        return []
+    lines = [_dashboard_divider("Accounts"), ""]
+    for row in rows:
+        marker = _account_marker(row.severity)
+        if row.email:
+            label = f"{row.provider or '?'} ({row.email})"
+        else:
+            label = row.provider or row.account_name
+        line = f"  {marker} {label}  {row.summary}"
+        if row.severity == "critical":
+            line += " ▲ over weekly limit"
+        elif row.severity == "warning":
+            line += " ◆ approaching ceiling"
+        if row.reset_at and row.severity in {"warning", "critical"}:
+            line += f" · resets {row.reset_at}"
+        lines.append(line)
+    lines.append("")
+    return lines
+
+
 def _recent_briefing_entry(base_dir: Path, *, now: datetime, status: str):
     from pollypm.plugins_builtin.morning_briefing.inbox import list_briefings
 
@@ -525,6 +698,7 @@ def _build_dashboard(supervisor, config, config_path: Path | None = None) -> str
     streaks = _shipper_streaks(all_tasks, now=now)
     streak_header = _render_streak_header(streaks)
     token_gauge = _build_token_gauge(supervisor, config, now=now)
+    account_rows = _build_account_usage_rows(supervisor, config, now=now)
     briefing_banner = _briefing_banner(config, config_path=config_path, now=now)
     suggestions = _rank_dashboard_suggestions(
         review_tasks=all_review,
@@ -544,6 +718,14 @@ def _build_dashboard(supervisor, config, config_path: Path | None = None) -> str
     if briefing_banner is not None:
         lines.append(f"  ☀ {briefing_banner.text}")
     lines.append("")
+
+    # #1093: per-account quota surface. Quota is account-level
+    # (multiple Claude Code sessions on the same Anthropic Max
+    # account share one weekly bucket), so this is one row per
+    # account. The single ``Token burn:`` line above shows the
+    # hottest account; this section shows them all so a 79% → 100%
+    # slide on a non-hottest account is still visible.
+    lines.extend(_render_account_usage_lines(account_rows))
 
     attention: list[str] = []
     if all_review:

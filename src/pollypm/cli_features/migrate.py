@@ -110,7 +110,10 @@ def register_migrate_commands(app: typer.Typer) -> None:
 def _run_check(db_path: Path) -> None:
     from pollypm.store import migrations as _migrations
 
-    status = _migrations.inspect(db_path)
+    try:
+        status = _migrations.inspect(db_path)
+    except _migrations.UnusableDatabaseError as exc:
+        _migrations.exit_unusable_database(exc)
     if status.up_to_date:
         typer.echo(f"All migrations up to date ({db_path}).")
         raise typer.Exit(code=0)
@@ -227,7 +230,10 @@ def _run_apply(db_path: Path, *, force: bool = False) -> None:
         if live:
             _refuse_live_processes(live)
 
-    outcome = _migrations.apply(db_path)
+    try:
+        outcome = _migrations.apply(db_path)
+    except _migrations.UnusableDatabaseError as exc:
+        _migrations.exit_unusable_database(exc)
     if outcome.already_up_to_date:
         typer.echo("All migrations up to date.")
     else:

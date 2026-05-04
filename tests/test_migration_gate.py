@@ -76,6 +76,11 @@ def _write_minimal_config(tmp_path: Path) -> Path:
     return config_path
 
 
+def _write_corrupt_db(path: Path) -> Path:
+    path.write_text("garbage", encoding="utf-8")
+    return path
+
+
 # ---------------------------------------------------------------------------
 # --check / --apply
 # ---------------------------------------------------------------------------
@@ -205,6 +210,16 @@ def test_synthetic_failing_migration_caught_by_check(
     assert version == expected
 
 
+def test_inspect_rejects_corrupt_state_db(tmp_path: Path) -> None:
+    db_path = _write_corrupt_db(tmp_path / "state.db")
+
+    with pytest.raises(mig_mod.UnusableDatabaseError) as exc:
+        mig_mod.inspect(db_path)
+
+    assert exc.value.db_path == db_path
+    assert "not a database" in exc.value.detail
+
+
 # ---------------------------------------------------------------------------
 # Refuse-start gate
 # ---------------------------------------------------------------------------
@@ -261,6 +276,24 @@ def test_cockpit_refuses_start_on_pending_migration(
     with pytest.raises(SystemExit) as exc:
         mig_mod.require_no_pending_or_exit(db_path)
     assert exc.value.code != 0
+
+
+def test_refuse_start_reports_corrupt_db_without_migration_advice(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    db_path = _write_corrupt_db(tmp_path / "state.db")
+
+    with pytest.raises(SystemExit) as exc:
+        mig_mod.require_no_pending_or_exit(db_path)
+
+    captured = capsys.readouterr()
+    assert exc.value.code == 2
+    assert "Cannot use state.db" in captured.err
+    assert "not a valid SQLite database" in captured.err
+    assert "pm doctor" in captured.err
+    assert "pm restore" in captured.err
+    assert "Cannot start" not in captured.err
+    assert "Apply (recommended)" not in captured.err
 
 
 def test_migration_gate_skipped_when_bypass_env_set(
@@ -332,6 +365,55 @@ def test_cli_migrate_check_outputs_up_to_date(tmp_path: Path) -> None:
     assert "up to date" in result.stdout.lower()
 
 
+def test_cli_migrate_check_reports_corrupt_db_without_traceback(tmp_path: Path) -> None:
+    config_path = _write_minimal_config(tmp_path)
+    _write_corrupt_db(tmp_path / "state.db")
+
+    app = _build_cli_app()
+    result = runner.invoke(app, ["--check", "--config", str(config_path)])
+
+    combined = result.stdout + "\n" + (result.stderr or "")
+    assert result.exit_code == 2, result.output
+    assert "Cannot use state.db" in combined
+    assert "not a valid SQLite database" in combined
+    assert "pm doctor" in combined
+    assert "Traceback" not in combined
+
+
+def test_cli_migrate_apply_reports_corrupt_db_without_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pollypm.cli_features import migrate as _migrate_mod
+
+    monkeypatch.setattr(_migrate_mod, "_live_pollypm_processes", lambda: [])
+    config_path = _write_minimal_config(tmp_path)
+    _write_corrupt_db(tmp_path / "state.db")
+
+    app = _build_cli_app()
+    result = runner.invoke(app, ["--apply", "--config", str(config_path)])
+
+    combined = result.stdout + "\n" + (result.stderr or "")
+    assert result.exit_code == 2, result.output
+    assert "Cannot use state.db" in combined
+    assert "pm migrate --apply" not in combined
+    assert "Traceback" not in combined
+
+
+def test_cli_status_reports_corrupt_db_without_traceback(tmp_path: Path) -> None:
+    from pollypm import cli as _cli
+
+    config_path = _write_minimal_config(tmp_path)
+    _write_corrupt_db(tmp_path / "state.db")
+
+    result = runner.invoke(_cli.app, ["status", "--config", str(config_path)])
+
+    combined = result.stdout + "\n" + (result.stderr or "")
+    assert result.exit_code == 2, result.output
+    assert "Cannot use state.db" in combined
+    assert "pm doctor" in combined
+    assert "Traceback" not in combined
+
+
 def test_cli_migrate_check_renders_failure_in_structured_shape(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -380,6 +462,9 @@ def test_cli_migrate_check_renders_failure_in_structured_shape(
 def test_cli_migrate_apply_reports_applied(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from pollypm.cli_features import migrate as _migrate_mod
+
+    monkeypatch.setattr(_migrate_mod, "_live_pollypm_processes", lambda: [])
     # No fresh DB this time — let --apply bootstrap it so the CLI prints
     # a non-empty "applied" list.
     config_path = _write_minimal_config(tmp_path)

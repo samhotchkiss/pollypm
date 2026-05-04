@@ -247,6 +247,7 @@ def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
     ) -> None:
         if not helpers._config_option_was_explicit():
             config_path = helpers._discover_config_path(config_path)
+        helpers._enforce_migration_gate(config_path)
         from pollypm.service_api import PollyPMService
 
         payload = PollyPMService(config_path).session_status(session_name)

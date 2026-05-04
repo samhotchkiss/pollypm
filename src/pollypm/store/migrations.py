@@ -45,6 +45,15 @@ NAMESPACE_STATE = "state"
 NAMESPACE_WORK = "work"
 
 
+class UnusableDatabaseError(RuntimeError):
+    """Raised when ``state.db`` exists but cannot be read as SQLite."""
+
+    def __init__(self, db_path: Path, detail: str) -> None:
+        self.db_path = db_path
+        self.detail = detail
+        super().__init__(f"{db_path}: {detail}")
+
+
 @dataclass(frozen=True)
 class PendingMigration:
     """One migration that has not yet been applied to a target DB."""
@@ -121,6 +130,27 @@ def _readonly_connect(db_path: Path) -> sqlite3.Connection | None:
         return None
 
 
+def _looks_like_unusable_database_error(exc: sqlite3.Error) -> bool:
+    detail = str(exc).lower()
+    return (
+        "file is not a database" in detail
+        or "database disk image is malformed" in detail
+        or "file is encrypted or is not a database" in detail
+    )
+
+
+def _ensure_readable_sqlite(conn: sqlite3.Connection, db_path: Path) -> None:
+    """Fail fast when an existing file is not a usable SQLite database."""
+    try:
+        row = conn.execute("PRAGMA quick_check").fetchone()
+    except sqlite3.Error as exc:
+        if _looks_like_unusable_database_error(exc):
+            raise UnusableDatabaseError(db_path, str(exc)) from exc
+        return
+    if row and str(row[0]).lower() != "ok":
+        raise UnusableDatabaseError(db_path, str(row[0]))
+
+
 def _applied_version(conn: sqlite3.Connection, table: str) -> int:
     """Return ``MAX(version)`` from a schema-tracking table, 0 if missing."""
     try:
@@ -163,6 +193,7 @@ def inspect(db_path: Path) -> MigrationStatus:
         )
 
     try:
+        _ensure_readable_sqlite(conn, db_path)
         applied = {
             NAMESPACE_STATE: _applied_version(conn, "schema_version"),
             NAMESPACE_WORK: _applied_version(conn, "work_schema_version"),
@@ -372,6 +403,45 @@ def format_pending_summary(status: MigrationStatus) -> str:
     return "\n".join(lines)
 
 
+def format_unusable_database_message(error: UnusableDatabaseError) -> str:
+    """Render a friendly corruption/recovery message for CLI surfaces."""
+    from pollypm.structured_message import StructuredUserMessage
+
+    details = "\n".join([
+        f"DB: {error.db_path}",
+        f"SQLite error: {error.detail}",
+    ])
+    msg = StructuredUserMessage(
+        summary="Cannot use state.db — the file is not a valid SQLite database.",
+        why=(
+            "PollyPM could not read its central store. This is data-store "
+            "corruption, not a pending schema migration, so `pm migrate` "
+            "cannot repair it."
+        ),
+        next_action=(
+            "Run `pm doctor` to confirm the failure, then restore from a "
+            "recent backup with `pm restore <snapshot> --confirm` or move "
+            "the corrupt state.db aside before reinitializing."
+        ),
+        suggested_actions=(
+            ("Diagnose", "pm doctor"),
+            ("List backups", "ls ~/.pollypm/backups"),
+            (
+                "Restore backup",
+                "pm restore ~/.pollypm/backups/<snapshot>.db.gz --confirm",
+            ),
+        ),
+        details=details,
+    )
+    return msg.render_cli(show_details=True)
+
+
+def exit_unusable_database(error: UnusableDatabaseError, *, code: int = 2) -> None:
+    """Print the corruption message and exit with a non-zero CLI code."""
+    sys.stderr.write(format_unusable_database_message(error) + "\n")
+    raise SystemExit(code)
+
+
 # ---------------------------------------------------------------------------
 # Refuse-start gate
 # ---------------------------------------------------------------------------
@@ -456,7 +526,10 @@ def require_no_pending_or_exit(db_path: Path) -> None:
         return
     if not db_path.is_file():
         return
-    status = inspect(db_path)
+    try:
+        status = inspect(db_path)
+    except UnusableDatabaseError as exc:
+        exit_unusable_database(exc)
     if status.up_to_date:
         return
     sys.stderr.write(_format_refuse_start_message(status) + "\n")

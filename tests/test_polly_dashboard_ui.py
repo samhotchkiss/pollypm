@@ -131,7 +131,10 @@ def test_polly_dashboard_renders_recent_messages(monkeypatch, tmp_path: Path) ->
     rendered = str(app.messages_body.render())
     assert "polly" in rendered
     assert "Feedback on shortlink_gen/5" in rendered
-    assert "Press i to jump to the inbox" in rendered
+    # #1100 — Home advertises capital ``I`` because lowercase ``i`` from
+    # the rail is the project-surface-only forward binding (#1089) and a
+    # no-op on Home; only ``I`` actually opens the global inbox here.
+    assert "Press I to jump to the inbox" in rendered
 
 
 def test_polly_dashboard_shows_inbox_count_without_recent_messages(tmp_path: Path) -> None:
@@ -144,7 +147,9 @@ def test_polly_dashboard_shows_inbox_count_without_recent_messages(tmp_path: Pat
     rendered = str(app.messages_body.render())
     assert "Inbox is clear" not in rendered
     assert "13 items in the inbox" in rendered
-    assert "Press i to jump to the inbox" in rendered
+    # #1100 — Home dashboard hint advertises capital ``I`` (see sister
+    # test for full rationale).
+    assert "Press I to jump to the inbox" in rendered
 
 
 def test_dashboard_gather_uses_rail_inbox_counter(monkeypatch, tmp_path: Path) -> None:

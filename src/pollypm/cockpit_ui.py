@@ -3002,7 +3002,12 @@ class PollyDashboardApp(App[None]):
                 )
                 message_lines.append(f"  [dim]{meta}[/dim]")
                 message_lines.append("")
-            message_lines.append("[dim]Press [b]i[/b] to jump to the inbox[/dim]")
+            # #1100 — capital ``I`` matches the post-#1089 global Inbox
+            # binding. Lowercase ``i`` is a no-op from the Home rail
+            # because the rail's ``i`` is the (project-surface-only)
+            # ``forward_project_jump_inbox`` priority binding; advertising
+            # it here misled users into thinking the cockpit was stuck.
+            message_lines.append("[dim]Press [b]I[/b] to jump to the inbox[/dim]")
         elif data.inbox_count:
             # ``recent_messages`` filters to tracked projects only,
             # but ``inbox_count`` (and the rail's Inbox badge) cover
@@ -3015,7 +3020,9 @@ class PollyDashboardApp(App[None]):
                 f"[dim]No recent messages from tracked projects "
                 f"· [b]{count}[/b] {noun} in the inbox[/dim]"
             )
-            message_lines.append("[dim]Press [b]i[/b] to jump to the inbox[/dim]")
+            # #1100 — see sibling comment above; capital ``I`` is the
+            # actual Home-reachable Inbox keystroke post-#1089.
+            message_lines.append("[dim]Press [b]I[/b] to jump to the inbox[/dim]")
         else:
             message_lines.append("[dim]Inbox is clear.[/dim]")
         self.messages_body.update("\n".join(message_lines))

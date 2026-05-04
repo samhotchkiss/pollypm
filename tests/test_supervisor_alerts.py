@@ -833,6 +833,87 @@ def test_claude_empty_prompt_pane_classifies_as_legitimate_idle() -> None:
     assert classify_stall(ctx) == "legitimate_idle"
 
 
+def test_no_tasks_available_pane_classifies_as_idle_placeholder() -> None:
+    """A worker pane whose most recent reply is ``No tasks available.`` is
+    an alive-but-idle worker — it ran ``pm task next``, got the canonical
+    no-work response, and is correctly waiting for the queue.
+
+    Without this short-circuit the recovery classifier treats the worker
+    as ``SILENT_WORKER`` (last_event_seconds_ago > 30min, no claim),
+    fires ``prompt_pm_task_next`` every cycle, and escalates to
+    ``alert`` after 3 cycles even though the worker is responding
+    correctly (#1084).
+    """
+    from pollypm.idle_placeholders import (
+        pane_is_idle_placeholder,
+        pane_shows_no_tasks_available,
+    )
+
+    pane_text = "\n".join([
+        "› H: pm task next",
+        "• Ran pm task next",
+        "  └ No tasks available.",
+        "",
+        "──────────────────────────────────────────────────────",
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+    ])
+
+    assert pane_shows_no_tasks_available(pane_text) is True
+    assert pane_is_idle_placeholder(pane_text) is True
+
+
+def test_no_tasks_available_does_not_match_when_followed_by_real_output() -> None:
+    """The detector walks from the tail and only fires when the most
+    recent informative line is ``No tasks available.``. A worker that
+    received the no-work reply and then started doing other work (so the
+    last line is real assistant output) must not be treated as idle.
+    """
+    from pollypm.idle_placeholders import pane_shows_no_tasks_available
+
+    pane_text = "\n".join([
+        "• Ran pm task next",
+        "  └ No tasks available.",
+        "• Picked up follow-up task work — running migrations now.",
+    ])
+
+    assert pane_shows_no_tasks_available(pane_text) is False
+
+
+def test_default_recovery_policy_classifies_no_tasks_pane_as_healthy() -> None:
+    """End-to-end #1084 contract: a worker whose last reply is
+    ``No tasks available.`` short-circuits to ``HEALTHY`` even when the
+    silent-worker timer (``last_event_seconds_ago > 30min``) would
+    otherwise flag it as ``SILENT_WORKER``.
+    """
+    from pollypm.recovery.base import SessionHealth, SessionSignals
+    from pollypm.recovery.default import DefaultRecoveryPolicy
+
+    policy = DefaultRecoveryPolicy()
+
+    healthy_idle = SessionSignals(
+        session_name="worker_pomodoro",
+        window_present=True,
+        pane_dead=False,
+        session_role="worker",
+        last_event_seconds_ago=3600,  # Past SILENT_WORKER_SECONDS.
+        pane_is_idle_placeholder=True,
+    )
+    assert policy.classify(healthy_idle) == SessionHealth.HEALTHY
+
+    # Without the placeholder flag the same signals classify as
+    # SILENT_WORKER, confirming the short-circuit is what flips the
+    # verdict (and matches the #1084 false-positive symptom).
+    silent = SessionSignals(
+        session_name="worker_pomodoro",
+        window_present=True,
+        pane_dead=False,
+        session_role="worker",
+        last_event_seconds_ago=3600,
+        pane_is_idle_placeholder=False,
+    )
+    assert policy.classify(silent) == SessionHealth.SILENT_WORKER
+
+
 def test_default_recovery_policy_classifies_placeholder_pane_as_healthy(
     tmp_path: Path,
 ) -> None:

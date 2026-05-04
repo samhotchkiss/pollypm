@@ -119,17 +119,67 @@ def pane_shows_claude_empty_prompt(pane_text: str) -> bool:
     return False
 
 
+def pane_shows_no_tasks_available(pane_text: str) -> bool:
+    """True if the pane's most recent assistant response was ``No tasks available.``.
+
+    A worker that just ran ``pm task next`` and received the canonical
+    "No tasks available." reply IS responding to the heartbeat — it's an
+    alive-but-idle worker, NOT silent. The recovery classifier's
+    ``SILENT_WORKER`` rung otherwise treats this as a missed-queue-event
+    case and escalates to ``alert`` after three cycles (#1084).
+
+    Walks from the tail and returns ``True`` when the most recent
+    informative output line (skipping TUI footer chrome and box-drawing
+    runs) contains the exact CLI-produced ``No tasks available.``
+    substring.
+    """
+    if not pane_text:
+        return False
+    if "No tasks available." not in pane_text:
+        return False
+    for raw_line in reversed(pane_text.splitlines()):
+        line = raw_line.strip()
+        if not line:
+            continue
+        # Skip the same TUI footer chrome the empty-prompt check skips.
+        lower = line.lower()
+        if (
+            "bypass permissions" in lower
+            or "shift+tab to cycle" in lower
+            or "ctrl+t to" in lower
+            or line.startswith("⏵⏵")  # ⏵⏵
+        ):
+            continue
+        # Box-drawing horizontal rules surround the Claude/Codex input
+        # box — skip them so we don't false-negative on the divider that
+        # sits above the most recent reply.
+        if set(line) <= {"─", "━", " "}:  # ─ ━
+            continue
+        # Codex rotating placeholder hints can also sit at the tail
+        # below the actual reply — treat them as chrome here so the
+        # detector still finds the "No tasks available." line above.
+        if is_codex_idle_placeholder(line):
+            continue
+        # The Claude empty-prompt glyph ``❯`` followed by no content is
+        # also chrome that can sit below the reply.
+        if line.startswith("❯") and not line.lstrip("❯").strip():
+            continue
+        return "No tasks available." in line
+    return False
+
+
 def pane_is_idle_placeholder(pane_text: str) -> bool:
     """True if ``pane_text`` shows a known idle-placeholder UI state.
 
-    Combines the Codex rotating-placeholder check and the Claude
-    empty-prompt check — both are alive-but-idle agents and should
-    NOT be classified as ``unhealthy`` by the session-health classifier
-    (#1010).
+    Combines the Codex rotating-placeholder check, the Claude
+    empty-prompt check, and the worker "No tasks available." idle reply
+    (#1084) — all are alive-but-idle agents and should NOT be classified
+    as ``unhealthy`` by the session-health classifier (#1010).
     """
     return (
         pane_shows_codex_idle_placeholder(pane_text)
         or pane_shows_claude_empty_prompt(pane_text)
+        or pane_shows_no_tasks_available(pane_text)
     )
 
 
@@ -138,5 +188,6 @@ __all__ = [
     "is_codex_idle_placeholder",
     "pane_shows_codex_idle_placeholder",
     "pane_shows_claude_empty_prompt",
+    "pane_shows_no_tasks_available",
     "pane_is_idle_placeholder",
 ]

@@ -2327,8 +2327,20 @@ class PollyCockpitApp(App[None]):
             self.nav.index = len(children) - 1
         self._sync_selected_from_nav()
 
+    def _selected_open_key(self) -> str | None:
+        if self.selected_key == "settings" and self._settings_visible():
+            return "settings"
+        visible_keys = {
+            item.key
+            for item in getattr(self, "_items", [])
+            if getattr(item, "selectable", True)
+        }
+        if self.selected_key in visible_keys:
+            return self.selected_key
+        return self._selected_row_key()
+
     def action_open_selected(self) -> None:
-        key = self._selected_row_key()
+        key = self._selected_open_key()
         if key is None:
             return
         self._schedule_route_selected(key, label=key)
@@ -2570,6 +2582,8 @@ class PollyCockpitApp(App[None]):
     def action_forward_workers_auto_refresh(self) -> None:
         if self.selected_key == "workers":
             self._send_key_to_right_pane("A")
+            return
+        self._schedule_route_selected("workers", label="Workers")
 
     def action_forward_action_button_1(self) -> None:
         self._send_key_to_right_pane("1")

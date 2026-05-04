@@ -3653,8 +3653,12 @@ class PollyCockpitRail:
         if key == b"\t":
             self.router.send_key_to_right_pane("Tab")
             return True
-        if key == b"A" and self.selected_key == "workers":
-            self.router.send_key_to_right_pane("A")
+        if key == b"A":
+            if self.selected_key == "workers":
+                self.router.send_key_to_right_pane("A")
+            else:
+                self.router.route_selected("workers")
+                self.selected_key = "workers"
             return True
         if key in {b"p", b"P"} and self.selected_key.startswith("project:"):
             project_key = self.selected_key.split(":", 2)[1]

@@ -4233,6 +4233,46 @@ def test_cockpit_app_routes_detail_hint_keys_from_rail() -> None:
     assert ("send", "A") in calls
 
 
+def test_cockpit_enter_routes_visible_workers_selection_when_nav_cursor_lags() -> None:
+    """#1134: Enter must follow the visible active marker, not stale nav.index."""
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    calls: list[tuple[str, str | None]] = []
+    app.selected_key = "workers"
+    app._items = [
+        SimpleNamespace(key="dashboard", selectable=True),
+        SimpleNamespace(key="polly", selectable=True),
+        SimpleNamespace(key="workers", selectable=True),
+        SimpleNamespace(key="metrics", selectable=True),
+    ]
+    app._selected_row_key = lambda: "metrics"  # type: ignore[method-assign]
+    app._schedule_route_selected = (  # type: ignore[method-assign]
+        lambda key, *, label=None: calls.append((key, label))
+    )
+
+    app.action_open_selected()
+
+    assert calls == [("workers", "workers")]
+
+
+def test_cockpit_capital_a_opens_workers_then_forwards_auto_refresh() -> None:
+    """#1134: A is a rail shortcut to Workers; on Workers it reaches the pane."""
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    calls: list[tuple[str, str]] = []
+    app._schedule_route_selected = (  # type: ignore[method-assign]
+        lambda key, *, label=None: calls.append(("route", key))
+    )
+    app._send_key_to_right_pane = (  # type: ignore[method-assign]
+        lambda key: calls.append(("send", key))
+    )
+
+    app.selected_key = "dashboard"
+    app.action_forward_workers_auto_refresh()
+    app.selected_key = "workers"
+    app.action_forward_workers_auto_refresh()
+
+    assert calls == [("route", "workers"), ("send", "A")]
+
+
 def test_cockpit_app_open_live_session_keeps_rail_focus_until_tab() -> None:
     app = PollyCockpitApp.__new__(PollyCockpitApp)
     calls: list[str | tuple[str, str]] = []
@@ -4389,6 +4429,35 @@ def test_cockpit_rail_forwards_detail_hint_keys(monkeypatch, tmp_path: Path) -> 
     assert rail._handle_key(b"A", items) is True
 
     assert rail.router.sent == ["Tab", "A"]
+
+
+def test_cockpit_rail_capital_a_routes_workers_when_not_active(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    class FakeRouter:
+        def __init__(self, _config_path: Path) -> None:
+            self.calls: list[str] = []
+            self.tmux = None
+
+        def selected_key(self) -> str:
+            return "polly"
+
+        def route_selected(self, key: str) -> None:
+            self.calls.append(key)
+
+    monkeypatch.setattr("pollypm.cockpit_rail.CockpitRouter", FakeRouter)
+    from pollypm.cockpit_rail import CockpitItem, PollyCockpitRail
+
+    rail = PollyCockpitRail(tmp_path / "pollypm.toml")
+    items = [
+        CockpitItem("polly", "Polly", "ready"),
+        CockpitItem("workers", "Workers", "ready"),
+    ]
+
+    assert rail._handle_key(b"A", items) is True
+
+    assert rail.router.calls == ["workers"]
+    assert rail.selected_key == "workers"
 
 
 def test_cockpit_rail_picks_up_external_selection(monkeypatch, tmp_path: Path) -> None:

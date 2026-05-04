@@ -2163,6 +2163,42 @@ def test_inbox_filter_mode_shows_prompt_before_typing(inbox_env) -> None:
     _run(body())
 
 
+def test_inbox_filter_bridge_literal_slash_opens_input(inbox_env) -> None:
+    """#1127: `pm cockpit-send-key /` opens the right-pane Inbox filter."""
+    if not _load_config_compatible(inbox_env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_input_bridge import send_key
+    from pollypm.cockpit_ui import PollyInboxApp
+
+    app = PollyInboxApp(inbox_env["config_path"])
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            initial_count = len(_visible_titles(app))
+            assert initial_count > 1
+            handle = getattr(app, "_input_bridge_handle", None)
+            assert handle is not None
+            assert handle.socket_path.name.startswith("pane_inbox-")
+
+            send_key(handle.socket_path, "/")
+            await pilot.pause(0.2)
+
+            assert app.filter_bar.display is True
+            assert app.filter_input.display is True
+            assert app.filter_input.has_focus
+
+            for key in ("V", "C", "L"):
+                send_key(handle.socket_path, key)
+            await pilot.pause(0.3)
+
+            assert app.filter_input.value == "VCL"
+            assert _visible_titles(app) == ["Deploy blocked"]
+            assert len(_visible_titles(app)) < initial_count
+
+    _run(body())
+
+
 def test_background_refresh_skips_when_content_unchanged(inbox_env, inbox_app) -> None:
     """The visible flash every ~8s was caused by the background refresh
     calling ListView.clear() and re-appending every row on every tick,

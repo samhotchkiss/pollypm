@@ -7150,6 +7150,25 @@ class PollyInboxApp(App[None]):
         # paint on a narrow pane is already vertical (no flash of the
         # unreadable side-by-side split before the first resize).
         self._apply_stacked_layout()
+        # #1127 — the interactive Inbox is a separate right-pane
+        # Textual app, so it needs its own TTY-less bridge. Without it,
+        # `pm cockpit-send-key /` falls back to the rail's `cockpit-*`
+        # socket and never reaches the Inbox filter binding.
+        try:
+            from pollypm.cockpit_input_bridge import start_input_bridge
+            self._input_bridge_handle = start_input_bridge(
+                self, kind="pane-inbox", config_path=self.config_path,
+            )
+        except Exception:  # noqa: BLE001
+            self._input_bridge_handle = None
+
+    def on_unmount(self) -> None:
+        bridge = getattr(self, "_input_bridge_handle", None)
+        if bridge is not None:
+            try:
+                bridge.stop()
+            except Exception:  # noqa: BLE001
+                pass
 
     # #1078 — switch to stacked (detail-below-list) layout when the
     # detail column would otherwise drop below this many cols of usable
@@ -7200,6 +7219,21 @@ class PollyInboxApp(App[None]):
             focused is self.reply_input and not self.reply_input.value
         ):
             self.list_view.focus()
+
+    def on_key(self, event: events.Key) -> None:
+        """Treat bridge-delivered literal `/` like the terminal slash key.
+
+        ``App.simulate_key("/")`` preserves the character so focused
+        Inputs can type it, but Textual bindings listen for the named
+        ``slash`` key. The bridge path needs to open filtering from list
+        focus without stealing literal slash input once a text field owns
+        focus.
+        """
+        if self.reply_input.has_focus or self.filter_input.has_focus:
+            return
+        if event.key == "/" or getattr(event, "character", None) == "/":
+            event.stop()
+            self.action_start_filter()
 
     # ------------------------------------------------------------------
     # Data loading

@@ -189,6 +189,13 @@ def _count_inbox_tasks_for_label(config) -> int:
       once.
     - Messages by their ``(scope, message_id)`` pair — same reason.
 
+    Applies ``_filter_approved_plan_reviews`` so the rail badge tracks
+    the inbox list view: phantom ``plan_review`` rows whose underlying
+    user_approval is already APPROVED don't inflate the count (#1107).
+    Without this filter the rail badge stays stale relative to the list
+    by however many phantom rows are pending sweep, which masked the
+    success of #1103 for several overnight loop ticks.
+
     The function name is kept for backward compatibility with existing
     callers; the return value is now an item count, not just a task
     count.
@@ -197,6 +204,8 @@ def _count_inbox_tasks_for_label(config) -> int:
         from pollypm.work.inbox_view import inbox_tasks
         from pollypm.work.sqlite_service import SQLiteWorkService
         from pollypm.cockpit_inbox_items import (
+            _WORKSPACE_DB_KEY,
+            _filter_approved_plan_reviews,
             annotate_inbox_entry,
             message_row_to_inbox_entry,
             task_to_inbox_entry,
@@ -211,11 +220,21 @@ def _count_inbox_tasks_for_label(config) -> int:
 
     seen_task_ids: set[str] = set()
     seen_message_keys: set[tuple[str, object]] = set()
+    # Collect actionable entries so the plan-review filter can drop
+    # phantoms before we count. ``_filter_approved_plan_reviews`` needs
+    # a per-project ``(db_path, project_path)`` map to resolve refs.
+    task_entries: dict[str, object] = {}
+    message_entries: dict[tuple[str, object], object] = {}
+    project_db_paths: dict[str, tuple[Path, Path]] = {}
     known_projects = set(getattr(config, "projects", {}).keys())
 
     for project_key, db_path, project_path in _inbox_db_sources(config):
         if not db_path.exists():
             continue
+        if project_key:
+            project_db_paths[project_key] = (db_path, project_path)
+        else:
+            project_db_paths[_WORKSPACE_DB_KEY] = (db_path, project_path)
         try:
             with SQLiteWorkService(
                 db_path=db_path, project_path=project_path,
@@ -227,6 +246,7 @@ def _count_inbox_tasks_for_label(config) -> int:
                     )
                     if getattr(item, "needs_action", False):
                         seen_task_ids.add(task.task_id)
+                        task_entries.setdefault(task.task_id, item)
         except Exception:  # noqa: BLE001
             pass
 
@@ -283,12 +303,24 @@ def _count_inbox_tasks_for_label(config) -> int:
                     known_projects=known_projects,
                 )
                 if getattr(item, "needs_action", False):
-                    seen_message_keys.add((str(scope), row_id))
+                    msg_key = (str(scope), row_id)
+                    seen_message_keys.add(msg_key)
+                    message_entries.setdefault(msg_key, item)
         finally:
             try:
                 store.close()
             except Exception:  # noqa: BLE001
                 pass
+    # #1107 — drop ``plan_review`` rows whose underlying user_approval
+    # has already been APPROVED so the rail badge tracks the inbox
+    # list view (which already runs this filter inside
+    # ``load_inbox_entries``).
+    collected = list(task_entries.values()) + list(message_entries.values())
+    if collected and project_db_paths:
+        kept = _filter_approved_plan_reviews(
+            collected, project_db_paths=project_db_paths,
+        )
+        return len(kept)
     return len(seen_task_ids) + len(seen_message_keys)
 
 

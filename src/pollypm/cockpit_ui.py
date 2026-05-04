@@ -6300,17 +6300,22 @@ def _task_is_rollup(task) -> bool:
 
 
 def _fuzzy_subseq_match(query: str, hay: str) -> bool:
-    """Subsequence fuzzy match: every char in ``query`` appears in ``hay`` in order.
+    """Inbox text match with fuzzy affordance for short abbreviations.
 
-    ``"shp"`` matches ``"shipped"`` (s, h, p land in order). Substring
-    matches are a subset, so a plain ``"deploy"`` query against
-    ``"deploy blocked"`` still matches via the same algorithm.
+    Literal substring matches always win. Short abbreviations like
+    ``"shp"`` can still match ``"shipped"`` as a subsequence, but
+    longer queries stay literal so a word like ``"recovery"`` does not
+    match rows where those letters are merely scattered across metadata.
     Empty query matches everything; case is folded before compare so
     the call site doesn't have to.
     """
     if not query:
         return True
     if not hay:
+        return False
+    if query in hay:
+        return True
+    if len(query) > 3:
         return False
     qi = 0
     q = query

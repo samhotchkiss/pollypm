@@ -230,6 +230,54 @@ def test_fuzzy_subsequence_match(filter_env, filter_app) -> None:
     _run(body())
 
 
+def test_long_filter_query_requires_literal_substring(tmp_path: Path) -> None:
+    """#1159: long terms must not match letters scattered across metadata."""
+
+    async def body() -> None:
+        project_path = tmp_path / "demo"
+        project_path.mkdir()
+        (project_path / ".git").mkdir()
+        config_path = tmp_path / "pollypm.toml"
+        _write_minimal_config(project_path, config_path)
+        _seed_project(
+            project_path,
+            items=[
+                ("RECOVERY MODE injection burst", "actual literal match", None),
+                (
+                    "Refine estimate, confirm options, verify edge replies yesterday",
+                    "letters are in order but not contiguous",
+                    None,
+                ),
+            ],
+        )
+        if not _load_config_compatible(config_path):
+            pytest.skip("minimal pollypm.toml fixture not supported by loader")
+
+        from pollypm.cockpit_input_bridge import send_key
+        from pollypm.cockpit_ui import PollyInboxApp
+
+        app = PollyInboxApp(config_path)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            initial_count = len(_visible_titles(app))
+            assert initial_count == 2
+            handle = getattr(app, "_input_bridge_handle", None)
+            assert handle is not None
+
+            send_key(handle.socket_path, "/")
+            await pilot.pause(0.2)
+            for key in "RECOVERY":
+                send_key(handle.socket_path, key)
+            await pilot.pause(0.3)
+
+            assert app.filter_input.value == "RECOVERY"
+            visible = _visible_titles(app)
+            assert visible == ["RECOVERY MODE injection burst"]
+            assert len(visible) < initial_count
+
+    _run(body())
+
+
 # ---------------------------------------------------------------------------
 # 3. Unread-only chip narrows the list
 # ---------------------------------------------------------------------------

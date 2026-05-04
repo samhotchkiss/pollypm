@@ -85,7 +85,19 @@ _UP_HELP = help_with_examples(
             "pm up --config ~/.pollypm/pollypm.toml",
             "boot a specific PollyPM config",
         ),
+        (
+            "pm up --phantom-client",
+            "spawn a detached pty client so the cockpit keeps processing input "
+            "after you close the terminal (workaround for #1109)",
+        ),
     ],
+    trailing=(
+        "Note (#1109): the cockpit's Textual app stops handling keystrokes when "
+        "no tmux client is attached to the session. Keep a terminal attached "
+        "(`tmux attach -t pollypm`) for the lifetime of the session, or pass "
+        "`--phantom-client` to spawn a background pty so `tmux send-keys` keeps "
+        "working when you detach."
+    ),
 )
 
 _STATUS_HELP = help_with_examples(
@@ -631,6 +643,16 @@ def _classify_cockpit_panes(panes) -> tuple[bool, bool, bool]:
 @app.command(help=_UP_HELP)
 def up(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+    phantom_client: bool = typer.Option(
+        False,
+        "--phantom-client",
+        help=(
+            "After boot, spawn a detached pty client attached to the pollypm "
+            "session so the cockpit keeps processing keystrokes when no real "
+            "terminal is attached. Workaround for #1109. Experimental — see "
+            "the issue for caveats."
+        ),
+    ),
 ) -> None:
     config_path = _discover_config_path(config_path)
     if not config_path.exists():
@@ -678,6 +700,24 @@ def up(
         import time
         time.sleep(0.3)  # let tmux settle after the split
         supervisor.start_cockpit_tui(session_name)
+        if phantom_client:
+            # #1109 — spawn a detached pty client so the cockpit's
+            # Textual app keeps processing input even when no real
+            # terminal is attached. Best-effort; failures only mean
+            # the workaround didn't engage.
+            spawned = _spawn_phantom_client(session_name)
+            if spawned:
+                typer.echo(
+                    f"[#1109] phantom-client attached to {session_name} "
+                    "(cockpit input loop kept alive while you detach)"
+                )
+            else:
+                typer.echo(
+                    "[#1109] phantom-client spawn failed — "
+                    "`tmux send-keys` may not work after detach. "
+                    "See `pm up --help` for context.",
+                    err=True,
+                )
 
     # #896 — drive every supervisor / tmux mutation through the
     # state-machine executor so plan.actions is the source of
@@ -774,6 +814,72 @@ def _spawn_rail_daemon(config_path: Path) -> None:
             "will only run while the cockpit is open.",
             err=True,
         )
+
+
+def _spawn_phantom_client(session_name: str) -> bool:
+    """Spawn a detached pty-backed ``tmux attach`` client to keep the
+    cockpit's input loop alive when no real terminal is attached (#1109).
+
+    Background: the cockpit's Textual app stops handling keystrokes
+    when no tmux client is attached to the session. ``tmux send-keys``
+    silently no-ops in that state, which destroys overnight test loops
+    where Sam detaches and expects the harness to drive the cockpit
+    via ``send-keys``. Wrapping ``tmux attach`` in ``script`` gives it
+    a controlling pty so tmux treats it as a live client.
+
+    Best-effort. Returns ``True`` on successful spawn (process started),
+    ``False`` on any error. Caller decides how to surface failure. The
+    spawned process is detached (``start_new_session=True``) so it
+    survives the parent ``pm`` exit.
+
+    Caveats (worth documenting in the issue rather than complicating
+    the helper):
+    - The phantom client doesn't auto-replace itself if it dies.
+    - It will steal focus from a real client briefly during attach;
+      pass ``-d`` so any real attach detaches the phantom.
+    - On systems where ``script`` doesn't accept ``-q`` / the
+      pty allocation fails, the spawn returns ``False``.
+    """
+    import shutil as _shutil
+    import subprocess as _sp
+
+    script_bin = _shutil.which("script")
+    tmux_bin = _shutil.which("tmux")
+    if script_bin is None or tmux_bin is None:
+        return False
+    pollypm_home = Path(DEFAULT_CONFIG_PATH).parent
+    pollypm_home.mkdir(parents=True, exist_ok=True)
+    log_path = pollypm_home / "phantom_client.log"
+    try:
+        log_fh = open(log_path, "a", buffering=1)
+    except OSError:
+        return False
+    # macOS ``script`` signature is ``script [-q] file command...``;
+    # GNU ``script`` is ``script [-q] -c "command" file``. Detect by
+    # platform — both ship with ``-q``.
+    import sys as _sys
+    if _sys.platform == "darwin":
+        argv = [script_bin, "-q", "/dev/null", tmux_bin, "attach", "-d", "-t", session_name]
+    else:
+        argv = [
+            script_bin,
+            "-q",
+            "-c",
+            f"{tmux_bin} attach -d -t {session_name}",
+            "/dev/null",
+        ]
+    try:
+        _sp.Popen(
+            argv,
+            stdout=log_fh,
+            stderr=log_fh,
+            stdin=_sp.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    return True
 
 
 def _stop_rail_daemon() -> None:

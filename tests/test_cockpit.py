@@ -4672,6 +4672,52 @@ def test_cockpit_forwards_p_to_right_pane_only_on_project_surface() -> None:
     assert sent == ["p"]
 
 
+def test_cockpit_forwards_i_to_right_pane_only_on_project_surface() -> None:
+    """``i`` from rail forwards to the right pane only on a project (#1089).
+
+    Before the fix, ``i`` was bound to ``open_inbox`` (priority=True) and
+    routed to the global cockpit inbox even when the dashboard's bottom
+    hint promised ``i inbox`` would scroll to the project's own inbox
+    section. After the fix ``i`` forwards to the right pane on a project
+    surface so the dashboard's ``jump_inbox`` handler runs; global
+    Inbox stays reachable via capital ``I``.
+    """
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    sent: list[str] = []
+    app._send_key_to_right_pane = lambda key: sent.append(key)  # type: ignore[method-assign]
+
+    app.selected_key = "polly"
+    app.action_forward_project_jump_inbox()
+    assert sent == [], "should not forward i outside of project surfaces"
+
+    app.selected_key = "project:demo:dashboard"
+    app.action_forward_project_jump_inbox()
+    assert sent == ["i"]
+
+
+def test_cockpit_forwards_q_to_right_pane_only_on_project_surface() -> None:
+    """``q`` from rail forwards to the right pane only on a project (#1089).
+
+    Before the fix, ``q`` was bound to ``request_quit`` (priority=True);
+    on a project surface it sidestepped the dashboard's own ``q,escape``
+    → ``back`` handler and routed home via the rail's path. After the
+    fix ``q`` forwards so the dashboard's advertised ``q home`` keystroke
+    actually fires the dashboard's ``action_back``. Quit moves to
+    capital ``Q`` / ``Ctrl-Q``.
+    """
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    sent: list[str] = []
+    app._send_key_to_right_pane = lambda key: sent.append(key)  # type: ignore[method-assign]
+
+    app.selected_key = "polly"
+    app.action_forward_project_home()
+    assert sent == [], "should not forward q outside of project surfaces"
+
+    app.selected_key = "project:demo:dashboard"
+    app.action_forward_project_home()
+    assert sent == ["q"]
+
+
 def test_cockpit_project_enter_advances_cursor_to_dashboard_subitem() -> None:
     """Pressing Enter on a project advances the rail cursor to the
     project's Dashboard sub-item in one stroke (#880).

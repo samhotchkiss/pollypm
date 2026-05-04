@@ -966,7 +966,20 @@ class PollyCockpitApp(App[None]):
     BINDINGS = [
         Binding("enter,o", "open_selected", "Open"),
         Binding("n", "new_worker", "New Worker"),
-        Binding("i", "open_inbox", "Inbox", show=False, priority=True),
+        # #1089 — ``i`` from the rail used to fire ``open_inbox``, which
+        # shadowed the project dashboard's advertised ``i inbox`` (the
+        # dashboard hint reads ``c chat · p plan · i inbox · l log
+        # · q home`` and binds ``i`` to ``jump_inbox`` — scrolling to
+        # the project's own inbox section instead of the global feed).
+        # Forward ``i`` to the right pane on a project surface so the
+        # dashboard's own ``jump_inbox`` handler runs; capital ``I``
+        # keeps the global Inbox affordance reachable from the rail
+        # (mirrors the ``p``/``P`` split in #1088).
+        Binding(
+            "i", "forward_project_jump_inbox", "Inbox",
+            show=False, priority=True,
+        ),
+        Binding("I", "open_inbox", "Inbox"),
         Binding("t", "open_activity", "Activity"),
         # #1088 — ``p`` from the rail used to fire ``toggle_project_pin``,
         # which shadowed the project dashboard's advertised ``p plan``
@@ -1029,7 +1042,20 @@ class PollyCockpitApp(App[None]):
         Binding("k,up", "cursor_up", "Up", show=False, priority=True),
         Binding("g,home", "cursor_first", "First", show=False, priority=True),
         Binding("G,end", "cursor_last", "Last", show=False, priority=True),
-        Binding("q,Q,ctrl+q", "request_quit", "Quit", priority=True),
+        # #1089 — ``q`` from the rail used to fire ``request_quit``,
+        # which on a project surface routed back to Home via the rail's
+        # own ``_navigate_home`` path (skipping the dashboard's ``q,escape``
+        # → ``back`` handler). Forward ``q`` to the right pane on a
+        # project surface so the dashboard's advertised ``q home`` keystroke
+        # actually runs the dashboard's own ``action_back`` (matching the
+        # surface's bindings 1:1). Quit moves to capital ``Q`` /
+        # ``Ctrl-Q`` so the destructive shutdown shortcut stays reachable
+        # without colliding with the dashboard hint.
+        Binding(
+            "q", "forward_project_home", "Home",
+            show=False, priority=True,
+        ),
+        Binding("Q,ctrl+q", "request_quit", "Quit", priority=True),
         Binding("escape", "back_to_home", "Back to Home", show=False, priority=True),
         Binding("w,W,ctrl+w", "detach", "Detach", priority=True),
     ]
@@ -1046,7 +1072,7 @@ class PollyCockpitApp(App[None]):
     # App down, so without this gate the App's priority binding always
     # wins over the modal's own priority binding for the same key.
     _HELP_MODAL_GATED_ACTIONS = frozenset({
-        "request_quit",          # q, Q, ctrl+q
+        "request_quit",          # Q, ctrl+q (#1089 — q forwards instead)
         "back_to_home",          # escape
         "show_keyboard_help",    # ?  (so reopening on top is suppressed,
                                  #     letting the modal close itself)
@@ -1054,7 +1080,6 @@ class PollyCockpitApp(App[None]):
         "cursor_up",             # k, up
         "cursor_first",          # g, home
         "cursor_last",           # G, end
-        "open_inbox",            # i
         "forward_tab_to_right",  # tab
         "forward_action_button_1",
         "forward_action_button_2",
@@ -1062,6 +1087,8 @@ class PollyCockpitApp(App[None]):
         "forward_project_chat",  # c
         "forward_project_log",   # l
         "forward_project_plan",  # p (#1088)
+        "forward_project_jump_inbox",  # i (#1089)
+        "forward_project_home",  # q (#1089)
         "forward_workers_auto_refresh",  # A
         "view_alert_detail",     # !  (#989 — let the alert modal own ! when up)
     })
@@ -1074,7 +1101,7 @@ class PollyCockpitApp(App[None]):
     # second ``:`` / ``Ctrl-K`` does not stack a second palette on top
     # — instead the existing one stays up and Esc still works.
     _PALETTE_MODAL_GATED_ACTIONS = frozenset({
-        "request_quit",          # q, Q, ctrl+q
+        "request_quit",          # Q, ctrl+q (#1089 — q forwards instead)
         "back_to_home",          # escape
         "open_command_palette",  # : / ctrl+k (no double-stack)
         "show_keyboard_help",    # ? (don't open help on top of palette)
@@ -1082,7 +1109,6 @@ class PollyCockpitApp(App[None]):
         "cursor_up",             # k, up
         "cursor_first",          # g, home
         "cursor_last",           # G, end
-        "open_inbox",            # i
         "forward_tab_to_right",  # tab
         "forward_action_button_1",
         "forward_action_button_2",
@@ -1090,6 +1116,8 @@ class PollyCockpitApp(App[None]):
         "forward_project_chat",  # c
         "forward_project_log",   # l
         "forward_project_plan",  # p (#1088)
+        "forward_project_jump_inbox",  # i (#1089)
+        "forward_project_home",  # q (#1089)
         "forward_workers_auto_refresh",  # A
         "view_alert_detail",     # !  (#989)
     })
@@ -1098,7 +1126,8 @@ class PollyCockpitApp(App[None]):
     # modal while it owns the screen stack so the user can navigate
     # actions / dismiss without the rail eating the keystroke first.
     _ALERT_DETAIL_MODAL_GATED_ACTIONS = frozenset({
-        "request_quit",          # q  (modal binds it to dismiss)
+        "request_quit",          # Q, ctrl+q  (#1089 — q forwards instead)
+        "forward_project_home",  # q  (#1089 — modal binds it to dismiss)
         "back_to_home",          # escape
         "view_alert_detail",     # !  (no double-stack)
         "cursor_down",           # j, down
@@ -2543,6 +2572,37 @@ class PollyCockpitApp(App[None]):
         """
         if self._on_project_surface():
             self._send_key_to_right_pane("p")
+
+    def action_forward_project_jump_inbox(self) -> None:
+        """#1089 — forward ``i`` to the right pane so the project
+        dashboard's ``jump_inbox`` handler (which the bottom hint
+        advertises as ``i inbox``) actually runs.
+
+        Without this, the rail's ``i`` was bound to ``open_inbox`` and
+        the keystroke routed to the global cockpit inbox instead of the
+        project's inbox section. Global Inbox stays reachable via
+        capital ``I``. Off a project surface this is a no-op so the
+        global ``I`` affordance is the only ``i``-family keystroke that
+        does anything from Home / Settings / etc.
+        """
+        if self._on_project_surface():
+            self._send_key_to_right_pane("i")
+
+    def action_forward_project_home(self) -> None:
+        """#1089 — forward ``q`` to the right pane so the project
+        dashboard's ``back`` handler (which the bottom hint advertises
+        as ``q home``) actually runs.
+
+        Without this, the rail's ``q`` was bound to ``request_quit``,
+        which on a sub-surface called ``_navigate_home`` directly —
+        skipping the dashboard's own ``q,escape`` → ``back`` handler.
+        Forwarding mirrors #1088 so the dashboard owns its own
+        bottom-hint keystrokes 1:1. Quit stays reachable from the rail
+        via capital ``Q`` / ``Ctrl-Q``. Off a project surface this is
+        a no-op (Esc still routes to Home everywhere).
+        """
+        if self._on_project_surface():
+            self._send_key_to_right_pane("q")
 
     def action_forward_recovery_action(self) -> None:
         """#1016 — forward ``R`` to the right pane so the project

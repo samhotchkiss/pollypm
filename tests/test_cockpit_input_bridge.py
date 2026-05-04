@@ -137,6 +137,19 @@ def test_special_tokens_normalize_to_textual_key_names(fake_config: Path) -> Non
         handle.stop()
 
 
+def test_literal_question_mark_normalizes_to_textual_key_name(
+    fake_config: Path,
+) -> None:
+    app = _FakeApp()
+    handle = start_input_bridge(app, kind="cockpit", config_path=fake_config)
+    assert handle is not None
+    try:
+        send_key(handle.socket_path, "?")
+        assert _wait_for(lambda: app.keys == ["question_mark"])
+    finally:
+        handle.stop()
+
+
 def test_modifier_tokens_pass_through(fake_config: Path) -> None:
     app = _FakeApp()
     handle = start_input_bridge(app, kind="cockpit", config_path=fake_config)

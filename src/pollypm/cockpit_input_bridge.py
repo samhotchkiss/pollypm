@@ -85,6 +85,14 @@ _SPECIAL_TOKENS: dict[str, str] = {
     "<end>": "end",
 }
 
+# `simulate_key("?")` creates a literal-character event whose key is
+# `"?"`; Textual's keyboard bindings for the physical ? key are named
+# `question_mark`. Normalize that one user-facing token so
+# `pm cockpit-send-key '?'` follows the same path as a real keypress.
+_CHAR_KEY_ALIASES: dict[str, str] = {
+    "?": "question_mark",
+}
+
 
 def _normalize_token(raw: str) -> str | None:
     """Map a wire-format token to the form ``simulate_key`` expects."""
@@ -94,6 +102,8 @@ def _normalize_token(raw: str) -> str | None:
     lowered = token.lower()
     if lowered in _SPECIAL_TOKENS:
         return _SPECIAL_TOKENS[lowered]
+    if token in _CHAR_KEY_ALIASES:
+        return _CHAR_KEY_ALIASES[token]
     # Allow ``ctrl+x`` / ``shift+a`` style modifiers verbatim — Textual
     # already understands those.
     return token

@@ -153,6 +153,34 @@ def test_question_mark_opens_help_modal(
     _run(body())
 
 
+@pytest.mark.parametrize("app_factory_name", ["PollyCockpitApp", "PollyInboxApp"])
+def test_bridge_literal_question_mark_opens_help_modal(
+    single_project_env, app_factory_name,
+) -> None:
+    """``pm cockpit-send-key '?'`` opens help from rail and inbox surfaces."""
+    if not _load_config_compatible(single_project_env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm import cockpit_ui
+    from pollypm.cockpit_input_bridge import send_key
+
+    cls = getattr(cockpit_ui, app_factory_name)
+    app = cls(single_project_env["config_path"])
+
+    async def body() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert _find_help_modal(app) is None
+            handle = getattr(app, "_input_bridge_handle", None)
+            assert handle is not None
+
+            send_key(handle.socket_path, "?")
+            await pilot.pause(0.2)
+
+            assert _find_help_modal(app) is not None
+
+    _run(body())
+
+
 def test_question_mark_opens_help_modal_project_dashboard(
     single_project_env,
 ) -> None:

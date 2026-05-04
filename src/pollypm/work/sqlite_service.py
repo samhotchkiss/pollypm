@@ -660,7 +660,16 @@ class SQLiteWorkService:
         self._project_path = project_path
         self._sync = sync_manager
         self._session_mgr = session_manager
-        self._conn = sqlite3.connect(str(db_path), timeout=30.0)
+        # #1095: route through ``open_workspace_db`` so the
+        # ``OperationalError: unable to open database file`` branch
+        # carries structured diagnostics (path tried, exists?, size,
+        # parent writable, stale -wal / -shm sidecars). Three workers
+        # hit this intermittently in the wild and we couldn't tell
+        # which path/sidecar was at fault. Any other open error keeps
+        # the original message.
+        from pollypm.storage.sqlite_pragmas import open_workspace_db
+
+        self._conn = open_workspace_db(db_path, timeout=30.0)
         self._conn.row_factory = sqlite3.Row
         # #1018: centralised WAL + busy_timeout. Wait up to 30 s for
         # busy locks before raising — prevents the Textual inbox UI

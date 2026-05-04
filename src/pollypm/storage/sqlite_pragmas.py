@@ -1,4 +1,4 @@
-"""Workspace SQLite connection PRAGMAs (#1018).
+"""Workspace SQLite connection PRAGMAs (#1018) and open-time diagnostics (#1095).
 
 Post-#1004 collapsed all per-project DBs into a single workspace-root
 ``state.db``. The default rollback-journal mode serialises every writer,
@@ -45,8 +45,10 @@ narrow-error predicate to non-worker callers.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import time
+from pathlib import Path
 from typing import Callable, TypeVar
 
 
@@ -197,10 +199,106 @@ def retry_on_database_locked(
     raise AssertionError("retry_on_database_locked exhausted without raising")
 
 
+def diagnose_unable_to_open(db_path: Path | str) -> str:
+    """Return a structured one-line diagnostic for ``unable to open database file``.
+
+    #1095: when ``sqlite3.connect`` raises ``OperationalError: unable to
+    open database file`` we currently get the message and nothing else —
+    no idea which path was tried, whether the parent directory is
+    writable, or whether stale WAL/SHM sidecars are blocking the open.
+    Three workers (pomodoro, blackjack-trainer, camptown) hit this
+    intermittently/persistently in #1095 and we couldn't tell *which*
+    cause was active.
+
+    Best-effort: every probe is wrapped — a failed stat or readdir must
+    not turn a useful diagnostic into a worse exception. Returns a
+    short ``key=value`` string suitable for tacking onto the original
+    error message and logging at ERROR.
+    """
+    try:
+        path = Path(db_path)
+    except Exception:  # noqa: BLE001
+        return f"db_path={db_path!r} diagnostics=path-coercion-failed"
+
+    parts: list[str] = [f"db_path={path}"]
+
+    def _stat(p: Path, label: str) -> None:
+        try:
+            if not p.exists():
+                parts.append(f"{label}_exists=no")
+                return
+            st = p.stat()
+            parts.append(f"{label}_exists=yes")
+            parts.append(f"{label}_size={st.st_size}")
+            parts.append(f"{label}_mtime={int(st.st_mtime)}")
+            parts.append(f"{label}_mode=0o{st.st_mode & 0o7777:o}")
+        except Exception as exc:  # noqa: BLE001
+            parts.append(f"{label}_stat_err={type(exc).__name__}")
+
+    _stat(path, "db")
+
+    parent = path.parent
+    try:
+        parts.append(f"parent_exists={'yes' if parent.exists() else 'no'}")
+        if parent.exists():
+            parts.append(f"parent_writable={'yes' if os.access(parent, os.W_OK) else 'no'}")
+    except Exception as exc:  # noqa: BLE001
+        parts.append(f"parent_probe_err={type(exc).__name__}")
+
+    # Stale WAL/SHM sidecars from a crashed writer can prevent open on
+    # some platforms — surface their presence so the operator can
+    # inspect / move them aside.
+    for suffix in ("-wal", "-shm", "-journal"):
+        sidecar = path.with_name(path.name + suffix)
+        try:
+            if sidecar.exists():
+                st = sidecar.stat()
+                parts.append(f"{suffix.lstrip('-')}_size={st.st_size}")
+        except Exception as exc:  # noqa: BLE001
+            parts.append(f"{suffix.lstrip('-')}_stat_err={type(exc).__name__}")
+
+    return " ".join(parts)
+
+
+def open_workspace_db(
+    db_path: Path | str,
+    *,
+    timeout: float = 30.0,
+) -> sqlite3.Connection:
+    """Open a workspace SQLite DB, attaching a diagnostic on open failure.
+
+    #1095: thin wrapper around ``sqlite3.connect`` that re-raises an
+    ``OperationalError("unable to open database file")`` with a
+    structured ``key=value`` suffix so the next time this fires we know
+    which path was tried, whether the parent is writable, and whether
+    stale WAL/SHM sidecars are present. The original error class and
+    chain are preserved so callers that match on
+    ``OperationalError`` keep working.
+
+    All other errors propagate untouched — only the specific
+    ``unable to open`` failure mode gets the extra context. This is
+    deliberately narrow because the more general lock / busy errors
+    already have their own retry path (:func:`retry_on_database_locked`).
+    """
+    try:
+        return sqlite3.connect(str(db_path), timeout=timeout)
+    except sqlite3.OperationalError as exc:
+        msg = str(exc)
+        if "unable to open database file" not in msg:
+            raise
+        diag = diagnose_unable_to_open(db_path)
+        # Log at ERROR so the diagnostic survives even if the caller
+        # swallows the exception higher up.
+        logger.error("sqlite open failed: %s :: %s", msg, diag)
+        raise sqlite3.OperationalError(f"{msg} ({diag})") from exc
+
+
 __all__ = [
     "DB_LOCK_RETRY_BACKOFF",
     "DEFAULT_BUSY_TIMEOUT_MS",
     "apply_workspace_pragmas",
+    "diagnose_unable_to_open",
     "is_database_locked_error",
+    "open_workspace_db",
     "retry_on_database_locked",
 ]

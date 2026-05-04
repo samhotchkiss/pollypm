@@ -556,3 +556,91 @@ def test_sqlalchemy_engine_applies_wal_and_busy_timeout(tmp_path: Path) -> None:
     finally:
         write_engine.dispose()
         read_engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# #1095 — open-time diagnostics for "unable to open database file"
+# ---------------------------------------------------------------------------
+
+
+def test_diagnose_unable_to_open_reports_missing_db(tmp_path: Path) -> None:
+    """A non-existent DB path surfaces ``db_exists=no`` plus parent state.
+
+    The wild #1095 signal was three workers (pomodoro, blackjack-trainer,
+    camptown) hitting ``OperationalError: unable to open database file``
+    with no path or filesystem context — we couldn't tell whether the
+    file was missing, the parent unwritable, or stale WAL/SHM sidecars
+    were blocking the open. The diagnostic helper has to surface enough
+    state to disambiguate next time.
+    """
+    from pollypm.storage.sqlite_pragmas import diagnose_unable_to_open
+
+    missing = tmp_path / "no_such_dir" / "state.db"
+    diag = diagnose_unable_to_open(missing)
+
+    assert f"db_path={missing}" in diag
+    assert "db_exists=no" in diag
+    assert "parent_exists=no" in diag
+
+
+def test_diagnose_unable_to_open_reports_existing_db_and_sidecars(tmp_path: Path) -> None:
+    """An existing DB plus stale ``-wal`` / ``-shm`` files appear in output.
+
+    Stale sidecars from a crashed writer is a leading hypothesis for the
+    persistent #1095 failure on camptown — confirming the helper sees
+    them is the regression we want.
+    """
+    from pollypm.storage.sqlite_pragmas import diagnose_unable_to_open
+
+    db = tmp_path / "state.db"
+    db.write_bytes(b"x" * 16)
+    (tmp_path / "state.db-wal").write_bytes(b"y" * 8)
+    (tmp_path / "state.db-shm").write_bytes(b"z" * 4)
+
+    diag = diagnose_unable_to_open(db)
+
+    assert "db_exists=yes" in diag
+    assert "db_size=16" in diag
+    assert "parent_exists=yes" in diag
+    assert "parent_writable=yes" in diag
+    assert "wal_size=8" in diag
+    assert "shm_size=4" in diag
+
+
+def test_open_workspace_db_attaches_diagnostic_on_unable_to_open(tmp_path: Path) -> None:
+    """``open_workspace_db`` re-raises with the diagnostic appended.
+
+    Forcing a real ``unable to open`` in CI is platform-dependent; the
+    most reliable handle is a path whose parent does not exist, which
+    SQLite refuses to create itself. The wrapper must preserve the
+    ``OperationalError`` class and the original message so callers that
+    match on the type or substring keep working.
+    """
+    from pollypm.storage.sqlite_pragmas import open_workspace_db
+
+    bogus = tmp_path / "no_such_dir" / "state.db"
+
+    with pytest.raises(sqlite3.OperationalError) as excinfo:
+        open_workspace_db(bogus)
+
+    msg = str(excinfo.value)
+    assert "unable to open database file" in msg
+    assert f"db_path={bogus}" in msg
+    assert "db_exists=no" in msg
+    # Original error chained for traceback-readers.
+    assert excinfo.value.__cause__ is not None
+
+
+def test_open_workspace_db_passes_through_for_normal_open(tmp_path: Path) -> None:
+    """A clean open returns a usable connection without rewriting messages."""
+    from pollypm.storage.sqlite_pragmas import open_workspace_db
+
+    db = tmp_path / "state.db"
+    conn = open_workspace_db(db)
+    try:
+        conn.execute("CREATE TABLE t (x INTEGER)")
+        conn.execute("INSERT INTO t VALUES (1)")
+        row = conn.execute("SELECT x FROM t").fetchone()
+        assert row[0] == 1
+    finally:
+        conn.close()

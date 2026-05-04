@@ -3190,14 +3190,39 @@ class PollyDashboardApp(App[None]):
 
         self.done_body.update("\n".join(done_lines))
 
-        # ── Token chart ──
+        # ── Token chart + cached LLM account quota ──
+        chart_lines: list[str] = []
+        account_usages = getattr(data, "account_usages", [])
+        if account_usages:
+            chart_lines.append("[b]LLM account quota usage[/b]")
+            for usage in account_usages:
+                if usage.severity == "critical":
+                    marker = "[#f85149]▲[/#f85149]"
+                    suffix = " · over limit"
+                elif usage.severity == "warning":
+                    marker = "[#d29922]◆[/#d29922]"
+                    suffix = " · approaching ceiling"
+                else:
+                    marker = "[dim]·[/dim]"
+                    suffix = ""
+                label = usage.provider or usage.account_name
+                if usage.email:
+                    label = f"{label} ({usage.email})"
+                line = (
+                    f"{marker} {_escape(label)}  "
+                    f"[b]{usage.used_pct}%[/b] used of {_escape(usage.limit_label)}"
+                )
+                if usage.reset_at and usage.severity in {"warning", "critical"}:
+                    suffix += f" · resets {_escape(usage.reset_at)}"
+                chart_lines.append(line + suffix)
+            chart_lines.append("")
+
         if data.daily_tokens:
             values = [t for _, t in data.daily_tokens]
             max_val = max(values) or 1
             chart_height = 6
             bars = [max(0, min(chart_height, round(v / max_val * chart_height))) for v in values]
 
-            chart_lines: list[str] = []
             for row in range(chart_height, 0, -1):
                 line_chars: list[str] = []
                 for bar_h in bars:
@@ -3220,7 +3245,8 @@ class PollyDashboardApp(App[None]):
             )
             self.chart_body.update("\n".join(chart_lines))
         else:
-            self.chart_body.update("[dim]No token data yet[/dim]")
+            chart_lines.append("[dim]No token data yet[/dim]")
+            self.chart_body.update("\n".join(chart_lines))
 
         # ── Footer ──
         sweep_word = "sweep" if data.sweep_count_24h == 1 else "sweeps"

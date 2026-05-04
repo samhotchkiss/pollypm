@@ -8,7 +8,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from pollypm.cockpit_ui import PollyDashboardApp
-from pollypm.dashboard_data import DashboardData, InboxPreview, load_dashboard
+from pollypm.dashboard_data import (
+    AccountQuotaUsage,
+    DashboardData,
+    InboxPreview,
+    load_dashboard,
+)
+from pollypm.storage.state import AccountUsageRecord
 
 
 def _run(coro) -> None:
@@ -152,6 +158,31 @@ def test_polly_dashboard_shows_inbox_count_without_recent_messages(tmp_path: Pat
     assert "Press I to jump to the inbox" in rendered
 
 
+def test_polly_dashboard_renders_llm_quota_usage(tmp_path: Path) -> None:
+    app = PollyDashboardApp(tmp_path / "pollypm.toml")
+    data = _fake_dashboard_data()
+    data.account_usages = [
+        AccountQuotaUsage(
+            account_name="claude_main",
+            provider="Anthropic",
+            email="claude@swh.me",
+            used_pct=84,
+            summary="16% left this week",
+            severity="warning",
+            limit_label="weekly limit",
+            reset_at="Apr 24 01:00",
+        )
+    ]
+
+    app._render_dashboard(_fake_config(), data)
+
+    rendered = str(app.chart_body.render())
+    assert "LLM account quota usage" in rendered
+    assert "84% used of weekly limit" in rendered
+    assert "approaching ceiling" in rendered
+    assert "No token data yet" in rendered
+
+
 def test_dashboard_gather_uses_rail_inbox_counter(monkeypatch, tmp_path: Path) -> None:
     """Home inbox count must match the rail, including untracked projects."""
     from pollypm.dashboard_data import gather
@@ -204,6 +235,71 @@ def test_dashboard_gather_uses_rail_inbox_counter(monkeypatch, tmp_path: Path) -
     assert seen == [config]
     assert data.inbox_count == 13
     assert "13 inbox items waiting" in data.briefing
+
+
+def test_dashboard_gather_includes_cached_llm_quota_usage(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    from pollypm.dashboard_data import gather
+
+    config = SimpleNamespace(
+        projects={},
+        accounts={
+            "claude_main": SimpleNamespace(
+                provider="claude",
+                email="claude@swh.me",
+            )
+        },
+    )
+
+    class FakeStore:
+        def list_session_runtimes(self):
+            return []
+
+        def recent_events(self, *, limit: int):
+            del limit
+            return []
+
+        def daily_token_usage(self, *, days: int):
+            del days
+            return []
+
+        def get_account_usage(self, account_name: str):
+            assert account_name == "claude_main"
+            return AccountUsageRecord(
+                account_name="claude_main",
+                provider="claude",
+                plan="max",
+                health="near-limit",
+                usage_summary="21% left this week",
+                raw_text="",
+                updated_at="2026-04-21T14:10:00+00:00",
+                used_pct=79,
+                remaining_pct=21,
+                reset_at="Apr 24 01:00",
+                period_label="current week",
+            )
+
+        def open_alerts(self):
+            return []
+
+    monkeypatch.setattr(
+        "pollypm.service_api.plan_launches_readonly",
+        lambda _config, _store: [],
+    )
+    monkeypatch.setattr("pollypm.dashboard_data._recent_commits", lambda *_a, **_kw: [])
+    monkeypatch.setattr("pollypm.dashboard_data._completed_issues", lambda *_a, **_kw: [])
+    monkeypatch.setattr("pollypm.dashboard_data._recent_inbox_messages", lambda *_a, **_kw: [])
+    monkeypatch.setattr("pollypm.dashboard_data._count_dashboard_inbox_items", lambda _config: 0)
+
+    data = gather(config, FakeStore())
+
+    assert len(data.account_usages) == 1
+    usage = data.account_usages[0]
+    assert usage.provider == "Anthropic"
+    assert usage.email == "claude@swh.me"
+    assert usage.used_pct == 79
+    assert usage.limit_label == "weekly limit"
 
 
 def test_polly_dashboard_i_key_routes_to_inbox(monkeypatch, tmp_path: Path) -> None:

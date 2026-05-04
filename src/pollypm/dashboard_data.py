@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -139,6 +139,18 @@ class InboxPreview:
 
 
 @dataclass(slots=True)
+class AccountQuotaUsage:
+    account_name: str
+    provider: str
+    email: str
+    used_pct: int
+    summary: str
+    severity: str
+    limit_label: str = "limit"
+    reset_at: str = ""
+
+
+@dataclass(slots=True)
 class DashboardData:
     active_sessions: list[SessionActivity]
     recent_commits: list[CommitInfo]
@@ -152,6 +164,7 @@ class DashboardData:
     recovery_count_24h: int
     inbox_count: int
     alert_count: int
+    account_usages: list[AccountQuotaUsage] = field(default_factory=list)
     briefing: str = ""  # morning briefing narrative (if user was away)
 
 
@@ -639,6 +652,80 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
     return previews[:limit]
 
 
+def _provider_label(provider: object) -> str:
+    raw = getattr(provider, "value", provider)
+    text = str(raw or "").strip().lower()
+    if text in {"claude", "anthropic"}:
+        return "Anthropic"
+    if text == "codex":
+        return "OpenAI"
+    if not text:
+        return ""
+    return text.capitalize()
+
+
+def _quota_severity(used_pct: int) -> str:
+    if used_pct >= 95:
+        return "critical"
+    if used_pct >= 80:
+        return "warning"
+    return "ok"
+
+
+def _quota_limit_label(period_label: object) -> str:
+    label = str(period_label or "").strip().lower()
+    if "week" in label:
+        return "weekly limit"
+    if "month" in label:
+        return "monthly limit"
+    if "day" in label:
+        return "daily limit"
+    return "limit"
+
+
+def _account_quota_usage(config: PollyPMConfig, store: StateStore) -> list[AccountQuotaUsage]:
+    """Return cached LLM account quota percentages for the Home dashboard."""
+    rows: list[AccountQuotaUsage] = []
+    seen_emails: set[str] = set()
+    for account_name, account in getattr(config, "accounts", {}).items():
+        email = (getattr(account, "email", None) or "").strip()
+        if email:
+            if email in seen_emails:
+                continue
+            seen_emails.add(email)
+        try:
+            usage = store.get_account_usage(account_name)
+        except Exception:  # noqa: BLE001
+            usage = None
+        used_pct = getattr(usage, "used_pct", None) if usage is not None else None
+        if used_pct is None:
+            continue
+        pct = int(used_pct)
+        rows.append(
+            AccountQuotaUsage(
+                account_name=account_name,
+                provider=_provider_label(
+                    getattr(account, "provider", None)
+                    or getattr(usage, "provider", "")
+                ),
+                email=email,
+                used_pct=pct,
+                summary=str(getattr(usage, "usage_summary", "") or f"{pct}% used"),
+                severity=_quota_severity(pct),
+                limit_label=_quota_limit_label(getattr(usage, "period_label", "")),
+                reset_at=str(getattr(usage, "reset_at", "") or ""),
+            )
+        )
+    rows.sort(
+        key=lambda row: (
+            -row.used_pct,
+            row.provider.lower(),
+            row.account_name,
+        )
+    )
+    return rows
+
+
 def load_dashboard(config_path: Path) -> tuple[PollyPMConfig, DashboardData]:
     """Load config + state store and gather one blocking dashboard snapshot."""
     config = load_config(config_path)
@@ -696,6 +783,7 @@ def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
     values = [t for _, t in daily]
     today_str = now.strftime("%Y-%m-%d")
     today_tokens = next((t for d, t in daily if d == today_str), 0)
+    account_usages = _account_quota_usage(config, store)
 
     commits = _recent_commits(config, hours=24)
     completed = _completed_issues(config, hours=72)
@@ -765,5 +853,6 @@ def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
         recovery_count_24h=recoveries,
         inbox_count=inbox_count,
         alert_count=alert_count,
+        account_usages=account_usages,
         briefing=briefing,
     )

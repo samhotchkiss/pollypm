@@ -250,14 +250,12 @@ def _transitions_db_path(project_path: Path) -> Path | None:
     Returns ``None`` when no state.db is reachable — callers treat that
     as "no transitions this window," same as a missing per-project file.
 
-    See :func:`pollypm.plugins_builtin.advisor.handlers.advisor_tick._resolve_state_db`
-    for the canonical helper; we re-import it instead of duplicating
-    the walk so the two probes stay in lockstep (#1037).
+    See :func:`pollypm.plugins_builtin.advisor.db_paths.resolve_state_db`
+    for the canonical helper so the two probes stay in lockstep (#1037).
     """
-    from pollypm.plugins_builtin.advisor.handlers.advisor_tick import (
-        _resolve_state_db,
-    )
-    return _resolve_state_db(project_path)
+    from pollypm.plugins_builtin.advisor.db_paths import resolve_state_db
+
+    return resolve_state_db(project_path)
 
 
 def _gather_task_transitions(

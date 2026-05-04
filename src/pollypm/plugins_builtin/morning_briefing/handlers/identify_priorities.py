@@ -16,10 +16,10 @@ from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from pollypm.models import KnownProject
@@ -94,18 +94,6 @@ class PriorityList:
 # ---------------------------------------------------------------------------
 
 
-def _open_readonly(db_path: Path) -> sqlite3.Connection | None:
-    if not db_path.exists():
-        return None
-    try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    except sqlite3.Error as exc:
-        logger.debug("briefing: ro connect failed for %s: %s", db_path, exc)
-        return None
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 def _parse_iso(value: str) -> datetime | None:
     if not value:
         return None
@@ -118,7 +106,7 @@ def _parse_iso(value: str) -> datetime | None:
     return dt
 
 
-def _age_seconds(row: sqlite3.Row, *, now_utc: datetime) -> float:
+def _age_seconds(row: Mapping[str, Any], *, now_utc: datetime) -> float:
     """Time since the task last changed state (or was created)."""
     # Prefer updated_at (indexed), fall back to created_at.
     ref = _parse_iso(row["updated_at"]) or _parse_iso(row["created_at"])
@@ -149,54 +137,26 @@ def _gather_top_tasks_for_project(
     this project's rows. Duplicate ``(project, task_number)`` pairs from
     overlapping DBs are deduped (per-project DB wins on ordering).
     """
-    out: list[PriorityEntry] = []
-    seen_ids: set[tuple[str, int]] = set()
-    for db_path in project_state_db_paths(project, config):
-        conn = _open_readonly(db_path)
-        if conn is None:
-            continue
-        try:
-            try:
-                rows = conn.execute(
-                    "SELECT project, task_number, title, priority, work_status, "
-                    "       COALESCE(assignee, '') AS assignee, created_at, updated_at "
-                    "FROM work_tasks "
-                    "WHERE project = ? AND work_status IN (?, ?, ?, ?) "
-                    "ORDER BY "
-                    "  CASE priority "
-                    "    WHEN 'critical' THEN 0 "
-                    "    WHEN 'high' THEN 1 "
-                    "    WHEN 'normal' THEN 2 "
-                    "    WHEN 'low' THEN 3 ELSE 4 END ASC, "
-                    "  updated_at ASC "
-                    "LIMIT ?",
-                    (project.key, *_OPEN_STATUSES, max(1, limit) * 4),
-                ).fetchall()
-            except sqlite3.Error as exc:
-                logger.debug("briefing: top-tasks SQL failed for %s: %s", project.key, exc)
-                continue
-        finally:
-            conn.close()
+    from pollypm.storage.morning_briefing_queries import priority_task_rows
 
-        for r in rows:
-            proj = r["project"]
-            num = r["task_number"]
-            dedupe_key = (proj, num)
-            if dedupe_key in seen_ids:
-                continue
-            seen_ids.add(dedupe_key)
-            out.append(
-                PriorityEntry(
-                    project=proj,
-                    task_id=f"{proj}/{num}",
-                    title=r["title"] or "",
-                    priority=(r["priority"] or "normal").lower(),
-                    state=r["work_status"] or "",
-                    assignee=r["assignee"] or "",
-                    age_seconds=_age_seconds(r, now_utc=now_utc),
-                )
-            )
-    return out
+    rows = priority_task_rows(
+        project_state_db_paths(project, config),
+        project_key=project.key,
+        open_statuses=_OPEN_STATUSES,
+        limit=limit,
+    )
+    return [
+        PriorityEntry(
+            project=str(row["project"] or ""),
+            task_id=f"{row['project']}/{row['task_number']}",
+            title=str(row["title"] or ""),
+            priority=str(row["priority"] or "normal").lower(),
+            state=str(row["work_status"] or ""),
+            assignee=str(row["assignee"] or ""),
+            age_seconds=_age_seconds(row, now_utc=now_utc),
+        )
+        for row in rows
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -216,63 +176,19 @@ def _gather_blockers_for_project(
     this project's blocked tasks. Duplicate ``(project, task_number)``
     pairs from overlapping DBs are deduped.
     """
-    results: list[BlockerEntry] = []
-    seen_ids: set[tuple[str, int]] = set()
-    for db_path in project_state_db_paths(project, config):
-        conn = _open_readonly(db_path)
-        if conn is None:
-            continue
-        try:
-            try:
-                rows = conn.execute(
-                    "SELECT project, task_number, title "
-                    "FROM work_tasks "
-                    "WHERE project = ? AND work_status = 'blocked' "
-                    "ORDER BY updated_at ASC",
-                    (project.key,),
-                ).fetchall()
-            except sqlite3.Error:
-                continue
-            for r in rows:
-                proj = r["project"]
-                num = r["task_number"]
-                dedupe_key = (proj, num)
-                if dedupe_key in seen_ids:
-                    continue
-                seen_ids.add(dedupe_key)
-                try:
-                    dep_rows = conn.execute(
-                        "SELECT d.to_project AS to_project, d.to_task_number AS to_task_number, "
-                        "       COALESCE(t.work_status, '') AS blocker_status "
-                        "FROM work_task_dependencies d "
-                        "LEFT JOIN work_tasks t "
-                        "  ON t.project = d.to_project AND t.task_number = d.to_task_number "
-                        "WHERE d.from_project = ? AND d.from_task_number = ? "
-                        "  AND d.kind = 'blocks' ",
-                        (proj, num),
-                    ).fetchall()
-                except sqlite3.Error:
-                    dep_rows = []
-                blocked_by: list[str] = []
-                unresolved: list[str] = []
-                for d in dep_rows:
-                    blocker_id = f"{d['to_project']}/{d['to_task_number']}"
-                    blocked_by.append(blocker_id)
-                    status = (d["blocker_status"] or "").lower()
-                    if status and status not in ("done", "cancelled"):
-                        unresolved.append(blocker_id)
-                results.append(
-                    BlockerEntry(
-                        project=proj,
-                        task_id=f"{proj}/{num}",
-                        title=r["title"] or "",
-                        blocked_by=blocked_by,
-                        unresolved_blockers=unresolved,
-                    )
-                )
-        finally:
-            conn.close()
-    return results
+    from pollypm.storage.morning_briefing_queries import blocker_rows
+
+    rows = blocker_rows(project_state_db_paths(project, config), project_key=project.key)
+    return [
+        BlockerEntry(
+            project=str(row["project"] or ""),
+            task_id=f"{row['project']}/{row['task_number']}",
+            title=str(row["title"] or ""),
+            blocked_by=list(row.get("blocked_by") or []),
+            unresolved_blockers=list(row.get("unresolved_blockers") or []),
+        )
+        for row in rows
+    ]
 
 
 # ---------------------------------------------------------------------------

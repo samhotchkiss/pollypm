@@ -120,45 +120,9 @@ def _user_waiting_task_ids(ctx: RailContext) -> frozenset[str]:
     config = _config(ctx)
     if config is None:
         return frozenset()
-    cache = ctx.extras.setdefault("user_waiting_task_ids_cache", {})
-    out: set[str] = set()
-    import sqlite3 as _sqlite3
-    for project_key, project in getattr(config, "projects", {}).items():
-        # Same tracked-only invariant as
-        # ``dashboard_data._user_waiting_task_ids_across_projects`` (cycle 86)
-        # and ``recovery_prompt._pending_inbox_section`` (cycle 85). The
-        # docstring above already promises "tracked project's state.db".
-        if not getattr(project, "tracked", False):
-            continue
-        db_path = project.path / ".pollypm" / "state.db"
-        try:
-            mtime = db_path.stat().st_mtime if db_path.exists() else 0.0
-        except OSError:
-            continue
-        cached = cache.get(project_key)
-        if cached is not None and cached[0] == mtime:
-            out.update(cached[1])
-            continue
-        ids: set[str] = set()
-        if mtime > 0.0:
-            try:
-                conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-                try:
-                    rows = conn.execute(
-                        "SELECT task_number FROM work_tasks "
-                        "WHERE project = ? "
-                        "AND work_status IN ('blocked','on_hold','waiting_on_user')",
-                        (project_key,),
-                    ).fetchall()
-                finally:
-                    conn.close()
-                for (number,) in rows:
-                    ids.add(f"{project_key}/{number}")
-            except (_sqlite3.Error, OSError):
-                pass
-        cache[project_key] = (mtime, ids)
-        out.update(ids)
-    return frozenset(out)
+    from pollypm.work.task_state import user_waiting_task_ids
+
+    return user_waiting_task_ids(config)
 
 
 def _active_task_numbers(project: Any, *, config: Any = None) -> list[int]:
@@ -186,62 +150,12 @@ def _active_task_numbers(project: Any, *, config: Any = None) -> list[int]:
     Failures (missing db, sqlite errors) yield an empty list — the
     rail simply shows no per-task rows rather than crashing.
     """
-    import sqlite3
-    from pathlib import Path
-
     project_key = getattr(project, "key", None)
     if not project_key:
         return []
+    from pollypm.work.task_state import active_task_numbers
 
-    candidates: list[Path] = [project.path / ".pollypm" / "state.db"]
-    workspace_root = None
-    if config is not None:
-        workspace_root = getattr(
-            getattr(config, "project", None), "workspace_root", None,
-        )
-    if workspace_root is not None:
-        candidates.append(Path(workspace_root) / ".pollypm" / "state.db")
-
-    seen: set[str] = set()
-    for db_path in candidates:
-        try:
-            if not db_path.exists():
-                continue
-        except OSError:
-            continue
-        key = str(db_path)
-        if key in seen:
-            continue
-        seen.add(key)
-        try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        except sqlite3.Error:
-            continue
-        try:
-            try:
-                rows = conn.execute(
-                    "SELECT task_number FROM work_tasks "
-                    "WHERE project = ? "
-                    "AND work_status IN ('in_progress','rework') "
-                    "ORDER BY task_number ASC",
-                    (project_key,),
-                ).fetchall()
-            except sqlite3.Error:
-                continue
-        finally:
-            try:
-                conn.close()
-            except sqlite3.Error:
-                pass
-        if rows:
-            out: list[int] = []
-            for row in rows:
-                try:
-                    out.append(int(row[0]))
-                except (TypeError, ValueError):
-                    continue
-            return out
-    return []
+    return active_task_numbers(project, config=config)
 
 
 def _polly_state(ctx: RailContext) -> str:
@@ -350,7 +264,7 @@ def _classify_projects(ctx: RailContext) -> tuple[list[tuple[str, Any]], list[tu
         return [], [], {}
 
     from datetime import UTC, datetime, timedelta
-    import sqlite3
+    from pathlib import Path
 
     now = datetime.now(UTC)
     cutoff_iso = (now - timedelta(hours=24)).isoformat()
@@ -359,63 +273,37 @@ def _classify_projects(ctx: RailContext) -> tuple[list[tuple[str, Any]], list[tu
     inactive_projects: list[tuple[str, Any]] = []
     project_has_active_task: dict[str, bool] = {}
 
+    def _path_mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime if path.exists() else 0.0
+        except OSError:
+            return 0.0
+
     def _project_activity(project_key: str, project: Any) -> tuple[bool, bool]:
         db_path = project.path / ".pollypm" / "state.db"
         git_dir = project.path / ".git"
-        try:
-            db_mtime = db_path.stat().st_mtime if db_path.exists() else 0.0
-        except OSError:
-            db_mtime = 0.0
-        try:
-            git_mtime = git_dir.stat().st_mtime if git_dir.exists() else 0.0
-        except OSError:
-            git_mtime = 0.0
+        db_mtime = _path_mtime(db_path)
+        workspace_root = getattr(getattr(config, "project", None), "workspace_root", None)
+        if workspace_root is not None:
+            db_mtime = max(
+                db_mtime,
+                _path_mtime(Path(workspace_root) / ".pollypm" / "state.db"),
+            )
+        git_mtime = _path_mtime(git_dir)
         cache = getattr(router, "_project_activity_cache", None)
         if isinstance(cache, dict):
             cached = cache.get(project_key)
             if cached is not None and cached[0] == db_mtime and cached[1] == git_mtime:
                 return cached[2], cached[3]
 
-        is_active = False
-        has_working_task = False
-        if db_mtime > 0.0:
-            try:
-                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-                try:
-                    conn.row_factory = sqlite3.Row
-                    # ``has_working_task`` drives the ``◆ working`` rail
-                    # state on the project row, which the renderer turns
-                    # into a spinning glyph (cockpit_ui ProjectRowGlyph,
-                    # ``"working" in self.item.state`` branch). A task in
-                    # ``review`` is waiting for the user / reviewer to act
-                    # — that's the opposite of an active turn, so counting
-                    # it here makes the spinner spin perpetually whenever
-                    # any task sits at code_review or user_approval. Match
-                    # ``cockpit_project_state._is_automated_progress`` (the
-                    # rollup's ``WORKING`` predicate): only ``in_progress``
-                    # is genuine automated work. ``queued`` is intentionally
-                    # excluded too — a queued task with no live worker
-                    # shouldn't spin.
-                    row = conn.execute(
-                        "SELECT "
-                        "  SUM(CASE WHEN work_status = 'in_progress' "
-                        "           THEN 1 ELSE 0 END) AS working_count, "
-                        "  MAX(updated_at) AS max_updated "
-                        "FROM work_tasks WHERE project = ?",
-                        (project_key,),
-                    ).fetchone()
-                finally:
-                    conn.close()
-                if row is not None:
-                    working_count = row["working_count"] or 0
-                    max_updated = row["max_updated"] or ""
-                    if working_count > 0:
-                        has_working_task = True
-                        is_active = True
-                    if max_updated and max_updated >= cutoff_iso:
-                        is_active = True
-            except (sqlite3.Error, OSError):
-                pass
+        from pollypm.work.task_state import project_activity as _work_project_activity
+
+        is_active, has_working_task = _work_project_activity(
+            project_key=project_key,
+            project=project,
+            cutoff_iso=cutoff_iso,
+            config=config,
+        )
         if not is_active and git_mtime > cutoff_ts:
             is_active = True
         if isinstance(cache, dict):

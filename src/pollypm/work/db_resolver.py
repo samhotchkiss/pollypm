@@ -17,7 +17,7 @@ Layout (post-#339, finalized in #1004):
   silently kept landing in the workspace DB — `pm task list` and
   `pm task get` would disagree about the same task. The resolver no
   longer routes to the per-project file. Existing per-project DBs
-  are migrated by ``pollypm.work.legacy_per_project_db.migrate_legacy_per_project_dbs``.
+  are migrated by ``pollypm.storage.legacy_per_project_db.migrate_legacy_per_project_dbs``.
 
 The function never raises — config-load failures fall through to the
 cwd-relative default. Callers that genuinely care about a missing DB
@@ -108,7 +108,7 @@ def resolve_work_db_path(
                     logger.debug(
                         "db_resolver: ignoring legacy per-project DB at %s "
                         "(post-#1004 layout collapses to workspace-root). "
-                        "Run pollypm.work.legacy_per_project_db."
+                        "Run pollypm.storage.legacy_per_project_db."
                         "migrate_legacy_per_project_dbs to import any "
                         "leftover rows and archive the file.",
                         project_db,

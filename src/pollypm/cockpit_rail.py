@@ -1625,8 +1625,8 @@ class CockpitRouter:
         db_path = project_path / ".pollypm" / "state.db"
         if not db_path.exists():
             return [], False
-        from pollypm.cockpit_ui import _project_storage_aliases
         from pollypm.plugins_builtin.project_planning.plan_presence import has_acceptable_plan
+        from pollypm.work.project_aliases import project_storage_aliases
         from pollypm.work.sqlite_service import SQLiteWorkService
 
         work = SQLiteWorkService(db_path, project_path=project_path)
@@ -1641,7 +1641,7 @@ class CockpitRouter:
             # ``ProjectRailState.NONE`` and the held-task project shows
             # up in the rail with the idle ``♥·`` glyph (no marker)
             # instead of the ``◆`` "needs attention" indicator.
-            aliases = _project_storage_aliases(config, project_key)
+            aliases = project_storage_aliases(config, project_key)
             seen_ids: set[str] = set()
             tasks: list = []
             for alias in aliases:

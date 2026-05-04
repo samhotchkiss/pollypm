@@ -7364,20 +7364,10 @@ class PollyInboxApp(App[None]):
         actions must target the project-specific DB. We resolve the
         project from the task_id prefix and look up its path in config.
         """
-        from pollypm.work.sqlite_service import SQLiteWorkService
-
-        project_key = task_id.split("/", 1)[0]
         config = load_config(self.config_path)
-        project = config.projects.get(project_key)
-        if project is None:
-            return None
-        db_path = project.path / ".pollypm" / "state.db"
-        if not db_path.exists():
-            return None
-        try:
-            return SQLiteWorkService(db_path=db_path, project_path=project.path)
-        except Exception:  # noqa: BLE001
-            return None
+        from pollypm.work.inbox_actions import open_work_service_for_task
+
+        return open_work_service_for_task(config, task_id)
 
     def _resolve_inbox_svc(self, item, task_id: str):
         """Best-effort resolve a SQLiteWorkService for a cockpit inbox row.
@@ -7395,33 +7385,10 @@ class PollyInboxApp(App[None]):
         unresolved row so future regressions surface a clear signal
         instead of a silent yellow fallback.
         """
-        svc = self._svc_for_task(task_id)
-        if svc is not None:
-            return svc
-        db_path = getattr(item, "db_path", None) if item is not None else None
-        if db_path is not None:
-            try:
-                from pollypm.work.sqlite_service import SQLiteWorkService
+        config = load_config(self.config_path)
+        from pollypm.work.inbox_actions import resolve_inbox_work_service
 
-                svc = SQLiteWorkService(
-                    db_path=db_path, project_path=db_path.parent.parent,
-                )
-            except Exception:  # noqa: BLE001
-                svc = None
-        if svc is None:
-            try:  # noqa: SIM105
-                log = logging.getLogger(__name__)
-                log.warning(
-                    "cockpit inbox: svc unresolved for task_id=%s "
-                    "project_name=%r scope=%r db_path=%r",
-                    task_id,
-                    getattr(item, "project", None) if item is not None else None,
-                    getattr(item, "scope", None) if item is not None else None,
-                    getattr(item, "db_path", None) if item is not None else None,
-                )
-            except Exception:  # noqa: BLE001
-                pass
-        return svc
+        return resolve_inbox_work_service(config, item, task_id)
 
     def _project_key_is_unknown(self, project_key: str) -> bool:
         """True when ``project_key`` is not a registered project.
@@ -10349,51 +10316,9 @@ def _project_storage_aliases(config: object, project_key: str) -> list[str]:
     was created with a casing mismatch (e.g. operator typed
     ``-p PollyPM`` instead of the slugified key).
     """
-    aliases: list[str] = []
+    from pollypm.work.project_aliases import project_storage_aliases
 
-    def _add(value: object) -> None:
-        if not isinstance(value, str):
-            return
-        text = value.strip()
-        if not text or text in aliases:
-            return
-        aliases.append(text)
-
-    _add(project_key)
-    project = (getattr(config, "projects", None) or {}).get(project_key)
-    if project is not None:
-        _add(getattr(project, "name", None))
-        path = getattr(project, "path", None)
-        if path is not None:
-            try:
-                _add(Path(path).name)
-            except TypeError:
-                pass
-    # Hyphen <-> underscore swap covers the common slugify ambiguity
-    # without depending on a config lookup.
-    _add(project_key.replace("_", "-"))
-    _add(project_key.replace("-", "_"))
-
-    # #915 — include the canonical pre-override display name. The local
-    # ``project.toml`` ``display_name`` override clobbers ``project.name``
-    # (so ``project.name`` may now read ``"pollypm"`` even though the
-    # work DB still has rows stored under ``"PollyPM"``). Re-derive the
-    # canonical form so the original casing remains queryable.
-    try:
-        from pollypm.config import _normalize_project_display_name
-        _add(_normalize_project_display_name(project_key, None))
-    except Exception:  # noqa: BLE001
-        pass
-
-    # Add lowercase + title-case variants of every alias gathered so far
-    # so any casing drift between create-time and dashboard-render-time
-    # (operator capitalisation, manual ``-p`` typo, post-rename overrides)
-    # still surfaces the row.
-    for existing in list(aliases):
-        _add(existing.lower())
-        _add(existing.casefold())
-        _add(existing.title())
-    return aliases
+    return project_storage_aliases(config, project_key)
 
 
 def _dashboard_discover_db_aliases(

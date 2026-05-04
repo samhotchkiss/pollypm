@@ -63,23 +63,9 @@ def _resolve_state_db(project_path: Path) -> Path | None:
     advisor probe returns False on every tick and the user sees
     ``last run: (never)`` forever — see #1037.
     """
-    project_path = Path(project_path)
-    per_project = project_path / ".pollypm" / "state.db"
-    if per_project.exists():
-        return per_project
+    from pollypm.plugins_builtin.advisor.db_paths import resolve_state_db
 
-    # Walk up looking for an ancestor's .pollypm/state.db. Bound the
-    # walk at filesystem root so a path entirely outside any pollypm
-    # workspace returns cleanly.
-    try:
-        resolved = project_path.resolve()
-    except OSError:
-        resolved = project_path
-    for ancestor in [resolved, *resolved.parents]:
-        candidate = ancestor / ".pollypm" / "state.db"
-        if candidate.exists():
-            return candidate
-    return None
+    return resolve_state_db(project_path)
 
 
 # ---------------------------------------------------------------------------

@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -300,20 +299,6 @@ def _gather_commits_for_project(
 # ---------------------------------------------------------------------------
 
 
-_TRANSITION_SQL = (
-    "SELECT t.task_project AS project, t.task_number AS task_number, "
-    "       COALESCE(w.title, '') AS title, "
-    "       t.from_state AS from_state, t.to_state AS to_state, "
-    "       t.actor AS actor, t.created_at AS created_at "
-    "FROM work_transitions t "
-    "LEFT JOIN work_tasks w "
-    "  ON w.project = t.task_project AND w.task_number = t.task_number "
-    "WHERE t.task_project = ? "
-    "  AND t.created_at >= ? AND t.created_at < ? "
-    "ORDER BY t.created_at ASC"
-)
-
-
 def _gather_transitions_for_project(
     project: KnownProject,
     *,
@@ -327,47 +312,26 @@ def _gather_transitions_for_project(
     filtered by ``task_project = project.key`` because a shared
     workspace DB holds rows for many projects.
     """
-    out: list[TransitionRecord] = []
-    seen_keys: set[tuple[str, int, str]] = set()
-    for db_path in project_state_db_paths(project, config):
-        try:
-            uri = f"file:{db_path}?mode=ro"
-            conn = sqlite3.connect(uri, uri=True)
-        except sqlite3.Error as exc:
-            logger.debug("briefing: cannot open %s: %s", db_path, exc)
-            continue
-        try:
-            conn.row_factory = sqlite3.Row
-            try:
-                rows = conn.execute(
-                    _TRANSITION_SQL, (project.key, since_iso, until_iso),
-                ).fetchall()
-            except sqlite3.Error as exc:
-                logger.debug("briefing: transitions SQL failed for %s: %s", project.key, exc)
-                continue
-        finally:
-            conn.close()
+    from pollypm.storage.morning_briefing_queries import transition_rows
 
-        for r in rows:
-            proj = r["project"]
-            num = r["task_number"]
-            ts = r["created_at"] or ""
-            dedupe_key = (proj, num, ts)
-            if dedupe_key in seen_keys:
-                continue
-            seen_keys.add(dedupe_key)
-            out.append(
-                TransitionRecord(
-                    project=proj,
-                    task_id=f"{proj}/{num}",
-                    task_title=r["title"] or "",
-                    from_state=r["from_state"] or "",
-                    to_state=r["to_state"] or "",
-                    actor=r["actor"] or "",
-                    timestamp=ts,
-                )
-            )
-    return out
+    rows = transition_rows(
+        project_state_db_paths(project, config),
+        project_key=project.key,
+        since_iso=since_iso,
+        until_iso=until_iso,
+    )
+    return [
+        TransitionRecord(
+            project=str(row["project"] or ""),
+            task_id=f"{row['project']}/{row['task_number']}",
+            task_title=str(row["title"] or ""),
+            from_state=str(row["from_state"] or ""),
+            to_state=str(row["to_state"] or ""),
+            actor=str(row["actor"] or ""),
+            timestamp=str(row["created_at"] or ""),
+        )
+        for row in rows
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -451,53 +415,23 @@ def _gather_downtime_artifacts(
     by ``task_project = project.key`` so a shared workspace DB only
     surfaces this project's rows.
     """
-    out: list[DowntimeArtifactSummary] = []
-    seen_keys: set[tuple[str, int, str]] = set()
-    for db_path in project_state_db_paths(project, config):
-        try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        except sqlite3.Error:
-            continue
-        try:
-            conn.row_factory = sqlite3.Row
-            try:
-                rows = conn.execute(
-                    "SELECT t.task_project AS project, t.task_number AS task_number, "
-                    "       COALESCE(w.title, '') AS title, t.created_at AS created_at, "
-                    "       COALESCE(w.labels, '[]') AS labels "
-                    "FROM work_transitions t "
-                    "LEFT JOIN work_tasks w "
-                    "  ON w.project = t.task_project AND w.task_number = t.task_number "
-                    "WHERE t.task_project = ? "
-                    "  AND t.to_state = 'awaiting_approval' "
-                    "  AND t.created_at >= ? AND t.created_at < ? "
-                    "ORDER BY t.created_at ASC",
-                    (project.key, since_iso, until_iso),
-                ).fetchall()
-            except sqlite3.Error:
-                continue
-        finally:
-            conn.close()
-        for r in rows:
-            labels_raw = r["labels"] or "[]"
-            if "downtime" not in labels_raw.lower():
-                continue
-            proj = r["project"]
-            num = r["task_number"]
-            ts = r["created_at"] or ""
-            dedupe_key = (proj, num, ts)
-            if dedupe_key in seen_keys:
-                continue
-            seen_keys.add(dedupe_key)
-            out.append(
-                DowntimeArtifactSummary(
-                    project=proj,
-                    task_id=f"{proj}/{num}",
-                    title=r["title"] or "",
-                    reached_at=ts,
-                )
-            )
-    return out
+    from pollypm.storage.morning_briefing_queries import downtime_artifact_rows
+
+    rows = downtime_artifact_rows(
+        project_state_db_paths(project, config),
+        project_key=project.key,
+        since_iso=since_iso,
+        until_iso=until_iso,
+    )
+    return [
+        DowntimeArtifactSummary(
+            project=str(row["project"] or ""),
+            task_id=f"{row['project']}/{row['task_number']}",
+            title=str(row["title"] or ""),
+            reached_at=str(row["created_at"] or ""),
+        )
+        for row in rows
+    ]
 
 
 # ---------------------------------------------------------------------------

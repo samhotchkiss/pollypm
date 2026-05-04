@@ -24,7 +24,12 @@ from pollypm.rejection_feedback import (
 )
 from pollypm.store import SQLAlchemyStore
 from pollypm.work.inbox_view import inbox_tasks
-from pollypm.work.models import Decision, ExecutionStatus
+from pollypm.work.inbox_plan_reviews import (
+    PLAN_APPROVAL_NODE_ID,
+    approved_plan_review_refs,
+    is_plan_task_approved,
+    task_user_approval_is_approved,
+)
 from pollypm.work.sqlite_service import SQLiteWorkService
 
 logger = logging.getLogger(__name__)
@@ -38,7 +43,7 @@ logger = logging.getLogger(__name__)
 # that lands, filter at render time so the user's drain-action doesn't
 # hit dead items. Imported as a constant so tests can pin the node id
 # without depending on private flow internals.
-_PLAN_APPROVAL_NODE_ID = "user_approval"
+_PLAN_APPROVAL_NODE_ID = PLAN_APPROVAL_NODE_ID
 
 
 _MARKDOWN_DECORATION_RE = re.compile(r"[*_`#>\[\]]+")
@@ -496,17 +501,7 @@ def _task_user_approval_is_approved(task) -> bool:
     structural surprise — fail-open so a transient anomaly never
     silently hides a real action-needed row.
     """
-    for execution in reversed(getattr(task, "executions", []) or []):
-        if getattr(execution, "node_id", None) != _PLAN_APPROVAL_NODE_ID:
-            continue
-        if getattr(execution, "status", None) is not ExecutionStatus.COMPLETED:
-            continue
-        decision = getattr(execution, "decision", None)
-        if decision is Decision.APPROVED:
-            return True
-        if decision is Decision.REJECTED:
-            return False
-    return False
+    return task_user_approval_is_approved(task)
 
 
 def _is_plan_task_approved(svc, project: str, task_number: int) -> bool:
@@ -519,17 +514,7 @@ def _is_plan_task_approved(svc, project: str, task_number: int) -> bool:
     Returns False on any lookup failure — fail-open so a transient DB
     error never silently hides a real action-needed row.
     """
-    task_id = f"{project}/{task_number}"
-    try:
-        task = svc.get(task_id)
-    except Exception:  # noqa: BLE001
-        logger.debug(
-            "inbox: get(%s) failed during plan-review approval check",
-            task_id,
-            exc_info=True,
-        )
-        return False
-    return _task_user_approval_is_approved(task)
+    return is_plan_task_approved(svc, project, task_number)
 
 
 # Sentinel key for the workspace-root state.db inside ``project_db_paths``.
@@ -610,27 +595,11 @@ def _filter_approved_plan_reviews(
                 refs_unparsed,
             )
         return items
-    approved_refs: set[str] = set()
-    for db_key, refs in refs_by_db.items():
-        db_path, project_path = project_db_paths[db_key]
-        try:
-            svc = SQLiteWorkService(db_path=db_path, project_path=project_path)
-        except Exception:  # noqa: BLE001
-            logger.debug(
-                "inbox: open svc failed for db %s during plan-review check",
-                db_key,
-                exc_info=True,
-            )
-            continue
-        try:
-            for project, number in refs:
-                if _is_plan_task_approved(svc, project, number):
-                    approved_refs.add(f"{project}/{number}")
-        finally:
-            try:
-                svc.close()
-            except Exception:  # noqa: BLE001
-                pass
+    approved_refs = approved_plan_review_refs(
+        refs_by_db=refs_by_db,
+        project_db_paths=project_db_paths,
+        service_factory=SQLiteWorkService,
+    )
     kept: list[InboxEntry] = []
     dropped = 0
     for item in items:

@@ -253,7 +253,7 @@ def _run_legacy_per_project_db_migration() -> None:
     once. A re-run reports zero copied rows.
     """
     try:
-        from pollypm.work.legacy_per_project_db import (
+        from pollypm.storage.legacy_per_project_db import (
             migrate_legacy_per_project_dbs,
         )
     except Exception as exc:  # noqa: BLE001

@@ -220,26 +220,15 @@ def sweep_ephemeral_sessions(supervisor: Any, store: Any) -> dict[str, int]:
     return summary
 
 
-# Terminal work_status values per ``pollypm.work.models.TERMINAL_STATUSES``.
-# Duplicated here as a string set so the sweep doesn't have to import the
-# work-service module from a recurring handler that runs in the heartbeat
-# loop. Keep in sync with that module.
-_TERMINAL_WORK_STATUSES: frozenset[str] = frozenset({"done", "cancelled"})
-
-
 def _parse_task_window_name(name: str) -> tuple[str, int] | None:
     """Parse ``task-<project>-<N>`` into ``(project, N)``. Returns None on miss.
 
     Mirrors the construction in
     :func:`pollypm.work.session_manager.task_window_name` — keep in sync.
     """
-    if not name.startswith("task-"):
-        return None
-    suffix = name[len("task-"):]
-    project, sep, number = suffix.rpartition("-")
-    if not sep or not project or not number.isdigit():
-        return None
-    return project, int(number)
+    from pollypm.work.task_state import parse_task_window_name
+
+    return parse_task_window_name(name)
 
 
 def _task_is_terminal_or_missing(supervisor: Any, name: str) -> bool:
@@ -254,91 +243,10 @@ def _task_is_terminal_or_missing(supervisor: Any, name: str) -> bool:
     short-circuits to False so we never kill a live task window
     because we couldn't read the DB.
     """
-    parsed = _parse_task_window_name(name)
-    if parsed is None:
-        return False
-    project_key, task_number = parsed
-
     config = getattr(supervisor, "config", None)
-    projects = getattr(config, "projects", None) if config is not None else None
-    if not projects:
-        return False
-    project = projects.get(project_key)
-    if project is None:
-        # The project itself is unknown to the config — the window is
-        # unambiguously orphaned.
-        return True
-    project_path = getattr(project, "path", None)
-    if project_path is None:
-        return False
+    from pollypm.work.task_state import task_window_terminal_or_missing
 
-    import sqlite3
-    from pathlib import Path
-
-    candidates: list[Path] = [project_path / ".pollypm" / "state.db"]
-    workspace_root = getattr(
-        getattr(config, "project", None), "workspace_root", None,
-    )
-    if workspace_root is not None:
-        candidates.append(Path(workspace_root) / ".pollypm" / "state.db")
-
-    found_any_db = False
-    seen: set[str] = set()
-    for db_path in candidates:
-        try:
-            if not db_path.exists():
-                continue
-        except OSError:
-            continue
-        key = str(db_path)
-        if key in seen:
-            continue
-        seen.add(key)
-        found_any_db = True
-        try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        except sqlite3.Error:
-            continue
-        # #1018 — read-only probe during ``session.health_sweep`` itself;
-        # busy_timeout lets us ride out a writer's commit instead of
-        # raising ``database is locked`` mid-sweep (escalates to
-        # ``critical_error`` via JobWorkerPool — see #67108).
-        try:
-            from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas
-
-            apply_workspace_pragmas(conn, readonly=True)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            try:
-                row = conn.execute(
-                    "SELECT work_status FROM work_tasks "
-                    "WHERE project = ? AND task_number = ?",
-                    (project_key, task_number),
-                ).fetchone()
-            except sqlite3.Error:
-                continue
-        finally:
-            try:
-                conn.close()
-            except sqlite3.Error:
-                pass
-        if row is None:
-            # Try the next candidate — the row may live in the
-            # workspace-root DB instead.
-            continue
-        status = row[0]
-        if not isinstance(status, str):
-            return False
-        return status in _TERMINAL_WORK_STATUSES
-
-    if not found_any_db:
-        # No DB at all means the project is genuinely gone — the
-        # window is orphaned.
-        return True
-    # Every candidate DB exists but none had the row — the task has
-    # been removed from the work-service.
-    return True
+    return task_window_terminal_or_missing(config, name)
 
 
 def _kill_zombie_task_window(supervisor: Any, handle: Any) -> bool:

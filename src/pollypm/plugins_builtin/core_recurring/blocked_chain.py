@@ -37,7 +37,6 @@ this sweep clearing rows whose tasks are no longer blocked).
 from __future__ import annotations
 
 import logging
-import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -99,30 +98,15 @@ def _blocked_since(work: Any, project: str, task_number: int) -> datetime | None
     Falls back to ``updated_at`` / ``created_at`` when no transition row
     exists. Returns ``None`` only if every candidate is unparseable.
     """
-    try:
-        row = work._conn.execute(
-            "SELECT created_at FROM work_transitions "
-            "WHERE task_project = ? AND task_number = ? AND to_state = ? "
-            "ORDER BY id DESC LIMIT 1",
-            (project, int(task_number), WorkStatus.BLOCKED.value),
-        ).fetchone()
-    except sqlite3.Error:
-        row = None
-    if row is not None:
-        ts = _parse_iso(row["created_at"] if hasattr(row, "keys") else row[0])
-        if ts is not None:
-            return ts
-    try:
-        task_row = work._conn.execute(
-            "SELECT updated_at, created_at FROM work_tasks "
-            "WHERE project = ? AND task_number = ?",
-            (project, int(task_number)),
-        ).fetchone()
-    except sqlite3.Error:
-        task_row = None
-    if task_row is None:
-        return None
-    return _parse_iso(task_row["updated_at"]) or _parse_iso(task_row["created_at"])
+    from pollypm.work.task_state import blocked_since_stamp_for_service
+
+    stamp = blocked_since_stamp_for_service(
+        work,
+        project_key=project,
+        task_number=task_number,
+        blocked_status=WorkStatus.BLOCKED.value,
+    )
+    return _parse_iso(stamp)
 
 
 def _walk_blocker_chain(
@@ -140,39 +124,13 @@ def _walk_blocker_chain(
     can treat them as unresolved (the dependency exists but the task
     record is gone).
     """
-    visited: set[tuple[str, int]] = set()
-    status_by_key: dict[tuple[str, int], str] = {}
-    stack: list[tuple[str, int]] = [(project, int(task_number))]
+    from pollypm.work.task_state import blocker_chain_for_service
 
-    while stack:
-        cur_project, cur_number = stack.pop()
-        try:
-            rows = work._conn.execute(
-                "SELECT from_project, from_task_number FROM work_task_dependencies "
-                "WHERE to_project = ? AND to_task_number = ? AND kind = 'blocks'",
-                (cur_project, cur_number),
-            ).fetchall()
-        except sqlite3.Error:
-            continue
-        for row in rows:
-            key = (row["from_project"], int(row["from_task_number"]))
-            if key in visited:
-                continue
-            visited.add(key)
-            try:
-                status_row = work._conn.execute(
-                    "SELECT work_status FROM work_tasks "
-                    "WHERE project = ? AND task_number = ?",
-                    key,
-                ).fetchone()
-            except sqlite3.Error:
-                status_row = None
-            status_by_key[key] = (
-                status_row["work_status"] if status_row is not None else ""
-            )
-            stack.append(key)
-
-    return visited, status_by_key
+    return blocker_chain_for_service(
+        work,
+        project_key=project,
+        task_number=task_number,
+    )
 
 
 def is_dead_end_chain(status_by_key: dict[tuple[str, int], str]) -> bool:
@@ -353,25 +311,9 @@ def sweep_blocked_chains(
 
 def _open_project_work(project: Any) -> Any | None:
     """Open a per-project SQLite work service. Returns None on failure."""
-    project_path = getattr(project, "path", None)
-    if project_path is None:
-        return None
-    db_path = Path(project_path) / ".pollypm" / "state.db"
-    try:
-        if not db_path.exists():
-            return None
-    except OSError:
-        return None
-    try:
-        from pollypm.work.sqlite_service import SQLiteWorkService
+    from pollypm.work.service_factory import open_project_work_service
 
-        return SQLiteWorkService(db_path=db_path, project_path=Path(project_path))
-    except Exception:  # noqa: BLE001
-        logger.debug(
-            "blocked_chain.sweep: open work service failed for %s",
-            getattr(project, "key", "?"), exc_info=True,
-        )
-        return None
+    return open_project_work_service(project)
 
 
 def _close_quietly(work: Any) -> None:
@@ -392,9 +334,7 @@ def blocked_chain_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     per-project DB, calling :func:`sweep_blocked_chains` once per DB.
     Idempotent across ticks via ``upsert_alert`` dedupe.
     """
-    from pollypm.plugins_builtin.task_assignment_notify.api import (
-        load_runtime_services,
-    )
+    from pollypm.runtime_services import load_runtime_services
 
     config_path_hint = payload.get("config_path") if isinstance(payload, dict) else None
     config_path = Path(config_path_hint) if config_path_hint else None

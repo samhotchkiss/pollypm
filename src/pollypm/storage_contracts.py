@@ -269,7 +269,7 @@ LEGACY_WRITERS: tuple[LegacyWriter, ...] = (
             "Post-#1004 the canonical work DB is workspace-root only. "
             "Any pre-existing <project>/.pollypm/state.db is migrated "
             "into the workspace DB by "
-            "pollypm.work.legacy_per_project_db.migrate_legacy_per_project_dbs "
+            "pollypm.storage.legacy_per_project_db.migrate_legacy_per_project_dbs "
             "and archived to state.db.legacy-1004. The resolver no "
             "longer routes reads to per-project files."
         ),

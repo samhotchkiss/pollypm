@@ -5,7 +5,7 @@ from pathlib import Path
 
 from pollypm.models import AccountConfig, ProjectSettings
 from pollypm.providers.base import LaunchCommand
-from pollypm.runtime_env import container_runtime_env_for_provider
+from pollypm.runtime_env import container_runtime_env_for_provider, launch_context_env
 from pollypm.runtimes.base import WrappedRuntimeCommand
 
 
@@ -49,7 +49,11 @@ class DockerRuntimeAdapter:
 
         account.home.mkdir(parents=True, exist_ok=True)
 
-        env = container_runtime_env_for_provider(account.provider, Path(self.home_mount), base_env=command.env)
+        env = container_runtime_env_for_provider(
+            account.provider,
+            Path(self.home_mount),
+            base_env=launch_context_env(base_env=command.env),
+        )
 
         inner_parts = [
             "mkdir -p \"$HOME\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_STATE_HOME\"",
@@ -135,7 +139,7 @@ class DockerRuntimeAdapter:
         env = container_runtime_env_for_provider(
             account.provider,
             Path(self.home_mount),
-            base_env=command.env,
+            base_env=launch_context_env(base_env=command.env),
         )
 
         inner_parts = [

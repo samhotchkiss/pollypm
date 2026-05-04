@@ -10,7 +10,7 @@ import subprocess
 
 from pollypm.models import AccountConfig, ProjectSettings
 from pollypm.providers.base import LaunchCommand
-from pollypm.runtime_env import provider_profile_env
+from pollypm.runtime_env import launch_context_env, provider_profile_env
 from pollypm.runtimes.base import WrappedRuntimeCommand
 
 logger = logging.getLogger(__name__)
@@ -156,7 +156,10 @@ class LocalRuntimeAdapter:
         account: AccountConfig,
         project: ProjectSettings,
     ) -> str:
-        env = provider_profile_env(account, base_env=command.env)
+        env = provider_profile_env(
+            account,
+            base_env=launch_context_env(base_env=command.env),
+        )
         # #965 — resolve agent binary to an absolute path so the
         # runtime_launcher's ``os.execvpe`` does not need to search a
         # sanitized child-process PATH (npm-global stripped under tmux).
@@ -204,7 +207,12 @@ class LocalRuntimeAdapter:
         project: ProjectSettings,
     ) -> WrappedRuntimeCommand:
         env = os.environ.copy()
-        env.update(provider_profile_env(account, base_env=command.env))
+        env.update(
+            provider_profile_env(
+                account,
+                base_env=launch_context_env(base_env=command.env),
+            )
+        )
         src_dir = (project.root_dir / "src").resolve()
         if src_dir.is_dir():
             existing = env.get("PYTHONPATH")

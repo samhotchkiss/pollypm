@@ -38,6 +38,40 @@ def test_local_runtime_wraps_home_and_command(tmp_path: Path) -> None:
     assert "pollypm.runtime_launcher" in wrapped
 
 
+def test_local_runtime_payload_carries_round_start_env(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    round_start = "2026-05-04T15:14:55+00:00"
+    monkeypatch.setenv("ROUND_START_ISO_TS", round_start)
+    session = SessionConfig(
+        name="worker",
+        role="worker",
+        provider=ProviderKind.CODEX,
+        account="codex_primary",
+        cwd=tmp_path,
+        project="demo-project",
+        prompt="hello",
+    )
+    account = AccountConfig(
+        name="codex_primary",
+        provider=ProviderKind.CODEX,
+        email="codex@example.com",
+        runtime=RuntimeKind.LOCAL,
+        home=tmp_path / "home",
+    )
+
+    command = CodexAdapter().build_launch_command(session, account)
+    wrapped = LocalRuntimeAdapter().wrap_command(
+        command,
+        account,
+        ProjectSettings(root_dir=tmp_path),
+    )
+
+    payload = _decoded_payload(wrapped)
+    assert payload["env"]["ROUND_START_ISO_TS"] == round_start
+
+
 def test_docker_runtime_mounts_workspace_and_home(tmp_path: Path) -> None:
     project_root = tmp_path / "repo"
     cwd = project_root / "subdir"
@@ -72,6 +106,43 @@ def test_docker_runtime_mounts_workspace_and_home(tmp_path: Path) -> None:
     assert f"{project_root.resolve()}:/workspace" in wrapped
     assert f"{home.resolve()}:/home/pollypm" in wrapped
     assert "CODEX_HOME=/home/pollypm/.codex" in wrapped
+
+
+def test_docker_runtime_exports_round_start_env(tmp_path: Path, monkeypatch) -> None:
+    round_start = "2026-05-04T15:14:55+00:00"
+    monkeypatch.setenv("ROUND_START_ISO_TS", round_start)
+    project_root = tmp_path / "repo"
+    cwd = project_root / "subdir"
+    home = tmp_path / "home"
+    cwd.mkdir(parents=True)
+    home.mkdir(parents=True)
+
+    session = SessionConfig(
+        name="worker",
+        role="worker",
+        provider=ProviderKind.CODEX,
+        account="codex_primary",
+        cwd=cwd,
+        project="demo-project",
+        prompt="hello",
+    )
+    account = AccountConfig(
+        name="codex_primary",
+        provider=ProviderKind.CODEX,
+        email="codex@example.com",
+        runtime=RuntimeKind.DOCKER,
+        home=home,
+        docker_image="ghcr.io/example/pollypm-agent:latest",
+    )
+
+    command = CodexAdapter().build_launch_command(session, account)
+    wrapped = DockerRuntimeAdapter().wrap_command(
+        command,
+        account,
+        ProjectSettings(root_dir=project_root),
+    )
+
+    assert f"ROUND_START_ISO_TS={round_start}" in wrapped
 
 
 def test_claude_runtime_sets_provider_native_config_dir(tmp_path: Path) -> None:

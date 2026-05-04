@@ -6989,6 +6989,28 @@ class PollyInboxApp(App[None]):
     def on_resize(self, _event: events.Resize) -> None:
         self._apply_stacked_layout()
 
+    def on_app_focus(self, _event: events.AppFocus) -> None:
+        """Re-focus the list when the tmux pane regains focus (#1090).
+
+        The cockpit inbox runs in tmux pane 1; selecting that pane fires
+        an ``AppFocus`` event that Textual handles by restoring focus to
+        whichever widget last held it. If that was nothing, Textual's
+        auto-focus picks the first focusable in the tree — which lands
+        on the always-mounted ``Reply`` Input rather than the list.
+        Either way, ``j``/``k``/``Enter`` keystrokes silently type into
+        the input instead of moving the selection. The user's documented
+        hint (``j/k move · ↵ open``) only fires from the list, so
+        whenever focus would otherwise be the reply input (or unset),
+        snap it back to the list. Pressing ``r`` (or Tab/click) still
+        reaches the input — this only intercepts the "pane just got
+        focus" path.
+        """
+        focused = self.focused
+        if focused is None or (
+            focused is self.reply_input and not self.reply_input.value
+        ):
+            self.list_view.focus()
+
     # ------------------------------------------------------------------
     # Data loading
     # ------------------------------------------------------------------

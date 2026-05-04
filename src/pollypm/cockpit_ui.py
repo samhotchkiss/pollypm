@@ -7486,7 +7486,20 @@ class PollyInboxApp(App[None]):
         out: list = []
         recent_cutoff_ts = self._recent_cutoff_timestamp() if self._filter_recent else None
         for t in tasks:
-            if not self._show_orphaned and getattr(t, "is_orphaned", False):
+            # #1105 — orphaned rows (project unknown to current config) are
+            # default-hidden, but an active text filter is the user's
+            # explicit "find this thing" intent. If we silently drop a
+            # row whose title contains their literal query, the filter
+            # looks broken — they get an empty list with no hint that the
+            # match is hidden behind the orphaned lens. Reveal orphaned
+            # rows whenever a text query is active so the search lands
+            # the same way the action-lens / notify-only filters already
+            # bow out under an explicit query.
+            if (
+                not self._show_orphaned
+                and not text_q
+                and getattr(t, "is_orphaned", False)
+            ):
                 continue
             # #1027 — pure ``notify``-type FYI rows (completion
             # announcements, heartbeat alerts) bury actionable items;

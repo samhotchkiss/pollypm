@@ -1049,6 +1049,49 @@ def test_orphaned_workspace_messages_hidden_by_default(
     _run(body())
 
 
+def test_text_filter_reveals_orphaned_rows(inbox_env, inbox_app) -> None:
+    """#1105 — an explicit text filter must surface orphaned matches.
+
+    Before the fix the orphaned-by-default lens hid rows whose project
+    was unknown to the current cockpit config, even when the user typed
+    a query that literally appeared in the row's title. Result: ``/`` +
+    ``smoketest`` showed an empty list with no hint that the match was
+    behind the orphaned lens. Now an active text query bypasses the
+    orphaned-hide just like it bypasses the notify-only-hide and the
+    action lens — the user's "find this" intent is treated as the
+    explicit signal that they want the row regardless of triage.
+    """
+    workspace_root = inbox_env["project_path"].parent
+    _seed_workspace_message(
+        workspace_root,
+        subject="[Action] Plan ready for review: smoketest",
+        body="Orphaned plan from a deleted project.",
+        scope="ghost_proj",
+    )
+
+    async def body() -> None:
+        async with inbox_app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            # Default lens: orphaned row is hidden.
+            assert not _has_title_substring(
+                _visible_titles(inbox_app),
+                "Plan ready for review: smoketest",
+            )
+
+            # User opens filter, types the literal subject — the row
+            # appears, even though it lives in an orphaned project.
+            await pilot.press("slash")
+            await pilot.pause()
+            inbox_app.filter_input.value = "smoketest"
+            await pilot.pause()
+            assert _has_title_substring(
+                _visible_titles(inbox_app),
+                "Plan ready for review: smoketest",
+            )
+
+    _run(body())
+
+
 def _has_title_substring(titles: list[str], substring: str) -> bool:
     """Helper: notify producers prepend ``[Action]``/``[FYI]`` tags, so
     tests assert by substring match instead of exact equality."""

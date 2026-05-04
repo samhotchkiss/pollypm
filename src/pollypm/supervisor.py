@@ -1945,6 +1945,12 @@ class Supervisor:
         self._assert_lease_available(session_name, owner=owner, force=force, action="send input to")
 
         target = self._resolve_send_target(launch)
+        from pollypm.dev_network_simulation import raise_if_network_dead_for_base_dir
+
+        raise_if_network_dead_for_base_dir(
+            self.config.project.base_dir,
+            surface=f"send input to {session_name}",
+        )
         prefixed = _prefix_for_owner(owner, text)
         self.session_service.tmux.send_keys(target, prefixed, press_enter=press_enter)
         # Codex CLI buffers input and requires a second Enter to submit.

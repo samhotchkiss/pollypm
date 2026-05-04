@@ -2203,6 +2203,12 @@ class CockpitRouter:
         window_target: str,
         route: LiveSessionRoute,
     ) -> None:
+        from pollypm.dev_network_simulation import raise_if_network_dead
+
+        raise_if_network_dead(
+            self.config_path,
+            surface=f"live session route to {route.session_name}",
+        )
         launches = supervisor.plan_launches()
         storage_session = supervisor.storage_closet_session_name()
         launch = next((item for item in launches if item.session.name == route.session_name), None)

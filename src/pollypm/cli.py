@@ -53,6 +53,7 @@ from pollypm.launch_state import (
     plan_launch,
 )
 from pollypm.cli_features.issues import issue_app, itsalive_app, report_app
+from pollypm.cli_features.dev import dev_app
 from pollypm.cli_features.maintenance import debug_app, register_maintenance_commands
 from pollypm.cli_features.migrate import register_migrate_commands
 from pollypm.cli_features.projects import register_project_commands
@@ -159,6 +160,7 @@ app.add_typer(issue_app, name="issue")
 app.add_typer(report_app, name="report")
 app.add_typer(itsalive_app, name="itsalive")
 app.add_typer(debug_app, name="debug")
+app.add_typer(dev_app, name="dev")
 
 from pollypm.work.cli import task_app, flow_app
 app.add_typer(task_app, name="task")

@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import logging
+import os
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Callable
 
 from pollypm.models import AccountConfig, ProviderKind, SessionConfig, SessionLaunchSpec
@@ -37,6 +39,12 @@ if TYPE_CHECKING:
 from pollypm.models import CONTROL_ROLES as _CONTROL_ROLES
 
 _ROUTED_ROLES = frozenset({"operator-pm", "architect", "worker", "reviewer"})
+_ROUND_START_ENV_KEYS = (
+    "ROUND_START_ISO_TS",
+    "ROUND_START_ERRNO24",
+    "ROUND_START_HBFAIL",
+    "ROUND_START_MISSING_WINDOW",
+)
 _log = logging.getLogger(__name__)
 
 
@@ -64,6 +72,27 @@ def _write_codex_agents_md_to_disk(account: AccountConfig, content: str) -> None
     target = codex_home_dir(account.home) / "AGENTS.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content.rstrip() + "\n", encoding="utf-8")
+
+
+def _carry_round_start_env(
+    launch: LaunchCommand,
+    *,
+    ambient_env: Mapping[str, str] | None = None,
+) -> LaunchCommand:
+    env = dict(launch.env)
+    ambient = ambient_env if ambient_env is not None else os.environ
+    changed = False
+    for key in _ROUND_START_ENV_KEYS:
+        if key in env:
+            continue
+        value = ambient.get(key)
+        if not value:
+            continue
+        env[key] = value
+        changed = True
+    if not changed:
+        return launch
+    return replace(launch, env=env)
 
 
 def _preferred_account_names(
@@ -169,6 +198,7 @@ class DefaultLaunchPlanner:
                 )
             provider = get_provider(effective.provider, root_dir=ctx.config.project.root_dir)
             launch = provider.build_launch_command(effective, account)
+            launch = _carry_round_start_env(launch)
             launch = ctx.apply_role_launch_restrictions(effective, launch)
             # Architect warm-resume: when an architect was previously
             # idle-closed by the heartbeat sweep, swap its argv to the

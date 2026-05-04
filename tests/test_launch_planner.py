@@ -250,6 +250,29 @@ def test_planner_routes_operator_to_codex_when_compatible_account_exists(tmp_pat
     ]
 
 
+def test_planner_carries_round_start_env_into_launch_payload(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ROUND_START_ISO_TS", "2026-05-04T20:01:00Z")
+    monkeypatch.setenv("ROUND_START_ERRNO24", "983")
+    monkeypatch.setenv("ROUND_START_HBFAIL", "507")
+    monkeypatch.setenv("ROUND_START_MISSING_WINDOW", "0")
+    config = _config(tmp_path)
+    config.accounts["claude_controller"].env["ROUND_START_ERRNO24"] = "explicit"
+    sup = Supervisor(config)
+    sup.ensure_layout()
+
+    launch = next(item for item in sup.plan_launches() if item.session.name == "operator")
+    payload = _decode_launch_payload(launch.command)
+
+    env = payload["env"]
+    assert env["ROUND_START_ISO_TS"] == "2026-05-04T20:01:00Z"
+    assert env["ROUND_START_ERRNO24"] == "explicit"
+    assert env["ROUND_START_HBFAIL"] == "507"
+    assert env["ROUND_START_MISSING_WINDOW"] == "0"
+
+
 def test_supervisor_launch_planner_property_returns_default(tmp_path: Path) -> None:
     """Supervisor exposes the configured planner via the ``launch_planner`` property."""
     config = _config(tmp_path)

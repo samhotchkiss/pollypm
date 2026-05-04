@@ -12,6 +12,7 @@ Contract:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 import re
 from typing import Any
@@ -23,7 +24,21 @@ from pollypm.rejection_feedback import (
 )
 from pollypm.store import SQLAlchemyStore
 from pollypm.work.inbox_view import inbox_tasks
+from pollypm.work.models import Decision, ExecutionStatus
 from pollypm.work.sqlite_service import SQLiteWorkService
+
+logger = logging.getLogger(__name__)
+
+
+# Plan-review notify rows reference the underlying user_approval task
+# via ``plan_task:<project>/<number>``. Once that task's
+# ``user_approval`` node-run is COMPLETED + APPROVED, the inbox row is
+# phantom action — the approval already happened (#1103). The proper
+# fix is an event listener that archives the row on approval; until
+# that lands, filter at render time so the user's drain-action doesn't
+# hit dead items. Imported as a constant so tests can pin the node id
+# without depending on private flow internals.
+_PLAN_APPROVAL_NODE_ID = "user_approval"
 
 
 _MARKDOWN_DECORATION_RE = re.compile(r"[*_`#>\[\]]+")
@@ -461,6 +476,130 @@ def _dedupe_replayed_plan_reviews(items: list[InboxEntry]) -> list[InboxEntry]:
     ]
 
 
+def _plan_task_ref(item: InboxEntry) -> str:
+    """Return the ``plan_task:<project/number>`` ref payload, or ``""``."""
+    labels = list(getattr(item, "labels", []) or [])
+    for label in labels:
+        text = str(label)
+        if text.startswith("plan_task:"):
+            return text.split(":", 1)[1].strip()
+    return ""
+
+
+def _is_plan_task_approved(svc, project: str, task_number: int) -> bool:
+    """Return True when ``project/task_number`` has user_approval = APPROVED.
+
+    Walks the task's executions for the canonical ``user_approval``
+    node, takes the latest completed visit, and reports whether its
+    decision is APPROVED. Latest-wins matches the binding-decision
+    semantics already used by ``plan_presence._find_approved_plan_task``.
+    Returns False on any lookup failure — fail-open so a transient DB
+    error never silently hides a real action-needed row.
+    """
+    task_id = f"{project}/{task_number}"
+    try:
+        task = svc.get(task_id)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "inbox: get(%s) failed during plan-review approval check",
+            task_id,
+            exc_info=True,
+        )
+        return False
+    for execution in reversed(getattr(task, "executions", []) or []):
+        if getattr(execution, "node_id", None) != _PLAN_APPROVAL_NODE_ID:
+            continue
+        if getattr(execution, "status", None) is not ExecutionStatus.COMPLETED:
+            continue
+        decision = getattr(execution, "decision", None)
+        if decision is Decision.APPROVED:
+            return True
+        if decision is Decision.REJECTED:
+            return False
+    return False
+
+
+def _filter_approved_plan_reviews(
+    items: list[InboxEntry],
+    *,
+    project_db_paths: dict[str, tuple[Path, Path]],
+) -> list[InboxEntry]:
+    """Drop ``plan_review`` rows whose user_approval is already APPROVED.
+
+    Per-render filter — the proper fix is an event listener that
+    archives the inbox row on approval-completion (#1103). Until that
+    lands, this keeps stale "Plan ready for review" rows from sitting
+    in the action lens for days after the approval has happened at the
+    work-service layer.
+
+    Logs the number of phantom rows filtered so we can measure inbox
+    cleanup and decide when the proper sweeper is needed.
+    """
+    if not items or not project_db_paths:
+        return items
+    # Group plan_task refs by project so each project's svc is opened
+    # at most once per render.
+    refs_by_project: dict[str, set[int]] = {}
+    for item in items:
+        labels = {str(lbl) for lbl in (getattr(item, "labels", []) or [])}
+        if "plan_review" not in labels:
+            continue
+        ref = _plan_task_ref(item)
+        if not ref or "/" not in ref:
+            continue
+        project, _, number_text = ref.partition("/")
+        try:
+            number = int(number_text)
+        except (TypeError, ValueError):
+            continue
+        if project not in project_db_paths:
+            continue
+        refs_by_project.setdefault(project, set()).add(number)
+    if not refs_by_project:
+        return items
+    approved_refs: set[str] = set()
+    for project, numbers in refs_by_project.items():
+        db_path, project_path = project_db_paths[project]
+        try:
+            svc = SQLiteWorkService(db_path=db_path, project_path=project_path)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "inbox: open svc failed for project %s during plan-review check",
+                project,
+                exc_info=True,
+            )
+            continue
+        try:
+            for number in numbers:
+                if _is_plan_task_approved(svc, project, number):
+                    approved_refs.add(f"{project}/{number}")
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+    if not approved_refs:
+        return items
+    kept: list[InboxEntry] = []
+    dropped = 0
+    for item in items:
+        labels = {str(lbl) for lbl in (getattr(item, "labels", []) or [])}
+        if "plan_review" in labels:
+            ref = _plan_task_ref(item)
+            if ref and ref in approved_refs:
+                dropped += 1
+                continue
+        kept.append(item)
+    if dropped:
+        logger.info(
+            "inbox: filtered %d phantom plan_review row(s) "
+            "(user_approval already APPROVED) across %d project(s)",
+            dropped,
+            len(approved_refs),
+        )
+    return kept
+
+
 def load_inbox_entries(
     config,
     *,
@@ -473,10 +612,16 @@ def load_inbox_entries(
     replies_by_task: dict[str, list] = {}
     seen_task_ids: set[str] = set()
     known_projects = set(getattr(config, "projects", {}).keys())
+    # ``plan_task:<project/number>`` refs may point at a project other
+    # than the one that hosts the notify message — collect db paths for
+    # every project so the approval filter can resolve any ref.
+    project_db_paths: dict[str, tuple[Path, Path]] = {}
     for project_key, db_path, project_path in _inbox_db_sources(config):
         if not db_path.exists():
             continue
         source_key = project_key or "__workspace__"
+        if project_key:
+            project_db_paths[project_key] = (db_path, project_path)
         try:
             store = SQLAlchemyStore(f"sqlite:///{db_path}")
         except Exception:  # noqa: BLE001
@@ -555,4 +700,7 @@ def load_inbox_entries(
                 pass
     items = _dedupe_replayed_plan_reviews(items)
     items = _dedupe_message_vs_task_plan_reviews(items)
+    items = _filter_approved_plan_reviews(
+        items, project_db_paths=project_db_paths,
+    )
     return items, unread, replies_by_task

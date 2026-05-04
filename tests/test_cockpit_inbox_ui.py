@@ -398,6 +398,120 @@ def test_task_backed_inbox_entries_default_to_action() -> None:
     assert item.triage_label == "task assigned"
 
 
+def test_filter_approved_plan_reviews_drops_completed_user_approval(
+    monkeypatch,
+) -> None:
+    """A plan_review row whose user_approval is COMPLETED+APPROVED gets dropped.
+
+    Sibling rows whose underlying user_approval is still PENDING (or whose
+    plan_task ref points at an unknown project) survive untouched (#1103).
+    """
+    from datetime import datetime
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_inbox_items import (
+        InboxEntry,
+        _filter_approved_plan_reviews,
+    )
+    from pollypm.work.models import Decision, ExecutionStatus
+
+    approved_msg = InboxEntry(
+        task_id="msg:smoketest:1",
+        title="[Action] Plan ready for review: smoketest",
+        project="smoketest",
+        labels=["plan_review", "project:smoketest", "plan_task:smoketest/1"],
+        created_at=datetime(2026, 4, 30, 10, 0, 0),
+        updated_at=datetime(2026, 4, 30, 10, 0, 0),
+    )
+    pending_msg = InboxEntry(
+        task_id="msg:bikepath:7",
+        title="[Action] Plan ready for review: bikepath",
+        project="bikepath",
+        labels=["plan_review", "project:bikepath", "plan_task:bikepath/7"],
+        created_at=datetime(2026, 5, 1, 9, 0, 0),
+        updated_at=datetime(2026, 5, 1, 9, 0, 0),
+    )
+    unrelated = InboxEntry(
+        task_id="msg:bikepath:9",
+        title="[Action] Random action",
+        project="bikepath",
+        labels=["project:bikepath"],
+        created_at=datetime(2026, 5, 1, 12, 0, 0),
+        updated_at=datetime(2026, 5, 1, 12, 0, 0),
+    )
+
+    approved_exec = SimpleNamespace(
+        node_id="user_approval",
+        status=ExecutionStatus.COMPLETED,
+        decision=Decision.APPROVED,
+    )
+    pending_exec = SimpleNamespace(
+        node_id="user_approval",
+        status=ExecutionStatus.ACTIVE,
+        decision=None,
+    )
+    tasks_by_id = {
+        "smoketest/1": SimpleNamespace(
+            task_id="smoketest/1", executions=[approved_exec],
+        ),
+        "bikepath/7": SimpleNamespace(
+            task_id="bikepath/7", executions=[pending_exec],
+        ),
+    }
+
+    class FakeSvc:
+        def __init__(self, **kwargs):
+            self._kwargs = kwargs
+
+        def get(self, task_id):
+            return tasks_by_id[task_id]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "pollypm.cockpit_inbox_items.SQLiteWorkService",
+        FakeSvc,
+    )
+
+    project_db_paths = {
+        "smoketest": (Path("/tmp/smoketest.db"), Path("/tmp/smoketest")),
+        "bikepath": (Path("/tmp/bikepath.db"), Path("/tmp/bikepath")),
+    }
+    kept = _filter_approved_plan_reviews(
+        [approved_msg, pending_msg, unrelated],
+        project_db_paths=project_db_paths,
+    )
+    kept_ids = [getattr(item, "task_id", None) for item in kept]
+    # Approved plan-review filtered out — phantom action drained.
+    assert "msg:smoketest:1" not in kept_ids
+    # Pending plan-review and unrelated row survive.
+    assert "msg:bikepath:7" in kept_ids
+    assert "msg:bikepath:9" in kept_ids
+
+
+def test_filter_approved_plan_reviews_no_op_without_project_paths() -> None:
+    """No project_db_paths → filter is a no-op (defensive guard)."""
+    from datetime import datetime
+
+    from pollypm.cockpit_inbox_items import (
+        InboxEntry,
+        _filter_approved_plan_reviews,
+    )
+
+    item = InboxEntry(
+        task_id="msg:smoketest:1",
+        title="[Action] Plan ready for review: smoketest",
+        project="smoketest",
+        labels=["plan_review", "plan_task:smoketest/1"],
+        created_at=datetime(2026, 4, 30, 10, 0, 0),
+        updated_at=datetime(2026, 4, 30, 10, 0, 0),
+    )
+    kept = _filter_approved_plan_reviews([item], project_db_paths={})
+    assert kept == [item]
+
+
 def test_inbox_lists_seeded_messages(inbox_env, inbox_app) -> None:
     """On mount, every seeded inbox task shows up in the left list."""
     async def body() -> None:

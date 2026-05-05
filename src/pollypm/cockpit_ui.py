@@ -9209,6 +9209,9 @@ class PollyInboxApp(App[None]):
         a real tmux server. See ``test_cockpit_inbox_ui.py`` for the
         monkeypatch target.
         """
+        from pollypm.dev_network_simulation import raise_if_network_dead
+
+        raise_if_network_dead(self.config_path, surface="Inbox discuss with PM")
         router = CockpitRouter(self.config_path)
         router.route_selected(cockpit_key)
         supervisor = router._load_supervisor()
@@ -14566,6 +14569,11 @@ class PollyProjectDashboardApp(App[None]):
         Split out exactly like the inbox path so the same
         ``monkeypatch`` strategy works for the dashboard's chat keybind.
         """
+        from pollypm.dev_network_simulation import raise_if_network_dead
+
+        raise_if_network_dead(
+            self.config_path, surface="Project dashboard discuss with PM",
+        )
         router = CockpitRouter(self.config_path)
         router.route_selected(cockpit_key)
         supervisor = router._load_supervisor()

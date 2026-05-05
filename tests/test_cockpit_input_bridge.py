@@ -457,6 +457,55 @@ def test_cockpit_send_key_forwards_to_focused_live_right_pane(
         cockpit.stop()
 
 
+def test_cockpit_send_key_enter_consumes_network_dead_for_live_right_pane(
+    valid_cockpit_config: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pollypm.cockpit_rail as cockpit_rail
+    from pollypm.cli_features import ui as ui_commands
+    from pollypm.dev_network_simulation import arm_network_dead, network_dead_armed
+
+    class FakeTmux:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+
+        def run(self, *args: object, **kwargs: object) -> None:
+            self.calls.append(("run", *args, kwargs))
+
+        def send_keys(
+            self, target: str, text: str, *, press_enter: bool = True,
+        ) -> None:
+            self.calls.append(("send_keys", target, text, press_enter))
+
+    class FakeRouter:
+        def __init__(self) -> None:
+            self.tmux = FakeTmux()
+
+        def active_live_right_pane_id(self) -> str:
+            return "%2"
+
+    router = FakeRouter()
+    monkeypatch.setattr(cockpit_rail, "CockpitRouter", lambda _path: router)
+
+    arm_network_dead(valid_cockpit_config)
+
+    delivered = ui_commands._send_key_to_active_live_right_pane(
+        valid_cockpit_config, "<cr>",
+    )
+
+    assert delivered == "%2"
+    assert not network_dead_armed(valid_cockpit_config)
+    assert router.tmux.calls == [
+        ("run", "send-keys", "-t", "%2", "C-u", {"check": False}),
+        (
+            "send_keys",
+            "%2",
+            "PollyPM chat failed: network unreachable (simulated): "
+            "connection refused for cockpit live chat submit",
+            False,
+        ),
+    ]
+
+
 def test_send_key_to_first_live_skips_stale_sockets(fake_config: Path, tmp_path: Path) -> None:
     bridge_dir = fake_config.parent / "cockpit_inputs"
     bridge_dir.mkdir(parents=True, exist_ok=True)

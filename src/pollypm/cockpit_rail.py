@@ -2786,6 +2786,8 @@ class CockpitRouter:
             return None
         if getattr(active, "pane_id", None) != right_pane_id:
             return None
+        if not self._is_live_provider_pane(active):
+            return None
         return right_pane_id
 
     def reload_cockpit_shell(

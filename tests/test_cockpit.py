@@ -2932,14 +2932,21 @@ def test_cockpit_router_detects_active_live_right_pane(tmp_path: Path) -> None:
     )
 
     class FakeTmux:
-        def __init__(self, right_active: bool) -> None:
+        def __init__(self, right_active: bool, right_command: str = "codex") -> None:
             self.right_active = right_active
+            self.right_command = right_command
 
         def list_panes(self, target: str):
             assert target == "pollypm:PollyPM"
             return [
-                SimpleNamespace(pane_id="%1", active=not self.right_active, pane_dead=False),
-                SimpleNamespace(pane_id="%2", active=self.right_active, pane_dead=False),
+                SimpleNamespace(
+                    pane_id="%1", active=not self.right_active,
+                    pane_dead=False, pane_current_command="uv",
+                ),
+                SimpleNamespace(
+                    pane_id="%2", active=self.right_active,
+                    pane_dead=False, pane_current_command=self.right_command,
+                ),
             ]
 
     router = CockpitRouter(config_path)
@@ -2949,6 +2956,9 @@ def test_cockpit_router_detects_active_live_right_pane(tmp_path: Path) -> None:
     assert router.active_live_right_pane_id() == "%2"
 
     router.tmux = FakeTmux(right_active=False)  # type: ignore[assignment]
+    assert router.active_live_right_pane_id() is None
+
+    router.tmux = FakeTmux(right_active=True, right_command="python")  # type: ignore[assignment]
     assert router.active_live_right_pane_id() is None
 
 

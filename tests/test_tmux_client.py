@@ -89,6 +89,47 @@ def test_has_session_returns_false_when_tmux_hangs(monkeypatch) -> None:
     assert client.has_session("pollypm") is False
 
 
+def test_show_environment_reads_session_scoped_value(monkeypatch) -> None:
+    captured: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        captured.append(list(args))
+
+        class Result:
+            returncode = 0
+            stdout = "HOME=/tmp/polly-fresh\n"
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    client = TmuxClient()
+
+    assert client.show_environment("pollypm", "HOME") == "/tmp/polly-fresh"
+    assert captured[0] == [
+        "tmux",
+        "show-environment",
+        "-t",
+        "=pollypm",
+        "HOME",
+    ]
+
+
+def test_show_environment_treats_hidden_value_as_missing(monkeypatch) -> None:
+    def fake_run(args, **kwargs):
+        class Result:
+            returncode = 0
+            stdout = "-HOME\n"
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    client = TmuxClient()
+
+    assert client.show_environment("pollypm", "HOME") is None
+
+
 def test_send_keys_long_text_uses_per_call_named_buffer(monkeypatch, tmp_path) -> None:
     """#808: long sends must use a per-call named tmux paste buffer so
     two concurrent sends can't paste each other's text. Two

@@ -19,6 +19,7 @@ Contract:
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -230,6 +231,14 @@ def switch_client_to_session(session_name: str) -> int:
     return _switch_client_to_session(session_name)
 
 
+def session_environment_value(session_name: str, variable: str) -> str | None:
+    from pollypm.session_services import (
+        session_environment_value as _session_environment_value,
+    )
+
+    return _session_environment_value(session_name, variable)
+
+
 def start_transcript_ingestion(config) -> None:
     from pollypm.transcript_ingest import start_transcript_ingestion as _start_transcript_ingestion
 
@@ -265,12 +274,77 @@ def _attach_existing_session_without_config() -> bool:
     for session_name in _session_name_candidates():
         if not probe_session(session_name):
             continue
+        if _session_home_mismatch(_bootstrap_session_home(session_name)) is not None:
+            continue
         if current_tmux == session_name:
             return True
         if current_tmux:
             raise typer.Exit(code=switch_client_to_session(session_name))
         raise typer.Exit(code=attach_existing_session(session_name))
     return False
+
+
+def _normalize_path_for_compare(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        return str(Path(value).expanduser().resolve(strict=False))
+    except Exception:  # noqa: BLE001
+        return str(Path(value).expanduser())
+
+
+def _session_home_mismatch(owner_home: str | None) -> tuple[str, str] | None:
+    current_home = os.environ.get("HOME")
+    owner = _normalize_path_for_compare(owner_home)
+    current = _normalize_path_for_compare(current_home)
+    if not owner or not current or owner == current:
+        return None
+    return (owner, current)
+
+
+def _bootstrap_session_home(session_name: str) -> str | None:
+    try:
+        return session_environment_value(session_name, "HOME")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _supervisor_session_home(supervisor, session_name: str) -> str | None:
+    tmux = getattr(supervisor, "tmux", None)
+    show_environment = getattr(tmux, "show_environment", None)
+    if not callable(show_environment):
+        return None
+    try:
+        return show_environment(session_name, "HOME")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _refuse_foreign_tmux_sessions(
+    supervisor,
+    probe: LaunchProbe,
+    config_path: Path,
+) -> None:
+    """Fail closed before mutating a same-named session from another HOME."""
+    sessions = (
+        (probe.main_session_name, probe.main_session_alive),
+        (probe.closet_session_name, probe.closet_session_alive),
+    )
+    for session_name, alive in sessions:
+        if not session_name or not alive:
+            continue
+        mismatch = _session_home_mismatch(
+            _supervisor_session_home(supervisor, session_name)
+        )
+        if mismatch is None:
+            continue
+        owner_home, current_home = mismatch
+        raise typer.BadParameter(
+            f"tmux session '{session_name}' is in use by another HOME "
+            f"({owner_home}); current HOME is {current_home}. Set "
+            f"`project.tmux_session` in {config_path} to a unique name "
+            "before running `pm up`."
+        )
 
 
 def _load_supervisor(config_path: Path):
@@ -681,6 +755,7 @@ def up(
     # ambient state. The probe only reads tmux + config; building it
     # is side-effect-free.
     probe = _build_launch_probe(supervisor)
+    _refuse_foreign_tmux_sessions(supervisor, probe, config_path)
     plan = plan_launch(probe)
     typer.echo(f"[launch] {plan.state.value}: {plan.reason}")
     if plan.state is LaunchState.UNSUPPORTED:

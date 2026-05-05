@@ -16,6 +16,7 @@ __all__ = [
     "current_session_name",
     "get_session_service",
     "probe_session",
+    "session_environment_value",
     "switch_client_to_session",
 ]
 
@@ -57,6 +58,11 @@ def create_tmux_client():
 def probe_session(name: str) -> bool:
     """Return True if a session with this name exists at the tmux layer."""
     return create_tmux_client().has_session(name)
+
+
+def session_environment_value(session_name: str, variable: str) -> str | None:
+    """Return a tmux session environment value before config is loaded."""
+    return create_tmux_client().show_environment(session_name, variable)
 
 
 def attach_existing_session(name: str) -> int:

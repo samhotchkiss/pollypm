@@ -126,6 +126,31 @@ class TmuxClient:
         result = self.run("has-session", "-t", self._exact_target(name), check=False)
         return result.returncode == 0
 
+    def show_environment(self, session_name: str, variable: str) -> str | None:
+        """Return one tmux session environment value, if it is visible.
+
+        tmux prints hidden/unset variables as ``-NAME`` and regular
+        variables as ``NAME=value``. Treat hidden, unset, malformed, and
+        failed probes as missing so callers can stay conservative.
+        """
+        self._validate_name(session_name, "session name")
+        result = self.run(
+            "show-environment",
+            "-t",
+            self._exact_target(session_name),
+            variable,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        line = result.stdout.strip()
+        if not line or line.startswith(f"-{variable}"):
+            return None
+        prefix = f"{variable}="
+        if not line.startswith(prefix):
+            return None
+        return line[len(prefix):]
+
     def _spawn_env_args(self) -> list[str]:
         args: list[str] = []
         for name in _SPAWN_ENV_VARS:

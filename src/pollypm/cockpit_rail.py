@@ -3573,15 +3573,21 @@ class CockpitRouter:
         *,
         task_id: str | None = None,
     ) -> str:
-        root = shlex.quote(str(self.config_path.parent.resolve()))
-        import shutil
-        pm_cmd = "pm" if shutil.which("pm") else "uv run pm"
+        root = str(self.config_path.parent.resolve())
+        package_parent = Path(__file__).resolve().parents[1]
+        python_path = str(package_parent)
+        existing_python_path = os.environ.get("PYTHONPATH")
+        if existing_python_path:
+            python_path = os.pathsep.join([python_path, existing_python_path])
         args = [
             "env",
             "POLLYPM_HOLD_UNUSABLE_DATABASE_SCREEN=1",
-            pm_cmd,
+            f"PYTHONPATH={python_path}",
+            sys.executable,
+            "-m",
+            "pollypm.cli",
             "cockpit-pane",
-            shlex.quote(kind),
+            kind,
         ]
         if project_key is not None:
             # #751 — inbox and activity both use --project to scope
@@ -3589,20 +3595,21 @@ class CockpitRouter:
             # the positional target argument because they mount the
             # per-project screen directly, not a scoped filter.
             if kind in {"inbox", "activity"}:
-                args.extend(["--project", shlex.quote(project_key)])
+                args.extend(["--project", project_key])
             else:
-                args.append(shlex.quote(project_key))
+                args.append(project_key)
         if task_id is not None:
-            args.extend(["--task", shlex.quote(task_id)])
-        joined = " ".join(args)
-        # #986 — ``exec`` replaces the shell with the ``pm`` process so
+            args.extend(["--task", task_id])
+        joined = shlex.join(args)
+        # #986 — ``exec`` replaces the shell with the pane CLI process so
         # tmux's ``respawn-pane -k`` SIGKILL hits the Python child
         # directly. Without ``exec`` the shell parent is killed but its
         # Python child survives, reparenting to PID 1 across cockpit
         # kill+restart cycles. Each respawn would then leak one
         # cockpit-pane orphan that holds open file handles, races the
         # fresh cockpit's right-pane app, and persists across boots.
-        return f"sh -lc 'cd {root} && exec {joined}'"
+        inner = f"cd {shlex.quote(root)} && exec {joined}"
+        return f"sh -lc {shlex.quote(inner)}"
 
 
 def focus_cockpit_rail_pane(config_path: Path) -> bool:

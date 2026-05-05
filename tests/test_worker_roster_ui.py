@@ -787,6 +787,72 @@ def test_gather_worker_roster_surfaces_per_task_storage_window(
     assert task_row.status == "idle"
 
 
+def test_gather_worker_roster_marks_stopped_synthetic_worker_stuck(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A stopped long-running worker window must not render idle/healthy."""
+    import pollypm.cockpit_inbox as cockpit_inbox
+    import pollypm.session_services as session_services
+    from pollypm.cockpit import _gather_worker_roster
+
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+
+    class _Project:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+            self.name = "Demo"
+
+        def display_label(self) -> str:
+            return self.name
+
+    class _InnerProject:
+        tmux_session = "pollypm-test"
+
+    class _Config:
+        project = _InnerProject()
+
+        def __init__(self, project_path: Path) -> None:
+            self.projects = {"demo": _Project(project_path)}
+
+    class FakeWindow:
+        name = "worker-demo"
+        pane_id = "%12"
+        pane_pid = 12345
+        pane_dead = False
+
+    class FakeTmux:
+        def list_windows(self, session_name: str):
+            assert session_name == "pollypm-test-storage-closet"
+            return [FakeWindow()]
+
+        def pane_has_stopped_descendant(
+            self,
+            *,
+            pane_pid: int | None = None,
+            pane_id: str | None = None,
+        ) -> bool:
+            return pane_pid == 12345 or pane_id == "%12"
+
+        def capture_pane(self, pane_id: str, lines: int = 15) -> str:
+            raise AssertionError("stopped panes should not need turn detection")
+
+    monkeypatch.setattr(
+        cockpit_inbox, "_try_load_supervisor_for_config", lambda config: None,
+    )
+    monkeypatch.setattr(session_services, "create_tmux_client", lambda: FakeTmux())
+
+    rows = _gather_worker_roster(_Config(project_path))
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.session_name == "worker-demo"
+    assert row.project_key == "demo"
+    assert row.status == "stuck"
+    assert row.health == "unresponsive"
+
+
 def test_gather_worker_roster_skips_malformed_task_window(
     tmp_path: Path,
     monkeypatch,

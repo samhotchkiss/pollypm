@@ -20,6 +20,7 @@ import typer
 from pollypm.config import DEFAULT_CONFIG_PATH
 
 _RIGHT_PANE_BRIDGE_BYPASS_ESCAPE_TOKENS = frozenset({"<esc>", "esc", "escape"})
+_HELP_KEY_TOKENS = frozenset({"?", "question_mark"})
 _RIGHT_PANE_TMUX_KEY_TOKENS: dict[str, str] = {
     "<bs>": "BSpace",
     "backspace": "BSpace",
@@ -46,6 +47,41 @@ _RIGHT_PANE_TMUX_KEY_TOKENS: dict[str, str] = {
     "<end>": "End",
     "end": "End",
 }
+
+
+def _is_help_key(key: str) -> bool:
+    return key.strip().lower() in _HELP_KEY_TOKENS
+
+
+def _content_bridge_kind_for_selected_key(selected_key: str) -> str | None:
+    """Return the right-pane bridge kind for selected static cockpit views."""
+    if selected_key in {"dashboard", "polly"}:
+        return "dashboard"
+    if selected_key == "inbox" or selected_key.startswith("inbox:"):
+        return "pane-inbox"
+    if selected_key == "settings":
+        return "settings"
+    return None
+
+
+def _send_help_key_to_content_bridge(config_path: Path, key: str) -> Path | None:
+    """Deliver ``?`` to the selected content-pane app when it has a bridge."""
+    if not _is_help_key(key):
+        return None
+    try:
+        from pollypm.cockpit_input_bridge import send_key_to_first_live
+        from pollypm.cockpit_rail import CockpitRouter
+
+        selected = CockpitRouter(config_path).selected_key()
+    except Exception:  # noqa: BLE001
+        return None
+    kind = _content_bridge_kind_for_selected_key(selected)
+    if kind is None:
+        return None
+    try:
+        return send_key_to_first_live(config_path, key, kind=kind, timeout=0.2)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _tmux_event_for_cockpit_key(key: str) -> tuple[str, bool] | None:
@@ -361,6 +397,12 @@ def register_ui_commands(app: typer.Typer) -> None:
                 typer.echo(
                     f"Delivered {key!r} via cockpit right pane {delivered_to_right}"
                 )
+                return
+            delivered_to_content = _send_help_key_to_content_bridge(
+                config_path, key,
+            )
+            if delivered_to_content is not None:
+                typer.echo(f"Delivered {key!r} via {delivered_to_content}")
                 return
 
         delivered_to = send_key_to_first_live(config_path, key, kind=kind)

@@ -82,6 +82,20 @@ def fake_config() -> Iterator[Path]:
         shutil.rmtree(root, ignore_errors=True)
 
 
+@pytest.fixture()
+def valid_cockpit_config(tmp_path: Path) -> Path:
+    """Minimal config that ``CockpitRouter`` can use for state lookup."""
+    base_dir = tmp_path / ".pollypm"
+    config = tmp_path / "pollypm.toml"
+    config.write_text(
+        "[project]\n"
+        'name = "PollyPM"\n'
+        'tmux_session = "pollypm-test"\n'
+        f'base_dir = "{base_dir}"\n'
+    )
+    return config
+
+
 def test_start_input_bridge_creates_socket(fake_config: Path) -> None:
     app = _FakeApp()
     handle = start_input_bridge(app, kind="cockpit", config_path=fake_config)
@@ -223,6 +237,51 @@ def test_cockpit_send_key_defaults_to_cockpit_socket(fake_config: Path) -> None:
     finally:
         cockpit.stop()
         dashboard.stop()
+
+
+@pytest.mark.parametrize(
+    ("selected_key", "bridge_kind"),
+    [
+        ("dashboard", "dashboard"),
+        ("inbox", "pane-inbox"),
+    ],
+)
+def test_cockpit_send_key_question_mark_prefers_content_pane_bridge(
+    valid_cockpit_config: Path,
+    selected_key: str,
+    bridge_kind: str,
+) -> None:
+    import typer
+    from typer.testing import CliRunner
+
+    from pollypm.cli_features.ui import register_ui_commands
+    from pollypm.cockpit_rail import CockpitRouter
+
+    cockpit_app = _FakeApp()
+    content_app = _FakeApp()
+    cockpit = start_input_bridge(
+        cockpit_app, kind="cockpit", config_path=valid_cockpit_config,
+    )
+    assert cockpit is not None
+    content = start_input_bridge(
+        content_app, kind=bridge_kind, config_path=valid_cockpit_config,
+    )
+    assert content is not None
+    try:
+        CockpitRouter(valid_cockpit_config).set_selected_key(selected_key)
+
+        app = typer.Typer()
+        register_ui_commands(app)
+        result = CliRunner().invoke(
+            app, ["cockpit-send-key", "?", "--config", str(valid_cockpit_config)]
+        )
+        assert result.exit_code == 0, result.output
+        assert f"via {content.socket_path}" in result.output
+        assert _wait_for(lambda: content_app.keys == ["question_mark"])
+        assert cockpit_app.keys == []
+    finally:
+        cockpit.stop()
+        content.stop()
 
 
 def test_cockpit_send_key_forwards_to_focused_live_right_pane(

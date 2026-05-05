@@ -2487,6 +2487,76 @@ def test_inbox_bridge_jk_moves_list_cursor(inbox_env) -> None:
     _run(body())
 
 
+def test_inbox_j_navigation_defers_detail_until_after_refresh(
+    inbox_env, monkeypatch,
+) -> None:
+    """#1226: ``j`` paints the list cursor before detail/read IO runs."""
+    if not _load_config_compatible(inbox_env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_ui import PollyInboxApp
+
+    app = PollyInboxApp(inbox_env["config_path"])
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            callbacks = []
+            rendered: list[tuple[str, bool]] = []
+            marked_read: list[str] = []
+
+            def fake_call_after_refresh(callback, *args, **kwargs):
+                callbacks.append((callback, args, kwargs))
+
+            def fake_render_detail(task_id: str, *, prefer_cache: bool = False) -> None:
+                rendered.append((task_id, prefer_cache))
+
+            monkeypatch.setattr(app, "call_after_refresh", fake_call_after_refresh)
+            monkeypatch.setattr(app, "_render_detail", fake_render_detail)
+            monkeypatch.setattr(app, "_mark_open_read", marked_read.append)
+
+            assert app.list_view.index == 0
+            app.action_cursor_down()
+
+            assert app.list_view.index == 1
+            assert rendered == []
+            assert marked_read == []
+            assert len(callbacks) == 1
+
+            callback, args, kwargs = callbacks.pop()
+            callback(*args, **kwargs)
+
+            assert rendered == [(app._visible_rows[1].task_id, True)]
+            assert marked_read == [app._visible_rows[1].task_id]
+
+    _run(body())
+
+
+def test_inbox_open_selected_marks_current_row_read() -> None:
+    """Opening the highlighted row still does the full read/open work."""
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyInboxApp
+
+    app = PollyInboxApp.__new__(PollyInboxApp)
+    app.list_view = SimpleNamespace(index=0)
+    app._visible_rows = [SimpleNamespace(key="task:demo/1", task_id="demo/1")]
+    app._selected_row_key = "task:demo/1"
+    app._selected_task_id = "demo/1"
+    rendered: list[tuple[str, bool]] = []
+    read: list[str] = []
+    app._render_detail = (  # type: ignore[method-assign]
+        lambda task_id, *, prefer_cache=False: rendered.append(
+            (task_id, prefer_cache)
+        )
+    )
+    app._mark_open_read = lambda task_id: read.append(task_id)  # type: ignore[method-assign]
+
+    app.action_open_selected()
+
+    assert rendered == [("demo/1", False)]
+    assert read == ["demo/1"]
+
+
 def test_inbox_bridge_dispatches_discuss_approve_archive_actions(
     inbox_env, monkeypatch,
 ) -> None:

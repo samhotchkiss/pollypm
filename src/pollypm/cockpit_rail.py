@@ -845,7 +845,7 @@ class CockpitRouter:
         self._validate_state()
         data = self._load_state()
         value = data.get("selected")
-        return str(value) if isinstance(value, str) and value else "polly"
+        return str(value) if isinstance(value, str) and value else "dashboard"
 
     def set_selected_key(self, key: str) -> None:
         data = self._load_state()
@@ -3481,7 +3481,16 @@ class CockpitRouter:
                 # while the actual mount finishes — every project sub
                 # route legitimately overlays the project dashboard.
                 return self._right_pane_command("project", project_key)
-        return self._right_pane_command("polly")
+        if isinstance(selected, str):
+            if selected in {"dashboard", "inbox", "workers", "metrics", "activity", "settings"}:
+                return self._right_pane_command(selected)
+            if selected.startswith("inbox:"):
+                return self._right_pane_command("inbox", selected.split(":", 1)[1])
+            if selected.startswith("activity:"):
+                return self._right_pane_command("activity", selected.split(":", 1)[1])
+            if selected == "polly":
+                return self._right_pane_command("polly")
+        return self._right_pane_command("dashboard")
 
     def _right_pane_command(
         self,

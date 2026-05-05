@@ -964,7 +964,7 @@ class PollyCockpitApp(App[None]):
     """
 
     BINDINGS = [
-        Binding("enter,o", "open_selected", "Open"),
+        Binding("enter,o", "open_selected", "Open", priority=True),
         Binding("n", "new_worker", "New Worker"),
         # #1089 — ``i`` from the rail used to fire ``open_inbox``, which
         # shadowed the project dashboard's advertised ``i inbox`` (the
@@ -979,7 +979,8 @@ class PollyCockpitApp(App[None]):
             "i", "forward_project_jump_inbox", "Inbox",
             show=False, priority=True,
         ),
-        Binding("I", "open_inbox", "Inbox"),
+        Binding("I", "open_inbox", "Inbox", priority=True),
+        Binding("H", "open_home", "Home", show=False, priority=True),
         Binding("t", "open_activity", "Activity"),
         # #1088 — ``p`` from the rail used to fire ``toggle_project_pin``,
         # which shadowed the project dashboard's advertised ``p plan``
@@ -994,7 +995,7 @@ class PollyCockpitApp(App[None]):
         ),
         Binding("P", "toggle_project_pin", "Pin Project"),
         Binding("r", "refresh", "Refresh"),
-        Binding("s", "open_settings", "Settings"),
+        Binding("s", "open_settings", "Settings", priority=True),
         Binding("tab", "forward_tab_to_right", "Right Pane", show=False, priority=True),
         Binding("A", "forward_workers_auto_refresh", "Workers Auto", show=False, priority=True),
         Binding("d", "forward_inbox_discuss", "Inbox discuss", show=False),
@@ -1074,6 +1075,10 @@ class PollyCockpitApp(App[None]):
     # wins over the modal's own priority binding for the same key.
     _HELP_MODAL_GATED_ACTIONS = frozenset({
         "request_quit",          # Q, ctrl+q (#1089 — q forwards instead)
+        "open_selected",         # enter/o
+        "open_home",             # H
+        "open_inbox",            # I
+        "open_settings",         # s
         "back_to_home",          # escape
         "show_keyboard_help",    # ?  (so reopening on top is suppressed,
                                  #     letting the modal close itself)
@@ -1103,6 +1108,10 @@ class PollyCockpitApp(App[None]):
     # — instead the existing one stays up and Esc still works.
     _PALETTE_MODAL_GATED_ACTIONS = frozenset({
         "request_quit",          # Q, ctrl+q (#1089 — q forwards instead)
+        "open_selected",         # enter/o
+        "open_home",             # H
+        "open_inbox",            # I
+        "open_settings",         # s
         "back_to_home",          # escape
         "open_command_palette",  # : / ctrl+k (no double-stack)
         "show_keyboard_help",    # ? (don't open help on top of palette)
@@ -1128,6 +1137,10 @@ class PollyCockpitApp(App[None]):
     # actions / dismiss without the rail eating the keystroke first.
     _ALERT_DETAIL_MODAL_GATED_ACTIONS = frozenset({
         "request_quit",          # Q, ctrl+q  (#1089 — q forwards instead)
+        "open_selected",         # enter/o
+        "open_home",             # H
+        "open_inbox",            # I
+        "open_settings",         # s
         "forward_project_home",  # q  (#1089 — modal binds it to dismiss)
         "back_to_home",          # escape
         "view_alert_detail",     # !  (no double-stack)
@@ -1196,8 +1209,8 @@ class PollyCockpitApp(App[None]):
         self._update_pill_dismissed = False
         self.spinner_index = 0
         self._ticker_started_at = time.monotonic()
-        self.selected_key = "polly"
-        self._last_router_selected_key = "polly"
+        self.selected_key = "dashboard"
+        self._last_router_selected_key = "dashboard"
         self._items: list[CockpitItem] = []
         self._row_widgets: dict[str, RailItem] = {}
         self._section_sep: ListItem | None = None
@@ -2440,6 +2453,9 @@ class PollyCockpitApp(App[None]):
     def action_open_activity(self) -> None:
         self._schedule_route_selected("activity", label="Activity")
 
+    def action_open_home(self) -> None:
+        self._navigate_home()
+
     # ------------------------------------------------------------------
     # Async routing (#959)
     #
@@ -2846,8 +2862,8 @@ class PollyCockpitApp(App[None]):
         )
 
     def _navigate_home(self) -> bool:
-        """Switch to the Home (dashboard / polly) surface. Return True on success."""
-        self._schedule_route_selected("polly", label="Home")
+        """Switch to the Home dashboard surface. Return True on success."""
+        self._schedule_route_selected("dashboard", label="Home")
         return True
 
     def action_back_to_home(self) -> None:
@@ -2890,7 +2906,7 @@ class PollyCockpitApp(App[None]):
         selections (#959) so a slow supervisor load can never block the
         click handler / freeze cockpit input.
         """
-        self._schedule_route_selected("polly", label="Home")
+        self._schedule_route_selected("dashboard", label="Home")
 
     def action_detach(self) -> None:
         self.router.tmux.run("detach-client", check=False)

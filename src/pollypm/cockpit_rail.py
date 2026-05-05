@@ -2741,6 +2741,37 @@ class CockpitRouter:
         if right_pane is not None:
             self.tmux.run("send-keys", "-t", right_pane, key, check=False)
 
+    def active_live_right_pane_id(self) -> str | None:
+        """Return the right pane id when tmux focus is in a mounted live agent.
+
+        ``pm cockpit-send-key`` normally enters through the rail's Textual
+        input bridge. After a live chat mount, though, the cockpit
+        intentionally moves tmux focus to the right pane so typing should
+        reach Codex/Claude instead of rail hotkeys.
+        """
+        state = self._load_state()
+        mounted = state.get("mounted_session")
+        right_pane_id = state.get("right_pane_id")
+        if not isinstance(mounted, str) or not mounted:
+            return None
+        if not isinstance(right_pane_id, str) or not right_pane_id:
+            return None
+        try:
+            config = self._load_config()
+            window_target = f"{config.project.tmux_session}:{self._COCKPIT_WINDOW}"
+            panes = self.tmux.list_panes(window_target)
+        except Exception:  # noqa: BLE001
+            return None
+        active = next(
+            (pane for pane in panes if getattr(pane, "active", False)),
+            None,
+        )
+        if active is None or getattr(active, "pane_dead", False):
+            return None
+        if getattr(active, "pane_id", None) != right_pane_id:
+            return None
+        return right_pane_id
+
     def reload_cockpit_shell(
         self,
         *,

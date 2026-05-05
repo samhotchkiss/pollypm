@@ -1083,6 +1083,58 @@ def test_run_heartbeat_invokes_recovery_alert_auto_clear_sweep(
     )
 
 
+def test_run_heartbeat_retries_transient_first_party_notify_sweep_import(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    import pollypm.supervisor as supervisor_mod
+
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+
+    attempts = 0
+    sleeps: list[float] = []
+    swept: list[object] = []
+
+    def _flaky_load_sweep_stale_notifies():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ModuleNotFoundError(
+                "No module named 'pollypm.inbox_sweep'",
+                name="pollypm.inbox_sweep",
+            )
+        return lambda store: swept.append(store)
+
+    monkeypatch.setattr(
+        supervisor_mod,
+        "_load_sweep_stale_notifies",
+        _flaky_load_sweep_stale_notifies,
+    )
+    monkeypatch.setattr(
+        supervisor_mod.time,
+        "sleep",
+        lambda seconds: sleeps.append(seconds),
+    )
+    monkeypatch.setattr(
+        "pollypm.supervisor.get_heartbeat_backend",
+        lambda name, root_dir=None: type(
+            "_Backend", (), {"run": staticmethod(lambda api, snapshot_lines=200: [])},
+        )(),
+    )
+    monkeypatch.setattr(supervisor, "ensure_heartbeat_schedule", lambda: None)
+    monkeypatch.setattr(
+        "pollypm.supervisor.sync_token_ledger_for_config",
+        lambda config: [],
+    )
+
+    supervisor.run_heartbeat()
+
+    assert attempts == 2
+    assert sleeps == [supervisor_mod._FIRST_PARTY_IMPORT_RETRY_DELAYS[0]]
+    assert swept == [supervisor._msg_store]
+
+
 # ---------------------------------------------------------------------------
 # #1019 — fd-exhaustion early-warning sweep
 # ---------------------------------------------------------------------------

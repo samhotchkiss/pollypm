@@ -12,7 +12,9 @@ shutdown.
 
 from __future__ import annotations
 
+import importlib
 import logging
+import time
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -22,6 +24,38 @@ if TYPE_CHECKING:
     from pollypm.storage.state import StateStore
 
 logger = logging.getLogger(__name__)
+
+
+_HEARTBEAT_IMPORT_RETRY_DELAYS = (0.05, 0.2, 0.5)
+
+
+def _is_first_party_module_missing(exc: ModuleNotFoundError) -> bool:
+    missing_name = exc.name or ""
+    return missing_name == "pollypm" or missing_name.startswith("pollypm.")
+
+
+def _load_heartbeat_rail_class():
+    from pollypm.heartbeat.boot import HeartbeatRail
+
+    return HeartbeatRail
+
+
+def _load_heartbeat_rail_class_with_retry():
+    for delay in (*_HEARTBEAT_IMPORT_RETRY_DELAYS, None):
+        try:
+            return _load_heartbeat_rail_class()
+        except ModuleNotFoundError as exc:
+            if delay is None or not _is_first_party_module_missing(exc):
+                raise
+            logger.warning(
+                "CoreRail.start(): HeartbeatRail import missing first-party "
+                "module %r; retrying in %.2fs",
+                exc.name,
+                delay,
+            )
+            importlib.invalidate_caches()
+            time.sleep(delay)
+    raise RuntimeError("unreachable heartbeat import retry state")
 
 
 @runtime_checkable
@@ -160,7 +194,7 @@ class CoreRail:
         if self._heartbeat_rail is not None:
             return
         try:
-            from pollypm.heartbeat.boot import HeartbeatRail
+            HeartbeatRail = _load_heartbeat_rail_class_with_retry()
 
             rail = HeartbeatRail.from_plugin_host(
                 state_db=self._config.project.state_db,

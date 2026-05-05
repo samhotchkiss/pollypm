@@ -20,6 +20,7 @@ import typer
 from pollypm.config import DEFAULT_CONFIG_PATH
 
 _RIGHT_PANE_BRIDGE_BYPASS_ESCAPE_TOKENS = frozenset({"<esc>", "esc", "escape"})
+_LIVE_RIGHT_PANE_INPUT_STICKY = "live_right_pane_input_sticky"
 _HELP_KEY_TOKENS = frozenset({"?", "question_mark"})
 _HELP_CONTENT_BRIDGE_FALLBACK_KINDS = ("dashboard", "pane-inbox", "settings")
 _INBOX_BRIDGE_FIRST_TOKENS = frozenset({"/", "d"})
@@ -210,10 +211,66 @@ def _live_chat_submit_blocked_by_network_dead(
     return False
 
 
+def _set_live_right_pane_input_sticky(router: object, active: bool) -> None:
+    try:
+        load_state = getattr(router, "_load_state")
+        write_state = getattr(router, "_write_state")
+        state = load_state()
+        if not isinstance(state, dict):
+            return
+        if active:
+            if state.get(_LIVE_RIGHT_PANE_INPUT_STICKY) is True:
+                return
+            state[_LIVE_RIGHT_PANE_INPUT_STICKY] = True
+        else:
+            if _LIVE_RIGHT_PANE_INPUT_STICKY not in state:
+                return
+            state.pop(_LIVE_RIGHT_PANE_INPUT_STICKY, None)
+        write_state(state)
+    except Exception:  # noqa: BLE001
+        return
+
+
+def _sticky_live_right_pane_id(router: object) -> str | None:
+    try:
+        state = getattr(router, "_load_state")()
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(state, dict):
+        return None
+    if state.get(_LIVE_RIGHT_PANE_INPUT_STICKY) is not True:
+        return None
+    mounted = state.get("mounted_session")
+    right_pane_id = state.get("right_pane_id")
+    if not isinstance(mounted, str) or not mounted:
+        _set_live_right_pane_input_sticky(router, False)
+        return None
+    if not isinstance(right_pane_id, str) or not right_pane_id:
+        _set_live_right_pane_input_sticky(router, False)
+        return None
+    try:
+        config = getattr(router, "_load_config")()
+        cockpit_window = getattr(router, "_COCKPIT_WINDOW", "PollyPM")
+        window_target = f"{config.project.tmux_session}:{cockpit_window}"
+        panes = router.tmux.list_panes(window_target)
+    except Exception:  # noqa: BLE001
+        return None
+    right_pane = next(
+        (pane for pane in panes if getattr(pane, "pane_id", None) == right_pane_id),
+        None,
+    )
+    if right_pane is None or getattr(right_pane, "pane_dead", False):
+        _set_live_right_pane_input_sticky(router, False)
+        return None
+    is_live_provider_pane = getattr(router, "_is_live_provider_pane", None)
+    if callable(is_live_provider_pane) and not is_live_provider_pane(right_pane):
+        _set_live_right_pane_input_sticky(router, False)
+        return None
+    return right_pane_id
+
+
 def _send_key_to_active_live_right_pane(config_path: Path, key: str) -> str | None:
     """Deliver ``key`` to the focused live right pane, if one owns focus."""
-    if key.strip().lower() in _RIGHT_PANE_BRIDGE_BYPASS_ESCAPE_TOKENS:
-        return None
     try:
         from pollypm.cockpit_rail import CockpitRouter
 
@@ -221,8 +278,13 @@ def _send_key_to_active_live_right_pane(config_path: Path, key: str) -> str | No
         right_pane = router.active_live_right_pane_id()
     except Exception:  # noqa: BLE001
         return None
-    if right_pane is None:
+    if key.strip().lower() in _RIGHT_PANE_BRIDGE_BYPASS_ESCAPE_TOKENS:
+        _set_live_right_pane_input_sticky(router, False)
         return None
+    if right_pane is None:
+        right_pane = _sticky_live_right_pane_id(router)
+        if right_pane is None:
+            return None
     event = _tmux_event_for_cockpit_key(key)
     if event is None:
         return None
@@ -235,6 +297,7 @@ def _send_key_to_active_live_right_pane(config_path: Path, key: str) -> str | No
         router.tmux.send_keys(right_pane, value, press_enter=False)
     else:
         router.tmux.run("send-keys", "-t", right_pane, value, check=False)
+    _set_live_right_pane_input_sticky(router, True)
     return right_pane
 
 

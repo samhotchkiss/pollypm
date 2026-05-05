@@ -17,6 +17,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import pytest
@@ -504,6 +505,112 @@ def test_cockpit_send_key_enter_consumes_network_dead_for_live_right_pane(
             False,
         ),
     ]
+
+
+def test_cockpit_send_key_keeps_live_right_pane_sticky_after_first_char(
+    valid_cockpit_config: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pollypm.cockpit_rail as cockpit_rail
+    from pollypm.cli_features import ui as ui_commands
+
+    class FakeTmux:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+
+        def list_panes(self, target: str):
+            assert target == "pollypm-test:PollyPM"
+            return [
+                SimpleNamespace(
+                    pane_id="%1", active=True, pane_dead=False,
+                    pane_current_command="uv",
+                ),
+                SimpleNamespace(
+                    pane_id="%2", active=False, pane_dead=False,
+                    pane_current_command="codex",
+                ),
+            ]
+
+        def send_keys(
+            self, target: str, text: str, *, press_enter: bool = True,
+        ) -> None:
+            self.calls.append(("send_keys", target, text, press_enter))
+
+    class FakeRouter:
+        _COCKPIT_WINDOW = "PollyPM"
+
+        def __init__(self) -> None:
+            self.tmux = FakeTmux()
+            self.state = {
+                "mounted_session": "architect_demo",
+                "right_pane_id": "%2",
+            }
+            self.active_calls = 0
+
+        def active_live_right_pane_id(self) -> str | None:
+            self.active_calls += 1
+            return "%2" if self.active_calls == 1 else None
+
+        def _load_state(self) -> dict[str, object]:
+            return dict(self.state)
+
+        def _write_state(self, state: dict[str, object]) -> None:
+            self.state = dict(state)
+
+        def _load_config(self):
+            return SimpleNamespace(
+                project=SimpleNamespace(tmux_session="pollypm-test")
+            )
+
+        def _is_live_provider_pane(self, pane: object) -> bool:
+            return getattr(pane, "pane_current_command", None) == "codex"
+
+    router = FakeRouter()
+    monkeypatch.setattr(cockpit_rail, "CockpitRouter", lambda _path: router)
+
+    assert ui_commands._send_key_to_active_live_right_pane(
+        valid_cockpit_config, "R",
+    ) == "%2"
+    assert router.state["live_right_pane_input_sticky"] is True
+
+    assert ui_commands._send_key_to_active_live_right_pane(
+        valid_cockpit_config, "e",
+    ) == "%2"
+    assert router.tmux.calls == [
+        ("send_keys", "%2", "R", False),
+        ("send_keys", "%2", "e", False),
+    ]
+
+
+def test_cockpit_send_key_escape_clears_live_right_pane_sticky(
+    valid_cockpit_config: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pollypm.cockpit_rail as cockpit_rail
+    from pollypm.cli_features import ui as ui_commands
+
+    class FakeRouter:
+        def __init__(self) -> None:
+            self.state = {
+                "mounted_session": "architect_demo",
+                "right_pane_id": "%2",
+                "live_right_pane_input_sticky": True,
+            }
+
+        def active_live_right_pane_id(self) -> str | None:
+            return "%2"
+
+        def _load_state(self) -> dict[str, object]:
+            return dict(self.state)
+
+        def _write_state(self, state: dict[str, object]) -> None:
+            self.state = dict(state)
+
+    router = FakeRouter()
+    monkeypatch.setattr(cockpit_rail, "CockpitRouter", lambda _path: router)
+
+    assert ui_commands._send_key_to_active_live_right_pane(
+        valid_cockpit_config, "<esc>",
+    ) is None
+    assert "live_right_pane_input_sticky" not in router.state
 
 
 def test_send_key_to_first_live_skips_stale_sockets(fake_config: Path, tmp_path: Path) -> None:

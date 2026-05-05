@@ -21,6 +21,7 @@ from pollypm.config import DEFAULT_CONFIG_PATH
 
 _RIGHT_PANE_BRIDGE_BYPASS_ESCAPE_TOKENS = frozenset({"<esc>", "esc", "escape"})
 _HELP_KEY_TOKENS = frozenset({"?", "question_mark"})
+_INBOX_BRIDGE_FIRST_TOKENS = frozenset({"d"})
 _RIGHT_PANE_TMUX_KEY_TOKENS: dict[str, str] = {
     "<bs>": "BSpace",
     "backspace": "BSpace",
@@ -80,6 +81,30 @@ def _send_help_key_to_content_bridge(config_path: Path, key: str) -> Path | None
         return None
     try:
         return send_key_to_first_live(config_path, key, kind=kind, timeout=0.2)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _send_selected_action_key_to_content_bridge(
+    config_path: Path, key: str,
+) -> Path | None:
+    """Deliver selected-pane action keys before live-pane PTY fallback."""
+    token = key.strip()
+    if token not in _INBOX_BRIDGE_FIRST_TOKENS:
+        return None
+    try:
+        from pollypm.cockpit_input_bridge import send_key_to_first_live
+        from pollypm.cockpit_rail import CockpitRouter
+
+        selected = CockpitRouter(config_path).selected_key()
+    except Exception:  # noqa: BLE001
+        return None
+    if _content_bridge_kind_for_selected_key(selected) != "pane-inbox":
+        return None
+    try:
+        return send_key_to_first_live(
+            config_path, key, kind="pane-inbox", timeout=0.2,
+        )
     except Exception:  # noqa: BLE001
         return None
 
@@ -390,6 +415,12 @@ def register_ui_commands(app: typer.Typer) -> None:
         from pollypm.cockpit_input_bridge import send_key_to_first_live
 
         if kind == "cockpit":
+            delivered_to_content = _send_selected_action_key_to_content_bridge(
+                config_path, key,
+            )
+            if delivered_to_content is not None:
+                typer.echo(f"Delivered {key!r} via {delivered_to_content}")
+                return
             delivered_to_right = _send_key_to_active_live_right_pane(
                 config_path, key,
             )

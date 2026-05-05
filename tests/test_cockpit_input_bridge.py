@@ -284,6 +284,48 @@ def test_cockpit_send_key_question_mark_prefers_content_pane_bridge(
         content.stop()
 
 
+def test_cockpit_send_key_inbox_discuss_prefers_inbox_bridge_over_live_pane(
+    valid_cockpit_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import typer
+    from typer.testing import CliRunner
+
+    from pollypm.cli_features import ui as ui_commands
+    from pollypm.cockpit_rail import CockpitRouter
+
+    inbox_app = _FakeApp()
+    inbox = start_input_bridge(
+        inbox_app, kind="pane-inbox", config_path=valid_cockpit_config,
+    )
+    assert inbox is not None
+    live_pane_attempts: list[tuple[Path, str]] = []
+
+    def fake_live_pane(config_path: Path, key: str) -> str | None:
+        live_pane_attempts.append((config_path, key))
+        return "%2"
+
+    monkeypatch.setattr(
+        ui_commands,
+        "_send_key_to_active_live_right_pane",
+        fake_live_pane,
+    )
+    try:
+        CockpitRouter(valid_cockpit_config).set_selected_key("inbox")
+
+        app = typer.Typer()
+        ui_commands.register_ui_commands(app)
+        result = CliRunner().invoke(
+            app, ["cockpit-send-key", "d", "--config", str(valid_cockpit_config)]
+        )
+        assert result.exit_code == 0, result.output
+        assert f"via {inbox.socket_path}" in result.output
+        assert _wait_for(lambda: inbox_app.keys == ["d"])
+        assert live_pane_attempts == []
+    finally:
+        inbox.stop()
+
+
 def test_cockpit_send_key_forwards_to_focused_live_right_pane(
     fake_config: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

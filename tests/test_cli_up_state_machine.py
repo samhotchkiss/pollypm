@@ -321,7 +321,62 @@ def test_up_refuses_foreign_home_tmux_session_before_side_effects(
     assert result.exit_code != 0
     assert "tmux session 'pollypm' is in use by another HOME" in result.output
     assert "project.tmux_session" in result.output
+    assert "before running `pm up`" in result.output
     assert side_effects == []
+
+
+def test_root_pm_foreign_home_tmux_session_error_names_pm(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """#1227: bare ``pm`` should not report that the user ran ``pm up``."""
+    fresh_home = tmp_path / "fresh-home"
+    fresh_home.mkdir()
+    monkeypatch.setenv("HOME", str(fresh_home))
+    config_path = fresh_home / ".pollypm" / "pollypm.toml"
+    config_path.parent.mkdir()
+    config_path.write_text("[project]\nname = \"pollypm\"\n")
+
+    class _FakeTmux:
+        def has_session(self, name: str) -> bool:
+            return name == "pollypm"
+
+        def current_session_name(self) -> None:
+            return None
+
+        def show_environment(self, session_name: str, variable: str) -> str | None:
+            assert session_name == "pollypm"
+            assert variable == "HOME"
+            return "/Users/sam"
+
+    class _FakeSupervisor:
+        def __init__(self) -> None:
+            self.tmux = _FakeTmux()
+            self.config = type(
+                "Config",
+                (),
+                {
+                    "project": type(
+                        "Project",
+                        (),
+                        {
+                            "tmux_session": "pollypm",
+                            "base_dir": config_path.parent,
+                        },
+                    )(),
+                    "accounts": {},
+                    "projects": {},
+                },
+            )()
+
+    monkeypatch.setattr(cli, "_load_supervisor", lambda _path: _FakeSupervisor())
+
+    runner = CliRunner()
+    result = runner.invoke(cli.app, ["--config", str(config_path)])
+
+    assert result.exit_code != 0
+    assert "tmux session 'pollypm' is in use by another HOME" in result.output
+    assert "before running `pm`" in result.output
+    assert "before running `pm up`" not in result.output
 
 
 def test_probe_detects_dead_console_pane() -> None:

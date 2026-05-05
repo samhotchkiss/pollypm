@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import tomllib
 from pathlib import Path
@@ -1033,13 +1034,22 @@ def render_example_config() -> str:
     return render_config(_build_example_config(root))
 
 
-def _build_example_config(root: Path) -> PollyPMConfig:
+def _default_init_tmux_session(root: Path) -> str:
+    try:
+        identity = str(root.resolve())
+    except OSError:
+        identity = str(root.absolute())
+    digest = hashlib.sha1(identity.encode("utf-8")).hexdigest()[:8]
+    return f"pollypm-{digest}"
+
+
+def _build_example_config(root: Path, *, tmux_session: str = "pollypm") -> PollyPMConfig:
     base_dir = root / ".pollypm"
     return PollyPMConfig(
         project=ProjectSettings(
             name="PollyPM",
             root_dir=root,
-            tmux_session="pollypm",
+            tmux_session=tmux_session,
             workspace_root=Path.home() / "dev",
             base_dir=base_dir,
             logs_dir=base_dir / "logs",
@@ -1121,7 +1131,11 @@ def write_example_config(path: Path = DEFAULT_CONFIG_PATH, force: bool = False) 
     if path.exists() and not force:
         raise FileExistsError(f"Config already exists: {path}")
     root = path.resolve().parent
-    return write_config(_build_example_config(root), path, force=True)
+    return write_config(
+        _build_example_config(root, tmux_session=_default_init_tmux_session(root)),
+        path,
+        force=True,
+    )
 
 
 def write_config(config: PollyPMConfig, path: Path = DEFAULT_CONFIG_PATH, force: bool = False) -> Path:

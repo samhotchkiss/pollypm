@@ -4403,6 +4403,42 @@ def test_cockpit_rail_ctrl_k_routes_to_settings(monkeypatch, tmp_path: Path) -> 
     assert rail.selected_key == "settings"
 
 
+def test_cockpit_rail_jk_on_settings_forward_to_settings_pane(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    class FakeRouter:
+        def __init__(self, config_path: Path) -> None:
+            self.config_path = config_path
+            self.sent: list[str] = []
+            self.selected_updates: list[str] = []
+            self.tmux = None
+
+        def selected_key(self) -> str:
+            return "settings"
+
+        def send_key_to_right_pane(self, key: str) -> None:
+            self.sent.append(key)
+
+        def set_selected_key(self, key: str) -> None:
+            self.selected_updates.append(key)
+
+    monkeypatch.setattr("pollypm.cockpit_rail.CockpitRouter", FakeRouter)
+    from pollypm.cockpit_rail import CockpitItem, PollyCockpitRail
+
+    rail = PollyCockpitRail(tmp_path / "pollypm.toml")
+    items = [
+        CockpitItem("polly", "Polly", "ready"),
+        CockpitItem("settings", "Settings", "config"),
+    ]
+
+    assert rail._handle_key(b"j", items) is True
+    assert rail._handle_key(b"\x1b[A", items) is True
+
+    assert rail.selected_key == "settings"
+    assert rail.router.sent == ["j", "k"]
+    assert rail.router.selected_updates == []
+
+
 def test_cockpit_rail_forwards_detail_hint_keys(monkeypatch, tmp_path: Path) -> None:
     class FakeRouter:
         def __init__(self, _config_path: Path) -> None:

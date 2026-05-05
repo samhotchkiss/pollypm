@@ -3627,9 +3627,15 @@ class PollyCockpitRail:
         if key in {b"q", b"\x03"}:
             return False
         if key in {b"j", b"\x1b[B"}:
+            if self.selected_key == "settings":
+                self._send_key_to_settings_pane("j")
+                return True
             self._move(1, items)
             return True
         if key in {b"k", b"\x1b[A"}:
+            if self.selected_key == "settings":
+                self._send_key_to_settings_pane("k")
+                return True
             self._move(-1, items)
             return True
         if key in {b"g", b"\x1b[H"}:
@@ -3677,6 +3683,22 @@ class PollyCockpitRail:
             self.selected_key = "settings"
             return True
         return True
+
+    def _send_key_to_settings_pane(self, key: str) -> None:
+        delivered = None
+        try:
+            from pollypm.cockpit_input_bridge import send_key_to_first_live
+            delivered = send_key_to_first_live(
+                self.router.config_path, key, kind="settings", timeout=0.2,
+            )
+        except Exception:  # noqa: BLE001
+            delivered = None
+        if delivered is not None:
+            return
+        try:
+            self.router.send_key_to_right_pane(key)
+        except Exception:  # noqa: BLE001
+            pass
 
     # ── Navigation ───────────────────────────────────────────────────────
 

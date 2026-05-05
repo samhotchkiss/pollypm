@@ -7358,6 +7358,10 @@ class PollyInboxApp(App[None]):
         # ``project:<key>``) land here so reply / jump paths don't have
         # to re-parse on each keystroke.
         self._blocking_question_meta: dict[str, dict] = {}
+        self._pending_detail_task_id: str | None = None
+        self._pending_detail_row_key: str | None = None
+        self._pending_detail_mark_read: bool = False
+        self._detail_render_scheduled: bool = False
 
     def compose(self) -> ComposeResult:
         yield self.filter_bar
@@ -8268,7 +8272,7 @@ class PollyInboxApp(App[None]):
         except Exception:  # noqa: BLE001
             pass
 
-    def _render_detail(self, task_id: str) -> None:
+    def _render_detail(self, task_id: str, *, prefer_cache: bool = False) -> None:
         item = self._item_for_id(task_id)
         if item is None:
             self.detail.update("[red]Inbox item is no longer available.[/red]")
@@ -8279,45 +8283,52 @@ class PollyInboxApp(App[None]):
             self._render_message_detail(item)
             return
         self._set_reply_mode_for_task()
-        # #1101: route through the unified ``_resolve_inbox_svc`` helper so
-        # the project-key-mismatch fallback is consistent with the action
-        # handlers (archive / approve / discuss / reply). Workspace-scoped
-        # tasks still short-circuit to the message renderer per #855.
-        project_key = task_id.split("/", 1)[0] if "/" in task_id else None
-        is_workspace = (
-            project_key is None
-            or project_key in {"inbox", "workspace", "[workspace]"}
-            or self._project_key_is_unknown(project_key)
-        )
-        svc = self._resolve_inbox_svc(item, task_id)
-        if svc is None:
-            if is_workspace:
-                self._render_message_detail(item)
+        if prefer_cache:
+            task = item
+            replies = list(self._replies_by_task.get(task_id, ()))
+            rollup_items_raw = []
+            hydrate_from_cache = True
+        else:
+            hydrate_from_cache = False
+            # #1101: route through the unified ``_resolve_inbox_svc`` helper so
+            # the project-key-mismatch fallback is consistent with the action
+            # handlers (archive / approve / discuss / reply). Workspace-scoped
+            # tasks still short-circuit to the message renderer per #855.
+            project_key = task_id.split("/", 1)[0] if "/" in task_id else None
+            is_workspace = (
+                project_key is None
+                or project_key in {"inbox", "workspace", "[workspace]"}
+                or self._project_key_is_unknown(project_key)
+            )
+            svc = self._resolve_inbox_svc(item, task_id)
+            if svc is None:
+                if is_workspace:
+                    self._render_message_detail(item)
+                    return
+                self.detail.update(
+                    "[#f0c45a]This task lives in a project that is not "
+                    "currently registered with PollyPM. Add the project from "
+                    "the project picker to load its details here.[/#f0c45a]"
+                )
+                self._clear_rollup_items()
                 return
-            self.detail.update(
-                "[#f0c45a]This task lives in a project that is not "
-                "currently registered with PollyPM. Add the project from "
-                "the project picker to load its details here.[/#f0c45a]"
-            )
-            self._clear_rollup_items()
-            return
-        try:
-            task = svc.get(task_id)
-            replies = svc.list_replies(task_id)
-            rollup_items_raw = (
-                svc.get_context(task_id, entry_type="rollup_item")
-                if _task_is_rollup(task) else []
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.detail.update(f"[red]Error loading task: {exc}[/red]")
-            self._clear_rollup_items()
-            svc.close()
-            return
-        finally:
             try:
+                task = svc.get(task_id)
+                replies = svc.list_replies(task_id)
+                rollup_items_raw = (
+                    svc.get_context(task_id, entry_type="rollup_item")
+                    if _task_is_rollup(task) else []
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.detail.update(f"[red]Error loading task: {exc}[/red]")
+                self._clear_rollup_items()
                 svc.close()
-            except Exception:  # noqa: BLE001
-                pass
+                return
+            finally:
+                try:
+                    svc.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
         from pollypm.tz import format_relative
 
@@ -8447,10 +8458,12 @@ class PollyInboxApp(App[None]):
         # that the task-Review tab renders (#708) so the user can see
         # the summary inline without a separate pane-jump. Same
         # component, same content, same mental model across surfaces.
-        try:
-            review_block = self._render_inline_review_artifact(task)
-        except Exception:  # noqa: BLE001
-            review_block = None
+        review_block = None
+        if not hydrate_from_cache:
+            try:
+                review_block = self._render_inline_review_artifact(task)
+            except Exception:  # noqa: BLE001
+                review_block = None
         if review_block:
             sections.append("")
             sections.append("[dim]── review artifact ──[/dim]")
@@ -8614,12 +8627,52 @@ class PollyInboxApp(App[None]):
     # Selection / navigation
     # ------------------------------------------------------------------
 
-    def _sync_selection_from_list(self) -> None:
+    def _sync_selection_from_list(
+        self, *, defer_detail: bool = False, mark_read: bool = True,
+    ) -> None:
         idx = self.list_view.index
         if idx is None or idx < 0 or idx >= len(self._visible_rows):
             return
         row = self._visible_rows[idx]
+        self._select_inbox_row(
+            row, defer_detail=defer_detail, mark_read=mark_read,
+        )
+
+    def _schedule_detail_render(
+        self, task_id: str, row_key: str, *, mark_read: bool,
+    ) -> None:
+        self._pending_detail_task_id = task_id
+        self._pending_detail_row_key = row_key
+        self._pending_detail_mark_read = mark_read
+        if self._detail_render_scheduled:
+            return
+        self._detail_render_scheduled = True
+        self.call_after_refresh(self._flush_pending_detail_render)
+
+    def _flush_pending_detail_render(self) -> None:
+        self._detail_render_scheduled = False
+        task_id = self._pending_detail_task_id
+        row_key = self._pending_detail_row_key
+        mark_read = self._pending_detail_mark_read
+        self._pending_detail_task_id = None
+        self._pending_detail_row_key = None
+        self._pending_detail_mark_read = False
+        if not task_id or row_key != self._selected_row_key:
+            return
+        self._render_detail(task_id, prefer_cache=True)
+        if mark_read:
+            self._mark_open_read(task_id)
+
+    def _select_inbox_row(
+        self,
+        row: InboxThreadRow,
+        *,
+        defer_detail: bool,
+        mark_read: bool,
+    ) -> None:
         if row.key == self._selected_row_key:
+            if mark_read and not defer_detail:
+                self._mark_open_read(row.task_id)
             return
         task_changed = row.task_id != self._selected_task_id
         self._selected_task_id = row.task_id
@@ -8628,20 +8681,24 @@ class PollyInboxApp(App[None]):
         # a half-typed message doesn't get posted to a different task.
         if task_changed and self.reply_input.value:
             self.reply_input.value = ""
-        self._render_detail(row.task_id)
-        self._mark_open_read(row.task_id)
+        if defer_detail:
+            self._schedule_detail_render(row.task_id, row.key, mark_read=mark_read)
+            return
+        self._render_detail(row.task_id, prefer_cache=True)
+        if mark_read:
+            self._mark_open_read(row.task_id)
 
     def action_cursor_down(self) -> None:
         if self.reply_input.has_focus or self.filter_input.has_focus:
             return
         self.list_view.action_cursor_down()
-        self._sync_selection_from_list()
+        self._sync_selection_from_list(defer_detail=True, mark_read=True)
 
     def action_cursor_up(self) -> None:
         if self.reply_input.has_focus or self.filter_input.has_focus:
             return
         self.list_view.action_cursor_up()
-        self._sync_selection_from_list()
+        self._sync_selection_from_list(defer_detail=True, mark_read=True)
 
     def action_cursor_first(self) -> None:
         if self._visible_rows:
@@ -8692,7 +8749,14 @@ class PollyInboxApp(App[None]):
             self._sync_selection_from_list()
 
     def action_open_selected(self) -> None:
-        self._sync_selection_from_list()
+        idx = self.list_view.index
+        if idx is None or idx < 0 or idx >= len(self._visible_rows):
+            return
+        row = self._visible_rows[idx]
+        self._selected_task_id = row.task_id
+        self._selected_row_key = row.key
+        self._render_detail(row.task_id)
+        self._mark_open_read(row.task_id)
 
     def action_refresh(self) -> None:
         self._refresh_list(select_first=False)
@@ -8764,19 +8828,18 @@ class PollyInboxApp(App[None]):
 
     @on(ListView.Highlighted, "#inbox-list")
     def _on_row_highlighted(self, event: ListView.Highlighted) -> None:
-        # Keyboard j/k emits Highlighted before any Selected; render eagerly
-        # so the right pane tracks the cursor without requiring Enter.
+        # Keyboard j/k emits Highlighted before any Selected; defer the
+        # heavier detail/read work until the list highlight has painted.
         row = event.item
         if not isinstance(row, _InboxListItem):
             return
         if self._selected_row_key == row.row_ref.key:
             return
-        task_changed = self._selected_task_id != row.task_id
-        self._selected_task_id = row.task_id
-        self._selected_row_key = row.row_ref.key
-        if task_changed and self.reply_input.value:
-            self.reply_input.value = ""
-        self._render_detail(row.task_id)
+        self._select_inbox_row(
+            row.row_ref,
+            defer_detail=True,
+            mark_read=True,
+        )
 
     # ------------------------------------------------------------------
     # Read / archive / reply actions

@@ -1882,12 +1882,86 @@ class PollyCockpitApp(App[None]):
     def _nav_items(self) -> list[CockpitItem]:
         return [item for item in self._items if item.key != "settings"]
 
+    # #1208 — guard so only one ``build_items`` worker is in flight at a
+    # time. Without it, every periodic tick that finds the state mtime
+    # newer than the previous one stacks another worker, all racing on
+    # the same supervisor + DB; the UI thread then ends up sequentially
+    # applying ~10 stale builds and the rail looks frozen.
+    _refresh_in_flight: bool = False
+
     def _refresh_rows(self) -> None:
+        """Refresh the rail rows without blocking the UI thread.
+
+        ``router.build_items`` walks the supervisor + plugin rail
+        registry + recent-events log; on a populated install that is
+        ~1.5-2s of synchronous I/O. Running it on the UI thread blocks
+        every keystroke for the duration — including the cold-path
+        capital ``I`` that #1208 tracks.
+
+        We split the refresh into two steps:
+
+        1. Off-thread (worker pool): ``build_items`` produces the new
+           ``CockpitItem`` list. No UI mutation here — pure data load.
+        2. On-thread (UI): apply the items, rebuild row widgets,
+           restore the cursor index.
+
+        Step 2 itself is dominated by ``self.nav.extend(rows)`` for ~25
+        rows — a few ms — so the UI-thread cost is negligible after
+        step 1 lands. ``_refresh_in_flight`` debounces overlapping
+        scheduled refreshes.
+
+        Falls back to inline execution when no event loop is available
+        (unit tests that bypass ``App.__init__``) so existing test
+        harnesses keep working.
+        """
+        if self._refresh_in_flight:
+            return
         self._adopt_router_selection_if_changed()
+        spinner_index = self.spinner_index
+
+        def _build() -> "list[CockpitItem]":
+            return self.router.build_items(spinner_index=spinner_index)
+
+        def _apply(items: "list[CockpitItem]") -> None:
+            try:
+                self._refresh_in_flight = False
+                self._apply_built_items(items)
+            except Exception:  # noqa: BLE001
+                pass
+
         try:
-            self._items = self.router.build_items(spinner_index=self.spinner_index)
+            self._refresh_in_flight = True
+            self.run_worker(
+                lambda: self._refresh_rows_worker(_build, _apply),
+                thread=True,
+                exclusive=True,
+                group="rail_refresh",
+            )
         except Exception:  # noqa: BLE001
-            return  # keep previous items rather than crashing the rail
+            # No event loop (unit tests) — execute inline.
+            self._refresh_in_flight = False
+            try:
+                items = _build()
+            except Exception:  # noqa: BLE001
+                return
+            self._apply_built_items(items)
+
+    def _refresh_rows_worker(self, build_fn, apply_fn) -> None:
+        try:
+            items = build_fn()
+        except Exception:  # noqa: BLE001
+            try:
+                self.call_from_thread(setattr, self, "_refresh_in_flight", False)
+            except Exception:  # noqa: BLE001
+                self._refresh_in_flight = False
+            return
+        try:
+            self.call_from_thread(apply_fn, items)
+        except Exception:  # noqa: BLE001
+            apply_fn(items)
+
+    def _apply_built_items(self, items: "list[CockpitItem]") -> None:
+        self._items = items
         # Track working→idle transitions for unread indicators
         new_working: set[str] = set()
         for item in self._items:
@@ -2516,6 +2590,19 @@ class PollyCockpitApp(App[None]):
 
     _ROUTE_SELECT_TIMEOUT_SECONDS: float = 20.0
 
+    # #1208 — keys that map to static cockpit views (no sub-item
+    # expansion needed in the rail). Clicks on these keys skip the
+    # synchronous ``_refresh_rows`` rebuild on the click path because
+    # ``router.build_items`` is ~1.5-2s on a populated install. The
+    # active-marker update via ``_apply_active_view_to_rows`` is
+    # sufficient for the optimistic UI; the next periodic ``_tick``
+    # (0.8s) picks up any data changes. Project keys must NOT be in
+    # this set — pressing Enter on a project should expand its
+    # sub-items immediately (#1192).
+    _STATIC_RAIL_KEYS = frozenset(
+        {"dashboard", "inbox", "workers", "metrics", "activity", "settings", "polly"},
+    )
+
     # Monotonically-increasing click counter (#967). Each click bumps
     # this; the value at click time is captured by the worker thread
     # and re-checked before any post-route UI update is applied. A
@@ -2590,8 +2677,29 @@ class PollyCockpitApp(App[None]):
             self.hint.update(self._route_status_hint)
         except Exception:  # noqa: BLE001
             pass
+        # #1208 — for static rail keys (``inbox``, ``dashboard``,
+        # ``workers``, ``metrics``, ``activity``, ``settings``) skip the
+        # heavy synchronous ``_refresh_rows`` and only paint the
+        # optimistic active marker via the cheap
+        # ``_apply_active_view_to_rows``. ``_refresh_rows`` calls
+        # ``router.build_items`` which loads the supervisor, walks every
+        # plugin section, and reads the recent events log; on a populated
+        # install that is ~1.5-2s of UI-thread blocking work which
+        # delays ``_dispatch_route_in_worker`` and pushes the cold-path
+        # capital ``I`` budget over 2s. Static keys do not require row
+        # rebuilds (no sub-item expansion) so the lighter active-marker
+        # update is sufficient — the next periodic ``_tick`` (0.8s)
+        # picks up any data changes. Project keys still need a
+        # synchronous refresh so sub-items expand on Enter (#1192).
+        is_static_key = (
+            isinstance(key, str)
+            and key in self._STATIC_RAIL_KEYS
+        )
         try:
-            self._refresh_rows()
+            if is_static_key:
+                self._apply_active_view_to_rows()
+            else:
+                self._refresh_rows()
         except Exception:  # noqa: BLE001
             pass
         self._dispatch_route_in_worker(key, seq)

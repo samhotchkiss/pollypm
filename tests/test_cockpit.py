@@ -4072,8 +4072,8 @@ def test_cockpit_ui_arrow_and_enter_route_selected(tmp_path: Path) -> None:
     asyncio.run(exercise())
 
 
-def test_cockpit_send_key_inbox_shortcut_keeps_nav_cursor_on_inbox(tmp_path: Path) -> None:
-    """#1122/#1137: after global ``I``, Down stays owned by Inbox."""
+def test_cockpit_send_key_inbox_shortcut_keeps_rail_nav_active(tmp_path: Path) -> None:
+    """#1206: after global ``I``, Down/Up still move the rail cursor."""
 
     class FakeRouter:
         def __init__(self) -> None:
@@ -4135,6 +4135,11 @@ def test_cockpit_send_key_inbox_shortcut_keeps_nav_cursor_on_inbox(tmp_path: Pat
             assert app._selected_row_key() == "inbox"
 
             send_key(handle.socket_path, "<down>")
+            await pilot.pause(0.4)
+            assert app.selected_key == "activity"
+            assert app._selected_row_key() == "activity"
+
+            send_key(handle.socket_path, "<up>")
             await pilot.pause(0.4)
             assert app.selected_key == "inbox"
             assert app._selected_row_key() == "inbox"
@@ -5189,8 +5194,8 @@ def test_cockpit_jk_navigates_rail_outside_inbox_surface() -> None:
         assert sent == []
 
 
-def test_cockpit_inbox_surface_forwards_footer_keys_to_inbox_pane() -> None:
-    """#1128/#1137/#1146/#1158/#1162: active Inbox owns its footer keys."""
+def test_cockpit_inbox_surface_forwards_non_nav_footer_keys_to_inbox_pane() -> None:
+    """#1128/#1146/#1158/#1162: active Inbox owns non-nav footer keys."""
     app = PollyCockpitApp.__new__(PollyCockpitApp)
     forwarded: list[str] = []
     routes: list[str] = []
@@ -5208,14 +5213,12 @@ def test_cockpit_inbox_surface_forwards_footer_keys_to_inbox_pane() -> None:
     app._selected_row_key = lambda: "project:demo"  # type: ignore[method-assign]
 
     app.action_new_worker()
-    app.action_cursor_down()
-    app.action_cursor_up()
     app.action_forward_inbox_discuss()
     app.action_forward_workers_auto_refresh()
     app.action_view_alerts()
     app.action_refresh()
 
-    assert forwarded == ["n", "j", "k", "d", "A", "a", "r"]
+    assert forwarded == ["n", "d", "A", "a", "r"]
     assert routes == []
 
 
@@ -5315,8 +5318,8 @@ class _StubNav:
                 return
 
 
-def test_cockpit_j_from_inbox_forwards_to_inbox_cursor() -> None:
-    """#1137: pressing ``j`` from active Inbox moves the inbox cursor."""
+def test_cockpit_jk_from_inbox_navigates_rail_round_trip() -> None:
+    """#1206: active Inbox must not capture rail navigation keys."""
     app = PollyCockpitApp.__new__(PollyCockpitApp)
     items = [
         _StubItem("inbox"),
@@ -5345,9 +5348,15 @@ def test_cockpit_j_from_inbox_forwards_to_inbox_cursor() -> None:
 
     app.action_cursor_down()
 
+    assert nav.index == 2
+    assert app.selected_key == "project:booktalk"
+    assert captured == []
+
+    app.action_cursor_up()
+
     assert nav.index == 0
     assert app.selected_key == "inbox"
-    assert captured == ["j"]
+    assert captured == []
 
 
 def test_cockpit_j_at_last_item_is_silent_noop() -> None:

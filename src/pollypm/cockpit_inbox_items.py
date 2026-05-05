@@ -545,6 +545,10 @@ def _filter_approved_plan_reviews(
     Logs the number of phantom rows filtered so we can measure inbox
     cleanup and decide when the proper sweeper is needed.
 
+    Task-backed plan-review rows are checked against their loaded task
+    state directly. Message-backed rows still resolve their
+    ``plan_task:<project/number>`` labels through the DB map.
+
     DB resolution: ``project_db_paths`` may carry both per-project
     entries (``project_key -> (db, project_path)``) AND a workspace-root
     entry under the ``__workspace__`` sentinel key. When a plan_review's
@@ -563,11 +567,15 @@ def _filter_approved_plan_reviews(
     refs_by_db: dict[str, set[tuple[str, int]]] = {}
     considered = 0
     refs_unparsed = 0
+    has_task_backed_plan_reviews = False
     for item in items:
         labels = {str(lbl) for lbl in (getattr(item, "labels", []) or [])}
         if "plan_review" not in labels:
             continue
         considered += 1
+        if getattr(item, "source", None) == "task":
+            has_task_backed_plan_reviews = True
+            continue
         ref = _plan_task_ref(item)
         if not ref or "/" not in ref:
             refs_unparsed += 1
@@ -597,17 +605,26 @@ def _filter_approved_plan_reviews(
                 considered,
                 refs_unparsed,
             )
-        return items
-    approved_refs = approved_plan_review_refs(
-        refs_by_db=refs_by_db,
-        project_db_paths=project_db_paths,
-        service_factory=SQLiteWorkService,
-    )
+        if not has_task_backed_plan_reviews:
+            return items
+        approved_refs = set()
+    else:
+        approved_refs = approved_plan_review_refs(
+            refs_by_db=refs_by_db,
+            project_db_paths=project_db_paths,
+            service_factory=SQLiteWorkService,
+        )
     kept: list[InboxEntry] = []
     dropped = 0
     for item in items:
         labels = {str(lbl) for lbl in (getattr(item, "labels", []) or [])}
         if "plan_review" in labels:
+            if getattr(item, "source", None) == "task":
+                if _task_user_approval_is_approved(item):
+                    dropped += 1
+                    continue
+                kept.append(item)
+                continue
             ref = _plan_task_ref(item)
             if ref and ref in approved_refs:
                 dropped += 1
@@ -716,14 +733,10 @@ def load_inbox_entries(
                     continue
                 seen_task_ids.add(task.task_id)
                 # Synth-source filter for plan_review (#1103, 4th
-                # attempt). The post-emission ``_filter_approved_plan_reviews``
-                # only catches notify-message rows that carry a
-                # ``plan_task:<project/number>`` ref label — task-backed
-                # synth rows (the ones produced here) don't carry that
-                # label, so the filter never sees them. Check the
-                # task's own user_approval execution directly: if it's
-                # COMPLETED + APPROVED, the plan review is already
-                # done and emitting the row would be a phantom action.
+                # attempt). Check the task's own user_approval
+                # execution directly: if it's COMPLETED + APPROVED,
+                # the plan review is already done and emitting the row
+                # would be a phantom action.
                 task_labels = {str(lbl) for lbl in (getattr(task, "labels", []) or [])}
                 if "plan_review" in task_labels:
                     emit = not _task_user_approval_is_approved(task)

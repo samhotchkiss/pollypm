@@ -548,6 +548,71 @@ def test_filter_approved_plan_reviews_drops_completed_user_approval(
     assert "msg:bikepath:9" in kept_ids
 
 
+def test_filter_approved_plan_reviews_keeps_task_backed_pending_user_approval(
+    monkeypatch,
+) -> None:
+    """Task-backed plan_review rows use their loaded task approval state."""
+    from datetime import datetime
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_inbox_items import (
+        InboxEntry,
+        _filter_approved_plan_reviews,
+    )
+    from pollypm.work.models import Decision, ExecutionStatus
+
+    pending_exec = SimpleNamespace(
+        node_id="user_approval",
+        status=ExecutionStatus.ACTIVE,
+        decision=None,
+    )
+    approved_exec = SimpleNamespace(
+        node_id="user_approval",
+        status=ExecutionStatus.COMPLETED,
+        decision=Decision.APPROVED,
+    )
+    pending_item = InboxEntry(
+        raw=SimpleNamespace(executions=[pending_exec]),
+        source="task",
+        task_id="bikepath/7",
+        title="Plan ready for review: bikepath",
+        project="bikepath",
+        labels=["plan_review", "project:bikepath", "plan_task:bikepath/7"],
+        created_at=datetime(2026, 5, 5, 10, 0, 0),
+        updated_at=datetime(2026, 5, 5, 10, 0, 0),
+    )
+    approved_item = InboxEntry(
+        raw=SimpleNamespace(executions=[approved_exec]),
+        source="task",
+        task_id="smoketest/7",
+        title="Plan ready for review: smoketest",
+        project="smoketest",
+        labels=["plan_review", "project:smoketest", "plan_task:smoketest/7"],
+        created_at=datetime(2026, 5, 5, 10, 0, 0),
+        updated_at=datetime(2026, 5, 5, 10, 0, 0),
+    )
+
+    def fail_if_ref_filter_runs(**_kwargs):
+        raise AssertionError("task-backed plan reviews should not use ref lookup")
+
+    monkeypatch.setattr(
+        "pollypm.cockpit_inbox_items.approved_plan_review_refs",
+        fail_if_ref_filter_runs,
+    )
+
+    project_db_paths = {
+        "bikepath": (Path("/tmp/bikepath.db"), Path("/tmp/bikepath")),
+        "smoketest": (Path("/tmp/smoketest.db"), Path("/tmp/smoketest")),
+    }
+    kept = _filter_approved_plan_reviews(
+        [pending_item, approved_item],
+        project_db_paths=project_db_paths,
+    )
+
+    assert kept == [pending_item]
+
+
 def test_filter_approved_plan_reviews_no_op_without_project_paths() -> None:
     """No project_db_paths → filter is a no-op (defensive guard)."""
     from datetime import datetime

@@ -29,13 +29,13 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from pollypm.jobs import HandlerSpec, JobQueue, JobWorkerPool
 from pollypm.jobs.workers import (
-    _DB_LOCK_RETRY_BACKOFF,
     _is_database_locked_error,
 )
 from pollypm.storage.sqlite_pragmas import (
@@ -270,7 +270,7 @@ def test_pool_retries_handler_when_first_call_raises_database_locked(
         pool = JobWorkerPool(q, registry=registry, poll_interval=0.01)
         pool.start(concurrency=1)
         try:
-            jid = q.enqueue("flaky", max_attempts=1)
+            q.enqueue("flaky", max_attempts=1)
             assert _wait_until(lambda: q.stats().done == 1, timeout=5.0), (
                 f"job did not complete; stats={q.stats()!r} "
                 f"invocations={invocations!r}"
@@ -458,6 +458,38 @@ def test_queue_enqueue_retries_on_database_locked(tmp_path: Path) -> None:
         assert isinstance(jid, int) and jid > 0
         assert wrapper.fired, "test did not trigger the lock branch"
         # Job actually landed in the table.
+        assert q.stats().queued == 1
+    finally:
+        q.close()
+
+
+def test_heartbeatrail_tick_reopens_owned_queue_after_closed_db(tmp_path: Path) -> None:
+    """#1178: a stale owned queue connection must not crash heartbeat tick."""
+
+    from pollypm.heartbeat import Heartbeat
+    from pollypm.heartbeat.boot import HeartbeatRail
+    from pollypm.heartbeat.roster import Roster
+
+    q = JobQueue(db_path=tmp_path / "jobs.db")
+    try:
+        roster = Roster()
+        roster.register(
+            schedule="@on_startup",
+            handler_name="noop",
+            payload={"source": "test"},
+            dedupe_key="heartbeat:test",
+        )
+        heartbeat = Heartbeat(roster, q)
+
+        rail = HeartbeatRail.__new__(HeartbeatRail)
+        rail.heartbeat = heartbeat  # type: ignore[attr-defined]
+
+        with q._lock:
+            q._conn.close()
+
+        result = rail.tick(datetime.now(UTC))
+
+        assert result.enqueued_count == 1
         assert q.stats().queued == 1
     finally:
         q.close()

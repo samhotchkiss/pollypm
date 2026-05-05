@@ -4782,6 +4782,19 @@ def test_cockpit_escape_at_home_is_noop() -> None:
     assert calls == [], f"expected no-op at home but saw {calls}"
 
 
+def test_cockpit_escape_from_live_chat_focuses_rail_pane() -> None:
+    """#1151: Esc from a mounted chat returns tmux focus to the rail."""
+    app, calls = _build_back_to_home_app()
+    app.selected_key = "polly"
+    app._last_router_selected_key = "polly"
+    app.router._load_state = lambda: {"mounted_session": "operator"}  # type: ignore[attr-defined]
+    app.router.focus_rail_pane = lambda: calls.append("focus_rail")  # type: ignore[attr-defined]
+
+    app.action_back_to_home()
+
+    assert calls == ["focus_rail"]
+
+
 def test_cockpit_action_button_digits_forward_from_rail() -> None:
     """1/2/3 from rail forwards to the right pane so Action Needed buttons fire (#862)."""
     app = PollyCockpitApp.__new__(PollyCockpitApp)

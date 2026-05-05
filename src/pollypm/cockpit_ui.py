@@ -1644,6 +1644,11 @@ class PollyCockpitApp(App[None]):
         if callable(focus_method):
             focus_method()
 
+    def _focus_rail_pane(self) -> None:
+        focus_method = getattr(self.router, "focus_rail_pane", None)
+        if callable(focus_method):
+            focus_method()
+
     def _right_pane_has_live_session(self) -> bool:
         try:
             state = self.router._load_state()
@@ -2795,6 +2800,9 @@ class PollyCockpitApp(App[None]):
         return True
 
     def action_back_to_home(self) -> None:
+        if self._right_pane_has_live_session():
+            self._focus_rail_pane()
+            return
         if self._is_on_home():
             return
         self._navigate_home()

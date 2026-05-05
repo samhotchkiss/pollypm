@@ -143,6 +143,26 @@ def test_dedupe_key_allows_reenqueue_after_failed(tmp_path: Path) -> None:
     assert jid2 != jid1
 
 
+def test_late_retry_fail_does_not_resurrect_terminal_dedupe_row(
+    tmp_path: Path,
+) -> None:
+    q = JobQueue(db_path=tmp_path / "q.db")
+    jid1 = q.enqueue("sweep", dedupe_key="sweep:a")
+    (job,) = q.claim("w")
+    q.fail(job.id, "terminal", retry=False)
+    jid2 = q.enqueue("sweep", dedupe_key="sweep:a")
+
+    q.fail(job.id, "late timeout", retry=True)
+
+    old = q.get(jid1)
+    new = q.get(jid2)
+    assert old is not None
+    assert old.status is JobStatus.FAILED
+    assert q.get_last_error(jid1) == "terminal"
+    assert new is not None
+    assert new.status is JobStatus.QUEUED
+
+
 def test_recover_orphaned_claims_resets_status_and_frees_dedupe(
     tmp_path: Path,
 ) -> None:

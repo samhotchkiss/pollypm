@@ -65,6 +65,7 @@ def _run_cockpit_pane_fast(argv: list[str]) -> bool:
     config_path, project = parsed
     resolved_config_path = config_path or _default_config_path()
     _paint_inbox_loading_placeholder()
+    snapshot_error = _paint_inbox_snapshot(resolved_config_path, project=project)
 
     from pollypm.cli_features.ui import (
         _enforce_migration_gate,
@@ -73,7 +74,7 @@ def _run_cockpit_pane_fast(argv: list[str]) -> bool:
 
     _enforce_migration_gate(resolved_config_path)
     _install_cockpit_debug_log_handler(resolved_config_path)
-    _paint_inbox_snapshot(resolved_config_path, project=project)
+    _log_inbox_snapshot_error(snapshot_error)
 
     from pollypm.cockpit_ui import PollyInboxApp
 
@@ -102,7 +103,7 @@ def _default_config_path() -> Path:
     return Path.home() / ".pollypm" / "pollypm.toml"
 
 
-def _paint_inbox_snapshot(config_path: Path, *, project: str | None) -> None:
+def _paint_inbox_snapshot(config_path: Path, *, project: str | None) -> Exception | None:
     """Prepaint a real inbox list before importing the interactive TUI."""
     try:
         from pollypm.cockpit_inbox_items import load_inbox_entries
@@ -119,7 +120,22 @@ def _paint_inbox_snapshot(config_path: Path, *, project: str | None) -> None:
         )
         sys.stdout.write(f"{_CLEAR_SCREEN}{frame}")
         sys.stdout.flush()
-    except Exception:  # noqa: BLE001 - fast prepaint must never block launch
+        return None
+    except Exception as exc:  # noqa: BLE001 - fast prepaint must never block launch
+        return exc
+
+
+def _log_inbox_snapshot_error(exc: Exception | None) -> None:
+    if exc is None:
+        return
+    try:
+        import logging
+
+        logging.getLogger(__name__).debug(
+            "Inbox snapshot prepaint failed.",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+    except Exception:  # noqa: BLE001
         pass
 
 

@@ -706,6 +706,9 @@ class CockpitRouter:
     _COCKPIT_WINDOW = "PollyPM"
     _LEFT_PANE_WIDTH = 30  # default; actual value persisted in cockpit state.
     _STATE_WRITE_DEBOUNCE_SECONDS = 0.25
+    _SUPERVISOR_FREE_STATIC_KEYS = frozenset(
+        {"dashboard", "inbox", "workers", "metrics", "activity", "settings"},
+    )
 
     def __init__(self, config_path: Path) -> None:
         self.config_path = config_path
@@ -2596,6 +2599,8 @@ class CockpitRouter:
         self.set_selected_key(key)
         token = self._begin_layout_mutation()
         try:
+            if self._route_supervisor_free_static(key):
+                return
             supervisor = self._load_supervisor()
             window_target = f"{supervisor.config.project.tmux_session}:{self._COCKPIT_WINDOW}"
             self.ensure_cockpit_layout()
@@ -2627,6 +2632,62 @@ class CockpitRouter:
             except Exception:  # noqa: BLE001
                 pass
             self._end_layout_mutation(token)
+
+    def _route_supervisor_free_static(self, key: str) -> bool:
+        if key not in self._SUPERVISOR_FREE_STATIC_KEYS:
+            return False
+        state = self._load_state()
+        config = self._load_config()
+        has_mount_state = (
+            isinstance(state.get("mounted_session"), str)
+            or isinstance(state.get("mounted_identity"), dict)
+        )
+        if has_mount_state:
+            window_target = f"{config.project.tmux_session}:{self._COCKPIT_WINDOW}"
+            try:
+                panes = self.tmux.list_panes(window_target)
+            except Exception:  # noqa: BLE001
+                return False
+            right_pane_id = state.get("right_pane_id")
+            right_pane = next(
+                (
+                    pane for pane in panes
+                    if isinstance(right_pane_id, str)
+                    and getattr(pane, "pane_id", None) == right_pane_id
+                ),
+                None,
+            )
+            if right_pane is None and len(panes) >= 2:
+                right_pane = max(panes, key=self._pane_left)
+            if right_pane is not None and self._is_live_provider_pane(right_pane):
+                return False
+            state.pop("mounted_session", None)
+            state.pop("mounted_identity", None)
+        state.pop("mounted_return_key", None)
+        manager = CockpitWindowManager(
+            CockpitWindowSpec(
+                tmux_session=config.project.tmux_session,
+                cockpit_window=self._COCKPIT_WINDOW,
+                rail_width=self.rail_width(),
+                default_content_command=self._default_repair_command(state),
+                rail_command=None,
+            ),
+            self.tmux,
+        )
+        right_pane_id = state.get("right_pane_id")
+        result = manager.show_static(
+            self._right_pane_command(key),
+            CockpitWindowState(
+                right_pane_id=right_pane_id if isinstance(right_pane_id, str) else None,
+            ),
+        )
+        if not result.ok:
+            raise RuntimeError(
+                "Cockpit pane layout is invalid after static route: "
+                + "; ".join(result.postcondition.errors)
+            )
+        self._write_window_state(result.state, base=state)
+        return True
 
     def _heal_layout_after_route(self) -> None:
         """Repair a degraded cockpit layout left over from a failed route.

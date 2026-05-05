@@ -3,8 +3,8 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
 from types import SimpleNamespace
+from typing import Any
 
 from pollypm.cockpit_rail import CockpitRouter
 
@@ -54,6 +54,113 @@ def test_right_pane_command_executes_cockpit_pane_help(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "Usage:" in result.stdout
     assert "cockpit-pane" in result.stdout
+
+
+def test_route_inbox_skips_supervisor_context_before_respawn(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Capital-I should reach tmux respawn without loading session plans."""
+
+    router = _router(tmp_path)
+
+    left = SimpleNamespace(
+        pane_id="%1",
+        pane_current_command="python",
+        pane_left=0,
+        pane_width=30,
+        pane_dead=False,
+    )
+    right = SimpleNamespace(
+        pane_id="%2",
+        pane_current_command="python",
+        pane_left=31,
+        pane_width=120,
+        pane_dead=False,
+    )
+
+    class FakeTmux:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[Any, ...]]] = []
+
+        def list_panes(self, target: str) -> list[Any]:
+            assert target == "pollypm:PollyPM"
+            return [left, right]
+
+        def list_windows(self, name: str) -> list[Any]:
+            self.calls.append(("list_windows", (name,)))
+            return []
+
+        def split_window(self, *args: Any, **kwargs: Any) -> str:
+            raise AssertionError("two-pane route should not split")
+
+        def kill_pane(self, target: str) -> None:
+            raise AssertionError(f"unexpected kill_pane {target}")
+
+        def resize_pane_width(self, target: str, width: int) -> None:
+            self.calls.append(("resize_pane_width", (target, width)))
+
+        def respawn_pane(self, target: str, command: str) -> None:
+            self.calls.append(("respawn_pane", (target, command)))
+
+        def join_pane(self, *args: Any, **kwargs: Any) -> None:
+            raise AssertionError("unexpected join_pane")
+
+        def break_pane(self, *args: Any, **kwargs: Any) -> None:
+            raise AssertionError("unexpected break_pane")
+
+        def rename_window(self, *args: Any, **kwargs: Any) -> None:
+            raise AssertionError("unexpected rename_window")
+
+        def swap_pane(self, *args: Any, **kwargs: Any) -> None:
+            raise AssertionError("unexpected swap_pane")
+
+        def select_pane(self, target: str) -> None:
+            self.calls.append(("select_pane", (target,)))
+
+        def set_pane_history_limit(self, target: str, limit: int) -> None:
+            self.calls.append(("set_pane_history_limit", (target, limit)))
+
+        def run(self, *args: str, check: bool = True) -> None:
+            self.calls.append(("run", (*args, check)))
+
+    tmux = FakeTmux()
+    router.tmux = tmux  # type: ignore[assignment]
+    router._write_state(
+        {
+            "selected": "dashboard",
+            "right_pane_id": "%2",
+            "mounted_session": "operator",
+            "mounted_identity": {"session_name": "operator"},
+        }
+    )
+    monkeypatch.setattr(
+        router,
+        "_load_supervisor",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("inbox route loaded supervisor"),
+        ),
+    )
+    monkeypatch.setattr(
+        router,
+        "_content_context",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("inbox route resolved content context"),
+        ),
+    )
+
+    router.route_selected("inbox")
+
+    respawns = [call for call in tmux.calls if call[0] == "respawn_pane"]
+    assert len(respawns) == 1
+    target, command = respawns[0][1]
+    assert target == "%2"
+    assert "-m pollypm cockpit-pane inbox" in command
+    assert "uv run pm" not in command
+    state = router._load_state()
+    assert state["selected"] == "inbox"
+    assert "mounted_session" not in state
+    assert "mounted_identity" not in state
 
 
 def test_package_main_fast_dispatches_inbox_pane(
@@ -167,7 +274,7 @@ def test_package_main_fast_dispatches_inbox_pane(
 
     assert handled is True
     assert first_package_import
-    assert first_package_import[0][0] == "pollypm.cli_features.ui"
+    assert first_package_import[0][0] == "pollypm.cockpit_inbox_items"
     pre_import_output = first_package_import[0][1]
     assert "Inbox" in pre_import_output
     assert "Loading messages..." in pre_import_output

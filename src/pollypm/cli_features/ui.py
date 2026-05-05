@@ -19,6 +19,74 @@ import typer
 
 from pollypm.config import DEFAULT_CONFIG_PATH
 
+_RIGHT_PANE_BRIDGE_BYPASS_ESCAPE_TOKENS = frozenset({"<esc>", "esc", "escape"})
+_RIGHT_PANE_TMUX_KEY_TOKENS: dict[str, str] = {
+    "<bs>": "BSpace",
+    "backspace": "BSpace",
+    "<cr>": "Enter",
+    "enter": "Enter",
+    "<tab>": "Tab",
+    "tab": "Tab",
+    "<space>": "Space",
+    "space": "Space",
+    "<up>": "Up",
+    "up": "Up",
+    "<down>": "Down",
+    "down": "Down",
+    "<left>": "Left",
+    "left": "Left",
+    "<right>": "Right",
+    "right": "Right",
+    "<pgup>": "PageUp",
+    "pageup": "PageUp",
+    "<pgdn>": "PageDown",
+    "pagedown": "PageDown",
+    "<home>": "Home",
+    "home": "Home",
+    "<end>": "End",
+    "end": "End",
+}
+
+
+def _tmux_event_for_cockpit_key(key: str) -> tuple[str, bool] | None:
+    """Return ``(value, literal)`` for forwarding a bridge token to tmux."""
+    token = key.strip()
+    if not token:
+        return None
+    lowered = token.lower()
+    mapped = _RIGHT_PANE_TMUX_KEY_TOKENS.get(lowered)
+    if mapped is not None:
+        return mapped, False
+    if lowered.startswith("ctrl+") and len(token) > len("ctrl+"):
+        return f"C-{token[len('ctrl+'):].lower()}", False
+    if lowered.startswith("c-") and len(token) > 2:
+        return f"C-{token[2:].lower()}", False
+    return key, True
+
+
+def _send_key_to_active_live_right_pane(config_path: Path, key: str) -> str | None:
+    """Deliver ``key`` to the focused live right pane, if one owns focus."""
+    if key.strip().lower() in _RIGHT_PANE_BRIDGE_BYPASS_ESCAPE_TOKENS:
+        return None
+    try:
+        from pollypm.cockpit_rail import CockpitRouter
+
+        router = CockpitRouter(config_path)
+        right_pane = router.active_live_right_pane_id()
+    except Exception:  # noqa: BLE001
+        return None
+    if right_pane is None:
+        return None
+    event = _tmux_event_for_cockpit_key(key)
+    if event is None:
+        return None
+    value, literal = event
+    if literal:
+        router.tmux.send_keys(right_pane, value, press_enter=False)
+    else:
+        router.tmux.run("send-keys", "-t", right_pane, value, check=False)
+    return right_pane
+
 
 def _install_cockpit_debug_log_handler(config_path: Path) -> None:
     """Attach a ``FileHandler`` so cockpit-side ``logger.info``/``warning``
@@ -284,6 +352,16 @@ def register_ui_commands(app: typer.Typer) -> None:
         ),
     ) -> None:
         from pollypm.cockpit_input_bridge import send_key_to_first_live
+
+        if kind == "cockpit":
+            delivered_to_right = _send_key_to_active_live_right_pane(
+                config_path, key,
+            )
+            if delivered_to_right is not None:
+                typer.echo(
+                    f"Delivered {key!r} via cockpit right pane {delivered_to_right}"
+                )
+                return
 
         delivered_to = send_key_to_first_live(config_path, key, kind=kind)
         if delivered_to is None:

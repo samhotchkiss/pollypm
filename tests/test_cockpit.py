@@ -2924,6 +2924,34 @@ def test_cockpit_router_focus_right_shows_return_affordance(monkeypatch, tmp_pat
     assert calls[1] == ("select", ("%2",))
 
 
+def test_cockpit_router_detects_active_live_right_pane(tmp_path: Path) -> None:
+    """#1203: bridge-delivered typing should follow live right-pane focus."""
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+
+    class FakeTmux:
+        def __init__(self, right_active: bool) -> None:
+            self.right_active = right_active
+
+        def list_panes(self, target: str):
+            assert target == "pollypm:PollyPM"
+            return [
+                SimpleNamespace(pane_id="%1", active=not self.right_active, pane_dead=False),
+                SimpleNamespace(pane_id="%2", active=self.right_active, pane_dead=False),
+            ]
+
+    router = CockpitRouter(config_path)
+    router._write_state({"right_pane_id": "%2", "mounted_session": "architect_demo"})
+    router.tmux = FakeTmux(right_active=True)  # type: ignore[assignment]
+
+    assert router.active_live_right_pane_id() == "%2"
+
+    router.tmux = FakeTmux(right_active=False)  # type: ignore[assignment]
+    assert router.active_live_right_pane_id() is None
+
+
 def test_cockpit_router_focus_rail_selects_leftmost_pane(
     monkeypatch, tmp_path: Path,
 ) -> None:

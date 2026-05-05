@@ -450,12 +450,14 @@ class JobQueue:
         def _do_fail() -> None:
             with self._lock:
                 row = self._conn.execute(
-                    "SELECT attempt, max_attempts FROM work_jobs WHERE id = ?",
+                    "SELECT status, attempt, max_attempts FROM work_jobs WHERE id = ?",
                     (int(job_id),),
                 ).fetchone()
                 if row is None:
                     return
-                attempt, max_attempts = int(row[0]), int(row[1])
+                status, attempt, max_attempts = str(row[0]), int(row[1]), int(row[2])
+                if status != JobStatus.CLAIMED.value:
+                    return
 
                 if not retry or attempt >= max_attempts:
                     self._conn.execute(

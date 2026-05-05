@@ -337,6 +337,24 @@ def _selected_key(ctx: RailContext) -> str:
     return str(value) if isinstance(value, str) and value else "polly"
 
 
+def _project_chat_persona(project: Any, session_role: Any) -> str | None:
+    if isinstance(session_role, str) and session_role.strip():
+        try:
+            from pollypm.role_contract import canonical_role, persona_for
+
+            if canonical_role(session_role) == "architect":
+                return persona_for("architect")
+        except ValueError:
+            pass
+
+    persona_raw = getattr(project, "persona_name", None)
+    return (
+        persona_raw.strip()
+        if isinstance(persona_raw, str) and persona_raw.strip()
+        else None
+    )
+
+
 def _project_rows(ctx: RailContext) -> list[RailRow]:
     router = _router(ctx)
     if router is None:
@@ -352,20 +370,25 @@ def _project_rows(ctx: RailContext) -> list[RailRow]:
     selected = _selected_key(ctx)
     config = _config(ctx)
 
-    # Map project -> session name for session_state fallback.
+    # Map project -> session name/role for session_state fallback and label copy.
     from pollypm.models import CONTROL_ROLES
 
-    project_session_map: dict[str, str] = {}
+    project_session_map: dict[str, tuple[str, str]] = {}
     for launch in _launches(ctx):
         role = getattr(launch.session, "role", "")
         if role in CONTROL_ROLES:
             continue
-        project_session_map.setdefault(launch.session.project, launch.session.name)
+        project_session_map.setdefault(
+            launch.session.project,
+            (launch.session.name, role),
+        )
 
     rows: list[RailRow] = []
 
     def _emit(project_key: str, project: Any) -> None:
-        session_name = project_session_map.get(project_key)
+        session_info = project_session_map.get(project_key)
+        session_name = session_info[0] if session_info is not None else None
+        session_role = session_info[1] if session_info is not None else None
         if has_working.get(project_key):
             state = "\u25c6 working"
         elif session_name is not None:
@@ -383,12 +406,7 @@ def _project_rows(ctx: RailContext) -> list[RailRow]:
                 label="  Dashboard",
                 state="sub",
             ))
-            persona_raw = getattr(project, "persona_name", None)
-            persona = (
-                persona_raw.strip()
-                if isinstance(persona_raw, str) and persona_raw.strip()
-                else None
-            )
+            persona = _project_chat_persona(project, session_role)
             label = f"  PM Chat ({persona})" if persona else "  PM Chat"
             rows.append(RailRow(
                 key=f"project:{project_key}:session",

@@ -88,6 +88,59 @@ class _FakeWindow:
         self.pane_id = f"%{name}"
 
 
+@pytest.mark.parametrize(
+    ("session_role", "expected_label"),
+    [
+        ("architect", "  PM Chat (Archie)"),
+        ("worker", "  PM Chat (Bea)"),
+    ],
+)
+def test_pm_chat_label_matches_project_session_persona(
+    monkeypatch, tmp_path: Path, session_role: str, expected_label: str,
+) -> None:
+    project = KnownProject(
+        key="bikepath",
+        path=tmp_path,
+        name="Bikepath",
+        persona_name="Bea",
+        kind=ProjectKind.GIT,
+    )
+    config = type("Config", (), {"projects": {"bikepath": project}})()
+
+    class _Router:
+        def _session_state(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            return "idle"
+
+    monkeypatch.setattr(
+        core_rail_items_plugin,
+        "_classify_projects",
+        lambda ctx: ([("bikepath", project)], [], {"bikepath": False}),
+    )
+    monkeypatch.setattr(
+        core_rail_items_plugin,
+        "_active_task_numbers",
+        lambda project, *, config=None: [],
+    )
+    ctx = RailContext(
+        router=_Router(),
+        config=config,
+        launches=[
+            _FakeLaunch(
+                f"{session_role}_bikepath",
+                session_role,
+                "bikepath",
+                f"{session_role}-bikepath",
+            ),
+        ],
+        cockpit_state={"selected": "project:bikepath"},
+    )
+
+    rows = core_rail_items_plugin._project_rows(ctx)
+
+    session_row = next(row for row in rows if row.key == "project:bikepath:session")
+    assert session_row.label == expected_label
+
+
 def _fake_supervisor(
     tmp_path: Path,
     *,

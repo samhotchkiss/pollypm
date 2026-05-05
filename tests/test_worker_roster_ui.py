@@ -132,6 +132,35 @@ def test_roster_renders_all_configured_workers(roster_env, roster_app) -> None:
     _run(body())
 
 
+def test_roster_paints_loading_before_gathering_workers(roster_env, roster_app) -> None:
+    """#1244: opening Workers must replace stale Home content immediately."""
+    async def body() -> None:
+        worker_calls: list[tuple[object, bool, bool, str]] = []
+
+        def _run_worker(callable_, *, thread, exclusive, group):  # noqa: ANN001
+            worker_calls.append((callable_, thread, exclusive, group))
+
+        def _fail_gather():
+            raise AssertionError("worker roster gather ran before first paint")
+
+        roster_app.run_worker = _run_worker  # type: ignore[method-assign]
+        roster_app._gather = _fail_gather  # type: ignore[method-assign]
+
+        async with roster_app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            assert "Workers" in str(roster_app.topbar.render())
+            assert "loading" in str(roster_app.topbar.render()).lower()
+            assert "Loading worker roster" in str(roster_app.counters.render())
+            assert worker_calls
+            _, thread, exclusive, group = worker_calls[0]
+            assert thread is True
+            assert exclusive is True
+            assert group == "wr_refresh"
+            assert roster_app.table.row_count == 0
+
+    _run(body())
+
+
 def test_status_dots_for_each_category(roster_env, roster_app) -> None:
     """Health states map to the expected glyph set.
 

@@ -158,6 +158,7 @@ class PollyWorkerRosterApp(App[None]):
         self._auto_refresh_timer = None
         self._active_shipments: set[str] = set()
         self._seen_shipments: set[str] = set()
+        self._refresh_in_flight = False
         self._worker_color_overrides = load_worker_color_overrides(config_path)
 
     def compose(self) -> ComposeResult:
@@ -173,7 +174,8 @@ class PollyWorkerRosterApp(App[None]):
         self.table.add_columns(
             "Project", "Worker", "Health", "Task", "Node", "Turn", "Last commit",
         )
-        self._refresh()
+        self._render_loading()
+        self._schedule_refresh(show_loading=False)
         # Alert toast surface removed in #956 — the worker roster no
         # longer mounts floating alert cards over the table.
 
@@ -196,17 +198,68 @@ class PollyWorkerRosterApp(App[None]):
         except Exception:  # noqa: BLE001
             return []
 
-    def _refresh(self) -> None:
+    def _render_loading(self) -> None:
+        self.topbar.update("[b #eef6ff]Workers[/b #eef6ff]   [#97a6b2]loading...[/#97a6b2]")
+        self.counters.update("[dim]Loading worker roster...[/dim]")
+        self.table.clear()
+        self.hint.update("[dim]Loading workers...[/dim]")
+
+    def _collect_refresh(self) -> tuple[object | None, list, Exception | None]:
         try:
-            self._worker_color_overrides = load_worker_color_overrides(self.config_path)
+            color_overrides = load_worker_color_overrides(self.config_path)
             rows = self._gather()
         except Exception as exc:  # noqa: BLE001
+            return None, [], exc
+        return color_overrides, rows, None
+
+    def _apply_refresh_result(
+        self,
+        color_overrides: object | None,
+        rows: list,
+        error: Exception | None,
+    ) -> None:
+        self._refresh_in_flight = False
+        if error is not None:
             self.topbar.update(
-                f"[#ff5f6d]Error loading workers:[/#ff5f6d] {_escape(str(exc))}"
+                f"[#ff5f6d]Error loading workers:[/#ff5f6d] {_escape(str(error))}"
             )
             return
+        if color_overrides is not None:
+            self._worker_color_overrides = color_overrides
         self._rows = rows
         self._render()
+
+    def _refresh(self) -> None:
+        color_overrides, rows, error = self._collect_refresh()
+        self._apply_refresh_result(color_overrides, rows, error)
+
+    def _refresh_in_worker(self) -> None:
+        color_overrides, rows, error = self._collect_refresh()
+        try:
+            self.call_from_thread(
+                self._apply_refresh_result,
+                color_overrides,
+                rows,
+                error,
+            )
+        except Exception:  # noqa: BLE001
+            self._apply_refresh_result(color_overrides, rows, error)
+
+    def _schedule_refresh(self, *, show_loading: bool) -> None:
+        if self._refresh_in_flight:
+            return
+        self._refresh_in_flight = True
+        if show_loading:
+            self._render_loading()
+        try:
+            self.run_worker(
+                self._refresh_in_worker,
+                thread=True,
+                exclusive=True,
+                group="wr_refresh",
+            )
+        except Exception:  # noqa: BLE001
+            self._refresh()
 
     def _render(self) -> None:
         self.table.clear()
@@ -350,14 +403,15 @@ class PollyWorkerRosterApp(App[None]):
             self.hint.update(self._DEFAULT_HINT)
 
     def action_refresh(self) -> None:
-        self._refresh()
+        self._schedule_refresh(show_loading=True)
 
     def action_toggle_auto(self) -> None:
         self._auto_refresh = not self._auto_refresh
         if self._auto_refresh:
             if self._auto_refresh_timer is None:
                 self._auto_refresh_timer = self.set_interval(
-                    self.AUTO_REFRESH_SECONDS, self._refresh,
+                    self.AUTO_REFRESH_SECONDS,
+                    lambda: self._schedule_refresh(show_loading=False),
                 )
             self.notify(
                 f"Auto-refresh on ({int(self.AUTO_REFRESH_SECONDS)}s).",

@@ -90,6 +90,7 @@ from pollypm.work.service_queries import (
     blocked_tasks as read_blocked_tasks,
     create_task,
     get_task,
+    list_nonterminal_tasks as read_nonterminal_tasks,
     list_tasks as read_tasks,
     my_tasks as read_my_tasks,
     next_task,
@@ -1676,6 +1677,14 @@ class SQLiteWorkService:
             limit=limit,
             offset=offset,
         )
+
+    def list_nonterminal_tasks(
+        self,
+        *,
+        project: str | None = None,
+    ) -> list[Task]:
+        """Return tasks that can still require inbox attention."""
+        return read_nonterminal_tasks(self, project=project)
 
     def update(self, task_id: str, **fields: object) -> Task:
         """Update mutable fields on a task."""

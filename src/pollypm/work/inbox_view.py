@@ -28,6 +28,7 @@ from pollypm.work.models import (
     Priority,
     Task,
     TERMINAL_STATUSES,
+    WorkStatus,
 )
 
 
@@ -191,7 +192,22 @@ def inbox_tasks(
     ``service`` must satisfy the WorkService protocol. In particular it must
     provide ``list_tasks(project=...)`` and ``get_flow(name, project=...)``.
     """
-    candidates: Iterable[Task] = service.list_tasks(project=project)
+    list_nonterminal = getattr(service, "list_nonterminal_tasks", None)
+    if callable(list_nonterminal):
+        candidates: Iterable[Task] = list_nonterminal(project=project)
+    else:
+        try:
+            candidates = [
+                task
+                for status in WorkStatus
+                if status not in TERMINAL_STATUSES
+                for task in service.list_tasks(
+                    project=project,
+                    work_status=status.value,
+                )
+            ]
+        except TypeError:
+            candidates = service.list_tasks(project=project)
     flow_cache: dict[tuple[str, int], FlowTemplate] = {}
     matches = [
         task for task in candidates

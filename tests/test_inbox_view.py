@@ -131,10 +131,19 @@ class FakeWorkService:
         self._tasks = list(tasks)
         self._flows = flows or {}
 
-    def list_tasks(self, *, project: str | None = None, **_ignored) -> list[Task]:
-        if project is None:
-            return list(self._tasks)
-        return [t for t in self._tasks if t.project == project]
+    def list_tasks(
+        self,
+        *,
+        project: str | None = None,
+        work_status: str | None = None,
+        **_ignored,
+    ) -> list[Task]:
+        tasks = list(self._tasks)
+        if project is not None:
+            tasks = [t for t in tasks if t.project == project]
+        if work_status is not None:
+            tasks = [t for t in tasks if t.work_status.value == work_status]
+        return tasks
 
     def get_flow(self, name: str, project: str | None = None) -> FlowTemplate:
         if name not in self._flows:
@@ -201,6 +210,50 @@ class TestInboxTasksQuery:
         )
         svc = FakeWorkService([t], flows={"standard": _flow_standard()})
         assert inbox_tasks(svc) == []
+
+    def test_terminal_statuses_are_not_loaded_when_service_can_filter(self):
+        """The cockpit Inbox cold path should not hydrate terminal history."""
+
+        open_task = _task(
+            "proj",
+            6,
+            "open task",
+            roles={"requester": "user"},
+            status=WorkStatus.QUEUED,
+        )
+        done_task = _task(
+            "proj",
+            7,
+            "done task",
+            roles={"requester": "user"},
+            status=WorkStatus.DONE,
+        )
+
+        class RecordingService(FakeWorkService):
+            def __init__(self, tasks: list[Task]) -> None:
+                super().__init__(tasks, flows={"standard": _flow_standard()})
+                self.queried_statuses: list[str | None] = []
+
+            def list_tasks(
+                self,
+                *,
+                project: str | None = None,
+                work_status: str | None = None,
+                **kwargs,
+            ) -> list[Task]:
+                self.queried_statuses.append(work_status)
+                return super().list_tasks(
+                    project=project,
+                    work_status=work_status,
+                    **kwargs,
+                )
+
+        svc = RecordingService([open_task, done_task])
+
+        assert [x.task_id for x in inbox_tasks(svc)] == ["proj/6"]
+        assert None not in svc.queried_statuses
+        assert WorkStatus.DONE.value not in svc.queried_statuses
+        assert WorkStatus.CANCELLED.value not in svc.queried_statuses
 
     def test_sort_priority_desc_then_updated_desc(self):
         # Three tasks, all matching:

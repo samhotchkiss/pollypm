@@ -30,6 +30,7 @@ atomic — two concurrent claim() calls cannot return the same row.
 from __future__ import annotations
 
 import json
+import logging
 import random
 import sqlite3
 import threading
@@ -37,12 +38,17 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 
 from pollypm.storage.sqlite_pragmas import (
     apply_workspace_pragmas,
     retry_on_database_locked,
 )
+
+
+logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 __all__ = [
@@ -146,6 +152,13 @@ def _parse_ts(value: str | None) -> datetime | None:
     return dt
 
 
+_CLOSED_DB_MARKER = "Cannot operate on a closed database"
+
+
+def _is_closed_db_error(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.ProgrammingError) and _CLOSED_DB_MARKER in str(exc)
+
+
 class JobQueue:
     """Thread-safe SQLite-backed durable job queue.
 
@@ -171,27 +184,64 @@ class JobQueue:
             raise ValueError("JobQueue requires exactly one of db_path or connection")
         self._lock = threading.RLock()
         self._owns_connection = connection is None
+        self._db_path = Path(db_path) if db_path is not None else None
+        self._closed = False
         if connection is not None:
             self._conn = connection
         else:
-            path = Path(db_path)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(
-                str(path), check_same_thread=False, isolation_level=None
-            )
-            with self._lock:
-                # #1018: same WAL + busy_timeout treatment as the app state DB.
-                # JobQueue is one of the heaviest writers (claim+complete
-                # per job) so we keep the historical 30 s timeout instead
-                # of the 5 s workspace default.
-                apply_workspace_pragmas(self._conn, busy_timeout_ms=30000)
+            self._conn = self._open_owned_connection()
         self._ensure_schema()
         self.default_max_attempts = default_max_attempts
         self.retry_policy = retry_policy or exponential_backoff()
 
+    def _open_owned_connection(self) -> sqlite3.Connection:
+        if self._db_path is None:
+            raise RuntimeError("cannot open JobQueue connection without db_path")
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(
+            str(self._db_path), check_same_thread=False, isolation_level=None
+        )
+        # #1018: same WAL + busy_timeout treatment as the app state DB.
+        # JobQueue is one of the heaviest writers (claim+complete per job)
+        # so we keep the historical 30 s timeout instead of the 5 s
+        # workspace default.
+        apply_workspace_pragmas(conn, busy_timeout_ms=30000)
+        return conn
+
+    def _reopen_owned_connection(self, *, label: str) -> bool:
+        if not self._owns_connection or self._db_path is None or self._closed:
+            return False
+        with self._lock:
+            if self._closed:
+                return False
+            try:
+                self._conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._conn = self._open_owned_connection()
+            self._ensure_schema()
+        logger.warning("%s: reopened closed JobQueue SQLite connection", label)
+        return True
+
+    def _retry_reopening_closed_connection(
+        self,
+        fn: Callable[[], T],
+        *,
+        label: str,
+    ) -> T:
+        try:
+            return retry_on_database_locked(fn, label=label)
+        except BaseException as exc:  # noqa: BLE001
+            if not _is_closed_db_error(exc):
+                raise
+            if not self._reopen_owned_connection(label=label):
+                raise
+        return retry_on_database_locked(fn, label=label)
+
     def close(self) -> None:
         if self._owns_connection:
             with self._lock:
+                self._closed = True
                 try:
                     self._conn.close()
                 except Exception:  # noqa: BLE001
@@ -308,7 +358,10 @@ class JobQueue:
                     return int(existing[0])
                 return int(cursor.lastrowid)
 
-        return retry_on_database_locked(_do_enqueue, label="JobQueue.enqueue")
+        return self._retry_reopening_closed_connection(
+            _do_enqueue,
+            label="JobQueue.enqueue",
+        )
 
     # ------------------------------------------------------------------
     # Claim / complete / fail

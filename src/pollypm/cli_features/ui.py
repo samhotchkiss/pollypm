@@ -21,7 +21,18 @@ from pollypm.config import DEFAULT_CONFIG_PATH
 
 _RIGHT_PANE_BRIDGE_BYPASS_ESCAPE_TOKENS = frozenset({"<esc>", "esc", "escape"})
 _HELP_KEY_TOKENS = frozenset({"?", "question_mark"})
-_INBOX_BRIDGE_FIRST_TOKENS = frozenset({"d"})
+_INBOX_BRIDGE_FIRST_TOKENS = frozenset({"/", "d"})
+_INBOX_FILTER_INPUT_TOKENS = frozenset({
+    "<bs>",
+    "<cr>",
+    "<esc>",
+    "<space>",
+    "backspace",
+    "enter",
+    "esc",
+    "escape",
+    "space",
+})
 _SETTINGS_BRIDGE_FIRST_TOKENS = frozenset({
     "<down>",
     "<tab>",
@@ -105,11 +116,18 @@ def _send_selected_action_key_to_content_bridge(
         from pollypm.cockpit_input_bridge import send_key_to_first_live
         from pollypm.cockpit_rail import CockpitRouter
 
-        selected = CockpitRouter(config_path).selected_key()
+        router = CockpitRouter(config_path)
+        selected = router.selected_key()
     except Exception:  # noqa: BLE001
         return None
     kind = _content_bridge_kind_for_selected_key(selected)
     if kind == "pane-inbox" and token in _INBOX_BRIDGE_FIRST_TOKENS:
+        pass
+    elif (
+        kind == "pane-inbox"
+        and _inbox_filter_token(token, lowered)
+        and router.inbox_filter_input_active()
+    ):
         pass
     elif kind == "settings" and lowered in _SETTINGS_BRIDGE_FIRST_TOKENS:
         pass
@@ -119,6 +137,12 @@ def _send_selected_action_key_to_content_bridge(
         return send_key_to_first_live(config_path, key, kind=kind, timeout=0.2)
     except Exception:  # noqa: BLE001
         return None
+
+
+def _inbox_filter_token(token: str, lowered: str) -> bool:
+    if lowered in _INBOX_FILTER_INPUT_TOKENS:
+        return True
+    return len(token) == 1 and token.isprintable()
 
 
 def _tmux_event_for_cockpit_key(key: str) -> tuple[str, bool] | None:

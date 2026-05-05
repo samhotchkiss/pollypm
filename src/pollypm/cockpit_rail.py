@@ -863,6 +863,22 @@ class CockpitRouter:
         except Exception:  # noqa: BLE001
             pass
 
+    def inbox_filter_input_active(self) -> bool:
+        data = self._load_state()
+        return data.get("inbox_filter_input_active") is True
+
+    def set_inbox_filter_input_active(self, active: bool) -> None:
+        data = self._load_state()
+        if active:
+            if data.get("inbox_filter_input_active") is True:
+                return
+            data["inbox_filter_input_active"] = True
+        else:
+            if "inbox_filter_input_active" not in data:
+                return
+            data.pop("inbox_filter_input_active", None)
+        self._write_state(data)
+
     def _return_key_for_live_mount(self, previous_key: object) -> str | None:
         """Return the static cockpit route to restore after a live mount."""
         if not isinstance(previous_key, str) or not previous_key:

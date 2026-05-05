@@ -2341,6 +2341,67 @@ def test_inbox_filter_bridge_literal_slash_opens_input(inbox_env) -> None:
     _run(body())
 
 
+def test_cockpit_send_key_inbox_filter_sequence_routes_to_inbox_bridge(
+    inbox_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1214: default cockpit-send-key drives Inbox filter text via bridge."""
+    if not _load_config_compatible(inbox_env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    import typer
+    from typer.testing import CliRunner
+
+    from pollypm.cli_features import ui as ui_commands
+    from pollypm.cockpit_rail import CockpitRouter
+    from pollypm.cockpit_ui import PollyInboxApp
+
+    cli = typer.Typer()
+    ui_commands.register_ui_commands(cli)
+    live_pane_attempts: list[tuple[Path, str]] = []
+
+    def fake_live_pane(config_path: Path, key: str) -> str | None:
+        live_pane_attempts.append((config_path, key))
+        return "%2"
+
+    monkeypatch.setattr(
+        ui_commands,
+        "_send_key_to_active_live_right_pane",
+        fake_live_pane,
+    )
+
+    app = PollyInboxApp(inbox_env["config_path"])
+    CockpitRouter(inbox_env["config_path"]).set_selected_key("inbox")
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            initial_count = len(_visible_titles(app))
+            assert initial_count > 1
+            handle = getattr(app, "_input_bridge_handle", None)
+            assert handle is not None
+
+            for key in ("/", "V", "C", "L"):
+                result = CliRunner().invoke(
+                    cli,
+                    [
+                        "cockpit-send-key",
+                        key,
+                        "--config",
+                        str(inbox_env["config_path"]),
+                    ],
+                )
+                assert result.exit_code == 0, result.output
+                assert str(handle.socket_path) in result.output
+                await pilot.pause(0.1)
+
+            assert live_pane_attempts == []
+            assert app.filter_input.value == "VCL"
+            assert _visible_titles(app) == ["Deploy blocked"]
+            assert len(_visible_titles(app)) < initial_count
+
+    _run(body())
+
+
 def test_inbox_bridge_n_keypress_toggles_notifications_visible(
     inbox_env,
 ) -> None:

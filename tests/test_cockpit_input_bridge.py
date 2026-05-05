@@ -326,6 +326,60 @@ def test_cockpit_send_key_inbox_discuss_prefers_inbox_bridge_over_live_pane(
         inbox.stop()
 
 
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        ("j", "j"),
+        ("k", "k"),
+        ("<down>", "down"),
+        ("<up>", "up"),
+        ("<tab>", "tab"),
+    ],
+)
+def test_cockpit_send_key_settings_nav_prefers_settings_bridge_over_live_pane(
+    valid_cockpit_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    key: str,
+    expected: str,
+) -> None:
+    import typer
+    from typer.testing import CliRunner
+
+    from pollypm.cli_features import ui as ui_commands
+    from pollypm.cockpit_rail import CockpitRouter
+
+    settings_app = _FakeApp()
+    settings = start_input_bridge(
+        settings_app, kind="settings", config_path=valid_cockpit_config,
+    )
+    assert settings is not None
+    live_pane_attempts: list[tuple[Path, str]] = []
+
+    def fake_live_pane(config_path: Path, key: str) -> str | None:
+        live_pane_attempts.append((config_path, key))
+        return "%2"
+
+    monkeypatch.setattr(
+        ui_commands,
+        "_send_key_to_active_live_right_pane",
+        fake_live_pane,
+    )
+    try:
+        CockpitRouter(valid_cockpit_config).set_selected_key("settings")
+
+        app = typer.Typer()
+        ui_commands.register_ui_commands(app)
+        result = CliRunner().invoke(
+            app, ["cockpit-send-key", key, "--config", str(valid_cockpit_config)]
+        )
+        assert result.exit_code == 0, result.output
+        assert f"via {settings.socket_path}" in result.output
+        assert _wait_for(lambda: settings_app.keys == [expected])
+        assert live_pane_attempts == []
+    finally:
+        settings.stop()
+
+
 def test_cockpit_send_key_forwards_to_focused_live_right_pane(
     fake_config: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -2382,9 +2382,6 @@ class PollyCockpitApp(App[None]):
         if self.selected_key == "settings":
             self._send_key_to_settings_pane("j")
             return
-        if self._on_inbox_surface():
-            self._send_key_to_inbox_pane("j")
-            return
         self._align_nav_cursor_to_selected_key()
         last_idx = self._last_nav_index()
         # On the last selectable nav row + Settings is visible → step
@@ -2405,9 +2402,6 @@ class PollyCockpitApp(App[None]):
     def action_cursor_up(self) -> None:
         if self.selected_key == "settings":
             self._send_key_to_settings_pane("k")
-            return
-        if self._on_inbox_surface():
-            self._send_key_to_inbox_pane("k")
             return
         self._align_nav_cursor_to_selected_key()
         # Step up off the virtual Settings row onto the last

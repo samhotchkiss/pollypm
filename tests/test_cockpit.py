@@ -6029,6 +6029,52 @@ def test_default_repair_command_uses_home_dashboard(tmp_path: Path) -> None:
     )
 
 
+def test_static_route_postcondition_error_is_logged_not_raised(
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    """#1235: static route layout races must not bubble up as rail hints."""
+
+    from pollypm.cockpit_window_manager import CockpitWindowState
+
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\n"
+        f"base_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+    router = CockpitRouter(config_path)
+    router._write_state(
+        {"selected": "project:booktalk:dashboard", "right_pane_id": "%2"}
+    )
+    healed: list[bool] = []
+    router._heal_layout_after_route = lambda: healed.append(True)  # type: ignore[method-assign]
+
+    class FakeManager:
+        def show_static(self, command, state):  # noqa: ANN001
+            assert command == "pm cockpit-pane project booktalk"
+            assert state.right_pane_id == "%2"
+            return SimpleNamespace(
+                ok=False,
+                state=CockpitWindowState(right_pane_id="%2"),
+                postcondition=SimpleNamespace(
+                    errors=("expected exactly 2 live panes, found 1",),
+                ),
+            )
+
+    router._window_manager = lambda _supervisor: FakeManager()  # type: ignore[method-assign]
+
+    with caplog.at_level("WARNING", logger="pollypm.cockpit_rail"):
+        router._show_command_view(
+            SimpleNamespace(),
+            "pollypm:PollyPM",
+            "pm cockpit-pane project booktalk",
+        )
+
+    assert healed == [True]
+    assert "Cockpit pane layout invalid after static route" in caplog.text
+    assert router._load_state()["right_pane_id"] == "%2"
+
+
 def test_cockpit_pane_subprocess_dies_with_shell_wrapper(tmp_path: Path) -> None:
     """#986 — process-level regression: the shell wrapper used by
     ``CockpitRouter._right_pane_command`` must not strand its Python

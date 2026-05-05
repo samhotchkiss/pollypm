@@ -22,6 +22,7 @@ back-compat shim defined there.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import select
 import shlex
@@ -68,6 +69,8 @@ from pollypm.runtimes import get_runtime
 # tasks); deferring this import shaves the supervisor cost off any pane
 # that doesn't instantiate a ``CockpitRouter``.
 from pollypm.session_services import create_tmux_client
+
+logger = logging.getLogger(__name__)
 
 
 # ── Color palette ────────────────────────────────────────────────────────────
@@ -2682,12 +2685,17 @@ class CockpitRouter:
             ),
         )
         if not result.ok:
-            raise RuntimeError(
-                "Cockpit pane layout is invalid after static route: "
-                + "; ".join(result.postcondition.errors)
-            )
+            self._handle_invalid_static_route(result)
         self._write_window_state(result.state, base=state)
         return True
+
+    def _handle_invalid_static_route(self, result) -> None:
+        errors = "; ".join(result.postcondition.errors)
+        logger.warning("Cockpit pane layout invalid after static route: %s", errors)
+        try:
+            self._heal_layout_after_route()
+        except Exception:  # noqa: BLE001
+            logger.debug("Cockpit pane layout heal failed after static route.", exc_info=True)
 
     def _heal_layout_after_route(self) -> None:
         """Repair a degraded cockpit layout left over from a failed route.
@@ -3548,10 +3556,7 @@ class CockpitRouter:
             self._window_state_from_cockpit_state(supervisor, state),
         )
         if not result.ok:
-            raise RuntimeError(
-                "Cockpit pane layout is invalid after static route: "
-                + "; ".join(result.postcondition.errors)
-            )
+            self._handle_invalid_static_route(result)
         self._write_window_state(result.state, base=state)
 
     def _cleanup_extra_panes(self, window_target: str) -> None:

@@ -132,6 +132,7 @@ async def _wait_for_help_modal(app, pilot, *, attempts: int = 5):
 @pytest.mark.parametrize(
     "app_factory_name",
     [
+        "PollyDashboardApp",
         "PollyInboxApp",
         "PollyCockpitApp",
         "PollyWorkerRosterApp",
@@ -162,11 +163,14 @@ def test_question_mark_opens_help_modal(
     _run(body())
 
 
-@pytest.mark.parametrize("app_factory_name", ["PollyCockpitApp", "PollyInboxApp"])
+@pytest.mark.parametrize(
+    "app_factory_name",
+    ["PollyCockpitApp", "PollyDashboardApp", "PollyInboxApp"],
+)
 def test_bridge_literal_question_mark_opens_help_modal(
     single_project_env, app_factory_name,
 ) -> None:
-    """``pm cockpit-send-key '?'`` opens help from rail and inbox surfaces."""
+    """``pm cockpit-send-key '?'`` opens help from bridged cockpit surfaces."""
     if not _load_config_compatible(single_project_env["config_path"]):
         pytest.skip("minimal pollypm.toml fixture not supported by loader")
     from pollypm import cockpit_ui
@@ -539,6 +543,7 @@ def test_question_mark_binding_registered_on_every_cockpit_app() -> None:
     from pollypm.cockpit_ui import (
         PollyActivityFeedApp,
         PollyCockpitApp,
+        PollyDashboardApp,
         PollyInboxApp,
         PollyProjectDashboardApp,
         PollySettingsPaneApp,
@@ -554,6 +559,7 @@ def test_question_mark_binding_registered_on_every_cockpit_app() -> None:
 
     for cls in (
         PollyCockpitApp,
+        PollyDashboardApp,
         PollyInboxApp,
         PollyProjectDashboardApp,
         PollyWorkerRosterApp,

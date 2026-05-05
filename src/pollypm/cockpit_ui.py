@@ -2999,6 +2999,7 @@ class PollyDashboardApp(App[None]):
     BINDINGS = [
         Binding("i", "jump_inbox", "Inbox"),
         Binding("r", "refresh", "Refresh"),
+        Binding("question_mark", "show_keyboard_help", "Help", priority=True),
         # The screen overflows on a 65-row laptop terminal — Tokens
         # sits below the fold (#874). The Screen already declares
         # ``overflow-y: auto`` but Textual does not bind navigation
@@ -3032,6 +3033,9 @@ class PollyDashboardApp(App[None]):
     .chart-section { padding: 0 0 0 2; }
     .footer { color: #484f58; padding: 1 0 0 0; }
     """
+
+    def action_show_keyboard_help(self) -> None:
+        _open_keyboard_help(self)
 
     def __init__(self, config_path: Path) -> None:
         super().__init__()

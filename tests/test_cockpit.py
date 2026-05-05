@@ -4873,6 +4873,25 @@ def test_cockpit_escape_from_live_chat_focuses_rail_pane() -> None:
     assert calls == ["focus_rail"]
 
 
+def test_cockpit_escape_from_inbox_opened_chat_routes_back_to_inbox() -> None:
+    """#1199: Esc from an Inbox-started chat returns to Inbox content."""
+    app, calls = _build_back_to_home_app()
+    app.selected_key = "project:demo:session"
+    app._last_router_selected_key = "project:demo:session"
+    app.router._load_state = lambda: {  # type: ignore[attr-defined]
+        "mounted_session": "architect_demo",
+        "mounted_return_key": "inbox",
+    }
+    app.router.focus_rail_pane = lambda: calls.append("focus_rail")  # type: ignore[attr-defined]
+    app._schedule_route_selected = (  # type: ignore[method-assign]
+        lambda key, *, label=None: calls.append(("route", key, label))
+    )
+
+    app.action_back_to_home()
+
+    assert calls == [("route", "inbox", "inbox")]
+
+
 def test_cockpit_action_button_digits_forward_from_rail() -> None:
     """1/2/3 from rail forwards to the right pane so Action Needed buttons fire (#862)."""
     app = PollyCockpitApp.__new__(PollyCockpitApp)
@@ -5867,6 +5886,47 @@ def test_route_selected_persists_intent_before_layout_work(
         "next periodic _refresh_rows will bounce the cursor back to the "
         f"stale state[\"selected\"]={state.get('selected')!r} (#967)."
     )
+
+
+def test_route_selected_records_return_key_for_live_mount(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """#1199: live chats opened from Inbox remember how to get back."""
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\n"
+        f"tmux_session = \"pollypm\"\n"
+        f"base_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+
+    class FakeSupervisor:
+        class Config:
+            class Project:
+                tmux_session = "pollypm"
+                base_dir = tmp_path / ".pollypm"
+                root_dir = tmp_path
+
+            project = Project()
+            projects = {}
+
+        config = Config()
+
+        def plan_launches(self):
+            return []
+
+    router = CockpitRouter(config_path)
+    router._write_state({"selected": "inbox", "right_pane_id": "%2"})
+    monkeypatch.setattr(router, "_load_supervisor", lambda: FakeSupervisor())
+    monkeypatch.setattr(router, "ensure_cockpit_layout", lambda: None)
+    monkeypatch.setattr(router, "_right_pane_id", lambda target: "%2")
+    monkeypatch.setattr(router, "_route_content_plan", lambda *args: None)
+    monkeypatch.setattr(router, "_heal_layout_after_route", lambda: None)
+
+    router.route_selected("polly")
+
+    state = router._load_state()
+    assert state.get("selected") == "polly"
+    assert state.get("mounted_return_key") == "inbox"
 
 
 def test_right_pane_command_uses_exec_to_avoid_orphans(tmp_path: Path) -> None:

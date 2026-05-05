@@ -21,6 +21,7 @@ from pollypm.config import DEFAULT_CONFIG_PATH
 
 _RIGHT_PANE_BRIDGE_BYPASS_ESCAPE_TOKENS = frozenset({"<esc>", "esc", "escape"})
 _HELP_KEY_TOKENS = frozenset({"?", "question_mark"})
+_HELP_CONTENT_BRIDGE_FALLBACK_KINDS = ("dashboard", "pane-inbox", "settings")
 _INBOX_BRIDGE_FIRST_TOKENS = frozenset({"/", "d"})
 _INBOX_FILTER_INPUT_TOKENS = frozenset({
     "<bs>",
@@ -98,12 +99,24 @@ def _send_help_key_to_content_bridge(config_path: Path, key: str) -> Path | None
     except Exception:  # noqa: BLE001
         return None
     kind = _content_bridge_kind_for_selected_key(selected)
-    if kind is None:
-        return None
-    try:
-        return send_key_to_first_live(config_path, key, kind=kind, timeout=0.2)
-    except Exception:  # noqa: BLE001
-        return None
+    candidates = []
+    if kind is not None:
+        candidates.append(kind)
+    candidates.extend(
+        fallback
+        for fallback in _HELP_CONTENT_BRIDGE_FALLBACK_KINDS
+        if fallback not in candidates
+    )
+    for candidate in candidates:
+        try:
+            delivered = send_key_to_first_live(
+                config_path, key, kind=candidate, timeout=0.2,
+            )
+        except Exception:  # noqa: BLE001
+            delivered = None
+        if delivered is not None:
+            return delivered
+    return None
 
 
 def _send_selected_action_key_to_content_bridge(

@@ -284,6 +284,42 @@ def test_cockpit_send_key_question_mark_prefers_content_pane_bridge(
         content.stop()
 
 
+def test_cockpit_send_key_question_mark_falls_back_to_visible_dashboard_bridge(
+    valid_cockpit_config: Path,
+) -> None:
+    import typer
+    from typer.testing import CliRunner
+
+    from pollypm.cli_features.ui import register_ui_commands
+    from pollypm.cockpit_rail import CockpitRouter
+
+    cockpit_app = _FakeApp()
+    dashboard_app = _FakeApp()
+    cockpit = start_input_bridge(
+        cockpit_app, kind="cockpit", config_path=valid_cockpit_config,
+    )
+    assert cockpit is not None
+    dashboard = start_input_bridge(
+        dashboard_app, kind="dashboard", config_path=valid_cockpit_config,
+    )
+    assert dashboard is not None
+    try:
+        CockpitRouter(valid_cockpit_config).set_selected_key("inbox")
+
+        app = typer.Typer()
+        register_ui_commands(app)
+        result = CliRunner().invoke(
+            app, ["cockpit-send-key", "?", "--config", str(valid_cockpit_config)]
+        )
+        assert result.exit_code == 0, result.output
+        assert f"via {dashboard.socket_path}" in result.output
+        assert _wait_for(lambda: dashboard_app.keys == ["question_mark"])
+        assert cockpit_app.keys == []
+    finally:
+        cockpit.stop()
+        dashboard.stop()
+
+
 @pytest.mark.parametrize(("key", "expected"), [("d", "d"), ("/", "/")])
 def test_cockpit_send_key_inbox_action_prefers_inbox_bridge_over_live_pane(
     valid_cockpit_config: Path,

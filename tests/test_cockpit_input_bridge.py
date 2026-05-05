@@ -17,6 +17,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import pytest
@@ -284,6 +285,141 @@ def test_cockpit_send_key_question_mark_prefers_content_pane_bridge(
         content.stop()
 
 
+def test_cockpit_send_key_question_mark_falls_back_to_visible_dashboard_bridge(
+    valid_cockpit_config: Path,
+) -> None:
+    import typer
+    from typer.testing import CliRunner
+
+    from pollypm.cli_features.ui import register_ui_commands
+    from pollypm.cockpit_rail import CockpitRouter
+
+    cockpit_app = _FakeApp()
+    dashboard_app = _FakeApp()
+    cockpit = start_input_bridge(
+        cockpit_app, kind="cockpit", config_path=valid_cockpit_config,
+    )
+    assert cockpit is not None
+    dashboard = start_input_bridge(
+        dashboard_app, kind="dashboard", config_path=valid_cockpit_config,
+    )
+    assert dashboard is not None
+    try:
+        CockpitRouter(valid_cockpit_config).set_selected_key("inbox")
+
+        app = typer.Typer()
+        register_ui_commands(app)
+        result = CliRunner().invoke(
+            app, ["cockpit-send-key", "?", "--config", str(valid_cockpit_config)]
+        )
+        assert result.exit_code == 0, result.output
+        assert f"via {dashboard.socket_path}" in result.output
+        assert _wait_for(lambda: dashboard_app.keys == ["question_mark"])
+        assert "question_mark" not in cockpit_app.keys
+    finally:
+        cockpit.stop()
+        dashboard.stop()
+
+
+@pytest.mark.parametrize(("key", "expected"), [("d", "d"), ("/", "/")])
+def test_cockpit_send_key_inbox_action_prefers_inbox_bridge_over_live_pane(
+    valid_cockpit_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    key: str,
+    expected: str,
+) -> None:
+    import typer
+    from typer.testing import CliRunner
+
+    from pollypm.cli_features import ui as ui_commands
+    from pollypm.cockpit_rail import CockpitRouter
+
+    inbox_app = _FakeApp()
+    inbox = start_input_bridge(
+        inbox_app, kind="pane-inbox", config_path=valid_cockpit_config,
+    )
+    assert inbox is not None
+    live_pane_attempts: list[tuple[Path, str]] = []
+
+    def fake_live_pane(config_path: Path, key: str) -> str | None:
+        live_pane_attempts.append((config_path, key))
+        return "%2"
+
+    monkeypatch.setattr(
+        ui_commands,
+        "_send_key_to_active_live_right_pane",
+        fake_live_pane,
+    )
+    try:
+        CockpitRouter(valid_cockpit_config).set_selected_key("inbox")
+
+        app = typer.Typer()
+        ui_commands.register_ui_commands(app)
+        result = CliRunner().invoke(
+            app, ["cockpit-send-key", key, "--config", str(valid_cockpit_config)]
+        )
+        assert result.exit_code == 0, result.output
+        assert f"via {inbox.socket_path}" in result.output
+        assert _wait_for(lambda: inbox_app.keys == [expected])
+        assert live_pane_attempts == []
+    finally:
+        inbox.stop()
+
+
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        ("j", "j"),
+        ("k", "k"),
+        ("<down>", "down"),
+        ("<up>", "up"),
+        ("<tab>", "tab"),
+    ],
+)
+def test_cockpit_send_key_settings_nav_prefers_settings_bridge_over_live_pane(
+    valid_cockpit_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    key: str,
+    expected: str,
+) -> None:
+    import typer
+    from typer.testing import CliRunner
+
+    from pollypm.cli_features import ui as ui_commands
+    from pollypm.cockpit_rail import CockpitRouter
+
+    settings_app = _FakeApp()
+    settings = start_input_bridge(
+        settings_app, kind="settings", config_path=valid_cockpit_config,
+    )
+    assert settings is not None
+    live_pane_attempts: list[tuple[Path, str]] = []
+
+    def fake_live_pane(config_path: Path, key: str) -> str | None:
+        live_pane_attempts.append((config_path, key))
+        return "%2"
+
+    monkeypatch.setattr(
+        ui_commands,
+        "_send_key_to_active_live_right_pane",
+        fake_live_pane,
+    )
+    try:
+        CockpitRouter(valid_cockpit_config).set_selected_key("settings")
+
+        app = typer.Typer()
+        ui_commands.register_ui_commands(app)
+        result = CliRunner().invoke(
+            app, ["cockpit-send-key", key, "--config", str(valid_cockpit_config)]
+        )
+        assert result.exit_code == 0, result.output
+        assert f"via {settings.socket_path}" in result.output
+        assert _wait_for(lambda: settings_app.keys == [expected])
+        assert live_pane_attempts == []
+    finally:
+        settings.stop()
+
+
 def test_cockpit_send_key_forwards_to_focused_live_right_pane(
     fake_config: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -320,6 +456,161 @@ def test_cockpit_send_key_forwards_to_focused_live_right_pane(
         assert cockpit_app.keys == []
     finally:
         cockpit.stop()
+
+
+def test_cockpit_send_key_enter_consumes_network_dead_for_live_right_pane(
+    valid_cockpit_config: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pollypm.cockpit_rail as cockpit_rail
+    from pollypm.cli_features import ui as ui_commands
+    from pollypm.dev_network_simulation import arm_network_dead, network_dead_armed
+
+    class FakeTmux:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+
+        def run(self, *args: object, **kwargs: object) -> None:
+            self.calls.append(("run", *args, kwargs))
+
+        def send_keys(
+            self, target: str, text: str, *, press_enter: bool = True,
+        ) -> None:
+            self.calls.append(("send_keys", target, text, press_enter))
+
+    class FakeRouter:
+        def __init__(self) -> None:
+            self.tmux = FakeTmux()
+
+        def active_live_right_pane_id(self) -> str:
+            return "%2"
+
+    router = FakeRouter()
+    monkeypatch.setattr(cockpit_rail, "CockpitRouter", lambda _path: router)
+
+    arm_network_dead(valid_cockpit_config)
+
+    delivered = ui_commands._send_key_to_active_live_right_pane(
+        valid_cockpit_config, "<cr>",
+    )
+
+    assert delivered == "%2"
+    assert not network_dead_armed(valid_cockpit_config)
+    assert router.tmux.calls == [
+        ("run", "send-keys", "-t", "%2", "C-u", {"check": False}),
+        (
+            "send_keys",
+            "%2",
+            "PollyPM chat failed: network unreachable (simulated): "
+            "connection refused for cockpit live chat submit",
+            False,
+        ),
+    ]
+
+
+def test_cockpit_send_key_keeps_live_right_pane_sticky_after_first_char(
+    valid_cockpit_config: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pollypm.cockpit_rail as cockpit_rail
+    from pollypm.cli_features import ui as ui_commands
+
+    class FakeTmux:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+
+        def list_panes(self, target: str):
+            assert target == "pollypm-test:PollyPM"
+            return [
+                SimpleNamespace(
+                    pane_id="%1", active=True, pane_dead=False,
+                    pane_current_command="uv",
+                ),
+                SimpleNamespace(
+                    pane_id="%2", active=False, pane_dead=False,
+                    pane_current_command="codex",
+                ),
+            ]
+
+        def send_keys(
+            self, target: str, text: str, *, press_enter: bool = True,
+        ) -> None:
+            self.calls.append(("send_keys", target, text, press_enter))
+
+    class FakeRouter:
+        _COCKPIT_WINDOW = "PollyPM"
+
+        def __init__(self) -> None:
+            self.tmux = FakeTmux()
+            self.state = {
+                "mounted_session": "architect_demo",
+                "right_pane_id": "%2",
+            }
+            self.active_calls = 0
+
+        def active_live_right_pane_id(self) -> str | None:
+            self.active_calls += 1
+            return "%2" if self.active_calls == 1 else None
+
+        def _load_state(self) -> dict[str, object]:
+            return dict(self.state)
+
+        def _write_state(self, state: dict[str, object]) -> None:
+            self.state = dict(state)
+
+        def _load_config(self):
+            return SimpleNamespace(
+                project=SimpleNamespace(tmux_session="pollypm-test")
+            )
+
+        def _is_live_provider_pane(self, pane: object) -> bool:
+            return getattr(pane, "pane_current_command", None) == "codex"
+
+    router = FakeRouter()
+    monkeypatch.setattr(cockpit_rail, "CockpitRouter", lambda _path: router)
+
+    assert ui_commands._send_key_to_active_live_right_pane(
+        valid_cockpit_config, "R",
+    ) == "%2"
+    assert router.state["live_right_pane_input_sticky"] is True
+
+    assert ui_commands._send_key_to_active_live_right_pane(
+        valid_cockpit_config, "e",
+    ) == "%2"
+    assert router.tmux.calls == [
+        ("send_keys", "%2", "R", False),
+        ("send_keys", "%2", "e", False),
+    ]
+
+
+def test_cockpit_send_key_escape_clears_live_right_pane_sticky(
+    valid_cockpit_config: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pollypm.cockpit_rail as cockpit_rail
+    from pollypm.cli_features import ui as ui_commands
+
+    class FakeRouter:
+        def __init__(self) -> None:
+            self.state = {
+                "mounted_session": "architect_demo",
+                "right_pane_id": "%2",
+                "live_right_pane_input_sticky": True,
+            }
+
+        def active_live_right_pane_id(self) -> str | None:
+            return "%2"
+
+        def _load_state(self) -> dict[str, object]:
+            return dict(self.state)
+
+        def _write_state(self, state: dict[str, object]) -> None:
+            self.state = dict(state)
+
+    router = FakeRouter()
+    monkeypatch.setattr(cockpit_rail, "CockpitRouter", lambda _path: router)
+
+    assert ui_commands._send_key_to_active_live_right_pane(
+        valid_cockpit_config, "<esc>",
+    ) is None
+    assert "live_right_pane_input_sticky" not in router.state
 
 
 def test_send_key_to_first_live_skips_stale_sockets(fake_config: Path, tmp_path: Path) -> None:

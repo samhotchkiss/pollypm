@@ -20,7 +20,31 @@ import typer
 from pollypm.config import DEFAULT_CONFIG_PATH
 
 _RIGHT_PANE_BRIDGE_BYPASS_ESCAPE_TOKENS = frozenset({"<esc>", "esc", "escape"})
+_LIVE_RIGHT_PANE_INPUT_STICKY = "live_right_pane_input_sticky"
 _HELP_KEY_TOKENS = frozenset({"?", "question_mark"})
+_HELP_CONTENT_BRIDGE_FALLBACK_KINDS = ("dashboard", "pane-inbox", "settings")
+_INBOX_BRIDGE_FIRST_TOKENS = frozenset({"/", "d"})
+_INBOX_FILTER_INPUT_TOKENS = frozenset({
+    "<bs>",
+    "<cr>",
+    "<esc>",
+    "<space>",
+    "backspace",
+    "enter",
+    "esc",
+    "escape",
+    "space",
+})
+_SETTINGS_BRIDGE_FIRST_TOKENS = frozenset({
+    "<down>",
+    "<tab>",
+    "<up>",
+    "down",
+    "j",
+    "k",
+    "tab",
+    "up",
+})
 _RIGHT_PANE_TMUX_KEY_TOKENS: dict[str, str] = {
     "<bs>": "BSpace",
     "backspace": "BSpace",
@@ -47,6 +71,7 @@ _RIGHT_PANE_TMUX_KEY_TOKENS: dict[str, str] = {
     "<end>": "End",
     "end": "End",
 }
+_LIVE_CHAT_NETWORK_DEAD_MESSAGE_PREFIX = "PollyPM chat failed"
 
 
 def _is_help_key(key: str) -> bool:
@@ -76,12 +101,63 @@ def _send_help_key_to_content_bridge(config_path: Path, key: str) -> Path | None
     except Exception:  # noqa: BLE001
         return None
     kind = _content_bridge_kind_for_selected_key(selected)
-    if kind is None:
+    candidates = []
+    if kind is not None:
+        candidates.append(kind)
+    candidates.extend(
+        fallback
+        for fallback in _HELP_CONTENT_BRIDGE_FALLBACK_KINDS
+        if fallback not in candidates
+    )
+    for candidate in candidates:
+        try:
+            delivered = send_key_to_first_live(
+                config_path, key, kind=candidate, timeout=0.2,
+            )
+        except Exception:  # noqa: BLE001
+            delivered = None
+        if delivered is not None:
+            return delivered
+    return None
+
+
+def _send_selected_action_key_to_content_bridge(
+    config_path: Path, key: str,
+) -> Path | None:
+    """Deliver selected-pane action keys before live-pane PTY fallback."""
+    token = key.strip()
+    lowered = token.lower()
+    try:
+        from pollypm.cockpit_input_bridge import send_key_to_first_live
+        from pollypm.cockpit_rail import CockpitRouter
+
+        router = CockpitRouter(config_path)
+        selected = router.selected_key()
+    except Exception:  # noqa: BLE001
+        return None
+    kind = _content_bridge_kind_for_selected_key(selected)
+    if kind == "pane-inbox" and token in _INBOX_BRIDGE_FIRST_TOKENS:
+        pass
+    elif (
+        kind == "pane-inbox"
+        and _inbox_filter_token(token, lowered)
+        and router.inbox_filter_input_active()
+    ):
+        pass
+    elif kind == "settings" and lowered in _SETTINGS_BRIDGE_FIRST_TOKENS:
+        pass
+    else:
         return None
     try:
         return send_key_to_first_live(config_path, key, kind=kind, timeout=0.2)
     except Exception:  # noqa: BLE001
         return None
+
+
+def _inbox_filter_token(token: str, lowered: str) -> bool:
+    if lowered in _INBOX_FILTER_INPUT_TOKENS:
+        return True
+    return len(token) == 1 and token.isprintable()
 
 
 def _tmux_event_for_cockpit_key(key: str) -> tuple[str, bool] | None:
@@ -100,10 +176,101 @@ def _tmux_event_for_cockpit_key(key: str) -> tuple[str, bool] | None:
     return key, True
 
 
+def _live_chat_submit_blocked_by_network_dead(
+    config_path: Path,
+    key: str,
+    *,
+    router: object,
+    right_pane: str,
+) -> bool:
+    """Consume the dev network-dead marker on live-chat submit."""
+    event = _tmux_event_for_cockpit_key(key)
+    if event != ("Enter", False):
+        return False
+    try:
+        from pollypm.dev_network_simulation import (
+            SimulatedNetworkDead,
+            raise_if_network_dead,
+        )
+
+        raise_if_network_dead(config_path, surface="cockpit live chat submit")
+    except SimulatedNetworkDead as exc:
+        tmux = getattr(router, "tmux", None)
+        if tmux is not None:
+            run = getattr(tmux, "run", None)
+            if callable(run):
+                run("send-keys", "-t", right_pane, "C-u", check=False)
+            send_keys = getattr(tmux, "send_keys", None)
+            if callable(send_keys):
+                send_keys(
+                    right_pane,
+                    f"{_LIVE_CHAT_NETWORK_DEAD_MESSAGE_PREFIX}: {exc}",
+                    press_enter=False,
+                )
+        return True
+    return False
+
+
+def _set_live_right_pane_input_sticky(router: object, active: bool) -> None:
+    try:
+        load_state = getattr(router, "_load_state")
+        write_state = getattr(router, "_write_state")
+        state = load_state()
+        if not isinstance(state, dict):
+            return
+        if active:
+            if state.get(_LIVE_RIGHT_PANE_INPUT_STICKY) is True:
+                return
+            state[_LIVE_RIGHT_PANE_INPUT_STICKY] = True
+        else:
+            if _LIVE_RIGHT_PANE_INPUT_STICKY not in state:
+                return
+            state.pop(_LIVE_RIGHT_PANE_INPUT_STICKY, None)
+        write_state(state)
+    except Exception:  # noqa: BLE001
+        return
+
+
+def _sticky_live_right_pane_id(router: object) -> str | None:
+    try:
+        state = getattr(router, "_load_state")()
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(state, dict):
+        return None
+    if state.get(_LIVE_RIGHT_PANE_INPUT_STICKY) is not True:
+        return None
+    mounted = state.get("mounted_session")
+    right_pane_id = state.get("right_pane_id")
+    if not isinstance(mounted, str) or not mounted:
+        _set_live_right_pane_input_sticky(router, False)
+        return None
+    if not isinstance(right_pane_id, str) or not right_pane_id:
+        _set_live_right_pane_input_sticky(router, False)
+        return None
+    try:
+        config = getattr(router, "_load_config")()
+        cockpit_window = getattr(router, "_COCKPIT_WINDOW", "PollyPM")
+        window_target = f"{config.project.tmux_session}:{cockpit_window}"
+        panes = router.tmux.list_panes(window_target)
+    except Exception:  # noqa: BLE001
+        return None
+    right_pane = next(
+        (pane for pane in panes if getattr(pane, "pane_id", None) == right_pane_id),
+        None,
+    )
+    if right_pane is None or getattr(right_pane, "pane_dead", False):
+        _set_live_right_pane_input_sticky(router, False)
+        return None
+    is_live_provider_pane = getattr(router, "_is_live_provider_pane", None)
+    if callable(is_live_provider_pane) and not is_live_provider_pane(right_pane):
+        _set_live_right_pane_input_sticky(router, False)
+        return None
+    return right_pane_id
+
+
 def _send_key_to_active_live_right_pane(config_path: Path, key: str) -> str | None:
     """Deliver ``key`` to the focused live right pane, if one owns focus."""
-    if key.strip().lower() in _RIGHT_PANE_BRIDGE_BYPASS_ESCAPE_TOKENS:
-        return None
     try:
         from pollypm.cockpit_rail import CockpitRouter
 
@@ -111,16 +278,26 @@ def _send_key_to_active_live_right_pane(config_path: Path, key: str) -> str | No
         right_pane = router.active_live_right_pane_id()
     except Exception:  # noqa: BLE001
         return None
-    if right_pane is None:
+    if key.strip().lower() in _RIGHT_PANE_BRIDGE_BYPASS_ESCAPE_TOKENS:
+        _set_live_right_pane_input_sticky(router, False)
         return None
+    if right_pane is None:
+        right_pane = _sticky_live_right_pane_id(router)
+        if right_pane is None:
+            return None
     event = _tmux_event_for_cockpit_key(key)
     if event is None:
         return None
+    if _live_chat_submit_blocked_by_network_dead(
+        config_path, key, router=router, right_pane=right_pane,
+    ):
+        return right_pane
     value, literal = event
     if literal:
         router.tmux.send_keys(right_pane, value, press_enter=False)
     else:
         router.tmux.run("send-keys", "-t", right_pane, value, check=False)
+    _set_live_right_pane_input_sticky(router, True)
     return right_pane
 
 
@@ -390,6 +567,12 @@ def register_ui_commands(app: typer.Typer) -> None:
         from pollypm.cockpit_input_bridge import send_key_to_first_live
 
         if kind == "cockpit":
+            delivered_to_content = _send_selected_action_key_to_content_bridge(
+                config_path, key,
+            )
+            if delivered_to_content is not None:
+                typer.echo(f"Delivered {key!r} via {delivered_to_content}")
+                return
             delivered_to_right = _send_key_to_active_live_right_pane(
                 config_path, key,
             )

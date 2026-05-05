@@ -48,7 +48,6 @@ from pollypm.cli_help import help_with_examples
 from pollypm.cli_features.alerts import alert_app, heartbeat_app, session_app
 from pollypm.launch_executor import LaunchPlanExecutor
 from pollypm.launch_state import (
-    LaunchAction,
     LaunchProbe,
     LaunchState,
     plan_launch,
@@ -101,6 +100,7 @@ _UP_HELP = help_with_examples(
         "working when you detach."
     ),
 )
+_UP_INVOCATION_COMMAND = "pm up"
 
 _STATUS_HELP = help_with_examples(
     "Show configured session state, runtime status, and open-alert counts.",
@@ -324,6 +324,7 @@ def _refuse_foreign_tmux_sessions(
     supervisor,
     probe: LaunchProbe,
     config_path: Path,
+    command_display: str = "pm up",
 ) -> None:
     """Fail closed before mutating a same-named session from another HOME."""
     sessions = (
@@ -343,7 +344,7 @@ def _refuse_foreign_tmux_sessions(
             f"tmux session '{session_name}' is in use by another HOME "
             f"({owner_home}); current HOME is {current_home}. Set "
             f"`project.tmux_session` in {config_path} to a unique name "
-            "before running `pm up`."
+            f"before running `{command_display}`."
         )
 
 
@@ -459,7 +460,13 @@ def main(
         # didn't reliably apply the Typer Option default in production
         # (the OptionInfo sentinel survived and tripped the phantom-client
         # launch path on bare `pm`).
-        ctx.invoke(up, config_path=config_path, phantom_client=False)
+        global _UP_INVOCATION_COMMAND
+        previous_command = _UP_INVOCATION_COMMAND
+        _UP_INVOCATION_COMMAND = "pm"
+        try:
+            ctx.invoke(up, config_path=config_path, phantom_client=False)
+        finally:
+            _UP_INVOCATION_COMMAND = previous_command
 
 
 @app.command(help="Write the example PollyPM config to disk to bootstrap a new install.")
@@ -755,7 +762,12 @@ def up(
     # ambient state. The probe only reads tmux + config; building it
     # is side-effect-free.
     probe = _build_launch_probe(supervisor)
-    _refuse_foreign_tmux_sessions(supervisor, probe, config_path)
+    _refuse_foreign_tmux_sessions(
+        supervisor,
+        probe,
+        config_path,
+        command_display=_UP_INVOCATION_COMMAND,
+    )
     plan = plan_launch(probe)
     typer.echo(f"[launch] {plan.state.value}: {plan.reason}")
     if plan.state is LaunchState.UNSUPPORTED:

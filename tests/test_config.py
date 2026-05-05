@@ -1,7 +1,14 @@
 from pathlib import Path
 
 from pollypm.plugins_builtin.core_agent_profiles.profiles import heartbeat_prompt, polly_prompt
-from pollypm.config import load_config, project_config_path, render_example_config, resolve_config_path, write_config
+from pollypm.config import (
+    load_config,
+    project_config_path,
+    render_example_config,
+    resolve_config_path,
+    write_config,
+    write_example_config,
+)
 from pollypm.models import (
     AccountConfig,
     KnownProject,
@@ -34,6 +41,16 @@ def test_load_example_config(tmp_path: Path) -> None:
     assert set(config.projects) == {"pollypm"}
     assert config.sessions["operator"].provider.value == "codex"
     assert config.sessions["heartbeat"].provider.value == "codex"
+
+
+def test_write_example_config_uses_fresh_install_session_name(tmp_path: Path) -> None:
+    config_path = tmp_path / ".pollypm" / "pollypm.toml"
+
+    write_example_config(config_path)
+    config = load_config(config_path)
+
+    assert config.project.tmux_session.startswith("pollypm-")
+    assert config.project.tmux_session != "pollypm"
 
 
 def test_resolve_config_path_returns_global_config(monkeypatch, tmp_path: Path) -> None:

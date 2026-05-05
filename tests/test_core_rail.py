@@ -299,6 +299,102 @@ def test_corerail_drives_plugin_host_load(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_corerail_start_retries_transient_first_party_heartbeat_import(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    import pollypm.core.rail as rail_mod
+
+    attempts = 0
+    sleeps: list[float] = []
+    started: list[bool] = []
+    stopped: list[bool] = []
+
+    class _FakeHost:
+        def plugins(self):
+            return {}
+
+    class _FakeHeartbeatRail:
+        def __init__(self) -> None:
+            self.roster = type("_Roster", (), {"entries": []})()
+
+        @classmethod
+        def from_plugin_host(cls, *, state_db, plugin_host):
+            return cls()
+
+        def start(self, *, start_workers: bool = True) -> None:
+            started.append(start_workers)
+
+        def stop(self) -> None:
+            stopped.append(True)
+
+    def _flaky_load_heartbeat_rail_class():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ModuleNotFoundError(
+                "No module named 'pollypm.heartbeat'",
+                name="pollypm.heartbeat",
+            )
+        return _FakeHeartbeatRail
+
+    monkeypatch.setattr(
+        rail_mod, "_load_heartbeat_rail_class", _flaky_load_heartbeat_rail_class,
+    )
+    monkeypatch.setattr(rail_mod.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    config = _config(tmp_path)
+    store = StateStore(config.project.state_db)
+    rail = CoreRail(config, store, _FakeHost())
+
+    rail.start()
+    try:
+        assert attempts == 2
+        assert sleeps == [rail_mod._HEARTBEAT_IMPORT_RETRY_DELAYS[0]]
+        assert started == [True]
+        assert isinstance(rail.get_heartbeat_rail(), _FakeHeartbeatRail)
+    finally:
+        rail.stop()
+    assert stopped == [True]
+
+
+def test_corerail_start_does_not_retry_non_first_party_missing_dependency(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    import pollypm.core.rail as rail_mod
+
+    attempts = 0
+    sleeps: list[float] = []
+
+    class _FakeHost:
+        def plugins(self):
+            return {}
+
+    def _load_heartbeat_rail_class():
+        nonlocal attempts
+        attempts += 1
+        raise ModuleNotFoundError(
+            "No module named 'third_party_dependency'",
+            name="third_party_dependency",
+        )
+
+    monkeypatch.setattr(
+        rail_mod, "_load_heartbeat_rail_class", _load_heartbeat_rail_class,
+    )
+    monkeypatch.setattr(rail_mod.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    config = _config(tmp_path)
+    store = StateStore(config.project.state_db)
+    rail = CoreRail(config, store, _FakeHost())
+
+    rail.start()
+    try:
+        assert attempts == 1
+        assert sleeps == []
+        assert rail.get_heartbeat_rail() is None
+    finally:
+        rail.stop()
+
+
 def test_corerail_start_boots_heartbeat_rail(tmp_path: Path) -> None:
     """CoreRail.start() constructs + boots a HeartbeatRail so roster-
     registered recurring handlers get drained by a running worker pool.

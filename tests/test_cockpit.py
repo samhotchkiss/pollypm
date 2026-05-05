@@ -2932,14 +2932,21 @@ def test_cockpit_router_detects_active_live_right_pane(tmp_path: Path) -> None:
     )
 
     class FakeTmux:
-        def __init__(self, right_active: bool) -> None:
+        def __init__(self, right_active: bool, right_command: str = "codex") -> None:
             self.right_active = right_active
+            self.right_command = right_command
 
         def list_panes(self, target: str):
             assert target == "pollypm:PollyPM"
             return [
-                SimpleNamespace(pane_id="%1", active=not self.right_active, pane_dead=False),
-                SimpleNamespace(pane_id="%2", active=self.right_active, pane_dead=False),
+                SimpleNamespace(
+                    pane_id="%1", active=not self.right_active,
+                    pane_dead=False, pane_current_command="uv",
+                ),
+                SimpleNamespace(
+                    pane_id="%2", active=self.right_active,
+                    pane_dead=False, pane_current_command=self.right_command,
+                ),
             ]
 
     router = CockpitRouter(config_path)
@@ -2949,6 +2956,9 @@ def test_cockpit_router_detects_active_live_right_pane(tmp_path: Path) -> None:
     assert router.active_live_right_pane_id() == "%2"
 
     router.tmux = FakeTmux(right_active=False)  # type: ignore[assignment]
+    assert router.active_live_right_pane_id() is None
+
+    router.tmux = FakeTmux(right_active=True, right_command="python")  # type: ignore[assignment]
     assert router.active_live_right_pane_id() is None
 
 
@@ -4090,6 +4100,9 @@ def test_cockpit_send_key_inbox_shortcut_keeps_rail_nav_active(tmp_path: Path) -
         def selected_key(self) -> str:
             return self._selected
 
+        def set_selected_key(self, key: str) -> None:
+            self._selected = key
+
         def _load_state(self) -> dict:
             return {}
 
@@ -5164,8 +5177,15 @@ def test_cockpit_jk_navigates_rail_outside_inbox_surface() -> None:
     app._send_key_to_right_pane = lambda key: sent.append(key)  # type: ignore[method-assign]
     app._sync_selected_from_nav = lambda: moves.append("sync")  # type: ignore[method-assign]
 
+    class _Child:
+        disabled = False
+
+        def __init__(self, cockpit_key: str) -> None:
+            self.cockpit_key = cockpit_key
+
     class _Nav:
         index: int | None = 0
+        children = [_Child("polly"), _Child("activity"), _Child("metrics")]
 
         def action_cursor_down(self) -> None:
             moves.append("nav_down")
@@ -5181,7 +5201,7 @@ def test_cockpit_jk_navigates_rail_outside_inbox_surface() -> None:
         sent.clear()
 
         app.action_cursor_down()
-        assert moves == ["nav_down", "sync"], (
+        assert moves == ["sync"], (
             f"j on {surface!r} should navigate the rail, got moves={moves}"
         )
         assert sent == [], (
@@ -5190,7 +5210,7 @@ def test_cockpit_jk_navigates_rail_outside_inbox_surface() -> None:
 
         moves.clear()
         app.action_cursor_up()
-        assert moves == ["nav_up", "sync"]
+        assert moves == ["sync"]
         assert sent == []
 
 
@@ -5459,6 +5479,76 @@ def test_cockpit_down_starts_from_visible_project_subtab_after_pane_swap() -> No
     assert app.selected_key == "project:demo:issues"
 
 
+def test_cockpit_jk_walks_visible_rail_rows_incrementally() -> None:
+    """#1221: j/k/arrows must move one visible rail row at a time."""
+    items = [
+        _StubItem("dashboard"),
+        _StubItem("polly"),
+        _StubItem("workers"),
+        _StubItem("metrics"),
+        _StubItem("inbox"),
+        _StubItem(None, disabled=True),  # ── projects ── divider
+        _StubItem("project:bikepath"),
+        _StubItem("project:booktalk"),
+        _StubItem("activity"),
+    ]
+    app, nav = _make_rail_app_with_settings(
+        items,
+        items_keys=[
+            "dashboard",
+            "polly",
+            "workers",
+            "metrics",
+            "inbox",
+            "project:bikepath",
+            "project:booktalk",
+            "activity",
+            "settings",
+        ],
+        selected_key="dashboard",
+    )
+    nav.index = 0
+    persisted: list[str] = []
+
+    class _Router:
+        def set_selected_key(self, key: str) -> None:
+            persisted.append(key)
+
+    app.router = _Router()  # type: ignore[assignment]
+
+    expected_down = [
+        ("polly", 1),
+        ("workers", 2),
+        ("metrics", 3),
+        ("inbox", 4),
+        ("project:bikepath", 6),
+        ("project:booktalk", 7),
+        ("activity", 8),
+        ("settings", 8),
+    ]
+    for key, index in expected_down:
+        app.action_cursor_down()
+        assert app.selected_key == key
+        assert nav.index == index
+        assert persisted[-1] == key
+
+    expected_up = [
+        ("activity", 8),
+        ("project:booktalk", 7),
+        ("project:bikepath", 6),
+        ("inbox", 4),
+        ("metrics", 3),
+        ("workers", 2),
+        ("polly", 1),
+        ("dashboard", 0),
+    ]
+    for key, index in expected_up:
+        app.action_cursor_up()
+        assert app.selected_key == key
+        assert nav.index == index
+        assert persisted[-1] == key
+
+
 def test_cockpit_j_at_last_nav_row_steps_onto_settings() -> None:
     """j on the last nav row (Activity) lands on Settings when the gear
     row is visible — the blank gap between Activity and Settings must
@@ -5476,16 +5566,16 @@ def test_cockpit_j_at_last_nav_row_steps_onto_settings() -> None:
         f"j from Activity should land on Settings; got {app.selected_key!r}"
     )
 
-    # Repeat j on Settings belongs to the Settings pane's own nav.
+    # Repeat j on Settings stays at the bottom of the rail.
     sent: list[str] = []
     app._send_key_to_settings_pane = lambda key: sent.append(key)  # type: ignore[method-assign]
     app.action_cursor_down()
     assert app.selected_key == "settings"
-    assert sent == ["j"]
+    assert sent == []
 
 
-def test_cockpit_k_on_settings_forwards_to_settings_pane() -> None:
-    """k from Settings belongs to the Settings pane's own nav (#1130)."""
+def test_cockpit_k_on_settings_steps_back_to_last_nav_row() -> None:
+    """k/up from Settings returns to the previous rail row (#1221)."""
     items = [_StubItem("polly"), _StubItem("activity")]
     app, nav = _make_rail_app_with_settings(
         items,
@@ -5497,9 +5587,9 @@ def test_cockpit_k_on_settings_forwards_to_settings_pane() -> None:
     app._send_key_to_settings_pane = lambda key: sent.append(key)  # type: ignore[method-assign]
 
     app.action_cursor_up()
-    assert app.selected_key == "settings"
-    assert nav.index == 0
-    assert sent == ["k"]
+    assert app.selected_key == "activity"
+    assert nav.index == 1
+    assert sent == []
 
 
 def test_cockpit_G_lands_on_settings_when_visible() -> None:

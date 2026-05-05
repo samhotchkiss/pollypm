@@ -50,6 +50,19 @@ def is_git_checkout(repo_root: Path) -> bool:
     return (repo_root / ".git").exists()
 
 
+def _is_claude_agent_worktree(repo_root: Path) -> bool:
+    """True iff ``repo_root`` points at or inside a Claude agent worktree."""
+    parts = repo_root.parts
+    for index in range(len(parts) - 2):
+        if (
+            parts[index] == ".claude"
+            and parts[index + 1] == "worktrees"
+            and parts[index + 2].startswith("agent-")
+        ):
+            return True
+    return False
+
+
 @dataclass(slots=True)
 class CommitInfo:
     sha: str
@@ -267,6 +280,23 @@ def update(
     do_reset = reset_runner or (
         lambda r, target: _do_reset_hard(r, target)
     )
+
+    if _is_claude_agent_worktree(repo):
+        msg = (
+            f"refusing to update: repo_root {repo} looks like a Claude "
+            "agent worktree, not the canonical install path. Run "
+            "`pm update` from the canonical install directory."
+        )
+        step(msg)
+        return UpdateResult(
+            ok=False,
+            check_only=check_only,
+            refused=True,
+            old_sha="",
+            new_sha="",
+            commits=[],
+            message=msg,
+        )
 
     # Refuse on in_progress work — yanking source out from under a live
     # worker corrupts logs and confuses the supervisor. The user can

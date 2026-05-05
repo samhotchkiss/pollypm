@@ -48,6 +48,7 @@ Supervisor-direct imports are confined to the allow-list.
 from __future__ import annotations
 
 import json
+import importlib
 import logging
 import os
 import re
@@ -95,6 +96,37 @@ if TYPE_CHECKING:
     from pollypm.core import CoreRail
     from pollypm.providers.base import LaunchCommand
     from pollypm.store.protocol import Store
+
+
+_FIRST_PARTY_IMPORT_RETRY_DELAYS = (0.05, 0.2, 0.5)
+
+
+def _is_first_party_module_missing(exc: ModuleNotFoundError) -> bool:
+    missing_name = exc.name or ""
+    return missing_name == "pollypm" or missing_name.startswith("pollypm.")
+
+
+def _load_sweep_stale_notifies():
+    from pollypm.inbox_sweep import sweep_stale_notifies
+
+    return sweep_stale_notifies
+
+
+def _load_sweep_stale_notifies_with_retry():
+    for delay in (*_FIRST_PARTY_IMPORT_RETRY_DELAYS, None):
+        try:
+            return _load_sweep_stale_notifies()
+        except ModuleNotFoundError as exc:
+            if delay is None or not _is_first_party_module_missing(exc):
+                raise
+            logger.warning(
+                "notify-sweep import missing first-party module %r; retrying in %.2fs",
+                exc.name,
+                delay,
+            )
+            importlib.invalidate_caches()
+            time.sleep(delay)
+    raise RuntimeError("unreachable notify-sweep import retry state")
 
 
 def _count_open_fds() -> int | None:
@@ -1382,7 +1414,7 @@ class Supervisor:
         # a 59-item inbox, signal-to-noise <5%). Default retention is
         # 14 days; tunable via POLLYPM_NOTIFY_RETENTION_DAYS.
         try:
-            from pollypm.inbox_sweep import sweep_stale_notifies
+            sweep_stale_notifies = _load_sweep_stale_notifies_with_retry()
             sweep_stale_notifies(self._msg_store)
         except Exception:  # noqa: BLE001
             logger.warning("notify-sweep skipped", exc_info=True)

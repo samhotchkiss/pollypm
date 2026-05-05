@@ -2002,6 +2002,9 @@ class PollyCockpitApp(App[None]):
         child = children[index]
         if isinstance(child, RailItem):
             return child.cockpit_key
+        child_key = getattr(child, "cockpit_key", None)
+        if isinstance(child_key, str):
+            return child_key
         return None
 
     def _apply_active_view_to_rows(self) -> None:
@@ -2304,6 +2307,7 @@ class PollyCockpitApp(App[None]):
         if key is not None:
             self._cancel_pending_route_selection()
             self.selected_key = key
+            self._persist_router_selected_key(key)
             self._last_nav_change = self._tick_count
             self._apply_active_view_to_rows()
 
@@ -2327,21 +2331,25 @@ class PollyCockpitApp(App[None]):
 
     def _last_nav_index(self) -> int | None:
         """Highest selectable index in the nav ListView, or None."""
+        indices = self._selectable_nav_indices()
+        return indices[-1] if indices else None
+
+    def _selectable_nav_indices(self) -> list[int]:
         try:
             children = list(self.nav.children)
         except AttributeError:
-            return None
-        for i in range(len(children) - 1, -1, -1):
-            child = children[i]
+            return []
+        indices: list[int] = []
+        for i, child in enumerate(children):
             if getattr(child, "disabled", False):
                 continue
             # Allow RailItem in production, or anything with a non-None
             # ``cockpit_key`` for test stubs (#1080).
             if isinstance(child, RailItem):
-                return i
-            if getattr(child, "cockpit_key", None) is not None:
-                return i
-        return None
+                indices.append(i)
+            elif getattr(child, "cockpit_key", None) is not None:
+                indices.append(i)
+        return indices
 
     def _nav_index_for_key(self, key: str) -> int | None:
         try:
@@ -2372,15 +2380,52 @@ class PollyCockpitApp(App[None]):
         finally:
             self._suspend_selection_events = False
 
+    def _persist_router_selected_key(self, key: str) -> None:
+        set_selected = getattr(getattr(self, "router", None), "set_selected_key", None)
+        if not callable(set_selected):
+            return
+        try:
+            set_selected(key)
+        except Exception:  # noqa: BLE001
+            return
+        self._last_router_selected_key = key
+
+    def _set_nav_index(self, index: int) -> None:
+        self._suspend_selection_events = True
+        try:
+            self.nav.index = index
+        finally:
+            self._suspend_selection_events = False
+
+    def _move_nav_cursor(self, delta: int) -> bool:
+        indices = self._selectable_nav_indices()
+        if not indices:
+            return False
+        current = self.nav.index
+        if current is None:
+            target = indices[0]
+        elif current in indices:
+            pos = indices.index(current) + delta
+            pos = max(0, min(pos, len(indices) - 1))
+            target = indices[pos]
+        elif delta > 0:
+            target = next((index for index in indices if index > current), indices[-1])
+        else:
+            target = next((index for index in reversed(indices) if index < current), indices[0])
+        if current == target:
+            return False
+        self._set_nav_index(target)
+        return True
+
     def _select_settings_row(self) -> None:
         self._cancel_pending_route_selection()
         self.selected_key = "settings"
+        self._persist_router_selected_key("settings")
         self._last_nav_change = self._tick_count
         self._apply_active_view_to_rows()
 
     def action_cursor_down(self) -> None:
         if self.selected_key == "settings":
-            self._send_key_to_settings_pane("j")
             return
         self._align_nav_cursor_to_selected_key()
         last_idx = self._last_nav_index()
@@ -2393,27 +2438,27 @@ class PollyCockpitApp(App[None]):
         ):
             self._select_settings_row()
             return
-        if self.nav.index is None:
-            self.nav.index = 0
-        else:
-            self.nav.action_cursor_down()
+        self._move_nav_cursor(1)
         self._sync_selected_from_nav()
 
     def action_cursor_up(self) -> None:
-        if self.selected_key == "settings":
-            self._send_key_to_settings_pane("k")
+        if self.selected_key == "settings" and self._settings_visible():
+            last_idx = self._last_nav_index()
+            if last_idx is None:
+                return
+            self._set_nav_index(last_idx)
+            self._sync_selected_from_nav()
             return
         self._align_nav_cursor_to_selected_key()
         # Step up off the virtual Settings row onto the last
         # selectable nav row (#1080).
-        if self.nav.index is None:
-            self.nav.index = 0
-        else:
-            self.nav.action_cursor_up()
+        self._move_nav_cursor(-1)
         self._sync_selected_from_nav()
 
     def action_cursor_first(self) -> None:
-        self.nav.index = 0
+        indices = self._selectable_nav_indices()
+        if indices:
+            self._set_nav_index(indices[0])
         self._sync_selected_from_nav()
 
     def action_cursor_last(self) -> None:
@@ -2423,9 +2468,9 @@ class PollyCockpitApp(App[None]):
         if self._settings_visible():
             self._select_settings_row()
             return
-        children = list(self.nav.children)
-        if children:
-            self.nav.index = len(children) - 1
+        last_idx = self._last_nav_index()
+        if last_idx is not None:
+            self._set_nav_index(last_idx)
         self._sync_selected_from_nav()
 
     def _selected_open_key(self) -> str | None:
@@ -2999,6 +3044,7 @@ class PollyDashboardApp(App[None]):
     BINDINGS = [
         Binding("i", "jump_inbox", "Inbox"),
         Binding("r", "refresh", "Refresh"),
+        Binding("question_mark", "show_keyboard_help", "Help", priority=True),
         # The screen overflows on a 65-row laptop terminal — Tokens
         # sits below the fold (#874). The Screen already declares
         # ``overflow-y: auto`` but Textual does not bind navigation
@@ -3032,6 +3078,9 @@ class PollyDashboardApp(App[None]):
     .chart-section { padding: 0 0 0 2; }
     .footer { color: #484f58; padding: 1 0 0 0; }
     """
+
+    def action_show_keyboard_help(self) -> None:
+        _open_keyboard_help(self)
 
     def __init__(self, config_path: Path) -> None:
         super().__init__()
@@ -7307,6 +7356,10 @@ class PollyInboxApp(App[None]):
         # ``project:<key>``) land here so reply / jump paths don't have
         # to re-parse on each keystroke.
         self._blocking_question_meta: dict[str, dict] = {}
+        self._pending_detail_task_id: str | None = None
+        self._pending_detail_row_key: str | None = None
+        self._pending_detail_mark_read: bool = False
+        self._detail_render_scheduled: bool = False
 
     def compose(self) -> ComposeResult:
         yield self.filter_bar
@@ -7338,6 +7391,7 @@ class PollyInboxApp(App[None]):
             self.filter_input.display = False
             self.filter_bar.display = False
             self.filter_chips.display = False
+        self._set_filter_bridge_active(False)
         self._refresh_list(select_first=True)
         self.set_interval(self.REFRESH_INTERVAL_SECONDS, self._background_refresh)
         self.list_view.focus()
@@ -7361,12 +7415,19 @@ class PollyInboxApp(App[None]):
             self._input_bridge_handle = None
 
     def on_unmount(self) -> None:
+        self._set_filter_bridge_active(False)
         bridge = getattr(self, "_input_bridge_handle", None)
         if bridge is not None:
             try:
                 bridge.stop()
             except Exception:  # noqa: BLE001
                 pass
+
+    def _set_filter_bridge_active(self, active: bool) -> None:
+        try:
+            CockpitRouter(self.config_path).set_inbox_filter_input_active(active)
+        except Exception:  # noqa: BLE001
+            pass
 
     # #1078 — switch to stacked (detail-below-list) layout when the
     # detail column would otherwise drop below this many cols of usable
@@ -7969,6 +8030,7 @@ class PollyInboxApp(App[None]):
         self.filter_input.value = self._filter_text
         self._update_filter_chips()
         self.filter_input.focus()
+        self._set_filter_bridge_active(True)
 
     def action_toggle_filter_unread(self) -> None:
         if self.reply_input.has_focus or self.filter_input.has_focus:
@@ -8063,6 +8125,7 @@ class PollyInboxApp(App[None]):
         # Enter inside the filter Input applies + returns focus to the
         # list so j/k works without an extra Esc.
         self.list_view.focus()
+        self._set_filter_bridge_active(False)
 
     # ------------------------------------------------------------------
     # Detail rendering
@@ -8207,7 +8270,7 @@ class PollyInboxApp(App[None]):
         except Exception:  # noqa: BLE001
             pass
 
-    def _render_detail(self, task_id: str) -> None:
+    def _render_detail(self, task_id: str, *, prefer_cache: bool = False) -> None:
         item = self._item_for_id(task_id)
         if item is None:
             self.detail.update("[red]Inbox item is no longer available.[/red]")
@@ -8218,45 +8281,52 @@ class PollyInboxApp(App[None]):
             self._render_message_detail(item)
             return
         self._set_reply_mode_for_task()
-        # #1101: route through the unified ``_resolve_inbox_svc`` helper so
-        # the project-key-mismatch fallback is consistent with the action
-        # handlers (archive / approve / discuss / reply). Workspace-scoped
-        # tasks still short-circuit to the message renderer per #855.
-        project_key = task_id.split("/", 1)[0] if "/" in task_id else None
-        is_workspace = (
-            project_key is None
-            or project_key in {"inbox", "workspace", "[workspace]"}
-            or self._project_key_is_unknown(project_key)
-        )
-        svc = self._resolve_inbox_svc(item, task_id)
-        if svc is None:
-            if is_workspace:
-                self._render_message_detail(item)
+        if prefer_cache:
+            task = item
+            replies = list(self._replies_by_task.get(task_id, ()))
+            rollup_items_raw = []
+            hydrate_from_cache = True
+        else:
+            hydrate_from_cache = False
+            # #1101: route through the unified ``_resolve_inbox_svc`` helper so
+            # the project-key-mismatch fallback is consistent with the action
+            # handlers (archive / approve / discuss / reply). Workspace-scoped
+            # tasks still short-circuit to the message renderer per #855.
+            project_key = task_id.split("/", 1)[0] if "/" in task_id else None
+            is_workspace = (
+                project_key is None
+                or project_key in {"inbox", "workspace", "[workspace]"}
+                or self._project_key_is_unknown(project_key)
+            )
+            svc = self._resolve_inbox_svc(item, task_id)
+            if svc is None:
+                if is_workspace:
+                    self._render_message_detail(item)
+                    return
+                self.detail.update(
+                    "[#f0c45a]This task lives in a project that is not "
+                    "currently registered with PollyPM. Add the project from "
+                    "the project picker to load its details here.[/#f0c45a]"
+                )
+                self._clear_rollup_items()
                 return
-            self.detail.update(
-                "[#f0c45a]This task lives in a project that is not "
-                "currently registered with PollyPM. Add the project from "
-                "the project picker to load its details here.[/#f0c45a]"
-            )
-            self._clear_rollup_items()
-            return
-        try:
-            task = svc.get(task_id)
-            replies = svc.list_replies(task_id)
-            rollup_items_raw = (
-                svc.get_context(task_id, entry_type="rollup_item")
-                if _task_is_rollup(task) else []
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.detail.update(f"[red]Error loading task: {exc}[/red]")
-            self._clear_rollup_items()
-            svc.close()
-            return
-        finally:
             try:
+                task = svc.get(task_id)
+                replies = svc.list_replies(task_id)
+                rollup_items_raw = (
+                    svc.get_context(task_id, entry_type="rollup_item")
+                    if _task_is_rollup(task) else []
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.detail.update(f"[red]Error loading task: {exc}[/red]")
+                self._clear_rollup_items()
                 svc.close()
-            except Exception:  # noqa: BLE001
-                pass
+                return
+            finally:
+                try:
+                    svc.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
         from pollypm.tz import format_relative
 
@@ -8386,10 +8456,12 @@ class PollyInboxApp(App[None]):
         # that the task-Review tab renders (#708) so the user can see
         # the summary inline without a separate pane-jump. Same
         # component, same content, same mental model across surfaces.
-        try:
-            review_block = self._render_inline_review_artifact(task)
-        except Exception:  # noqa: BLE001
-            review_block = None
+        review_block = None
+        if not hydrate_from_cache:
+            try:
+                review_block = self._render_inline_review_artifact(task)
+            except Exception:  # noqa: BLE001
+                review_block = None
         if review_block:
             sections.append("")
             sections.append("[dim]── review artifact ──[/dim]")
@@ -8553,12 +8625,52 @@ class PollyInboxApp(App[None]):
     # Selection / navigation
     # ------------------------------------------------------------------
 
-    def _sync_selection_from_list(self) -> None:
+    def _sync_selection_from_list(
+        self, *, defer_detail: bool = False, mark_read: bool = True,
+    ) -> None:
         idx = self.list_view.index
         if idx is None or idx < 0 or idx >= len(self._visible_rows):
             return
         row = self._visible_rows[idx]
+        self._select_inbox_row(
+            row, defer_detail=defer_detail, mark_read=mark_read,
+        )
+
+    def _schedule_detail_render(
+        self, task_id: str, row_key: str, *, mark_read: bool,
+    ) -> None:
+        self._pending_detail_task_id = task_id
+        self._pending_detail_row_key = row_key
+        self._pending_detail_mark_read = mark_read
+        if self._detail_render_scheduled:
+            return
+        self._detail_render_scheduled = True
+        self.call_after_refresh(self._flush_pending_detail_render)
+
+    def _flush_pending_detail_render(self) -> None:
+        self._detail_render_scheduled = False
+        task_id = self._pending_detail_task_id
+        row_key = self._pending_detail_row_key
+        mark_read = self._pending_detail_mark_read
+        self._pending_detail_task_id = None
+        self._pending_detail_row_key = None
+        self._pending_detail_mark_read = False
+        if not task_id or row_key != self._selected_row_key:
+            return
+        self._render_detail(task_id, prefer_cache=True)
+        if mark_read:
+            self._mark_open_read(task_id)
+
+    def _select_inbox_row(
+        self,
+        row: InboxThreadRow,
+        *,
+        defer_detail: bool,
+        mark_read: bool,
+    ) -> None:
         if row.key == self._selected_row_key:
+            if mark_read and not defer_detail:
+                self._mark_open_read(row.task_id)
             return
         task_changed = row.task_id != self._selected_task_id
         self._selected_task_id = row.task_id
@@ -8567,20 +8679,24 @@ class PollyInboxApp(App[None]):
         # a half-typed message doesn't get posted to a different task.
         if task_changed and self.reply_input.value:
             self.reply_input.value = ""
-        self._render_detail(row.task_id)
-        self._mark_open_read(row.task_id)
+        if defer_detail:
+            self._schedule_detail_render(row.task_id, row.key, mark_read=mark_read)
+            return
+        self._render_detail(row.task_id, prefer_cache=True)
+        if mark_read:
+            self._mark_open_read(row.task_id)
 
     def action_cursor_down(self) -> None:
         if self.reply_input.has_focus or self.filter_input.has_focus:
             return
         self.list_view.action_cursor_down()
-        self._sync_selection_from_list()
+        self._sync_selection_from_list(defer_detail=True, mark_read=True)
 
     def action_cursor_up(self) -> None:
         if self.reply_input.has_focus or self.filter_input.has_focus:
             return
         self.list_view.action_cursor_up()
-        self._sync_selection_from_list()
+        self._sync_selection_from_list(defer_detail=True, mark_read=True)
 
     def action_cursor_first(self) -> None:
         if self._visible_rows:
@@ -8631,7 +8747,14 @@ class PollyInboxApp(App[None]):
             self._sync_selection_from_list()
 
     def action_open_selected(self) -> None:
-        self._sync_selection_from_list()
+        idx = self.list_view.index
+        if idx is None or idx < 0 or idx >= len(self._visible_rows):
+            return
+        row = self._visible_rows[idx]
+        self._selected_task_id = row.task_id
+        self._selected_row_key = row.key
+        self._render_detail(row.task_id)
+        self._mark_open_read(row.task_id)
 
     def action_refresh(self) -> None:
         self._refresh_list(select_first=False)
@@ -8653,6 +8776,7 @@ class PollyInboxApp(App[None]):
             self._filter_text = ""
             self.filter_input.value = ""
             self._filter_bar_visible = False
+            self._set_filter_bridge_active(False)
             self._render_list(select_first=False)
             self.list_view.focus()
             return
@@ -8698,19 +8822,18 @@ class PollyInboxApp(App[None]):
 
     @on(ListView.Highlighted, "#inbox-list")
     def _on_row_highlighted(self, event: ListView.Highlighted) -> None:
-        # Keyboard j/k emits Highlighted before any Selected; render eagerly
-        # so the right pane tracks the cursor without requiring Enter.
+        # Keyboard j/k emits Highlighted before any Selected; defer the
+        # heavier detail/read work until the list highlight has painted.
         row = event.item
         if not isinstance(row, _InboxListItem):
             return
         if self._selected_row_key == row.row_ref.key:
             return
-        task_changed = self._selected_task_id != row.task_id
-        self._selected_task_id = row.task_id
-        self._selected_row_key = row.row_ref.key
-        if task_changed and self.reply_input.value:
-            self.reply_input.value = ""
-        self._render_detail(row.task_id)
+        self._select_inbox_row(
+            row.row_ref,
+            defer_detail=True,
+            mark_read=True,
+        )
 
     # ------------------------------------------------------------------
     # Read / archive / reply actions
@@ -9143,6 +9266,9 @@ class PollyInboxApp(App[None]):
         a real tmux server. See ``test_cockpit_inbox_ui.py`` for the
         monkeypatch target.
         """
+        from pollypm.dev_network_simulation import raise_if_network_dead
+
+        raise_if_network_dead(self.config_path, surface="Inbox discuss with PM")
         router = CockpitRouter(self.config_path)
         router.route_selected(cockpit_key)
         supervisor = router._load_supervisor()
@@ -14500,6 +14626,11 @@ class PollyProjectDashboardApp(App[None]):
         Split out exactly like the inbox path so the same
         ``monkeypatch`` strategy works for the dashboard's chat keybind.
         """
+        from pollypm.dev_network_simulation import raise_if_network_dead
+
+        raise_if_network_dead(
+            self.config_path, surface="Project dashboard discuss with PM",
+        )
         router = CockpitRouter(self.config_path)
         router.route_selected(cockpit_key)
         supervisor = router._load_supervisor()

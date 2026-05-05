@@ -1774,6 +1774,26 @@ def test_status_bar_pluralises_message_and_action_count(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_pm_dispatch_consumes_network_dead_marker(inbox_env) -> None:
+    from pollypm.cockpit_ui import PollyInboxApp
+    from pollypm.dev_network_simulation import (
+        SimulatedNetworkDead,
+        arm_network_dead,
+        network_dead_armed,
+    )
+
+    config_path = inbox_env["config_path"]
+    app = PollyInboxApp.__new__(PollyInboxApp)
+    app.config_path = config_path
+
+    arm_network_dead(config_path)
+
+    with pytest.raises(SimulatedNetworkDead, match="network unreachable"):
+        app._perform_pm_dispatch("project:demo:session", 're: inbox/1 "stub"')
+
+    assert not network_dead_armed(config_path)
+
+
 def _write_persona_config(
     project_path: Path, config_path: Path, persona_name: str,
 ) -> None:
@@ -2341,6 +2361,67 @@ def test_inbox_filter_bridge_literal_slash_opens_input(inbox_env) -> None:
     _run(body())
 
 
+def test_cockpit_send_key_inbox_filter_sequence_routes_to_inbox_bridge(
+    inbox_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1214: default cockpit-send-key drives Inbox filter text via bridge."""
+    if not _load_config_compatible(inbox_env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    import typer
+    from typer.testing import CliRunner
+
+    from pollypm.cli_features import ui as ui_commands
+    from pollypm.cockpit_rail import CockpitRouter
+    from pollypm.cockpit_ui import PollyInboxApp
+
+    cli = typer.Typer()
+    ui_commands.register_ui_commands(cli)
+    live_pane_attempts: list[tuple[Path, str]] = []
+
+    def fake_live_pane(config_path: Path, key: str) -> str | None:
+        live_pane_attempts.append((config_path, key))
+        return "%2"
+
+    monkeypatch.setattr(
+        ui_commands,
+        "_send_key_to_active_live_right_pane",
+        fake_live_pane,
+    )
+
+    app = PollyInboxApp(inbox_env["config_path"])
+    CockpitRouter(inbox_env["config_path"]).set_selected_key("inbox")
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            initial_count = len(_visible_titles(app))
+            assert initial_count > 1
+            handle = getattr(app, "_input_bridge_handle", None)
+            assert handle is not None
+
+            for key in ("/", "V", "C", "L"):
+                result = CliRunner().invoke(
+                    cli,
+                    [
+                        "cockpit-send-key",
+                        key,
+                        "--config",
+                        str(inbox_env["config_path"]),
+                    ],
+                )
+                assert result.exit_code == 0, result.output
+                assert str(handle.socket_path) in result.output
+                await pilot.pause(0.1)
+
+            assert live_pane_attempts == []
+            assert app.filter_input.value == "VCL"
+            assert _visible_titles(app) == ["Deploy blocked"]
+            assert len(_visible_titles(app)) < initial_count
+
+    _run(body())
+
+
 def test_inbox_bridge_n_keypress_toggles_notifications_visible(
     inbox_env,
 ) -> None:
@@ -2404,6 +2485,76 @@ def test_inbox_bridge_jk_moves_list_cursor(inbox_env) -> None:
             assert app.list_view.index == 0
 
     _run(body())
+
+
+def test_inbox_j_navigation_defers_detail_until_after_refresh(
+    inbox_env, monkeypatch,
+) -> None:
+    """#1226: ``j`` paints the list cursor before detail/read IO runs."""
+    if not _load_config_compatible(inbox_env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_ui import PollyInboxApp
+
+    app = PollyInboxApp(inbox_env["config_path"])
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            callbacks = []
+            rendered: list[tuple[str, bool]] = []
+            marked_read: list[str] = []
+
+            def fake_call_after_refresh(callback, *args, **kwargs):
+                callbacks.append((callback, args, kwargs))
+
+            def fake_render_detail(task_id: str, *, prefer_cache: bool = False) -> None:
+                rendered.append((task_id, prefer_cache))
+
+            monkeypatch.setattr(app, "call_after_refresh", fake_call_after_refresh)
+            monkeypatch.setattr(app, "_render_detail", fake_render_detail)
+            monkeypatch.setattr(app, "_mark_open_read", marked_read.append)
+
+            assert app.list_view.index == 0
+            app.action_cursor_down()
+
+            assert app.list_view.index == 1
+            assert rendered == []
+            assert marked_read == []
+            assert len(callbacks) == 1
+
+            callback, args, kwargs = callbacks.pop()
+            callback(*args, **kwargs)
+
+            assert rendered == [(app._visible_rows[1].task_id, True)]
+            assert marked_read == [app._visible_rows[1].task_id]
+
+    _run(body())
+
+
+def test_inbox_open_selected_marks_current_row_read() -> None:
+    """Opening the highlighted row still does the full read/open work."""
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyInboxApp
+
+    app = PollyInboxApp.__new__(PollyInboxApp)
+    app.list_view = SimpleNamespace(index=0)
+    app._visible_rows = [SimpleNamespace(key="task:demo/1", task_id="demo/1")]
+    app._selected_row_key = "task:demo/1"
+    app._selected_task_id = "demo/1"
+    rendered: list[tuple[str, bool]] = []
+    read: list[str] = []
+    app._render_detail = (  # type: ignore[method-assign]
+        lambda task_id, *, prefer_cache=False: rendered.append(
+            (task_id, prefer_cache)
+        )
+    )
+    app._mark_open_read = lambda task_id: read.append(task_id)  # type: ignore[method-assign]
+
+    app.action_open_selected()
+
+    assert rendered == [("demo/1", False)]
+    assert read == ["demo/1"]
 
 
 def test_inbox_bridge_dispatches_discuss_approve_archive_actions(

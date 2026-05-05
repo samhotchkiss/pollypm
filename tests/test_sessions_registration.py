@@ -155,6 +155,31 @@ def test_bootstrap_registers_every_session_row(monkeypatch, tmp_path: Path) -> N
     assert rows["pm-reviewer"].role == "reviewer"
 
 
+def test_bootstrap_continues_when_pipe_pane_fails(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    _neutralize_tmux(supervisor, monkeypatch)
+    piped_targets: list[str] = []
+
+    def _pipe_pane(target: str, _path: Path) -> None:
+        piped_targets.append(target)
+        raise subprocess.CalledProcessError(
+            1,
+            ["tmux", "pipe-pane", "-t", target],
+        )
+
+    monkeypatch.setattr(supervisor.tmux, "pipe_pane", _pipe_pane)
+
+    controller = supervisor.bootstrap_tmux()
+
+    assert controller == "claude_controller"
+    assert piped_targets
+    rows = sorted(s.name for s in supervisor.store.list_sessions())
+    assert rows == ["heartbeat", "operator", "pm-reviewer"]
+
+
 def test_rebootstrap_is_idempotent(monkeypatch, tmp_path: Path) -> None:
     """A second bootstrap over already-live sessions must upsert (not duplicate)
     and must register any sessions that were already running — the scenario

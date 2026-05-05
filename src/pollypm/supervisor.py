@@ -894,7 +894,7 @@ class Supervisor:
             target = f"{storage_session}:{launch.window_name}"
             self._set_window_option_best_effort(target, "allow-passthrough", "on")
             self._set_window_option_best_effort(target, "focus-events", "on")
-            self.session_service.tmux.pipe_pane(target, launch.log_path)
+            self._pipe_pane_best_effort(target, launch.log_path)
             self._record_launch(launch)
             created += 1
 
@@ -933,7 +933,7 @@ class Supervisor:
             window_target = f"{storage_session}:{first.window_name}"
             self._set_window_option_best_effort(window_target, "allow-passthrough", "on")
             self._set_window_option_best_effort(window_target, "focus-events", "on")
-            self.session_service.tmux.pipe_pane(window_target, first.log_path)
+            self._pipe_pane_best_effort(window_target, first.log_path)
             self._record_launch(first)
             # Use pane ID from create_session for unambiguous targeting
             pane_target = first_pane_id or window_target
@@ -945,7 +945,7 @@ class Supervisor:
                 window_target = f"{storage_session}:{launch.window_name}"
                 self._set_window_option_best_effort(window_target, "allow-passthrough", "on")
                 self._set_window_option_best_effort(window_target, "focus-events", "on")
-                self.session_service.tmux.pipe_pane(window_target, launch.log_path)
+                self._pipe_pane_best_effort(window_target, launch.log_path)
                 self._record_launch(launch)
                 # Use pane ID returned by create_window for unambiguous targeting
                 pane_target = pane_id or self._resolve_pane_id(storage_session, launch.window_name) or window_target
@@ -981,6 +981,16 @@ class Supervisor:
                 target,
                 option,
                 value,
+                exc,
+            )
+
+    def _pipe_pane_best_effort(self, target: str, log_path: Path) -> None:
+        try:
+            self.session_service.tmux.pipe_pane(target, log_path)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            logger.warning(
+                "tmux pipe-pane failed for %s during bootstrap; continuing without live log piping: %s",
+                target,
                 exc,
             )
 
@@ -3226,7 +3236,7 @@ class Supervisor:
         target = new_pane_id or window_target
         # Cap scrollback to prevent slow pane-switching in the cockpit
         self.session_service.tmux.set_pane_history_limit(target, 200)
-        self.session_service.tmux.pipe_pane(target, launch.log_path)
+        self._pipe_pane_best_effort(target, launch.log_path)
         self._record_launch(launch)
         # #935 — defer the resume-UUID capture until after the bootstrap
         # text lands in the transcript. Stash the pre-launch snapshot

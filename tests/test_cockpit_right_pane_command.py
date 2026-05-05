@@ -55,6 +55,7 @@ def test_right_pane_command_executes_cockpit_pane_help(tmp_path: Path) -> None:
 
 
 def test_package_main_fast_dispatches_inbox_pane(
+    capsys,
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -85,6 +86,9 @@ def test_package_main_fast_dispatches_inbox_pane(
             *,
             initial_project: str | None = None,
         ) -> None:
+            out = capsys.readouterr().out
+            assert "Inbox" in out
+            assert "Loading action needed items..." in out
             calls.append(("app", (path, initial_project)))
 
         def run(self, *, mouse: bool) -> None:

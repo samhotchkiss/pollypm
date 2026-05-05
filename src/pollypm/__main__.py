@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 _COCKPIT_PANE_HELP_FLAGS = frozenset({"--help", "-h"})
+_CLEAR_SCREEN = "\x1b[2J\x1b[H"
 
 
 def _parse_cockpit_pane_options(
@@ -67,13 +68,35 @@ def _run_cockpit_pane_fast(argv: list[str]) -> bool:
         _install_cockpit_debug_log_handler,
     )
     from pollypm.config import DEFAULT_CONFIG_PATH
-    from pollypm.cockpit_ui import PollyInboxApp
 
     resolved_config_path = config_path or Path(DEFAULT_CONFIG_PATH)
     _enforce_migration_gate(resolved_config_path)
     _install_cockpit_debug_log_handler(resolved_config_path)
+    _paint_inbox_loading_placeholder()
+
+    from pollypm.cockpit_ui import PollyInboxApp
+
     PollyInboxApp(resolved_config_path, initial_project=project).run(mouse=True)
     return True
+
+
+def _paint_inbox_loading_placeholder() -> None:
+    """Show an immediate frame while Textual builds and loads the inbox.
+
+    The cockpit's Home -> Inbox budget is measured from keypress to first
+    visible pane content. ``PollyInboxApp.on_mount`` still performs the real
+    inbox read before its first Textual frame, so print a minimal truthful
+    loading frame before importing/rendering the heavy app work.
+    """
+    try:
+        sys.stdout.write(
+            f"{_CLEAR_SCREEN}"
+            "Inbox\n\n"
+            "Loading action needed items..."
+        )
+        sys.stdout.flush()
+    except Exception:  # noqa: BLE001 - placeholder must never block launch
+        pass
 
 
 def main() -> None:

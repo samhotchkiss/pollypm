@@ -3585,7 +3585,7 @@ class CockpitRouter:
             f"PYTHONPATH={python_path}",
             sys.executable,
             "-m",
-            "pollypm.cli",
+            "pollypm",
             "cockpit-pane",
             kind,
         ]

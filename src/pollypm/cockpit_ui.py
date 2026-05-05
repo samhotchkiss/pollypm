@@ -1672,6 +1672,14 @@ class PollyCockpitApp(App[None]):
             return False
         return bool(state.get("mounted_session"))
 
+    def _mounted_return_key(self) -> str | None:
+        try:
+            state = self.router._load_state()
+        except Exception:  # noqa: BLE001
+            return None
+        value = state.get("mounted_return_key")
+        return value if isinstance(value, str) and value else None
+
     def _send_key_to_right_pane(self, key: str) -> None:
         send_method = getattr(self.router, "send_key_to_right_pane", None)
         if callable(send_method):
@@ -2879,6 +2887,10 @@ class PollyCockpitApp(App[None]):
 
     def action_back_to_home(self) -> None:
         if self._right_pane_has_live_session():
+            return_key = self._mounted_return_key()
+            if return_key:
+                self._schedule_route_selected(return_key, label=return_key)
+                return
             self._focus_rail_pane()
             return
         if self._is_on_home():

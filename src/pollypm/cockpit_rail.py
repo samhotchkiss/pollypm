@@ -863,6 +863,45 @@ class CockpitRouter:
         except Exception:  # noqa: BLE001
             pass
 
+    def _return_key_for_live_mount(self, previous_key: object) -> str | None:
+        """Return the static cockpit route to restore after a live mount."""
+        if not isinstance(previous_key, str) or not previous_key:
+            return None
+        if previous_key in {
+            "dashboard",
+            "inbox",
+            "workers",
+            "metrics",
+            "settings",
+            "activity",
+        }:
+            return previous_key
+        if previous_key.startswith(("inbox:", "activity:")):
+            return previous_key
+        if previous_key.startswith("project:"):
+            parts = previous_key.split(":")
+            if len(parts) == 2:
+                return f"{previous_key}:dashboard"
+            if len(parts) >= 3 and parts[2] in {"dashboard", "settings", "issues"}:
+                return previous_key
+        return None
+
+    def _record_live_mount_return_key(
+        self,
+        plan,
+        previous_key: object,
+    ) -> None:
+        state = self._load_state()
+        if isinstance(plan, LiveAgentPane):
+            return_key = self._return_key_for_live_mount(previous_key)
+            if return_key:
+                state["mounted_return_key"] = return_key
+            else:
+                state.pop("mounted_return_key", None)
+        else:
+            state.pop("mounted_return_key", None)
+        self._write_state(state)
+
     def should_show_palette_tip(self) -> bool:
         data = self._load_state()
         return not bool(data.get("palette_tip_seen"))
@@ -2552,6 +2591,8 @@ class CockpitRouter:
         # right pane to the stale prior selection. Writing the new key
         # to disk first keeps the rail aligned with the user's intent
         # even when downstream work raises.
+        state_before_route = self._load_state()
+        previous_key = state_before_route.get("selected")
         self.set_selected_key(key)
         token = self._begin_layout_mutation()
         try:
@@ -2563,6 +2604,7 @@ class CockpitRouter:
                 raise RuntimeError("Cockpit right pane is not available.")
 
             plan = resolve_cockpit_content(key, self._content_context(supervisor))
+            self._record_live_mount_return_key(plan, previous_key)
             self._route_content_plan(supervisor, window_target, plan)
         finally:
             # #995 — guarantee a two-pane cockpit on every rail click.
@@ -3408,6 +3450,7 @@ class CockpitRouter:
     ) -> None:
         self._park_mounted_session(supervisor, window_target)
         state = self._load_state()
+        state.pop("mounted_return_key", None)
         result = self._window_manager(supervisor).show_static(
             command,
             self._window_state_from_cockpit_state(supervisor, state),

@@ -1774,6 +1774,26 @@ def test_status_bar_pluralises_message_and_action_count(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_pm_dispatch_consumes_network_dead_marker(inbox_env) -> None:
+    from pollypm.cockpit_ui import PollyInboxApp
+    from pollypm.dev_network_simulation import (
+        SimulatedNetworkDead,
+        arm_network_dead,
+        network_dead_armed,
+    )
+
+    config_path = inbox_env["config_path"]
+    app = PollyInboxApp.__new__(PollyInboxApp)
+    app.config_path = config_path
+
+    arm_network_dead(config_path)
+
+    with pytest.raises(SimulatedNetworkDead, match="network unreachable"):
+        app._perform_pm_dispatch("project:demo:session", 're: inbox/1 "stub"')
+
+    assert not network_dead_armed(config_path)
+
+
 def _write_persona_config(
     project_path: Path, config_path: Path, persona_name: str,
 ) -> None:

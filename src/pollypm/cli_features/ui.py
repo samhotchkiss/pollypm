@@ -70,6 +70,7 @@ _RIGHT_PANE_TMUX_KEY_TOKENS: dict[str, str] = {
     "<end>": "End",
     "end": "End",
 }
+_LIVE_CHAT_NETWORK_DEAD_MESSAGE_PREFIX = "PollyPM chat failed"
 
 
 def _is_help_key(key: str) -> bool:
@@ -174,6 +175,41 @@ def _tmux_event_for_cockpit_key(key: str) -> tuple[str, bool] | None:
     return key, True
 
 
+def _live_chat_submit_blocked_by_network_dead(
+    config_path: Path,
+    key: str,
+    *,
+    router: object,
+    right_pane: str,
+) -> bool:
+    """Consume the dev network-dead marker on live-chat submit."""
+    event = _tmux_event_for_cockpit_key(key)
+    if event != ("Enter", False):
+        return False
+    try:
+        from pollypm.dev_network_simulation import (
+            SimulatedNetworkDead,
+            raise_if_network_dead,
+        )
+
+        raise_if_network_dead(config_path, surface="cockpit live chat submit")
+    except SimulatedNetworkDead as exc:
+        tmux = getattr(router, "tmux", None)
+        if tmux is not None:
+            run = getattr(tmux, "run", None)
+            if callable(run):
+                run("send-keys", "-t", right_pane, "C-u", check=False)
+            send_keys = getattr(tmux, "send_keys", None)
+            if callable(send_keys):
+                send_keys(
+                    right_pane,
+                    f"{_LIVE_CHAT_NETWORK_DEAD_MESSAGE_PREFIX}: {exc}",
+                    press_enter=False,
+                )
+        return True
+    return False
+
+
 def _send_key_to_active_live_right_pane(config_path: Path, key: str) -> str | None:
     """Deliver ``key`` to the focused live right pane, if one owns focus."""
     if key.strip().lower() in _RIGHT_PANE_BRIDGE_BYPASS_ESCAPE_TOKENS:
@@ -190,6 +226,10 @@ def _send_key_to_active_live_right_pane(config_path: Path, key: str) -> str | No
     event = _tmux_event_for_cockpit_key(key)
     if event is None:
         return None
+    if _live_chat_submit_blocked_by_network_dead(
+        config_path, key, router=router, right_pane=right_pane,
+    ):
+        return right_pane
     value, literal = event
     if literal:
         router.tmux.send_keys(right_pane, value, press_enter=False)

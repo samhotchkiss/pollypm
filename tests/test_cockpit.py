@@ -4100,6 +4100,9 @@ def test_cockpit_send_key_inbox_shortcut_keeps_rail_nav_active(tmp_path: Path) -
         def selected_key(self) -> str:
             return self._selected
 
+        def set_selected_key(self, key: str) -> None:
+            self._selected = key
+
         def _load_state(self) -> dict:
             return {}
 
@@ -5505,6 +5508,13 @@ def test_cockpit_jk_walks_visible_rail_rows_incrementally() -> None:
         selected_key="dashboard",
     )
     nav.index = 0
+    persisted: list[str] = []
+
+    class _Router:
+        def set_selected_key(self, key: str) -> None:
+            persisted.append(key)
+
+    app.router = _Router()  # type: ignore[assignment]
 
     expected_down = [
         ("polly", 1),
@@ -5520,6 +5530,7 @@ def test_cockpit_jk_walks_visible_rail_rows_incrementally() -> None:
         app.action_cursor_down()
         assert app.selected_key == key
         assert nav.index == index
+        assert persisted[-1] == key
 
     expected_up = [
         ("activity", 8),
@@ -5535,6 +5546,7 @@ def test_cockpit_jk_walks_visible_rail_rows_incrementally() -> None:
         app.action_cursor_up()
         assert app.selected_key == key
         assert nav.index == index
+        assert persisted[-1] == key
 
 
 def test_cockpit_j_at_last_nav_row_steps_onto_settings() -> None:

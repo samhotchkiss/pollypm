@@ -2307,6 +2307,7 @@ class PollyCockpitApp(App[None]):
         if key is not None:
             self._cancel_pending_route_selection()
             self.selected_key = key
+            self._persist_router_selected_key(key)
             self._last_nav_change = self._tick_count
             self._apply_active_view_to_rows()
 
@@ -2379,6 +2380,16 @@ class PollyCockpitApp(App[None]):
         finally:
             self._suspend_selection_events = False
 
+    def _persist_router_selected_key(self, key: str) -> None:
+        set_selected = getattr(getattr(self, "router", None), "set_selected_key", None)
+        if not callable(set_selected):
+            return
+        try:
+            set_selected(key)
+        except Exception:  # noqa: BLE001
+            return
+        self._last_router_selected_key = key
+
     def _set_nav_index(self, index: int) -> None:
         self._suspend_selection_events = True
         try:
@@ -2409,6 +2420,7 @@ class PollyCockpitApp(App[None]):
     def _select_settings_row(self) -> None:
         self._cancel_pending_route_selection()
         self.selected_key = "settings"
+        self._persist_router_selected_key("settings")
         self._last_nav_change = self._tick_count
         self._apply_active_view_to_rows()
 

@@ -5020,6 +5020,52 @@ def test_cockpit_project_enter_advances_cursor_to_dashboard_subitem() -> None:
     assert app.selected_key == "project:demo:dashboard"
 
 
+def test_cockpit_project_enter_primes_subitems_before_route_worker() -> None:
+    """#1192: Enter on a project should expand its sub-items immediately."""
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    events: list[tuple[str, str, str] | tuple[str, str]] = []
+
+    class _Router:
+        selected = "polly"
+
+        def set_selected_key(self, key: str) -> None:
+            events.append(("set", key))
+            self.selected = key
+
+        def selected_key(self) -> str:
+            return self.selected
+
+        def route_selected(self, key: str) -> None:
+            events.append(("route", key))
+            self.selected = f"{key}:dashboard"
+
+    router = _Router()
+    app.router = router  # type: ignore[assignment]
+    app.selected_key = "project:demo"
+    app._last_router_selected_key = "polly"
+    app._items = [SimpleNamespace(key="project:demo", selectable=True)]
+    app._selected_row_key = lambda: "project:demo"  # type: ignore[method-assign]
+    app.hint = _CaptureWidget()
+    app._refresh_rows = (  # type: ignore[method-assign]
+        lambda: events.append(("refresh", app.selected_key, router.selected_key()))
+    )
+
+    app.action_open_selected()
+
+    first_refresh_index = next(
+        index for index, event in enumerate(events) if event[0] == "refresh"
+    )
+    route_index = events.index(("route", "project:demo"))
+
+    assert events[0] == ("set", "project:demo:dashboard")
+    assert events[first_refresh_index] == (
+        "refresh",
+        "project:demo:dashboard",
+        "project:demo:dashboard",
+    )
+    assert first_refresh_index < route_index
+
+
 def test_cockpit_pin_toggle_round_trips_and_reports_state() -> None:
     """``p`` toggles the pin AND surfaces a hint about the new state (#858)."""
     app = PollyCockpitApp.__new__(PollyCockpitApp)

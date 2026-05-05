@@ -2485,6 +2485,11 @@ class PollyCockpitApp(App[None]):
     # bounce reported in #967. The seq guard short-circuits that path.
     _route_click_seq: int = 0
 
+    def _optimistic_selected_key_for_route(self, key: str) -> str:
+        if key.startswith("project:") and key.count(":") == 1:
+            return f"{key}:dashboard"
+        return key
+
     def _ensure_navigation_controller(self) -> NavigationController:
         controller = getattr(self, "_navigation_controller", None)
         if controller is not None:
@@ -2522,7 +2527,13 @@ class PollyCockpitApp(App[None]):
         # rail highlight tracks the user's intent before the route work
         # even starts. The router may correct this once it knows the
         # canonical selection (e.g. ``project:x`` → ``project:x:dashboard``).
-        self.selected_key = key
+        optimistic_key = self._optimistic_selected_key_for_route(key)
+        self.selected_key = optimistic_key
+        if optimistic_key != key:
+            try:
+                self.router.set_selected_key(optimistic_key)
+            except Exception:  # noqa: BLE001
+                pass
         request = self._ensure_navigation_controller().accept(key)
         seq = request.request_id
         self._route_click_seq = seq

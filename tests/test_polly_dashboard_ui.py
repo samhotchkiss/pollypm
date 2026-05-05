@@ -158,6 +158,24 @@ def test_polly_dashboard_shows_inbox_count_without_recent_messages(tmp_path: Pat
     assert "Press I to jump to the inbox" in rendered
 
 
+def test_polly_dashboard_zero_project_footer_points_to_add_project(
+    tmp_path: Path,
+) -> None:
+    app = PollyDashboardApp(tmp_path / "pollypm.toml")
+    data = _fake_dashboard_data()
+    config = SimpleNamespace(
+        projects={},
+        sessions={"operator": object(), "reviewer": object()},
+    )
+
+    app._render_dashboard(config, data)
+
+    rendered = str(app.footer_w.render())
+    assert "Add a project" in rendered
+    assert "pm add-project" in rendered
+    assert "Click Polly to connect" not in rendered
+
+
 def test_polly_dashboard_renders_llm_quota_usage(tmp_path: Path) -> None:
     app = PollyDashboardApp(tmp_path / "pollypm.toml")
     data = _fake_dashboard_data()

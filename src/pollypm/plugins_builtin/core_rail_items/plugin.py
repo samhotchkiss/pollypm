@@ -343,7 +343,12 @@ def _project_rows(ctx: RailContext) -> list[RailRow]:
         return []
     active, inactive, has_working = _classify_projects(ctx)
     if not active and not inactive:
-        return []
+        return [RailRow(
+            key="projects_root",
+            label="Projects",
+            state="separator",
+            selectable=False,
+        )]
     selected = _selected_key(ctx)
     config = _config(ctx)
 

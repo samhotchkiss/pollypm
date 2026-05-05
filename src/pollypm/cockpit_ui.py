@@ -3259,8 +3259,13 @@ class PollyDashboardApp(App[None]):
         # ── Footer ──
         sweep_word = "sweep" if data.sweep_count_24h == 1 else "sweeps"
         msg_word = "message" if data.message_count_24h == 1 else "messages"
+        footer_action = (
+            "Click Polly to connect"
+            if n_projects
+            else "Add a project: pm add-project"
+        )
         footer = (
-            "[dim]Click Polly to connect  \u00b7  "
+            f"[dim]{footer_action}  \u00b7  "
             f"{data.sweep_count_24h} {sweep_word} today  \u00b7  "
             f"{data.message_count_24h} {msg_word}"
         )

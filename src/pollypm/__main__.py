@@ -63,17 +63,16 @@ def _run_cockpit_pane_fast(argv: list[str]) -> bool:
     if parsed is None:
         return False
     config_path, project = parsed
+    resolved_config_path = config_path or _default_config_path()
+    _paint_inbox_loading_placeholder()
 
     from pollypm.cli_features.ui import (
         _enforce_migration_gate,
         _install_cockpit_debug_log_handler,
     )
-    from pollypm.config import DEFAULT_CONFIG_PATH
 
-    resolved_config_path = config_path or Path(DEFAULT_CONFIG_PATH)
     _enforce_migration_gate(resolved_config_path)
     _install_cockpit_debug_log_handler(resolved_config_path)
-    _paint_inbox_loading_placeholder()
     _paint_inbox_snapshot(resolved_config_path, project=project)
 
     from pollypm.cockpit_ui import PollyInboxApp
@@ -97,6 +96,10 @@ def _paint_inbox_loading_placeholder() -> None:
         sys.stdout.flush()
     except Exception:  # noqa: BLE001 - placeholder must never block launch
         pass
+
+
+def _default_config_path() -> Path:
+    return Path.home() / ".pollypm" / "pollypm.toml"
 
 
 def _paint_inbox_snapshot(config_path: Path, *, project: str | None) -> None:

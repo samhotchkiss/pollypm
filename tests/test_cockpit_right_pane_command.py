@@ -1,3 +1,4 @@
+import builtins
 import os
 import subprocess
 import sys
@@ -112,6 +113,25 @@ def test_package_main_fast_dispatches_inbox_pane(
             {},
         ),
     )
+    original_import = builtins.__import__
+    first_package_import: list[tuple[str, str]] = []
+
+    def tracking_import(
+        name: str,
+        globals: dict[str, Any] | None = None,
+        locals: dict[str, Any] | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> Any:
+        if (
+            level == 0
+            and not first_package_import
+            and (name == "pollypm" or name.startswith("pollypm."))
+        ):
+            first_package_import.append((name, capsys.readouterr().out))
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", tracking_import)
 
     class FakeInboxApp:
         def __init__(
@@ -122,7 +142,6 @@ def test_package_main_fast_dispatches_inbox_pane(
         ) -> None:
             out = capsys.readouterr().out
             assert "Inbox" in out
-            assert "Loading messages..." in out
             assert "action needed" in out
             assert "Plan ready for review" in out
             assert "Other project" not in out
@@ -147,6 +166,13 @@ def test_package_main_fast_dispatches_inbox_pane(
     )
 
     assert handled is True
+    assert first_package_import
+    assert first_package_import[0][0] == "pollypm.cli_features.ui"
+    pre_import_output = first_package_import[0][1]
+    assert "Inbox" in pre_import_output
+    assert "Loading messages..." in pre_import_output
+    assert "action needed" not in pre_import_output
+    assert "Inbox is clear" not in pre_import_output
     assert ("gate", config_path) in calls
     assert ("log", config_path) in calls
     assert ("app", (config_path, "demo")) in calls

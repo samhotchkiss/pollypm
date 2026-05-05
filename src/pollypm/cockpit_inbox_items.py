@@ -402,30 +402,33 @@ def _dedupe_message_vs_task_plan_reviews(
     higher-fidelity surface — drop the bare task row when a message
     with ``plan_task:<task_id>`` already covers it.
     """
-    # Build the set of task_ids that a notify-message already covers.
-    message_covered_task_ids: set[str] = set()
+    # Build refs to plan tasks already covered by a richer handoff row.
+    message_covered_task_ids: dict[str, set[str]] = {}
     for item in items:
         labels = {str(lbl) for lbl in (getattr(item, "labels", []) or [])}
         if "plan_review" not in labels:
             continue
-        # Task-based entries also carry ``plan_review`` via annotation,
-        # but they don't carry the ``plan_task:<id>`` reference label
-        # the architect's notify includes. Only message rows have it.
+        # Task-backed notify rows can also carry ``plan_task:<id>``.
+        # Track who provides the coverage so a self-referential row
+        # never dedupes itself out of the rendered inbox.
         for label in labels:
             if label.startswith("plan_task:"):
                 ref = label.split(":", 1)[1].strip()
                 if ref:
-                    message_covered_task_ids.add(ref)
+                    coverer_id = str(getattr(item, "task_id", "") or "")
+                    message_covered_task_ids.setdefault(ref, set()).add(coverer_id)
                 break
     if not message_covered_task_ids:
         return items
     kept: list[InboxEntry] = []
     for item in items:
-        # Only drop task-based entries — message rows we keep no matter
-        # what (they may be the source of the coverage).
+        # Only drop task-based entries when a different row covers the
+        # same plan task — message rows and self-referential task rows
+        # remain visible.
         if is_task_inbox_entry(item):
             task_id = str(getattr(item, "task_id", "") or "")
-            if task_id in message_covered_task_ids:
+            coverers = message_covered_task_ids.get(task_id, set())
+            if any(coverer_id != task_id for coverer_id in coverers):
                 continue
         kept.append(item)
     return kept

@@ -124,6 +124,37 @@ def _seed_threaded_task(project_path: Path) -> str:
         svc.close()
 
 
+def _seed_self_referential_plan_review(project_path: Path) -> str:
+    """Create a task-backed plan_review row whose plan_task label is itself."""
+    db_path = project_path / ".pollypm" / "state.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    svc = SQLiteWorkService(db_path=db_path, project_path=project_path)
+    try:
+        task = svc.create(
+            title="Plan ready for review: demo",
+            description="Review the proposed demo plan.",
+            type="task",
+            project="demo",
+            flow_template="chat",
+            roles={"requester": "user", "operator": "architect"},
+            priority="normal",
+            created_by="architect",
+            labels=["plan_review", "notify", "project:demo"],
+        )
+        task = svc.update(
+            task.task_id,
+            labels=[
+                "plan_review",
+                "notify",
+                "project:demo",
+                f"plan_task:{task.task_id}",
+            ],
+        )
+        return task.task_id
+    finally:
+        svc.close()
+
+
 @pytest.fixture
 def inbox_env(tmp_path: Path):
     project_path = tmp_path / "demo"
@@ -373,6 +404,32 @@ def test_message_plan_review_dedupes_against_task_entry() -> None:
     # Message row kept; unrelated row kept.
     assert "msg:booktalk:1" in deduped_ids
     assert "msg:polly_remote:12" in deduped_ids
+
+
+def test_task_backed_plan_review_does_not_dedupe_itself() -> None:
+    """A task-backed plan_review can carry its own plan_task sidecar.
+
+    The dedupe pass should only drop the bare plan task when a different
+    row covers it. If the only covering row is the task itself, keep it.
+    """
+    from datetime import datetime
+
+    from pollypm.cockpit_inbox_items import (
+        InboxEntry,
+        _dedupe_message_vs_task_plan_reviews,
+    )
+
+    item = InboxEntry(
+        source="task",
+        task_id="demo/7",
+        title="Plan ready for review: demo",
+        project="demo",
+        labels=["plan_review", "project:demo", "plan_task:demo/7"],
+        created_at=datetime(2026, 5, 5, 10, 0, 0),
+        updated_at=datetime(2026, 5, 5, 10, 0, 0),
+    )
+
+    assert _dedupe_message_vs_task_plan_reviews([item]) == [item]
 
 
 def test_task_backed_inbox_entries_default_to_action() -> None:
@@ -1019,6 +1076,26 @@ def test_action_items_sort_ahead_of_completed_updates(
             assert titles.index("[Action] Fly.io setup needed for demo") < titles.index(
                 "[Action] Demo shipped cleanly"
             )
+
+    _run(body())
+
+
+def test_self_referential_plan_review_row_is_visible(
+    inbox_env, inbox_app,
+) -> None:
+    """Plan-review task rows must survive dedupe and render in the inbox."""
+    title = "Plan ready for review: demo"
+    plan_review_id = _seed_self_referential_plan_review(inbox_env["project_path"])
+
+    async def body() -> None:
+        async with inbox_app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert any(t.task_id == plan_review_id for t in inbox_app._tasks)
+            assert title in _visible_titles(inbox_app)
+
+            await pilot.press("m")
+            await pilot.pause()
+            assert title in _visible_titles(inbox_app)
 
     _run(body())
 

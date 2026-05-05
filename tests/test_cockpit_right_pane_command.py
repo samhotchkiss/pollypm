@@ -3,6 +3,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
 
 from pollypm.cockpit_rail import CockpitRouter
 
@@ -61,8 +62,10 @@ def test_package_main_fast_dispatches_inbox_pane(
 ) -> None:
     """``python -m pollypm cockpit-pane inbox`` skips root CLI import."""
 
-    import pollypm.cli_features.ui as ui
     import pollypm.cockpit_ui as cockpit_ui
+    import pollypm.cli_features.ui as ui
+    import pollypm.config as config_mod
+    import pollypm.cockpit_inbox_items as inbox_items
     from pollypm import __main__ as package_main
 
     config_path = tmp_path / "pollypm.toml"
@@ -78,6 +81,37 @@ def test_package_main_fast_dispatches_inbox_pane(
         "_install_cockpit_debug_log_handler",
         lambda path: calls.append(("log", path)),
     )
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda path: SimpleNamespace(projects={"demo": object()}),
+    )
+    monkeypatch.setattr(
+        inbox_items,
+        "load_inbox_entries",
+        lambda config: (
+            [
+                SimpleNamespace(
+                    task_id="demo/1",
+                    title="Plan ready for review",
+                    project="demo",
+                    triage_label="plan review",
+                    needs_action=True,
+                    is_orphaned=False,
+                ),
+                SimpleNamespace(
+                    task_id="other/1",
+                    title="Other project",
+                    project="other",
+                    triage_label="plan review",
+                    needs_action=True,
+                    is_orphaned=False,
+                ),
+            ],
+            {"demo/1"},
+            {},
+        ),
+    )
 
     class FakeInboxApp:
         def __init__(
@@ -88,7 +122,12 @@ def test_package_main_fast_dispatches_inbox_pane(
         ) -> None:
             out = capsys.readouterr().out
             assert "Inbox" in out
-            assert "Loading action needed items..." in out
+            assert "Loading messages..." in out
+            assert "action needed" in out
+            assert "Plan ready for review" in out
+            assert "Other project" not in out
+            assert "Loading action needed" not in out
+            assert "Inbox is clear" not in out
             calls.append(("app", (path, initial_project)))
 
         def run(self, *, mouse: bool) -> None:

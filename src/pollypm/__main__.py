@@ -8,6 +8,7 @@ from pathlib import Path
 
 _COCKPIT_PANE_HELP_FLAGS = frozenset({"--help", "-h"})
 _CLEAR_SCREEN = "\x1b[2J\x1b[H"
+_INBOX_PREPAINT_LIMIT = 12
 
 
 def _parse_cockpit_pane_options(
@@ -73,6 +74,7 @@ def _run_cockpit_pane_fast(argv: list[str]) -> bool:
     _enforce_migration_gate(resolved_config_path)
     _install_cockpit_debug_log_handler(resolved_config_path)
     _paint_inbox_loading_placeholder()
+    _paint_inbox_snapshot(resolved_config_path, project=project)
 
     from pollypm.cockpit_ui import PollyInboxApp
 
@@ -83,20 +85,117 @@ def _run_cockpit_pane_fast(argv: list[str]) -> bool:
 def _paint_inbox_loading_placeholder() -> None:
     """Show an immediate frame while Textual builds and loads the inbox.
 
-    The cockpit's Home -> Inbox budget is measured from keypress to first
-    visible pane content. ``PollyInboxApp.on_mount`` still performs the real
-    inbox read before its first Textual frame, so print a minimal truthful
-    loading frame before importing/rendering the heavy app work.
+    This deliberately avoids the issue's pass substrings. The follow-up
+    prepaint prints real inbox data once it has been read.
     """
     try:
         sys.stdout.write(
             f"{_CLEAR_SCREEN}"
             "Inbox\n\n"
-            "Loading action needed items..."
+            "Loading messages..."
         )
         sys.stdout.flush()
     except Exception:  # noqa: BLE001 - placeholder must never block launch
         pass
+
+
+def _paint_inbox_snapshot(config_path: Path, *, project: str | None) -> None:
+    """Prepaint a real inbox list before importing the interactive TUI."""
+    try:
+        from pollypm.cockpit_inbox_items import load_inbox_entries
+        from pollypm.config import load_config
+
+        config = load_config(config_path)
+        items, unread, _replies = load_inbox_entries(config)
+        visible = _initial_inbox_visible_items(items, project=project)
+        frame = _render_inbox_snapshot(
+            visible,
+            total=len(items),
+            unread_count=len(unread),
+            project=project,
+        )
+        sys.stdout.write(f"{_CLEAR_SCREEN}{frame}")
+        sys.stdout.flush()
+    except Exception:  # noqa: BLE001 - fast prepaint must never block launch
+        pass
+
+
+def _initial_inbox_visible_items(
+    items: list[object], *, project: str | None,
+) -> list[object]:
+    try:
+        from pollypm.notify_task import is_notify_only_inbox_entry
+    except Exception:  # noqa: BLE001
+        def is_notify_only_inbox_entry(_item: object) -> bool:
+            return False
+
+    candidates: list[object] = []
+    for item in items:
+        if project and (getattr(item, "project", "") or "") != project:
+            continue
+        if getattr(item, "is_orphaned", False):
+            continue
+        if (
+            is_notify_only_inbox_entry(item)
+            and not getattr(item, "needs_action", False)
+        ):
+            continue
+        candidates.append(item)
+    if any(getattr(item, "needs_action", False) for item in candidates):
+        return [item for item in candidates if getattr(item, "needs_action", False)]
+    return candidates
+
+
+def _render_inbox_snapshot(
+    items: list[object],
+    *,
+    total: int,
+    unread_count: int,
+    project: str | None,
+) -> str:
+    lines = ["Inbox", ""]
+    if not items:
+        lines.append("Inbox is clear.")
+        return "\n".join(lines)
+
+    action_lens = any(getattr(item, "needs_action", False) for item in items)
+    lines.append("action needed" if action_lens else "messages")
+    for item in items[:_INBOX_PREPAINT_LIMIT]:
+        title = _clip(_plain_inbox_text(getattr(item, "title", "") or "(no subject)"))
+        project_key = _plain_inbox_text(getattr(item, "project", "") or "inbox")
+        label = _plain_inbox_text(getattr(item, "triage_label", "") or "")
+        marker = "*" if getattr(item, "task_id", None) else "-"
+        lines.append(f"{marker} {title}")
+        meta = "  " + project_key
+        if label:
+            meta += f"  -  {label}"
+        lines.append(meta)
+    if len(items) > _INBOX_PREPAINT_LIMIT:
+        remaining = len(items) - _INBOX_PREPAINT_LIMIT
+        lines.append(f"... {remaining} more")
+    verb = "needs" if len(items) == 1 else "need"
+    status = (
+        f"{len(items)} {verb} action"
+        if action_lens
+        else f"{len(items)} messages"
+    )
+    if unread_count:
+        status += f" - {unread_count} unread"
+    if project:
+        status += f" - project:{project}"
+    if total != len(items):
+        status += f" - {total} total"
+    lines.append(status)
+    return "\n".join(lines)
+
+
+def _plain_inbox_text(value: object) -> str:
+    text = str(value or "").replace("\n", " ").strip()
+    return " ".join(text.split())
+
+
+def _clip(text: str, width: int = 74) -> str:
+    return text if len(text) <= width else text[: width - 3] + "..."
 
 
 def main() -> None:

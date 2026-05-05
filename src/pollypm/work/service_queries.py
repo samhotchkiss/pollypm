@@ -186,7 +186,19 @@ def list_nonterminal_tasks(
         params,
     ).fetchall()
     token_sums = service._load_task_token_sums_bulk(project=project)
-    return [service._row_to_task(row, token_sums=token_sums) for row in rows]
+    from pollypm.work.sqlite_service import _safe_json_list
+
+    tasks: list[Task] = []
+    for row in rows:
+        labels = set(_safe_json_list(row["labels"]))
+        tasks.append(
+            service._row_to_task(
+                row,
+                token_sums=token_sums,
+                include_history="plan_review" in labels,
+            )
+        )
+    return tasks
 
 
 def update_task(service: "SQLiteWorkService", task_id: str, **fields: object) -> Task:

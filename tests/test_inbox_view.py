@@ -28,6 +28,7 @@ from pollypm.work.models import (
     TaskType,
     WorkStatus,
 )
+from pollypm.work.sqlite_service import SQLiteWorkService
 
 
 runner = CliRunner()
@@ -254,6 +255,41 @@ class TestInboxTasksQuery:
         assert None not in svc.queried_statuses
         assert WorkStatus.DONE.value not in svc.queried_statuses
         assert WorkStatus.CANCELLED.value not in svc.queried_statuses
+
+    def test_sqlite_nonterminal_query_uses_lightweight_task_hydration(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ):
+        """The first inbox list should not load per-task history rows."""
+
+        svc = SQLiteWorkService(
+            db_path=tmp_path / "state.db",
+            project_path=tmp_path,
+        )
+        try:
+            task = svc.create(
+                title="Open request",
+                type="task",
+                project="proj",
+                flow_template="chat",
+                roles={"requester": "user"},
+            )
+            svc.add_context(task.task_id, "agent", "large prior context")
+
+            def fail_history_load(project: str, task_number: int):
+                raise AssertionError(
+                    f"history loaded for {project}/{task_number}"
+                )
+
+            monkeypatch.setattr(svc, "_load_context_entries", fail_history_load)
+
+            matches = inbox_tasks(svc)
+        finally:
+            svc.close()
+
+        assert [task.task_id for task in matches] == ["proj/1"]
+        assert matches[0].context == []
 
     def test_sort_priority_desc_then_updated_desc(self):
         # Three tasks, all matching:

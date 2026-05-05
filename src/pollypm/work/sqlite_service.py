@@ -1020,6 +1020,8 @@ class SQLiteWorkService:
         self,
         row: sqlite3.Row,
         token_sums: dict[tuple[str, int], tuple[int, int, int]] | None = None,
+        *,
+        include_history: bool = True,
     ) -> Task:
         """Build a Task dataclass from a database row.
 
@@ -1033,10 +1035,16 @@ class SQLiteWorkService:
         project = row["project"]
         task_number = row["task_number"]
 
-        transitions = self._load_transitions(project, task_number)
-        executions = self._load_executions(project, task_number)
-        rels = self._load_relationships(project, task_number)
-        context_entries = self._load_context_entries(project, task_number)
+        if include_history:
+            transitions = self._load_transitions(project, task_number)
+            executions = self._load_executions(project, task_number)
+            rels = self._load_relationships(project, task_number)
+            context_entries = self._load_context_entries(project, task_number)
+        else:
+            transitions = []
+            executions = []
+            rels = {}
+            context_entries = []
 
         if token_sums is not None:
             tokens_in, tokens_out, sess_count = token_sums.get(

@@ -7181,12 +7181,10 @@ class PollyInboxApp(App[None]):
         Binding("ctrl+r", "refresh", "Refresh", show=False),
         Binding("ctrl+k,colon", "open_command_palette", "Palette", priority=True),
         Binding("question_mark", "show_keyboard_help", "Help", priority=True),
-        # #789: previously labelled "Back", but at the list level
-        # ``action_back_or_cancel`` calls ``self.exit()`` which tears
-        # down the entire right pane. ``Close`` matches what actually
-        # happens; from the filter or reply input we still bounce
-        # focus back to the list before exit kicks in.
-        Binding("q,escape", "back_or_cancel", "Close"),
+        # At the list level, Esc/q should hand focus back to the rail
+        # without tearing down the right-pane process. From filter or
+        # reply input we still bounce focus back to the list.
+        Binding("q,escape", "back_or_cancel", "Rail"),
         # #985 — escape hatch from the inbox back to the rail without
         # tearing down the inbox app. Without this binding, once the
         # user's tmux client focuses the right pane (e.g. via the
@@ -8639,20 +8637,17 @@ class PollyInboxApp(App[None]):
         self._refresh_list(select_first=False)
 
     def action_back_or_cancel(self) -> None:
-        """Esc/q returns focus to the list from inputs, else hands tmux
-        focus back to the rail (#985).
+        """Esc/q returns focus to the list from inputs, else focuses rail.
 
         From the filter Input: clears the typed query + closes the bar
         (per the brief — "Esc clears + closes"). Chip toggles aren't
         cleared here; ``c`` is the explicit "wipe everything" key.
 
         Top-level Esc/q used to call ``self.exit()`` directly, which
-        tore down the inbox app but left tmux focus on the right pane
-        (the dead shell that respawned ``pm cockpit-pane inbox``).
-        That broke #985: the user could read inbox entries but had no
-        keyboard path back to the rail. Now we shift tmux focus to the
-        rail first so j/k start moving the rail cursor again, then
-        exit so the right pane re-mounts cleanly on the next route.
+        tore down the inbox app. During bridge-driven smoke tests, a
+        stale filter-focus flag could route a harmless ``<esc>`` here
+        and close the pane mid-scenario (#1237). Keep the app alive and
+        only shift tmux focus so j/k start moving the rail cursor again.
         """
         if self.filter_input.has_focus:
             self._filter_text = ""
@@ -8667,7 +8662,6 @@ class PollyInboxApp(App[None]):
             self.list_view.focus()
             return
         self._focus_cockpit_rail()
-        self.exit()
 
     def action_focus_rail(self) -> None:
         """Hand tmux focus to the cockpit rail without tearing the inbox down.

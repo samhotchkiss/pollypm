@@ -2706,17 +2706,16 @@ def test_inbox_ctrl_h_returns_focus_to_rail_without_exiting(
     _run(body())
 
 
-def test_inbox_back_or_cancel_focuses_rail_before_exit(
+def test_inbox_back_or_cancel_focuses_rail_without_exit(
     inbox_env, inbox_app, monkeypatch,
 ) -> None:
-    """Top-level ``q``/``Esc`` exits the inbox (legacy behaviour) AND
-    shifts tmux focus to the rail (#985).
+    """Top-level ``q``/``Esc`` shifts tmux focus to the rail without
+    tearing down the Inbox pane (#985/#1237).
 
-    Before this fix, ``self.exit()`` tore down the inbox app but left
-    tmux focus on the now-shell-only right pane. The user could no
-    longer drive the rail with j/k — the cockpit had to be killed
-    and restarted. The fix calls ``focus_cockpit_rail_pane`` before
-    exit so the user lands on the rail with one keystroke.
+    Closing the right-pane process on a normal escape key can leave the
+    cockpit in a degraded or vanished-session state during bridge-driven
+    smoke tests. The safe behavior is to keep the pane running and hand
+    focus back to the rail.
     """
     calls: list[Path] = []
 
@@ -2733,6 +2732,7 @@ def test_inbox_back_or_cancel_focuses_rail_before_exit(
             await pilot.pause()
 
             assert calls == [inbox_env["config_path"]]
+            assert inbox_app.is_running
     _run(body())
 
 

@@ -1882,12 +1882,86 @@ class PollyCockpitApp(App[None]):
     def _nav_items(self) -> list[CockpitItem]:
         return [item for item in self._items if item.key != "settings"]
 
+    # #1208 — guard so only one ``build_items`` worker is in flight at a
+    # time. Without it, every periodic tick that finds the state mtime
+    # newer than the previous one stacks another worker, all racing on
+    # the same supervisor + DB; the UI thread then ends up sequentially
+    # applying ~10 stale builds and the rail looks frozen.
+    _refresh_in_flight: bool = False
+
     def _refresh_rows(self) -> None:
+        """Refresh the rail rows without blocking the UI thread.
+
+        ``router.build_items`` walks the supervisor + plugin rail
+        registry + recent-events log; on a populated install that is
+        ~1.5-2s of synchronous I/O. Running it on the UI thread blocks
+        every keystroke for the duration — including the cold-path
+        capital ``I`` that #1208 tracks.
+
+        We split the refresh into two steps:
+
+        1. Off-thread (worker pool): ``build_items`` produces the new
+           ``CockpitItem`` list. No UI mutation here — pure data load.
+        2. On-thread (UI): apply the items, rebuild row widgets,
+           restore the cursor index.
+
+        Step 2 itself is dominated by ``self.nav.extend(rows)`` for ~25
+        rows — a few ms — so the UI-thread cost is negligible after
+        step 1 lands. ``_refresh_in_flight`` debounces overlapping
+        scheduled refreshes.
+
+        Falls back to inline execution when no event loop is available
+        (unit tests that bypass ``App.__init__``) so existing test
+        harnesses keep working.
+        """
+        if self._refresh_in_flight:
+            return
         self._adopt_router_selection_if_changed()
+        spinner_index = self.spinner_index
+
+        def _build() -> "list[CockpitItem]":
+            return self.router.build_items(spinner_index=spinner_index)
+
+        def _apply(items: "list[CockpitItem]") -> None:
+            try:
+                self._refresh_in_flight = False
+                self._apply_built_items(items)
+            except Exception:  # noqa: BLE001
+                pass
+
         try:
-            self._items = self.router.build_items(spinner_index=self.spinner_index)
+            self._refresh_in_flight = True
+            self.run_worker(
+                lambda: self._refresh_rows_worker(_build, _apply),
+                thread=True,
+                exclusive=True,
+                group="rail_refresh",
+            )
         except Exception:  # noqa: BLE001
-            return  # keep previous items rather than crashing the rail
+            # No event loop (unit tests) — execute inline.
+            self._refresh_in_flight = False
+            try:
+                items = _build()
+            except Exception:  # noqa: BLE001
+                return
+            self._apply_built_items(items)
+
+    def _refresh_rows_worker(self, build_fn, apply_fn) -> None:
+        try:
+            items = build_fn()
+        except Exception:  # noqa: BLE001
+            try:
+                self.call_from_thread(setattr, self, "_refresh_in_flight", False)
+            except Exception:  # noqa: BLE001
+                self._refresh_in_flight = False
+            return
+        try:
+            self.call_from_thread(apply_fn, items)
+        except Exception:  # noqa: BLE001
+            apply_fn(items)
+
+    def _apply_built_items(self, items: "list[CockpitItem]") -> None:
+        self._items = items
         # Track working→idle transitions for unread indicators
         new_working: set[str] = set()
         for item in self._items:
@@ -2516,6 +2590,19 @@ class PollyCockpitApp(App[None]):
 
     _ROUTE_SELECT_TIMEOUT_SECONDS: float = 20.0
 
+    # #1208 — keys that map to static cockpit views (no sub-item
+    # expansion needed in the rail). Clicks on these keys skip the
+    # synchronous ``_refresh_rows`` rebuild on the click path because
+    # ``router.build_items`` is ~1.5-2s on a populated install. The
+    # active-marker update via ``_apply_active_view_to_rows`` is
+    # sufficient for the optimistic UI; the next periodic ``_tick``
+    # (0.8s) picks up any data changes. Project keys must NOT be in
+    # this set — pressing Enter on a project should expand its
+    # sub-items immediately (#1192).
+    _STATIC_RAIL_KEYS = frozenset(
+        {"dashboard", "inbox", "workers", "metrics", "activity", "settings", "polly"},
+    )
+
     # Monotonically-increasing click counter (#967). Each click bumps
     # this; the value at click time is captured by the worker thread
     # and re-checked before any post-route UI update is applied. A
@@ -2590,8 +2677,29 @@ class PollyCockpitApp(App[None]):
             self.hint.update(self._route_status_hint)
         except Exception:  # noqa: BLE001
             pass
+        # #1208 — for static rail keys (``inbox``, ``dashboard``,
+        # ``workers``, ``metrics``, ``activity``, ``settings``) skip the
+        # heavy synchronous ``_refresh_rows`` and only paint the
+        # optimistic active marker via the cheap
+        # ``_apply_active_view_to_rows``. ``_refresh_rows`` calls
+        # ``router.build_items`` which loads the supervisor, walks every
+        # plugin section, and reads the recent events log; on a populated
+        # install that is ~1.5-2s of UI-thread blocking work which
+        # delays ``_dispatch_route_in_worker`` and pushes the cold-path
+        # capital ``I`` budget over 2s. Static keys do not require row
+        # rebuilds (no sub-item expansion) so the lighter active-marker
+        # update is sufficient — the next periodic ``_tick`` (0.8s)
+        # picks up any data changes. Project keys still need a
+        # synchronous refresh so sub-items expand on Enter (#1192).
+        is_static_key = (
+            isinstance(key, str)
+            and key in self._STATIC_RAIL_KEYS
+        )
         try:
-            self._refresh_rows()
+            if is_static_key:
+                self._apply_active_view_to_rows()
+            else:
+                self._refresh_rows()
         except Exception:  # noqa: BLE001
             pass
         self._dispatch_route_in_worker(key, seq)
@@ -7230,12 +7338,10 @@ class PollyInboxApp(App[None]):
         Binding("ctrl+r", "refresh", "Refresh", show=False),
         Binding("ctrl+k,colon", "open_command_palette", "Palette", priority=True),
         Binding("question_mark", "show_keyboard_help", "Help", priority=True),
-        # #789: previously labelled "Back", but at the list level
-        # ``action_back_or_cancel`` calls ``self.exit()`` which tears
-        # down the entire right pane. ``Close`` matches what actually
-        # happens; from the filter or reply input we still bounce
-        # focus back to the list before exit kicks in.
-        Binding("q,escape", "back_or_cancel", "Close"),
+        # At the list level, Esc/q should hand focus back to the rail
+        # without tearing down the right-pane process. From filter or
+        # reply input we still bounce focus back to the list.
+        Binding("q,escape", "back_or_cancel", "Rail"),
         # #985 — escape hatch from the inbox back to the rail without
         # tearing down the inbox app. Without this binding, once the
         # user's tmux client focuses the right pane (e.g. via the
@@ -8762,20 +8868,17 @@ class PollyInboxApp(App[None]):
         self._refresh_list(select_first=False)
 
     def action_back_or_cancel(self) -> None:
-        """Esc/q returns focus to the list from inputs, else hands tmux
-        focus back to the rail (#985).
+        """Esc/q returns focus to the list from inputs, else focuses rail.
 
         From the filter Input: clears the typed query + closes the bar
         (per the brief — "Esc clears + closes"). Chip toggles aren't
         cleared here; ``c`` is the explicit "wipe everything" key.
 
         Top-level Esc/q used to call ``self.exit()`` directly, which
-        tore down the inbox app but left tmux focus on the right pane
-        (the dead shell that respawned ``pm cockpit-pane inbox``).
-        That broke #985: the user could read inbox entries but had no
-        keyboard path back to the rail. Now we shift tmux focus to the
-        rail first so j/k start moving the rail cursor again, then
-        exit so the right pane re-mounts cleanly on the next route.
+        tore down the inbox app. During bridge-driven smoke tests, a
+        stale filter-focus flag could route a harmless ``<esc>`` here
+        and close the pane mid-scenario (#1237). Keep the app alive and
+        only shift tmux focus so j/k start moving the rail cursor again.
         """
         if self.filter_input.has_focus:
             self._filter_text = ""
@@ -8791,7 +8894,6 @@ class PollyInboxApp(App[None]):
             self.list_view.focus()
             return
         self._focus_cockpit_rail()
-        self.exit()
 
     def action_focus_rail(self) -> None:
         """Hand tmux focus to the cockpit rail without tearing the inbox down.

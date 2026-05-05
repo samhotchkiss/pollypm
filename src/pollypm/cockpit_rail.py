@@ -22,6 +22,7 @@ back-compat shim defined there.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import select
 import shlex
@@ -68,6 +69,8 @@ from pollypm.runtimes import get_runtime
 # tasks); deferring this import shaves the supervisor cost off any pane
 # that doesn't instantiate a ``CockpitRouter``.
 from pollypm.session_services import create_tmux_client
+
+logger = logging.getLogger(__name__)
 
 
 # ── Color palette ────────────────────────────────────────────────────────────
@@ -706,6 +709,9 @@ class CockpitRouter:
     _COCKPIT_WINDOW = "PollyPM"
     _LEFT_PANE_WIDTH = 30  # default; actual value persisted in cockpit state.
     _STATE_WRITE_DEBOUNCE_SECONDS = 0.25
+    _SUPERVISOR_FREE_STATIC_KEYS = frozenset(
+        {"dashboard", "inbox", "workers", "metrics", "activity", "settings"},
+    )
 
     def __init__(self, config_path: Path) -> None:
         self.config_path = config_path
@@ -2612,6 +2618,8 @@ class CockpitRouter:
         self.set_selected_key(key)
         token = self._begin_layout_mutation()
         try:
+            if self._route_supervisor_free_static(key):
+                return
             supervisor = self._load_supervisor()
             window_target = f"{supervisor.config.project.tmux_session}:{self._COCKPIT_WINDOW}"
             self.ensure_cockpit_layout()
@@ -2643,6 +2651,67 @@ class CockpitRouter:
             except Exception:  # noqa: BLE001
                 pass
             self._end_layout_mutation(token)
+
+    def _route_supervisor_free_static(self, key: str) -> bool:
+        if key not in self._SUPERVISOR_FREE_STATIC_KEYS:
+            return False
+        state = self._load_state()
+        config = self._load_config()
+        has_mount_state = (
+            isinstance(state.get("mounted_session"), str)
+            or isinstance(state.get("mounted_identity"), dict)
+        )
+        if has_mount_state:
+            window_target = f"{config.project.tmux_session}:{self._COCKPIT_WINDOW}"
+            try:
+                panes = self.tmux.list_panes(window_target)
+            except Exception:  # noqa: BLE001
+                return False
+            right_pane_id = state.get("right_pane_id")
+            right_pane = next(
+                (
+                    pane for pane in panes
+                    if isinstance(right_pane_id, str)
+                    and getattr(pane, "pane_id", None) == right_pane_id
+                ),
+                None,
+            )
+            if right_pane is None and len(panes) >= 2:
+                right_pane = max(panes, key=self._pane_left)
+            if right_pane is not None and self._is_live_provider_pane(right_pane):
+                return False
+            state.pop("mounted_session", None)
+            state.pop("mounted_identity", None)
+        state.pop("mounted_return_key", None)
+        manager = CockpitWindowManager(
+            CockpitWindowSpec(
+                tmux_session=config.project.tmux_session,
+                cockpit_window=self._COCKPIT_WINDOW,
+                rail_width=self.rail_width(),
+                default_content_command=self._default_repair_command(state),
+                rail_command=None,
+            ),
+            self.tmux,
+        )
+        right_pane_id = state.get("right_pane_id")
+        result = manager.show_static(
+            self._right_pane_command(key),
+            CockpitWindowState(
+                right_pane_id=right_pane_id if isinstance(right_pane_id, str) else None,
+            ),
+        )
+        if not result.ok:
+            self._handle_invalid_static_route(result)
+        self._write_window_state(result.state, base=state)
+        return True
+
+    def _handle_invalid_static_route(self, result) -> None:
+        errors = "; ".join(result.postcondition.errors)
+        logger.warning("Cockpit pane layout invalid after static route: %s", errors)
+        try:
+            self._heal_layout_after_route()
+        except Exception:  # noqa: BLE001
+            logger.debug("Cockpit pane layout heal failed after static route.", exc_info=True)
 
     def _heal_layout_after_route(self) -> None:
         """Repair a degraded cockpit layout left over from a failed route.
@@ -3505,10 +3574,7 @@ class CockpitRouter:
             self._window_state_from_cockpit_state(supervisor, state),
         )
         if not result.ok:
-            raise RuntimeError(
-                "Cockpit pane layout is invalid after static route: "
-                + "; ".join(result.postcondition.errors)
-            )
+            self._handle_invalid_static_route(result)
         self._write_window_state(result.state, base=state)
 
     def _cleanup_extra_panes(self, window_target: str) -> None:
@@ -3591,15 +3657,21 @@ class CockpitRouter:
         *,
         task_id: str | None = None,
     ) -> str:
-        root = shlex.quote(str(self.config_path.parent.resolve()))
-        import shutil
-        pm_cmd = "pm" if shutil.which("pm") else "uv run pm"
+        root = str(self.config_path.parent.resolve())
+        package_parent = Path(__file__).resolve().parents[1]
+        python_path = str(package_parent)
+        existing_python_path = os.environ.get("PYTHONPATH")
+        if existing_python_path:
+            python_path = os.pathsep.join([python_path, existing_python_path])
         args = [
             "env",
             "POLLYPM_HOLD_UNUSABLE_DATABASE_SCREEN=1",
-            pm_cmd,
+            f"PYTHONPATH={python_path}",
+            sys.executable,
+            "-m",
+            "pollypm",
             "cockpit-pane",
-            shlex.quote(kind),
+            kind,
         ]
         if project_key is not None:
             # #751 — inbox and activity both use --project to scope
@@ -3607,20 +3679,21 @@ class CockpitRouter:
             # the positional target argument because they mount the
             # per-project screen directly, not a scoped filter.
             if kind in {"inbox", "activity"}:
-                args.extend(["--project", shlex.quote(project_key)])
+                args.extend(["--project", project_key])
             else:
-                args.append(shlex.quote(project_key))
+                args.append(project_key)
         if task_id is not None:
-            args.extend(["--task", shlex.quote(task_id)])
-        joined = " ".join(args)
-        # #986 — ``exec`` replaces the shell with the ``pm`` process so
+            args.extend(["--task", task_id])
+        joined = shlex.join(args)
+        # #986 — ``exec`` replaces the shell with the pane CLI process so
         # tmux's ``respawn-pane -k`` SIGKILL hits the Python child
         # directly. Without ``exec`` the shell parent is killed but its
         # Python child survives, reparenting to PID 1 across cockpit
         # kill+restart cycles. Each respawn would then leak one
         # cockpit-pane orphan that holds open file handles, races the
         # fresh cockpit's right-pane app, and persists across boots.
-        return f"sh -lc 'cd {root} && exec {joined}'"
+        inner = f"cd {shlex.quote(root)} && exec {joined}"
+        return f"sh -lc {shlex.quote(inner)}"
 
 
 def focus_cockpit_rail_pane(config_path: Path) -> bool:

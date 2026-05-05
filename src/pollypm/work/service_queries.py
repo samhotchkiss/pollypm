@@ -170,6 +170,39 @@ def list_tasks(
     return tasks
 
 
+def list_nonterminal_tasks(
+    service: "SQLiteWorkService",
+    *,
+    project: str | None = None,
+) -> list[Task]:
+    clauses = ["work_status NOT IN (?, ?)"]
+    params: list[object] = [WorkStatus.DONE.value, WorkStatus.CANCELLED.value]
+    if project is not None:
+        clauses.append("project = ?")
+        params.append(project)
+    rows = service._conn.execute(
+        f"SELECT * FROM work_tasks WHERE {' AND '.join(clauses)} "
+        "ORDER BY project, task_number",
+        params,
+    ).fetchall()
+    token_sums = service._load_task_token_sums_bulk(project=project)
+    tasks: list[Task] = []
+    for row in rows:
+        try:
+            raw_labels = json.loads(row["labels"] or "[]")
+        except (TypeError, ValueError):
+            raw_labels = []
+        labels = set(raw_labels if isinstance(raw_labels, list) else [])
+        tasks.append(
+            service._row_to_task(
+                row,
+                token_sums=token_sums,
+                include_history="plan_review" in labels,
+            )
+        )
+    return tasks
+
+
 def update_task(service: "SQLiteWorkService", task_id: str, **fields: object) -> Task:
     if "work_status" in fields:
         raise ValidationError(

@@ -4083,7 +4083,7 @@ def test_cockpit_ui_arrow_and_enter_route_selected(tmp_path: Path) -> None:
 
 
 def test_cockpit_send_key_inbox_shortcut_keeps_rail_nav_active(tmp_path: Path) -> None:
-    """#1206: after global ``I``, Down/Up still move the rail cursor."""
+    """#1206/#1236: after global ``I``, Down/Up still move the rail."""
 
     class FakeRouter:
         def __init__(self) -> None:
@@ -4418,6 +4418,11 @@ def test_cockpit_app_open_live_session_keeps_rail_focus_until_tab() -> None:
     # synchronously to paint the optimistic loading state, then the
     # worker calls ``route_selected`` and refreshes again with the
     # resolved key. Order: refresh, route, refresh.
+    #
+    # ``russell`` is a project key so it goes through the project path
+    # which still calls ``_refresh_rows`` synchronously to expand
+    # sub-items (#1192). #1208 only skipped the synchronous refresh
+    # for static rail keys (inbox/dashboard/workers/etc).
     assert ("route", "russell") in calls
     assert calls.count("refresh") >= 2
 
@@ -5339,7 +5344,7 @@ class _StubNav:
 
 
 def test_cockpit_jk_from_inbox_navigates_rail_round_trip() -> None:
-    """#1206: active Inbox must not capture rail navigation keys."""
+    """#1236: active Inbox must not capture rail navigation keys."""
     app = PollyCockpitApp.__new__(PollyCockpitApp)
     items = [
         _StubItem("inbox"),
@@ -5757,6 +5762,156 @@ def test_async_click_dispatches_via_run_worker_when_available() -> None:
     assert ("route", "settings") not in events
 
 
+def test_refresh_rows_runs_build_items_off_ui_thread_when_event_loop_present() -> None:
+    """#1208 — ``_refresh_rows`` MUST hand ``router.build_items`` off
+    to a thread worker so the UI thread is free during the ~1.5-2s
+    that ``build_items`` takes on a populated install. Without this,
+    every periodic ``_tick`` (0.8s) blocks keystroke processing for
+    seconds at a time and the cold-path capital ``I`` falls behind
+    the 2s budget. The test asserts that when ``run_worker`` is
+    available (production), ``build_items`` is NOT invoked
+    synchronously from ``_refresh_rows``.
+    """
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    build_calls: list[str] = []
+
+    class _Router:
+        def build_items(self, *, spinner_index: int = 0) -> list:
+            build_calls.append("build")
+            return []
+
+        def selected_key(self) -> str:
+            return "polly"
+
+    app.router = _Router()  # type: ignore[assignment]
+    app.spinner_index = 0
+    app.selected_key = "polly"
+    app._refresh_in_flight = False
+
+    worker_payloads: list = []
+
+    def _fake_run_worker(callable_, *, thread, exclusive, group):
+        # Capture the worker but do NOT execute it — we are asserting
+        # that ``build_items`` runs in the worker (off-UI), not inline.
+        worker_payloads.append((callable_, thread, exclusive, group))
+
+    app.run_worker = _fake_run_worker  # type: ignore[method-assign]
+    app._adopt_router_selection_if_changed = lambda: None  # type: ignore[method-assign]
+
+    app._refresh_rows()
+
+    assert build_calls == [], (
+        "_refresh_rows must run ``build_items`` on a worker thread, "
+        "not inline on the UI thread (#1208)"
+    )
+    assert len(worker_payloads) == 1, (
+        "_refresh_rows must dispatch exactly one worker"
+    )
+    _, thread, exclusive, group = worker_payloads[0]
+    assert thread is True
+    assert exclusive is True
+    assert group == "rail_refresh"
+    assert app._refresh_in_flight is True
+
+
+def test_refresh_rows_falls_back_to_inline_when_no_event_loop() -> None:
+    """When no event loop is available (unit tests that bypass
+    ``App.__init__``), ``_refresh_rows`` MUST fall back to inline
+    execution so existing test harnesses that rely on synchronous
+    behaviour keep working.
+    """
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    build_calls: list[str] = []
+    apply_calls: list[str] = []
+
+    class _Item:
+        key = "polly"
+        state = "idle"
+        selectable = True
+
+    class _Router:
+        def build_items(self, *, spinner_index: int = 0) -> list:
+            build_calls.append("build")
+            return [_Item()]
+
+        def selected_key(self) -> str:
+            return "polly"
+
+    app.router = _Router()  # type: ignore[assignment]
+    app.spinner_index = 0
+    app.selected_key = "polly"
+    app._refresh_in_flight = False
+    app._adopt_router_selection_if_changed = lambda: None  # type: ignore[method-assign]
+    app._apply_built_items = (  # type: ignore[method-assign]
+        lambda items: apply_calls.append(f"apply:{len(items)}")
+    )
+
+    # No ``run_worker`` attribute — emulate the no-event-loop path.
+
+    app._refresh_rows()
+
+    assert build_calls == ["build"], "inline fallback must call build_items"
+    assert apply_calls == ["apply:1"], (
+        "inline fallback must call _apply_built_items with the items"
+    )
+
+
+def test_schedule_route_static_key_skips_refresh_rows_synchronously() -> None:
+    """#1208 — pressing capital ``I`` from the cockpit measured 5-9s
+    cold-path latency to first inbox content visible. Instrumentation
+    pinned ~1.5-2s of the gap to ``_refresh_rows`` running on the UI
+    thread inside ``_schedule_route_selected`` BEFORE the route worker
+    was dispatched. ``_refresh_rows`` calls
+    ``router.build_items`` which loads the supervisor, walks every
+    plugin section (`launches`, `windows`, `alerts`, `recent_events`
+    with limit=300) and does per-project session-metadata attaches —
+    on a populated install that is ~1.5-2s of synchronous I/O on the
+    UI thread.
+
+    For static rail keys (``inbox``, ``dashboard``, ``workers``,
+    ``metrics``, ``activity``, ``settings``) the click handler now
+    paints the optimistic active marker via the cheap
+    ``_apply_active_view_to_rows`` (a per-row class flip) instead of
+    the full row rebuild. Project keys still get a synchronous
+    refresh so sub-items expand on Enter (#1192).
+
+    This regression test pins that for ``inbox`` the heavy
+    ``_refresh_rows`` is NOT called on the click path so the slow
+    path can't sneak back in.
+    """
+    app, events = _make_async_click_app()
+    refresh_calls: list[str] = []
+    apply_active_calls: list[str] = []
+
+    def _spy_refresh() -> None:
+        refresh_calls.append("refresh")
+        events.append("refresh")
+
+    def _spy_apply_active() -> None:
+        apply_active_calls.append("apply_active")
+
+    def _spy_dispatch(key: str, seq: int = 0) -> None:
+        events.append(("dispatch", key))
+
+    app._refresh_rows = _spy_refresh  # type: ignore[method-assign]
+    app._apply_active_view_to_rows = _spy_apply_active  # type: ignore[method-assign]
+    app._dispatch_route_in_worker = _spy_dispatch  # type: ignore[assignment]
+
+    app.action_open_inbox()
+
+    assert apply_active_calls == ["apply_active"], (
+        "lightweight active-marker update must run on the click path"
+    )
+    assert refresh_calls == [], (
+        "_refresh_rows must NOT be called synchronously from the click "
+        "handler for static keys — it blocks the UI thread for ~1.5-2s "
+        "on a populated install (router.build_items loads supervisor + "
+        "plugin rail registry + recent_events) and pushes capital-I "
+        "cold path past the 2s budget tracked by issue #1208"
+    )
+    assert ("dispatch", "inbox") in events
+
+
 def test_async_click_surfaces_timeout_on_slow_route() -> None:
     """A blocked route call MUST surface a timeout in the loading
     pane within the deadline rather than hang the click forever."""
@@ -6126,6 +6281,52 @@ def test_default_repair_command_uses_home_dashboard(tmp_path: Path) -> None:
     assert "cockpit-pane polly" in router._default_repair_command(
         {"selected": "polly"}
     )
+
+
+def test_static_route_postcondition_error_is_logged_not_raised(
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    """#1235: static route layout races must not bubble up as rail hints."""
+
+    from pollypm.cockpit_window_manager import CockpitWindowState
+
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\n"
+        f"base_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+    router = CockpitRouter(config_path)
+    router._write_state(
+        {"selected": "project:booktalk:dashboard", "right_pane_id": "%2"}
+    )
+    healed: list[bool] = []
+    router._heal_layout_after_route = lambda: healed.append(True)  # type: ignore[method-assign]
+
+    class FakeManager:
+        def show_static(self, command, state):  # noqa: ANN001
+            assert command == "pm cockpit-pane project booktalk"
+            assert state.right_pane_id == "%2"
+            return SimpleNamespace(
+                ok=False,
+                state=CockpitWindowState(right_pane_id="%2"),
+                postcondition=SimpleNamespace(
+                    errors=("expected exactly 2 live panes, found 1",),
+                ),
+            )
+
+    router._window_manager = lambda _supervisor: FakeManager()  # type: ignore[method-assign]
+
+    with caplog.at_level("WARNING", logger="pollypm.cockpit_rail"):
+        router._show_command_view(
+            SimpleNamespace(),
+            "pollypm:PollyPM",
+            "pm cockpit-pane project booktalk",
+        )
+
+    assert healed == [True]
+    assert "Cockpit pane layout invalid after static route" in caplog.text
+    assert router._load_state()["right_pane_id"] == "%2"
 
 
 def test_cockpit_pane_subprocess_dies_with_shell_wrapper(tmp_path: Path) -> None:

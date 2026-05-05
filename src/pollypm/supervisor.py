@@ -53,6 +53,7 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -859,8 +860,8 @@ class Supervisor:
             else:
                 self.session_service.tmux.create_window(storage_session, launch.window_name, launch.command, detached=True)
             target = f"{storage_session}:{launch.window_name}"
-            self.session_service.tmux.set_window_option(target, "allow-passthrough", "on")
-            self.session_service.tmux.set_window_option(target, "focus-events", "on")
+            self._set_window_option_best_effort(target, "allow-passthrough", "on")
+            self._set_window_option_best_effort(target, "focus-events", "on")
             self.session_service.tmux.pipe_pane(target, launch.log_path)
             self._record_launch(launch)
             created += 1
@@ -898,8 +899,8 @@ class Supervisor:
                 on_status(f"Creating {first.session.name}...")
             first_pane_id = self.session_service.tmux.create_session(storage_session, first.window_name, first.command)
             window_target = f"{storage_session}:{first.window_name}"
-            self.session_service.tmux.set_window_option(window_target, "allow-passthrough", "on")
-            self.session_service.tmux.set_window_option(window_target, "focus-events", "on")
+            self._set_window_option_best_effort(window_target, "allow-passthrough", "on")
+            self._set_window_option_best_effort(window_target, "focus-events", "on")
             self.session_service.tmux.pipe_pane(window_target, first.log_path)
             self._record_launch(first)
             # Use pane ID from create_session for unambiguous targeting
@@ -910,8 +911,8 @@ class Supervisor:
                     on_status(f"Creating {launch.session.name}...")
                 pane_id = self.session_service.tmux.create_window(storage_session, launch.window_name, launch.command, detached=True)
                 window_target = f"{storage_session}:{launch.window_name}"
-                self.session_service.tmux.set_window_option(window_target, "allow-passthrough", "on")
-                self.session_service.tmux.set_window_option(window_target, "focus-events", "on")
+                self._set_window_option_best_effort(window_target, "allow-passthrough", "on")
+                self._set_window_option_best_effort(window_target, "focus-events", "on")
                 self.session_service.tmux.pipe_pane(window_target, launch.log_path)
                 self._record_launch(launch)
                 # Use pane ID returned by create_window for unambiguous targeting
@@ -921,10 +922,10 @@ class Supervisor:
         # Phase 2: Create the cockpit session so the user can attach immediately.
         self.session_service.tmux.create_session(session_name, self._CONSOLE_WINDOW, self._console_command(), remain_on_exit=False)
         console_target = f"{session_name}:{self._CONSOLE_WINDOW}"
-        self.session_service.tmux.set_window_option(console_target, "allow-passthrough", "on")
-        self.session_service.tmux.set_window_option(console_target, "focus-events", "on")
-        self.session_service.tmux.set_window_option(console_target, "window-size", "latest")
-        self.session_service.tmux.set_window_option(console_target, "aggressive-resize", "on")
+        self._set_window_option_best_effort(console_target, "allow-passthrough", "on")
+        self._set_window_option_best_effort(console_target, "focus-events", "on")
+        self._set_window_option_best_effort(console_target, "window-size", "latest")
+        self._set_window_option_best_effort(console_target, "aggressive-resize", "on")
         self.focus_console()
 
         # Phase 3: Finish the slow provider bootstrap in the background.
@@ -938,6 +939,18 @@ class Supervisor:
         )
         coordinator.start()
         self._bootstrap_completion_thread = coordinator
+
+    def _set_window_option_best_effort(self, target: str, option: str, value: str) -> None:
+        try:
+            self.session_service.tmux.set_window_option(target, option, value)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            logger.warning(
+                "tmux set-window-option failed for %s %s=%s during bootstrap; continuing: %s",
+                target,
+                option,
+                value,
+                exc,
+            )
 
     def _finish_bootstrap_sessions(
         self,

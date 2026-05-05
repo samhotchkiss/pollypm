@@ -29,6 +29,7 @@ def _clear_gate_bypass(monkeypatch: pytest.MonkeyPatch) -> None:
     The migration-gate suite exercises the gate itself, so we clear it.
     """
     monkeypatch.delenv("POLLYPM_SKIP_MIGRATION_GATE", raising=False)
+    monkeypatch.delenv("POLLYPM_HOLD_UNUSABLE_DATABASE_SCREEN", raising=False)
 
 
 def _fresh_state_db(path: Path) -> Path:
@@ -294,6 +295,32 @@ def test_refuse_start_reports_corrupt_db_without_migration_advice(
     assert "pm restore" in captured.err
     assert "Cannot start" not in captured.err
     assert "Apply (recommended)" not in captured.err
+
+
+def test_unusable_db_hold_mode_parks_after_rendering_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    db_path = _write_corrupt_db(tmp_path / "state.db")
+    error = mig_mod.UnusableDatabaseError(db_path, "file is not a database")
+    held: list[int] = []
+
+    def fake_hold(*, code: int) -> None:
+        held.append(code)
+        raise SystemExit(99)
+
+    monkeypatch.setenv("POLLYPM_HOLD_UNUSABLE_DATABASE_SCREEN", "1")
+    monkeypatch.setattr(mig_mod, "_hold_unusable_database_screen", fake_hold)
+
+    with pytest.raises(SystemExit) as exc:
+        mig_mod.exit_unusable_database(error, code=2)
+
+    captured = capsys.readouterr()
+    assert exc.value.code == 99
+    assert held == [2]
+    assert "Cannot use state.db" in captured.err
+    assert "pm restore" in captured.err
 
 
 def test_migration_gate_skipped_when_bypass_env_set(

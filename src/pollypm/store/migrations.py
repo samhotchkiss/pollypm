@@ -439,7 +439,21 @@ def format_unusable_database_message(error: UnusableDatabaseError) -> str:
 def exit_unusable_database(error: UnusableDatabaseError, *, code: int = 2) -> None:
     """Print the corruption message and exit with a non-zero CLI code."""
     sys.stderr.write(format_unusable_database_message(error) + "\n")
+    sys.stderr.flush()
+    if hold_unusable_database_screen_enabled():
+        _hold_unusable_database_screen(code=code)
     raise SystemExit(code)
+
+
+def _hold_unusable_database_screen(*, code: int) -> None:
+    """Keep a cockpit pane alive after rendering an unrecoverable DB error."""
+    import time
+
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt as exc:
+        raise SystemExit(code) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -451,10 +465,15 @@ def exit_unusable_database(error: UnusableDatabaseError, *, code: int = 2) -> No
 # migration CLI can actually open the store to fix the situation. Also
 # useful for tests that want to exercise the raw store.
 _BYPASS_ENV = "POLLYPM_SKIP_MIGRATION_GATE"
+_HOLD_UNUSABLE_DATABASE_ENV = "POLLYPM_HOLD_UNUSABLE_DATABASE_SCREEN"
 
 
 def bypass_env_is_set() -> bool:
     return bool(os.environ.get(_BYPASS_ENV))
+
+
+def hold_unusable_database_screen_enabled() -> bool:
+    return bool(os.environ.get(_HOLD_UNUSABLE_DATABASE_ENV))
 
 
 def set_bypass(enabled: bool) -> None:

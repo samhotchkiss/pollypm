@@ -3493,7 +3493,13 @@ class CockpitRouter:
         root = shlex.quote(str(self.config_path.parent.resolve()))
         import shutil
         pm_cmd = "pm" if shutil.which("pm") else "uv run pm"
-        args = [pm_cmd, "cockpit-pane", shlex.quote(kind)]
+        args = [
+            "env",
+            "POLLYPM_HOLD_UNUSABLE_DATABASE_SCREEN=1",
+            pm_cmd,
+            "cockpit-pane",
+            shlex.quote(kind),
+        ]
         if project_key is not None:
             # #751 — inbox and activity both use --project to scope
             # their view. Other views (settings/issues/project) use

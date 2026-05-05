@@ -5702,6 +5702,10 @@ def test_right_pane_command_uses_exec_to_avoid_orphans(tmp_path: Path) -> None:
             f"{kind!r} pane command missing ``exec`` keyword (would leak "
             f"orphan on respawn-pane -k): {command!r}"
         )
+        assert "env POLLYPM_HOLD_UNUSABLE_DATABASE_SCREEN=1" in command, (
+            f"{kind!r} pane command does not park on unrecoverable DB "
+            f"corruption: {command!r}"
+        )
         # Sanity: the command actually runs cockpit-pane (not just exec
         # of something else) — guards against an accidental refactor
         # that drops the cockpit-pane invocation entirely.

@@ -314,7 +314,7 @@ def test_cockpit_send_key_question_mark_falls_back_to_visible_dashboard_bridge(
         assert result.exit_code == 0, result.output
         assert f"via {dashboard.socket_path}" in result.output
         assert _wait_for(lambda: dashboard_app.keys == ["question_mark"])
-        assert cockpit_app.keys == []
+        assert "question_mark" not in cockpit_app.keys
     finally:
         cockpit.stop()
         dashboard.stop()

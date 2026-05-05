@@ -7344,6 +7344,7 @@ class PollyInboxApp(App[None]):
             self.filter_input.display = False
             self.filter_bar.display = False
             self.filter_chips.display = False
+        self._set_filter_bridge_active(False)
         self._refresh_list(select_first=True)
         self.set_interval(self.REFRESH_INTERVAL_SECONDS, self._background_refresh)
         self.list_view.focus()
@@ -7367,12 +7368,19 @@ class PollyInboxApp(App[None]):
             self._input_bridge_handle = None
 
     def on_unmount(self) -> None:
+        self._set_filter_bridge_active(False)
         bridge = getattr(self, "_input_bridge_handle", None)
         if bridge is not None:
             try:
                 bridge.stop()
             except Exception:  # noqa: BLE001
                 pass
+
+    def _set_filter_bridge_active(self, active: bool) -> None:
+        try:
+            CockpitRouter(self.config_path).set_inbox_filter_input_active(active)
+        except Exception:  # noqa: BLE001
+            pass
 
     # #1078 — switch to stacked (detail-below-list) layout when the
     # detail column would otherwise drop below this many cols of usable
@@ -7975,6 +7983,7 @@ class PollyInboxApp(App[None]):
         self.filter_input.value = self._filter_text
         self._update_filter_chips()
         self.filter_input.focus()
+        self._set_filter_bridge_active(True)
 
     def action_toggle_filter_unread(self) -> None:
         if self.reply_input.has_focus or self.filter_input.has_focus:
@@ -8069,6 +8078,7 @@ class PollyInboxApp(App[None]):
         # Enter inside the filter Input applies + returns focus to the
         # list so j/k works without an extra Esc.
         self.list_view.focus()
+        self._set_filter_bridge_active(False)
 
     # ------------------------------------------------------------------
     # Detail rendering
@@ -8662,6 +8672,7 @@ class PollyInboxApp(App[None]):
             self._filter_text = ""
             self.filter_input.value = ""
             self._filter_bar_visible = False
+            self._set_filter_bridge_active(False)
             self._render_list(select_first=False)
             self.list_view.focus()
             return

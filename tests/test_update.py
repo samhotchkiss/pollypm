@@ -72,6 +72,44 @@ def test_update_refuses_when_repo_not_a_git_checkout(tmp_path: Path) -> None:
     assert "not a git checkout" in result.message
 
 
+def test_update_refuses_claude_agent_worktree_before_side_effects(tmp_path: Path) -> None:
+    repo = tmp_path / "pollypm" / ".claude" / "worktrees" / "agent-abc123"
+    repo.mkdir(parents=True)
+    (repo / ".git").write_text("gitdir: /tmp/gitdir\n")
+    calls: list[str] = []
+
+    def _fetcher(repo_root: Path) -> tuple[bool, str]:
+        calls.append("fetch")
+        return (True, "")
+
+    def _resolver(repo_root: Path) -> update_mod.PendingCommits:
+        calls.append("resolve")
+        return update_mod.PendingCommits(head_sha="aaaa", target_sha="bbbb")
+
+    def _runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append("install")
+        return _ok_run()
+
+    def _reset(repo_root: Path, target: str) -> tuple[bool, str]:
+        calls.append("reset")
+        return (True, "")
+
+    result = update_mod.update(
+        repo_root=repo,
+        in_progress_count=0,
+        fetcher=_fetcher,
+        resolver=_resolver,
+        runner=_runner,
+        reset_runner=_reset,
+    )
+
+    assert result.ok is False
+    assert result.refused is True
+    assert "agent worktree" in result.message
+    assert "canonical install" in result.message
+    assert calls == []
+
+
 # --------------------------------------------------------------------------- #
 # update() — fetch + check-only
 # --------------------------------------------------------------------------- #

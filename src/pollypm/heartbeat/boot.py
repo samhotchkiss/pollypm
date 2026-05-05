@@ -118,7 +118,7 @@ class HeartbeatRail:
 
     __slots__ = (
         "queue", "pool", "heartbeat", "roster", "_concurrency",
-        "_tick_interval", "_tick_thread", "_tick_stop",
+        "_tick_interval", "_tick_thread", "_tick_stop", "_tick_lock",
     )
 
     def __init__(
@@ -143,6 +143,7 @@ class HeartbeatRail:
         )
         self._tick_thread: threading.Thread | None = None
         self._tick_stop = threading.Event()
+        self._tick_lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # Construction
@@ -318,7 +319,8 @@ class HeartbeatRail:
         try:
             self.pool.stop(timeout=timeout)
         finally:
-            self.queue.close()
+            with self._tick_lock:
+                self.queue.close()
 
     def tick(self, now: datetime | None = None):
         """Run one heartbeat tick — enqueue jobs for due roster entries.
@@ -334,10 +336,21 @@ class HeartbeatRail:
         ``boot.py:258 -> tick.py:143 -> queue.py:269``).
         """
         resolved = now or datetime.now(UTC)
-        return retry_on_database_locked(
-            lambda: self.heartbeat.tick(resolved),
-            label="HeartbeatRail.tick",
-        )
+        lock = getattr(self, "_tick_lock", None)
+
+        def _do_tick():
+            stop_event = getattr(self, "_tick_stop", None)
+            if stop_event is not None and stop_event.is_set():
+                return None
+            return retry_on_database_locked(
+                lambda: self.heartbeat.tick(resolved),
+                label="HeartbeatRail.tick",
+            )
+
+        if lock is None:
+            return _do_tick()
+        with lock:
+            return _do_tick()
 
     # Context manager sugar — mostly useful for tests.
     def __enter__(self) -> "HeartbeatRail":

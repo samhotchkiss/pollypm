@@ -2002,6 +2002,9 @@ class PollyCockpitApp(App[None]):
         child = children[index]
         if isinstance(child, RailItem):
             return child.cockpit_key
+        child_key = getattr(child, "cockpit_key", None)
+        if isinstance(child_key, str):
+            return child_key
         return None
 
     def _apply_active_view_to_rows(self) -> None:
@@ -2304,6 +2307,7 @@ class PollyCockpitApp(App[None]):
         if key is not None:
             self._cancel_pending_route_selection()
             self.selected_key = key
+            self._persist_router_selected_key(key)
             self._last_nav_change = self._tick_count
             self._apply_active_view_to_rows()
 
@@ -2327,21 +2331,25 @@ class PollyCockpitApp(App[None]):
 
     def _last_nav_index(self) -> int | None:
         """Highest selectable index in the nav ListView, or None."""
+        indices = self._selectable_nav_indices()
+        return indices[-1] if indices else None
+
+    def _selectable_nav_indices(self) -> list[int]:
         try:
             children = list(self.nav.children)
         except AttributeError:
-            return None
-        for i in range(len(children) - 1, -1, -1):
-            child = children[i]
+            return []
+        indices: list[int] = []
+        for i, child in enumerate(children):
             if getattr(child, "disabled", False):
                 continue
             # Allow RailItem in production, or anything with a non-None
             # ``cockpit_key`` for test stubs (#1080).
             if isinstance(child, RailItem):
-                return i
-            if getattr(child, "cockpit_key", None) is not None:
-                return i
-        return None
+                indices.append(i)
+            elif getattr(child, "cockpit_key", None) is not None:
+                indices.append(i)
+        return indices
 
     def _nav_index_for_key(self, key: str) -> int | None:
         try:
@@ -2372,15 +2380,52 @@ class PollyCockpitApp(App[None]):
         finally:
             self._suspend_selection_events = False
 
+    def _persist_router_selected_key(self, key: str) -> None:
+        set_selected = getattr(getattr(self, "router", None), "set_selected_key", None)
+        if not callable(set_selected):
+            return
+        try:
+            set_selected(key)
+        except Exception:  # noqa: BLE001
+            return
+        self._last_router_selected_key = key
+
+    def _set_nav_index(self, index: int) -> None:
+        self._suspend_selection_events = True
+        try:
+            self.nav.index = index
+        finally:
+            self._suspend_selection_events = False
+
+    def _move_nav_cursor(self, delta: int) -> bool:
+        indices = self._selectable_nav_indices()
+        if not indices:
+            return False
+        current = self.nav.index
+        if current is None:
+            target = indices[0]
+        elif current in indices:
+            pos = indices.index(current) + delta
+            pos = max(0, min(pos, len(indices) - 1))
+            target = indices[pos]
+        elif delta > 0:
+            target = next((index for index in indices if index > current), indices[-1])
+        else:
+            target = next((index for index in reversed(indices) if index < current), indices[0])
+        if current == target:
+            return False
+        self._set_nav_index(target)
+        return True
+
     def _select_settings_row(self) -> None:
         self._cancel_pending_route_selection()
         self.selected_key = "settings"
+        self._persist_router_selected_key("settings")
         self._last_nav_change = self._tick_count
         self._apply_active_view_to_rows()
 
     def action_cursor_down(self) -> None:
         if self.selected_key == "settings":
-            self._send_key_to_settings_pane("j")
             return
         self._align_nav_cursor_to_selected_key()
         last_idx = self._last_nav_index()
@@ -2393,27 +2438,27 @@ class PollyCockpitApp(App[None]):
         ):
             self._select_settings_row()
             return
-        if self.nav.index is None:
-            self.nav.index = 0
-        else:
-            self.nav.action_cursor_down()
+        self._move_nav_cursor(1)
         self._sync_selected_from_nav()
 
     def action_cursor_up(self) -> None:
-        if self.selected_key == "settings":
-            self._send_key_to_settings_pane("k")
+        if self.selected_key == "settings" and self._settings_visible():
+            last_idx = self._last_nav_index()
+            if last_idx is None:
+                return
+            self._set_nav_index(last_idx)
+            self._sync_selected_from_nav()
             return
         self._align_nav_cursor_to_selected_key()
         # Step up off the virtual Settings row onto the last
         # selectable nav row (#1080).
-        if self.nav.index is None:
-            self.nav.index = 0
-        else:
-            self.nav.action_cursor_up()
+        self._move_nav_cursor(-1)
         self._sync_selected_from_nav()
 
     def action_cursor_first(self) -> None:
-        self.nav.index = 0
+        indices = self._selectable_nav_indices()
+        if indices:
+            self._set_nav_index(indices[0])
         self._sync_selected_from_nav()
 
     def action_cursor_last(self) -> None:
@@ -2423,9 +2468,9 @@ class PollyCockpitApp(App[None]):
         if self._settings_visible():
             self._select_settings_row()
             return
-        children = list(self.nav.children)
-        if children:
-            self.nav.index = len(children) - 1
+        last_idx = self._last_nav_index()
+        if last_idx is not None:
+            self._set_nav_index(last_idx)
         self._sync_selected_from_nav()
 
     def _selected_open_key(self) -> str | None:

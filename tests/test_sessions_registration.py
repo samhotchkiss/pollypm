@@ -21,6 +21,7 @@ These tests exercise:
 
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -202,6 +203,65 @@ def test_rebootstrap_is_idempotent(monkeypatch, tmp_path: Path) -> None:
     rows = sorted(s.name for s in supervisor.store.list_sessions())
     # No duplicates (PRIMARY KEY on name prevents duplicates anyway, but
     # verify the set is unchanged and not empty after reconcile).
+    assert rows == ["heartbeat", "operator", "pm-reviewer"]
+
+
+def test_reconcile_continues_when_window_option_fails(monkeypatch, tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    storage = supervisor.storage_closet_session_name()
+    cockpit = config.project.tmux_session
+
+    created_windows: list[tuple[str, str, bool]] = []
+    piped_targets: list[str] = []
+    window_options: list[tuple[str, str, str]] = []
+
+    monkeypatch.setattr(supervisor.tmux, "has_session", lambda name: name in {storage, cockpit})
+    monkeypatch.setattr(
+        supervisor.tmux,
+        "list_windows",
+        lambda name: [
+            TmuxWindow(
+                session=storage,
+                index=i,
+                name=w,
+                active=(i == 0),
+                pane_id=f"%{i + 10}",
+                pane_current_command="claude",
+                pane_current_path=str(tmp_path),
+                pane_dead=False,
+            )
+            for i, w in enumerate(["pm-heartbeat", "pm-operator"])
+        ] if name == storage else [],
+    )
+    monkeypatch.setattr(
+        supervisor.tmux,
+        "create_window",
+        lambda name, window_name, command, detached=False: created_windows.append(
+            (name, window_name, detached)
+        ),
+    )
+
+    def _set_window_option(target: str, option: str, value: str) -> None:
+        window_options.append((target, option, value))
+        if target == f"{storage}:pm-reviewer" and option == "allow-passthrough":
+            raise subprocess.CalledProcessError(
+                1,
+                ["tmux", "set-window-option", "-t", target, option, value],
+            )
+
+    monkeypatch.setattr(supervisor.tmux, "set_window_option", _set_window_option)
+    monkeypatch.setattr(supervisor.tmux, "pipe_pane", lambda target, path: piped_targets.append(target))
+    monkeypatch.setattr(supervisor, "ensure_heartbeat_schedule", lambda: None)
+    monkeypatch.setattr(supervisor, "ensure_knowledge_extraction_schedule", lambda: None)
+
+    controller = supervisor.bootstrap_tmux()
+
+    assert controller == "claude_controller"
+    assert created_windows == [(storage, "pm-reviewer", True)]
+    assert piped_targets == [f"{storage}:pm-reviewer"]
+    assert (f"{storage}:pm-reviewer", "focus-events", "on") in window_options
+    rows = sorted(s.name for s in supervisor.store.list_sessions())
     assert rows == ["heartbeat", "operator", "pm-reviewer"]
 
 

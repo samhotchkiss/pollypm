@@ -284,9 +284,11 @@ def test_cockpit_send_key_question_mark_prefers_content_pane_bridge(
         content.stop()
 
 
-def test_cockpit_send_key_inbox_discuss_prefers_inbox_bridge_over_live_pane(
+@pytest.mark.parametrize("key", ["d", "A"])
+def test_cockpit_send_key_inbox_action_prefers_inbox_bridge_over_live_pane(
     valid_cockpit_config: Path,
     monkeypatch: pytest.MonkeyPatch,
+    key: str,
 ) -> None:
     import typer
     from typer.testing import CliRunner
@@ -316,11 +318,11 @@ def test_cockpit_send_key_inbox_discuss_prefers_inbox_bridge_over_live_pane(
         app = typer.Typer()
         ui_commands.register_ui_commands(app)
         result = CliRunner().invoke(
-            app, ["cockpit-send-key", "d", "--config", str(valid_cockpit_config)]
+            app, ["cockpit-send-key", key, "--config", str(valid_cockpit_config)]
         )
         assert result.exit_code == 0, result.output
         assert f"via {inbox.socket_path}" in result.output
-        assert _wait_for(lambda: inbox_app.keys == ["d"])
+        assert _wait_for(lambda: inbox_app.keys == [key])
         assert live_pane_attempts == []
     finally:
         inbox.stop()

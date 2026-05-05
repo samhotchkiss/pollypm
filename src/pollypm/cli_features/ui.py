@@ -21,7 +21,7 @@ from pollypm.config import DEFAULT_CONFIG_PATH
 
 _RIGHT_PANE_BRIDGE_BYPASS_ESCAPE_TOKENS = frozenset({"<esc>", "esc", "escape"})
 _HELP_KEY_TOKENS = frozenset({"?", "question_mark"})
-_INBOX_BRIDGE_FIRST_TOKENS = frozenset({"d"})
+_INBOX_BRIDGE_FIRST_TOKENS = frozenset({"A", "d"})
 _RIGHT_PANE_TMUX_KEY_TOKENS: dict[str, str] = {
     "<bs>": "BSpace",
     "backspace": "BSpace",

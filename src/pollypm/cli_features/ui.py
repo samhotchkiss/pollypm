@@ -23,7 +23,18 @@ _RIGHT_PANE_BRIDGE_BYPASS_ESCAPE_TOKENS = frozenset({"<esc>", "esc", "escape"})
 _LIVE_RIGHT_PANE_INPUT_STICKY = "live_right_pane_input_sticky"
 _HELP_KEY_TOKENS = frozenset({"?", "question_mark"})
 _HELP_CONTENT_BRIDGE_FALLBACK_KINDS = ("dashboard", "pane-inbox", "settings")
-_INBOX_BRIDGE_FIRST_TOKENS = frozenset({"/", "d"})
+_INBOX_BRIDGE_FIRST_TOKENS = frozenset({
+    "/",
+    "<down>",
+    "<up>",
+    "A",
+    "a",
+    "d",
+    "down",
+    "j",
+    "k",
+    "up",
+})
 _INBOX_FILTER_INPUT_TOKENS = frozenset({
     "<bs>",
     "<cr>",

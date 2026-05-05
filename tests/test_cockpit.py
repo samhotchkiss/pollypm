@@ -4082,8 +4082,8 @@ def test_cockpit_ui_arrow_and_enter_route_selected(tmp_path: Path) -> None:
     asyncio.run(exercise())
 
 
-def test_cockpit_send_key_inbox_shortcut_keeps_rail_nav_active(tmp_path: Path) -> None:
-    """#1206/#1236: after global ``I``, Down/Up still move the rail."""
+def test_cockpit_send_key_inbox_shortcut_keeps_inbox_nav_active(tmp_path: Path) -> None:
+    """#1238: after global ``I``, Down/Up stay owned by the Inbox."""
 
     class FakeRouter:
         def __init__(self) -> None:
@@ -4146,16 +4146,22 @@ def test_cockpit_send_key_inbox_shortcut_keeps_rail_nav_active(tmp_path: Path) -
             await pilot.pause(0.4)
             assert app.selected_key == "inbox"
             assert app._selected_row_key() == "inbox"
+            forwarded: list[str] = []
+            app._send_key_to_inbox_pane = (  # type: ignore[method-assign]
+                lambda key: forwarded.append(key) or True
+            )
 
             send_key(handle.socket_path, "<down>")
             await pilot.pause(0.4)
-            assert app.selected_key == "activity"
-            assert app._selected_row_key() == "activity"
+            assert app.selected_key == "inbox"
+            assert app._selected_row_key() == "inbox"
+            assert forwarded == ["j"]
 
             send_key(handle.socket_path, "<up>")
             await pilot.pause(0.4)
             assert app.selected_key == "inbox"
             assert app._selected_row_key() == "inbox"
+            assert forwarded == ["j", "k"]
 
     asyncio.run(exercise())
 
@@ -5343,8 +5349,8 @@ class _StubNav:
                 return
 
 
-def test_cockpit_jk_from_inbox_navigates_rail_round_trip() -> None:
-    """#1236: active Inbox must not capture rail navigation keys."""
+def test_cockpit_jk_from_inbox_forwards_to_inbox_pane() -> None:
+    """#1137/#1238: active Inbox owns row-navigation keys."""
     app = PollyCockpitApp.__new__(PollyCockpitApp)
     items = [
         _StubItem("inbox"),
@@ -5373,15 +5379,61 @@ def test_cockpit_jk_from_inbox_navigates_rail_round_trip() -> None:
 
     app.action_cursor_down()
 
-    assert nav.index == 2
-    assert app.selected_key == "project:booktalk"
-    assert captured == []
+    assert nav.index == 0
+    assert app.selected_key == "inbox"
+    assert captured == ["j"]
 
     app.action_cursor_up()
 
     assert nav.index == 0
     assert app.selected_key == "inbox"
-    assert captured == []
+    assert captured == ["j", "k"]
+
+
+def test_cockpit_jk_from_inbox_falls_back_when_pane_cannot_accept() -> None:
+    """If the Inbox pane bridge is unavailable, j/k still move the rail."""
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    items = [
+        _StubItem("inbox"),
+        _StubItem(None, disabled=True),  # ── projects ── divider
+        _StubItem("project:booktalk"),
+        _StubItem("project:blackjack-trainer"),
+    ]
+    nav = _StubNav(items)
+    nav.index = 0
+    app.nav = nav  # type: ignore[assignment]
+    app.selected_key = "inbox"
+    app._tick_count = 0
+    app._last_nav_change = -10
+    app._apply_active_view_to_rows = lambda: None  # type: ignore[method-assign]
+
+    def _selected_row_key() -> str | None:
+        idx = nav.index
+        if idx is None:
+            return None
+        return items[idx].cockpit_key
+
+    app._selected_row_key = _selected_row_key  # type: ignore[method-assign]
+
+    captured: list[str] = []
+
+    def _decline_inbox_key(key: str) -> bool:
+        captured.append(key)
+        return False
+
+    app._send_key_to_inbox_pane = _decline_inbox_key  # type: ignore[method-assign]
+
+    app.action_cursor_down()
+
+    assert nav.index == 2
+    assert app.selected_key == "project:booktalk"
+    assert captured == ["j"]
+
+    app.action_cursor_up()
+
+    assert nav.index == 0
+    assert app.selected_key == "inbox"
+    assert captured == ["j"]
 
 
 def test_cockpit_j_at_last_item_is_silent_noop() -> None:

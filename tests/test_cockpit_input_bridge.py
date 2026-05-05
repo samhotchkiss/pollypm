@@ -321,7 +321,19 @@ def test_cockpit_send_key_question_mark_falls_back_to_visible_dashboard_bridge(
         dashboard.stop()
 
 
-@pytest.mark.parametrize(("key", "expected"), [("d", "d"), ("/", "/")])
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        ("d", "d"),
+        ("/", "/"),
+        ("a", "a"),
+        ("A", "A"),
+        ("j", "j"),
+        ("k", "k"),
+        ("<down>", "down"),
+        ("<up>", "up"),
+    ],
+)
 def test_cockpit_send_key_inbox_action_prefers_inbox_bridge_over_live_pane(
     valid_cockpit_config: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -1680,10 +1680,12 @@ class PollyCockpitApp(App[None]):
         value = state.get("mounted_return_key")
         return value if isinstance(value, str) and value else None
 
-    def _send_key_to_right_pane(self, key: str) -> None:
+    def _send_key_to_right_pane(self, key: str) -> bool:
         send_method = getattr(self.router, "send_key_to_right_pane", None)
         if callable(send_method):
             send_method(key)
+            return True
+        return False
 
     def _send_key_to_settings_pane(self, key: str) -> None:
         delivered = None
@@ -1725,8 +1727,7 @@ class PollyCockpitApp(App[None]):
         if self._right_pane_has_live_session():
             return False
         try:
-            self._send_key_to_right_pane(key)
-            return True
+            return self._send_key_to_right_pane(key)
         except Exception:  # noqa: BLE001
             return False
 
@@ -2499,6 +2500,8 @@ class PollyCockpitApp(App[None]):
         self._apply_active_view_to_rows()
 
     def action_cursor_down(self) -> None:
+        if self._on_inbox_surface() and self._send_key_to_inbox_pane("j"):
+            return
         if self.selected_key == "settings":
             return
         self._align_nav_cursor_to_selected_key()
@@ -2516,6 +2519,8 @@ class PollyCockpitApp(App[None]):
         self._sync_selected_from_nav()
 
     def action_cursor_up(self) -> None:
+        if self._on_inbox_surface() and self._send_key_to_inbox_pane("k"):
+            return
         if self.selected_key == "settings" and self._settings_visible():
             last_idx = self._last_nav_index()
             if last_idx is None:

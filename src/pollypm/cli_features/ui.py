@@ -21,6 +21,7 @@ from pollypm.config import DEFAULT_CONFIG_PATH
 
 _RIGHT_PANE_BRIDGE_BYPASS_ESCAPE_TOKENS = frozenset({"<esc>", "esc", "escape"})
 _HELP_KEY_TOKENS = frozenset({"?", "question_mark"})
+_COCKPIT_BRIDGE_FIRST_TOKENS = frozenset({"s", "S"})
 _INBOX_BRIDGE_FIRST_TOKENS = frozenset({"/", "d"})
 _SETTINGS_BRIDGE_FIRST_TOKENS = frozenset({
     "<down>",
@@ -117,6 +118,21 @@ def _send_selected_action_key_to_content_bridge(
         return None
     try:
         return send_key_to_first_live(config_path, key, kind=kind, timeout=0.2)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _send_global_nav_key_to_cockpit_bridge(
+    config_path: Path, key: str,
+) -> Path | None:
+    """Deliver global rail navigation keys before live-pane PTY fallback."""
+    token = key.strip()
+    if token not in _COCKPIT_BRIDGE_FIRST_TOKENS:
+        return None
+    try:
+        from pollypm.cockpit_input_bridge import send_key_to_first_live
+
+        return send_key_to_first_live(config_path, key, kind="cockpit", timeout=0.2)
     except Exception:  # noqa: BLE001
         return None
 
@@ -432,6 +448,12 @@ def register_ui_commands(app: typer.Typer) -> None:
             )
             if delivered_to_content is not None:
                 typer.echo(f"Delivered {key!r} via {delivered_to_content}")
+                return
+            delivered_to_cockpit = _send_global_nav_key_to_cockpit_bridge(
+                config_path, key,
+            )
+            if delivered_to_cockpit is not None:
+                typer.echo(f"Delivered {key!r} via {delivered_to_cockpit}")
                 return
             delivered_to_right = _send_key_to_active_live_right_pane(
                 config_path, key,

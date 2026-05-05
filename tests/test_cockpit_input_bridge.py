@@ -383,7 +383,7 @@ def test_cockpit_send_key_settings_nav_prefers_settings_bridge_over_live_pane(
         settings.stop()
 
 
-def test_cockpit_send_key_forwards_to_focused_live_right_pane(
+def test_cockpit_send_key_global_settings_prefers_cockpit_bridge_over_live_pane(
     fake_config: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import typer
@@ -413,8 +413,45 @@ def test_cockpit_send_key_forwards_to_focused_live_right_pane(
             app, ["cockpit-send-key", "s", "--config", str(fake_config)]
         )
         assert result.exit_code == 0, result.output
+        assert f"via {cockpit.socket_path}" in result.output
+        assert forwarded == []
+        assert _wait_for(lambda: cockpit_app.keys == ["s"])
+    finally:
+        cockpit.stop()
+
+
+def test_cockpit_send_key_forwards_to_focused_live_right_pane(
+    fake_config: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import typer
+    from typer.testing import CliRunner
+
+    from pollypm.cli_features import ui as ui_commands
+
+    cockpit_app = _FakeApp()
+    cockpit = start_input_bridge(cockpit_app, kind="cockpit", config_path=fake_config)
+    assert cockpit is not None
+    forwarded: list[tuple[Path, str]] = []
+
+    def fake_forward(config_path: Path, key: str) -> str | None:
+        forwarded.append((config_path, key))
+        return "%2"
+
+    monkeypatch.setattr(
+        ui_commands,
+        "_send_key_to_active_live_right_pane",
+        fake_forward,
+    )
+
+    try:
+        app = typer.Typer()
+        ui_commands.register_ui_commands(app)
+        result = CliRunner().invoke(
+            app, ["cockpit-send-key", "x", "--config", str(fake_config)]
+        )
+        assert result.exit_code == 0, result.output
         assert "via cockpit right pane %2" in result.output
-        assert forwarded == [(fake_config, "s")]
+        assert forwarded == [(fake_config, "x")]
         time.sleep(0.1)
         assert cockpit_app.keys == []
     finally:

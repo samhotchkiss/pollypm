@@ -676,6 +676,33 @@ def _pane_text_shows_active_turn(pane_text: str) -> bool:
     )
 
 
+def _tmux_window_has_stopped_descendant(tmux, window: object | None) -> bool:
+    if tmux is None or window is None or bool(getattr(window, "pane_dead", False)):
+        return False
+    check = getattr(tmux, "pane_has_stopped_descendant", None)
+    if not callable(check):
+        return False
+    pane_pid = None
+    pane_pid_raw = getattr(window, "pane_pid", None)
+    if pane_pid_raw is not None:
+        try:
+            pane_pid = int(pane_pid_raw)
+        except (TypeError, ValueError):
+            pane_pid = None
+    if pane_pid is not None and pane_pid > 0:
+        try:
+            return bool(check(pane_pid=pane_pid))
+        except Exception:  # noqa: BLE001
+            pass
+    pane_id = getattr(window, "pane_id", None)
+    if pane_id:
+        try:
+            return bool(check(pane_id=str(pane_id)))
+        except Exception:  # noqa: BLE001
+            return False
+    return False
+
+
 def _format_worker_turn_label(
     *, last_heartbeat_iso: str | None, is_turn_active: bool,
 ) -> str:
@@ -939,6 +966,10 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
             has_window = window is not None and not getattr(
                 window, "pane_dead", False,
             )
+            pane_stopped = (
+                has_window
+                and _tmux_window_has_stopped_descendant(tmux, window)
+            )
             session_name = ws.agent_name or window_name
 
             last_heartbeat_iso: str | None = None
@@ -971,7 +1002,7 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
                 if heartbeat is not None:
                     last_heartbeat_iso = getattr(heartbeat, "created_at", None)
 
-            if has_window:
+            if has_window and not pane_stopped:
                 pane_text = read_recent_heartbeat_snapshot(heartbeat)
                 if pane_text is None and tmux is not None:
                     try:
@@ -983,6 +1014,8 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
 
             if not has_window:
                 status = "offline"
+            elif pane_stopped:
+                status = "stuck"
             elif stuck:
                 status = "stuck"
             elif is_turn_active:
@@ -1068,13 +1101,16 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
                 # the same working/idle dot the DB-backed rows do.
                 pane_text = ""
                 pane_id = getattr(window, "pane_id", None)
-                if not is_dead and tmux is not None and pane_id:
+                pane_stopped = _tmux_window_has_stopped_descendant(tmux, window)
+                if not is_dead and not pane_stopped and tmux is not None and pane_id:
                     try:
                         pane_text = tmux.capture_pane(pane_id, lines=15) or ""
                     except Exception:  # noqa: BLE001
                         pane_text = ""
                 if is_dead:
                     status = "offline"
+                elif pane_stopped:
+                    status = "stuck"
                 elif pane_text and _pane_text_shows_active_turn(pane_text):
                     status = "working"
                 else:
@@ -1118,7 +1154,13 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
                 continue
             kind, _, label = window_name.partition("-")
             project_key = label or "[workspace]"
-            status = "offline" if is_dead else "idle"
+            pane_stopped = _tmux_window_has_stopped_descendant(tmux, window)
+            if is_dead:
+                status = "offline"
+            elif pane_stopped:
+                status = "stuck"
+            else:
+                status = "idle"
             health, health_tooltip = _worker_health_snapshot(
                 status=status,
                 last_heartbeat_iso=None,

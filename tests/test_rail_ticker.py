@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -115,6 +116,50 @@ class TestTickerThreadLifecycle:
         assert rail._tick_stop.is_set()
         assert not ticker.is_alive(), "ticker thread did not exit after stop()"
         assert rail._tick_thread is None
+
+    def test_stop_does_not_close_queue_during_active_tick(self, tmp_path: Path) -> None:
+        """#1194: shutdown must not close the queue under an in-flight tick."""
+
+        rail = _build_rail(tmp_path, tick_interval=0.05)
+        rail.roster.register(
+            schedule="@on_startup",
+            handler_name="noop",
+            payload={"source": "test"},
+            dedupe_key="heartbeat:test",
+        )
+        inner = rail.heartbeat
+        entered = threading.Event()
+        release = threading.Event()
+        errors: list[BaseException] = []
+
+        class _SlowHeartbeat:
+            def tick(self, now):
+                entered.set()
+                assert release.wait(2.0), "test did not release heartbeat tick"
+                return inner.tick(now)
+
+        rail.heartbeat = _SlowHeartbeat()  # type: ignore[assignment]
+
+        def run_tick() -> None:
+            try:
+                rail.tick(datetime.now(UTC))
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        tick_thread = threading.Thread(target=run_tick)
+        tick_thread.start()
+        assert entered.wait(2.0), "heartbeat tick did not start"
+
+        stop_thread = threading.Thread(target=lambda: rail.stop(timeout=0.01))
+        stop_thread.start()
+        release.set()
+
+        tick_thread.join(timeout=2.0)
+        stop_thread.join(timeout=2.0)
+
+        assert not tick_thread.is_alive(), "tick thread did not finish"
+        assert not stop_thread.is_alive(), "stop thread did not finish"
+        assert errors == []
 
     def test_tick_exception_does_not_kill_thread(self, tmp_path: Path) -> None:
         """One bad tick must not kill the ticker — next iteration keeps going."""

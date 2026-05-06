@@ -117,6 +117,8 @@ class PollyMetricsApp(App[None]):
         self.snapshot = None
         self._auto_refresh: bool = False
         self._auto_refresh_timer = None
+        self._refresh_in_flight: bool = False
+        self._refresh_seq: int = 0
         self._selected_index: int = 0
         self._section_order = [
             "fleet",
@@ -146,6 +148,7 @@ class PollyMetricsApp(App[None]):
         yield self.hint
 
     def on_mount(self) -> None:
+        self._render()
         self._refresh()
         # Alert toast surface removed in #956 — the alert list still
         # renders inside this metrics pane via the drill-down modal.
@@ -170,8 +173,37 @@ class PollyMetricsApp(App[None]):
             return None
 
     def _refresh(self) -> None:
-        self.snapshot = self._gather()
-        self._render()
+        if self._refresh_in_flight:
+            return
+        self._refresh_seq += 1
+        seq = self._refresh_seq
+        self._refresh_in_flight = True
+        try:
+            self.run_worker(
+                lambda: self._refresh_worker(seq),
+                thread=True,
+                exclusive=True,
+                group="metrics_refresh",
+            )
+        except Exception:  # noqa: BLE001
+            self._refresh_in_flight = False
+            self.snapshot = self._gather()
+            self._render()
+
+    def _refresh_worker(self, seq: int) -> None:
+        snap = self._gather()
+
+        def _apply() -> None:
+            self._refresh_in_flight = False
+            if seq != self._refresh_seq:
+                return
+            self.snapshot = snap
+            self._render()
+
+        try:
+            self.call_from_thread(_apply)
+        except Exception:  # noqa: BLE001
+            _apply()
 
     @staticmethod
     def _tone_colour(tone: str) -> str:

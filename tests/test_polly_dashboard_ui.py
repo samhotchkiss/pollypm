@@ -194,6 +194,10 @@ def test_polly_dashboard_renders_llm_quota_usage(tmp_path: Path) -> None:
 
     app._render_dashboard(_fake_config(), data)
 
+    header = str(app.header_w.render())
+    assert "LLM quota:" in header
+    assert "84% used of weekly limit" in header
+
     rendered = str(app.chart_body.render())
     assert "LLM account quota usage" in rendered
     assert "84% used of weekly limit" in rendered

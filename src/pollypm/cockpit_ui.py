@@ -3350,7 +3350,17 @@ class PollyDashboardApp(App[None]):
             parts.append(
                 f"[#f85149][b]{data.alert_count}[/b] needs action[/#f85149]"
             )
-        header_text = "  " + "  \u00b7  ".join(parts)
+        header_lines = ["  " + "  \u00b7  ".join(parts)]
+        account_usages = getattr(data, "account_usages", [])
+        if account_usages:
+            usage = account_usages[0]
+            label = usage.provider or usage.account_name
+            header_lines.append(
+                "  "
+                f"LLM quota: {_escape(label)} \u00b7 "
+                f"[b]{usage.used_pct}%[/b] used of {_escape(usage.limit_label)}"
+            )
+        header_text = "\n".join(header_lines)
         if data.briefing:
             header_text += f"\n\n  [#58a6ff]{data.briefing}[/#58a6ff]"
         self.header_w.update(header_text)
@@ -3472,7 +3482,6 @@ class PollyDashboardApp(App[None]):
 
         # ── Token chart + cached LLM account quota ──
         chart_lines: list[str] = []
-        account_usages = getattr(data, "account_usages", [])
         if account_usages:
             chart_lines.append("[b]LLM account quota usage[/b]")
             for usage in account_usages:

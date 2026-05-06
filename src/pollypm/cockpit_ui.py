@@ -6403,6 +6403,15 @@ def _triage_label(task) -> str:
     return "update"
 
 
+def _archive_success_message(item, task_id: str) -> str:
+    if is_task_inbox_entry(item):
+        return f"Archived {task_id}"
+    title = str(getattr(item, "title", "") or "").strip()
+    if title:
+        return f"Archived {_strip_action_subject_prefix(title)}"
+    return "Archived notification"
+
+
 def _render_user_prompt_block(payload: object) -> str | None:
     """Build the plain-English action block for a message detail pane.
 
@@ -7208,6 +7217,11 @@ class PollyInboxApp(App[None]):
         background: #0f1317;
         color: #eef2f4;
         padding: 0;
+    }
+    ToastRack {
+        /* #1280: keep bottom-right toasts above the reply input and
+           pane borders instead of painting through their box lines. */
+        margin-bottom: 6;
     }
     #inbox-layout {
         height: 1fr;
@@ -9225,7 +9239,12 @@ class PollyInboxApp(App[None]):
             except Exception as exc:  # noqa: BLE001
                 self.notify(f"Archive failed: {exc}", severity="error")
                 return
-            self.notify(f"Archived {task_id}", severity="information", timeout=2.0)
+            self.notify(
+                _archive_success_message(item, task_id),
+                severity="information",
+                timeout=2.0,
+                markup=False,
+            )
             self._tasks = [task for task in self._tasks if task.task_id != task_id]
             self._unread_ids.discard(task_id)
             self._session_read_ids.discard(task_id)
@@ -9272,7 +9291,12 @@ class PollyInboxApp(App[None]):
         self._emit_event(
             task_id, "inbox.message.archived", f"user archived {task_id}",
         )
-        self.notify(f"Archived {task_id}", severity="information", timeout=2.0)
+        self.notify(
+            _archive_success_message(item, task_id),
+            severity="information",
+            timeout=2.0,
+            markup=False,
+        )
         # Remove from local state + list so the row disappears immediately
         # (the 8s background refresh would do it anyway, but snappy UX).
         self._tasks = [t for t in self._tasks if t.task_id != task_id]

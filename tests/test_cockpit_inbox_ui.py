@@ -1722,6 +1722,54 @@ def test_archive_closes_store_notification_and_removes_row(inbox_env, inbox_app)
     _run(body())
 
 
+def test_archive_store_notification_toast_stays_clear_of_reply_border(
+    inbox_env,
+) -> None:
+    """#1280: archive toast must not paint through inbox pane borders."""
+    message_id = _seed_workspace_message(
+        inbox_env["project_path"].parent,
+        subject="Workspace notify",
+        body="Fresh notification from Store.",
+        scope="__workspace__",
+    )
+
+    async def body() -> None:
+        from pollypm.cockpit_ui import PollyInboxApp, _InboxListItem
+
+        app = PollyInboxApp(inbox_env["config_path"])
+        async with app.run_test(size=(220, 80), notifications=True) as pilot:
+            await pilot.pause()
+            await pilot.press("m")
+            await pilot.press("O")
+            await pilot.pause()
+
+            visible_items = [
+                child for child in app.list_view.children
+                if isinstance(child, _InboxListItem)
+            ]
+            app.list_view.index = next(
+                idx for idx, child in enumerate(visible_items)
+                if child.task_ref.message_id == message_id
+            )
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("a")
+            await pilot.pause()
+
+            lines = [strip.text for strip in app.screen._compositor.render_strips()]
+            toast_lines = [line for line in lines if "\u258c" in line]
+            toast_text = "\n".join(toast_lines)
+            assert "Archived Workspace notify" in toast_text
+            assert "msg:" not in toast_text
+            assert "__workspace__" not in toast_text
+            assert not any(
+                any(ch in line for ch in "\u256d\u256e\u2570\u256f\u2500")
+                for line in toast_lines
+            ), toast_lines
+
+    _run(body())
+
+
 def test_empty_state_message_when_no_inbox(tmp_path: Path) -> None:
     """An inbox with zero messages shows the friendly empty-state copy."""
     async def body() -> None:

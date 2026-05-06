@@ -239,6 +239,16 @@ def test_session_description_uses_meaningful_line_before_cli_tip(tmp_path) -> No
     assert desc == "Updated dashboard activity filtering tests."
 
 
+def test_operator_pm_healthy_copy_matches_now_feed_voice() -> None:
+    """#1299: Polly's own Now-feed row should not use bland filler copy."""
+    from pollypm.dashboard_data import _session_description
+
+    desc = _session_description("healthy", "operator-pm", None)
+
+    assert desc == "Plating the brief"
+    assert "managing projects" not in desc.lower()
+
+
 def test_session_description_keeps_real_codex_working_status(tmp_path) -> None:
     """#994 negative: the fix must not regress working-session
     rendering. A pane snapshot showing Codex actively working (the
@@ -257,6 +267,18 @@ def test_session_description_keeps_real_codex_working_status(tmp_path) -> None:
     desc = _session_description("healthy", "worker", str(snapshot))
     assert "working" in desc.lower()
     assert "3m" in desc
+
+
+def test_session_description_trims_working_duration_spacing(tmp_path) -> None:
+    """#1299: ``Working (0s ...)`` should not render as ``working (0s )``."""
+    from pollypm.dashboard_data import _session_description
+
+    snapshot = tmp_path / "snap.txt"
+    snapshot.write_text("⏺ Working (0s · esc to interrupt)\n")
+
+    desc = _session_description("healthy", "worker", str(snapshot))
+
+    assert desc == "working (0s)"
 
 
 def test_session_description_truncates_at_word_boundary(tmp_path) -> None:

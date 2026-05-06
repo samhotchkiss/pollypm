@@ -389,7 +389,7 @@ def _session_description(status: str, role: str, snapshot_path: str | None) -> s
     """Build a human-readable description of what a session is doing."""
     if role == "operator-pm":
         if status == "healthy":
-            return "managing projects and reviewing work"
+            return "Plating the brief"
         if status == "waiting_on_user":
             return "waiting for your direction"
         return "supervising"
@@ -425,7 +425,7 @@ def _session_description(status: str, role: str, snapshot_path: str | None) -> s
                 # Working indicator with time
                 m = re.search(r"Working \((\d+[ms]\s?\d*s?)\s*", stripped)
                 if m:
-                    return f"working ({m.group(1)})"
+                    return f"working ({m.group(1).strip()})"
             # #1025 (Home dashboard "Now" feed) — when the visible
             # last-line of pane is mid-sentence noise, prefer a
             # recognized event signature picked from the most-recent

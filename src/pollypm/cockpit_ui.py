@@ -4880,10 +4880,28 @@ class PollySettingsPaneApp(App[None]):
             "inbox": len(data.inbox) if data else 0,
             "about": len(data.about) if data else 0,
         }
+        # #1288 — re-resolve nav widgets from the live DOM each render.
+        # The cached ``_nav_widgets`` references can go stale if Textual
+        # re-mounts a child (e.g. on a layout pass triggered by toggling
+        # the ``-narrow`` class), and a stale ``Static.update`` is a
+        # silent no-op — leaving the ▸ marker pinned to its first
+        # painted row at narrow widths even though ``_nav_cursor`` is
+        # advancing on every j/k.
+        try:
+            live_nav_items = list(self.nav.query(".nav-item"))
+        except Exception:  # noqa: BLE001
+            live_nav_items = []
+        live_by_index: dict[int, Static] = {}
+        for index, widget in enumerate(live_nav_items):
+            if isinstance(widget, Static):
+                live_by_index[index] = widget
         for i, (key, label) in enumerate(_SETTINGS_SECTIONS):
-            widget = self._nav_widgets.get(key)
+            widget = live_by_index.get(i) or self._nav_widgets.get(key)
             if widget is None:
                 continue
+            # Keep the cache in sync so callers that introspect
+            # ``_nav_widgets`` still see the live widget.
+            self._nav_widgets[key] = widget
             widget.update(self._nav_label(key, label, count=counts.get(key)))
             widget.remove_class("-selected")
             widget.remove_class("-section-active")
@@ -4891,6 +4909,14 @@ class PollySettingsPaneApp(App[None]):
                 widget.add_class("-selected")
             if key == self._active_section:
                 widget.add_class("-section-active")
+            # Force a repaint even when the renderable text is the
+            # same length as before — Static.update can short-circuit
+            # in that case, which is what was anchoring the ▸ glyph
+            # at narrow widths (#1288).
+            try:
+                widget.refresh()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _nav_label(self, key: str, label: str, *, count: int | None) -> str:
         try:

@@ -1471,6 +1471,67 @@ def test_cockpit_router_primes_per_project_pm_session_distinctly() -> None:
     assert len(sent) == 2  # unchanged
 
 
+def test_project_pm_primer_matches_architect_session_persona() -> None:
+    """An architect-backed PM Chat should greet Archie, not the project's
+    worker persona (#1321).
+    """
+    sent: list[tuple[str, str]] = []
+    primed_state: dict[str, object] = {}
+
+    class _FakeTmux:
+        def send_keys(self, target, text, press_enter=True):  # noqa: ARG002
+            sent.append((target, text))
+
+    class _Project:
+        key = "bikepath"
+        name = "bikepath"
+        path = Path("/tmp/bikepath-no-db")
+        persona_name = "Bea"
+
+    class _FakeConfig:
+        projects = {"bikepath": _Project()}
+
+    class _FakeSupervisor:
+        config = _FakeConfig()
+
+        def plan_launches(self):
+            class _Sess:
+                name = "architect_bikepath"
+                role = "architect"
+                project = "bikepath"
+
+            class _L:
+                session = _Sess()
+
+            return [_L()]
+
+    router = CockpitRouter.__new__(CockpitRouter)
+    router.config_path = Path("/tmp/pollypm.toml")
+    router.tmux = _FakeTmux()
+    router._right_pane_id = lambda window_target: "%right"  # type: ignore[assignment]
+    router._load_state = lambda: dict(primed_state)  # type: ignore[assignment]
+
+    def _write(data):
+        primed_state.clear()
+        primed_state.update(data)
+
+    router._write_state = _write  # type: ignore[assignment]
+    router._session_available_for_mount = lambda *a, **k: True  # type: ignore[assignment]
+    router._show_live_session = lambda *a, **k: None  # type: ignore[assignment]
+
+    supervisor = _FakeSupervisor()
+
+    router._route_project_selection(
+        supervisor,
+        "pollypm:PollyPM",
+        ProjectRoute(project_key="bikepath", sub_view="session"),
+    )
+
+    assert len(sent) == 1
+    assert "Hey Archie" in sent[0][1]
+    assert "Hey Bea" not in sent[0][1]
+
+
 def test_create_worker_and_route_targets_pm_chat_session_when_worker_exists() -> None:
     """#964 regression: after :meth:`create_worker_and_route` spawns
     the per-project worker (or finds a pre-existing one), it MUST route

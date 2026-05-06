@@ -426,7 +426,38 @@ def _visibility_passes(reg, ctx) -> bool:
     return True
 
 
-def _build_project_pm_primer(supervisor, project_key: str) -> str | None:
+def _project_pm_persona_for_role(session_role: object) -> str | None:
+    if isinstance(session_role, str) and session_role.strip():
+        try:
+            from pollypm.role_contract import canonical_role, persona_for
+
+            if canonical_role(session_role) == "architect":
+                return persona_for("architect")
+        except ValueError:
+            pass
+    return None
+
+
+def _session_role_for_name(supervisor, session_name: str | None) -> object | None:
+    if not session_name:
+        return None
+    try:
+        launches = supervisor.plan_launches()
+    except Exception:  # noqa: BLE001
+        return None
+    for launch in launches:
+        session = getattr(launch, "session", None)
+        if getattr(session, "name", None) == session_name:
+            return getattr(session, "role", None)
+    return None
+
+
+def _build_project_pm_primer(
+    supervisor,
+    project_key: str,
+    *,
+    session_name: str | None = None,
+) -> str | None:
     """Return a project-context priming message for a per-project PM session.
 
     The cockpit attaches a project's PM Chat to the project's worker
@@ -446,12 +477,16 @@ def _build_project_pm_primer(supervisor, project_key: str) -> str | None:
     project = supervisor.config.projects.get(project_key)
     if project is None:
         return None
-    persona_raw = getattr(project, "persona_name", None)
-    persona = (
-        persona_raw.strip()
-        if isinstance(persona_raw, str) and persona_raw.strip()
-        else None
+    persona = _project_pm_persona_for_role(
+        _session_role_for_name(supervisor, session_name),
     )
+    if persona is None:
+        persona_raw = getattr(project, "persona_name", None)
+        persona = (
+            persona_raw.strip()
+            if isinstance(persona_raw, str) and persona_raw.strip()
+            else None
+        )
     project_name = project.name or project_key
     project_path = str(project.path)
 
@@ -3112,7 +3147,11 @@ class CockpitRouter:
                 primed = set()
             if session_name in primed:
                 return
-            primer = _build_project_pm_primer(supervisor, project_key)
+            primer = _build_project_pm_primer(
+                supervisor,
+                project_key,
+                session_name=session_name,
+            )
             if not primer:
                 return
             right_pane_id = self._right_pane_id(window_target)

@@ -650,6 +650,15 @@ def maybe_record_first_shipped(
 class SQLiteWorkService:
     """SQLite-backed work service implementing the WorkService protocol."""
 
+    # TODO(savethenovel-followup): emit ``work_table.cleared`` from
+    # the codepath that recreates ``work_tasks`` from scratch (DB
+    # rebuild on first open against a missing/empty file, or any
+    # admin reset path). Today the only ``DELETE FROM work_tasks``
+    # is the per-row prune in :meth:`_prune_cancelled_critique_child`
+    # which is already audited as ``task.deleted``. The wholesale
+    # wipe vector that prompted this audit log is suspected to be
+    # an external ``pm reset``-class operation; instrument that
+    # caller (and any future bulk-clear path) here.
     def __init__(
         self,
         db_path: Path,
@@ -1431,6 +1440,28 @@ class SQLiteWorkService:
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (project, task_number, from_state, to_state, actor, reason, _now()),
         )
+        # Audit hook (#savethenovel) — every transition lands here.
+        # Mirrors the work_transitions row so post-mortem readers
+        # can correlate the audit log with the DB even when one of
+        # the two has been wiped.
+        try:
+            from pollypm.audit import emit as _audit_emit
+            from pollypm.audit.log import EVENT_TASK_STATUS_CHANGED
+
+            _audit_emit(
+                event=EVENT_TASK_STATUS_CHANGED,
+                project=project,
+                subject=f"{project}/{task_number}",
+                actor=actor or "",
+                metadata={
+                    "from": from_state,
+                    "to": to_state,
+                    "reason": reason,
+                },
+                project_path=self._project_path,
+            )
+        except Exception:  # noqa: BLE001 — audit must never break transitions
+            pass
 
     @staticmethod
     def _gate_skip_reason(results: list[GateResult]) -> str | None:
@@ -2429,6 +2460,29 @@ class SQLiteWorkService:
         except Exception:
             self._conn.rollback()
             raise
+        # Audit hook (#savethenovel) — record the row delete.
+        # work_tasks is the spine; once a row leaves it the only
+        # forensic trail of "this task ever existed" is the audit
+        # log. Emit AFTER commit so we don't record phantom
+        # deletes for rolled-back transactions.
+        try:
+            from pollypm.audit import emit as _audit_emit
+            from pollypm.audit.log import EVENT_TASK_DELETED
+
+            _audit_emit(
+                event=EVENT_TASK_DELETED,
+                project=task.project,
+                subject=task.task_id,
+                actor="system",
+                metadata={
+                    "reason": "prune_cancelled_critique_child",
+                    "flow_template": task.flow_template_id,
+                    "title": task.title,
+                },
+                project_path=self._project_path,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _on_task_done(self, task_id: str, actor: str) -> None:
         """Post-commit hook — fire milestone/digest flush on done transitions.

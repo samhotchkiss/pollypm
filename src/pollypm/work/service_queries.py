@@ -100,6 +100,29 @@ def create_task(
     )
     service._conn.commit()
     task = service.get(f"{project}/{task_number}")
+    # Audit hook (#savethenovel) — record the create so a forensic
+    # reader can reconstruct task creation order even if the row is
+    # later wiped from work_tasks. Best-effort; emit() never raises.
+    try:
+        from pollypm.audit import emit as _audit_emit
+        from pollypm.audit.log import EVENT_TASK_CREATED
+
+        _audit_emit(
+            event=EVENT_TASK_CREATED,
+            project=project,
+            subject=task.task_id,
+            actor=created_by or "system",
+            metadata={
+                "title": title,
+                "type": task_type.value,
+                "flow_template": template.name,
+                "priority": task_priority.value,
+                "requires_human_review": bool(requires_human_review),
+            },
+            project_path=service._project_path,
+        )
+    except Exception:  # noqa: BLE001 — audit must never break creates
+        pass
     if service._sync:
         external_refs_before_sync = dict(task.external_refs)
         service._sync.on_create(task)

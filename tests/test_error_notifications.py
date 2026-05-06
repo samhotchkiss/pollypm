@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from pollypm.error_log import install
+from pollypm.error_log import install, path
 from pollypm.error_notifications import (
     CriticalErrorNotificationHandler,
     build_critical_error_notification,
@@ -145,6 +145,16 @@ def test_install_adds_notification_handler_once(tmp_path: Path, monkeypatch) -> 
                 pass
         root.handlers = old_handlers
         root.setLevel(old_level)
+
+
+def test_error_log_path_honors_env_override(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    target = tmp_path / "pytest-errors.log"
+    monkeypatch.setenv("POLLYPM_ERROR_LOG_PATH", str(target))
+
+    assert path() == target
 
 
 def test_install_can_disable_durable_error_notifications(

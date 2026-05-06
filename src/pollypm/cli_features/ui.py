@@ -111,6 +111,8 @@ def _send_help_key_to_content_bridge(config_path: Path, key: str) -> Path | None
         selected = CockpitRouter(config_path).selected_key()
     except Exception:  # noqa: BLE001
         return None
+    if selected in {"dashboard", "polly"}:
+        return None
     kind = _content_bridge_kind_for_selected_key(selected)
     candidates = []
     if kind is not None:

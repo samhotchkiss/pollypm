@@ -533,6 +533,30 @@ def test_row_highlight_updates_health_tooltip_hint(roster_env, roster_app) -> No
     _run(body())
 
 
+def test_stuck_worker_hint_points_to_task_recovery(roster_env, roster_app) -> None:
+    """#1286: stuck rows must show a cockpit-visible recovery path."""
+    async def body() -> None:
+        rows = [
+            _make_row(
+                status="stuck",
+                health="unresponsive",
+                health_tooltip="stuck; heartbeat not recorded · session: worker_demo",
+                task_number=7,
+            ),
+        ]
+        roster_app._gather = lambda: rows  # type: ignore[method-assign]
+        async with roster_app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            roster_app.table.focus()
+            await pilot.pause()
+            hint_text = str(roster_app.hint.render())
+            assert "stuck; heartbeat not recorded" in hint_text
+            assert "d open task" in hint_text
+            assert "then R recovery" in hint_text
+
+    _run(body())
+
+
 # ---------------------------------------------------------------------------
 # Gather-layer sanity — exercises the data-plane without the TUI.
 # ---------------------------------------------------------------------------

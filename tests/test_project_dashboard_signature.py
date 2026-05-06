@@ -73,6 +73,12 @@ def test_signature_changes_on_status_label_change() -> None:
     assert _project_dashboard_signature(a) != _project_dashboard_signature(b)
 
 
+def test_signature_changes_on_pm_label_change() -> None:
+    a = _make(pm_label="PM: Bea")
+    b = _make(pm_label="PM: Archie")
+    assert _project_dashboard_signature(a) != _project_dashboard_signature(b)
+
+
 def test_signature_changes_on_worker_heartbeat() -> None:
     """Heartbeat updates intentionally invalidate so the worker
     section stays current."""

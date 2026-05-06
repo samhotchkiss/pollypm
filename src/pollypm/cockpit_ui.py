@@ -6778,6 +6778,41 @@ class _InboxProjectPickerModal(ModalScreen[str | None]):
         self.action_select()
 
 
+def _project_pm_persona(config: object, project_key: str, project: object) -> str | None:
+    sessions = getattr(config, "sessions", {}) or {}
+    session_role: object | None = None
+    if isinstance(sessions, dict):
+        from pollypm.models import CONTROL_ROLES
+
+        for session in sessions.values():
+            if getattr(session, "project", None) != project_key:
+                continue
+            if getattr(session, "enabled", True) is False:
+                continue
+            role = getattr(session, "role", "")
+            if role in CONTROL_ROLES:
+                continue
+            session_role = role
+            break
+
+    if isinstance(session_role, str) and session_role.strip():
+        try:
+            from pollypm.role_contract import canonical_role, persona_for
+
+            if canonical_role(session_role) == "architect":
+                return persona_for("architect")
+        except ValueError:
+            pass
+
+    persona = getattr(project, "persona_name", None)
+    return persona.strip() if isinstance(persona, str) and persona.strip() else None
+
+
+def _project_pm_label(config: object, project_key: str, project: object) -> str:
+    persona = _project_pm_persona(config, project_key, project)
+    return f"PM: {persona}" if persona else "PM: Project PM"
+
+
 def _resolve_pm_target(config_path: Path, project_key: str | None) -> tuple[str, str]:
     """Resolve the cockpit-router key + display name for a project's PM.
 
@@ -6800,10 +6835,8 @@ def _resolve_pm_target(config_path: Path, project_key: str | None) -> tuple[str,
     project = projects.get(project_key)
     if project is None:
         return fallback_key, fallback_name
-    persona = getattr(project, "persona_name", None)
-    if isinstance(persona, str) and persona.strip():
-        return f"project:{project_key}:session", persona.strip()
-    return f"project:{project_key}:session", "Project PM"
+    persona = _project_pm_persona(config, project_key, project)
+    return f"project:{project_key}:session", persona or "Project PM"
 
 
 def _build_pm_context_line(
@@ -12650,11 +12683,7 @@ def _gather_project_dashboard(
         else (getattr(project, "name", None) or project_key)
     )
     persona = getattr(project, "persona_name", None)
-    pm_label = (
-        f"PM: {persona.strip()}"
-        if isinstance(persona, str) and persona.strip()
-        else "PM: Project PM"
-    )
+    pm_label = _project_pm_label(config, project_key, project)
 
     exists_on_disk = bool(
         project_path is not None
@@ -12781,6 +12810,7 @@ def _project_dashboard_signature(
     worker = data.active_worker or {}
     return (
         data.project_key,
+        data.pm_label,
         data.exists_on_disk,
         data.status_dot,
         data.status_label,

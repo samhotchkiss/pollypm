@@ -1957,9 +1957,15 @@ def test_cockpit_router_primes_workspace_operator_on_attach() -> None:
     # the workspace-scope discriminators below still uniquely identify
     # the workspace primer.
     assert "operator chat" in text
-    # Workspace-scope (not project-scope) discriminators.
-    assert "Workspace:" in text
-    assert "Active inbox:" in text
+    # Workspace-scope (not project-scope) context, phrased without
+    # implementation-y counters or CLI command names.
+    assert "The user can see 2 projects in PollyPM." in text
+    assert "Visible projects:" in text
+    assert "0 inbox items are waiting." in text
+    assert "Workspace:" not in text
+    assert "under management" not in text
+    assert "project(s)" not in text
+    assert "item(s)" not in text
     assert "workspace-wide" not in text
     assert "pm inbox" not in text
     assert "pm status" not in text

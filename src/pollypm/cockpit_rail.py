@@ -618,16 +618,20 @@ def _build_operator_primer(supervisor) -> str | None:
     # New wording is conversational: the user just mounted Polly chat,
     # so frame the primer as a workspace briefing she'd want before
     # the user starts talking, rather than a role-imposition.
+    project_word = "project" if project_count == 1 else "projects"
     lines = [
         "Hey Polly — the user just opened the operator chat. Quick "
         "workspace briefing so you have the context they're seeing "
         "before they say anything.",
-        f"Workspace: {project_count} project(s) under management.",
+        f"The user can see {project_count} {project_word} in PollyPM.",
     ]
     if project_lines:
-        lines.append("Projects:")
+        lines.append("Visible projects:")
         lines.extend(project_lines[:10])
-    lines.append(f"Active inbox: {inbox_total} item(s)")
+    if inbox_total == 1:
+        lines.append("1 inbox item is waiting.")
+    else:
+        lines.append(f"{inbox_total} inbox items are waiting.")
     if inbox_titles:
         lines.append("Recent inbox:")
         for project_name, title in inbox_titles[:5]:

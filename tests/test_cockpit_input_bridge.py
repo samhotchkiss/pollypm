@@ -708,6 +708,13 @@ def test_cockpit_send_key_enter_consumes_network_dead_for_live_right_pane(
     valid_cockpit_config: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import pollypm.cockpit_rail as cockpit_rail
+    from pollypm.cockpit_live_chat_notice import (
+        LIVE_CHAT_NETWORK_DEAD_NOTICE_MESSAGE_KEY,
+        LIVE_CHAT_NETWORK_DEAD_NOTICE_UNTIL_KEY,
+        LIVE_CHAT_NETWORK_DEAD_RAIL_MESSAGE,
+        LIVE_CHAT_NETWORK_DEAD_TMUX_MESSAGE,
+        LIVE_CHAT_NETWORK_DEAD_TMUX_DISPLAY_MS,
+    )
     from pollypm.cli_features import ui as ui_commands
     from pollypm.dev_network_simulation import arm_network_dead, network_dead_armed
 
@@ -751,20 +758,32 @@ def test_cockpit_send_key_enter_consumes_network_dead_for_live_right_pane(
     assert router.tmux.calls == [
         ("run", "send-keys", "-t", "%2", "C-u", {"check": False}),
         (
-            "send_keys",
+            "run",
+            "display-message",
+            "-d",
+            LIVE_CHAT_NETWORK_DEAD_TMUX_DISPLAY_MS,
+            "-t",
             "%2",
-            "PollyPM chat failed: network unreachable. "
-            "Type again to clear this and retry; check connection.",
-            False,
+            LIVE_CHAT_NETWORK_DEAD_TMUX_MESSAGE,
+            {"check": False},
         ),
     ]
-    assert router.state["live_chat_network_dead_prompt_active"] is True
+    assert router.state[LIVE_CHAT_NETWORK_DEAD_NOTICE_MESSAGE_KEY] == (
+        LIVE_CHAT_NETWORK_DEAD_RAIL_MESSAGE
+    )
+    assert router.state[LIVE_CHAT_NETWORK_DEAD_NOTICE_UNTIL_KEY] > time.time()
+    assert "live_chat_network_dead_prompt_active" not in router.state
 
 
-def test_cockpit_send_key_after_network_dead_prompt_clears_before_typing(
+def test_cockpit_send_key_after_network_dead_notice_forwards_typing(
     valid_cockpit_config: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import pollypm.cockpit_rail as cockpit_rail
+    from pollypm.cockpit_live_chat_notice import (
+        LIVE_CHAT_NETWORK_DEAD_NOTICE_MESSAGE_KEY,
+        LIVE_CHAT_NETWORK_DEAD_NOTICE_UNTIL_KEY,
+        LIVE_CHAT_NETWORK_DEAD_RAIL_MESSAGE,
+    )
     from pollypm.cli_features import ui as ui_commands
 
     class FakeTmux:
@@ -786,7 +805,10 @@ def test_cockpit_send_key_after_network_dead_prompt_clears_before_typing(
                 "mounted_session": "operator",
                 "right_pane_id": "%2",
                 "live_right_pane_input_sticky": True,
-                "live_chat_network_dead_prompt_active": True,
+                LIVE_CHAT_NETWORK_DEAD_NOTICE_MESSAGE_KEY: (
+                    LIVE_CHAT_NETWORK_DEAD_RAIL_MESSAGE
+                ),
+                LIVE_CHAT_NETWORK_DEAD_NOTICE_UNTIL_KEY: time.time() + 10,
             }
 
         def active_live_right_pane_id(self) -> str:
@@ -807,10 +829,11 @@ def test_cockpit_send_key_after_network_dead_prompt_clears_before_typing(
 
     assert delivered == "%2"
     assert router.tmux.calls == [
-        ("run", "send-keys", "-t", "%2", "C-u", {"check": False}),
         ("send_keys", "%2", "h", False),
     ]
-    assert "live_chat_network_dead_prompt_active" not in router.state
+    assert router.state[LIVE_CHAT_NETWORK_DEAD_NOTICE_MESSAGE_KEY] == (
+        LIVE_CHAT_NETWORK_DEAD_RAIL_MESSAGE
+    )
 
 
 def test_cockpit_send_key_keeps_live_right_pane_sticky_after_first_char(
@@ -899,7 +922,6 @@ def test_cockpit_send_key_escape_clears_live_right_pane_sticky(
                 "mounted_session": "architect_demo",
                 "right_pane_id": "%2",
                 "live_right_pane_input_sticky": True,
-                "live_chat_network_dead_prompt_active": True,
             }
 
         def active_live_right_pane_id(self) -> str | None:
@@ -918,7 +940,6 @@ def test_cockpit_send_key_escape_clears_live_right_pane_sticky(
         valid_cockpit_config, "<esc>",
     ) is None
     assert "live_right_pane_input_sticky" not in router.state
-    assert "live_chat_network_dead_prompt_active" not in router.state
 
 
 def test_send_key_to_first_live_skips_stale_sockets(fake_config: Path, tmp_path: Path) -> None:

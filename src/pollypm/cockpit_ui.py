@@ -78,6 +78,12 @@ from pollypm.cockpit_inbox_items import (
     message_row_to_inbox_entry,
     task_to_inbox_entry,
 )
+from pollypm.cockpit_live_chat_notice import (
+    LIVE_CHAT_NETWORK_DEAD_TMUX_MESSAGE,
+    clear_live_chat_network_dead_notice,
+    current_live_chat_network_dead_notice,
+    live_chat_network_dead_notice_present,
+)
 from pollypm.cockpit_metrics import (  # noqa: F401  (re-exported)
     PollyMetricsApp,
     _MetricsDrillDownModal,
@@ -1234,6 +1240,7 @@ class PollyCockpitApp(App[None]):
             window_manager=_CockpitRouteWindowApplier(self),
         )
         self._route_status_hint: str | None = None
+        self._transient_notice_active = False
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -1251,6 +1258,7 @@ class PollyCockpitApp(App[None]):
         self._refresh_rows()
         self._update_ticker()
         self._update_pill_refresh()
+        self._update_transient_notice()
         self.set_interval(0.8, self._tick)
         self.set_interval(self.SCHEDULER_POLL_INTERVAL_SECONDS, self._tick_scheduler)
         self.nav.focus()
@@ -1891,6 +1899,7 @@ class PollyCockpitApp(App[None]):
         # feedback loop from "upgrade complete" → visible notice is
         # sub-second.
         self._check_post_upgrade_flag()
+        self._update_transient_notice()
         # Layout check much less frequently
         if self._tick_count % self._LAYOUT_CHECK_INTERVAL == 0:
             try:
@@ -2217,6 +2226,27 @@ class PollyCockpitApp(App[None]):
         ticker_text = self._event_ticker_text()
         self.ticker.update(ticker_text)
         self.ticker.display = bool(ticker_text)
+
+    def _update_transient_notice(self) -> bool:
+        try:
+            state = self.router._load_state()
+        except Exception:  # noqa: BLE001
+            return False
+        notice = current_live_chat_network_dead_notice(state)
+        if notice is None:
+            if live_chat_network_dead_notice_present(state):
+                clear_live_chat_network_dead_notice(self.router)
+            if self._transient_notice_active:
+                self._transient_notice_active = False
+                self.update_pill.tooltip = None
+                self.update_pill.display = False
+                self._update_pill_refresh()
+            return False
+        self._transient_notice_active = True
+        self.update_pill.tooltip = LIVE_CHAT_NETWORK_DEAD_TMUX_MESSAGE
+        self.update_pill.update(f"[#ff5f6d]{_escape(notice)}[/]")
+        self.update_pill.display = True
+        return True
 
     def _update_pill_refresh(self) -> None:
         """Refresh the update-available pill in the rail top area.

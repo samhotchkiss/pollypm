@@ -10061,12 +10061,15 @@ class PollyInboxApp(App[None]):
             and not fast_track
             and not self._plan_review_round_trip.get(task_id, False)
         ):
-            self.notify(
-                "Discuss the plan with your PM first (press d). "
-                "Approve unlocks after the first round-trip.",
-                severity="warning", timeout=4.0,
-            )
-            return
+            if self._plan_review_discussion_marker_exists(item, task_id):
+                self._mark_plan_review_discussion_unlocked(task_id)
+            else:
+                self.notify(
+                    "Discuss the plan with your PM first (press d). "
+                    "Approve unlocks after the first round-trip.",
+                    severity="warning", timeout=4.0,
+                )
+                return
         # Route through the work-service approve path directly — the
         # CLI entry point is just sugar over ``svc.approve``, and we
         # already hold the project context.

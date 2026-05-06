@@ -1471,6 +1471,67 @@ def test_cockpit_router_primes_per_project_pm_session_distinctly() -> None:
     assert len(sent) == 2  # unchanged
 
 
+def test_project_pm_primer_matches_architect_session_persona() -> None:
+    """An architect-backed PM Chat should greet Archie, not the project's
+    worker persona (#1321).
+    """
+    sent: list[tuple[str, str]] = []
+    primed_state: dict[str, object] = {}
+
+    class _FakeTmux:
+        def send_keys(self, target, text, press_enter=True):  # noqa: ARG002
+            sent.append((target, text))
+
+    class _Project:
+        key = "bikepath"
+        name = "bikepath"
+        path = Path("/tmp/bikepath-no-db")
+        persona_name = "Bea"
+
+    class _FakeConfig:
+        projects = {"bikepath": _Project()}
+
+    class _FakeSupervisor:
+        config = _FakeConfig()
+
+        def plan_launches(self):
+            class _Sess:
+                name = "architect_bikepath"
+                role = "architect"
+                project = "bikepath"
+
+            class _L:
+                session = _Sess()
+
+            return [_L()]
+
+    router = CockpitRouter.__new__(CockpitRouter)
+    router.config_path = Path("/tmp/pollypm.toml")
+    router.tmux = _FakeTmux()
+    router._right_pane_id = lambda window_target: "%right"  # type: ignore[assignment]
+    router._load_state = lambda: dict(primed_state)  # type: ignore[assignment]
+
+    def _write(data):
+        primed_state.clear()
+        primed_state.update(data)
+
+    router._write_state = _write  # type: ignore[assignment]
+    router._session_available_for_mount = lambda *a, **k: True  # type: ignore[assignment]
+    router._show_live_session = lambda *a, **k: None  # type: ignore[assignment]
+
+    supervisor = _FakeSupervisor()
+
+    router._route_project_selection(
+        supervisor,
+        "pollypm:PollyPM",
+        ProjectRoute(project_key="bikepath", sub_view="session"),
+    )
+
+    assert len(sent) == 1
+    assert "Hey Archie" in sent[0][1]
+    assert "Hey Bea" not in sent[0][1]
+
+
 def test_create_worker_and_route_targets_pm_chat_session_when_worker_exists() -> None:
     """#964 regression: after :meth:`create_worker_and_route` spawns
     the per-project worker (or finds a pre-existing one), it MUST route
@@ -1957,9 +2018,15 @@ def test_cockpit_router_primes_workspace_operator_on_attach() -> None:
     # the workspace-scope discriminators below still uniquely identify
     # the workspace primer.
     assert "operator chat" in text
-    # Workspace-scope (not project-scope) discriminators.
-    assert "Workspace:" in text
-    assert "Active inbox:" in text
+    # Workspace-scope (not project-scope) context, phrased without
+    # implementation-y counters or CLI command names.
+    assert "The user can see 2 projects in PollyPM." in text
+    assert "Visible projects:" in text
+    assert "0 inbox items are waiting." in text
+    assert "Workspace:" not in text
+    assert "under management" not in text
+    assert "project(s)" not in text
+    assert "item(s)" not in text
     assert "workspace-wide" not in text
     assert "pm inbox" not in text
     assert "pm status" not in text
@@ -4780,6 +4847,15 @@ def test_settings_pane_renders_accounts_and_toggles_permissions(monkeypatch, tmp
     asyncio.run(exercise())
 
 
+def test_settings_nav_marker_follows_visible_cursor_not_active_section() -> None:
+    app = PollySettingsPaneApp.__new__(PollySettingsPaneApp)
+    app._active_section = "accounts"
+    app._nav_cursor = 1
+
+    assert app._nav_label("accounts", "Accounts", count=2).startswith("  ")
+    assert app._nav_label("projects", "Projects", count=10).startswith("\u25b8 ")
+
+
 def test_cockpit_app_tick_scheduler_is_noop(tmp_path: Path) -> None:
     """The scheduler tick is a no-op — heartbeat runs via cron, not the cockpit."""
     app = PollyCockpitApp(tmp_path / "pollypm.toml")
@@ -5443,6 +5519,63 @@ class _InboxNavRouter:
 
     def set_selected_key(self, key: str) -> None:
         self.persisted.append(key)
+
+
+def test_cockpit_inbox_tab_right_and_enter_activate_pane_nav() -> None:
+    """#1298: explicit Inbox focus keys make j/k drive the Inbox list."""
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    router = _InboxNavRouter(active=False)
+    app.router = router  # type: ignore[assignment]
+    app.selected_key = "inbox"
+    app._items = [SimpleNamespace(key="inbox", selectable=True)]
+    app._selected_row_key = lambda: "inbox"  # type: ignore[method-assign]
+    app._right_pane_has_live_session = lambda: False  # type: ignore[method-assign]
+
+    focused: list[str] = []
+    sent_right: list[str] = []
+    routes: list[str] = []
+    app._focus_right_pane = lambda: focused.append("focus")  # type: ignore[method-assign]
+    app._send_key_to_right_pane = lambda key: sent_right.append(key)  # type: ignore[method-assign]
+    app._schedule_route_selected = (  # type: ignore[method-assign]
+        lambda key, *, label=None: routes.append(key)
+    )
+
+    app.action_forward_tab_to_right()
+    assert router.active is True
+    assert focused == ["focus"]
+    assert sent_right == []
+
+    router.active = False
+    app.action_focus_inbox_pane_nav()
+    assert router.active is True
+    assert focused == ["focus", "focus"]
+
+    router.active = False
+    app.action_open_selected()
+    assert router.active is True
+    assert routes == ["inbox"]
+
+
+def test_cockpit_escape_and_q_from_active_inbox_nav_return_to_inbox_pane() -> None:
+    """Bridge-delivered Esc/q should release Inbox nav through the Inbox app."""
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    router = _InboxNavRouter(active=True)
+    app.router = router  # type: ignore[assignment]
+    app.selected_key = "inbox"
+
+    forwarded: list[str] = []
+    navigated: list[str] = []
+    app._send_key_to_inbox_pane = (  # type: ignore[method-assign]
+        lambda key: forwarded.append(key) or True
+    )
+    app._right_pane_has_live_session = lambda: False  # type: ignore[method-assign]
+    app._navigate_home = lambda: navigated.append("home") or True  # type: ignore[method-assign]
+
+    app.action_back_to_home()
+    app.action_forward_project_home()
+
+    assert forwarded == ["escape", "q"]
+    assert navigated == []
 
 
 def test_cockpit_jk_from_inbox_forwards_to_inbox_pane() -> None:

@@ -5,10 +5,16 @@ See docs/extensible-rail-spec.md §5 and issue #222.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
 
+from pollypm.cockpit_live_chat_notice import (
+    LIVE_CHAT_NETWORK_DEAD_NOTICE_MESSAGE_KEY,
+    LIVE_CHAT_NETWORK_DEAD_NOTICE_UNTIL_KEY,
+    LIVE_CHAT_NETWORK_DEAD_RAIL_MESSAGE,
+)
 from pollypm.cockpit_rail import CockpitRouter
 from pollypm.models import KnownProject, ProjectKind
 from pollypm.plugin_api.v1 import (
@@ -88,6 +94,48 @@ class _FakeWindow:
         self.pane_id = f"%{name}"
 
 
+def test_polly_state_surfaces_live_chat_network_dead_notice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        core_rail_items_plugin,
+        "_session_state",
+        lambda *_args, **_kwargs: "ready",
+    )
+    ctx = RailContext(
+        cockpit_state={
+            LIVE_CHAT_NETWORK_DEAD_NOTICE_MESSAGE_KEY: (
+                LIVE_CHAT_NETWORK_DEAD_RAIL_MESSAGE
+            ),
+            LIVE_CHAT_NETWORK_DEAD_NOTICE_UNTIL_KEY: time.time() + 30,
+        },
+    )
+
+    assert core_rail_items_plugin._polly_state(ctx) == (
+        f"! {LIVE_CHAT_NETWORK_DEAD_RAIL_MESSAGE}"
+    )
+
+
+def test_polly_state_ignores_expired_live_chat_network_dead_notice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        core_rail_items_plugin,
+        "_session_state",
+        lambda *_args, **_kwargs: "ready",
+    )
+    ctx = RailContext(
+        cockpit_state={
+            LIVE_CHAT_NETWORK_DEAD_NOTICE_MESSAGE_KEY: (
+                LIVE_CHAT_NETWORK_DEAD_RAIL_MESSAGE
+            ),
+            LIVE_CHAT_NETWORK_DEAD_NOTICE_UNTIL_KEY: time.time() - 1,
+        },
+    )
+
+    assert core_rail_items_plugin._polly_state(ctx) == "ready"
+
+
 @pytest.mark.parametrize(
     ("session_role", "expected_label"),
     [
@@ -139,6 +187,43 @@ def test_pm_chat_label_matches_project_session_persona(
 
     session_row = next(row for row in rows if row.key == "project:bikepath:session")
     assert session_row.label == expected_label
+
+
+def test_pm_chat_label_uses_project_pm_fallback(monkeypatch, tmp_path: Path) -> None:
+    project = KnownProject(
+        key="booktalk",
+        path=tmp_path,
+        name="Booktalk",
+        persona_name=None,
+        kind=ProjectKind.GIT,
+    )
+    config = type("Config", (), {"projects": {"booktalk": project}})()
+
+    class _Router:
+        def _session_state(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            return "idle"
+
+    monkeypatch.setattr(
+        core_rail_items_plugin,
+        "_classify_projects",
+        lambda ctx: ([("booktalk", project)], [], {"booktalk": False}),
+    )
+    monkeypatch.setattr(
+        core_rail_items_plugin,
+        "_active_task_numbers",
+        lambda project, *, config=None: [],
+    )
+    ctx = RailContext(
+        router=_Router(),
+        config=config,
+        launches=[],
+        cockpit_state={"selected": "project:booktalk"},
+    )
+
+    rows = core_rail_items_plugin._project_rows(ctx)
+
+    session_row = next(row for row in rows if row.key == "project:booktalk:session")
+    assert session_row.label == "  PM Chat (Project PM)"
 
 
 def _fake_supervisor(

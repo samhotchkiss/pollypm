@@ -159,11 +159,26 @@ def _active_task_numbers(project: Any, *, config: Any = None) -> list[int]:
 
 
 def _polly_state(ctx: RailContext) -> str:
+    notice_state = _live_chat_network_dead_state(ctx)
+    if notice_state is not None:
+        return notice_state
     return _session_state(ctx, "operator")
 
 
 def _russell_state(ctx: RailContext) -> str:
     return _session_state(ctx, "reviewer")
+
+
+def _live_chat_network_dead_state(ctx: RailContext) -> str | None:
+    try:
+        from pollypm.cockpit_live_chat_notice import (
+            current_live_chat_network_dead_notice,
+        )
+
+        notice = current_live_chat_network_dead_notice(ctx.cockpit_state)
+    except Exception:  # noqa: BLE001
+        return None
+    return f"! {notice}" if notice else None
 
 
 def _session_configured(ctx: RailContext, session_name: str) -> bool:
@@ -337,7 +352,7 @@ def _selected_key(ctx: RailContext) -> str:
     return str(value) if isinstance(value, str) and value else "polly"
 
 
-def _project_chat_persona(project: Any, session_role: Any) -> str | None:
+def _project_chat_persona(project: Any, session_role: Any) -> str:
     if isinstance(session_role, str) and session_role.strip():
         try:
             from pollypm.role_contract import canonical_role, persona_for
@@ -351,7 +366,7 @@ def _project_chat_persona(project: Any, session_role: Any) -> str | None:
     return (
         persona_raw.strip()
         if isinstance(persona_raw, str) and persona_raw.strip()
-        else None
+        else "Project PM"
     )
 
 
@@ -407,7 +422,7 @@ def _project_rows(ctx: RailContext) -> list[RailRow]:
                 state="sub",
             ))
             persona = _project_chat_persona(project, session_role)
-            label = f"  PM Chat ({persona})" if persona else "  PM Chat"
+            label = f"  PM Chat ({persona})"
             rows.append(RailRow(
                 key=f"project:{project_key}:session",
                 label=label,

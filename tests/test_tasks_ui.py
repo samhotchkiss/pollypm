@@ -463,7 +463,7 @@ def test_task_app_surfaces_stage_timestamps_and_live_session_tabs(env, monkeypat
             live = str(app.query_one("#task-live", Static).render())
             timeline_rows = _table_rows(app.query_one("#task-timeline", DataTable))
 
-            assert "Stage      synthesize · work · architect" in overview
+            assert "Stage      Synthesize · Work · Architect" in overview
             assert "Session    architect_polly_remote" in overview
             assert "Branch     demo-architect" in live
             assert "Peek" in live
@@ -680,7 +680,7 @@ def test_task_app_refresh_preserves_selected_task_and_updates_tabs(env, monkeypa
             await pilot.pause()
             first = str(app.query_one("#task-detail", Static).render())
             first_live = str(app.query_one("#task-live", Static).render())
-            assert "synthesize · work · architect" in first
+            assert "Synthesize · Work · Architect" in first
             assert "Still synthesizing" in first_live
 
             state["task"] = _task(
@@ -716,7 +716,7 @@ def test_task_app_refresh_preserves_selected_task_and_updates_tabs(env, monkeypa
             second_live = str(app.query_one("#task-live", Static).render())
             timeline_rows = _table_rows(app.query_one("#task-timeline", DataTable))
 
-            assert "critic_panel · review · reviewer" in second
+            assert "Critic Panel · Review · Reviewer" in second
             assert "Waiting on critic feedback" in second_live
             assert timeline_rows[-1][0] == "⟳ critic_panel"
             assert timeline_rows[-1][2] == "TS[17:20]"
@@ -1358,10 +1358,10 @@ def test_task_app_surfaces_unread_rejection_feedback(env, monkeypatch) -> None:
             overview = str(app.query_one("#task-detail", Static).render())
 
             assert len(rows) == 1
-            assert rows[0][1] == "in_progress"
+            assert rows[0][1] == "In progress"
             assert rows[0][2] == "🔄 🟠 Ship Notesy visibility"
-            assert rows[0][4] == "synthesize"
-            assert "in_progress" in header
+            assert rows[0][4] == "Synthesize"
+            assert "In progress" in header
             assert "Unread rejection feedback in inbox" in header
             assert overview.index("In plain English") < overview.index("Status")
             assert "This task has unread reviewer feedback in the inbox." in overview
@@ -1463,7 +1463,7 @@ def test_task_app_leads_user_review_with_plain_language_summary(
             header = str(app.query_one("#task-header", Static).render())
             overview = str(app.query_one("#task-detail", Static).render())
 
-            assert "user-review" in header
+            assert "Needs review" in header
             assert overview.index("In plain English") < overview.index("Status")
             assert "Review needed: the project plan is waiting" in overview
             assert "approve it or reject with the changes you need" in overview
@@ -1527,9 +1527,16 @@ def test_task_app_leads_on_hold_feedback_with_paused_review_summary(
             "Confidence: 6/10 — core is correct, but two gaps block approval."
         ),
     )
+    flow = _flow()
+    flow.nodes["code_review"] = FlowNode(
+        name="Code review",
+        type=NodeType.REVIEW,
+        actor_type=ActorType.ROLE,
+        actor_role="reviewer",
+    )
     fake_svc = _FakeSvc(
         tasks_factory=lambda: [work_task, feedback_task],
-        flow=_flow(),
+        flow=flow,
         context_by_id={("demo/1", None): work_task.context},
     )
 
@@ -1541,8 +1548,14 @@ def test_task_app_leads_on_hold_feedback_with_paused_review_summary(
     async def body() -> None:
         async with app.run_test(size=(140, 50)) as pilot:
             await pilot.pause()
+            rows = _table_rows(app.query_one("#tasks-table", DataTable))
+            header = str(app.query_one("#task-header", Static).render())
             overview = str(app.query_one("#task-detail", Static).render())
 
+            assert rows[0][1] == "On hold"
+            assert rows[0][4] == "Code review"
+            assert "On hold" in header
+            assert "on_hold" not in header
             assert overview.index("In plain English") < overview.index("Status")
             assert (
                 "You're being asked to approve two deviations from the original plan."
@@ -1550,6 +1563,73 @@ def test_task_app_leads_on_hold_feedback_with_paused_review_summary(
             assert "Browser requirement: strike browser use from v1" in overview
             assert "Eventbrite: move it to v2 so v1 can get to testing" in overview
             assert "Confidence: 6/10" in overview
+            assert "Status     On hold" in overview
+            assert "Stage      Code review · Review · Reviewer" in overview
+            assert "on_hold" not in overview
+            assert "code_review" not in overview
+
+    _run(body())
+
+
+def test_task_app_all_filter_uses_human_readable_status_labels(
+    env, monkeypatch,
+) -> None:
+    """#1301 — the Tasks table must not leak raw WorkStatus enum values."""
+    if not _load_config_compatible(env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_tasks import PollyTasksApp
+
+    on_hold = _task(
+        node_id="code_review",
+        title="Paused scraper work",
+        status=WorkStatus.ON_HOLD,
+    )
+    draft = _task(
+        task_number=2,
+        node_id="research",
+        title="Plan next milestone",
+        status=WorkStatus.DRAFT,
+    )
+    complete = _task(
+        task_number=3,
+        node_id="research",
+        title="Completed migration",
+        status=WorkStatus.DONE,
+    )
+    fake_svc = _FakeSvc(
+        tasks_factory=lambda: [draft, complete, on_hold],
+        flow=_flow(),
+    )
+
+    monkeypatch.setattr("pollypm.cockpit_tasks.create_tmux_client", lambda: _FakeTmux([]))
+
+    app = PollyTasksApp(env["config_path"], "demo")
+    app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            app._status_filter = "all"
+            app._sync_filter_buttons()
+            app._render_table(select_first=True)
+            await pilot.pause()
+
+            rows = _table_rows(app.query_one("#tasks-table", DataTable))
+            summary = str(app.query_one("#tasks-summary", Static).render())
+            header = str(app.query_one("#task-header", Static).render())
+            overview = str(app.query_one("#task-detail", Static).render())
+            assert [row[1] for row in rows] == ["On hold", "Draft", "Done"]
+            assert "On hold" in summary
+            assert "Done" in summary
+            assert "on_hold" not in summary
+            assert "done" not in summary
+            assert "On hold" in header
+            assert "Status     On hold" in overview
+            assert "on_hold" not in rows[0]
+            assert "draft" not in rows[1]
+            assert "done" not in rows[2]
+            assert "on_hold" not in header
+            assert "on_hold" not in overview
 
     _run(body())
 
@@ -1593,12 +1673,12 @@ def test_task_app_keeps_autoreview_state_distinct_from_feedback_inbox(
             overview = str(app.query_one("#task-detail", Static).render())
 
             assert len(rows) == 1
-            assert rows[0][1] == "autoreview"
+            assert rows[0][1] == "Auto review"
             assert rows[0][2] == "🔄 🟠 Review Notesy visibility"
-            assert rows[0][4] == "critic_panel"
-            assert "autoreview" in header
+            assert rows[0][4] == "Critic panel"
+            assert "Auto review" in header
             assert "Unread rejection feedback in inbox" in header
-            assert "Status     autoreview" in overview
+            assert "Status     Auto review" in overview
             assert "Artifact   Unread rejection feedback (demo/99)" in overview
             assert "Need stronger rollout coverage before approval." in overview
 
@@ -1657,9 +1737,9 @@ def test_task_app_sorts_user_review_before_autoreview(
             rows = _table_rows(app.query_one("#tasks-table", DataTable))
 
             assert [row[1] for row in rows] == [
-                "user-review",
-                "user-review",
-                "autoreview",
+                "Needs review",
+                "Needs review",
+                "Auto review",
             ]
             assert [row[2] for row in rows] == [
                 "🟠 Human high-priority review",
@@ -1705,9 +1785,9 @@ def test_task_app_surfaces_plan_blocked_queued_tasks(env, monkeypatch) -> None:
             header = str(app.query_one("#task-header", Static).render())
             overview = str(app.query_one("#task-detail", Static).render())
 
-            assert rows[0][1] == "waiting_on_plan"
+            assert rows[0][1] == "Waiting on plan"
             assert rows[0][2] == "🟠 Implement planned child"
-            assert "waiting_on_plan" in header
+            assert "Waiting on plan" in header
             assert "Plan Gate" in overview
             assert "Approve    demo/2 · plan_project/user_approval" in overview
 
@@ -1753,10 +1833,10 @@ def test_task_app_honours_per_project_enforce_plan_false(env, monkeypatch) -> No
         async with app.run_test(size=(140, 50)) as pilot:
             await pilot.pause()
             rows = _table_rows(app.query_one("#tasks-table", DataTable))
-            # Without bypass this would render "waiting_on_plan" because
+            # Without bypass this would render "Waiting on plan" because
             # the project has no plan.md / approved plan_project task.
-            assert rows[0][1] == "queued", (
-                f"expected 'queued' with per-project bypass, got {rows[0][1]!r}"
+            assert rows[0][1] == "Queued", (
+                f"expected 'Queued' with per-project bypass, got {rows[0][1]!r}"
             )
 
     _run(body())
@@ -1838,7 +1918,7 @@ def test_task_app_clears_rejection_feedback_after_inbox_open(env, monkeypatch) -
             overview = str(app.query_one("#task-detail", Static).render())
 
             assert len(rows) == 1
-            assert rows[0][1] == "in_progress"
+            assert rows[0][1] == "In progress"
             assert rows[0][2] == "🟠 Ship Notesy visibility"
             assert "Inbox Feedback" not in overview
 

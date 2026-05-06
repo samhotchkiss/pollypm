@@ -239,6 +239,16 @@ def test_session_description_uses_meaningful_line_before_cli_tip(tmp_path) -> No
     assert desc == "Updated dashboard activity filtering tests."
 
 
+def test_operator_pm_healthy_copy_matches_now_feed_voice() -> None:
+    """#1299: Polly's own Now-feed row should not use bland filler copy."""
+    from pollypm.dashboard_data import _session_description
+
+    desc = _session_description("healthy", "operator-pm", None)
+
+    assert desc == "Plating the brief"
+    assert "managing projects" not in desc.lower()
+
+
 def test_session_description_keeps_real_codex_working_status(tmp_path) -> None:
     """#994 negative: the fix must not regress working-session
     rendering. A pane snapshot showing Codex actively working (the
@@ -257,6 +267,55 @@ def test_session_description_keeps_real_codex_working_status(tmp_path) -> None:
     desc = _session_description("healthy", "worker", str(snapshot))
     assert "working" in desc.lower()
     assert "3m" in desc
+
+
+def test_session_description_rewrites_zero_second_working_copy(tmp_path) -> None:
+    """#1327: zero-second Codex working chrome is filler, not useful status."""
+    from pollypm.dashboard_data import _session_description
+
+    snapshot = tmp_path / "snap.txt"
+    snapshot.write_text("⏺ Working (0s · esc to interrupt)\n")
+
+    desc = _session_description("healthy", "worker", str(snapshot))
+
+    assert desc == "Warming up"
+
+
+def test_session_description_rewrites_raw_no_tasks_copy(tmp_path) -> None:
+    """#1327: task-list command output should not leak into the Now feed."""
+    from pollypm.dashboard_data import _session_description
+
+    raw_lines = (
+        "Result: No tasks found.",
+        "- pm task list --status review → No tasks found.",
+    )
+    for raw in raw_lines:
+        snapshot = tmp_path / "snap.txt"
+        snapshot.write_text(raw + "\n")
+
+        desc = _session_description("healthy", "worker", str(snapshot))
+
+        assert desc == "Nothing on the burner"
+        assert "No tasks found" not in desc
+        assert "pm task list" not in desc
+
+
+def test_session_description_rewrites_fragmentary_worker_copy(tmp_path) -> None:
+    """#1327: lower-case mid-sentence fragments get a stable worker idiom."""
+    from pollypm.dashboard_data import _session_description
+
+    fragments = (
+        "implementing worker tasks.",
+        "treat the worktree as potentially dirty and avoid clobbering unrelated",
+        "operating norms, the architect role guide, and the project rules…",
+    )
+    for fragment in fragments:
+        snapshot = tmp_path / "snap.txt"
+        snapshot.write_text(fragment + "\n")
+
+        desc = _session_description("healthy", "worker", str(snapshot))
+
+        assert desc == "On the line"
 
 
 def test_session_description_truncates_at_word_boundary(tmp_path) -> None:

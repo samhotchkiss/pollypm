@@ -78,6 +78,12 @@ from pollypm.cockpit_inbox_items import (
     message_row_to_inbox_entry,
     task_to_inbox_entry,
 )
+from pollypm.cockpit_live_chat_notice import (
+    LIVE_CHAT_NETWORK_DEAD_TMUX_MESSAGE,
+    clear_live_chat_network_dead_notice,
+    current_live_chat_network_dead_notice,
+    live_chat_network_dead_notice_present,
+)
 from pollypm.cockpit_metrics import (  # noqa: F401  (re-exported)
     PollyMetricsApp,
     _MetricsDrillDownModal,
@@ -1041,6 +1047,7 @@ class PollyCockpitApp(App[None]):
         # or a modal that just dismissed) intercepts the keystroke and
         # the rail's cursor stops moving — the user has to Tab back
         # to the nav before navigation responds again.
+        Binding("right", "focus_inbox_pane_nav", "Inbox pane", show=False, priority=True),
         Binding("j,down", "cursor_down", "Down", show=False, priority=True),
         Binding("k,up", "cursor_up", "Up", show=False, priority=True),
         Binding("g,home", "cursor_first", "First", show=False, priority=True),
@@ -1087,6 +1094,7 @@ class PollyCockpitApp(App[None]):
         "cursor_up",             # k, up
         "cursor_first",          # g, home
         "cursor_last",           # G, end
+        "focus_inbox_pane_nav",  # right
         "forward_tab_to_right",  # tab
         "forward_action_button_1",
         "forward_action_button_2",
@@ -1120,6 +1128,7 @@ class PollyCockpitApp(App[None]):
         "cursor_up",             # k, up
         "cursor_first",          # g, home
         "cursor_last",           # G, end
+        "focus_inbox_pane_nav",  # right
         "forward_tab_to_right",  # tab
         "forward_action_button_1",
         "forward_action_button_2",
@@ -1234,6 +1243,7 @@ class PollyCockpitApp(App[None]):
             window_manager=_CockpitRouteWindowApplier(self),
         )
         self._route_status_hint: str | None = None
+        self._transient_notice_active = False
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -1251,6 +1261,7 @@ class PollyCockpitApp(App[None]):
         self._refresh_rows()
         self._update_ticker()
         self._update_pill_refresh()
+        self._update_transient_notice()
         self.set_interval(0.8, self._tick)
         self.set_interval(self.SCHEDULER_POLL_INTERVAL_SECONDS, self._tick_scheduler)
         self.nav.focus()
@@ -1772,6 +1783,15 @@ class PollyCockpitApp(App[None]):
         except Exception:  # noqa: BLE001
             return False
 
+    def _activate_inbox_pane_nav(self, *, focus_pane: bool = False) -> bool:
+        """Let the mounted Inbox pane own row-navigation keys."""
+        if not self._on_inbox_surface():
+            return False
+        self._set_inbox_pane_nav_active(True)
+        if focus_pane:
+            self._focus_right_pane()
+        return True
+
     def _cancel_pending_route_selection(self) -> None:
         controller = getattr(self, "_navigation_controller", None)
         current_id = getattr(controller, "current_request_id", None)
@@ -1891,6 +1911,7 @@ class PollyCockpitApp(App[None]):
         # feedback loop from "upgrade complete" → visible notice is
         # sub-second.
         self._check_post_upgrade_flag()
+        self._update_transient_notice()
         # Layout check much less frequently
         if self._tick_count % self._LAYOUT_CHECK_INTERVAL == 0:
             try:
@@ -2217,6 +2238,27 @@ class PollyCockpitApp(App[None]):
         ticker_text = self._event_ticker_text()
         self.ticker.update(ticker_text)
         self.ticker.display = bool(ticker_text)
+
+    def _update_transient_notice(self) -> bool:
+        try:
+            state = self.router._load_state()
+        except Exception:  # noqa: BLE001
+            return False
+        notice = current_live_chat_network_dead_notice(state)
+        if notice is None:
+            if live_chat_network_dead_notice_present(state):
+                clear_live_chat_network_dead_notice(self.router)
+            if self._transient_notice_active:
+                self._transient_notice_active = False
+                self.update_pill.tooltip = None
+                self.update_pill.display = False
+                self._update_pill_refresh()
+            return False
+        self._transient_notice_active = True
+        self.update_pill.tooltip = LIVE_CHAT_NETWORK_DEAD_TMUX_MESSAGE
+        self.update_pill.update(f"[#ff5f6d]{_escape(notice)}[/]")
+        self.update_pill.display = True
+        return True
 
     def _update_pill_refresh(self) -> None:
         """Refresh the update-available pill in the rail top area.
@@ -2605,6 +2647,9 @@ class PollyCockpitApp(App[None]):
         key = self._selected_open_key()
         if key is None:
             return
+        inbox_nav_requested = key == "inbox" or key.startswith("inbox:")
+        if inbox_nav_requested:
+            self._set_inbox_pane_nav_active(True)
         self._schedule_route_selected(key, label=key)
 
     def action_open_settings(self) -> None:
@@ -2854,6 +2899,8 @@ class PollyCockpitApp(App[None]):
                 self._refresh_rows()
             except Exception:  # noqa: BLE001
                 pass
+            if self._on_inbox_surface() and self._inbox_pane_owns_nav():
+                self._focus_right_pane()
 
         try:
             self.call_from_thread(_apply)
@@ -2890,10 +2937,15 @@ class PollyCockpitApp(App[None]):
             _apply()
 
     def action_forward_tab_to_right(self) -> None:
+        if self._activate_inbox_pane_nav(focus_pane=True):
+            return
         if self._right_pane_has_live_session():
             self._focus_right_pane()
             return
         self._send_key_to_right_pane("Tab")
+
+    def action_focus_inbox_pane_nav(self) -> None:
+        self._activate_inbox_pane_nav(focus_pane=True)
 
     def action_forward_workers_auto_refresh(self) -> None:
         if self._on_inbox_surface():
@@ -2971,6 +3023,11 @@ class PollyCockpitApp(App[None]):
         via capital ``Q`` / ``Ctrl-Q``. Off a project surface this is
         a no-op (Esc still routes to Home everywhere).
         """
+        if self._inbox_pane_owns_nav():
+            if self._send_key_to_inbox_pane("q"):
+                return
+            self._set_inbox_pane_nav_active(False)
+            return
         if self._on_project_surface():
             self._send_key_to_right_pane("q")
 
@@ -3083,6 +3140,11 @@ class PollyCockpitApp(App[None]):
     def action_back_to_home(self) -> None:
         if self._inbox_filter_input_active():
             self._send_key_to_inbox_pane("escape")
+            return
+        if self._inbox_pane_owns_nav():
+            if self._send_key_to_inbox_pane("escape"):
+                return
+            self._set_inbox_pane_nav_active(False)
             return
         if self._right_pane_has_live_session():
             return_key = self._mounted_return_key()
@@ -4831,7 +4893,11 @@ class PollySettingsPaneApp(App[None]):
                 widget.add_class("-section-active")
 
     def _nav_label(self, key: str, label: str, *, count: int | None) -> str:
-        marker = "\u25b8" if key == self._active_section else " "
+        try:
+            cursor_key = _SETTINGS_SECTIONS[self._nav_cursor][0]
+        except (AttributeError, IndexError):
+            cursor_key = self._active_section
+        marker = "\u25b8" if key == cursor_key else " "
         cnt = f"  [dim]{count}[/dim]" if count is not None else ""
         return f"{marker} {_escape(label)}{cnt}"
 
@@ -6367,6 +6433,15 @@ def _triage_label(task) -> str:
     return "update"
 
 
+def _archive_success_message(item, task_id: str) -> str:
+    if is_task_inbox_entry(item):
+        return f"Archived {task_id}"
+    title = str(getattr(item, "title", "") or "").strip()
+    if title:
+        return f"Archived {_strip_action_subject_prefix(title)}"
+    return "Archived notification"
+
+
 def _render_user_prompt_block(payload: object) -> str | None:
     """Build the plain-English action block for a message detail pane.
 
@@ -7172,6 +7247,11 @@ class PollyInboxApp(App[None]):
         background: #0f1317;
         color: #eef2f4;
         padding: 0;
+    }
+    ToastRack {
+        /* #1280: keep bottom-right toasts above the reply input and
+           pane borders instead of painting through their box lines. */
+        margin-bottom: 6;
     }
     #inbox-layout {
         height: 1fr;
@@ -9189,7 +9269,12 @@ class PollyInboxApp(App[None]):
             except Exception as exc:  # noqa: BLE001
                 self.notify(f"Archive failed: {exc}", severity="error")
                 return
-            self.notify(f"Archived {task_id}", severity="information", timeout=2.0)
+            self.notify(
+                _archive_success_message(item, task_id),
+                severity="information",
+                timeout=2.0,
+                markup=False,
+            )
             self._tasks = [task for task in self._tasks if task.task_id != task_id]
             self._unread_ids.discard(task_id)
             self._session_read_ids.discard(task_id)
@@ -9236,7 +9321,12 @@ class PollyInboxApp(App[None]):
         self._emit_event(
             task_id, "inbox.message.archived", f"user archived {task_id}",
         )
-        self.notify(f"Archived {task_id}", severity="information", timeout=2.0)
+        self.notify(
+            _archive_success_message(item, task_id),
+            severity="information",
+            timeout=2.0,
+            markup=False,
+        )
         # Remove from local state + list so the row disappears immediately
         # (the 8s background refresh would do it anyway, but snappy UX).
         self._tasks = [t for t in self._tasks if t.task_id != task_id]

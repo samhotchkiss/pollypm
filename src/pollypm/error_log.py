@@ -65,6 +65,10 @@ class _ProcessTagFilter(logging.Filter):
 
 def _log_path() -> Path:
     """~/.pollypm/errors.log — mirrors the DEFAULT_CONFIG_PATH convention."""
+    override = os.environ.get("POLLYPM_ERROR_LOG_PATH")
+    if override:
+        return Path(override).expanduser()
+
     from pollypm.config import DEFAULT_CONFIG_PATH
 
     return Path(DEFAULT_CONFIG_PATH).parent / DEFAULT_LOG_FILENAME

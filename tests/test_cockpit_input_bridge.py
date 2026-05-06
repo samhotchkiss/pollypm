@@ -392,6 +392,51 @@ def test_cockpit_send_key_help_modal_dismiss_clears_content_bridge(
         dashboard.stop()
 
 
+def test_help_modal_control_key_survives_home_alias_change(
+    valid_cockpit_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pollypm.cli_features import ui as ui_commands
+    import pollypm.cockpit_input_bridge as input_bridge
+    from pollypm.cockpit_rail import CockpitRouter
+
+    calls: list[tuple[str, str | None]] = []
+
+    def fake_send_key_to_first_live(
+        _config_path: Path,
+        key: str,
+        *,
+        kind: str | None = None,
+        timeout: float = 2.0,
+    ) -> Path:
+        calls.append((key, kind))
+        return Path("/tmp/dashboard.sock")
+
+    monkeypatch.setattr(
+        input_bridge,
+        "send_key_to_first_live",
+        fake_send_key_to_first_live,
+    )
+    router = CockpitRouter(valid_cockpit_config)
+    router.set_selected_key("polly")
+    ui_commands._remember_help_modal_bridge(
+        valid_cockpit_config,
+        kind="dashboard",
+        selected_key="polly",
+    )
+
+    router.set_selected_key("dashboard")
+
+    assert (
+        ui_commands._send_help_modal_key_to_recorded_bridge(
+            valid_cockpit_config,
+            "<pgdn>",
+        )
+        == Path("/tmp/dashboard.sock")
+    )
+    assert calls == [("<pgdn>", "dashboard")]
+
+
 @pytest.mark.parametrize("selected_key", ["dashboard", "polly"])
 def test_cockpit_send_key_question_mark_on_home_without_dashboard_bridge_stays_on_cockpit_bridge(
     valid_cockpit_config: Path,

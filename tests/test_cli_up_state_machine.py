@@ -648,6 +648,108 @@ def test_probe_treats_shell_wrapped_visible_cockpit_rail_as_healthy() -> None:
     assert LaunchAction.RESPAWN_RAIL not in plan.actions
 
 
+def test_probe_lists_cockpit_panes_from_window_pane_id() -> None:
+    """#1293 — resolve the cockpit window through the exact session before
+    listing panes so tmux cannot classify a similarly named session."""
+    from pollypm.launch_state import LaunchState, plan_launch
+    from pollypm.tmux.client import TmuxPane, TmuxWindow
+
+    class _FakeTmux:
+        def __init__(self) -> None:
+            self.pane_targets: list[str] = []
+
+        def has_session(self, name: str) -> bool:
+            return name in {"pollypm", "pollypm-storage-closet"}
+
+        def current_session_name(self) -> None:
+            return None
+
+        def list_windows(self, name: str) -> list[TmuxWindow]:
+            assert name == "pollypm"
+            return [
+                TmuxWindow(
+                    session="pollypm",
+                    index=0,
+                    name="PollyPM",
+                    active=True,
+                    pane_id="%rail",
+                    pane_current_command="zsh",
+                    pane_current_path="/",
+                    pane_dead=False,
+                )
+            ]
+
+        def list_panes(self, target: str) -> list[TmuxPane]:
+            self.pane_targets.append(target)
+            if target == "%rail":
+                return [
+                    TmuxPane(
+                        session="pollypm",
+                        window_index=0,
+                        window_name="PollyPM",
+                        pane_index=0,
+                        pane_id="%rail",
+                        active=True,
+                        pane_current_command="zsh",
+                        pane_current_path="/",
+                        pane_dead=False,
+                        pane_left=0,
+                        pane_width=30,
+                    ),
+                    TmuxPane(
+                        session="pollypm",
+                        window_index=0,
+                        window_name="PollyPM",
+                        pane_index=1,
+                        pane_id="%right",
+                        active=False,
+                        pane_current_command="python",
+                        pane_current_path="/",
+                        pane_dead=False,
+                        pane_left=31,
+                        pane_width=120,
+                    ),
+                ]
+            return [
+                TmuxPane(
+                    session="pollypm-extra",
+                    window_index=0,
+                    window_name="PollyPM",
+                    pane_index=0,
+                    pane_id="%wrong",
+                    active=True,
+                    pane_current_command="zsh",
+                    pane_current_path="/",
+                    pane_dead=False,
+                    pane_left=0,
+                    pane_width=30,
+                )
+            ]
+
+        def capture_pane(self, target: str, lines: int = 200) -> str:
+            assert lines == 40
+            if target != "%rail":
+                return ""
+            return "Polly Home Workers Inbox"
+
+    class _FakeSupervisor:
+        def __init__(self) -> None:
+            self.tmux = _FakeTmux()
+            self.config = type(
+                "Config",
+                (),
+                {"project": type("Project", (), {"tmux_session": "pollypm"})()},
+            )()
+
+    supervisor = _FakeSupervisor()
+    probe = cli._build_launch_probe(supervisor)
+    plan = plan_launch(probe)
+
+    assert supervisor.tmux.pane_targets == ["%rail"]
+    assert probe.rail_pane_running_non_shell is True
+    assert plan.state is LaunchState.ATTACH_EXISTING
+
+
 def test_probe_falls_back_when_list_panes_unavailable() -> None:
     """#906 — when ``list_panes`` cannot enumerate (returns an
     empty list / raises), pane-liveness defaults to True. The

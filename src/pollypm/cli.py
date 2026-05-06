@@ -661,7 +661,7 @@ def _build_launch_probe(supervisor) -> LaunchProbe:
     rail_pane_alive = True
     rail_pane_running_non_shell = True
     if main_alive and main_name:
-        target = f"{main_name}:{_COCKPIT_WINDOW_NAME}"
+        target = _cockpit_window_pane_target(tmux, main_name)
         # ``list_panes`` returns ``[]`` for both "window absent" and
         # "tmux unavailable"; the state machine treats both as
         # console+rail healthy via the default-True values above.
@@ -684,6 +684,23 @@ def _build_launch_probe(supervisor) -> LaunchProbe:
         rail_pane_running_non_shell=rail_pane_running_non_shell,
         current_tmux_session=current_tmux,
     )
+
+
+def _cockpit_window_pane_target(tmux, main_name: str) -> str:
+    """Return an unambiguous tmux target for the cockpit window's panes."""
+    list_windows = getattr(tmux, "list_windows", None)
+    if callable(list_windows):
+        try:
+            windows = list_windows(main_name) or []
+        except Exception:  # noqa: BLE001
+            windows = []
+        for window in windows:
+            if getattr(window, "name", "") != _COCKPIT_WINDOW_NAME:
+                continue
+            pane_id = getattr(window, "pane_id", None)
+            if isinstance(pane_id, str) and pane_id:
+                return pane_id
+    return f"{main_name}:{_COCKPIT_WINDOW_NAME}"
 
 
 def _classify_cockpit_panes(panes, *, capture_pane=None) -> tuple[bool, bool, bool]:

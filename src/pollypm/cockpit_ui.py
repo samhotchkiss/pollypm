@@ -1734,6 +1734,20 @@ class PollyCockpitApp(App[None]):
         except Exception:  # noqa: BLE001
             return False
 
+    def _inbox_filter_input_active(self) -> bool:
+        if not self._on_inbox_surface():
+            return False
+        router = getattr(self, "router", None)
+        if router is None:
+            return False
+        is_active = getattr(router, "inbox_filter_input_active", None)
+        if not callable(is_active):
+            return False
+        try:
+            return bool(is_active())
+        except Exception:  # noqa: BLE001
+            return False
+
     def _send_key_to_inbox_pane(self, key: str) -> bool:
         """Forward an Inbox-owned key to the right-pane Inbox app.
 
@@ -3064,6 +3078,9 @@ class PollyCockpitApp(App[None]):
         return True
 
     def action_back_to_home(self) -> None:
+        if self._inbox_filter_input_active():
+            self._send_key_to_inbox_pane("escape")
+            return
         if self._right_pane_has_live_session():
             return_key = self._mounted_return_key()
             if return_key:

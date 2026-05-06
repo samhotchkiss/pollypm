@@ -4902,6 +4902,35 @@ def test_cockpit_escape_routes_back_to_home_from_settings() -> None:
     assert app.selected_key == "dashboard"
 
 
+def test_cockpit_escape_with_active_inbox_filter_stays_in_inbox() -> None:
+    """#1275: Esc in the active Inbox filter clears the filter only."""
+    app, calls = _build_back_to_home_app()
+    app.selected_key = "inbox"
+    app._last_router_selected_key = "inbox"
+    forwarded: list[str] = []
+
+    class _Router:
+        def _load_state(self) -> dict[str, object]:
+            return {}
+
+        def inbox_filter_input_active(self) -> bool:
+            return True
+
+    app.router = _Router()  # type: ignore[assignment]
+    app._send_key_to_inbox_pane = (  # type: ignore[method-assign]
+        lambda key: forwarded.append(key) or True
+    )
+    app._schedule_route_selected = (  # type: ignore[method-assign]
+        lambda key, *, label=None: calls.append(("route", key))
+    )
+
+    app.action_back_to_home()
+
+    assert forwarded == ["escape"]
+    assert calls == []
+    assert app.selected_key == "inbox"
+
+
 def test_cockpit_capital_h_routes_back_to_home() -> None:
     """#1163: capital H is an explicit global Home jump."""
     app, calls = _build_back_to_home_app()

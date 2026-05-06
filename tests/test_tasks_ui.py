@@ -1615,10 +1615,21 @@ def test_task_app_all_filter_uses_human_readable_status_labels(
             await pilot.pause()
 
             rows = _table_rows(app.query_one("#tasks-table", DataTable))
+            summary = str(app.query_one("#tasks-summary", Static).render())
+            header = str(app.query_one("#task-header", Static).render())
+            overview = str(app.query_one("#task-detail", Static).render())
             assert [row[1] for row in rows] == ["On hold", "Draft", "Done"]
+            assert "On hold" in summary
+            assert "Done" in summary
+            assert "on_hold" not in summary
+            assert "done" not in summary
+            assert "On hold" in header
+            assert "Status     On hold" in overview
             assert "on_hold" not in rows[0]
             assert "draft" not in rows[1]
             assert "done" not in rows[2]
+            assert "on_hold" not in header
+            assert "on_hold" not in overview
 
     _run(body())
 

@@ -1820,7 +1820,7 @@ class PollyTasksApp(App[None]):
             count = counts.get(status, 0)
             if count:
                 icon = self._STATUS_ICONS.get(status, "·")
-                parts.append(f"{icon} {count} {status.replace('_', ' ')}")
+                parts.append(f"{icon} {count} {_status_display_label(status)}")
         total = len(self._tasks)
         shown = len(visible)
         if shown != total:

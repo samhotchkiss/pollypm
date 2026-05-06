@@ -284,3 +284,49 @@ def test_package_main_fast_dispatches_inbox_pane(
     assert ("log", config_path) in calls
     assert ("app", (config_path, "demo")) in calls
     assert ("run", True) in calls
+
+
+def test_package_main_prepaints_action_preview_without_full_inbox_load(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """#1273: first Inbox frame should not wait for the full inbox load."""
+
+    import pollypm.config as config_mod
+    import pollypm.cockpit_inbox_items as inbox_items
+    from pollypm import __main__ as package_main
+
+    config_path = tmp_path / "pollypm.toml"
+    config = SimpleNamespace(projects={"demo": object()})
+    preview = SimpleNamespace(
+        task_id="msg:demo:1",
+        title="[Action] Plan ready for review",
+        project="demo",
+        triage_label="plan review",
+        needs_action=True,
+        is_orphaned=False,
+    )
+
+    monkeypatch.setattr(config_mod, "load_config", lambda path: config)
+    monkeypatch.setattr(
+        inbox_items,
+        "load_inbox_action_preview",
+        lambda loaded, *, project, limit: ([preview], {"msg:demo:1"}, 1),
+    )
+    monkeypatch.setattr(
+        inbox_items,
+        "load_inbox_entries",
+        lambda loaded: (_ for _ in ()).throw(
+            AssertionError("full inbox load should not run for action preview")
+        ),
+    )
+
+    error = package_main._paint_inbox_snapshot(config_path, project="demo")
+
+    out = capsys.readouterr().out
+    assert error is None
+    assert "Inbox" in out
+    assert "action needed" in out
+    assert "Plan ready for review" in out
+    assert "1 needs action" in out

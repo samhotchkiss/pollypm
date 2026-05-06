@@ -772,3 +772,72 @@ def load_inbox_entries(
         items, project_db_paths=project_db_paths,
     )
     return items, unread, replies_by_task
+
+
+def load_inbox_action_preview(
+    config,
+    *,
+    project: str | None = None,
+    limit: int = 12,
+) -> tuple[list[InboxEntry], set[str], int]:
+    """Load a small Store-backed action preview for first Inbox paint.
+
+    The interactive Inbox still does the full ``load_inbox_entries`` pass.
+    This helper is only for the cockpit-pane prepaint path, where showing the
+    first action rows quickly matters more than reply counts or task-backed
+    rows that will arrive with the Textual app's normal refresh.
+    """
+    preview_limit = max(int(limit), 1)
+    rows_per_source = max(preview_limit * 4, 48)
+    known_projects = set(getattr(config, "projects", {}).keys())
+    items: list[InboxEntry] = []
+
+    for project_key, db_path, _project_path in _inbox_db_sources(config):
+        if not db_path.exists():
+            continue
+        try:
+            store = SQLAlchemyStore(f"sqlite:///{db_path}")
+        except Exception:  # noqa: BLE001
+            continue
+        try:
+            try:
+                rows = store.query_messages(
+                    recipient="user",
+                    state="open",
+                    type=["notify", "inbox_task", "alert"],
+                    limit=rows_per_source,
+                )
+            except Exception:  # noqa: BLE001
+                rows = []
+            for row in rows:
+                if _row_is_dev_channel(row.get("labels")):
+                    continue
+                item = annotate_inbox_entry(
+                    message_row_to_inbox_entry(
+                        row,
+                        source_key=project_key or _WORKSPACE_DB_KEY,
+                        db_path=db_path,
+                    ),
+                    known_projects=known_projects,
+                )
+                if project and (getattr(item, "project", "") or "") != project:
+                    continue
+                if getattr(item, "is_orphaned", False):
+                    continue
+                if not getattr(item, "needs_action", False):
+                    continue
+                items.append(item)
+        finally:
+            try:
+                store.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    if not items:
+        return [], set(), 0
+
+    items = _dedupe_replayed_plan_reviews(items)
+    items.sort(key=_entry_sort_value, reverse=True)
+    preview = items[:preview_limit]
+    unread = {item.task_id for item in preview}
+    return preview, unread, len(items)

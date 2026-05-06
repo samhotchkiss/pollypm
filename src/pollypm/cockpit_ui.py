@@ -1708,7 +1708,10 @@ class PollyCockpitApp(App[None]):
         return isinstance(key, str) and (key == "inbox" or key.startswith("inbox:"))
 
     def _set_inbox_pane_nav_active(self, active: bool) -> None:
-        set_active = getattr(self.router, "set_inbox_pane_nav_active", None)
+        router = getattr(self, "router", None)
+        if router is None:
+            return
+        set_active = getattr(router, "set_inbox_pane_nav_active", None)
         if not callable(set_active):
             return
         try:
@@ -1719,7 +1722,10 @@ class PollyCockpitApp(App[None]):
     def _inbox_pane_owns_nav(self) -> bool:
         if not self._on_inbox_surface():
             return False
-        is_active = getattr(self.router, "inbox_pane_nav_active", None)
+        router = getattr(self, "router", None)
+        if router is None:
+            return False
+        is_active = getattr(router, "inbox_pane_nav_active", None)
         if not callable(is_active):
             return False
         try:

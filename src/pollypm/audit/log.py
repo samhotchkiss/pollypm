@@ -39,6 +39,16 @@ EVENT_MARKER_RELEASED = "marker.released"
 EVENT_MARKER_CREATE_FAILED = "marker.create_failed"
 EVENT_MARKER_LEAKED = "marker.leaked"
 EVENT_WORK_TABLE_CLEARED = "work_table.cleared"
+# #savethenovel-followup: emitted from ``SQLiteWorkService.__init__``
+# every time the service stamps work tables onto a SQLite file. The
+# dual-DB layout (``~/.pollypm/state.db`` vs
+# ``<workspace>/.pollypm/state.db``) made it easy for callsites to
+# pass the wrong path and silently create empty work tables on the
+# messages-side DB. Pairing this with the ``had_messages_table_pre_open``
+# flag in metadata gives operators an immediate "wrong DB"
+# breadcrumb — see comment in ``SQLiteWorkService.__init__`` for the
+# reasoning.
+EVENT_WORK_DB_OPENED = "work_db.opened"
 
 
 @dataclass(slots=True, frozen=True)
@@ -386,6 +396,7 @@ __all__ = [
     "EVENT_MARKER_CREATE_FAILED",
     "EVENT_MARKER_LEAKED",
     "EVENT_WORK_TABLE_CLEARED",
+    "EVENT_WORK_DB_OPENED",
     "AuditEvent",
     "central_log_path",
     "emit",

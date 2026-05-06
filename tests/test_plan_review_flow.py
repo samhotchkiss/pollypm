@@ -706,6 +706,78 @@ def test_d_key_on_plan_review_injects_primer_not_generic_line(
     _run(body())
 
 
+def test_d_key_on_plan_review_records_discussion_unlock(
+    plan_review_env, inbox_app,
+) -> None:
+    """A successful PM dispatch unlocks approval for the same plan row."""
+    async def body() -> None:
+        calls: list[tuple[str, str]] = []
+        captured_approve: list[tuple[str, str]] = []
+
+        from pollypm.cockpit_ui import (
+            PollyInboxApp,
+            _PLAN_REVIEW_DISCUSSION_ENTRY_TYPE,
+        )
+        from pollypm.work.sqlite_service import SQLiteWorkService as _S
+
+        def fake_dispatch(self, cockpit_key: str, context_line: str) -> None:
+            calls.append((cockpit_key, context_line))
+
+        def fake_approve(self, task_id, actor, reason=None):
+            captured_approve.append((task_id, actor))
+            return self.get(task_id)
+
+        original_dispatch = PollyInboxApp._perform_pm_dispatch
+        original_approve = _S.approve
+        PollyInboxApp._perform_pm_dispatch = fake_dispatch  # type: ignore[assignment]
+        _S.approve = fake_approve  # type: ignore[assignment]
+        try:
+            async with inbox_app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                inbox_app.list_view.index = 0
+                await pilot.press("enter")
+                await pilot.pause()
+
+                task_id = plan_review_env["plan_review_id"]
+                assert not inbox_app._plan_review_round_trip.get(task_id, False)
+
+                await pilot.press("d")
+                for _ in range(10):
+                    await pilot.pause(0.1)
+                    if inbox_app._plan_review_round_trip.get(task_id, False):
+                        break
+
+                assert calls
+                assert inbox_app._plan_review_round_trip.get(task_id, False)
+
+                svc = _S(
+                    db_path=plan_review_env["project_path"]
+                    / ".pollypm"
+                    / "state.db",
+                    project_path=plan_review_env["project_path"],
+                )
+                try:
+                    markers = svc.get_context(
+                        task_id,
+                        entry_type=_PLAN_REVIEW_DISCUSSION_ENTRY_TYPE,
+                    )
+                finally:
+                    svc.close()
+                assert len(markers) == 1
+
+                await pilot.press("A")
+                await pilot.pause()
+
+                assert captured_approve[-1] == (
+                    plan_review_env["plan_task_id"],
+                    "user",
+                )
+        finally:
+            PollyInboxApp._perform_pm_dispatch = original_dispatch  # type: ignore[assignment]
+            _S.approve = original_approve  # type: ignore[assignment]
+    _run(body())
+
+
 def test_no_x_binding_on_plan_review_items(
     plan_review_env, inbox_app,
 ) -> None:

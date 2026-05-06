@@ -141,6 +141,43 @@ def test_pm_chat_label_matches_project_session_persona(
     assert session_row.label == expected_label
 
 
+def test_pm_chat_label_uses_project_pm_fallback(monkeypatch, tmp_path: Path) -> None:
+    project = KnownProject(
+        key="booktalk",
+        path=tmp_path,
+        name="Booktalk",
+        persona_name=None,
+        kind=ProjectKind.GIT,
+    )
+    config = type("Config", (), {"projects": {"booktalk": project}})()
+
+    class _Router:
+        def _session_state(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            return "idle"
+
+    monkeypatch.setattr(
+        core_rail_items_plugin,
+        "_classify_projects",
+        lambda ctx: ([("booktalk", project)], [], {"booktalk": False}),
+    )
+    monkeypatch.setattr(
+        core_rail_items_plugin,
+        "_active_task_numbers",
+        lambda project, *, config=None: [],
+    )
+    ctx = RailContext(
+        router=_Router(),
+        config=config,
+        launches=[],
+        cockpit_state={"selected": "project:booktalk"},
+    )
+
+    rows = core_rail_items_plugin._project_rows(ctx)
+
+    session_row = next(row for row in rows if row.key == "project:booktalk:session")
+    assert session_row.label == "  PM Chat (Project PM)"
+
+
 def _fake_supervisor(
     tmp_path: Path,
     *,

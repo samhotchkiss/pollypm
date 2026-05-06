@@ -708,6 +708,13 @@ def test_cockpit_send_key_enter_consumes_network_dead_for_live_right_pane(
     valid_cockpit_config: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import pollypm.cockpit_rail as cockpit_rail
+    from pollypm.cockpit_live_chat_notice import (
+        LIVE_CHAT_NETWORK_DEAD_NOTICE_MESSAGE_KEY,
+        LIVE_CHAT_NETWORK_DEAD_NOTICE_UNTIL_KEY,
+        LIVE_CHAT_NETWORK_DEAD_RAIL_MESSAGE,
+        LIVE_CHAT_NETWORK_DEAD_TMUX_MESSAGE,
+        LIVE_CHAT_NETWORK_DEAD_TMUX_DISPLAY_MS,
+    )
     from pollypm.cli_features import ui as ui_commands
     from pollypm.dev_network_simulation import arm_network_dead, network_dead_armed
 
@@ -726,9 +733,16 @@ def test_cockpit_send_key_enter_consumes_network_dead_for_live_right_pane(
     class FakeRouter:
         def __init__(self) -> None:
             self.tmux = FakeTmux()
+            self.state: dict[str, object] = {}
 
         def active_live_right_pane_id(self) -> str:
             return "%2"
+
+        def _load_state(self) -> dict[str, object]:
+            return dict(self.state)
+
+        def _write_state(self, state: dict[str, object]) -> None:
+            self.state = dict(state)
 
     router = FakeRouter()
     monkeypatch.setattr(cockpit_rail, "CockpitRouter", lambda _path: router)
@@ -747,14 +761,79 @@ def test_cockpit_send_key_enter_consumes_network_dead_for_live_right_pane(
             "run",
             "display-message",
             "-d",
-            "5000",
+            LIVE_CHAT_NETWORK_DEAD_TMUX_DISPLAY_MS,
             "-t",
             "%2",
-            "PollyPM chat failed: network unreachable. "
-            "Input cleared; check connection and try again.",
+            LIVE_CHAT_NETWORK_DEAD_TMUX_MESSAGE,
             {"check": False},
         ),
     ]
+    assert router.state[LIVE_CHAT_NETWORK_DEAD_NOTICE_MESSAGE_KEY] == (
+        LIVE_CHAT_NETWORK_DEAD_RAIL_MESSAGE
+    )
+    assert router.state[LIVE_CHAT_NETWORK_DEAD_NOTICE_UNTIL_KEY] > time.time()
+    assert "live_chat_network_dead_prompt_active" not in router.state
+
+
+def test_cockpit_send_key_after_network_dead_notice_forwards_typing(
+    valid_cockpit_config: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pollypm.cockpit_rail as cockpit_rail
+    from pollypm.cockpit_live_chat_notice import (
+        LIVE_CHAT_NETWORK_DEAD_NOTICE_MESSAGE_KEY,
+        LIVE_CHAT_NETWORK_DEAD_NOTICE_UNTIL_KEY,
+        LIVE_CHAT_NETWORK_DEAD_RAIL_MESSAGE,
+    )
+    from pollypm.cli_features import ui as ui_commands
+
+    class FakeTmux:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+
+        def run(self, *args: object, **kwargs: object) -> None:
+            self.calls.append(("run", *args, kwargs))
+
+        def send_keys(
+            self, target: str, text: str, *, press_enter: bool = True,
+        ) -> None:
+            self.calls.append(("send_keys", target, text, press_enter))
+
+    class FakeRouter:
+        def __init__(self) -> None:
+            self.tmux = FakeTmux()
+            self.state = {
+                "mounted_session": "operator",
+                "right_pane_id": "%2",
+                "live_right_pane_input_sticky": True,
+                LIVE_CHAT_NETWORK_DEAD_NOTICE_MESSAGE_KEY: (
+                    LIVE_CHAT_NETWORK_DEAD_RAIL_MESSAGE
+                ),
+                LIVE_CHAT_NETWORK_DEAD_NOTICE_UNTIL_KEY: time.time() + 10,
+            }
+
+        def active_live_right_pane_id(self) -> str:
+            return "%2"
+
+        def _load_state(self) -> dict[str, object]:
+            return dict(self.state)
+
+        def _write_state(self, state: dict[str, object]) -> None:
+            self.state = dict(state)
+
+    router = FakeRouter()
+    monkeypatch.setattr(cockpit_rail, "CockpitRouter", lambda _path: router)
+
+    delivered = ui_commands._send_key_to_active_live_right_pane(
+        valid_cockpit_config, "h",
+    )
+
+    assert delivered == "%2"
+    assert router.tmux.calls == [
+        ("send_keys", "%2", "h", False),
+    ]
+    assert router.state[LIVE_CHAT_NETWORK_DEAD_NOTICE_MESSAGE_KEY] == (
+        LIVE_CHAT_NETWORK_DEAD_RAIL_MESSAGE
+    )
 
 
 def test_cockpit_send_key_keeps_live_right_pane_sticky_after_first_char(

@@ -778,6 +778,60 @@ def test_d_key_on_plan_review_records_discussion_unlock(
     _run(body())
 
 
+def test_plan_review_accept_rechecks_persisted_discussion_marker(
+    plan_review_env, inbox_app,
+) -> None:
+    """A stale detail cache must not keep a discussed plan_review gated."""
+    async def body() -> None:
+        captured_approve: list[tuple[str, str]] = []
+
+        from pollypm.cockpit_ui import _PLAN_REVIEW_DISCUSSION_ENTRY_TYPE
+        from pollypm.work.sqlite_service import SQLiteWorkService as _S
+
+        def fake_approve(self, task_id, actor, reason=None):
+            captured_approve.append((task_id, actor))
+            return self.get(task_id)
+
+        original_approve = _S.approve
+        _S.approve = fake_approve  # type: ignore[assignment]
+        try:
+            async with inbox_app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                inbox_app.list_view.index = 0
+                await pilot.press("enter")
+                await pilot.pause()
+
+                task_id = plan_review_env["plan_review_id"]
+                assert not inbox_app._plan_review_round_trip.get(task_id, False)
+
+                svc = _S(
+                    db_path=plan_review_env["project_path"]
+                    / ".pollypm"
+                    / "state.db",
+                    project_path=plan_review_env["project_path"],
+                )
+                try:
+                    svc.add_context(
+                        task_id,
+                        actor="user",
+                        text="Plan review routed to PM discussion.",
+                        entry_type=_PLAN_REVIEW_DISCUSSION_ENTRY_TYPE,
+                    )
+                finally:
+                    svc.close()
+
+                await pilot.press("A")
+                await pilot.pause()
+
+                assert captured_approve[-1] == (
+                    plan_review_env["plan_task_id"],
+                    "user",
+                )
+        finally:
+            _S.approve = original_approve  # type: ignore[assignment]
+    _run(body())
+
+
 def test_no_x_binding_on_plan_review_items(
     plan_review_env, inbox_app,
 ) -> None:

@@ -204,7 +204,16 @@ def _recorded_help_modal_bridge(config_path: Path) -> str | None:
         return None
     if not isinstance(kind, str) or not kind:
         return None
-    if not isinstance(selected, str) or selected != current_selected:
+    if not isinstance(selected, str):
+        _clear_help_modal_bridge(config_path)
+        return None
+    if selected != current_selected:
+        selected_kind = _content_bridge_kind_for_selected_key(selected)
+        current_kind = _content_bridge_kind_for_selected_key(current_selected)
+        if selected_kind != kind or current_kind != kind:
+            _clear_help_modal_bridge(config_path)
+            return None
+    if not current_selected:
         _clear_help_modal_bridge(config_path)
         return None
     if not isinstance(opened_at, int | float):

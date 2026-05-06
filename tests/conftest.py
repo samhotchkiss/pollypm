@@ -7,6 +7,8 @@ Module-specific fixtures live beside their tests.
 from __future__ import annotations
 
 import os
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -25,6 +27,14 @@ def pytest_configure(config):  # noqa: ARG001
     os.environ.setdefault("POLLYPM_SKIP_RAIL_DAEMON", "1")
     os.environ.setdefault("POLLYPM_DISABLE_ERROR_NOTIFICATIONS", "1")
     os.environ.setdefault("POLLYPM_DISABLE_AGENTIC_REVIEW_SUMMARIES", "1")
+    os.environ.setdefault(
+        "POLLYPM_ERROR_LOG_PATH",
+        str(
+            Path(tempfile.gettempdir())
+            / f"pollypm-pytest-{os.getpid()}"
+            / "errors.log"
+        ),
+    )
     # Tests build their config in pytest tmp dirs but ``state_db``
     # defaults to ``~/.pollypm/state.db`` on the dev machine — which
     # may legitimately have pending migrations. Skip the refuse-start

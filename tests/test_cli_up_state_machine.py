@@ -648,6 +648,140 @@ def test_probe_treats_shell_wrapped_visible_cockpit_rail_as_healthy() -> None:
     assert LaunchAction.RESPAWN_RAIL not in plan.actions
 
 
+def test_probe_retries_transient_empty_rail_capture(monkeypatch) -> None:
+    """#1293 — ``tmux capture-pane`` against the cockpit rail can
+    return an empty / mid-redraw buffer when ``pm`` polls during a
+    state transition. A single empty capture used to flip the rail
+    classification to ``running_non_shell=False`` and route a healthy
+    rail through ``RECOVER_DEAD_RAIL``, surfacing a false-positive
+    diagnostic. The probe must retry on transient-empty captures
+    before declaring the rail dead.
+
+    Pins: first capture returns ``""`` (mid-redraw), second returns
+    real cockpit content. Probe must trust the retry and emit
+    ``ATTACH_EXISTING`` — not ``RECOVER_DEAD_RAIL``."""
+    from pollypm.launch_state import LaunchAction, LaunchState, plan_launch
+    from pollypm.tmux.client import TmuxPane
+
+    # Capture call counter — first call returns empty, subsequent
+    # calls return a real rail capture. This is the actual failure
+    # mode the bug report describes (transient-empty / mid-redraw).
+    capture_calls: list[str] = []
+
+    class _FakeTmux:
+        def has_session(self, name: str) -> bool:
+            return name in {"pollypm", "pollypm-storage-closet"}
+
+        def current_session_name(self) -> None:
+            return None
+
+        def list_panes(self, _target: str) -> list[TmuxPane]:
+            return [
+                TmuxPane(
+                    session="pollypm",
+                    window_index="0",
+                    window_name="PollyPM",
+                    pane_index="0",
+                    pane_id="%1",
+                    active=True,
+                    pane_current_command="zsh",
+                    pane_current_path="/",
+                    pane_dead=False,
+                    pane_left=0,
+                    pane_width=30,
+                ),
+                TmuxPane(
+                    session="pollypm",
+                    window_index="0",
+                    window_name="PollyPM",
+                    pane_index="1",
+                    pane_id="%2",
+                    active=False,
+                    pane_current_command="Python",
+                    pane_current_path="/",
+                    pane_dead=False,
+                    pane_left=31,
+                    pane_width=120,
+                ),
+            ]
+
+        def capture_pane(self, target: str, lines: int = 200) -> str:
+            capture_calls.append(target)
+            # First call: empty (mid-redraw). Subsequent calls:
+            # real cockpit content with all four required tokens.
+            if len(capture_calls) == 1:
+                return ""
+            return """
+     █▀█ █▀█ █   █   █▄█     │
+     █▀▀ █▄█ █▄▄ █▄▄  █      │
+        Plans first.         │
+        Chaos later.         │
+   ○ Home                    │
+   ♡· Polly · chat           │
+   ○ Workers (11)            │
+   ◆ Inbox (42)              │
+   ── projects ────────      │
+"""
+
+    class _FakeSupervisor:
+        def __init__(self) -> None:
+            self.tmux = _FakeTmux()
+            self.config = type(
+                "Config",
+                (),
+                {"project": type("Project", (), {"tmux_session": "pollypm"})()},
+            )()
+
+    # Don't actually sleep during the test — the retry backoff is
+    # an internal implementation detail. Patching ``time.sleep`` on
+    # the cli module would shadow other call sites; the function
+    # imports ``time`` locally so we patch the module reference.
+    import time as _time
+
+    monkeypatch.setattr(_time, "sleep", lambda _s: None)
+
+    probe = cli._build_launch_probe(_FakeSupervisor())
+    # Probe must trust the retry — rail is healthy, not dead.
+    assert probe.rail_pane_alive is True
+    assert probe.rail_pane_running_non_shell is True
+    # And we must have actually retried — at least two captures.
+    assert len(capture_calls) >= 2
+
+    plan = plan_launch(probe)
+    assert plan.state is LaunchState.ATTACH_EXISTING
+    assert LaunchAction.RESPAWN_RAIL not in plan.actions
+
+
+def test_pane_capture_retry_gives_up_on_persistent_empty() -> None:
+    """The retry loop must terminate when captures are persistently
+    empty. A genuinely dead rail (every retry empty) should still
+    return False so the legit ``RECOVER_DEAD_RAIL`` path keeps
+    working — the fix for #1293 must not hide real dead rails."""
+    capture_calls: list[str] = []
+
+    def _always_empty_capture(_pane_id: str, lines: int = 40) -> str:
+        capture_calls.append(_pane_id)
+        return ""
+
+    class _Pane:
+        pane_id = "%9"
+
+    import time as _time
+
+    # Don't burn wall clock on retry delays; we only assert the
+    # function gave up and returned False.
+    original_sleep = _time.sleep
+    _time.sleep = lambda _s: None  # type: ignore[assignment]
+    try:
+        result = cli._pane_capture_looks_like_cockpit_rail(_Pane(), _always_empty_capture)
+    finally:
+        _time.sleep = original_sleep  # type: ignore[assignment]
+
+    assert result is False
+    # Retry loop must have actually retried, then given up.
+    assert len(capture_calls) >= 2
+
+
 def test_probe_falls_back_when_list_panes_unavailable() -> None:
     """#906 — when ``list_panes`` cannot enumerate (returns an
     empty list / raises), pane-liveness defaults to True. The

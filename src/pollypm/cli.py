@@ -740,23 +740,76 @@ def _classify_cockpit_panes(panes, *, capture_pane=None) -> tuple[bool, bool, bo
     return (console_alive, rail_alive, rail_non_shell)
 
 
+_RAIL_CAPTURE_RETRY_DELAYS_S: tuple[float, ...] = (0.05, 0.1, 0.2)
+"""Backoff delays for retrying a transient-empty rail pane capture.
+
+#1293 — ``tmux capture-pane`` against the cockpit rail can return an
+empty / mid-redraw buffer when ``pm`` polls during a state transition
+(right after a resize / refresh, between Textual draw cycles, while the
+cockpit is repainting). A single empty capture used to flip
+``rail_pane_running_non_shell`` to ``False`` and route a healthy rail
+through ``RECOVER_DEAD_RAIL``, surfacing a false-positive diagnostic to
+the user. Quick retries with short backoffs absorb the redraw window
+without measurably slowing the launch path; the cumulative worst-case
+budget is ~350ms across three retries, only paid when the *first*
+capture is empty/short.
+"""
+
+
+_RAIL_CAPTURE_MIN_CHARS: int = 4
+"""Minimum non-whitespace characters that count as a "real" capture.
+
+A capture below this threshold is treated as transient-empty and
+retried. The cockpit rail prints multi-line ASCII art plus the four
+required tokens; a real capture is hundreds of characters. The bar is
+deliberately low — anything above noise but below "actual UI" still
+triggers a retry rather than declaring the rail dead.
+"""
+
+
 def _pane_capture_looks_like_cockpit_rail(pane, capture_pane) -> bool:
     if not callable(capture_pane):
         return False
     pane_id = getattr(pane, "pane_id", None)
     if not isinstance(pane_id, str) or not pane_id:
         return False
-    try:
-        text = str(capture_pane(pane_id, lines=40) or "")
-    except Exception:  # noqa: BLE001
-        return False
-    normalized = " ".join(text.lower().split())
-    return (
-        "polly" in normalized
-        and "home" in normalized
-        and "workers" in normalized
-        and "inbox" in normalized
-    )
+
+    # #1293 — retry on transient-empty / mid-redraw captures before
+    # declaring the rail dead. The rail is a Textual TUI; tmux can
+    # capture a blank buffer if we hit it between draw cycles. A
+    # single empty capture used to surface a false-positive
+    # ``recover_dead_rail`` diagnostic. Quick backoff retries absorb
+    # the redraw window. Real dead-rail detection still works: every
+    # retry returns empty, the loop exits, and the function returns
+    # False as before.
+    import time
+
+    delays = (0.0,) + _RAIL_CAPTURE_RETRY_DELAYS_S
+    for delay in delays:
+        if delay:
+            try:
+                time.sleep(delay)
+            except Exception:  # noqa: BLE001 — never block the probe
+                pass
+        try:
+            text = str(capture_pane(pane_id, lines=40) or "")
+        except Exception:  # noqa: BLE001
+            return False
+        # Only retry on transient-empty / very short captures. A real
+        # capture that simply lacks the four tokens (rail genuinely
+        # showing some other content) should fall through immediately —
+        # retrying that case wastes time and changes nothing.
+        stripped = text.strip()
+        if len(stripped) < _RAIL_CAPTURE_MIN_CHARS:
+            continue
+        normalized = " ".join(text.lower().split())
+        return (
+            "polly" in normalized
+            and "home" in normalized
+            and "workers" in normalized
+            and "inbox" in normalized
+        )
+    return False
 
 
 @app.command(help=_UP_HELP)

@@ -5454,6 +5454,63 @@ class _InboxNavRouter:
         self.persisted.append(key)
 
 
+def test_cockpit_inbox_tab_right_and_enter_activate_pane_nav() -> None:
+    """#1298: explicit Inbox focus keys make j/k drive the Inbox list."""
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    router = _InboxNavRouter(active=False)
+    app.router = router  # type: ignore[assignment]
+    app.selected_key = "inbox"
+    app._items = [SimpleNamespace(key="inbox", selectable=True)]
+    app._selected_row_key = lambda: "inbox"  # type: ignore[method-assign]
+    app._right_pane_has_live_session = lambda: False  # type: ignore[method-assign]
+
+    focused: list[str] = []
+    sent_right: list[str] = []
+    routes: list[str] = []
+    app._focus_right_pane = lambda: focused.append("focus")  # type: ignore[method-assign]
+    app._send_key_to_right_pane = lambda key: sent_right.append(key)  # type: ignore[method-assign]
+    app._schedule_route_selected = (  # type: ignore[method-assign]
+        lambda key, *, label=None: routes.append(key)
+    )
+
+    app.action_forward_tab_to_right()
+    assert router.active is True
+    assert focused == ["focus"]
+    assert sent_right == []
+
+    router.active = False
+    app.action_focus_inbox_pane_nav()
+    assert router.active is True
+    assert focused == ["focus", "focus"]
+
+    router.active = False
+    app.action_open_selected()
+    assert router.active is True
+    assert routes == ["inbox"]
+
+
+def test_cockpit_escape_and_q_from_active_inbox_nav_return_to_inbox_pane() -> None:
+    """Bridge-delivered Esc/q should release Inbox nav through the Inbox app."""
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    router = _InboxNavRouter(active=True)
+    app.router = router  # type: ignore[assignment]
+    app.selected_key = "inbox"
+
+    forwarded: list[str] = []
+    navigated: list[str] = []
+    app._send_key_to_inbox_pane = (  # type: ignore[method-assign]
+        lambda key: forwarded.append(key) or True
+    )
+    app._right_pane_has_live_session = lambda: False  # type: ignore[method-assign]
+    app._navigate_home = lambda: navigated.append("home") or True  # type: ignore[method-assign]
+
+    app.action_back_to_home()
+    app.action_forward_project_home()
+
+    assert forwarded == ["escape", "q"]
+    assert navigated == []
+
+
 def test_cockpit_jk_from_inbox_forwards_to_inbox_pane() -> None:
     """#1137/#1238: active Inbox owns row-navigation keys."""
     app = PollyCockpitApp.__new__(PollyCockpitApp)

@@ -669,8 +669,9 @@ def _build_launch_probe(supervisor) -> LaunchProbe:
         # is the source of truth.
         panes = _safe("list_panes", target, default=None)
         if panes:
+            capture_pane = getattr(tmux, "capture_pane", None)
             console_pane_alive, rail_pane_alive, rail_pane_running_non_shell = (
-                _classify_cockpit_panes(panes)
+                _classify_cockpit_panes(panes, capture_pane=capture_pane)
             )
 
     return LaunchProbe(
@@ -685,7 +686,7 @@ def _build_launch_probe(supervisor) -> LaunchProbe:
     )
 
 
-def _classify_cockpit_panes(panes) -> tuple[bool, bool, bool]:
+def _classify_cockpit_panes(panes, *, capture_pane=None) -> tuple[bool, bool, bool]:
     """Classify the cockpit window's pane list into the three
     pane-liveness probe fields.
 
@@ -694,7 +695,9 @@ def _classify_cockpit_panes(panes) -> tuple[bool, bool, bool]:
     Returns ``(console_alive, rail_alive, rail_non_shell)``. When only
     one pane is present, infer whether it is the rail from the command:
     shell means the rail has not started; non-shell means the right pane
-    is missing.
+    is missing. Some real rail panes report the shell wrapper as the
+    current command even while the cockpit rail is visibly running; when a
+    safe pane capture proves that UI is present, treat the rail as healthy.
     """
     left = None
     right = None
@@ -714,7 +717,10 @@ def _classify_cockpit_panes(panes) -> tuple[bool, bool, bool]:
         pane = left[1]
         pane_alive = not bool(getattr(pane, "pane_dead", False))
         pane_cmd = (getattr(pane, "pane_current_command", "") or "").lower()
-        pane_non_shell = pane_alive and pane_cmd not in _SHELL_COMMANDS
+        pane_non_shell = pane_alive and (
+            pane_cmd not in _SHELL_COMMANDS
+            or _pane_capture_looks_like_cockpit_rail(pane, capture_pane)
+        )
         if pane_non_shell:
             return (False, True, True)
         return (pane_alive, False, False)
@@ -727,8 +733,30 @@ def _classify_cockpit_panes(panes) -> tuple[bool, bool, bool]:
     console_alive = not bool(getattr(console_pane, "pane_dead", False))
     rail_alive = not bool(getattr(rail_pane, "pane_dead", False))
     rail_cmd = (getattr(rail_pane, "pane_current_command", "") or "").lower()
-    rail_non_shell = rail_alive and rail_cmd not in _SHELL_COMMANDS
+    rail_non_shell = rail_alive and (
+        rail_cmd not in _SHELL_COMMANDS
+        or _pane_capture_looks_like_cockpit_rail(rail_pane, capture_pane)
+    )
     return (console_alive, rail_alive, rail_non_shell)
+
+
+def _pane_capture_looks_like_cockpit_rail(pane, capture_pane) -> bool:
+    if not callable(capture_pane):
+        return False
+    pane_id = getattr(pane, "pane_id", None)
+    if not isinstance(pane_id, str) or not pane_id:
+        return False
+    try:
+        text = str(capture_pane(pane_id, lines=40) or "")
+    except Exception:  # noqa: BLE001
+        return False
+    normalized = " ".join(text.lower().split())
+    return (
+        "polly" in normalized
+        and "home" in normalized
+        and "workers" in normalized
+        and "inbox" in normalized
+    )
 
 
 @app.command(help=_UP_HELP)

@@ -325,6 +325,15 @@ class TmuxSessionService:
                             # Fresh marker stays so the next correct
                             # send-tuple still bootstraps. The error
                             # log line above carries the diagnostic.
+                            # #1338 — flag the leak-prone branch so
+                            # marker-reap rates can be correlated with
+                            # persona-swap aborts in the heartbeat log.
+                            logger.warning(
+                                "fresh_launch_marker leak risk: persona_swap_detected for %s "
+                                "(window=%s); marker %s left in place — relies on a future "
+                                "correct send-tuple OR the worker_marker_reaper sweep.",
+                                name, wname, fresh_launch_marker,
+                            )
                             kickoff = None
                         else:
                             raise
@@ -333,6 +342,17 @@ class TmuxSessionService:
                         self.tmux.send_keys(target, kickoff)
                         self._verify_input_submitted(target, kickoff, provider)
                         fresh_launch_marker.unlink(missing_ok=True)
+                else:
+                    # #1338 — identity-stacking guards refused the
+                    # send. Marker is left in place (matches the
+                    # legacy contract) but flagged so leak rates are
+                    # visible without instrumenting the reaper.
+                    logger.warning(
+                        "fresh_launch_marker leak risk: identity guard refused kickoff "
+                        "for %s (window=%s); marker %s left in place — worker_marker_reaper "
+                        "will reap it once the task is terminal or the window dies.",
+                        name, wname, fresh_launch_marker,
+                    )
 
         # Write resume marker
         if resume_marker:

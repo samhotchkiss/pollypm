@@ -812,6 +812,25 @@ class Supervisor:
                     for marker in markers_dir.iterdir():
                         marker.unlink(missing_ok=True)
 
+        # #1338 — reap orphan worker-marker .fresh files left behind by
+        # the asymmetric cleanup paths in
+        # ``session_services/tmux.py``. Bootstrap is a safe time to run
+        # this because no per-task workers are alive yet — every
+        # remaining ``*.fresh`` file is by definition stale. Failures
+        # are logged inside the reaper, never raised, so a stat failure
+        # on one project doesn't block cockpit startup.
+        try:
+            from pollypm.work.worker_marker_reaper import (
+                reap_orphan_worker_markers,
+            )
+
+            tmux = getattr(self.session_service, "tmux", None)
+            reap_orphan_worker_markers(self.config, tmux=tmux)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "worker-marker reaper failed at bootstrap", exc_info=True,
+            )
+
     def repair_sessions_table(self) -> int:
         """Upsert a ``sessions`` row for every configured session whose
         tmux window is currently alive.
@@ -1428,6 +1447,21 @@ class Supervisor:
             sweep_stale_notifies(self._msg_store)
         except Exception:  # noqa: BLE001
             logger.warning("notify-sweep skipped", exc_info=True)
+
+        # #1338 — runtime reconciliation for ``worker-markers/*.fresh``
+        # files. Complements the bootstrap reaper above: handles
+        # orphans created *after* startup (cancelled tasks, worker
+        # crashes whose tmux window also vanished) without requiring
+        # a supervisor restart. The sweep additionally kills any dead
+        # tmux window matching a reaped marker so a re-claim can
+        # cleanly bootstrap a fresh worker.
+        try:
+            from pollypm.work.worker_marker_reaper import sweep_worker_markers
+
+            tmux = getattr(self.session_service, "tmux", None)
+            sweep_worker_markers(self.config, tmux=tmux)
+        except Exception:  # noqa: BLE001
+            logger.warning("worker-marker sweep skipped", exc_info=True)
 
         # Re-arm the heartbeat schedule so the next sweep is always queued.
         # Without this, the scheduler permanently stops if the heartbeat

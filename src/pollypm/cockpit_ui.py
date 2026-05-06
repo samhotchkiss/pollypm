@@ -4831,7 +4831,11 @@ class PollySettingsPaneApp(App[None]):
                 widget.add_class("-section-active")
 
     def _nav_label(self, key: str, label: str, *, count: int | None) -> str:
-        marker = "\u25b8" if key == self._active_section else " "
+        try:
+            cursor_key = _SETTINGS_SECTIONS[self._nav_cursor][0]
+        except (AttributeError, IndexError):
+            cursor_key = self._active_section
+        marker = "\u25b8" if key == cursor_key else " "
         cnt = f"  [dim]{count}[/dim]" if count is not None else ""
         return f"{marker} {_escape(label)}{cnt}"
 

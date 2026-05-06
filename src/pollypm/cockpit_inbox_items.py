@@ -355,7 +355,7 @@ def message_row_to_inbox_entry(
         sender=row.get("sender") or "polly",
         project=project,
         title=row.get("subject") or "(no subject)",
-        description=row.get("body") or "",
+        description=str(row.get("body") or "").replace("\\n", "\n"),
         created_at=row.get("created_at"),
         updated_at=row.get("updated_at") or row.get("created_at"),
         priority=priority,

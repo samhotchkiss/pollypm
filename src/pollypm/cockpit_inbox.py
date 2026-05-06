@@ -733,11 +733,25 @@ def _format_worker_turn_label(
     return f"{prefix} {unit}"
 
 
-def _last_commit_age(project_path: Path, branch_name: str | None) -> str:
-    """Return a short relative-age string for the worker's branch tip.
+def _format_commit_age(total_s: int) -> str:
+    if total_s < 60:
+        return "just now"
+    if total_s < 3600:
+        return f"{total_s // 60}m ago"
+    if total_s < 3600 * 24:
+        return f"{total_s // 3600}h ago"
+    return f"{total_s // (3600 * 24)}d ago"
+
+
+def _last_commit_age_info(
+    project_path: Path,
+    branch_name: str | None,
+) -> tuple[str, int | None]:
+    """Return a short relative-age string and seconds since branch tip.
 
     Best-effort: we only run ``git log -1 --format=%ct`` so a missing
-    branch / non-repo path falls through to the empty-age dash.
+    branch / non-repo path falls through to the empty-age dash and no
+    recency signal.
 
     For control sessions (architect-/worker-/pm-) without a per-task
     branch, fall back to the project's ``HEAD`` so the column reflects
@@ -752,27 +766,27 @@ def _last_commit_age(project_path: Path, branch_name: str | None) -> str:
             capture_output=True, text=True, check=False, timeout=2,
         )
     except Exception:  # noqa: BLE001
-        return "\u2014"
+        return "\u2014", None
     if result.returncode != 0:
-        return "\u2014"
+        return "\u2014", None
     ts_raw = (result.stdout or "").strip()
     if not ts_raw:
-        return "\u2014"
+        return "\u2014", None
     try:
         ts = int(ts_raw)
     except ValueError:
-        return "\u2014"
+        return "\u2014", None
     from datetime import UTC, datetime
     dt = datetime.fromtimestamp(ts, tz=UTC)
     delta = datetime.now(UTC) - dt
     total_s = max(0, int(delta.total_seconds()))
-    if total_s < 60:
-        return "just now"
-    if total_s < 3600:
-        return f"{total_s // 60}m ago"
-    if total_s < 3600 * 24:
-        return f"{total_s // 3600}h ago"
-    return f"{total_s // (3600 * 24)}d ago"
+    return _format_commit_age(total_s), total_s
+
+
+def _last_commit_age(project_path: Path, branch_name: str | None) -> str:
+    """Return a short relative-age string for the worker's branch tip."""
+    label, _seconds_ago = _last_commit_age_info(project_path, branch_name)
+    return label
 
 
 def _format_heartbeat_age(last_heartbeat_iso: str | None) -> str:
@@ -829,6 +843,7 @@ def _worker_health_snapshot(
     token_total: int,
     session_name: str,
     current_node: str | None = None,
+    last_commit_seconds_ago: int | None = None,
 ) -> tuple[str, str]:
     """Map worker state to a health bucket + tooltip.
 
@@ -843,13 +858,25 @@ def _worker_health_snapshot(
         health = "unresponsive"
     elif status == "idle":
         try:
-            dt = datetime.fromisoformat(last_heartbeat_iso) if last_heartbeat_iso else None
+            dt = (
+                datetime.fromisoformat(last_heartbeat_iso)
+                if last_heartbeat_iso
+                else None
+            )
         except (TypeError, ValueError):
             dt = None
         if dt is not None and dt.tzinfo is None:
             dt = dt.replace(tzinfo=UTC)
         idle_long = dt is not None and dt <= datetime.now(UTC) - timedelta(minutes=5)
-        health = "idle_warn" if dt is None or idle_long else "alive"
+        recent_commit = (
+            last_commit_seconds_ago is not None
+            and last_commit_seconds_ago < 24 * 3600
+        )
+        health = (
+            "idle_warn"
+            if (dt is None and not recent_commit) or idle_long
+            else "alive"
+        )
     else:
         health = "alive"
     if health == "handed_off":
@@ -860,6 +887,8 @@ def _worker_health_snapshot(
         heartbeat_part = f"last heartbeat {_format_heartbeat_age(last_heartbeat_iso)}"
     elif status in {"working", "idle"}:
         heartbeat_part = f"{status}; heartbeat not recorded"
+        if last_commit_seconds_ago is not None and status == "idle":
+            heartbeat_part += f"; last commit {_format_commit_age(last_commit_seconds_ago)}"
     else:
         heartbeat_part = "last heartbeat unknown"
     tooltip = (
@@ -1027,13 +1056,17 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
                 last_heartbeat_iso=last_heartbeat_iso,
                 is_turn_active=is_turn_active,
             )
-            last_commit_label = _last_commit_age(project_path, ws.branch_name)
+            last_commit_label, last_commit_seconds_ago = _last_commit_age_info(
+                project_path,
+                ws.branch_name,
+            )
             health, health_tooltip = _worker_health_snapshot(
                 status=status,
                 last_heartbeat_iso=last_heartbeat_iso,
                 token_total=token_total,
                 session_name=session_name,
                 current_node=current_node,
+                last_commit_seconds_ago=last_commit_seconds_ago,
             )
 
             rows.append(
@@ -1161,13 +1194,6 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
                 status = "stuck"
             else:
                 status = "idle"
-            health, health_tooltip = _worker_health_snapshot(
-                status=status,
-                last_heartbeat_iso=None,
-                token_total=0,
-                session_name=window_name,
-                current_node=None,
-            )
             # Synthetic control-session rows have no per-task branch.
             # Fall back to the project's HEAD so the "Last commit" column
             # surfaces real activity instead of being empty for every
@@ -1177,9 +1203,20 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
             synthetic_project = projects.get(project_key)
             synthetic_path = getattr(synthetic_project, "path", None)
             if isinstance(synthetic_path, Path):
-                synthetic_last_commit = _last_commit_age(synthetic_path, None)
+                synthetic_last_commit, synthetic_last_commit_seconds_ago = (
+                    _last_commit_age_info(synthetic_path, None)
+                )
             else:
                 synthetic_last_commit = "—"
+                synthetic_last_commit_seconds_ago = None
+            health, health_tooltip = _worker_health_snapshot(
+                status=status,
+                last_heartbeat_iso=None,
+                token_total=0,
+                session_name=window_name,
+                current_node=None,
+                last_commit_seconds_ago=synthetic_last_commit_seconds_ago,
+            )
             rows.append(
                 WorkerRosterRow(
                     project_key=project_key,

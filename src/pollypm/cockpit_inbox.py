@@ -873,9 +873,9 @@ def _worker_health_snapshot(
             and last_commit_seconds_ago < 24 * 3600
         )
         health = (
-            "idle_warn"
-            if (dt is None and not recent_commit) or idle_long
-            else "alive"
+            "alive"
+            if recent_commit or (dt is not None and not idle_long)
+            else "idle_warn"
         )
     else:
         health = "alive"
@@ -885,6 +885,10 @@ def _worker_health_snapshot(
         )
     elif last_heartbeat_iso:
         heartbeat_part = f"last heartbeat {_format_heartbeat_age(last_heartbeat_iso)}"
+        if last_commit_seconds_ago is not None and status == "idle":
+            heartbeat_part += (
+                f"; last commit {_format_commit_age(last_commit_seconds_ago)}"
+            )
     elif status in {"working", "idle"}:
         heartbeat_part = f"{status}; heartbeat not recorded"
         if last_commit_seconds_ago is not None and status == "idle":

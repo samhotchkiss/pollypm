@@ -314,6 +314,26 @@ def test_idle_worker_without_heartbeat_uses_recent_commit_as_alive_signal() -> N
     assert stale_health == "idle_warn"
 
 
+def test_idle_worker_stale_heartbeat_uses_recent_commit_as_alive_signal() -> None:
+    """#1322: recent project activity wins over an old idle heartbeat."""
+    from datetime import UTC, datetime, timedelta
+
+    from pollypm.cockpit_inbox import _worker_health_snapshot
+
+    stale_heartbeat = (datetime.now(UTC) - timedelta(minutes=12)).isoformat()
+    health, tooltip = _worker_health_snapshot(
+        status="idle",
+        last_heartbeat_iso=stale_heartbeat,
+        token_total=0,
+        session_name="worker_demo",
+        last_commit_seconds_ago=36 * 60,
+    )
+
+    assert health == "alive"
+    assert "last heartbeat 12m ago" in tooltip
+    assert "last commit 36m ago" in tooltip
+
+
 def test_offline_at_review_node_classifies_as_handed_off() -> None:
     """Regression: when a worker exits cleanly after handing off to a
     reviewer (task at ``code_review`` / ``user_approval``), the

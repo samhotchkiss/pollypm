@@ -744,11 +744,15 @@ def test_cockpit_send_key_enter_consumes_network_dead_for_live_right_pane(
     assert router.tmux.calls == [
         ("run", "send-keys", "-t", "%2", "C-u", {"check": False}),
         (
-            "send_keys",
+            "run",
+            "display-message",
+            "-d",
+            "5000",
+            "-t",
             "%2",
-            "PollyPM chat failed: network unreachable (simulated): "
-            "connection refused for cockpit live chat submit",
-            False,
+            "PollyPM chat failed: network unreachable. "
+            "Input cleared; check connection and try again.",
+            {"check": False},
         ),
     ]
 

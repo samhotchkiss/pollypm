@@ -13,6 +13,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -380,6 +381,27 @@ def test_work_transition_projection(tmp_path: Path) -> None:
     # blocked is elevated to recommendation severity.
     assert t8.severity == "recommendation"
     assert "missing spec" in t8.summary
+
+
+def test_missing_work_transitions_table_short_circuits_without_error_log(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    state_db = tmp_path / "state.db"
+    work_db = tmp_path / "demo" / ".pollypm" / "state.db"
+    work_db.parent.mkdir(parents=True)
+    StateStore(state_db).close()
+    sqlite3.connect(str(work_db)).close()
+
+    caplog.set_level(
+        logging.ERROR,
+        logger="pollypm.plugins_builtin.activity_feed.handlers.event_projector",
+    )
+
+    entries = EventProjector(state_db, [("demo", work_db)]).project(limit=20)
+
+    assert entries == []
+    assert "work-db projection failed" not in caplog.text
 
 
 def test_cross_source_entries_sort_chronologically(tmp_path: Path) -> None:

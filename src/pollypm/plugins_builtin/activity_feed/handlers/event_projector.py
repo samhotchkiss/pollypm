@@ -438,6 +438,12 @@ class EventProjector:
         )
         try:
             conn.row_factory = sqlite3.Row
+            has_work_transitions = conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'work_transitions'"
+            ).fetchone()
+            if has_work_transitions is None:
+                return []
             params: list[Any] = []
             where = ""
             if since_ts is not None:

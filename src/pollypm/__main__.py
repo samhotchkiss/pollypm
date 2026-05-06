@@ -106,10 +106,33 @@ def _default_config_path() -> Path:
 def _paint_inbox_snapshot(config_path: Path, *, project: str | None) -> Exception | None:
     """Prepaint a real inbox list before importing the interactive TUI."""
     try:
-        from pollypm.cockpit_inbox_items import load_inbox_entries
+        from pollypm.cockpit_inbox_items import (
+            load_inbox_action_preview,
+            load_inbox_entries,
+        )
         from pollypm.config import load_config
 
         config = load_config(config_path)
+        try:
+            preview, preview_unread, preview_total = load_inbox_action_preview(
+                config,
+                project=project,
+                limit=_INBOX_PREPAINT_LIMIT,
+            )
+        except Exception:  # noqa: BLE001 - exact loader below is the fallback
+            preview = []
+            preview_unread = set()
+            preview_total = 0
+        if preview:
+            frame = _render_inbox_snapshot(
+                preview,
+                total=preview_total,
+                unread_count=len(preview_unread),
+                project=project,
+            )
+            sys.stdout.write(f"{_CLEAR_SCREEN}{frame}")
+            sys.stdout.flush()
+            return None
         items, unread, _replies = load_inbox_entries(config)
         visible = _initial_inbox_visible_items(items, project=project)
         frame = _render_inbox_snapshot(

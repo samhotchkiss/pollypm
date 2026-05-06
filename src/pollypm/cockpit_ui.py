@@ -1041,6 +1041,7 @@ class PollyCockpitApp(App[None]):
         # or a modal that just dismissed) intercepts the keystroke and
         # the rail's cursor stops moving — the user has to Tab back
         # to the nav before navigation responds again.
+        Binding("right", "focus_inbox_pane_nav", "Inbox pane", show=False, priority=True),
         Binding("j,down", "cursor_down", "Down", show=False, priority=True),
         Binding("k,up", "cursor_up", "Up", show=False, priority=True),
         Binding("g,home", "cursor_first", "First", show=False, priority=True),
@@ -1087,6 +1088,7 @@ class PollyCockpitApp(App[None]):
         "cursor_up",             # k, up
         "cursor_first",          # g, home
         "cursor_last",           # G, end
+        "focus_inbox_pane_nav",  # right
         "forward_tab_to_right",  # tab
         "forward_action_button_1",
         "forward_action_button_2",
@@ -1120,6 +1122,7 @@ class PollyCockpitApp(App[None]):
         "cursor_up",             # k, up
         "cursor_first",          # g, home
         "cursor_last",           # G, end
+        "focus_inbox_pane_nav",  # right
         "forward_tab_to_right",  # tab
         "forward_action_button_1",
         "forward_action_button_2",
@@ -1771,6 +1774,15 @@ class PollyCockpitApp(App[None]):
             return self._send_key_to_right_pane(key)
         except Exception:  # noqa: BLE001
             return False
+
+    def _activate_inbox_pane_nav(self, *, focus_pane: bool = False) -> bool:
+        """Let the mounted Inbox pane own row-navigation keys."""
+        if not self._on_inbox_surface():
+            return False
+        self._set_inbox_pane_nav_active(True)
+        if focus_pane:
+            self._focus_right_pane()
+        return True
 
     def _cancel_pending_route_selection(self) -> None:
         controller = getattr(self, "_navigation_controller", None)
@@ -2605,6 +2617,9 @@ class PollyCockpitApp(App[None]):
         key = self._selected_open_key()
         if key is None:
             return
+        inbox_nav_requested = key == "inbox" or key.startswith("inbox:")
+        if inbox_nav_requested:
+            self._set_inbox_pane_nav_active(True)
         self._schedule_route_selected(key, label=key)
 
     def action_open_settings(self) -> None:
@@ -2854,6 +2869,8 @@ class PollyCockpitApp(App[None]):
                 self._refresh_rows()
             except Exception:  # noqa: BLE001
                 pass
+            if self._on_inbox_surface() and self._inbox_pane_owns_nav():
+                self._focus_right_pane()
 
         try:
             self.call_from_thread(_apply)
@@ -2890,10 +2907,15 @@ class PollyCockpitApp(App[None]):
             _apply()
 
     def action_forward_tab_to_right(self) -> None:
+        if self._activate_inbox_pane_nav(focus_pane=True):
+            return
         if self._right_pane_has_live_session():
             self._focus_right_pane()
             return
         self._send_key_to_right_pane("Tab")
+
+    def action_focus_inbox_pane_nav(self) -> None:
+        self._activate_inbox_pane_nav(focus_pane=True)
 
     def action_forward_workers_auto_refresh(self) -> None:
         if self._on_inbox_surface():
@@ -2971,6 +2993,11 @@ class PollyCockpitApp(App[None]):
         via capital ``Q`` / ``Ctrl-Q``. Off a project surface this is
         a no-op (Esc still routes to Home everywhere).
         """
+        if self._inbox_pane_owns_nav():
+            if self._send_key_to_inbox_pane("q"):
+                return
+            self._set_inbox_pane_nav_active(False)
+            return
         if self._on_project_surface():
             self._send_key_to_right_pane("q")
 
@@ -3083,6 +3110,11 @@ class PollyCockpitApp(App[None]):
     def action_back_to_home(self) -> None:
         if self._inbox_filter_input_active():
             self._send_key_to_inbox_pane("escape")
+            return
+        if self._inbox_pane_owns_nav():
+            if self._send_key_to_inbox_pane("escape"):
+                return
+            self._set_inbox_pane_nav_active(False)
             return
         if self._right_pane_has_live_session():
             return_key = self._mounted_return_key()

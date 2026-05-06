@@ -310,6 +310,19 @@ def _send_selected_action_key_to_content_bridge(
     except Exception:  # noqa: BLE001
         return None
     kind = _content_bridge_kind_for_selected_key(selected)
+    # #1282: rail nav keys (`<home>`, `g`, `G`, j/k bursts) drift the
+    # rail's `selected_key` away from "inbox" even when the Inbox surface
+    # is still mounted in the right pane. Gate inbox action keys on the
+    # visible surface — i.e. presence of a live `pane-inbox` bridge —
+    # rather than on `selected_key`, so e.g. `<esc> → I → <home> → A`
+    # still fires the approve gate instead of hijacking to Workers.
+    if token in _INBOX_BRIDGE_FIRST_TOKENS and _has_live_inbox_bridge(config_path):
+        try:
+            return send_key_to_first_live(
+                config_path, key, kind="pane-inbox", timeout=0.2,
+            )
+        except Exception:  # noqa: BLE001
+            return None
     if kind == "pane-inbox" and token in _INBOX_BRIDGE_FIRST_TOKENS:
         pass
     elif (
@@ -326,6 +339,23 @@ def _send_selected_action_key_to_content_bridge(
         return send_key_to_first_live(config_path, key, kind=kind, timeout=0.2)
     except Exception:  # noqa: BLE001
         return None
+
+
+def _has_live_inbox_bridge(config_path: Path) -> bool:
+    """Return True when an Inbox right-pane bridge socket is live (#1282).
+
+    The Inbox app starts a `kind="pane-inbox"` bridge on mount and stops
+    it on unmount, so a live socket is the canonical signal that the
+    Inbox surface is the visible right-pane content — independent of the
+    rail's `selected_key`, which can drift to "dashboard" after `<home>`
+    or other rail nav.
+    """
+    try:
+        from pollypm.cockpit_input_bridge import list_bridge_sockets
+
+        return bool(list_bridge_sockets(config_path, kind="pane-inbox"))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _inbox_filter_token(token: str, lowered: str) -> bool:

@@ -109,15 +109,20 @@ def _send_help_key_to_content_bridge(config_path: Path, key: str) -> Path | None
         selected = CockpitRouter(config_path).selected_key()
     except Exception:  # noqa: BLE001
         return None
-    if selected in {"dashboard", "polly"}:
-        return None
     kind = _content_bridge_kind_for_selected_key(selected)
     candidates = []
     if kind is not None:
         candidates.append(kind)
+    if selected in {"dashboard", "polly"}:
+        # Home help belongs on the visible dashboard pane when its
+        # bridge is live, but it should not fall through to stale
+        # non-Home content bridges if that pane is not ready (#1254).
+        fallbacks: tuple[str, ...] = ()
+    else:
+        fallbacks = _HELP_CONTENT_BRIDGE_FALLBACK_KINDS
     candidates.extend(
         fallback
-        for fallback in _HELP_CONTENT_BRIDGE_FALLBACK_KINDS
+        for fallback in fallbacks
         if fallback not in candidates
     )
     for candidate in candidates:

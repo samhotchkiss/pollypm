@@ -99,7 +99,7 @@ class PollyWorkerRosterApp(App[None]):
         Binding("r,R", "refresh", "Refresh"),
         Binding("a,A", "toggle_auto", "Auto-refresh"),
         Binding("enter", "jump_to_project", "Open"),
-        Binding("d", "jump_to_worker", "Discuss"),
+        Binding("d", "jump_to_worker", "Open task"),
         Binding("ctrl+k,colon", "open_command_palette", "Palette", priority=True),
         Binding("question_mark", "show_keyboard_help", "Help", priority=True),
         Binding("q,escape", "back", "Back"),
@@ -135,7 +135,11 @@ class PollyWorkerRosterApp(App[None]):
 
     _DEFAULT_HINT = (
         "R refresh \u00b7 A auto-refresh \u00b7 \u21b5 open project "
-        "\u00b7 d discuss \u00b7 q back"
+        "\u00b7 d open task \u00b7 q back"
+    )
+    _STUCK_TASK_HINT = (
+        "stuck: d open task \u00b7 then R recovery \u00b7 "
+        "\u21b5 open project \u00b7 q back"
     )
 
     def __init__(self, config_path: Path) -> None:
@@ -395,12 +399,21 @@ class PollyWorkerRosterApp(App[None]):
         if row is None:
             self.hint.update(self._DEFAULT_HINT)
             return
+        hint = self._hint_for_row(row)
         if tooltip:
             self.hint.update(
-                f"[dim]{_escape(tooltip)}[/dim]\n[dim]{self._DEFAULT_HINT}[/dim]"
+                f"[dim]{_escape(tooltip)}[/dim]\n[dim]{_escape(hint)}[/dim]"
             )
         else:
-            self.hint.update(self._DEFAULT_HINT)
+            self.hint.update(hint)
+
+    def _hint_for_row(self, row) -> str:
+        if (
+            getattr(row, "status", "") == "stuck"
+            and getattr(row, "task_number", None) is not None
+        ):
+            return self._STUCK_TASK_HINT
+        return self._DEFAULT_HINT
 
     def action_refresh(self) -> None:
         self._schedule_refresh(show_loading=True)

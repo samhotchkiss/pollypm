@@ -347,6 +347,34 @@ def _task_status_value(task) -> str:
     )
 
 
+_STATUS_DISPLAY_LABELS = {
+    "autoreview": "Auto review",
+    "blocked": "Blocked",
+    "cancelled": "Cancelled",
+    "done": "Done",
+    "draft": "Draft",
+    "in_progress": "In progress",
+    "on_hold": "On hold",
+    "queued": "Queued",
+    "review": "In review",
+    "rework": "Rework needed",
+    "user-review": "Needs review",
+    "waiting_on_plan": "Waiting on plan",
+}
+
+
+def _display_label(value: object, *, fallback: str = "—") -> str:
+    text = str(value or "").strip()
+    if not text:
+        return fallback
+    label = text.replace("_", " ").replace("-", " ")
+    return label[:1].upper() + label[1:]
+
+
+def _status_display_label(status: str) -> str:
+    return _STATUS_DISPLAY_LABELS.get(status, _display_label(status))
+
+
 def _task_sort_key(
     task,
     *,
@@ -371,16 +399,16 @@ def _format_stage_label(task, flow) -> str:
     if not node_id:
         return "—"
     if flow is None:
-        return str(node_id)
+        return _display_label(node_id)
     node = getattr(flow, "nodes", {}).get(node_id)
     if node is None:
-        return str(node_id)
-    parts = [str(node_id)]
+        return _display_label(node_id)
+    parts = [_display_label(getattr(node, "name", None) or node_id)]
     node_type = getattr(getattr(node, "type", None), "value", None) or getattr(
         node, "type", None
     )
     if node_type:
-        parts.append(str(node_type))
+        parts.append(_display_label(node_type))
     actor = (
         getattr(node, "actor_role", None)
         or getattr(node, "agent_name", None)
@@ -388,7 +416,7 @@ def _format_stage_label(task, flow) -> str:
         or getattr(node, "actor_type", None)
     )
     if actor:
-        parts.append(str(actor))
+        parts.append(_display_label(actor))
     return " · ".join(parts)
 
 
@@ -727,7 +755,7 @@ def _render_overview(
         ])
     lines.extend([
         "",
-        f"Status     {status_label}",
+        f"Status     {_status_display_label(status_label)}",
         f"Priority   {priority_label(task)}",
         f"Flow       {task.flow_template_id}",
         f"Stage      {_format_stage_label(task, flow)}",
@@ -1956,9 +1984,10 @@ class PollyTasksApp(App[None]):
             feedback = self._rejection_feedback_by_task_id.get(task.task_id)
             plan_blocked = task.task_id in self._plan_blocked_task_ids
             recently_pinged = task.task_id in self._recent_sweeper_ping_task_ids
-            status = _status_label(task, owner, plan_blocked=plan_blocked)
+            status_label = _status_label(task, owner, plan_blocked=plan_blocked)
+            status = _status_display_label(status_label)
             title = f"{priority_glyph(task)} {task.title}"
-            stage = task.current_node_id or "—"
+            stage = _display_label(task.current_node_id)
             task_number = f"#{task.task_number}"
             if task.task_id in self._selected_task_ids:
                 task_number = f"◉ {task_number}"
@@ -2090,7 +2119,10 @@ class PollyTasksApp(App[None]):
         icon = self._STATUS_ICONS.get(status_label, "·")
         header_bits = [
             f"{'🔄 ' if feedback is not None else ''}{icon} #{task.task_number} {priority_glyph(task)} {task.title}",
-            f"{status_label} · {_format_relative_age(task.updated_at or task.created_at)}",
+            (
+                f"{_status_display_label(status_label)} · "
+                f"{_format_relative_age(task.updated_at or task.created_at)}"
+            ),
         ]
         if recently_pinged:
             header_bits.append("Sweeper pinged in the last minute")

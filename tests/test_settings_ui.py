@@ -928,3 +928,58 @@ def test_mount_perf_budget_for_20_projects_5_accounts(tmp_path: Path, monkeypatc
         assert elapsed < 1.5, f"mount too slow: {elapsed:.3f}s"
 
     _run(body())
+
+
+def test_narrow_settings_nav_cursor_advances_visibly_on_j(settings_env) -> None:
+    """#1288 — at narrow widths the ▸ glyph in the left nav must follow
+    j/k, not just the right-pane overlay header. Previously the cached
+    ``_nav_widgets`` references could go stale across the layout pass
+    that toggles the ``-narrow`` class, so ``Static.update`` was a
+    silent no-op and the cursor stayed pinned to row 0 (Accounts) on
+    every j press even though ``_nav_cursor`` had advanced.
+    """
+    app = settings_env["app"]
+
+    async def body() -> None:
+        # Width <110 → narrow mode (see ``_NARROW_THRESHOLD``).
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            from textual.containers import Vertical
+            from textual.widgets import Static
+
+            outer = app.query_one("#settings-outer", Vertical)
+            assert outer.has_class("-narrow"), (
+                "size=(80, 40) should put the settings pane in narrow mode"
+            )
+
+            # Use ``simulate_key`` because that's the path
+            # ``pm cockpit-send-key 'j'`` takes via the input bridge.
+            app.simulate_key("j")
+            await pilot.pause()
+
+            assert app._nav_cursor == 1
+            nav_items = list(app.query("#settings-nav .nav-item"))
+            # 8 sections (accounts, projects, roles, heartbeat, plugins,
+            # planner, inbox, about) → 8 ``Static`` rows.
+            assert len(nav_items) >= 2
+            row_renders = [
+                str(item.render())
+                for item in nav_items
+                if isinstance(item, Static)
+            ]
+            assert row_renders[0].startswith("  Accounts"), row_renders[0]
+            assert row_renders[1].startswith("▸ Projects"), row_renders[1]
+
+            app.simulate_key("j")
+            await pilot.pause()
+
+            assert app._nav_cursor == 2
+            row_renders = [
+                str(item.render())
+                for item in app.query("#settings-nav .nav-item")
+                if isinstance(item, Static)
+            ]
+            assert row_renders[1].startswith("  Projects"), row_renders[1]
+            assert row_renders[2].startswith("▸ Roles"), row_renders[2]
+
+    _run(body())

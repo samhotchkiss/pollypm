@@ -30,13 +30,40 @@ def resolve_inbox_work_service(config: Any, item: Any, task_id: str) -> Any | No
     """Resolve a work service for a cockpit inbox row.
 
     The task-id project key is tried first. If that does not map to a
-    registered project DB, the inbox entry's source ``db_path`` is used
-    as a best-effort fallback.
+    registered project DB, or if that DB exists but does not contain the
+    task that produced the inbox row, the inbox entry's source
+    ``db_path`` is used as a best-effort fallback.
     """
+    db_path = getattr(item, "db_path", None) if item is not None else None
     svc = open_work_service_for_task(config, task_id)
     if svc is not None:
-        return svc
-    db_path = getattr(item, "db_path", None) if item is not None else None
+        item_db_path = Path(db_path) if db_path is not None else None
+        svc_db_path = getattr(svc, "_db_path", None)
+        try:
+            same_db = (
+                item_db_path is not None
+                and svc_db_path is not None
+                and item_db_path.resolve() == Path(svc_db_path).resolve()
+            )
+        except Exception:  # noqa: BLE001
+            same_db = False
+        if item_db_path is None or same_db:
+            return svc
+        try:
+            svc.get(task_id)
+            return svc
+        except Exception:  # noqa: BLE001
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+            logger.debug(
+                "cockpit inbox: registered project db did not contain %s; "
+                "falling back to source db_path=%r",
+                task_id,
+                db_path,
+                exc_info=True,
+            )
     if db_path is not None:
         try:
             from pollypm.work.sqlite_service import SQLiteWorkService

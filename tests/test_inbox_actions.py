@@ -8,6 +8,7 @@ threads, read-markers, and archival from the TUI.
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -186,3 +187,66 @@ class TestArchiveTask:
     def test_archive_on_missing_task_raises(self, svc):
         with pytest.raises(TaskNotFoundError):
             svc.archive_task("demo/777", actor="user")
+
+
+# ---------------------------------------------------------------------------
+# resolve_inbox_work_service
+# ---------------------------------------------------------------------------
+
+
+class TestResolveInboxWorkService:
+    def test_falls_back_to_source_db_when_registered_project_db_lacks_task(
+        self, tmp_path,
+    ):
+        """Workspace-root task rows must render even if a project DB exists."""
+        project_path = tmp_path / "pollypm"
+        project_path.mkdir()
+        project_db = project_path / ".pollypm" / "state.db"
+        project_db.parent.mkdir(parents=True, exist_ok=True)
+        project_svc = SQLiteWorkService(
+            db_path=project_db, project_path=project_path,
+        )
+        project_svc.close()
+
+        workspace_db = tmp_path / ".pollypm" / "state.db"
+        workspace_db.parent.mkdir(parents=True, exist_ok=True)
+        workspace_svc = SQLiteWorkService(
+            db_path=workspace_db, project_path=tmp_path,
+        )
+        try:
+            task = workspace_svc.create(
+                title="Plan ready for review: pollypm",
+                description="Plan: docs/project-plan.md",
+                type="task",
+                project="pollypm",
+                flow_template="chat",
+                roles={"requester": "user", "operator": "architect"},
+                priority="normal",
+                created_by="architect",
+                labels=[
+                    "plan_review",
+                    "project:pollypm",
+                    "plan_task:pollypm/1",
+                ],
+            )
+            task_id = task.task_id
+        finally:
+            workspace_svc.close()
+
+        from pollypm.work.inbox_actions import resolve_inbox_work_service
+
+        config = SimpleNamespace(
+            projects={"pollypm": SimpleNamespace(path=project_path)},
+        )
+        item = SimpleNamespace(
+            db_path=workspace_db,
+            project="pollypm",
+            scope="pollypm",
+        )
+        resolved = resolve_inbox_work_service(config, item, task_id)
+        assert resolved is not None
+        try:
+            assert getattr(resolved, "_db_path") == workspace_db
+            assert resolved.get(task_id).title == "Plan ready for review: pollypm"
+        finally:
+            resolved.close()

@@ -289,6 +289,31 @@ def test_idle_worker_without_heartbeat_warns_instead_of_green() -> None:
     assert "session: worker_demo" in tooltip
 
 
+def test_idle_worker_without_heartbeat_uses_recent_commit_as_alive_signal() -> None:
+    """#1307: missing heartbeat is still differentiated by recent project activity."""
+    from pollypm.cockpit_inbox import _worker_health_snapshot
+
+    health, tooltip = _worker_health_snapshot(
+        status="idle",
+        last_heartbeat_iso=None,
+        token_total=0,
+        session_name="worker_demo",
+        last_commit_seconds_ago=33 * 60,
+    )
+
+    assert health == "alive"
+    assert "last commit 33m ago" in tooltip
+
+    stale_health, _ = _worker_health_snapshot(
+        status="idle",
+        last_heartbeat_iso=None,
+        token_total=0,
+        session_name="worker_demo",
+        last_commit_seconds_ago=21 * 24 * 3600,
+    )
+    assert stale_health == "idle_warn"
+
+
 def test_offline_at_review_node_classifies_as_handed_off() -> None:
     """Regression: when a worker exits cleanly after handing off to a
     reviewer (task at ``code_review`` / ``user_approval``), the
@@ -1062,5 +1087,7 @@ def test_gather_worker_roster_synthetic_row_last_commit_uses_project_head(
     assert architect.last_commit_label not in ("", "—"), (
         f"expected HEAD-fallback age, got {architect.last_commit_label!r}"
     )
+    assert architect.health == "alive"
     # ``pm-heartbeat`` has no matching project entry; it keeps the dash.
     assert by_session["pm-heartbeat"].last_commit_label == "—"
+    assert by_session["pm-heartbeat"].health == "idle_warn"

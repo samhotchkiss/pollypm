@@ -115,7 +115,10 @@ _RIGHT_PANE_TMUX_KEY_TOKENS: dict[str, str] = {
     "<end>": "End",
     "end": "End",
 }
-_LIVE_CHAT_NETWORK_DEAD_MESSAGE_PREFIX = "PollyPM chat failed"
+_LIVE_CHAT_NETWORK_DEAD_MESSAGE = (
+    "PollyPM chat failed: network unreachable. "
+    "Input cleared; check connection and try again."
+)
 
 
 def _is_help_key(key: str) -> bool:
@@ -366,18 +369,20 @@ def _live_chat_submit_blocked_by_network_dead(
         )
 
         raise_if_network_dead(config_path, surface="cockpit live chat submit")
-    except SimulatedNetworkDead as exc:
+    except SimulatedNetworkDead:
         tmux = getattr(router, "tmux", None)
         if tmux is not None:
             run = getattr(tmux, "run", None)
             if callable(run):
                 run("send-keys", "-t", right_pane, "C-u", check=False)
-            send_keys = getattr(tmux, "send_keys", None)
-            if callable(send_keys):
-                send_keys(
+                run(
+                    "display-message",
+                    "-d",
+                    "5000",
+                    "-t",
                     right_pane,
-                    f"{_LIVE_CHAT_NETWORK_DEAD_MESSAGE_PREFIX}: {exc}",
-                    press_enter=False,
+                    _LIVE_CHAT_NETWORK_DEAD_MESSAGE,
+                    check=False,
                 )
         return True
     return False

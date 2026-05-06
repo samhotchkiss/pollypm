@@ -674,6 +674,52 @@ def test_topbar_uses_configured_persona(tmp_path: Path) -> None:
     _run(body())
 
 
+def test_project_pm_labels_match_architect_session_persona(tmp_path: Path) -> None:
+    """When PM Chat routes to an architect session, adjacent content
+    surfaces should name Archie instead of the project's worker persona.
+    """
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    (project_path / ".git").mkdir()
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        "[project]\n"
+        'tmux_session = "pollypm-test"\n'
+        f'workspace_root = "{tmp_path}"\n'
+        "\n"
+        "[accounts.controller]\n"
+        'provider = "claude"\n'
+        "\n"
+        "[sessions.architect_demo]\n"
+        'role = "architect"\n'
+        'provider = "claude"\n'
+        'account = "controller"\n'
+        f'cwd = "{project_path}"\n'
+        'project = "demo"\n'
+        'window_name = "architect-demo"\n'
+        "\n"
+        "[projects.demo]\n"
+        'key = "demo"\n'
+        'name = "Demo"\n'
+        f'path = "{project_path}"\n'
+        'persona_name = "Bea"\n',
+        encoding="utf-8",
+    )
+    _seed_tasks(project_path)
+    if not _load_config_compatible(config_path):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+
+    from pollypm.cockpit_ui import _gather_project_dashboard, _resolve_pm_target
+
+    dashboard = _gather_project_dashboard(config_path, "demo")
+    assert dashboard is not None
+    assert dashboard.pm_label == "PM: Archie"
+    assert _resolve_pm_target(config_path, "demo") == (
+        "project:demo:session",
+        "Archie",
+    )
+
+
 # ---------------------------------------------------------------------------
 # 2. Status indicator — reflects active-worker / attention / idle
 # ---------------------------------------------------------------------------

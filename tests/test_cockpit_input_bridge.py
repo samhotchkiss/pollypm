@@ -243,6 +243,8 @@ def test_cockpit_send_key_defaults_to_cockpit_socket(fake_config: Path) -> None:
 @pytest.mark.parametrize(
     ("selected_key", "bridge_kind"),
     [
+        ("dashboard", "dashboard"),
+        ("polly", "dashboard"),
         ("inbox", "pane-inbox"),
     ],
 )
@@ -285,7 +287,7 @@ def test_cockpit_send_key_question_mark_prefers_content_pane_bridge(
 
 
 @pytest.mark.parametrize("selected_key", ["dashboard", "polly"])
-def test_cockpit_send_key_question_mark_on_home_stays_on_cockpit_bridge(
+def test_cockpit_send_key_question_mark_on_home_without_dashboard_bridge_stays_on_cockpit_bridge(
     valid_cockpit_config: Path,
     selected_key: str,
 ) -> None:
@@ -296,15 +298,10 @@ def test_cockpit_send_key_question_mark_on_home_stays_on_cockpit_bridge(
     from pollypm.cockpit_rail import CockpitRouter
 
     cockpit_app = _FakeApp()
-    dashboard_app = _FakeApp()
     cockpit = start_input_bridge(
         cockpit_app, kind="cockpit", config_path=valid_cockpit_config,
     )
     assert cockpit is not None
-    dashboard = start_input_bridge(
-        dashboard_app, kind="dashboard", config_path=valid_cockpit_config,
-    )
-    assert dashboard is not None
     try:
         CockpitRouter(valid_cockpit_config).set_selected_key(selected_key)
 
@@ -316,10 +313,8 @@ def test_cockpit_send_key_question_mark_on_home_stays_on_cockpit_bridge(
         assert result.exit_code == 0, result.output
         assert f"via {cockpit.socket_path}" in result.output
         assert _wait_for(lambda: cockpit_app.keys == ["question_mark"])
-        assert dashboard_app.keys == []
     finally:
         cockpit.stop()
-        dashboard.stop()
 
 
 def test_cockpit_send_key_question_mark_falls_back_to_visible_dashboard_bridge(

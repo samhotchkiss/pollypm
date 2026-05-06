@@ -4089,6 +4089,7 @@ def test_cockpit_send_key_inbox_shortcut_keeps_inbox_nav_active(tmp_path: Path) 
         def __init__(self) -> None:
             self.calls: list[str] = []
             self._selected = "polly"
+            self._inbox_pane_nav_active = False
 
         @property
         def tmux(self):
@@ -4102,6 +4103,12 @@ def test_cockpit_send_key_inbox_shortcut_keeps_inbox_nav_active(tmp_path: Path) 
 
         def set_selected_key(self, key: str) -> None:
             self._selected = key
+
+        def inbox_pane_nav_active(self) -> bool:
+            return self._inbox_pane_nav_active
+
+        def set_inbox_pane_nav_active(self, active: bool) -> None:
+            self._inbox_pane_nav_active = active
 
         def _load_state(self) -> dict:
             return {}
@@ -4146,6 +4153,7 @@ def test_cockpit_send_key_inbox_shortcut_keeps_inbox_nav_active(tmp_path: Path) 
             await pilot.pause(0.4)
             assert app.selected_key == "inbox"
             assert app._selected_row_key() == "inbox"
+            assert app.router.inbox_pane_nav_active() is True
             forwarded: list[str] = []
             app._send_key_to_inbox_pane = (  # type: ignore[method-assign]
                 lambda key: forwarded.append(key) or True
@@ -5300,6 +5308,32 @@ def test_cockpit_inbox_forward_does_not_tmux_forward_into_live_session(
     assert sent == []
 
 
+def test_inbox_focus_rail_releases_inbox_nav_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Esc/q in the Inbox pane hands j/k ownership back to the rail."""
+    from pollypm.cockpit_ui import PollyInboxApp
+
+    app = PollyInboxApp.__new__(PollyInboxApp)
+    app.config_path = tmp_path / "pollypm.toml"
+    focus_calls: list[Path] = []
+    router = _InboxNavRouter(active=True)
+
+    monkeypatch.setattr(
+        "pollypm.cockpit_rail.CockpitRouter",
+        lambda config_path: router,
+    )
+    monkeypatch.setattr(
+        "pollypm.cockpit_rail.focus_cockpit_rail_pane",
+        lambda config_path: focus_calls.append(config_path),
+    )
+
+    app._focus_cockpit_rail()
+
+    assert router.active is False
+    assert focus_calls == [app.config_path]
+
+
 class _StubItem:
     """Minimal stand-in for a ListItem with a ``disabled`` flag and a
     cockpit key — used to drive the rail's ``action_cursor_down`` over a
@@ -5349,6 +5383,21 @@ class _StubNav:
                 return
 
 
+class _InboxNavRouter:
+    def __init__(self, *, active: bool) -> None:
+        self.active = active
+        self.persisted: list[str] = []
+
+    def inbox_pane_nav_active(self) -> bool:
+        return self.active
+
+    def set_inbox_pane_nav_active(self, active: bool) -> None:
+        self.active = active
+
+    def set_selected_key(self, key: str) -> None:
+        self.persisted.append(key)
+
+
 def test_cockpit_jk_from_inbox_forwards_to_inbox_pane() -> None:
     """#1137/#1238: active Inbox owns row-navigation keys."""
     app = PollyCockpitApp.__new__(PollyCockpitApp)
@@ -5362,6 +5411,7 @@ def test_cockpit_jk_from_inbox_forwards_to_inbox_pane() -> None:
     nav.index = 0  # cursor on Inbox
     app.nav = nav  # type: ignore[assignment]
     app.selected_key = "inbox"
+    app.router = _InboxNavRouter(active=True)  # type: ignore[assignment]
     app._tick_count = 0
     app._last_nav_change = -10
     app._apply_active_view_to_rows = lambda: None  # type: ignore[method-assign]
@@ -5390,6 +5440,48 @@ def test_cockpit_jk_from_inbox_forwards_to_inbox_pane() -> None:
     assert captured == ["j", "k"]
 
 
+def test_cockpit_jk_from_inbox_after_rail_focus_moves_rail() -> None:
+    """#1246: once Inbox yields focus, Inbox row selection is rail-only."""
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    items = [
+        _StubItem("inbox"),
+        _StubItem("activity"),
+        _StubItem(None, disabled=True),  # ── projects ── divider
+        _StubItem("project:booktalk"),
+    ]
+    nav = _StubNav(items)
+    nav.index = 0  # rail cursor visibly on Inbox
+    app.nav = nav  # type: ignore[assignment]
+    app.selected_key = "inbox"
+    app.router = _InboxNavRouter(active=False)  # type: ignore[assignment]
+    app._tick_count = 0
+    app._last_nav_change = -10
+    app._apply_active_view_to_rows = lambda: None  # type: ignore[method-assign]
+
+    def _selected_row_key() -> str | None:
+        idx = nav.index
+        if idx is None:
+            return None
+        return items[idx].cockpit_key
+
+    app._selected_row_key = _selected_row_key  # type: ignore[method-assign]
+
+    captured: list[str] = []
+    app._send_key_to_inbox_pane = lambda key: captured.append(key) or True  # type: ignore[method-assign]
+
+    app.action_cursor_down()
+
+    assert nav.index == 1
+    assert app.selected_key == "activity"
+    assert captured == []
+
+    app.action_cursor_down()
+
+    assert nav.index == 3
+    assert app.selected_key == "project:booktalk"
+    assert captured == []
+
+
 def test_cockpit_jk_from_inbox_falls_back_when_pane_cannot_accept() -> None:
     """If the Inbox pane bridge is unavailable, j/k still move the rail."""
     app = PollyCockpitApp.__new__(PollyCockpitApp)
@@ -5403,6 +5495,7 @@ def test_cockpit_jk_from_inbox_falls_back_when_pane_cannot_accept() -> None:
     nav.index = 0
     app.nav = nav  # type: ignore[assignment]
     app.selected_key = "inbox"
+    app.router = _InboxNavRouter(active=True)  # type: ignore[assignment]
     app._tick_count = 0
     app._last_nav_change = -10
     app._apply_active_view_to_rows = lambda: None  # type: ignore[method-assign]

@@ -271,6 +271,16 @@ def test_modal_style_masks_background_and_keeps_nav_pair_visible() -> None:
     assert lines[key_index + 1] == "      [dim]Up[/dim]"
 
 
+def test_dashboard_help_title_uses_home_label() -> None:
+    """Home dashboard help should have a short, visible title label (#1270)."""
+    from pollypm.cockpit_palette import _screen_title_for_help
+    from pollypm.cockpit_ui import PollyDashboardApp
+
+    app = PollyDashboardApp(Path("/tmp/nope"))
+
+    assert _screen_title_for_help(app) == "Home"
+
+
 # ---------------------------------------------------------------------------
 # 3. Modal shows global bindings.
 # ---------------------------------------------------------------------------

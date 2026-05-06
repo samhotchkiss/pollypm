@@ -286,6 +286,112 @@ def test_cockpit_send_key_question_mark_prefers_content_pane_bridge(
         content.stop()
 
 
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        ("<pgdn>", "pagedown"),
+        ("<space>", "space"),
+        ("f", "f"),
+        ("<down>", "down"),
+    ],
+)
+def test_cockpit_send_key_help_modal_controls_stay_on_content_bridge(
+    valid_cockpit_config: Path,
+    key: str,
+    expected: str,
+) -> None:
+    import typer
+    from typer.testing import CliRunner
+
+    from pollypm.cli_features.ui import register_ui_commands
+    from pollypm.cockpit_rail import CockpitRouter
+
+    cockpit_app = _FakeApp()
+    dashboard_app = _FakeApp()
+    cockpit = start_input_bridge(
+        cockpit_app, kind="cockpit", config_path=valid_cockpit_config,
+    )
+    assert cockpit is not None
+    dashboard = start_input_bridge(
+        dashboard_app, kind="dashboard", config_path=valid_cockpit_config,
+    )
+    assert dashboard is not None
+    try:
+        CockpitRouter(valid_cockpit_config).set_selected_key("dashboard")
+
+        app = typer.Typer()
+        register_ui_commands(app)
+        result = CliRunner().invoke(
+            app, ["cockpit-send-key", "?", "--config", str(valid_cockpit_config)]
+        )
+        assert result.exit_code == 0, result.output
+        assert f"via {dashboard.socket_path}" in result.output
+        assert _wait_for(lambda: dashboard_app.keys == ["question_mark"])
+
+        result = CliRunner().invoke(
+            app, ["cockpit-send-key", key, "--config", str(valid_cockpit_config)]
+        )
+        assert result.exit_code == 0, result.output
+        assert f"via {dashboard.socket_path}" in result.output
+        assert _wait_for(
+            lambda: dashboard_app.keys == ["question_mark", expected]
+        )
+        assert cockpit_app.keys == []
+    finally:
+        cockpit.stop()
+        dashboard.stop()
+
+
+def test_cockpit_send_key_help_modal_dismiss_clears_content_bridge(
+    valid_cockpit_config: Path,
+) -> None:
+    import typer
+    from typer.testing import CliRunner
+
+    from pollypm.cli_features.ui import register_ui_commands
+    from pollypm.cockpit_rail import CockpitRouter
+
+    cockpit_app = _FakeApp()
+    dashboard_app = _FakeApp()
+    cockpit = start_input_bridge(
+        cockpit_app, kind="cockpit", config_path=valid_cockpit_config,
+    )
+    assert cockpit is not None
+    dashboard = start_input_bridge(
+        dashboard_app, kind="dashboard", config_path=valid_cockpit_config,
+    )
+    assert dashboard is not None
+    try:
+        CockpitRouter(valid_cockpit_config).set_selected_key("dashboard")
+
+        app = typer.Typer()
+        register_ui_commands(app)
+        result = CliRunner().invoke(
+            app, ["cockpit-send-key", "?", "--config", str(valid_cockpit_config)]
+        )
+        assert result.exit_code == 0, result.output
+        assert _wait_for(lambda: dashboard_app.keys == ["question_mark"])
+
+        result = CliRunner().invoke(
+            app, ["cockpit-send-key", "<esc>", "--config", str(valid_cockpit_config)]
+        )
+        assert result.exit_code == 0, result.output
+        assert f"via {dashboard.socket_path}" in result.output
+        assert _wait_for(
+            lambda: dashboard_app.keys == ["question_mark", "escape"]
+        )
+
+        result = CliRunner().invoke(
+            app, ["cockpit-send-key", "<down>", "--config", str(valid_cockpit_config)]
+        )
+        assert result.exit_code == 0, result.output
+        assert f"via {cockpit.socket_path}" in result.output
+        assert _wait_for(lambda: cockpit_app.keys == ["down"])
+    finally:
+        cockpit.stop()
+        dashboard.stop()
+
+
 @pytest.mark.parametrize("selected_key", ["dashboard", "polly"])
 def test_cockpit_send_key_question_mark_on_home_without_dashboard_bridge_stays_on_cockpit_bridge(
     valid_cockpit_config: Path,

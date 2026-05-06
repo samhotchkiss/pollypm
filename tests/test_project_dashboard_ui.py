@@ -843,7 +843,8 @@ def test_plan_gate_alert_counts_as_project_attention(
         def __init__(self, _config_path: Path) -> None:
             pass
 
-        def load_supervisor(self) -> FakeSupervisor:
+        def load_supervisor(self, *, readonly_state: bool = False) -> FakeSupervisor:
+            assert readonly_state is True
             return FakeSupervisor()
 
     monkeypatch.setattr("pollypm.service_api.PollyPMService", FakeService)
@@ -3172,6 +3173,38 @@ def test_classify_worker_activity_working_when_architect_pane_moves() -> None:
         project_aliases={"demo"},
         project_path=None,
         has_pane_permission_alert=False,
+    )
+    assert state == "working"
+
+
+def test_classify_worker_activity_uses_prefetched_task_buckets() -> None:
+    """The dashboard already gathered task buckets before ranking live
+    sessions. Reuse that snapshot so first paint does not open the work
+    DB again just to answer task ownership.
+    """
+    from types import SimpleNamespace
+    from pollypm.cockpit_ui import _classify_worker_activity
+
+    class _FakeStore:
+        def recent_heartbeats(self, name, *, limit=2):
+            return [
+                SimpleNamespace(snapshot_hash="hash1"),
+                SimpleNamespace(snapshot_hash="hash2"),
+            ]
+
+    sup = SimpleNamespace(store=_FakeStore())
+    state = _classify_worker_activity(
+        sup,
+        session_name="worker_demo",
+        role="worker",
+        project_aliases={"demo"},
+        project_path=None,
+        has_pane_permission_alert=False,
+        task_buckets={
+            "in_progress": [
+                {"assignee": "worker_demo", "task_id": "demo/1"},
+            ],
+        },
     )
     assert state == "working"
 

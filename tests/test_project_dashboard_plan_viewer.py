@@ -142,6 +142,41 @@ def test_plan_renders_markdown_body_inline(env, app) -> None:
     _run(body())
 
 
+def test_large_plan_uses_preview_until_plan_focus(env, app) -> None:
+    """Collapsed dashboards should not render an arbitrarily large plan
+    body on first paint; plan-focus mode still shows the full file.
+    """
+    async def body() -> None:
+        from pollypm.cockpit_ui import _PLAN_INLINE_PREVIEW_MAX_LINES
+
+        lines = ["# Plan", ""]
+        lines.extend(
+            f"ordinary plan line {idx}"
+            for idx in range(_PLAN_INLINE_PREVIEW_MAX_LINES + 20)
+        )
+        _write_plan(env["project_path"], "\n".join(lines))
+
+        async with app.run_test(size=(160, 60)) as pilot:
+            await pilot.pause()
+            preview = str(app.plan_content.render())
+            assert "ordinary plan line 0" in preview
+            assert (
+                f"ordinary plan line {_PLAN_INLINE_PREVIEW_MAX_LINES + 10}"
+                not in preview
+            )
+            assert "Plan preview truncated" in preview
+
+            await pilot.press("p")
+            await pilot.pause()
+            focused = str(app.plan_content.render())
+            assert (
+                f"ordinary plan line {_PLAN_INLINE_PREVIEW_MAX_LINES + 10}"
+                in focused
+            )
+            assert "Plan preview truncated" not in focused
+    _run(body())
+
+
 # ---------------------------------------------------------------------------
 # 2. Plan section shows empty state when missing
 # ---------------------------------------------------------------------------

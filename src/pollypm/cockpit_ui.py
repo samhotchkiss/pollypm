@@ -10383,6 +10383,11 @@ _PLAN_EXPLAINER_CANDIDATES_FMT: tuple[str, ...] = (
     "reports/plan-review.html",
     "reports/{key}-plan-review.html",
 )
+_PLAN_INLINE_PREVIEW_MAX_LINES = 120
+
+
+def _unexpected_keyword_type_error(exc: TypeError) -> bool:
+    return "unexpected keyword argument" in str(exc)
 
 
 def _dashboard_plan_path(project_path: Path) -> Path | None:
@@ -11161,6 +11166,7 @@ def _classify_worker_activity(
     project_aliases: set[str],
     project_path: Path | None,
     has_pane_permission_alert: bool,
+    task_buckets: dict[str, list[dict]] | None = None,
 ) -> str:
     """Return ``"working" | "idle" | "awaiting_user"`` for a live session.
 
@@ -11208,7 +11214,13 @@ def _classify_worker_activity(
         pane_changed = False
 
     has_owned_task = False
-    if project_path is not None:
+    if task_buckets is not None:
+        for row in task_buckets.get("in_progress", []) or []:
+            assignee = str(row.get("assignee") or "")
+            if assignee == session_name or assignee == role:
+                has_owned_task = True
+                break
+    elif project_path is not None:
         try:
             from pollypm.work.sqlite_service import SQLiteWorkService
 
@@ -11257,6 +11269,8 @@ def _dashboard_active_worker(
     project_key: str,
     *,
     action_items: list[dict] | None = None,
+    config: object | None = None,
+    task_buckets: dict[str, list[dict]] | None = None,
 ) -> tuple[dict | None, int]:
     """Inspect supervisor state for a live worker on this project.
 
@@ -11286,7 +11300,9 @@ def _dashboard_active_worker(
     alert_count = 0
     try:
         from pollypm.service_api import PollyPMService
-        supervisor = PollyPMService(config_path).load_supervisor()
+        supervisor = PollyPMService(config_path).load_supervisor(
+            readonly_state=True,
+        )
     except Exception:  # noqa: BLE001
         return None, 0
     try:
@@ -11308,10 +11324,13 @@ def _dashboard_active_worker(
         # under the work-DB form (``blackjack-trainer``) are still
         # recognised when the dashboard receives the slugified config
         # key (``blackjack_trainer``).
-        try:
-            _config = load_config(config_path)
-        except Exception:  # noqa: BLE001
-            _config = None
+        if config is not None:
+            _config = config
+        else:
+            try:
+                _config = load_config(config_path)
+            except Exception:  # noqa: BLE001
+                _config = None
         _alias_set = set(_project_storage_aliases(_config, project_key))
         project_sessions = [
             launch.session for launch in launches
@@ -11420,6 +11439,7 @@ def _dashboard_active_worker(
                     _alias_set,
                     _project_path,
                     has_perm_alert,
+                    task_buckets=task_buckets,
                 )
             except Exception:  # noqa: BLE001
                 activity = "idle"
@@ -11469,7 +11489,11 @@ _DASHBOARD_INBOX_CACHE: dict[
 
 
 def _dashboard_inbox(
-    config_path: Path, project_key: str, project_path: Path,
+    config_path: Path,
+    project_key: str,
+    project_path: Path,
+    *,
+    config: object | None = None,
 ) -> tuple[int, list[dict], list[dict]]:
     """Return project-scoped inbox items + actionable PM blocker notes."""
     from datetime import datetime
@@ -11496,10 +11520,11 @@ def _dashboard_inbox(
         from pollypm.cockpit_inbox import _row_is_dev_channel
     except Exception:  # noqa: BLE001
         return 0, [], []
-    try:
-        config = load_config(config_path)
-    except Exception:  # noqa: BLE001
-        return 0, [], []
+    if config is None:
+        try:
+            config = load_config(config_path)
+        except Exception:  # noqa: BLE001
+            return 0, [], []
 
     def _sort_value(value: object) -> float:
         if not value:
@@ -12699,7 +12724,11 @@ _DASHBOARD_ACTIVITY_CACHE: dict[
 
 
 def _dashboard_activity(
-    config_path: Path, project_key: str, *, limit: int = 10,
+    config_path: Path,
+    project_key: str,
+    *,
+    limit: int = 10,
+    config: object | None = None,
 ) -> list[dict]:
     """Fetch the last ``limit`` activity-feed entries for this project.
 
@@ -12711,10 +12740,11 @@ def _dashboard_activity(
         from pollypm.plugins_builtin.activity_feed.plugin import build_projector
     except Exception:  # noqa: BLE001
         return []
-    try:
-        config = load_config(config_path)
-    except Exception:  # noqa: BLE001
-        return []
+    if config is None:
+        try:
+            config = load_config(config_path)
+        except Exception:  # noqa: BLE001
+            return []
     # Content-addressed cache: an unchanged db_mtime means no event
     # has landed since the last call so the projection is unchanged.
     project = (config.projects or {}).get(project_key)
@@ -12783,9 +12813,16 @@ def _gather_project_dashboard(
 
     if exists_on_disk:
         counts, buckets = _dashboard_gather_tasks(config, project_key, project_path)
-        inbox_count, inbox_top, action_items = _dashboard_inbox(
-            config_path, project_key, project_path,
-        )
+        try:
+            inbox_count, inbox_top, action_items = _dashboard_inbox(
+                config_path, project_key, project_path, config=config,
+            )
+        except TypeError as exc:
+            if not _unexpected_keyword_type_error(exc):
+                raise
+            inbox_count, inbox_top, action_items = _dashboard_inbox(
+                config_path, project_key, project_path,
+            )
         plan_path = _dashboard_plan_path(project_path)
         plan_text: str | None = None
         plan_mtime: float | None = None
@@ -12807,7 +12844,14 @@ def _gather_project_dashboard(
         plan_stale_reason = _dashboard_plan_staleness(
             plan_path, plan_mtime, project_path, project_key,
         )
-        activity_entries = _dashboard_activity(config_path, project_key)
+        try:
+            activity_entries = _dashboard_activity(
+                config_path, project_key, config=config,
+            )
+        except TypeError as exc:
+            if not _unexpected_keyword_type_error(exc):
+                raise
+            activity_entries = _dashboard_activity(config_path, project_key)
     else:
         counts = {}
         buckets = {}
@@ -12823,9 +12867,20 @@ def _gather_project_dashboard(
         plan_stale_reason = None
         activity_entries = []
 
-    active_worker, alert_count = _dashboard_active_worker(
-        config_path, project_key, action_items=action_items,
-    )
+    try:
+        active_worker, alert_count = _dashboard_active_worker(
+            config_path,
+            project_key,
+            action_items=action_items,
+            config=config,
+            task_buckets=buckets,
+        )
+    except TypeError as exc:
+        if not _unexpected_keyword_type_error(exc):
+            raise
+        active_worker, alert_count = _dashboard_active_worker(
+            config_path, project_key, action_items=action_items,
+        )
     blocker_count = int(counts.get("blocked", 0))
     on_hold_count = int(counts.get("on_hold", 0))
     in_progress_count = int(counts.get("in_progress", 0))
@@ -14160,6 +14215,16 @@ class PollyProjectDashboardApp(App[None]):
         text = data.plan_text
         if not text:
             return ""
+        if not self._plan_view_mode:
+            lines = text.splitlines()
+            if len(lines) > _PLAN_INLINE_PREVIEW_MAX_LINES:
+                hidden = len(lines) - _PLAN_INLINE_PREVIEW_MAX_LINES
+                text = "\n".join(lines[:_PLAN_INLINE_PREVIEW_MAX_LINES])
+                text += (
+                    "\n\n"
+                    f"_Plan preview truncated; press p to view {hidden} "
+                    "more lines._"
+                )
         try:
             return _md_to_rich(_escape_body(text))
         except Exception:  # noqa: BLE001
@@ -15286,6 +15351,7 @@ class PollyProjectDashboardApp(App[None]):
                 )
             return
         self._plan_view_mode = not self._plan_view_mode
+        self.plan_content.update(self._render_plan_content(data))
         other_section_ids = (
             "#proj-now-section",
             "#proj-pipeline-section",

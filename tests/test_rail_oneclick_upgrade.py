@@ -99,6 +99,21 @@ def test_trigger_upgrade_updates_pill_to_upgrading_state(fake_config):
     assert app.update_pill.display is True
 
 
+def test_trigger_upgrade_success_does_not_emit_rail_toast(fake_config, monkeypatch):
+    from pollypm.cockpit_ui import PollyCockpitApp
+
+    app = PollyCockpitApp(fake_config)
+    app.router.tmux = MagicMock()
+    notices: list[str] = []
+    monkeypatch.setattr(
+        app, "notify", lambda msg, *, timeout=None: notices.append(msg),
+    )
+
+    app.action_trigger_upgrade()
+
+    assert notices == []
+
+
 def test_trigger_upgrade_handles_tmux_failure(fake_config, monkeypatch):
     from pollypm.cockpit_ui import PollyCockpitApp
 

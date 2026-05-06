@@ -273,6 +273,22 @@ def test_working_worker_without_heartbeat_explains_tmux_activity() -> None:
     assert "session: worker_demo" in tooltip
 
 
+def test_idle_worker_without_heartbeat_warns_instead_of_green() -> None:
+    """#1284: idle rows with no heartbeat must not render as healthy."""
+    from pollypm.cockpit_inbox import _worker_health_snapshot
+
+    health, tooltip = _worker_health_snapshot(
+        status="idle",
+        last_heartbeat_iso=None,
+        token_total=0,
+        session_name="worker_demo",
+    )
+
+    assert health == "idle_warn"
+    assert "idle; heartbeat not recorded" in tooltip
+    assert "session: worker_demo" in tooltip
+
+
 def test_offline_at_review_node_classifies_as_handed_off() -> None:
     """Regression: when a worker exits cleanly after handing off to a
     reviewer (task at ``code_review`` / ``user_approval``), the

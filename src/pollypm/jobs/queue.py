@@ -459,7 +459,7 @@ class JobQueue:
                 if status != JobStatus.CLAIMED.value:
                     return
 
-                if not retry or attempt >= max_attempts:
+                def _mark_terminal_failed() -> None:
                     self._conn.execute(
                         """
                         UPDATE work_jobs
@@ -468,22 +468,35 @@ class JobQueue:
                         """,
                         (now_dt.isoformat(), error_text, int(job_id)),
                     )
+
+                if not retry or attempt >= max_attempts:
+                    _mark_terminal_failed()
                     return
 
                 delay = self.retry_policy(attempt)
                 next_run = (now_dt + delay).isoformat()
-                self._conn.execute(
-                    """
-                    UPDATE work_jobs
-                    SET status = 'queued',
-                        run_after = ?,
-                        last_error = ?,
-                        claimed_at = NULL,
-                        claimed_by = NULL
-                    WHERE id = ?
-                    """,
-                    (next_run, error_text, int(job_id)),
-                )
+                try:
+                    self._conn.execute(
+                        """
+                        UPDATE work_jobs
+                        SET status = 'queued',
+                            run_after = ?,
+                            last_error = ?,
+                            claimed_at = NULL,
+                            claimed_by = NULL
+                        WHERE id = ?
+                        """,
+                        (next_run, error_text, int(job_id)),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    if "work_jobs.dedupe_key" not in str(exc):
+                        raise
+                    logger.warning(
+                        "JobQueue.fail: retry for job %s hit a dedupe_key "
+                        "collision; marking failed instead",
+                        job_id,
+                    )
+                    _mark_terminal_failed()
 
         retry_on_database_locked(_do_fail, label="JobQueue.fail")
 

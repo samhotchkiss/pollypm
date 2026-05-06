@@ -4640,3 +4640,194 @@ def test_gather_project_dashboard_completes_under_budget(
         f"sessions configured — exceeds 500ms budget. Likely regression "
         f"of #1290 (worker enumeration re-running the launch pipeline)."
     )
+
+
+# ---------------------------------------------------------------------------
+# #1290 follow-up — zero-tasks empty-state affordance
+# ---------------------------------------------------------------------------
+#
+# The savethenovel project landed in a state with zero ``work_tasks`` rows
+# (registered, briefly had a task, then deleted). The drilldown showed a
+# bare ``○`` glyph and no affordances — the operator watched it for 2.5+
+# hours with nothing to act on. The empty-state panel must surface the
+# moment the user navigates into a project with zero tasks, regardless of
+# tracked-state, and must NOT appear when there are real tasks.
+
+
+def _empty_project_env(tmp_path: Path):
+    """Fresh project with the config wired up but zero ``work_tasks`` rows."""
+    project_path = tmp_path / "savethenovel"
+    project_path.mkdir()
+    _init_git_repo(project_path)
+    config_path = tmp_path / "pollypm.toml"
+    _write_config(project_path, config_path)
+    return {
+        "config_path": config_path,
+        "project_path": project_path,
+    }
+
+
+def test_empty_state_appears_when_zero_tasks(tmp_path: Path) -> None:
+    """Zero ``work_tasks`` rows → drilldown surfaces the affordance copy
+    naming both the planner and manual-create commands."""
+    env = _empty_project_env(tmp_path)
+    if not _load_config_compatible(env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+    from pollypm import cockpit_ui as _cockpit_ui
+    _cockpit_ui._PROJECT_DASHBOARD_TASK_CACHE.clear()
+    app = PollyProjectDashboardApp(env["config_path"], "demo")
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            assert app.data is not None
+            # Sanity: the fixture really has zero tasks.
+            total = sum(int(v or 0) for v in (app.data.task_counts or {}).values())
+            assert total == 0
+            # Empty-state panel must be visible (not -hidden) and contain
+            # the affordance copy.
+            assert "-hidden" not in app.empty_state.classes
+            rendered = str(app.empty_state.render())
+            assert "No tasks for" in rendered
+            assert "pm project plan" in rendered
+            assert "pm task create" in rendered
+    _run(body())
+
+
+def test_empty_state_hidden_when_tasks_exist(dashboard_env, dashboard_app) -> None:
+    """Real tasks present → the empty-state panel must NOT render. The
+    fixture's seeded queued/in_progress/done tasks should suppress it."""
+    async def body() -> None:
+        async with dashboard_app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            assert dashboard_app.data is not None
+            total = sum(
+                int(v or 0)
+                for v in (dashboard_app.data.task_counts or {}).values()
+            )
+            assert total > 0
+            assert "-hidden" in dashboard_app.empty_state.classes
+            assert str(dashboard_app.empty_state.render()).strip() == ""
+    _run(body())
+
+
+def test_empty_state_renders_at_narrow_width(tmp_path: Path) -> None:
+    """Narrow cockpit (80 cols) must still render the affordance — copy
+    is short enough to fit on one wrapped line."""
+    env = _empty_project_env(tmp_path)
+    if not _load_config_compatible(env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+    from pollypm import cockpit_ui as _cockpit_ui
+    _cockpit_ui._PROJECT_DASHBOARD_TASK_CACHE.clear()
+    app = PollyProjectDashboardApp(env["config_path"], "demo")
+
+    async def body() -> None:
+        async with app.run_test(size=(80, 50)) as pilot:
+            await pilot.pause()
+            assert "-hidden" not in app.empty_state.classes
+            rendered = str(app.empty_state.render())
+            assert "No tasks for" in rendered
+            # The pipeline section must still render (no layout break)
+            assert app.pipeline_body is not None
+    _run(body())
+
+
+def test_empty_state_pure_renderer_returns_affordance(tmp_path: Path) -> None:
+    """Unit-level: ``_render_empty_state`` returns the affordance string
+    when ``data.task_counts`` and ``data.task_buckets`` are both empty,
+    and returns ``""`` when any task is present."""
+    from pollypm.cockpit_ui import (
+        PollyProjectDashboardApp,
+        ProjectDashboardData,
+    )
+
+    base_kwargs = dict(
+        project_key="savethenovel",
+        project_name="Save The Novel",
+        project_path=tmp_path,
+        persona_name=None,
+        pm_label="PM: polly",
+        exists_on_disk=True,
+        status_dot="○",
+        status_color="#4a5568",
+        status_label="idle",
+        active_worker=None,
+        architect=None,
+        plan_path=None,
+        plan_sections=[],
+        plan_explainer=None,
+        plan_text=None,
+        plan_aux_files=[],
+        plan_mtime=None,
+        plan_stale_reason=None,
+        activity_entries=[],
+        inbox_count=0,
+        inbox_top=[],
+        action_items=[],
+        alert_count=0,
+    )
+
+    empty = ProjectDashboardData(
+        task_counts={},
+        task_buckets={},
+        **base_kwargs,
+    )
+    rendered_empty = PollyProjectDashboardApp._render_empty_state(
+        None, empty,  # type: ignore[arg-type]
+    )
+    assert "No tasks for savethenovel" in rendered_empty
+    assert "pm project plan savethenovel" in rendered_empty
+    assert "pm task create" in rendered_empty
+
+    populated = ProjectDashboardData(
+        task_counts={"queued": 1},
+        task_buckets={
+            "queued": [{"task_id": "t1", "title": "Real task"}],
+        },
+        **base_kwargs,
+    )
+    assert PollyProjectDashboardApp._render_empty_state(
+        None, populated,  # type: ignore[arg-type]
+    ) == ""
+
+
+def test_empty_state_suppressed_when_path_missing(tmp_path: Path) -> None:
+    """When the project path does not exist on disk, the topbar already
+    surfaces a louder warning — the empty-state panel should defer."""
+    from pollypm.cockpit_ui import (
+        PollyProjectDashboardApp,
+        ProjectDashboardData,
+    )
+
+    data = ProjectDashboardData(
+        project_key="missing",
+        project_name="missing",
+        project_path=None,
+        persona_name=None,
+        pm_label="PM: polly",
+        exists_on_disk=False,
+        status_dot="○",
+        status_color="#4a5568",
+        status_label="idle",
+        active_worker=None,
+        architect=None,
+        task_counts={},
+        task_buckets={},
+        plan_path=None,
+        plan_sections=[],
+        plan_explainer=None,
+        plan_text=None,
+        plan_aux_files=[],
+        plan_mtime=None,
+        plan_stale_reason=None,
+        activity_entries=[],
+        inbox_count=0,
+        inbox_top=[],
+        action_items=[],
+        alert_count=0,
+    )
+    assert PollyProjectDashboardApp._render_empty_state(
+        None, data,  # type: ignore[arg-type]
+    ) == ""

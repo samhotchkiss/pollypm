@@ -72,6 +72,32 @@ def _truncate_for_now_panel(text: str, *, limit: int = 70) -> str:
     return text[:cut].rstrip() + "…"
 
 
+_NO_TASKS_FOUND_RE = re.compile(
+    r"(?:\bpm\s+task\s+list\b.*)?\b(?:result:\s*)?no tasks found\b",
+    re.IGNORECASE,
+)
+_ZERO_DURATION_RE = re.compile(r"0[sm](?:\s*0s)?")
+
+
+def _is_zero_duration(text: str) -> bool:
+    return _ZERO_DURATION_RE.fullmatch(text.strip()) is not None
+
+
+def _now_feed_friendly_fallback(line: str) -> str | None:
+    """Return cleaner Home Now copy for raw or fragmentary pane lines."""
+    text = line.strip()
+    if not text:
+        return None
+    lower = text.lower()
+    if _NO_TASKS_FOUND_RE.search(text):
+        return "Nothing on the burner"
+    if "implementing worker tasks" in lower:
+        return "On the line"
+    if text[0].islower():
+        return "On the line"
+    return None
+
+
 # Codex idle-input placeholder detection lives in
 # :mod:`pollypm.idle_placeholders` (#1010 extraction) so the dashboard
 # renderer here and the heartbeat session-health classifier share one
@@ -425,7 +451,10 @@ def _session_description(status: str, role: str, snapshot_path: str | None) -> s
                 # Working indicator with time
                 m = re.search(r"Working \((\d+[ms]\s?\d*s?)\s*", stripped)
                 if m:
-                    return f"working ({m.group(1).strip()})"
+                    duration = m.group(1).strip()
+                    if _is_zero_duration(duration):
+                        return "Warming up"
+                    return f"working ({duration})"
             # #1025 (Home dashboard "Now" feed) — when the visible
             # last-line of pane is mid-sentence noise, prefer a
             # recognized event signature picked from the most-recent
@@ -435,6 +464,9 @@ def _session_description(status: str, role: str, snapshot_path: str | None) -> s
             # whatever the cursor happens to be sitting on right now.
             event_match = _scan_for_event_signature(clean_lines)
             if event_match:
+                friendly = _now_feed_friendly_fallback(event_match)
+                if friendly is not None:
+                    return friendly
                 return _truncate_for_now_panel(event_match)
             # Look for meaningful lines in the snapshot — restrict to
             # escape-free lines so a fused render (#792) doesn't end
@@ -485,6 +517,9 @@ def _session_description(status: str, role: str, snapshot_path: str | None) -> s
                 # box (#994).
                 if _is_codex_idle_placeholder(line):
                     continue
+                friendly = _now_feed_friendly_fallback(line)
+                if friendly is not None:
+                    return friendly
                 return _truncate_for_now_panel(line)
         except (FileNotFoundError, OSError):
             pass

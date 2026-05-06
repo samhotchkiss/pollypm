@@ -269,8 +269,8 @@ def test_session_description_keeps_real_codex_working_status(tmp_path) -> None:
     assert "3m" in desc
 
 
-def test_session_description_trims_working_duration_spacing(tmp_path) -> None:
-    """#1299: ``Working (0s ...)`` should not render as ``working (0s )``."""
+def test_session_description_rewrites_zero_second_working_copy(tmp_path) -> None:
+    """#1327: zero-second Codex working chrome is filler, not useful status."""
     from pollypm.dashboard_data import _session_description
 
     snapshot = tmp_path / "snap.txt"
@@ -278,7 +278,44 @@ def test_session_description_trims_working_duration_spacing(tmp_path) -> None:
 
     desc = _session_description("healthy", "worker", str(snapshot))
 
-    assert desc == "working (0s)"
+    assert desc == "Warming up"
+
+
+def test_session_description_rewrites_raw_no_tasks_copy(tmp_path) -> None:
+    """#1327: task-list command output should not leak into the Now feed."""
+    from pollypm.dashboard_data import _session_description
+
+    raw_lines = (
+        "Result: No tasks found.",
+        "- pm task list --status review → No tasks found.",
+    )
+    for raw in raw_lines:
+        snapshot = tmp_path / "snap.txt"
+        snapshot.write_text(raw + "\n")
+
+        desc = _session_description("healthy", "worker", str(snapshot))
+
+        assert desc == "Nothing on the burner"
+        assert "No tasks found" not in desc
+        assert "pm task list" not in desc
+
+
+def test_session_description_rewrites_fragmentary_worker_copy(tmp_path) -> None:
+    """#1327: lower-case mid-sentence fragments get a stable worker idiom."""
+    from pollypm.dashboard_data import _session_description
+
+    fragments = (
+        "implementing worker tasks.",
+        "treat the worktree as potentially dirty and avoid clobbering unrelated",
+        "operating norms, the architect role guide, and the project rules…",
+    )
+    for fragment in fragments:
+        snapshot = tmp_path / "snap.txt"
+        snapshot.write_text(fragment + "\n")
+
+        desc = _session_description("healthy", "worker", str(snapshot))
+
+        assert desc == "On the line"
 
 
 def test_session_description_truncates_at_word_boundary(tmp_path) -> None:

@@ -1033,32 +1033,40 @@ class _TaskRejectReasonModal(ModalScreen[str | None]):
     def on_mount(self) -> None:
         self.reason_input.focus()
 
+    def _dismiss_if_current(self, result: str | None) -> None:
+        screen_stack = self.app.screen_stack
+        if len(screen_stack) <= 1 or screen_stack[-1] is not self:
+            return
+        self.dismiss(result)
+
     def action_cancel(self) -> None:
-        self.dismiss(None)
+        self._dismiss_if_current(None)
 
     def action_pick_tests(self) -> None:
-        self.dismiss("Tests missing or broken")
+        self._dismiss_if_current("Tests missing or broken")
 
     def action_pick_scope(self) -> None:
-        self.dismiss("Scope drift")
+        self._dismiss_if_current("Scope drift")
 
     def action_pick_fix(self) -> None:
         def _after(reason: str | None) -> None:
-            self.dismiss(reason or None)
+            self.app.call_after_refresh(
+                lambda: self._dismiss_if_current(reason or None)
+            )
 
         self.app.push_screen(_TaskRejectFixModal(), _after)
 
     def action_pick_other(self) -> None:
         reason = (self.reason_input.value or "").strip()
         if reason:
-            self.dismiss(reason)
+            self._dismiss_if_current(reason)
             return
         self.reason_input.focus()
 
     @on(Input.Submitted, "#task-reject-reason")
     def _on_submit(self, event: Input.Submitted) -> None:
         reason = (event.value or "").strip()
-        self.dismiss(reason or None)
+        self._dismiss_if_current(reason or None)
 
     @on(Button.Pressed, "#task-reject-tests")
     def _on_press_tests(self) -> None:

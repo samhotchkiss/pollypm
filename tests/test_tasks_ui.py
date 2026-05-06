@@ -2226,6 +2226,40 @@ def test_task_reject_modal_quick_pick_and_follow_up_reason(env, monkeypatch) -> 
     _run(body())
 
 
+def test_task_reject_modal_ignores_stale_submit_after_dismiss(env, monkeypatch) -> None:
+    if not _load_config_compatible(env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_tasks import PollyTasksApp
+
+    task = _task(node_id="critic_panel", status=WorkStatus.REVIEW)
+    fake_svc = _FakeSvc(tasks_factory=lambda: [task], flow=_flow())
+
+    monkeypatch.setattr("pollypm.cockpit_tasks.create_tmux_client", lambda: _FakeTmux([]))
+    monkeypatch.setattr("pollypm.cockpit_tasks._PENDING_UNDO_SECONDS", 60.0)
+
+    app = PollyTasksApp(env["config_path"], "demo")
+    app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            app.reject_button.press()
+            await pilot.pause()
+            modal = app._active_reject_modal
+            assert modal is not None
+            modal._on_submit(Input.Submitted(modal.reason_input, "needs tests"))
+            await pilot.pause()
+            assert app._active_reject_modal is None
+            assert app._pending_review_action is not None
+            assert app._pending_review_action.reason == "needs tests"
+
+            modal._on_submit(Input.Submitted(modal.reason_input, "late duplicate"))
+            await pilot.pause()
+            assert app._pending_review_action.reason == "needs tests"
+
+    _run(body())
+
+
 def test_task_live_scroll_pauses_on_scroll_up_and_resumes(env, monkeypatch) -> None:
     if not _load_config_compatible(env["config_path"]):
         pytest.skip("minimal pollypm.toml fixture not supported by loader")

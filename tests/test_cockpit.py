@@ -4780,6 +4780,15 @@ def test_settings_pane_renders_accounts_and_toggles_permissions(monkeypatch, tmp
     asyncio.run(exercise())
 
 
+def test_settings_nav_marker_follows_visible_cursor_not_active_section() -> None:
+    app = PollySettingsPaneApp.__new__(PollySettingsPaneApp)
+    app._active_section = "accounts"
+    app._nav_cursor = 1
+
+    assert app._nav_label("accounts", "Accounts", count=2).startswith("  ")
+    assert app._nav_label("projects", "Projects", count=10).startswith("\u25b8 ")
+
+
 def test_cockpit_app_tick_scheduler_is_noop(tmp_path: Path) -> None:
     """The scheduler tick is a no-op — heartbeat runs via cron, not the cockpit."""
     app = PollyCockpitApp(tmp_path / "pollypm.toml")

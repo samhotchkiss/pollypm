@@ -1115,14 +1115,7 @@ def _build_example_config(root: Path, *, tmux_session: str = "pollypm") -> Polly
                 prompt="Inspect the repository and propose the next high-leverage implementation step.",
             ),
         },
-        projects={
-            "pollypm": KnownProject(
-                key="pollypm",
-                path=root,
-                name="PollyPM",
-                kind=ProjectKind.GIT if (root / ".git").exists() else ProjectKind.FOLDER,
-            ),
-        },
+        projects={},
         memory=MemorySettings(backend="file"),
     )
 

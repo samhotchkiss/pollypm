@@ -38,9 +38,10 @@ def test_load_example_config(tmp_path: Path) -> None:
     assert config.memory.backend == "file"
     assert set(config.accounts) == {"codex_primary", "claude_primary"}
     assert set(config.sessions) == {"heartbeat", "operator"}
-    assert set(config.projects) == {"pollypm"}
+    assert config.projects == {}
     assert config.sessions["operator"].provider.value == "codex"
     assert config.sessions["heartbeat"].provider.value == "codex"
+    assert "[projects." not in config_path.read_text()
 
 
 def test_write_example_config_uses_fresh_install_session_name(tmp_path: Path) -> None:

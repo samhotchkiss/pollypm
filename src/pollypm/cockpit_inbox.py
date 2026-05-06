@@ -849,7 +849,7 @@ def _worker_health_snapshot(
         if dt is not None and dt.tzinfo is None:
             dt = dt.replace(tzinfo=UTC)
         idle_long = dt is not None and dt <= datetime.now(UTC) - timedelta(minutes=5)
-        health = "idle_warn" if idle_long else "alive"
+        health = "idle_warn" if dt is None or idle_long else "alive"
     else:
         health = "alive"
     if health == "handed_off":

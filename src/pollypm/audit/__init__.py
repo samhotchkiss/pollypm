@@ -76,11 +76,25 @@ from pollypm.audit.log import (
     project_log_path,
     read_events,
 )
+from pollypm.audit.watchdog import (
+    EVENT_AUDIT_FINDING,
+    EVENT_HEARTBEAT_TICK,
+    Finding,
+    WatchdogConfig,
+    scan_events,
+    scan_project,
+)
 
 __all__ = [
     "AuditEvent",
+    "EVENT_AUDIT_FINDING",
+    "EVENT_HEARTBEAT_TICK",
+    "Finding",
+    "WatchdogConfig",
     "central_log_path",
     "emit",
     "project_log_path",
     "read_events",
+    "scan_events",
+    "scan_project",
 ]

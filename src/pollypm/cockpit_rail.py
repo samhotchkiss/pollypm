@@ -584,8 +584,14 @@ def _build_operator_primer(supervisor) -> str | None:
     projects = getattr(supervisor.config, "projects", {}) or {}
     for project_key, project in projects.items():
         project_count += 1
-        project_name = getattr(project, "name", None) or project_key
-        project_lines.append(f"  - {project_name} ({project_key})")
+        display_label = getattr(project, "display_label", None)
+        if callable(display_label):
+            project_name = display_label()
+        else:
+            project_name = getattr(project, "name", None) or project_key.replace(
+                "_", "-"
+            )
+        project_lines.append(f"  - {project_name}")
         if inbox_tasks is None or SQLiteWorkService is None:
             continue
         db_path = project.path / ".pollypm" / "state.db"
@@ -600,7 +606,7 @@ def _build_operator_primer(supervisor) -> str | None:
                 for task in items[:2]:
                     title = (task.title or "").strip()
                     if title:
-                        inbox_titles.append((project_key, f"{task.task_id}: {title}"))
+                        inbox_titles.append((project_name, title))
         except Exception:  # noqa: BLE001 — primer is best-effort
             continue
 
@@ -621,14 +627,13 @@ def _build_operator_primer(supervisor) -> str | None:
     if project_lines:
         lines.append("Projects:")
         lines.extend(project_lines[:10])
-    lines.append(f"Active inbox (workspace-wide): {inbox_total} item(s)")
+    lines.append(f"Active inbox: {inbox_total} item(s)")
     if inbox_titles:
         lines.append("Recent inbox:")
-        for project_key, title in inbox_titles[:5]:
-            lines.append(f"  - [{project_key}] {title}")
+        for project_name, title in inbox_titles[:5]:
+            lines.append(f"  - {project_name}: {title}")
     lines.append(
-        "Glance at the inbox/status (`pm inbox`, `pm status`) and "
-        "pick up wherever the user takes the conversation."
+        "Use the visible inbox and status context, then follow the user's lead."
     )
     return "\n".join(lines)
 

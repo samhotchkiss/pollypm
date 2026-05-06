@@ -46,17 +46,18 @@ def _run_cockpit_pane_fast(argv: list[str]) -> bool:
 
     ``CockpitRouter`` spawns panes with ``python -m pollypm cockpit-pane ...``.
     Importing :mod:`pollypm.cli` first loads every top-level command family
-    before the pane-specific command can import its Textual app. The Inbox
-    cold path is budgeted from keystroke to first paint, so avoid that root CLI
-    import for the pane launches the cockpit itself generates. Help and any
-    unfamiliar shape fall back to the Typer command below.
+    before the pane-specific command can import its Textual app. The Inbox and
+    project-dashboard cold paths are budgeted from keystroke to first paint, so
+    avoid that root CLI import for the pane launches the cockpit itself
+    generates. Help and any unfamiliar shape fall back to the Typer command
+    below.
     """
     if len(argv) < 2 or argv[0] != "cockpit-pane":
         return False
     if any(token in _COCKPIT_PANE_HELP_FLAGS for token in argv[1:]):
         return False
     kind = argv[1]
-    if kind != "inbox":
+    if kind not in {"inbox", "project"}:
         return False
 
     parsed = _parse_cockpit_pane_options(argv)
@@ -64,6 +65,23 @@ def _run_cockpit_pane_fast(argv: list[str]) -> bool:
         return False
     config_path, project = parsed
     resolved_config_path = config_path or _default_config_path()
+    if kind == "project":
+        if not project:
+            return False
+        _paint_project_dashboard_snapshot(resolved_config_path, project)
+        from pollypm.cli_features.ui import (
+            _enforce_migration_gate,
+            _install_cockpit_debug_log_handler,
+        )
+
+        _enforce_migration_gate(resolved_config_path)
+        _install_cockpit_debug_log_handler(resolved_config_path)
+
+        from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+        PollyProjectDashboardApp(resolved_config_path, project).run(mouse=True)
+        return True
+
     _paint_inbox_loading_placeholder()
     snapshot_error = _paint_inbox_snapshot(resolved_config_path, project=project)
 
@@ -80,6 +98,61 @@ def _run_cockpit_pane_fast(argv: list[str]) -> bool:
 
     PollyInboxApp(resolved_config_path, initial_project=project).run(mouse=True)
     return True
+
+
+def _paint_project_dashboard_snapshot(config_path: Path, project: str) -> None:
+    """Prepaint a cheap project-dashboard frame before Textual imports."""
+    try:
+        frame = _render_project_dashboard_snapshot(config_path, project)
+        sys.stdout.write(f"{_CLEAR_SCREEN}{frame}")
+        sys.stdout.flush()
+    except Exception:  # noqa: BLE001 - prepaint must never block launch
+        pass
+
+
+def _render_project_dashboard_snapshot(config_path: Path, project: str) -> str:
+    try:
+        from pollypm.config import load_config
+
+        config = load_config(config_path)
+        project_obj = (getattr(config, "projects", {}) or {}).get(project)
+        if project_obj is None:
+            return (
+                f"{project}   PM: Project PM\n\n"
+                "Loading project dashboard..."
+            )
+        name = (
+            project_obj.display_label()
+            if hasattr(project_obj, "display_label")
+            else (getattr(project_obj, "name", None) or project)
+        )
+        persona = getattr(project_obj, "persona_name", None)
+        pm = (
+            f"PM: {persona.strip()}"
+            if isinstance(persona, str) and persona.strip()
+            else "PM: Project PM"
+        )
+        return "\n".join(
+            [
+                f"{_plain_inbox_text(name)}   {_plain_inbox_text(pm)}",
+                "",
+                "Loading project dashboard...",
+                "",
+                "Inbox",
+                "  Loading project inbox...",
+                "",
+                "Current activity",
+                "  Loading worker state...",
+                "",
+                "Task pipeline",
+                "  Loading task pipeline...",
+                "",
+                "Recent activity",
+                "  Loading recent activity...",
+            ]
+        )
+    except Exception:  # noqa: BLE001
+        return f"{project}   PM: Project PM\n\nLoading project dashboard..."
 
 
 def _paint_inbox_loading_placeholder() -> None:

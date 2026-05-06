@@ -518,6 +518,7 @@ class EventProjector:
         if since is not None and since_ts is None:
             since_ts = (datetime.now(UTC) - since).isoformat()
 
+        project_filter = set(projects) if projects else None
         entries: list[FeedEntry] = []
         entries.extend(
             self._project_from_state_store(
@@ -525,6 +526,8 @@ class EventProjector:
             )
         )
         for project_key, work_db in self._work_dbs:
+            if project_filter is not None and project_key not in project_filter:
+                continue
             entries.extend(
                 self._project_from_work_db(
                     project_key, work_db, since_ts=since_ts, limit=limit,
@@ -533,7 +536,6 @@ class EventProjector:
 
         # Filter post-projection so callers can constrain without having
         # to wire each filter into every source.
-        project_filter = set(projects) if projects else None
         kind_filter = _expand_kind_filter(kinds)
         actor_filter = set(actors) if actors else None
 

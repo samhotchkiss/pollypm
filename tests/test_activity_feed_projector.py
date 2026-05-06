@@ -512,6 +512,32 @@ def test_filter_by_kind_and_project(tmp_path: Path) -> None:
     assert {e.kind for e in only_sessions} == {"session"}
 
 
+def test_project_filter_skips_unrelated_work_dbs(tmp_path: Path) -> None:
+    state_db = tmp_path / "state.db"
+    StateStore(state_db).close()
+    calls: list[str] = []
+
+    class RecordingProjector(EventProjector):
+        def _project_from_state_store(self, **_kwargs):
+            return []
+
+        def _project_from_work_db(self, project_key, work_db, **_kwargs):
+            calls.append(project_key)
+            return []
+
+    projector = RecordingProjector(
+        state_db,
+        [
+            ("demo", tmp_path / "demo" / ".pollypm" / "state.db"),
+            ("other", tmp_path / "other" / ".pollypm" / "state.db"),
+        ],
+    )
+
+    projector.project(projects=["demo"], limit=10)
+
+    assert calls == ["demo"]
+
+
 def test_feedentry_as_dict_round_trip() -> None:
     entry = FeedEntry(
         id="evt:1",
@@ -673,10 +699,6 @@ def test_alert_cleared_via_v1_service_emits_event(tmp_path: Path) -> None:
     ``alert.cleared`` event whose payload attributes the close to the
     explicit CLI invocation (#1033).
     """
-    from sqlalchemy import select as _select
-
-    from pollypm.store.schema import messages as _messages
-
     db = tmp_path / "state.db"
     store = SQLAlchemyStore(f"sqlite:///{db}")
     try:

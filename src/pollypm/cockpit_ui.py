@@ -22,6 +22,7 @@ from __future__ import annotations
 import gc
 import asyncio
 import json
+import logging
 import os
 import resource
 from pathlib import Path
@@ -152,6 +153,8 @@ from pollypm.cockpit_rail import CockpitItem, CockpitPresence, CockpitRouter
 
 import re as _re
 
+
+logger = logging.getLogger(__name__)
 
 _INLINE_BOLD_RE = _re.compile(r"\*\*(.+?)\*\*")
 _INLINE_ITALIC_RE = _re.compile(r"\*(.+?)\*")
@@ -10386,10 +10389,6 @@ _PLAN_EXPLAINER_CANDIDATES_FMT: tuple[str, ...] = (
 _PLAN_INLINE_PREVIEW_MAX_LINES = 120
 
 
-def _unexpected_keyword_type_error(exc: TypeError) -> bool:
-    return "unexpected keyword argument" in str(exc)
-
-
 def _dashboard_plan_path(project_path: Path) -> Path | None:
     for rel in _PLAN_FILE_CANDIDATES:
         p = project_path / rel
@@ -10647,6 +10646,7 @@ class ProjectDashboardData:
         "action_items",
         "alert_count",
         "enforce_plan",
+        "is_loading",
     )
 
     def __init__(
@@ -10678,6 +10678,7 @@ class ProjectDashboardData:
         action_items: list[dict],
         alert_count: int,
         enforce_plan: bool = True,
+        is_loading: bool = False,
     ) -> None:
         self.project_key = project_key
         self.project_name = project_name
@@ -10705,6 +10706,7 @@ class ProjectDashboardData:
         self.action_items = action_items
         self.alert_count = alert_count
         self.enforce_plan = enforce_plan
+        self.is_loading = is_loading
 
 
 # Module-level cache keyed by project plus the task DB paths/mtimes so a
@@ -12784,10 +12786,32 @@ def _dashboard_activity(
     return result
 
 
-def _gather_project_dashboard(
+def _project_dashboard_gather_profile(
+    project_key: str,
+    total_ms: float,
+    timings: list[tuple[str, float]],
+) -> None:
+    """Log slow project-dashboard gathers with per-section timings."""
+    if total_ms < 1000.0:
+        return
+    parts = " ".join(f"{label}={ms:.1f}ms" for label, ms in timings)
+    logger.info(
+        "project_dashboard_gather project=%s total=%.1fms %s",
+        project_key,
+        total_ms,
+        parts,
+    )
+
+
+def _gather_project_dashboard_shell(
     config_path: Path, project_key: str,
 ) -> ProjectDashboardData | None:
-    """Build the full ``ProjectDashboardData`` snapshot for one project."""
+    """Build the cheap first-paint shell for a project dashboard.
+
+    This intentionally avoids Store/Supervisor/activity-feed reads so a
+    project drilldown can show the project name and ``PM:`` header while the
+    full gather fills in the heavy sections on the worker thread.
+    """
     try:
         config = load_config(config_path)
     except Exception:  # noqa: BLE001
@@ -12810,25 +12834,117 @@ def _gather_project_dashboard(
         and isinstance(project_path, Path)
         and project_path.exists()
     )
+    planner_settings = getattr(config, "planner", None)
+    global_enforce = bool(getattr(planner_settings, "enforce_plan", True))
+    project_enforce = getattr(project, "enforce_plan", None)
+    enforce_plan = (
+        project_enforce if project_enforce is not None else global_enforce
+    )
+    empty_buckets = {
+        "queued": [],
+        "in_progress": [],
+        "review": [],
+        "blocked": [],
+        "on_hold": [],
+        "done": [],
+    }
+    plan_path = (
+        _dashboard_plan_path(project_path)
+        if exists_on_disk and isinstance(project_path, Path)
+        else None
+    )
+    return ProjectDashboardData(
+        project_key=project_key,
+        project_name=name,
+        project_path=project_path if exists_on_disk else None,
+        persona_name=persona if isinstance(persona, str) else None,
+        pm_label=pm_label,
+        exists_on_disk=exists_on_disk,
+        status_dot="○",
+        status_color="#6b7a88",
+        status_label="loading",
+        active_worker=None,
+        architect=None,
+        task_counts={},
+        task_buckets=empty_buckets,
+        plan_path=plan_path,
+        plan_sections=[],
+        plan_explainer=None,
+        plan_text=None,
+        plan_aux_files=[],
+        plan_mtime=None,
+        plan_stale_reason=None,
+        activity_entries=[],
+        inbox_count=0,
+        inbox_top=[],
+        action_items=[],
+        alert_count=0,
+        enforce_plan=enforce_plan,
+        is_loading=True,
+    )
+
+
+def _gather_project_dashboard(
+    config_path: Path, project_key: str,
+) -> ProjectDashboardData | None:
+    """Build the full ``ProjectDashboardData`` snapshot for one project."""
+    gather_start = time.perf_counter()
+    timings: list[tuple[str, float]] = []
+
+    def _timed(label: str, func: Callable[[], object]) -> object:
+        start = time.perf_counter()
+        try:
+            return func()
+        finally:
+            timings.append((label, (time.perf_counter() - start) * 1000.0))
+
+    try:
+        config = _timed("load_config", lambda: load_config(config_path))
+    except Exception:  # noqa: BLE001
+        return None
+    projects = getattr(config, "projects", {}) or {}
+    project = projects.get(project_key)
+    if project is None:
+        return None
+
+    project_path = getattr(project, "path", None)
+    name = (
+        project.display_label() if hasattr(project, "display_label")
+        else (getattr(project, "name", None) or project_key)
+    )
+    persona = getattr(project, "persona_name", None)
+    pm_label = _project_pm_label(config, project_key, project)
+
+    exists_on_disk = bool(
+        project_path is not None
+        and isinstance(project_path, Path)
+        and project_path.exists()
+    )
 
     if exists_on_disk:
-        counts, buckets = _dashboard_gather_tasks(config, project_key, project_path)
-        try:
-            inbox_count, inbox_top, action_items = _dashboard_inbox(
-                config_path, project_key, project_path, config=config,
-            )
-        except TypeError as exc:
-            if not _unexpected_keyword_type_error(exc):
-                raise
-            inbox_count, inbox_top, action_items = _dashboard_inbox(
-                config_path, project_key, project_path,
-            )
-        plan_path = _dashboard_plan_path(project_path)
+        counts, buckets = _timed(
+            "tasks",
+            lambda: _dashboard_gather_tasks(config, project_key, project_path),
+        )
+        inbox_count, inbox_top, action_items = _timed(
+            "inbox",
+            lambda: _dashboard_inbox(
+                config_path,
+                project_key,
+                project_path,
+                config=config,
+            ),
+        )
+        plan_path = _timed(
+            "plan_path", lambda: _dashboard_plan_path(project_path),
+        )
         plan_text: str | None = None
         plan_mtime: float | None = None
         if plan_path is not None:
             try:
-                plan_text = plan_path.read_text(encoding="utf-8")
+                plan_text = _timed(
+                    "plan_read", lambda: plan_path.read_text(encoding="utf-8"),
+                )
                 plan_sections = _extract_h2_sections(plan_text)
             except OSError:
                 plan_sections = []
@@ -12839,19 +12955,23 @@ def _gather_project_dashboard(
                 plan_mtime = None
         else:
             plan_sections = []
-        plan_explainer = _dashboard_plan_explainer(project_path, project_key)
-        plan_aux_files = _dashboard_plan_aux_files(project_path)
-        plan_stale_reason = _dashboard_plan_staleness(
-            plan_path, plan_mtime, project_path, project_key,
+        plan_explainer = _timed(
+            "plan_explainer",
+            lambda: _dashboard_plan_explainer(project_path, project_key),
         )
-        try:
-            activity_entries = _dashboard_activity(
-                config_path, project_key, config=config,
-            )
-        except TypeError as exc:
-            if not _unexpected_keyword_type_error(exc):
-                raise
-            activity_entries = _dashboard_activity(config_path, project_key)
+        plan_aux_files = _timed(
+            "plan_aux", lambda: _dashboard_plan_aux_files(project_path),
+        )
+        plan_stale_reason = _timed(
+            "plan_stale",
+            lambda: _dashboard_plan_staleness(
+                plan_path, plan_mtime, project_path, project_key,
+            ),
+        )
+        activity_entries = _timed(
+            "activity",
+            lambda: _dashboard_activity(config_path, project_key, config=config),
+        )
     else:
         counts = {}
         buckets = {}
@@ -12867,20 +12987,16 @@ def _gather_project_dashboard(
         plan_stale_reason = None
         activity_entries = []
 
-    try:
-        active_worker, alert_count = _dashboard_active_worker(
+    active_worker, alert_count = _timed(
+        "active_worker",
+        lambda: _dashboard_active_worker(
             config_path,
             project_key,
             action_items=action_items,
             config=config,
             task_buckets=buckets,
-        )
-    except TypeError as exc:
-        if not _unexpected_keyword_type_error(exc):
-            raise
-        active_worker, alert_count = _dashboard_active_worker(
-            config_path, project_key, action_items=action_items,
-        )
+        ),
+    )
     blocker_count = int(counts.get("blocked", 0))
     on_hold_count = int(counts.get("on_hold", 0))
     in_progress_count = int(counts.get("in_progress", 0))
@@ -12909,7 +13025,7 @@ def _gather_project_dashboard(
         project_enforce if project_enforce is not None else global_enforce
     )
 
-    return ProjectDashboardData(
+    data = ProjectDashboardData(
         project_key=project_key,
         project_name=name,
         project_path=project_path if exists_on_disk else None,
@@ -12937,6 +13053,12 @@ def _gather_project_dashboard(
         alert_count=alert_count,
         enforce_plan=enforce_plan,
     )
+    _project_dashboard_gather_profile(
+        project_key,
+        (time.perf_counter() - gather_start) * 1000.0,
+        timings,
+    )
+    return data
 
 
 def _project_dashboard_signature(
@@ -12955,6 +13077,7 @@ def _project_dashboard_signature(
     worker = data.active_worker or {}
     return (
         data.project_key,
+        bool(getattr(data, "is_loading", False)),
         data.pm_label,
         data.exists_on_disk,
         data.status_dot,
@@ -13366,18 +13489,22 @@ class PollyProjectDashboardApp(App[None]):
         yield self.hint
 
     def on_mount(self) -> None:
-        # Paint a "Loading…" placeholder immediately so the click-to-
-        # visible-pane delay is just the Python + Textual cold-boot
-        # cost, not an additional 1–2s of synchronous DB walks. The
-        # actual gather runs on a worker thread (mirrors the workspace
-        # dashboard's ``_refresh_dashboard_sync`` pattern) and the
-        # first ``_render`` fires when it completes.
-        self.topbar.update(
-            f"[b]{_escape(self.project_key)}[/b]   "
-            f"[dim]loading project dashboard…[/dim]"
-        )
         self._first_refresh_running = False
-        self._refresh()
+        self._full_refresh_loaded = False
+        # Paint a cheap shell immediately: config/project labels only,
+        # no Store/Supervisor/activity reads. The full gather still runs
+        # off-thread and replaces the section placeholders when complete.
+        shell = _gather_project_dashboard_shell(self.config_path, self.project_key)
+        if shell is not None:
+            self.data = shell
+            self._last_render_signature = _project_dashboard_signature(shell)
+            self._render()
+        else:
+            self.topbar.update(
+                f"[b]{_escape(self.project_key)}[/b]   "
+                f"[dim]loading project dashboard…[/dim]"
+            )
+        self._start_first_refresh()
         self.set_interval(self.REFRESH_INTERVAL_SECONDS, self._refresh)
         # Alert toast surface removed in #956 — ``a`` still opens the
         # alert list (Metrics drill-down).
@@ -13390,23 +13517,17 @@ class PollyProjectDashboardApp(App[None]):
     # ------------------------------------------------------------------
 
     def _refresh(self) -> None:
-        # First refresh runs off the UI thread so the placeholder topbar
-        # stays visible until data lands. Subsequent timer-driven
-        # refreshes are cheap (cycle 138/139 caches collapse them to
-        # stat()s when nothing has changed), so we keep them on the
-        # UI thread to avoid worker-thread overhead.
         if getattr(self, "_first_refresh_running", False):
             # Worker is still gathering — avoid a parallel sync gather
             # that would race the worker's call_from_thread completion.
             return
-        if self.data is None:
-            self._first_refresh_running = True
-            self.run_worker(
-                self._first_refresh_sync,
-                thread=True,
-                exclusive=True,
-                group="proj_dashboard_first_refresh",
-            )
+        # The first full refresh runs off the UI thread so the cheap
+        # shell remains responsive while cold Store/Supervisor/activity
+        # reads finish. Subsequent timer-driven refreshes are cheap
+        # enough to keep synchronous because the caches collapse them to
+        # stat()s when nothing changed.
+        if not getattr(self, "_full_refresh_loaded", False):
+            self._start_first_refresh()
             return
         try:
             self.data = _gather_project_dashboard(
@@ -13431,6 +13552,17 @@ class PollyProjectDashboardApp(App[None]):
         self._last_render_signature = signature
         self._render()
 
+    def _start_first_refresh(self) -> None:
+        if getattr(self, "_first_refresh_running", False):
+            return
+        self._first_refresh_running = True
+        self.run_worker(
+            self._first_refresh_sync,
+            thread=True,
+            exclusive=True,
+            group="proj_dashboard_first_refresh",
+        )
+
     def _first_refresh_sync(self) -> None:
         """Off-thread first-refresh: gather then hand back to the UI
         thread for render. Keeps the placeholder topbar visible
@@ -13447,6 +13579,7 @@ class PollyProjectDashboardApp(App[None]):
 
     def _first_refresh_completed(self, data) -> None:
         self._first_refresh_running = False
+        self._full_refresh_loaded = True
         self.data = data
         self._last_render_signature = _project_dashboard_signature(data)
         self._render()
@@ -13554,6 +13687,11 @@ class PollyProjectDashboardApp(App[None]):
         self.hint.update(hint)
 
     def _update_action_bar(self, data: ProjectDashboardData) -> None:
+        if getattr(data, "is_loading", False):
+            self.action_bar.remove_class("-attention")
+            self.action_bar.remove_class("-critical")
+            self.action_bar.update("[b]Loading project dashboard...[/b]")
+            return
         # #1025 — only count review tasks that genuinely need a user
         # decision. ``review`` rows that are auto-handled (Russell
         # mid-review) are not actionable for the operator; counting
@@ -13801,6 +13939,8 @@ class PollyProjectDashboardApp(App[None]):
     # ------------------------------------------------------------------
 
     def _render_now_body(self, data: ProjectDashboardData) -> str:
+        if getattr(data, "is_loading", False):
+            return "[dim]Loading worker state...[/dim]"
         w = data.active_worker
         if w:
             sess_raw = w.get("session_name") or ""
@@ -13957,6 +14097,8 @@ class PollyProjectDashboardApp(App[None]):
         return "[dim]Idle. No tasks in flight and no user action needed.[/dim]"
 
     def _render_pipeline_body(self, data: ProjectDashboardData) -> str:
+        if getattr(data, "is_loading", False):
+            return "[dim]Loading task pipeline...[/dim]"
         if not data.exists_on_disk:
             return "[dim]No project path on disk.[/dim]"
         counts = data.task_counts
@@ -14152,6 +14294,8 @@ class PollyProjectDashboardApp(App[None]):
         return "\n".join(out)
 
     def _render_plan_body(self, data: ProjectDashboardData) -> str:
+        if getattr(data, "is_loading", False):
+            return "[dim]Loading plan summary...[/dim]"
         if not data.exists_on_disk:
             return "[dim]Virtual project — no plan on disk.[/dim]"
         if data.plan_path is None:
@@ -14232,6 +14376,8 @@ class PollyProjectDashboardApp(App[None]):
             return _escape_body(text)
 
     def _render_activity_body(self, data: ProjectDashboardData) -> str:
+        if getattr(data, "is_loading", False):
+            return "[dim]Loading recent activity...[/dim]"
         if not data.activity_entries:
             return "[dim]No recent activity for this project.[/dim]"
         lines: list[str] = []
@@ -14364,6 +14510,8 @@ class PollyProjectDashboardApp(App[None]):
         view stays around for tests + the click-hint computation in
         ``_action_card_click_hint`` callers.
         """
+        if getattr(data, "is_loading", False):
+            return "[dim]Loading project inbox...[/dim]"
         count = data.inbox_count
         blocked_total = int(data.task_counts.get("blocked", 0))
         on_hold_total = int(data.task_counts.get("on_hold", 0))

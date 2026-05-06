@@ -99,9 +99,13 @@ def _run(coro) -> None:
 async def _wait_for_dashboard_data(app, pilot, *, timeout: float = 3.0) -> None:
     """Wait for the off-thread first dashboard refresh to publish data."""
     deadline = time.monotonic() + timeout
-    while app.data is None and time.monotonic() < deadline:
+    while (
+        (app.data is None or getattr(app.data, "is_loading", False))
+        and time.monotonic() < deadline
+    ):
         await pilot.pause(0.05)
     assert app.data is not None
+    assert not getattr(app.data, "is_loading", False)
 
 
 def _write_plan(project_path: Path, body: str) -> Path:

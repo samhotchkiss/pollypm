@@ -639,9 +639,13 @@ def _run(coro) -> None:
 async def _wait_for_dashboard_data(app, pilot, *, timeout: float = 3.0) -> None:
     """Wait for the off-thread first dashboard refresh to publish data."""
     deadline = time.monotonic() + timeout
-    while app.data is None and time.monotonic() < deadline:
+    while (
+        (app.data is None or getattr(app.data, "is_loading", False))
+        and time.monotonic() < deadline
+    ):
         await pilot.pause(0.05)
     assert app.data is not None
+    assert not getattr(app.data, "is_loading", False)
 
 
 # ---------------------------------------------------------------------------
@@ -658,6 +662,42 @@ def test_topbar_renders_name_and_default_pm(dashboard_env, dashboard_app) -> Non
             assert "Demo" in topbar_text
             assert "PM: Project PM" in topbar_text
     _run(body())
+
+
+def test_initial_shell_renders_pm_without_heavy_reads(
+    dashboard_env, monkeypatch,
+) -> None:
+    """The first-paint shell must not wait on Store/Supervisor sections."""
+    from pollypm import cockpit_ui
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("heavy dashboard gather should not run")
+
+    monkeypatch.setattr(cockpit_ui, "_dashboard_gather_tasks", boom)
+    monkeypatch.setattr(cockpit_ui, "_dashboard_inbox", boom)
+    monkeypatch.setattr(cockpit_ui, "_dashboard_activity", boom)
+    monkeypatch.setattr(cockpit_ui, "_dashboard_active_worker", boom)
+
+    shell = cockpit_ui._gather_project_dashboard_shell(
+        dashboard_env["config_path"], "demo",
+    )
+
+    assert shell is not None
+    assert shell.is_loading is True
+    assert shell.project_name == "Demo"
+    assert shell.pm_label == "PM: Project PM"
+    assert shell.task_counts == {}
+
+
+def test_project_prepaint_snapshot_contains_pm_header(dashboard_env) -> None:
+    from pollypm.__main__ import _render_project_dashboard_snapshot
+
+    frame = _render_project_dashboard_snapshot(
+        dashboard_env["config_path"], "demo",
+    )
+
+    assert "Demo   PM: Project PM" in frame
+    assert "Loading project dashboard..." in frame
 
 
 def test_topbar_uses_configured_persona(tmp_path: Path) -> None:
@@ -747,7 +787,9 @@ def test_status_green_when_worker_heartbeat_alive(
             "last_heartbeat": datetime.now(UTC).isoformat(),
         }
 
-        def _fake_active_worker(config_path, project_key, *, action_items=None):
+        def _fake_active_worker(
+            config_path, project_key, *, action_items=None, **_kwargs,
+        ):
             return fake_worker, 0
 
         from pollypm import cockpit_ui
@@ -1481,7 +1523,9 @@ def test_current_activity_calls_out_user_decision_when_only_architect_active(
         "last_heartbeat": datetime.now(UTC).isoformat(),
     }
 
-    def _fake_active_worker(config_path, project_key, *, action_items=None):
+    def _fake_active_worker(
+        config_path, project_key, *, action_items=None, **_kwargs,
+    ):
         return fake_worker, 0
 
     from pollypm import cockpit_ui as _cockpit_ui
@@ -1532,7 +1576,7 @@ def test_current_activity_calls_out_user_decision_when_only_architect_active(
 
     async def body() -> None:
         async with dashboard_app.run_test(size=(160, 60)) as pilot:
-            await pilot.pause()
+            await _wait_for_dashboard_data(dashboard_app, pilot)
             assert dashboard_app.data is not None
             assert dashboard_app.data.active_worker is not None
             assert dashboard_app.data.action_items
@@ -1573,7 +1617,9 @@ def test_current_activity_keeps_session_name_when_distinct_from_role(
         "last_heartbeat": datetime.now(UTC).isoformat(),
     }
 
-    def _fake_active_worker(config_path, project_key, *, action_items=None):
+    def _fake_active_worker(
+        config_path, project_key, *, action_items=None, **_kwargs,
+    ):
         return fake_worker, 0
 
     from pollypm import cockpit_ui as _cockpit_ui
@@ -1583,7 +1629,7 @@ def test_current_activity_keeps_session_name_when_distinct_from_role(
 
     async def body() -> None:
         async with dashboard_app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
+            await _wait_for_dashboard_data(dashboard_app, pilot)
             rendered = str(dashboard_app.now_body.render())
             # Both bits of identity survive when they're distinct.
             assert "task-demo-7" in rendered
@@ -2508,7 +2554,9 @@ def test_status_pill_prefers_user_attention_over_active_worker(
         "last_heartbeat": datetime.now(UTC).isoformat(),
     }
 
-    def _fake_active_worker(config_path, project_key, *, action_items=None):
+    def _fake_active_worker(
+        config_path, project_key, *, action_items=None, **_kwargs,
+    ):
         return fake_worker, 0
 
     from pollypm import cockpit_ui as _cockpit_ui
@@ -2535,7 +2583,7 @@ def test_status_pill_prefers_user_attention_over_active_worker(
 
     async def body() -> None:
         async with dashboard_app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
+            await _wait_for_dashboard_data(dashboard_app, pilot)
             assert dashboard_app.data is not None
             assert dashboard_app.data.active_worker is not None
             assert dashboard_app.data.inbox_count >= 1
@@ -3237,7 +3285,7 @@ def test_recent_activity_elides_self_reference_in_transition_reason(
         },
     ]
 
-    def _fake_activity(config_path, project_key, *, limit=10):
+    def _fake_activity(config_path, project_key, *, limit=10, **_kwargs):
         return fake_entries[:limit]
 
     from pollypm import cockpit_ui
@@ -3245,7 +3293,7 @@ def test_recent_activity_elides_self_reference_in_transition_reason(
 
     async def body() -> None:
         async with dashboard_app.run_test(size=(160, 60)) as pilot:
-            await pilot.pause()
+            await _wait_for_dashboard_data(dashboard_app, pilot)
             rendered = str(dashboard_app.activity_body.render())
             # The leading ``task #12:`` survives.
             assert "task #12: review → on_hold" in rendered
@@ -3279,7 +3327,7 @@ def test_recent_activity_strips_in_project_task_prefix_and_action_tag(
         },
     ]
 
-    def _fake_activity(config_path, project_key, *, limit=10):
+    def _fake_activity(config_path, project_key, *, limit=10, **_kwargs):
         return fake_entries[:limit]
 
     from pollypm import cockpit_ui
@@ -3287,7 +3335,7 @@ def test_recent_activity_strips_in_project_task_prefix_and_action_tag(
 
     async def body() -> None:
         async with dashboard_app.run_test(size=(160, 60)) as pilot:
-            await pilot.pause()
+            await _wait_for_dashboard_data(dashboard_app, pilot)
             rendered = str(dashboard_app.activity_body.render())
             # In-project refs collapse to #N form.
             assert "task #12: review → on_hold" in rendered
@@ -3597,7 +3645,7 @@ def test_recent_activity_renders_feed_entries(
             for i in range(12)
         ]
 
-        def _fake_activity(config_path, project_key, *, limit=10):
+        def _fake_activity(config_path, project_key, *, limit=10, **_kwargs):
             assert project_key == "demo"
             return fake_entries[:limit]
 
@@ -3607,7 +3655,7 @@ def test_recent_activity_renders_feed_entries(
         )
 
         async with dashboard_app.run_test(size=(160, 60)) as pilot:
-            await pilot.pause()
+            await _wait_for_dashboard_data(dashboard_app, pilot)
             assert dashboard_app.data is not None
             assert len(dashboard_app.data.activity_entries) == 10
             rendered = str(dashboard_app.activity_body.render())

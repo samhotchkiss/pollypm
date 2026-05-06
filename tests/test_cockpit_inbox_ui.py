@@ -1382,6 +1382,43 @@ def test_action_message_detail_shows_action_required_banner(
     _run(body())
 
 
+def test_action_message_detail_normalizes_literal_newline_escapes(
+    inbox_env, inbox_app,
+) -> None:
+    r"""#1281: the raw details body should not show literal ``\n`` text."""
+    workspace_root = inbox_env["project_path"].parent
+    title = "[Action] same scope escalation pattern"
+    _seed_workspace_message(
+        workspace_root,
+        subject=title,
+        body=(
+            "Task: demo/12\\nStatus: At code_review.\\n\\n"
+            "Blocker: The walkthrough was not run.\\n\\n"
+            "Recommendation:\\n"
+            "- Option A: Accept code delivery.\\n"
+            "- Option B: Hold until the live system is available."
+        ),
+        scope="demo",
+    )
+
+    async def body() -> None:
+        async with inbox_app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            titles = _visible_titles(inbox_app)
+            assert title in titles
+            inbox_app.list_view.index = titles.index(title)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            detail_text = str(inbox_app.detail.render())
+            assert "details from Polly" in detail_text
+            assert "Task: demo/12\nStatus: At code_review." in detail_text
+            assert "Recommendation:\n  • Option A" in detail_text
+            assert "\\n" not in detail_text
+
+    _run(body())
+
+
 def test_reply_input_is_always_present_on_detail_open(inbox_env, inbox_app) -> None:
     """Reply Input is visible from mount — not gated by pressing ``r``.
 

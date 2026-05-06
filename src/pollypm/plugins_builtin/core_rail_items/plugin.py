@@ -337,7 +337,7 @@ def _selected_key(ctx: RailContext) -> str:
     return str(value) if isinstance(value, str) and value else "polly"
 
 
-def _project_chat_persona(project: Any, session_role: Any) -> str | None:
+def _project_chat_persona(project: Any, session_role: Any) -> str:
     if isinstance(session_role, str) and session_role.strip():
         try:
             from pollypm.role_contract import canonical_role, persona_for
@@ -351,7 +351,7 @@ def _project_chat_persona(project: Any, session_role: Any) -> str | None:
     return (
         persona_raw.strip()
         if isinstance(persona_raw, str) and persona_raw.strip()
-        else None
+        else "Project PM"
     )
 
 
@@ -407,7 +407,7 @@ def _project_rows(ctx: RailContext) -> list[RailRow]:
                 state="sub",
             ))
             persona = _project_chat_persona(project, session_role)
-            label = f"  PM Chat ({persona})" if persona else "  PM Chat"
+            label = f"  PM Chat ({persona})"
             rows.append(RailRow(
                 key=f"project:{project_key}:session",
                 label=label,

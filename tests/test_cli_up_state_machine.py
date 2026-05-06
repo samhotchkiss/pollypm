@@ -682,6 +682,244 @@ def test_probe_falls_back_when_list_panes_unavailable() -> None:
     assert plan_launch(probe).state is LaunchState.ATTACH_EXISTING
 
 
+def test_probe_treats_shell_with_python_descendant_as_healthy(monkeypatch) -> None:
+    """#1293 — when tmux reports the rail pane's foreground command as
+    a shell (the rail launcher's ``while true; do pm cockpit; done``
+    wrapper), the probe must walk the pane's process tree before
+    declaring the rail dead. If a ``pm`` / ``python`` descendant is
+    found, the cockpit is live regardless of redraw timing.
+
+    This is the regression fix: previous attempts (#1336, #1338) used a
+    capture-pane token scan with retry, but Textual redraw windows can
+    exceed 20 seconds on cold boot, far outside any reasonable retry
+    budget. Process liveness is independent of rendering."""
+    from pollypm.launch_state import LaunchAction, LaunchState, plan_launch
+    from pollypm.tmux.client import TmuxPane
+
+    class _FakeTmux:
+        def has_session(self, name: str) -> bool:
+            return name in {"pollypm", "pollypm-storage-closet"}
+
+        def current_session_name(self) -> None:
+            return None
+
+        def list_panes(self, _target: str) -> list[TmuxPane]:
+            return [
+                TmuxPane(
+                    session="pollypm",
+                    window_index="0",
+                    window_name="PollyPM",
+                    pane_index="0",
+                    pane_id="%1",
+                    active=True,
+                    pane_current_command="bash",  # shell wrapper foregrounded
+                    pane_current_path="/",
+                    pane_dead=False,
+                    pane_left=0,
+                    pane_width=30,
+                ),
+                TmuxPane(
+                    session="pollypm",
+                    window_index="0",
+                    window_name="PollyPM",
+                    pane_index="1",
+                    pane_id="%2",
+                    active=False,
+                    pane_current_command="bash",
+                    pane_current_path="/",
+                    pane_dead=False,
+                    pane_left=31,
+                    pane_width=120,
+                ),
+            ]
+
+        def get_pane_pid(self, pane_id: str) -> int | None:
+            # Rail pane's pid -> 4242, console pane's pid -> 5151.
+            if pane_id == "%1":
+                return 4242
+            if pane_id == "%2":
+                return 5151
+            return None
+
+    class _FakeSupervisor:
+        def __init__(self) -> None:
+            self.tmux = _FakeTmux()
+            self.config = type(
+                "Config",
+                (),
+                {"project": type("Project", (), {"tmux_session": "pollypm"})()},
+            )()
+
+    # ps output: pid 4242 (bash) -> child 4243 (pm = the cockpit Python)
+    # Console pane (5151) has no child.
+    fake_ps_stdout = (
+        "4242 1 bash\n"
+        "4243 4242 pm\n"
+        "5151 1 bash\n"
+    )
+
+    def _fake_run(cmd, **kwargs):
+        assert cmd[0] == "ps"
+        return type(
+            "Result",
+            (),
+            {"returncode": 0, "stdout": fake_ps_stdout, "stderr": ""},
+        )()
+
+    monkeypatch.setattr(cli.subprocess, "run", _fake_run)
+
+    probe = cli._build_launch_probe(_FakeSupervisor())
+    assert probe.rail_pane_alive is True
+    # Rail pane's bash wrapper has a `pm` child — cockpit is live.
+    assert probe.rail_pane_running_non_shell is True
+
+    plan = plan_launch(probe)
+    assert plan.state is LaunchState.ATTACH_EXISTING
+    assert LaunchAction.RESPAWN_RAIL not in plan.actions
+
+
+def test_probe_treats_bare_bash_pane_as_dead_rail(monkeypatch) -> None:
+    """#1293 — the legitimate dead-rail recovery path must still fire
+    when the pane is genuinely a bare shell with no cockpit Python in
+    its process tree. The new process-tree check returns False here so
+    the planner routes to RECOVER_DEAD_RAIL as it always has."""
+    from pollypm.launch_state import LaunchState, plan_launch
+    from pollypm.tmux.client import TmuxPane
+
+    class _FakeTmux:
+        def has_session(self, name: str) -> bool:
+            return name in {"pollypm", "pollypm-storage-closet"}
+
+        def current_session_name(self) -> None:
+            return None
+
+        def list_panes(self, _target: str) -> list[TmuxPane]:
+            return [
+                TmuxPane(
+                    session="pollypm",
+                    window_index="0",
+                    window_name="PollyPM",
+                    pane_index="0",
+                    pane_id="%1",
+                    active=True,
+                    pane_current_command="bash",
+                    pane_current_path="/",
+                    pane_dead=False,
+                    pane_left=0,
+                    pane_width=30,
+                ),
+                TmuxPane(
+                    session="pollypm",
+                    window_index="0",
+                    window_name="PollyPM",
+                    pane_index="1",
+                    pane_id="%2",
+                    active=False,
+                    pane_current_command="zsh",
+                    pane_current_path="/",
+                    pane_dead=False,
+                    pane_left=31,
+                    pane_width=120,
+                ),
+            ]
+
+        def get_pane_pid(self, pane_id: str) -> int | None:
+            return {"%1": 4242, "%2": 5151}.get(pane_id)
+
+        def capture_pane(self, target: str, lines: int = 200) -> str:
+            return "$ "  # bare shell prompt
+
+    class _FakeSupervisor:
+        def __init__(self) -> None:
+            self.tmux = _FakeTmux()
+            self.config = type(
+                "Config",
+                (),
+                {"project": type("Project", (), {"tmux_session": "pollypm"})()},
+            )()
+
+    # ps: only bash, no Python descendants anywhere.
+    fake_ps_stdout = (
+        "4242 1 bash\n"
+        "5151 1 zsh\n"
+    )
+
+    def _fake_run(cmd, **kwargs):
+        return type(
+            "Result",
+            (),
+            {"returncode": 0, "stdout": fake_ps_stdout, "stderr": ""},
+        )()
+
+    monkeypatch.setattr(cli.subprocess, "run", _fake_run)
+
+    probe = cli._build_launch_probe(_FakeSupervisor())
+    assert probe.rail_pane_alive is True
+    assert probe.rail_pane_running_non_shell is False
+
+    plan = plan_launch(probe)
+    assert plan.state is LaunchState.RECOVER_DEAD_RAIL
+
+
+def test_pane_runs_cockpit_python_descendant_unit(monkeypatch) -> None:
+    """Direct unit coverage for the process-tree liveness helper.
+
+    Pins:
+    - ``python`` descendant counts as cockpit-live.
+    - Capitalized ``Python`` counts (macOS).
+    - Path-prefixed comm (e.g. ``/usr/bin/python3``) counts.
+    - Tree without any cockpit process name returns False.
+    - Missing ``get_pane_pid`` (tmux too old / mock) returns False
+      so the legitimate dead-rail path keeps firing.
+    """
+
+    class _Pane:
+        pane_id = "%1"
+
+    class _Tmux:
+        def __init__(self, pid):
+            self._pid = pid
+
+        def get_pane_pid(self, pane_id: str) -> int | None:
+            return self._pid
+
+    def _stub_ps(stdout: str):
+        def _run(cmd, **kwargs):
+            return type(
+                "Result",
+                (),
+                {"returncode": 0, "stdout": stdout, "stderr": ""},
+            )()
+
+        monkeypatch.setattr(cli.subprocess, "run", _run)
+
+    # 1. python descendant.
+    _stub_ps("100 1 bash\n200 100 python\n")
+    assert cli._pane_runs_cockpit_python_descendant(_Pane(), _Tmux(100)) is True
+
+    # 2. capitalized Python.
+    _stub_ps("100 1 bash\n200 100 Python\n")
+    assert cli._pane_runs_cockpit_python_descendant(_Pane(), _Tmux(100)) is True
+
+    # 3. path-prefixed comm.
+    _stub_ps("100 1 bash\n200 100 /usr/bin/python3\n")
+    assert cli._pane_runs_cockpit_python_descendant(_Pane(), _Tmux(100)) is True
+
+    # 4. only bash, no cockpit process — process tree says dead.
+    _stub_ps("100 1 bash\n200 100 sleep\n")
+    assert cli._pane_runs_cockpit_python_descendant(_Pane(), _Tmux(100)) is False
+
+    # 5. tmux without ``get_pane_pid`` -> defensive False.
+    class _OldTmux:
+        pass
+
+    assert cli._pane_runs_cockpit_python_descendant(_Pane(), _OldTmux()) is False
+
+    # 6. ``pm`` entrypoint as the descendant.
+    _stub_ps("100 1 bash\n200 100 pm\n")
+    assert cli._pane_runs_cockpit_python_descendant(_Pane(), _Tmux(100)) is True
+
+
 def test_probe_plus_planner_attach_existing_no_typer() -> None:
     """End-to-end probe → planner check that bypasses Typer +
     monkeypatch + ``runner.invoke``.

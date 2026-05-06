@@ -106,6 +106,27 @@ def _default_config_path() -> Path:
 def _paint_inbox_snapshot(config_path: Path, *, project: str | None) -> Exception | None:
     """Prepaint a real inbox list before importing the interactive TUI."""
     try:
+        from pollypm.storage.inbox_action_preview import (
+            load_fast_inbox_action_preview,
+        )
+
+        fast_preview = load_fast_inbox_action_preview(
+            config_path,
+            project=project,
+            limit=_INBOX_PREPAINT_LIMIT,
+        )
+        if fast_preview is not None:
+            preview, preview_unread, preview_total = fast_preview
+            frame = _render_inbox_snapshot(
+                preview,
+                total=preview_total,
+                unread_count=len(preview_unread),
+                project=project,
+            )
+            sys.stdout.write(f"{_CLEAR_SCREEN}{frame}")
+            sys.stdout.flush()
+            return None
+
         from pollypm.cockpit_inbox_items import (
             load_inbox_action_preview,
             load_inbox_entries,

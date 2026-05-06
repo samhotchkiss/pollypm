@@ -2276,14 +2276,9 @@ class PollyCockpitApp(App[None]):
             "[#e0af68]Upgrading… see window `pm-upgrade`[/]"
         )
         self.update_pill.display = True
-        try:
-            self.notify(
-                "Upgrade started in window `pm-upgrade`. Keep working; "
-                "the rail will tell you when it's done.",
-                timeout=5,
-            )
-        except Exception:  # noqa: BLE001
-            pass
+        # #1256: this app renders in the narrow rail pane. A long
+        # success toast wraps through rail rows, so keep success feedback
+        # in the existing one-line pill.
 
     def _post_upgrade_flag_path(self) -> Path:
         """Sentinel written by ``pm upgrade`` on success.

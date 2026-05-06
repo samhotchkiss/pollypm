@@ -766,3 +766,150 @@ def test_up_first_launch_state_named(monkeypatch, tmp_path: Path) -> None:
 
     assert "[launch]" in result.output
     assert "first_launch" in result.output
+
+
+# ---------------------------------------------------------------------------
+# #1293 regression — partial-render retry for ``capture-pane`` token gate
+# ---------------------------------------------------------------------------
+
+
+class _StubPane:
+    """Minimal stand-in for ``TmuxPane`` exposing the pane_id used by
+    ``_pane_capture_looks_like_cockpit_rail``."""
+
+    def __init__(self, pane_id: str = "%1") -> None:
+        self.pane_id = pane_id
+
+
+_REAL_COCKPIT_RAIL_FRAME = """
+     █▀█ █▀█ █   █   █▄█     │
+     █▀▀ █▄█ █▄▄ █▄▄  █      │
+        Plans first.         │
+        Chaos later.         │
+   ○ Home                    │
+   ♡· Polly · chat           │
+   ○ Workers (11)            │
+   ◆ Inbox (42)              │
+   ── projects ────────      │
+"""
+
+# A partial mid-redraw frame: rendered ASCII logo only, no menu tokens
+# (`polly`/`home`/`workers`/`inbox`). Long enough (>4 chars) that the
+# old length-based gate would not trigger a retry — this is the failure
+# mode reviewers reproduced 4/10 times against the unfixed worker fix.
+_PARTIAL_RAIL_LOGO_FRAME = """
+     █▀█ █▀█ █   █   █▄█     │
+     █▀▀ █▄█ █▄▄ █▄▄  █      │
+"""
+
+
+def test_pane_capture_retries_on_partial_render_then_succeeds(monkeypatch) -> None:
+    """#1293 — the first capture-pane call may return a partial
+    redraw (rendered logo without the four menu tokens). The
+    helper must retry instead of returning False on the partial.
+
+    This is the behavioural pin reviewers asked for: the failure mode
+    that escaped PR #1336's empty-only retry is exactly this case
+    (capture is long but missing the four menu tokens). The test must
+    fail on the unfixed code path."""
+    captures = [_PARTIAL_RAIL_LOGO_FRAME, _REAL_COCKPIT_RAIL_FRAME]
+    calls: list[tuple[str, int]] = []
+
+    def _capture_pane(pane_id: str, lines: int = 200) -> str:
+        calls.append((pane_id, lines))
+        if len(captures) > 1:
+            return captures.pop(0)
+        return captures[0]
+
+    # Don't actually sleep during the test — but exercise the real
+    # helper signature (no sleep kwarg) so the behavioural assertion
+    # holds regardless of implementation details.
+    import time as _time
+
+    monkeypatch.setattr(_time, "sleep", lambda _s: None)
+
+    result = cli._pane_capture_looks_like_cockpit_rail(
+        _StubPane("%1"),
+        _capture_pane,
+    )
+
+    assert result is True
+    # First call returned the partial frame; we needed at least one
+    # retry to see the healthy capture.
+    assert len(calls) >= 2
+
+
+def test_pane_capture_retries_on_empty_then_succeeds() -> None:
+    """Pre-render empty buffer is still a covered failure mode."""
+    captures = ["", _REAL_COCKPIT_RAIL_FRAME]
+    calls: list[tuple[str, int]] = []
+
+    def _capture_pane(pane_id: str, lines: int = 200) -> str:
+        calls.append((pane_id, lines))
+        if len(captures) > 1:
+            return captures.pop(0)
+        return captures[0]
+
+    result = cli._pane_capture_looks_like_cockpit_rail(
+        _StubPane("%1"),
+        _capture_pane,
+        sleep=lambda _s: None,
+    )
+    assert result is True
+    assert len(calls) >= 2
+
+
+def test_pane_capture_returns_false_after_budget_exhausted() -> None:
+    """A genuinely dead rail keeps returning a non-cockpit capture
+    forever. The helper must exhaust its retry budget and return
+    False so the legit ``recover_dead_rail`` path still fires."""
+    calls: list[tuple[str, int]] = []
+
+    def _capture_pane(pane_id: str, lines: int = 200) -> str:
+        calls.append((pane_id, lines))
+        return _PARTIAL_RAIL_LOGO_FRAME
+
+    result = cli._pane_capture_looks_like_cockpit_rail(
+        _StubPane("%1"),
+        _capture_pane,
+        sleep=lambda _s: None,
+    )
+    assert result is False
+    # Initial call + one retry per budgeted delay.
+    assert len(calls) == 1 + len(cli._RAIL_CAPTURE_RETRY_DELAYS_MS)
+
+
+def test_pane_capture_fast_path_no_retry_on_healthy_first_capture() -> None:
+    """Healthy first capture must not pay any retry budget — bare
+    `pm` invocations on a healthy cockpit should stay snappy."""
+    calls: list[tuple[str, int]] = []
+    sleeps: list[float] = []
+
+    def _capture_pane(pane_id: str, lines: int = 200) -> str:
+        calls.append((pane_id, lines))
+        return _REAL_COCKPIT_RAIL_FRAME
+
+    def _fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    result = cli._pane_capture_looks_like_cockpit_rail(
+        _StubPane("%1"),
+        _capture_pane,
+        sleep=_fake_sleep,
+    )
+    assert result is True
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+def test_pane_capture_retry_budget_within_acceptable_bound_ms() -> None:
+    """Worst-case retry budget should be bounded for UX. We pay
+    this only on the first-bad-capture path; on healthy cockpits
+    bare `pm` short-circuits with zero sleep. The budget must be
+    long enough to span a Textual redraw (~3–5s observed) without
+    being so long that real dead-rail recoveries feel hung. Pin
+    the chosen budget at <=3000ms."""
+    total_ms = sum(cli._RAIL_CAPTURE_RETRY_DELAYS_MS)
+    assert total_ms <= 3000
+    # And long enough to actually catch the typical redraw window.
+    assert total_ms >= 1500

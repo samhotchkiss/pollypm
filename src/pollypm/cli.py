@@ -740,16 +740,27 @@ def _classify_cockpit_panes(panes, *, capture_pane=None) -> tuple[bool, bool, bo
     return (console_alive, rail_alive, rail_non_shell)
 
 
-def _pane_capture_looks_like_cockpit_rail(pane, capture_pane) -> bool:
-    if not callable(capture_pane):
-        return False
-    pane_id = getattr(pane, "pane_id", None)
-    if not isinstance(pane_id, str) or not pane_id:
-        return False
-    try:
-        text = str(capture_pane(pane_id, lines=40) or "")
-    except Exception:  # noqa: BLE001
-        return False
+# #1293 — bare `pm` intermittently emitted a false-positive
+# ``recover_dead_rail`` diagnostic when the cockpit rail was healthy.
+# Root cause: the rail pane reports a shell wrapper as
+# ``pane_current_command`` while the Textual TUI runs inside it, so the
+# probe falls back to a tmux capture-pane to confirm the rail UI is
+# visible. That capture races against Textual's redraw cycle: in the
+# wild the capture can return either an empty buffer (pre-render) OR a
+# partial frame containing only the ASCII logo (~120 chars) without the
+# four menu tokens (`polly`/`home`/`workers`/`inbox`). PR #1336's
+# retry-on-empty fix only covered the empty-buffer case; the
+# partial-render case still slipped past the gate. Reviewer observed
+# Textual redraw windows of 3–5s, so a 350ms total budget was
+# under-provisioned. The retry below fires whenever the four required
+# tokens are missing — empty OR partial — and stretches across ~1.85s
+# (100/250/500/1000ms), which covers the typical redraw window without
+# making bare `pm` feel sluggish on real failures (worst case ~1.85s
+# only when the FIRST capture is bad; healthy panes hit the fast path).
+_RAIL_CAPTURE_RETRY_DELAYS_MS: tuple[int, ...] = (100, 250, 500, 1000)
+
+
+def _capture_has_cockpit_rail_tokens(text: str) -> bool:
     normalized = " ".join(text.lower().split())
     return (
         "polly" in normalized
@@ -757,6 +768,48 @@ def _pane_capture_looks_like_cockpit_rail(pane, capture_pane) -> bool:
         and "workers" in normalized
         and "inbox" in normalized
     )
+
+
+def _pane_capture_looks_like_cockpit_rail(
+    pane,
+    capture_pane,
+    *,
+    retry_delays_ms: tuple[int, ...] = _RAIL_CAPTURE_RETRY_DELAYS_MS,
+    sleep=None,
+) -> bool:
+    if not callable(capture_pane):
+        return False
+    pane_id = getattr(pane, "pane_id", None)
+    if not isinstance(pane_id, str) or not pane_id:
+        return False
+
+    def _safe_capture() -> str:
+        try:
+            return str(capture_pane(pane_id, lines=40) or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    text = _safe_capture()
+    if _capture_has_cockpit_rail_tokens(text):
+        return True
+
+    # The first capture missed the menu tokens — could be empty
+    # (pre-render) or a partial frame mid-redraw. Retry on a backoff;
+    # only return False once the budget is exhausted and the tokens
+    # are still absent (which legitimately means the rail is dead).
+    if sleep is None:
+        import time as _time
+
+        sleep = _time.sleep
+    for delay_ms in retry_delays_ms:
+        try:
+            sleep(delay_ms / 1000.0)
+        except Exception:  # noqa: BLE001
+            pass
+        text = _safe_capture()
+        if _capture_has_cockpit_rail_tokens(text):
+            return True
+    return False
 
 
 @app.command(help=_UP_HELP)

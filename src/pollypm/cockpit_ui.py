@@ -13098,6 +13098,23 @@ class PollyProjectDashboardApp(App[None]):
     .proj-empty {
         color: #6b7a88;
     }
+    /* #1290 follow-up — empty-state affordance for projects with zero
+       work_tasks rows. Without this panel the drilldown was completely
+       silent (bare ◯ glyph, no copy) for hours after a fresh
+       ``pm add-project`` if no task ever landed. The panel sits above
+       every other section so it's the first thing the operator sees
+       when they navigate into the project. */
+    #proj-empty-state {
+        height: auto;
+        margin-bottom: 1;
+        padding: 0 2;
+        background: #1a2330;
+        color: #f7d67a;
+        border: round #5b8aff;
+    }
+    #proj-empty-state.-hidden {
+        display: none;
+    }
     #proj-plan-scroll {
         height: auto;
         max-height: 30;
@@ -13189,6 +13206,13 @@ class PollyProjectDashboardApp(App[None]):
         self.topbar = Static("", id="proj-topbar", markup=True)
         self.status_line = Static("", id="proj-status", markup=True)
         self.action_bar = Static("", id="proj-action-bar", markup=True)
+        # #1290 follow-up — empty-state panel surfaces a clear
+        # affordance when a project has zero ``work_tasks`` rows.
+        # Hidden by default; ``_render`` toggles ``-hidden`` based
+        # on ``data.task_counts`` totals.
+        self.empty_state = Static(
+            "", id="proj-empty-state", classes="-hidden", markup=True,
+        )
         self.now_title = Static(
             "[b]Current activity[/b]",
             classes="proj-section-title",
@@ -13325,6 +13349,12 @@ class PollyProjectDashboardApp(App[None]):
             yield self.status_line
             yield self.action_bar
             with VerticalScroll(id="proj-body"):
+                # #1290 follow-up — empty-state for "registered project
+                # with zero work_tasks rows" sits at the top of the body
+                # so the operator sees the affordance the instant they
+                # navigate into a fresh project. Hidden by default; the
+                # ``-hidden`` class is removed only when totals are zero.
+                yield self.empty_state
                 with Vertical(classes="proj-section", id="proj-inbox-section"):
                     yield self.inbox_title
                     yield self.inbox_lead
@@ -13468,6 +13498,24 @@ class PollyProjectDashboardApp(App[None]):
         )
         self.status_line.update(status_markup)
         self._update_action_bar(data)
+
+        # ── Empty-state affordance ──
+        # #1290 follow-up — savethenovel landed in a state with zero
+        # ``work_tasks`` rows (registered project, never planned, never
+        # had a task). The drilldown showed a bare ``○`` glyph and no
+        # affordances; the operator watched it for hours with nothing
+        # to act on. Surface a one-line panel pointing at the two
+        # commands that move the project forward (planner architect or
+        # manual task create). Renders for ``tracked=False`` projects
+        # too — the renderer doesn't filter on tracked, so an untracked
+        # fresh project still gets the affordance.
+        empty_text = self._render_empty_state(data)
+        if empty_text:
+            self.empty_state.update(empty_text)
+            self.empty_state.remove_class("-hidden")
+        else:
+            self.empty_state.update("")
+            self.empty_state.add_class("-hidden")
 
         # ── Current activity ──
         self.now_body.update(self._render_now_body(data))
@@ -13786,6 +13834,35 @@ class PollyProjectDashboardApp(App[None]):
     # Section renderers — all return Rich-markup strings, all handle
     # missing-data gracefully with friendly empty-state copy.
     # ------------------------------------------------------------------
+
+    def _render_empty_state(self, data: ProjectDashboardData) -> str:
+        """Return the prominent zero-tasks affordance, or "" when there
+        is at least one ``work_tasks`` row.
+
+        Triggered when the project has zero rows in *any* status bucket
+        (queued / in_progress / review / blocked / on_hold / done). The
+        savethenovel repro showed the dashboard going completely silent
+        in this state — the operator watched a bare ``○`` glyph for
+        2.5+ hours with no copy and no affordances. The panel names the
+        two commands that move a fresh project forward so the user can
+        act without having to leave the cockpit and grep the docs.
+        """
+        # Don't surface an affordance when the project path is missing —
+        # that's a separate (and louder) failure mode the topbar
+        # already calls out.
+        if not data.exists_on_disk:
+            return ""
+        counts = data.task_counts or {}
+        buckets = data.task_buckets or {}
+        total = sum(int(v or 0) for v in counts.values())
+        if total or any(buckets.values()):
+            return ""
+        project = _escape(data.project_key)
+        return (
+            f"[#f7d67a][b]No tasks for {project}.[/b][/] "
+            f"[#d6dee5]Run [b]pm project plan {project}[/b] to start the "
+            f"architect, or [b]pm task create[/b] to add one manually.[/]"
+        )
 
     def _render_now_body(self, data: ProjectDashboardData) -> str:
         w = data.active_worker

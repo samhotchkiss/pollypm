@@ -557,6 +557,72 @@ def test_cockpit_send_key_inbox_action_prefers_inbox_bridge_over_live_pane(
         inbox.stop()
 
 
+def test_cockpit_send_key_inbox_A_after_home_drift_still_routes_to_inbox(
+    valid_cockpit_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1282 regression: tester repro `<esc> → I → <home> → A`.
+
+    The rail handles `<home>` itself (jump to first selectable item),
+    which moves `selected_key` from "inbox" to "dashboard" even though
+    the Inbox surface is still mounted in the right pane. Capital A
+    must continue to fire the approve gate — i.e. land on the live
+    `pane-inbox` bridge — instead of falling through to the cockpit
+    bridge (which would route to Workers).
+
+    The bounced PR #1332 only handled the case where `selected_key`
+    was still "inbox"; this test pins the documented drift path that
+    PR could not catch.
+    """
+    import typer
+    from typer.testing import CliRunner
+
+    from pollypm.cli_features import ui as ui_commands
+    from pollypm.cockpit_rail import CockpitRouter
+
+    cockpit_app = _FakeApp()
+    inbox_app = _FakeApp()
+    cockpit = start_input_bridge(
+        cockpit_app, kind="cockpit", config_path=valid_cockpit_config,
+    )
+    assert cockpit is not None
+    inbox = start_input_bridge(
+        inbox_app, kind="pane-inbox", config_path=valid_cockpit_config,
+    )
+    assert inbox is not None
+
+    monkeypatch.setattr(
+        ui_commands,
+        "_send_key_to_active_live_right_pane",
+        lambda _config_path, _key: None,
+    )
+    try:
+        # Simulate the full repro: user pressed I (inbox selected),
+        # then <home>, which the rail intercepted and moved selection
+        # to the first selectable item ("dashboard"). The Inbox app is
+        # still mounted in the right pane (its bridge is still live).
+        router = CockpitRouter(valid_cockpit_config)
+        router.set_selected_key("inbox")
+        router.set_selected_key("dashboard")
+        assert router.selected_key() == "dashboard"
+
+        app = typer.Typer()
+        ui_commands.register_ui_commands(app)
+        result = CliRunner().invoke(
+            app, ["cockpit-send-key", "A", "--config", str(valid_cockpit_config)]
+        )
+        assert result.exit_code == 0, result.output
+        # The visible surface (Inbox) owns A — not the rail.
+        assert f"via {inbox.socket_path}" in result.output
+        assert _wait_for(lambda: inbox_app.keys == ["A"])
+        # The rail/cockpit bridge must NOT see this A; otherwise the
+        # rail's `_handle_key` would route to Workers (the bug).
+        assert "A" not in cockpit_app.keys
+    finally:
+        cockpit.stop()
+        inbox.stop()
+
+
 @pytest.mark.parametrize(
     ("key", "expected"),
     [

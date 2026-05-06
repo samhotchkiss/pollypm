@@ -35,6 +35,7 @@ from pollypm.audit import (
 from pollypm.audit.log import (
     EVENT_TASK_CREATED,
     EVENT_TASK_STATUS_CHANGED,
+    EVENT_WORK_DB_OPENED,
     SCHEMA_VERSION,
 )
 
@@ -408,3 +409,148 @@ def test_workservice_transition_emits_status_changed(tmp_path: Path) -> None:
     assert "from" in last.metadata
     assert "to" in last.metadata
     assert last.metadata["to"] == "queued"
+
+
+# ---------------------------------------------------------------------------
+# Integration: SQLiteWorkService DB-open breadcrumb
+# ---------------------------------------------------------------------------
+
+
+def _read_central_records(audit_home: Path) -> list[dict]:
+    """Read every JSONL row across the central tail.
+
+    The ``work_db.opened`` event uses ``project=""`` (workspace-level,
+    not project-scoped), so it lands only in the central tail under
+    the sanitized ``"_unknown"`` filename. We scan every file in the
+    audit home so the test stays robust if the sanitizer changes.
+    """
+    records: list[dict] = []
+    if not audit_home.exists():
+        return records
+    for f in audit_home.iterdir():
+        if f.is_file() and f.suffix == ".jsonl":
+            for line in f.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    records.append(json.loads(line))
+    return records
+
+
+def test_workservice_open_emits_work_db_opened_on_fresh_db(
+    tmp_path: Path, _isolate_audit_home: Path,
+) -> None:
+    """Opening a brand-new SQLite file emits ``work_db.opened`` with
+    ``had_messages_table_pre_open=False`` and ``tables_created=True`` —
+    the canonical "first-time workspace open" signal."""
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    db_path = tmp_path / "fresh.db"
+    svc = SQLiteWorkService(db_path=db_path)
+    try:
+        records = _read_central_records(_isolate_audit_home)
+        opens = [r for r in records if r["event"] == EVENT_WORK_DB_OPENED]
+        assert len(opens) == 1, f"expected one work_db.opened row, got {len(opens)}"
+        row = opens[0]
+        assert row["subject"] == str(db_path)
+        assert row["actor"] == "system"
+        assert row["metadata"]["had_messages_table_pre_open"] is False
+        assert row["metadata"]["tables_created"] is True
+    finally:
+        svc.close()
+
+
+def test_workservice_open_flags_messages_side_db(
+    tmp_path: Path, _isolate_audit_home: Path,
+) -> None:
+    """The dual-DB confusion case: a messages-side DB has a
+    ``messages`` table. When ``SQLiteWorkService`` is pointed at one,
+    the audit row carries ``had_messages_table_pre_open=True`` so a
+    grep over the audit log surfaces the misroute immediately."""
+    import sqlite3
+
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    db_path = tmp_path / "messages-side.db"
+    # Pre-create a messages-side DB by stamping the marker table.
+    pre = sqlite3.connect(db_path)
+    try:
+        pre.execute(
+            "CREATE TABLE messages ("
+            "id INTEGER PRIMARY KEY, body TEXT, created_at TEXT"
+            ")"
+        )
+        pre.commit()
+    finally:
+        pre.close()
+
+    svc = SQLiteWorkService(db_path=db_path)
+    try:
+        records = _read_central_records(_isolate_audit_home)
+        opens = [r for r in records if r["event"] == EVENT_WORK_DB_OPENED]
+        assert len(opens) == 1
+        row = opens[0]
+        # The warning signal — work_tasks didn't exist yet (so we
+        # stamped them on), but the DB ALREADY had a messages table.
+        # That combination = wrong DB.
+        assert row["metadata"]["had_messages_table_pre_open"] is True
+        assert row["metadata"]["tables_created"] is True
+    finally:
+        svc.close()
+
+
+def test_workservice_open_reports_tables_created_false_on_existing_work_db(
+    tmp_path: Path, _isolate_audit_home: Path,
+) -> None:
+    """Re-opening a workspace DB that already has work tables emits
+    ``tables_created=False`` — the steady-state signal that
+    distinguishes a normal restart from a first-time stamp."""
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    db_path = tmp_path / "existing.db"
+    # First open materializes work_tasks et al.
+    svc1 = SQLiteWorkService(db_path=db_path)
+    svc1.close()
+
+    # Wipe the audit log so we only see the second open's row.
+    for f in _isolate_audit_home.iterdir() if _isolate_audit_home.exists() else []:
+        if f.is_file():
+            f.unlink()
+
+    svc2 = SQLiteWorkService(db_path=db_path)
+    try:
+        records = _read_central_records(_isolate_audit_home)
+        opens = [r for r in records if r["event"] == EVENT_WORK_DB_OPENED]
+        assert len(opens) == 1
+        row = opens[0]
+        assert row["metadata"]["had_messages_table_pre_open"] is False
+        assert row["metadata"]["tables_created"] is False
+    finally:
+        svc2.close()
+
+
+def test_workservice_open_per_project_log_when_project_path_supplied(
+    tmp_path: Path, _isolate_audit_home: Path,
+) -> None:
+    """When the caller passes a ``project_path``, the breadcrumb also
+    lands in ``<project>/.pollypm/audit.jsonl`` so the row travels
+    with the project tree (matches the per-project + central
+    pattern used by every other audit hook in this module)."""
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    project_root = tmp_path / "proj"
+    (project_root / ".pollypm").mkdir(parents=True)
+    db_path = tmp_path / "p.db"
+
+    svc = SQLiteWorkService(db_path=db_path, project_path=project_root)
+    try:
+        per_project = project_log_path(project_root)
+        assert per_project is not None and per_project.exists()
+        rows = [
+            json.loads(l)
+            for l in per_project.read_text(encoding="utf-8").splitlines()
+            if l.strip()
+        ]
+        opens = [r for r in rows if r["event"] == EVENT_WORK_DB_OPENED]
+        assert len(opens) == 1
+        assert opens[0]["metadata"]["project_path"] == str(project_root)
+    finally:
+        svc.close()

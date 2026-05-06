@@ -689,7 +689,58 @@ class SQLiteWorkService:
 
         apply_workspace_pragmas(self._conn, busy_timeout_ms=30000)
         self._conn.execute("PRAGMA foreign_keys=ON")
+        # #savethenovel-followup: forensic breadcrumb for the dual-DB
+        # layout. The workspace has TWO state DBs by accident — the
+        # CLI-side ``~/.pollypm/state.db`` (messages/sessions) and the
+        # workspace-local ``<root>/.pollypm/state.db`` (work tables) —
+        # and several callsites historically passed the wrong path,
+        # silently stamping empty work tables on the messages-side DB
+        # and looking like a wipe. Snapshot the pre-existing tables so
+        # the audit row distinguishes "first-time workspace open" from
+        # "stamped onto the wrong DB".
+        _had_messages_table_pre_open = False
+        _had_work_tables_pre_open = False
+        try:
+            _row = self._conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name IN ('messages', 'work_tasks')",
+            ).fetchall()
+            _names = {r[0] for r in _row}
+            _had_messages_table_pre_open = "messages" in _names
+            _had_work_tables_pre_open = "work_tasks" in _names
+        except Exception:  # noqa: BLE001 — diagnostic only
+            pass
         create_work_tables(self._conn)
+        # Emit AFTER stamping so ``tables_created`` reflects whether
+        # ``create_work_tables`` actually had work to do. Wrapped in a
+        # broad try/except so audit infra failure cannot block work-
+        # service init — matches the pattern used at the other audit
+        # callsites in this module.
+        try:
+            from pollypm.audit import emit as _audit_emit
+            from pollypm.audit.log import EVENT_WORK_DB_OPENED
+
+            # ``emit()`` skips the central tail when ``project`` is
+            # empty (no project file to address), so use a synthetic
+            # workspace-level key. Keeps these rows out of any real
+            # project's central file while still landing them on disk
+            # for ``pm doctor`` / heartbeat to grep.
+            _audit_emit(
+                event=EVENT_WORK_DB_OPENED,
+                project="_workspace",
+                subject=str(db_path),
+                actor="system",
+                metadata={
+                    "had_messages_table_pre_open": _had_messages_table_pre_open,
+                    "tables_created": not _had_work_tables_pre_open,
+                    "project_path": (
+                        str(project_path) if project_path is not None else None
+                    ),
+                },
+                project_path=project_path,
+            )
+        except Exception:  # noqa: BLE001 — audit must never break init
+            pass
         self._gate_registry = GateRegistry(project_path=project_path)
         self._flow_cache: dict[tuple[str, int], FlowTemplate] = {}
         self._work_output_cache: dict[str, dict[str, Any]] = {}

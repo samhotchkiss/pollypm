@@ -22,6 +22,7 @@ from pollypm.config import DEFAULT_CONFIG_PATH
 
 _RIGHT_PANE_BRIDGE_BYPASS_ESCAPE_TOKENS = frozenset({"<esc>", "esc", "escape"})
 _LIVE_RIGHT_PANE_INPUT_STICKY = "live_right_pane_input_sticky"
+_LIVE_CHAT_NETWORK_DEAD_PROMPT_ACTIVE = "live_chat_network_dead_prompt_active"
 _HELP_MODAL_BRIDGE_KIND = "help_modal_bridge_kind"
 _HELP_MODAL_SELECTED_KEY = "help_modal_selected_key"
 _HELP_MODAL_OPENED_AT = "help_modal_opened_at"
@@ -117,7 +118,7 @@ _RIGHT_PANE_TMUX_KEY_TOKENS: dict[str, str] = {
 }
 _LIVE_CHAT_NETWORK_DEAD_MESSAGE = (
     "PollyPM chat failed: network unreachable. "
-    "Input cleared; check connection and try again."
+    "Type again to clear this and retry; check connection."
 )
 
 
@@ -375,17 +376,46 @@ def _live_chat_submit_blocked_by_network_dead(
             run = getattr(tmux, "run", None)
             if callable(run):
                 run("send-keys", "-t", right_pane, "C-u", check=False)
-                run(
-                    "display-message",
-                    "-d",
-                    "5000",
-                    "-t",
+            send_keys = getattr(tmux, "send_keys", None)
+            if callable(send_keys):
+                send_keys(
                     right_pane,
                     _LIVE_CHAT_NETWORK_DEAD_MESSAGE,
-                    check=False,
+                    press_enter=False,
                 )
+                _set_live_chat_network_dead_prompt_active(router, True)
         return True
     return False
+
+
+def _set_live_chat_network_dead_prompt_active(router: object, active: bool) -> None:
+    try:
+        load_state = getattr(router, "_load_state")
+        write_state = getattr(router, "_write_state")
+        state = load_state()
+        if not isinstance(state, dict):
+            return
+        if active:
+            if state.get(_LIVE_CHAT_NETWORK_DEAD_PROMPT_ACTIVE) is True:
+                return
+            state[_LIVE_CHAT_NETWORK_DEAD_PROMPT_ACTIVE] = True
+        else:
+            if _LIVE_CHAT_NETWORK_DEAD_PROMPT_ACTIVE not in state:
+                return
+            state.pop(_LIVE_CHAT_NETWORK_DEAD_PROMPT_ACTIVE, None)
+        write_state(state)
+    except Exception:  # noqa: BLE001
+        return
+
+
+def _live_chat_network_dead_prompt_active(router: object) -> bool:
+    try:
+        state = getattr(router, "_load_state")()
+    except Exception:  # noqa: BLE001
+        return False
+    if not isinstance(state, dict):
+        return False
+    return state.get(_LIVE_CHAT_NETWORK_DEAD_PROMPT_ACTIVE) is True
 
 
 def _set_live_right_pane_input_sticky(router: object, active: bool) -> None:
@@ -446,6 +476,22 @@ def _sticky_live_right_pane_id(router: object) -> str | None:
     return right_pane_id
 
 
+def _clear_live_chat_network_dead_prompt(
+    router: object,
+    right_pane: str,
+    event: tuple[str, bool],
+) -> bool:
+    if not _live_chat_network_dead_prompt_active(router):
+        return False
+    tmux = getattr(router, "tmux", None)
+    run = getattr(tmux, "run", None) if tmux is not None else None
+    if callable(run):
+        run("send-keys", "-t", right_pane, "C-u", check=False)
+    _set_live_chat_network_dead_prompt_active(router, False)
+    value, literal = event
+    return not literal and value in {"Enter", "BSpace"}
+
+
 def _send_key_to_active_live_right_pane(config_path: Path, key: str) -> str | None:
     """Deliver ``key`` to the focused live right pane, if one owns focus."""
     try:
@@ -456,6 +502,10 @@ def _send_key_to_active_live_right_pane(config_path: Path, key: str) -> str | No
     except Exception:  # noqa: BLE001
         return None
     if key.strip().lower() in _RIGHT_PANE_BRIDGE_BYPASS_ESCAPE_TOKENS:
+        if right_pane is None:
+            right_pane = _sticky_live_right_pane_id(router)
+        if right_pane is not None:
+            _clear_live_chat_network_dead_prompt(router, right_pane, ("Escape", False))
         _set_live_right_pane_input_sticky(router, False)
         return None
     if right_pane is None:
@@ -470,6 +520,9 @@ def _send_key_to_active_live_right_pane(config_path: Path, key: str) -> str | No
     ):
         return right_pane
     value, literal = event
+    if _clear_live_chat_network_dead_prompt(router, right_pane, event):
+        _set_live_right_pane_input_sticky(router, True)
+        return right_pane
     if literal:
         router.tmux.send_keys(right_pane, value, press_enter=False)
     else:

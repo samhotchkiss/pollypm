@@ -726,9 +726,16 @@ def test_cockpit_send_key_enter_consumes_network_dead_for_live_right_pane(
     class FakeRouter:
         def __init__(self) -> None:
             self.tmux = FakeTmux()
+            self.state: dict[str, object] = {}
 
         def active_live_right_pane_id(self) -> str:
             return "%2"
+
+        def _load_state(self) -> dict[str, object]:
+            return dict(self.state)
+
+        def _write_state(self, state: dict[str, object]) -> None:
+            self.state = dict(state)
 
     router = FakeRouter()
     monkeypatch.setattr(cockpit_rail, "CockpitRouter", lambda _path: router)
@@ -744,17 +751,66 @@ def test_cockpit_send_key_enter_consumes_network_dead_for_live_right_pane(
     assert router.tmux.calls == [
         ("run", "send-keys", "-t", "%2", "C-u", {"check": False}),
         (
-            "run",
-            "display-message",
-            "-d",
-            "5000",
-            "-t",
+            "send_keys",
             "%2",
             "PollyPM chat failed: network unreachable. "
-            "Input cleared; check connection and try again.",
-            {"check": False},
+            "Type again to clear this and retry; check connection.",
+            False,
         ),
     ]
+    assert router.state["live_chat_network_dead_prompt_active"] is True
+
+
+def test_cockpit_send_key_after_network_dead_prompt_clears_before_typing(
+    valid_cockpit_config: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pollypm.cockpit_rail as cockpit_rail
+    from pollypm.cli_features import ui as ui_commands
+
+    class FakeTmux:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+
+        def run(self, *args: object, **kwargs: object) -> None:
+            self.calls.append(("run", *args, kwargs))
+
+        def send_keys(
+            self, target: str, text: str, *, press_enter: bool = True,
+        ) -> None:
+            self.calls.append(("send_keys", target, text, press_enter))
+
+    class FakeRouter:
+        def __init__(self) -> None:
+            self.tmux = FakeTmux()
+            self.state = {
+                "mounted_session": "operator",
+                "right_pane_id": "%2",
+                "live_right_pane_input_sticky": True,
+                "live_chat_network_dead_prompt_active": True,
+            }
+
+        def active_live_right_pane_id(self) -> str:
+            return "%2"
+
+        def _load_state(self) -> dict[str, object]:
+            return dict(self.state)
+
+        def _write_state(self, state: dict[str, object]) -> None:
+            self.state = dict(state)
+
+    router = FakeRouter()
+    monkeypatch.setattr(cockpit_rail, "CockpitRouter", lambda _path: router)
+
+    delivered = ui_commands._send_key_to_active_live_right_pane(
+        valid_cockpit_config, "h",
+    )
+
+    assert delivered == "%2"
+    assert router.tmux.calls == [
+        ("run", "send-keys", "-t", "%2", "C-u", {"check": False}),
+        ("send_keys", "%2", "h", False),
+    ]
+    assert "live_chat_network_dead_prompt_active" not in router.state
 
 
 def test_cockpit_send_key_keeps_live_right_pane_sticky_after_first_char(
@@ -843,6 +899,7 @@ def test_cockpit_send_key_escape_clears_live_right_pane_sticky(
                 "mounted_session": "architect_demo",
                 "right_pane_id": "%2",
                 "live_right_pane_input_sticky": True,
+                "live_chat_network_dead_prompt_active": True,
             }
 
         def active_live_right_pane_id(self) -> str | None:
@@ -861,6 +918,7 @@ def test_cockpit_send_key_escape_clears_live_right_pane_sticky(
         valid_cockpit_config, "<esc>",
     ) is None
     assert "live_right_pane_input_sticky" not in router.state
+    assert "live_chat_network_dead_prompt_active" not in router.state
 
 
 def test_send_key_to_first_live_skips_stale_sockets(fake_config: Path, tmp_path: Path) -> None:

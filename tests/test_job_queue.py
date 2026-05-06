@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,6 +15,28 @@ from pollypm.jobs import (
     JobStatus,
     exponential_backoff,
 )
+
+
+class _DedupeIntegrityOnRetryConnection:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self.fired = False
+
+    def execute(self, sql, *args, **kwargs):
+        normalized = " ".join(str(sql).split()).upper()
+        if (
+            not self.fired
+            and normalized.startswith("UPDATE WORK_JOBS")
+            and "SET STATUS = 'QUEUED'" in normalized
+        ):
+            self.fired = True
+            raise sqlite3.IntegrityError(
+                "UNIQUE constraint failed: work_jobs.dedupe_key"
+            )
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +186,31 @@ def test_late_retry_fail_does_not_resurrect_terminal_dedupe_row(
     assert new.status is JobStatus.QUEUED
 
 
+def test_retry_fail_converts_dedupe_integrity_error_to_failed_warning(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    q = JobQueue(db_path=tmp_path / "q.db")
+    jid = q.enqueue("sweep", dedupe_key="sweep:a")
+    (job,) = q.claim("w")
+    wrapper = _DedupeIntegrityOnRetryConnection(q._conn)
+    original_conn = q._conn
+
+    caplog.set_level("WARNING", logger="pollypm.jobs.queue")
+    q._conn = wrapper  # type: ignore[assignment]
+    try:
+        q.fail(job.id, "timeout", retry=True)
+    finally:
+        q._conn = original_conn
+
+    stored = q.get(jid)
+    assert wrapper.fired
+    assert stored is not None
+    assert stored.status is JobStatus.FAILED
+    assert q.get_last_error(jid) == "timeout"
+    assert "dedupe_key collision; marking failed instead" in caplog.text
+
+
 def test_recover_orphaned_claims_resets_status_and_frees_dedupe(
     tmp_path: Path,
 ) -> None:
@@ -267,7 +315,7 @@ def test_null_dedupe_key_does_not_deduplicate(tmp_path: Path) -> None:
 def test_run_after_hides_job_until_due(tmp_path: Path) -> None:
     q = JobQueue(db_path=tmp_path / "q.db")
     future = datetime.now(UTC) + timedelta(hours=1)
-    jid = q.enqueue("later", run_after=future)
+    q.enqueue("later", run_after=future)
 
     # Not yet visible.
     assert q.claim("w") == []

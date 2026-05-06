@@ -31,6 +31,11 @@ from pollypm.plugins_builtin.core_recurring.shared import (  # noqa: F401
     is_ephemeral_session_name,
     sweep_ephemeral_sessions,
 )
+from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+    AUDIT_WATCHDOG_HANDLER_NAME,
+    AUDIT_WATCHDOG_SCHEDULE,
+    audit_watchdog_handler,
+)
 from pollypm.plugins_builtin.core_recurring.blocked_chain import (
     blocked_chain_sweep_handler,
 )
@@ -141,6 +146,7 @@ _DEDUPED_CADENCE_HANDLERS: frozenset[str] = frozenset({
     "task_assignment.sweep",
     "itsalive.deploy_sweep",
     "blocked_chain.sweep",
+    "audit.watchdog",
 })
 _STALE_QUEUED_CUTOFF_SECONDS: float = 3600.0
 
@@ -443,6 +449,14 @@ def _register_handlers(api: JobHandlerAPI) -> None:
         "blocked_chain.sweep", blocked_chain_sweep_handler,
         max_attempts=1, timeout_seconds=120.0,
     )
+    # #savethenovel followup — audit-log watchdog. Reads the per-project
+    # / central audit-log tail and surfaces orphan markers, marker
+    # leaks, stuck drafts, and post-cancel planning stalls via the
+    # existing ``upsert_alert`` channel. Idempotent across ticks.
+    api.register_handler(
+        AUDIT_WATCHDOG_HANDLER_NAME, audit_watchdog_handler,
+        max_attempts=1, timeout_seconds=60.0,
+    )
 
 
 def _register_roster(api: RosterAPI) -> None:
@@ -514,6 +528,14 @@ def _register_roster(api: RosterAPI) -> None:
         "@every 10m", "blocked_chain.sweep", {},
         dedupe_key="blocked_chain.sweep",
     )
+    # #savethenovel followup — audit-log watchdog. Cadence matches
+    # ``alerts.gc`` / ``stuck_claims.sweep`` (5 min) so a savethenovel-
+    # class symptom (orphan marker, stuck draft, cancel-stall) lands
+    # in ``pm alerts`` within ~5 min of occurrence.
+    api.register_recurring(
+        AUDIT_WATCHDOG_SCHEDULE, AUDIT_WATCHDOG_HANDLER_NAME, {},
+        dedupe_key=AUDIT_WATCHDOG_HANDLER_NAME,
+    )
 
 
 plugin = PollyPMPlugin(
@@ -543,6 +565,7 @@ plugin = PollyPMPlugin(
         Capability(kind="job_handler", name="worktree.state_audit"),
         Capability(kind="job_handler", name="stuck_claims.sweep"),
         Capability(kind="job_handler", name="blocked_chain.sweep"),
+        Capability(kind="job_handler", name="audit.watchdog"),
         Capability(kind="roster_entry", name="core_recurring"),
     ),
     register_handlers=_register_handlers,

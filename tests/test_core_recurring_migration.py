@@ -56,6 +56,9 @@ class TestCoreRecurringPlugin:
             "stuck_claims.sweep",
             # #1073 — auto-escalate blocked-chain dead ends.
             "blocked_chain.sweep",
+            # #savethenovel followup — audit-log watchdog (orphan
+            # markers, stuck drafts, cancellation gaps).
+            "audit.watchdog",
         }
         assert expected.issubset(set(registry.names()))
         # inbox.sweep was retired with the legacy inbox subsystem (iv04).
@@ -96,6 +99,8 @@ class TestCoreRecurringPlugin:
             "stuck_claims.sweep",
             # #1073 — blocked-chain dead-end escalation, @every 10m.
             "blocked_chain.sweep",
+            # #savethenovel followup — audit-log watchdog, @every 5m.
+            "audit.watchdog",
         }
 
         # Cadences per issue #164 / #249.
@@ -138,6 +143,8 @@ class TestCoreRecurringPlugin:
         assert _interval_seconds(entries["stuck_claims.sweep"]) == 300
         # #1073 — blocked-chain escalation sweep, @every 10m.
         assert _interval_seconds(entries["blocked_chain.sweep"]) == 600
+        # #savethenovel followup — audit-log watchdog, @every 5m.
+        assert _interval_seconds(entries["audit.watchdog"]) == 300
 
     def test_plugin_declares_expected_capabilities(self) -> None:
         kinds = {cap.kind for cap in core_plugin.capabilities}

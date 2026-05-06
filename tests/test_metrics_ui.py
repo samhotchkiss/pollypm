@@ -177,6 +177,41 @@ def test_compact_viewport_renders_section_labels(metrics_env, metrics_app) -> No
     _run(body())
 
 
+def test_mount_paints_shell_before_slow_metrics_gather(metrics_env) -> None:
+    """The Metrics pane should not stay blank while live gather is slow."""
+    async def body() -> None:
+        from threading import Event
+
+        from pollypm.cockpit_smoke import SmokeHarness
+        from pollypm.cockpit_ui import PollyMetricsApp
+
+        release_gather = Event()
+        metrics_app = PollyMetricsApp(metrics_env["config_path"])
+
+        def _slow_gather():
+            release_gather.wait(timeout=2.0)
+            return _make_snapshot()
+
+        metrics_app._gather = _slow_gather  # type: ignore[method-assign]
+        async with SmokeHarness.mount(metrics_app, size=(189, 80)) as smoke:
+            capture = smoke.snapshot()
+            text = capture.rendered_text
+            assert sum(1 for line in capture.visible_lines if line.strip()) > 0
+            assert "Metrics" in text
+            assert "Fleet" in text
+            assert "no snapshot" in text
+
+            release_gather.set()
+            for _ in range(20):
+                await asyncio.sleep(0.05)
+                if "Workers:" in smoke.snapshot().rendered_text:
+                    break
+            else:
+                pytest.fail("metrics gather did not repaint populated rows")
+
+    _run(body())
+
+
 # ---------------------------------------------------------------------------
 # 2. Fleet counts line up with synthetic task/worker data
 # ---------------------------------------------------------------------------

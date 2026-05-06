@@ -1,5 +1,6 @@
 import builtins
 import os
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -16,6 +17,63 @@ def _router(tmp_path: Path) -> CockpitRouter:
         f"base_dir = \"{tmp_path / '.pollypm'}\"\n"
     )
     return CockpitRouter(config_path)
+
+
+def _seed_fast_preview_message_db(root: Path) -> Path:
+    db = root / ".pollypm" / "state.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope TEXT NOT NULL,
+                type TEXT NOT NULL,
+                tier TEXT NOT NULL,
+                recipient TEXT NOT NULL,
+                sender TEXT NOT NULL,
+                state TEXT NOT NULL,
+                parent_id INTEGER,
+                subject TEXT NOT NULL,
+                body TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                labels TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                closed_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO messages (
+                scope, type, tier, recipient, sender, state, parent_id,
+                subject, body, payload_json, labels, created_at, updated_at,
+                closed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "inbox",
+                "notify",
+                "immediate",
+                "user",
+                "polly",
+                "open",
+                None,
+                "[Action] Need your call on launch scope",
+                "Please decide before I continue.",
+                "{}",
+                "[]",
+                "2026-05-06T05:00:00+00:00",
+                "2026-05-06T05:00:00+00:00",
+                None,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return db
 
 
 def test_right_pane_command_skips_uv_run_startup(tmp_path: Path) -> None:
@@ -274,7 +332,7 @@ def test_package_main_fast_dispatches_inbox_pane(
 
     assert handled is True
     assert first_package_import
-    assert first_package_import[0][0] == "pollypm.cockpit_inbox_items"
+    assert first_package_import[0][0] == "pollypm.storage.inbox_action_preview"
     pre_import_output = first_package_import[0][1]
     assert "Inbox" in pre_import_output
     assert "Loading messages..." in pre_import_output
@@ -330,3 +388,42 @@ def test_package_main_prepaints_action_preview_without_full_inbox_load(
     assert "action needed" in out
     assert "Plan ready for review" in out
     assert "1 needs action" in out
+
+
+def test_package_main_fast_message_prepaint_skips_full_inbox_import(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """#1318: Store-backed action rows should paint before full inbox imports."""
+
+    from pollypm import __main__ as package_main
+
+    _seed_fast_preview_message_db(tmp_path)
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        "[project]\n"
+        f"workspace_root = \"{tmp_path}\"\n"
+    )
+    original_import = builtins.__import__
+
+    def fail_full_inbox_import(
+        name: str,
+        globals: dict[str, Any] | None = None,
+        locals: dict[str, Any] | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> Any:
+        if level == 0 and name == "pollypm.cockpit_inbox_items":
+            raise AssertionError("fast Store preview should avoid full inbox import")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fail_full_inbox_import)
+
+    error = package_main._paint_inbox_snapshot(config_path, project=None)
+
+    out = capsys.readouterr().out
+    assert error is None
+    assert "Inbox" in out
+    assert "action needed" in out
+    assert "Need your call on launch scope" in out

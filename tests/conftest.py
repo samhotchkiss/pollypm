@@ -35,6 +35,21 @@ def pytest_configure(config):  # noqa: ARG001
             / "errors.log"
         ),
     )
+    # ``pollypm.audit.log`` writes JSONL tails under ``~/.pollypm/audit/``
+    # by default. Without this redirect every test that triggers a task
+    # lifecycle event (worker register, marker reap, work-service hooks)
+    # leaks audit rows into the dev machine's real audit dir. Mirror the
+    # error-log pattern above and point at a pytest-tmp dir so the user's
+    # real audit history stays clean. Tests that exercise the audit-log
+    # itself (see ``tests/test_audit_log.py``) override via monkeypatch.
+    os.environ.setdefault(
+        "POLLYPM_AUDIT_HOME",
+        str(
+            Path(tempfile.gettempdir())
+            / f"pollypm-pytest-{os.getpid()}"
+            / "audit"
+        ),
+    )
     # Tests build their config in pytest tmp dirs but ``state_db``
     # defaults to ``~/.pollypm/state.db`` on the dev machine — which
     # may legitimately have pending migrations. Skip the refuse-start

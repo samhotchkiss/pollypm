@@ -641,10 +641,45 @@ class SessionManager:
             marker_dir = self._project_path / ".pollypm" / "worker-markers"
             marker_dir.mkdir(parents=True, exist_ok=True)
             marker_path = marker_dir / f"{window_name}.fresh"
+            marker_create_status = "ok"
+            marker_create_error: str | None = None
             try:
                 marker_path.write_text(_now())
-            except OSError:
+            except OSError as marker_exc:
                 logger.warning("Could not write fresh_launch_marker for %s", window_name)
+                marker_create_status = "error"
+                marker_create_error = str(marker_exc)
+            # Audit hook (#savethenovel) — markers are the spine of the
+            # cockpit's worker affordance; an orphan marker without a
+            # matching ``work_tasks`` row is exactly the symptom we
+            # need to detect post-wipe. Emit both the success and the
+            # failure path so a leaked-marker condition is visible.
+            try:
+                from pollypm.audit import emit as _audit_emit
+                from pollypm.audit.log import (
+                    EVENT_MARKER_CREATED,
+                    EVENT_MARKER_CREATE_FAILED,
+                )
+
+                _audit_emit(
+                    event=(
+                        EVENT_MARKER_CREATED
+                        if marker_create_status == "ok"
+                        else EVENT_MARKER_CREATE_FAILED
+                    ),
+                    project=project,
+                    subject=str(marker_path),
+                    actor=agent_name or "system",
+                    status=marker_create_status,
+                    metadata={
+                        "window_name": window_name,
+                        "marker_kind": "fresh",
+                        "error": marker_create_error,
+                    },
+                    project_path=self._project_path,
+                )
+            except Exception:  # noqa: BLE001 — audit must never block launch
+                pass
             fresh_launch_marker = fresh_launch_marker or marker_path
 
             handle = self._session_service.create(

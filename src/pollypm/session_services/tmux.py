@@ -31,6 +31,65 @@ _STORAGE_CLOSET_SUFFIX = "-storage-closet"
 _CONSOLE_WINDOW = "PollyPM"
 
 
+def _project_key_from_marker_path(marker_path: Path) -> tuple[str, Path | None]:
+    """Best-effort derivation of (project_key, project_path) from a
+    worker-marker path.
+
+    Worker markers live at ``<project_root>/.pollypm/worker-markers/<window>.fresh``
+    so two ``parents`` levels up is the project's ``.pollypm`` dir
+    and three levels up is the project root. We use the directory
+    name of the project root as the project key — for the post-mortem
+    use case this is "good enough"; the audit log doesn't need to
+    be authoritative about config keys, just consistent with the
+    rest of the project's audit lines.
+    """
+    try:
+        # marker_path = <root>/.pollypm/worker-markers/<window>.fresh
+        worker_markers_dir = marker_path.parent
+        pollypm_dir = worker_markers_dir.parent
+        project_root = pollypm_dir.parent
+        return project_root.name, project_root
+    except Exception:  # noqa: BLE001
+        return "", None
+
+
+def _emit_marker_audit(
+    event: str,
+    marker_path: Path,
+    *,
+    window_name: str,
+    session_role: str | None,
+    error: str | None = None,
+    status: str = "ok",
+) -> None:
+    """Best-effort audit emit from inside the tmux session-service.
+
+    Centralises the project-key derivation + try/except wrapper so
+    each callsite stays a one-liner. The session-service has no
+    direct ``project`` parameter, so we derive it from the marker
+    path layout — see :func:`_project_key_from_marker_path`.
+    """
+    try:
+        from pollypm.audit import emit as _audit_emit
+
+        project_key, project_path = _project_key_from_marker_path(marker_path)
+        _audit_emit(
+            event=event,
+            project=project_key,
+            subject=str(marker_path),
+            actor=session_role or "session_service",
+            status=status,
+            metadata={
+                "window_name": window_name,
+                "session_role": session_role,
+                "error": error,
+            },
+            project_path=project_path,
+        )
+    except Exception:  # noqa: BLE001 — audit must never block tmux ops
+        pass
+
+
 def _pane_already_bootstrapped_as_other_role(
     tmux: TmuxClient, role: str | None, target: str,
 ) -> bool:
@@ -335,6 +394,17 @@ class TmuxSessionService:
                                 name, wname, fresh_launch_marker,
                             )
                             kickoff = None
+                            # Audit hook (#savethenovel) — record the
+                            # leak so the heartbeat can detect a marker
+                            # that was created but never consumed.
+                            _emit_marker_audit(
+                                "marker.leaked",
+                                fresh_launch_marker,
+                                window_name=wname,
+                                session_role=session_role,
+                                error=str(exc),
+                                status="warn",
+                            )
                         else:
                             raise
                     if kickoff is not None:
@@ -342,6 +412,17 @@ class TmuxSessionService:
                         self.tmux.send_keys(target, kickoff)
                         self._verify_input_submitted(target, kickoff, provider)
                         fresh_launch_marker.unlink(missing_ok=True)
+                        # Audit hook (#savethenovel) — successful
+                        # consumption of a fresh marker. Pairs with
+                        # ``marker.created`` from the work-service so
+                        # a forensic reader can confirm the launch
+                        # actually completed.
+                        _emit_marker_audit(
+                            "marker.released",
+                            fresh_launch_marker,
+                            window_name=wname,
+                            session_role=session_role,
+                        )
                 else:
                     # #1338 — identity-stacking guards refused the
                     # send. Marker is left in place (matches the

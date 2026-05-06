@@ -11,6 +11,7 @@ Contract:
 from __future__ import annotations
 
 import logging
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +22,41 @@ from pollypm.config import DEFAULT_CONFIG_PATH
 
 _RIGHT_PANE_BRIDGE_BYPASS_ESCAPE_TOKENS = frozenset({"<esc>", "esc", "escape"})
 _LIVE_RIGHT_PANE_INPUT_STICKY = "live_right_pane_input_sticky"
+_HELP_MODAL_BRIDGE_KIND = "help_modal_bridge_kind"
+_HELP_MODAL_SELECTED_KEY = "help_modal_selected_key"
+_HELP_MODAL_OPENED_AT = "help_modal_opened_at"
+_HELP_MODAL_TTL_SECONDS = 300.0
 _HELP_KEY_TOKENS = frozenset({"?", "question_mark"})
+_HELP_MODAL_DISMISS_TOKENS = frozenset({
+    "?",
+    "question_mark",
+    "q",
+    "<esc>",
+    "esc",
+    "escape",
+})
+_HELP_MODAL_CONTROL_TOKENS = frozenset({
+    *_HELP_MODAL_DISMISS_TOKENS,
+    "j",
+    "k",
+    "f",
+    "b",
+    "g",
+    "down",
+    "<down>",
+    "up",
+    "<up>",
+    "pagedown",
+    "<pgdn>",
+    "pageup",
+    "<pgup>",
+    "space",
+    "<space>",
+    "home",
+    "<home>",
+    "end",
+    "<end>",
+})
 _HELP_CONTENT_BRIDGE_FALLBACK_KINDS = ("dashboard", "pane-inbox", "settings")
 # Keep row-navigation keys on the cockpit bridge. PollyCockpitApp still
 # forwards them to the Inbox pane when the Inbox surface is active (#1238),
@@ -87,6 +122,17 @@ def _is_help_key(key: str) -> bool:
     return key.strip().lower() in _HELP_KEY_TOKENS
 
 
+def _is_help_modal_control_key(key: str) -> bool:
+    token = key.strip()
+    if token == "G":
+        return True
+    return token.lower() in _HELP_MODAL_CONTROL_TOKENS
+
+
+def _is_help_modal_dismiss_key(key: str) -> bool:
+    return key.strip().lower() in _HELP_MODAL_DISMISS_TOKENS
+
+
 def _content_bridge_kind_for_selected_key(selected_key: str) -> str | None:
     """Return the right-pane bridge kind for selected static cockpit views."""
     if selected_key in {"dashboard", "polly"}:
@@ -96,6 +142,102 @@ def _content_bridge_kind_for_selected_key(selected_key: str) -> str | None:
     if selected_key == "settings":
         return "settings"
     return None
+
+
+def _remember_help_modal_bridge(
+    config_path: Path,
+    *,
+    kind: str,
+    selected_key: str,
+) -> None:
+    try:
+        from pollypm.cockpit_rail import CockpitRouter
+
+        router = CockpitRouter(config_path)
+        state = router._load_state()
+        if not isinstance(state, dict):
+            return
+        state[_HELP_MODAL_BRIDGE_KIND] = kind
+        state[_HELP_MODAL_SELECTED_KEY] = selected_key
+        state[_HELP_MODAL_OPENED_AT] = time.time()
+        router._write_state(state)
+    except Exception:  # noqa: BLE001
+        return
+
+
+def _clear_help_modal_bridge(config_path: Path) -> None:
+    try:
+        from pollypm.cockpit_rail import CockpitRouter
+
+        router = CockpitRouter(config_path)
+        state = router._load_state()
+        if not isinstance(state, dict):
+            return
+        changed = False
+        for key in (
+            _HELP_MODAL_BRIDGE_KIND,
+            _HELP_MODAL_SELECTED_KEY,
+            _HELP_MODAL_OPENED_AT,
+        ):
+            if key in state:
+                state.pop(key, None)
+                changed = True
+        if changed:
+            router._write_state(state)
+    except Exception:  # noqa: BLE001
+        return
+
+
+def _recorded_help_modal_bridge(config_path: Path) -> str | None:
+    try:
+        from pollypm.cockpit_rail import CockpitRouter
+
+        router = CockpitRouter(config_path)
+        state = router._load_state()
+        if not isinstance(state, dict):
+            return None
+        kind = state.get(_HELP_MODAL_BRIDGE_KIND)
+        selected = state.get(_HELP_MODAL_SELECTED_KEY)
+        opened_at = state.get(_HELP_MODAL_OPENED_AT)
+        current_selected = router.selected_key()
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(kind, str) or not kind:
+        return None
+    if not isinstance(selected, str) or selected != current_selected:
+        _clear_help_modal_bridge(config_path)
+        return None
+    if not isinstance(opened_at, int | float):
+        _clear_help_modal_bridge(config_path)
+        return None
+    if time.time() - float(opened_at) > _HELP_MODAL_TTL_SECONDS:
+        _clear_help_modal_bridge(config_path)
+        return None
+    return kind
+
+
+def _send_help_modal_key_to_recorded_bridge(
+    config_path: Path,
+    key: str,
+) -> Path | None:
+    """Continue routing help-modal keys to the bridge that opened help."""
+    if not _is_help_modal_control_key(key):
+        return None
+    kind = _recorded_help_modal_bridge(config_path)
+    if kind is None:
+        return None
+    try:
+        from pollypm.cockpit_input_bridge import send_key_to_first_live
+
+        delivered = send_key_to_first_live(config_path, key, kind=kind, timeout=0.2)
+    except Exception:  # noqa: BLE001
+        delivered = None
+    if delivered is None:
+        _clear_help_modal_bridge(config_path)
+        return None
+    if _is_help_modal_dismiss_key(key):
+        _clear_help_modal_bridge(config_path)
+    return delivered
 
 
 def _send_help_key_to_content_bridge(config_path: Path, key: str) -> Path | None:
@@ -133,6 +275,11 @@ def _send_help_key_to_content_bridge(config_path: Path, key: str) -> Path | None
         except Exception:  # noqa: BLE001
             delivered = None
         if delivered is not None:
+            _remember_help_modal_bridge(
+                config_path,
+                kind=candidate,
+                selected_key=selected,
+            )
             return delivered
     return None
 
@@ -583,6 +730,12 @@ def register_ui_commands(app: typer.Typer) -> None:
         from pollypm.cockpit_input_bridge import send_key_to_first_live
 
         if kind == "cockpit":
+            delivered_to_content = _send_help_modal_key_to_recorded_bridge(
+                config_path, key,
+            )
+            if delivered_to_content is not None:
+                typer.echo(f"Delivered {key!r} via {delivered_to_content}")
+                return
             delivered_to_content = _send_selected_action_key_to_content_bridge(
                 config_path, key,
             )

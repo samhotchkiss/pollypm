@@ -777,6 +777,7 @@ def _screen_title_for_help(app: App) -> str:
     cls_name = type(app).__name__
     mapping = {
         "PollyCockpitApp": "Cockpit",
+        "PollyDashboardApp": "Home",
         "PollyInboxApp": "Inbox",
         "PollyProjectDashboardApp": "Project dashboard",
         "PollyWorkerRosterApp": "Workers",

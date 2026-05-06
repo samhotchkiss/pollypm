@@ -2611,7 +2611,10 @@ class PollyCockpitApp(App[None]):
         self._schedule_route_selected("settings", label="Settings")
 
     def action_open_inbox(self) -> None:
-        self._set_inbox_pane_nav_active(True)
+        # #1272: capital-I opens the Inbox content while keeping the rail
+        # cursor in charge of j/k/arrows. If the user later focuses the
+        # right pane directly, the Inbox app still owns its own keys.
+        self._set_inbox_pane_nav_active(False)
         self._schedule_route_selected("inbox", label="Inbox")
 
     def action_open_activity(self) -> None:

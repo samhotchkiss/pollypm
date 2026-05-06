@@ -96,6 +96,14 @@ def _run(coro) -> None:
     asyncio.run(coro)
 
 
+async def _wait_for_dashboard_data(app, pilot, *, timeout: float = 3.0) -> None:
+    """Wait for the off-thread first dashboard refresh to publish data."""
+    deadline = time.monotonic() + timeout
+    while app.data is None and time.monotonic() < deadline:
+        await pilot.pause(0.05)
+    assert app.data is not None
+
+
 def _write_plan(project_path: Path, body: str) -> Path:
     plan_path = project_path / "docs" / "plan" / "plan.md"
     plan_path.parent.mkdir(parents=True, exist_ok=True)
@@ -127,8 +135,7 @@ def test_plan_renders_markdown_body_inline(env, app) -> None:
             "Then the other thing.\n",
         )
         async with app.run_test(size=(160, 60)) as pilot:
-            await pilot.pause()
-            assert app.data is not None
+            await _wait_for_dashboard_data(app, pilot)
             # Plan text loaded into the snapshot.
             assert app.data.plan_text is not None
             assert "Do the **important** thing" in app.data.plan_text
@@ -157,7 +164,7 @@ def test_large_plan_uses_preview_until_plan_focus(env, app) -> None:
         _write_plan(env["project_path"], "\n".join(lines))
 
         async with app.run_test(size=(160, 60)) as pilot:
-            await pilot.pause()
+            await _wait_for_dashboard_data(app, pilot)
             preview = str(app.plan_content.render())
             assert "ordinary plan line 0" in preview
             assert (
@@ -186,8 +193,7 @@ def test_plan_content_empty_when_no_file(env, app) -> None:
     """With no plan.md on disk the plan-content widget stays blank."""
     async def body() -> None:
         async with app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
-            assert app.data is not None
+            await _wait_for_dashboard_data(app, pilot)
             assert app.data.plan_path is None
             assert app.data.plan_text is None
             # Content widget renders nothing extra (empty-state lives
@@ -222,8 +228,7 @@ def test_toc_lists_h2_headers(env, app) -> None:
             "# Plan\n\n## Alpha\n\n## Beta\n\n### Not a TOC entry\n\n## Gamma\n",
         )
         async with app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
-            assert app.data is not None
+            await _wait_for_dashboard_data(app, pilot)
             assert app.data.plan_sections == ["Alpha", "Beta", "Gamma"]
             rendered = str(app.plan_body.render())
             assert "Alpha" in rendered
@@ -252,8 +257,7 @@ def test_aux_files_listed_in_plan_body(env, app) -> None:
         (milestones / "m2.md").write_text("m2")
 
         async with app.run_test(size=(160, 60)) as pilot:
-            await pilot.pause()
-            assert app.data is not None
+            await _wait_for_dashboard_data(app, pilot)
             aux_names = [p.name for p in app.data.plan_aux_files]
             assert "architecture.md" in aux_names
             assert "risks.md" in aux_names
@@ -288,8 +292,7 @@ def test_staleness_from_backlog_timestamp(env, app, monkeypatch) -> None:
         _cockpit_ui._PROJECT_DASHBOARD_TASK_CACHE.clear()
 
         async with app.run_test(size=(160, 60)) as pilot:
-            await pilot.pause()
-            assert app.data is not None
+            await _wait_for_dashboard_data(app, pilot)
             assert app.data.plan_stale_reason is not None
             rendered = str(app.plan_stale.render())
             assert "stale" in rendered.lower()
@@ -313,8 +316,7 @@ def test_staleness_from_mtime(env, app) -> None:
         _cockpit_ui._PROJECT_DASHBOARD_TASK_CACHE.clear()
 
         async with app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
-            assert app.data is not None
+            await _wait_for_dashboard_data(app, pilot)
             assert app.data.plan_stale_reason is not None
             rendered = str(app.plan_stale.render())
             assert "stale" in rendered.lower()
@@ -326,8 +328,7 @@ def test_no_staleness_when_fresh(env, app) -> None:
     async def body() -> None:
         _write_plan(env["project_path"], "# Plan\n\n## One\n")
         async with app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
-            assert app.data is not None
+            await _wait_for_dashboard_data(app, pilot)
             assert app.data.plan_stale_reason is None
             assert str(app.plan_stale.render()).strip() == ""
     _run(body())
@@ -361,8 +362,7 @@ def test_v_opens_explainer_when_present(env, app, monkeypatch) -> None:
         )
 
         async with app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
-            assert app.data is not None
+            await _wait_for_dashboard_data(app, pilot)
             assert app.data.plan_explainer == explainer
             await pilot.press("v")
             await pilot.pause()
@@ -392,8 +392,7 @@ def test_v_noop_when_explainer_absent(env, app, monkeypatch) -> None:
         )
 
         async with app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
-            assert app.data is not None
+            await _wait_for_dashboard_data(app, pilot)
             assert app.data.plan_explainer is None
             await pilot.press("v")
             await pilot.pause()
@@ -411,7 +410,7 @@ def test_p_toggles_plan_view_mode(env, app) -> None:
     async def body() -> None:
         _write_plan(env["project_path"], "# Plan\n\n## One\n")
         async with app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
+            await _wait_for_dashboard_data(app, pilot)
             # Start: not in plan view.
             assert app._plan_view_mode is False
             await pilot.press("p")
@@ -452,7 +451,7 @@ def test_o_opens_plan_in_editor(env, app, monkeypatch) -> None:
         )
 
         async with app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
+            await _wait_for_dashboard_data(app, pilot)
             await pilot.press("o")
             await pilot.pause()
             assert opened, "expected _open_external to be called for plan.md"

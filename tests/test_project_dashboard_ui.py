@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -635,6 +636,14 @@ def _run(coro) -> None:
     asyncio.run(coro)
 
 
+async def _wait_for_dashboard_data(app, pilot, *, timeout: float = 3.0) -> None:
+    """Wait for the off-thread first dashboard refresh to publish data."""
+    deadline = time.monotonic() + timeout
+    while app.data is None and time.monotonic() < deadline:
+        await pilot.pause(0.05)
+    assert app.data is not None
+
+
 # ---------------------------------------------------------------------------
 # 1. Top bar — project name + PM persona
 # ---------------------------------------------------------------------------
@@ -644,7 +653,7 @@ def test_topbar_renders_name_and_default_pm(dashboard_env, dashboard_app) -> Non
     """With no persona configured the top bar uses a neutral PM label."""
     async def body() -> None:
         async with dashboard_app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
+            await _wait_for_dashboard_data(dashboard_app, pilot)
             topbar_text = str(dashboard_app.topbar.render())
             assert "Demo" in topbar_text
             assert "PM: Project PM" in topbar_text
@@ -668,7 +677,7 @@ def test_topbar_uses_configured_persona(tmp_path: Path) -> None:
         from pollypm.cockpit_ui import PollyProjectDashboardApp
         app = PollyProjectDashboardApp(config_path, "demo")
         async with app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
+            await _wait_for_dashboard_data(app, pilot)
             topbar_text = str(app.topbar.render())
             assert "PM: Ruby" in topbar_text
     _run(body())
@@ -747,8 +756,7 @@ def test_status_green_when_worker_heartbeat_alive(
         )
 
         async with dashboard_app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
-            assert dashboard_app.data is not None
+            await _wait_for_dashboard_data(dashboard_app, pilot)
             assert dashboard_app.data.active_worker == fake_worker
             assert dashboard_app.data.status_label == "active"
             # Green color in the markup.
@@ -786,8 +794,7 @@ def test_status_yellow_when_inbox_has_items(
         _cockpit_ui._PROJECT_DASHBOARD_TASK_CACHE.clear()
 
         async with dashboard_app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
-            assert dashboard_app.data is not None
+            await _wait_for_dashboard_data(dashboard_app, pilot)
             assert dashboard_app.data.inbox_count >= 1
             # No worker in flight → yellow ("needs attention").
             assert dashboard_app.data.active_worker is None
@@ -807,8 +814,7 @@ def test_status_idle_when_nothing_active(
     """
     async def body() -> None:
         async with dashboard_app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
-            assert dashboard_app.data is not None
+            await _wait_for_dashboard_data(dashboard_app, pilot)
             # Only non-inbox tasks were seeded; inbox should be zero.
             assert dashboard_app.data.inbox_count == 0
             assert dashboard_app.data.active_worker is None
@@ -895,8 +901,7 @@ def test_status_yellow_when_task_is_on_hold(
 
     async def body() -> None:
         async with dashboard_app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
-            assert dashboard_app.data is not None
+            await _wait_for_dashboard_data(dashboard_app, pilot)
             assert dashboard_app.data.status_label == "needs attention"
             # Banner promotes on_hold to the lead — "Paused: 1 task is
             # on hold" — so the user sees the user-attention need
@@ -937,8 +942,7 @@ def test_status_yellow_when_workspace_action_message_exists(
 
     async def body() -> None:
         async with dashboard_app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
-            assert dashboard_app.data is not None
+            await _wait_for_dashboard_data(dashboard_app, pilot)
             assert dashboard_app.data.inbox_count >= 1
             assert dashboard_app.data.action_items
             assert dashboard_app.data.status_label == "needs attention"
@@ -990,7 +994,7 @@ def test_project_overview_sections_are_clickable(
         plan_path.write_text("# Plan\n\n## Next\n")
 
         async with dashboard_app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
+            await _wait_for_dashboard_data(dashboard_app, pilot)
 
             class _Click:
                 def stop(self) -> None:

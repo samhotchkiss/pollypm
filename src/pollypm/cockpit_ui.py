@@ -11316,10 +11316,6 @@ def _dashboard_active_worker(
     except Exception:  # noqa: BLE001
         return None, 0
     try:
-        try:
-            launches = list(supervisor.plan_launches())
-        except Exception:  # noqa: BLE001
-            launches = []
         # Skip control-plane roles (operator-pm, reviewer,
         # heartbeat-supervisor, triage) — they're system-wide
         # processes, not real work on this project. Counting them
@@ -11339,11 +11335,31 @@ def _dashboard_active_worker(
         except Exception:  # noqa: BLE001
             _config = None
         _alias_set = set(_project_storage_aliases(_config, project_key))
-        project_sessions = [
-            launch.session for launch in launches
-            if getattr(launch.session, "project", None) in _alias_set
-            and getattr(launch.session, "role", "") not in _CONTROL_ROLES
-        ]
+        # #1290 — enumerate session candidates directly from config
+        # instead of calling ``supervisor.plan_launches()``. The full
+        # launch plan resolves provider profiles, scans the rules
+        # catalog, writes session manifests, and builds wrapped tmux
+        # commands — none of which the dashboard reads. cProfile on
+        # the pollypm drilldown showed ``plan_launches`` consumed
+        # ~380ms of the 510ms ``_dashboard_active_worker`` budget, all
+        # to populate fields we discard. We only need ``name``,
+        # ``role``, ``project``, and ``enabled`` — every one is a
+        # plain attribute on ``SessionConfig`` that ``effective_session``
+        # never modifies for the routing path. Per-session account
+        # overrides reshape provider/account, but the dashboard's
+        # downstream callers (heartbeat lookup, alert filter, activity
+        # classifier) key off the session ``name`` only, so the
+        # untransformed config session is sufficient.
+        project_sessions: list = []
+        if _config is not None:
+            for session in (_config.sessions or {}).values():
+                if not getattr(session, "enabled", True):
+                    continue
+                if getattr(session, "project", None) not in _alias_set:
+                    continue
+                if getattr(session, "role", "") in _CONTROL_ROLES:
+                    continue
+                project_sessions.append(session)
         # Resolve the project's on-disk path so the activity classifier
         # can open its work-service DB and check task ownership. The
         # config form keyed by ``project_key`` is canonical; aliases

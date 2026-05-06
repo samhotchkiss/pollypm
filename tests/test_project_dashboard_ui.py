@@ -4548,3 +4548,95 @@ def test_inbox_section_hides_action_groups_when_no_action_items(
                 assert "-hidden" in group.classes
 
     _run(body())
+
+
+def test_gather_project_dashboard_completes_under_budget(
+    dashboard_env, monkeypatch,
+) -> None:
+    """Cold ``_gather_project_dashboard`` must finish under 500ms (#1290).
+
+    Regression for #1290: the cockpit drilldown felt sluggish (3.6–8.0s)
+    because ``_dashboard_active_worker`` called
+    ``supervisor.plan_launches()``, which resolves provider profiles,
+    scans the rules catalog, and writes session manifests for every
+    enabled session — all to surface the worker name + role on the
+    drilldown banner. Profiling pinned ~380ms of the 510ms budget on
+    that one call. Now we enumerate ``config.sessions`` directly and
+    skip the launch-plan pipeline entirely.
+
+    The fixture is intentionally scaled: 30 dummy sessions are written
+    to the config so the *old* code path would have done 30x the
+    profile / catalog work. The new path skips that pipeline so the
+    session count barely moves the needle. Threshold is 500ms — well
+    under the 1000ms acceptance bar — so a regression that re-introduces
+    plan_launches-style work shows up clearly.
+    """
+    import time as _time
+
+    from pollypm.cockpit_ui import _gather_project_dashboard
+
+    # Re-write the config with many enabled sessions on the project so
+    # the worker-enumeration path has real work to do.
+    project_path = dashboard_env["project_path"]
+    config_path = dashboard_env["config_path"]
+    sessions_block = "\n".join(
+        f"[sessions.session_{i}]\n"
+        f'role = "worker"\n'
+        f'project = "demo"\n'
+        f'provider = "claude"\n'
+        f'account = "primary"\n'
+        f'cwd = "{project_path}"\n'
+        f"enabled = true\n"
+        for i in range(30)
+    )
+    config_path.write_text(
+        "[project]\n"
+        f'tmux_session = "pollypm-test"\n'
+        f'workspace_root = "{project_path.parent}"\n'
+        "\n"
+        "[accounts.primary]\n"
+        'provider = "claude"\n'
+        "\n"
+        f'[projects.demo]\n'
+        f'key = "demo"\n'
+        f'name = "Demo"\n'
+        f'path = "{project_path}"\n'
+        "\n"
+        f"{sessions_block}"
+    )
+
+    # Drop every dashboard cache so the call exercises the cold path.
+    from pollypm import cockpit_ui as _cockpit_ui
+    for cache_name in (
+        "_PROJECT_DASHBOARD_TASK_CACHE",
+        "_DASHBOARD_INBOX_CACHE",
+        "_DASHBOARD_ACTIVITY_CACHE",
+        "_PLAN_STALENESS_CACHE",
+    ):
+        cache = getattr(_cockpit_ui, cache_name, None)
+        if isinstance(cache, dict):
+            cache.clear()
+
+    # Warm every module that the function imports lazily so the timed
+    # call measures *work*, not first-import overhead.
+    _gather_project_dashboard(config_path, "demo")
+    for cache_name in (
+        "_PROJECT_DASHBOARD_TASK_CACHE",
+        "_DASHBOARD_INBOX_CACHE",
+        "_DASHBOARD_ACTIVITY_CACHE",
+        "_PLAN_STALENESS_CACHE",
+    ):
+        cache = getattr(_cockpit_ui, cache_name, None)
+        if isinstance(cache, dict):
+            cache.clear()
+
+    t0 = _time.perf_counter()
+    data = _gather_project_dashboard(config_path, "demo")
+    elapsed_ms = (_time.perf_counter() - t0) * 1000
+
+    assert data is not None
+    assert elapsed_ms < 500.0, (
+        f"_gather_project_dashboard took {elapsed_ms:.0f}ms with 30 "
+        f"sessions configured — exceeds 500ms budget. Likely regression "
+        f"of #1290 (worker enumeration re-running the launch pipeline)."
+    )

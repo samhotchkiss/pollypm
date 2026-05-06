@@ -162,6 +162,7 @@ _PLAN_REVIEW_UNAVAILABLE_HINT_RE = _re.compile(
     r"d\s+to\s+discuss\s+with\s+the\s+PM,\s*A\s+to\s+approve\.?",
     _re.IGNORECASE,
 )
+_PLAN_REVIEW_DISCUSSION_ENTRY_TYPE = "plan_review_discussed"
 
 
 class _CockpitRouteContentResolver:
@@ -7689,6 +7690,72 @@ class PollyInboxApp(App[None]):
 
         return resolve_inbox_work_service(config, item, task_id)
 
+    def _record_plan_review_discussion_marker(self, item, task_id: str) -> bool:
+        """Persist that a task-backed plan review reached PM discussion."""
+        if item is None or not is_task_inbox_entry(item):
+            return False
+        labels = list(getattr(item, "labels", []) or [])
+        if "plan_review" not in labels:
+            return False
+        roles = getattr(item, "roles", {}) or {}
+        actor = str(roles.get("requester") or "user").strip() or "user"
+        svc = self._resolve_inbox_svc(item, task_id)
+        if svc is None:
+            return False
+        try:
+            existing = svc.get_context(
+                task_id,
+                entry_type=_PLAN_REVIEW_DISCUSSION_ENTRY_TYPE,
+                limit=1,
+            )
+            if not existing:
+                svc.add_context(
+                    task_id,
+                    actor,
+                    "Plan review routed to PM discussion from the cockpit inbox.",
+                    entry_type=_PLAN_REVIEW_DISCUSSION_ENTRY_TYPE,
+                )
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _plan_review_discussion_marker_exists(self, item, task_id: str) -> bool:
+        """Return True when a previous ``d`` dispatch unlocked discussion."""
+        svc = self._resolve_inbox_svc(item, task_id)
+        if svc is None:
+            return False
+        try:
+            return bool(
+                svc.get_context(
+                    task_id,
+                    entry_type=_PLAN_REVIEW_DISCUSSION_ENTRY_TYPE,
+                    limit=1,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _mark_plan_review_discussion_unlocked(self, task_id: str) -> None:
+        self._plan_review_round_trip[task_id] = True
+        if self._selected_task_id != task_id:
+            return
+        meta = self._plan_review_meta.get(task_id) or {}
+        self._update_hint_for_plan_review(
+            fast_track=bool(meta.get("fast_track", False)),
+            round_trip=True,
+            has_explainer=bool(meta.get("explainer_path", True)),
+        )
+
     def _project_key_is_unknown(self, project_key: str) -> bool:
         """True when ``project_key`` is not a registered project.
 
@@ -8560,6 +8627,10 @@ class PollyInboxApp(App[None]):
             round_trip = _plan_review_has_round_trip(
                 replies, requester=(task.roles or {}).get("requester", "user"),
             )
+            if not round_trip:
+                round_trip = self._plan_review_discussion_marker_exists(
+                    item, task_id,
+                )
             self._plan_review_round_trip[task_id] = round_trip
             self._update_hint_for_plan_review(
                 fast_track=meta.get("fast_track", False),
@@ -9220,6 +9291,7 @@ class PollyInboxApp(App[None]):
         cockpit_key, pm_label = _resolve_pm_target(
             self.config_path, project_for_pm,
         )
+        plan_review_discussion_item = None
         # Plan-review items (#297) inject a richer primer instead of the
         # generic ``re: inbox/N ...`` line so the PM lands in the
         # conversation with the co-refinement brief already framed.
@@ -9255,6 +9327,7 @@ class PollyInboxApp(App[None]):
                 plan_task_id=plan_task_id,
                 reviewer_name=reviewer_name,
             )
+            plan_review_discussion_item = item
         else:
             context_line = _build_pm_context_line(task, item=focus_item)
 
@@ -9263,7 +9336,11 @@ class PollyInboxApp(App[None]):
         # pure subprocess invocations — safe off the UI thread.
         self.run_worker(
             lambda: self._dispatch_to_pm_sync(
-                cockpit_key, context_line, pm_label,
+                cockpit_key,
+                context_line,
+                pm_label,
+                plan_review_discussion_item=plan_review_discussion_item,
+                plan_review_discussion_task_id=task_id,
             ),
             thread=True,
             exclusive=True,
@@ -9271,7 +9348,13 @@ class PollyInboxApp(App[None]):
         )
 
     def _dispatch_to_pm_sync(
-        self, cockpit_key: str, context_line: str, pm_label: str,
+        self,
+        cockpit_key: str,
+        context_line: str,
+        pm_label: str,
+        *,
+        plan_review_discussion_item=None,
+        plan_review_discussion_task_id: str | None = None,
     ) -> None:
         """Worker-thread body: route cockpit + inject the context line."""
         try:
@@ -9281,6 +9364,22 @@ class PollyInboxApp(App[None]):
                 self.notify, f"Jump to PM failed: {exc}", severity="error",
             )
             return
+        if (
+            plan_review_discussion_task_id
+            and self._record_plan_review_discussion_marker(
+                plan_review_discussion_item,
+                plan_review_discussion_task_id,
+            )
+        ):
+            try:
+                self.call_from_thread(
+                    self._mark_plan_review_discussion_unlocked,
+                    plan_review_discussion_task_id,
+                )
+            except Exception:  # noqa: BLE001
+                self._mark_plan_review_discussion_unlocked(
+                    plan_review_discussion_task_id,
+                )
         # #1102 \u2014 once the right pane is "borrowed" by the PM session,
         # tmux focus moves there and the user's keystrokes land in the
         # PM's CLI (typically Codex). ``Esc``/``q``/``Backspace`` all

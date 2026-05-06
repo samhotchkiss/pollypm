@@ -365,10 +365,6 @@ def test_cockpit_send_key_question_mark_falls_back_to_visible_dashboard_bridge(
         ("/", "/"),
         ("a", "a"),
         ("A", "A"),
-        ("j", "j"),
-        ("k", "k"),
-        ("<down>", "down"),
-        ("<up>", "up"),
     ],
 )
 def test_cockpit_send_key_inbox_action_prefers_inbox_bridge_over_live_pane(
@@ -412,6 +408,61 @@ def test_cockpit_send_key_inbox_action_prefers_inbox_bridge_over_live_pane(
         assert _wait_for(lambda: inbox_app.keys == [expected])
         assert live_pane_attempts == []
     finally:
+        inbox.stop()
+
+
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        ("j", "j"),
+        ("k", "k"),
+        ("<down>", "down"),
+        ("<up>", "up"),
+    ],
+)
+def test_cockpit_send_key_inbox_nav_keeps_default_cockpit_bridge(
+    valid_cockpit_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    key: str,
+    expected: str,
+) -> None:
+    """#1246: rail navigation reaches the cockpit before Inbox fallback."""
+    import typer
+    from typer.testing import CliRunner
+
+    from pollypm.cli_features import ui as ui_commands
+    from pollypm.cockpit_rail import CockpitRouter
+
+    cockpit_app = _FakeApp()
+    inbox_app = _FakeApp()
+    cockpit = start_input_bridge(
+        cockpit_app, kind="cockpit", config_path=valid_cockpit_config,
+    )
+    assert cockpit is not None
+    inbox = start_input_bridge(
+        inbox_app, kind="pane-inbox", config_path=valid_cockpit_config,
+    )
+    assert inbox is not None
+
+    monkeypatch.setattr(
+        ui_commands,
+        "_send_key_to_active_live_right_pane",
+        lambda _config_path, _key: None,
+    )
+    try:
+        CockpitRouter(valid_cockpit_config).set_selected_key("inbox")
+
+        app = typer.Typer()
+        ui_commands.register_ui_commands(app)
+        result = CliRunner().invoke(
+            app, ["cockpit-send-key", key, "--config", str(valid_cockpit_config)]
+        )
+        assert result.exit_code == 0, result.output
+        assert f"via {cockpit.socket_path}" in result.output
+        assert _wait_for(lambda: cockpit_app.keys == [expected])
+        assert inbox_app.keys == []
+    finally:
+        cockpit.stop()
         inbox.stop()
 
 

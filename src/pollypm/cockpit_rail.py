@@ -862,6 +862,8 @@ class CockpitRouter:
         if data.get("selected") == key:
             return
         data["selected"] = key
+        if not (key == "inbox" or key.startswith("inbox:")):
+            data.pop("inbox_pane_nav_active", None)
         self._write_state(data)
         try:
             from pollypm.state_epoch import bump
@@ -883,6 +885,22 @@ class CockpitRouter:
             if "inbox_filter_input_active" not in data:
                 return
             data.pop("inbox_filter_input_active", None)
+        self._write_state(data)
+
+    def inbox_pane_nav_active(self) -> bool:
+        data = self._load_state()
+        return data.get("inbox_pane_nav_active") is True
+
+    def set_inbox_pane_nav_active(self, active: bool) -> None:
+        data = self._load_state()
+        if active:
+            if data.get("inbox_pane_nav_active") is True:
+                return
+            data["inbox_pane_nav_active"] = True
+        else:
+            if "inbox_pane_nav_active" not in data:
+                return
+            data.pop("inbox_pane_nav_active", None)
         self._write_state(data)
 
     def _return_key_for_live_mount(self, previous_key: object) -> str | None:
@@ -2814,6 +2832,7 @@ class CockpitRouter:
         config = self._load_config()
         window_target = f"{config.project.tmux_session}:{self._COCKPIT_WINDOW}"
         self.ensure_cockpit_layout()
+        self.set_inbox_pane_nav_active(False)
         rail_pane = self._left_pane_id(window_target)
         if rail_pane is not None:
             self.tmux.select_pane(rail_pane)

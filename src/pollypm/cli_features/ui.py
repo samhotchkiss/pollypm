@@ -23,17 +23,15 @@ _RIGHT_PANE_BRIDGE_BYPASS_ESCAPE_TOKENS = frozenset({"<esc>", "esc", "escape"})
 _LIVE_RIGHT_PANE_INPUT_STICKY = "live_right_pane_input_sticky"
 _HELP_KEY_TOKENS = frozenset({"?", "question_mark"})
 _HELP_CONTENT_BRIDGE_FALLBACK_KINDS = ("dashboard", "pane-inbox", "settings")
+# Keep row-navigation keys on the cockpit bridge. PollyCockpitApp still
+# forwards them to the Inbox pane when the Inbox surface is active (#1238),
+# but the CLI must not bypass the rail just because the rail cursor is on
+# the Inbox row (#1246).
 _INBOX_BRIDGE_FIRST_TOKENS = frozenset({
     "/",
-    "<down>",
-    "<up>",
     "A",
     "a",
     "d",
-    "down",
-    "j",
-    "k",
-    "up",
 })
 _INBOX_FILTER_INPUT_TOKENS = frozenset({
     "<bs>",

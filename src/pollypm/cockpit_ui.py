@@ -1707,6 +1707,26 @@ class PollyCockpitApp(App[None]):
         key = getattr(self, "selected_key", None)
         return isinstance(key, str) and (key == "inbox" or key.startswith("inbox:"))
 
+    def _set_inbox_pane_nav_active(self, active: bool) -> None:
+        set_active = getattr(self.router, "set_inbox_pane_nav_active", None)
+        if not callable(set_active):
+            return
+        try:
+            set_active(active)
+        except Exception:  # noqa: BLE001
+            return
+
+    def _inbox_pane_owns_nav(self) -> bool:
+        if not self._on_inbox_surface():
+            return False
+        is_active = getattr(self.router, "inbox_pane_nav_active", None)
+        if not callable(is_active):
+            return False
+        try:
+            return bool(is_active())
+        except Exception:  # noqa: BLE001
+            return False
+
     def _send_key_to_inbox_pane(self, key: str) -> bool:
         """Forward an Inbox-owned key to the right-pane Inbox app.
 
@@ -2383,6 +2403,7 @@ class PollyCockpitApp(App[None]):
             self._cancel_pending_route_selection()
             self.selected_key = key
             self._persist_router_selected_key(key)
+            self._set_inbox_pane_nav_active(False)
             self._last_nav_change = self._tick_count
             self._apply_active_view_to_rows()
 
@@ -2500,7 +2521,7 @@ class PollyCockpitApp(App[None]):
         self._apply_active_view_to_rows()
 
     def action_cursor_down(self) -> None:
-        if self._on_inbox_surface() and self._send_key_to_inbox_pane("j"):
+        if self._inbox_pane_owns_nav() and self._send_key_to_inbox_pane("j"):
             return
         if self.selected_key == "settings":
             return
@@ -2519,7 +2540,7 @@ class PollyCockpitApp(App[None]):
         self._sync_selected_from_nav()
 
     def action_cursor_up(self) -> None:
-        if self._on_inbox_surface() and self._send_key_to_inbox_pane("k"):
+        if self._inbox_pane_owns_nav() and self._send_key_to_inbox_pane("k"):
             return
         if self.selected_key == "settings" and self._settings_visible():
             last_idx = self._last_nav_index()
@@ -2574,6 +2595,7 @@ class PollyCockpitApp(App[None]):
         self._schedule_route_selected("settings", label="Settings")
 
     def action_open_inbox(self) -> None:
+        self._set_inbox_pane_nav_active(True)
         self._schedule_route_selected("inbox", label="Inbox")
 
     def action_open_activity(self) -> None:
@@ -2668,6 +2690,8 @@ class PollyCockpitApp(App[None]):
         # canonical selection (e.g. ``project:x`` → ``project:x:dashboard``).
         optimistic_key = self._optimistic_selected_key_for_route(key)
         self.selected_key = optimistic_key
+        if not (optimistic_key == "inbox" or optimistic_key.startswith("inbox:")):
+            self._set_inbox_pane_nav_active(False)
         if optimistic_key != key:
             try:
                 self.router.set_selected_key(optimistic_key)
@@ -8917,7 +8941,11 @@ class PollyInboxApp(App[None]):
         environment that hosts it (including ``run_test`` harnesses
         without a live tmux server).
         """
-        from pollypm.cockpit_rail import focus_cockpit_rail_pane
+        from pollypm.cockpit_rail import CockpitRouter, focus_cockpit_rail_pane
+        try:
+            CockpitRouter(self.config_path).set_inbox_pane_nav_active(False)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             focus_cockpit_rail_pane(self.config_path)
         except Exception:  # noqa: BLE001

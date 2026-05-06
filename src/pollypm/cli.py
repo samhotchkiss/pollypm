@@ -671,7 +671,9 @@ def _build_launch_probe(supervisor) -> LaunchProbe:
         if panes:
             capture_pane = getattr(tmux, "capture_pane", None)
             console_pane_alive, rail_pane_alive, rail_pane_running_non_shell = (
-                _classify_cockpit_panes(panes, capture_pane=capture_pane)
+                _classify_cockpit_panes(
+                    panes, tmux=tmux, capture_pane=capture_pane
+                )
             )
 
     return LaunchProbe(
@@ -686,7 +688,9 @@ def _build_launch_probe(supervisor) -> LaunchProbe:
     )
 
 
-def _classify_cockpit_panes(panes, *, capture_pane=None) -> tuple[bool, bool, bool]:
+def _classify_cockpit_panes(
+    panes, *, tmux=None, capture_pane=None
+) -> tuple[bool, bool, bool]:
     """Classify the cockpit window's pane list into the three
     pane-liveness probe fields.
 
@@ -696,8 +700,14 @@ def _classify_cockpit_panes(panes, *, capture_pane=None) -> tuple[bool, bool, bo
     one pane is present, infer whether it is the rail from the command:
     shell means the rail has not started; non-shell means the right pane
     is missing. Some real rail panes report the shell wrapper as the
-    current command even while the cockpit rail is visibly running; when a
-    safe pane capture proves that UI is present, treat the rail as healthy.
+    current command even while the cockpit rail is visibly running (the
+    rail launcher wraps ``pm cockpit`` in a ``while true; do … done`` shell
+    loop, so during a brief moment between iterations or right at startup
+    the foreground process is the bash wrapper rather than Python). #1293:
+    when ``pane_current_command`` reports a shell, walk the pane's
+    process tree for a Python/``pm`` descendant before declaring the rail
+    dead — this is independent of redraw timing, unlike a capture-pane
+    token scan.
     """
     left = None
     right = None
@@ -719,6 +729,7 @@ def _classify_cockpit_panes(panes, *, capture_pane=None) -> tuple[bool, bool, bo
         pane_cmd = (getattr(pane, "pane_current_command", "") or "").lower()
         pane_non_shell = pane_alive and (
             pane_cmd not in _SHELL_COMMANDS
+            or _pane_runs_cockpit_python_descendant(pane, tmux)
             or _pane_capture_looks_like_cockpit_rail(pane, capture_pane)
         )
         if pane_non_shell:
@@ -735,9 +746,94 @@ def _classify_cockpit_panes(panes, *, capture_pane=None) -> tuple[bool, bool, bo
     rail_cmd = (getattr(rail_pane, "pane_current_command", "") or "").lower()
     rail_non_shell = rail_alive and (
         rail_cmd not in _SHELL_COMMANDS
+        or _pane_runs_cockpit_python_descendant(rail_pane, tmux)
         or _pane_capture_looks_like_cockpit_rail(rail_pane, capture_pane)
     )
     return (console_alive, rail_alive, rail_non_shell)
+
+
+# Process-name tokens that count as "the cockpit Python is running" when
+# found anywhere in the pane's process tree. ``pm`` is the installed
+# console_scripts entrypoint; ``python``/``python3`` are the interpreter
+# names users see on macOS and Linux when ``pm cockpit`` is exec'd via
+# ``uv run``; ``cockpit`` is a defensive match against the argv tail.
+_COCKPIT_PROCESS_NAMES: frozenset[str] = frozenset(
+    {"pm", "pollypm", "python", "python3", "cockpit"}
+)
+
+
+def _pane_runs_cockpit_python_descendant(pane, tmux) -> bool:
+    """Return True iff the pane's process tree contains a cockpit Python.
+
+    #1293 root cause: ``pane_current_command`` only reports the foreground
+    process name for the pane, which on the rail is the bash ``while true``
+    wrapper around ``pm cockpit``. During tmux's redraw windows (occasionally
+    20+ seconds on cold boot) capturing the rendered output is unreliable,
+    causing false-positive ``recover_dead_rail`` diagnostics on bare ``pm``.
+
+    Process liveness sidesteps redraw timing entirely: we ask tmux for the
+    pane's PID, then walk the process tree once with ``ps`` and look for
+    any descendant whose short name matches ``pm``/``python``/``pollypm``.
+    Returns False on any tmux/ps failure so the legitimate dead-rail
+    recovery path still fires when the rail truly dropped to a bare shell.
+    """
+    if tmux is None:
+        return False
+    pane_id = getattr(pane, "pane_id", None)
+    if not isinstance(pane_id, str) or not pane_id:
+        return False
+    get_pid = getattr(tmux, "get_pane_pid", None)
+    if not callable(get_pid):
+        return False
+    try:
+        root_pid = get_pid(pane_id)
+    except Exception:  # noqa: BLE001
+        return False
+    if not isinstance(root_pid, int) or root_pid <= 0:
+        return False
+
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,comm="],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    if result.returncode != 0:
+        return False
+
+    children: dict[int, list[int]] = {}
+    comms: dict[int, str] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        comms[pid] = parts[2].strip()
+        children.setdefault(ppid, []).append(pid)
+
+    stack = [root_pid]
+    seen: set[int] = set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        comm = comms.get(pid, "")
+        # Match on the basename of the comm (some kernels prefix paths,
+        # and some processes report e.g. ``Python`` with capitalization).
+        short = comm.rsplit("/", 1)[-1].lower()
+        if short in _COCKPIT_PROCESS_NAMES:
+            return True
+        stack.extend(children.get(pid, []))
+    return False
 
 
 def _pane_capture_looks_like_cockpit_rail(pane, capture_pane) -> bool:

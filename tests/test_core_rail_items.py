@@ -5,10 +5,16 @@ See docs/extensible-rail-spec.md §5 and issue #222.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
 
+from pollypm.cockpit_live_chat_notice import (
+    LIVE_CHAT_NETWORK_DEAD_NOTICE_MESSAGE_KEY,
+    LIVE_CHAT_NETWORK_DEAD_NOTICE_UNTIL_KEY,
+    LIVE_CHAT_NETWORK_DEAD_RAIL_MESSAGE,
+)
 from pollypm.cockpit_rail import CockpitRouter
 from pollypm.models import KnownProject, ProjectKind
 from pollypm.plugin_api.v1 import (
@@ -86,6 +92,48 @@ class _FakeWindow:
         self.name = name
         self.pane_dead = pane_dead
         self.pane_id = f"%{name}"
+
+
+def test_polly_state_surfaces_live_chat_network_dead_notice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        core_rail_items_plugin,
+        "_session_state",
+        lambda *_args, **_kwargs: "ready",
+    )
+    ctx = RailContext(
+        cockpit_state={
+            LIVE_CHAT_NETWORK_DEAD_NOTICE_MESSAGE_KEY: (
+                LIVE_CHAT_NETWORK_DEAD_RAIL_MESSAGE
+            ),
+            LIVE_CHAT_NETWORK_DEAD_NOTICE_UNTIL_KEY: time.time() + 30,
+        },
+    )
+
+    assert core_rail_items_plugin._polly_state(ctx) == (
+        f"! {LIVE_CHAT_NETWORK_DEAD_RAIL_MESSAGE}"
+    )
+
+
+def test_polly_state_ignores_expired_live_chat_network_dead_notice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        core_rail_items_plugin,
+        "_session_state",
+        lambda *_args, **_kwargs: "ready",
+    )
+    ctx = RailContext(
+        cockpit_state={
+            LIVE_CHAT_NETWORK_DEAD_NOTICE_MESSAGE_KEY: (
+                LIVE_CHAT_NETWORK_DEAD_RAIL_MESSAGE
+            ),
+            LIVE_CHAT_NETWORK_DEAD_NOTICE_UNTIL_KEY: time.time() - 1,
+        },
+    )
+
+    assert core_rail_items_plugin._polly_state(ctx) == "ready"
 
 
 @pytest.mark.parametrize(

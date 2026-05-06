@@ -161,6 +161,22 @@ def test_mount_renders_all_five_sections(metrics_env, metrics_app) -> None:
     _run(body())
 
 
+def test_compact_viewport_renders_section_labels(metrics_env, metrics_app) -> None:
+    """At the issue's 80x24 size, section boxes must not render blank."""
+    async def body() -> None:
+        from pollypm.cockpit_smoke import SmokeHarness
+
+        metrics_app._gather = lambda: _make_snapshot()  # type: ignore[method-assign]
+        async with SmokeHarness.mount(metrics_app, size=(80, 24)) as smoke:
+            capture = smoke.snapshot()
+            text = capture.rendered_text
+            assert "Fleet" in text
+            assert "Workers:" in text
+            assert "Resources" in text
+            assert "state.db:" in text
+    _run(body())
+
+
 # ---------------------------------------------------------------------------
 # 2. Fleet counts line up with synthetic task/worker data
 # ---------------------------------------------------------------------------

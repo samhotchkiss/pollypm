@@ -67,6 +67,7 @@ class PollyMetricsApp(App[None]):
         scrollbar-color: #2a3340;
     }
     .me-section {
+        height: auto;
         margin-bottom: 1;
         padding: 1 2;
         background: #111820;

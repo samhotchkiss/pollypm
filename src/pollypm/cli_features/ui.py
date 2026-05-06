@@ -58,10 +58,10 @@ _HELP_MODAL_CONTROL_TOKENS = frozenset({
     "<end>",
 })
 _HELP_CONTENT_BRIDGE_FALLBACK_KINDS = ("dashboard", "pane-inbox", "settings")
-# Keep row-navigation keys on the cockpit bridge. PollyCockpitApp still
-# forwards them to the Inbox pane when the Inbox surface is active (#1238),
-# but the CLI must not bypass the rail just because the rail cursor is on
-# the Inbox row (#1246).
+# Keep row-navigation keys on the cockpit bridge. The Inbox pane has its
+# own bridge for explicit Inbox actions/filter input, but rail j/k/arrows
+# must continue moving the rail cursor when the selected row is Inbox
+# (#1246/#1272).
 _INBOX_BRIDGE_FIRST_TOKENS = frozenset({
     "/",
     "A",

@@ -4082,8 +4082,8 @@ def test_cockpit_ui_arrow_and_enter_route_selected(tmp_path: Path) -> None:
     asyncio.run(exercise())
 
 
-def test_cockpit_send_key_inbox_shortcut_keeps_inbox_nav_active(tmp_path: Path) -> None:
-    """#1238: after global ``I``, Down/Up stay owned by the Inbox."""
+def test_cockpit_send_key_inbox_shortcut_keeps_rail_nav_active(tmp_path: Path) -> None:
+    """#1272: after global ``I``, Down/Up/j/k keep moving the rail cursor."""
 
     class FakeRouter:
         def __init__(self) -> None:
@@ -4153,7 +4153,7 @@ def test_cockpit_send_key_inbox_shortcut_keeps_inbox_nav_active(tmp_path: Path) 
             await pilot.pause(0.4)
             assert app.selected_key == "inbox"
             assert app._selected_row_key() == "inbox"
-            assert app.router.inbox_pane_nav_active() is True
+            assert app.router.inbox_pane_nav_active() is False
             forwarded: list[str] = []
             app._send_key_to_inbox_pane = (  # type: ignore[method-assign]
                 lambda key: forwarded.append(key) or True
@@ -4161,15 +4161,27 @@ def test_cockpit_send_key_inbox_shortcut_keeps_inbox_nav_active(tmp_path: Path) 
 
             send_key(handle.socket_path, "<down>")
             await pilot.pause(0.4)
-            assert app.selected_key == "inbox"
-            assert app._selected_row_key() == "inbox"
-            assert forwarded == ["j"]
+            assert app.selected_key == "activity"
+            assert app._selected_row_key() == "activity"
+            assert forwarded == []
+
+            send_key(handle.socket_path, "j")
+            await pilot.pause(0.4)
+            assert app.selected_key == "project:demo"
+            assert app._selected_row_key() == "project:demo"
+            assert forwarded == []
 
             send_key(handle.socket_path, "<up>")
             await pilot.pause(0.4)
+            assert app.selected_key == "activity"
+            assert app._selected_row_key() == "activity"
+            assert forwarded == []
+
+            send_key(handle.socket_path, "k")
+            await pilot.pause(0.4)
             assert app.selected_key == "inbox"
             assert app._selected_row_key() == "inbox"
-            assert forwarded == ["j", "k"]
+            assert forwarded == []
 
     asyncio.run(exercise())
 

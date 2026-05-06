@@ -1901,7 +1901,7 @@ def test_cockpit_router_primes_workspace_operator_on_attach() -> None:
     class _FakeConfig:
         projects = {
             "alpha": _Project("alpha", "Alpha"),
-            "beta": _Project("beta", "Beta"),
+            "health_coach": _Project("health_coach", "health-coach"),
         }
 
     class _FakeSupervisor:
@@ -1959,7 +1959,13 @@ def test_cockpit_router_primes_workspace_operator_on_attach() -> None:
     assert "operator chat" in text
     # Workspace-scope (not project-scope) discriminators.
     assert "Workspace:" in text
-    assert "Active inbox (workspace-wide):" in text
+    assert "Active inbox:" in text
+    assert "workspace-wide" not in text
+    assert "pm inbox" not in text
+    assert "pm status" not in text
+    assert "Alpha (alpha)" not in text
+    assert "health-coach (health_coach)" not in text
+    assert "health-coach" in text
     # Distinct from the per-project primer's signature.
     assert "Project root:" not in text  # per-project primer marker
     assert "Plan: " not in text  # per-project primer marker

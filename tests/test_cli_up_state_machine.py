@@ -570,6 +570,84 @@ def test_probe_treats_rail_running_shell_as_recoverable() -> None:
     assert plan.state.value in {"recover_dead_rail"}
 
 
+def test_probe_treats_shell_wrapped_visible_cockpit_rail_as_healthy() -> None:
+    """#1293 — tmux may report the rail pane's shell wrapper as
+    ``pane_current_command`` while the cockpit rail UI is visibly
+    running. The probe should trust that capture before emitting a
+    recover_dead_rail diagnostic."""
+    from pollypm.launch_state import LaunchAction, LaunchState, plan_launch
+    from pollypm.tmux.client import TmuxPane
+
+    class _FakeTmux:
+        def has_session(self, name: str) -> bool:
+            return name in {"pollypm", "pollypm-storage-closet"}
+
+        def current_session_name(self) -> None:
+            return None
+
+        def list_panes(self, _target: str) -> list[TmuxPane]:
+            return [
+                TmuxPane(
+                    session="pollypm",
+                    window_index="0",
+                    window_name="PollyPM",
+                    pane_index="0",
+                    pane_id="%1",
+                    active=True,
+                    pane_current_command="zsh",
+                    pane_current_path="/",
+                    pane_dead=False,
+                    pane_left=0,
+                    pane_width=30,
+                ),
+                TmuxPane(
+                    session="pollypm",
+                    window_index="0",
+                    window_name="PollyPM",
+                    pane_index="1",
+                    pane_id="%2",
+                    active=False,
+                    pane_current_command="Python",
+                    pane_current_path="/",
+                    pane_dead=False,
+                    pane_left=31,
+                    pane_width=120,
+                ),
+            ]
+
+        def capture_pane(self, target: str, lines: int = 200) -> str:
+            assert target == "%1"
+            assert lines == 40
+            return """
+     █▀█ █▀█ █   █   █▄█     │
+     █▀▀ █▄█ █▄▄ █▄▄  █      │
+        Plans first.         │
+        Chaos later.         │
+   ○ Home                    │
+   ♡· Polly · chat           │
+   ○ Workers (11)            │
+   ◆ Inbox (42)              │
+   ── projects ────────      │
+"""
+
+    class _FakeSupervisor:
+        def __init__(self) -> None:
+            self.tmux = _FakeTmux()
+            self.config = type(
+                "Config",
+                (),
+                {"project": type("Project", (), {"tmux_session": "pollypm"})()},
+            )()
+
+    probe = cli._build_launch_probe(_FakeSupervisor())
+    assert probe.rail_pane_alive is True
+    assert probe.rail_pane_running_non_shell is True
+
+    plan = plan_launch(probe)
+    assert plan.state is LaunchState.ATTACH_EXISTING
+    assert LaunchAction.RESPAWN_RAIL not in plan.actions
+
+
 def test_probe_falls_back_when_list_panes_unavailable() -> None:
     """#906 — when ``list_panes`` cannot enumerate (returns an
     empty list / raises), pane-liveness defaults to True. The

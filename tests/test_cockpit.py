@@ -4683,6 +4683,41 @@ def test_cockpit_rail_forwards_detail_hint_keys(monkeypatch, tmp_path: Path) -> 
     assert rail.router.sent == ["Tab", "A"]
 
 
+def test_cockpit_rail_capital_a_on_inbox_forwards_approval_key(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """#1282: Inbox owns A so plan-review approval can show its gate toast."""
+    class FakeRouter:
+        def __init__(self, _config_path: Path) -> None:
+            self.calls: list[str] = []
+            self.sent: list[str] = []
+            self.tmux = None
+
+        def selected_key(self) -> str:
+            return "inbox"
+
+        def route_selected(self, key: str) -> None:
+            self.calls.append(key)
+
+        def send_key_to_right_pane(self, key: str) -> None:
+            self.sent.append(key)
+
+    monkeypatch.setattr("pollypm.cockpit_rail.CockpitRouter", FakeRouter)
+    from pollypm.cockpit_rail import CockpitItem, PollyCockpitRail
+
+    rail = PollyCockpitRail(tmp_path / "pollypm.toml")
+    items = [
+        CockpitItem("inbox", "Inbox", "has"),
+        CockpitItem("workers", "Workers", "ready"),
+    ]
+
+    assert rail._handle_key(b"A", items) is True
+
+    assert rail.router.sent == ["A"]
+    assert rail.router.calls == []
+    assert rail.selected_key == "inbox"
+
+
 def test_cockpit_rail_capital_a_routes_workers_when_not_active(
     monkeypatch, tmp_path: Path,
 ) -> None:

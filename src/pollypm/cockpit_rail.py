@@ -3916,7 +3916,9 @@ class PollyCockpitRail:
             self.router.send_key_to_right_pane("Tab")
             return True
         if key == b"A":
-            if self.selected_key == "workers":
+            if self.selected_key == "inbox" or self.selected_key.startswith("inbox:"):
+                self.router.send_key_to_right_pane("A")
+            elif self.selected_key == "workers":
                 self.router.send_key_to_right_pane("A")
             else:
                 self.router.route_selected("workers")

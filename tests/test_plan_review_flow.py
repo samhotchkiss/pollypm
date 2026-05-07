@@ -397,8 +397,9 @@ def test_plan_review_label_swaps_hint_bar_to_gated(
             assert meta["plan_task_id"] == plan_review_env["plan_task_id"]
             assert meta["fast_track"] is False
             # Hint bar is gated — ``A`` is hidden until round-trip.
+            # ``v open explainer`` was removed in #1405 (broken keybinding).
             hint_text = str(inbox_app.hint.render())
-            assert "v open explainer" in hint_text
+            assert "v open explainer" not in hint_text
             assert "d discuss" in hint_text
             assert "A approve" not in hint_text
     _run(body())
@@ -624,10 +625,10 @@ def test_plan_review_message_approve_archives_notification(
     _run(body())
 
 
-def test_v_key_opens_explainer_with_path(
+def test_v_key_is_unbound_after_1405(
     plan_review_env, inbox_app,
 ) -> None:
-    """``v`` shells out via the ``_open_explainer`` hook; path is passed."""
+    """``v`` no longer triggers the explainer hook (binding removed in #1405)."""
     async def body() -> None:
         calls: list[str] = []
 
@@ -645,7 +646,10 @@ def test_v_key_opens_explainer_with_path(
                 await pilot.pause()
                 await pilot.press("v")
                 await pilot.pause()
-                assert calls == [plan_review_env["explainer_path"]]
+                assert calls == [], (
+                    "v keybinding was removed in #1405 "
+                    "(broken visual explainer, deferred to v1+)"
+                )
         finally:
             PollyInboxApp._open_explainer = original  # type: ignore[assignment]
     _run(body())

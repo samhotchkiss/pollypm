@@ -7520,12 +7520,11 @@ class PollyInboxApp(App[None]):
         # archiving, but with a decision trail.
         Binding("A", "accept_proposal", "Accept", show=False),
         Binding("X", "reject_proposal", "Reject", show=False),
-        # Plan review (#297). ``v`` opens the rendered HTML explainer in
-        # the user's browser — reviewing against the visual page is the
-        # whole point of the plan-review flow. Accept (capital A) routes
-        # through ``action_accept_proposal`` which branches on label,
-        # so no separate keybinding is needed here for approve.
-        Binding("v", "open_plan_explainer", "Explainer", show=False),
+        # Plan review (#297). Accept (capital A) routes through
+        # ``action_accept_proposal`` which branches on label, so no
+        # separate keybinding is needed here for approve. The ``v``
+        # explainer keybinding was removed in #1405 (broken — never
+        # opened anything reliably; deferred to v1+ for redesign).
         Binding("e", "expand_all_rollup", "Expand all", show=False),
         # Filter / search bar (#NEW).
         Binding("slash", "start_filter", "Filter", show=False),
@@ -9830,14 +9829,16 @@ class PollyInboxApp(App[None]):
     )
     # Plan-review hint bars (#297). The gated variant hides ``A`` until
     # the thread has a round-trip; the ungated variant surfaces it.
+    # ``v open explainer`` was dropped in #1405 along with the broken
+    # keybinding \u2014 pending redesign post-v1.
     _PLAN_REVIEW_HINT_GATED = (
-        "v open explainer \u00b7 d discuss with PM \u00b7 q close"
+        "d discuss with PM \u00b7 q close"
     )
     _PLAN_REVIEW_HINT_OPEN = (
-        "v open explainer \u00b7 d discuss \u00b7 A approve \u00b7 q close"
+        "d discuss \u00b7 A approve \u00b7 q close"
     )
     _PLAN_REVIEW_HINT_FAST_TRACK = (
-        "v open explainer \u00b7 d discuss \u00b7 A approve \u00b7 q close"
+        "d discuss \u00b7 A approve \u00b7 q close"
     )
     # Blocking-question hint (#302). ``r`` replies to the worker via
     # ``pm send --force`` so the blocker clears without the PM needing
@@ -9874,7 +9875,12 @@ class PollyInboxApp(App[None]):
         Fast-tracked items (Polly's inbox) never gate — Accept is live
         from the first render. User-inbox items are gated until the
         thread has at least one exchange with the PM.
+
+        ``has_explainer`` is retained for call-site compatibility but
+        is no longer consulted — the ``v`` keybinding was removed in
+        #1405 and the hint bars never mention an explainer now.
         """
+        del has_explainer  # kwarg kept for API stability post-#1405
         if fast_track or round_trip:
             text = (
                 self._PLAN_REVIEW_HINT_FAST_TRACK
@@ -9882,8 +9888,6 @@ class PollyInboxApp(App[None]):
             )
         else:
             text = self._PLAN_REVIEW_HINT_GATED
-        if not has_explainer:
-            text = text.replace("v open explainer · ", "")
         try:
             self.hint.update(text)
         except Exception:  # noqa: BLE001
@@ -13219,7 +13223,9 @@ class PollyProjectDashboardApp(App[None]):
         Binding("4", "action_card_4", "Second card primary action"),
         Binding("5", "action_card_5", "Second card secondary action"),
         Binding("6", "action_card_6", "Second card reply"),
-        Binding("v", "open_explainer", "Explainer", show=False),
+        # ``v`` (open_explainer) was removed in #1405 — it was broken in
+        # practice and is deferred until the visual explainer is
+        # redesigned post-v1.
         Binding("o", "open_editor", "Editor", show=False),
         Binding("j", "plan_scroll_down", "Scroll down", show=False),
         Binding("k", "plan_scroll_up", "Scroll up", show=False),
@@ -14419,9 +14425,9 @@ class PollyProjectDashboardApp(App[None]):
                 except (ValueError, TypeError):
                     aux_rel = aux.name
                 lines.append(f"  \u00b7 {_escape(aux_rel)}")
-        if data.plan_explainer is not None:
-            lines.append("")
-            lines.append("[dim]Press [b]v[/b] to open the visual explainer[/dim]")
+        # Visual-explainer prompt removed in #1405 (keybinding broken,
+        # deferred for v1+). ``data.plan_explainer`` may still surface
+        # via other paths but we no longer advertise the ``v`` shortcut.
         return "\n".join(lines)
 
     def _render_plan_stale(self, data: ProjectDashboardData) -> str:

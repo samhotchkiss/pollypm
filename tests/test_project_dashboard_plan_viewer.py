@@ -299,12 +299,14 @@ def test_no_staleness_when_fresh(env, app) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6a. `v` opens explainer when present
+# 6. ``v`` keybinding was removed in #1405 (broken visual explainer).
+# Pressing ``v`` is now a no-op at the dashboard layer regardless of
+# whether the explainer artifact exists on disk.
 # ---------------------------------------------------------------------------
 
 
-def test_v_opens_explainer_when_present(env, app, monkeypatch) -> None:
-    """Pressing ``v`` invokes ``_open_external`` on the explainer path."""
+def test_v_is_unbound_after_1405(env, app, monkeypatch) -> None:
+    """``v`` no longer triggers ``_open_external`` (binding removed)."""
     async def body() -> None:
         _write_plan(env["project_path"], "# Plan\n\n## One\n")
         reports = env["project_path"] / "reports"
@@ -328,41 +330,9 @@ def test_v_opens_explainer_when_present(env, app, monkeypatch) -> None:
         async with app.run_test(size=(140, 50)) as pilot:
             await pilot.pause()
             assert app.data is not None
-            assert app.data.plan_explainer == explainer
             await pilot.press("v")
             await pilot.pause()
-            assert opened, "expected _open_external to be called"
-            assert opened[-1] == explainer
-    _run(body())
-
-
-# ---------------------------------------------------------------------------
-# 6b. `v` is a no-op (warning notify, no crash) when absent
-# ---------------------------------------------------------------------------
-
-
-def test_v_noop_when_explainer_absent(env, app, monkeypatch) -> None:
-    """``v`` does not call ``_open_external`` when no explainer exists."""
-    async def body() -> None:
-        _write_plan(env["project_path"], "# Plan\n\n## One\n")
-
-        opened: list[Path] = []
-
-        def fake_open(self, path: Path) -> None:
-            opened.append(path)
-
-        from pollypm.cockpit_ui import PollyProjectDashboardApp
-        monkeypatch.setattr(
-            PollyProjectDashboardApp, "_open_external", fake_open,
-        )
-
-        async with app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
-            assert app.data is not None
-            assert app.data.plan_explainer is None
-            await pilot.press("v")
-            await pilot.pause()
-            assert opened == [], "open_external must not fire without explainer"
+            assert opened == [], "v must be unbound after #1405"
     _run(body())
 
 

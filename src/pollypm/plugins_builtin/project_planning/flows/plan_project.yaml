@@ -2,8 +2,10 @@ name: plan_project
 description: >-
   Multi-stage project planning flow. Architect gathers context, generates
   candidate decompositions, runs a 5-critic panel, synthesizes the best
-  candidate, then stops for user approval before emitting backlog tasks.
-  See docs/planner-plugin-spec.md §3 for stage semantics.
+  candidate, runs a final plan_review reflection pass that hoists the
+  judgment calls most likely to draw user pushback to the top, then stops
+  for user approval before emitting backlog tasks. See
+  docs/planner-plugin-spec.md §3 for stage semantics.
 
   Per-node budget_seconds values are the per-spec defaults (§6). They
   are overridden by [planner.budgets].<stage_name> in pollypm.toml when
@@ -78,15 +80,30 @@ nodes:
     type: work
     actor_type: role
     actor_role: architect
-    next_node: user_approval
+    next_node: plan_review
     gates: [log_present]
     budget_seconds: 600  # 10 min
+
+  # Stage 6.5 — plan review reflection. The architect re-reads the
+  # synthesized plan + every critic verdict and produces a single
+  # canonical review document with judgment calls hoisted to the top
+  # so the user sees the most-likely-pushback decisions first. The
+  # output replaces the previous plan body content (it becomes the
+  # canonical plan rendered to the user at user_approval). See #1399.
+  plan_review:
+    type: work
+    actor_type: role
+    actor_role: architect
+    next_node: user_approval
+    gates: [log_present]
+    budget_seconds: 300  # 5 min — reflection pass, not new analysis
 
   # Stage 7 — single human touchpoint. Plan is presented with the Risk
   # Ledger and the user approves/rejects. actor_type=human handles the
   # waiting state. Rejection sends the architect back to synthesize to
-  # fold in user feedback before re-presenting. No budget: waits
-  # indefinitely for the user (spec §3 stage 7).
+  # fold in user feedback before re-presenting (which then re-runs
+  # plan_review on the way out). No budget: waits indefinitely for the
+  # user (spec §3 stage 7).
   user_approval:
     type: review
     actor_type: human

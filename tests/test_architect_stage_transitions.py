@@ -158,17 +158,18 @@ def _advance_to(
         ("magic", "docs/plan/magic.md"),
         ("critic_panel", "docs/plan/critic-panel.md"),
         ("synthesize", "docs/project-plan.md"),
+        ("plan_review", "docs/project-plan.md"),
     ]
     for stage, path in chain:
         if stage == target_node:
             return
         # Write the stage's artifact so gates on downstream stages
-        # (log_present on synthesize, etc) succeed.
+        # (log_present on synthesize / plan_review, etc) succeed.
         artifact = project_root / path
         artifact.parent.mkdir(parents=True, exist_ok=True)
         artifact.write_text(f"# {stage} artifact\nNon-empty body.\n", encoding="utf-8")
-        # Synthesize also needs the session log (log_present gate).
-        if stage == "synthesize":
+        # Synthesize and plan_review both need the session log (log_present).
+        if stage in ("synthesize", "plan_review"):
             (project_root / "docs" / "planning-session-log.md").write_text(
                 "# Planning session log\nNarrative of the session.\n",
                 encoding="utf-8",
@@ -246,12 +247,10 @@ def test_decompose_done_advances_to_test_strategy(
 # ---------------------------------------------------------------------------
 
 
-def test_synthesize_done_advances_to_user_approval_and_flips_to_review(
+def test_synthesize_done_advances_to_plan_review(
     svc: SQLiteWorkService, project_root: Path,
 ) -> None:
-    """Synthesize is the last work node before the review stop-point.
-    A successful ``node_done`` both advances the node AND flips status
-    to ``review`` (user_approval is a review node)."""
+    """Synthesize hands off to the plan_review reflection node (#1399)."""
     task_id = _create_and_claim_plan_task(svc)
     _advance_to(svc, task_id, "synthesize", project_root)
     assert svc.get(task_id).current_node_id == "synthesize"
@@ -267,6 +266,36 @@ def test_synthesize_done_advances_to_user_approval_and_flips_to_review(
     result = svc.node_done(
         task_id, "architect",
         _done_output("synthesize", "docs/project-plan.md"),
+    )
+    # Synthesize → plan_review (still a work node, not the review stop).
+    assert result.current_node_id == "plan_review"
+    assert result.work_status.value == "in_progress"
+
+
+def test_plan_review_done_advances_to_user_approval_and_flips_to_review(
+    svc: SQLiteWorkService, project_root: Path,
+) -> None:
+    """plan_review is the last work node before the review stop-point.
+    A successful ``node_done`` both advances the node AND flips status
+    to ``review`` (user_approval is a review node)."""
+    task_id = _create_and_claim_plan_task(svc)
+    _advance_to(svc, task_id, "plan_review", project_root)
+    assert svc.get(task_id).current_node_id == "plan_review"
+
+    # plan_review rewrites the canonical plan + appends to the log.
+    (project_root / "docs" / "project-plan.md").write_text(
+        "# Project plan\n\n## Summary\n\n## Judgment calls\n\n"
+        "## Plan body\n\n## Critic synthesis\n",
+        encoding="utf-8",
+    )
+    (project_root / "docs" / "planning-session-log.md").write_text(
+        "# Session log\n\n## Stage 6.5 plan review\nFlags hoisted.\n",
+        encoding="utf-8",
+    )
+
+    result = svc.node_done(
+        task_id, "architect",
+        _done_output("plan_review", "docs/project-plan.md"),
     )
     assert result.current_node_id == "user_approval"
     assert result.work_status.value == "review"
@@ -314,8 +343,8 @@ def test_user_approval_refuses_node_done(
     NOT another ``pm task done``. ``node_done`` on a review node must
     raise so an over-eager agent can't accidentally skip the user."""
     task_id = _create_and_claim_plan_task(svc)
-    _advance_to(svc, task_id, "synthesize", project_root)
-    # Advance through synthesize so the task is now at user_approval.
+    _advance_to(svc, task_id, "plan_review", project_root)
+    # Advance through plan_review so the task is now at user_approval.
     (project_root / "docs" / "project-plan.md").write_text(
         "# Plan\nbody\n", encoding="utf-8",
     )
@@ -324,7 +353,7 @@ def test_user_approval_refuses_node_done(
     )
     svc.node_done(
         task_id, "architect",
-        _done_output("synthesize", "docs/project-plan.md"),
+        _done_output("plan_review", "docs/project-plan.md"),
     )
     task = svc.get(task_id)
     assert task.current_node_id == "user_approval"
@@ -367,7 +396,8 @@ def test_architect_prompt_includes_stage_transitions_block() -> None:
     # current node to an instruction.
     for stage in (
         "research", "discover", "decompose", "test_strategy",
-        "magic", "critic_panel", "synthesize", "user_approval", "emit",
+        "magic", "critic_panel", "synthesize", "plan_review",
+        "user_approval", "emit",
     ):
         assert stage in text, f"stage '{stage}' missing from architect prompt"
     # HALT instruction at user_approval is load-bearing — without it

@@ -17,6 +17,9 @@ def _task(
     node: str = "",
     flow: str = "implementation",
     project: str = "demo",
+    assignee: str = "",
+    actor_type: str = "",
+    owner: str = "",
 ):
     return SimpleNamespace(
         project=project,
@@ -26,6 +29,9 @@ def _task(
         current_node_id=node,
         flow_template_id=flow,
         labels=[],
+        assignee=assignee,
+        actor_type=actor_type,
+        owner=owner,
     )
 
 
@@ -239,6 +245,73 @@ def test_actionable_alert_prefixes_drive_red_state() -> None:
 
     assert rollup.state is ProjectRailState.RED
     assert rollup.badge == "🔴"
+
+
+def test_rollup_counts_human_review_tasks_for_rail_affordance() -> None:
+    """#1390 — savethenovel parked at user_approval for hours with no
+    rail-level signal. The rollup must count tasks where status=review
+    and a human is the assignee/actor so the rail can surface a
+    prominent "needs your decision" affordance."""
+    rollup = rollup_project_state(
+        "savethenovel",
+        [
+            _task(1, "review", node="user_approval", assignee="human"),
+            _task(2, "in_progress"),
+        ],
+    )
+
+    assert rollup.approvals_pending == 1
+
+
+def test_rollup_approvals_pending_counts_multiple() -> None:
+    """When more than one task is parked at a human-decision node the
+    rail's ``(N⚠)`` suffix must reflect the actual count."""
+    rollup = rollup_project_state(
+        "savethenovel",
+        [
+            _task(1, "review", node="user_approval", assignee="human"),
+            _task(2, "review", node="awaiting_approval", actor_type="human"),
+            _task(3, "review", node="user_approval", owner="user"),
+            _task(4, "in_progress"),
+        ],
+    )
+
+    assert rollup.approvals_pending == 3
+
+
+def test_rollup_approvals_pending_zero_without_human_review() -> None:
+    """Autoreview / automated review tasks must not inflate the count
+    — only human-decision review nodes drive the affordance."""
+    rollup = rollup_project_state(
+        "demo",
+        [
+            _task(1, "in_progress"),
+            _task(2, "review", node="autoreview"),
+            _task(3, "queued"),
+        ],
+    )
+
+    assert rollup.approvals_pending == 0
+
+
+def test_rollup_approvals_pending_survives_red_alert() -> None:
+    """Even when the project rolls up to RED for an operational alert,
+    the count of pending approvals must be preserved so a user-visible
+    decision isn't masked by an unrelated fault on a sibling task."""
+    alerts = [SimpleNamespace(alert_type="stuck_on_task:demo/2")]
+    rollup = rollup_project_state(
+        "demo",
+        [
+            _task(1, "review", node="user_approval", assignee="human"),
+            _task(2, "in_progress"),
+        ],
+        actionable_task_alert_ids=actionable_alert_task_ids(
+            alerts, project_key="demo",
+        ),
+    )
+
+    assert rollup.state is ProjectRailState.RED
+    assert rollup.approvals_pending == 1
 
 
 def test_surfaceable_operational_alert_taxonomy_keeps_user_action_signals_visible() -> None:

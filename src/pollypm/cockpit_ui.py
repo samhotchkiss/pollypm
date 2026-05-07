@@ -752,6 +752,15 @@ class RailItem(ListItem):
             "#f0c45a" if self.item.alert_severity == "warn" else "#ff5f6d"
         )
         if self.item.key.startswith("project:"):
+            # #1390 — Approval-pending takes precedence over the rollup
+            # color so a project parked at user_approval reads as "act
+            # on me" even if it was otherwise GREEN/YELLOW. Skip RED so
+            # the operational-fault triangle keeps its dedicated slot.
+            if (
+                getattr(self.item, "approvals_pending", 0) > 0
+                and self.item.state != "project-red"
+            ):
+                return "▶", "#ff5f6d"
             if self.item.state == "project-red":
                 return "▲", alert_color
             if self.item.state == "project-yellow":

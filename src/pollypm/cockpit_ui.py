@@ -15159,7 +15159,28 @@ class PollyProjectDashboardApp(App[None]):
         cockpit_key, pm_label = _resolve_pm_target(
             self.config_path, self.project_key,
         )
-        if self._idle_project_needs_plan():
+        # #1404 — chat-to-refine. When the project drilldown is showing a
+        # pending plan-review surface, ``[c]`` opens the PM chat with a
+        # refinement primer (in-place revision, same task id, version
+        # bumps via the SDK once the architect ships the rewrite). The
+        # routing helper returns ``None`` for non-plan-review dashboards
+        # so the existing idle-plan / blocker-context / generic branches
+        # still fire for everything else.
+        refinement_primer: str | None = None
+        try:
+            from pollypm.plan_refinement import (
+                select_chat_primer_for_project_dashboard,
+            )
+            data = getattr(self, "data", None)
+            if data is not None:
+                refinement_primer = select_chat_primer_for_project_dashboard(
+                    data,
+                )
+        except Exception:  # noqa: BLE001
+            refinement_primer = None
+        if refinement_primer is not None:
+            context_line = refinement_primer
+        elif self._idle_project_needs_plan():
             context_line = (
                 f're: project/{self.project_key} '
                 f'"please draft an initial plan for this project"'

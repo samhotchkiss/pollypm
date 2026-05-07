@@ -1165,12 +1165,20 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     throttle_seconds=DEDUPE_WINDOW_SECONDS,
                 )
             finally:
-                closer = getattr(services.work_service, "close", None)
-                if callable(closer):
-                    try:
-                        closer()
-                    except Exception:  # noqa: BLE001
-                        pass
+                # #1372 — release every owned sqlite connection. The
+                # pre-fix version closed only ``services.work_service``
+                # and leaked the fresh ``StateStore`` opened by
+                # ``load_runtime_services`` on each resume_ping
+                # evaluation (regression of #1069 — the same pattern
+                # this plugin's handlers/notify.py and handlers/sweep.py
+                # already fixed via ``services.close()``).
+                try:
+                    services.close()
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "heartbeat resume_ping: services.close raised",
+                        exc_info=True,
+                    )
 
             # Raise a low-severity alert so the cockpit surfaces it.
             try:

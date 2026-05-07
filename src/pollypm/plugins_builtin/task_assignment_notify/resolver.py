@@ -414,15 +414,18 @@ def clear_alerts_for_cancelled_task(
         owns_work_service = True
         store = services.msg_store or services.state_store
     if store is None:
-        # Best-effort: nothing to do without a store. Still close any
-        # incidental work-service connection the resolver opened.
+        # Best-effort: nothing to do without a store. Still close every
+        # incidental connection the resolver opened. #1374 — pre-fix
+        # closed only services.work_service and leaked the fresh
+        # ``StateStore`` opened by ``load_runtime_services``.
         if owns_work_service and services is not None:
-            work_closer = getattr(services.work_service, "close", None)
-            if callable(work_closer):
-                try:
-                    work_closer()
-                except Exception:  # noqa: BLE001
-                    pass
+            try:
+                services.close()
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "task_assignment_notify clear_alerts: services.close raised",
+                    exc_info=True,
+                )
         return {
             "cleared_per_task": cleared_per_task,
             "cleared_project": cleared_project,
@@ -459,16 +462,19 @@ def clear_alerts_for_cancelled_task(
                     "task_assignment_notify: clear_alert(no_session) "
                     "failed for %s", candidate, exc_info=True,
                 )
-    # Close the work-service connection we incidentally opened via
+    # Close every connection we incidentally opened via
     # ``load_runtime_services`` — the cancel call site owns its own
-    # connection and we mustn't leak ours.
+    # connections and we mustn't leak ours. #1374 — pre-fix closed
+    # only services.work_service and leaked the fresh StateStore
+    # (regression of #1069's documented pattern).
     if owns_work_service and services is not None:
-        work_closer = getattr(services.work_service, "close", None)
-        if callable(work_closer):
-            try:
-                work_closer()
-            except Exception:  # noqa: BLE001
-                pass
+        try:
+            services.close()
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "task_assignment_notify clear_alerts: services.close raised",
+                exc_info=True,
+            )
     return {
         "cleared_per_task": cleared_per_task,
         "cleared_project": cleared_project,
@@ -521,13 +527,18 @@ def clear_no_session_alert_for_task(
                     "failed for %s", task_id, exc_info=True,
                 )
     finally:
+        # #1374 — close every owned sqlite connection. Pre-fix closed
+        # only services.work_service and leaked the fresh StateStore
+        # opened by load_runtime_services on every approve.
         if owns_work_service and services is not None:
-            work_closer = getattr(services.work_service, "close", None)
-            if callable(work_closer):
-                try:
-                    work_closer()
-                except Exception:  # noqa: BLE001
-                    pass
+            try:
+                services.close()
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "task_assignment_notify clear_no_session_alert: "
+                    "services.close raised",
+                    exc_info=True,
+                )
     return {"cleared_per_task": cleared_per_task}
 
 

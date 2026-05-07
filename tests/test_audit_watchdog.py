@@ -1078,3 +1078,54 @@ def test_cadence_handler_skips_dispatch_for_legacy_rules(
     assert counters["dispatches_sent"] == 0
     assert counters["dispatches_throttled"] == 0
     assert sent == []
+
+
+# ---------------------------------------------------------------------------
+# #1420 — auto-unstick brief must be SUBMITTED, not just typed
+# ---------------------------------------------------------------------------
+
+
+def test_send_brief_to_architect_presses_enter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for #1420.
+
+    PR #1415 originally called ``tmux.send_keys(..., press_enter=False)``,
+    so the brief sat in the architect pane's input buffer until a human
+    pressed Enter — undermining the "no user intervention" goal.
+
+    The dispatch helper must call ``send_keys`` with ``press_enter=True``
+    (or pass a positional True) so the architect agent actually processes
+    the turn.
+    """
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _send_brief_to_architect,
+    )
+
+    captured: list[dict] = []
+
+    class _FakeTmux:
+        def send_keys(
+            self, target: str, text: str, press_enter: bool = True,
+        ) -> None:
+            captured.append(
+                {"target": target, "text": text, "press_enter": press_enter},
+            )
+
+    # Patch the import inside the helper so it picks up our fake.
+    import pollypm.tmux.client as tmux_mod
+
+    monkeypatch.setattr(tmux_mod, "TmuxClient", _FakeTmux)
+
+    ok = _send_brief_to_architect(
+        "pollypm-storage-closet:architect-savethenovel",
+        "WATCHDOG ESCALATION ...",
+    )
+    assert ok is True
+    assert len(captured) == 1
+    call = captured[0]
+    assert call["target"] == "pollypm-storage-closet:architect-savethenovel"
+    assert call["press_enter"] is True, (
+        "Auto-unstick must submit the brief (press_enter=True); otherwise "
+        "the architect agent never processes it. See issue #1420."
+    )

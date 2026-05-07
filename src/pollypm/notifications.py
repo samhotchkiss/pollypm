@@ -22,11 +22,23 @@ def send_notification(title: str, body: str, *, method: str = "macos") -> bool:
     return False
 
 
+def _escape_applescript(raw: str) -> str:
+    """Escape a Python string for embedding in an AppleScript string literal.
+
+    Order matters: replace backslashes *before* double quotes, otherwise the
+    backslashes we introduce while escaping ``"`` would be doubled again.
+    Skipping the backslash escape (the pre-#1378 behaviour) lets a caller
+    smuggle in ``\\"``, which AppleScript parses as ``\\`` followed by a
+    string-terminating ``"`` — opening a path to arbitrary AppleScript /
+    ``do shell script`` execution.
+    """
+    return raw.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _macos_notification(title: str, body: str) -> bool:
     """Send a macOS notification via osascript."""
-    # Escape for AppleScript
-    title_escaped = title.replace('"', '\\"')
-    body_escaped = body.replace('"', '\\"')
+    title_escaped = _escape_applescript(title)
+    body_escaped = _escape_applescript(body)
     script = f'display notification "{body_escaped}" with title "{title_escaped}"'
     try:
         subprocess.run(

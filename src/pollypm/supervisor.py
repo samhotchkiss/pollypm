@@ -831,6 +831,24 @@ class Supervisor:
                 "worker-marker reaper failed at bootstrap", exc_info=True,
             )
 
+        # #1368 — reap stale ``cockpit_inputs/*.sock`` whose owning PID
+        # is dead. The bridge unlinks on clean shutdown but ``SIGKILL``
+        # / crash paths leave one entry per crashed cockpit boot; in the
+        # field we observed 318 stale sockets accumulating. Bootstrap is
+        # the safe sweep time — no cockpit is alive yet, so any reapable
+        # socket is by definition dead and a runtime race can't unlink
+        # a live cockpit's only discoverable bridge.
+        try:
+            from pollypm.cockpit_socket_reaper import (
+                reap_stale_cockpit_sockets,
+            )
+
+            reap_stale_cockpit_sockets(self.config.project.base_dir)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "cockpit-socket reaper failed at bootstrap", exc_info=True,
+            )
+
     def repair_sessions_table(self) -> int:
         """Upsert a ``sessions`` row for every configured session whose
         tmux window is currently alive.

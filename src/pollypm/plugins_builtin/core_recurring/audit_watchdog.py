@@ -206,19 +206,31 @@ def _send_brief_to_architect(
 ) -> bool:
     """Best-effort tmux send-keys of the brief to the architect window.
 
-    Returns True on success. The brief is sent as multiple lines —
-    each line followed by a literal Enter — so the architect's chat
-    surface treats it as a single user turn ending with Enter.
+    Returns True on success. The brief is sent as a single text blob
+    followed by Enter so the architect agent (Codex/Claude) actually
+    processes the turn — agents don't act on their input buffer until
+    Enter lands.
+
+    #1420: previously called ``send_keys(..., press_enter=False)`` on
+    the rationale that the architect should "review before submitting"
+    (mirroring ``_perform_pm_dispatch``'s human-gated semantics). But
+    ``_perform_pm_dispatch`` is for *user-initiated* cockpit dispatches
+    where a human finalizes the send; here the receiver is an agent,
+    so the brief sat in the prompt indefinitely until a human pressed
+    Enter — undermining auto-unstick's "no user intervention" framing.
+
+    The Enter is delivered by ``TmuxClient.send_keys`` after a 500ms
+    settle delay on the paste-buffer path, mirroring the supervisor
+    primer (``cockpit_rail.py`` ``_maybe_prime_*``) and chat dispatch
+    convention (#1403, #1404, #1411).
     """
     try:
         from pollypm.tmux.client import TmuxClient
 
         tmux = TmuxClient()
-        # Send the brief as a single literal text blob; no Enter so the
-        # architect can review before submitting. Mirrors the cockpit's
-        # ``_perform_pm_dispatch`` semantics where the user finishes
-        # the send themselves — except here the "user" is the architect.
-        tmux.send_keys(target, brief, press_enter=False)
+        # press_enter=True so the agent submits the turn autonomously.
+        # See module-level docstring + #1420 for the rationale.
+        tmux.send_keys(target, brief, press_enter=True)
         return True
     except Exception:  # noqa: BLE001
         logger.debug(

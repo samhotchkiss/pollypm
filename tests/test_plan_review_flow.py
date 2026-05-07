@@ -566,8 +566,15 @@ def test_plan_review_message_uses_plan_review_controls(
             detail_text = str(plan_review_message_app.detail.render())
             hint_text = str(plan_review_message_app.hint.render())
 
-            assert "Press v to open the explainer (unavailable)" not in detail_text
-            assert "No visual explainer is available for this plan" in detail_text
+            # #1397: the file-pointer body has been replaced. When no
+            # plan markdown is on disk, we surface a fallback rather
+            # than the legacy "Press v" / explainer-unavailable copy.
+            assert "Press v to open the explainer" not in detail_text
+            assert "No visual explainer is available for this plan" not in detail_text
+            assert (
+                "Plan content is not available on disk yet" in detail_text
+                or "## " in detail_text
+            )
             assert "v open explainer" not in hint_text
             assert "d discuss" in hint_text
             assert "A approve" in hint_text
@@ -863,4 +870,320 @@ def test_no_x_binding_on_plan_review_items(
                 t.task_id == plan_review_env["plan_review_id"]
                 for t in inbox_app._tasks
             )
+    _run(body())
+
+
+# ---------------------------------------------------------------------------
+# #1397 — render plan content inline in the cockpit
+# ---------------------------------------------------------------------------
+
+
+class TestPlanInlineRendering:
+    """Helpers that turn a plan body into structured preview blocks."""
+
+    def test_summary_block_extracts_paragraph_under_summary_header(self) -> None:
+        from pollypm.cockpit_ui import _extract_plan_summary_block
+        text = (
+            "# Project plan\n\n"
+            "## Summary\n"
+            "Ship the rendering pipeline in three steps; each step lands\n"
+            "as its own task so we can pause between phases.\n\n"
+            "## Judgment calls\n- foo\n"
+        )
+        summary = _extract_plan_summary_block(text)
+        assert summary.startswith("Ship the rendering pipeline")
+        assert "three steps" in summary
+        assert "foo" not in summary  # stops at the next header
+
+    def test_summary_block_falls_back_to_first_paragraph(self) -> None:
+        from pollypm.cockpit_ui import _extract_plan_summary_block
+        text = (
+            "# Old-style plan\n\n"
+            "This is the leading paragraph that doubles as a summary.\n\n"
+            "## Some other header\nThe rest.\n"
+        )
+        summary = _extract_plan_summary_block(text)
+        assert summary.startswith("This is the leading paragraph")
+
+    def test_judgment_calls_extracts_bullet_list(self) -> None:
+        from pollypm.cockpit_ui import _extract_plan_judgment_calls
+        text = (
+            "## Summary\nA paragraph.\n\n"
+            "## Judgment calls\n"
+            "- Whether to ship the rename in a single PR or split it\n"
+            "- The cache eviction strategy\n"
+            "- Stamping plan_version on every transition or only on user_approval\n\n"
+            "## Plan body\nActual plan...\n"
+        )
+        points = _extract_plan_judgment_calls(text)
+        assert len(points) == 3
+        assert points[0].startswith("Whether to ship the rename")
+        assert "cache eviction" in points[1]
+
+    def test_judgment_calls_returns_empty_when_section_missing(self) -> None:
+        from pollypm.cockpit_ui import _extract_plan_judgment_calls
+        assert _extract_plan_judgment_calls("# A plan\n\nNo judgment section.") == []
+
+    def test_action_card_renders_judgment_calls_for_plan_review(self) -> None:
+        """The Action Needed card on the project drilldown surfaces
+        the architect's flagged judgment-call points right under the
+        summary so the user knows what to weigh in on."""
+        from pollypm.cockpit_ui import PollyProjectDashboardApp
+        # Just exercise the pure render helper — no Pilot needed.
+        app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+        item = {
+            "is_plan_review": True,
+            "plain_prompt": "A short plan summary appears here.",
+            "judgment_calls": [
+                "Whether to ship in one PR or split it.",
+                "The cache eviction strategy.",
+            ],
+            "unblock_steps": ["Open the plan review surface."],
+            "decision_question": "Is this ready to become tasks?",
+        }
+        body = app._render_action_card_body(item, compact=False)
+        assert "Flagged judgment calls" in body
+        assert "Whether to ship in one PR" in body
+        assert "cache eviction" in body
+        assert "A short plan summary appears here" in body
+
+    def test_action_card_caps_long_summary_at_80_chars(self) -> None:
+        from pollypm.cockpit_ui import PollyProjectDashboardApp
+        app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+        long_summary = "x" * 200
+        item = {
+            "is_plan_review": True,
+            "plain_prompt": long_summary,
+            "judgment_calls": [],
+            "unblock_steps": [],
+            "decision_question": "Ready?",
+        }
+        body = app._render_action_card_body(item, compact=False)
+        # Summary is truncated with an ellipsis, so the rendered ``x``
+        # run is well under 200 chars.
+        assert "x" * 100 not in body
+        assert "..." in body
+
+    def test_action_card_omits_judgment_calls_when_not_plan_review(self) -> None:
+        from pollypm.cockpit_ui import PollyProjectDashboardApp
+        app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+        item = {
+            "plain_prompt": "Generic message.",
+            "unblock_steps": ["Step 1.", "Step 2."],
+            "decision_question": "Choose.",
+        }
+        body = app._render_action_card_body(item, compact=False)
+        assert "Flagged judgment calls" not in body
+
+
+def test_plan_review_message_detail_renders_plan_inline_when_available(
+    tmp_path: Path,
+) -> None:
+    """Issue #1397: when a plan_review message renders, the detail pane
+    shows the plan markdown body inline instead of the file-pointer
+    text the architect emits."""
+    from pollypm.cockpit_ui import PollyInboxApp
+
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    (project_path / ".git").mkdir()
+    (project_path / "docs").mkdir()
+    plan_md = (
+        "# Demo plan\n\n"
+        "## Summary\n"
+        "We will ship the rendering pipeline as three small tasks.\n\n"
+        "## Judgment calls\n"
+        "- Whether to keep the legacy code path during migration.\n"
+        "- Cache eviction strategy in the renderer.\n\n"
+        "## Plan body\n"
+        "1. Wire the renderer.\n2. Migrate callers.\n3. Drop the legacy path.\n"
+    )
+    (project_path / "docs" / "project-plan.md").write_text(plan_md, encoding="utf-8")
+    config_path = tmp_path / "pollypm.toml"
+    _write_minimal_config(project_path, config_path)
+    plan_task_id = _seed_plan_task(project_path)
+    message_id = _seed_plan_review_message(
+        project_path,
+        plan_task_id=plan_task_id,
+        body=(
+            f"Plan: {project_path}/docs/project-plan.md\n"
+            "Press v to open the explainer (unavailable), "
+            "d to discuss with the PM, A to approve."
+        ),
+    )
+    if not _load_config_compatible(config_path):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    app = PollyInboxApp(config_path)
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app._selected_task_id = message_id
+            app._render_detail(message_id)
+            await pilot.pause()
+            detail = str(app.detail.render())
+            assert "Demo plan" in detail
+            assert "rendering pipeline as three small tasks" in detail
+            # File path NOT surfaced in the body — implementation detail.
+            assert "/docs/project-plan.md" not in detail
+            assert "Press v to open the explainer" not in detail
+
+    _run(body())
+
+
+def test_plan_review_message_detail_falls_back_when_plan_missing(
+    plan_review_message_env, plan_review_message_app,
+) -> None:
+    """When no plan markdown is on disk, the detail pane shows a
+    discoverability hint rather than the file-pointer body."""
+    async def body() -> None:
+        async with plan_review_message_app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            task_id = plan_review_message_env["message_id"]
+            plan_review_message_app._selected_task_id = task_id
+            plan_review_message_app._render_detail(task_id)
+            await pilot.pause()
+            detail = str(plan_review_message_app.detail.render())
+            # Fallback hint replaces the file-pointer body.
+            assert "Plan content is not available on disk yet" in detail
+            assert "Plan: docs/project-plan.md" not in detail
+
+    _run(body())
+
+
+def test_long_plan_renders_in_scrollable_detail_pane(tmp_path: Path) -> None:
+    """A long plan should not break the inbox detail layout; the host
+    pane is a VerticalScroll so the long render scrolls inside it."""
+    from pollypm.cockpit_ui import PollyInboxApp
+    from textual.containers import VerticalScroll
+
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    (project_path / ".git").mkdir()
+    (project_path / "docs").mkdir()
+    big_body = ["# Demo plan", "", "## Summary", "Tiny summary.", ""]
+    for idx in range(120):
+        big_body.append(f"## Section {idx}")
+        big_body.append(f"Body for section {idx}.")
+        big_body.append("")
+    (project_path / "docs" / "project-plan.md").write_text(
+        "\n".join(big_body), encoding="utf-8",
+    )
+    config_path = tmp_path / "pollypm.toml"
+    _write_minimal_config(project_path, config_path)
+    plan_task_id = _seed_plan_task(project_path)
+    message_id = _seed_plan_review_message(
+        project_path,
+        plan_task_id=plan_task_id,
+    )
+    if not _load_config_compatible(config_path):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    app = PollyInboxApp(config_path)
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app._selected_task_id = message_id
+            app._render_detail(message_id)
+            await pilot.pause()
+            # The host scroll exists and contains the detail Static.
+            scroll = app.query_one("#inbox-detail-scroll", VerticalScroll)
+            assert scroll is not None
+            detail = str(app.detail.render())
+            # Many sections rendered without crashing layout.
+            assert "Section 0" in detail
+            assert "Section 119" in detail
+
+    _run(body())
+
+
+def test_project_drilldown_plan_review_card_surfaces_plan_summary(
+    tmp_path: Path,
+) -> None:
+    """Drilling into a project with a pending plan_review action card
+    surfaces the plan summary + judgment-call points inline (the rich
+    project drilldown surface that #1397 calls out)."""
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    (project_path / ".git").mkdir()
+    (project_path / "docs").mkdir()
+    plan_md = (
+        "# Demo plan\n\n"
+        "## Summary\n"
+        "Three-phase rollout: scaffolding, migration, cleanup.\n\n"
+        "## Judgment calls\n"
+        "- Whether to keep the legacy path during migration.\n"
+        "- Where to cut the cache invalidation.\n\n"
+        "## Plan body\nDetails...\n"
+    )
+    (project_path / "docs" / "project-plan.md").write_text(plan_md, encoding="utf-8")
+    config_path = tmp_path / "pollypm.toml"
+    _write_minimal_config(project_path, config_path)
+    plan_task_id = _seed_plan_task(project_path)
+    # Use the work service so the row carries the right needs_action /
+    # triage_bucket flags the dashboard's action_items extractor uses.
+    db_path = project_path / ".pollypm" / "state.db"
+    svc = SQLiteWorkService(db_path=db_path, project_path=project_path)
+    try:
+        from pollypm.store import SQLAlchemyStore
+        store = SQLAlchemyStore(f"sqlite:///{db_path}")
+        try:
+            store.enqueue_message(
+                type="notify",
+                tier="immediate",
+                recipient="user",
+                sender="architect",
+                subject="Plan ready for review: demo",
+                body=(
+                    f"Plan: {project_path}/docs/project-plan.md\n\n"
+                    "Press v to open the explainer (unavailable), "
+                    "d to discuss with the PM, A to approve."
+                ),
+                scope="demo",
+                labels=[
+                    "plan_review",
+                    "project:demo",
+                    f"plan_task:{plan_task_id}",
+                ],
+                payload={
+                    "actor": "architect",
+                    "project": "demo",
+                    "user_prompt": {
+                        "summary": "A full project plan is ready for your review.",
+                        "actions": [
+                            {"label": "Review plan", "kind": "review_plan"},
+                            {"label": "Open task", "kind": "open_task",
+                             "task_id": plan_task_id},
+                        ],
+                    },
+                },
+                state="open",
+            )
+        finally:
+            store.close()
+    finally:
+        svc.close()
+    if not _load_config_compatible(config_path):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm import cockpit_ui as _cockpit_ui
+    _cockpit_ui._PROJECT_DASHBOARD_TASK_CACHE.clear()
+    _cockpit_ui._DASHBOARD_INBOX_CACHE.clear()
+    app = PollyProjectDashboardApp(config_path, "demo")
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 60)) as pilot:
+            await pilot.pause()
+            rendered = app._inbox_section_text()
+            # Plan summary surfaced (at minimum, the leading clause).
+            assert "Three-phase rollout" in rendered
+            # Judgment calls surfaced as the flagged-points block.
+            assert "Flagged judgment calls" in rendered
+            assert "legacy path during migration" in rendered
+            assert "cache invalidation" in rendered
+            # File path NOT surfaced in the action card.
+            assert "docs/project-plan.md" not in rendered
+
     _run(body())

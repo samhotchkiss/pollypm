@@ -18,10 +18,12 @@ Design goals:
 - **Tracebacks included.** ``logger.exception(...)`` lands with
   the full traceback; plain ``logger.error("msg")`` lands with
   just the message. Both are useful; both are captured.
-- **No dependency on the scheduler/rail.** The handler is a plain
-  stdlib ``logging.FileHandler`` — safe to install before the
-  plugin host / rail / event bus exist. A boot-time crash still
-  gets logged.
+- **No dependency on the scheduler/rail.** The handler is a stdlib
+  :class:`~logging.handlers.RotatingFileHandler` (#1366) — safe to
+  install before the plugin host / rail / event bus exist. A
+  boot-time crash still gets logged, and the handler caps its own
+  growth at the configured ``[logging] rotate_size_mb`` so this
+  file no longer balloons to hundreds of MB.
 - **Idempotent.** Calling ``install`` twice (e.g. the cockpit
   initializing after ``pm up``) doesn't duplicate lines.
 
@@ -37,6 +39,7 @@ import os
 from pathlib import Path
 
 from pollypm.error_notifications import CriticalErrorNotificationHandler
+from pollypm.log_rotation import make_rotating_file_handler
 
 DEFAULT_LOG_FILENAME = "errors.log"
 DEFAULT_LEVEL = logging.WARNING
@@ -94,8 +97,7 @@ def install(
     if not any(getattr(h, "_pollypm_error_handler", False) for h in root.handlers):
         target = path or _log_path()
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            handler = logging.FileHandler(target, encoding="utf-8")
+            handler = make_rotating_file_handler(target)
         except Exception:  # noqa: BLE001
             # Can't write the log file — don't take the whole process
             # down over it. Callers still get stderr logging from their

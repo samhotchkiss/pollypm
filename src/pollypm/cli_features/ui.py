@@ -528,20 +528,21 @@ def _install_cockpit_debug_log_handler(config_path: Path) -> None:
     launches in the same process won't stack handlers.
     """
     debug_log = config_path.parent / "cockpit_debug.log"
-    try:
-        debug_log.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        # If we can't create the dir, the open() below would fail too;
-        # logging is best-effort, never block cockpit boot on it.
-        return
     sentinel = "_pollypm_cockpit_debug_log"
     root = logging.getLogger()
     for existing in root.handlers:
         if getattr(existing, sentinel, False):
             return  # already installed in this process
+    # #1366: use a RotatingFileHandler so cockpit_debug.log doesn't
+    # balloon unbounded — previously it grew to 34 MB+ between
+    # rotations because nothing rotated ``~/.pollypm/`` files.
     try:
-        handler = logging.FileHandler(debug_log, mode="a", encoding="utf-8")
+        from pollypm.log_rotation import make_rotating_file_handler
+
+        handler = make_rotating_file_handler(debug_log)
     except OSError:
+        return
+    except Exception:  # noqa: BLE001
         return
     handler.setLevel(logging.INFO)
     handler.setFormatter(

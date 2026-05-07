@@ -92,7 +92,12 @@ Leases auto-expire after 30 minutes. The cockpit auto-claims/releases leases whe
 | Command | What it does |
 |---------|-------------|
 | `pm projects` | List configured projects |
-| `pm add-project <path>` | Register a project |
+| `pm add-project <path>` | Register a project (defaults to `tracked=true` so cockpit/briefing/recovery surfaces include it) |
+| `pm add-project <path> --no-track` | Register without marking the project as tracked (use for experimental/archival registrations) |
+| `pm add-project <path> --skip-plan` | Register without auto-firing the planner |
+| `pm project new <path>` | Register and immediately run the planner |
+| `pm project plan <project>` | Spawn the architect with the planning flow (use for first plan and re-plans, not `pm task create`) |
+| `pm project rename <old> <new>` | Rename a project's slug (with `--dry-run` to preview) |
 | `pm scan-projects` | Auto-discover git repos in workspace |
 | `pm init-tracker` | Initialize the issue tracker for a project |
 
@@ -138,9 +143,20 @@ When you add a project with `pm add-project`, the import runs automatically. Use
 | `pm upgrade` | Check GitHub for new versions and install updates |
 | `pm upgrade --check` | Only check if an update is available |
 
+## Help
+
+| Command | What it does |
+|---------|-------------|
+| `pm help worker` | Print the canonical worker guide (single source of truth for the worker role) |
+| `pm shortcuts` | Curated cheatsheet of common PollyPM commands |
+
 ## Diagnostics
 
 | Command | What it does |
 |---------|-------------|
-| `pm doctor` | Check prerequisites (tmux, claude, codex, docker) |
+| `pm doctor` | Run the full diagnostic checklist: prerequisites (tmux, claude, codex, docker), provider-account auth, dual-DB consistency, and worker-marker health |
+| `pm doctor --json` | Emit the report as machine-readable JSON |
+| `pm doctor --fix` | Apply the safe subset of automatic repairs (missing dirs, stale panes, orphan worker markers) |
+| `pm doctor --fix-dry-run` | Show what `--fix` would change, without mutating anything |
 | `pm account-doctor` | Deep-check account health and isolation |
+| `pm errors` | Triage view over `~/.pollypm/errors.log` |

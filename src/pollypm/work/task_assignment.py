@@ -185,11 +185,12 @@ def role_candidate_names(
     # #1057 — per-task worker windows fulfill ANY role for their
     # specific task. Compute the per-task candidate once and prepend
     # below so it takes precedence over role-specific candidates.
-    # TODO(#1057): the simpler "per-task worker fulfills any role"
-    # semantics ships now. If we later decide a per-task pane should
-    # only fulfill the role it was spawned to handle (e.g. because the
-    # window's persona was overwritten), narrow this check by reading
-    # the task's ``assignee`` and matching it against ``role``.
+    # Note: the simpler "per-task worker fulfills any role" semantics
+    # is the shipped behavior (#1057 CLOSED). If we ever decide a
+    # per-task pane should only fulfill the role it was spawned to
+    # handle (e.g. because the window's persona was overwritten),
+    # narrow this check by reading the task's ``assignee`` and matching
+    # it against ``role``.
     per_task_candidate: str | None = None
     if task_number is not None and project:
         per_task_candidate = f"task-{project}-{int(task_number)}"

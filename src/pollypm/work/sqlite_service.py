@@ -650,15 +650,15 @@ def maybe_record_first_shipped(
 class SQLiteWorkService:
     """SQLite-backed work service implementing the WorkService protocol."""
 
-    # TODO(savethenovel-followup): emit ``work_table.cleared`` from
-    # the codepath that recreates ``work_tasks`` from scratch (DB
-    # rebuild on first open against a missing/empty file, or any
+    # Note: the audit-log surface should emit ``work_table.cleared``
+    # from any codepath that recreates ``work_tasks`` from scratch
+    # (DB rebuild on first open against a missing/empty file, or any
     # admin reset path). Today the only ``DELETE FROM work_tasks``
     # is the per-row prune in :meth:`_prune_cancelled_critique_child`
     # which is already audited as ``task.deleted``. The wholesale
-    # wipe vector that prompted this audit log is suspected to be
-    # an external ``pm reset``-class operation; instrument that
-    # caller (and any future bulk-clear path) here.
+    # wipe vector is suspected to be an external ``pm reset``-class
+    # operation; instrument that caller (and any future bulk-clear
+    # path) when it surfaces. Tracked in #1359.
     def __init__(
         self,
         db_path: Path,

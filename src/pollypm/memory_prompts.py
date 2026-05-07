@@ -92,7 +92,7 @@ def build_memory_injection(
     backend: MemoryBackend,
     *,
     user_id: str,
-    project_name: str,
+    project_key: str,
     task_context_summary: str,
     types: Iterable[str] | None = None,
     importance_min: int = 3,
@@ -102,7 +102,7 @@ def build_memory_injection(
     """Render the ``## What you should know`` section for session start.
 
     Runs recall against the passed-in backend, scoped to
-    ``[("user", user_id), ("project", project_name)]`` and filtered by
+    ``[("user", user_id), ("project", project_key)]`` and filtered by
     the caller-specified memory types (defaults to the four surfacing
     types from the spec: user, feedback, project, pattern).
 
@@ -123,7 +123,7 @@ def build_memory_injection(
     dropped first (the coordinator sorts by score desc before rendering).
     """
     type_filter = list(types) if types is not None else list(_DEFAULT_TYPES)
-    scope_pairs = [("user", user_id), ("project", project_name)]
+    scope_pairs = [("user", user_id), ("project", project_key)]
     query = (task_context_summary or "").strip()
 
     def _safe_recall(q: str) -> list[RecallResult]:

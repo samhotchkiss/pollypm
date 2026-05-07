@@ -115,7 +115,7 @@ def test_build_memory_injection_surfaces_all_four_sections(seeded_backend: FileM
     injection = build_memory_injection(
         seeded_backend,
         user_id="operator",
-        project_name="pollypm",
+        project_key="pollypm",
         task_context_summary="testing pytest",
     )
     assert injection, "expected non-empty injection for a seeded store"
@@ -132,7 +132,7 @@ def test_build_memory_injection_contains_salient_fields(seeded_backend: FileMemo
     injection = build_memory_injection(
         seeded_backend,
         user_id="operator",
-        project_name="pollypm",
+        project_key="pollypm",
         task_context_summary="testing pytest",
     )
     # Each seeded memory should surface its salient value.
@@ -152,7 +152,7 @@ def test_build_memory_injection_empty_when_store_is_empty(tmp_path: Path) -> Non
     injection = build_memory_injection(
         backend,
         user_id="operator",
-        project_name="new-project",
+        project_key="new-project",
         task_context_summary="brand new",
     )
     assert injection == ""
@@ -166,7 +166,7 @@ def test_build_memory_injection_empty_when_no_matching_scope(seeded_backend: Fil
     injection = build_memory_injection(
         seeded_backend,
         user_id="different-user",
-        project_name="different-project",
+        project_key="different-project",
         task_context_summary="irrelevant",
     )
     assert injection == ""
@@ -180,7 +180,7 @@ def test_build_memory_injection_empty_when_no_matching_scope(seeded_backend: Fil
 def test_build_memory_injection_is_deterministic(seeded_backend: FileMemoryBackend) -> None:
     kwargs = dict(
         user_id="operator",
-        project_name="pollypm",
+        project_key="pollypm",
         task_context_summary="testing pytest",
     )
     a = build_memory_injection(seeded_backend, **kwargs)
@@ -212,7 +212,7 @@ def test_build_memory_injection_respects_budget_cap(tmp_path: Path) -> None:
     injection = build_memory_injection(
         backend,
         user_id="operator",
-        project_name="pollypm",
+        project_key="pollypm",
         task_context_summary="large corpus test",
         limit=30,
     )
@@ -225,7 +225,7 @@ def test_build_memory_injection_budget_override_works(seeded_backend: FileMemory
     tiny = build_memory_injection(
         seeded_backend,
         user_id="operator",
-        project_name="pollypm",
+        project_key="pollypm",
         task_context_summary="testing pytest",
         budget_chars=400,
     )
@@ -249,7 +249,7 @@ def test_build_memory_injection_marks_when_entries_are_truncated(tmp_path: Path)
     injection = build_memory_injection(
         backend,
         user_id="operator",
-        project_name="pollypm",
+        project_key="pollypm",
         task_context_summary="large corpus test",
         limit=12,
         budget_chars=300,
@@ -280,7 +280,7 @@ def test_build_memory_injection_respects_importance_floor(tmp_path: Path) -> Non
     injection = build_memory_injection(
         backend,
         user_id="operator",
-        project_name="pollypm",
+        project_key="pollypm",
         task_context_summary="anything",
     )
     assert injection == ""
@@ -338,7 +338,7 @@ def test_full_injection_matches_spec_shape(seeded_backend: FileMemoryBackend) ->
     injection = build_memory_injection(
         seeded_backend,
         user_id="operator",
-        project_name="pollypm",
+        project_key="pollypm",
         task_context_summary="testing",
     )
     lines = injection.splitlines()

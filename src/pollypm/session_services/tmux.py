@@ -1121,7 +1121,7 @@ class TmuxSessionService:
             memory_injection = build_memory_injection(
                 backend,
                 user_id=user_id,
-                project_name=project_name,
+                project_key=project_name,
                 task_context_summary=summary,
             )
         except Exception:  # noqa: BLE001

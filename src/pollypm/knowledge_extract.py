@@ -160,7 +160,7 @@ def _store_memory_entries(config, project_root: Path, delta: "KnowledgeDelta") -
     except Exception:  # noqa: BLE001
         return 0
     count = 0
-    project_name = project_root.name
+    project_key = project_root.name
     kind_map = {
         "decision": delta.decisions,
         "goal": delta.goals,
@@ -181,15 +181,15 @@ def _store_memory_entries(config, project_root: Path, delta: "KnowledgeDelta") -
         summary_path = summary_paths[kind]
         for item in items:
             # Check for duplicates by title+scope
-            existing = store.list_memory_entries(scope=project_name, kind=kind, limit=200)
+            existing = store.list_memory_entries(scope=project_key, kind=kind, limit=200)
             if any(e.title == item for e in existing):
                 continue
             store.record_memory_entry(
-                scope=project_name,
+                scope=project_key,
                 kind=kind,
                 title=item,
                 body="",
-                tags=[project_name, kind],
+                tags=[project_key, kind],
                 source="knowledge_extract",
                 file_path=str(summary_path),
                 summary_path=str(summary_path),

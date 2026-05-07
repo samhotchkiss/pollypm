@@ -144,7 +144,7 @@ def _config_from_payload(payload: dict[str, Any]) -> WatchdogConfig:
 
 
 def _gather_open_tasks(project_key: str, project_path: Path | None) -> list[Any]:
-    """Best-effort load of in-flight tasks for ``role_session_missing``.
+    """Best-effort load of in-flight tasks for state-based rules.
 
     Routes through :func:`pollypm.work.create_work_service` (the factory
     landed in #1389), which delegates path resolution to
@@ -155,10 +155,21 @@ def _gather_open_tasks(project_key: str, project_path: Path | None) -> list[Any]
     ``db_path`` here. ``project_key`` is forwarded for resolver warnings
     and ``project_path`` for project-aware audit metadata only.
 
+    Powers four rules: ``role_session_missing`` (since #1414), and the
+    state-based variants of ``task_review_stale``, ``task_on_hold_stale``,
+    and ``stuck_draft`` (#1433). For tasks at the watched states
+    (review / on_hold / draft) we re-fetch via :meth:`get` so
+    ``transitions`` are hydrated — :meth:`list_nonterminal_tasks` skips
+    transition loading for non-plan-review tasks (it only includes
+    history for plan-review labelled rows). Without transitions the
+    state-based detectors fall back to ``updated_at``, which is touched
+    on every status change and is therefore a noisy proxy.
+
     Returns an empty list on any failure — the watchdog keeps working
-    even when the work-service is unreachable; the new rule simply
-    no-ops for that project.
+    even when the work-service is unreachable; the affected rules
+    simply no-op for that project.
     """
+    _STATE_RULE_STATES = frozenset({"review", "on_hold", "draft"})
     try:
         from pollypm.work import create_work_service
 
@@ -169,7 +180,37 @@ def _gather_open_tasks(project_key: str, project_path: Path | None) -> list[Any]
             list_fn = getattr(svc, "list_nonterminal_tasks", None)
             if not callable(list_fn):
                 return []
-            return list(list_fn(project=project_key))
+            tasks = list(list_fn(project=project_key))
+            # Hydrate transitions for tasks at the watched states so the
+            # state-based detectors can compute "time in this state"
+            # accurately. Best-effort; if ``svc.get`` blows up we fall
+            # through to the un-hydrated row (the detector then falls
+            # back to ``updated_at``, which is still better than nothing).
+            get_fn = getattr(svc, "get", None)
+            if callable(get_fn):
+                hydrated: list[Any] = []
+                for task in tasks:
+                    status = getattr(task, "work_status", None)
+                    status_value = getattr(status, "value", status)
+                    if status_value in _STATE_RULE_STATES:
+                        try:
+                            project = getattr(task, "project", "")
+                            task_number = getattr(task, "task_number", None)
+                            if project and task_number is not None:
+                                full = get_fn(f"{project}/{task_number}")
+                                if full is not None:
+                                    hydrated.append(full)
+                                    continue
+                        except Exception:  # noqa: BLE001
+                            logger.debug(
+                                "audit.watchdog: hydrate-transitions failed for %s/%s",
+                                getattr(task, "project", "?"),
+                                getattr(task, "task_number", "?"),
+                                exc_info=True,
+                            )
+                    hydrated.append(task)
+                return hydrated
+            return tasks
     except Exception:  # noqa: BLE001
         logger.debug(
             "audit.watchdog: open-task load failed for %s",

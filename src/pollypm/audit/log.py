@@ -70,6 +70,18 @@ EVENT_SOCKET_REAPED = "socket.reaped"
 # render plan-history breadcrumbs without scanning task content.
 EVENT_PLAN_VERSION_INCREMENTED = "plan.version_incremented"
 EVENT_PLAN_SUCCESSOR_CREATED = "plan.successor_created"
+# #1414 — auto-unstick infrastructure. ``worker.session_reaped`` fires
+# whenever the worker-marker reaper unlinks an orphan marker (one event
+# per reaped marker); the watchdog's dead-loop detector counts these
+# per-task to spot a reaper firing repeatedly on the same task without
+# the underlying problem being fixed. ``watchdog.escalation_dispatched``
+# fires from the watchdog cadence handler when a finding is routed to
+# the project's architect with an unstick brief — the throttle window
+# query treats the audit log itself as the source of truth, so this
+# event must be present (and queryable by ``finding_type`` + ``subject``)
+# for the dedup to work.
+EVENT_WORKER_SESSION_REAPED = "worker.session_reaped"
+EVENT_WATCHDOG_ESCALATION_DISPATCHED = "watchdog.escalation_dispatched"
 
 
 @dataclass(slots=True, frozen=True)
@@ -422,6 +434,8 @@ __all__ = [
     "EVENT_SOCKET_REAPED",
     "EVENT_PLAN_VERSION_INCREMENTED",
     "EVENT_PLAN_SUCCESSOR_CREATED",
+    "EVENT_WORKER_SESSION_REAPED",
+    "EVENT_WATCHDOG_ESCALATION_DISPATCHED",
     "AuditEvent",
     "central_log_path",
     "emit",

@@ -65,6 +65,8 @@ from pollypm.audit.log import (
     EVENT_MARKER_RELEASED,
     EVENT_TASK_CREATED,
     EVENT_TASK_STATUS_CHANGED,
+    EVENT_WATCHDOG_ESCALATION_DISPATCHED,
+    EVENT_WORKER_SESSION_REAPED,
     AuditEvent,
 )
 
@@ -78,13 +80,19 @@ __all__ = [
     "RULE_MARKER_LEAKED",
     "RULE_STUCK_DRAFT",
     "RULE_CANCEL_NO_PROMOTION",
+    "RULE_TASK_REVIEW_STALE",
+    "RULE_ROLE_SESSION_MISSING",
+    "RULE_WORKER_SESSION_DEAD_LOOP",
     "scan_events",
     "scan_project",
     "emit_heartbeat_tick",
     "emit_finding",
+    "emit_escalation_dispatched",
+    "format_unstick_brief",
     "watchdog_alert_session_name",
     "WATCHDOG_ALERT_TYPE",
     "format_finding_message",
+    "ESCALATION_THROTTLE_SECONDS",
 ]
 
 
@@ -98,6 +106,23 @@ RULE_ORPHAN_MARKER = "orphan_marker"
 RULE_MARKER_LEAKED = "marker_leaked"
 RULE_STUCK_DRAFT = "stuck_draft"
 RULE_CANCEL_NO_PROMOTION = "cancellation_no_promotion"
+# #1414 — auto-unstick rules. ``task_review_stale`` catches a task
+# parked at status=review with no transitions for a while; that's the
+# savethenovel/10 pattern (reviewer agent never spawned). The other
+# two cover the architectural pattern: an in-flight task with no
+# matching role tmux session, and a worker reaper firing in a loop on
+# the same task.
+RULE_TASK_REVIEW_STALE = "task_review_stale"
+RULE_ROLE_SESSION_MISSING = "role_session_missing"
+RULE_WORKER_SESSION_DEAD_LOOP = "worker_session_dead_loop"
+
+# Throttle window for the dispatch path. We re-fire findings on every
+# tick (the audit log is forensic and operators want repeat counts),
+# but we deliberately do NOT re-dispatch the architect for the same
+# (project, finding_type, subject) within 30 min. The dispatch event
+# itself is the source of truth — querying the audit log avoids any
+# in-memory state that wouldn't survive a heartbeat process restart.
+ESCALATION_THROTTLE_SECONDS = 1800
 
 # Audit events emitted *by* the watchdog itself.
 EVENT_HEARTBEAT_TICK = "heartbeat.tick"
@@ -149,6 +174,14 @@ class WatchdogConfig:
     # queue the replacement. If no ``task.created`` for the same
     # project lands in that window, fire the finding.
     cancel_grace_seconds: int = 300
+    # #1414 — task_review_stale: a task at status=review must have its
+    # most recent transition older than this before we fire. 30 min
+    # mirrors the savethenovel/10 case (reviewer agent never spawned).
+    review_stale_seconds: int = 1800
+    # #1414 — worker_session_dead_loop: how many reaper events for the
+    # same task within ``dead_loop_window_seconds`` count as a loop.
+    dead_loop_threshold: int = 3
+    dead_loop_window_seconds: int = 600
 
 
 @dataclass(slots=True, frozen=True)
@@ -507,6 +540,217 @@ def _detect_cancellation_no_promotion(
 
 
 # ---------------------------------------------------------------------------
+# Auto-unstick rules (#1414)
+# ---------------------------------------------------------------------------
+
+
+def _detect_task_review_stale(
+    events: Sequence[AuditEvent],
+    *,
+    now: datetime,
+    config: WatchdogConfig,
+) -> list[Finding]:
+    """Rule 5: task at ``status=review`` with no transition for > threshold.
+
+    Walks ``task.status_changed`` events and finds the latest transition
+    per task subject. If the latest transition lands the task in
+    ``review`` and is older than ``review_stale_seconds`` ago, fire.
+    """
+    findings: list[Finding] = []
+    cutoff = now - timedelta(seconds=config.review_stale_seconds)
+
+    # subject -> (latest_ts, ev) — pick the latest transition per task.
+    latest: dict[str, tuple[datetime, AuditEvent]] = {}
+    for ev in events:
+        if ev.event != EVENT_TASK_STATUS_CHANGED:
+            continue
+        ts = _parse_iso(ev.ts)
+        if ts is None:
+            continue
+        prior = latest.get(ev.subject)
+        if prior is None or ts > prior[0]:
+            latest[ev.subject] = (ts, ev)
+
+    for subject, (ts, ev) in latest.items():
+        to_state = (ev.metadata or {}).get("to")
+        if to_state != "review":
+            continue
+        if ts > cutoff:
+            # Not stale enough yet — give the reviewer time to act.
+            continue
+        key = _task_subject_key(subject)
+        if key is None:
+            continue
+        project, _ = key
+        stuck_minutes = max(1, int((now - ts).total_seconds() // 60))
+        findings.append(Finding(
+            rule=RULE_TASK_REVIEW_STALE,
+            project=project,
+            subject=subject,
+            message=(
+                f"Task {subject} has been at status=review for "
+                f"~{stuck_minutes} min with no further transitions."
+            ),
+            recommendation=(
+                f"Either spawn a reviewer or run `pm task done "
+                f"{subject}` if the work is correct as-is."
+            ),
+            metadata={
+                "review_since": ev.ts,
+                "stuck_minutes": stuck_minutes,
+                "from": (ev.metadata or {}).get("from"),
+                "actor": ev.actor,
+            },
+        ))
+    return findings
+
+
+def _detect_role_session_missing(
+    events: Sequence[AuditEvent],
+    *,
+    now: datetime,
+    config: WatchdogConfig,
+    open_tasks: Sequence[Any] | None = None,
+    storage_window_names: Sequence[str] | None = None,
+    project: str = "",
+) -> list[Finding]:
+    """Rule 6: in-flight task whose assigned role has no tmux session.
+
+    Iterates ``open_tasks`` (in_progress / review with an assignee or
+    role mapping). For each task whose role can be resolved, check
+    whether ``<role>-<project>`` exists in the storage-closet window
+    list. If not, fire.
+
+    The window-name list is passed in (not queried here) so the pure
+    detector can be unit-tested without spinning up tmux.
+    """
+    findings: list[Finding] = []
+    if not open_tasks or storage_window_names is None:
+        return findings
+    window_set = {str(name).strip() for name in storage_window_names if name}
+
+    for task in open_tasks:
+        status = getattr(task, "work_status", None)
+        # Accept either a WorkStatus enum or a raw string.
+        status_value = getattr(status, "value", status)
+        if status_value not in ("in_progress", "review"):
+            continue
+        task_project = getattr(task, "project", "") or project
+        task_number = getattr(task, "task_number", None)
+        if not task_project or task_number is None:
+            continue
+        # Role resolution preference: explicit roles dict (architect /
+        # reviewer / worker) → assignee fallback. We pick the most
+        # specific role for the current state — review tasks need a
+        # reviewer; in_progress tasks need a worker.
+        roles = getattr(task, "roles", {}) or {}
+        candidate_roles: list[str] = []
+        if status_value == "review":
+            candidate_roles = ["reviewer", "architect", "worker"]
+        else:
+            candidate_roles = ["worker", "architect", "reviewer"]
+        role_used: str | None = None
+        for role in candidate_roles:
+            if role in roles and roles[role]:
+                role_used = role
+                break
+        if role_used is None:
+            assignee = getattr(task, "assignee", None)
+            if assignee:
+                # Best-effort: use assignee as the role token. Most of
+                # PollyPM's per-task workers run as ``worker-<project>``,
+                # so this is the right default when no roles are set.
+                role_used = "worker"
+        if role_used is None:
+            continue
+        expected_window = f"{role_used}-{task_project}"
+        if expected_window in window_set:
+            continue
+        findings.append(Finding(
+            rule=RULE_ROLE_SESSION_MISSING,
+            project=task_project,
+            subject=f"{task_project}/{task_number}",
+            message=(
+                f"Task {task_project}/{task_number} is at "
+                f"status={status_value} but no '{expected_window}' "
+                f"window exists in the storage-closet — the role agent "
+                f"is not running."
+            ),
+            recommendation=(
+                f"Spawn a `{role_used}` for {task_project} (e.g. "
+                f"`pm chat {task_project} --role {role_used}`) or "
+                f"reassign the task."
+            ),
+            metadata={
+                "expected_window": expected_window,
+                "role": role_used,
+                "status": status_value,
+            },
+        ))
+    return findings
+
+
+def _detect_worker_session_dead_loop(
+    events: Sequence[AuditEvent],
+    *,
+    now: datetime,
+    config: WatchdogConfig,
+) -> list[Finding]:
+    """Rule 7: 3+ ``worker.session_reaped`` for the same task in a 10-min window.
+
+    Each reaping is itself a sign the worker session crashed; three in
+    a row means the underlying problem isn't the session, it's the
+    task — and the architect needs to look at it instead of the reaper
+    burning energy in a loop.
+    """
+    findings: list[Finding] = []
+    cutoff = now - timedelta(seconds=config.dead_loop_window_seconds)
+
+    # subject -> [(ts, ev), ...]
+    by_subject: dict[str, list[tuple[datetime, AuditEvent]]] = {}
+    for ev in events:
+        if ev.event != EVENT_WORKER_SESSION_REAPED:
+            continue
+        ts = _parse_iso(ev.ts)
+        if ts is None or ts < cutoff:
+            continue
+        if not ev.subject:
+            continue
+        by_subject.setdefault(ev.subject, []).append((ts, ev))
+
+    for subject, hits in by_subject.items():
+        if len(hits) < config.dead_loop_threshold:
+            continue
+        key = _task_subject_key(subject)
+        if key is None:
+            continue
+        project, _ = key
+        latest_ts, latest_ev = max(hits, key=lambda x: x[0])
+        findings.append(Finding(
+            rule=RULE_WORKER_SESSION_DEAD_LOOP,
+            project=project,
+            subject=subject,
+            message=(
+                f"Worker session for {subject} was reaped "
+                f"{len(hits)} times in the last "
+                f"{config.dead_loop_window_seconds // 60} min — the "
+                f"reaper is firing in a loop."
+            ),
+            recommendation=(
+                f"Inspect the task and decide whether to cancel "
+                f"(`pm task cancel {subject}`), reassign, or fix the "
+                f"underlying spawn failure."
+            ),
+            metadata={
+                "reap_count": len(hits),
+                "latest_at": latest_ev.ts,
+                "latest_reason": (latest_ev.metadata or {}).get("reason"),
+            },
+        ))
+    return findings
+
+
+# ---------------------------------------------------------------------------
 # Public API — scan_events / scan_project
 # ---------------------------------------------------------------------------
 
@@ -516,6 +760,9 @@ def scan_events(
     *,
     now: datetime,
     config: WatchdogConfig | None = None,
+    open_tasks: Sequence[Any] | None = None,
+    storage_window_names: Sequence[str] | None = None,
+    project: str = "",
 ) -> list[Finding]:
     """Run every detection rule against ``events`` and return findings.
 
@@ -531,6 +778,15 @@ def scan_events(
             instant in tests.
         config: tunable thresholds. ``None`` uses :class:`WatchdogConfig`
             defaults.
+        open_tasks: live in-flight tasks for the ``role_session_missing``
+            rule — typically the result of
+            ``WorkService.list_nonterminal_tasks(project=...)``. ``None``
+            disables the rule (e.g. unit tests that only feed events).
+        storage_window_names: window names visible in the storage-closet
+            tmux session. Passed in so ``role_session_missing`` stays a
+            pure function.
+        project: project key — only used by ``role_session_missing``
+            when the open_task rows don't carry it.
     """
     if config is None:
         config = WatchdogConfig()
@@ -550,6 +806,20 @@ def scan_events(
     findings.extend(_detect_cancellation_no_promotion(
         materialised, now=now, config=config,
     ))
+    findings.extend(_detect_task_review_stale(
+        materialised, now=now, config=config,
+    ))
+    findings.extend(_detect_role_session_missing(
+        materialised,
+        now=now,
+        config=config,
+        open_tasks=open_tasks,
+        storage_window_names=storage_window_names,
+        project=project,
+    ))
+    findings.extend(_detect_worker_session_dead_loop(
+        materialised, now=now, config=config,
+    ))
     return findings
 
 
@@ -559,6 +829,8 @@ def scan_project(
     project_path: Path | str | None = None,
     now: datetime | None = None,
     config: WatchdogConfig | None = None,
+    open_tasks: Sequence[Any] | None = None,
+    storage_window_names: Sequence[str] | None = None,
 ) -> list[Finding]:
     """Read audit events for ``project`` and scan them.
 
@@ -566,6 +838,11 @@ def scan_project(
     from the per-project log when ``project_path`` exists, else
     from the central tail (mirrors :func:`pollypm.audit.read_events`
     source-preference rules).
+
+    ``open_tasks`` and ``storage_window_names`` are pass-through inputs
+    for the auto-unstick rules (#1414); when omitted those rules become
+    no-ops, which is the right default for callers that only have audit
+    events on hand.
     """
     from pollypm.audit.log import read_events
 
@@ -584,7 +861,14 @@ def scan_project(
         since=since,
         project_path=project_path,
     )
-    return scan_events(events, now=resolved_now, config=config)
+    return scan_events(
+        events,
+        now=resolved_now,
+        config=config,
+        open_tasks=open_tasks,
+        storage_window_names=storage_window_names,
+        project=project,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -644,3 +928,190 @@ def emit_finding(finding: Finding) -> None:
         )
     except Exception:  # noqa: BLE001
         logger.debug("emit_finding failed", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Auto-unstick dispatch (#1414)
+# ---------------------------------------------------------------------------
+
+
+def was_recently_dispatched(
+    *,
+    project: str,
+    finding_type: str,
+    subject: str,
+    now: datetime,
+    project_path: Path | str | None = None,
+    throttle_seconds: int = ESCALATION_THROTTLE_SECONDS,
+) -> bool:
+    """Return True iff the audit log shows a matching dispatch in-window.
+
+    The throttle uses the audit log itself as the source of truth so a
+    heartbeat-process restart doesn't reset the dedup window. We scan
+    ``EVENT_WATCHDOG_ESCALATION_DISPATCHED`` for the project in the last
+    ``throttle_seconds`` and look for a row whose metadata.finding_type
+    and subject both match.
+    """
+    from pollypm.audit.log import read_events
+
+    cutoff = (now - timedelta(seconds=throttle_seconds)).isoformat()
+    try:
+        recent = read_events(
+            project,
+            since=cutoff,
+            event=EVENT_WATCHDOG_ESCALATION_DISPATCHED,
+            project_path=project_path,
+        )
+    except Exception:  # noqa: BLE001 — never block dispatch on read failure
+        logger.debug(
+            "was_recently_dispatched: read_events failed", exc_info=True,
+        )
+        return False
+    for ev in recent:
+        meta = ev.metadata or {}
+        if (
+            meta.get("finding_type") == finding_type
+            and (ev.subject == subject or meta.get("subject") == subject)
+        ):
+            return True
+    return False
+
+
+def emit_escalation_dispatched(
+    *,
+    project: str,
+    finding_type: str,
+    subject: str,
+    brief: str,
+    project_path: Path | str | None = None,
+) -> None:
+    """Emit a ``watchdog.escalation_dispatched`` event.
+
+    The metadata carries enough to reconstruct the dispatch decision:
+    finding_type, subject, and the brief that was sent. Best-effort —
+    never raises.
+    """
+    from pollypm.audit.log import emit as _audit_emit
+    try:
+        _audit_emit(
+            event=EVENT_WATCHDOG_ESCALATION_DISPATCHED,
+            project=project,
+            subject=subject,
+            actor="audit_watchdog",
+            status="warn",
+            metadata={
+                "finding_type": finding_type,
+                "subject": subject,
+                "brief": brief,
+            },
+            project_path=project_path,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("emit_escalation_dispatched failed", exc_info=True)
+
+
+def format_unstick_brief(finding: Finding) -> str:
+    """Render a finding as a structured brief for the architect.
+
+    Each rule produces a tailored brief — the framing is the same
+    (``WATCHDOG ESCALATION`` header + structured fields + decision
+    options) but the ``Observed evidence`` and ``Your job`` lines vary
+    so the architect knows which lever to pull first.
+    """
+    project = finding.project or "<unknown>"
+    subject = finding.subject or "<unknown>"
+    meta = finding.metadata or {}
+
+    lines: list[str] = ["WATCHDOG ESCALATION", ""]
+    lines.append(f"Project: {project}")
+    lines.append(f"Finding: {finding.rule}")
+    lines.append(f"Subject: {subject}")
+
+    if finding.rule == RULE_TASK_REVIEW_STALE:
+        stuck_minutes = meta.get("stuck_minutes")
+        review_since = meta.get("review_since")
+        lines.append(
+            f"Stuck for: {stuck_minutes} minutes" if stuck_minutes
+            else "Stuck for: unknown duration"
+        )
+        lines.append("Observed evidence:")
+        if review_since:
+            lines.append(f"- Task transitioned to status=review at {review_since}")
+        lines.append(
+            "- No subsequent task.status_changed for this subject"
+        )
+        lines.append(
+            "- Reviewer agent appears to be absent or stuck"
+        )
+        lines.append("")
+        lines.append(
+            "Your job: investigate and unstick. Options: "
+            "(a) spawn a reviewer for this project so the queue resumes, "
+            f"(b) review the work yourself and call `pm task done {subject}` "
+            "if it's correct, "
+            "(c) escalate to user via `pm notify` with a clear summary."
+        )
+    elif finding.rule == RULE_ROLE_SESSION_MISSING:
+        expected = meta.get("expected_window") or "<unknown>"
+        role = meta.get("role") or "<unknown>"
+        status = meta.get("status") or "<unknown>"
+        lines.append("Stuck for: a watchdog cycle (>= 5 minutes)")
+        lines.append("Observed evidence:")
+        lines.append(f"- Task at status={status} with role={role}")
+        lines.append(
+            f"- No '{expected}' window in the storage-closet "
+            f"tmux session"
+        )
+        lines.append(
+            "- Without the role session, the task cannot make progress"
+        )
+        lines.append("")
+        lines.append(
+            "Your job: investigate and unstick. Options: "
+            f"(a) spawn the missing `{role}` (e.g. "
+            f"`pm chat {project} --role {role}`) and let it pick up the work, "
+            "(b) reassign the task to a role that IS present, "
+            "(c) escalate to user via `pm notify` if the spawn failure is "
+            "persistent (config / auth / quota)."
+        )
+    elif finding.rule == RULE_WORKER_SESSION_DEAD_LOOP:
+        reap_count = meta.get("reap_count") or "?"
+        latest_reason = meta.get("latest_reason") or "<unknown>"
+        lines.append(
+            f"Stuck for: {reap_count} reaps in the last 10 minutes"
+        )
+        lines.append("Observed evidence:")
+        lines.append(
+            f"- Worker session for {subject} reaped {reap_count} times"
+        )
+        lines.append(f"- Most recent reaper reason: {latest_reason}")
+        lines.append(
+            "- The reaper is firing in a loop — the session keeps "
+            "dying after spawn"
+        )
+        lines.append("")
+        lines.append(
+            "Your job: investigate and unstick. Options: "
+            f"(a) cancel the task (`pm task cancel {subject}`) if it's "
+            "fundamentally broken, "
+            "(b) reassign or rewrite the task to bypass the spawn failure, "
+            "(c) escalate to user via `pm notify` if the failure is in the "
+            "spawn infra itself, not the task content."
+        )
+    else:
+        # Fallback: orphan_marker / marker_leaked / stuck_draft / cancel_no_promotion
+        # all have human-readable messages already; we re-use those.
+        lines.append("Stuck for: see message")
+        lines.append("Observed evidence:")
+        if finding.message:
+            lines.append(f"- {finding.message}")
+        if finding.recommendation:
+            lines.append(f"- Recommendation: {finding.recommendation}")
+        lines.append("")
+        lines.append(
+            "Your job: investigate and unstick. Options: "
+            "(a) act on the recommendation above, "
+            "(b) take a different action you judge appropriate, "
+            "(c) escalate to user via `pm notify`."
+        )
+    return "\n".join(lines)

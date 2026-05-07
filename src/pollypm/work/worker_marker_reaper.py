@@ -75,6 +75,53 @@ WORKER_MARKER_REAPABLE_STATUSES: frozenset[str] = (
 )
 
 
+def _emit_worker_session_reaped(decision: "ReapedMarker") -> None:
+    """Best-effort audit emit for one reaped marker.
+
+    The watchdog's ``worker_session_dead_loop`` rule (#1414) counts
+    these per task to detect a reaper firing repeatedly without the
+    underlying problem being fixed. We carry the window name (so the
+    rule can parse out ``<project>/<task_number>``) and the reaper's
+    classification reason as metadata. Best-effort — never raises.
+    """
+    try:
+        from pollypm.audit.log import (
+            EVENT_WORKER_SESSION_REAPED,
+            emit as _audit_emit,
+        )
+
+        # Parse the window name to a canonical ``<project>/<N>`` subject.
+        subject = ""
+        try:
+            parsed = parse_task_window_name(decision.window_name)
+            if parsed is not None:
+                # ``parse_task_window_name`` returns (project, num) per
+                # the existing helper; use it for the subject when
+                # present, else fall back to the raw window name.
+                proj, num = parsed
+                subject = f"{proj}/{num}"
+        except Exception:  # noqa: BLE001
+            subject = ""
+        if not subject:
+            subject = f"{decision.project_key}/{decision.window_name}"
+        _audit_emit(
+            event=EVENT_WORKER_SESSION_REAPED,
+            project=decision.project_key,
+            subject=subject,
+            actor="worker_marker_reaper",
+            status="warn",
+            metadata={
+                "window_name": decision.window_name,
+                "marker_path": str(decision.marker_path),
+                "reason": decision.reason,
+            },
+        )
+    except Exception:  # noqa: BLE001 — audit failures must never block reaping
+        logger.debug(
+            "worker_marker_reaper: audit emit failed", exc_info=True,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ReapedMarker:
     """Record of a worker marker that was unlinked by the reaper.
@@ -298,8 +345,13 @@ def reap_orphan_worker_markers(
                 decision.window_name,
                 decision.reason,
             )
-            # Placeholder for the parallel audit-log infra. When that
-            # ships, replace this print with an audit event.
+            # #1414 — audit-log emit so the watchdog's
+            # ``worker_session_dead_loop`` rule can count repeat reaps
+            # per task. Subject is the canonical ``<project>/<task_number>``
+            # parsed from the window name (``task-<project>-<N>``); we
+            # fall back to the marker path when the window name isn't
+            # task-bound (e.g. future advisor markers).
+            _emit_worker_session_reaped(decision)
             print(
                 f"[worker_marker_reaper] reaped {decision.window_name} "
                 f"in {decision.project_key}: {decision.reason}",

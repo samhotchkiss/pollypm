@@ -1754,3 +1754,358 @@ def test_classify_on_hold_reason_defaults_to_architect() -> None:
     assert _classify_on_hold_reason("human-needed: y") == ON_HOLD_HUMAN_NEEDED_TAG
     # Case-insensitive
     assert _classify_on_hold_reason("[HUMAN-NEEDED] z") == ON_HOLD_HUMAN_NEEDED_TAG
+
+
+# ---------------------------------------------------------------------------
+# #1433 — state-based detection for review / on_hold / stuck_draft
+#
+# Issue #1433: previously these rules only fired when a matching
+# transition event landed inside the audit-log scan window (~1h). Tasks
+# that entered the watched state earlier were invisible — savethenovel/11
+# sat at on_hold for ~110 min and never got escalated. The state-based
+# path queries the live ``work_tasks`` view via ``open_tasks`` so the
+# detection horizon no longer depends on the audit log's retention.
+# ---------------------------------------------------------------------------
+
+
+class _FakeTransition:
+    """Minimal stand-in for ``work.models.Transition`` (frozen-ish)."""
+
+    def __init__(
+        self,
+        *,
+        from_state: str,
+        to_state: str,
+        timestamp: datetime,
+        actor: str = "polly",
+        reason: str | None = None,
+    ) -> None:
+        self.from_state = from_state
+        self.to_state = to_state
+        self.timestamp = timestamp
+        self.actor = actor
+        self.reason = reason
+
+
+class _StatefulTask:
+    """Stand-in for ``work.models.Task`` with state + transitions + timestamps."""
+
+    class _Status:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+    def __init__(
+        self,
+        *,
+        project: str,
+        task_number: int,
+        work_status: str,
+        transitions: list[_FakeTransition] | None = None,
+        created_at: datetime | None = None,
+        updated_at: datetime | None = None,
+        created_by: str = "polly",
+        title: str = "",
+    ) -> None:
+        self.project = project
+        self.task_number = task_number
+        self.work_status = self._Status(work_status)
+        self.transitions = list(transitions or [])
+        self.created_at = created_at
+        self.updated_at = updated_at
+        self.created_by = created_by
+        self.title = title
+        # Keep the role-session detector happy when reused.
+        self.roles: dict[str, str] = {}
+        self.assignee: str | None = None
+
+
+def test_task_review_stale_state_based_fires_for_old_entry(now: datetime) -> None:
+    """A task at status=review whose review transition predates the
+    audit-event scan window still fires via the state-based path."""
+    from pollypm.audit.watchdog import RULE_TASK_REVIEW_STALE
+
+    # Transition is 4h old — well outside the default scan window.
+    task = _StatefulTask(
+        project="savethenovel",
+        task_number=10,
+        work_status="review",
+        transitions=[
+            _FakeTransition(
+                from_state="in_progress",
+                to_state="review",
+                timestamp=now - timedelta(hours=4),
+                actor="russell",
+            ),
+        ],
+        created_at=now - timedelta(hours=5),
+        updated_at=now - timedelta(hours=4),
+    )
+    findings = scan_events([], now=now, open_tasks=[task])
+    matched = [f for f in findings if f.rule == RULE_TASK_REVIEW_STALE]
+    assert len(matched) == 1
+    f = matched[0]
+    assert f.subject == "savethenovel/10"
+    assert f.metadata["detected_via"] == "state"
+    assert f.metadata["stuck_minutes"] >= 30
+
+
+def test_task_review_stale_state_based_silent_when_briefly_in_state(
+    now: datetime,
+) -> None:
+    """A task that just entered review (within grace) does not fire."""
+    from pollypm.audit.watchdog import RULE_TASK_REVIEW_STALE
+
+    task = _StatefulTask(
+        project="demo",
+        task_number=3,
+        work_status="review",
+        transitions=[
+            _FakeTransition(
+                from_state="in_progress",
+                to_state="review",
+                timestamp=now - timedelta(minutes=2),
+                actor="polly",
+            ),
+        ],
+        updated_at=now - timedelta(minutes=2),
+    )
+    findings = scan_events([], now=now, open_tasks=[task])
+    assert not any(f.rule == RULE_TASK_REVIEW_STALE for f in findings)
+
+
+def test_task_review_stale_state_based_silent_when_no_longer_in_state(
+    now: datetime,
+) -> None:
+    """A task that has moved out of review is not reported."""
+    from pollypm.audit.watchdog import RULE_TASK_REVIEW_STALE
+
+    task = _StatefulTask(
+        project="demo",
+        task_number=3,
+        work_status="done",  # No longer in review
+        transitions=[
+            _FakeTransition(
+                from_state="in_progress",
+                to_state="review",
+                timestamp=now - timedelta(hours=4),
+            ),
+            _FakeTransition(
+                from_state="review",
+                to_state="done",
+                timestamp=now - timedelta(minutes=10),
+            ),
+        ],
+        updated_at=now - timedelta(minutes=10),
+    )
+    findings = scan_events([], now=now, open_tasks=[task])
+    assert not any(f.rule == RULE_TASK_REVIEW_STALE for f in findings)
+
+
+def test_task_review_stale_state_dedupes_with_event_path(now: datetime) -> None:
+    """A task visible to BOTH paths fires exactly once (state path wins)."""
+    from pollypm.audit.watchdog import RULE_TASK_REVIEW_STALE
+
+    task = _StatefulTask(
+        project="demo",
+        task_number=4,
+        work_status="review",
+        transitions=[
+            _FakeTransition(
+                from_state="in_progress",
+                to_state="review",
+                timestamp=now - timedelta(minutes=45),
+            ),
+        ],
+        updated_at=now - timedelta(minutes=45),
+    )
+    events = [
+        _make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            project="demo",
+            subject="demo/4",
+            metadata={"from": "in_progress", "to": "review"},
+            ts=now - timedelta(minutes=45),
+        ),
+    ]
+    findings = scan_events(events, now=now, open_tasks=[task])
+    matched = [f for f in findings if f.rule == RULE_TASK_REVIEW_STALE]
+    assert len(matched) == 1
+    assert matched[0].metadata["detected_via"] == "state"
+
+
+def test_task_review_stale_state_falls_back_to_updated_at(now: datetime) -> None:
+    """A task with no hydrated transitions still fires using updated_at."""
+    from pollypm.audit.watchdog import RULE_TASK_REVIEW_STALE
+
+    task = _StatefulTask(
+        project="demo",
+        task_number=5,
+        work_status="review",
+        transitions=[],  # no history loaded
+        updated_at=now - timedelta(hours=2),
+        created_at=now - timedelta(hours=3),
+    )
+    findings = scan_events([], now=now, open_tasks=[task])
+    matched = [f for f in findings if f.rule == RULE_TASK_REVIEW_STALE]
+    assert len(matched) == 1
+    assert matched[0].metadata["detected_via"] == "state"
+
+
+def test_task_on_hold_stale_state_based_fires_for_old_entry(
+    now: datetime,
+) -> None:
+    """savethenovel/11 class — on_hold > 1h, no recent transition events."""
+    from pollypm.audit.watchdog import RULE_TASK_ON_HOLD_STALE
+
+    task = _StatefulTask(
+        project="savethenovel",
+        task_number=11,
+        work_status="on_hold",
+        transitions=[
+            _FakeTransition(
+                from_state="review",
+                to_state="on_hold",
+                timestamp=now - timedelta(minutes=110),
+                actor="russell",
+                reason="[architect-actionable] Footer.astro:20 placeholder copy",
+            ),
+        ],
+        updated_at=now - timedelta(minutes=110),
+    )
+    findings = scan_events([], now=now, open_tasks=[task])
+    matched = [f for f in findings if f.rule == RULE_TASK_ON_HOLD_STALE]
+    assert len(matched) == 1
+    f = matched[0]
+    assert f.subject == "savethenovel/11"
+    assert f.metadata["detected_via"] == "state"
+    assert f.metadata["routing"] == "architect-actionable"
+    assert "Footer.astro" in (f.metadata.get("reason") or "")
+    assert f.metadata["stuck_minutes"] >= 90
+
+
+def test_task_on_hold_stale_state_based_silent_when_briefly_in_state(
+    now: datetime,
+) -> None:
+    """An on_hold task entered <threshold ago does not fire."""
+    from pollypm.audit.watchdog import RULE_TASK_ON_HOLD_STALE
+
+    task = _StatefulTask(
+        project="demo",
+        task_number=3,
+        work_status="on_hold",
+        transitions=[
+            _FakeTransition(
+                from_state="review",
+                to_state="on_hold",
+                timestamp=now - timedelta(minutes=5),
+            ),
+        ],
+        updated_at=now - timedelta(minutes=5),
+    )
+    findings = scan_events([], now=now, open_tasks=[task])
+    assert not any(f.rule == RULE_TASK_ON_HOLD_STALE for f in findings)
+
+
+def test_task_on_hold_stale_state_dedupes_with_event_path(now: datetime) -> None:
+    """A task visible to BOTH paths fires once; state path wins."""
+    from pollypm.audit.watchdog import RULE_TASK_ON_HOLD_STALE
+
+    task = _StatefulTask(
+        project="demo",
+        task_number=6,
+        work_status="on_hold",
+        transitions=[
+            _FakeTransition(
+                from_state="review",
+                to_state="on_hold",
+                timestamp=now - timedelta(minutes=20),
+                reason="[architect-actionable] x",
+            ),
+        ],
+        updated_at=now - timedelta(minutes=20),
+    )
+    events = [
+        _make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            project="demo",
+            subject="demo/6",
+            metadata={"from": "review", "to": "on_hold", "reason": "[architect-actionable] x"},
+            ts=now - timedelta(minutes=20),
+        ),
+    ]
+    findings = scan_events(events, now=now, open_tasks=[task])
+    matched = [f for f in findings if f.rule == RULE_TASK_ON_HOLD_STALE]
+    assert len(matched) == 1
+    assert matched[0].metadata["detected_via"] == "state"
+
+
+def test_stuck_draft_state_based_fires_for_old_draft(now: datetime) -> None:
+    """A task currently at status=draft older than threshold fires."""
+    task = _StatefulTask(
+        project="demo",
+        task_number=2,
+        work_status="draft",
+        transitions=[],
+        created_at=now - timedelta(hours=2),
+        updated_at=now - timedelta(hours=2),
+        created_by="polly",
+        title="Plan the next chapter",
+    )
+    findings = scan_events([], now=now, open_tasks=[task])
+    matched = [f for f in findings if f.rule == RULE_STUCK_DRAFT]
+    assert len(matched) == 1
+    f = matched[0]
+    assert f.subject == "demo/2"
+    assert f.metadata["detected_via"] == "state"
+    assert f.metadata["title"] == "Plan the next chapter"
+
+
+def test_stuck_draft_state_based_silent_when_promoted(now: datetime) -> None:
+    """A task that has moved out of draft is not reported."""
+    task = _StatefulTask(
+        project="demo",
+        task_number=2,
+        work_status="queued",  # promoted
+        created_at=now - timedelta(hours=2),
+        updated_at=now - timedelta(minutes=10),
+    )
+    findings = scan_events([], now=now, open_tasks=[task])
+    assert not any(f.rule == RULE_STUCK_DRAFT for f in findings)
+
+
+def test_stuck_draft_state_dedupes_with_event_path(now: datetime) -> None:
+    """A draft visible to BOTH paths fires once; state path wins."""
+    task = _StatefulTask(
+        project="demo",
+        task_number=2,
+        work_status="draft",
+        created_at=now - timedelta(minutes=15),
+        updated_at=now - timedelta(minutes=15),
+    )
+    events = [
+        _make_event(
+            event=EVENT_TASK_CREATED,
+            subject="demo/2",
+            metadata={"title": "Plan the next chapter"},
+            ts=now - timedelta(minutes=15),
+        ),
+    ]
+    findings = scan_events(events, now=now, open_tasks=[task])
+    matched = [f for f in findings if f.rule == RULE_STUCK_DRAFT]
+    assert len(matched) == 1
+    assert matched[0].metadata["detected_via"] == "state"
+
+
+def test_state_based_detectors_silent_when_open_tasks_empty(now: datetime) -> None:
+    """No open_tasks → state path no-ops, original event path still works."""
+    from pollypm.audit.watchdog import (
+        RULE_TASK_ON_HOLD_STALE,
+        RULE_TASK_REVIEW_STALE,
+    )
+
+    findings = scan_events([], now=now, open_tasks=[])
+    # No events, no tasks → nothing should fire.
+    assert not any(
+        f.rule in (RULE_TASK_REVIEW_STALE, RULE_TASK_ON_HOLD_STALE, RULE_STUCK_DRAFT)
+        for f in findings
+    )

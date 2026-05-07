@@ -439,20 +439,71 @@ def _detect_stuck_drafts(
     *,
     now: datetime,
     config: WatchdogConfig,
+    open_tasks: Sequence[Any] | None = None,
 ) -> list[Finding]:
-    """Rule 3: ``task.created`` older than ``stuck_draft_seconds`` with
-    no promotion.
+    """Rule 3 (state-based, #1433): tasks currently at ``status=draft``
+    older than ``stuck_draft_seconds``.
 
-    Iterates ``task.created`` events older than the threshold. For
-    each, we check whether *any* ``task.status_changed`` for the
-    same subject exists at all (looking at the full event list, not
-    just inside the lookback window — a task that got promoted before
-    the window started is fine). If no promotion is recorded, the
-    draft is stuck.
+    Primary detection path queries the live ``work_tasks`` view via
+    ``open_tasks`` — any task currently at ``status=draft`` whose
+    ``created_at`` is older than the threshold is stuck. The audit-event
+    path still fires for synthetic-fixture tests (and as a safety net
+    when ``open_tasks`` isn't supplied), so old behavior is preserved.
+
+    Findings produced by the state path take precedence — we dedupe
+    on ``(project, subject)`` so a task that is both visible in
+    ``open_tasks`` AND has a matching audit event only fires once.
     """
     findings: list[Finding] = []
+    seen_subjects: set[str] = set()
     cutoff = now - timedelta(seconds=config.stuck_draft_seconds)
 
+    # State-based path (#1433): walks current ``work_tasks`` rows.
+    if open_tasks:
+        for task in open_tasks:
+            status = getattr(task, "work_status", None)
+            status_value = getattr(status, "value", status)
+            if status_value != "draft":
+                continue
+            created_at = getattr(task, "created_at", None)
+            if created_at is None:
+                continue
+            if getattr(created_at, "tzinfo", None) is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            if created_at > cutoff:
+                continue
+            project = getattr(task, "project", "") or ""
+            task_number = getattr(task, "task_number", None)
+            if not project or task_number is None:
+                continue
+            subject = f"{project}/{task_number}"
+            if subject in seen_subjects:
+                continue
+            seen_subjects.add(subject)
+            actor = getattr(task, "created_by", "") or "unknown"
+            findings.append(Finding(
+                rule=RULE_STUCK_DRAFT,
+                project=project,
+                subject=subject,
+                message=(
+                    f"Draft task {subject} has sat unpromoted for "
+                    f">{config.stuck_draft_seconds // 60} min "
+                    f"(created {created_at.isoformat()})."
+                ),
+                recommendation=(
+                    f"Promote with `pm task queue {subject}` or "
+                    f"discard with `pm task cancel {subject}`. "
+                    f"Originating actor: {actor}."
+                ),
+                metadata={
+                    "created_at": created_at.isoformat(),
+                    "actor": actor,
+                    "title": getattr(task, "title", None),
+                    "detected_via": "state",
+                },
+            ))
+
+    # Event-based fallback (backward-compat with old fixtures).
     promoted_subjects: set[str] = set()
     created_events: list[AuditEvent] = []
     for ev in events:
@@ -473,10 +524,13 @@ def _detect_stuck_drafts(
     for ev in created_events:
         if ev.subject in promoted_subjects:
             continue
+        if ev.subject in seen_subjects:
+            continue
         key = _task_subject_key(ev.subject)
         if key is None:
             continue
         project, task_number = key
+        seen_subjects.add(ev.subject)
         findings.append(Finding(
             rule=RULE_STUCK_DRAFT,
             project=project,
@@ -495,6 +549,7 @@ def _detect_stuck_drafts(
                 "created_at": ev.ts,
                 "actor": ev.actor,
                 "title": (ev.metadata or {}).get("title"),
+                "detected_via": "event",
             },
         ))
     return findings
@@ -571,22 +626,123 @@ def _detect_cancellation_no_promotion(
 # ---------------------------------------------------------------------------
 
 
+def _state_entry_time(
+    task: Any, target_state: str,
+) -> tuple[datetime | None, dict[str, Any]]:
+    """Return ``(entry_ts, transition_meta)`` for ``task`` entering ``target_state``.
+
+    Walks ``task.transitions`` (newest first by timestamp) and returns
+    the timestamp of the most recent transition whose ``to_state``
+    matches. ``transition_meta`` carries ``from``, ``actor``, and
+    ``reason`` so callers can fold them into the Finding metadata
+    without re-walking.
+
+    When the task carries no transition history (e.g. the
+    ``include_history=False`` path of :class:`SQLiteWorkService`),
+    falls back to ``task.updated_at`` and finally ``task.created_at``.
+    Either fallback is best-effort but yields a still-useful "stuck
+    since" signal — the threshold check still gates the finding.
+    """
+    transitions = list(getattr(task, "transitions", None) or [])
+    matching: list[Any] = []
+    for tr in transitions:
+        to_state = getattr(tr, "to_state", None)
+        if to_state == target_state:
+            matching.append(tr)
+    if matching:
+        matching.sort(
+            key=lambda tr: getattr(tr, "timestamp", None) or datetime.min,
+            reverse=True,
+        )
+        latest = matching[0]
+        ts = getattr(latest, "timestamp", None)
+        if isinstance(ts, datetime):
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return ts, {
+                "from": getattr(latest, "from_state", None),
+                "actor": getattr(latest, "actor", None),
+                "reason": getattr(latest, "reason", None),
+            }
+    # Fallback: ``updated_at`` is touched on every status change, so
+    # for a task currently *at* ``target_state`` it's a reasonable
+    # proxy for state-entry time. ``created_at`` is the last-resort.
+    fallback = getattr(task, "updated_at", None) or getattr(
+        task, "created_at", None,
+    )
+    if isinstance(fallback, datetime):
+        if fallback.tzinfo is None:
+            fallback = fallback.replace(tzinfo=timezone.utc)
+        return fallback, {"from": None, "actor": None, "reason": None}
+    return None, {"from": None, "actor": None, "reason": None}
+
+
 def _detect_task_review_stale(
     events: Sequence[AuditEvent],
     *,
     now: datetime,
     config: WatchdogConfig,
+    open_tasks: Sequence[Any] | None = None,
 ) -> list[Finding]:
-    """Rule 5: task at ``status=review`` with no transition for > threshold.
+    """Rule 5 (state-based, #1433): tasks currently at ``status=review``
+    whose entry-into-review is older than ``review_stale_seconds``.
 
-    Walks ``task.status_changed`` events and finds the latest transition
-    per task subject. If the latest transition lands the task in
-    ``review`` and is older than ``review_stale_seconds`` ago, fire.
+    Primary path queries the live ``work_tasks`` view (any task at
+    ``status=review``) and computes "how long in this state" from the
+    most recent ``review`` transition (``task.transitions``) or
+    falls back to ``updated_at`` / ``created_at``. This catches tasks
+    that entered ``review`` *before* the audit-log scan window and
+    would otherwise be invisible to the watchdog.
+
+    Audit-event scan is preserved as a fallback so synthetic-fixture
+    tests (and event-only callers) keep firing. Findings dedupe on
+    ``subject`` so we never report the same task twice in one tick.
     """
     findings: list[Finding] = []
+    seen_subjects: set[str] = set()
     cutoff = now - timedelta(seconds=config.review_stale_seconds)
 
-    # subject -> (latest_ts, ev) — pick the latest transition per task.
+    # State-based path (#1433): walks current ``work_tasks`` rows.
+    if open_tasks:
+        for task in open_tasks:
+            status = getattr(task, "work_status", None)
+            status_value = getattr(status, "value", status)
+            if status_value != "review":
+                continue
+            project = getattr(task, "project", "") or ""
+            task_number = getattr(task, "task_number", None)
+            if not project or task_number is None:
+                continue
+            subject = f"{project}/{task_number}"
+            entry_ts, tr_meta = _state_entry_time(task, "review")
+            if entry_ts is None:
+                continue
+            if entry_ts > cutoff:
+                continue
+            stuck_minutes = max(1, int((now - entry_ts).total_seconds() // 60))
+            seen_subjects.add(subject)
+            findings.append(Finding(
+                rule=RULE_TASK_REVIEW_STALE,
+                project=project,
+                subject=subject,
+                message=(
+                    f"Task {subject} has been at status=review for "
+                    f"~{stuck_minutes} min with no further transitions."
+                ),
+                recommendation=(
+                    f"Either spawn a reviewer or run `pm task done "
+                    f"{subject}` if the work is correct as-is."
+                ),
+                metadata={
+                    "review_since": entry_ts.isoformat(),
+                    "stuck_minutes": stuck_minutes,
+                    "from": tr_meta.get("from"),
+                    "actor": tr_meta.get("actor"),
+                    "detected_via": "state",
+                },
+            ))
+
+    # Event-based fallback path (backward-compat with old fixtures).
     latest: dict[str, tuple[datetime, AuditEvent]] = {}
     for ev in events:
         if ev.event != EVENT_TASK_STATUS_CHANGED:
@@ -599,17 +755,19 @@ def _detect_task_review_stale(
             latest[ev.subject] = (ts, ev)
 
     for subject, (ts, ev) in latest.items():
+        if subject in seen_subjects:
+            continue
         to_state = (ev.metadata or {}).get("to")
         if to_state != "review":
             continue
         if ts > cutoff:
-            # Not stale enough yet — give the reviewer time to act.
             continue
         key = _task_subject_key(subject)
         if key is None:
             continue
         project, _ = key
         stuck_minutes = max(1, int((now - ts).total_seconds() // 60))
+        seen_subjects.add(subject)
         findings.append(Finding(
             rule=RULE_TASK_REVIEW_STALE,
             project=project,
@@ -627,6 +785,7 @@ def _detect_task_review_stale(
                 "stuck_minutes": stuck_minutes,
                 "from": (ev.metadata or {}).get("from"),
                 "actor": ev.actor,
+                "detected_via": "event",
             },
         ))
     return findings
@@ -661,24 +820,74 @@ def _detect_task_on_hold_stale(
     *,
     now: datetime,
     config: WatchdogConfig,
+    open_tasks: Sequence[Any] | None = None,
 ) -> list[Finding]:
-    """Rule 5b (#1424): task at ``status=on_hold`` for > threshold.
+    """Rule 5b (state-based, #1424 + #1433): tasks currently at
+    ``status=on_hold`` longer than ``on_hold_stale_seconds``.
 
-    Mirrors :func:`_detect_task_review_stale` — pick the latest
-    transition per task subject. If the latest transition lands the
-    task in ``on_hold`` and is older than ``on_hold_stale_seconds``,
-    fire. The reviewer's transition reason is included in the finding
-    metadata so the brief generator can surface it to the architect.
+    Primary path queries the live ``work_tasks`` view; fires for any
+    task currently at ``on_hold`` whose entry-into-on_hold (from
+    ``task.transitions`` or ``updated_at`` fallback) is older than the
+    threshold. This catches tasks that entered ``on_hold`` *before*
+    the audit-log scan window — savethenovel/11's class.
 
-    The two rules are intentionally separate (different windows,
-    different routing). The architect-vs-human routing hint is computed
-    here from the reason tag and stored under ``routing`` in metadata
-    so the cadence handler can read it without re-parsing the reason.
+    Audit-event scan is preserved for synthetic-fixture tests and as
+    a safety net. Findings dedupe on ``subject``.
     """
     findings: list[Finding] = []
+    seen_subjects: set[str] = set()
     cutoff = now - timedelta(seconds=config.on_hold_stale_seconds)
 
-    # subject -> (latest_ts, ev) — pick the latest transition per task.
+    # State-based path (#1433): walks current ``work_tasks`` rows.
+    if open_tasks:
+        for task in open_tasks:
+            status = getattr(task, "work_status", None)
+            status_value = getattr(status, "value", status)
+            if status_value != "on_hold":
+                continue
+            project = getattr(task, "project", "") or ""
+            task_number = getattr(task, "task_number", None)
+            if not project or task_number is None:
+                continue
+            subject = f"{project}/{task_number}"
+            entry_ts, tr_meta = _state_entry_time(task, "on_hold")
+            if entry_ts is None:
+                continue
+            if entry_ts > cutoff:
+                continue
+            stuck_minutes = max(1, int((now - entry_ts).total_seconds() // 60))
+            reason = tr_meta.get("reason")
+            routing = _classify_on_hold_reason(
+                reason if isinstance(reason, str) else None,
+            )
+            seen_subjects.add(subject)
+            findings.append(Finding(
+                rule=RULE_TASK_ON_HOLD_STALE,
+                project=project,
+                subject=subject,
+                message=(
+                    f"Task {subject} has been at status=on_hold for "
+                    f"~{stuck_minutes} min — escalating to architect for "
+                    f"first-responder unstick."
+                ),
+                recommendation=(
+                    f"Architect: re-read the reviewer's rationale, fix the "
+                    f"issue, then `pm task queue {subject}`. Only escalate "
+                    f"to user via `pm notify` if the issue genuinely needs "
+                    f"human judgement."
+                ),
+                metadata={
+                    "on_hold_since": entry_ts.isoformat(),
+                    "stuck_minutes": stuck_minutes,
+                    "from": tr_meta.get("from"),
+                    "reason": reason if isinstance(reason, str) else None,
+                    "routing": routing,
+                    "actor": tr_meta.get("actor"),
+                    "detected_via": "state",
+                },
+            ))
+
+    # Event-based fallback path (backward-compat with old fixtures).
     latest: dict[str, tuple[datetime, AuditEvent]] = {}
     for ev in events:
         if ev.event != EVENT_TASK_STATUS_CHANGED:
@@ -691,12 +900,13 @@ def _detect_task_on_hold_stale(
             latest[ev.subject] = (ts, ev)
 
     for subject, (ts, ev) in latest.items():
+        if subject in seen_subjects:
+            continue
         meta = ev.metadata or {}
         to_state = meta.get("to")
         if to_state != "on_hold":
             continue
         if ts > cutoff:
-            # Fresh on_hold — give the reviewer / architect a beat.
             continue
         key = _task_subject_key(subject)
         if key is None:
@@ -707,6 +917,7 @@ def _detect_task_on_hold_stale(
         routing = _classify_on_hold_reason(
             reason if isinstance(reason, str) else None,
         )
+        seen_subjects.add(subject)
         findings.append(Finding(
             rule=RULE_TASK_ON_HOLD_STALE,
             project=project,
@@ -729,6 +940,7 @@ def _detect_task_on_hold_stale(
                 "reason": reason if isinstance(reason, str) else None,
                 "routing": routing,
                 "actor": ev.actor,
+                "detected_via": "event",
             },
         ))
     return findings
@@ -930,16 +1142,16 @@ def scan_events(
         materialised, now=now, config=config,
     ))
     findings.extend(_detect_stuck_drafts(
-        materialised, now=now, config=config,
+        materialised, now=now, config=config, open_tasks=open_tasks,
     ))
     findings.extend(_detect_cancellation_no_promotion(
         materialised, now=now, config=config,
     ))
     findings.extend(_detect_task_review_stale(
-        materialised, now=now, config=config,
+        materialised, now=now, config=config, open_tasks=open_tasks,
     ))
     findings.extend(_detect_task_on_hold_stale(
-        materialised, now=now, config=config,
+        materialised, now=now, config=config, open_tasks=open_tasks,
     ))
     findings.extend(_detect_role_session_missing(
         materialised,

@@ -106,6 +106,23 @@ def _infer_notify_actor(config_path: Path, actor: str) -> tuple[str, str | None]
     """
     if (actor or "").strip() != "polly":
         return actor, None
+    matched = _match_notify_session_config(config_path)
+    if matched is None:
+        return actor, None
+    session_name, _session_cfg = matched
+    return session_name, session_name
+
+
+def _match_notify_session_config(
+    config_path: Path,
+) -> tuple[str, object] | None:
+    """Find the configured session matching the current tmux window.
+
+    Returns ``(session_name, session_cfg)`` when the caller is running
+    inside a managed role pane (reviewer, operator, architect, worker),
+    or ``None`` when no match can be made. Shared by the actor and
+    project inference paths so both surfaces agree on the session.
+    """
     try:
         from pollypm.config import load_config
         from pollypm.session_services import create_tmux_client
@@ -114,23 +131,48 @@ def _infer_notify_actor(config_path: Path, actor: str) -> tuple[str, str | None]
         tmux_session = tmux.current_session_name()
         window_index = tmux.current_window_index()
         if not tmux_session or window_index is None:
-            return actor, None
+            return None
         window_name = None
         for window in tmux.list_windows(tmux_session):
             if str(getattr(window, "index", "")) == str(window_index):
                 window_name = getattr(window, "name", None)
                 break
         if not window_name:
-            return actor, None
+            return None
         config = load_config(config_path)
         sessions = getattr(config, "sessions", {}) or {}
         for session_name, session_cfg in sessions.items():
             expected = getattr(session_cfg, "window_name", None) or session_name
             if expected == window_name:
-                return session_name, session_name
+                return session_name, session_cfg
     except Exception:  # noqa: BLE001
-        return actor, None
-    return actor, None
+        return None
+    return None
+
+
+def _infer_notify_project(config_path: Path) -> str | None:
+    """Resolve ``pm notify``'s default ``--project`` from the calling pane.
+
+    Issue #1425: when an agent that's running in a project context
+    (e.g. ``reviewer-savethenovel``) calls ``pm notify`` without an
+    explicit ``--project``, the message should land at that project's
+    namespace — not the synthetic ``inbox`` bucket. Otherwise project-
+    scoped views (``pm message list --project <key>``, the cockpit's
+    project-filtered inbox) silently drop substantive review feedback
+    because the operator has to know to look in the global inbox.
+
+    Returns the matching session's ``project`` key, or ``None`` when no
+    project context can be inferred (so the caller can fall back to
+    the legacy ``inbox`` default).
+    """
+    matched = _match_notify_session_config(config_path)
+    if matched is None:
+        return None
+    _session_name, session_cfg = matched
+    project_key = getattr(session_cfg, "project", None)
+    if not project_key:
+        return None
+    return str(project_key)
 
 
 def _hold_review_tasks_for_notify(
@@ -517,8 +559,17 @@ def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
         body: str = typer.Argument(..., help="Message body. Pass '-' to read from stdin."),
         actor: str = typer.Option("polly", "--actor", help="Who is posting the notification."),
         project: str = typer.Option(
-            "inbox", "--project", "-p",
-            help="Project namespace for the notification task (default: 'inbox').",
+            "", "--project", "-p",
+            help=(
+                "Project namespace for the notification task. When omitted, "
+                "infer from the calling tmux pane's session config "
+                "(reviewer-<project>, worker-<project>, architect, …) — "
+                "agents running in a project context land their notify on "
+                "that project automatically (#1425). Falls back to 'inbox' "
+                "(global) when no project context is detectable. Pass "
+                "``--project inbox`` explicitly to force a global "
+                "notification from a project-scoped pane."
+            ),
         ),
         priority: str = typer.Option(
             "auto", "--priority",
@@ -639,6 +690,17 @@ def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
         actor, current_session_name = _infer_notify_actor(
             resolved_config_path, actor,
         )
+
+        # #1425 — when the caller didn't pass ``--project``, infer it
+        # from the calling pane's session config so a reviewer running
+        # in ``reviewer-savethenovel`` lands its notify on
+        # ``project=savethenovel`` instead of the synthetic global
+        # ``inbox`` bucket. Explicit ``--project inbox`` (or any other
+        # value) still wins so global broadcasts and bootstrap scripts
+        # keep working from inside a project-scoped pane.
+        if not (project or "").strip():
+            inferred_project = _infer_notify_project(resolved_config_path)
+            project = inferred_project or "inbox"
 
         from pollypm.store.classifier import classify_priority, validate_priority
 

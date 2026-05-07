@@ -11055,6 +11055,7 @@ def _dashboard_gather_tasks(
         return {}, {}
 
     buckets: dict[str, list[dict]] = {
+        "draft": [],
         "queued": [],
         "in_progress": [],
         "review": [],
@@ -13115,6 +13116,23 @@ class PollyProjectDashboardApp(App[None]):
     #proj-empty-state.-hidden {
         display: none;
     }
+    /* Drafts-pending affordance: fires when the project has draft tasks
+       but no live (queued/in_progress/review) work. Mirrors the empty-
+       state's "you need to take action" tone — a project full of
+       unpromoted drafts looks dead but actually has work waiting. The
+       108-drafts forensic (oldest 16d) showed drafts can sit invisibly
+       for weeks. */
+    #proj-drafts-pending {
+        height: auto;
+        margin-bottom: 1;
+        padding: 0 2;
+        background: #1a2330;
+        color: #d6dee5;
+        border: round #97a6b2;
+    }
+    #proj-drafts-pending.-hidden {
+        display: none;
+    }
     #proj-plan-scroll {
         height: auto;
         max-height: 30;
@@ -13212,6 +13230,14 @@ class PollyProjectDashboardApp(App[None]):
         # on ``data.task_counts`` totals.
         self.empty_state = Static(
             "", id="proj-empty-state", classes="-hidden", markup=True,
+        )
+        # Drafts-pending panel — surfaces unpromoted drafts when no
+        # live work exists. Without this, drafts pile up invisibly
+        # (forensic found 108 system-wide, oldest 16 days) because the
+        # empty-state only fires at total==0 and the pipeline strip
+        # historically omitted ``draft``.
+        self.drafts_pending = Static(
+            "", id="proj-drafts-pending", classes="-hidden", markup=True,
         )
         self.now_title = Static(
             "[b]Current activity[/b]",
@@ -13355,6 +13381,12 @@ class PollyProjectDashboardApp(App[None]):
                 # navigate into a fresh project. Hidden by default; the
                 # ``-hidden`` class is removed only when totals are zero.
                 yield self.empty_state
+                # Drafts-pending sits just below empty-state so the
+                # affordance reads top-down: zero-tasks > unpromoted
+                # drafts > everything else. Hidden by default; the
+                # render path toggles ``-hidden`` based on whether
+                # there's draft work with no live work to act on.
+                yield self.drafts_pending
                 with Vertical(classes="proj-section", id="proj-inbox-section"):
                     yield self.inbox_title
                     yield self.inbox_lead
@@ -13516,6 +13548,22 @@ class PollyProjectDashboardApp(App[None]):
         else:
             self.empty_state.update("")
             self.empty_state.add_class("-hidden")
+
+        # ── Drafts-pending affordance ──
+        # Drafts that never got promoted (``pm task queue``) accumulate
+        # invisibly: the empty-state only fires at total==0, and a
+        # project with 1 draft + 1 cancelled has total>0 but nothing
+        # live. The forensic audit found 108 such drafts system-wide
+        # (oldest 16d). Surface them prominently when no live work
+        # exists; the pipeline-strip ``draft`` bucket handles the
+        # mixed-state case.
+        drafts_text = self._render_drafts_pending(data)
+        if drafts_text:
+            self.drafts_pending.update(drafts_text)
+            self.drafts_pending.remove_class("-hidden")
+        else:
+            self.drafts_pending.update("")
+            self.drafts_pending.add_class("-hidden")
 
         # ── Current activity ──
         self.now_body.update(self._render_now_body(data))
@@ -13864,6 +13912,66 @@ class PollyProjectDashboardApp(App[None]):
             f"architect, or [b]pm task create[/b] to add one manually.[/]"
         )
 
+    def _render_drafts_pending(self, data: ProjectDashboardData) -> str:
+        """Return the drafts-pending affordance, or "" when there's
+        live work or no drafts.
+
+        Surfaces unpromoted drafts when the project has zero live
+        (queued / in_progress / review) tasks. The savethenovel repro
+        had 1 cancelled + 1 draft = 2 tasks total, so the empty-state
+        affordance suppressed itself, and the pipeline strip
+        historically omitted ``draft`` — the only "live" work was
+        invisible. Forensic audit found 108 drafts stuck system-wide,
+        oldest 16d, exactly this pattern.
+
+        Hidden when there's any live work (drafts coexist with live
+        tasks via the pipeline-strip ``draft`` bucket instead) and
+        when there are no drafts at all.
+        """
+        if not data.exists_on_disk:
+            return ""
+        counts = data.task_counts or {}
+        buckets = data.task_buckets or {}
+        draft_count = int(counts.get("draft", 0))
+        if draft_count <= 0:
+            return ""
+        live_count = (
+            int(counts.get("queued", 0))
+            + int(counts.get("in_progress", 0))
+            + int(counts.get("review", 0))
+        )
+        if live_count > 0:
+            # Drafts coexist with live work — pipeline-strip draft
+            # bucket already shows them; don't duplicate.
+            return ""
+        # Build a short list of draft refs (project/N) for the lead
+        # line. Cap at three so narrow widths stay readable.
+        draft_rows = list(buckets.get("draft", []) or [])
+        refs: list[str] = []
+        for row in draft_rows[:3]:
+            num = row.get("task_number")
+            if num is None:
+                continue
+            refs.append(f"{data.project_key}/{num}")
+        more = max(draft_count - len(refs), 0)
+        head = ", ".join(_escape(r) for r in refs) if refs else ""
+        if more and head:
+            head = f"{head} (+{more} more)"
+        elif more and not head:
+            head = f"+{more} more"
+        noun = "draft" if draft_count == 1 else "drafts"
+        lead = (
+            f"[#f7d67a][b]{draft_count} {noun} pending[/b][/]"
+        )
+        if head:
+            lead = f"{lead} [#d6dee5]({head})[/]"
+        return (
+            f"{lead}\n"
+            f"[#d6dee5]No live work — run "
+            f"[b]pm task queue <id>[/b] to promote a draft to the "
+            f"architect.[/]"
+        )
+
     def _render_now_body(self, data: ProjectDashboardData) -> str:
         w = data.active_worker
         if w:
@@ -14035,7 +14143,15 @@ class PollyProjectDashboardApp(App[None]):
         # (squared inner square) for blocked so the "waiting on
         # dependencies" rows look distinct from the "in flight" rows
         # at a glance.
+        # ``draft`` was previously omitted from the pipeline strip even
+        # though ``_dashboard_gather_tasks`` collects drafts \u2014 so a
+        # project with only unpromoted drafts looked empty on the
+        # drilldown. Forensic audit found 108 stuck drafts system-wide
+        # (oldest 16d) accumulating invisibly. Surface drafts here as a
+        # bucket so they coexist visibly with live work; the separate
+        # "Drafts pending" panel above handles the no-live-work case.
         strip_order = [
+            ("draft", "#97a6b2", "\u270e"),
             ("queued", "#6b7a88", "\u25cb"),
             ("in_progress", "#f0c45a", "\u25c6"),
             ("review", "#5b8aff", "\u25c9"),

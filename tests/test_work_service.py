@@ -1078,3 +1078,141 @@ class TestActorTypeAgent:
         """)
         with pytest.raises(FlowValidationError, match="agent_name"):
             parse_flow_yaml(yaml_text)
+
+
+# ---------------------------------------------------------------------------
+# Plan task evolution metadata (#1398)
+# ---------------------------------------------------------------------------
+
+
+class TestPlanTaskMetadata:
+    """Coverage for plan_version + predecessor_task_id (#1398)."""
+
+    def test_create_defaults_plan_version_to_1(self, svc):
+        task = _create_standard_task(svc)
+        assert task.plan_version == 1
+        assert task.predecessor_task_id is None
+
+    def test_create_with_predecessor_records_link(self, svc):
+        first = _create_standard_task(svc, title="original")
+        successor = _create_standard_task(
+            svc,
+            title="replan",
+            predecessor_task_id=first.task_id,
+        )
+        # Predecessor link should be queryable on the successor
+        assert successor.predecessor_task_id == first.task_id
+        # Re-read from the DB to confirm persistence (not just the
+        # post-INSERT in-memory shape).
+        refetched = svc.get(successor.task_id)
+        assert refetched.predecessor_task_id == first.task_id
+
+    def test_list_successors_returns_replan_chain(self, svc):
+        first = _create_standard_task(svc, title="original")
+        s1 = _create_standard_task(
+            svc, title="replan-1", predecessor_task_id=first.task_id
+        )
+        s2 = _create_standard_task(
+            svc, title="replan-2", predecessor_task_id=first.task_id
+        )
+        # Unrelated task shouldn't appear in the result.
+        _create_standard_task(svc, title="unrelated")
+
+        successors = svc.list_successors(first.task_id)
+        ids = {s.task_id for s in successors}
+        assert ids == {s1.task_id, s2.task_id}
+
+    def test_increment_plan_version_bumps_value(self, svc):
+        task = _create_standard_task(svc)
+        assert task.plan_version == 1
+        bumped = svc.increment_plan_version(task.task_id, actor="architect")
+        assert bumped.plan_version == 2
+        # Re-fetch to confirm the bump persisted.
+        refetched = svc.get(task.task_id)
+        assert refetched.plan_version == 2
+
+    def test_increment_plan_version_emits_audit_event(
+        self, svc, tmp_path, monkeypatch
+    ):
+        """``plan.version_incremented`` should fire with old/new versions."""
+        from pollypm.audit import central_log_path, read_events
+        from pollypm.audit.log import EVENT_PLAN_VERSION_INCREMENTED
+
+        # Redirect the central audit tail to a temp dir so the test
+        # never touches the user's real ~/.pollypm/audit/ tree.
+        audit_home = tmp_path / "audit-home"
+        monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+        task = _create_standard_task(svc, project="auditproj")
+        svc.increment_plan_version(
+            task.task_id, actor="architect", reason="refined plan"
+        )
+
+        events = read_events(
+            "auditproj", event=EVENT_PLAN_VERSION_INCREMENTED
+        )
+        assert len(events) == 1, (
+            f"expected one plan.version_incremented event, "
+            f"got: {[e.event for e in events]}"
+        )
+        evt = events[0]
+        assert evt.subject == task.task_id
+        assert evt.actor == "architect"
+        assert evt.metadata["old_version"] == 1
+        assert evt.metadata["new_version"] == 2
+        assert evt.metadata["task_id"] == task.task_id
+        assert evt.metadata.get("reason") == "refined plan"
+        # Sanity: the central tail file exists where we expect.
+        assert central_log_path("auditproj").exists()
+
+    def test_create_successor_emits_plan_successor_audit_event(
+        self, svc, tmp_path, monkeypatch
+    ):
+        from pollypm.audit import read_events
+        from pollypm.audit.log import EVENT_PLAN_SUCCESSOR_CREATED
+
+        audit_home = tmp_path / "audit-home"
+        monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+        first = _create_standard_task(svc, project="replanproj")
+        successor = _create_standard_task(
+            svc,
+            project="replanproj",
+            title="replan",
+            predecessor_task_id=first.task_id,
+        )
+
+        events = read_events(
+            "replanproj", event=EVENT_PLAN_SUCCESSOR_CREATED
+        )
+        assert len(events) == 1
+        evt = events[0]
+        assert evt.subject == successor.task_id
+        assert evt.metadata["predecessor"] == first.task_id
+        assert evt.metadata["successor"] == successor.task_id
+
+    def test_create_no_predecessor_does_not_emit_successor_event(
+        self, svc, tmp_path, monkeypatch
+    ):
+        """A regular task create must NOT emit plan.successor_created."""
+        from pollypm.audit import read_events
+        from pollypm.audit.log import EVENT_PLAN_SUCCESSOR_CREATED
+
+        audit_home = tmp_path / "audit-home"
+        monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+        _create_standard_task(svc, project="noreplan")
+        events = read_events("noreplan", event=EVENT_PLAN_SUCCESSOR_CREATED)
+        assert events == []
+
+    def test_increment_plan_version_unknown_task_raises(self, svc):
+        with pytest.raises(TaskNotFoundError):
+            svc.increment_plan_version("ghost/999")
+
+    def test_create_with_malformed_predecessor_raises(self, svc):
+        with pytest.raises(ValidationError):
+            _create_standard_task(
+                svc,
+                title="bad replan",
+                predecessor_task_id="not-a-task-id",
+            )

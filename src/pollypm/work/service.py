@@ -46,6 +46,7 @@ class WorkService(Protocol):
         relevant_files: list[str] | None = None,
         labels: list[str] | None = None,
         requires_human_review: bool = False,
+        predecessor_task_id: str | None = None,
     ) -> Task:
         """Create a task in ``draft`` state.
 
@@ -54,7 +55,32 @@ class WorkService(Protocol):
         ``created_by`` records the author of the task. Defaults to
         ``"system"`` for orchestrator-spawned work; CLI / API callers
         should pass a real actor (#796).
+
+        ``predecessor_task_id`` (#1398) wires the new task as the
+        successor of an earlier attempt (replan flow). Defaults to
+        ``None`` (no predecessor — original task). Setting the value
+        emits a ``plan.successor_created`` audit event.
         """
+        ...
+
+    def increment_plan_version(
+        self,
+        task_id: str,
+        *,
+        actor: str = "system",
+        reason: str | None = None,
+    ) -> Task:
+        """Bump ``plan_version`` on a plan task and emit an audit event (#1398).
+
+        Used by the plan-refinement flow when an architect updates a
+        plan in place. Emits ``plan.version_incremented`` with the
+        old/new version pair so plan-history consumers can reconstruct
+        the revision timeline.
+        """
+        ...
+
+    def list_successors(self, predecessor_task_id: str) -> list[Task]:
+        """Return tasks that descend from ``predecessor_task_id`` (#1398)."""
         ...
 
     def get(self, task_id: str) -> Task:

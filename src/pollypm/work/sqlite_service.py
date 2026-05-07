@@ -157,6 +157,32 @@ def first_shipped_at(path: Path | None = None) -> str | None:
     return str(value) if isinstance(value, str) and value else None
 
 
+def _row_get(row: object, column: str, default: object = None) -> object:
+    """Read ``column`` from a sqlite3.Row, returning ``default`` if absent.
+
+    ``sqlite3.Row.keys()`` reports the columns available on the
+    underlying SELECT result. We need this defensive accessor for
+    columns added by recent migrations (e.g. ``plan_version`` /
+    ``predecessor_task_id`` from #1398) so a row produced by a
+    SELECT * against a partially-migrated DB — or by test code that
+    inserts via legacy column lists — doesn't ``IndexError`` here.
+    Production DBs always carry the column post-``create_work_tables``,
+    but the helper preserves the corrupt-payload-defense pattern used
+    by ``_safe_json_dict`` / ``_safe_json_list`` below.
+    """
+    try:
+        keys = row.keys()
+    except (AttributeError, TypeError):
+        return default
+    if column in keys:
+        try:
+            value = row[column]
+        except (KeyError, IndexError):
+            return default
+        return default if value is None else value
+    return default
+
+
 def _safe_json_dict(raw: object) -> dict:
     """Decode a JSON column expected to be a dict, defensively.
 
@@ -1142,6 +1168,11 @@ class SQLiteWorkService:
             supersedes_task_number=row["supersedes_task_number"],
             superseded_by_project=rels.get("superseded_by_project"),
             superseded_by_task_number=rels.get("superseded_by_task_number"),
+            # #1398 — plan-task evolution metadata. Legacy rows that
+            # pre-date the column read NULL/None which we coerce to
+            # the documented defaults.
+            plan_version=int(_row_get(row, "plan_version", 1) or 1),
+            predecessor_task_id=_row_get(row, "predecessor_task_id", None),
             roles=_safe_json_dict(row["roles"]),
             external_refs=_safe_json_dict(row["external_refs"]),
             created_at=datetime.fromisoformat(row["created_at"]),
@@ -1598,8 +1629,17 @@ class SQLiteWorkService:
         relevant_files: list[str] | None = None,
         labels: list[str] | None = None,
         requires_human_review: bool = False,
+        predecessor_task_id: str | None = None,
     ) -> Task:
-        """Create a task in draft state."""
+        """Create a task in draft state.
+
+        ``predecessor_task_id`` (#1398) wires this new task as the
+        successor of an earlier attempt — used by the plan-replan flow
+        when a fresh task supersedes a prior one. ``None`` is the
+        default and produces a regular standalone task. Setting the
+        value emits a ``plan.successor_created`` audit event so the
+        heartbeat can render plan-history breadcrumbs.
+        """
         return create_task(
             self,
             title=title,
@@ -1615,7 +1655,84 @@ class SQLiteWorkService:
             relevant_files=relevant_files,
             labels=labels,
             requires_human_review=requires_human_review,
+            predecessor_task_id=predecessor_task_id,
         )
+
+    def increment_plan_version(
+        self,
+        task_id: str,
+        *,
+        actor: str = "system",
+        reason: str | None = None,
+    ) -> Task:
+        """Bump ``plan_version`` on a plan task and emit an audit event (#1398).
+
+        Used by the plan-refinement flow: the architect updates the
+        plan in place (same task_id) and the version increments to
+        record the revision history. Emits
+        ``plan.version_incremented`` with the old/new version pair so
+        downstream consumers (heartbeat, inbox, plan-history UI) can
+        reconstruct the revision timeline without scanning task
+        content. Audit emission is best-effort — a failed audit write
+        never blocks the version bump.
+
+        Returns the refreshed Task with the new version applied.
+        """
+        project, task_number = _parse_task_id(task_id)
+        row = self._conn.execute(
+            "SELECT plan_version FROM work_tasks "
+            "WHERE project = ? AND task_number = ?",
+            (project, task_number),
+        ).fetchone()
+        if row is None:
+            raise TaskNotFoundError(f"Task '{task_id}' not found.")
+        old_version = int(_row_get(row, "plan_version", 1) or 1)
+        new_version = old_version + 1
+        self._conn.execute(
+            "UPDATE work_tasks "
+            "SET plan_version = ?, updated_at = ? "
+            "WHERE project = ? AND task_number = ?",
+            (new_version, _now(), project, task_number),
+        )
+        self._conn.commit()
+
+        try:
+            from pollypm.audit import emit as _audit_emit
+            from pollypm.audit.log import EVENT_PLAN_VERSION_INCREMENTED
+
+            metadata: dict[str, object] = {
+                "task_id": task_id,
+                "old_version": old_version,
+                "new_version": new_version,
+            }
+            if reason:
+                metadata["reason"] = reason
+            _audit_emit(
+                event=EVENT_PLAN_VERSION_INCREMENTED,
+                project=project,
+                subject=task_id,
+                actor=actor or "system",
+                metadata=metadata,
+                project_path=self._project_path,
+            )
+        except Exception:  # noqa: BLE001 — audit must never break the bump
+            pass
+
+        return self.get(task_id)
+
+    def list_successors(self, predecessor_task_id: str) -> list[Task]:
+        """Return tasks whose ``predecessor_task_id`` is ``predecessor_task_id`` (#1398).
+
+        Forward-walks the replan chain. Empty list when no replans
+        exist. Stable ordering by ``project, task_number`` matches
+        ``list_tasks`` so callers can present chronological succession.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM work_tasks WHERE predecessor_task_id = ? "
+            "ORDER BY project, task_number",
+            (predecessor_task_id,),
+        ).fetchall()
+        return [self._row_to_task(row) for row in rows]
 
     def has_human_review_approval(self, task_id: str) -> bool:
         """Return True when a pre-queue human review approval is recorded."""

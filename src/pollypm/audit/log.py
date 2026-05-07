@@ -63,6 +63,13 @@ EVENT_WORKER_THREAD_LEAKED = "worker.thread_leaked"
 # ``cockpit-<pid>.sock`` whose owning PID is no longer alive. Lets
 # operators forensically count leak rates without scraping logs.
 EVENT_SOCKET_REAPED = "socket.reaped"
+# #1398 — plan task evolution. ``plan.version_incremented`` fires when
+# a plan task is refined in place (same task_id, version bump);
+# ``plan.successor_created`` fires when a replan creates a new task
+# linked to a predecessor. Together they let the heartbeat / inbox
+# render plan-history breadcrumbs without scanning task content.
+EVENT_PLAN_VERSION_INCREMENTED = "plan.version_incremented"
+EVENT_PLAN_SUCCESSOR_CREATED = "plan.successor_created"
 
 
 @dataclass(slots=True, frozen=True)
@@ -413,6 +420,8 @@ __all__ = [
     "EVENT_WORK_DB_OPENED",
     "EVENT_WORKER_THREAD_LEAKED",
     "EVENT_SOCKET_REAPED",
+    "EVENT_PLAN_VERSION_INCREMENTED",
+    "EVENT_PLAN_SUCCESSOR_CREATED",
     "AuditEvent",
     "central_log_path",
     "emit",

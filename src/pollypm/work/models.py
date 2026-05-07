@@ -286,6 +286,15 @@ class Task:
     superseded_by_project: str | None = None
     superseded_by_task_number: int | None = None
 
+    # --- Plan task evolution (#1398) ---
+    # ``plan_version`` increments on every refinement of a plan task
+    # (same task_id, new revision). Defaults to 1.
+    # ``predecessor_task_id`` points to the prior attempt when a
+    # replan creates a NEW task instead of refining the existing one;
+    # canonical ``project/task_number`` form, ``None`` for originals.
+    plan_version: int = 1
+    predecessor_task_id: str | None = None
+
     # --- Roles ---
     roles: dict[str, str] = field(default_factory=dict)
 

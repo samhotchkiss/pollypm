@@ -127,6 +127,7 @@ class MockWorkService:
         relevant_files: list[str] | None = None,
         labels: list[str] | None = None,
         requires_human_review: bool = False,
+        predecessor_task_id: str | None = None,
     ) -> Task:
         template = self._resolve_flow(flow_template)
 
@@ -154,6 +155,12 @@ class MockWorkService:
         num = self._counter.get(project, 0) + 1
         self._counter[project] = num
 
+        # #1398 — normalise predecessor_task_id; raises on bad shape.
+        predecessor_normalized: str | None = None
+        if predecessor_task_id is not None:
+            pred_project, pred_number = _parse_task_id(predecessor_task_id)
+            predecessor_normalized = f"{pred_project}/{pred_number}"
+
         now = _now()
         task = Task(
             project=project,
@@ -176,12 +183,39 @@ class MockWorkService:
             created_at=now,
             created_by=created_by,
             updated_at=now,
+            plan_version=1,
+            predecessor_task_id=predecessor_normalized,
         )
         self._tasks[task.task_id] = task
         self._context[task.task_id] = []
         self._executions[task.task_id] = []
         self._transitions[task.task_id] = []
         return deepcopy(task)
+
+    def increment_plan_version(
+        self,
+        task_id: str,
+        *,
+        actor: str = "system",
+        reason: str | None = None,
+    ) -> Task:
+        """Bump ``plan_version`` on the in-memory task (#1398)."""
+        task = self._tasks.get(task_id)
+        if task is None:
+            raise TaskNotFoundError(f"Task '{task_id}' not found.")
+        task.plan_version = int(task.plan_version) + 1
+        task.updated_at = _now()
+        return deepcopy(task)
+
+    def list_successors(self, predecessor_task_id: str) -> list[Task]:
+        """Return tasks whose ``predecessor_task_id`` matches (#1398)."""
+        result = [
+            deepcopy(t)
+            for t in self._tasks.values()
+            if t.predecessor_task_id == predecessor_task_id
+        ]
+        result.sort(key=lambda t: (t.project, t.task_number))
+        return result
 
     def get(self, task_id: str) -> Task:
         task = self._tasks.get(task_id)

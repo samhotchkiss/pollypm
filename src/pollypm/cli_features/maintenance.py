@@ -336,6 +336,36 @@ def register_maintenance_commands(app: typer.Typer) -> None:
         if fix_summary:
             typer.echo("")
             typer.echo(fix_summary)
+
+        # #savethenovel-followup: emit a ``pm.doctor_run`` audit event
+        # so the heartbeat watchdog can correlate doctor runs with
+        # subsequent state mutations (e.g. "the user ran pm doctor and
+        # then the table got wiped" vs "the table wiped without
+        # operator intervention"). Best-effort; never blocks the CLI.
+        try:
+            from pollypm.audit import emit as _audit_emit
+
+            _audit_emit(
+                event="pm.doctor_run",
+                project="_workspace",
+                subject="pm doctor",
+                actor="user",
+                status="ok" if report.ok else "warn",
+                metadata={
+                    "findings_total": len(report.errors) + len(report.warnings),
+                    "errors": len(report.errors),
+                    "warnings": len(report.warnings),
+                    "checks_total": len(report.results),
+                    "passed": report.passed_count,
+                    "skipped": report.skipped_count,
+                    "duration_seconds": round(report.duration_seconds, 3),
+                    "json_output": bool(json_output),
+                    "fix_applied": bool(fix),
+                },
+            )
+        except Exception:  # noqa: BLE001 — audit must never break CLI
+            pass
+
         raise typer.Exit(code=0 if report.ok else 1)
 
     @app.command(

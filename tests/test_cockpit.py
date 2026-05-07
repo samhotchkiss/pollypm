@@ -990,6 +990,58 @@ def test_cockpit_raw_rail_approval_affordance_fits_narrow_30col_pane() -> None:
     assert "savethenovel" in row.text
 
 
+def test_cockpit_raw_rail_on_hold_renders_decision_affordance() -> None:
+    """#1426 — when a project carries an on_hold task the rollup now
+    sets approvals_pending>0; the rail must render the same ▶ + (N⚠)
+    affordance it uses for review tasks so the user gets a single
+    consistent "needs your decision" signal in the rail line."""
+    rail = PollyCockpitRail.__new__(PollyCockpitRail)
+    rail.selected_key = "polly"
+    rail.spinner_index = 0
+
+    # The rollup produces YELLOW for an on_hold task (it falls in
+    # _WAITING_STATUSES) — the affordance must still win over the
+    # quiet ◆ glyph, matching the behavior for review.
+    row = rail._item_row(
+        CockpitItem(
+            "project:savethenovel",
+            "savethenovel (1⚠)",
+            "project-yellow",
+            approvals_pending=1,
+        ),
+        width=40,
+        active_view="polly",
+    )
+
+    assert "savethenovel" in row.text
+    assert "▶" in row.text
+    assert "(1⚠)" in row.text
+
+
+def test_cockpit_raw_rail_on_hold_affordance_fits_narrow_pane() -> None:
+    """80x40 / 30-col-rail narrow-mode rendering for the on_hold
+    affordance. The ▶ + (N⚠) suffix must fit without truncating
+    typical project keys, matching the #1396 narrow-mode budget."""
+    rail = PollyCockpitRail.__new__(PollyCockpitRail)
+    rail.selected_key = "polly"
+    rail.spinner_index = 0
+
+    row = rail._item_row(
+        CockpitItem(
+            "project:savethenovel",
+            "savethenovel (2⚠)",
+            "project-yellow",
+            approvals_pending=2,
+        ),
+        width=30,
+        active_view="polly",
+    )
+
+    assert "▶" in row.text
+    assert "savethenovel" in row.text
+    assert "(2⚠)" in row.text
+
+
 def test_cockpit_rail_session_indicator_combines_pulse_and_work_glyph(monkeypatch, tmp_path: Path) -> None:
     config_path = tmp_path / "pollypm.toml"
     config_path.write_text(

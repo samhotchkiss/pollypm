@@ -279,15 +279,66 @@ def test_rollup_approvals_pending_counts_multiple() -> None:
     assert rollup.approvals_pending == 3
 
 
-def test_rollup_approvals_pending_zero_without_human_review() -> None:
-    """Autoreview / automated review tasks must not inflate the count
-    — only human-decision review nodes drive the affordance."""
+def test_rollup_approvals_pending_includes_autoreview_after_widening() -> None:
+    """#1426 widened the rail affordance from "human-review only" to
+    "any task in review or on_hold" — a reviewer parking a task at
+    autoreview still stalls the project until the reviewer acts, so
+    the rail must surface it, not pretend the project is moving."""
     rollup = rollup_project_state(
         "demo",
         [
             _task(1, "in_progress"),
             _task(2, "review", node="autoreview"),
             _task(3, "queued"),
+        ],
+    )
+
+    assert rollup.approvals_pending == 1
+
+
+def test_rollup_approvals_pending_fires_on_on_hold_only_project() -> None:
+    """#1426 — savethenovel/11 sat in on_hold for 1+ hour with no rail
+    signal because #1390 only counted ``status=review``. A task parked
+    at on_hold is by definition awaiting a decision before it can
+    move — the rail must surface it just like a review."""
+    rollup = rollup_project_state(
+        "savethenovel",
+        [
+            _task(1, "on_hold"),
+            _task(2, "in_progress"),
+        ],
+    )
+
+    assert rollup.approvals_pending == 1
+
+
+def test_rollup_approvals_pending_combines_review_and_on_hold() -> None:
+    """When a project has both a task in review AND a task in on_hold,
+    the count rolls them up into a single (N⚠) suffix — per #1426 we
+    keep one count so the 22-char label budget from #1396 is safe."""
+    rollup = rollup_project_state(
+        "savethenovel",
+        [
+            _task(1, "review", node="user_approval", assignee="human"),
+            _task(2, "on_hold"),
+            _task(3, "in_progress"),
+        ],
+    )
+
+    assert rollup.approvals_pending == 2
+
+
+def test_rollup_approvals_pending_zero_for_done_and_blocked_only() -> None:
+    """Tasks that are terminal (done/cancelled) or blocked-on-deps
+    must NOT inflate the count. ``blocked`` is a wait-on-system state,
+    not a wait-on-decision state — surfacing every blocked task as
+    "needs your decision" would flood the rail."""
+    rollup = rollup_project_state(
+        "demo",
+        [
+            _task(1, "done"),
+            _task(2, "blocked"),
+            _task(3, "cancelled"),
         ],
     )
 

@@ -134,20 +134,25 @@ def _config_from_payload(payload: dict[str, Any]) -> WatchdogConfig:
 def _gather_open_tasks(project_key: str, project_path: Path | None) -> list[Any]:
     """Best-effort load of in-flight tasks for ``role_session_missing``.
 
+    Routes through :func:`pollypm.work.create_work_service` (the factory
+    landed in #1389), which delegates path resolution to
+    :func:`pollypm.work.db_resolver.resolve_work_db_path`. Post-#1004
+    the canonical DB lives at ``<workspace_root>/.pollypm/state.db`` —
+    a per-project ``<project>/.pollypm/state.db`` is at best stale and
+    at worst empty (#1419), so we deliberately do NOT pass a hand-built
+    ``db_path`` here. ``project_key`` is forwarded for resolver warnings
+    and ``project_path`` for project-aware audit metadata only.
+
     Returns an empty list on any failure — the watchdog keeps working
     even when the work-service is unreachable; the new rule simply
     no-ops for that project.
     """
-    if project_path is None:
-        return []
     try:
         from pollypm.work import create_work_service
 
-        db_path = project_path / ".pollypm" / "state.db"
-        if not db_path.exists():
-            return []
         with create_work_service(
-            db_path=db_path, project_path=project_path,
+            project_path=project_path,
+            project_key=project_key,
         ) as svc:
             list_fn = getattr(svc, "list_nonterminal_tasks", None)
             if not callable(list_fn):

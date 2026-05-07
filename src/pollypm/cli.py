@@ -490,7 +490,12 @@ def shortcuts() -> None:
 
 
 _ROLE_GUIDES = {
-    "worker": ("docs/worker-guide.md", "Worker onboarding guide"),
+    # role: (repo-relative path, packaged-resource path under pollypm/, title)
+    "worker": (
+        "docs/worker-guide.md",
+        "defaults/docs/worker-guide.md",
+        "Worker onboarding guide",
+    ),
 }
 
 
@@ -517,33 +522,38 @@ def role_help(
             err=True,
         )
         raise typer.Exit(code=1)
-    rel_path, title = entry
-    # Resolve against the repo root. ``pollypm`` is installed editable
-    # during dev; at runtime we prefer the packaged doc if it exists,
-    # falling back to the repo copy.
-    from importlib.resources import files as _files
+    rel_path, packaged_rel, title = entry
+    # Resolve in priority order:
+    #   1) Packaged resource shipped with the wheel
+    #      (src/pollypm/<packaged_rel>) — works in any worktree, even
+    #      one without docs/ on disk. This is the savethenovel fix:
+    #      workers no longer thrash on a missing docs/worker-guide.md.
+    #   2) Repo-relative path on disk — editable installs / running
+    #      from a clone resolve here.
+    from importlib.resources import as_file, files as _files
 
     doc_text: str | None = None
     try:
-        # Packaged layout: src/pollypm/defaults/worker-guide.md (if we
-        # later ship it). For now fall through to the repo docs dir.
-        candidate = _files("pollypm").joinpath(f"../../{rel_path}")
+        candidate = _files("pollypm").joinpath(packaged_rel)
         if candidate.is_file():
-            doc_text = candidate.read_text()
+            with as_file(candidate) as on_disk:
+                doc_text = Path(on_disk).read_text(encoding="utf-8")
     except (ModuleNotFoundError, FileNotFoundError, TypeError):
         pass
     if doc_text is None:
         # Walk up from this file to find the project root's docs/ dir.
         here = Path(__file__).resolve()
         for parent in here.parents:
-            candidate = parent / rel_path
-            if candidate.is_file():
-                doc_text = candidate.read_text()
+            candidate_path = parent / rel_path
+            if candidate_path.is_file():
+                doc_text = candidate_path.read_text(encoding="utf-8")
                 break
     if doc_text is None:
         typer.echo(
-            f"Could not locate {rel_path} on disk. "
-            f"The guide exists in the PollyPM repo at that path.",
+            f"Could not locate {rel_path} on disk and no packaged "
+            f"copy was found. Reinstall PollyPM "
+            f"(`uv tool install --reinstall .`) to refresh the bundled "
+            f"guide.",
             err=True,
         )
         raise typer.Exit(code=1)

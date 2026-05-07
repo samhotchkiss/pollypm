@@ -206,7 +206,21 @@ def built_in_guide_source_path(role: str) -> Path | None:
     if normalized == "reviewer":
         return Path(__file__).resolve().parent / "plugins_builtin" / "core_agent_profiles" / "profiles.py"
     if normalized == "worker":
-        return _locate_repo_file("docs/worker-guide.md")
+        # Prefer the repo copy (editable install / in-tree dev) so
+        # forks of the doc surface during dev cycles. In a packaged
+        # install the repo copy isn't present — fall back to the
+        # bundled copy under ``pollypm/defaults/docs/worker-guide.md``
+        # so workers in any worktree get a real guide path.
+        repo_copy = _locate_repo_file("docs/worker-guide.md")
+        if repo_copy is not None:
+            return repo_copy
+        packaged = (
+            Path(__file__).resolve().parent
+            / "defaults"
+            / "docs"
+            / "worker-guide.md"
+        )
+        return packaged if packaged.is_file() else None
     raise ValueError(f"Unsupported role '{role}'.")
 
 

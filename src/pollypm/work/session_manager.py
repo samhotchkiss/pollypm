@@ -1208,14 +1208,32 @@ class SessionManager:
 
         guide_reference = worker_guide_reference(self._project_path)
 
+        # When there's no project-local guide, point the worker at the
+        # `pm help worker` meta-command — it prints the playbook from a
+        # packaged resource and works in any worktree, even one without
+        # docs/ on disk (savethenovel fix). When a project has its own
+        # forked guide, name that file directly so the worker reads
+        # the local override.
+        if guide_reference == "docs/worker-guide.md":
+            guide_instruction = (
+                "Run `pm help worker` first for the worker playbook. "
+                "(`pm help worker` prints the guide from PollyPM's "
+                "packaged resources, so it works in any worktree.)"
+            )
+        else:
+            guide_instruction = (
+                f"Read `{guide_reference}` first for the worker playbook "
+                f"(project-local override). If that file is missing, run "
+                f"`pm help worker` for the built-in guide."
+            )
+
         return (
             f"You are a PollyPM task worker. You have one job: complete the task below.\n\n"
             f"You are working in a git worktree at: {worktree_path}\n"
             f"This is an isolated branch — your changes won't affect other workers.\n\n"
             f"{task_info}"
             f"## Worker Guide\n\n"
-            f"Read `{guide_reference}` first for the worker playbook. Use the "
-            f"project-local guide when present; otherwise use the built-in one.\n\n"
+            f"{guide_instruction}\n\n"
             f"## How to Work\n\n"
             f"1. Read the task description carefully\n"
             f"2. Implement the work: read code, write code, run tests, commit\n"

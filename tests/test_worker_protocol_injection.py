@@ -60,7 +60,10 @@ def test_injection_empty_for_non_worker_roles():
 def test_injection_non_empty_for_worker_role():
     out = build_worker_protocol_injection(session_role="worker")
     assert out.startswith(WORKER_PROTOCOL_HEADING)
-    assert "docs/worker-guide.md" in out
+    # Default kickoff routes through `pm help worker` — savethenovel
+    # showed that pointing workers at docs/worker-guide.md by path
+    # fails in any worktree where docs/ isn't checked out.
+    assert "pm help worker" in out
     assert "claim work" in out
     assert "ship it" in out
     assert "recover" in out
@@ -75,7 +78,9 @@ def test_injection_accepts_explicit_guide_text_for_isolation():
         guide_text=payload,
     )
     assert out.startswith(WORKER_PROTOCOL_HEADING + "\n")
-    assert "docs/worker-guide.md" in out
+    # Default reference now routes through the packaged-resource
+    # printer (`pm help worker`), not the docs/ path.
+    assert "pm help worker" in out
     assert "Body goes here." not in out
 
 
@@ -89,14 +94,15 @@ def test_injection_uses_explicit_guide_reference_when_provided():
 
 
 def test_injection_uses_pointer_when_guide_missing():
-    """Blank guide text no longer inlines the guide; it still points
-    workers at docs/worker-guide.md."""
+    """Blank guide text no longer inlines the guide; it points workers
+    at ``pm help worker`` (which prints the packaged guide) so a worker
+    in a worktree without docs/ on disk can still recover."""
     out = build_worker_protocol_injection(
         session_role="worker",
         guide_text="",
     )
     assert out.startswith(WORKER_PROTOCOL_HEADING)
-    assert "docs/worker-guide.md" in out
+    assert "pm help worker" in out
     assert "Body goes here." not in out
 
 
@@ -219,7 +225,9 @@ def test_tmux_service_injects_worker_protocol_for_worker(tmux_service):
         user_id="operator",
     )
     assert WORKER_PROTOCOL_HEADING in out
-    assert "docs/worker-guide.md" in out
+    # Default kickoff points at `pm help worker` so it works in any
+    # worktree (savethenovel fix).
+    assert "pm help worker" in out
     assert persona in out
     # Protocol appears above the persona.
     assert out.index(WORKER_PROTOCOL_HEADING) < out.index(persona)
@@ -259,8 +267,10 @@ def test_tmux_service_skips_worker_protocol_for_other_roles(tmux_service, role):
 
 
 def test_tmux_service_injects_worker_protocol_even_without_guide_text(tmux_service, monkeypatch):
-    """The kickoff now points to docs/worker-guide.md directly, so a
-    missing on-disk guide_text hook must not suppress the pointer."""
+    """A missing on-disk guide must not suppress the kickoff pointer.
+    The pointer now routes through `pm help worker` (packaged
+    resource), so workers in a fresh worktree without docs/ on disk
+    still get the playbook."""
     import pollypm.memory_prompts as mp
 
     monkeypatch.setattr(mp, "load_worker_guide_text", lambda: "")
@@ -274,5 +284,5 @@ def test_tmux_service_injects_worker_protocol_even_without_guide_text(tmux_servi
         user_id="operator",
     )
     assert WORKER_PROTOCOL_HEADING in out
-    assert "docs/worker-guide.md" in out
+    assert "pm help worker" in out
     assert persona in out

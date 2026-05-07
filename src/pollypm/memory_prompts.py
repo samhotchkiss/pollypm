@@ -313,15 +313,23 @@ def _locate_worker_guide() -> Path | None:
 
     We walk up from this file's directory looking for a sibling
     ``docs/worker-guide.md``. In an editable install this resolves to
-    the repo's real doc; in a packaged install where the doc isn't
-    shipped, the search returns ``None`` and the caller falls through
-    to an empty injection (so session startup isn't blocked).
+    the repo's real doc; in a packaged install we fall back to the
+    bundled copy under ``pollypm/defaults/docs/worker-guide.md`` so
+    workers running in a fresh worktree (no ``docs/`` checked out)
+    still get the playbook.
     """
     here = Path(__file__).resolve()
     for parent in here.parents:
         candidate = parent / _WORKER_GUIDE_RELATIVE
         if candidate.is_file():
             return candidate
+    # Packaged fallback: the doc is shipped under the pollypm package
+    # tree. This makes ``pm`` self-sufficient in any worktree (the
+    # savethenovel fix — workers no longer fail to read a missing
+    # docs/worker-guide.md).
+    packaged = Path(__file__).resolve().parent / "defaults" / "docs" / "worker-guide.md"
+    if packaged.is_file():
+        return packaged
     return None
 
 
@@ -362,10 +370,26 @@ def build_worker_protocol_injection(
         return ""
     guide_ref = guide_reference or "docs/worker-guide.md"
     # Keep the kickoff compact: the full playbook lives in docs/worker-guide.md.
+    #
+    # Workers spawn in a git worktree where ``docs/`` is rarely checked
+    # out. The previous kickoff told the worker to "Read
+    # docs/worker-guide.md" and the file wasn't there — savethenovel
+    # spent 37s thrashing on the missing path. The kickoff now tells the
+    # worker to run ``pm help worker`` (which prints the guide from a
+    # packaged resource) when the reference is the default repo path.
+    if guide_ref == "docs/worker-guide.md":
+        return (
+            f"{WORKER_PROTOCOL_HEADING}\n\n"
+            "Run `pm help worker` for the worker playbook, including "
+            "how to claim work, ship it, and recover. (`pm help worker` "
+            "prints the guide from PollyPM's packaged resources, so it "
+            "works in any worktree.)"
+        )
     return (
         f"{WORKER_PROTOCOL_HEADING}\n\n"
         f"Read `{guide_ref}` for the worker playbook, including how to "
-        "claim work, ship it, and recover."
+        "claim work, ship it, and recover. If that file is missing, "
+        "run `pm help worker` for the built-in guide."
     )
 
 

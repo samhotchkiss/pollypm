@@ -1283,3 +1283,474 @@ def test_gather_open_tasks_returns_empty_on_factory_failure(
     )
 
     assert _gather_open_tasks("demo", None) == []
+
+
+# ---------------------------------------------------------------------------
+# #1424 — task_on_hold_stale rule + on_hold escalation dispatch
+# ---------------------------------------------------------------------------
+
+
+def test_task_on_hold_stale_fires_after_threshold(now: datetime) -> None:
+    """A task at status=on_hold for >threshold fires the new rule."""
+    from pollypm.audit.watchdog import RULE_TASK_ON_HOLD_STALE
+
+    events = [
+        _make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            project="savethenovel",
+            subject="savethenovel/11",
+            metadata={
+                "from": "review",
+                "to": "on_hold",
+                "reason": (
+                    "[architect-actionable] Footer.astro placeholder "
+                    "copy fails 'No placeholders'"
+                ),
+            },
+            ts=now - timedelta(minutes=20),
+        ),
+    ]
+    findings = scan_events(events, now=now)
+    matched = [f for f in findings if f.rule == RULE_TASK_ON_HOLD_STALE]
+    assert len(matched) == 1
+    f = matched[0]
+    assert f.subject == "savethenovel/11"
+    assert f.project == "savethenovel"
+    assert f.metadata["routing"] == "architect-actionable"
+    assert "Footer.astro" in (f.metadata.get("reason") or "")
+    assert "review" == f.metadata["from"]
+
+
+def test_task_on_hold_stale_silent_within_grace(now: datetime) -> None:
+    """An on_hold transition within the grace window doesn't fire."""
+    from pollypm.audit.watchdog import RULE_TASK_ON_HOLD_STALE
+
+    events = [
+        _make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            project="demo",
+            subject="demo/3",
+            metadata={"from": "review", "to": "on_hold", "reason": "..."},
+            # Default threshold is 900s = 15 min; 5 min ago is fresh.
+            ts=now - timedelta(minutes=5),
+        ),
+    ]
+    findings = scan_events(events, now=now)
+    assert not any(f.rule == RULE_TASK_ON_HOLD_STALE for f in findings)
+
+
+def test_task_on_hold_stale_silent_when_resumed(now: datetime) -> None:
+    """A later transition out of on_hold suppresses the finding."""
+    from pollypm.audit.watchdog import RULE_TASK_ON_HOLD_STALE
+
+    events = [
+        _make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            project="demo",
+            subject="demo/3",
+            metadata={"from": "review", "to": "on_hold"},
+            ts=now - timedelta(minutes=45),
+        ),
+        _make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            project="demo",
+            subject="demo/3",
+            metadata={"from": "on_hold", "to": "queued"},
+            ts=now - timedelta(minutes=5),
+        ),
+    ]
+    findings = scan_events(events, now=now)
+    assert not any(f.rule == RULE_TASK_ON_HOLD_STALE for f in findings)
+
+
+def test_task_on_hold_stale_does_not_disturb_review_stale(now: datetime) -> None:
+    """Existing review_stale rule still fires only on status=review.
+
+    Regression guard for #1424's hard constraint: the new rule MUST be
+    additive. A status=review task should never trigger the on_hold rule
+    and vice-versa.
+    """
+    from pollypm.audit.watchdog import (
+        RULE_TASK_ON_HOLD_STALE,
+        RULE_TASK_REVIEW_STALE,
+    )
+
+    events = [
+        _make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            project="demo",
+            subject="demo/4",
+            metadata={"from": "in_progress", "to": "review"},
+            ts=now - timedelta(minutes=45),
+        ),
+        _make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            project="demo",
+            subject="demo/5",
+            metadata={"from": "review", "to": "on_hold", "reason": "x"},
+            ts=now - timedelta(minutes=20),
+        ),
+    ]
+    findings = scan_events(events, now=now)
+    review = [f for f in findings if f.rule == RULE_TASK_REVIEW_STALE]
+    on_hold = [f for f in findings if f.rule == RULE_TASK_ON_HOLD_STALE]
+    assert len(review) == 1
+    assert len(on_hold) == 1
+    assert review[0].subject == "demo/4"
+    assert on_hold[0].subject == "demo/5"
+
+
+def test_task_on_hold_stale_human_needed_routing(now: datetime) -> None:
+    """A reviewer-tagged ``[human-needed]`` reason routes to human."""
+    from pollypm.audit.watchdog import (
+        ON_HOLD_HUMAN_NEEDED_TAG,
+        RULE_TASK_ON_HOLD_STALE,
+    )
+
+    events = [
+        _make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            project="demo",
+            subject="demo/9",
+            metadata={
+                "from": "review",
+                "to": "on_hold",
+                "reason": "[human-needed] Need product call on copy direction",
+            },
+            ts=now - timedelta(minutes=20),
+        ),
+    ]
+    findings = scan_events(events, now=now)
+    matched = [f for f in findings if f.rule == RULE_TASK_ON_HOLD_STALE]
+    assert len(matched) == 1
+    assert matched[0].metadata["routing"] == ON_HOLD_HUMAN_NEEDED_TAG
+
+
+def test_format_unstick_brief_on_hold_includes_evidence_and_default() -> None:
+    """The brief lists the reviewer's reason, evidence, and 'fix and re-submit' default."""
+    from pollypm.audit.watchdog import (
+        RULE_TASK_ON_HOLD_STALE,
+        format_unstick_brief,
+    )
+
+    finding = Finding(
+        rule=RULE_TASK_ON_HOLD_STALE,
+        project="savethenovel",
+        subject="savethenovel/11",
+        message="Task savethenovel/11 has been at on_hold for ~20 min",
+        recommendation="Architect: re-read the rationale.",
+        metadata={
+            "stuck_minutes": 20,
+            "on_hold_since": "2026-05-07T08:30:00+00:00",
+            "from": "review",
+            "reason": (
+                "[architect-actionable] Footer.astro:20 placeholder "
+                "copy + untracked planning docs"
+            ),
+            "routing": "architect-actionable",
+            "reviewer_evidence": [
+                "reviewer exec [code_review @ 2026-05-07T08:25:00+00:00] "
+                "decision=rejected reason: placeholder copy fails 'No placeholders'",
+                "inbox msg from russell: review of savethenovel/11 — "
+                "Footer.astro:20 has TODO copy, untracked docs",
+            ],
+        },
+    )
+    brief = format_unstick_brief(finding)
+    assert brief.startswith("WATCHDOG ESCALATION")
+    assert "Project: savethenovel" in brief
+    assert "Finding: task_on_hold_stale" in brief
+    assert "20 minutes" in brief
+    # The on_hold reason / reviewer rationale must be visible verbatim.
+    assert "Footer.astro:20" in brief
+    assert "Routing: architect-actionable" in brief
+    # Reviewer evidence section must list both lines.
+    assert "Recent reviewer evidence" in brief
+    assert "code_review" in brief
+    assert "russell" in brief
+    # Default action must steer the architect to fix and re-queue.
+    assert "DEFAULT" in brief or "default" in brief.lower()
+    assert "pm task queue savethenovel/11" in brief
+    assert "pm task approve savethenovel/11" in brief
+    # Escalation path is mentioned but framed as last-resort.
+    assert "pm notify" in brief
+
+
+def test_format_unstick_brief_on_hold_handles_missing_evidence() -> None:
+    """When no reviewer evidence is available, the brief still renders cleanly."""
+    from pollypm.audit.watchdog import (
+        RULE_TASK_ON_HOLD_STALE,
+        format_unstick_brief,
+    )
+
+    finding = Finding(
+        rule=RULE_TASK_ON_HOLD_STALE,
+        project="demo",
+        subject="demo/1",
+        metadata={
+            "stuck_minutes": 25,
+            "on_hold_since": "2026-05-07T08:00:00+00:00",
+            "from": "in_progress",
+            "reason": None,
+            "routing": "architect-actionable",
+        },
+    )
+    brief = format_unstick_brief(finding)
+    assert "no transition reason" in brief.lower()
+    # Don't include a stale "Recent reviewer evidence" header.
+    assert "No additional reviewer execution rows" in brief
+
+
+def test_cadence_handler_dispatches_on_hold_with_reviewer_evidence(
+    now: datetime, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """End-to-end: an on_hold transition triggers a brief carrying evidence.
+
+    Seeds an on_hold transition into the central audit log and a real
+    reviewer rejection into a workspace-layout DB. The cadence handler
+    should fire ``task_on_hold_stale``, fold the reviewer's exec row +
+    inbox message into the brief, and send the result to the architect's
+    pane via the (stubbed) tmux send_keys.
+    """
+    from pollypm.audit.log import central_log_path
+    from pollypm.audit.watchdog import RULE_TASK_ON_HOLD_STALE
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _scan_one_project,
+    )
+    from pollypm.work import create_work_service
+
+    workspace_root = tmp_path / "workspace"
+    canonical_db = workspace_root / ".pollypm" / "state.db"
+    canonical_db.parent.mkdir(parents=True, exist_ok=True)
+    project_path = workspace_root / "savethenovel"
+    project_path.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        "pollypm.work.db_resolver.resolve_work_db_path",
+        lambda *a, **kw: canonical_db,
+    )
+
+    # Seed the task and a reviewer rejection row into the work-service DB.
+    with create_work_service(
+        db_path=canonical_db, project_path=project_path,
+    ) as svc:
+        task = svc.create(
+            title="hero copy",
+            description="hero copy work",
+            type="task",
+            project="savethenovel",
+            flow_template="standard",
+            roles={"worker": "claude:worker", "reviewer": "claude:reviewer"},
+            priority="normal",
+            created_by="tester",
+        )
+        # Insert a reviewer execution row directly so the test stays
+        # decoupled from the flow engine's transition wiring.
+        svc._conn.execute(
+            "INSERT INTO work_node_executions "
+            "(task_project, task_number, node_id, visit, status, "
+            " decision, decision_reason, started_at, completed_at, "
+            " work_output) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task.project,
+                task.task_number,
+                "code_review",
+                1,
+                "completed",
+                "rejected",
+                "Footer.astro:20 placeholder copy fails No placeholders",
+                "2026-05-07T08:20:00+00:00",
+                "2026-05-07T08:25:00+00:00",
+                None,
+            ),
+        )
+        svc._conn.execute(
+            "UPDATE work_tasks SET work_status = ? "
+            "WHERE project = ? AND task_number = ?",
+            ("on_hold", task.project, task.task_number),
+        )
+        svc._conn.commit()
+        task_number = task.task_number
+
+    subject = f"savethenovel/{task_number}"
+
+    # Seed a stale on_hold transition into the central audit tail.
+    central = central_log_path("savethenovel")
+    central.parent.mkdir(parents=True, exist_ok=True)
+    stale_ts = (now - timedelta(minutes=20)).isoformat()
+    payload = {
+        "schema": 1,
+        "ts": stale_ts,
+        "project": "savethenovel",
+        "event": EVENT_TASK_STATUS_CHANGED,
+        "subject": subject,
+        "actor": "russell",
+        "status": "ok",
+        "metadata": {
+            "from": "review",
+            "to": "on_hold",
+            "reason": (
+                "[architect-actionable] Footer.astro:20 placeholder "
+                "copy + untracked planning docs"
+            ),
+        },
+    }
+    central.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    # Capture tmux send-keys instead of touching tmux.
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._send_brief_to_architect",
+        lambda target, brief: sent.append((target, brief)) or True,
+    )
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._gather_storage_windows",
+        lambda name: [],
+    )
+
+    class _MsgStore:
+        """Minimal stand-in that captures upserts AND surfaces a reviewer message."""
+
+        def __init__(self) -> None:
+            self.alerts: list = []
+
+        def upsert_alert(
+            self, scope: str, alert_type: str, severity: str, message: str,
+        ) -> None:
+            self.alerts.append((scope, alert_type, severity, message))
+
+        def query_messages(self, **filters):  # noqa: ANN001
+            return [
+                {
+                    "title": f"Russell: review of {subject}",
+                    "subject": subject,
+                    "body": (
+                        f"Rejecting {subject}: untracked planning docs at "
+                        "project root + Footer.astro:20 placeholder copy."
+                    ),
+                    "requester": "russell",
+                    "actor": "russell",
+                    "created_at": "2026-05-07T08:30:00+00:00",
+                    "project": "savethenovel",
+                },
+            ]
+
+    store = _MsgStore()
+    counters = _scan_one_project(
+        project_key="savethenovel",
+        project_path=project_path,
+        msg_store=store,
+        state_store=None,
+        now=now,
+        config=WatchdogConfig(),
+        storage_closet_name="pollypm-storage-closet",
+    )
+
+    assert counters["findings"] >= 1
+    assert counters["dispatches_sent"] == 1
+    assert len(sent) == 1
+    target, brief = sent[0]
+    assert target == "pollypm-storage-closet:architect-savethenovel"
+    assert RULE_TASK_ON_HOLD_STALE in brief
+    assert subject in brief
+    # Reviewer rationale (from the on_hold reason) must be in the brief.
+    assert "Footer.astro:20" in brief
+    # Reviewer execution row must be folded in via the enrichment path.
+    assert "code_review" in brief
+    assert "rejected" in brief
+    # Inbox-message lookup must surface russell's review message.
+    assert "russell" in brief.lower()
+    # Default-fix framing.
+    assert "pm task queue " + subject in brief
+
+
+def test_cadence_handler_throttles_on_hold_repeat_dispatch(
+    now: datetime, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 30-min throttle applies to on_hold escalations too."""
+    from pollypm.audit.log import central_log_path
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _scan_one_project,
+    )
+
+    central = central_log_path("savethenovel")
+    central.parent.mkdir(parents=True, exist_ok=True)
+    stale_ts = (now - timedelta(minutes=20)).isoformat()
+    payload = {
+        "schema": 1,
+        "ts": stale_ts,
+        "project": "savethenovel",
+        "event": EVENT_TASK_STATUS_CHANGED,
+        "subject": "savethenovel/11",
+        "actor": "russell",
+        "status": "ok",
+        "metadata": {
+            "from": "review",
+            "to": "on_hold",
+            "reason": "[architect-actionable] x",
+        },
+    }
+    central.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._send_brief_to_architect",
+        lambda target, brief: sent.append((target, brief)) or True,
+    )
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._gather_storage_windows",
+        lambda name: [],
+    )
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._gather_open_tasks",
+        lambda key, path: [],
+    )
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._gather_reviewer_evidence",
+        lambda **kw: [],
+    )
+
+    store = _RecordingStore()
+    first = _scan_one_project(
+        project_key="savethenovel",
+        project_path=None,
+        msg_store=store,
+        state_store=None,
+        now=now,
+        config=WatchdogConfig(),
+        storage_closet_name="pollypm-storage-closet",
+    )
+    second = _scan_one_project(
+        project_key="savethenovel",
+        project_path=None,
+        msg_store=store,
+        state_store=None,
+        now=now + timedelta(minutes=5),
+        config=WatchdogConfig(),
+        storage_closet_name="pollypm-storage-closet",
+    )
+
+    assert first["dispatches_sent"] == 1
+    assert second["dispatches_sent"] == 0
+    assert second["dispatches_throttled"] == 1
+    assert len(sent) == 1
+
+
+def test_classify_on_hold_reason_defaults_to_architect() -> None:
+    """Untagged or unknown-tag reason routes to architect-actionable."""
+    from pollypm.audit.watchdog import (
+        ON_HOLD_ARCHITECT_TAG,
+        ON_HOLD_HUMAN_NEEDED_TAG,
+        _classify_on_hold_reason,
+    )
+
+    assert _classify_on_hold_reason(None) == ON_HOLD_ARCHITECT_TAG
+    assert _classify_on_hold_reason("") == ON_HOLD_ARCHITECT_TAG
+    assert _classify_on_hold_reason("just stuck") == ON_HOLD_ARCHITECT_TAG
+    assert _classify_on_hold_reason("[architect-actionable] x") == ON_HOLD_ARCHITECT_TAG
+    assert _classify_on_hold_reason("architect-actionable: x") == ON_HOLD_ARCHITECT_TAG
+    assert _classify_on_hold_reason("[human-needed] copy") == ON_HOLD_HUMAN_NEEDED_TAG
+    assert _classify_on_hold_reason("human-needed: y") == ON_HOLD_HUMAN_NEEDED_TAG
+    # Case-insensitive
+    assert _classify_on_hold_reason("[HUMAN-NEEDED] z") == ON_HOLD_HUMAN_NEEDED_TAG

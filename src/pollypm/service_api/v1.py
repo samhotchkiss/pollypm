@@ -842,9 +842,10 @@ class PollyPMService:
             verification=verification,
         )
         store = StateStore(config.project.state_db)
-        # TODO(#342-followup): ``record_checkpoint`` still writes the
-        # ``checkpoints`` domain table through StateStore; port to a Core
-        # Table def when the checkpoint surface moves.
+        # Note: ``record_checkpoint`` still writes the ``checkpoints``
+        # domain table through StateStore. The original #342 cleanup
+        # (CLOSED) didn't migrate this surface; revisit if the
+        # checkpoint surface ever moves to a Core Table def.
         record_checkpoint(
             store,
             launch,

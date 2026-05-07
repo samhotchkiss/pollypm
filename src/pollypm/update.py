@@ -221,9 +221,13 @@ def count_in_progress_tasks() -> int:
     # ``DEFAULT_CONFIG_PATH`` makes the dependency obvious for
     # readers and keeps the import-graph audit happy.
     _ = DEFAULT_CONFIG_PATH
+    # #1377 — wrap in a context manager so the SQLite connection is
+    # always closed. Process exit reaps it for ``pm update``'s one-shot
+    # CLI today, but the leaky pattern would bite any future caller
+    # that loops. Mirrors the close-on-exit pattern from #1069 / #1381.
     try:
-        svc = SQLiteWorkService(db_path=db_path)
-        tasks = svc.list_tasks(work_status="in_progress")
+        with SQLiteWorkService(db_path=db_path) as svc:
+            tasks = svc.list_tasks(work_status="in_progress")
     except Exception:  # noqa: BLE001
         return 0
     return len(tasks)

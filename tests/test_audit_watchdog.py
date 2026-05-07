@@ -216,7 +216,7 @@ def test_stuck_draft_detected_when_never_promoted(now: datetime) -> None:
     findings = [f for f in scan_events(events, now=now) if f.rule == RULE_STUCK_DRAFT]
     assert len(findings) == 1
     assert findings[0].subject == "demo/2"
-    assert "pm task promote demo/2" in findings[0].recommendation
+    assert "pm task queue demo/2" in findings[0].recommendation
 
 
 def test_stuck_draft_silenced_by_promotion(now: datetime) -> None:
@@ -352,11 +352,11 @@ def test_format_finding_message_includes_recommendation() -> None:
         project="demo",
         subject="demo/2",
         message="Draft demo/2 is stuck.",
-        recommendation="Run pm task promote demo/2.",
+        recommendation="Run pm task queue demo/2.",
     )
     rendered = format_finding_message(finding)
     assert "Draft demo/2 is stuck." in rendered
-    assert "Recommendation: Run pm task promote demo/2." in rendered
+    assert "Recommendation: Run pm task queue demo/2." in rendered
 
 
 def test_alert_session_name_is_stable() -> None:

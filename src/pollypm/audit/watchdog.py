@@ -42,7 +42,7 @@ Detection rules (each returns a list of :class:`Finding`):
 
 Severity is ``"warn"`` for every rule today. The recovery hint is
 attached to each finding so the alert message can include a
-copy-pasteable next step (``"run pm task promote ..."``).
+copy-pasteable next step (``"run pm task queue ..."``).
 
 The watchdog itself emits a synthetic ``heartbeat.tick`` audit event
 each time it runs so we can prove the heartbeat is alive (and
@@ -427,7 +427,7 @@ def _detect_stuck_drafts(
                 f"(created {ev.ts})."
             ),
             recommendation=(
-                f"Promote with `pm task promote {ev.subject}` or "
+                f"Promote with `pm task queue {ev.subject}` or "
                 f"discard with `pm task cancel {ev.subject}`. "
                 f"Originating actor: {ev.actor or 'unknown'}."
             ),

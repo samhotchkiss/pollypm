@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -35,6 +36,98 @@ from pollypm.models import KnownProject
 
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Signal filter
+# ---------------------------------------------------------------------------
+#
+# A tracked project is only worth surfacing in the briefing when it has
+# *something* — a transition, a creation, an inbox arrival, an error.
+# Without this gate, ``tracked=true`` becoming the default for all new
+# projects (parallel UX change) would balloon the briefing into a wall
+# of empty headers for every dormant project the user has ever touched.
+#
+# We use the audit log as the cheap "did anything happen here" probe:
+# every task-lifecycle, marker, and inbox mutation already lands there
+# (see :mod:`pollypm.audit`). Reading one JSONL file per project is far
+# cheaper than the existing per-project SQL + git-log probes — and lets
+# us short-circuit the latter entirely when the project sat idle.
+#
+# The bar is intentionally low: ANY non-heartbeat event in the window
+# qualifies. Heartbeat ticks alone (the audit-watchdog liveness pulse)
+# are background noise and do not count. When in doubt — missing log,
+# unparseable line, anything funky — we INCLUDE the project. Better an
+# occasional quiet header than silently dropping a project the user
+# actually cares about.
+
+# Events that, on their own, do not constitute "valuable signal" for
+# the briefing. Anything else in the audit log is treated as signal.
+_BACKGROUND_AUDIT_EVENTS: frozenset[str] = frozenset({
+    "heartbeat.tick",
+})
+
+# Operator override: setting this env var to a truthy value forces the
+# briefing to include every tracked project, bypassing the signal gate.
+# Useful for debugging the gate itself or for users who want a fully
+# exhaustive briefing regardless of activity.
+_INCLUDE_ALL_ENV = "POLLYPM_BRIEFING_INCLUDE_ALL"
+
+
+def _truthy(value: str | None) -> bool:
+    if not value:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def project_has_signal(
+    project: KnownProject,
+    *,
+    since_iso: str,
+) -> bool:
+    """Return ``True`` when ``project`` has briefing-worthy activity since ``since_iso``.
+
+    "Signal" is any audit-log event other than the heartbeat-watchdog
+    liveness pulse (``heartbeat.tick``). Specifically counted:
+
+    * ``task.created`` / ``task.status_changed`` / ``task.deleted``
+    * ``marker.*`` (worker lifecycle: created, released, leaked, failed)
+    * ``work_table.cleared`` (forensic — savethenovel-class incidents)
+    * ``work_db.opened`` (DB stamp events; rare, but real)
+    * Any future ``noun.verb`` audit event.
+
+    Behavior on missing data is conservative: if the audit log is
+    absent or unreadable we return ``False`` (skip). New / brand-new
+    projects with no audit history don't have signal *because* nothing
+    has happened yet — by definition. The briefing's job is to flag
+    today's activity, not to advertise project rosters.
+
+    Errors during the read default to ``True`` (include) so a transient
+    permission glitch doesn't silently amputate the briefing.
+    """
+    try:
+        from pollypm.audit import read_events
+    except Exception as exc:  # noqa: BLE001 — never crash the briefing
+        logger.debug("briefing: audit import failed, including %s: %s", project.key, exc)
+        return True
+
+    try:
+        events = read_events(
+            project.key,
+            since=since_iso,
+            project_path=project.path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "briefing: read_events failed for %s, including conservatively: %s",
+            project.key, exc,
+        )
+        return True
+
+    for ev in events:
+        if ev.event not in _BACKGROUND_AUDIT_EVENTS:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -444,11 +537,25 @@ def gather_yesterday(
     *,
     now_local: datetime,
     project_root: Path | None = None,
+    include_quiet_projects: bool | None = None,
 ) -> YesterdaySnapshot:
     """Build a :class:`YesterdaySnapshot` for the day before ``now_local``.
 
     ``config`` is a :class:`PollyPMConfig`. ``project_root`` defaults to
     ``config.project.root_dir`` — it's where the advisor log lives.
+
+    ``include_quiet_projects`` controls the audit-log signal gate:
+
+    * ``None`` (default) — honour the ``POLLYPM_BRIEFING_INCLUDE_ALL``
+      env var; when unset, gate by :func:`project_has_signal`.
+    * ``True`` — bypass the gate; iterate every tracked project (legacy
+      behaviour). Useful for tests and the operator-debug knob.
+    * ``False`` — force the gate on regardless of the env var.
+
+    When the gate trims a project, the briefing skips its commits,
+    transitions, downtime artifacts entirely. The advisor-log read
+    is unconditional — it lives at the workspace root, not per
+    project, and the heuristic doesn't apply.
     """
     if now_local.tzinfo is None:
         raise ValueError("now_local must be timezone-aware")
@@ -466,7 +573,30 @@ def gather_yesterday(
         window_end_utc=until_iso,
     )
 
+    if include_quiet_projects is None:
+        include_quiet_projects = _truthy(os.environ.get(_INCLUDE_ALL_ENV))
+
     projects = iter_tracked_projects(config)
+    if not include_quiet_projects:
+        filtered: list[KnownProject] = []
+        for project in projects:
+            try:
+                has_signal = project_has_signal(project, since_iso=since_iso)
+            except Exception as exc:  # noqa: BLE001 — conservative include
+                logger.debug(
+                    "briefing: signal probe crashed for %s, including: %s",
+                    project.key, exc,
+                )
+                has_signal = True
+            if has_signal:
+                filtered.append(project)
+            else:
+                logger.debug(
+                    "briefing: skipping %s — no audit signal in window",
+                    project.key,
+                )
+        projects = filtered
+
     for project in projects:
         try:
             commits = _gather_commits_for_project(

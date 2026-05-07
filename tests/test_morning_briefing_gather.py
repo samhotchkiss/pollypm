@@ -22,6 +22,7 @@ from pollypm.plugins_builtin.morning_briefing.handlers.gather_yesterday import (
     _gather_advisor_insights,
     gather_yesterday,
     iter_tracked_projects,
+    project_has_signal,
     project_state_db_paths,
     yesterday_window,
 )
@@ -172,6 +173,45 @@ def _raw_insert_transition(
         conn.commit()
     finally:
         conn.close()
+
+
+def _emit_audit_event(
+    project_path: Path,
+    *,
+    project_key: str,
+    event: str = "task.status_changed",
+    subject: str = "",
+    actor: str = "test",
+) -> None:
+    """Emit a single audit event so the briefing's signal gate sees activity.
+
+    Tests that build state directly via raw SQL inserts skip the
+    work-service hooks that normally populate the audit log; they
+    must call this helper to keep their projects visible to
+    :func:`gather_yesterday` after the audit-signal filter landed.
+
+    We write only the per-project log (under
+    ``<project>/.pollypm/audit.jsonl``) so that the global
+    ``~/.pollypm/audit/`` tree stays untouched. ``read_events``
+    prefers the per-project log when ``project_path`` is set.
+    """
+    import json as _json
+    from datetime import datetime as _dt, timezone as _tz
+    log_dir = project_path / ".pollypm"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "audit.jsonl"
+    record = {
+        "schema": 1,
+        "ts": _dt.now(_tz.utc).isoformat(),
+        "project": project_key,
+        "event": event,
+        "subject": subject or f"{project_key}/0",
+        "actor": actor,
+        "status": "ok",
+        "metadata": {},
+    }
+    with open(log_path, "a", encoding="utf-8") as fh:
+        fh.write(_json.dumps(record) + "\n")
 
 
 def _raw_insert_dep(
@@ -533,6 +573,9 @@ class TestGatherYesterdayIntegration:
             db_b, project="beta", task_number=7,
             from_state="draft", to_state="queued", created_at=yesterday_ts,
         )
+        # Seed audit-log signal so the briefing gate keeps both projects.
+        _emit_audit_event(alpha, project_key="alpha", subject="alpha/1")
+        _emit_audit_event(beta, project_key="beta", subject="beta/7")
 
         advisor_log = ambient / ".pollypm" / "advisor-log.jsonl"
         advisor_log.parent.mkdir(parents=True, exist_ok=True)
@@ -660,6 +703,7 @@ class TestPerfBudget:
                     db, project=key, task_number=t + 1,
                     from_state="draft", to_state="queued", created_at=yesterday_ts,
                 )
+            _emit_audit_event(path, project_key=key, subject=f"{key}/1")
             projects[key] = KnownProject(key=key, path=path, tracked=True)
         config.projects = projects
 
@@ -857,6 +901,8 @@ class TestPost339WorkspaceLayoutGather:
         config.projects = {
             "alpha": KnownProject(key="alpha", path=alpha_path, tracked=True),
         }
+        # Seed audit-log signal so the briefing gate keeps the project.
+        _emit_audit_event(alpha_path, project_key="alpha", subject="alpha/1")
 
         now_local = datetime(2026, 4, 16, 6, 0, tzinfo=UTC)
         snapshot = gather_yesterday(config, now_local=now_local)
@@ -958,3 +1004,248 @@ class TestPost339WorkspaceLayoutPriorities:
         priorities = identify_priorities(config, now_local=now_local, priorities_count=5)
         ids = {t.task_id for t in priorities.top_tasks}
         assert "alpha/1" in ids
+
+
+# ---------------------------------------------------------------------------
+# Audit-log signal gate
+#
+# The briefing iterates *tracked* projects, and ``tracked=true`` is now
+# the default for new projects. Without a signal gate, every dormant
+# project would land a header in the briefing every day. These tests
+# pin the gate's include/skip behaviour:
+#
+# * project with a real audit event (task transition, etc.)  → include
+# * project with only ``heartbeat.tick`` audit events         → skip
+# * project with no audit log at all                          → skip
+# * project with only stale events from before the window     → skip
+# * read errors / odd cases                                   → include
+# ---------------------------------------------------------------------------
+
+
+class TestProjectHasSignal:
+    def test_recent_task_event_included(self, tmp_path: Path) -> None:
+        proj_path = _make_project(tmp_path, "alpha")
+        _emit_audit_event(
+            proj_path, project_key="alpha", event="task.status_changed",
+            subject="alpha/1",
+        )
+        project = KnownProject(key="alpha", path=proj_path, tracked=True)
+        assert project_has_signal(
+            project, since_iso="2026-01-01T00:00:00+00:00",
+        ) is True
+
+    def test_only_heartbeat_ticks_skipped(self, tmp_path: Path) -> None:
+        proj_path = _make_project(tmp_path, "alpha")
+        # Many heartbeat ticks, zero real events.
+        for _ in range(5):
+            _emit_audit_event(
+                proj_path, project_key="alpha", event="heartbeat.tick",
+                subject="alpha/_watchdog",
+            )
+        project = KnownProject(key="alpha", path=proj_path, tracked=True)
+        assert project_has_signal(
+            project, since_iso="2026-01-01T00:00:00+00:00",
+        ) is False
+
+    def test_no_audit_log_skipped(self, tmp_path: Path) -> None:
+        # Brand-new / unaudited project — no .pollypm/audit.jsonl at all.
+        proj_path = _make_project(tmp_path, "alpha")
+        project = KnownProject(key="alpha", path=proj_path, tracked=True)
+        assert project_has_signal(
+            project, since_iso="2026-01-01T00:00:00+00:00",
+        ) is False
+
+    def test_stale_events_before_window_skipped(self, tmp_path: Path) -> None:
+        # Manually write an audit line with an old timestamp; the
+        # signal probe must respect the ``since_iso`` cutoff.
+        proj_path = _make_project(tmp_path, "alpha")
+        log_path = proj_path / ".pollypm" / "audit.jsonl"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(
+            json.dumps({
+                "schema": 1,
+                "ts": "2026-01-15T12:00:00+00:00",  # months before window
+                "project": "alpha",
+                "event": "task.status_changed",
+                "subject": "alpha/1",
+                "actor": "test",
+                "status": "ok",
+                "metadata": {},
+            }) + "\n"
+        )
+        project = KnownProject(key="alpha", path=proj_path, tracked=True)
+        # Window starts April 15 — stale event is before it.
+        assert project_has_signal(
+            project, since_iso="2026-04-15T00:00:00+00:00",
+        ) is False
+
+    def test_mixed_heartbeat_and_real_event_included(self, tmp_path: Path) -> None:
+        proj_path = _make_project(tmp_path, "alpha")
+        _emit_audit_event(
+            proj_path, project_key="alpha", event="heartbeat.tick",
+            subject="alpha/_watchdog",
+        )
+        _emit_audit_event(
+            proj_path, project_key="alpha", event="task.created",
+            subject="alpha/1",
+        )
+        _emit_audit_event(
+            proj_path, project_key="alpha", event="heartbeat.tick",
+            subject="alpha/_watchdog",
+        )
+        project = KnownProject(key="alpha", path=proj_path, tracked=True)
+        assert project_has_signal(
+            project, since_iso="2026-01-01T00:00:00+00:00",
+        ) is True
+
+    def test_marker_event_counts_as_signal(self, tmp_path: Path) -> None:
+        # Worker lifecycle events (marker.*) are signal — they include
+        # the leak / failure cases the user wants to see.
+        proj_path = _make_project(tmp_path, "alpha")
+        _emit_audit_event(
+            proj_path, project_key="alpha", event="marker.leaked",
+            subject="alpha/2",
+        )
+        project = KnownProject(key="alpha", path=proj_path, tracked=True)
+        assert project_has_signal(
+            project, since_iso="2026-01-01T00:00:00+00:00",
+        ) is True
+
+
+class TestGatherYesterdaySignalGate:
+    """gather_yesterday must apply the signal gate end-to-end."""
+
+    def test_quiet_project_dropped(self, tmp_path: Path) -> None:
+        # alpha has activity (audit event + transition); beta is dormant
+        # (transition exists in DB but no audit event reaches the gate).
+        ambient = tmp_path / "ambient"
+        ambient.mkdir()
+        alpha = _make_project(tmp_path, "alpha")
+        beta = _make_project(tmp_path, "beta")
+        db_a = _init_work_db(alpha)
+        db_b = _init_work_db(beta)
+
+        yesterday_ts = "2026-04-15T14:00:00"
+        _raw_insert_task(db_a, project="alpha", task_number=1, title="A", work_status="done")
+        _raw_insert_transition(
+            db_a, project="alpha", task_number=1,
+            from_state="review", to_state="done", created_at=yesterday_ts,
+        )
+        _raw_insert_task(db_b, project="beta", task_number=7, title="B", work_status="queued")
+        _raw_insert_transition(
+            db_b, project="beta", task_number=7,
+            from_state="draft", to_state="queued", created_at=yesterday_ts,
+        )
+        # Only alpha gets an audit event.
+        _emit_audit_event(alpha, project_key="alpha", subject="alpha/1")
+
+        config = _make_empty_config(ambient)
+        config.projects = {
+            "alpha": KnownProject(key="alpha", path=alpha, tracked=True),
+            "beta": KnownProject(key="beta", path=beta, tracked=True),
+        }
+        now_local = datetime(2026, 4, 16, 6, 0, tzinfo=UTC)
+        snapshot = gather_yesterday(config, now_local=now_local)
+
+        ids = {r.task_id for r in snapshot.task_transitions}
+        # alpha's transition still surfaces; beta's was skipped at the
+        # gate because beta has no audit signal.
+        assert "alpha/1" in ids
+        assert "beta/7" not in ids
+
+    def test_heartbeat_only_project_dropped(self, tmp_path: Path) -> None:
+        ambient = tmp_path / "ambient"
+        ambient.mkdir()
+        proj = _make_project(tmp_path, "alpha")
+        db = _init_work_db(proj)
+        _raw_insert_task(db, project="alpha", task_number=1, title="A", work_status="queued")
+        _raw_insert_transition(
+            db, project="alpha", task_number=1,
+            from_state="draft", to_state="queued", created_at="2026-04-15T14:00:00",
+        )
+        # Heartbeat-only audit log → no signal.
+        _emit_audit_event(
+            proj, project_key="alpha", event="heartbeat.tick",
+            subject="alpha/_watchdog",
+        )
+        config = _make_empty_config(ambient)
+        config.projects = {
+            "alpha": KnownProject(key="alpha", path=proj, tracked=True),
+        }
+        now_local = datetime(2026, 4, 16, 6, 0, tzinfo=UTC)
+        snapshot = gather_yesterday(config, now_local=now_local)
+        # Project skipped at gate → no transitions surfaced.
+        assert snapshot.task_transitions == []
+
+    def test_include_quiet_projects_bypasses_gate(self, tmp_path: Path) -> None:
+        # Same setup as test_quiet_project_dropped, but force-include.
+        ambient = tmp_path / "ambient"
+        ambient.mkdir()
+        proj = _make_project(tmp_path, "alpha")
+        db = _init_work_db(proj)
+        _raw_insert_task(db, project="alpha", task_number=1, title="A", work_status="done")
+        _raw_insert_transition(
+            db, project="alpha", task_number=1,
+            from_state="review", to_state="done", created_at="2026-04-15T14:00:00",
+        )
+        # No audit signal at all — would normally be filtered out.
+        config = _make_empty_config(ambient)
+        config.projects = {
+            "alpha": KnownProject(key="alpha", path=proj, tracked=True),
+        }
+        now_local = datetime(2026, 4, 16, 6, 0, tzinfo=UTC)
+        snapshot = gather_yesterday(
+            config, now_local=now_local, include_quiet_projects=True,
+        )
+        ids = {r.task_id for r in snapshot.task_transitions}
+        assert "alpha/1" in ids
+
+    def test_env_var_override_includes_all(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        ambient = tmp_path / "ambient"
+        ambient.mkdir()
+        proj = _make_project(tmp_path, "alpha")
+        db = _init_work_db(proj)
+        _raw_insert_task(db, project="alpha", task_number=1, title="A", work_status="done")
+        _raw_insert_transition(
+            db, project="alpha", task_number=1,
+            from_state="review", to_state="done", created_at="2026-04-15T14:00:00",
+        )
+        config = _make_empty_config(ambient)
+        config.projects = {
+            "alpha": KnownProject(key="alpha", path=proj, tracked=True),
+        }
+        now_local = datetime(2026, 4, 16, 6, 0, tzinfo=UTC)
+
+        # Without override: project skipped (no audit signal).
+        monkeypatch.delenv("POLLYPM_BRIEFING_INCLUDE_ALL", raising=False)
+        snapshot = gather_yesterday(config, now_local=now_local)
+        assert snapshot.task_transitions == []
+
+        # With override: project included.
+        monkeypatch.setenv("POLLYPM_BRIEFING_INCLUDE_ALL", "1")
+        snapshot = gather_yesterday(config, now_local=now_local)
+        ids = {r.task_id for r in snapshot.task_transitions}
+        assert "alpha/1" in ids
+
+    def test_advisor_log_unaffected_by_gate(self, tmp_path: Path) -> None:
+        # Advisor log lives at workspace root, not per project — the
+        # signal gate's per-project cull must not drop advisor entries.
+        ambient = tmp_path / "ambient"
+        ambient.mkdir()
+        advisor_log = ambient / ".pollypm" / "advisor-log.jsonl"
+        advisor_log.parent.mkdir(parents=True, exist_ok=True)
+        advisor_log.write_text(
+            json.dumps({
+                "timestamp": "2026-04-15T14:00:00", "emit": True,
+                "project": "alpha", "kind": "perf",
+                "title": "slow", "body": "…",
+            }) + "\n"
+        )
+        config = _make_empty_config(ambient)
+        # No tracked projects with signal — but advisor log still flows.
+        now_local = datetime(2026, 4, 16, 6, 0, tzinfo=UTC)
+        snapshot = gather_yesterday(config, now_local=now_local)
+        kinds = {a.kind for a in snapshot.advisor_insights}
+        assert "perf" in kinds

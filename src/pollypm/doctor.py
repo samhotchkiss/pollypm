@@ -1009,6 +1009,545 @@ def check_db_layout_canonical() -> CheckResult:
 
 
 # --------------------------------------------------------------------- #
+# Workspace-health checks added by #savethenovel-followup
+#
+# These probes surface the dual-DB schema-drift class of bugs that the
+# 2026-05-06 post-mortem pinned on "the wrong state.db got passed to
+# SQLiteWorkService". They are pure read-only file/sqlite probes — safe
+# to run while the cockpit is alive (no locks held, no writes to live
+# DBs). See :func:`check_dual_db_work_tasks_drift`,
+# :func:`check_orphan_worker_markers`, and
+# :func:`check_doubled_pollypm_path` below.
+# --------------------------------------------------------------------- #
+
+
+def _count_work_tasks_ro(db_path: Path) -> int | None:
+    """Return ``COUNT(*) FROM work_tasks`` on ``db_path``, or ``None``.
+
+    Returns ``None`` when the file is missing OR when the ``work_tasks``
+    table does not exist on it. Returns 0 when the table exists but is
+    empty. Read-only access (``mode=ro``) — never mutates the DB,
+    never holds a write lock; safe to run against a live cockpit DB.
+    """
+    if not db_path.is_file():
+        return None
+    uri = f"file:{db_path}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+    except sqlite3.Error:
+        return None
+    try:
+        try:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='work_tasks'"
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return None
+        try:
+            row = conn.execute("SELECT COUNT(*) FROM work_tasks").fetchone()
+        except sqlite3.Error:
+            return None
+        return int(row[0]) if row and row[0] is not None else 0
+    finally:
+        conn.close()
+
+
+def _has_messages_table_ro(db_path: Path) -> bool:
+    """Return True when ``db_path`` is a messages-side DB (has ``messages``).
+
+    Read-only probe; returns False on any open / read failure.
+    """
+    if not db_path.is_file():
+        return False
+    uri = f"file:{db_path}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+    except sqlite3.Error:
+        return False
+    try:
+        try:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='messages'"
+            ).fetchone()
+        except sqlite3.Error:
+            return False
+        return row is not None
+    finally:
+        conn.close()
+
+
+def _messages_side_db_path(config: PollyPMConfig | None = None) -> Path | None:
+    """Return ``config.project.state_db`` — the messages-side DB.
+
+    This is the path the supervisor's :class:`StateStore` opens and
+    where ``messages``/``sessions``/``heartbeats`` live. When the user's
+    config keeps ``state_db = "state.db"`` and ``base_dir = "."`` this
+    resolves under ``~/.pollypm/state.db``, which is *not* the same as
+    the workspace work DB at ``<workspace_root>/.pollypm/state.db``.
+    Returns ``None`` when no config can be loaded.
+    """
+    if config is None:
+        from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+
+        if not DEFAULT_CONFIG_PATH.exists():
+            return None
+        try:
+            config = load_config(DEFAULT_CONFIG_PATH)
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        db_path = getattr(config.project, "state_db", None)
+    except Exception:  # noqa: BLE001
+        return None
+    if db_path is None:
+        return None
+    return Path(db_path)
+
+
+def _read_recent_work_db_opened_events(
+    *, limit: int = 5, project_path: Path | None = None,
+) -> list[dict[str, object]]:
+    """Tail the ``work_db.opened`` audit events with ``had_messages_table_pre_open=true``.
+
+    Reads the central tail at
+    ``~/.pollypm/audit/_workspace.jsonl`` (the synthetic project key
+    ``SQLiteWorkService.__init__`` emits under). Each returned dict
+    carries the parsed ``ts``, ``subject`` (the DB path stamped) and
+    metadata so the doctor output can name the offending callsite.
+
+    Read-only / best-effort — returns ``[]`` on any failure or when the
+    audit log does not yet exist (fresh install or pre-#1343 build).
+    """
+    try:
+        from pollypm.audit.log import (
+            EVENT_WORK_DB_OPENED,
+            read_events,
+        )
+    except Exception:  # noqa: BLE001
+        return []
+    try:
+        events = read_events(
+            "_workspace",
+            event=EVENT_WORK_DB_OPENED,
+            project_path=project_path,
+        )
+    except Exception:  # noqa: BLE001
+        return []
+    flagged: list[dict[str, object]] = []
+    for ev in events:
+        meta = ev.metadata or {}
+        if meta.get("had_messages_table_pre_open"):
+            flagged.append(
+                {
+                    "ts": ev.ts,
+                    "subject": ev.subject,
+                    "project_path": meta.get("project_path"),
+                    "tables_created": meta.get("tables_created"),
+                }
+            )
+    if limit is not None and limit >= 0:
+        return flagged[-limit:]
+    return flagged
+
+
+def check_dual_db_work_tasks_drift() -> CheckResult:
+    """Detect work-tables stamped on the messages-side DB (savethenovel class).
+
+    PollyPM keeps two state DBs that look similar but serve different
+    purposes:
+
+    * ``~/.pollypm/state.db`` (``config.project.state_db``) — messages,
+      sessions, heartbeats. The supervisor's :class:`StateStore` writes
+      here.
+    * ``<workspace_root>/.pollypm/state.db`` (resolved via
+      :func:`pollypm.work.db_resolver.resolve_work_db_path`) — work
+      tables (``work_tasks``, transitions, sessions). The work service
+      writes here.
+
+    ``SQLiteWorkService.__init__`` auto-creates the work tables on
+    *whatever* DB it is handed. When a callsite hands it the messages-
+    side DB by accident, an empty ``work_tasks`` table gets stamped on
+    the wrong file. A diagnostic agent that reads from that DB then
+    sees "0 rows" and misdiagnoses a wipe — exactly the savethenovel
+    failure mode.
+
+    This check warns when any of:
+
+    * Both DBs hold ``COUNT(*) FROM work_tasks > 0`` (schema drift —
+      writers are split across two files; the canonical workspace DB
+      should be the source of truth).
+    * The messages-side DB has a ``work_tasks`` table at all (even
+      empty) — that's a stamping bug, the table should never have
+      been created here. The check tails the central audit log for
+      recent ``work_db.opened`` events with
+      ``had_messages_table_pre_open=true`` so the report can name the
+      most recent callsites.
+
+    Severity is ``warning`` (not error): the dual-DB confusion is a
+    forensic / diagnostic hazard, not a correctness regression —
+    readers go through ``resolve_work_db_path``, so the canonical
+    workspace DB is still authoritative for the live system.
+    """
+    _path, config = _safe_load_config()
+    if config is None:
+        return _skip("dual-db check skipped (no config)")
+
+    messages_db = _messages_side_db_path(config)
+    workspace_db = _workspace_state_db_path(config)
+
+    if messages_db is None or workspace_db is None:
+        return _skip("dual-db check skipped (state_db / workspace_root unset)")
+
+    # Same path resolves to same file — collapsed layout, no drift
+    # possible.
+    try:
+        if messages_db.resolve() == workspace_db.resolve():
+            return _ok(
+                "dual-db drift impossible (single state.db)",
+                data={
+                    "messages_db": str(messages_db),
+                    "workspace_db": str(workspace_db),
+                },
+            )
+    except OSError:
+        # ``resolve()`` can fail on non-existent symlinks; fall through
+        # to the count-based comparison below.
+        pass
+
+    messages_count = _count_work_tasks_ro(messages_db)
+    workspace_count = _count_work_tasks_ro(workspace_db)
+
+    recent_stampings = _read_recent_work_db_opened_events(limit=5)
+
+    data = {
+        "messages_db": str(messages_db),
+        "messages_db_work_tasks": messages_count,
+        "workspace_db": str(workspace_db),
+        "workspace_db_work_tasks": workspace_count,
+        "recent_stampings": recent_stampings,
+    }
+
+    # Case 1: schema drift — both DBs hold rows.
+    if (
+        messages_count is not None
+        and workspace_count is not None
+        and messages_count > 0
+        and workspace_count > 0
+    ):
+        return _fail(
+            (
+                f"work_tasks rows on BOTH DBs "
+                f"(messages-side={messages_count}, workspace={workspace_count}) "
+                f"— readers see {workspace_db}"
+            ),
+            why=(
+                "PollyPM keeps two state DBs and the work-service has "
+                "stamped tables on both. The canonical reader is the "
+                "workspace DB; rows on the messages-side DB are stranded "
+                "writes from a callsite that passed the wrong path. A "
+                "diagnostic agent reading the messages-side DB will "
+                "misdiagnose the canonical (workspace) state."
+            ),
+            fix=(
+                f"Canonical work DB:  {workspace_db}\n"
+                f"Stamped (orphan):   {messages_db}\n"
+                "Confirm rows on the messages-side DB are stale, then "
+                "archive that file —\n"
+                f"  sqlite3 {messages_db} 'SELECT project, task_number, work_status FROM work_tasks;'\n"
+                f"  mv {messages_db} {messages_db}.stamped-bak\n"
+                "Recheck: pm doctor"
+            ),
+            severity="warning",
+            data=data,
+        )
+
+    # Case 2: stamping bug — work tables exist on the messages-side DB
+    # at all, even if empty. The presence of the table means at least
+    # one ``SQLiteWorkService.__init__`` ran against the wrong path.
+    if messages_count is not None:
+        suffix = ""
+        if recent_stampings:
+            tails = [
+                f"\n  - {ev.get('ts', '?')}: subject={ev.get('subject', '?')} "
+                f"project_path={ev.get('project_path', '?')}"
+                for ev in recent_stampings[-3:]
+            ]
+            suffix = (
+                f"\nRecent ``work_db.opened`` events with "
+                f"``had_messages_table_pre_open=true`` ("
+                f"{len(recent_stampings)} total):"
+                + "".join(tails)
+            )
+        return _fail(
+            (
+                f"work_tasks table stamped on messages-side DB "
+                f"(rows={messages_count}) at {messages_db}"
+            ),
+            why=(
+                "``SQLiteWorkService.__init__`` auto-creates work tables "
+                "on whatever DB it's handed. The presence of ``work_tasks`` "
+                "on the messages-side DB means at least one callsite "
+                "passed the wrong path. This is the savethenovel class "
+                "of bug — empty tables on the wrong file fool diagnostic "
+                "agents into reporting a 'wholesale wipe'."
+            ),
+            fix=(
+                f"Canonical work DB:  {workspace_db}\n"
+                f"Stamped (orphan):   {messages_db}\n"
+                "Drop the stamped tables (safe — readers go through "
+                "resolve_work_db_path) —\n"
+                f"  sqlite3 {messages_db} 'DROP TABLE work_tasks; "
+                "DROP TABLE IF EXISTS work_transitions; "
+                "DROP TABLE IF EXISTS work_sessions;'\n"
+                "Or archive the file:\n"
+                f"  mv {messages_db} {messages_db}.stamped-bak\n"
+                "Then grep the central audit log to find the offending "
+                "callsite —\n"
+                "  grep '\"had_messages_table_pre_open\": true' "
+                "~/.pollypm/audit/_workspace.jsonl"
+                + suffix +
+                "\nRecheck: pm doctor"
+            ),
+            severity="warning",
+            data=data,
+        )
+
+    return _ok(
+        "no dual-DB drift (messages-side has no work tables)",
+        data=data,
+    )
+
+
+def _iter_orphan_worker_markers_safe() -> tuple[list[Any], str | None]:
+    """Run :func:`reap_orphan_worker_markers`-style classification, no unlinks.
+
+    Returns ``(orphan_markers, skip_reason)``. ``skip_reason`` is None
+    when the probe ran end-to-end; otherwise it carries a short
+    explanation the doctor can surface as a clean skip. Never raises;
+    never mutates the filesystem.
+    """
+    _path, config = _safe_load_config()
+    if config is None:
+        return [], "no config"
+    projects = getattr(config, "projects", None) or {}
+    if not projects:
+        return [], "no projects"
+
+    # Reuse the reaper's pure helpers — same window-name parser, same
+    # classifier, same status probe — so the doctor output stays
+    # consistent with the bootstrap reaper landed in #1341.
+    try:
+        from pollypm.work.worker_marker_reaper import (
+            _classify_marker,
+            _iter_worker_markers,
+            _resolve_workspace_root,
+        )
+    except Exception:  # noqa: BLE001
+        return [], "reaper module unavailable"
+
+    workspace_root = _resolve_workspace_root(config)
+    # Doctor must not poke tmux from a check (fast & safe by spec) —
+    # pass an empty live-window set so a marker only counts as orphan
+    # when its task row is missing or terminal. The bootstrap / runtime
+    # reaper paths take care of the "tmux window dead" branch.
+    live_windows: set[str] = set()
+
+    orphans: list[Any] = []
+    for project_key, project in projects.items():
+        project_path = getattr(project, "path", None)
+        if project_path is None:
+            continue
+        project_path = Path(project_path)
+        try:
+            markers = _iter_worker_markers(project_path)
+        except Exception:  # noqa: BLE001
+            continue
+        for marker in markers:
+            try:
+                decision = _classify_marker(
+                    marker=marker,
+                    project_key=str(project_key),
+                    project_path=project_path,
+                    workspace_root=workspace_root,
+                    live_window_names=live_windows,
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            if decision is not None:
+                orphans.append(decision)
+    return orphans, None
+
+
+def check_orphan_worker_markers() -> CheckResult:
+    """Surface ``worker-markers/*.fresh`` files whose backing task is gone.
+
+    The bootstrap reaper landed in #1341 clears orphan markers when the
+    cockpit boots. This check exists for the in-between case: the user
+    has not booted ``pm up`` recently but wants to verify the workspace
+    is clean. Reuses the reaper's pure helpers (``_classify_marker`` /
+    ``_iter_worker_markers``) so the verdict is byte-identical.
+
+    Doctor never touches tmux from a check; the "tmux window dead for
+    a non-terminal task" branch is intentionally skipped here. The
+    runtime sweep covers it once the supervisor is alive.
+    """
+    orphans, skip_reason = _iter_orphan_worker_markers_safe()
+    if skip_reason is not None:
+        return _skip(f"orphan-worker-markers check skipped ({skip_reason})")
+
+    if not orphans:
+        return _ok("no orphan worker markers", data={"count": 0})
+
+    samples = [
+        {
+            "project": getattr(o, "project_key", "?"),
+            "window": getattr(o, "window_name", "?"),
+            "marker": str(getattr(o, "marker_path", "")),
+            "reason": getattr(o, "reason", "?"),
+        }
+        for o in orphans[:5]
+    ]
+    word = "marker" if len(orphans) == 1 else "markers"
+    summary = ", ".join(
+        f"{s['project']}/{s['window']} ({s['reason']})" for s in samples[:3]
+    )
+    return _fail(
+        f"{len(orphans)} orphan worker {word}: {summary}",
+        why=(
+            "Worker markers at ``<project>/.pollypm/worker-markers/"
+            "*.fresh`` should be unlinked once their task either ships "
+            "or is cancelled. Leaked markers cause SessionManager to "
+            "skip the kickoff string for the next worker that lands on "
+            "that window — the worker boots silent."
+        ),
+        fix=(
+            "Boot the cockpit to run the bootstrap reaper —\n"
+            "  pm up   # auto-clears at supervisor start\n"
+            "Or remove the orphans by hand once you've confirmed they "
+            "really are dead —\n"
+            "  rm <listed-marker-paths>\n"
+            "Recheck: pm doctor"
+        ),
+        severity="warning",
+        data={"count": len(orphans), "samples": samples},
+    )
+
+
+def check_doubled_pollypm_path() -> CheckResult:
+    """Detect the legacy ``~/.pollypm/.pollypm/`` doubled-path artifact.
+
+    ``config._resolve_path`` documents the failure mode (config.py
+    around line 104): older renders wrote sibling paths as
+    ``.pollypm/...`` relative to ``~/.pollypm``, which reloads as a
+    bogus nested ``~/.pollypm/.pollypm`` directory. The resolver
+    now strips the duplicate prefix on read, but a previous bad
+    render may have already materialised files under that path.
+    Nothing reads them; they just waste disk and make grep noisy.
+
+    Surfaces the path with size + age when present; clean otherwise.
+    """
+    from pollypm.config import GLOBAL_CONFIG_DIR
+
+    doubled = GLOBAL_CONFIG_DIR / GLOBAL_CONFIG_DIR.name
+    data: dict[str, object] = {"path": str(doubled)}
+
+    if not doubled.exists():
+        return _ok("no doubled ~/.pollypm/.pollypm/ path", data=data)
+
+    # Walk the tree once, summing sizes and tracking newest mtime.
+    total_bytes = 0
+    file_count = 0
+    newest_mtime = 0.0
+    try:
+        for entry in doubled.rglob("*"):
+            try:
+                if entry.is_file():
+                    stat = entry.stat()
+                    total_bytes += stat.st_size
+                    file_count += 1
+                    if stat.st_mtime > newest_mtime:
+                        newest_mtime = stat.st_mtime
+            except OSError:
+                continue
+    except OSError as exc:
+        return _fail(
+            f"~/.pollypm/.pollypm/ exists but is unreadable: {exc}",
+            why=(
+                "The doubled-path artifact is unreadable. Even an empty "
+                "directory under this name is a leftover from a buggy "
+                "config render and should be removed."
+            ),
+            fix=(
+                f"Remove the directory once you've confirmed it isn't "
+                f"holding anything you need —\n"
+                f"  rm -rf {doubled}\n"
+                "Recheck: pm doctor"
+            ),
+            severity="warning",
+            data=data,
+        )
+
+    data.update(
+        {
+            "size_bytes": total_bytes,
+            "file_count": file_count,
+            "newest_mtime": newest_mtime,
+        }
+    )
+
+    # Empty-directory case — still flag (the path should not exist at
+    # all) but report it as a tiny, informational warn.
+    if file_count == 0:
+        return _fail(
+            f"empty ~/.pollypm/.pollypm/ directory (artifact)",
+            why=(
+                "An empty doubled-path directory is a leftover scaffold "
+                "from a pre-fix config render. Removing it keeps grep / "
+                "find output honest."
+            ),
+            fix=(
+                f"Remove the empty directory —\n"
+                f"  rmdir {doubled}\n"
+                "Recheck: pm doctor"
+            ),
+            severity="warning",
+            data=data,
+        )
+
+    age_seconds = max(0.0, time.time() - newest_mtime) if newest_mtime else 0.0
+    age_days = age_seconds / 86400.0
+    size_kib = total_bytes / 1024.0
+    word = "file" if file_count == 1 else "files"
+    return _fail(
+        (
+            f"~/.pollypm/.pollypm/ holds {file_count} {word} "
+            f"({size_kib:.1f} KiB, newest {age_days:.1f}d old)"
+        ),
+        why=(
+            "config.py:_resolve_path documents this artifact: an older "
+            "render wrote sibling paths relative to ``~/.pollypm`` and "
+            "reload now strips the duplicate prefix, but pre-fix files "
+            "stranded under ``~/.pollypm/.pollypm/`` are read by no "
+            "code path. They waste disk and confuse forensic grep."
+        ),
+        fix=(
+            f"Move the artifact to a backup location once you have "
+            f"confirmed nothing under it is needed —\n"
+            f"  mv {doubled} {doubled}.bak-$(date +%Y%m%d)\n"
+            "Or remove it outright:\n"
+            f"  rm -rf {doubled}\n"
+            "Recheck: pm doctor"
+        ),
+        severity="warning",
+        data=data,
+    )
+
+
+# --------------------------------------------------------------------- #
 # Tmux session state
 # --------------------------------------------------------------------- #
 
@@ -3247,6 +3786,13 @@ def _registered_checks() -> list[Check]:
         Check("pollypm-plugins-dir", check_pollypm_plugins_dir, "filesystem", severity="warning"),
         Check("tracked-project-paths", check_tracked_project_state_parents, "filesystem"),
         Check("db-layout-canonical", check_db_layout_canonical, "filesystem", severity="warning"),
+        # #savethenovel-followup: dual-DB drift, orphan worker markers,
+        # and the ~/.pollypm/.pollypm/ doubled-path artifact. All three
+        # are filesystem-scope health probes so they sit next to the
+        # existing layout / tracked-project-path checks.
+        Check("dual-db-work-tasks-drift", check_dual_db_work_tasks_drift, "filesystem", severity="warning"),
+        Check("orphan-worker-markers", check_orphan_worker_markers, "filesystem", severity="warning"),
+        Check("doubled-pollypm-path", check_doubled_pollypm_path, "filesystem", severity="warning"),
         Check("disk-space", check_disk_space, "filesystem"),
         # Tmux session state
         Check("tmux-daemon", check_tmux_daemon, "tmux"),

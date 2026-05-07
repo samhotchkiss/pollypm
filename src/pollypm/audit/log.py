@@ -82,6 +82,14 @@ EVENT_PLAN_SUCCESSOR_CREATED = "plan.successor_created"
 # for the dedup to work.
 EVENT_WORKER_SESSION_REAPED = "worker.session_reaped"
 EVENT_WATCHDOG_ESCALATION_DISPATCHED = "watchdog.escalation_dispatched"
+# #1413 — emitted whenever the supervisor / on-demand path provisions a
+# project-scoped role session (e.g. reviewer-<project>) that did not
+# previously exist. The watchdog (#1414) reads this stream to surface
+# "tracked project shipped without a reviewer for N hours" without
+# scraping logs. ``metadata`` carries ``role`` (``"reviewer"`` /
+# ``"architect"``), ``project``, and ``reason`` (``"bootstrap"`` /
+# ``"on_demand_review"``).
+EVENT_SESSION_PROVISIONED = "session.provisioned"
 
 
 @dataclass(slots=True, frozen=True)

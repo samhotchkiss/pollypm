@@ -1137,12 +1137,66 @@ class WorkTransitionManager:
                             exc,
                         )
                 self.service._on_task_done(task_id, actor)
+            elif result.work_status == WorkStatus.REVIEW:
+                # #1413 — when a worker finishes a node and the task
+                # advances to a review node, make sure the project has
+                # a reviewer session ready to consume the queue. The
+                # bootstrap sweep handles fresh-boot tracked projects;
+                # this hook catches projects registered AFTER bootstrap
+                # (or whose reviewer session was manually torn down)
+                # without waiting for the heartbeat's 60s threshold.
+                self._ensure_reviewer_for_review_handoff(result)
 
         return self._finish(
             task_id,
             task.work_status.value,
             after_reload=_before_sync,
         )
+
+    def _ensure_reviewer_for_review_handoff(self, task: Task) -> None:
+        """Fire-and-forget provision of a reviewer session for ``task.project``.
+
+        Called from ``complete_node`` when the task transitions to
+        ``review``. Mirrors the worker provision hook in :meth:`claim`
+        (which calls ``self.service._session_mgr.provision_worker``).
+        Reviewer provisioning lives in
+        :mod:`pollypm.recovery.reviewer_provisioning` because it operates
+        on the long-lived per-project reviewer lane (config-level), not
+        per-task tmux windows like worker provisioning.
+
+        Best-effort: any failure is logged and swallowed — the task is
+        already in REVIEW state and the heartbeat's no_session recovery
+        catches stragglers within ~60s. We log so the audit trail
+        records the attempt, and we never block the transition path.
+        """
+        try:
+            from pollypm.config import DEFAULT_CONFIG_PATH
+            from pollypm.recovery.reviewer_provisioning import (
+                ensure_reviewer_session_for_project,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "complete_node: reviewer provisioning import failed",
+                exc_info=True,
+            )
+            return
+        try:
+            created, detail = ensure_reviewer_session_for_project(
+                DEFAULT_CONFIG_PATH,
+                task.project,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "complete_node: ensure_reviewer_session failed for %s: %s",
+                task.project, exc,
+            )
+            return
+        if created:
+            logger.info(
+                "complete_node: provisioned reviewer session for %s "
+                "on review handoff (%s)",
+                task.project, detail,
+            )
 
     def approve(
         self,

@@ -7714,7 +7714,10 @@ class PollyInboxApp(App[None]):
         Binding("e", "expand_all_rollup", "Expand all", show=False),
         # Filter / search bar (#NEW).
         Binding("slash", "start_filter", "Filter", show=False),
-        Binding("u", "toggle_filter_unread", "Unread", show=False),
+        # #1402: ``u`` first checks for a pending plan approval (within
+        # the 10s undo window) and rolls it back; otherwise it falls
+        # through to the legacy unread-filter toggle.
+        Binding("u", "undo_plan_approval", "Unread / Undo approve", show=False),
         Binding("p", "pick_filter_project", "Project", show=False),
         Binding("R", "toggle_filter_recent", "Recent", show=False),
         Binding("l", "toggle_filter_plan_review", "Plan review", show=False),
@@ -7759,6 +7762,11 @@ class PollyInboxApp(App[None]):
         _open_keyboard_help(self)
 
     REFRESH_INTERVAL_SECONDS = 8
+    # Plan-approval celebration (#1402). Window during which ``[u]``
+    # rolls back the deferred ``svc.approve`` call. Tests can override
+    # the instance attribute to a near-zero value to drive the commit
+    # synchronously without sleeping for the full window.
+    _approve_undo_window_seconds: float = 10.0
     # Show the first ``ROLLUP_DEFAULT_VISIBLE`` items of a rollup, collapse
     # the rest behind an expand keybind so a 40-item digest doesn't flood
     # the detail pane.
@@ -7867,6 +7875,17 @@ class PollyInboxApp(App[None]):
         self._pending_detail_row_key: str | None = None
         self._pending_detail_mark_read: bool = False
         self._detail_render_scheduled: bool = False
+        # Plan-approval celebration state (#1402). When the user
+        # presses ``A`` on a plan_review row the toast fires immediately
+        # but the underlying ``svc.approve`` is deferred so ``u``
+        # (within ``_approve_undo_window_seconds``) can roll it back.
+        # ``_pending_plan_approval`` carries the inputs needed to commit
+        # the approval; ``_pending_plan_approval_timer`` is the deferred
+        # set_timer handle so undo can cancel it cleanly.
+        self._pending_plan_approval: dict | None = None
+        self._pending_plan_approval_timer = None
+        self._pending_plan_approval_sparkle_timer = None
+        self._pending_plan_approval_countdown_timer = None
 
     def compose(self) -> ComposeResult:
         yield self.filter_bar
@@ -10484,12 +10503,21 @@ class PollyInboxApp(App[None]):
         Gating (user-inbox only): when ``fast_track`` is NOT set, the
         approve keybinding should have been hidden by the hint bar
         until the thread has a round-trip. We still enforce the gate
-        here — belt-and-braces against stale state — and warn the user
-        if they somehow triggered Accept before the conversation.
+        here — belt-and-braces against stale state — and warn
+        the user if they somehow triggered Accept before the conversation.
+
+        #1402 — the actual ``svc.approve`` call is deferred by
+        ``_approve_undo_window_seconds`` so ``u`` can roll back. The
+        celebration toast (persona voice + sparkle) fires immediately
+        on entry; the work-service mutations land when the timer fires.
         """
         task_id = self._selected_task_id
         if task_id is None:
             return
+        # #1402: pre-empt any pending plan approval from another row so
+        # we don't queue two deferred approvals concurrently.
+        if self._pending_plan_approval is not None:
+            self._cancel_pending_plan_approval(commit=True)
         item = self._item_for_id(task_id)
         is_message_item = item is not None and not is_task_inbox_entry(item)
         task, labels = self._selected_plan_review_task()
@@ -10534,13 +10562,101 @@ class PollyInboxApp(App[None]):
                     severity="warning", timeout=4.0,
                 )
                 return
-        # Route through the work-service approve path directly — the
-        # CLI entry point is just sugar over ``svc.approve``, and we
-        # already hold the project context.
-        # #1101: unified resolver — pass the inbox ``item`` so the
-        # ``db_path`` fallback can resolve the project even when the
-        # plan_task_id's project key prefix differs from the registered
-        # key (e.g. ``polly_remote`` vs. ``polly-remote``).
+        # #1402 — count decomposed sub-tasks for the celebration copy.
+        sub_task_count = self._plan_task_subtask_count(item, plan_task_id)
+        # Resolve the project's PM persona for the toast voice.
+        persona_name = self._project_persona_name(meta.get("project") or "")
+        from pollypm.plan_approval_celebration import (
+            compose_celebration_message,
+            sparkle_frames,
+            undo_hint,
+        )
+        celebration = compose_celebration_message(
+            persona_name=persona_name,
+            sub_task_count=sub_task_count,
+        )
+        first_sparkle = sparkle_frames()[0]
+        toast_body = (
+            f"{first_sparkle}  {celebration}    "
+            f"{undo_hint(self._approve_undo_window_seconds)}"
+        )
+        self.notify(
+            toast_body,
+            severity="information",
+            timeout=max(3.0, float(self._approve_undo_window_seconds) + 0.5),
+        )
+        self._pending_plan_approval = {
+            "task_id": task_id,
+            "plan_task_id": plan_task_id,
+            "actor_name": actor_name,
+            "is_message_item": is_message_item,
+            "item": item,
+            "celebration": celebration,
+            "sub_task_count": sub_task_count,
+            "persona_name": persona_name,
+        }
+        # Schedule the deferred commit. Tests override the window on
+        # the instance to drive timing.
+        window = float(self._approve_undo_window_seconds)
+        if window <= 0.0:
+            self._commit_pending_plan_approval()
+        else:
+            try:
+                self._pending_plan_approval_timer = self.set_timer(
+                    window, self._commit_pending_plan_approval,
+                )
+            except Exception:  # noqa: BLE001
+                self._commit_pending_plan_approval()
+
+    def action_undo_plan_approval(self) -> None:
+        """Roll back the pending plan-review approval (#1402).
+
+        Bound to ``u`` while the celebration toast is up. When no
+        approval is pending we delegate to the original ``u`` filter
+        toggle so the keybinding keeps its meaning.
+        """
+        if self._pending_plan_approval is None:
+            return self.action_toggle_filter_unread()
+        pending = self._pending_plan_approval
+        self._cancel_pending_plan_approval(commit=False)
+        self.notify(
+            f"Undid approval for plan {pending.get('plan_task_id', '')}.",
+            severity="information",
+            timeout=3.0,
+        )
+
+    def _cancel_pending_plan_approval(self, *, commit: bool) -> None:
+        """Stop the pending-approval timers; optionally commit first.
+
+        ``commit=True`` is used when a second approve pre-empts the
+        first — we honor the original action before queuing the
+        new one. ``commit=False`` is the user-driven undo path: drop
+        the pending state without ever calling ``svc.approve``.
+        """
+        timer = self._pending_plan_approval_timer
+        self._pending_plan_approval_timer = None
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        if commit and self._pending_plan_approval is not None:
+            self._commit_pending_plan_approval()
+        else:
+            self._pending_plan_approval = None
+
+    def _commit_pending_plan_approval(self) -> None:
+        """Run the deferred plan_review approve + archive cascade."""
+        pending = self._pending_plan_approval
+        if pending is None:
+            return
+        self._pending_plan_approval = None
+        self._pending_plan_approval_timer = None
+        task_id = pending["task_id"]
+        plan_task_id = pending["plan_task_id"]
+        actor_name = pending["actor_name"]
+        is_message_item = pending["is_message_item"]
+        item = pending["item"]
         svc = self._resolve_inbox_svc(item, plan_task_id)
         if svc is None:
             self.notify(
@@ -10574,7 +10690,6 @@ class PollyInboxApp(App[None]):
                 pass
         if first_shipped_created:
             _celebrate_first_shipped(self)
-        # Archive the inbox row so it drops out of the list.
         if is_message_item and item is not None:
             try:
                 from pollypm.store import SQLAlchemyStore
@@ -10587,15 +10702,13 @@ class PollyInboxApp(App[None]):
             except Exception:  # noqa: BLE001
                 pass
         else:
-            # #1101: unified resolver here too so the inbox-row archive
-            # succeeds for tracked projects with mismatched keys.
             svc = self._resolve_inbox_svc(item, task_id)
             if svc is not None:
                 try:
                     svc.add_context(
                         task_id,
                         actor=actor_name,
-                        text=f"Plan approved \u2192 {plan_task_id}",
+                        text=f"Plan approved → {plan_task_id}",
                         entry_type="plan_review_approved",
                     )
                     svc.archive_task(task_id, actor=actor_name)
@@ -10610,10 +10723,6 @@ class PollyInboxApp(App[None]):
             task_id, "inbox.plan_review.approved",
             f"{actor_name} approved plan {plan_task_id} via {task_id}",
         )
-        self.notify(
-            f"Plan approved \u2014 {plan_task_id}",
-            severity="information", timeout=3.0,
-        )
         self._tasks = [t for t in self._tasks if t.task_id != task_id]
         self._unread_ids.discard(task_id)
         self._session_read_ids.discard(task_id)
@@ -10624,8 +10733,53 @@ class PollyInboxApp(App[None]):
         if self._selected_task_id == task_id:
             self._selected_task_id = None
             self._selected_row_key = None
-        self._render_list(select_first=bool(self._tasks))
-        self._restore_default_hint()
+        try:
+            self._render_list(select_first=bool(self._tasks))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._restore_default_hint()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _plan_task_subtask_count(self, item, plan_task_id: str) -> int:
+        """Count decomposed sub-tasks (children) of the plan_task.
+
+        Used to adapt the celebration copy. Returns 0 when the lookup
+        fails so the toast still renders rather than crashing.
+        """
+        if not plan_task_id:
+            return 0
+        svc = None
+        try:
+            svc = self._resolve_inbox_svc(item, plan_task_id)
+            if svc is None:
+                return 0
+            try:
+                task = svc.get(plan_task_id)
+            except Exception:  # noqa: BLE001
+                return 0
+            return len(getattr(task, "children", []) or [])
+        finally:
+            if svc is not None:
+                try:
+                    svc.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _project_persona_name(self, project_key: str) -> str | None:
+        """Resolve the project's PM persona for the celebration toast."""
+        if not project_key:
+            return None
+        try:
+            config = load_config(self.config_path)
+        except Exception:  # noqa: BLE001
+            return None
+        projects = getattr(config, "projects", {}) or {}
+        project = projects.get(project_key)
+        if project is None:
+            return None
+        return _project_pm_persona(config, project_key, project)
 
     # ------------------------------------------------------------------
     # Plan review deny flow (#1403) — capture reason, cancel + replan
@@ -13842,12 +13996,22 @@ class PollyProjectDashboardApp(App[None]):
         Binding("k", "plan_scroll_up", "Scroll up", show=False),
         Binding("g", "plan_scroll_top", "Top", show=False),
         Binding("G", "plan_scroll_bottom", "Bottom", show=False),
-        Binding("u,r", "refresh", "Refresh", show=False),
+        # #1402: ``u`` is now used for plan-approval undo (with refresh
+        # fallback when no approval is pending). ``r`` keeps refresh.
+        Binding("r", "refresh", "Refresh", show=False),
         # #1016 — capital ``R`` surfaces the recovery action for the
         # project's most-stuck task. Refresh stays on ``r``; ``R`` is
         # the recovery affordance the issue spec asks for.
         Binding("R", "recovery_action", "Recovery"),
-        Binding("a", "view_alerts", "Alerts", show=False),
+        # #1402: ``a`` first checks for a plan_review action card on
+        # this drilldown. When one is present we run the plan-approval
+        # celebration flow (10s undo + persona toast). Otherwise we
+        # fall through to the legacy alerts view.
+        Binding("a", "approve_or_alerts", "Approve / Alerts", show=False),
+        # ``u`` rolls back a pending plan-review approval; falls
+        # through to refresh when there is nothing pending (the legacy
+        # ``u`` binding co-existed with ``r`` for refresh).
+        Binding("u", "undo_plan_approval_or_refresh", "Undo / Refresh", show=False),
         Binding("ctrl+k,colon", "open_command_palette", "Palette", priority=True),
         Binding("question_mark", "show_keyboard_help", "Help", priority=True),
         Binding("q,escape", "back", "Back"),
@@ -14026,6 +14190,11 @@ class PollyProjectDashboardApp(App[None]):
         self._last_render_signature: tuple | None = None
         self._ticks_since_force_render: int = 0
         self._FORCE_RENDER_EVERY_N_TICKS = 6  # ~60s at 10s tick
+        # Plan-approval celebration state (#1402). Mirrors the inbox
+        # path: pending dict carries the action_index + plan_task_id;
+        # timer is the deferred-commit handle so ``u`` can cancel it.
+        self._pending_plan_approval: dict | None = None
+        self._pending_plan_approval_timer = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -14095,6 +14264,185 @@ class PollyProjectDashboardApp(App[None]):
 
     def action_view_alerts(self) -> None:
         _action_view_alerts(self)
+
+    # ------------------------------------------------------------------
+    # Plan-approval celebration (#1402) — drilldown surface
+    # ------------------------------------------------------------------
+
+    # Class-level default mirrors PollyInboxApp so tests can override
+    # the instance attribute to drive timing.
+    _approve_undo_window_seconds: float = 10.0
+
+    def action_approve_or_alerts(self) -> None:
+        """``a`` — approve the first plan_review card or open alerts.
+
+        When a plan_review action card sits at the top of the project
+        drilldown we treat ``a`` as "approve that plan" with the same
+        10s undo + persona celebration toast the inbox uses. When no
+        plan_review card is present we fall back to the legacy alert
+        list view that ``a`` historically opened.
+        """
+        if self._approve_first_plan_review_if_present():
+            return
+        self.action_view_alerts()
+
+    def action_undo_plan_approval_or_refresh(self) -> None:
+        """``u`` — undo a pending plan approval, or fall back to refresh."""
+        if getattr(self, "_pending_plan_approval", None) is not None:
+            pending = self._pending_plan_approval
+            self._cancel_drilldown_pending_plan_approval(commit=False)
+            self.notify(
+                f"Undid approval for plan {pending.get('plan_task_id', '')}.",
+                severity="information",
+                timeout=3.0,
+            )
+            return
+        self.action_refresh()
+
+    def _approve_first_plan_review_if_present(self) -> bool:
+        """Approve the first plan_review action card. Returns True on hit."""
+        data = getattr(self, "data", None)
+        if data is None:
+            return False
+        items = list(getattr(data, "action_items", []) or [])
+        target = None
+        target_index = -1
+        for idx, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            if item.get("is_plan_review"):
+                target = item
+                target_index = idx
+                break
+        if target is None:
+            return False
+        # Resolve the underlying plan_task_id. The action card carries
+        # the plan_task_id either via ``primary_action.task_id`` or
+        # ``primary_ref``; both are normalized to ``project/N``.
+        plan_task_id = ""
+        primary_action = target.get("primary_action") or {}
+        if isinstance(primary_action, dict):
+            plan_task_id = str(primary_action.get("task_id") or "")
+        if not _PROJECT_TASK_REF_RE.fullmatch(plan_task_id):
+            plan_task_id = str(target.get("primary_ref") or "")
+        if not _PROJECT_TASK_REF_RE.fullmatch(plan_task_id):
+            self.notify(
+                "Could not resolve plan task to approve.",
+                severity="warning",
+                timeout=2.0,
+            )
+            return True  # consumed the keypress; don't fall through to alerts
+        # Pre-empt any prior pending approval (commit it).
+        if getattr(self, "_pending_plan_approval", None) is not None:
+            self._cancel_drilldown_pending_plan_approval(commit=True)
+        # Count children + resolve persona for the celebration copy.
+        sub_task_count = self._drilldown_plan_task_subtask_count(plan_task_id)
+        persona_name = self._drilldown_project_persona_name()
+        from pollypm.plan_approval_celebration import (
+            compose_celebration_message,
+            sparkle_frames,
+            undo_hint,
+        )
+        celebration = compose_celebration_message(
+            persona_name=persona_name,
+            sub_task_count=sub_task_count,
+        )
+        first_sparkle = sparkle_frames()[0]
+        toast_body = (
+            f"{first_sparkle}  {celebration}    "
+            f"{undo_hint(self._approve_undo_window_seconds)}"
+        )
+        self.notify(
+            toast_body,
+            severity="information",
+            timeout=max(3.0, float(self._approve_undo_window_seconds) + 0.5),
+        )
+        self._pending_plan_approval = {
+            "plan_task_id": plan_task_id,
+            "action_index": target_index,
+            "celebration": celebration,
+            "sub_task_count": sub_task_count,
+            "persona_name": persona_name,
+        }
+        window = float(self._approve_undo_window_seconds)
+        if window <= 0.0:
+            self._commit_drilldown_pending_plan_approval()
+        else:
+            try:
+                self._pending_plan_approval_timer = self.set_timer(
+                    window, self._commit_drilldown_pending_plan_approval,
+                )
+            except Exception:  # noqa: BLE001
+                self._commit_drilldown_pending_plan_approval()
+        return True
+
+    def _cancel_drilldown_pending_plan_approval(self, *, commit: bool) -> None:
+        timer = getattr(self, "_pending_plan_approval_timer", None)
+        self._pending_plan_approval_timer = None
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        if commit and getattr(self, "_pending_plan_approval", None) is not None:
+            self._commit_drilldown_pending_plan_approval()
+        else:
+            self._pending_plan_approval = None
+
+    def _commit_drilldown_pending_plan_approval(self) -> None:
+        pending = getattr(self, "_pending_plan_approval", None)
+        if pending is None:
+            return
+        self._pending_plan_approval = None
+        self._pending_plan_approval_timer = None
+        # Reuse the existing record-action-response path so we land on
+        # the same approval semantics as a click on the primary button.
+        try:
+            self._record_action_response(
+                pending["action_index"],
+                "Approved from project dashboard.",
+                approve_if_possible=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.notify(f"Approve failed: {exc}", severity="error")
+
+    def _drilldown_plan_task_subtask_count(self, plan_task_id: str) -> int:
+        """Count children for the celebration copy. 0 on lookup failure."""
+        if not plan_task_id:
+            return 0
+        try:
+            from pollypm.work.inbox_actions import open_work_service_for_task
+            config = load_config(self.config_path)
+        except Exception:  # noqa: BLE001
+            return 0
+        try:
+            svc = open_work_service_for_task(config, plan_task_id)
+        except Exception:  # noqa: BLE001
+            return 0
+        if svc is None:
+            return 0
+        try:
+            try:
+                task = svc.get(plan_task_id)
+            except Exception:  # noqa: BLE001
+                return 0
+            return len(getattr(task, "children", []) or [])
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _drilldown_project_persona_name(self) -> str | None:
+        try:
+            config = load_config(self.config_path)
+        except Exception:  # noqa: BLE001
+            return None
+        projects = getattr(config, "projects", {}) or {}
+        project = projects.get(self.project_key)
+        if project is None:
+            return None
+        return _project_pm_persona(config, self.project_key, project)
 
     # ------------------------------------------------------------------
     # Data

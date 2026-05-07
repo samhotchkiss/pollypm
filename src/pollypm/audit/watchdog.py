@@ -83,6 +83,9 @@ __all__ = [
     "RULE_TASK_REVIEW_STALE",
     "RULE_ROLE_SESSION_MISSING",
     "RULE_WORKER_SESSION_DEAD_LOOP",
+    "RULE_TASK_ON_HOLD_STALE",
+    "ON_HOLD_HUMAN_NEEDED_TAG",
+    "ON_HOLD_ARCHITECT_TAG",
     "scan_events",
     "scan_project",
     "emit_heartbeat_tick",
@@ -115,6 +118,23 @@ RULE_CANCEL_NO_PROMOTION = "cancellation_no_promotion"
 RULE_TASK_REVIEW_STALE = "task_review_stale"
 RULE_ROLE_SESSION_MISSING = "role_session_missing"
 RULE_WORKER_SESSION_DEAD_LOOP = "worker_session_dead_loop"
+# #1424 — task_on_hold_stale catches the savethenovel/11 pattern where
+# the reviewer transitions a task to status=on_hold (instead of reject),
+# parking it for a human. The watchdog used to go silent on on_hold
+# because ``task_review_stale`` only matches status=review. The new rule
+# escalates to the architect by default — the architect re-assesses the
+# reviewer's findings and either fixes them or, if the issue genuinely
+# requires human judgement, calls ``pm notify`` itself.
+RULE_TASK_ON_HOLD_STALE = "task_on_hold_stale"
+
+# Reason-string tags reviewers use to hint the watchdog routing. The
+# default (no tag) is architect-actionable. ``ON_HOLD_HUMAN_NEEDED_TAG``
+# is reserved for cases that genuinely need a product/taste call from
+# the user; the dispatch path can escalate to user directly when it
+# spots this prefix. The strings are matched case-insensitively against
+# the leading characters of the on_hold transition reason.
+ON_HOLD_ARCHITECT_TAG = "architect-actionable"
+ON_HOLD_HUMAN_NEEDED_TAG = "human-needed"
 
 # Throttle window for the dispatch path. We re-fire findings on every
 # tick (the audit log is forensic and operators want repeat counts),
@@ -178,6 +198,13 @@ class WatchdogConfig:
     # most recent transition older than this before we fire. 30 min
     # mirrors the savethenovel/10 case (reviewer agent never spawned).
     review_stale_seconds: int = 1800
+    # #1424 — task_on_hold_stale: a task at status=on_hold for longer
+    # than this triggers the architect-first escalation. Defaults to
+    # 15 min — shorter than ``review_stale_seconds`` because on_hold is
+    # supposed to be a brief routing detour (reviewer can't decide,
+    # parks task), not a sustained state. Anything longer than the
+    # cadence-tick stride means a human is now load-bearing.
+    on_hold_stale_seconds: int = 900
     # #1414 — worker_session_dead_loop: how many reaper events for the
     # same task within ``dead_loop_window_seconds`` count as a loop.
     dead_loop_threshold: int = 3
@@ -605,6 +632,108 @@ def _detect_task_review_stale(
     return findings
 
 
+def _classify_on_hold_reason(reason: str | None) -> str:
+    """Return ``architect-actionable`` or ``human-needed`` based on the reason.
+
+    Reviewers tag on_hold transitions with a leading routing hint so the
+    watchdog can decide whether the architect or the user should be the
+    first responder. The match is case-insensitive and tolerant of
+    surrounding punctuation (``"[human-needed] copy approval"`` works).
+    Default routing is architect-actionable because that's what #1424
+    sets as the post-mortem default — the architect can always escalate
+    upward, but parking on the human is the failure mode.
+    """
+    if not reason:
+        return ON_HOLD_ARCHITECT_TAG
+    head = reason.strip().lower()
+    if head.startswith(ON_HOLD_HUMAN_NEEDED_TAG.lower()):
+        return ON_HOLD_HUMAN_NEEDED_TAG
+    # ``[architect-actionable] ...`` and bare ``architect-actionable: ...``
+    # both collapse to the architect default. Anything else also defaults
+    # to architect — the reviewer just didn't tag it.
+    if head.startswith("[" + ON_HOLD_HUMAN_NEEDED_TAG.lower()):
+        return ON_HOLD_HUMAN_NEEDED_TAG
+    return ON_HOLD_ARCHITECT_TAG
+
+
+def _detect_task_on_hold_stale(
+    events: Sequence[AuditEvent],
+    *,
+    now: datetime,
+    config: WatchdogConfig,
+) -> list[Finding]:
+    """Rule 5b (#1424): task at ``status=on_hold`` for > threshold.
+
+    Mirrors :func:`_detect_task_review_stale` — pick the latest
+    transition per task subject. If the latest transition lands the
+    task in ``on_hold`` and is older than ``on_hold_stale_seconds``,
+    fire. The reviewer's transition reason is included in the finding
+    metadata so the brief generator can surface it to the architect.
+
+    The two rules are intentionally separate (different windows,
+    different routing). The architect-vs-human routing hint is computed
+    here from the reason tag and stored under ``routing`` in metadata
+    so the cadence handler can read it without re-parsing the reason.
+    """
+    findings: list[Finding] = []
+    cutoff = now - timedelta(seconds=config.on_hold_stale_seconds)
+
+    # subject -> (latest_ts, ev) — pick the latest transition per task.
+    latest: dict[str, tuple[datetime, AuditEvent]] = {}
+    for ev in events:
+        if ev.event != EVENT_TASK_STATUS_CHANGED:
+            continue
+        ts = _parse_iso(ev.ts)
+        if ts is None:
+            continue
+        prior = latest.get(ev.subject)
+        if prior is None or ts > prior[0]:
+            latest[ev.subject] = (ts, ev)
+
+    for subject, (ts, ev) in latest.items():
+        meta = ev.metadata or {}
+        to_state = meta.get("to")
+        if to_state != "on_hold":
+            continue
+        if ts > cutoff:
+            # Fresh on_hold — give the reviewer / architect a beat.
+            continue
+        key = _task_subject_key(subject)
+        if key is None:
+            continue
+        project, _ = key
+        stuck_minutes = max(1, int((now - ts).total_seconds() // 60))
+        reason = meta.get("reason")
+        routing = _classify_on_hold_reason(
+            reason if isinstance(reason, str) else None,
+        )
+        findings.append(Finding(
+            rule=RULE_TASK_ON_HOLD_STALE,
+            project=project,
+            subject=subject,
+            message=(
+                f"Task {subject} has been at status=on_hold for "
+                f"~{stuck_minutes} min — escalating to architect for "
+                f"first-responder unstick."
+            ),
+            recommendation=(
+                f"Architect: re-read the reviewer's rationale, fix the "
+                f"issue, then `pm task queue {subject}`. Only escalate "
+                f"to user via `pm notify` if the issue genuinely needs "
+                f"human judgement."
+            ),
+            metadata={
+                "on_hold_since": ev.ts,
+                "stuck_minutes": stuck_minutes,
+                "from": meta.get("from"),
+                "reason": reason if isinstance(reason, str) else None,
+                "routing": routing,
+                "actor": ev.actor,
+            },
+        ))
+    return findings
+
+
 def _detect_role_session_missing(
     events: Sequence[AuditEvent],
     *,
@@ -807,6 +936,9 @@ def scan_events(
         materialised, now=now, config=config,
     ))
     findings.extend(_detect_task_review_stale(
+        materialised, now=now, config=config,
+    ))
+    findings.extend(_detect_task_on_hold_stale(
         materialised, now=now, config=config,
     ))
     findings.extend(_detect_role_session_missing(
@@ -1027,7 +1159,53 @@ def format_unstick_brief(finding: Finding) -> str:
     lines.append(f"Finding: {finding.rule}")
     lines.append(f"Subject: {subject}")
 
-    if finding.rule == RULE_TASK_REVIEW_STALE:
+    if finding.rule == RULE_TASK_ON_HOLD_STALE:
+        stuck_minutes = meta.get("stuck_minutes")
+        on_hold_since = meta.get("on_hold_since")
+        from_state = meta.get("from") or "<unknown>"
+        reason = meta.get("reason")
+        routing = meta.get("routing") or ON_HOLD_ARCHITECT_TAG
+        reviewer_evidence = meta.get("reviewer_evidence") or []
+        lines.append(
+            f"Stuck for: {stuck_minutes} minutes" if stuck_minutes
+            else "Stuck for: unknown duration"
+        )
+        lines.append(f"Routing: {routing}")
+        lines.append("Observed evidence:")
+        if on_hold_since:
+            lines.append(
+                f"- Task transitioned {from_state} -> on_hold at {on_hold_since}"
+            )
+        if reason:
+            lines.append(f"- Reviewer rationale: {reason}")
+        else:
+            lines.append("- No transition reason was recorded.")
+        if reviewer_evidence:
+            lines.append("- Recent reviewer evidence:")
+            for entry in reviewer_evidence:
+                # Each entry is a one-line string already shaped by
+                # the cadence handler (exec row OR inbox message).
+                lines.append(f"  * {entry}")
+        else:
+            lines.append(
+                "- No additional reviewer execution rows or inbox "
+                "messages were available."
+            )
+        lines.append("")
+        lines.append(
+            "Your job (DEFAULT: fix and re-submit). Options: "
+            "(a) address the reviewer's findings yourself (fix code / "
+            f"docs / commit untracked artifacts) and run `pm task queue "
+            f"{subject}` to put the task back in the worker pool, "
+            "(b) create a sibling tracking task for a non-blocking "
+            f"finding and `pm task approve {subject}` the original, "
+            "(c) ONLY escalate to user via `pm notify --priority "
+            "immediate` if the issue genuinely needs human judgement "
+            "(product direction, taste, external info you can't "
+            "access). Parking on the user is the failure mode this "
+            "rule exists to prevent."
+        )
+    elif finding.rule == RULE_TASK_REVIEW_STALE:
         stuck_minutes = meta.get("stuck_minutes")
         review_since = meta.get("review_since")
         lines.append(

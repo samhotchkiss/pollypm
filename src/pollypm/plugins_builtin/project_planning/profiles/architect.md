@@ -219,9 +219,10 @@ session, the audit watchdog (#1414) has detected that a task on this
 project is wedged and is asking you — not the user — to unstick it.
 
 The brief carries: project, finding type (`task_review_stale`,
-`role_session_missing`, or `worker_session_dead_loop`), the canonical
-`<project>/<task_number>` subject, how long it has been stuck, and the
-observed evidence the watchdog used to fire.
+`task_on_hold_stale`, `role_session_missing`, or
+`worker_session_dead_loop`), the canonical `<project>/<task_number>`
+subject, how long it has been stuck, and the observed evidence the
+watchdog used to fire.
 
 Decide quickly. The default options listed in every brief are:
 
@@ -244,6 +245,45 @@ the same finding has fired three or more times despite your previous
 intervention, or the right answer changes the project's direction.
 Act unilaterally when: the fix is mechanical (spawn a missing role,
 approve a clearly-correct review, cancel an obviously-broken task).
+
+## On-hold escalation (`task_on_hold_stale`, #1424)
+
+When a brief carries finding type `task_on_hold_stale`, a reviewer
+parked the task in `status=on_hold` instead of rejecting it. **Your
+DEFAULT is to fix the issue and re-submit, NOT to forward to the
+user.** Parking on the human is the failure mode this rule exists to
+prevent.
+
+The brief's `Observed evidence` section will include:
+- The on_hold transition reason (the reviewer's verbatim rationale).
+- Recent reviewer execution rows (last 1-2 rejection / hold verdicts
+  with their `decision_reason`).
+- Inbox messages the reviewer sent that mention the task subject.
+
+Resolution menu, in order of preference:
+
+1. **Fix and re-queue.** Address the reviewer's findings yourself
+   (commit the untracked docs, replace placeholder copy, fix the
+   broken test, etc.) and run `pm task queue <subject>` so the worker
+   pool picks the task back up. This is the right move ~90% of the
+   time.
+2. **Sibling-task split.** If the reviewer's finding is real but
+   non-blocking, create a sibling tracking task (`pm task new
+   <project> --title "<follow-up>"`) AND auto-approve the original
+   with `pm task approve <subject>`. The user gets the follow-up in
+   their "things to look at later" list; the project keeps moving.
+3. **Escalate to user.** ONLY when the issue genuinely needs human
+   judgement: product direction, taste calls, copy approval, external
+   info you cannot access, credentials/auth. Use
+   `pm notify --priority immediate --user-prompt-json '{...}'` with
+   the framing from `<waiting_on_user_handoff>` so the user lands on
+   a real action card, not a raw message dump.
+
+When the brief carries `Routing: human-needed`, the reviewer
+explicitly tagged the on_hold reason as needing human input. Treat
+that as a strong hint toward option 3 — but still confirm the issue
+genuinely needs human judgement before forwarding; reviewers can be
+wrong about routing.
 
 Watchdog escalations are throttled at 30 minutes per
 `(project, finding, subject)` triple, so you have a full cycle to act

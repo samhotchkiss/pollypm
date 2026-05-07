@@ -34,6 +34,7 @@ from pollypm.audit.watchdog import (
     ESCALATION_THROTTLE_SECONDS,
     Finding,
     RULE_ROLE_SESSION_MISSING,
+    RULE_TASK_ON_HOLD_STALE,
     RULE_TASK_REVIEW_STALE,
     RULE_WORKER_SESSION_DEAD_LOOP,
     WATCHDOG_ALERT_TYPE,
@@ -57,6 +58,11 @@ _DISPATCHABLE_RULES: frozenset[str] = frozenset({
     RULE_TASK_REVIEW_STALE,
     RULE_ROLE_SESSION_MISSING,
     RULE_WORKER_SESSION_DEAD_LOOP,
+    # #1424 — on_hold escalation lands in the architect's pane with the
+    # reviewer's rationale folded into the brief. Default first responder
+    # is the architect; only the architect calls ``pm notify`` if the
+    # issue genuinely needs human judgement.
+    RULE_TASK_ON_HOLD_STALE,
 })
 
 
@@ -120,7 +126,13 @@ def _config_from_payload(payload: dict[str, Any]) -> WatchdogConfig:
     if not isinstance(payload, dict):
         return WatchdogConfig()
     kwargs: dict[str, int] = {}
-    for field_name in ("window_seconds", "stuck_draft_seconds", "cancel_grace_seconds"):
+    for field_name in (
+        "window_seconds",
+        "stuck_draft_seconds",
+        "cancel_grace_seconds",
+        "review_stale_seconds",
+        "on_hold_stale_seconds",
+    ):
         raw = payload.get(field_name)
         if raw is None:
             continue
@@ -244,6 +256,166 @@ def _send_brief_to_architect(
         return False
 
 
+def _gather_reviewer_evidence(
+    *,
+    project_key: str,
+    project_path: Path | None,
+    subject: str,
+    msg_store: Any,
+    limit_executions: int = 2,
+    limit_messages: int = 2,
+) -> list[str]:
+    """Collect reviewer execution rows + recent inbox messages for ``subject``.
+
+    Returns a list of one-line strings safe to embed verbatim in the
+    architect brief. Best-effort — any failure (DB unreachable, message
+    store missing) returns an empty list and the brief just says "no
+    additional reviewer evidence available". The caller treats the
+    evidence as advisory only.
+
+    The execution rows are filtered to the reviewer node (``code_review``
+    or any node whose name contains ``review``) so the architect sees
+    the rejecting verdict, not the worker's commits. Inbox messages are
+    filtered to those that mention the subject so we don't dump the
+    whole project queue into the brief.
+    """
+    evidence: list[str] = []
+
+    # 1. Recent reviewer execution rows from the work-service DB.
+    try:
+        from pollypm.work import create_work_service
+
+        with create_work_service(
+            project_path=project_path,
+            project_key=project_key,
+        ) as svc:
+            try:
+                task = svc.get(subject)
+            except Exception:  # noqa: BLE001
+                task = None
+            if task is not None:
+                # ``task.executions`` is the in-memory join the work
+                # service hydrates on read (see SQLiteWorkService._load_executions).
+                executions = list(getattr(task, "executions", None) or [])
+                # Filter to reviewer-side rows; sort newest first; cap.
+                review_rows = [
+                    ex for ex in executions
+                    if "review" in (getattr(ex, "node_id", "") or "").lower()
+                ]
+                review_rows.sort(
+                    key=lambda ex: getattr(ex, "completed_at", None)
+                    or getattr(ex, "started_at", None)
+                    or "",
+                    reverse=True,
+                )
+                for ex in review_rows[:limit_executions]:
+                    decision = getattr(ex, "decision", None)
+                    decision_value = getattr(decision, "value", decision) or "?"
+                    reason = getattr(ex, "decision_reason", None) or ""
+                    node = getattr(ex, "node_id", "") or "?"
+                    completed = getattr(ex, "completed_at", None)
+                    completed_s = (
+                        completed.isoformat() if completed is not None else "?"
+                    )
+                    line = (
+                        f"reviewer exec [{node} @ {completed_s}] "
+                        f"decision={decision_value}"
+                    )
+                    if reason:
+                        # Truncate aggressively — the brief is
+                        # already structured.
+                        clipped = reason.strip().splitlines()[0][:240]
+                        line = f"{line} reason: {clipped}"
+                    evidence.append(line)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: reviewer-execution fetch failed for %s",
+            subject, exc_info=True,
+        )
+
+    # 2. Inbox messages that reference the task subject. We use the
+    # generic ``query_messages`` surface (post-#349) and filter
+    # client-side because every persona persists messages here. The
+    # filter is deliberately permissive — anything mentioning the
+    # canonical ``project/N`` string is considered relevant.
+    try:
+        if msg_store is not None and hasattr(msg_store, "query_messages"):
+            rows = msg_store.query_messages(project=project_key) or []
+            matched: list[dict[str, Any]] = []
+            for row in rows:
+                body = (
+                    str(row.get("body") or "")
+                    + " "
+                    + str(row.get("title") or "")
+                    + " "
+                    + str(row.get("subject") or "")
+                )
+                if subject in body or row.get("subject") == subject:
+                    matched.append(row)
+            # Sort by created_at desc when available, then cap.
+            matched.sort(
+                key=lambda r: r.get("created_at") or r.get("ts") or "",
+                reverse=True,
+            )
+            for row in matched[:limit_messages]:
+                role = (
+                    row.get("requester")
+                    or row.get("actor")
+                    or row.get("from")
+                    or "?"
+                )
+                title = row.get("title") or row.get("subject") or "(no title)"
+                body = (row.get("body") or "").strip().splitlines()
+                first_line = body[0][:240] if body else ""
+                line = f"inbox msg from {role}: {title}"
+                if first_line:
+                    line = f"{line} — {first_line}"
+                evidence.append(line)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: reviewer-message fetch failed for %s",
+            subject, exc_info=True,
+        )
+
+    return evidence
+
+
+def _enrich_finding_metadata(
+    finding: Finding,
+    *,
+    project_key: str,
+    project_path: Path | None,
+    msg_store: Any,
+) -> Finding:
+    """Return a copy of ``finding`` with reviewer evidence folded in.
+
+    Only :data:`RULE_TASK_ON_HOLD_STALE` is enriched today — the brief
+    generator surfaces ``metadata['reviewer_evidence']`` for that rule.
+    Other rules are returned unchanged. We rebuild a Finding rather than
+    mutating because :class:`Finding` is frozen.
+    """
+    if finding.rule != RULE_TASK_ON_HOLD_STALE:
+        return finding
+    evidence = _gather_reviewer_evidence(
+        project_key=project_key,
+        project_path=project_path,
+        subject=finding.subject,
+        msg_store=msg_store,
+    )
+    if not evidence:
+        return finding
+    enriched_meta = {**(finding.metadata or {}), "reviewer_evidence": evidence}
+    return Finding(
+        rule=finding.rule,
+        project=finding.project,
+        subject=finding.subject,
+        severity=finding.severity,
+        message=finding.message,
+        recommendation=finding.recommendation,
+        metadata=enriched_meta,
+    )
+
+
 def _maybe_dispatch_to_architect(
     finding: Finding,
     *,
@@ -345,8 +517,18 @@ def _scan_one_project(
         # #1414 — eligible findings get an architect dispatch on top
         # of the alert. Throttle window is owned by the audit log so
         # repeat dispatches are deduped across cadence-process restarts.
-        outcome = _maybe_dispatch_to_architect(
+        # #1424 — for ``task_on_hold_stale`` we enrich the finding with
+        # the reviewer's recent execution rows + inbox messages so the
+        # architect's brief carries the rejection rationale, not just
+        # the bare on_hold timestamp.
+        dispatch_finding = _enrich_finding_metadata(
             finding,
+            project_key=project_key,
+            project_path=project_path,
+            msg_store=msg_store,
+        )
+        outcome = _maybe_dispatch_to_architect(
+            dispatch_finding,
             project_path=project_path,
             storage_closet_name=storage_closet_name,
             now=now,

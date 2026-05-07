@@ -33,7 +33,7 @@ Verify your environment:
 pm doctor
 ```
 
-Run `pm doctor` — it reports tmux, git, provider auth, and storage health. Fix anything that comes back red before continuing.
+Run `pm doctor` — it reports tmux, git, provider auth, storage health, dual-DB consistency, and worker-marker hygiene. Fix anything that comes back red before continuing. Use `pm doctor --fix` to apply the safe subset of automatic repairs, or `pm doctor --json` for a machine-readable report.
 
 Now launch PollyPM:
 
@@ -80,11 +80,15 @@ A "project" in PollyPM is a registered git repository with a `.pollypm/` directo
 # Register an existing repo without planning
 pm add-project ~/dev/my-app
 
+# Register without marking it as tracked (no rail badges, no morning
+# briefings, no recovery prompts) — useful for experimental/archival repos
+pm add-project ~/dev/my-app --no-track
+
 # Or register + kick off the architecture planner in one go
 pm project new ~/dev/my-app
 ```
 
-`pm add-project` is the lightweight path — it scaffolds `.pollypm/`, imports git and transcript history, and returns. `pm project new` does the same and then prompts to run the planner, which produces `docs/project-plan.md` and a prioritized task backlog.
+`pm add-project` is the lightweight path — it scaffolds `.pollypm/`, imports git and transcript history, marks the project as tracked, and returns. Tracked projects appear in cockpit rail badges, morning briefings, and recovery prompts; opt out with `--no-track` if you want a project registered but quiet. `pm project new` does the same and then prompts to run the planner, which produces `docs/project-plan.md` and a prioritized task backlog.
 
 List registered projects:
 

@@ -83,6 +83,14 @@ Do NOT:
 
 If Sam later wants to change the slug: run `pm project rename <old> <new>` (dry-run first), then restart affected sessions.
 
+## Project Planning
+
+When a project needs a plan (initial planning or re-planning after cancellation):
+
+- **Use `pm project plan <project>`** to spawn the architect with the planning flow.
+- Do NOT craft a "Plan X" task manually with `pm task create` — that uses the standard flow with `worker=worker`, lacks the architect's planning structure, and routes through code review instead of plan review.
+- This applies to BOTH the first plan after `pm project new` AND any re-plan after a cancelled or stale plan.
+
 ## Plan Review
 
 A `plan_review` item means the architect produced a plan.
@@ -107,6 +115,8 @@ pm task create "Title" -p <project> -d "desc + acceptance criteria" \
   -f standard --priority normal -r worker=worker -r reviewer=russell
 pm task queue <id>
 ```
+
+For "Plan <project>" work, use `pm project plan <project>` instead — see the Project Planning section above.
 
 ### Monitor
 

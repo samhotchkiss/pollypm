@@ -1129,3 +1129,157 @@ def test_send_brief_to_architect_presses_enter(
         "Auto-unstick must submit the brief (press_enter=True); otherwise "
         "the architect agent never processes it. See issue #1420."
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression: _gather_open_tasks against canonical workspace DB (#1419)
+# ---------------------------------------------------------------------------
+
+
+def test_gather_open_tasks_routes_through_factory_to_workspace_db(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, now: datetime,
+) -> None:
+    """``_gather_open_tasks`` must read the canonical workspace DB.
+
+    Regression for #1419. Before the fix, the watchdog hardcoded
+    ``<project_path>/.pollypm/state.db`` — a path that #1004 collapsed
+    into the workspace-root DB. On post-#1004 layouts, the per-project
+    file is either missing or empty, so the legacy lookup silently
+    returned ``[]`` and ``role_session_missing`` no-oped in production.
+
+    This test seeds a real ``in_progress`` task into a workspace-layout
+    DB, points the resolver at that DB, leaves the per-project path
+    empty, and confirms ``_gather_open_tasks`` finds the task. It then
+    runs the full ``_scan_one_project`` and asserts
+    ``role_session_missing`` actually fires.
+    """
+    from pollypm.audit.watchdog import RULE_ROLE_SESSION_MISSING
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _gather_open_tasks,
+        _scan_one_project,
+    )
+    from pollypm.work import create_work_service
+
+    # Workspace-layout DB at <workspace_root>/.pollypm/state.db.
+    workspace_root = tmp_path / "workspace"
+    canonical_db = workspace_root / ".pollypm" / "state.db"
+    canonical_db.parent.mkdir(parents=True, exist_ok=True)
+
+    # Project path that, in the legacy layout, would have its own DB.
+    # We deliberately leave <project_path>/.pollypm/state.db absent to
+    # prove the fix doesn't depend on it existing.
+    project_path = tmp_path / "workspace" / "savethenovel"
+    project_path.mkdir(parents=True, exist_ok=True)
+    legacy_per_project_db = project_path / ".pollypm" / "state.db"
+    assert not legacy_per_project_db.exists(), (
+        "fixture precondition: per-project DB must NOT exist so we can "
+        "prove the fix reads the canonical workspace DB instead."
+    )
+
+    # Pin the resolver to the workspace-layout DB. This is the same
+    # surface the production code path takes — load_config() resolves
+    # workspace_root, and the canonical DB sits at <root>/.pollypm/state.db.
+    monkeypatch.setattr(
+        "pollypm.work.db_resolver.resolve_work_db_path",
+        lambda *a, **kw: canonical_db,
+    )
+
+    # Seed an in_progress task in the canonical DB so the
+    # role_session_missing rule has fuel to fire on.
+    with create_work_service(
+        db_path=canonical_db, project_path=project_path,
+    ) as svc:
+        task = svc.create(
+            title="reviewer agent never spawned",
+            description="savethenovel/N — reviewer-savethenovel window absent",
+            type="task",
+            project="savethenovel",
+            flow_template="standard",
+            roles={"worker": "claude:worker", "reviewer": "claude:reviewer"},
+            priority="normal",
+            created_by="tester",
+        )
+        # Drop it into in_progress directly. We only care that the
+        # downstream query yields a non-terminal row whose work_status
+        # the rule accepts; transition_manager bookkeeping isn't part
+        # of the contract being regressed here.
+        svc._conn.execute(
+            "UPDATE work_tasks SET work_status = ? "
+            "WHERE project = ? AND task_number = ?",
+            ("in_progress", task.project, task.task_number),
+        )
+        svc._conn.commit()
+        task_number = task.task_number
+
+    # 1. Direct contract: _gather_open_tasks finds the seeded task.
+    open_tasks = _gather_open_tasks("savethenovel", project_path)
+    assert len(open_tasks) == 1, (
+        "Expected the canonical workspace DB to surface 1 open task; "
+        f"got {len(open_tasks)}. The legacy per-project lookup would "
+        "have returned [] here."
+    )
+    assert open_tasks[0].project == "savethenovel"
+    assert open_tasks[0].task_number == task_number
+
+    # 2. End-to-end: role_session_missing fires for that task.
+    # The seeded task is in_progress with a ``worker`` role assigned, so
+    # the rule expects a ``worker-savethenovel`` window. We deliberately
+    # leave that window out of the storage closet to mirror savethenovel's
+    # production failure shape (the role agent never spawned).
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._gather_storage_windows",
+        lambda name: ["architect-savethenovel"],
+    )
+    # Capture send-keys instead of touching tmux.
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._send_brief_to_architect",
+        lambda target, brief: True,
+    )
+
+    store = _RecordingStore()
+    counters = _scan_one_project(
+        project_key="savethenovel",
+        project_path=project_path,
+        msg_store=store,
+        state_store=None,
+        now=now,
+        config=WatchdogConfig(),
+        storage_closet_name="pollypm-storage-closet",
+    )
+
+    role_alerts = [
+        a for a in store.alerts
+        if RULE_ROLE_SESSION_MISSING in a[0]
+    ]
+    assert len(role_alerts) == 1, (
+        f"role_session_missing should fire exactly once for the "
+        f"seeded in_progress task. Captured alerts: {store.alerts}"
+    )
+    assert counters["findings"] >= 1
+
+
+def test_gather_open_tasks_returns_empty_on_factory_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``create_work_service`` raises, the watchdog stays alive.
+
+    The rule must no-op for the project rather than crash the cadence
+    handler. Mirrors the broad-except in the production code; this
+    test pins the contract so a future "raise on missing config"
+    refactor of the factory can't silently break the heartbeat.
+    """
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _gather_open_tasks,
+    )
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("simulated factory failure")
+
+    monkeypatch.setattr("pollypm.work.create_work_service", _boom)
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog.create_work_service",
+        _boom,
+        raising=False,
+    )
+
+    assert _gather_open_tasks("demo", None) == []

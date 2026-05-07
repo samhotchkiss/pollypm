@@ -760,12 +760,26 @@ class Supervisor:
         session_name = self.config.project.tmux_session
         existing = [name for name in self._all_tmux_session_names() if self.session_service.tmux.has_session(name)]
         if existing:
-            # Sessions already running — reconcile instead of failing
+            # Sessions already running — reconcile instead of failing.
+            # Auto-provision reviewer rows BEFORE reconcile so any
+            # tracked project missing a reviewer session gets one in
+            # this pass (#1413). The reconcile path's ``plan_launches``
+            # call below picks up the new session config.
+            self._ensure_tracked_reviewer_sessions()
             return self._reconcile_existing(session_name, on_status=on_status)
 
         # Clear stale markers BEFORE plan_launches so launch commands don't
         # use --continue from a previous run's resume markers.
         self._bootstrap_clear_markers()
+
+        # #1413 — auto-provision reviewer sessions for every tracked
+        # project before plan_launches reads the session table.
+        # ``savethenovel`` shipped without a reviewer because nothing in
+        # the bootstrap path mirrored the architect auto-spawn (#257) for
+        # the reviewer role; the first task to land at code_review sat
+        # there forever. Workers stay per-task (not bootstrap-time);
+        # reviewers are long-lived per-project, like architects.
+        self._ensure_tracked_reviewer_sessions()
 
         failures: list[str] = []
         for controller_account in self._controller_candidates():
@@ -797,6 +811,81 @@ class Supervisor:
                         self.session_service.tmux.kill_session(tmux_session)
 
         raise RuntimeError("PollyPM could not launch any controller account: " + "; ".join(failures))
+
+    def _ensure_tracked_reviewer_sessions(self) -> None:
+        """Auto-provision a reviewer session for every tracked project (#1413).
+
+        Mirrors the architect auto-spawn (#257) but at supervisor
+        bootstrap rather than ``pm project new``. Every project with
+        ``tracked=True`` and no enabled reviewer session in config gets
+        a fresh ``reviewer_<project>`` SessionConfig added so the
+        downstream ``plan_launches`` call sees it. Idempotent — projects
+        whose reviewer already exists are left alone.
+
+        The actual launch is handled by ``_bootstrap_launches`` /
+        ``_reconcile_existing`` which iterate ``plan_launches()`` after
+        this hook runs. We don't launch here to avoid duplicating
+        launch wiring for the bootstrap path; the on-demand path
+        (``ensure_reviewer_session_for_project``) launches inline
+        because it runs after bootstrap and the supervisor is already
+        live.
+
+        Best-effort: a per-project failure logs and continues to the
+        next project so a single misconfigured account can't block the
+        whole workspace boot.
+        """
+        try:
+            from pollypm.recovery.reviewer_provisioning import (
+                ensure_reviewer_sessions_for_tracked_projects,
+            )
+            from pollypm.config import DEFAULT_CONFIG_PATH
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "reviewer auto-provision: import failed", exc_info=True,
+            )
+            return
+        # The supervisor doesn't carry the config path it was loaded
+        # from (config object is detached after construction). Mirror
+        # the no_session_spawn fallback: prefer ``self.config.config_path``
+        # if a future refactor adds it, otherwise resolve via the
+        # workspace default.
+        cfg_path = getattr(self.config, "config_path", None)
+        if cfg_path is None:
+            cfg_path = DEFAULT_CONFIG_PATH
+        try:
+            results = ensure_reviewer_sessions_for_tracked_projects(
+                cfg_path, launch=False,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "reviewer auto-provision: bootstrap sweep failed",
+                exc_info=True,
+            )
+            return
+        # Refresh the in-memory config so plan_launches sees the new
+        # sessions registered in the on-disk config. ``write_config``
+        # invalidates ``_config_cache`` via mtime, but our ``self.config``
+        # was loaded before this sweep ran.
+        created_count = sum(1 for _, created, _ in results if created)
+        if created_count:
+            try:
+                from pollypm.config import load_config
+
+                refreshed = load_config(cfg_path)
+                self.config = refreshed
+                # Drop the cached launch plan so the new reviewer
+                # sessions appear in the next plan_launches() call.
+                self.invalidate_launch_cache()
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "reviewer auto-provision: config refresh failed",
+                    exc_info=True,
+                )
+            logger.info(
+                "reviewer auto-provision: provisioned %d reviewer "
+                "session(s) at bootstrap (results=%s)",
+                created_count, results,
+            )
 
     def _bootstrap_clear_markers(self) -> None:
         """Clear stale session markers so all sessions start fresh."""

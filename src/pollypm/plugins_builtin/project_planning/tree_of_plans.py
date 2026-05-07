@@ -128,6 +128,99 @@ def synthesis_stage_prompt() -> str:
     )
 
 
+def plan_review_stage_prompt() -> str:
+    """Instruction block appended to the architect persona at stage 6.5.
+
+    The ``plan_review`` node sits between ``synthesize`` and
+    ``user_approval``. The architect (same role) re-reads the
+    synthesized plan body plus every critic verdict, reflects, and
+    rewrites the canonical plan document so that the decisions most
+    likely to draw user pushback are surfaced at the top — not buried
+    inside the body.
+
+    The contract is deliberately silent on flag count. The architect
+    is expected to emit *however many genuine flags exist*; that may
+    be zero on a tightly-scoped brief, or ten-plus on an ambitious
+    greenfield project. Forcing a fixed count would either pad
+    nothing-burgers onto easy plans or truncate real surface area on
+    hard ones — both fail the user.
+
+    See #1399 for the acceptance criteria.
+    """
+    return (
+        "<plan-review-stage>\n"
+        "You are in Stage 6.5 (Plan review) of the PollyPM planning flow. "
+        "The synthesize stage has already picked a winning candidate, "
+        "folded critic objections into a Risk Ledger, and written "
+        "`docs/project-plan.md`. Your job here is NOT to re-analyse — "
+        "it is to REFLECT and to RESHAPE the canonical plan document "
+        "so the user sees the load-bearing decisions before the body.\n\n"
+        "## Inputs you MUST read before writing\n"
+        "- `docs/project-plan.md` — the synthesized plan body.\n"
+        "- Every `docs/planning/candidate_*.md` — so you remember which "
+        "decompositions were live before synthesis picked the winner.\n"
+        "- Every critic JSON output from the panel (the work-service "
+        "executions on the critic_panel children) — including their "
+        "`objections_for_risk_ledger` lists and `preferred_candidate` votes.\n"
+        "- `docs/planning-session-log.md` — for the rationale narrative "
+        "you wrote at synthesize.\n\n"
+        "## Reflection lens\n"
+        "Ask yourself, decision by decision: *if Sam reads this plan "
+        "and pushes back, which call is he most likely to push back on?* "
+        "Plan reviews fail when the architect buries a controversial "
+        "judgment call (a plugin boundary that's premature, a data "
+        "source that's product-wrong, a magic flourish that expands "
+        "scope, a sequencing call that delays the user-visible move) "
+        "inside three pages of decomposition. Surface those calls at "
+        "the top so the user can spend their review budget on the few "
+        "decisions that actually matter.\n\n"
+        "## Output document structure (rewrite `docs/project-plan.md`)\n"
+        "Replace the existing plan body with a single document that "
+        "follows this exact section order:\n\n"
+        "1. **Summary** — 1-2 sentences. What is being approved? Plain "
+        "English; no node names, no jargon.\n"
+        "2. **Judgment calls** — a flat list with however many genuine "
+        "flags exist. Could be 0. Could be 10+. Do NOT invent flags to "
+        "pad the section, and do NOT collapse two real flags into one "
+        "to look terse. Each item is exactly:\n"
+        "   - One line stating the decision (`Decision:` prefix is fine).\n"
+        "   - One or two sentences on why this could go either way — "
+        "what the alternative was, who argued for it, what the cost is "
+        "if Sam disagrees with the call.\n"
+        "   If there are zero genuine judgment calls, write a single "
+        "sentence saying so and explain why (e.g. \"Brief was tightly "
+        "scoped; every decision followed from the stated constraints.\"). "
+        "Do NOT skip the section header.\n"
+        "3. **Plan body** — the decomposition (modules with name, "
+        "purpose, user-level test description, acceptance criteria, "
+        "dependencies, magic note, estimated size), the test strategy, "
+        "the magic list, and the sequencing — i.e. the same content "
+        "synthesize wrote, preserved verbatim or lightly tightened. Do "
+        "NOT lose modules during the rewrite.\n"
+        "4. **Critic synthesis** — where critics disagreed and how you "
+        "resolved each disagreement. One row per material disagreement: "
+        "what was contested, who took which side, your call, why. The "
+        "Risk Ledger from synthesize stays where it is (under the plan "
+        "body); this section is the *meta-narrative* about the panel.\n\n"
+        "## Constraints\n"
+        "- Variable-length judgment calls list. The acceptance gate is "
+        "*authentic flags only*; a list of three real flags beats a "
+        "list of seven padded ones.\n"
+        "- Hoist, don't duplicate. If a judgment call is also a Risk "
+        "Ledger row, the top-of-doc flag is the short form (1-2 "
+        "sentences); the Risk Ledger row stays the canonical entry.\n"
+        "- The document you produce IS the canonical plan rendered to "
+        "the user at user_approval. The visual-explainer skill will "
+        "render this version, not the pre-review draft.\n"
+        "- The `log_present` gate still applies — append a `Stage 6.5 "
+        "plan review` entry to `docs/planning-session-log.md` "
+        "narrating which judgment calls you flagged and why.\n\n"
+        "Then call `pm task done <task_id> --actor architect --output "
+        "...` to advance plan_review → user_approval.\n"
+        "</plan-review-stage>"
+    )
+
+
 def critic_panel_prompt() -> str:
     """Instruction block appended to the critic persona on stage 5.
 

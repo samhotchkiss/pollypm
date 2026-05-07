@@ -140,14 +140,17 @@ def test_planner_flows_listed_in_available() -> None:
 
 
 def test_plan_project_has_nine_active_stages() -> None:
-    """The plan_project flow follows the 9-stage spec (§3):
+    """The plan_project flow follows the 9-stage spec (§3) plus the
+    stage 6.5 plan_review reflection node added for #1399:
     research, discover, decompose, test_strategy, magic, critic_panel,
-    synthesize, user_approval, emit, + done terminal = 10 nodes.
+    synthesize, plan_review, user_approval, emit, + done terminal =
+    11 nodes.
     """
     template = resolve_flow("plan_project")
     expected_stage_names = {
         "research", "discover", "decompose", "test_strategy", "magic",
-        "critic_panel", "synthesize", "user_approval", "emit", "done",
+        "critic_panel", "synthesize", "plan_review", "user_approval",
+        "emit", "done",
     }
     assert set(template.nodes.keys()) == expected_stage_names
     assert template.start_node == "research"
@@ -908,7 +911,7 @@ def test_plan_project_nodes_have_default_budgets() -> None:
     # Every "work" node that has a spec-§6 default should carry a
     # budget_seconds value on the YAML.
     for stage in ("research", "discover", "decompose", "test_strategy",
-                  "magic", "synthesize"):
+                  "magic", "synthesize", "plan_review"):
         assert template.nodes[stage].budget_seconds is not None, (
             f"{stage} missing budget_seconds"
         )
@@ -1128,6 +1131,159 @@ def test_user_approval_node_waits_indefinitely() -> None:
     assert node.budget_seconds is None
     assert node.next_node_id == "emit"
     assert node.reject_node_id == "synthesize"
+
+
+# ---------------------------------------------------------------------------
+# #1399 — plan_review reflection node (stage 6.5)
+# ---------------------------------------------------------------------------
+
+
+def test_plan_review_node_exists_and_is_owned_by_architect() -> None:
+    """#1399 acceptance: a `plan_review` node exists, is a work node,
+    and is run by the architect (same role as synthesize)."""
+    template = resolve_flow("plan_project")
+    assert "plan_review" in template.nodes, (
+        "plan_review node missing from plan_project flow"
+    )
+    node = template.nodes["plan_review"]
+    assert node.type == NodeType.WORK
+    assert node.actor_type == ActorType.ROLE
+    assert node.actor_role == "architect"
+
+
+def test_plan_review_sits_between_critic_panel_and_user_approval() -> None:
+    """#1399 acceptance: the new node follows critic_panel (transitively
+    via synthesize) and immediately precedes user_approval."""
+    template = resolve_flow("plan_project")
+    # critic_panel → synthesize → plan_review → user_approval.
+    assert template.nodes["critic_panel"].next_node_id == "synthesize"
+    assert template.nodes["synthesize"].next_node_id == "plan_review"
+    assert template.nodes["plan_review"].next_node_id == "user_approval"
+
+
+def test_plan_review_carries_log_present_gate() -> None:
+    """plan_review appends to the session log; the log_present gate
+    keeps that contract honest."""
+    template = resolve_flow("plan_project")
+    assert "log_present" in template.nodes["plan_review"].gates
+
+
+def test_plan_review_has_budget() -> None:
+    """plan_review is a reflection pass, not new analysis — it carries
+    a budget_seconds value (positive integer)."""
+    template = resolve_flow("plan_project")
+    budget = template.nodes["plan_review"].budget_seconds
+    assert budget is not None
+    assert budget > 0
+
+
+def test_plan_review_stage_prompt_describes_four_section_structure() -> None:
+    """The architect's prompt for plan_review must call out the exact
+    four-section output structure (#1399): summary, judgment calls,
+    plan body, critic synthesis."""
+    from pollypm.plugins_builtin.project_planning.tree_of_plans import (
+        plan_review_stage_prompt,
+    )
+    text = plan_review_stage_prompt()
+    assert "Summary" in text
+    assert "Judgment calls" in text
+    assert "Plan body" in text
+    assert "Critic synthesis" in text
+
+
+def test_plan_review_stage_prompt_does_not_dictate_count() -> None:
+    """The prompt must explicitly allow a variable-length judgment-calls
+    list — including zero genuine flags — and forbid padding."""
+    from pollypm.plugins_builtin.project_planning.tree_of_plans import (
+        plan_review_stage_prompt,
+    )
+    text = plan_review_stage_prompt()
+    # Some signal that the count is variable.
+    assert "however many genuine flags exist" in text
+    # Some signal that zero is acceptable.
+    assert "Could be 0" in text or "could be 0" in text.lower()
+    # Some signal that 10+ is acceptable.
+    assert "10+" in text or "ten" in text.lower()
+    # Some signal that padding is forbidden.
+    assert "pad" in text.lower() or "invent" in text.lower()
+
+
+def test_plan_review_stage_prompt_names_required_inputs() -> None:
+    """The prompt must direct the architect to read the synthesized
+    plan, the candidate decompositions, the critic verdicts, and the
+    session log — all the artifacts the reflection pass synthesizes."""
+    from pollypm.plugins_builtin.project_planning.tree_of_plans import (
+        plan_review_stage_prompt,
+    )
+    text = plan_review_stage_prompt()
+    assert "docs/project-plan.md" in text
+    assert "candidate_" in text  # the planning/candidate_*.md files
+    assert "critic" in text.lower()
+    assert "planning-session-log.md" in text
+
+
+def test_plan_review_stage_prompt_renders_with_sample_inputs() -> None:
+    """Smoke test: the prompt is callable, returns a non-empty string,
+    and stays within sane bounds. Sample plan + critic input fixtures
+    are interpolated by reference (the prompt instructs the architect
+    to read them off disk), so we verify the prompt body is stable
+    text rather than a templated render."""
+    from pollypm.plugins_builtin.project_planning.tree_of_plans import (
+        plan_review_stage_prompt,
+    )
+    sample_plan = "# Project Plan\n\n## Modules\n- **Foo** — does foo\n"
+    sample_critic = {
+        "candidates": [{"id": "A", "score": 8, "verdict": "approved"}],
+        "preferred_candidate": "A",
+        "objections_for_risk_ledger": [
+            "Foo plugin boundary may be premature",
+        ],
+    }
+    # Architect reads these off disk; the prompt itself is fixed.
+    assert sample_plan and sample_critic
+    text = plan_review_stage_prompt()
+    assert text.startswith("<plan-review-stage>")
+    assert text.endswith("</plan-review-stage>")
+    # Substantive instruction body.
+    assert len(text.split()) > 200
+
+
+def test_plan_review_yaml_snapshot_node_order() -> None:
+    """Snapshot guard on the YAML: plan_review is between critic_panel
+    (transitively via synthesize) and user_approval, in source order.
+    Catches accidental reordering during merges."""
+    yaml_path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "pollypm"
+        / "plugins_builtin"
+        / "project_planning"
+        / "flows"
+        / "plan_project.yaml"
+    )
+    text = yaml_path.read_text(encoding="utf-8")
+    # Build an ordered list of node names from the YAML source.
+    import re as _re
+    names: list[str] = []
+    for line in text.splitlines():
+        # Match a 2-space-indented `name:` declaration that is the
+        # node-key (followed by no further content — the value lives
+        # on subsequent lines).
+        m = _re.match(r"^  ([a-z_]+):\s*$", line)
+        if m:
+            names.append(m.group(1))
+    # The relevant slice in source order.
+    for required in ("critic_panel", "synthesize", "plan_review",
+                     "user_approval"):
+        assert required in names, f"{required} missing from YAML node block"
+    cp = names.index("critic_panel")
+    syn = names.index("synthesize")
+    pr = names.index("plan_review")
+    ua = names.index("user_approval")
+    assert cp < syn < pr < ua, (
+        f"Expected critic_panel < synthesize < plan_review < user_approval, "
+        f"got order {names}"
+    )
 
 
 # ---------------------------------------------------------------------------

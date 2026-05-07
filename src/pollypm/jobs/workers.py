@@ -20,6 +20,7 @@ dict ``{handler_name: HandlerSpec}`` is fine.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import threading
 import time
@@ -232,6 +233,11 @@ class JobWorkerPool:
         Workers finish their current job before exiting. Any thread still
         alive after ``timeout`` is left as a daemon — callers should treat
         this as best-effort.
+
+        When a worker thread fails to stop within the deadline we also
+        emit a ``worker.thread_leaked`` audit event (#1370) so the fleet
+        can quantify how often this is firing without grepping
+        ``errors.log``.
         """
         with self._lock:
             if not self._started:
@@ -246,6 +252,29 @@ class JobWorkerPool:
             t.join(timeout=remaining)
             if t.is_alive():
                 logger.warning("JobWorkerPool: thread %s did not stop within timeout", t.name)
+                self._emit_thread_leaked(t.name, timeout)
+
+    @staticmethod
+    def _emit_thread_leaked(thread_name: str, timeout: float) -> None:
+        """Best-effort audit hook for #1370.
+
+        Audit emit is intentionally lazy-imported and exception-swallowed:
+        the shutdown path must never raise from a telemetry hook.
+        """
+        try:
+            from pollypm.audit.log import EVENT_WORKER_THREAD_LEAKED
+            from pollypm.audit.log import emit as _audit_emit
+
+            _audit_emit(
+                event=EVENT_WORKER_THREAD_LEAKED,
+                project="",
+                subject=thread_name,
+                actor="system",
+                status="warn",
+                metadata={"timeout_seconds": float(timeout)},
+            )
+        except Exception:  # noqa: BLE001 — audit must not break stop()
+            pass
 
     @property
     def is_running(self) -> bool:
@@ -261,41 +290,73 @@ class JobWorkerPool:
 
     def _run(self, worker_id: str) -> None:
         logger.debug("JobWorkerPool: worker %s starting", worker_id)
-        while not self._stop_event.is_set():
-            try:
-                batch = self.queue.claim(worker_id, limit=1)
-            except Exception as exc:  # noqa: BLE001
-                if _is_closed_db_error(exc):
-                    self._handle_closed_db(worker_id, "claim")
-                    break
-                if _is_database_locked_error(exc):
-                    # #1018 — transient WAL contention on claim; back
-                    # off briefly and retry on the next poll. Don't log
-                    # a full traceback (would spam ``errors.log`` and,
-                    # via the heartbeat alert pipeline, raise a
-                    # ``critical_error`` for a recoverable condition).
-                    logger.debug(
-                        "JobWorkerPool: claim hit transient lock for %s; "
-                        "backing off",
-                        worker_id,
-                    )
+        # #1370 — per-worker single-threaded executor reused across
+        # job invocations. Pre-fix, ``_run_one`` spawned a fresh
+        # ``threading.Thread(daemon=True)`` per attempt and abandoned
+        # the reference on timeout, leaking one thread per timed-out
+        # handler attempt (and up to four per job once the lock-retry
+        # loop kicked in). With a single-slot executor the worker has
+        # at most one in-flight handler thread at a time; on timeout
+        # the executor's worker keeps running the dead handler in the
+        # background but no *new* thread is created — the next attempt
+        # reuses the next executor slot once the old future drops the
+        # reservation. The executor is shut down with
+        # ``cancel_futures=True`` and ``wait=False`` when the worker
+        # exits so a wedged handler can't block ``pool.stop()``.
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"{self.worker_name_prefix}-handler",
+        )
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    batch = self.queue.claim(worker_id, limit=1)
+                except Exception as exc:  # noqa: BLE001
+                    if _is_closed_db_error(exc):
+                        self._handle_closed_db(worker_id, "claim")
+                        break
+                    if _is_database_locked_error(exc):
+                        # #1018 — transient WAL contention on claim; back
+                        # off briefly and retry on the next poll. Don't log
+                        # a full traceback (would spam ``errors.log`` and,
+                        # via the heartbeat alert pipeline, raise a
+                        # ``critical_error`` for a recoverable condition).
+                        logger.debug(
+                            "JobWorkerPool: claim hit transient lock for %s; "
+                            "backing off",
+                            worker_id,
+                        )
+                        if self._stop_event.wait(self.poll_interval):
+                            break
+                        continue
+                    logger.exception("JobWorkerPool: claim failed for %s: %s", worker_id, exc)
                     if self._stop_event.wait(self.poll_interval):
                         break
                     continue
-                logger.exception("JobWorkerPool: claim failed for %s: %s", worker_id, exc)
-                if self._stop_event.wait(self.poll_interval):
-                    break
-                continue
 
-            if not batch:
-                if self._stop_event.wait(self.poll_interval):
-                    break
-                continue
+                if not batch:
+                    if self._stop_event.wait(self.poll_interval):
+                        break
+                    continue
 
-            for job in batch:
-                self._run_one(job)
-                if self._stop_event.is_set():
-                    break
+                for job in batch:
+                    self._run_one(job, executor)
+                    if self._stop_event.is_set():
+                        break
+        finally:
+            # ``cancel_futures=True`` drops anything still queued behind
+            # an in-flight handler; ``wait=False`` lets a wedged handler
+            # die at process exit instead of pinning the worker thread
+            # in ``executor.__exit__``. Both are deliberate — the
+            # alternative is exactly the leak this PR is fixing.
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:  # noqa: BLE001 — never block worker exit
+                logger.debug(
+                    "JobWorkerPool: worker %s executor shutdown raised",
+                    worker_id,
+                    exc_info=True,
+                )
 
         logger.debug("JobWorkerPool: worker %s stopping", worker_id)
 
@@ -329,7 +390,7 @@ class JobWorkerPool:
             return self._registry.get(name)
         return self._registry.get(name)
 
-    def _run_one(self, job) -> None:
+    def _run_one(self, job, executor: concurrent.futures.ThreadPoolExecutor) -> None:
         spec = self._lookup_handler(job.handler_name)
         if spec is None:
             # No handler — fail permanently with a clear message.
@@ -358,33 +419,49 @@ class JobWorkerPool:
             # falling through to the regular ``fail()`` path. Without
             # this, every transient lock during ``session.health_sweep``
             # bubbled up as a ``critical_error`` alert (#67108).
+            #
+            # #1370 — invocations route through a single-slot
+            # ``ThreadPoolExecutor`` owned by the worker thread, not a
+            # fresh ``threading.Thread`` per attempt. ``future.result()``
+            # gives the same per-attempt timeout semantics as
+            # ``Thread.join(timeout=)`` without spawning a new OS thread
+            # each retry. On timeout we abandon the future (the
+            # underlying handler keeps running in the executor's worker
+            # thread) and bail out of the retry loop — re-submitting
+            # while the previous attempt is still alive would either
+            # block on the executor's single slot or, pre-fix, double
+            # up handler threads against the same job.
             attempts = 1 + len(_DB_LOCK_RETRY_BACKOFF)
-            result_holder: dict[str, Any] = {}
-            exc_holder: dict[str, BaseException] = {}
             timed_out = False
+            last_err: BaseException | None = None
             for attempt_index in range(attempts):
-                result_holder = {}
-                exc_holder = {}
+                payload_copy = dict(job.payload)
+                try:
+                    future = executor.submit(spec.handler, payload_copy)
+                except RuntimeError:
+                    # Executor was shut down underneath us (pool stopping).
+                    # Treat as a stop signal and exit without bookkeeping —
+                    # ``stop()`` already accounts for in-flight work.
+                    return
 
-                def _invoke() -> None:
-                    try:
-                        result_holder["value"] = spec.handler(dict(job.payload))
-                    except BaseException as e:  # noqa: BLE001
-                        exc_holder["err"] = e
-
-                t = threading.Thread(
-                    target=_invoke,
-                    name=f"{self.worker_name_prefix}-handler-{job.id}",
-                    daemon=True,
-                )
-                t.start()
-                t.join(timeout=spec.timeout_seconds)
-                if t.is_alive():
+                try:
+                    future.result(timeout=spec.timeout_seconds)
+                    last_err = None
+                except concurrent.futures.TimeoutError:
+                    # Handler is still running on the executor's worker
+                    # thread. Abandon the future — the executor will
+                    # not accept a new submit() until this one finishes
+                    # (single-slot), and re-trying while it's stuck
+                    # would just block here on the next submit(). Mark
+                    # timed_out and break so the regular timeout-fail
+                    # path runs.
+                    future.cancel()  # no-op once running, but cheap.
                     timed_out = True
                     break
+                except BaseException as e:  # noqa: BLE001
+                    last_err = e
 
-                err = exc_holder.get("err")
-                if err is None or not _is_database_locked_error(err):
+                if last_err is None or not _is_database_locked_error(last_err):
                     break
 
                 # Lock-retry path. Last attempt falls through with the
@@ -417,8 +494,8 @@ class JobWorkerPool:
                     )
                 return
 
-            if "err" in exc_holder:
-                err = exc_holder["err"]
+            if last_err is not None:
+                err = last_err
                 tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
                 elapsed_ms = (time.monotonic() - start) * 1000
                 # #1018 — log lock-exhaustion at WARNING (not ERROR /

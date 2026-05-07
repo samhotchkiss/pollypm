@@ -4831,3 +4831,409 @@ def test_empty_state_suppressed_when_path_missing(tmp_path: Path) -> None:
     assert PollyProjectDashboardApp._render_empty_state(
         None, data,  # type: ignore[arg-type]
     ) == ""
+
+
+# ---------------------------------------------------------------------------
+# Drafts-pending affordance — surface unpromoted drafts in the drilldown
+# ---------------------------------------------------------------------------
+#
+# Forensic audit found 108 drafts stuck system-wide (oldest 16 days). The
+# pipeline-bucket renderer historically showed queued / in_progress /
+# review / blocked / on_hold / done — but NOT draft, so drafts piled up
+# invisibly. PR #1340's empty-state only fires when total tasks == 0; a
+# project with 1 cancelled + 1 draft (the savethenovel repro) has
+# total>0 but no live work, so neither affordance fired and the only
+# live task — the unpromoted draft — was hidden.
+
+
+def _draft_data(
+    tmp_path: Path,
+    *,
+    draft_count: int = 1,
+    extra_counts: dict[str, int] | None = None,
+    extra_buckets: dict[str, list[dict]] | None = None,
+):
+    """Build a ``ProjectDashboardData`` with N drafts and optional
+    other-status mix. Keeps the unit tests away from the work-service
+    bootstrap."""
+    from pollypm.cockpit_ui import ProjectDashboardData
+
+    counts: dict[str, int] = {"draft": draft_count}
+    counts.update(extra_counts or {})
+    buckets: dict[str, list[dict]] = {
+        "draft": [
+            {
+                "task_id": f"savethenovel/{i}",
+                "task_number": i,
+                "title": f"Draft {i}",
+                "updated_at": "",
+            }
+            for i in range(1, draft_count + 1)
+        ]
+    }
+    buckets.update(extra_buckets or {})
+    return ProjectDashboardData(
+        project_key="savethenovel",
+        project_name="Save The Novel",
+        project_path=tmp_path,
+        persona_name=None,
+        pm_label="PM: polly",
+        exists_on_disk=True,
+        status_dot="○",
+        status_color="#4a5568",
+        status_label="idle",
+        active_worker=None,
+        architect=None,
+        task_counts=counts,
+        task_buckets=buckets,
+        plan_path=None,
+        plan_sections=[],
+        plan_explainer=None,
+        plan_text=None,
+        plan_aux_files=[],
+        plan_mtime=None,
+        plan_stale_reason=None,
+        activity_entries=[],
+        inbox_count=0,
+        inbox_top=[],
+        action_items=[],
+        alert_count=0,
+    )
+
+
+def test_drafts_pending_renderer_fires_when_only_drafts(tmp_path: Path) -> None:
+    """Drafts present, no live work → ``_render_drafts_pending`` returns
+    the affordance copy with the count, the queue command, and the
+    project-qualified draft refs."""
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    data = _draft_data(tmp_path, draft_count=3)
+    rendered = PollyProjectDashboardApp._render_drafts_pending(
+        None, data,  # type: ignore[arg-type]
+    )
+    assert "3 drafts pending" in rendered
+    assert "pm task queue" in rendered
+    # Refs use project/N form so the operator can copy-paste
+    # ``pm task queue savethenovel/1``.
+    assert "savethenovel/1" in rendered
+    assert "savethenovel/2" in rendered
+    assert "savethenovel/3" in rendered
+
+
+def test_drafts_pending_renderer_singular_copy(tmp_path: Path) -> None:
+    """Single draft → ``1 draft pending`` (singular noun)."""
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    data = _draft_data(tmp_path, draft_count=1)
+    rendered = PollyProjectDashboardApp._render_drafts_pending(
+        None, data,  # type: ignore[arg-type]
+    )
+    assert "1 draft pending" in rendered
+    assert "drafts pending" not in rendered
+
+
+def test_drafts_pending_renderer_truncates_long_lists(tmp_path: Path) -> None:
+    """More than three drafts → first three refs + ``(+N more)`` so the
+    line stays readable on narrow terminals."""
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    data = _draft_data(tmp_path, draft_count=7)
+    rendered = PollyProjectDashboardApp._render_drafts_pending(
+        None, data,  # type: ignore[arg-type]
+    )
+    assert "7 drafts pending" in rendered
+    assert "savethenovel/1" in rendered
+    assert "savethenovel/3" in rendered
+    # Refs 4..7 collapse into "+N more"
+    assert "+4 more" in rendered
+    assert "savethenovel/7" not in rendered
+
+
+def test_drafts_pending_renderer_silent_when_live_work_exists(
+    tmp_path: Path,
+) -> None:
+    """Drafts coexist with live work (queued / in_progress / review) →
+    the panel stays hidden so it doesn't shout. The pipeline-strip
+    ``draft`` bucket carries the surface in that case."""
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    for live_status in ("queued", "in_progress", "review"):
+        data = _draft_data(
+            tmp_path,
+            draft_count=2,
+            extra_counts={live_status: 1},
+            extra_buckets={
+                live_status: [
+                    {
+                        "task_id": f"savethenovel/9",
+                        "task_number": 9,
+                        "title": "Live work",
+                        "updated_at": "",
+                    }
+                ],
+            },
+        )
+        rendered = PollyProjectDashboardApp._render_drafts_pending(
+            None, data,  # type: ignore[arg-type]
+        )
+        assert rendered == "", (
+            f"drafts panel must hide when {live_status!r} task exists "
+            f"(got {rendered!r})"
+        )
+
+
+def test_drafts_pending_renderer_silent_when_no_drafts(tmp_path: Path) -> None:
+    """Zero drafts → no false affordance, even with terminal-state
+    tasks (cancelled / done) on the project."""
+    from pollypm.cockpit_ui import (
+        PollyProjectDashboardApp,
+        ProjectDashboardData,
+    )
+
+    data = ProjectDashboardData(
+        project_key="savethenovel",
+        project_name="Save The Novel",
+        project_path=tmp_path,
+        persona_name=None,
+        pm_label="PM: polly",
+        exists_on_disk=True,
+        status_dot="○",
+        status_color="#4a5568",
+        status_label="idle",
+        active_worker=None,
+        architect=None,
+        task_counts={"done": 1},
+        task_buckets={
+            "done": [
+                {
+                    "task_id": "savethenovel/1",
+                    "task_number": 1,
+                    "title": "Shipped",
+                    "updated_at": "",
+                }
+            ]
+        },
+        plan_path=None,
+        plan_sections=[],
+        plan_explainer=None,
+        plan_text=None,
+        plan_aux_files=[],
+        plan_mtime=None,
+        plan_stale_reason=None,
+        activity_entries=[],
+        inbox_count=0,
+        inbox_top=[],
+        action_items=[],
+        alert_count=0,
+    )
+    assert PollyProjectDashboardApp._render_drafts_pending(
+        None, data,  # type: ignore[arg-type]
+    ) == ""
+
+
+def test_drafts_pending_renderer_silent_when_path_missing(
+    tmp_path: Path,
+) -> None:
+    """Project path missing on disk → topbar surfaces a louder warning
+    already; the drafts panel defers (matches empty-state behavior)."""
+    from pollypm.cockpit_ui import (
+        PollyProjectDashboardApp,
+        ProjectDashboardData,
+    )
+
+    data = ProjectDashboardData(
+        project_key="savethenovel",
+        project_name="Save The Novel",
+        project_path=None,
+        persona_name=None,
+        pm_label="PM: polly",
+        exists_on_disk=False,
+        status_dot="○",
+        status_color="#4a5568",
+        status_label="idle",
+        active_worker=None,
+        architect=None,
+        task_counts={"draft": 5},
+        task_buckets={
+            "draft": [
+                {
+                    "task_id": "savethenovel/1",
+                    "task_number": 1,
+                    "title": "Draft 1",
+                    "updated_at": "",
+                }
+            ]
+        },
+        plan_path=None,
+        plan_sections=[],
+        plan_explainer=None,
+        plan_text=None,
+        plan_aux_files=[],
+        plan_mtime=None,
+        plan_stale_reason=None,
+        activity_entries=[],
+        inbox_count=0,
+        inbox_top=[],
+        action_items=[],
+        alert_count=0,
+    )
+    assert PollyProjectDashboardApp._render_drafts_pending(
+        None, data,  # type: ignore[arg-type]
+    ) == ""
+
+
+def test_drafts_pending_does_not_block_empty_state_at_zero_total(
+    tmp_path: Path,
+) -> None:
+    """Trigger conditions are disjoint: empty-state fires at total==0,
+    drafts-pending fires at total>0 with draft>0 and live==0. Don't
+    regress the empty-state's own trigger when drafts==0 too."""
+    from pollypm.cockpit_ui import (
+        PollyProjectDashboardApp,
+        ProjectDashboardData,
+    )
+
+    zero = ProjectDashboardData(
+        project_key="savethenovel",
+        project_name="Save The Novel",
+        project_path=tmp_path,
+        persona_name=None,
+        pm_label="PM: polly",
+        exists_on_disk=True,
+        status_dot="○",
+        status_color="#4a5568",
+        status_label="idle",
+        active_worker=None,
+        architect=None,
+        task_counts={},
+        task_buckets={},
+        plan_path=None,
+        plan_sections=[],
+        plan_explainer=None,
+        plan_text=None,
+        plan_aux_files=[],
+        plan_mtime=None,
+        plan_stale_reason=None,
+        activity_entries=[],
+        inbox_count=0,
+        inbox_top=[],
+        action_items=[],
+        alert_count=0,
+    )
+    assert PollyProjectDashboardApp._render_drafts_pending(
+        None, zero,  # type: ignore[arg-type]
+    ) == ""
+    # Empty-state still fires at total==0 — guard the disjoint trigger.
+    assert "No tasks for savethenovel" in (
+        PollyProjectDashboardApp._render_empty_state(
+            None, zero,  # type: ignore[arg-type]
+        )
+    )
+
+
+def test_pipeline_strip_includes_draft_bucket(tmp_path: Path) -> None:
+    """A project with only drafts must still render the pipeline strip
+    with a ``draft`` glyph — the historical strip omitted it, which is
+    why drafts piled up invisibly."""
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    data = _draft_data(tmp_path, draft_count=2)
+    rendered = PollyProjectDashboardApp._render_pipeline_body(
+        None, data,  # type: ignore[arg-type]
+    )
+    assert "No tasks yet" not in rendered
+    assert "draft" in rendered.lower()
+    # Bucket header + at least one draft row by number
+    assert "Draft" in rendered  # status header (.title())
+    assert "#1" in rendered or "Draft 1" in rendered
+
+
+def test_drafts_pending_real_db_only_drafts_no_live_work(tmp_path: Path) -> None:
+    """Integration: a real work-DB with only a draft row → the
+    gathered ``ProjectDashboardData`` carries the draft count and the
+    drafts-pending renderer fires while the empty-state stays hidden.
+
+    Bypasses the App pilot so this doesn't race the first-refresh
+    worker thread; the renderer is still the one the App calls."""
+    # ``_write_config`` writes ``[projects.demo]`` with the project
+    # path pointing at the directory we create — keep the project
+    # dir name aligned so the work-service stores tasks under the
+    # canonical project alias the dashboard looks up.
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    _init_git_repo(project_path)
+    config_path = tmp_path / "pollypm.toml"
+    _write_config(project_path, config_path)
+
+    if not _load_config_compatible(config_path):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+
+    project_db = project_path / ".pollypm" / "state.db"
+    project_db.parent.mkdir(parents=True, exist_ok=True)
+    with SQLiteWorkService(db_path=project_db, project_path=project_path) as svc:
+        svc.create(
+            title="Unpromoted draft",
+            description="seed",
+            type="task",
+            project="demo",
+            flow_template="standard",
+            roles={"worker": "worker", "reviewer": "reviewer"},
+            priority="normal",
+            created_by="polly",
+        )
+        # Note: do NOT call svc.queue() — the draft must stay in DRAFT.
+
+    from pollypm import cockpit_ui as _cockpit_ui
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    _cockpit_ui._PROJECT_DASHBOARD_TASK_CACHE.clear()
+    data = _cockpit_ui._gather_project_dashboard(config_path, "demo")
+    assert data is not None
+    # Sanity: exactly one draft, no live work, total > 0 (empty-state
+    # would have fired at total==0 instead).
+    assert data.task_counts.get("draft") == 1
+    assert not any(
+        int(data.task_counts.get(s, 0))
+        for s in ("queued", "in_progress", "review")
+    )
+    total = sum(int(v or 0) for v in (data.task_counts or {}).values())
+    assert total > 0
+
+    drafts_rendered = PollyProjectDashboardApp._render_drafts_pending(
+        None, data,  # type: ignore[arg-type]
+    )
+    assert "1 draft pending" in drafts_rendered
+    assert "pm task queue" in drafts_rendered
+
+    # Empty-state defers because total > 0.
+    empty_rendered = PollyProjectDashboardApp._render_empty_state(
+        None, data,  # type: ignore[arg-type]
+    )
+    assert empty_rendered == ""
+
+    # Pipeline body now contains the draft bucket too — verifying the
+    # historical "draft omitted" gap is closed.
+    pipeline_rendered = PollyProjectDashboardApp._render_pipeline_body(
+        None, data,  # type: ignore[arg-type]
+    )
+    assert "No tasks yet" not in pipeline_rendered
+    assert "draft" in pipeline_rendered.lower()
+
+
+def test_drafts_pending_panel_mounts_in_compose(tmp_path: Path) -> None:
+    """Confirm the drafts-pending widget participates in ``compose``
+    (mounted under ``proj-body`` between empty-state and inbox-section)
+    and starts hidden when the App is constructed."""
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    _init_git_repo(project_path)
+    config_path = tmp_path / "pollypm.toml"
+    _write_config(project_path, config_path)
+
+    app = PollyProjectDashboardApp(config_path, "demo")
+    assert app.drafts_pending is not None
+    assert app.drafts_pending.id == "proj-drafts-pending"
+    # Hidden by default (CSS class). The render path toggles it.
+    assert "-hidden" in app.drafts_pending.classes

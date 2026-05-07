@@ -651,7 +651,11 @@ class TestCliErrors:
         assert "Traceback" not in result.output
         assert "✗ Required task roles are missing." in result.output
         assert "Why: flow 'standard' requires worker, reviewer." in result.output
-        assert "Fix: rerun with `--role worker=<agent> --role reviewer=<agent>`." in result.output
+        # Tightened post-savethenovel: the fix-suggestion now spells out
+        # legal agent values and explicitly warns against ``user``.
+        assert "--role worker=<agent> --role reviewer=<agent>" in result.output
+        assert "architect, reviewer, worker, polly, russell, triage" in result.output
+        assert "NOT `user`" in result.output
 
     def test_cli_get_missing_task_includes_why_fix_and_suggestion(self, db_path):
         _create_task(db_path, title="Only task")
@@ -682,6 +686,89 @@ class TestCliErrors:
         assert "Why: `pm task update` only changes fields you pass as flags." in result.output
         assert "--title" in result.output
         assert "--relevant-files" in result.output
+
+
+class TestCliCreateRoleAgentValidation:
+    """savethenovel forensic — Polly typed ``--role worker=user --role
+    reviewer=user`` while planning a project, and the work service
+    happily stored ``roles={"worker":"user","reviewer":"user"}``. The
+    resulting worker session ran with ``Assignee: user`` for ~37
+    seconds before she self-cancelled. The validation gate must
+    reject ``user`` (and similar non-agent values) on roles that
+    drive autonomous-agent execution nodes.
+    """
+
+    def _create(self, db_path, roles, flow="standard"):
+        args = [
+            "create",
+            "Plan task",
+            "--project",
+            "proj",
+            "--flow",
+            flow,
+            "--db",
+            db_path,
+        ]
+        for r in roles:
+            args.extend(["--role", r])
+        return runner.invoke(task_app, args)
+
+    def test_worker_user_is_rejected_with_clear_error(self, db_path):
+        result = self._create(db_path, ["worker=user", "reviewer=user"])
+        assert result.exit_code == 1
+        assert "Traceback" not in result.output
+        assert "✗ Invalid agent value for an autonomous role." in result.output
+        assert "worker='user'" in result.output
+        assert "reviewer='user'" in result.output
+        # The error must list legal options so the next try works.
+        assert "architect" in result.output
+        assert "polly" in result.output
+        # And it must point at the project-plan escape hatch.
+        assert "pm project plan" in result.output
+
+    def test_human_and_placeholder_values_are_also_rejected(self, db_path):
+        # Personal names ("sam") are NOT rejected — existing fixtures use
+        # them as opaque worker IDs. Only canonical human-markers and
+        # obvious placeholders trip the gate.
+        for bad in ("human", "  USER  ", "nobody", "tbd", "?"):
+            result = self._create(db_path, [f"worker={bad}", "reviewer=russell"])
+            assert result.exit_code == 1, f"{bad!r} should be rejected: {result.output}"
+            assert "✗ Invalid agent value for an autonomous role." in result.output
+
+    def test_legitimate_agent_values_succeed(self, db_path):
+        # Canonical role-contract names.
+        result = self._create(
+            db_path, ["worker=architect", "reviewer=russell"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "Created proj/" in result.output
+
+    def test_agent_dash_id_pattern_still_succeeds(self, db_path):
+        # The existing test convention uses ``agent-1`` / ``agent-2`` — those
+        # opaque worker IDs must remain valid (the fix is a blacklist, not a
+        # whitelist).
+        result = self._create(
+            db_path, ["worker=agent-1", "reviewer=agent-2"]
+        )
+        assert result.exit_code == 0, result.output
+
+    def test_requester_user_remains_legal(self, db_path):
+        # Metadata-only roles like ``requester`` are NOT autonomous — the
+        # inbox view explicitly relies on ``requester=user`` to mark a
+        # task as user-facing (pollypm.work.inbox_view._roles_match_user).
+        result = self._create(
+            db_path,
+            ["worker=worker", "reviewer=russell", "requester=user"],
+        )
+        assert result.exit_code == 0, result.output
+
+    def test_required_role_gate_still_fires_for_missing_role(self, db_path):
+        # When ``--role`` is omitted entirely we should still hit the
+        # "Required task roles are missing" gate, not the new
+        # invalid-agent gate.
+        result = self._create(db_path, [])
+        assert result.exit_code == 1
+        assert "✗ Required task roles are missing." in result.output
 
 
 class TestCliContext:

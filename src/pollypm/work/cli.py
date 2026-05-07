@@ -74,6 +74,9 @@ _INVALID_TASK_ID_RE = re.compile(r"Invalid task_id '([^']+)'\.")
 _REQUIRED_ROLE_RE = re.compile(
     r"Required role '([^']+)' not provided\. Flow '([^']+)' requires: \[(.*)\]"
 )
+_INVALID_AGENT_VALUE_RE = re.compile(
+    r"Invalid agent value\(s\) for role\(s\): (.+?)\. '([^']+)' is not an autonomous agent"
+)
 
 
 def _nearest_task_id(service: object | None, task_id: str) -> str | None:
@@ -145,7 +148,30 @@ def _render_work_service_error(exc: Exception, fn) -> str:
                     f"flow '{flow_name}' requires "
                     f"{', '.join(required_roles)}."
                 ),
-                fix=f"rerun with `{role_flags}`.",
+                fix=(
+                    f"rerun with `{role_flags}` where `<agent>` is one of: "
+                    f"architect, reviewer, worker, polly, russell, triage "
+                    f"(NOT `user` — that's a human, not an autonomous agent)."
+                ),
+            )
+        match = _INVALID_AGENT_VALUE_RE.search(message)
+        if match:
+            offending_pairs = match.group(1)
+            sample_value = match.group(2)
+            return format_cli_error(
+                "Invalid agent value for an autonomous role.",
+                why=(
+                    f"{offending_pairs}: '{sample_value}' is not an "
+                    f"autonomous agent identity. Workers and reviewers "
+                    f"are agents that claim and execute the node; the "
+                    f"human ('user' / 'human' / 'sam') cannot."
+                ),
+                fix=(
+                    "rerun with one of: architect, reviewer, worker, "
+                    "polly, russell, triage — or, for project planning, "
+                    "use `pm project plan <project>` instead of `pm task "
+                    "create`."
+                ),
             )
 
     return render_cli_error(message)

@@ -255,13 +255,19 @@ def accept_proposal(
     title = (spec.get("title") or "").strip() or "Proposal follow-up"
     description = (spec.get("description") or "").strip()
     acceptance_criteria = spec.get("acceptance_criteria") or None
+    # The user-review flow has reviewer as ``actor_type: human``, so no
+    # ``reviewer=`` role assignment is needed. Previously this used the
+    # ``standard`` flow with ``reviewer=user`` — that's the savethenovel
+    # bug shape (``user`` is not an autonomous agent that can claim a
+    # role-typed review node). The user-review flow is the structurally
+    # correct way to express "worker implements, human reviews".
     task = service.create(
         title=title,
         description=description,
         type="task",
         project=project_key,
-        flow_template="standard",
-        roles={"worker": "worker", "reviewer": "user", "requester": "user"},
+        flow_template="user-review",
+        roles={"worker": "worker", "requester": "user"},
         priority="normal",
         created_by=actor,
         acceptance_criteria=acceptance_criteria,

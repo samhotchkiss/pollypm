@@ -1031,6 +1031,71 @@ def test_plan_review_message_detail_renders_plan_inline_when_available(
     _run(body())
 
 
+# ---------------------------------------------------------------------------
+# Deny flow (#1403) — capital D opens reason prompt, captures reason,
+# cancels the underlying plan_task, creates a successor with
+# ``predecessor_task_id``, and routes to the PM with a denial primer.
+# ---------------------------------------------------------------------------
+
+
+class TestPlanReviewDenialPrimer:
+    def test_primer_includes_denial_reason_and_successor(self) -> None:
+        from pollypm.cockpit_ui import _build_plan_review_denial_primer
+
+        primer = _build_plan_review_denial_primer(
+            project_key="demo",
+            cancelled_plan_task_id="demo/3",
+            successor_plan_task_id="demo/4",
+            denial_reason="Backlog is too coarse — break it down further.",
+            reviewer_name="Sam",
+        )
+        assert "denied plan task demo/3" in primer
+        assert "Successor plan task: demo/4" in primer
+        assert "Backlog is too coarse" in primer
+        assert "Sit with Sam on the concerns" in primer
+        assert "plan_review_denied" in primer
+
+    def test_primer_swaps_to_polly_when_fast_track(self) -> None:
+        from pollypm.cockpit_ui import _build_plan_review_denial_primer
+
+        primer = _build_plan_review_denial_primer(
+            project_key="demo",
+            cancelled_plan_task_id="demo/3",
+            successor_plan_task_id="demo/4",
+            denial_reason="not enough decomposition",
+            reviewer_name="Polly",
+        )
+        assert "Polly just denied plan task demo/3" in primer
+        assert "Sit with Polly on the concerns" in primer
+
+
+def test_capital_D_opens_denial_reason_prompt(
+    plan_review_env, inbox_app,
+) -> None:
+    """``D`` on a plan_review row repurposes the reply input as a
+    denial-reason prompt and arms ``_awaiting_denial_task_id``."""
+
+    async def body() -> None:
+        async with inbox_app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            inbox_app.list_view.index = 0
+            await pilot.press("enter")
+            await pilot.pause()
+            task_id = inbox_app._selected_task_id
+            assert task_id == plan_review_env["plan_review_id"]
+            assert inbox_app._awaiting_denial_task_id is None
+
+            await pilot.press("D")
+            await pilot.pause()
+
+            assert inbox_app._awaiting_denial_task_id == task_id
+            placeholder = inbox_app.reply_input.placeholder or ""
+            assert "Denial reason" in placeholder
+            assert inbox_app.reply_input.has_focus
+
+    _run(body())
+
+
 def test_plan_review_message_detail_falls_back_when_plan_missing(
     plan_review_message_env, plan_review_message_app,
 ) -> None:
@@ -1185,5 +1250,191 @@ def test_project_drilldown_plan_review_card_surfaces_plan_summary(
             assert "cache invalidation" in rendered
             # File path NOT surfaced in the action card.
             assert "docs/project-plan.md" not in rendered
+
+    _run(body())
+
+
+def test_capital_D_no_op_on_non_plan_review(tmp_path: Path) -> None:
+    """``D`` on a generic (non-plan_review) inbox row is a no-op."""
+
+    async def body() -> None:
+        project_path = tmp_path / "demo"
+        project_path.mkdir()
+        (project_path / ".git").mkdir()
+        config_path = tmp_path / "pollypm.toml"
+        _write_minimal_config(project_path, config_path)
+
+        # Seed a generic chat task — no plan_review label.
+        db_path = project_path / ".pollypm" / "state.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        svc = SQLiteWorkService(db_path=db_path, project_path=project_path)
+        try:
+            svc.create(
+                title="Just a regular task",
+                description="Generic body.",
+                type="task",
+                project="demo",
+                flow_template="chat",
+                roles={"requester": "user", "operator": "polly"},
+                priority="normal",
+                created_by="polly",
+            )
+        finally:
+            svc.close()
+
+        if not _load_config_compatible(config_path):
+            pytest.skip("minimal pollypm.toml fixture not supported by loader")
+
+        from pollypm.cockpit_ui import PollyInboxApp
+
+        app = PollyInboxApp(config_path)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            if not app._tasks:
+                pytest.skip("seed did not produce inbox rows")
+            app.list_view.index = 0
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._awaiting_denial_task_id is None
+            await pilot.press("D")
+            await pilot.pause()
+            assert app._awaiting_denial_task_id is None
+
+    _run(body())
+
+
+def test_finish_deny_cancels_plan_task_and_creates_successor(
+    plan_review_env, inbox_app,
+) -> None:
+    """End-to-end: ``D`` → type reason → Enter cancels the plan_task,
+    seeds a successor with ``predecessor_task_id``, and stamps the
+    denial reason on both the cancelled task and the successor."""
+
+    async def body() -> None:
+        # Stub the PM dispatch so the test doesn't try to talk to tmux.
+        from pollypm.cockpit_ui import PollyInboxApp
+
+        dispatch_calls: list[tuple[str, str, str]] = []
+
+        def fake_dispatch(self, cockpit_key, context_line, pm_label, **_kw):
+            dispatch_calls.append((cockpit_key, context_line, pm_label))
+
+        original = PollyInboxApp._dispatch_to_pm_sync
+        PollyInboxApp._dispatch_to_pm_sync = fake_dispatch  # type: ignore[assignment]
+        try:
+            async with inbox_app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                inbox_app.list_view.index = 0
+                await pilot.press("enter")
+                await pilot.pause()
+                task_id = inbox_app._selected_task_id
+                plan_task_id = plan_review_env["plan_task_id"]
+
+                await pilot.press("D")
+                await pilot.pause()
+                assert inbox_app._awaiting_denial_task_id == task_id
+
+                inbox_app.reply_input.value = (
+                    "Tasks are too coarse — break the auth flow into "
+                    "three separate tasks."
+                )
+                await pilot.press("enter")
+                await pilot.pause()
+
+                # The plan_task is cancelled with the reason.
+                svc = SQLiteWorkService(
+                    db_path=plan_review_env["project_path"] / ".pollypm" / "state.db",
+                    project_path=plan_review_env["project_path"],
+                )
+                try:
+                    cancelled = svc.get(plan_task_id)
+                    cancelled_status = (
+                        cancelled.work_status.value
+                        if hasattr(cancelled.work_status, "value")
+                        else cancelled.work_status
+                    )
+                    assert cancelled_status == "cancelled"
+                    # Cancellation reason is the user's first message —
+                    # the transition row stamps it under to_state=cancelled.
+                    cancel_reasons = [
+                        getattr(t, "reason", "") or ""
+                        for t in (cancelled.transitions or [])
+                        if getattr(t, "to_state", "") == "cancelled"
+                    ]
+                    assert any(
+                        "Tasks are too coarse" in r for r in cancel_reasons
+                    ), f"no matching transition reason: {cancel_reasons}"
+
+                    # Successor exists with ``predecessor_task_id``.
+                    successors = svc.list_successors(plan_task_id)
+                    assert len(successors) == 1
+                    successor = successors[0]
+                    assert successor.predecessor_task_id == plan_task_id
+                    assert successor.flow_template_id == "plan_project"
+
+                    # Denial reason is stamped on the successor as
+                    # ``plan_review_denied`` context.
+                    den_ctx = svc.get_context(
+                        successor.task_id,
+                        entry_type="plan_review_denied",
+                        limit=5,
+                    )
+                    den_text = " ".join(
+                        getattr(e, "text", "") or "" for e in den_ctx
+                    )
+                    assert "Tasks are too coarse" in den_text
+                finally:
+                    svc.close()
+
+                # Inbox row dropped from the cached list.
+                assert all(
+                    t.task_id != task_id for t in inbox_app._tasks
+                )
+                # Denial-pending state cleared.
+                assert inbox_app._awaiting_denial_task_id is None
+
+                # PM dispatch fired with a denial primer (best-effort,
+                # may be queued via run_worker so we tolerate an empty
+                # list under run_test).
+                if dispatch_calls:
+                    _, context_line, _ = dispatch_calls[-1]
+                    assert "denied plan task" in context_line
+                    assert "Tasks are too coarse" in context_line
+        finally:
+            PollyInboxApp._dispatch_to_pm_sync = original  # type: ignore[assignment]
+
+    _run(body())
+
+
+def test_esc_cancels_pending_denial(plan_review_env, inbox_app) -> None:
+    """Pressing Esc while ``_awaiting_denial_task_id`` is set clears
+    the pending denial without firing the cancel cascade."""
+
+    async def body() -> None:
+        async with inbox_app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            inbox_app.list_view.index = 0
+            await pilot.press("enter")
+            await pilot.pause()
+            task_id = inbox_app._selected_task_id
+
+            await pilot.press("D")
+            await pilot.pause()
+            assert inbox_app._awaiting_denial_task_id == task_id
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert inbox_app._awaiting_denial_task_id is None
+
+            # Plan task is still alive (no cancel fired).
+            svc = SQLiteWorkService(
+                db_path=plan_review_env["project_path"] / ".pollypm" / "state.db",
+                project_path=plan_review_env["project_path"],
+            )
+            try:
+                plan_task = svc.get(plan_review_env["plan_task_id"])
+                assert plan_task.work_status != "cancelled"
+            finally:
+                svc.close()
 
     _run(body())

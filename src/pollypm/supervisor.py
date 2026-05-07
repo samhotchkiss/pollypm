@@ -938,6 +938,27 @@ class Supervisor:
                 "cockpit-socket reaper failed at bootstrap", exc_info=True,
             )
 
+        # #1432 — reap stale ``pollypm.rail_daemon`` processes from
+        # prior boots. ``pm reset --force && pm up`` cycles, crashed
+        # cockpit teardowns, and test runs against temp configs all
+        # leave detached daemons alive that the PID-file gate
+        # (``cli._rail_daemon_live``) doesn't catch. The field machine
+        # accumulated three concurrent daemons (#1431 / #1432) before
+        # this reaper landed. Bootstrap is the safe sweep time: the
+        # launch executor's ``START_RAIL_DAEMON`` action fires AFTER
+        # this hook, so any daemon visible here is by definition from
+        # a prior boot and reaping it can't race with the current one.
+        try:
+            from pollypm.rail_daemon_reaper import reap_stale_rail_daemons
+            from pollypm.config import DEFAULT_CONFIG_PATH as _DEFAULT_CONFIG_PATH
+
+            cfg_path = getattr(self.config, "config_path", None) or _DEFAULT_CONFIG_PATH
+            reap_stale_rail_daemons(current_config_path=cfg_path)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "rail-daemon reaper failed at bootstrap", exc_info=True,
+            )
+
     def repair_sessions_table(self) -> int:
         """Upsert a ``sessions`` row for every configured session whose
         tmux window is currently alive.

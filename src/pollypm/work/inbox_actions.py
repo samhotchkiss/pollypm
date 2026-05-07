@@ -75,7 +75,7 @@ def resolve_inbox_work_service(config: Any, item: Any, task_id: str) -> Any | No
         except Exception:  # noqa: BLE001
             pass
     logger.warning(
-        "cockpit inbox: svc unresolved for task_id=%s project_name=%r scope=%r db_path=%r",
+        "cockpit inbox: svc unresolved for task_id=%s project_key=%r scope=%r db_path=%r",
         task_id,
         getattr(item, "project", None) if item is not None else None,
         getattr(item, "scope", None) if item is not None else None,

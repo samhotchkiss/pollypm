@@ -863,6 +863,133 @@ def test_cockpit_ui_project_rollup_status_uses_indicator_not_label() -> None:
     asyncio.run(exercise())
 
 
+def test_cockpit_router_decorate_project_row_carries_approval_count() -> None:
+    """The router's row decoration step copies ``approvals_pending``
+    from the rollup onto the CockpitItem and appends the ``(N⚠)``
+    suffix — the renderer reads only the item, so without this the
+    affordance never reaches the rail."""
+    router = CockpitRouter.__new__(CockpitRouter)
+    router.is_project_pinned = lambda key: False  # type: ignore[method-assign]
+
+    rollup = ProjectStateRollup(
+        state=ProjectRailState.GREEN,
+        badge="🟢",
+        sort_rank=2,
+        actionable_key="project:savethenovel:issues",
+        reason="user review remaining",
+        approvals_pending=2,
+    )
+    decorated = router._decorate_project_row(
+        CockpitItem("project:savethenovel", "savethenovel", "idle"),
+        sparkline=None,
+        rollup=rollup,
+    )
+
+    assert decorated.approvals_pending == 2
+    assert decorated.label.endswith("(2⚠)")
+    assert decorated.state == "project-green"
+
+
+def test_cockpit_raw_rail_project_row_renders_approval_affordance() -> None:
+    """#1390 — savethenovel-class scenario: a project with at least one
+    task in status=review + assignee=human must render the prominent
+    ▶ glyph + ``(N⚠)`` suffix on the rail line, not the quiet GREEN
+    dot, so the user can tell at a glance that a decision is waiting.
+    """
+    rail = PollyCockpitRail.__new__(PollyCockpitRail)
+    rail.selected_key = "polly"
+    rail.spinner_index = 0
+
+    row = rail._item_row(
+        CockpitItem(
+            "project:savethenovel",
+            "savethenovel (1⚠)",
+            "project-green",
+            approvals_pending=1,
+        ),
+        width=40,
+        active_view="polly",
+    )
+
+    assert "savethenovel" in row.text
+    assert "▶" in row.text
+    assert "(1⚠)" in row.text
+    # The quiet GREEN ``•`` indicator must be replaced — the whole
+    # point is to *not* read as an idle/moving project.
+    assert "• savethenovel" not in row.text
+
+
+def test_cockpit_raw_rail_project_row_no_affordance_without_pending() -> None:
+    """A normal moving project (no approvals_pending) keeps its
+    existing quiet glyph and bare label — the affordance is gated on
+    the explicit pending count, not on rollup color."""
+    rail = PollyCockpitRail.__new__(PollyCockpitRail)
+    rail.selected_key = "polly"
+    rail.spinner_index = 0
+
+    row = rail._item_row(
+        CockpitItem(
+            "project:savethenovel",
+            "savethenovel",
+            "project-working",
+        ),
+        width=40,
+        active_view="polly",
+    )
+
+    assert "savethenovel" in row.text
+    assert "▶" not in row.text
+    assert "⚠" not in row.text
+
+
+def test_cockpit_raw_rail_project_row_approval_count_pluralizes() -> None:
+    """When more than one task is parked at user_approval, the count
+    embedded in the label must reflect the actual number — single ▶
+    glyph stays the same, only the suffix changes."""
+    rail = PollyCockpitRail.__new__(PollyCockpitRail)
+    rail.selected_key = "polly"
+    rail.spinner_index = 0
+
+    row = rail._item_row(
+        CockpitItem(
+            "project:savethenovel",
+            "savethenovel (3⚠)",
+            "project-green",
+            approvals_pending=3,
+        ),
+        width=40,
+        active_view="polly",
+    )
+
+    assert "▶" in row.text
+    assert "(3⚠)" in row.text
+
+
+def test_cockpit_raw_rail_approval_affordance_fits_narrow_30col_pane() -> None:
+    """The rail's textual mode caps at 30 columns. The ▶ glyph + (N⚠)
+    suffix must not push the project name off-screen for typical
+    project keys (≤16 chars)."""
+    rail = PollyCockpitRail.__new__(PollyCockpitRail)
+    rail.selected_key = "polly"
+    rail.spinner_index = 0
+
+    row = rail._item_row(
+        CockpitItem(
+            "project:savethenovel",
+            "savethenovel (1⚠)",
+            "project-green",
+            approvals_pending=1,
+        ),
+        width=30,
+        active_view="polly",
+    )
+
+    # The full glyph + suffix combo fits in the 30-col pane without
+    # truncating the project key.
+    assert "▶" in row.text
+    assert "savethenovel" in row.text
+
+
 def test_cockpit_rail_session_indicator_combines_pulse_and_work_glyph(monkeypatch, tmp_path: Path) -> None:
     config_path = tmp_path / "pollypm.toml"
     config_path.write_text(

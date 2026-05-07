@@ -328,6 +328,10 @@ class CockpitItem:
     # ``alert_id`` is the supervisor's row id, used by recovery
     # handlers that need to clear/lookup the specific alert.
     alert_id: int | None = None
+    # #1390 — Number of tasks on this project that are parked at a
+    # human-decision review node (status=review + assignee=human).
+    # Drives the rail's ▶ "needs your decision" affordance + suffix.
+    approvals_pending: int = 0
 
 
 def _stuck_alert_already_user_waiting(
@@ -1688,12 +1692,20 @@ class CockpitRouter:
         label = item.label
         if self.is_project_pinned(item.key.split(":", 1)[1]):
             label = f"📌 {label}"
+        # #1390 — Append the "(N⚠)" approvals suffix BEFORE the activity
+        # sparkline so ``_strip_trailing_spark`` (used by the textual
+        # rail to render in the 30-col pane) can still peel the spark
+        # off the tail and the suffix survives into the visible label.
+        approvals = rollup.approvals_pending if rollup is not None else 0
+        if approvals > 0:
+            label = f"{label} ({approvals}⚠)"
         if sparkline:
             label = f"{label} {sparkline}"
         return replace(
             item,
             label=label,
             state=self._project_row_state(item.state, rollup),
+            approvals_pending=approvals,
         )
 
     def _project_row_state(
@@ -4216,6 +4228,15 @@ class PollyCockpitRail:
 
     def _indicator(self, item: CockpitItem) -> tuple[str, _C | None]:
         if item.key.startswith("project:"):
+            # #1390 — Approval-pending takes precedence over the rollup
+            # color so a project parked at user_approval reads as "act
+            # on me" even if it was otherwise GREEN/YELLOW. Skip RED so
+            # operational fault states keep their dedicated glyph.
+            if (
+                item.approvals_pending > 0
+                and item.state != "project-red"
+            ):
+                return "▶", PALETTE["alert_indicator"]
             if item.state == "project-red":
                 # #989 \u2014 The project rollup paints ``project-red`` for
                 # both warn and error alerts; pick the amber indicator

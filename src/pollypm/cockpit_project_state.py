@@ -72,6 +72,12 @@ class ProjectStateRollup:
     sort_rank: int
     actionable_key: str | None = None
     reason: str = ""
+    # #1390 — Count of tasks where status=review AND a human is the
+    # assignee/actor (e.g. user_approval node). The rail uses this to
+    # render a prominent "needs your decision" affordance — savethenovel
+    # had a plan parked at user_approval for hours without any
+    # rail-level signal because the GREEN dot reads as "fine, moving".
+    approvals_pending: int = 0
 
 
 def task_id_for(task: object) -> str | None:
@@ -124,6 +130,9 @@ def rollup_project_state(
         task for task in task_list
         if not _is_terminal(task) and _status(task) not in _INACTIVE_STATUSES
     ]
+    approvals_pending = sum(
+        1 for task in active_tasks if _is_human_review(task)
+    )
     if not active_tasks:
         return _rollup(ProjectRailState.NONE, project_key=project_key)
 
@@ -164,6 +173,7 @@ def rollup_project_state(
             project_key=project_key,
             task=_first_actionable_task(alerted),
             reason="operational alert needs review",
+            approvals_pending=approvals_pending,
         )
     if user_waiting:
         return _rollup(
@@ -175,6 +185,7 @@ def rollup_project_state(
                 if len(user_waiting) == len(active_tasks)
                 else "some tasks waiting on user"
             ),
+            approvals_pending=approvals_pending,
         )
     if all(_is_user_review(task) for task in active_tasks):
         return _rollup(
@@ -182,6 +193,7 @@ def rollup_project_state(
             project_key=project_key,
             task=active_tasks[0],
             reason="user review remaining",
+            approvals_pending=approvals_pending,
         )
     if any(_is_automated_progress(task) for task in active_tasks):
         return _rollup(
@@ -192,11 +204,13 @@ def rollup_project_state(
                 if plan_blocked and not advanceable
                 else "automated work active"
             ),
+            approvals_pending=approvals_pending,
         )
     return _rollup(
         ProjectRailState.WORKING,
         project_key=project_key,
         reason="non-terminal work remains",
+        approvals_pending=approvals_pending,
     )
 
 
@@ -206,6 +220,7 @@ def _rollup(
     project_key: str,
     task: object | None = None,
     reason: str = "",
+    approvals_pending: int = 0,
 ) -> ProjectStateRollup:
     return ProjectStateRollup(
         state=state,
@@ -213,6 +228,7 @@ def _rollup(
         sort_rank=_SORT_RANKS[state],
         actionable_key=_actionable_key(project_key, task),
         reason=reason,
+        approvals_pending=approvals_pending,
     )
 
 
@@ -237,6 +253,29 @@ def _is_terminal(task: object) -> bool:
 
 def _is_waiting_on_user(task: object) -> bool:
     return _status(task) in _WAITING_STATUSES
+
+
+def _is_human_review(task: object) -> bool:
+    """Return True for tasks parked at a human-decision review node.
+
+    Scoped narrower than ``_is_user_review``: only counts tasks where
+    ``status=='review'`` AND a human is named as the actor/assignee
+    (or the node id explicitly marks a user/approval touchpoint).
+    Drives the rail's ``(N approvals)`` affordance — see #1390.
+    """
+    if _status(task) != "review":
+        return False
+    owner = str(getattr(task, "owner", "") or "").lower()
+    actor = str(getattr(task, "actor_type", "") or "").lower()
+    assignee = str(getattr(task, "assignee", "") or "").lower()
+    if owner in {"human", "user", "operator", "operator-pm"}:
+        return True
+    if actor == "human":
+        return True
+    if assignee == "human":
+        return True
+    node_id = _node_id(task)
+    return any(marker in node_id for marker in _USER_NODE_MARKERS)
 
 
 def _is_user_review(task: object) -> bool:

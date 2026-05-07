@@ -59,6 +59,7 @@ pollypm = [
   "defaults/magic/*/**/*.json",
   "defaults/magic/*/LICENSE",
   "defaults/docs/*.template",
+  "defaults/docs/*.md",
   "defaults/docs/reference/*.md",
   "defaults/demo/*",
   "defaults/demo/**/*",

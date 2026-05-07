@@ -24,6 +24,11 @@ from pollypm.cockpit_sections.header import _section_header, _worker_presence
 from pollypm.cockpit_sections.health import format_project_health_scorecard
 from pollypm.cockpit_sections.in_flight import _section_in_flight
 from pollypm.cockpit_sections.insights import _section_insights
+from pollypm.cockpit_sections.plan_review import (
+    find_plan_review_task,
+    load_plan_text,
+    render_plan_review_surface,
+)
 from pollypm.cockpit_sections.quick_actions import _section_quick_actions
 from pollypm.cockpit_sections.recent import _section_recent
 from pollypm.cockpit_sections.recent_commits import _section_recent_commits
@@ -120,6 +125,20 @@ def _render_project_dashboard(
     tokens = _aggregate_project_tokens(db_path, project_key)
 
     name = getattr(project, "name", None) or project_key
+
+    # #1401 — when the project has a plan-review task parked at
+    # ``user_approval``, swap the regular dashboard for the dedicated
+    # plan-review surface (full plan body + visible action bar). When
+    # nothing is pending, fall through to the regular dashboard below.
+    plan_review_task = find_plan_review_task(tasks)
+    if plan_review_task is not None:
+        plan_text = load_plan_text(project.path)
+        return render_plan_review_surface(
+            project_key=project_key,
+            project_name=name,
+            task=plan_review_task,
+            plan_text=plan_text,
+        )
 
     # Partition tasks for downstream sections.
     in_progress = [

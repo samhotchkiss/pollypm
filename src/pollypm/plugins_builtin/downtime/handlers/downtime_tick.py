@@ -93,14 +93,14 @@ def schedule_downtime_task(
     matching handlers without reparsing the description.
     """
     try:
-        from pollypm.work.sqlite_service import SQLiteWorkService
+        from pollypm.work import create_work_service
     except Exception:  # noqa: BLE001 - work service optional in some tests
         logger.warning("downtime: work service unavailable, cannot schedule task")
         return None
 
     try:
         project_root = Path(getattr(config.project, "root_dir", Path.cwd()))
-        svc = SQLiteWorkService(
+        svc = create_work_service(
             db_path=str(db_path) if db_path else ":memory:",
             project_path=project_root,
         )
@@ -204,13 +204,13 @@ def has_active_downtime_task(
 ) -> bool:
     """Return True if any downtime-labelled task is ``in_progress`` or ``review``."""
     try:
-        from pollypm.work.sqlite_service import SQLiteWorkService
+        from pollypm.work import create_work_service
     except Exception:  # noqa: BLE001
         return False
     if db_path is None:
         return False
     try:
-        svc = SQLiteWorkService(
+        svc = create_work_service(
             db_path=str(db_path),
             project_path=project_root or Path.cwd(),
         )

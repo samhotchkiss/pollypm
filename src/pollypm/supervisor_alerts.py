@@ -171,12 +171,12 @@ def _review_tasks_for_project(
     if cached is not None and cached[0] == db_mtime:
         return cached[1], cached[2]
 
-    from pollypm.work.sqlite_service import SQLiteWorkService
+    from pollypm.work import create_work_service
 
     entries: list[str] = []
     re_review_count = 0
     try:
-        with SQLiteWorkService(db_path=db_path) as svc:
+        with create_work_service(db_path=db_path) as svc:
             tasks = svc.list_tasks(work_status="review", project=project_key)
             for task in tasks:
                 if task.current_node_id and "human" in task.current_node_id:
@@ -520,8 +520,8 @@ def _build_task_nudge(supervisor: SupervisorAlertBoundary, launch: SessionLaunch
     # #804: same boundary fix as _build_review_nudge — public resolver,
     # logged failures instead of swallowing every exception.
     try:
+        from pollypm.work import create_work_service
         from pollypm.work.db_resolver import resolve_work_db_path
-        from pollypm.work.sqlite_service import SQLiteWorkService
 
         project = launch.session.project
         # #928: same boundary fix as _build_review_nudge — route the
@@ -532,7 +532,7 @@ def _build_task_nudge(supervisor: SupervisorAlertBoundary, launch: SessionLaunch
         db_path = resolve_work_db_path(project=project, config=supervisor.config)
         if not db_path.exists():
             return None
-        with SQLiteWorkService(db_path=db_path) as svc:
+        with create_work_service(db_path=db_path) as svc:
             task = svc.next(project=project)
             if task is None:
                 return None

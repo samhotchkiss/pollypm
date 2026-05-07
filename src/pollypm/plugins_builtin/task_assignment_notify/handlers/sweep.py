@@ -1987,10 +1987,10 @@ def _open_workspace_project_work_service(project: Any, services: Any) -> Any | N
     if not db_path.exists():
         return None
     try:
-        from pollypm.work.sqlite_service import SQLiteWorkService
+        from pollypm.work import create_work_service
 
         project_root = Path(project_path)
-        svc = SQLiteWorkService(db_path=db_path, project_path=project_root)
+        svc = create_work_service(db_path=db_path, project_path=project_root)
     except Exception:  # noqa: BLE001
         logger.debug(
             "task_assignment sweep: failed to open workspace DB at %s",
@@ -2016,9 +2016,9 @@ def _open_project_work_service(project: Any, services: Any) -> Any | None:
     if not db_path.exists():
         return None
     try:
-        from pollypm.work.sqlite_service import SQLiteWorkService
+        from pollypm.work import create_work_service
 
-        svc = SQLiteWorkService(db_path=db_path, project_path=Path(project_path))
+        svc = create_work_service(db_path=db_path, project_path=Path(project_path))
     except Exception:  # noqa: BLE001
         logger.debug(
             "task_assignment sweep: failed to open per-project DB at %s",

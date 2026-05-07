@@ -576,11 +576,11 @@ def _remove_demo_repo_files(target: Path, relative_names: set[str]) -> None:
 def seed_demo_project_task(project_path: Path, *, project_key: str) -> str:
     """Seed one small PollyPM task into the demo project's work DB."""
     from pollypm.projects import ensure_project_scaffold
-    from pollypm.work.sqlite_service import SQLiteWorkService
+    from pollypm.work import create_work_service
 
     ensure_project_scaffold(project_path)
     db_path = project_path / ".pollypm" / "state.db"
-    with SQLiteWorkService(db_path=db_path, project_path=project_path) as svc:
+    with create_work_service(db_path=db_path, project_path=project_path) as svc:
         existing = svc.list_tasks(project=project_key)
         for task in existing:
             if task.title == DEMO_PROJECT_TASK_TITLE:

@@ -116,7 +116,7 @@ def enqueue_advisor_review(
     """
     close_service = False
     if work_service is None:
-        from pollypm.work.sqlite_service import SQLiteWorkService
+        from pollypm.work import create_work_service
 
         # Prefer an existing state.db (per-project or workspace-root,
         # #1037). Only synthesize the per-project path when neither
@@ -126,7 +126,7 @@ def enqueue_advisor_review(
         if db_path is None:
             db_path = project_path / ".pollypm" / "state.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        work_service = SQLiteWorkService(db_path=db_path, project_path=project_path)
+        work_service = create_work_service(db_path=db_path, project_path=project_path)
         close_service = True
 
     try:
@@ -219,8 +219,8 @@ def has_project_stagnation_candidate(
         if db_path is None:
             return False
         try:
-            from pollypm.work.sqlite_service import SQLiteWorkService
-            work_service = SQLiteWorkService(db_path=db_path, project_path=project_path)
+            from pollypm.work import create_work_service
+            work_service = create_work_service(db_path=db_path, project_path=project_path)
             close_service = True
         except Exception:  # noqa: BLE001
             return False

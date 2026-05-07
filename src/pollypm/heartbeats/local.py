@@ -186,13 +186,13 @@ def _collect_work_service_signals(
         if not work_db.exists():
             return out
 
-        from pollypm.work.sqlite_service import SQLiteWorkService
+        from pollypm.work import create_work_service
 
         worktree_path: str | None = None
         claim_started_at: str | None = None
         claim_task_id: str | None = None
         try:
-            with SQLiteWorkService(
+            with create_work_service(
                 db_path=work_db, project_path=project_path,
             ) as svc:
                 sessions = svc.list_worker_sessions(
@@ -1123,7 +1123,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 load_runtime_services,
                 notify as _notify,
             )
-            from pollypm.work.sqlite_service import SQLiteWorkService
+            from pollypm.work import create_work_service
 
             task_id = signals.active_claim_task_id
             if not task_id or "/" not in task_id:
@@ -1144,7 +1144,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
 
             services = load_runtime_services()
             try:
-                with SQLiteWorkService(
+                with create_work_service(
                     db_path=work_db, project_path=project_cfg.path,
                 ) as svc:
                     tasks = svc.list_tasks(project=project)

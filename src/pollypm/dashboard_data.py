@@ -543,8 +543,8 @@ def _session_description(status: str, role: str, snapshot_path: str | None) -> s
 def _count_inbox_tasks(config: PollyPMConfig) -> int:
     """Total inbox tasks across all tracked projects (work-service backed)."""
     try:
+        from pollypm.work import create_work_service
         from pollypm.work.inbox_view import inbox_tasks
-        from pollypm.work.sqlite_service import SQLiteWorkService
     except Exception:  # noqa: BLE001
         return 0
     total = 0
@@ -562,7 +562,7 @@ def _count_inbox_tasks(config: PollyPMConfig) -> int:
         if not db_path.exists():
             continue
         try:
-            with SQLiteWorkService(
+            with create_work_service(
                 db_path=db_path, project_path=project.path,
             ) as svc:
                 total += len(inbox_tasks(svc, project=project_key))
@@ -653,8 +653,8 @@ def _inbox_sender(task) -> str:
 
 def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[InboxPreview]:
     try:
+        from pollypm.work import create_work_service
         from pollypm.work.inbox_view import inbox_tasks
-        from pollypm.work.sqlite_service import SQLiteWorkService
     except Exception:  # noqa: BLE001
         return []
 
@@ -678,7 +678,7 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
         if not db_path.exists():
             continue
         try:
-            with SQLiteWorkService(db_path=db_path, project_path=project_path) as svc:
+            with create_work_service(db_path=db_path, project_path=project_path) as svc:
                 for task in inbox_tasks(svc, project=project_key):
                     if task.task_id in seen_task_ids:
                         continue

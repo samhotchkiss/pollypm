@@ -206,7 +206,7 @@ def _on_project_created(context) -> None:
         # service. Local import to avoid pulling SQLite deps into code
         # paths that don't need them.
         from pathlib import Path as _Path
-        from pollypm.work.sqlite_service import SQLiteWorkService
+        from pollypm.work import create_work_service
 
         project_path = _Path(project_path_raw)
         db_path = workspace_db_path or (project_path / ".pollypm" / "state.db")
@@ -225,7 +225,7 @@ def _on_project_created(context) -> None:
                 f"Auto-created on project.created. Run the architect "
                 f"+ 5-critic planning pipeline on {project_key}."
             )
-        with SQLiteWorkService(
+        with create_work_service(
             db_path=db_path, project_path=project_path,
         ) as svc:
             task = svc.create(

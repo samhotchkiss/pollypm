@@ -877,9 +877,9 @@ def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
 
         inbox_task_id: str | None = None
         if resolved_priority == "immediate":
-            from pollypm.work.sqlite_service import SQLiteWorkService
+            from pollypm.work import create_work_service
 
-            svc = SQLiteWorkService(
+            svc = create_work_service(
                 db_path=db_path,
                 project_path=db_path.parent.parent,
             )

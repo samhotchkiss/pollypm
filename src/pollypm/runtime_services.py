@@ -96,11 +96,11 @@ def load_runtime_services(
     )
     work_service: Any | None
     try:
-        from pollypm.work.sqlite_service import SQLiteWorkService
+        from pollypm.work import create_work_service
 
         db_path = project_root / ".pollypm" / "state.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        work_service = SQLiteWorkService(db_path=db_path, project_path=project_root)
+        work_service = create_work_service(db_path=db_path, project_path=project_root)
     except Exception:  # noqa: BLE001
         logger.debug("runtime_services: work service unavailable", exc_info=True)
         work_service = None

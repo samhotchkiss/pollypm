@@ -4048,9 +4048,9 @@ def _collect_recent_tasks_by_account(
         if not db_path.exists():
             continue
         try:
-            from pollypm.work.sqlite_service import SQLiteWorkService
+            from pollypm.work import create_work_service
 
-            with SQLiteWorkService(db_path=db_path, project_path=project_path) as svc:
+            with create_work_service(db_path=db_path, project_path=project_path) as svc:
                 for status in account_statuses:
                     key = str(getattr(status, "key", ""))
                     if not key:
@@ -10566,12 +10566,12 @@ def _dashboard_plan_staleness(
             _find_approved_plan_task,
             _plan_approved_at,
         )
-        from pollypm.work.sqlite_service import SQLiteWorkService
+        from pollypm.work import create_work_service
     except Exception:  # noqa: BLE001
         return None
     result: str | None = None
     try:
-        with SQLiteWorkService(
+        with create_work_service(
             db_path=db_path, project_path=project_path,
         ) as svc:
             plan_task = _find_approved_plan_task(svc, project_key)
@@ -11081,7 +11081,7 @@ def _dashboard_gather_tasks(
         return cached
 
     try:
-        from pollypm.work.sqlite_service import SQLiteWorkService
+        from pollypm.work import create_work_service
     except Exception:  # noqa: BLE001
         return {}, {}
 
@@ -11111,7 +11111,7 @@ def _dashboard_gather_tasks(
             if discovered not in db_aliases:
                 db_aliases.append(discovered)
         try:
-            with SQLiteWorkService(db_path=db_path, project_path=project_path) as svc:
+            with create_work_service(db_path=db_path, project_path=project_path) as svc:
                 tasks: list = []
                 seen_ids: set[str] = set()
                 for alias in db_aliases:
@@ -11272,11 +11272,11 @@ def _classify_worker_activity(
     has_owned_task = False
     if project_path is not None:
         try:
-            from pollypm.work.sqlite_service import SQLiteWorkService
+            from pollypm.work import create_work_service
 
             db_path = project_path / ".pollypm" / "state.db"
             if db_path.exists():
-                with SQLiteWorkService(
+                with create_work_service(
                     db_path=db_path, project_path=project_path,
                 ) as svc:
                     for alias in project_aliases:
@@ -11569,8 +11569,8 @@ def _dashboard_inbox(
         return cached
     try:
         from pollypm.store import SQLAlchemyStore
+        from pollypm.work import create_work_service
         from pollypm.work.inbox_view import inbox_tasks
-        from pollypm.work.sqlite_service import SQLiteWorkService
         from pollypm.cockpit_inbox import _row_is_dev_channel
     except Exception:  # noqa: BLE001
         return 0, [], []
@@ -12034,7 +12034,7 @@ def _dashboard_inbox(
     known_projects = set(getattr(config, "projects", {}).keys())
     items: list[dict] = []
     try:
-        with SQLiteWorkService(
+        with create_work_service(
             db_path=db_path, project_path=project_path,
         ) as svc:
             # #920 — query each project alias and dedupe so projects
@@ -14906,7 +14906,7 @@ class PollyProjectDashboardApp(App[None]):
             self.notify("Could not open project database.", severity="error")
             return
         try:
-            from pollypm.work.sqlite_service import SQLiteWorkService
+            from pollypm.work import create_work_service
         except Exception as exc:  # noqa: BLE001
             self.notify(f"Could not load task service: {exc}", severity="error")
             return
@@ -14923,7 +14923,7 @@ class PollyProjectDashboardApp(App[None]):
         initial_status = ""
         final_status = ""
         try:
-            with SQLiteWorkService(
+            with create_work_service(
                 db_path=db_path, project_path=data.project_path,
             ) as svc:
                 initial_status = svc.get(task_id).work_status.value

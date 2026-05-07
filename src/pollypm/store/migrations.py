@@ -310,12 +310,12 @@ def _apply_all(db_path: Path) -> None:
     a single pane of glass.
     """
     from pollypm.storage.state import StateStore
-    from pollypm.work.sqlite_service import SQLiteWorkService
+    from pollypm.work import create_work_service
 
     with StateStore(db_path) as _store:
         pass
 
-    with SQLiteWorkService(db_path) as _svc:
+    with create_work_service(db_path=db_path) as _svc:
         pass
 
     _record_schema_migrations(db_path)

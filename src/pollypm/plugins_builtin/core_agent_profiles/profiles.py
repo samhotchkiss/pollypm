@@ -502,8 +502,8 @@ def _render_operator_state_brief(context: AgentProfileContext) -> str:
 
 def _project_inbox_snapshot(project_key: str, project_root: Path) -> list[dict[str, str]]:
     try:
+        from pollypm.work import create_work_service
         from pollypm.work.inbox_view import inbox_tasks
-        from pollypm.work.sqlite_service import SQLiteWorkService
     except Exception:  # noqa: BLE001
         return []
 
@@ -511,7 +511,7 @@ def _project_inbox_snapshot(project_key: str, project_root: Path) -> list[dict[s
     if not db_path.exists():
         return []
     try:
-        with SQLiteWorkService(db_path=db_path, project_path=project_root) as svc:
+        with create_work_service(db_path=db_path, project_path=project_root) as svc:
             return [
                 {
                     "status": task.work_status.value,

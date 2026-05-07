@@ -495,13 +495,13 @@ def _build_project_pm_primer(
     inbox_titles: list[str] = []
     inbox_total = 0
     try:
+        from pollypm.work import create_work_service
         from pollypm.work.inbox_view import inbox_tasks
         from pollypm.work.models import WorkStatus
-        from pollypm.work.sqlite_service import SQLiteWorkService
 
         db_path = project.path / ".pollypm" / "state.db"
         if db_path.exists():
-            with SQLiteWorkService(
+            with create_work_service(
                 db_path=db_path, project_path=project.path,
             ) as svc:
                 tasks = list(svc.list_tasks(project=project_key))
@@ -610,11 +610,11 @@ def _build_operator_primer(supervisor) -> str | None:
     inbox_titles: list[tuple[str, str]] = []
     project_count = 0
     try:
+        from pollypm.work import create_work_service
         from pollypm.work.inbox_view import inbox_tasks
-        from pollypm.work.sqlite_service import SQLiteWorkService
     except Exception:  # noqa: BLE001
         inbox_tasks = None  # type: ignore[assignment]
-        SQLiteWorkService = None  # type: ignore[assignment]
+        create_work_service = None  # type: ignore[assignment]
 
     projects = getattr(supervisor.config, "projects", {}) or {}
     for project_key, project in projects.items():
@@ -627,13 +627,13 @@ def _build_operator_primer(supervisor) -> str | None:
                 "_", "-"
             )
         project_lines.append(f"  - {project_name}")
-        if inbox_tasks is None or SQLiteWorkService is None:
+        if inbox_tasks is None or create_work_service is None:
             continue
         db_path = project.path / ".pollypm" / "state.db"
         if not db_path.exists():
             continue
         try:
-            with SQLiteWorkService(
+            with create_work_service(
                 db_path=db_path, project_path=project.path,
             ) as svc:
                 items = list(inbox_tasks(svc, project=project_key))
@@ -1752,10 +1752,10 @@ class CockpitRouter:
         if not db_path.exists():
             return [], False
         from pollypm.plugins_builtin.project_planning.plan_presence import has_acceptable_plan
+        from pollypm.work import create_work_service
         from pollypm.work.project_aliases import project_storage_aliases
-        from pollypm.work.sqlite_service import SQLiteWorkService
 
-        work = SQLiteWorkService(db_path, project_path=project_path)
+        work = create_work_service(db_path=db_path, project_path=project_path)
         try:
             # #1092 — match the dashboard's alias-aware lookup. The work
             # DB stores tasks under the display name (``booktalk``) while

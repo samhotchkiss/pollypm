@@ -58,13 +58,13 @@ def _dashboard_project_tasks(
     if cached is not None and cached[0] == db_mtime:
         return cached[1], cached[2]
 
-    from pollypm.work.sqlite_service import SQLiteWorkService
+    from pollypm.work import create_work_service
     partitioned: dict[str, list] = {
         "in_progress": [], "review": [], "queued": [], "blocked": [], "done": [],
     }
     counts: dict[str, int] = {}
     try:
-        with SQLiteWorkService(db_path=db_path, project_path=project_path) as svc:
+        with create_work_service(db_path=db_path, project_path=project_path) as svc:
             tasks = svc.list_tasks(project=project_key)
             counts = svc.state_counts(project=project_key)
             for t in tasks:
@@ -95,7 +95,7 @@ def _render_project_dashboard(
     degrades gracefully on missing data so a fresh project with empty
     state still produces a readable surface.
     """
-    from pollypm.work.sqlite_service import SQLiteWorkService
+    from pollypm.work import create_work_service
 
     db_path = project.path / ".pollypm" / "state.db"
     if not db_path.exists():
@@ -104,7 +104,7 @@ def _render_project_dashboard(
     # Single SQLite open per render \u2014 every downstream section reuses
     # this hydrated task list and the counts map.
     inbox_count = 0
-    with SQLiteWorkService(db_path=db_path, project_path=project.path) as svc:
+    with create_work_service(db_path=db_path, project_path=project.path) as svc:
         try:
             from pollypm.work.inbox_view import inbox_tasks
         except Exception:  # noqa: BLE001

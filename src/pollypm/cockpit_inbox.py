@@ -54,13 +54,13 @@ def _timestamp_sort_value(value) -> float:
 
 def _render_work_service_issues(project: object) -> str:
     """Render tasks from the work service for a project."""
-    from pollypm.work.sqlite_service import SQLiteWorkService
+    from pollypm.work import create_work_service
 
     db_path = project.path / ".pollypm" / "state.db"
     if not db_path.exists():
         raise FileNotFoundError(db_path)
 
-    with SQLiteWorkService(db_path=db_path, project_path=project.path) as svc:
+    with create_work_service(db_path=db_path, project_path=project.path) as svc:
         counts = svc.state_counts(project=getattr(project, "key", None))
         tasks = svc.list_tasks(project=getattr(project, "key", None))
 
@@ -201,8 +201,8 @@ def _count_inbox_tasks_for_label(config) -> int:
     count.
     """
     try:
+        from pollypm.work import create_work_service
         from pollypm.work.inbox_view import inbox_tasks
-        from pollypm.work.sqlite_service import SQLiteWorkService
         from pollypm.cockpit_inbox_items import (
             _WORKSPACE_DB_KEY,
             _filter_approved_plan_reviews,
@@ -236,7 +236,7 @@ def _count_inbox_tasks_for_label(config) -> int:
         else:
             project_db_paths[_WORKSPACE_DB_KEY] = (db_path, project_path)
         try:
-            with SQLiteWorkService(
+            with create_work_service(
                 db_path=db_path, project_path=project_path,
             ) as svc:
                 for task in inbox_tasks(svc, project=project_key):
@@ -527,6 +527,7 @@ def _render_inbox_panel(config) -> str:
     each, and renders the combined view. Projects with no DB are silently
     skipped so a fresh install stays usable.
     """
+    from pollypm.work import create_work_service
     from pollypm.work.sqlite_service import SQLiteWorkService
 
     # Aggregate inbox tasks across all tracked projects. Each project has its
@@ -565,7 +566,7 @@ def _render_inbox_panel(config) -> str:
             if not db_path.exists():
                 continue
             try:
-                svc = SQLiteWorkService(
+                svc = create_work_service(
                     db_path=db_path, project_path=project_path,
                 )
             except Exception:  # noqa: BLE001
@@ -912,7 +913,7 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
     Always best-effort: a bad DB or missing tmux session degrades one
     project's worth of rows, never the whole roster.
     """
-    from pollypm.work.sqlite_service import SQLiteWorkService
+    from pollypm.work import create_work_service
 
     projects = getattr(config, "projects", {}) or {}
     if not projects:
@@ -952,7 +953,7 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
         if not db_path.exists():
             continue
         try:
-            svc = SQLiteWorkService(db_path=db_path, project_path=project_path)
+            svc = create_work_service(db_path=db_path, project_path=project_path)
         except Exception:  # noqa: BLE001
             continue
         try:

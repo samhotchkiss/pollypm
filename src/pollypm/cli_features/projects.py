@@ -92,9 +92,9 @@ def _emit_auto_plan_status(
     status: str | None = None
     if db_path.exists():
         try:
-            from pollypm.work.sqlite_service import SQLiteWorkService
+            from pollypm.work import create_work_service
 
-            with SQLiteWorkService(
+            with create_work_service(
                 db_path=db_path, project_path=project_path,
             ) as svc:
                 tasks = svc.list_tasks(project=project_key)

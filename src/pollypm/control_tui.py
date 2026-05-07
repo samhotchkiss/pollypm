@@ -46,8 +46,8 @@ def _inbox_tasks_for_tui(config):
     any error so the TUI still renders instead of blowing up mid-refresh.
     """
     try:
+        from pollypm.work import create_work_service
         from pollypm.work.inbox_view import inbox_tasks
-        from pollypm.work.sqlite_service import SQLiteWorkService
     except Exception:  # noqa: BLE001
         return []
     out: list = []
@@ -56,7 +56,7 @@ def _inbox_tasks_for_tui(config):
         if not db_path.exists():
             continue
         try:
-            with SQLiteWorkService(
+            with create_work_service(
                 db_path=db_path, project_path=project.path,
             ) as svc:
                 out.extend(inbox_tasks(svc, project=project_key))

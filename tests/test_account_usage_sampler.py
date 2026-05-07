@@ -259,7 +259,12 @@ def test_collect_account_usage_sample_kills_session_on_exception_path(
 def test_collect_account_usage_sample_falls_back_to_subprocess_when_kill_raises(
     monkeypatch, tmp_path: Path,
 ) -> None:
-    """If the wrapped tmux client errors during teardown, fall back to ``tmux kill-session``."""
+    """If the wrapped tmux client errors during teardown, fall back to the canonical ``TmuxClient``.
+
+    Per #1373, the fallback path now routes through ``pollypm.tmux.client``
+    rather than calling ``subprocess.run`` directly — but the on-the-wire
+    ``tmux kill-session -t =<probe-session>`` invocation is unchanged.
+    """
     from pollypm.provider_sdk import ProviderUsageSnapshot
 
     config_path, _ = _config(tmp_path)
@@ -285,10 +290,15 @@ def test_collect_account_usage_sample_falls_back_to_subprocess_when_kill_raises(
 
     def _fake_run(args, **kwargs):
         direct_calls.append(list(args))
+        # Pretend the session exists for the has-session probe so that
+        # the fallback proceeds to issue an actual kill-session call.
         return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
 
+    # The canonical ``TmuxClient.run`` shells out via
+    # ``pollypm.tmux.client.subprocess.run``; patch there so the fallback
+    # path is observable in this test without touching the live tmux binary.
     monkeypatch.setattr(
-        "pollypm.account_usage_sampler.subprocess.run", _fake_run,
+        "pollypm.tmux.client.subprocess.run", _fake_run,
     )
 
     collect_account_usage_sample(
@@ -296,10 +306,14 @@ def test_collect_account_usage_sample_falls_back_to_subprocess_when_kill_raises(
     )
 
     assert direct_calls, (
-        "wrapped client raised on kill — must fall through to direct "
-        "subprocess tmux kill-session"
+        "wrapped client raised on kill — must fall through to canonical "
+        "TmuxClient kill-session"
     )
-    cmd = direct_calls[0]
+    kill_calls = [
+        c for c in direct_calls if c[:2] == ["tmux", "kill-session"]
+    ]
+    assert kill_calls, "expected at least one tmux kill-session invocation"
+    cmd = kill_calls[0]
     assert cmd[:3] == ["tmux", "kill-session", "-t"]
     # Must use the ``=`` exact-target prefix so we don't accidentally kill
     # something whose name starts with our probe session name.
@@ -307,7 +321,11 @@ def test_collect_account_usage_sample_falls_back_to_subprocess_when_kill_raises(
 
 
 def test_sweep_orphan_usage_sessions_kills_only_pm_usage_prefix(monkeypatch) -> None:
-    """The boot-time sweep must target only ``pm-usage-*`` sessions."""
+    """The boot-time sweep must target only ``pm-usage-*`` sessions.
+
+    Patches the canonical tmux module seam (#1373) — sampler now routes
+    list-sessions / kill-session through ``pollypm.tmux.client``.
+    """
     listed = (
         "pm-usage-claude_primary-1\n"
         "pm-usage-codex_backup-2\n"
@@ -323,6 +341,10 @@ def test_sweep_orphan_usage_sessions_kills_only_pm_usage_prefix(monkeypatch) -> 
             return subprocess.CompletedProcess(
                 args=args, returncode=0, stdout=listed, stderr="",
             )
+        if args[:2] == ["tmux", "has-session"]:
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout="", stderr="",
+            )
         if args[:2] == ["tmux", "kill-session"]:
             return subprocess.CompletedProcess(
                 args=args, returncode=0, stdout="", stderr="",
@@ -330,7 +352,7 @@ def test_sweep_orphan_usage_sessions_kills_only_pm_usage_prefix(monkeypatch) -> 
         raise AssertionError(f"unexpected subprocess.run call: {args!r}")
 
     monkeypatch.setattr(
-        "pollypm.account_usage_sampler.subprocess.run", _fake_run,
+        "pollypm.tmux.client.subprocess.run", _fake_run,
     )
 
     killed = sweep_orphan_usage_sessions()
@@ -352,7 +374,7 @@ def test_sweep_orphan_usage_sessions_returns_zero_when_no_tmux_server(monkeypatc
         )
 
     monkeypatch.setattr(
-        "pollypm.account_usage_sampler.subprocess.run", _fake_run,
+        "pollypm.tmux.client.subprocess.run", _fake_run,
     )
 
     assert sweep_orphan_usage_sessions() == 0
@@ -364,7 +386,7 @@ def test_sweep_orphan_usage_sessions_swallows_subprocess_errors(monkeypatch) -> 
         raise OSError("tmux binary missing")
 
     monkeypatch.setattr(
-        "pollypm.account_usage_sampler.subprocess.run", _explode,
+        "pollypm.tmux.client.subprocess.run", _explode,
     )
 
     # Must not raise; sweep is best-effort.

@@ -14,6 +14,7 @@ import json
 from typing import TYPE_CHECKING
 
 from pollypm.work.models import Priority, Task, TaskType, WorkStatus
+from pollypm.work.role_validation import validate_role_assignments
 from pollypm.work.service_support import TaskNotFoundError, ValidationError, _now, _parse_task_id
 
 if TYPE_CHECKING:
@@ -47,6 +48,14 @@ def create_task(
                 f"Flow '{template.name}' requires: "
                 f"{[r for r, d in template.roles.items() if not (isinstance(d, dict) and d.get('optional', False))]}"
             )
+
+    # savethenovel-forensic guard: reject ``user`` / ``human`` and similar
+    # non-agent values for roles that drive autonomous-agent nodes (e.g.
+    # ``worker=user`` or ``reviewer=user`` would otherwise produce a task
+    # whose worker session runs with ``Assignee: user``). Metadata-only
+    # roles like ``requester=user`` remain legal — that's the inbox-view
+    # convention for marking a task as user-facing.
+    validate_role_assignments(template, roles)
 
     try:
         task_type = TaskType(type)

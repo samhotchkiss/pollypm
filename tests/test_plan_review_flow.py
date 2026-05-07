@@ -359,7 +359,13 @@ def inbox_app(plan_review_env):
     if not _load_config_compatible(plan_review_env["config_path"]):
         pytest.skip("minimal pollypm.toml fixture not supported by loader")
     from pollypm.cockpit_ui import PollyInboxApp
-    return PollyInboxApp(plan_review_env["config_path"])
+    app = PollyInboxApp(plan_review_env["config_path"])
+    # #1402: existing tests assert ``svc.approve`` fires synchronously
+    # on the ``A`` press. Disable the 10s undo window so they keep
+    # passing without timer awaits. The dedicated #1402 tests below
+    # exercise the deferred path explicitly.
+    app._approve_undo_window_seconds = 0.0
+    return app
 
 
 @pytest.fixture
@@ -367,7 +373,9 @@ def plan_review_message_app(plan_review_message_env):
     if not _load_config_compatible(plan_review_message_env["config_path"]):
         pytest.skip("minimal pollypm.toml fixture not supported by loader")
     from pollypm.cockpit_ui import PollyInboxApp
-    return PollyInboxApp(plan_review_message_env["config_path"])
+    app = PollyInboxApp(plan_review_message_env["config_path"])
+    app._approve_undo_window_seconds = 0.0
+    return app
 
 
 @pytest.fixture
@@ -375,7 +383,9 @@ def fast_track_inbox_app(fast_track_env):
     if not _load_config_compatible(fast_track_env["config_path"]):
         pytest.skip("minimal pollypm.toml fixture not supported by loader")
     from pollypm.cockpit_ui import PollyInboxApp
-    return PollyInboxApp(fast_track_env["config_path"])
+    app = PollyInboxApp(fast_track_env["config_path"])
+    app._approve_undo_window_seconds = 0.0
+    return app
 
 
 def test_plan_review_label_swaps_hint_bar_to_gated(
@@ -1438,3 +1448,397 @@ def test_esc_cancels_pending_denial(plan_review_env, inbox_app) -> None:
                 svc.close()
 
     _run(body())
+
+
+# ---------------------------------------------------------------------------
+# #1402 — approve flow celebration toast + 10s undo window
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def deferred_inbox_app(plan_review_env):
+    """Inbox fixture that keeps the deferred undo path enabled.
+
+    The shared ``inbox_app`` fixture sets the window to 0 so legacy
+    tests can press ``A`` and immediately observe ``svc.approve``.
+    The #1402 tests need the deferred path: a short window long enough
+    to land an undo, short enough to drive without long awaits.
+    """
+    if not _load_config_compatible(plan_review_env["config_path"]):
+        pytest.skip("minimal pollypm.toml fixture not supported by loader")
+    from pollypm.cockpit_ui import PollyInboxApp
+    app = PollyInboxApp(plan_review_env["config_path"])
+    app._approve_undo_window_seconds = 0.3
+    return app
+
+
+def _seed_round_trip(plan_review_env: dict) -> None:
+    """Mirror ``test_plan_review_accept_unlocks_after_round_trip``."""
+    svc = SQLiteWorkService(
+        db_path=plan_review_env["project_path"] / ".pollypm" / "state.db",
+        project_path=plan_review_env["project_path"],
+    )
+    try:
+        svc.add_reply(
+            plan_review_env["plan_review_id"],
+            "looks good modulo decomposition",
+            actor="user",
+        )
+        svc.add_reply(
+            plan_review_env["plan_review_id"],
+            "agreed - split module X into three",
+            actor="architect",
+        )
+    finally:
+        svc.close()
+
+
+class TestApproveCelebrationToast:
+    def test_approve_emits_persona_celebration_toast(
+        self, plan_review_env, deferred_inbox_app,
+    ) -> None:
+        """Pressing ``A`` surfaces a persona-driven celebration line."""
+        async def body() -> None:
+            _seed_round_trip(plan_review_env)
+            captured: list[str] = []
+
+            original_notify = deferred_inbox_app.notify
+
+            def fake_notify(message, *args, **kwargs):
+                captured.append(str(message))
+                return original_notify(message, *args, **kwargs)
+
+            deferred_inbox_app.notify = fake_notify  # type: ignore[assignment]
+            from pollypm.work.sqlite_service import SQLiteWorkService as _S
+            original_approve = _S.approve
+
+            def _fake_approve(self, task_id, actor, reason=None):
+                return self.get(task_id)
+
+            _S.approve = _fake_approve  # type: ignore[assignment]
+            try:
+                async with deferred_inbox_app.run_test(size=(140, 40)) as pilot:
+                    await pilot.pause()
+                    deferred_inbox_app.list_view.index = 0
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    await pilot.press("A")
+                    await pilot.pause(0.05)
+                    # The toast text contains the persona-driven line.
+                    joined = "\n".join(captured)
+                    # Plan task has zero children in the seeded fixture
+                    # so we should land in the "Quick bite" / 0-1 branch.
+                    assert (
+                        "Quick bite" in joined
+                        or "Out of the oven" in joined
+                        or "Big batch" in joined
+                    ), f"missing celebration line: {joined!r}"
+                    assert "[u] undo" in joined
+                    # Pending approval state recorded.
+                    assert deferred_inbox_app._pending_plan_approval is not None
+            finally:
+                _S.approve = original_approve  # type: ignore[assignment]
+        _run(body())
+
+
+class TestApproveDeferredUndo:
+    def test_undo_within_window_keeps_plan_in_review(
+        self, plan_review_env, deferred_inbox_app,
+    ) -> None:
+        """``u`` inside the window cancels the deferred ``svc.approve``."""
+        async def body() -> None:
+            _seed_round_trip(plan_review_env)
+            captured: list[tuple[str, str]] = []
+            from pollypm.work.sqlite_service import SQLiteWorkService as _S
+            original_approve = _S.approve
+
+            def _fake_approve(self, task_id, actor, reason=None):
+                captured.append((task_id, actor))
+                return self.get(task_id)
+
+            _S.approve = _fake_approve  # type: ignore[assignment]
+            try:
+                async with deferred_inbox_app.run_test(size=(140, 40)) as pilot:
+                    await pilot.pause()
+                    deferred_inbox_app.list_view.index = 0
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    await pilot.press("A")
+                    await pilot.pause(0.05)
+                    assert deferred_inbox_app._pending_plan_approval is not None
+                    # Undo before the timer fires.
+                    await pilot.press("u")
+                    await pilot.pause(0.5)
+                    # No approve call landed.
+                    assert captured == []
+                    # Pending state cleared.
+                    assert deferred_inbox_app._pending_plan_approval is None
+            finally:
+                _S.approve = original_approve  # type: ignore[assignment]
+        _run(body())
+
+    def test_window_elapses_then_approve_fires(
+        self, plan_review_env, deferred_inbox_app,
+    ) -> None:
+        """After the 10s window (here: 0.3s) the deferred approve fires."""
+        async def body() -> None:
+            _seed_round_trip(plan_review_env)
+            captured: list[tuple[str, str]] = []
+            from pollypm.work.sqlite_service import SQLiteWorkService as _S
+            original_approve = _S.approve
+
+            def _fake_approve(self, task_id, actor, reason=None):
+                captured.append((task_id, actor))
+                return self.get(task_id)
+
+            _S.approve = _fake_approve  # type: ignore[assignment]
+            try:
+                async with deferred_inbox_app.run_test(size=(140, 40)) as pilot:
+                    await pilot.pause()
+                    deferred_inbox_app.list_view.index = 0
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    await pilot.press("A")
+                    # Wait past the window so the timer fires.
+                    for _ in range(20):
+                        await pilot.pause(0.05)
+                        if captured:
+                            break
+                    assert captured, "approve never fired after window"
+                    assert captured[-1] == (
+                        plan_review_env["plan_task_id"], "user",
+                    )
+                    # Pending state cleared after commit.
+                    assert deferred_inbox_app._pending_plan_approval is None
+            finally:
+                _S.approve = original_approve  # type: ignore[assignment]
+        _run(body())
+
+
+class TestUndoWindowConstant:
+    def test_default_undo_window_is_ten_seconds(self) -> None:
+        """The class-level default matches the issue's spec."""
+        from pollypm.cockpit_ui import PollyInboxApp
+        # Class-level default lives on the type so we can read it
+        # without instantiating (which requires a config path).
+        assert PollyInboxApp._approve_undo_window_seconds == 10.0
+
+
+class TestPersonaLookup:
+    def test_persona_resolves_from_project_config(self, tmp_path) -> None:
+        """``_project_persona_name`` returns the configured persona."""
+        from pollypm.cockpit_ui import PollyInboxApp
+        project_path = tmp_path / "savethenovel"
+        project_path.mkdir()
+        (project_path / ".git").mkdir()
+        config_path = tmp_path / "pollypm.toml"
+        config_path.write_text(
+            "[project]\n"
+            f'tmux_session = "pollypm-test"\n'
+            f'workspace_root = "{project_path.parent}"\n'
+            "\n"
+            f'[projects.savethenovel]\n'
+            f'key = "savethenovel"\n'
+            f'name = "Save The Novel"\n'
+            f'path = "{project_path}"\n'
+            f'persona_name = "Sage"\n'
+        )
+        app = PollyInboxApp(config_path)
+        persona = app._project_persona_name("savethenovel")
+        assert persona == "Sage"
+
+    def test_unknown_project_returns_none(self, tmp_path) -> None:
+        """Bogus project key falls through to None (toast picks Polly)."""
+        from pollypm.cockpit_ui import PollyInboxApp
+        config_path = tmp_path / "pollypm.toml"
+        config_path.write_text(
+            "[project]\n"
+            f'tmux_session = "pollypm-test"\n'
+            f'workspace_root = "{tmp_path}"\n'
+        )
+        app = PollyInboxApp(config_path)
+        assert app._project_persona_name("nonexistent") is None
+        assert app._project_persona_name("") is None
+
+
+class TestSubtaskCount:
+    def test_subtask_count_matches_children(
+        self, plan_review_env, deferred_inbox_app,
+    ) -> None:
+        """The plan task's children list determines the toast copy."""
+        from pollypm.work.sqlite_service import SQLiteWorkService
+        plan_task_id = plan_review_env["plan_task_id"]
+        # Stamp three children onto the plan task using add_context to
+        # avoid running a full work-flow decomposition. We just need
+        # the children list non-empty for the count helper to pick up.
+        # The pure helper reads ``len(task.children)`` so we set the
+        # attribute directly via a fake task in a stub svc.
+
+        class _FakeSvc:
+            def __init__(self, count: int) -> None:
+                self._count = count
+
+            def get(self, task_id):
+                class _Task:
+                    children = [("demo", i) for i in range(self._count)]
+
+                return _Task()
+
+            def close(self):
+                pass
+
+        # Monkeypatch the resolver to return the fake.
+        def fake_resolve(item, plan_task_id):
+            return _FakeSvc(7)
+
+        deferred_inbox_app._resolve_inbox_svc = fake_resolve  # type: ignore[assignment]
+        count = deferred_inbox_app._plan_task_subtask_count(None, plan_task_id)
+        assert count == 7
+
+    def test_subtask_count_handles_lookup_failure(
+        self, deferred_inbox_app,
+    ) -> None:
+        """Missing svc / missing task → 0 (toast still renders)."""
+        deferred_inbox_app._resolve_inbox_svc = (
+            lambda item, plan_task_id: None
+        )  # type: ignore[assignment]
+        assert (
+            deferred_inbox_app._plan_task_subtask_count(None, "demo/1") == 0
+        )
+
+
+class TestDrilldownApproveFlow:
+    """Approve from project drilldown (#1402).
+
+    The drilldown surface intercepts ``a`` when a plan_review action
+    card is at the top of the dashboard data; otherwise it falls back
+    to the legacy alerts view.
+    """
+
+    def _stub_dashboard(self, action_items: list[dict]):
+        """Construct a bare ``PollyProjectDashboardApp`` for unit testing.
+
+        We bypass ``__init__`` because the real one requires a config
+        path and starts loading state. The methods under test only
+        touch ``self.data.action_items`` and a handful of helpers we
+        stub on the instance.
+        """
+        from pollypm.cockpit_ui import (
+            PollyProjectDashboardApp,
+            ProjectDashboardData,
+        )
+        app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+        app._pending_plan_approval = None
+        app._pending_plan_approval_timer = None
+        app._approve_undo_window_seconds = 0.0  # immediate commit
+        app.config_path = None  # type: ignore[assignment]
+        app.project_key = "demo"
+
+        # Minimal ProjectDashboardData stand-in. The real dataclass
+        # has many required fields so we use a SimpleNamespace.
+        from types import SimpleNamespace
+        app.data = SimpleNamespace(action_items=action_items)
+        # Stub the helpers the method calls.
+        app._drilldown_plan_task_subtask_count = lambda plan_task_id: 4
+        app._drilldown_project_persona_name = lambda: "Sage"
+        # Capture notify calls.
+        app._notify_calls = []
+        app.notify = lambda msg, **kw: app._notify_calls.append((str(msg), kw))
+        # Capture record_action_response calls.
+        app._record_calls = []
+
+        def fake_record(index, response, *, approve_if_possible=False):
+            app._record_calls.append((index, response, approve_if_possible))
+
+        app._record_action_response = fake_record  # type: ignore[assignment]
+        # action_view_alerts called when no plan_review present.
+        app._alerts_called = False
+
+        def fake_alerts():
+            app._alerts_called = True
+
+        app.action_view_alerts = fake_alerts  # type: ignore[assignment]
+        return app
+
+    def test_a_approves_first_plan_review_card(self) -> None:
+        """``a`` on a drilldown with a plan_review card runs the celebration."""
+        app = self._stub_dashboard([
+            {
+                "is_plan_review": True,
+                "primary_ref": "demo/3",
+                "primary_action": {"kind": "review_plan", "task_id": "demo/3"},
+            },
+        ])
+        result = app._approve_first_plan_review_if_present()
+        assert result is True
+        # Toast captured.
+        assert any(
+            "Sage:" in msg and "tasks plated" in msg
+            for msg, _ in app._notify_calls
+        )
+        # Immediate-commit path called record_action_response.
+        assert app._record_calls == [
+            (0, "Approved from project dashboard.", True),
+        ]
+        # No alerts fall-through.
+        assert app._alerts_called is False
+
+    def test_a_falls_through_to_alerts_when_no_plan_review(self) -> None:
+        """No plan_review card → ``a`` opens alerts."""
+        app = self._stub_dashboard([
+            {"is_plan_review": False, "primary_ref": "demo/9"},
+        ])
+        app.action_approve_or_alerts()
+        assert app._alerts_called is True
+        assert app._record_calls == []
+
+    def test_a_no_op_with_no_action_items(self) -> None:
+        """Empty action_items still falls through to alerts."""
+        app = self._stub_dashboard([])
+        app.action_approve_or_alerts()
+        assert app._alerts_called is True
+
+    def test_undo_within_window_skips_approval(self) -> None:
+        """``u`` after ``a`` cancels the deferred approval."""
+        from pollypm.cockpit_ui import PollyProjectDashboardApp
+        app = self._stub_dashboard([
+            {
+                "is_plan_review": True,
+                "primary_ref": "demo/3",
+                "primary_action": {"kind": "review_plan", "task_id": "demo/3"},
+            },
+        ])
+        # Use a finite window so we can land an undo. ``set_timer``
+        # isn't running (no event loop), so the except-fallback would
+        # commit immediately. To exercise the undo path purely we set
+        # the timer manually after ``approve``.
+        app._approve_undo_window_seconds = 100.0  # too long to elapse
+
+        # Stub set_timer to record without firing.
+        scheduled = []
+
+        def fake_set_timer(delay, fn):
+            scheduled.append((delay, fn))
+
+            class _T:
+                stopped = False
+
+                def stop(self_inner):
+                    self_inner.stopped = True
+
+            t = _T()
+            return t
+
+        app.set_timer = fake_set_timer  # type: ignore[assignment]
+        result = app._approve_first_plan_review_if_present()
+        assert result is True
+        # Pending state recorded; commit not yet fired.
+        assert app._pending_plan_approval is not None
+        assert app._record_calls == []
+        # Now press 'u' (undo).
+        app.action_undo_plan_approval_or_refresh()
+        # Pending state cleared; commit still not fired.
+        assert app._pending_plan_approval is None
+        assert app._record_calls == []
+        # Timer was stopped.
+        assert scheduled and scheduled[0][1] is not None

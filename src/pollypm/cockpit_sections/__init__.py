@@ -42,6 +42,14 @@ from pollypm.cockpit_sections.health import (
 from pollypm.cockpit_sections.in_flight import _section_in_flight
 from pollypm.cockpit_sections.insights import _section_insights
 from pollypm.cockpit_sections.just_shipped import _section_just_shipped
+from pollypm.cockpit_sections.plan_review import (
+    find_plan_review_task,
+    load_plan_text,
+    render_plan_review_action_bar,
+    render_plan_review_action_bar_plain,
+    render_plan_review_header_strip,
+    render_plan_review_surface,
+)
 from pollypm.cockpit_sections.project_dashboard import (
     _DASHBOARD_PROJECT_CACHE,
     _dashboard_project_tasks,
@@ -70,6 +78,12 @@ __all__ = [
     "_format_tokens",
     "_iso_to_dt",
     "_render_project_dashboard",
+    "find_plan_review_task",
+    "load_plan_text",
+    "render_plan_review_action_bar",
+    "render_plan_review_action_bar_plain",
+    "render_plan_review_header_strip",
+    "render_plan_review_surface",
     "format_project_health_scorecard",
     "project_health_glyph",
     "project_health_rank",

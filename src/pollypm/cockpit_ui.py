@@ -7010,6 +7010,131 @@ def _extract_plan_review_meta(labels: list[str] | None) -> dict:
     return meta
 
 
+def _plan_content_for_review(
+    plan_review_meta: dict,
+    config_path: object | None,
+) -> str | None:
+    """Load the plan markdown content referenced by a plan_review item.
+
+    Resolves the project from the meta, walks ``CANONICAL_PLAN_RELATIVE_PATHS``
+    for the project's on-disk path, and returns the file's text. Returns
+    ``None`` when the plan can't be located or read — callers fall back
+    to whatever they had before this lookup. Issue #1397: the cockpit
+    surfaces the plan inline instead of pointing at a file path the
+    user can't reach from a TUI.
+    """
+    if not isinstance(plan_review_meta, dict):
+        return None
+    project_key = str(plan_review_meta.get("project") or "").strip()
+    if not project_key:
+        plan_task_id = str(plan_review_meta.get("plan_task_id") or "")
+        if "/" in plan_task_id:
+            project_key = plan_task_id.split("/", 1)[0].strip()
+    if not project_key or config_path is None:
+        return None
+    try:
+        cfg = load_config(Path(config_path) if not isinstance(config_path, Path) else config_path)
+    except Exception:  # noqa: BLE001
+        return None
+    project = getattr(cfg, "projects", {}).get(project_key)
+    if project is None:
+        return None
+    project_path = getattr(project, "path", None)
+    if not isinstance(project_path, Path):
+        try:
+            project_path = Path(str(project_path))
+        except Exception:  # noqa: BLE001
+            return None
+    if not project_path.exists():
+        return None
+    plan_path = _dashboard_plan_path(project_path)
+    if plan_path is None:
+        return None
+    try:
+        return plan_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _extract_plan_summary_block(plan_text: str) -> str:
+    """Pull the leading summary paragraph from a plan markdown body.
+
+    Heuristic: the architect's ``plan_review`` synthesis (PR #1408)
+    leads with a ``## Summary`` section; pre-#1408 plans lead with the
+    first paragraph after the H1. Both shapes resolve here. Returns an
+    empty string when nothing summary-shaped is present.
+    """
+    text = (plan_text or "").strip()
+    if not text:
+        return ""
+    lines = text.splitlines()
+    # Look for a ``## Summary`` (or ``# Summary``) header and grab the
+    # paragraph that follows it.
+    for idx, line in enumerate(lines):
+        stripped = line.strip().lower()
+        if stripped in {"## summary", "# summary", "### summary"}:
+            collected: list[str] = []
+            for follow in lines[idx + 1:]:
+                if follow.strip().startswith("#"):
+                    break
+                if not follow.strip():
+                    if collected:
+                        break
+                    continue
+                collected.append(follow.strip())
+            if collected:
+                return " ".join(collected)
+    # Fall back to the first non-header paragraph.
+    collected = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if collected:
+                break
+            continue
+        if stripped.startswith("#"):
+            if collected:
+                break
+            continue
+        collected.append(stripped)
+    return " ".join(collected)
+
+
+def _extract_plan_judgment_calls(plan_text: str, *, limit: int = 5) -> list[str]:
+    """Extract the bullet list under a ``## Judgment calls`` header.
+
+    The PR #1408 ``plan_review`` synthesis encodes the architect's
+    flagged points as a bulleted list under ``## Judgment calls``
+    (case-insensitive). When that section is absent, returns an empty
+    list — callers should treat that as "no flagged points" rather
+    than synthesising a fake one.
+    """
+    text = plan_text or ""
+    if not text.strip():
+        return []
+    lines = text.splitlines()
+    target_headers = {"## judgment calls", "## judgement calls", "### judgment calls"}
+    out: list[str] = []
+    capturing = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.lower() in target_headers:
+            capturing = True
+            continue
+        if not capturing:
+            continue
+        if stripped.startswith("#"):
+            break
+        match = _ACTION_STEP_RE.match(line)
+        if match is not None:
+            point = _re.sub(r"\s+", " ", match.group("step")).strip()
+            if point:
+                out.append(point)
+                if len(out) >= limit:
+                    break
+    return out
+
+
 def _extract_blocking_question_meta(labels: list[str] | None) -> dict:
     """Parse ``blocking_question`` sidecar labels into a structured dict.
 
@@ -8613,6 +8738,13 @@ class PollyInboxApp(App[None]):
             # data, and the inbox detail surface should match. The
             # raw body still renders below for technical context.
             prompt_block = _render_heuristic_action_block(item.description)
+        # #1397: for plan_review items, the heuristic prompt block can
+        # echo the architect's "Plan: <abs path>" line as if it were a
+        # decision prompt. Suppress it — the inline plan render below
+        # is the canonical surface and the file path leaks an
+        # implementation detail.
+        if is_plan_review:
+            prompt_block = None
         if prompt_block:
             sections.append("")
             sections.append(prompt_block)
@@ -8622,7 +8754,22 @@ class PollyInboxApp(App[None]):
         if is_plan_review:
             body = _plan_review_message_body_for_display(body, plan_review_meta)
         sections.append("")
-        sections.append(_md_to_rich(_escape_body(body)))
+        if is_plan_review:
+            # #1397: surface the plan body inline instead of the
+            # file-pointer text the architect emitted. Users on remote
+            # TUIs cannot click through to a local markdown path.
+            plan_text = _plan_content_for_review(
+                plan_review_meta, getattr(self, "config_path", None),
+            )
+            if plan_text:
+                sections.append(_md_to_rich(_escape_body(plan_text)))
+            else:
+                sections.append(
+                    "[#f0c45a]Plan content is not available on disk yet — "
+                    "discuss with the PM (press d) to learn more.[/#f0c45a]"
+                )
+        else:
+            sections.append(_md_to_rich(_escape_body(body)))
         self.detail.update("\n".join(sections))
         self._proposal_specs.pop(item.task_id, None)
         if is_plan_review:
@@ -8760,7 +8907,26 @@ class PollyInboxApp(App[None]):
             sections.append(triage_banner)
         sections.append("")  # blank line before body
         body = task.description or "(no body)"
-        sections.append(_md_to_rich(_escape_body(body)))
+        # #1397: when this task IS a plan_review, surface the plan body
+        # inline rather than the architect's "Plan: <abs path>..." text.
+        # Users on a remote TUI cannot click through to a local file.
+        _task_labels_for_body = list(getattr(task, "labels", []) or [])
+        if "plan_review" in _task_labels_for_body:
+            _plan_review_meta_for_body = _extract_plan_review_meta(
+                _task_labels_for_body,
+            )
+            _plan_text_for_body = _plan_content_for_review(
+                _plan_review_meta_for_body,
+                getattr(self, "config_path", None),
+            )
+            if _plan_text_for_body:
+                sections.append(
+                    _md_to_rich(_escape_body(_plan_text_for_body))
+                )
+            else:
+                sections.append(_md_to_rich(_escape_body(body)))
+        else:
+            sections.append(_md_to_rich(_escape_body(body)))
 
         if replies:
             sections.append("")
@@ -11887,8 +12053,30 @@ def _dashboard_inbox(
             "Read the plan and any open decisions.",
             "Approve the plan when it is ready, or discuss changes with the PM.",
         ]
+        # #1397: load the plan markdown so the dashboard's action card +
+        # the cockpit drilldown can render the summary + judgment-call
+        # points inline. Falls back gracefully when the file isn't on
+        # disk yet (rare race window, or pre-#1408 plans without a
+        # ``## Summary`` block).
+        plan_text: str | None = None
+        plan_path_obj = _dashboard_plan_path(project_path)
+        if plan_path_obj is not None:
+            try:
+                plan_text = plan_path_obj.read_text(encoding="utf-8")
+            except OSError:
+                plan_text = None
+        plan_summary = (
+            _extract_plan_summary_block(plan_text or "") if plan_text else ""
+        )
+        judgment_calls = (
+            _extract_plan_judgment_calls(plan_text or "") if plan_text else []
+        )
+        plain_prompt = (
+            plan_summary if plan_summary
+            else "A full project plan is ready for your review."
+        )
         return {
-            "plain_prompt": "A full project plan is ready for your review.",
+            "plain_prompt": plain_prompt,
             "unblock_steps": steps[:5],
             "steps_heading": "What to do",
             "decision_question": (
@@ -11909,6 +12097,9 @@ def _dashboard_inbox(
                 "task_id": plan_task_id or fallback_task_id,
             },
             "other_placeholder": "Reply with plan feedback...",
+            "plan_summary": plan_summary,
+            "judgment_calls": list(judgment_calls),
+            "plan_text": plan_text or "",
         }
 
     def _deployment_decision(body: str, steps: list[str]) -> dict[str, object]:
@@ -12243,6 +12434,41 @@ def _dashboard_inbox(
                     )
                     or _plain_decision_from_body(subject, body, steps)
                 )
+                # #1397: when this is a plan_review item but
+                # ``_user_prompt_decision`` won the dispatch (the
+                # architect's payload provides a structured user_prompt),
+                # the plan summary / judgment-call points still need to
+                # ride along on the action card so the drilldown surface
+                # renders inline plan content. Always merge those fields
+                # in for plan_review items, regardless of which decision
+                # producer fired.
+                if "plan_review" in labels:
+                    plan_review_extras = _plan_review_decision(
+                        labels,
+                        body,
+                        fallback_task_id=(
+                            str(payload.get("task_id") or "")
+                            if payload.get("task_id")
+                            else None
+                        ),
+                    ) or {}
+                    for plan_key in (
+                        "plan_summary", "judgment_calls", "plan_text",
+                    ):
+                        if plan_key in plan_review_extras:
+                            decision.setdefault(plan_key, plan_review_extras[plan_key])
+                    # Override the prompt with the plan summary when the
+                    # user_prompt's summary is the generic boilerplate
+                    # (so the card actually surfaces the plan's leading
+                    # paragraph instead of "A full project plan is ready
+                    # for your review.").
+                    plan_summary = plan_review_extras.get("plan_summary") or ""
+                    current_prompt = str(decision.get("plain_prompt") or "")
+                    if (
+                        plan_summary
+                        and "ready for your review" in current_prompt.lower()
+                    ):
+                        decision["plain_prompt"] = plan_summary
                 items.append(
                     {
                         "task_id": entry.task_id,
@@ -14404,27 +14630,18 @@ class PollyProjectDashboardApp(App[None]):
                 "Press [b]c[/b] in this pane to chat with the PM and "
                 "ask for a plan now.[/dim]"
             )
+        # #1397: drop the leading file-path line and the
+        # ``Also in docs/plan/`` enumeration \u2014 file paths are an
+        # implementation detail, and users on a remote TUI cannot
+        # navigate to them anyway. The H2 outline below is the
+        # navigational hint; the full plan body renders inline via
+        # ``_render_plan_content``.
         lines: list[str] = []
-        rel_path = ""
-        try:
-            rel_path = str(data.plan_path.relative_to(data.project_path))
-        except (ValueError, TypeError):
-            rel_path = str(data.plan_path.name)
-        lines.append(f"[dim]{_escape(rel_path)}[/dim]")
         if data.plan_sections:
             for title in data.plan_sections:
                 lines.append(f"  \u25aa {_escape(title)}")
         else:
             lines.append("  [dim](no H2 sections found)[/dim]")
-        if data.plan_aux_files:
-            lines.append("")
-            lines.append("[dim]Also in docs/plan/:[/dim]")
-            for aux in data.plan_aux_files:
-                try:
-                    aux_rel = str(aux.relative_to(data.project_path))
-                except (ValueError, TypeError):
-                    aux_rel = aux.name
-                lines.append(f"  \u00b7 {_escape(aux_rel)}")
         # Visual-explainer prompt removed in #1405 (keybinding broken,
         # deferred for v1+). ``data.plan_explainer`` may still surface
         # via other paths but we no longer advertise the ``v`` shortcut.
@@ -14546,12 +14763,39 @@ class PollyProjectDashboardApp(App[None]):
         and polly_remote routinely renders two cards with 5 steps
         each, blowing past a single screen.
         """
-        prompt = _escape(
+        raw_prompt = (
             item.get("plain_prompt")
             or item.get("next_action")
             or "Polly needs your decision before this project can continue."
         )
+        # #1397: in the inbox-row preview the plan summary can be a
+        # full paragraph; cap it at ~80 chars so the rail row stays
+        # readable. The full text still renders in the drilldown +
+        # detail surfaces.
+        if item.get("is_plan_review") and len(raw_prompt) > 80:
+            raw_prompt = raw_prompt[:77].rstrip() + "..."
+        prompt = _escape(raw_prompt)
         lines: list[str] = [f"  [#f0c45a]◆[/#f0c45a] {prompt}"]
+        # #1397: when this is a plan_review item, show the architect's
+        # flagged judgment calls right under the summary. They're the
+        # single most decision-relevant thing to surface; everything
+        # else is inert "open the plan" boilerplate.
+        judgment_calls = [
+            str(point).strip()
+            for point in (item.get("judgment_calls") or [])
+            if str(point).strip()
+        ]
+        if judgment_calls:
+            lines.append("    [b]Flagged judgment calls[/b]")
+            point_cap = 2 if compact else 5
+            visible_points = judgment_calls[:point_cap]
+            for point in visible_points:
+                lines.append(f"    [#f0c45a]·[/#f0c45a] {_escape(point)}")
+            hidden_points = len(judgment_calls) - len(visible_points)
+            if hidden_points > 0:
+                lines.append(
+                    f"    [dim](+{hidden_points} more — open the plan to see all)[/dim]"
+                )
         unblock_steps = [
             str(step)
             for step in (item.get("unblock_steps") or item.get("steps") or [])

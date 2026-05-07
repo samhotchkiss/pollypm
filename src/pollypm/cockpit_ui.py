@@ -7243,6 +7243,61 @@ def _build_plan_review_primer(
     )
 
 
+def _build_plan_review_denial_primer(
+    *,
+    project_key: str,
+    cancelled_plan_task_id: str,
+    successor_plan_task_id: str,
+    denial_reason: str,
+    reviewer_name: str = "Sam",
+    plan_path: str = "",
+) -> str:
+    """Build the PM input primer injected after a plan-review deny (#1403).
+
+    Distinct from :func:`_build_plan_review_primer` — instead of opening
+    a co-refinement conversation, this primer:
+
+    * Frames the conversation as "the user just rejected the plan,
+      they're giving you context for why before the architect retries".
+    * Includes the denial reason verbatim so the PM persona has the
+      same "address these concerns" frame the architect sees on the
+      successor plan task's context.
+    * Identifies the cancelled / successor task pair so the persona
+      can reference them when chatting.
+
+    Output ends WITHOUT a trailing newline so the PM CLI can append
+    the user's typed follow-up directly.
+    """
+    person = (reviewer_name or "Sam").strip() or "Sam"
+    pronoun_subject = "Sam" if person == "Sam" else person
+    project_label = project_key or "(unknown)"
+    plan_line = f"Denied plan body: {plan_path}\n" if plan_path else ""
+    return (
+        f"{pronoun_subject} just denied plan task {cancelled_plan_task_id} "
+        f"for project: {project_label}.\n"
+        f"{plan_line}"
+        f"Successor plan task: {successor_plan_task_id} "
+        "(architect will run a fresh planning pass).\n"
+        "\n"
+        f"Reason {pronoun_subject} gave for the denial:\n"
+        f"{denial_reason}\n"
+        "\n"
+        "Your job in this conversation:\n"
+        f"- Sit with {pronoun_subject} on the concerns above before the "
+        "architect's replan kicks off; tease out anything the one-line "
+        "reason left implicit\n"
+        "- Push for concrete decomposition or scoping changes the "
+        "architect should bake into the next plan\n"
+        f"- When {pronoun_subject} signals 'ok, replan with that' "
+        "(or equivalent), summarise the brief and let the architect "
+        f"pick up successor task {successor_plan_task_id} — don't try "
+        "to write the plan yourself\n"
+        "- The denial reason is already attached to the successor task "
+        "as a ``plan_review_denied`` context entry, so the architect "
+        "will see it without further plumbing"
+    )
+
+
 def _extract_proposal_spec(task, *, labels: list[str] | None = None) -> dict:
     """Recover a proposal's ``proposed_task_spec`` from an inbox row.
 
@@ -7645,6 +7700,12 @@ class PollyInboxApp(App[None]):
         # archiving, but with a decision trail.
         Binding("A", "accept_proposal", "Accept", show=False),
         Binding("X", "reject_proposal", "Reject", show=False),
+        # Plan review deny (#1403). Capital ``D`` so it sits beside
+        # capital ``A`` (approve) in muscle memory and doesn't collide
+        # with lowercase ``d`` (jump-to-PM discuss). Branches inside
+        # ``action_deny_plan_review`` — silent no-op on non-plan_review
+        # selections so the key stays inert when it doesn't apply.
+        Binding("D", "deny_plan_review", "Deny plan", show=False),
         # Plan review (#297). Accept (capital A) routes through
         # ``action_accept_proposal`` which branches on label, so no
         # separate keybinding is needed here for approve. The ``v``
@@ -7780,6 +7841,11 @@ class PollyInboxApp(App[None]):
         # prompt. We flag it here so the Input.Submitted handler routes
         # to record_proposal_rejection instead of add_reply.
         self._awaiting_rejection_task_id: str | None = None
+        # Plan-review deny state (#1403). Mirrors ``_awaiting_rejection_task_id``
+        # but routes the submitted bytes to ``_finish_deny_plan_review``
+        # which cancels the underlying plan_task with the typed reason
+        # and seeds a successor plan_task carrying ``predecessor_task_id``.
+        self._awaiting_denial_task_id: str | None = None
         # Cache of parsed proposal_task_spec per inbox task_id, populated
         # on _render_detail. Accept uses it to seed the follow-on task
         # without re-reading the DB.
@@ -8648,11 +8714,16 @@ class PollyInboxApp(App[None]):
 
     def _set_reply_mode_for_task(self) -> None:
         self.reply_input.disabled = False
-        if self.reply_input.placeholder != "Why reject? (Enter to confirm, Esc to cancel)":
+        deny_placeholder = "Denial reason — what should the architect address? (Enter, Esc cancels)"
+        if self.reply_input.placeholder not in (
+            "Why reject? (Enter to confirm, Esc to cancel)",
+            deny_placeholder,
+        ):
             self.reply_input.placeholder = "Reply … (Enter to send, Esc back to list)"
 
     def _set_reply_mode_for_message(self) -> None:
         self._awaiting_rejection_task_id = None
+        self._awaiting_denial_task_id = None
         self.reply_input.value = ""
         self.reply_input.disabled = True
         self.reply_input.placeholder = (
@@ -8663,6 +8734,7 @@ class PollyInboxApp(App[None]):
 
     def _set_reply_mode_for_plan_review_message(self) -> None:
         self._awaiting_rejection_task_id = None
+        self._awaiting_denial_task_id = None
         self.reply_input.value = ""
         self.reply_input.disabled = True
         self.reply_input.placeholder = (
@@ -9335,6 +9407,21 @@ class PollyInboxApp(App[None]):
         if self.reply_input.has_focus:
             # Return focus to the list so j/k works again. Don't exit the
             # app — the reply input is always present on the detail pane.
+            # Clear pending deny/reject prompts so the next ``Enter`` from
+            # a fresh selection doesn't accidentally fire a stale finalizer
+            # (#1403).
+            if self._awaiting_denial_task_id is not None:
+                self._awaiting_denial_task_id = None
+                self.reply_input.placeholder = (
+                    "Reply … (Enter to send, Esc back to list)"
+                )
+                self.reply_input.value = ""
+            if self._awaiting_rejection_task_id is not None:
+                self._awaiting_rejection_task_id = None
+                self.reply_input.placeholder = (
+                    "Reply … (Enter to send, Esc back to list)"
+                )
+                self.reply_input.value = ""
             self.list_view.focus()
             return
         self._focus_cockpit_rail()
@@ -9912,6 +9999,25 @@ class PollyInboxApp(App[None]):
                 self.list_view.focus()
                 return
             self._finish_reject_proposal(task_id, body)
+            return
+        # Plan-review deny path (#1403): the user pressed ``D`` and the
+        # shared reply Input was repurposed as a denial-reason prompt.
+        # Route the bytes to the deny finalizer instead of add_reply so
+        # the underlying plan_task gets cancelled with this reason and
+        # a successor plan_task is created with ``predecessor_task_id``
+        # pointing at it.
+        if self._awaiting_denial_task_id is not None:
+            pending = self._awaiting_denial_task_id
+            self._awaiting_denial_task_id = None
+            self.reply_input.placeholder = (
+                "Reply … (Enter to send, Esc back to list)"
+            )
+            if not task_id or task_id != pending:
+                # Selection moved while typing — abandon the denial.
+                self.reply_input.value = ""
+                self.list_view.focus()
+                return
+            self._finish_deny_plan_review(task_id, body)
             return
         if not body or not task_id:
             # Empty submit — just hand focus back to the list.
@@ -10520,6 +10626,285 @@ class PollyInboxApp(App[None]):
             self._selected_row_key = None
         self._render_list(select_first=bool(self._tasks))
         self._restore_default_hint()
+
+    # ------------------------------------------------------------------
+    # Plan review deny flow (#1403) — capture reason, cancel + replan
+    # ------------------------------------------------------------------
+
+    def action_deny_plan_review(self) -> None:
+        """``D`` — start the deny flow for the selected plan_review item.
+
+        Mirrors :meth:`action_reject_proposal`: repurposes the shared
+        reply Input as a denial-reason prompt. The submitted bytes are
+        the cancellation reason on the underlying plan_task and the
+        seed context for the architect's replan.
+
+        Silent on non-plan_review selections so the keybinding stays
+        inert when it doesn't apply (e.g. the user pressed ``D`` while
+        a generic notification was selected).
+        """
+        if self.reply_input.has_focus:
+            return
+        task_id = self._selected_task_id
+        if task_id is None:
+            return
+        if not self._is_plan_review_selected():
+            self.notify(
+                "Deny only applies to plan_review items.",
+                severity="warning", timeout=2.0,
+            )
+            return
+        self._awaiting_denial_task_id = task_id
+        # Surface the primer header in the toast so the user sees the
+        # "what / why" frame before they start typing.
+        meta = self._plan_review_meta.get(task_id) or {}
+        plan_task_id = str(meta.get("plan_task_id") or task_id)
+        project_key = str(meta.get("project") or "")
+        primer_hdr = (
+            f"Denying plan {project_key + '/' if project_key else ''}"
+            f"{plan_task_id}. Type the reason — the architect will read "
+            "this as 'address these concerns' context for the replan."
+        )
+        self.notify(primer_hdr, severity="information", timeout=4.0)
+        self.reply_input.value = ""
+        self.reply_input.placeholder = (
+            "Denial reason — what should the architect address? "
+            "(Enter, Esc cancels)"
+        )
+        self.reply_input.disabled = False
+        self.reply_input.focus()
+
+    def _finish_deny_plan_review(self, task_id: str, reason: str) -> None:
+        """Cancel the plan_task with ``reason`` and seed a successor.
+
+        * Cancels the underlying plan_project task on its own
+          work-service via :meth:`SQLiteWorkService.cancel`. The reason
+          is the user's first message captured via the reply Input.
+        * Creates a new plan_project task with ``predecessor_task_id``
+          pointing at the cancelled task — this links the replan into
+          the chain (#1398) and emits ``plan.successor_created``.
+        * Adds an ``add_context`` entry on the new plan task carrying
+          the denial reason verbatim so the architect has the "address
+          these concerns" frame in its context window without scraping
+          tmux history.
+        * Archives the inbox plan_review row (the user has acted; the
+          actionable surface is now the new plan task).
+        * Routes the user to the project's PM session via
+          :meth:`_dispatch_to_pm_sync` with a denial-aware primer so
+          the conversation continues there. The chat history (PM's
+          response + user follow-ups) lands on the new plan task once
+          the architect picks it up.
+        """
+        item = self._item_for_id(task_id)
+        if item is None:
+            self.reply_input.value = ""
+            self.list_view.focus()
+            return
+        labels = list(getattr(item, "labels", []) or [])
+        meta = self._plan_review_meta.get(task_id) or _extract_plan_review_meta(
+            labels,
+        )
+        plan_task_id = str(meta.get("plan_task_id") or "")
+        if not plan_task_id:
+            self.notify(
+                "Missing plan_task label; cannot deny.",
+                severity="error", timeout=3.0,
+            )
+            self.reply_input.value = ""
+            self.list_view.focus()
+            return
+        project_key = str(meta.get("project") or "") or (
+            plan_task_id.split("/", 1)[0] if "/" in plan_task_id else ""
+        )
+        actor_name = "polly" if bool(meta.get("fast_track", False)) else "user"
+        clean_reason = (reason or "").strip()
+        if not clean_reason:
+            clean_reason = "(no reason given)"
+
+        # 1. Cancel the underlying plan_task. Open the svc for the
+        #    plan_task's project explicitly — the inbox row's project
+        #    may differ when the plan_review entry came in via the
+        #    workspace inbox sentinel.
+        plan_svc = self._resolve_inbox_svc(item, plan_task_id)
+        if plan_svc is None:
+            self.notify(
+                "Could not open project database for plan task.",
+                severity="error", timeout=3.0,
+            )
+            self.reply_input.value = ""
+            self.list_view.focus()
+            return
+        cancelled_task = None
+        new_task = None
+        try:
+            try:
+                cancelled_task = plan_svc.cancel(
+                    plan_task_id, actor_name, clean_reason,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.notify(
+                    f"Cancel failed: {exc}", severity="error", timeout=3.0,
+                )
+                return
+            # 2. Create the successor plan_project task. Mirror the
+            #    shape used by ``_plan_project_task`` (CLI helper) so
+            #    the architect's assignment sweep finds real work.
+            try:
+                new_task = plan_svc.create(
+                    title=f"Replan {project_key or 'project'}",
+                    description=(
+                        "Replan triggered by user denial of "
+                        f"{plan_task_id}.\n\n"
+                        "Address these concerns from the user:\n"
+                        f"{clean_reason}"
+                    ),
+                    type="task",
+                    project=cancelled_task.project,
+                    flow_template="plan_project",
+                    roles={"architect": cancelled_task.roles.get(
+                        "architect", "architect",
+                    )} if cancelled_task.roles else {"architect": "architect"},
+                    priority="high",
+                    created_by=actor_name,
+                    predecessor_task_id=plan_task_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.notify(
+                    f"Replan create failed: {exc}",
+                    severity="error", timeout=3.0,
+                )
+                return
+            # 2a. Best-effort auto-queue so the architect's assignment
+            #     sweep finds the task (mirrors ``_plan_project_task``).
+            try:
+                plan_svc.queue(new_task.task_id, actor="planner")
+            except Exception:  # noqa: BLE001
+                pass
+            # 2b. Stamp the denial reason on the new plan task as a
+            #     ``plan_review_denied`` context entry. Architect reads
+            #     this directly — no tmux scraping required.
+            try:
+                plan_svc.add_context(
+                    new_task.task_id,
+                    actor=actor_name,
+                    text=(
+                        f"Denial reason for {plan_task_id}:\n{clean_reason}"
+                    ),
+                    entry_type="plan_review_denied",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            try:
+                plan_svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 3. Archive the inbox plan_review row + record the deny on
+        #    the inbox task itself for audit. Uses a fresh svc since we
+        #    already closed the plan-task one.
+        inbox_svc = self._resolve_inbox_svc(item, task_id)
+        if inbox_svc is not None:
+            try:
+                inbox_svc.add_context(
+                    task_id,
+                    actor=actor_name,
+                    text=(
+                        f"Plan denied → cancelled {plan_task_id}, "
+                        f"created successor {new_task.task_id}: "
+                        f"{clean_reason[:200]}"
+                    ),
+                    entry_type="plan_review_denied",
+                )
+                inbox_svc.archive_task(task_id, actor=actor_name)
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                try:
+                    inbox_svc.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        self._emit_event(
+            task_id,
+            "inbox.plan_review.denied",
+            (
+                f"{actor_name} denied plan {plan_task_id}; "
+                f"successor={new_task.task_id} reason={clean_reason[:200]}"
+            ),
+        )
+        self.notify(
+            (
+                f"Denied {plan_task_id} — replan queued as "
+                f"{new_task.task_id}."
+            ),
+            severity="information", timeout=4.0,
+        )
+
+        # 4. Drop the row locally + clean caches.
+        self._tasks = [t for t in self._tasks if t.task_id != task_id]
+        self._unread_ids.discard(task_id)
+        self._session_read_ids.discard(task_id)
+        self._replies_by_task.pop(task_id, None)
+        self._thread_expanded_task_ids.discard(task_id)
+        self._plan_review_meta.pop(task_id, None)
+        self._plan_review_round_trip.pop(task_id, None)
+        if self._selected_task_id == task_id:
+            self._selected_task_id = None
+            self._selected_row_key = None
+        self.reply_input.value = ""
+        self.reply_input.placeholder = (
+            "Reply … (Enter to send, Esc back to list)"
+        )
+        self.list_view.focus()
+        self._render_list(select_first=bool(self._tasks))
+        self._restore_default_hint()
+
+        # 5. Open the project's PM chat thread with the denial primer
+        #    so the conversation continues there. Best-effort: the deny
+        #    has already landed in the work service even if tmux/PM
+        #    routing fails.
+        try:
+            cockpit_key, pm_label = _resolve_pm_target(
+                self.config_path,
+                project_key or cancelled_task.project,
+            )
+            # Try to resolve the canonical plan path so the primer can
+            # quote it for the PM persona. Best-effort — the architect
+            # already has the denial reason on the successor task even
+            # if the plan file lookup fails.
+            plan_path = ""
+            try:
+                config = load_config(self.config_path)
+                project = config.projects.get(
+                    project_key or cancelled_task.project,
+                )
+                if project is not None:
+                    for candidate in _PLAN_FILE_CANDIDATES:
+                        p = project.path / candidate
+                        if p.is_file():
+                            plan_path = str(p)
+                            break
+            except Exception:  # noqa: BLE001
+                plan_path = ""
+            primer = _build_plan_review_denial_primer(
+                project_key=project_key or cancelled_task.project,
+                cancelled_plan_task_id=plan_task_id,
+                successor_plan_task_id=new_task.task_id,
+                denial_reason=clean_reason,
+                reviewer_name="Polly" if actor_name == "polly" else "Sam",
+                plan_path=plan_path,
+            )
+            self.run_worker(
+                lambda: self._dispatch_to_pm_sync(
+                    cockpit_key, primer, pm_label,
+                ),
+                thread=True,
+                exclusive=True,
+                group="jump_to_pm",
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------
     # Event emission

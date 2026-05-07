@@ -493,6 +493,7 @@ def register_project(
     *,
     name: str | None = None,
     slug: str | None = None,
+    tracked: bool = True,
 ) -> KnownProject:
     """Register a project under ``config_path``.
 
@@ -501,6 +502,13 @@ def register_project(
     :func:`slugify_project_key`) and checked for uniqueness against
     existing projects. When not provided, the key is computed from the
     repo path's last segment — the legacy behavior. See #766.
+
+    ``tracked`` defaults to ``True`` so freshly registered projects are
+    visible to cockpit surfaces (rail badges, morning briefings,
+    recovery prompts) immediately. Pass ``tracked=False`` to opt a
+    project out at registration time — downgrading happens later if the
+    project goes cold. See savethenovel "silently invisible fresh
+    project" failure mode.
     """
     config = load_config(config_path)
     normalized_path = normalize_project_path(repo_path)
@@ -536,6 +544,7 @@ def register_project(
         name=name or normalized_path.name,
         persona_name=default_persona_name(name or normalized_path.name),
         kind=detect_project_kind(normalized_path),
+        tracked=bool(tracked),
     )
     config.projects[key] = project
     write_config(config, config_path, force=True)

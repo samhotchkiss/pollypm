@@ -92,8 +92,28 @@ The work service exposes its operations through the Layer 3 Service API, meaning
 ### Process Boundary
 
 V1 ships the work service as an in-process library. The `pm` CLI and other
-local callers construct `SQLiteWorkService` directly against the shared
-`state.db`; there is no separate daemon or Unix socket in the current build.
+local callers obtain a `SQLiteWorkService` against the shared `state.db`
+through the `pollypm.work.create_work_service` factory; there is no
+separate daemon or Unix socket in the current build.
+
+```python
+from pollypm.work import create_work_service
+
+with create_work_service(project_path=project.path) as svc:
+    ...
+```
+
+Direct construction of `SQLiteWorkService` from outside the `pollypm.work`
+package is discouraged: it forces every callsite to know the on-disk
+layout (workspace vs. per-project paths, dual-DB confusion, etc.) and
+bypasses future resolver enhancements (env overrides, fallbacks,
+telemetry). The factory resolves the canonical DB path via
+`pollypm.work.db_resolver.resolve_work_db_path` and yields a
+context-managed service so the SQLite handle closes deterministically.
+
+Callers that genuinely need a non-canonical path (legacy migration,
+tests, explicit `--db` overrides) may pass `db_path=...` explicitly so the
+deviation is visible at the callsite.
 
 - **Startup**: no dedicated service bootstrap. Each caller resolves config and
   builds the service object when needed.

@@ -653,12 +653,24 @@ def log_rotate_handler(payload: dict[str, Any]) -> dict[str, Any]:
 
 def notification_staging_prune_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Drop flushed + silent notification_staging rows older than 30d."""
-    from pollypm.work.sqlite_service import SQLiteWorkService
+    from pollypm.work import create_work_service
 
     with _load_config_and_store(payload) as (_config, store):
         retain_days = int(payload.get("retain_days") or 30)
-        db_path = getattr(store, "path", None) or _config.project.state_db
-        with SQLiteWorkService(db_path=db_path) as svc:
+        # #1369 / #savethenovel-followup: the legacy fallback here was
+        # ``_config.project.state_db`` — the *messages-side* DB. The
+        # ``notification_staging`` table lives on the work-side DB, so
+        # falling through to ``state_db`` would silently stamp the
+        # work schema onto the messages DB on a fresh install. Route
+        # through the work factory so the canonical resolver picks
+        # the workspace-root work DB regardless of which fallback the
+        # store ended up at.
+        store_path = getattr(store, "path", None)
+        if store_path is not None:
+            svc_ctx = create_work_service(db_path=store_path)
+        else:
+            svc_ctx = create_work_service(config=_config)
+        with svc_ctx as svc:
             summary = svc.prune_staged_notifications(retain_days=retain_days)
 
         msg_store = _open_msg_store(_config)

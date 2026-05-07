@@ -30,6 +30,7 @@ from pollypm.work.inbox_plan_reviews import (
     is_plan_task_approved,
     task_user_approval_is_approved,
 )
+from pollypm.work import create_work_service
 from pollypm.work.sqlite_service import SQLiteWorkService
 
 logger = logging.getLogger(__name__)
@@ -706,7 +707,7 @@ def load_inbox_entries(
                 except Exception:  # noqa: BLE001
                     pass
         try:
-            svc = SQLiteWorkService(db_path=db_path, project_path=project_path)
+            svc = create_work_service(db_path=db_path, project_path=project_path)
         except Exception:  # noqa: BLE001
             continue
         try:

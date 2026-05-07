@@ -205,8 +205,8 @@ def count_in_progress_tasks() -> int:
     """
     try:
         from pollypm.config import DEFAULT_CONFIG_PATH
+        from pollypm.work import create_work_service
         from pollypm.work.db_resolver import resolve_work_db_path
-        from pollypm.work.sqlite_service import SQLiteWorkService
     except Exception:  # noqa: BLE001
         return 0
     try:
@@ -226,7 +226,7 @@ def count_in_progress_tasks() -> int:
     # CLI today, but the leaky pattern would bite any future caller
     # that loops. Mirrors the close-on-exit pattern from #1069 / #1381.
     try:
-        with SQLiteWorkService(db_path=db_path) as svc:
+        with create_work_service(db_path=db_path) as svc:
             tasks = svc.list_tasks(work_status="in_progress")
     except Exception:  # noqa: BLE001
         return 0

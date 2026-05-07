@@ -213,11 +213,11 @@ def has_pending_work_for_session(config, session_name: str) -> bool:
             pass
 
         try:
-            from pollypm.work.sqlite_service import SQLiteWorkService
+            from pollypm.work import create_work_service
 
             db_path = project_path / ".pollypm" / "state.db"
             if db_path.exists():
-                with SQLiteWorkService(
+                with create_work_service(
                     db_path=db_path, project_path=project_path,
                 ) as svc:
                     for task in svc.list_tasks(project=project_key):

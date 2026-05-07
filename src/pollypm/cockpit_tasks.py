@@ -1528,7 +1528,7 @@ class PollyTasksApp(App[None]):
         from. Fall back to the project-local DB so the legacy contract
         still holds when neither DB has a row yet.
         """
-        from pollypm.work.sqlite_service import SQLiteWorkService
+        from pollypm.work import create_work_service
 
         try:
             config = load_config(self.config_path)
@@ -1540,7 +1540,7 @@ class PollyTasksApp(App[None]):
             return None
         for db_path, project_path in candidates:
             try:
-                svc = SQLiteWorkService(db_path=db_path, project_path=project_path)
+                svc = create_work_service(db_path=db_path, project_path=project_path)
             except Exception:  # noqa: BLE001
                 continue
             try:
@@ -1561,7 +1561,7 @@ class PollyTasksApp(App[None]):
         # the rest of the pane still has a working service handle.
         first_db, first_project_path = candidates[0]
         try:
-            return SQLiteWorkService(
+            return create_work_service(
                 db_path=first_db, project_path=first_project_path,
             )
         except Exception:  # noqa: BLE001

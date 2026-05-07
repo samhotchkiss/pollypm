@@ -38,7 +38,7 @@ from pollypm.model_registry import advisories_for, load_registry, resolve_alias
 from pollypm.models import ModelAssignment, ProviderKind
 from pollypm.role_routing import resolve_role_assignment
 from pollypm.service_api import PollyPMService
-from pollypm.work.sqlite_service import SQLiteWorkService
+from pollypm.work import create_work_service
 
 _PROJECT_ROLE_KEYS = ("architect", "worker", "reviewer")
 _ROLE_LABELS = {
@@ -583,7 +583,7 @@ class PollyProjectSettingsApp(App[None]):
         if not db_path.exists():
             return "[dim]No project database yet.[/dim]"
         try:
-            with SQLiteWorkService(db_path=db_path, project_path=project_path) as svc:
+            with create_work_service(db_path=db_path, project_path=project_path) as svc:
                 tasks = svc.list_tasks(assignee=worker.name, limit=5)
         except Exception as exc:  # noqa: BLE001
             return f"[dim]Recent tasks unavailable: {exc}[/dim]"

@@ -335,7 +335,7 @@ def _plan_project_task(
     # wired a full SQLite environment yet.
     import logging
 
-    from pollypm.work.sqlite_service import SQLiteWorkService
+    from pollypm.work import create_work_service
 
     log = logging.getLogger(__name__)
 
@@ -345,7 +345,7 @@ def _plan_project_task(
         create_parent=True,
     )
 
-    with SQLiteWorkService(db_path=db_path, project_path=project_path) as svc:
+    with create_work_service(db_path=db_path, project_path=project_path) as svc:
         task = svc.create(
             title=f"{title_prefix} {project_key}",
             description=description or (
@@ -483,11 +483,11 @@ def blocker_summary_cmd(
     )
 
     from pollypm.store import SQLAlchemyStore
-    from pollypm.work.sqlite_service import SQLiteWorkService
+    from pollypm.work import create_work_service
 
     store = SQLAlchemyStore(f"sqlite:///{db_path}")
     try:
-        with SQLiteWorkService(
+        with create_work_service(
             db_path=db_path, project_path=project_path,
         ) as svc:
             result = record_project_blocker_summary(
@@ -1136,9 +1136,9 @@ def _plan_task_exists(
     if not db_path.exists():
         return False
     try:
-        from pollypm.work.sqlite_service import SQLiteWorkService
+        from pollypm.work import create_work_service
 
-        with SQLiteWorkService(
+        with create_work_service(
             db_path=db_path, project_path=project_path,
         ) as svc:
             for task in svc.list_tasks(project=project_key):

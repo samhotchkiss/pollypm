@@ -222,8 +222,8 @@ def _pending_inbox_section(config: PollyPMConfig) -> RecoveryPromptSection | Non
     and summarises them. No legacy inbox.
     """
     try:
+        from pollypm.work import create_work_service
         from pollypm.work.inbox_view import inbox_tasks
-        from pollypm.work.sqlite_service import SQLiteWorkService
 
         summaries: list[str] = []
         total = 0
@@ -239,7 +239,7 @@ def _pending_inbox_section(config: PollyPMConfig) -> RecoveryPromptSection | Non
             if not db_path.exists():
                 continue
             try:
-                with SQLiteWorkService(
+                with create_work_service(
                     db_path=db_path, project_path=project.path,
                 ) as svc:
                     tasks = inbox_tasks(svc, project=project_key)

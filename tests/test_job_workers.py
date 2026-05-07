@@ -413,3 +413,178 @@ def test_metrics_track_per_handler_counts_and_duration(tmp_path: Path) -> None:
     assert snapshot["a"]["avg_duration_ms"] > 0
     assert snapshot["b"]["jobs_completed"] == 0
     assert snapshot["b"]["jobs_failed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# #1370 — JobWorkerPool thread leak regression coverage
+# ---------------------------------------------------------------------------
+
+
+def _handler_thread_count(prefix: str) -> int:
+    """Count live threads whose name starts with ``<prefix>-handler``.
+
+    Pre-fix, ``_run_one`` spawned one such thread per job *attempt*
+    and abandoned it on timeout, so the count grew monotonically.
+    Post-fix the executor reuses a single handler thread per worker.
+    """
+    return sum(
+        1 for t in threading.enumerate()
+        if t.name.startswith(f"{prefix}-handler") and t.is_alive()
+    )
+
+
+def test_handler_thread_does_not_leak_per_attempt(tmp_path: Path) -> None:
+    """#1370: handler invocations must reuse one thread per worker.
+
+    Pre-fix, ``_run_one`` spawned a fresh ``threading.Thread`` for
+    every retry attempt and abandoned the reference on the timeout
+    path. With the lock-retry loop active that meant up to 4 threads
+    per job, all daemon, all leaked for the lifetime of the process.
+    The fix routes invocations through a single-slot
+    ``ThreadPoolExecutor`` per worker, so the live handler-thread
+    count stays bounded by ``concurrency`` no matter how many jobs
+    run.
+    """
+    q = _make_queue(tmp_path)
+
+    def quick(payload: dict) -> None:
+        return None
+
+    prefix = "leak-test-pool"
+    registry = {"q": HandlerSpec("q", quick, timeout_seconds=5)}
+    pool = JobWorkerPool(
+        q, registry=registry, poll_interval=0.01,
+        worker_name_prefix=prefix,
+    )
+    pool.start(concurrency=2)
+    try:
+        for _ in range(50):
+            q.enqueue("q")
+        assert _wait_until(lambda: q.stats().done == 50, timeout=10.0)
+        # With concurrency=2 and the executor-based fix, at most two
+        # handler threads should ever be alive concurrently. Pre-fix
+        # this would be ~50 (one per completed job, since daemon
+        # threads outlive their invocation by epsilon under load).
+        live = _handler_thread_count(prefix)
+        assert live <= 2, f"handler threads leaked: {live} alive"
+    finally:
+        pool.stop(timeout=2)
+
+
+def test_timed_out_handler_does_not_spawn_new_thread_each_retry(
+    tmp_path: Path,
+) -> None:
+    """#1370: a hung handler must not multiply handler threads.
+
+    Pre-fix, every lock-retry attempt that timed out left a daemon
+    thread running the original handler. The post-fix executor
+    serializes attempts on a single slot — once a handler hangs past
+    its timeout we stop submitting new attempts (the executor would
+    block on the same slot anyway). Verifies the count stays at most
+    ``concurrency`` even when every handler hangs.
+    """
+    q = _make_queue(tmp_path)
+    release = threading.Event()
+
+    def hang(payload: dict) -> None:
+        # Block until the test releases us — must not be killed.
+        release.wait(timeout=10)
+
+    prefix = "hang-test-pool"
+    registry = {"hang": HandlerSpec(
+        "hang", hang, timeout_seconds=0.05, max_attempts=1,
+    )}
+    pool = JobWorkerPool(
+        q, registry=registry, poll_interval=0.01,
+        worker_name_prefix=prefix,
+    )
+    pool.start(concurrency=1)
+    try:
+        for _ in range(5):
+            q.enqueue("hang", max_attempts=1)
+        # Each job times out at 50ms; with 5 jobs the worker will
+        # cycle through them in <2s. We only care about leak count,
+        # not job outcomes.
+        assert _wait_until(lambda: q.stats().failed >= 1, timeout=5.0)
+        live = _handler_thread_count(prefix)
+        # With concurrency=1, one executor handler thread is expected.
+        # Pre-fix this was 1-per-attempt-per-job, easily 5+.
+        assert live <= 1, f"handler threads leaked under hang: {live} alive"
+    finally:
+        # Release the hung handlers so the executor's worker thread
+        # can exit cleanly when the pool tears down.
+        release.set()
+        pool.stop(timeout=2)
+
+
+def test_stop_emits_thread_leaked_audit_when_worker_blocked(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """#1370: ``pool.stop()`` emits ``worker.thread_leaked`` on join timeout.
+
+    Without this hook the only signal of a leaked worker thread was a
+    log line — and the heartbeat / pm doctor surfaces don't ingest
+    arbitrary log text. Emitting an audit event lets the fleet count
+    these without grepping ``errors.log``.
+    """
+    q = _make_queue(tmp_path)
+    release = threading.Event()
+
+    def hang(payload: dict) -> None:
+        release.wait(timeout=30)
+
+    registry = {"h": HandlerSpec("h", hang, timeout_seconds=30, max_attempts=1)}
+    pool = JobWorkerPool(q, registry=registry, poll_interval=0.01)
+
+    captured: list[dict] = []
+
+    def fake_emit(**kwargs):
+        captured.append(kwargs)
+
+    # Patch the lazy import target.
+    import pollypm.audit.log as audit_log
+    monkeypatch.setattr(audit_log, "emit", fake_emit)
+
+    pool.start(concurrency=1)
+    try:
+        q.enqueue("h", max_attempts=1)
+        # Wait for the worker to be inside the handler.
+        time.sleep(0.2)
+        # Fast stop — worker is wedged inside future.result(timeout=30s)
+        # so the join will time out.
+        pool.stop(timeout=0.2)
+    finally:
+        release.set()
+        # Defensive — give the wedged worker a chance to drop its lock.
+        time.sleep(0.05)
+
+    leaked_events = [e for e in captured if e.get("event") == "worker.thread_leaked"]
+    assert leaked_events, (
+        f"expected at least one worker.thread_leaked audit event, got {captured!r}"
+    )
+    assert leaked_events[0]["status"] == "warn"
+    assert "timeout_seconds" in leaked_events[0]["metadata"]
+
+
+def test_stop_does_not_emit_thread_leaked_for_clean_shutdown(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """#1370 happy-path: idle pool shuts down without emitting leak events."""
+    q = _make_queue(tmp_path)
+    pool = JobWorkerPool(q, registry={}, poll_interval=0.01)
+
+    captured: list[dict] = []
+
+    def fake_emit(**kwargs):
+        captured.append(kwargs)
+
+    import pollypm.audit.log as audit_log
+    monkeypatch.setattr(audit_log, "emit", fake_emit)
+
+    pool.start(concurrency=2)
+    pool.stop(timeout=2)
+
+    leaked_events = [e for e in captured if e.get("event") == "worker.thread_leaked"]
+    assert not leaked_events, (
+        f"clean shutdown should not emit leak events, got {leaked_events!r}"
+    )

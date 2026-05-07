@@ -49,6 +49,16 @@ EVENT_WORK_TABLE_CLEARED = "work_table.cleared"
 # breadcrumb — see comment in ``SQLiteWorkService.__init__`` for the
 # reasoning.
 EVENT_WORK_DB_OPENED = "work_db.opened"
+# #1370 — emitted from ``JobWorkerPool.stop()`` whenever a worker
+# thread does not exit within the join deadline. Pre-fix this fired
+# 8841 times in errors.log because ``_run_one`` spawned a fresh
+# ``threading.Thread`` per job attempt and abandoned it on handler
+# timeout. The fix routes invocations through a per-worker
+# ``ThreadPoolExecutor(max_workers=1)`` so the worker reuses one
+# executor thread instead of leaking one per attempt; this event lets
+# the fleet quantify whether the fix is holding without grepping
+# ``errors.log``.
+EVENT_WORKER_THREAD_LEAKED = "worker.thread_leaked"
 
 
 @dataclass(slots=True, frozen=True)
@@ -397,6 +407,7 @@ __all__ = [
     "EVENT_MARKER_LEAKED",
     "EVENT_WORK_TABLE_CLEARED",
     "EVENT_WORK_DB_OPENED",
+    "EVENT_WORKER_THREAD_LEAKED",
     "AuditEvent",
     "central_log_path",
     "emit",

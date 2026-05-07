@@ -112,6 +112,66 @@ def test_register_project_accepts_plain_folder_and_can_enable_tracker(tmp_path: 
     assert (project_path / "issues" / ".latest_issue_number").exists()
 
 
+def test_register_project_defaults_tracked_true(tmp_path: Path) -> None:
+    """Fresh registrations default to ``tracked=True`` so cockpit
+    surfaces (rail badges, morning briefings, recovery prompts) include
+    the project immediately. Previously projects landed as ``tracked
+    =False`` and disappeared from those surfaces — the savethenovel
+    "silently invisible fresh project" failure mode."""
+    project_path = tmp_path / "fresh-default"
+    project_path.mkdir()
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path, base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account=""),
+        accounts={},
+        sessions={},
+        projects={},
+    )
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path, force=True)
+
+    project = register_project(config_path, project_path, name="Fresh")
+    assert project.tracked is True
+    # The persisted toml entry must also reflect tracked=true so the
+    # next config-load picks it up correctly.
+    assert "tracked = true" in config_path.read_text()
+
+
+def test_register_project_honors_explicit_no_track_opt_out(tmp_path: Path) -> None:
+    """``register_project(..., tracked=False)`` is the documented
+    opt-out for experimental/archival registrations. The flag must be
+    threaded through and persisted; the toml entry should omit the
+    ``tracked = true`` line (the writer only emits the line for
+    truthy values)."""
+    project_path = tmp_path / "opt-out"
+    project_path.mkdir()
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path, base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account=""),
+        accounts={},
+        sessions={},
+        projects={},
+    )
+    config_path = tmp_path / "pollypm.toml"
+    write_config(config, config_path, force=True)
+
+    project = register_project(
+        config_path, project_path, name="OptOut", tracked=False,
+    )
+    assert project.tracked is False
+    assert "tracked = true" not in config_path.read_text()
+
+
 def test_register_project_accepts_explicit_slug_override(tmp_path: Path) -> None:
     """#766: callers (CLI --slug, cockpit slug picker) can pin the
     project key instead of relying on auto-derivation."""
@@ -711,3 +771,88 @@ def test_pm_add_project_leaves_git_status_clean_on_fresh_repo(tmp_path: Path) ->
         check=True, capture_output=True, text=True,
     ).stdout
     assert ".gitignore" in tree
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+def test_pm_add_project_default_writes_tracked_true_to_toml(tmp_path: Path) -> None:
+    """Default ``pm add-project`` must persist ``tracked = true`` in
+    ``pollypm.toml`` so cockpit surfaces (rail badges, morning
+    briefings, recovery prompts) include the project on the next
+    config-load. Regression guard for the savethenovel "silently
+    invisible fresh project" failure mode."""
+    from typer.testing import CliRunner
+    from pollypm.cli import app as root_app
+
+    repo = tmp_path / "fresh-repo"
+    repo.mkdir()
+    _git_init_repo(repo)
+
+    config_path = tmp_path / "pollypm.toml"
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            workspace_root=tmp_path,
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account=""),
+        accounts={},
+        sessions={},
+        projects={},
+    )
+    write_config(config, config_path, force=True)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        root_app,
+        [
+            "add-project", str(repo), "--skip-import", "--skip-plan",
+            "--config", str(config_path), "--name", "fresh-repo",
+        ],
+    )
+    assert result.exit_code == 0, (result.stdout or "") + (result.stderr or "")
+    assert "tracked = true" in config_path.read_text()
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+def test_pm_add_project_no_track_flag_omits_tracked_in_toml(tmp_path: Path) -> None:
+    """``pm add-project --no-track`` opts the project out of tracked
+    mode so it stays out of cockpit surfaces. The toml writer omits the
+    ``tracked = true`` line entirely when the value is falsy."""
+    from typer.testing import CliRunner
+    from pollypm.cli import app as root_app
+
+    repo = tmp_path / "opt-out-repo"
+    repo.mkdir()
+    _git_init_repo(repo)
+
+    config_path = tmp_path / "pollypm.toml"
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            workspace_root=tmp_path,
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account=""),
+        accounts={},
+        sessions={},
+        projects={},
+    )
+    write_config(config, config_path, force=True)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        root_app,
+        [
+            "add-project", str(repo), "--skip-import", "--skip-plan",
+            "--no-track",
+            "--config", str(config_path), "--name", "opt-out-repo",
+        ],
+    )
+    assert result.exit_code == 0, (result.stdout or "") + (result.stderr or "")
+    assert "tracked = true" not in config_path.read_text()

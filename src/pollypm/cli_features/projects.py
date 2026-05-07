@@ -188,12 +188,12 @@ def register_project_commands(app: typer.Typer) -> None:
             [
                 ("pm add-project ~/dev/my-app", "register a repo and import its history"),
                 (
-                    'pm add-project ~/dev/my-app --name "My App"',
-                    "override the display name",
-                ),
-                (
                     "pm add-project ~/dev/my-app --skip-plan",
                     "register the repo without planner auto-fire",
+                ),
+                (
+                    "pm add-project ~/dev/my-app --no-track",
+                    "register without marking the project as tracked",
                 ),
             ],
         )
@@ -211,6 +211,16 @@ def register_project_commands(app: typer.Typer) -> None:
                 "the global switch."
             ),
         ),
+        track: bool = typer.Option(
+            True,
+            "--track/--no-track",
+            help=(
+                "Mark the project as tracked so cockpit surfaces (rail "
+                "badges, morning briefings, recovery prompts) include it. "
+                "Defaults to tracked=true; pass --no-track to opt out for "
+                "experimental or archival registrations."
+            ),
+        ),
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     ) -> None:
         from pollypm.projects import normalize_project_path
@@ -226,7 +236,9 @@ def register_project_commands(app: typer.Typer) -> None:
         except Exception:  # noqa: BLE001
             was_preexisting = False
 
-        project = register_project(config_path, repo_path, name=name)
+        project = register_project(
+            config_path, repo_path, name=name, tracked=bool(track),
+        )
         typer.echo(f"Registered project {project.name or project.key} at {project.path}")
 
         if not was_preexisting:

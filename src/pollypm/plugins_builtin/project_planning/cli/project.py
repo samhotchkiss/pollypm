@@ -320,11 +320,24 @@ def _plan_project_task(
 ) -> Any:
     """Create a ``flow=plan_project`` task on the project's work service.
 
-    Returns the created ``Task``. Caller owns output formatting.
+    Mirrors the ``project.created`` observer (``plugin.py``): create the
+    task and immediately auto-queue it so the architect's assignment
+    sweep finds real work instead of leaving the task ``draft`` forever
+    (issue #993 / savethenovel forensic). Best-effort: a failure in the
+    queue gate keeps the draft so the user can fix it manually.
+
+    Returns the created ``Task`` (post-queue when auto-queue succeeds).
+    The ``work_status`` on the returned task tells the caller whether
+    auto-queue fired (``queued``) or fell back to ``draft``. Caller owns
+    output formatting.
     """
-    # Local import to keep the CLI importable in tests that haven't wired
-    # a full SQLite environment yet.
+    # Local imports to keep the CLI importable in tests that haven't
+    # wired a full SQLite environment yet.
+    import logging
+
     from pollypm.work.sqlite_service import SQLiteWorkService
+
+    log = logging.getLogger(__name__)
 
     db_path = _planner_db_path(
         project_path,
@@ -345,6 +358,21 @@ def _plan_project_task(
             roles={"architect": actor},
             priority="high",
         )
+        # Parity with ``_on_project_created`` (plugin.py:249-258): the
+        # architect spawn relies on the assignment sweep finding a
+        # ``queued`` task. Leaving the explicitly-requested task in
+        # ``draft`` recreates the "ready, sit idle forever" pattern
+        # from #993 — a regression seen in the savethenovel forensic.
+        # Best-effort: keep the draft on gate failure so the user can
+        # recover via ``pm task queue`` rather than crashing the CLI.
+        try:
+            task = svc.queue(task.task_id, actor="planner")
+        except Exception as queue_exc:  # noqa: BLE001
+            log.warning(
+                "project_planning: auto-queue of %s failed (%s); "
+                "task left in draft. Run `pm task queue %s` manually.",
+                task.task_id, queue_exc, task.task_id,
+            )
     return task
 
 
@@ -689,10 +717,13 @@ def plan_cmd(
         f"Created planning task {task.task_id} on project '{key}' "
         f"(flow={task.flow_template_id})."
     )
-    typer.echo(
-        "Next: `pm task queue " + task.task_id + "` to hand it off to the "
-        "architect worker."
-    )
+    if task.work_status.value == "queued":
+        typer.echo("Auto-queued for the architect.")
+    else:
+        typer.echo(
+            "Auto-queue failed — run `pm task queue " + task.task_id
+            + "` to hand it off to the architect worker."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -750,10 +781,13 @@ def replan_cmd(
         f"Created replan task {task.task_id} on project '{key}' "
         f"(flow={task.flow_template_id}, mode=replan)."
     )
-    typer.echo(
-        "Next: `pm task queue " + task.task_id + "` to hand it off to the "
-        "architect worker."
-    )
+    if task.work_status.value == "queued":
+        typer.echo("Auto-queued for the architect.")
+    else:
+        typer.echo(
+            "Auto-queue failed — run `pm task queue " + task.task_id
+            + "` to hand it off to the architect worker."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -998,10 +1032,13 @@ def new_cmd(
         f"Created planning task {task.task_id} on project "
         f"'{project.key}' (flow={task.flow_template_id})."
     )
-    typer.echo(
-        "Next: `pm task queue " + task.task_id + "` to hand it off to the "
-        "architect worker."
-    )
+    if task.work_status.value == "queued":
+        typer.echo("Auto-queued for the architect.")
+    else:
+        typer.echo(
+            "Auto-queue failed — run `pm task queue " + task.task_id
+            + "` to hand it off to the architect worker."
+        )
     _auto_spawn_architect(path, project.key)
 
 

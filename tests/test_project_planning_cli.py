@@ -364,6 +364,50 @@ class TestPlan:
         payload = json.loads(result.stdout)
         assert payload["project"] == "demo"
 
+    def test_plan_auto_queues_task(self, tmp_path: Path) -> None:
+        """Parity with ``project.created`` observer (#993).
+
+        ``pm project plan`` must leave the planning task in ``queued``,
+        not ``draft``: the architect's assignment sweep only finds queued
+        work, so a draft task sits idle forever (savethenovel forensic).
+        """
+        repo = _make_project_repo(tmp_path)
+        config_path = _write_minimal_config(tmp_path, projects={"demo": repo})
+
+        result = runner.invoke(
+            project_app,
+            ["plan", "demo", "--config", str(config_path), "--json"],
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        payload = json.loads(result.stdout)
+        assert payload["work_status"] == "queued"
+
+    def test_plan_auto_queue_failure_keeps_draft(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """If ``svc.queue`` raises, the create still succeeds.
+
+        We don't crash the user's command — log a warning and leave the
+        task in ``draft`` so the user can recover via ``pm task queue``.
+        """
+        repo = _make_project_repo(tmp_path)
+        config_path = _write_minimal_config(tmp_path, projects={"demo": repo})
+
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        def _boom(self, task_id, actor, skip_gates=False):  # noqa: ARG001
+            raise RuntimeError("synthetic gate failure")
+
+        monkeypatch.setattr(SQLiteWorkService, "queue", _boom)
+
+        result = runner.invoke(
+            project_app,
+            ["plan", "demo", "--config", str(config_path), "--json"],
+        )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        payload = json.loads(result.stdout)
+        assert payload["work_status"] == "draft"
+
 
 # ---------------------------------------------------------------------------
 # replan

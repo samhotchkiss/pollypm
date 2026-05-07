@@ -37,6 +37,7 @@ def create_task(
     relevant_files: list[str] | None = None,
     labels: list[str] | None = None,
     requires_human_review: bool = False,
+    predecessor_task_id: str | None = None,
 ) -> Task:
     template = service._ensure_flow_in_db(flow_template)
 
@@ -75,14 +76,25 @@ def create_task(
     ).fetchone()
     task_number = row["max_num"] + 1
 
+    # #1398 — normalise predecessor_task_id and let validation surface
+    # malformed forms early. ``_parse_task_id`` raises ValidationError
+    # on bad input; we deliberately don't verify the predecessor exists
+    # in work_tasks here so a caller can re-thread a replan even after
+    # the prior attempt has been pruned (e.g. cancelled/cleaned).
+    predecessor_normalized: str | None = None
+    if predecessor_task_id is not None:
+        pred_project, pred_number = _parse_task_id(predecessor_task_id)
+        predecessor_normalized = f"{pred_project}/{pred_number}"
+
     service._conn.execute(
         "INSERT INTO work_tasks "
         "(project, task_number, title, type, labels, work_status, "
         "flow_template_id, flow_template_version, current_node_id, "
         "assignee, priority, requires_human_review, description, "
         "acceptance_criteria, constraints, relevant_files, "
-        "roles, external_refs, created_at, created_by, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "roles, external_refs, created_at, created_by, updated_at, "
+        "plan_version, predecessor_task_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             project,
             task_number,
@@ -105,6 +117,8 @@ def create_task(
             now,
             created_by,
             now,
+            1,
+            predecessor_normalized,
         ),
     )
     service._conn.commit()
@@ -130,6 +144,23 @@ def create_task(
             },
             project_path=service._project_path,
         )
+        # #1398 — separate event for replan successor links so the
+        # heartbeat can render plan-history breadcrumbs without
+        # re-parsing every task.created metadata blob.
+        if predecessor_normalized is not None:
+            from pollypm.audit.log import EVENT_PLAN_SUCCESSOR_CREATED
+
+            _audit_emit(
+                event=EVENT_PLAN_SUCCESSOR_CREATED,
+                project=project,
+                subject=task.task_id,
+                actor=created_by or "system",
+                metadata={
+                    "predecessor": predecessor_normalized,
+                    "successor": task.task_id,
+                },
+                project_path=service._project_path,
+            )
     except Exception:  # noqa: BLE001 — audit must never break creates
         pass
     if service._sync:

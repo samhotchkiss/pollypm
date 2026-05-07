@@ -97,6 +97,13 @@ class TestWorkTasksColumns:
         for col in ("parent_project", "parent_task_number", "supersedes_project", "supersedes_task_number"):
             assert col in cols, f"Missing column: {col}"
 
+    def test_plan_metadata_columns(self, conn):
+        """#1398 — plan_version + predecessor_task_id present on fresh DB."""
+        create_work_tables(conn)
+        cols = _columns(conn, "work_tasks")
+        assert "plan_version" in cols
+        assert "predecessor_task_id" in cols
+
     def test_audit_columns(self, conn):
         create_work_tables(conn)
         cols = _columns(conn, "work_tasks")
@@ -263,10 +270,10 @@ def test_legacy_db_gets_hot_query_indexes_and_schema_bump(conn):
     version = conn.execute(
         "SELECT COALESCE(MAX(version), 0) FROM work_schema_version"
     ).fetchone()[0]
-    # Migration 7 (#922) records the kickoff_sent_at column bump on
-    # work_node_executions so the heartbeat sweep can force the first
-    # 'Resume work' ping past the bootstrap race.
-    assert version == 7
+    # Migration 8 (#1398) records the plan_version + predecessor_task_id
+    # column bumps on work_tasks so plan-task evolution metadata
+    # surfaces on legacy DBs without a backfill pass.
+    assert version == 8
 
 
 def test_migration_6_adds_provider_columns_to_work_sessions(conn):
@@ -301,4 +308,99 @@ def test_migration_7_adds_kickoff_sent_at_to_work_node_executions(conn):
     version = conn.execute(
         "SELECT COALESCE(MAX(version), 0) FROM work_schema_version"
     ).fetchone()[0]
-    assert version == 7
+    # The migration walk applies every pending step in order, so a v6
+    # legacy DB ends up at the latest version (v8 after #1398) — not
+    # at v7. Asserting the whole walk completed protects future
+    # migrations from a stale floor here.
+    assert version == 8
+
+
+def test_migration_8_adds_plan_metadata_columns_to_work_tasks(conn):
+    """#1398: legacy work_tasks rows get plan_version + predecessor_task_id.
+
+    Builds a v7-shaped DB with a populated row that pre-dates the
+    columns, runs the migration, and asserts:
+      * the new columns exist after migration,
+      * existing rows default to ``plan_version=1`` and
+        ``predecessor_task_id=NULL`` (additive migration — no data
+        loss / shape change),
+      * the schema_version row bumps to v8.
+    """
+    # Create a v7-shaped work_tasks table (no plan_version /
+    # predecessor_task_id columns) plus the schema_version row that
+    # pins us to v7 so the migration walk has to apply v8.
+    conn.executescript(
+        """
+        CREATE TABLE work_schema_version (
+            version INTEGER NOT NULL,
+            description TEXT NOT NULL,
+            applied_at TEXT NOT NULL
+        );
+        INSERT INTO work_schema_version (version, description, applied_at)
+        VALUES (7, 'pre-#1398', '2026-04-01T00:00:00+00:00');
+
+        CREATE TABLE work_tasks (
+            project TEXT NOT NULL,
+            task_number INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            type TEXT NOT NULL,
+            labels TEXT NOT NULL DEFAULT '[]',
+            work_status TEXT NOT NULL DEFAULT 'draft',
+            flow_template_id TEXT NOT NULL,
+            flow_template_version INTEGER NOT NULL DEFAULT 1,
+            current_node_id TEXT,
+            assignee TEXT,
+            priority TEXT NOT NULL DEFAULT 'normal',
+            requires_human_review INTEGER NOT NULL DEFAULT 0,
+            description TEXT NOT NULL DEFAULT '',
+            acceptance_criteria TEXT,
+            constraints TEXT,
+            relevant_files TEXT NOT NULL DEFAULT '[]',
+            parent_project TEXT,
+            parent_task_number INTEGER,
+            supersedes_project TEXT,
+            supersedes_task_number INTEGER,
+            roles TEXT NOT NULL DEFAULT '{}',
+            external_refs TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (project, task_number)
+        );
+        INSERT INTO work_tasks
+            (project, task_number, title, type, flow_template_id,
+             created_at, created_by, updated_at)
+        VALUES
+            ('demo', 1, 'pre-existing', 'task', 'standard',
+             '2026-01-01T00:00:00+00:00', 'tester',
+             '2026-01-01T00:00:00+00:00');
+        """
+    )
+
+    create_work_tables(conn)
+
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(work_tasks)")}
+    assert "plan_version" in cols, "plan_version column should exist post-migration"
+    assert "predecessor_task_id" in cols, (
+        "predecessor_task_id column should exist post-migration"
+    )
+
+    row = conn.execute(
+        "SELECT title, plan_version, predecessor_task_id FROM work_tasks "
+        "WHERE project = ? AND task_number = ?",
+        ("demo", 1),
+    ).fetchone()
+    assert row is not None, "existing row must survive additive migration"
+    assert row[0] == "pre-existing", "title must be untouched"
+    assert row[1] == 1, "plan_version defaults to 1 for pre-#1398 rows"
+    assert row[2] is None, "predecessor_task_id defaults to NULL"
+
+    version = conn.execute(
+        "SELECT COALESCE(MAX(version), 0) FROM work_schema_version"
+    ).fetchone()[0]
+    assert version == 8
+
+    idxs = _indexes(conn)
+    assert "idx_work_tasks_predecessor" in idxs, (
+        "successors lookup index should be created on legacy DB"
+    )

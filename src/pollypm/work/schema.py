@@ -81,6 +81,19 @@ CREATE TABLE IF NOT EXISTS work_tasks (
     supersedes_project TEXT,
     supersedes_task_number INTEGER,
 
+    -- #1398 — plan task evolution metadata.
+    -- ``plan_version`` increments each time a plan task gets refined
+    -- in place (same task ID, new revision). Defaults to 1 so legacy
+    -- rows (created before this column existed) read as the first
+    -- revision without requiring a backfill pass.
+    plan_version INTEGER NOT NULL DEFAULT 1,
+    -- ``predecessor_task_id`` points to the prior attempt when a
+    -- replan creates a new task instead of refining the existing
+    -- one. Stored as canonical ``project/task_number`` text so the
+    -- foreign key shape matches the rest of the codebase's task-id
+    -- convention; NULL means "no predecessor — original attempt".
+    predecessor_task_id TEXT,
+
     roles TEXT NOT NULL DEFAULT '{}',
     external_refs TEXT NOT NULL DEFAULT '{}',
 
@@ -107,6 +120,11 @@ CREATE INDEX IF NOT EXISTS idx_work_tasks_active
 
 CREATE INDEX IF NOT EXISTS idx_work_tasks_priority
     ON work_tasks(priority, work_status);
+-- idx_work_tasks_predecessor is created by
+-- _ensure_work_task_plan_columns after the column is backfilled
+-- (migration 8). SQLite won't parse an index that references a
+-- column the (pre-migration) legacy work_tasks table doesn't have
+-- yet, so it must live in the ensure helper rather than WORK_SCHEMA.
 
 -- -------------------------------------------------------------------
 -- Task dependencies / relationships
@@ -238,6 +256,7 @@ def create_work_tables(conn: sqlite3.Connection) -> None:
     _ensure_flow_node_columns(conn)
     _ensure_context_entry_columns(conn)
     _ensure_node_execution_columns(conn)
+    _ensure_work_task_plan_columns(conn)
     _run_work_migrations(conn)
 
 
@@ -278,6 +297,36 @@ def _ensure_node_execution_columns(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE work_node_executions ADD COLUMN kickoff_sent_at TEXT"
         )
+
+
+def _ensure_work_task_plan_columns(conn: sqlite3.Connection) -> None:
+    """Backfill plan_version + predecessor_task_id on work_tasks (#1398).
+
+    Mirrors the pattern used for kickoff_sent_at / entry_type / agent_name:
+    SQLite lacks IF NOT EXISTS on ADD COLUMN and CREATE TABLE IF NOT
+    EXISTS is a no-op on already-present tables, so legacy DBs that
+    pre-date this migration need an explicit guarded ALTER TABLE.
+    Migration v8 records the version bump for both fresh and legacy
+    rows so the schema_version row stays accurate.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(work_tasks)")}
+    if "plan_version" not in cols:
+        conn.execute(
+            "ALTER TABLE work_tasks "
+            "ADD COLUMN plan_version INTEGER NOT NULL DEFAULT 1"
+        )
+    if "predecessor_task_id" not in cols:
+        conn.execute(
+            "ALTER TABLE work_tasks ADD COLUMN predecessor_task_id TEXT"
+        )
+    # Successors lookup index. Created here (not just in WORK_SCHEMA)
+    # because legacy DBs that already have a work_tasks table must get
+    # the partial index after the column lands.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_work_tasks_predecessor "
+        "ON work_tasks(predecessor_task_id) "
+        "WHERE predecessor_task_id IS NOT NULL"
+    )
 
 
 def _ensure_context_entry_columns(conn: sqlite3.Connection) -> None:
@@ -413,6 +462,19 @@ _WORK_MIGRATIONS: list[tuple[int, str, list[str]]] = [
             # column on freshly-created tables. This migration entry
             # exists so the schema-version row records the v7 bump for
             # both fresh and pre-v7 databases.
+        ],
+    ),
+    (
+        8,
+        "Add plan_version + predecessor_task_id to work_tasks for "
+        "plan-task evolution (refinement vs replan) — #1398",
+        [
+            # Same pattern as v7 — the columns are actually added by
+            # ``_ensure_work_task_plan_columns`` (runs BEFORE the
+            # migration walk) because SQLite lacks IF NOT EXISTS on
+            # ADD COLUMN. The migration entry records the v8 bump so
+            # ``work_schema_version`` stays accurate for both fresh
+            # and legacy DBs.
         ],
     ),
 ]

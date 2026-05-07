@@ -561,7 +561,6 @@ _GLOBAL_HELP_BINDINGS: list[tuple[str, str]] = [
 
 _INBOX_LABEL_HELP: dict[str, list[tuple[str, str]]] = {
     "plan_review": [
-        ("v", "open visual explainer"),
         ("A", "approve plan"),
     ],
     "proposal": [

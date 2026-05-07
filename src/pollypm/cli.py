@@ -1021,6 +1021,15 @@ def _spawn_rail_daemon(config_path: Path) -> None:
     pollypm_home = Path(DEFAULT_CONFIG_PATH).parent
     pollypm_home.mkdir(parents=True, exist_ok=True)
     log_path = pollypm_home / "rail_daemon.log"
+    # #1366: shell-piped logs can't use Python RotatingFileHandler
+    # (the FD lives in the spawned process), so cap the previous
+    # tail at restart instead. Best-effort — never blocks the spawn.
+    try:
+        from pollypm.log_rotation import bootstrap_truncate_if_too_big
+
+        bootstrap_truncate_if_too_big(log_path)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         log_fh = open(log_path, "a", buffering=1)  # line-buffered
     except OSError as exc:
@@ -1081,6 +1090,16 @@ def _spawn_phantom_client(session_name: str) -> bool:
     pollypm_home = Path(DEFAULT_CONFIG_PATH).parent
     pollypm_home.mkdir(parents=True, exist_ok=True)
     log_path = pollypm_home / "phantom_client.log"
+    # #1366: phantom_client.log was the worst offender — observed at
+    # 275 MB on the reporter's machine. Cap the previous tail before
+    # the next spawn appends, so this file's worst-case is one
+    # phantom-client lifetime of growth instead of forever.
+    try:
+        from pollypm.log_rotation import bootstrap_truncate_if_too_big
+
+        bootstrap_truncate_if_too_big(log_path)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         log_fh = open(log_path, "a", buffering=1)
     except OSError:

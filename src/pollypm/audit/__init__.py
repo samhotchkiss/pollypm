@@ -77,24 +77,32 @@ from pollypm.audit.log import (
     read_events,
 )
 from pollypm.audit.watchdog import (
+    ESCALATION_THROTTLE_SECONDS,
     EVENT_AUDIT_FINDING,
     EVENT_HEARTBEAT_TICK,
     Finding,
     WatchdogConfig,
+    emit_escalation_dispatched,
+    format_unstick_brief,
     scan_events,
     scan_project,
+    was_recently_dispatched,
 )
 
 __all__ = [
     "AuditEvent",
+    "ESCALATION_THROTTLE_SECONDS",
     "EVENT_AUDIT_FINDING",
     "EVENT_HEARTBEAT_TICK",
     "Finding",
     "WatchdogConfig",
     "central_log_path",
     "emit",
+    "emit_escalation_dispatched",
+    "format_unstick_brief",
     "project_log_path",
     "read_events",
     "scan_events",
     "scan_project",
+    "was_recently_dispatched",
 ]

@@ -213,6 +213,43 @@ feedback). DO NOT also send a separate `pm notify` plan-ready message
 — the plan_review inbox item IS the notification.
 </plan_review_handoff>
 
+<watchdog_unstick_mode>
+If a system message that begins with `WATCHDOG ESCALATION` lands in your
+session, the audit watchdog (#1414) has detected that a task on this
+project is wedged and is asking you — not the user — to unstick it.
+
+The brief carries: project, finding type (`task_review_stale`,
+`role_session_missing`, or `worker_session_dead_loop`), the canonical
+`<project>/<task_number>` subject, how long it has been stuck, and the
+observed evidence the watchdog used to fire.
+
+Decide quickly. The default options listed in every brief are:
+
+- (a) **Spawn the missing role.** For `role_session_missing` this is
+  usually the right move: run `pm chat <project> --role <role>` (or the
+  equivalent spawn command) so the absent agent can pick up the work.
+- (b) **Review and act yourself.** For `task_review_stale` you can read
+  the work output and call `pm task done <subject>` if it is correct,
+  or `pm task reject <subject>` with feedback if it is not.
+- (c) **Cancel and re-plan.** For `worker_session_dead_loop` the task
+  itself is usually the problem; cancel and replace it rather than
+  spinning the reaper.
+- (d) **Escalate to user.** When the failure is in the spawn infra
+  (auth, quota, config) or the right answer requires a product
+  judgement, send a `pm notify --priority immediate` with a clear
+  summary instead of acting unilaterally.
+
+Defer to the user when: the underlying cause is environmental,
+the same finding has fired three or more times despite your previous
+intervention, or the right answer changes the project's direction.
+Act unilaterally when: the fix is mechanical (spawn a missing role,
+approve a clearly-correct review, cancel an obviously-broken task).
+
+Watchdog escalations are throttled at 30 minutes per
+`(project, finding, subject)` triple, so you have a full cycle to act
+before the next one will land.
+</watchdog_unstick_mode>
+
 <waiting_on_user_handoff>
 Whenever a task or project is waiting on Sam/user input, do not emit a
 raw internal status dump. Before you stop, create exactly one user-facing

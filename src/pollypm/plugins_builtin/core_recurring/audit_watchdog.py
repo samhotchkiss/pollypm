@@ -31,15 +31,33 @@ from pathlib import Path
 from typing import Any
 
 from pollypm.audit.watchdog import (
+    ESCALATION_THROTTLE_SECONDS,
     Finding,
+    RULE_ROLE_SESSION_MISSING,
+    RULE_TASK_REVIEW_STALE,
+    RULE_WORKER_SESSION_DEAD_LOOP,
     WATCHDOG_ALERT_TYPE,
     WatchdogConfig,
+    emit_escalation_dispatched,
     emit_finding,
     emit_heartbeat_tick,
     format_finding_message,
+    format_unstick_brief,
     scan_project,
+    was_recently_dispatched,
     watchdog_alert_session_name,
 )
+
+
+# #1414 — only the auto-unstick rules are eligible for architect dispatch.
+# Existing rules (orphan_marker, stuck_draft, etc.) already have
+# operator-actionable alerts and predate this dispatch path; we leave
+# them additive-only to keep the blast radius small.
+_DISPATCHABLE_RULES: frozenset[str] = frozenset({
+    RULE_TASK_REVIEW_STALE,
+    RULE_ROLE_SESSION_MISSING,
+    RULE_WORKER_SESSION_DEAD_LOOP,
+})
 
 
 logger = logging.getLogger(__name__)
@@ -113,6 +131,147 @@ def _config_from_payload(payload: dict[str, Any]) -> WatchdogConfig:
     return WatchdogConfig(**kwargs) if kwargs else WatchdogConfig()
 
 
+def _gather_open_tasks(project_key: str, project_path: Path | None) -> list[Any]:
+    """Best-effort load of in-flight tasks for ``role_session_missing``.
+
+    Returns an empty list on any failure — the watchdog keeps working
+    even when the work-service is unreachable; the new rule simply
+    no-ops for that project.
+    """
+    if project_path is None:
+        return []
+    try:
+        from pollypm.work import create_work_service
+
+        db_path = project_path / ".pollypm" / "state.db"
+        if not db_path.exists():
+            return []
+        with create_work_service(
+            db_path=db_path, project_path=project_path,
+        ) as svc:
+            list_fn = getattr(svc, "list_nonterminal_tasks", None)
+            if not callable(list_fn):
+                return []
+            return list(list_fn(project=project_key))
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: open-task load failed for %s",
+            project_key, exc_info=True,
+        )
+        return []
+
+
+def _gather_storage_windows(storage_closet_name: str | None) -> list[str]:
+    """Best-effort list of window names in the storage-closet session.
+
+    Returns an empty list when tmux is unreachable — the
+    ``role_session_missing`` rule then conservatively no-ops rather
+    than firing false-positives during a tmux outage.
+    """
+    if not storage_closet_name:
+        return []
+    try:
+        from pollypm.tmux.client import TmuxClient
+
+        tmux = TmuxClient()
+        if not tmux.has_session(storage_closet_name):
+            return []
+        windows = tmux.list_windows(storage_closet_name)
+        return [getattr(w, "name", "") or "" for w in windows]
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: list_windows failed for %s",
+            storage_closet_name, exc_info=True,
+        )
+        return []
+
+
+def _architect_window_target(
+    storage_closet_name: str | None, project_key: str,
+) -> str | None:
+    """Return ``<closet>:architect-<project>`` if the closet exists.
+
+    The dispatch path send-keys's the brief to that window. Returning
+    ``None`` means we can't dispatch right now (no closet, no architect
+    window) — the cadence handler treats that as a soft-fail so the
+    audit emit + alert still fire.
+    """
+    if not storage_closet_name or not project_key:
+        return None
+    return f"{storage_closet_name}:architect-{project_key}"
+
+
+def _send_brief_to_architect(
+    target: str, brief: str,
+) -> bool:
+    """Best-effort tmux send-keys of the brief to the architect window.
+
+    Returns True on success. The brief is sent as multiple lines —
+    each line followed by a literal Enter — so the architect's chat
+    surface treats it as a single user turn ending with Enter.
+    """
+    try:
+        from pollypm.tmux.client import TmuxClient
+
+        tmux = TmuxClient()
+        # Send the brief as a single literal text blob; no Enter so the
+        # architect can review before submitting. Mirrors the cockpit's
+        # ``_perform_pm_dispatch`` semantics where the user finishes
+        # the send themselves — except here the "user" is the architect.
+        tmux.send_keys(target, brief, press_enter=False)
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: send_keys(%s) failed", target, exc_info=True,
+        )
+        return False
+
+
+def _maybe_dispatch_to_architect(
+    finding: Finding,
+    *,
+    project_path: Path | None,
+    storage_closet_name: str | None,
+    now: datetime,
+) -> str:
+    """Apply throttle + emit + send brief. Returns a status code.
+
+    Status codes (used by the per-project counters):
+    * ``"skipped"`` — rule isn't dispatchable.
+    * ``"throttled"`` — already dispatched within the throttle window.
+    * ``"dispatched"`` — brief sent successfully.
+    * ``"send_failed"`` — emit ran, send-keys failed.
+    """
+    if finding.rule not in _DISPATCHABLE_RULES:
+        return "skipped"
+    if was_recently_dispatched(
+        project=finding.project,
+        finding_type=finding.rule,
+        subject=finding.subject,
+        now=now,
+        project_path=project_path,
+        throttle_seconds=ESCALATION_THROTTLE_SECONDS,
+    ):
+        return "throttled"
+    brief = format_unstick_brief(finding)
+    # Emit the dispatch event BEFORE the send so the throttle window
+    # is engaged even if the send fails — otherwise a tmux outage would
+    # cause every cadence tick to re-emit and re-attempt.
+    emit_escalation_dispatched(
+        project=finding.project,
+        finding_type=finding.rule,
+        subject=finding.subject,
+        brief=brief,
+        project_path=project_path,
+    )
+    target = _architect_window_target(storage_closet_name, finding.project)
+    if target is None:
+        return "send_failed"
+    if not _send_brief_to_architect(target, brief):
+        return "send_failed"
+    return "dispatched"
+
+
 def _scan_one_project(
     *,
     project_key: str,
@@ -121,19 +280,27 @@ def _scan_one_project(
     state_store: Any,
     now: datetime,
     config: WatchdogConfig,
+    storage_closet_name: str | None = None,
 ) -> dict[str, int]:
     """Scan one project and route every finding. Returns counters."""
     counters = {
         "findings": 0,
         "alerts_raised": 0,
         "alert_failures": 0,
+        "dispatches_sent": 0,
+        "dispatches_throttled": 0,
+        "dispatches_failed": 0,
     }
+    open_tasks = _gather_open_tasks(project_key, project_path)
+    storage_window_names = _gather_storage_windows(storage_closet_name)
     try:
         findings = scan_project(
             project_key,
             project_path=project_path,
             now=now,
             config=config,
+            open_tasks=open_tasks,
+            storage_window_names=storage_window_names,
         )
     except Exception:  # noqa: BLE001
         logger.debug(
@@ -158,6 +325,21 @@ def _scan_one_project(
                 finding.rule, finding.project, finding.subject,
                 finding.message, finding.recommendation,
             )
+        # #1414 — eligible findings get an architect dispatch on top
+        # of the alert. Throttle window is owned by the audit log so
+        # repeat dispatches are deduped across cadence-process restarts.
+        outcome = _maybe_dispatch_to_architect(
+            finding,
+            project_path=project_path,
+            storage_closet_name=storage_closet_name,
+            now=now,
+        )
+        if outcome == "dispatched":
+            counters["dispatches_sent"] += 1
+        elif outcome == "throttled":
+            counters["dispatches_throttled"] += 1
+        elif outcome == "send_failed":
+            counters["dispatches_failed"] += 1
     return counters
 
 
@@ -190,10 +372,16 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
         "findings": 0,
         "alerts_raised": 0,
         "alert_failures": 0,
+        "dispatches_sent": 0,
+        "dispatches_throttled": 0,
+        "dispatches_failed": 0,
     }
 
     try:
         seen_projects: set[str] = set()
+        storage_closet_name = getattr(
+            services, "storage_closet_name", None,
+        )
         for project in services.known_projects or ():
             project_key = getattr(project, "key", None)
             if not project_key or project_key in seen_projects:
@@ -207,6 +395,7 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 state_store=services.state_store,
                 now=now,
                 config=config,
+                storage_closet_name=storage_closet_name,
             )
             totals["projects_scanned"] += 1
             for k, v in partial.items():

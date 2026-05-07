@@ -24,6 +24,7 @@ import asyncio
 import json
 import os
 import resource
+from collections import OrderedDict
 from pathlib import Path
 import subprocess
 import time
@@ -10477,6 +10478,31 @@ def _dashboard_plan_aux_files(project_path: Path) -> list[Path]:
     return out[:12]
 
 
+# Default eviction cap for the mtime-keyed dashboard caches below.
+# Each ``state.db`` write bumps the mtime and so produces a fresh
+# cache key; without bounds the cache grows monotonically over the
+# cockpit's lifetime (#1375). 256 is generous: 9 projects * the last
+# ~28 distinct mtimes still fits, which is far past anything the
+# 10s refresh tick can churn through within a useful window.
+_DASHBOARD_CACHE_MAXSIZE = 256
+
+
+def _dashboard_cache_set(
+    cache: "OrderedDict", key, value, *, maxsize: int = _DASHBOARD_CACHE_MAXSIZE,
+) -> None:
+    """Insert ``key`` into ``cache`` with LRU eviction past ``maxsize``.
+
+    Uses ``OrderedDict.move_to_end`` so a re-insert refreshes the
+    recency order. When the cache exceeds ``maxsize``, the least
+    recently used entry is popped from the front.
+    """
+    if key in cache:
+        cache.move_to_end(key)
+    cache[key] = value
+    while len(cache) > maxsize:
+        cache.popitem(last=False)
+
+
 # Per-project plan-staleness cache. Key includes plan_mtime AND
 # state.db mtime so the cache invalidates whenever the inputs that
 # could change the answer change — no TTL needed. Cycle 133 perf fix:
@@ -10484,7 +10510,11 @@ def _dashboard_plan_aux_files(project_path: Path) -> list[Path]:
 # the whole task list on every per-project dashboard refresh tick
 # (every 10s). With this cache, a project with no plan or task
 # changes pays zero work past the first refresh.
-_PLAN_STALENESS_CACHE: dict[tuple[str, float | None, float | None], str | None] = {}
+#
+# #1375 — bounded with LRU eviction; each state.db write produces a
+# fresh cache key, so without a cap this grows for the cockpit's
+# lifetime.
+_PLAN_STALENESS_CACHE: "OrderedDict[tuple[str, float | None, float | None], str | None]" = OrderedDict()
 
 
 def _dashboard_plan_staleness(
@@ -10529,6 +10559,7 @@ def _dashboard_plan_staleness(
         db_mtime = None
     cache_key = (project_key, plan_mtime, db_mtime)
     if cache_key in _PLAN_STALENESS_CACHE:
+        _PLAN_STALENESS_CACHE.move_to_end(cache_key)
         return _PLAN_STALENESS_CACHE[cache_key]
     try:
         from pollypm.plugins_builtin.project_planning.plan_presence import (
@@ -10545,11 +10576,11 @@ def _dashboard_plan_staleness(
         ) as svc:
             plan_task = _find_approved_plan_task(svc, project_key)
             if plan_task is None:
-                _PLAN_STALENESS_CACHE[cache_key] = None
+                _dashboard_cache_set(_PLAN_STALENESS_CACHE, cache_key, None)
                 return None
             approved_at = _plan_approved_at(svc, plan_task)
             if approved_at is None:
-                _PLAN_STALENESS_CACHE[cache_key] = None
+                _dashboard_cache_set(_PLAN_STALENESS_CACHE, cache_key, None)
                 return None
             # Find latest non-planning task's created_at.
             tasks = svc.list_tasks(project=project_key)
@@ -10575,7 +10606,7 @@ def _dashboard_plan_staleness(
     except Exception:  # noqa: BLE001
         # Don't cache failures — let the next refresh retry.
         return None
-    _PLAN_STALENESS_CACHE[cache_key] = result
+    _dashboard_cache_set(_PLAN_STALENESS_CACHE, cache_key, result)
     return result
 
 
@@ -10732,10 +10763,9 @@ class ProjectDashboardData:
 # rapidly-rerendering dashboard doesn't hammer SQLite for the same data. The
 # dashboard refreshes every 10s by default; stale-cache hits are a net win
 # there too.
-_PROJECT_DASHBOARD_TASK_CACHE: dict[
-    tuple[str, tuple[tuple[str, float], ...]],
-    tuple[dict[str, int], dict[str, list[dict]]],
-] = {}
+#
+# #1375 — bounded with LRU eviction (see ``_dashboard_cache_set``).
+_PROJECT_DASHBOARD_TASK_CACHE: "OrderedDict[tuple[str, tuple[tuple[str, float], ...]], tuple[dict[str, int], dict[str, list[dict]]]]" = OrderedDict()
 
 
 def _dashboard_plain_text(value: object | None) -> str:
@@ -11047,6 +11077,7 @@ def _dashboard_gather_tasks(
     cache_token = tuple(cache_parts)
     cached = _PROJECT_DASHBOARD_TASK_CACHE.get((project_key, cache_token))
     if cached is not None:
+        _PROJECT_DASHBOARD_TASK_CACHE.move_to_end((project_key, cache_token))
         return cached
 
     try:
@@ -11177,7 +11208,11 @@ def _dashboard_gather_tasks(
     for status, items in buckets.items():
         items.sort(key=lambda d: d["updated_at"] or "", reverse=True)
 
-    _PROJECT_DASHBOARD_TASK_CACHE[(project_key, cache_token)] = (counts, buckets)
+    _dashboard_cache_set(
+        _PROJECT_DASHBOARD_TASK_CACHE,
+        (project_key, cache_token),
+        (counts, buckets),
+    )
     return counts, buckets
 
 
@@ -11505,10 +11540,9 @@ def _dashboard_active_worker(
 # task, or context entry bumps the mtime and the cache misses; an
 # idle project pays one stat() per tick instead of two DB opens.
 # Sister to ``_PLAN_STALENESS_CACHE`` (cycle 133).
-_DASHBOARD_INBOX_CACHE: dict[
-    tuple[str, float | None],
-    tuple[int, list[dict], list[dict]],
-] = {}
+#
+# #1375 — bounded with LRU eviction (see ``_dashboard_cache_set``).
+_DASHBOARD_INBOX_CACHE: "OrderedDict[tuple[str, float | None], tuple[int, list[dict], list[dict]]]" = OrderedDict()
 
 
 def _dashboard_inbox(
@@ -11531,6 +11565,7 @@ def _dashboard_inbox(
     cache_key = (project_key, db_mtime)
     cached = _DASHBOARD_INBOX_CACHE.get(cache_key)
     if cached is not None:
+        _DASHBOARD_INBOX_CACHE.move_to_end(cache_key)
         return cached
     try:
         from pollypm.store import SQLAlchemyStore
@@ -12254,7 +12289,7 @@ def _dashboard_inbox(
         if len(action_items) >= 2:
             break
     result = (_action_count(items, action_items), top, action_items)
-    _DASHBOARD_INBOX_CACHE[cache_key] = result
+    _dashboard_cache_set(_DASHBOARD_INBOX_CACHE, cache_key, result)
     return result
 
 
@@ -12736,9 +12771,9 @@ def _action_count(items: list[dict], action_items: list[dict]) -> int:
 # repeated work when no event has landed since the last call.
 # Sister to ``_DASHBOARD_INBOX_CACHE`` (cycle 138) and
 # ``_PLAN_STALENESS_CACHE`` (cycle 133).
-_DASHBOARD_ACTIVITY_CACHE: dict[
-    tuple[str, float | None, int], list[dict]
-] = {}
+#
+# #1375 — bounded with LRU eviction (see ``_dashboard_cache_set``).
+_DASHBOARD_ACTIVITY_CACHE: "OrderedDict[tuple[str, float | None, int], list[dict]]" = OrderedDict()
 
 
 def _dashboard_activity(
@@ -12771,6 +12806,7 @@ def _dashboard_activity(
     cache_key = (project_key, db_mtime, limit)
     cached = _DASHBOARD_ACTIVITY_CACHE.get(cache_key)
     if cached is not None:
+        _DASHBOARD_ACTIVITY_CACHE.move_to_end(cache_key)
         return cached
     projector = build_projector(config)
     if projector is None:
@@ -12793,7 +12829,7 @@ def _dashboard_activity(
         }
         for e in entries
     ]
-    _DASHBOARD_ACTIVITY_CACHE[cache_key] = result
+    _dashboard_cache_set(_DASHBOARD_ACTIVITY_CACHE, cache_key, result)
     return result
 
 

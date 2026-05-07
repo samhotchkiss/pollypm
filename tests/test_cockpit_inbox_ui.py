@@ -2850,3 +2850,294 @@ def test_inbox_back_or_cancel_skips_rail_focus_in_filter_input(
 
             assert calls == []
     _run(body())
+
+
+# ---------------------------------------------------------------------------
+# #1400 — inbox approval row: rich 2-line preview with summary + flags
+# ---------------------------------------------------------------------------
+
+
+def _make_plan_review_task(
+    *,
+    task_id: str = "demo/7",
+    project: str = "demo",
+    title: str = "Plan ready for review: demo",
+    description: str = "Plan ready for review.\n\nPlan path: /tmp/plan.md",
+    labels: list[str] | None = None,
+):
+    """Build a SimpleNamespace shaped like an inbox plan_review entry."""
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    if labels is None:
+        labels = [
+            "plan_review",
+            "project:demo",
+            "plan_task:demo/7",
+            "explainer:/tmp/plan-review.html",
+        ]
+    return SimpleNamespace(
+        task_id=task_id,
+        project=project,
+        title=title,
+        description=description,
+        labels=labels,
+        priority=SimpleNamespace(value="normal"),
+        triage_bucket="action",
+        triage_label="plan review",
+        updated_at=datetime(2026, 5, 6, 12, 0, tzinfo=UTC),
+    )
+
+
+def test_plan_review_row_renders_two_line_card_with_summary() -> None:
+    """The plan_review inbox row leads with the red ▶ glyph + Approve heading
+    and surfaces the architect's summary on the second line."""
+    from pollypm.cockpit_ui import _format_inbox_plan_review_row
+
+    task = _make_plan_review_task()
+    plan_summary = (
+        "We will rewrite the planner core in three slices and migrate the "
+        "stale rejection cache before the next release."
+    )
+    text = _format_inbox_plan_review_row(
+        task,
+        is_unread=True,
+        judgment_calls=["Cache eviction may drop in-flight rejections"],
+        show_judgment_calls=False,
+    )
+    # Inject the summary by patching the loader → exercising the
+    # truncation path. Direct: render via the helper that DOES NOT need
+    # plan_text on disk: pass description with a Summary block.
+    task2 = _make_plan_review_task(
+        description=(
+            "## Summary\n\n" + plan_summary + "\n"
+        ),
+    )
+    text2 = _format_inbox_plan_review_row(
+        task2,
+        is_unread=True,
+        config_path=None,
+        show_judgment_calls=False,
+    )
+    plain = text2.plain.splitlines()
+    assert len(plain) == 2, f"expected 2 lines, got {plain!r}"
+    # Line 1 contains the red ▶, "Approve plan:" label, and the task ref.
+    assert plain[0].startswith("▶ "), plain[0]
+    assert "Approve plan:" in plain[0]
+    assert "demo/7" in plain[0]
+    # Line 2 carries the summary; truncated/exact depending on length.
+    assert plain[1].strip().startswith("We will rewrite"), plain[1]
+
+
+def test_plan_review_row_truncates_long_summary_with_ellipsis() -> None:
+    """Summary blocks longer than ~100 chars truncate with an ellipsis."""
+    from pollypm.cockpit_ui import _format_inbox_plan_review_row
+
+    long_summary = "x" * 200
+    task = _make_plan_review_task(
+        description="## Summary\n\n" + long_summary + "\n",
+    )
+    text = _format_inbox_plan_review_row(task, is_unread=True)
+    plain = text.plain.splitlines()
+    assert plain[1].strip().endswith("…"), plain[1]
+    # Total length ~100 chars (not 200).
+    assert len(plain[1].strip()) <= 105, len(plain[1].strip())
+
+
+def test_plan_review_row_falls_back_when_no_summary() -> None:
+    """Missing summary block falls back to the first body line."""
+    from pollypm.cockpit_ui import _format_inbox_plan_review_row
+
+    task = _make_plan_review_task(
+        description="Polly thinks we should ship the plan refactor next.",
+    )
+    text = _format_inbox_plan_review_row(task, is_unread=True)
+    plain = text.plain.splitlines()
+    assert len(plain) == 2
+    assert "Polly thinks" in plain[1]
+
+
+def test_plan_review_row_shows_judgment_calls_when_expanded() -> None:
+    """When the row is highlighted, the flagged judgment calls render below."""
+    from pollypm.cockpit_ui import _format_inbox_plan_review_row
+
+    task = _make_plan_review_task()
+    text = _format_inbox_plan_review_row(
+        task,
+        is_unread=True,
+        judgment_calls=[
+            "Cache eviction may drop in-flight rejections",
+            "Migration order matters for downstream consumers",
+        ],
+        show_judgment_calls=True,
+    )
+    plain = text.plain
+    assert "Cache eviction may drop" in plain
+    assert "Migration order matters" in plain
+
+
+def test_plan_review_row_hides_judgment_calls_by_default() -> None:
+    """Without ``show_judgment_calls``, the bullets stay hidden."""
+    from pollypm.cockpit_ui import _format_inbox_plan_review_row
+
+    task = _make_plan_review_task()
+    text = _format_inbox_plan_review_row(
+        task,
+        is_unread=True,
+        judgment_calls=["secret bullet"],
+        show_judgment_calls=False,
+    )
+    assert "secret bullet" not in text.plain
+
+
+def test_regular_inbox_item_still_renders_unchanged() -> None:
+    """Non-plan_review rows continue to use the legacy single-line format."""
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+    from pollypm.cockpit_ui import _format_inbox_thread_row
+    from pollypm.cockpit_inbox import InboxThreadRow
+
+    task = SimpleNamespace(
+        task_id="demo/1",
+        title="Smoke subject",
+        project="demo",
+        priority=SimpleNamespace(value="normal"),
+        labels=[],
+        triage_bucket="action",
+        triage_label="task assigned",
+        updated_at=datetime(2026, 5, 6, 12, 0, tzinfo=UTC),
+    )
+    row = InboxThreadRow(
+        key="task:demo/1",
+        kind="task",
+        task=task,
+        task_id="demo/1",
+        reply=None,
+        reply_count=0,
+        expanded=False,
+    )
+    text = _format_inbox_thread_row(row, is_unread=True)
+    plain = text.plain
+    # The regular row uses the diamond glyph, not the plan-review ▶.
+    assert "◆" in plain
+    assert "Approve plan:" not in plain
+
+
+def test_plan_review_thread_row_dispatches_to_plan_review_renderer() -> None:
+    """``_format_inbox_thread_row`` routes ``plan_review`` rows to the card."""
+    from pollypm.cockpit_ui import _format_inbox_thread_row
+    from pollypm.cockpit_inbox import InboxThreadRow
+
+    task = _make_plan_review_task(
+        description="## Summary\n\nApprove the new approach now.\n",
+    )
+    row = InboxThreadRow(
+        key="task:demo/7",
+        kind="task",
+        task=task,
+        task_id="demo/7",
+        reply=None,
+        reply_count=0,
+        expanded=False,
+    )
+    text = _format_inbox_thread_row(row, is_unread=True)
+    plain = text.plain
+    assert "▶" in plain
+    assert "Approve plan:" in plain
+    assert "demo/7" in plain
+
+
+def test_truncate_plan_summary_collapses_whitespace() -> None:
+    from pollypm.cockpit_ui import _truncate_plan_summary
+
+    assert _truncate_plan_summary("  hello\n\nworld   foo  ") == "hello world foo"
+    assert _truncate_plan_summary("") == ""
+    assert _truncate_plan_summary(None) == ""  # type: ignore[arg-type]
+    assert _truncate_plan_summary("x" * 50, max_chars=10).endswith("…")
+
+
+def test_is_plan_review_task_helper() -> None:
+    from types import SimpleNamespace
+    from pollypm.cockpit_ui import _is_plan_review_task
+
+    pr = SimpleNamespace(labels=["plan_review", "project:demo"])
+    nonpr = SimpleNamespace(labels=["review_feedback"])
+    bare = SimpleNamespace(labels=None)
+    assert _is_plan_review_task(pr)
+    assert not _is_plan_review_task(nonpr)
+    assert not _is_plan_review_task(bare)
+
+
+def test_plan_review_thread_right_jumps_to_project(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Pressing ``→`` on a plan_review row routes to the project drilldown.
+
+    The cockpit navigation client is patched so we observe the call
+    without actually navigating tmux/cockpit state.
+    """
+    async def body() -> None:
+        project_path = tmp_path / "demo"
+        project_path.mkdir()
+        (project_path / ".git").mkdir()
+        config_path = tmp_path / "pollypm.toml"
+        _write_minimal_config(project_path, config_path)
+        # Seed a single plan_review task.
+        db_path = project_path / ".pollypm" / "state.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        svc = SQLiteWorkService(db_path=db_path, project_path=project_path)
+        try:
+            svc.create(
+                title="Plan ready for review: demo",
+                description="## Summary\n\nApprove the plan.\n",
+                type="task",
+                project="demo",
+                flow_template="chat",
+                roles={"requester": "polly", "operator": "user"},
+                priority="normal",
+                created_by="polly",
+                labels=[
+                    "plan_review", "project:demo", "plan_task:demo/1",
+                ],
+            )
+        finally:
+            svc.close()
+
+        if not _load_config_compatible(config_path):
+            pytest.skip("minimal pollypm.toml fixture not supported")
+
+        from pollypm.cockpit_ui import PollyInboxApp
+        app = PollyInboxApp(config_path)
+
+        captured: dict = {}
+
+        class _FakeClient:
+            def jump_to_project(self, project_key, *, view=None, **_kw):
+                captured["project_key"] = project_key
+                captured["view"] = view
+
+        import pollypm.cockpit_navigation_client as cnc
+        monkeypatch.setattr(
+            cnc, "file_navigation_client",
+            lambda *args, **kwargs: _FakeClient(),
+        )
+
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            # Plan-review row should be the only task; select it.
+            for idx, row in enumerate(app._visible_rows):
+                if row.is_task and "plan_review" in (
+                    row.task.labels or []
+                ):
+                    app.list_view.index = idx
+                    break
+            else:
+                pytest.skip("plan_review row not visible")
+            await pilot.pause()
+            await pilot.press("right")
+            await pilot.pause()
+
+        assert captured.get("project_key") == "demo"
+        assert captured.get("view") == "dashboard"
+
+    _run(body())

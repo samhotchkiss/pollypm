@@ -6663,6 +6663,151 @@ def _format_inbox_row(
     return text
 
 
+def _is_plan_review_task(task) -> bool:
+    """True when an inbox entry / task carries the ``plan_review`` label.
+
+    Both message-backed ``InboxEntry`` rows and work-service task rows
+    expose ``labels`` as a list of strings, so this helper works
+    uniformly across the two streams that feed the inbox list.
+    """
+    labels = getattr(task, "labels", None) or []
+    try:
+        return "plan_review" in labels
+    except TypeError:
+        return False
+
+
+def _truncate_plan_summary(summary: str, *, max_chars: int = 100) -> str:
+    """Trim the architect summary block to a single inbox preview line.
+
+    Collapses internal whitespace (the summary often arrives as a
+    multi-line markdown paragraph) and truncates with an ellipsis when
+    the result is longer than ``max_chars``. Returns an empty string
+    when the input is empty or whitespace-only so callers can fall back
+    to a default placeholder.
+    """
+    if not summary:
+        return ""
+    flat = " ".join(summary.split()).strip()
+    if not flat:
+        return ""
+    if len(flat) <= max_chars:
+        return flat
+    # ``-1`` to leave room for the ellipsis glyph.
+    return flat[: max(1, max_chars - 1)].rstrip() + "…"
+
+
+def _format_inbox_plan_review_row(
+    task,
+    *,
+    is_unread: bool,
+    width: int = 38,
+    tree_marker: str = "",
+    config_path: object | None = None,
+    judgment_calls: list[str] | None = None,
+    show_judgment_calls: bool = False,
+) -> Text:
+    """Render a ``plan_review`` inbox row as a heavier 2-line decision card.
+
+    Spec from #1400:
+    - Line 1: ``▶ Approve plan: <project>/<task_number>`` with a red
+      ``▶`` glyph (the rail "needs decision" affordance, kept consistent
+      with #1396's color/glyph convention so the operator's eye trains
+      to the same shape across surfaces).
+    - Line 2: TL;DR summary trimmed to ~100 chars from the architect's
+      ``## Summary`` block (loaded via ``_plan_content_for_review`` →
+      ``_extract_plan_summary_block``). When no plan markdown is on
+      disk yet, fall back to the message body's first non-empty line so
+      the row stays informative.
+    - When ``show_judgment_calls`` is set (e.g. on the highlighted row),
+      append the architect's flagged points as an indented bullet
+      sub-section below line 2.
+
+    The visual weight (red glyph + bold heading + dim summary) is
+    intentionally heavier than the diamond/circle treatment used for
+    other inbox items — these rows demand a decision, not a peek.
+    """
+    text = Text(no_wrap=True, overflow="ellipsis")
+    if tree_marker:
+        text.append(tree_marker, style="#6b7a88")
+
+    # Red play glyph — same affordance as the rail's "needs decision"
+    # signal so the operator's eye trains to the same shape.
+    text.append("▶ ", style="bold #ff6b5b")
+
+    # Heading: ``Approve plan: <project>/<task_number>`` (the inbox
+    # task_id is already in ``<project>/<n>`` shape, so we don't need
+    # to recompose it from labels — falling back to the project key
+    # alone keeps the row useful even when task_id is missing).
+    task_id = (getattr(task, "task_id", "") or "").strip()
+    project = (getattr(task, "project", "") or "").strip()
+    if task_id and "/" in task_id:
+        ref = task_id
+    elif project:
+        ref = project
+    else:
+        ref = "?"
+    heading_label = "Approve plan: "
+    heading_ref = ref
+    heading_style = "bold #f0c45a" if is_unread else "bold #d6a93f"
+    text.append(heading_label, style=heading_style)
+    text.append(heading_ref, style=heading_style)
+
+    # Line 2: trimmed summary. We fetch the plan body via the same
+    # helper the detail pane uses (#1410). When the plan markdown isn't
+    # on disk yet, fall back to the message body's first non-empty line
+    # — better than a blank summary while the architect's file is still
+    # propagating.
+    summary = ""
+    try:
+        labels = list(getattr(task, "labels", None) or [])
+        meta = _extract_plan_review_meta(labels)
+        plan_text = _plan_content_for_review(meta, config_path)
+        if plan_text:
+            summary = _extract_plan_summary_block(plan_text)
+    except Exception:  # noqa: BLE001 — never crash the row render
+        summary = ""
+    if not summary:
+        body = (getattr(task, "description", "") or "").strip()
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                summary = stripped
+                break
+    summary_line = _truncate_plan_summary(summary, max_chars=100)
+    if not summary_line:
+        summary_line = "(plan summary not yet on disk — open to view)"
+
+    indent = " " * max(2, len(tree_marker) + 2)
+    text.append("\n")
+    text.append(indent, style="#6b7a88")
+    text.append(summary_line, style="#c8d2da")
+
+    # Optional flagged-judgment-calls sub-section — only shown when the
+    # row is highlighted/expanded so the list stays compact at rest.
+    if show_judgment_calls:
+        calls = list(judgment_calls or [])
+        if not calls:
+            try:
+                meta = _extract_plan_review_meta(
+                    list(getattr(task, "labels", None) or []),
+                )
+                plan_text = _plan_content_for_review(meta, config_path)
+                if plan_text:
+                    calls = _extract_plan_judgment_calls(plan_text)
+            except Exception:  # noqa: BLE001
+                calls = []
+        for call in calls[:3]:
+            trimmed = _truncate_plan_summary(call, max_chars=80)
+            if not trimmed:
+                continue
+            text.append("\n")
+            text.append(indent + "  • ", style="#f0c45a")
+            text.append(trimmed, style="#a9b4be")
+
+    return text
+
+
 def _format_inbox_reply_row(task, reply, *, width: int = 38) -> Text:
     """Render one inline reply row underneath its parent inbox task."""
     from pollypm.tz import format_relative
@@ -6695,13 +6840,31 @@ def _format_inbox_thread_row(
     *,
     is_unread: bool,
     width: int = 38,
+    config_path: object | None = None,
+    show_judgment_calls: bool = False,
 ) -> Text:
-    """Render either a root task row or an inline reply row."""
+    """Render either a root task row or an inline reply row.
+
+    ``plan_review`` rows render via :func:`_format_inbox_plan_review_row`
+    so the approval decision card stands out from the regular diamond /
+    circle inbox items (#1400). ``show_judgment_calls`` is forwarded to
+    that renderer \u2014 callers set it to True when the row is the current
+    selection so the architect's flagged points appear inline.
+    """
     if row.is_reply and row.reply is not None:
         return _format_inbox_reply_row(row.task, row.reply, width=width)
     tree_marker = ""
     if row.has_children:
         tree_marker = "\u25be " if row.expanded else "\u25b8 "
+    if row.is_task and _is_plan_review_task(row.task):
+        return _format_inbox_plan_review_row(
+            row.task,
+            is_unread=is_unread,
+            width=width,
+            tree_marker=tree_marker,
+            config_path=config_path,
+            show_judgment_calls=show_judgment_calls,
+        )
     return _format_inbox_row(
         row.task,
         is_unread=is_unread,
@@ -7416,13 +7579,34 @@ class _RollupItem(ListItem):
 class _InboxListItem(ListItem):
     """One message in the inbox list — carries the task_id + unread flag."""
 
-    def __init__(self, row: InboxThreadRow, *, is_unread: bool) -> None:
+    def __init__(
+        self,
+        row: InboxThreadRow,
+        *,
+        is_unread: bool,
+        config_path: object | None = None,
+    ) -> None:
         self.row_ref = row
         self.task_id = row.task_id
         self.task_ref = row.task
         self.is_unread = is_unread
+        self._config_path = config_path
         row_classes = "inbox-row reply-row" if row.is_reply else "inbox-row"
-        self._body = Static(_format_inbox_thread_row(row, is_unread=is_unread), markup=False)
+        # Plan-review approval rows get a distinct class so the CSS can
+        # render a heavier border / background — these are decision
+        # cards, not informational pings (#1400).
+        self._is_plan_review = row.is_task and _is_plan_review_task(row.task)
+        if self._is_plan_review:
+            row_classes = f"{row_classes} plan-review-row"
+        self._body = Static(
+            _format_inbox_thread_row(
+                row,
+                is_unread=is_unread,
+                config_path=config_path,
+                show_judgment_calls=False,
+            ),
+            markup=False,
+        )
         super().__init__(self._body, classes=row_classes)
         if is_unread:
             self.add_class("unread")
@@ -7445,7 +7629,31 @@ class _InboxListItem(ListItem):
         if row is not None:
             self.row_ref = row
             self.task_ref = row.task
-        self._body.update(_format_inbox_thread_row(self.row_ref, is_unread=False))
+        self._body.update(
+            _format_inbox_thread_row(
+                self.row_ref,
+                is_unread=False,
+                config_path=self._config_path,
+            )
+        )
+
+    def set_show_judgment_calls(self, show: bool) -> None:
+        """Re-render the plan_review row with judgment calls toggled.
+
+        No-op on non-plan_review rows — the regular inbox row renderer
+        ignores the flag so calling this on every selection is safe and
+        keeps the rendering pipeline uniform across row kinds.
+        """
+        if not self._is_plan_review:
+            return
+        self._body.update(
+            _format_inbox_thread_row(
+                self.row_ref,
+                is_unread=self.is_unread,
+                config_path=self._config_path,
+                show_judgment_calls=show,
+            )
+        )
 
 
 class PollyInboxApp(App[None]):
@@ -7527,6 +7735,23 @@ class PollyInboxApp(App[None]):
     #inbox-list > .inbox-row.action-required {
         border-left: thick #f0c45a;
         background: #171611;
+    }
+    /* #1400 — plan-review approval card. Heavier than the regular
+       action-required border (4-row height + red accent) so the
+       decision row reads as "this needs you" before any text scan. */
+    #inbox-list > .inbox-row.plan-review-row {
+        height: 4;
+        border-left: thick #ff6b5b;
+        background: #1d1410;
+    }
+    #inbox-list > .inbox-row.plan-review-row.-highlight {
+        background: #2d1d18;
+        color: #fff3df;
+        border-left: thick #ff6b5b;
+    }
+    #inbox-list:focus > .inbox-row.plan-review-row.-highlight {
+        background: #3a241d;
+        color: #fff3df;
     }
     #inbox-list > .inbox-row.orphaned {
         border-left: thick #586773;
@@ -8207,7 +8432,11 @@ class PollyInboxApp(App[None]):
         self._visible_rows = visible_rows
         for idx, row_ref in enumerate(visible_rows):
             is_unread = row_ref.is_task and row_ref.task_id in self._unread_ids
-            row = _InboxListItem(row_ref, is_unread=is_unread)
+            row = _InboxListItem(
+                row_ref,
+                is_unread=is_unread,
+                config_path=getattr(self, "config_path", None),
+            )
             self.list_view.append(row)
             if previous_row_key and row_ref.key == previous_row_key:
                 restore_index = idx
@@ -9335,6 +9564,25 @@ class PollyInboxApp(App[None]):
     def action_thread_right(self) -> None:
         if self.reply_input.has_focus or self.filter_input.has_focus:
             return
+        # #1400 — on a plan_review row, ``→`` jumps to the project
+        # drilldown (the dashboard view that owns the plan-review
+        # surface) so the operator can read the full plan + history
+        # without leaving the keyboard. We branch BEFORE the standard
+        # thread expand/select action so the gesture stays predictable
+        # for users who learned ``→`` as "drill in" on the inbox rail.
+        current = self.list_view.index
+        if (
+            current is not None
+            and 0 <= current < len(self._visible_rows)
+        ):
+            row_ref = self._visible_rows[current]
+            if (
+                row_ref.is_task
+                and not row_ref.is_reply
+                and _is_plan_review_task(row_ref.task)
+            ):
+                self._jump_to_plan_review_project(row_ref.task)
+                return
         action, target = inbox_thread_right_action(
             self._visible_rows, self.list_view.index,
         )
@@ -9350,6 +9598,42 @@ class PollyInboxApp(App[None]):
         if action == "select_child" and target is not None:
             self.list_view.index = target
             self._sync_selection_from_list()
+
+    def _jump_to_plan_review_project(self, task) -> None:
+        """Route the cockpit to the project drilldown for a plan_review.
+
+        Resolves the project key from the inbox entry's ``plan_review``
+        labels first (architects emit ``project:<key>`` alongside the
+        ``plan_task:<project>/<n>`` ref), and falls back to the row's
+        ``project`` attribute when the labels weren't fully populated.
+        On failure we surface a notify so the gesture isn't silent.
+        """
+        labels = list(getattr(task, "labels", None) or [])
+        meta = _extract_plan_review_meta(labels)
+        project_key = str(meta.get("project") or "").strip()
+        if not project_key:
+            plan_task_id = str(meta.get("plan_task_id") or "").strip()
+            if "/" in plan_task_id:
+                project_key = plan_task_id.split("/", 1)[0].strip()
+        if not project_key:
+            project_key = (getattr(task, "project", "") or "").strip()
+        if not project_key or project_key == "inbox":
+            self.notify(
+                "Plan-review row is missing a project reference.",
+                severity="warning", timeout=2.0,
+            )
+            return
+        try:
+            from pollypm.cockpit_navigation_client import file_navigation_client
+            file_navigation_client(
+                self.config_path,
+                client_id="inbox",
+            ).jump_to_project(project_key, view="dashboard")
+        except Exception as exc:  # noqa: BLE001
+            self.notify(
+                f"Jump to project failed: {exc}",
+                severity="error", timeout=3.0,
+            )
 
     def action_thread_left(self) -> None:
         if self.reply_input.has_focus or self.filter_input.has_focus:
@@ -9470,6 +9754,15 @@ class PollyInboxApp(App[None]):
         row = event.item
         if not isinstance(row, _InboxListItem):
             return
+        # #1400 — expand the judgment-calls sub-section on the newly
+        # highlighted plan_review row, and collapse it on every other
+        # plan_review row so only one card carries the extra detail.
+        try:
+            for child in self.list_view.children:
+                if isinstance(child, _InboxListItem):
+                    child.set_show_judgment_calls(child is row)
+        except Exception:  # noqa: BLE001 — never crash on a UI tweak
+            pass
         if self._selected_row_key == row.row_ref.key:
             return
         self._select_inbox_row(

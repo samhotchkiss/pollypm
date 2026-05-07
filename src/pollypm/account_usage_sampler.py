@@ -13,7 +13,6 @@ Contract:
 from __future__ import annotations
 
 import logging
-import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -186,21 +185,18 @@ def _kill_probe_session(name: str, *, tmux=None) -> None:
         except Exception:  # noqa: BLE001
             logger.debug(
                 "account_usage_sampler: wrapped tmux client failed to kill "
-                "probe session %r; falling back to direct subprocess",
+                "probe session %r; falling back to canonical TmuxClient",
                 name,
                 exc_info=True,
             )
+    # Fallback: route through the canonical tmux module seam so version /
+    # quoting / timeout quirks stay handled in one place (#1373). A fresh
+    # ``TmuxClient`` instance bypasses whatever wrapper failed above.
     try:
-        subprocess.run(
-            ["tmux", "kill-session", "-t", f"={name}"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
+        create_tmux_client().kill_session(name)
     except Exception:  # noqa: BLE001
         logger.warning(
-            "account_usage_sampler: direct tmux kill-session failed for %r; "
+            "account_usage_sampler: tmux kill-session failed for %r; "
             "boot-time orphan sweep will catch this on next supervisor start",
             name,
             exc_info=True,
@@ -221,44 +217,31 @@ def sweep_orphan_usage_sessions() -> int:
     logging so a busted tmux server can't keep the supervisor from
     starting.
     """
+    # Route through the canonical tmux module seam (#1373). ``list_sessions``
+    # already swallows ``no server running``, timeouts, and missing-binary
+    # errors — returning ``[]`` in every "tmux unavailable" case.
+    tmux = create_tmux_client()
     try:
-        listing = subprocess.run(
-            ["tmux", "list-sessions", "-F", "#{session_name}"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
+        names = tmux.list_sessions()
     except Exception:  # noqa: BLE001
         logger.debug(
             "account_usage_sampler.sweep: tmux list-sessions failed",
             exc_info=True,
         )
         return 0
-    if listing.returncode != 0:
-        # ``no server running`` exits non-zero; nothing to sweep.
-        return 0
     killed = 0
-    for raw in listing.stdout.splitlines():
-        name = raw.strip()
+    for name in names:
         if not name.startswith(USAGE_PROBE_SESSION_PREFIX):
             continue
         try:
-            result = subprocess.run(
-                ["tmux", "kill-session", "-t", f"={name}"],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
+            if tmux.kill_session(name):
+                killed += 1
         except Exception:  # noqa: BLE001
             logger.debug(
                 "account_usage_sampler.sweep: kill-session failed for %r",
                 name, exc_info=True,
             )
             continue
-        if result.returncode == 0:
-            killed += 1
     if killed:
         logger.info(
             "account_usage_sampler.sweep: reaped %d orphan pm-usage-* "

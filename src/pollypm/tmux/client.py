@@ -390,14 +390,22 @@ class TmuxClient:
         if result.returncode != 0:
             logger.debug("kill-window %r returned %d (likely already gone)", target, result.returncode)
 
-    def kill_session(self, name: str) -> None:
-        """Kill a session. No-op if it doesn't exist."""
+    def kill_session(self, name: str) -> bool:
+        """Kill a session. No-op if it doesn't exist.
+
+        Returns ``True`` when a kill was issued and tmux acknowledged it,
+        ``False`` when the session was already gone or the kill failed.
+        Callers that only care about best-effort teardown can ignore the
+        return value.
+        """
         if not self.has_session(name):
             logger.debug("Session %r does not exist, skipping kill", name)
-            return
+            return False
         result = self.run("kill-session", "-t", self._exact_target(name), check=False)
         if result.returncode != 0:
             logger.debug("kill-session %r returned %d (likely already gone)", name, result.returncode)
+            return False
+        return True
 
     def kill_pane(self, target: str) -> None:
         self.run("kill-pane", "-t", self._exact_target(target))
@@ -434,6 +442,28 @@ class TmuxClient:
     def pipe_pane(self, target: str, log_path: Path) -> None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         self.run("pipe-pane", "-o", "-t", self._exact_target(target), f"cat >> {shlex.quote(str(log_path))}")
+
+    def list_sessions(self) -> list[str]:
+        """Return the names of every tmux session, or ``[]`` when unavailable.
+
+        The "unavailable" cases are deliberately swallowed so callers like the
+        boot-time orphan sweeper (#1009) can stay best-effort:
+
+        * No tmux server running — ``tmux list-sessions`` exits non-zero.
+        * tmux server wedged — :meth:`run` returns a 124 timeout result.
+        * Subprocess raises (e.g. tmux binary missing) — caught and treated
+          as "no sessions".
+        """
+        try:
+            result = self.run(
+                "list-sessions", "-F", "#{session_name}", check=False,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("list_sessions: tmux list-sessions failed", exc_info=True)
+            return []
+        if result.returncode != 0:
+            return []
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
     def list_windows(self, name: str) -> list[TmuxWindow]:
         fmt = (

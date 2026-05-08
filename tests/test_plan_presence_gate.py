@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from pollypm.plugins_builtin.project_planning.plan_presence import (
+from pollypm.plan_presence import (
     BYPASS_LABEL,
     MIN_PLAN_SIZE_BYTES,
     has_acceptable_plan,

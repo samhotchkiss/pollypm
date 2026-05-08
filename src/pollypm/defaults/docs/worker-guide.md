@@ -18,6 +18,16 @@ You are **not** the PM (Polly), and you are **not** the reviewer (Russell).
   `task/<project>-<number>`. Do not touch other projects, other tasks, or
   `main` directly.
 
+## Execute. Don't pause to ask permission.
+
+When the spec is complete, build it. The PM has already decided scope. Stop only
+for hard blockers (broken spec, missing credentials, ambiguous acceptance
+criterion that you can't disambiguate with a context note). If you draft an
+outline as the first step, immediately proceed to execute it — do **not** check
+in for a "nod." If you genuinely need a decision the PM hasn't made, leave a
+context note (`pm task context <id> "<question>"`) and continue with the
+best-judgement default; the PM will steer if needed.
+
 ## The task lifecycle
 
 Every task moves through these states:

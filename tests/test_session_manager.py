@@ -302,6 +302,20 @@ def test_build_task_prompt_points_at_builtin_worker_guide(manager, tmp_project) 
     assert "docs/worker-guide.md" not in prompt
 
 
+def test_build_task_prompt_includes_execute_dont_ask_rule(manager, tmp_project) -> None:
+    """The per-task prompt must carry the execute-don't-ask rule — the
+    worker reads this BEFORE the worker guide, so a task-prompt-only
+    reader still gets the guidance. coffeeboardnm/1 stalled exactly
+    here: it had the spec, drafted an outline, then waited for a nod."""
+    prompt = manager._build_task_prompt(
+        "proj/1",
+        tmp_project / ".pollypm" / "worktrees" / "proj-1",
+    )
+
+    assert "Execute, don't ask permission" in prompt
+    assert '"nod"' in prompt or '\\"nod\\"' in prompt
+
+
 def test_build_task_prompt_prefers_project_local_worker_guide(manager, tmp_project) -> None:
     guide_path = tmp_project / ".pollypm" / "project-guides" / "worker.md"
     guide_path.parent.mkdir(parents=True, exist_ok=True)

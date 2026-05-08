@@ -60,8 +60,11 @@ from pollypm.plugins_builtin.task_assignment_notify.resolver import (
 )
 from pollypm.work.models import ActorType, ExecutionStatus, WorkStatus
 from pollypm.work.task_assignment import (
+    RECENT_SWEEPER_PING_SECONDS,
     SessionRoleIndex,
+    SWEEPER_PING_CONTEXT_ENTRY_TYPE,
     TaskAssignmentEvent,
+    build_event_for_task,
     role_candidate_names,
 )
 
@@ -123,28 +126,6 @@ _ACTIVE_WORKER_STATUSES = (
     WorkStatus.REWORK.value,
 )
 
-# #927: terminal / parked statuses that must NEVER raise a
-# ``no_session_for_assignment`` alert. Cancelled / done tasks have no
-# pending work; on_hold tasks are intentionally parked. ``blocked`` is
-# its own alert family (gate-blocked surfaces via the gate-eval path)
-# — we skip it here too so a blocked task doesn't double-emit.
-# ``draft`` is pre-queue and has no actor binding.
-#
-# This is a belt-and-suspenders check: ``_SWEEPABLE_STATUSES`` already
-# enumerates only the active set, so a cancelled task never enters the
-# inner loop. The explicit guard inside ``_build_event_for_task``
-# defends against future churn (a sweepable status added without
-# updating this contract) and also ensures that a stale in-memory
-# ``Task`` snapshot whose underlying row was just cancelled in another
-# connection doesn't slip a ping through.
-_NON_ACTIVE_SWEEP_STATUSES = frozenset({
-    WorkStatus.DRAFT.value,
-    WorkStatus.BLOCKED.value,
-    WorkStatus.ON_HOLD.value,
-    WorkStatus.DONE.value,
-    WorkStatus.CANCELLED.value,
-})
-
 # Statuses where an idle-session gate is required before notifying. The
 # queued / review case is a new-or-pending assignment — pinging a busy
 # session is fine because the ping just surfaces in their queue. The
@@ -153,92 +134,10 @@ _NON_ACTIVE_SWEEP_STATUSES = frozenset({
 # relaunched with no context, etc.).
 _IDLE_GATED_STATUSES = frozenset(_ACTIVE_WORKER_STATUSES)
 
-# Per-task context marker written when a recurring sweeper emits (or
-# dedupes) a task assignment notification. Cockpit derives a transient
-# "recently pinged" badge from entries newer than this window.
-SWEEPER_PING_CONTEXT_ENTRY_TYPE = "sweeper_ping"
-RECENT_SWEEPER_PING_SECONDS = 60
-
 
 def _build_event_for_task(work_service: Any, task: Any) -> TaskAssignmentEvent | None:
-    """Load the current flow node for ``task`` and return a synthetic event.
-
-    Returns ``None`` when the task has no current node, the node doesn't
-    exist in the flow, the node is HUMAN, or the node is terminal.
-
-    For queued tasks without an explicit current node we fall back to
-    the flow's ``start_node`` — that's the effective pickup node for
-    the worker.
-    """
-    # #927: never emit assignment events for tasks in a terminal /
-    # parked / non-active state. The outer loop already iterates
-    # ``_SWEEPABLE_STATUSES``, but a stale row read or a future addition
-    # to that tuple shouldn't be able to fire a ``no_session_for_assignment``
-    # alert for a cancelled / done / on_hold task. Cancellation is meant
-    # to be honoured immediately — once the row says ``cancelled``, no
-    # ping should ever follow it.
-    status_value = getattr(getattr(task, "work_status", None), "value", None)
-    if status_value in _NON_ACTIVE_SWEEP_STATUSES:
-        return None
-    if not task.flow_template_id:
-        return None
-    try:
-        flow = work_service._load_flow_from_db(
-            task.flow_template_id, task.flow_template_version,
-        )
-    except Exception:  # noqa: BLE001
-        return None
-    node_id = task.current_node_id or flow.start_node
-    if not node_id:
-        return None
-    node = flow.nodes.get(node_id)
-    if node is None:
-        return None
-    actor_type = getattr(node, "actor_type", None)
-    if actor_type is None or actor_type is ActorType.HUMAN:
-        return None
-    node_type = getattr(node, "type", None)
-    node_kind = getattr(node_type, "value", node_type)
-    if node_kind == "terminal":
-        return None
-    if actor_type is ActorType.AGENT:
-        actor_name = getattr(node, "agent_name", "") or ""
-    else:
-        actor_name = getattr(node, "actor_role", "") or ""
-    if not actor_name:
-        return None
-    priority = getattr(task.priority, "value", str(task.priority))
-    # #279: look up the current execution's visit number so the dedupe
-    # key includes ``(session, task, execution_version)``. A rejection
-    # that bounces the task back to an earlier node opens a fresh visit,
-    # which correctly lets the retry ping through even inside the 30-min
-    # window. Best-effort — missing helper / errors fall back to 0,
-    # matching the pre-migration default for existing dedupe rows.
-    execution_version = 0
-    visit_fn = getattr(work_service, "current_node_visit", None)
-    if callable(visit_fn):
-        try:
-            execution_version = int(
-                visit_fn(task.project, task.task_number, node_id) or 0
-            )
-        except Exception:  # noqa: BLE001
-            execution_version = 0
-    return TaskAssignmentEvent(
-        task_id=task.task_id,
-        project=task.project,
-        task_number=task.task_number,
-        title=task.title,
-        current_node=node_id,
-        current_node_kind=str(node_kind) if node_kind is not None else "",
-        actor_type=actor_type,
-        actor_name=actor_name,
-        work_status=task.work_status.value,
-        priority=priority,
-        transitioned_at=datetime.now(timezone.utc),
-        transitioned_by="sweeper",
-        commit_ref=None,
-        execution_version=execution_version,
-    )
+    """Compatibility wrapper for the plugin's historical helper name."""
+    return build_event_for_task(work_service, task, transitioned_by="sweeper")
 
 
 def _target_session_is_idle(

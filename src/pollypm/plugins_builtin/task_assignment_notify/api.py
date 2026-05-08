@@ -13,20 +13,13 @@ hooks) imports from here; the underscored names remain in
 without breaking external callers as long as the names re-exported
 here keep their published shape.
 
-Core runtime callers route through the same surface (#939):
+Core runtime callers do not import this plugin surface (#1363). Neutral
+task-assignment constants, event construction, and the dispatch bus live
+in :mod:`pollypm.work.task_assignment`; this module remains the public
+surface for peer built-in plugins that still need notifier-owned helpers.
 
-* ``pollypm.heartbeats.local`` — uses :func:`build_event_for_task`,
-  :func:`load_runtime_services`, :func:`notify`, and
-  :data:`DEDUPE_WINDOW_SECONDS` to fire resume pings without
-  reaching into ``handlers.sweep`` / ``resolver`` privately.
-* ``pollypm.cockpit_tasks`` — uses
-  :data:`RECENT_SWEEPER_PING_SECONDS` and
-  :data:`SWEEPER_PING_CONTEXT_ENTRY_TYPE` to derive the recently-
-  pinged badge without importing the sweep handler module.
-
-If a future caller needs another helper, promote it here first, then
-update the caller — never let core depend on an underscored name from
-the plugin's internals.
+If a future peer-plugin caller needs another helper, promote it here first,
+then update the caller — never let core depend on this plugin's internals.
 
 Each public name is implemented as a thin trampoline that resolves the
 underlying private function via attribute lookup at call time. That

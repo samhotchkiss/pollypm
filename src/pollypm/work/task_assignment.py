@@ -18,9 +18,32 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable
 
-from pollypm.work.models import ActorType, Priority
+from pollypm.work.models import ActorType, Priority, WorkStatus
 
 logger = logging.getLogger(__name__)
+
+# 30-minute throttle on (session, task) pings — the spec's dedupe window.
+DEDUPE_WINDOW_SECONDS = 30 * 60
+
+# Sweeper's re-enqueue cooldown — re-notify a stale sitter every 5 min
+# at most even when the sweep cadence is 30s.
+SWEEPER_COOLDOWN_SECONDS = 5 * 60
+
+# Per-task context marker written when a recurring sweeper emits (or
+# dedupes) a task assignment notification. Cockpit derives a transient
+# "recently pinged" badge from entries newer than this window.
+SWEEPER_PING_CONTEXT_ENTRY_TYPE = "sweeper_ping"
+RECENT_SWEEPER_PING_SECONDS = 60
+
+_NON_ACTIVE_ASSIGNMENT_STATUSES = frozenset(
+    {
+        WorkStatus.CANCELLED.value,
+        WorkStatus.DONE.value,
+        WorkStatus.ON_HOLD.value,
+        WorkStatus.BLOCKED.value,
+        WorkStatus.DRAFT.value,
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +463,7 @@ def build_event_from_task(
     node: object,
     *,
     transitioned_by: str,
+    current_node_id: str | None = None,
     commit_ref: str | None = None,
     execution_version: int = 0,
 ) -> TaskAssignmentEvent | None:
@@ -484,7 +508,11 @@ def build_event_from_task(
         project=getattr(task, "project", ""),
         task_number=int(getattr(task, "task_number", 0) or 0),
         title=getattr(task, "title", ""),
-        current_node=getattr(task, "current_node_id", "") or "",
+        current_node=(
+            current_node_id
+            if current_node_id is not None
+            else getattr(task, "current_node_id", "") or ""
+        ),
         current_node_kind=node_kind_str,
         actor_type=actor_type,
         actor_name=actor_name,
@@ -494,4 +522,66 @@ def build_event_from_task(
         transitioned_by=transitioned_by,
         commit_ref=commit_ref,
         execution_version=int(execution_version or 0),
+    )
+
+
+def build_event_for_task(
+    work_service: object,
+    task: object,
+    *,
+    transitioned_by: str = "sweeper",
+    commit_ref: str | None = None,
+) -> TaskAssignmentEvent | None:
+    """Load ``task``'s current flow node and build an assignment event.
+
+    Returns ``None`` when the task is terminal/parked, has no flow, or its
+    current node does not expect a machine actor.
+    """
+    status = getattr(task, "work_status", None)
+    status_value = getattr(status, "value", status)
+    if status_value in _NON_ACTIVE_ASSIGNMENT_STATUSES:
+        return None
+
+    flow_template_id = getattr(task, "flow_template_id", None)
+    if not flow_template_id:
+        return None
+    try:
+        flow = work_service._load_flow_from_db(
+            flow_template_id,
+            getattr(task, "flow_template_version", 0),
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+    node_id = getattr(task, "current_node_id", None) or getattr(
+        flow, "start_node", None,
+    )
+    if not node_id:
+        return None
+    node = getattr(flow, "nodes", {}).get(node_id)
+    if node is None:
+        return None
+
+    execution_version = 0
+    visit_fn = getattr(work_service, "current_node_visit", None)
+    if callable(visit_fn):
+        try:
+            execution_version = int(
+                visit_fn(
+                    getattr(task, "project", ""),
+                    int(getattr(task, "task_number", 0) or 0),
+                    node_id,
+                )
+                or 0
+            )
+        except Exception:  # noqa: BLE001
+            execution_version = 0
+
+    return build_event_from_task(
+        task,
+        node,
+        transitioned_by=transitioned_by,
+        current_node_id=str(node_id),
+        commit_ref=commit_ref,
+        execution_version=execution_version,
     )

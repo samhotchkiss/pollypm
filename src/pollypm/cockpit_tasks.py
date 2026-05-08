@@ -47,10 +47,7 @@ from pollypm.plan_presence import (
     plan_approval_task,
     plan_blocked_task_ids,
 )
-from pollypm.plugins_builtin.task_assignment_notify.api import (
-    # #939: pull the sweeper-ping window + context-entry type from the
-    # plugin's public surface, not its handler module. Lets the plugin
-    # refactor ``handlers.sweep`` without breaking cockpit rendering.
+from pollypm.work.task_assignment import (
     RECENT_SWEEPER_PING_SECONDS,
     SWEEPER_PING_CONTEXT_ENTRY_TYPE,
 )

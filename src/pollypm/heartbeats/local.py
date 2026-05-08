@@ -1124,22 +1124,18 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         self, api, context: HeartbeatSessionContext, signals: SessionSignals,
         intervention,
     ) -> None:
-        """Emit a resume ping via task_assignment_notify (#249).
+        """Publish a resume ping event for task-assignment subscribers (#249).
 
-        Reuses the existing 30-min dedupe via ``notify()``. Best-effort —
-        all failures are logged and swallowed so the sweep never aborts
-        on an apply hiccup.
+        The task-assignment notify plugin subscribes to the core event bus
+        when loaded. Best-effort — all failures are logged and swallowed so
+        the sweep never aborts on an apply hiccup.
         """
         try:
-            # #939: route through the plugin's public API rather than
-            # reaching into ``handlers.sweep`` / ``resolver`` privately.
-            from pollypm.plugins_builtin.task_assignment_notify.api import (
-                DEDUPE_WINDOW_SECONDS,
-                build_event_for_task as _build_event_for_task,
-                load_runtime_services,
-                notify as _notify,
-            )
             from pollypm.work import create_work_service
+            from pollypm.work.task_assignment import (
+                build_event_for_task as _build_event_for_task,
+                dispatch as _dispatch_task_assignment,
+            )
 
             task_id = signals.active_claim_task_id
             if not task_id or "/" not in task_id:
@@ -1158,43 +1154,25 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             if not work_db.exists():
                 return
 
-            services = load_runtime_services()
-            try:
-                with create_work_service(
-                    db_path=work_db, project_path=project_cfg.path,
-                ) as svc:
-                    tasks = svc.list_tasks(project=project)
-                    task = next(
-                        (
-                            t for t in tasks
-                            if t.task_number == task_number
-                        ),
-                        None,
-                    )
-                    if task is None:
-                        return
-                    event = _build_event_for_task(svc, task)
-                if event is None:
-                    return
-                _notify(
-                    event, services=services,
-                    throttle_seconds=DEDUPE_WINDOW_SECONDS,
+            with create_work_service(
+                db_path=work_db, project_path=project_cfg.path,
+            ) as svc:
+                tasks = svc.list_tasks(project=project)
+                task = next(
+                    (
+                        t for t in tasks
+                        if t.task_number == task_number
+                    ),
+                    None,
                 )
-            finally:
-                # #1372 — release every owned sqlite connection. The
-                # pre-fix version closed only ``services.work_service``
-                # and leaked the fresh ``StateStore`` opened by
-                # ``load_runtime_services`` on each resume_ping
-                # evaluation (regression of #1069 — the same pattern
-                # this plugin's handlers/notify.py and handlers/sweep.py
-                # already fixed via ``services.close()``).
-                try:
-                    services.close()
-                except Exception:  # noqa: BLE001
-                    logger.debug(
-                        "heartbeat resume_ping: services.close raised",
-                        exc_info=True,
-                    )
+                if task is None:
+                    return
+                event = _build_event_for_task(
+                    svc, task, transitioned_by="heartbeat",
+                )
+            if event is None:
+                return
+            _dispatch_task_assignment(event)
 
             # Raise a low-severity alert so the cockpit surfaces it.
             try:

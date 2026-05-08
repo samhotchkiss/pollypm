@@ -15,20 +15,14 @@ from typing import Any
 
 from pollypm.runtime_services import _RuntimeServices, load_runtime_services
 from pollypm.work.task_assignment import (
+    DEDUPE_WINDOW_SECONDS,
     SessionRoleIndex,
+    SWEEPER_COOLDOWN_SECONDS as SWEEPER_COOLDOWN_SECONDS,
     TaskAssignmentEvent,
     format_ping_for_role,
 )
 
 logger = logging.getLogger(__name__)
-
-
-# 30-minute throttle on (session, task) pings — the spec's dedupe window.
-DEDUPE_WINDOW_SECONDS = 30 * 60
-
-# Sweeper's re-enqueue cooldown — we re-notify a stale sitter every 5 min
-# at most even when the sweep cadence is 30s.
-SWEEPER_COOLDOWN_SECONDS = 5 * 60
 
 
 # ---------------------------------------------------------------------------

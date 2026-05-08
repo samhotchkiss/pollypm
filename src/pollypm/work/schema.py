@@ -126,6 +126,43 @@ CREATE INDEX IF NOT EXISTS idx_work_tasks_priority
 -- column the (pre-migration) legacy work_tasks table doesn't have
 -- yet, so it must live in the ensure helper rather than WORK_SCHEMA.
 
+CREATE TABLE IF NOT EXISTS work_task_delete_audit_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project TEXT NOT NULL,
+    task_number INTEGER NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    flow_template_id TEXT NOT NULL DEFAULT '',
+    previous_status TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL DEFAULT '',
+    deleted_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_work_task_delete_audit_outbox_project
+    ON work_task_delete_audit_outbox(project, task_number);
+
+CREATE TRIGGER IF NOT EXISTS trg_work_tasks_delete_audit_outbox
+AFTER DELETE ON work_tasks
+BEGIN
+    INSERT INTO work_task_delete_audit_outbox (
+        project,
+        task_number,
+        title,
+        flow_template_id,
+        previous_status,
+        created_by,
+        deleted_at
+    )
+    VALUES (
+        OLD.project,
+        OLD.task_number,
+        OLD.title,
+        OLD.flow_template_id,
+        OLD.work_status,
+        OLD.created_by,
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    );
+END;
+
 -- -------------------------------------------------------------------
 -- Task dependencies / relationships
 -- -------------------------------------------------------------------
@@ -475,6 +512,16 @@ _WORK_MIGRATIONS: list[tuple[int, str, list[str]]] = [
             # ADD COLUMN. The migration entry records the v8 bump so
             # ``work_schema_version`` stays accurate for both fresh
             # and legacy DBs.
+        ],
+    ),
+    (
+        9,
+        "Add work_task_delete_audit_outbox trigger so raw work_tasks "
+        "deletes emit task.deleted audit events",
+        [
+            # The table, index, and trigger are created by WORK_SCHEMA before
+            # the migration walk. This row records that the DB has the delete
+            # audit guard installed.
         ],
     ),
 ]

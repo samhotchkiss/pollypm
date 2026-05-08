@@ -131,6 +131,21 @@ distilled task brief. Then:
 Work on `task/<project>-<number>`. Do **not** commit to `main`. Do **not** edit
 files outside the worktree.
 
+**Tell Polly when you finish a meaningful step.** Long-running tasks
+(rendering, deploying, multi-stage research) look stalled to the
+operator if there's no visible progress. Call `pm send-up` with a
+one-line summary at each milestone:
+
+```
+pm send-up "outline drafted, starting render" --task <project>/<N>
+pm send-up "tests passing, deploying"
+pm send-up "deploy verified, marking done"
+```
+
+The `--task` flag is optional when `POLLYPM_TASK_ID` is set in your
+environment. The card lands in the operator inbox without alerting
+or interrupting Polly's heartbeat — it's pure visibility.
+
 ### 5. Mark the node done with a work output
 
 The `pm task done` command takes a JSON work-output payload. The payload

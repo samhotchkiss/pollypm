@@ -57,6 +57,7 @@ from pollypm.cli_features.dev import dev_app
 from pollypm.cli_features.maintenance import debug_app, register_maintenance_commands
 from pollypm.cli_features.migrate import register_migrate_commands
 from pollypm.cli_features.projects import register_project_commands
+from pollypm.cli_features.send_up import register_send_up_commands
 from pollypm.cli_features.session_runtime import register_session_runtime_commands
 from pollypm.cli_features.ui import register_ui_commands
 from pollypm.cli_features.update import register_update_commands
@@ -205,6 +206,7 @@ register_upgrade_commands(app)
 register_migrate_commands(app)
 register_worker_commands(app)
 register_session_runtime_commands(app, helpers=sys.modules[__name__])
+register_send_up_commands(app, helpers=sys.modules[__name__])
 
 
 def attach_existing_session(session_name: str) -> int:

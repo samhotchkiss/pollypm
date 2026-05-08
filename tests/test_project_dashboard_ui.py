@@ -739,7 +739,7 @@ def test_status_green_when_worker_heartbeat_alive(
         }
 
         def _fake_active_worker(config_path, project_key, *, action_items=None):
-            return fake_worker, 0
+            return fake_worker, 0, []
 
         from pollypm import cockpit_ui
         monkeypatch.setattr(
@@ -848,12 +848,146 @@ def test_plan_gate_alert_counts_as_project_attention(
 
     monkeypatch.setattr("pollypm.service_api.PollyPMService", FakeService)
 
-    worker, alert_count = _dashboard_active_worker(
+    worker, alert_count, alert_types = _dashboard_active_worker(
         dashboard_env["config_path"], "demo",
     )
 
     assert worker is None
     assert alert_count == 1
+    assert alert_types == ["plan_missing"]
+
+
+def test_banner_never_says_polly_needs_to_inspect_when_alerts_exist() -> None:
+    """#1512 — the generic ``Polly needs to inspect a project issue`` lede
+    is unreachable. Even when the alert family is unmapped, the banner
+    must name the user as the actor and route them to the alert list,
+    NOT pretend the system will resolve it on its own.
+    """
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    fake_data = SimpleNamespace(
+        action_items=[],
+        alert_count=2,
+        # An alert type the banner switch does NOT know about — the
+        # fallback should still route the user to the alert list.
+        alert_types=["something_unmapped_6789"],
+        active_worker=None,
+        task_counts={},
+        task_buckets={"on_hold": []},
+        inbox_count=0,
+    )
+    banner = app._render_project_state_banner(fake_data, "▸ 2 alerts")
+    assert "Polly needs to inspect" not in banner
+    # User-as-actor: the lede should put the responsibility on the user.
+    assert "Waiting on you" in banner
+    # Affordance: the banner must name the keystroke route to the alert
+    # list, not be a dead-end string.
+    assert "press a" in banner
+
+
+def test_banner_routes_worker_question_alert_to_specific_copy() -> None:
+    """#1512 — a ``worker_question`` alert renders specific copy that
+    names the decision (worker is asking) and the action route.
+    """
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    fake_data = SimpleNamespace(
+        action_items=[],
+        alert_count=1,
+        alert_types=["worker_question"],
+        active_worker=None,
+        task_counts={},
+        task_buckets={"on_hold": []},
+        inbox_count=0,
+    )
+    banner = app._render_project_state_banner(fake_data, "▸ 1 alert")
+    assert "Polly needs to inspect" not in banner
+    assert "Waiting on you" in banner
+    assert "asking a question" in banner
+    assert "press a" in banner
+
+
+def test_banner_routes_recovery_limit_alert_to_specific_copy() -> None:
+    """#1512 — a ``recovery_limit`` alert reads as a paused auto-recovery,
+    not as ``Polly needs to inspect``."""
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    fake_data = SimpleNamespace(
+        action_items=[],
+        alert_count=1,
+        alert_types=["recovery_limit"],
+        active_worker=None,
+        task_counts={},
+        task_buckets={"on_hold": []},
+        inbox_count=0,
+    )
+    banner = app._render_project_state_banner(fake_data, "▸ 1 alert")
+    assert "Polly needs to inspect" not in banner
+    assert "auto-recovery" in banner
+    assert "press a" in banner
+
+
+def test_banner_routes_pane_permission_prompt_alert() -> None:
+    """``pane:permission_prompt`` keeps its colon-suffixed family — the
+    banner should still route correctly without truncating to ``pane``.
+    """
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    fake_data = SimpleNamespace(
+        action_items=[],
+        alert_count=1,
+        alert_types=["pane:permission_prompt"],
+        active_worker=None,
+        task_counts={},
+        task_buckets={"on_hold": []},
+        inbox_count=0,
+    )
+    banner = app._render_project_state_banner(fake_data, "▸ 1 alert")
+    assert "Polly needs to inspect" not in banner
+    assert "permission prompt" in banner
+    assert "press a" in banner
+
+
+def test_banner_action_items_still_outrank_alert() -> None:
+    """#1512 sanity — when an action_item exists (e.g. a plan-review
+    inbox row), the ``Waiting on you: <prompt>`` banner from the
+    action-items branch wins over the alert branch. The fix to the alert
+    branch must NOT regress this priority order.
+    """
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    fake_data = SimpleNamespace(
+        action_items=[{
+            "plain_prompt": "Plan ready for your review: coffeeboardnm",
+            "primary_ref": None,
+        }],
+        alert_count=1,
+        alert_types=["worker_question"],
+        active_worker=None,
+        task_counts={},
+        task_buckets={"on_hold": [], "review": []},
+        inbox_count=1,
+    )
+    banner = app._render_project_state_banner(fake_data, "▸ 1 action")
+    assert "Plan ready for your review" in banner
+    # The worker_question alert copy belongs to the alert branch, which
+    # the action_items branch outranks.
+    assert "asking a question" not in banner
 
 
 def test_status_yellow_when_task_is_on_hold(
@@ -1477,7 +1611,7 @@ def test_current_activity_calls_out_user_decision_when_only_architect_active(
     }
 
     def _fake_active_worker(config_path, project_key, *, action_items=None):
-        return fake_worker, 0
+        return fake_worker, 0, []
 
     from pollypm import cockpit_ui as _cockpit_ui
     monkeypatch.setattr(
@@ -1569,7 +1703,7 @@ def test_current_activity_keeps_session_name_when_distinct_from_role(
     }
 
     def _fake_active_worker(config_path, project_key, *, action_items=None):
-        return fake_worker, 0
+        return fake_worker, 0, []
 
     from pollypm import cockpit_ui as _cockpit_ui
     monkeypatch.setattr(
@@ -2504,7 +2638,7 @@ def test_status_pill_prefers_user_attention_over_active_worker(
     }
 
     def _fake_active_worker(config_path, project_key, *, action_items=None):
-        return fake_worker, 0
+        return fake_worker, 0, []
 
     from pollypm import cockpit_ui as _cockpit_ui
     monkeypatch.setattr(

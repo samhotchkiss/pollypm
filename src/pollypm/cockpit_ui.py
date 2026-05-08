@@ -11613,6 +11613,7 @@ class ProjectDashboardData:
         "inbox_top",
         "action_items",
         "alert_count",
+        "alert_types",
         "enforce_plan",
     )
 
@@ -11644,6 +11645,7 @@ class ProjectDashboardData:
         inbox_top: list[dict],
         action_items: list[dict],
         alert_count: int,
+        alert_types: list[str] | None = None,
         enforce_plan: bool = True,
     ) -> None:
         self.project_key = project_key
@@ -11671,6 +11673,7 @@ class ProjectDashboardData:
         self.inbox_top = inbox_top
         self.action_items = action_items
         self.alert_count = alert_count
+        self.alert_types = list(alert_types) if alert_types else []
         self.enforce_plan = enforce_plan
 
 
@@ -12242,14 +12245,18 @@ def _dashboard_active_worker(
     project_key: str,
     *,
     action_items: list[dict] | None = None,
-) -> tuple[dict | None, int]:
+) -> tuple[dict | None, int, list[str]]:
     """Inspect supervisor state for a live worker on this project.
 
-    Returns ``(worker_info, alert_count)`` where ``worker_info`` is
-    ``None`` when no worker is currently heartbeat-alive. ``alert_count``
+    Returns ``(worker_info, alert_count, alert_types)`` where ``worker_info``
+    is ``None`` when no worker is currently heartbeat-alive. ``alert_count``
     counts actionable alerts scoped to this project's sessions so the
     top bar can render the yellow "needs attention" light even when the
-    worker is idle.
+    worker is idle. ``alert_types`` is the de-duplicated list of those
+    alerts' ``alert_type`` strings (in count order, ties by stable insert
+    order) — the dashboard banner uses it to render specific copy per
+    alert family instead of falling back to a generic "Polly needs to
+    inspect a project issue" lede (#1512).
 
     When a worker is found, ``worker_info["activity"]`` carries the
     classifier result from :func:`_classify_worker_activity`:
@@ -12269,11 +12276,12 @@ def _dashboard_active_worker(
 
     worker_info: dict | None = None
     alert_count = 0
+    alert_types: list[str] = []
     try:
         from pollypm.service_api import PollyPMService
         supervisor = PollyPMService(config_path).load_supervisor()
     except Exception:  # noqa: BLE001
-        return None, 0
+        return None, 0, []
     try:
         # Skip control-plane roles (operator-pm, reviewer,
         # heartbeat-supervisor, triage) — they're system-wide
@@ -12375,16 +12383,31 @@ def _dashboard_active_worker(
                 for item in (action_items or [])
                 if item.get("primary_ref")
             }
-            alert_count = sum(
-                1 for a in open_alerts
+            actionable_alerts = [
+                a for a in open_alerts
                 if getattr(a, "session_name", None) in project_session_names
                 and not is_operational_alert(getattr(a, "alert_type", ""))
                 and not _stuck_alert_covers_action(
                     getattr(a, "alert_type", ""), covered_task_ids,
                 )
-            )
+            ]
+            alert_count = len(actionable_alerts)
+            # #1512 — surface the de-duplicated alert_type list so the
+            # banner can render specific copy per family instead of the
+            # generic "Polly needs to inspect a project issue" fallback.
+            # Preserve first-seen order so the most-recent alert (last in
+            # the list) doesn't always win on ties.
+            seen_types: set[str] = set()
+            alert_types = []
+            for a in actionable_alerts:
+                t = str(getattr(a, "alert_type", "") or "")
+                if not t or t in seen_types:
+                    continue
+                seen_types.add(t)
+                alert_types.append(t)
         except Exception:  # noqa: BLE001
             alert_count = 0
+            alert_types = []
         # #990 — classify the worker's actual activity. Heartbeat-alive
         # alone is not enough to claim "in action"; the dashboard must
         # also see either a claimed task with pane movement or, for an
@@ -12452,7 +12475,7 @@ def _dashboard_active_worker(
             supervisor.store.close()
         except Exception:  # noqa: BLE001
             pass
-    return worker_info, alert_count
+    return worker_info, alert_count, alert_types
 
 
 # Cache the project-scoped inbox snapshot by (project, db_mtime).
@@ -13862,7 +13885,7 @@ def _gather_project_dashboard(
         plan_stale_reason = None
         activity_entries = []
 
-    active_worker, alert_count = _dashboard_active_worker(
+    active_worker, alert_count, alert_types = _dashboard_active_worker(
         config_path, project_key, action_items=action_items,
     )
     blocker_count = int(counts.get("blocked", 0))
@@ -13919,6 +13942,7 @@ def _gather_project_dashboard(
         inbox_top=inbox_top,
         action_items=action_items,
         alert_count=alert_count,
+        alert_types=alert_types,
         enforce_plan=enforce_plan,
     )
 
@@ -13956,6 +13980,10 @@ def _project_dashboard_signature(
         # Action / inbox / alerts.
         data.inbox_count,
         data.alert_count,
+        # #1512 — alert types drive the typed banner copy, so re-render
+        # when the family shifts even if the count holds steady (e.g. a
+        # ``worker_question`` clears and a ``recovery_limit`` opens).
+        tuple(getattr(data, "alert_types", []) or []),
         len(data.action_items or []),
         tuple(
             (str(item.get("task_id") or ""), str(item.get("primary_ref") or ""))
@@ -13970,6 +13998,145 @@ def _project_dashboard_signature(
             (e.get("event_type"), e.get("created_at"))
             for e in (data.activity_entries or [])[:10]
         ),
+    )
+
+
+def _alert_banner_copy(alert_types: list[str], alert_count: int) -> str | None:
+    """Return banner copy describing the alerts waiting on the user.
+
+    #1512 — replaces the generic "Polly needs to inspect a project issue"
+    fallback. The alert is a USER-owed decision, not a self-healing system
+    event; the banner names the alert family and tells the user how to
+    reach the action surface (the ``a`` keybinding routes to Metrics →
+    Alerts) so the dashboard never reads as a dead-end.
+
+    Returns ``None`` when there is nothing to show.
+    """
+    if not alert_count:
+        return None
+
+    # Resolve the alert family for the first non-operational alert (the
+    # alert list is already filtered to actionable ones in
+    # ``_dashboard_active_worker``). Routing a single family is sufficient
+    # for the banner — the count suffix surfaces the rest, and the user
+    # opens the alert list to triage them all.
+    primary = alert_types[0] if alert_types else ""
+    family = primary.partition(":")[0] if primary else ""
+    # ``pane:permission_prompt`` and ``pane:stuck_on_error`` keep the full
+    # alert_type as their family (mirrors cockpit_alert_actions._alert_family).
+    if family == "pane":
+        family = primary
+
+    n = max(1, int(alert_count))
+    suffix = "s" if n != 1 else ""
+    other = max(0, n - 1)
+    other_part = (
+        f" · +{other} more alert" + ("s" if other != 1 else "")
+        if other
+        else ""
+    )
+
+    if family == "worker_question":
+        return (
+            f"Waiting on you: a worker is asking a question — press a to "
+            f"answer{other_part}"
+        )
+    if family == "recovery_limit":
+        return (
+            f"Waiting on you: auto-recovery paused — press a to resume or "
+            f"restart{other_part}"
+        )
+    if family == "auth_broken":
+        return (
+            f"Waiting on you: authentication is broken — press a to repair "
+            f"the account{other_part}"
+        )
+    if family == "plan_missing":
+        return (
+            f"Waiting on you: this project has no plan yet — press a to "
+            f"review, or c to ask the PM to plan{other_part}"
+        )
+    if family == "no_session_for_assignment":
+        return (
+            f"Waiting on you: a task is assigned with no live worker — "
+            f"press a to triage{other_part}"
+        )
+    if family == "no_session":
+        return (
+            f"Waiting on you: a task is stalled with no live worker — "
+            f"press a to triage{other_part}"
+        )
+    if family == "stuck_on_task":
+        return (
+            f"Waiting on you: a task is stuck on operator input — press a "
+            f"to open the inbox thread{other_part}"
+        )
+    if family == "pane:permission_prompt":
+        return (
+            f"Waiting on you: a worker is at a permission prompt — press a "
+            f"to view the pane{other_part}"
+        )
+    if family == "pane:stuck_on_error":
+        return (
+            f"Waiting on you: a worker is stuck on an error — press a to "
+            f"view the pane{other_part}"
+        )
+    if family == "crash_loop":
+        return (
+            f"Waiting on you: a session is in a crash loop — press a to "
+            f"restart{other_part}"
+        )
+    if family == "pane_stopped":
+        return (
+            f"Waiting on you: a worker pane has stopped — press a to "
+            f"restart{other_part}"
+        )
+    if family == "persona_drift_detected":
+        return (
+            f"Waiting on you: persona drift detected — press a to review"
+            f"{other_part}"
+        )
+    if family == "worktree_state":
+        return (
+            f"Waiting on you: a worktree is in a bad state — press a to "
+            f"review{other_part}"
+        )
+    if family == "state_drift":
+        return (
+            f"Waiting on you: task state has drifted from the work DB — "
+            f"press a to review{other_part}"
+        )
+    if family == "critical_error":
+        return (
+            f"Waiting on you: a critical error was logged — press a to "
+            f"review{other_part}"
+        )
+    if family == "itsalive_verification_required":
+        return (
+            f"Waiting on you: deploy verification required — press a to "
+            f"review{other_part}"
+        )
+    if family == "itsalive_verification_expired":
+        return (
+            f"Waiting on you: deploy verification expired — press a to "
+            f"review{other_part}"
+        )
+
+    # Unknown / unmapped alert family — never claim "Polly needs to
+    # inspect" (the system isn't going to inspect anything; the user is).
+    # Name the count and the route so the banner stays a real call to
+    # action. #1512.
+    if primary:
+        # Surface the raw type so the user can see what the supervisor
+        # actually raised — strips the payload (``foo:bar`` → ``foo``)
+        # to keep the banner short.
+        return (
+            f"Waiting on you: {n} alert{suffix} need{'s' if n == 1 else ''} "
+            f"your attention ({family or primary}) — press a to review"
+        )
+    return (
+        f"Waiting on you: {n} alert{suffix} need{'s' if n == 1 else ''} "
+        f"your attention — press a to review"
     )
 
 
@@ -14940,7 +15107,18 @@ class PollyProjectDashboardApp(App[None]):
             )
             return f"Waiting on you: {prompt}{extras_part} · {suffix}"
         if data.alert_count:
-            return f"Alert: Polly needs to inspect a project issue{count_suffix}"
+            # #1512 — render the specific alert family the supervisor
+            # raised instead of the generic "Polly needs to inspect a
+            # project issue" lede. Falls back to a count + route hint
+            # ("press a to review") when the family is unmapped — never
+            # to a dead-end string that implies the system is going to
+            # handle this on its own.
+            specific = _alert_banner_copy(
+                getattr(data, "alert_types", []) or [],
+                int(data.alert_count),
+            )
+            if specific:
+                return f"{specific}{count_suffix}"
         # On-hold tasks must outrank an active background worker. Today
         # media renders ``Moving now: worker_media is active · 1 on
         # hold`` while the pill correctly shows "needs attention" —

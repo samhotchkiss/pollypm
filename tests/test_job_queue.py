@@ -166,6 +166,29 @@ def test_dedupe_key_allows_reenqueue_after_failed(tmp_path: Path) -> None:
     assert jid2 != jid1
 
 
+def test_has_recent_or_active_dedupe_tracks_active_and_recent_rows(
+    tmp_path: Path,
+) -> None:
+    q = JobQueue(db_path=tmp_path / "q.db")
+    before_enqueue = datetime.now(UTC) - timedelta(seconds=1)
+    jid = q.enqueue("sweep", dedupe_key="sweep:a")
+
+    assert q.has_recent_or_active_dedupe(
+        "sweep:a",
+        since=datetime.now(UTC) + timedelta(days=1),
+    )
+
+    (job,) = q.claim("w")
+    q.complete(job.id)
+
+    assert q.has_recent_or_active_dedupe("sweep:a", since=before_enqueue)
+    assert not q.has_recent_or_active_dedupe(
+        "sweep:a",
+        since=datetime.now(UTC) + timedelta(days=1),
+    )
+    assert q.get(jid) is not None
+
+
 def test_late_retry_fail_does_not_resurrect_terminal_dedupe_row(
     tmp_path: Path,
 ) -> None:

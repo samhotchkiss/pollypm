@@ -55,6 +55,29 @@ class FakeQueue:
         return self.next_id
 
 
+@dataclass
+class DedupeAwareQueue(FakeQueue):
+    """Fake queue exposing the durable dedupe recency hook."""
+
+    active_keys: set[str] = field(default_factory=set)
+    recent_enqueued_at: dict[str, list[datetime]] = field(default_factory=dict)
+    dedupe_checks: list[tuple[str, datetime]] = field(default_factory=list)
+
+    def has_recent_or_active_dedupe(
+        self,
+        dedupe_key: str,
+        *,
+        since: datetime,
+    ) -> bool:
+        self.dedupe_checks.append((dedupe_key, since))
+        if dedupe_key in self.active_keys:
+            return True
+        return any(
+            enqueued_at > since
+            for enqueued_at in self.recent_enqueued_at.get(dedupe_key, [])
+        )
+
+
 def _utc(year=2026, month=1, day=1, hour=0, minute=0, second=0) -> datetime:
     return datetime(year, month, day, hour, minute, second, tzinfo=UTC)
 
@@ -247,6 +270,62 @@ class TestHeartbeatTick:
         # t=120s: fires again.
         hb.tick(_utc(minute=2))
         assert len(queue.enqueued) == 2
+
+    def test_every_dedupe_active_job_does_not_consume_next_beat(self) -> None:
+        roster = Roster()
+        roster.register(
+            schedule="@every 5m",
+            handler_name="audit.watchdog",
+            payload={},
+            dedupe_key="audit.watchdog",
+        )
+        queue = DedupeAwareQueue(active_keys={"audit.watchdog"})
+        hb = Heartbeat(roster, queue)
+
+        hb.tick(_utc(hour=12, minute=0))
+        result = hb.tick(_utc(hour=12, minute=5))
+
+        assert result.enqueued_count == 0
+        assert queue.enqueued == []
+        entry = roster.entries[0]
+        assert entry.last_fired_at is None
+        assert queue.dedupe_checks == [
+            ("audit.watchdog", _utc(hour=12, minute=0))
+        ]
+
+        queue.active_keys.clear()
+        result = hb.tick(_utc(hour=12, minute=5, second=15))
+
+        assert result.enqueued_count == 1
+        assert queue.enqueued[0]["handler_name"] == "audit.watchdog"
+        assert entry.last_fired_at == _utc(hour=12, minute=5, second=15)
+
+    def test_every_dedupe_recent_job_blocks_second_rail_double_pulse(self) -> None:
+        roster = Roster()
+        roster.register(
+            schedule="@every 5m",
+            handler_name="audit.watchdog",
+            payload={},
+            dedupe_key="audit.watchdog",
+        )
+        queue = DedupeAwareQueue(
+            recent_enqueued_at={"audit.watchdog": [_utc(hour=12, minute=5)]}
+        )
+        hb = Heartbeat(roster, queue)
+
+        hb.tick(_utc(hour=12, minute=0, second=26))
+        result = hb.tick(_utc(hour=12, minute=5, second=26))
+
+        assert result.enqueued_count == 0
+        assert queue.enqueued == []
+        entry = roster.entries[0]
+        assert entry.last_fired_at is None
+
+        result = hb.tick(_utc(hour=12, minute=10, second=1))
+
+        assert result.enqueued_count == 1
+        assert queue.enqueued[0]["handler_name"] == "audit.watchdog"
+        assert entry.last_fired_at == _utc(hour=12, minute=10, second=1)
 
     def test_single_due_cron_entry(self) -> None:
         roster = Roster()

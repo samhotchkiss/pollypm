@@ -11335,6 +11335,166 @@ def _dashboard_plan_path(project_path: Path) -> Path | None:
     return None
 
 
+# URL-shaped match used to harvest a deliverable hint from a done plan
+# task's external_refs / labels / description. We trim a couple of
+# trailing punctuation characters that show up when URLs land at the
+# end of free-form prose. Mirrors the conservative pattern in
+# ``task_shipped._URL_RE``.
+_PLAN_TASK_URL_RE = _re.compile(r"https?://[^\s\)<>]+")
+_PLAN_TASK_URL_TRAILING_TRIM = ".,;:!?)"
+
+
+def _plan_task_first_paragraph(description: str, *, limit: int = 280) -> str:
+    """Return the first paragraph (or sentence) of a plan-task description.
+
+    Used by the Plan section when there is no plan file but a done
+    plan-shaped task carries a description. Keeps the surface compact —
+    one paragraph capped at ``limit`` chars — so the dashboard pane
+    doesn't overflow for tasks with long bodies.
+    """
+    text = (description or "").strip()
+    if not text:
+        return ""
+    para = text.split("\n\n", 1)[0].strip()
+    if len(para) > limit:
+        para = para[: limit - 1].rstrip() + "…"
+    return para
+
+
+def _plan_task_deliverable_url(task: object) -> str | None:
+    """Return a URL hint for a done plan task, or None.
+
+    Looks at (in order): ``external_refs`` values, label values that
+    parse as URLs (``url:<href>`` form first, then any label that is
+    itself a URL), and finally the task description body. Conservative
+    on purpose — we only return ``http(s)`` URLs.
+    """
+    refs = getattr(task, "external_refs", None) or {}
+    if isinstance(refs, dict):
+        # Stable iteration so deterministic across runs; prefer keys
+        # that read as deliverable-y over arbitrary refs.
+        preferred_keys = (
+            "deliverable",
+            "deliverable_url",
+            "report",
+            "report_url",
+            "url",
+        )
+        for key in preferred_keys:
+            value = refs.get(key)
+            if isinstance(value, str) and value.startswith(("http://", "https://")):
+                return value
+        for value in refs.values():
+            if isinstance(value, str) and value.startswith(("http://", "https://")):
+                return value
+    labels = getattr(task, "labels", None) or []
+    for label in labels:
+        if not isinstance(label, str):
+            continue
+        if label.startswith("url:"):
+            candidate = label[len("url:"):].strip()
+            if candidate.startswith(("http://", "https://")):
+                return candidate
+        if label.startswith(("http://", "https://")):
+            return label
+    description = getattr(task, "description", "") or ""
+    match = _PLAN_TASK_URL_RE.search(description)
+    if match:
+        url = match.group(0)
+        while url and url[-1] in _PLAN_TASK_URL_TRAILING_TRIM:
+            url = url[:-1]
+        if url:
+            return url
+    return None
+
+
+def _dashboard_done_plan_task(
+    config: object, project_key: str, project_path: Path,
+) -> dict | None:
+    """Return a summary of the most recent done plan-shaped task, or None.
+
+    A "plan-shaped" task is one matching the conservative label-based
+    heuristic in :func:`pollypm.work.plan_review_emit.task_is_eligible_for_backstop`
+    (re-used here, do not duplicate). When the dashboard's Plan section
+    sees no plan file on disk, this is the fallback that lets it
+    surface "the plan task is done — open it" instead of the
+    "No plan yet" empty state (#1518).
+
+    Returns a small dict with the task identity, title, first-paragraph
+    description, and any deliverable URL hint we could harvest from
+    ``external_refs`` / labels / description. Returns ``None`` when no
+    plan-shaped done task exists, or when the work-service is
+    unreachable (no DB on disk yet, import fails, …) — callers fall
+    back to the file-only behavior.
+    """
+    db_paths = _dashboard_task_db_paths(config, project_path)
+    if not db_paths:
+        return None
+    try:
+        from pollypm.work import create_work_service
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        from pollypm.work.plan_review_emit import task_is_eligible_for_backstop
+    except Exception:  # noqa: BLE001
+        return None
+
+    aliases = _project_storage_aliases(config, project_key)
+    best_task: object | None = None
+    best_updated: str = ""
+    for db_path in db_paths:
+        db_aliases = list(aliases)
+        try:
+            for discovered in _dashboard_discover_db_aliases(db_path, aliases):
+                if discovered not in db_aliases:
+                    db_aliases.append(discovered)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            with create_work_service(
+                db_path=db_path, project_path=project_path,
+            ) as svc:
+                seen_ids: set[str] = set()
+                for alias in db_aliases:
+                    try:
+                        rows = svc.list_tasks(project=alias) or []
+                    except Exception:  # noqa: BLE001
+                        continue
+                    for found in rows:
+                        tid = getattr(found, "task_id", None)
+                        if not tid or tid in seen_ids:
+                            continue
+                        seen_ids.add(tid)
+                        if not task_is_eligible_for_backstop(found):
+                            continue
+                        updated = getattr(found, "updated_at", "") or ""
+                        if hasattr(updated, "isoformat"):
+                            updated = updated.isoformat()
+                        updated_s = str(updated)
+                        if best_task is None or updated_s > best_updated:
+                            best_task = found
+                            best_updated = updated_s
+        except Exception:  # noqa: BLE001
+            continue
+
+    if best_task is None:
+        return None
+
+    task_id = getattr(best_task, "task_id", None)
+    if not task_id:
+        return None
+    description = getattr(best_task, "description", "") or ""
+    return {
+        "task_id": task_id,
+        "task_number": getattr(best_task, "task_number", None),
+        "project": getattr(best_task, "project", "") or "",
+        "title": getattr(best_task, "title", "") or "",
+        "summary": _plan_task_first_paragraph(description),
+        "deliverable_url": _plan_task_deliverable_url(best_task),
+        "updated_at": best_updated,
+    }
+
+
 def _dashboard_plan_explainer(project_path: Path, project_key: str) -> Path | None:
     for rel in _PLAN_EXPLAINER_CANDIDATES_FMT:
         p = project_path / rel.format(key=project_key)
@@ -11608,6 +11768,7 @@ class ProjectDashboardData:
         "plan_aux_files",
         "plan_mtime",
         "plan_stale_reason",
+        "plan_task_summary",
         "activity_entries",
         "inbox_count",
         "inbox_top",
@@ -11641,6 +11802,7 @@ class ProjectDashboardData:
         plan_mtime: float | None,
         plan_stale_reason: str | None,
         activity_entries: list[dict],
+        plan_task_summary: dict | None = None,
         inbox_count: int,
         inbox_top: list[dict],
         action_items: list[dict],
@@ -11668,6 +11830,7 @@ class ProjectDashboardData:
         self.plan_aux_files = plan_aux_files
         self.plan_mtime = plan_mtime
         self.plan_stale_reason = plan_stale_reason
+        self.plan_task_summary = plan_task_summary
         self.activity_entries = activity_entries
         self.inbox_count = inbox_count
         self.inbox_top = inbox_top
@@ -13869,6 +14032,16 @@ def _gather_project_dashboard(
         plan_stale_reason = _dashboard_plan_staleness(
             plan_path, plan_mtime, project_path, project_key,
         )
+        # #1518 — surface a done plan-shaped task to the Plan section
+        # so projects whose plan completed via a non-plan_project flow
+        # don't read "No plan yet" forever. Best-effort: if the work
+        # service is unreachable we fall back to the file-only render.
+        try:
+            plan_task_summary = _dashboard_done_plan_task(
+                config, project_key, project_path,
+            )
+        except Exception:  # noqa: BLE001
+            plan_task_summary = None
         activity_entries = _dashboard_activity(config_path, project_key)
     else:
         counts = {}
@@ -13883,6 +14056,7 @@ def _gather_project_dashboard(
         plan_aux_files = []
         plan_mtime = None
         plan_stale_reason = None
+        plan_task_summary = None
         activity_entries = []
 
     active_worker, alert_count, alert_types = _dashboard_active_worker(
@@ -13937,6 +14111,7 @@ def _gather_project_dashboard(
         plan_aux_files=plan_aux_files,
         plan_mtime=plan_mtime,
         plan_stale_reason=plan_stale_reason,
+        plan_task_summary=plan_task_summary,
         activity_entries=activity_entries,
         inbox_count=inbox_count,
         inbox_top=inbox_top,
@@ -13993,6 +14168,20 @@ def _project_dashboard_signature(
         str(data.plan_path) if data.plan_path else None,
         data.plan_mtime,
         data.plan_stale_reason,
+        # #1518 — done plan-shaped task identity flips the section
+        # from "No plan yet" to a task-summary card; include just the
+        # identity bits so the cache invalidates on the structural
+        # change without churning on description-only edits.
+        (
+            (
+                (getattr(data, "plan_task_summary", None) or {}).get("task_id")
+                or ""
+            ),
+            (
+                (getattr(data, "plan_task_summary", None) or {}).get("updated_at")
+                or ""
+            ),
+        ),
         # Activity tail (newest entries' identity, not their age).
         tuple(
             (e.get("event_type"), e.get("created_at"))
@@ -15706,7 +15895,17 @@ class PollyProjectDashboardApp(App[None]):
     def _render_plan_body(self, data: ProjectDashboardData) -> str:
         if not data.exists_on_disk:
             return "[dim]Virtual project — no plan on disk.[/dim]"
+        # #1518 — a done plan-shaped task in the work service satisfies
+        # "this project has a plan". When the file is also present we
+        # prefer it (it's typically the rendered deliverable) but still
+        # surface the task ID so the user can navigate to the source.
+        # When only the task exists we render its title + first
+        # paragraph + any deliverable URL we could harvest, instead of
+        # the misleading "No plan yet" empty state.
+        plan_task_summary = getattr(data, "plan_task_summary", None) or None
         if data.plan_path is None:
+            if plan_task_summary:
+                return self._render_plan_task_summary(plan_task_summary)
             # Per-project ``[planner].enforce_plan = false`` opts the
             # project out of the planning ceremony entirely (one-off
             # cleanups, single-task scopes). The default "ask the PM to
@@ -15737,9 +15936,49 @@ class PollyProjectDashboardApp(App[None]):
                 lines.append(f"  \u25aa {_escape(title)}")
         else:
             lines.append("  [dim](no H2 sections found)[/dim]")
+        # #1518 \u2014 when a done plan-shaped task also exists alongside
+        # the file, mention the task ID below the TOC so the user can
+        # jump to the source. The file remains the primary surface.
+        if plan_task_summary:
+            task_id = plan_task_summary.get("task_id") or ""
+            if task_id:
+                lines.append("")
+                lines.append(
+                    f"  [dim]Plan task done: [b]{_escape(task_id)}[/b][/dim]"
+                )
         # Visual-explainer prompt removed in #1405 (keybinding broken,
         # deferred for v1+). ``data.plan_explainer`` may still surface
         # via other paths but we no longer advertise the ``v`` shortcut.
+        return "\n".join(lines)
+
+    def _render_plan_task_summary(self, summary: dict) -> str:
+        """Render a Plan section card backed by a done plan-shaped task (#1518).
+
+        Used when there is no plan file on disk but the work service
+        carries a ``done`` plan-shaped task (matching the conservative
+        label heuristic in
+        :func:`pollypm.work.plan_review_emit.task_is_eligible_for_backstop`).
+        Surfaces the task identity, title, first-paragraph description,
+        and any deliverable URL hint we could harvest — so the user
+        sees "the plan exists, here's where it landed" instead of
+        the misleading "No plan yet" empty state.
+        """
+        task_id = summary.get("task_id") or ""
+        title = summary.get("title") or ""
+        body = summary.get("summary") or ""
+        url = summary.get("deliverable_url") or ""
+        lines: list[str] = []
+        header = "[dim]Plan task done"
+        if task_id:
+            header += f" — [b]{_escape(task_id)}[/b]"
+        header += "[/dim]"
+        lines.append(header)
+        if title:
+            lines.append(f"  {_escape(title)}")
+        if body:
+            lines.append(f"  [dim]{_escape(body)}[/dim]")
+        if url:
+            lines.append(f"  [dim]Deliverable:[/dim] {_escape(url)}")
         return "\n".join(lines)
 
     def _render_plan_stale(self, data: ProjectDashboardData) -> str:

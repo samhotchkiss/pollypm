@@ -1854,6 +1854,12 @@ class PollyCockpitApp(App[None]):
     _LAYOUT_CHECK_INTERVAL = 38  # ~30s at 0.8s/tick
     # Force GC every ~2 minutes
     _GC_INTERVAL = 150
+    # Stale-paint defensive refresh: tmux focus loss / SIGWINCH drops can
+    # leave Textual without a redraw signal even though widget state is
+    # current. Force a non-layout refresh on this cadence so the rail
+    # recovers within a few seconds without operator intervention. See
+    # the rail-died report — detach + reattach was the manual workaround.
+    _STALE_PAINT_INTERVAL = 5  # ~4s at 0.8s/tick
 
     def _tick(self) -> None:
         self._tick_count += 1
@@ -1926,6 +1932,15 @@ class PollyCockpitApp(App[None]):
         if self._tick_count % self._LAYOUT_CHECK_INTERVAL == 0:
             try:
                 self._enforce_rail_width()
+            except Exception:  # noqa: BLE001
+                pass
+        # Stale-paint defense: force a Textual repaint every few ticks
+        # so the rail recovers from focus-loss / disconnect / SIGWINCH
+        # drops where Textual's own redraw signal got lost. layout=False
+        # because we only need a paint, not a reflow.
+        if self._tick_count % self._STALE_PAINT_INTERVAL == 0:
+            try:
+                self.refresh(layout=False)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -3109,6 +3124,19 @@ class PollyCockpitApp(App[None]):
         self._recover_cockpit_render(force_render=False)
 
     def on_resize(self, _event: events.Resize) -> None:
+        self.call_after_refresh(self._recover_after_resize)
+
+    def on_app_focus(self, _event: events.AppFocus) -> None:
+        """Force a full rail redraw when the tmux pane regains focus.
+
+        When the tmux client disconnects/reattaches, the user switches
+        away to another pane and back, or any other event drops the
+        Textual redraw signal, the rail can be left visibly blank
+        even though widget state is current and rail-daemon is alive.
+        Detach + reattach has been the manual workaround. Hooking
+        AppFocus restores the rail automatically the moment the pane
+        is observed again.
+        """
         self.call_after_refresh(self._recover_after_resize)
 
     def _recover_after_resize(self) -> None:

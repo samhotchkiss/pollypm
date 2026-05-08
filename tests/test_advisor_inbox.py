@@ -19,15 +19,13 @@ Covers:
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
 
 import pytest
 
 from pollypm.plugins_builtin.advisor.handlers.assess import (
-    AdvisorDecision,
     build_context_pack,
     parse_decision,
     record_decision,

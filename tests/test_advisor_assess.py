@@ -16,15 +16,12 @@ Covers:
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
-
-import pytest
 
 from pollypm.plugins_builtin.advisor.handlers.assess import (
     CONTEXT_FILENAME,
     MAX_CONTEXT_CHARS,
-    AdvisorDecision,
     ContextPack,
     _extract_first_json_object,
     build_context_pack,
@@ -38,7 +35,6 @@ from pollypm.plugins_builtin.advisor.handlers.detect_changes import (
 )
 from pollypm.plugins_builtin.advisor.handlers.history_log import (
     HistoryEntry,
-    append_decision,
     append_log_entry,
 )
 from pollypm.plugins_builtin.advisor.state import (

@@ -23,6 +23,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 from datetime import UTC, datetime
@@ -239,6 +240,38 @@ _POLLYPM_GENERATED_DOC_FILES = frozenset({
     "deprecated-facts.md",
     "history-import-questions.md",
 })
+
+
+_OVERWRITE_BY_MERGE_PATTERN = re.compile(
+    r"Your local changes to the following files would be overwritten by"
+    r" (?:merge|checkout):\s*\n((?:[^\n]*\n)+?)(?=\nPlease|\nAborting|\Z)",
+    re.MULTILINE,
+)
+
+
+def _parse_overwrite_files_from_stderr(stderr: str) -> list[str]:
+    """Parse git's "Your local changes ... would be overwritten by merge" stderr.
+
+    Returns the list of file paths git refused to overwrite, or an empty list
+    if the stderr doesn't match that error shape. Git emits the file list as
+    indented lines between the leading message and the trailing
+    "Please commit your changes or stash them" / "Aborting" / EOF.
+    """
+    if not stderr:
+        return []
+    match = _OVERWRITE_BY_MERGE_PATTERN.search(stderr)
+    if not match:
+        return []
+    block = match.group(1)
+    files: list[str] = []
+    for raw in block.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(("Please ", "Aborting")):
+            break
+        files.append(stripped)
+    return files
 
 
 def _gitignore_without_pollypm_entry(text: str) -> tuple[str, ...]:
@@ -3376,6 +3409,33 @@ class SQLiteWorkService:
         )
         if merge.returncode == 0:
             return
+
+        # #1496: git's pre-merge dirty-tree check sometimes refuses to even
+        # *start* the merge with "Your local changes to the following files
+        # would be overwritten by merge: <file>" — emitted before any
+        # MERGE_HEAD or conflict state exists. The python dirty gate above
+        # admits scaffold-only diffs (e.g. ``.gitignore`` carrying
+        # ``.pollypm/``), but git's merge engine doesn't share that
+        # allowance. When every refused file is in
+        # ``_UNION_SAFE_MERGE_FILES`` (where the merge result naturally
+        # supersedes either side), reset the working copies to HEAD and
+        # retry — the union-safe resolver below picks up any actual
+        # add/add conflict that surfaces during the proper merge.
+        overwrite_refused = _parse_overwrite_files_from_stderr(merge.stderr)
+        if overwrite_refused and all(
+            f in self._UNION_SAFE_MERGE_FILES for f in overwrite_refused
+        ):
+            for refused in overwrite_refused:
+                self._git_run(
+                    project_path, "checkout", "HEAD", "--", refused
+                )
+            merge = self._git_run(
+                project_path,
+                "-c", "merge.conflictStyle=diff3",
+                "merge", "--no-ff", "--no-edit", task_branch,
+            )
+            if merge.returncode == 0:
+                return
 
         # Merge produced conflicts. Inspect them: if every conflict is on a
         # union-safe file, resolve each via line-union and commit. Otherwise

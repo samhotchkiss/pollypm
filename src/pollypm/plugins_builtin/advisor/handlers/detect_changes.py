@@ -29,7 +29,6 @@ the cached report instead of re-shelling out to git.
 from __future__ import annotations
 
 import logging
-import sqlite3
 import subprocess
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -224,38 +223,30 @@ def _parse_unique_paths(raw: str) -> list[Path]:
 
 
 # ---------------------------------------------------------------------------
-# Work-service transitions — direct read-only SQL, same pattern as briefing.
+# Work-service transitions.
 # ---------------------------------------------------------------------------
-
-
-_TRANSITION_SQL = (
-    "SELECT t.task_project AS project, t.task_number AS task_number, "
-    "       COALESCE(w.title, '') AS title, "
-    "       t.from_state AS from_state, t.to_state AS to_state, "
-    "       t.actor AS actor, t.created_at AS created_at "
-    "FROM work_transitions t "
-    "LEFT JOIN work_tasks w "
-    "  ON w.project = t.task_project AND w.task_number = t.task_number "
-    "WHERE t.task_project = ? AND t.created_at >= ? "
-    "ORDER BY t.created_at ASC"
-)
 
 
 def _transitions_db_path(project_path: Path) -> Path | None:
     """Resolve the read-only work-service DB path for a project.
 
-    Tries the per-project ``<project_path>/.pollypm/state.db`` first
-    (legacy / per-project layout) then walks up to the workspace-root
-    ``<ancestor>/.pollypm/state.db`` (the layout #339 collapsed onto).
-    Returns ``None`` when no state.db is reachable — callers treat that
-    as "no transitions this window," same as a missing per-project file.
-
-    See :func:`pollypm.plugins_builtin.advisor.db_paths.resolve_state_db`
-    for the canonical helper so the two probes stay in lockstep (#1037).
+    Routes through :func:`pollypm.work.db_resolver.resolve_work_db_path`
+    so the advisor reads the same canonical workspace-root state.db that
+    every other engine writes to (post-#1004 layout). The deprecated
+    per-project DB is no longer probed — see the advisor.tick spam fix
+    note in :mod:`pollypm.plugins_builtin.advisor.handlers.advisor_tick`.
+    Returns ``None`` if the resolved path doesn't exist on disk so
+    callers can treat that as "no transitions this window."
     """
-    from pollypm.plugins_builtin.advisor.db_paths import resolve_state_db
+    from pollypm.work.db_resolver import resolve_work_db_path
 
-    return resolve_state_db(project_path)
+    try:
+        db_path = resolve_work_db_path()
+    except Exception:  # noqa: BLE001
+        return None
+    if db_path is None or not db_path.exists():
+        return None
+    return db_path
 
 
 def _gather_task_transitions(
@@ -269,8 +260,8 @@ def _gather_task_transitions(
 
     Prefers a caller-supplied work-service handle (tests inject an
     in-memory fake). Falls back to a read-only sqlite open of the
-    project's ``.pollypm/state.db`` so the advisor doesn't have to
-    round-trip through the single-writer daemon.
+    project's ``.pollypm/state.db`` through the storage query facade so
+    the advisor doesn't own raw SQLite connection details.
     """
     since_iso = since.isoformat() if since else _default_since_iso()
 
@@ -289,25 +280,13 @@ def _gather_task_transitions(
     if db_path is None or not db_path.exists():
         return []
 
-    try:
-        uri = f"file:{db_path}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True)
-    except sqlite3.Error as exc:
-        logger.debug("advisor: cannot open work DB %s: %s", db_path, exc)
-        return []
-    try:
-        conn.row_factory = sqlite3.Row
-        try:
-            rows = conn.execute(
-                _TRANSITION_SQL, (project_key, since_iso),
-            ).fetchall()
-        except sqlite3.Error as exc:
-            logger.debug(
-                "advisor: transitions SQL failed for %s: %s", project_key, exc,
-            )
-            return []
-    finally:
-        conn.close()
+    from pollypm.storage.work_transition_queries import advisor_transition_rows
+
+    rows = advisor_transition_rows(
+        db_path,
+        project_key=project_key,
+        since_iso=since_iso,
+    )
 
     out: list[TaskTransitionRecord] = []
     for r in rows:

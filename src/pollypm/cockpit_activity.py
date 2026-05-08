@@ -582,8 +582,9 @@ class PollyActivityFeedApp(App[None]):
             # head of the message \u2014 they're notify/supervisor
             # routing labels, not natural-language content, and the
             # Event column already conveys the kind.
-            from pollypm.cockpit_ui import _strip_action_subject_prefix
-            summary_text = _strip_action_subject_prefix(summary_text)
+            from pollypm.notify_task import strip_routing_tag_prefix
+
+            summary_text = strip_routing_tag_prefix(summary_text)
             self.table.add_row(
                 time_text,
                 project_text,

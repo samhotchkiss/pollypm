@@ -35,6 +35,9 @@ from pathlib import Path
 from typing import Any
 
 from pollypm.atomic_io import atomic_write_text
+from pollypm.plan_presence import (
+    CANONICAL_PLAN_RELATIVE_PATHS as PLAN_RELATIVE_CANDIDATES,
+)
 from pollypm.plugins_builtin.advisor.handlers.detect_changes import (
     ChangeReport,
 )
@@ -56,11 +59,8 @@ CONTEXT_FILENAME = ".pollypm-advisor-context.md"
 PLAN_RELATIVE_PATH = "docs/project-plan.md"
 # Candidates tried in order by :func:`_read_plan`. Shared with the
 # plan-presence gate, the recovery reconciler, and the cockpit plan-
-# review widget — :data:`~pollypm.plugins_builtin.project_planning.plan_presence.CANONICAL_PLAN_RELATIVE_PATHS`
+# review widget — :data:`~pollypm.plan_presence.CANONICAL_PLAN_RELATIVE_PATHS`
 # is the authoritative tuple.
-from pollypm.plugins_builtin.project_planning.plan_presence import (
-    CANONICAL_PLAN_RELATIVE_PATHS as PLAN_RELATIVE_CANDIDATES,
-)
 MAX_CONTEXT_CHARS = 20_000
 MAX_PLAN_CHARS = 8_000
 MAX_PER_FILE_DIFF_LINES = 500

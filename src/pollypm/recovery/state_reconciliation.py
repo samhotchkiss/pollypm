@@ -59,6 +59,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from pollypm.plan_presence import (
+    CANONICAL_PLAN_RELATIVE_PATHS as _PLAN_FILE_CANDIDATES,
+)
+
 
 # Minimum non-whitespace byte count before a plan file counts as a
 # real plan. Mirrors ``plan_presence.MIN_PLAN_SIZE_BYTES`` so the two
@@ -68,11 +72,8 @@ MIN_PLAN_SIZE_BYTES = 500
 # Candidate plan-file locations scanned in order. The first match wins.
 # Shared with the plan-presence gate, the advisor context pack, and
 # the cockpit plan-review widget — see
-# :data:`pollypm.plugins_builtin.project_planning.plan_presence.CANONICAL_PLAN_RELATIVE_PATHS`
+# :data:`pollypm.plan_presence.CANONICAL_PLAN_RELATIVE_PATHS`
 # for the authoritative tuple.
-from pollypm.plugins_builtin.project_planning.plan_presence import (
-    CANONICAL_PLAN_RELATIVE_PATHS as _PLAN_FILE_CANDIDATES,
-)
 
 # Window for matching a "plan ready" notify against the current sweep.
 # 1h is generous — the architect's turn might have ended anywhere from

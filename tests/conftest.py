@@ -27,6 +27,7 @@ def pytest_configure(config):  # noqa: ARG001
     os.environ.setdefault("POLLYPM_SKIP_RAIL_DAEMON", "1")
     os.environ.setdefault("POLLYPM_DISABLE_ERROR_NOTIFICATIONS", "1")
     os.environ.setdefault("POLLYPM_DISABLE_AGENTIC_REVIEW_SUMMARIES", "1")
+    os.environ.setdefault("POLLYPM_DISABLE_WORK_DB_OPENED_AUDIT", "1")
     os.environ.setdefault(
         "POLLYPM_ERROR_LOG_PATH",
         str(

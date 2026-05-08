@@ -67,10 +67,10 @@ def test_cache_avoids_reopening_workservice_on_repeat_call(tmp_path: Path) -> No
     with patch(
         "pollypm.work.sqlite_service.SQLiteWorkService", _FakeSvc,
     ), patch(
-        "pollypm.plugins_builtin.project_planning.plan_presence._find_approved_plan_task",
+        "pollypm.plan_presence._find_approved_plan_task",
         lambda _svc, _key: fake_plan_task,
     ), patch(
-        "pollypm.plugins_builtin.project_planning.plan_presence._plan_approved_at",
+        "pollypm.plan_presence._plan_approved_at",
         lambda _svc, _task: 1_700_000_000.0,
     ):
         first = _dashboard_plan_staleness(plan, plan_mtime, project, "demo")
@@ -106,10 +106,10 @@ def test_cache_invalidates_when_db_mtime_changes(tmp_path: Path) -> None:
     with patch(
         "pollypm.work.sqlite_service.SQLiteWorkService", _FakeSvc,
     ), patch(
-        "pollypm.plugins_builtin.project_planning.plan_presence._find_approved_plan_task",
+        "pollypm.plan_presence._find_approved_plan_task",
         lambda _svc, _key: fake_plan_task,
     ), patch(
-        "pollypm.plugins_builtin.project_planning.plan_presence._plan_approved_at",
+        "pollypm.plan_presence._plan_approved_at",
         lambda _svc, _task: 1_700_000_000.0,
     ):
         _dashboard_plan_staleness(plan, plan_mtime, project, "demo")

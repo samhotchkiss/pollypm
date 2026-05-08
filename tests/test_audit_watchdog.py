@@ -1526,11 +1526,12 @@ def test_format_unstick_brief_on_hold_includes_evidence_and_default() -> None:
     assert "Project: savethenovel" in brief
     assert "Finding: task_on_hold_stale" in brief
     assert "20 minutes" in brief
-    # The on_hold reason / reviewer rationale must be visible verbatim.
+    # The on_hold transition reason and reviewer evidence must both be visible.
     assert "Footer.astro:20" in brief
+    assert "On-hold transition reason:" in brief
     assert "Routing: architect-actionable" in brief
     # Reviewer evidence section must list both lines.
-    assert "Recent reviewer evidence" in brief
+    assert "Recent reviewer/inbox rationale evidence" in brief
     assert "code_review" in brief
     assert "russell" in brief
     # Default action must steer the architect to fix and re-queue.
@@ -1539,6 +1540,47 @@ def test_format_unstick_brief_on_hold_includes_evidence_and_default() -> None:
     assert "pm task approve savethenovel/11" in brief
     # Escalation path is mentioned but framed as last-resort.
     assert "pm notify" in brief
+
+
+def test_format_unstick_brief_on_hold_distinguishes_transition_reason() -> None:
+    """A policy/merge hold reason must not be mislabeled as reviewer rationale."""
+    from pollypm.audit.watchdog import (
+        RULE_TASK_ON_HOLD_STALE,
+        format_unstick_brief,
+    )
+
+    finding = Finding(
+        rule=RULE_TASK_ON_HOLD_STALE,
+        project="savethenovel",
+        subject="savethenovel/11",
+        metadata={
+            "stuck_minutes": 126,
+            "on_hold_since": "2026-05-07T15:46:17.005979+00:00",
+            "from": "review",
+            "reason": (
+                "Waiting on operator: review passed, but approve auto-merge "
+                "is blocked because the project root has untracked planning docs."
+            ),
+            "routing": "architect-actionable",
+            "reviewer_evidence": [
+                "inbox msg from reviewer_savethenovel: review decision blocked "
+                "savethenovel/11 — Decision would be reject: Criterion 3 "
+                "(No placeholders) fails. Live evidence: "
+                "src/components/Footer.astro:20-22 renders placeholder copy.",
+            ],
+        },
+    )
+
+    brief = format_unstick_brief(finding)
+
+    assert "Reviewer rationale: Waiting on operator" not in brief
+    assert "On-hold transition reason: Waiting on operator" in brief
+    assert "Recent reviewer/inbox rationale evidence" in brief
+    assert "Decision would be reject" in brief
+    assert "Footer.astro:20-22" in brief
+    assert brief.index("Decision would be reject") < brief.index(
+        "On-hold transition reason"
+    )
 
 
 def test_format_unstick_brief_on_hold_handles_missing_evidence() -> None:
@@ -1562,8 +1604,92 @@ def test_format_unstick_brief_on_hold_handles_missing_evidence() -> None:
     )
     brief = format_unstick_brief(finding)
     assert "no transition reason" in brief.lower()
-    # Don't include a stale "Recent reviewer evidence" header.
+    # Don't include a stale reviewer-evidence header.
     assert "No additional reviewer execution rows" in brief
+
+
+def test_gather_reviewer_evidence_checks_project_and_global_inbox_scopes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy reviewer notifies may be global inbox rows, not project-scoped rows."""
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _gather_reviewer_evidence,
+    )
+
+    def _boom_create_work_service(*_args, **_kwargs):
+        raise RuntimeError("skip execution lookup")
+
+    monkeypatch.setattr(
+        "pollypm.work.create_work_service",
+        _boom_create_work_service,
+    )
+
+    class _MsgStore:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def query_messages(self, **filters):  # noqa: ANN001
+            self.calls.append(filters)
+            if filters.get("scope") == "savethenovel":
+                return [
+                    {
+                        "id": 1,
+                        "subject": "savethenovel/11 approval blocked",
+                        "body": "Reviewed savethenovel/11 as approve-blocked.",
+                        "sender": "heartbeat",
+                        "created_at": "2026-05-07T15:46:31+00:00",
+                    },
+                ]
+            if filters.get("scope") == "inbox":
+                return [
+                    {
+                        "id": 4,
+                        "subject": "savethenovel/11 review completed but task is on_hold",
+                        "body": (
+                            "Russell completed code review for savethenovel/11. "
+                            "Verdict would be APPROVE after the hold is cleared."
+                        ),
+                        "sender": "heartbeat",
+                        "created_at": "2026-05-07T15:49:50+00:00",
+                    },
+                    {
+                        "id": 3,
+                        "subject": "savethenovel/11 review complete but task is on_hold",
+                        "body": (
+                            "Russell completed code review for savethenovel/11 "
+                            "and would approve it, but pm task approve is blocked."
+                        ),
+                        "sender": "heartbeat",
+                        "created_at": "2026-05-07T15:48:08+00:00",
+                    },
+                    {
+                        "id": 2,
+                        "subject": "review decision blocked: savethenovel/11 on_hold",
+                        "body": (
+                            "Decision would be reject: Criterion 3 "
+                            "(No placeholders) fails. Live evidence: "
+                            "src/components/Footer.astro:20-22 renders "
+                            "placeholder copy."
+                        ),
+                        "sender": "reviewer_savethenovel",
+                        "created_at": "2026-05-07T15:47:13+00:00",
+                    },
+                ]
+            return []
+
+    store = _MsgStore()
+
+    evidence = _gather_reviewer_evidence(
+        project_key="savethenovel",
+        project_path=None,
+        subject="savethenovel/11",
+        msg_store=store,
+    )
+
+    assert {"scope": "savethenovel"} in store.calls
+    assert {"scope": "inbox"} in store.calls
+    assert any("Decision would be reject" in line for line in evidence)
+    assert any("Footer.astro:20-22" in line for line in evidence)
 
 
 def test_cadence_handler_dispatches_on_hold_with_reviewer_evidence(

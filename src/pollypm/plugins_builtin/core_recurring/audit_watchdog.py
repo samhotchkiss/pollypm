@@ -309,7 +309,7 @@ def _gather_reviewer_evidence(
     subject: str,
     msg_store: Any,
     limit_executions: int = 2,
-    limit_messages: int = 2,
+    limit_messages: int = 5,
 ) -> list[str]:
     """Collect reviewer execution rows + recent inbox messages for ``subject``.
 
@@ -386,7 +386,24 @@ def _gather_reviewer_evidence(
     # canonical ``project/N`` string is considered relevant.
     try:
         if msg_store is not None and hasattr(msg_store, "query_messages"):
-            rows = msg_store.query_messages(project=project_key) or []
+            scopes = [project_key] if project_key else []
+            if "inbox" not in scopes:
+                # Pre-#1425 reviewer notifies could land in the global
+                # inbox scope even when the subject was project-specific.
+                # Include that legacy scope so forensic briefs see the
+                # actual reviewer finding instead of only the transition
+                # reason that parked the task.
+                scopes.append("inbox")
+            rows: list[dict[str, Any]] = []
+            seen_message_ids: set[Any] = set()
+            for scope in scopes:
+                for row in msg_store.query_messages(scope=scope) or []:
+                    message_id = row.get("id")
+                    if message_id is not None:
+                        if message_id in seen_message_ids:
+                            continue
+                        seen_message_ids.add(message_id)
+                    rows.append(row)
             matched: list[dict[str, Any]] = []
             for row in rows:
                 body = (

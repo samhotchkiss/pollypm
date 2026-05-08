@@ -1388,12 +1388,11 @@ def format_unstick_brief(finding: Finding) -> str:
             lines.append(
                 f"- Task transitioned {from_state} -> on_hold at {on_hold_since}"
             )
-        if reason:
-            lines.append(f"- Reviewer rationale: {reason}")
-        else:
-            lines.append("- No transition reason was recorded.")
         if reviewer_evidence:
-            lines.append("- Recent reviewer evidence:")
+            lines.append(
+                "- Recent reviewer/inbox rationale evidence "
+                "(authoritative if it differs from the transition reason):"
+            )
             for entry in reviewer_evidence:
                 # Each entry is a one-line string already shaped by
                 # the cadence handler (exec row OR inbox message).
@@ -1403,6 +1402,10 @@ def format_unstick_brief(finding: Finding) -> str:
                 "- No additional reviewer execution rows or inbox "
                 "messages were available."
             )
+        if reason:
+            lines.append(f"- On-hold transition reason: {reason}")
+        else:
+            lines.append("- No transition reason was recorded.")
         lines.append("")
         lines.append(
             "Your job (DEFAULT: fix and re-submit). Options: "

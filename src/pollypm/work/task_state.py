@@ -8,6 +8,7 @@ from typing import Any
 from pollypm.storage.work_task_state import (
     blocked_since_stamp,
     blocker_chain_statuses,
+    has_work_task_rows,
     project_activity_probe,
     task_numbers_with_statuses,
     task_status_probe,
@@ -63,6 +64,15 @@ def user_waiting_task_ids(config: Any) -> frozenset[str]:
         )
         out.update(f"{project_key}/{number}" for number in numbers)
     return frozenset(out)
+
+
+def has_work_tasks_in_db(
+    db_path: Path,
+    *,
+    project_key: str | None = None,
+) -> bool:
+    """Return whether a work DB has task rows without exposing SQLite to callers."""
+    return has_work_task_rows(Path(db_path), project_key=project_key)
 
 
 def project_activity(
@@ -166,6 +176,7 @@ __all__ = [
     "active_task_numbers",
     "blocked_since_stamp_for_service",
     "blocker_chain_for_service",
+    "has_work_tasks_in_db",
     "parse_task_window_name",
     "project_activity",
     "task_window_terminal_or_missing",

@@ -227,11 +227,10 @@ def _has_work_tasks(
 ) -> bool:
     """Return True iff *this* project's DB has ≥1 work_tasks row.
 
-    Reads the sqlite table directly — ``SQLiteWorkService`` is a heavier
-    entrypoint and this path runs on the happy path for every
-    ``pm project new`` invocation, so we keep it lean. Fails closed:
-    any DB / IO error returns False so we don't accidentally flag a
-    greenfield project as existing on a transient error.
+    The storage-layer probe keeps this lightweight without exposing raw
+    SQLite handles or work-task schema details to the plugin CLI. Fails
+    closed: any DB / IO error returns False so we don't accidentally
+    flag a greenfield project as existing on a transient error.
 
     Post-#339 the workspace-scope DB holds tasks for *every* registered
     project — so counting "any row in the workspace DB" for an unkeyed
@@ -248,28 +247,9 @@ def _has_work_tasks(
     if not db_path.exists():
         return False
     try:
-        import sqlite3
+        from pollypm.work.task_state import has_work_tasks_in_db
 
-        from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas
-
-        with sqlite3.connect(str(db_path)) as conn:
-            # #1018 — short busy_timeout so a planner probe doesn't
-            # race the heartbeat writer holding the same workspace DB.
-            apply_workspace_pragmas(conn)
-            cur = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' "
-                "AND name='work_tasks' LIMIT 1"
-            )
-            if cur.fetchone() is None:
-                return False
-            if project_key:
-                cur = conn.execute(
-                    "SELECT 1 FROM work_tasks WHERE project = ? LIMIT 1",
-                    (project_key,),
-                )
-            else:
-                cur = conn.execute("SELECT 1 FROM work_tasks LIMIT 1")
-            return cur.fetchone() is not None
+        return has_work_tasks_in_db(db_path, project_key=project_key)
     except Exception:  # noqa: BLE001
         return False
 

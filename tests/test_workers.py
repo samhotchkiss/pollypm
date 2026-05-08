@@ -136,6 +136,31 @@ def test_auto_select_worker_skips_runtime_unhealthy_account(tmp_path: Path, monk
     assert selected == "claude_worker"
 
 
+def test_auto_select_worker_skips_runtime_unhealthy_account_underscore_form(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Regression for #1437: writers in heartbeats/api.py and supervisor.py
+    persist ``status="auth_broken"`` (underscore). The account-runtime
+    reader must accept the canonical underscore form so per-task workers
+    skip the wedged account during selection. Before the fix, the reader
+    only matched the hyphenated form and silently let the wedged account
+    through, producing the savethenovel/15 wedge."""
+    config, config_path = _config(tmp_path)
+    store = StateStore(config.project.state_db)
+    store.upsert_account_runtime(
+        account_name="codex_backup",
+        provider=ProviderKind.CODEX.value,
+        status="auth_broken",
+        reason="live session reported authentication failure",
+    )
+
+    monkeypatch.setattr("pollypm.workers.detect_logged_in", lambda account: True)
+
+    selected = auto_select_worker_account(config_path)
+
+    assert selected == "claude_worker"
+
+
 def test_auto_select_worker_uses_control_plane_account_before_controller_last_resort(
     tmp_path: Path, monkeypatch
 ) -> None:

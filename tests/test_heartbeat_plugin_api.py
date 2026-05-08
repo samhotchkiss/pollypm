@@ -946,6 +946,69 @@ def test_local_heartbeat_backend_marks_auth_broken() -> None:
     assert ("worker_pollypm", "auth_broken") in api.alerts
 
 
+def test_local_heartbeat_backend_marks_auth_broken_on_org_disabled() -> None:
+    # Regression: Claude Code prints "Your organization has disabled Claude
+    # subscription access for Claude Code · Use an Anthropic API key instead"
+    # when the account's org disables Claude Code. Heartbeat must classify
+    # this as auth_broken so the recovery ladder can fail over.
+    pane_text = (
+        "Your organization has disabled Claude subscription access for "
+        "Claude Code · Use an Anthropic API key instead, or ask your admin "
+        "to enable access"
+    )
+    api = FakeHeartbeatAPI([_context(transcript_delta=pane_text)])
+
+    LocalHeartbeatBackend().run(api)
+
+    assert api.statuses["worker_pollypm"][0] == "auth_broken"
+    assert ("worker_pollypm", "auth_broken") in api.alerts
+    assert api.account_marks == [
+        ("claude_controller", "claude", "live session reported authentication failure")
+    ]
+
+
+def test_local_heartbeat_backend_triggers_recovery_on_auth_broken() -> None:
+    """Regression for #1437 (Bug B): when a per-task worker hits an
+    auth-block, the heartbeat must call ``recover_session`` so the
+    recovery ladder relaunches the session on a healthy failover
+    account. Before the fix, the heartbeat marked the account
+    auth_broken and pinned the session status but never invoked
+    recovery — the wedged tmux window stayed up for hours until manual
+    ``pm reset``."""
+    api = FakeHeartbeatAPI(
+        [_context(transcript_delta="Authentication failure: please login again.")]
+    )
+
+    LocalHeartbeatBackend().run(api)
+
+    # Existing assertions (unchanged behaviour).
+    assert api.statuses["worker_pollypm"][0] == "auth_broken"
+    assert ("worker_pollypm", "auth_broken") in api.alerts
+    # New assertion: recovery_session must fire so the supervisor's
+    # ladder can pick a healthy failover account on relaunch.
+    assert any(
+        session == "worker_pollypm" and failure_type == "auth_broken"
+        for session, failure_type, _ in api.recoveries
+    ), f"expected auth_broken recovery in {api.recoveries!r}"
+
+
+def test_local_heartbeat_backend_triggers_recovery_on_org_disabled() -> None:
+    """Companion to the org-disabled marking test: the org-disabled
+    pane text must also drive ``recover_session`` end-to-end (#1437)."""
+    pane_text = (
+        "Your organization has disabled Claude subscription access for "
+        "Claude Code · Use an Anthropic API key instead"
+    )
+    api = FakeHeartbeatAPI([_context(transcript_delta=pane_text)])
+
+    LocalHeartbeatBackend().run(api)
+
+    assert any(
+        session == "worker_pollypm" and failure_type == "auth_broken"
+        for session, failure_type, _ in api.recoveries
+    ), f"expected auth_broken recovery in {api.recoveries!r}"
+
+
 def test_local_heartbeat_backend_raises_alert_for_unfinished_turn() -> None:
     """Heartbeat raises an alert for needs_followup but does NOT inject messages into operator chat."""
     api = FakeHeartbeatAPI([_context(transcript_delta="Implemented the parser. Next step: add coverage.")])

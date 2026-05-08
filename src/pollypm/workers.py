@@ -6,6 +6,7 @@ from pathlib import Path
 
 import typer
 
+from pollypm.accounts import is_account_runtime_unavailable
 from pollypm.acct import detect_logged_in
 from pollypm.config import load_config, write_config
 from pollypm.onboarding import default_session_args
@@ -37,7 +38,11 @@ def _account_is_available(config_path: Path, account_name: str) -> bool:
         return False
     with StateStore(config.project.state_db) as store:
         runtime = store.get_account_runtime(account_name)
-    if runtime is not None and runtime.status in {"auth-broken", "exhausted", "provider_outage", "blocked"}:
+    # Accept both ``auth_broken`` (canonical, written by heartbeats/api.py
+    # and supervisor.py) and the legacy hyphenated ``auth-broken`` form
+    # so a runtime row written by either side correctly excludes the
+    # account from worker selection (#1437).
+    if runtime is not None and is_account_runtime_unavailable(runtime.status):
         return False
     return True
 

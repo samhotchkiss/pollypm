@@ -20,11 +20,11 @@ no new alert channel is introduced).
 Detection rules (each returns a list of :class:`Finding`):
 
 1. ``orphan_marker`` — ``marker.created`` for ``task-<project>-<N>``
-   with no matching ``marker.released`` within the window AND no
-   ``task.status_changed`` to a terminal state (``done`` / ``cancelled``
-   / ``abandoned``) in that window. Catches the savethenovel pattern
-   where a worker is launched and the task is then cancelled but the
-   on-disk marker lingers.
+   older than the configured threshold with no matching
+   ``marker.released`` AND no ``task.status_changed`` to a terminal
+   state (``done`` / ``cancelled`` / ``abandoned``). Catches the
+   savethenovel pattern where a worker is launched and the task is
+   then cancelled but the on-disk marker lingers.
 2. ``marker_leaked`` — any ``marker.leaked`` event in the window.
    Each occurrence is a finding because the persona-swap-detected
    branch firing at all means a worker was redirected — we want
@@ -186,11 +186,12 @@ class WatchdogConfig:
     """Tunable thresholds for watchdog detection rules.
 
     All durations are in seconds. Defaults match the spec in the
-    task brief — 30 min lookback for orphan/leak rules, 5 min for
-    the cheaper draft / cancellation gates.
+    task brief — 30 min orphan age threshold / leak lookback, 5 min
+    for the cheaper draft / cancellation gates.
     """
 
-    # Lookback for orphan-marker + leak detection.
+    # Age threshold for orphan-marker detection, and lookback for
+    # marker-leak detection.
     window_seconds: int = 1800
     # A draft must have existed this long with no promotion before
     # it counts as stuck. Short enough to catch the savethenovel
@@ -344,24 +345,26 @@ def _detect_orphan_markers(
     """Rule 1: ``marker.created`` with no release + no terminal transition.
 
     Walks the windowed event list once. For each ``marker.created``
-    we extract the (project, task_number) and check whether either
-    a ``marker.released`` for the same marker subject *or* a
-    ``task.status_changed`` to a terminal state for the same task
-    appears later in the window. If neither, it's an orphan.
+    older than ``window_seconds`` we extract the (project, task_number)
+    and check whether either a ``marker.released`` for the same marker
+    subject *or* a ``task.status_changed`` to a terminal state for the
+    same task appears in the scanned range. If neither, it's an orphan.
     """
     findings: list[Finding] = []
     cutoff = now - timedelta(seconds=config.window_seconds)
 
-    # Collect created markers within the window.
+    # Collect created markers that have crossed the orphan threshold.
     created: list[tuple[AuditEvent, tuple[str, int]]] = []
     released_subjects: set[str] = set()
     terminal_tasks: set[tuple[str, int]] = set()
 
     for ev in events:
         ts = _parse_iso(ev.ts)
-        if ts is None or ts < cutoff:
+        if ts is None:
             continue
         if ev.event == EVENT_MARKER_CREATED and ev.status == "ok":
+            if ts > cutoff:
+                continue
             key = _marker_task_key(ev.subject)
             if key is not None:
                 created.append((ev, key))

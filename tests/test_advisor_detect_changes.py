@@ -14,6 +14,7 @@ Covers:
 from __future__ import annotations
 
 import subprocess
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -21,11 +22,11 @@ import pytest
 
 from pollypm.plugins_builtin.advisor.handlers import detect_changes as dc_module
 from pollypm.plugins_builtin.advisor.handlers.detect_changes import (
-    ChangeReport,
     TaskTransitionRecord,
     clear_cache,
     detect_changes,
 )
+from pollypm.work.schema import create_work_tables
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +145,69 @@ class TestDetectChangesUnit:
         assert report.has_changes is True
         assert len(report.task_transitions) == 1
         assert report.task_transitions[0].task_id == "proj/42"
+
+    def test_task_transitions_sqlite_fallback_uses_storage_query(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        project = workspace / "proj"
+        project.mkdir(parents=True)
+        state_dir = workspace / ".pollypm"
+        state_dir.mkdir()
+        db_path = state_dir / "state.db"
+
+        created_at = "2026-04-16T12:01:00+00:00"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            create_work_tables(conn)
+            conn.execute(
+                "INSERT INTO work_tasks (project, task_number, title, type, "
+                "flow_template_id, created_at, created_by, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "proj",
+                    7,
+                    "storage boundary",
+                    "task",
+                    "chat",
+                    created_at,
+                    "test",
+                    created_at,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO work_transitions "
+                "(task_project, task_number, from_state, to_state, actor, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("proj", 7, "queued", "in_progress", "worker", created_at),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Post-#1471 the advisor resolves the workspace DB through the
+        # canonical resolver (no project_path arg). Pin it to the test's
+        # tmp workspace so the SQLite fallback exercises the storage facade.
+        monkeypatch.setattr(
+            dc_module, "_transitions_db_path", lambda _project_path: db_path,
+        )
+
+        rows = dc_module._gather_task_transitions(
+            project,
+            "proj",
+            datetime(2026, 4, 16, 12, 0, tzinfo=UTC),
+        )
+
+        assert len(rows) == 1
+        assert rows[0] == TaskTransitionRecord(
+            project="proj",
+            task_number=7,
+            task_title="storage boundary",
+            from_state="queued",
+            to_state="in_progress",
+            actor="worker",
+            timestamp=created_at,
+        )
 
     def test_no_signals_returns_has_changes_false(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

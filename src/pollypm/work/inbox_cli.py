@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Optional
+from typing import Any
 
 import typer
 
@@ -142,7 +142,7 @@ def _message_has_channel_label(row: dict[str, Any], channel: str) -> bool:
 @inbox_app.callback(invoke_without_command=True)
 def inbox_root(
     ctx: typer.Context,
-    project: Optional[str] = _PROJECT_OPTION,
+    project: str | None = _PROJECT_OPTION,
     db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
     channel: str = typer.Option(
@@ -537,14 +537,14 @@ def inbox_reply(
 
 @inbox_app.command("archive")
 def inbox_archive(
-    task_id: Optional[str] = typer.Argument(
+    task_id: str | None = typer.Argument(
         None,
         help=(
             "Task ID (``project/number``) or message ID (``msg:N``). "
             "Omit when using ``--match``."
         ),
     ),
-    match: Optional[str] = typer.Option(
+    match: str | None = typer.Option(
         None,
         "--match",
         help=(

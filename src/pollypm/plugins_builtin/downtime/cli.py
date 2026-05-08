@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, date as _date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import typer
 
@@ -272,7 +272,7 @@ def _parse_until(raw: str) -> str:
 
 @downtime_app.command("pause")
 def pause_cmd(
-    until: Optional[str] = typer.Option(
+    until: str | None = typer.Option(
         None, "--until", help="Pause until ISO date / datetime (default: +24h).",
     ),
     config_path: Path = typer.Option(

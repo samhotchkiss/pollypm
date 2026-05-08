@@ -31,10 +31,9 @@ def _work_progress_sweep_one(
     """Run one ``work.progress_sweep`` pass against a single work DB."""
     from datetime import UTC, datetime, timedelta
 
-    # #802: import via the plugin's public API surface so this
-    # cross-plugin dependency is documented and stable, instead of
-    # reaching into ``handlers.sweep`` privates / resolver internals.
-    from pollypm.plugins_builtin.task_assignment_notify.api import (
+    # #1365: recurring jobs use the shared task-assignment notification
+    # surface, not the sibling task_assignment_notify plugin package.
+    from pollypm.task_assignment_notify import (
         DEDUPE_WINDOW_SECONDS,
         build_event_for_task as _build_event_for_task,
         notify as _notify,
@@ -298,9 +297,9 @@ def _work_progress_sweep_one(
 
 def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Scan in_progress tasks for staleness and emit resume pings (#249)."""
-    # #802: route through the plugin's public API instead of poking
-    # private ``handlers.sweep._...`` and ``resolver`` internals.
-    from pollypm.plugins_builtin.task_assignment_notify.api import (
+    # #1365: route through the shared helper module instead of a sibling
+    # plugin API.
+    from pollypm.task_assignment_notify import (
         auto_claim_enabled_for_project as _auto_claim_enabled_for_project,
         close_quietly as _close_quietly,
         load_runtime_services,
@@ -425,10 +424,9 @@ def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
 
 def pane_text_classify_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Semantic pane-text classifier sweep — issue #250."""
-    # #802: ``load_runtime_services`` is part of the plugin's public
-    # API — import it from there rather than reaching into
-    # ``resolver`` privately.
-    from pollypm.plugins_builtin.task_assignment_notify.api import (
+    # ``load_runtime_services`` is shared runtime plumbing; avoid coupling
+    # this recurring plugin to task_assignment_notify's plugin package.
+    from pollypm.task_assignment_notify import (
         load_runtime_services,
     )
 

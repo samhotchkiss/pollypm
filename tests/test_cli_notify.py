@@ -26,7 +26,6 @@ from pollypm.work.sqlite_service import SQLiteWorkService
 from pollypm.cli import app as root_app
 from pollypm.store import SQLAlchemyStore
 from pollypm.work.models import WorkStatus
-from pollypm.work.sqlite_service import SQLiteWorkService
 
 
 runner = CliRunner()
@@ -37,11 +36,17 @@ def db_path(tmp_path: Path) -> str:
     return str(tmp_path / "state.db")
 
 
-def _invoke_notify(db_path: str, *args: str, input_text: str | None = None):
+def _invoke_notify(
+    db_path: str,
+    *args: str,
+    input_text: str | None = None,
+    env: dict[str, str] | None = None,
+):
     return runner.invoke(
         root_app,
         ["notify", *args, "--db", db_path],
         input=input_text,
+        env=env,
     )
 
 
@@ -308,13 +313,14 @@ class TestNotifyWritesToMessages:
         # tripped the validator without re-counting array indices.
         assert "Approve" in combined
 
-    def test_immediate_user_notify_without_user_prompt_warns(self, db_path):
+    def test_immediate_user_notify_without_user_prompt_is_quiet_by_default(
+        self, db_path
+    ):
         """An immediate-priority user-facing notify without ``--user-
         prompt-json`` is accepted (back-compat for legacy callers) but
-        produces a stderr warning so the operator knows the dashboard
-        will degrade to body heuristics. Pairs with the scan-side
-        ``user_action_message_missing_user_prompt`` invariant — this
-        is the emit-side reminder.
+        does not print a fallback warning. Role panes stream stderr
+        into user-visible logs, so the dashboard's heuristic fallback
+        must not look like a broken escalation.
         """
         result = _invoke_notify(
             db_path,
@@ -322,16 +328,32 @@ class TestNotifyWritesToMessages:
             "Review this plan.",
             "--priority", "immediate",
         )
-        # Exit 0 — warning, not rejection. Existing scripts keep working.
         assert result.exit_code == 0, result.output
         combined = result.output + (result.stderr or "")
-        assert "Warning" in combined
-        assert "--user-prompt-json" in combined
-        assert "Action Needed" in combined or "heuristic" in combined.lower()
+        assert "Warning" not in combined
+        assert "--user-prompt-json" not in combined
+        assert "Action Needed" not in combined
         # Message still landed.
         rows = _fetch_messages(db_path)
         assert len(rows) == 1
         assert rows[0]["tier"] == "immediate"
+
+    def test_immediate_user_notify_without_user_prompt_debug_note(self, db_path):
+        """Developers can opt into the missing-user-prompt diagnostic
+        without restoring the user-facing ``Warning:`` prefix."""
+        result = _invoke_notify(
+            db_path,
+            "Plan ready",
+            "Review this plan.",
+            "--priority", "immediate",
+            env={"POLLYPM_NOTIFY_USER_PROMPT_FALLBACK_NOTE": "1"},
+        )
+        assert result.exit_code == 0, result.output
+        combined = result.output + (result.stderr or "")
+        assert "Warning" not in combined
+        assert "note:" in combined
+        assert "--user-prompt-json" in combined
+        assert "fallback" in combined.lower()
 
     def test_immediate_user_notify_with_user_prompt_does_not_warn(self, db_path):
         """When the producer DOES pass ``--user-prompt-json``, no

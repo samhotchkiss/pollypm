@@ -58,6 +58,13 @@ def _fake_recovery_inbox_override_enabled() -> bool:
     raw = os.environ.get("POLLYPM_DEV_FAKE_RECOVERY_INBOX", "").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
+
+def _notify_user_prompt_fallback_note_enabled() -> bool:
+    """Return True when missing-user-prompt fallback notes should be printed."""
+    raw = os.environ.get("POLLYPM_NOTIFY_USER_PROMPT_FALLBACK_NOTE", "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ``<project>/<N>`` matches the canonical task id form. When ``pm send``
 # receives an argument matching this shape we translate it to the
 # per-task worker window name (#924) so the user does not have to know
@@ -830,25 +837,22 @@ def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
                         raise typer.Exit(code=1)
             user_prompt_payload = parsed_prompt
 
-        # Surface the contract gap at producer time — without this,
-        # operators discover hours later (in the dashboard or via
-        # release_invariants) that the Action Needed card fell back to
-        # heuristic body parsing because no ``--user-prompt-json`` was
-        # passed. The release invariant ``user_action_message_missing_
-        # user_prompt`` is the scan-side companion; this is the
-        # emit-side reminder. We warn (don't reject) so existing
-        # callers in scripts / older role prompts keep working —
-        # tightening to a hard error is a separate decision.
+        # The dashboard has a heuristic fallback when producers omit
+        # ``--user-prompt-json``. Keep that fallback quiet by default:
+        # role panes often stream stderr into user-facing logs, where a
+        # "Warning:" prefix reads like a broken escalation. Developers
+        # debugging producer payloads can opt into this diagnostic note.
         if (
             user_prompt_payload is None
             and resolved_priority == "immediate"
             and requester_role == "user"
             and channel_name == "inbox"
+            and _notify_user_prompt_fallback_note_enabled()
         ):
             typer.echo(
-                "Warning: posting an immediate-priority user-facing "
+                "note: posting an immediate-priority user-facing "
                 "notify without --user-prompt-json. The dashboard's "
-                "Action Needed card will fall back to body heuristics "
+                "Action Needed card is using body-heuristic fallback "
                 "and lose structured steps + decision question + "
                 "contextual buttons. Pass --user-prompt-json '{...}' "
                 "with at least one of summary/steps/question for a "

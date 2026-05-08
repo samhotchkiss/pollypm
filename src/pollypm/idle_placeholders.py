@@ -183,6 +183,125 @@ def pane_is_idle_placeholder(pane_text: str) -> bool:
     )
 
 
+# Phrase fragments that, in combination with sitting at the empty
+# Claude prompt, flag the agent as "awaiting an operator answer."
+# Lower-cased substring match against the joined assistant block.
+# Conservative list — we want to catch the obvious "ready to proceed?"
+# / "shall I?" patterns, not any text that happens to use a question
+# mark.
+_QUESTION_PATTERNS: tuple[str, ...] = (
+    "ready to proceed",
+    "should i ",
+    "should i?",
+    "shall i ",
+    "shall i?",
+    "would you ",
+    "do you want ",
+    "anything you want",
+    "anything else you ",
+    "want me to ",
+    "may i ",
+    "let me know ",
+    "let me know if",
+    "ok to proceed",
+    "okay to proceed",
+    "give the nod",
+)
+
+
+def pane_ends_with_unanswered_question(pane_text: str) -> str | None:
+    """Return the agent's question text iff the pane ends awaiting one.
+
+    Detects the exact failure-mode the heartbeat would otherwise miss:
+    the worker (or any Claude-CLI session) has just emitted a turn
+    that ends in a question to the operator and is now sitting at the
+    empty ``❯`` prompt waiting for an answer. ``pm status`` reports
+    ``healthy`` (the session is alive and responsive), but no work is
+    happening and the operator has no idea anything was asked.
+
+    Returns the joined assistant text (trimmed) when:
+
+    1. The pane tail is the Claude empty-``❯`` prompt — i.e., agent
+       finished its turn and is awaiting input.
+    2. The most recent assistant block (lines above the prompt, before
+       the previous user message) ends in a question pattern: either
+       a literal ``?``, or one of the recognized phrase fragments
+       (``"ready to proceed"``, ``"should I"``, ``"shall I"``, etc.).
+
+    Returns ``None`` otherwise — including when the agent is mid-turn,
+    when the assistant's last block has no question pattern, or when a
+    fresh user input line sits between the question and the prompt
+    (operator already answered).
+    """
+    if not pane_text:
+        return None
+    if not pane_shows_claude_empty_prompt(pane_text):
+        return None
+
+    collected: list[str] = []
+    for raw_line in reversed(pane_text.splitlines()):
+        line = raw_line.strip()
+        if not line:
+            continue
+        lower = line.lower()
+        # Skip Claude TUI footer chrome (mirrors pane_shows_claude_empty_prompt).
+        if (
+            "bypass permissions" in lower
+            or "shift+tab to cycle" in lower
+            or "ctrl+t to" in lower
+            or line.startswith("⏵⏵")  # ⏵⏵
+        ):
+            continue
+        # Skip box-drawing horizontal rules (── ━).
+        if set(line) <= {"─", "━", " "}:
+            continue
+        # Skip the empty prompt line itself.
+        if line.startswith("❯") and not line.lstrip("❯").strip():
+            continue
+        # Skip Claude's status spinner artifacts: ``✻ Cogitated for 1m 34s``,
+        # ``✶ Sautéed…``, ``✽ Rendering…`` etc.
+        if line.startswith(("✻", "✶", "✽", "·")):
+            continue
+        # Skip Codex rotating placeholder hints if they sit below the
+        # assistant block (rare in Claude panes but defensive).
+        if is_codex_idle_placeholder(line):
+            continue
+        # A user-input line (``❯`` followed by content) means the operator
+        # already answered — there is no unanswered question.
+        if line.startswith("❯") and line.lstrip("❯").strip():
+            return None
+        # Reached the assistant block's first line (``⏺ <text>`` marker).
+        if line.startswith("⏺"):
+            content = line.lstrip("⏺").strip()
+            if content:
+                collected.append(content)
+            break
+        # Regular content line within the assistant block.
+        collected.append(line)
+        # Cap walk distance to keep this O(1) on huge panes.
+        if len(collected) >= 40:
+            break
+
+    if not collected:
+        return None
+
+    # Reverse to forward order; join with single spaces (multi-line
+    # paragraphs render as one continuous string for substring match).
+    block_text = " ".join(reversed(collected))
+    block_lower = block_text.lower()
+
+    has_question_mark = "?" in block_text
+    has_pattern = any(pattern in block_lower for pattern in _QUESTION_PATTERNS)
+    if not (has_question_mark or has_pattern):
+        return None
+
+    # Trim for inbox-display friendliness. Keep the tail since the
+    # question typically sits at the end of the block.
+    if len(block_text) > 280:
+        return "…" + block_text[-279:]
+    return block_text
+
+
 __all__ = [
     "CODEX_IDLE_PLACEHOLDERS",
     "is_codex_idle_placeholder",
@@ -190,4 +309,5 @@ __all__ = [
     "pane_shows_claude_empty_prompt",
     "pane_shows_no_tasks_available",
     "pane_is_idle_placeholder",
+    "pane_ends_with_unanswered_question",
 ]

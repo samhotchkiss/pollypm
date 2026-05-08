@@ -834,19 +834,49 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     classify_stall,
                 )
                 from pollypm.idle_placeholders import (
+                    pane_ends_with_unanswered_question as _pane_ends_with_unanswered_question,
                     pane_is_idle_placeholder as _pane_is_idle_placeholder,
                 )
 
+                _pane_text = context.pane_text or ""
                 stall_ctx = StallContext(
                     role=context.role or "",
                     session_name=context.session_name,
                     has_pending_work=self._has_pending_work(api, context),
-                    pane_is_idle_placeholder=_pane_is_idle_placeholder(
-                        context.pane_text or "",
-                    ),
+                    pane_is_idle_placeholder=_pane_is_idle_placeholder(_pane_text),
+                    awaiting_operator_question=_pane_ends_with_unanswered_question(_pane_text),
                 )
                 stall_class = classify_stall(stall_ctx)
-                if stall_class != "unrecoverable_stall":
+                if stall_class == "awaiting_operator":
+                    # Surface the worker's pending question to the operator
+                    # inbox so polly / the user can see and answer it,
+                    # instead of the pane sitting silently with `pm status`
+                    # reporting healthy. Distinct alert_type from
+                    # ``suspected_loop`` so dedupe and routing don't
+                    # collapse the two categories.
+                    question_text = (stall_ctx.awaiting_operator_question or "").strip()
+                    short_question = question_text
+                    if len(short_question) > 140:
+                        short_question = short_question[:137].rstrip() + "…"
+                    _emit_routed_alert(
+                        api,
+                        session_name=context.session_name,
+                        alert_type="worker_question",
+                        severity="warn",
+                        message=(
+                            f"{context.role or 'session'} "
+                            f"{context.session_name} is waiting for an "
+                            f"operator answer: {short_question}"
+                        ),
+                        subject=f"{context.session_name} asked a question",
+                        suggested_action=(
+                            "Open the worker pane and answer, or `pm send "
+                            f"{context.session_name} \"<answer>\"`."
+                        ),
+                    )
+                    alerts.append("worker_question")
+                    api.clear_alert(context.session_name, "suspected_loop")
+                elif stall_class != "unrecoverable_stall":
                     api.clear_alert(context.session_name, "suspected_loop")
                 else:
                     # #760 — concrete actionable copy: name the role,

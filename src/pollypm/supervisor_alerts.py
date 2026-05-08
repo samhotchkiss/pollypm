@@ -259,9 +259,11 @@ def _update_alerts(
                 has_pending_work_for_session,
             )
             from pollypm.idle_placeholders import (
+                pane_ends_with_unanswered_question as _pane_ends_with_unanswered_question,
                 pane_is_idle_placeholder as _pane_is_idle_placeholder,
             )
 
+            _pane_text_for_classify = pane_text or ""
             stall_class = classify_stall(
                 StallContext(
                     role=launch.session.role or "",
@@ -270,11 +272,52 @@ def _update_alerts(
                         supervisor.config, session_name,
                     ),
                     pane_is_idle_placeholder=_pane_is_idle_placeholder(
-                        pane_text or "",
+                        _pane_text_for_classify,
+                    ),
+                    awaiting_operator_question=_pane_ends_with_unanswered_question(
+                        _pane_text_for_classify,
                     ),
                 )
             )
-            if stall_class != "unrecoverable_stall":
+            if stall_class == "awaiting_operator":
+                # The agent finished its turn with a question and is
+                # sitting at the empty prompt. Surface the question so
+                # the operator sees it instead of `pm status` reporting
+                # ``healthy`` while the worker silently waits.
+                _question = (
+                    _pane_ends_with_unanswered_question(_pane_text_for_classify)
+                    or ""
+                ).strip()
+                _short_q = _question if len(_question) <= 140 else (
+                    _question[:137].rstrip() + "…"
+                )
+                _question_body = (
+                    f"{launch.session.role or 'session'} {session_name} "
+                    f"is waiting for an operator answer: {_short_q}"
+                )
+                _route_signal(
+                    _envelope_for_alert(
+                        source="supervisor_alerts",
+                        alert_type="worker_question",
+                        severity_label="warn",
+                        session_name=session_name,
+                        subject=f"{session_name} asked a question",
+                        body=_question_body,
+                        suggested_action=(
+                            "Open the worker pane and answer, or `pm send "
+                            f"{session_name} \"<answer>\"`."
+                        ),
+                    )
+                )
+                supervisor.msg_store.upsert_alert(
+                    session_name,
+                    "worker_question",
+                    "warn",
+                    _question_body,
+                )
+                active_alerts.append("worker_question")
+                supervisor.msg_store.clear_alert(session_name, "suspected_loop")
+            elif stall_class != "unrecoverable_stall":
                 supervisor.msg_store.clear_alert(session_name, "suspected_loop")
             else:
                 # #760 — action-forward copy matching the heartbeat path.

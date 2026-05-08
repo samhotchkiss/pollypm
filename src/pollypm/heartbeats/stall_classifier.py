@@ -38,7 +38,12 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-StallClass = Literal["legitimate_idle", "transient", "unrecoverable_stall"]
+StallClass = Literal[
+    "legitimate_idle",
+    "transient",
+    "unrecoverable_stall",
+    "awaiting_operator",
+]
 
 
 # Roles whose tmux panes are expected to sit idle indefinitely. These
@@ -94,6 +99,16 @@ class StallContext:
     #: regardless of ``has_pending_work`` — work is queued behind the
     #: agent's input cycle, not behind a pane that needs unsticking.
     pane_is_idle_placeholder: bool = False
+    #: When set, the agent's most recent turn ended in a question to
+    #: the operator (e.g., "Ready to proceed when you give the nod —
+    #: anything you want to steer first?") and the pane is sitting at
+    #: the empty prompt waiting for an answer. Promotes the
+    #: classification to :class:`awaiting_operator` so the heartbeat
+    #: can surface the question to the operator's inbox instead of
+    #: silently filing the pane as ``legitimate_idle`` (which is what
+    #: the placeholder short-circuit would otherwise do — the pane
+    #: shows the empty prompt either way).
+    awaiting_operator_question: str | None = None
 
 
 def classify_stall(ctx: StallContext) -> StallClass:
@@ -123,6 +138,18 @@ def classify_stall(ctx: StallContext) -> StallClass:
     """
     role = (ctx.role or "").strip()
     session_name = (ctx.session_name or "").strip()
+
+    # An empty Claude prompt + a fresh question to the operator means
+    # the agent is alive-but-blocked: it finished its turn waiting for
+    # the operator to answer, but ``pm status`` would otherwise short-
+    # circuit to ``legitimate_idle`` via the placeholder check below
+    # and the question would never reach the inbox. ``awaiting_operator``
+    # is its own bucket — heartbeat surfaces it to the operator without
+    # the nudge/restart remediation ladder ``unrecoverable_stall``
+    # would invoke (the agent is fine; the operator just missed the
+    # cue).
+    if ctx.awaiting_operator_question:
+        return "awaiting_operator"
 
     # #1010 — placeholder-showing pane is alive-but-idle. The Codex
     # rotating-suggestion hint and the Claude empty-``❯`` prompt are

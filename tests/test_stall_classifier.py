@@ -118,6 +118,156 @@ def test_transient_signals_dont_apply_when_user_gate_holds() -> None:
     )
 
 
+def test_awaiting_operator_question_promotes_to_awaiting_operator() -> None:
+    """When the agent's last turn ends with a question to the operator
+    (pane sitting at empty ``❯`` prompt), classify_stall must return
+    ``awaiting_operator`` so the heartbeat surfaces the question to
+    the operator's inbox — instead of letting the placeholder short-
+    circuit silently file the pane as ``legitimate_idle``.
+    """
+    ctx = _ctx(
+        role="worker",
+        has_pending_work=True,
+        pane_is_idle_placeholder=True,
+        awaiting_operator_question=(
+            "Ready to proceed when you give the nod — "
+            "anything you want to steer first?"
+        ),
+    )
+    assert classify_stall(ctx) == "awaiting_operator"
+
+
+def test_awaiting_operator_takes_priority_over_legitimate_idle_paths() -> None:
+    """Even an architect or a control-name session with a pending
+    question must surface — the question signal beats the role-based
+    legitimate_idle promotion. Architects asking the user a question
+    is exactly the kind of thing the operator needs to see.
+    """
+    architect_ctx = _ctx(
+        role="architect",
+        has_pending_work=True,
+        pane_is_idle_placeholder=True,
+        awaiting_operator_question="Should I include venue X in scope?",
+    )
+    assert classify_stall(architect_ctx) == "awaiting_operator"
+
+    pollypm_worker_ctx = _ctx(
+        role="worker",
+        session_name="worker_pollypm",
+        has_pending_work=True,
+        pane_is_idle_placeholder=True,
+        awaiting_operator_question="Ready to proceed?",
+    )
+    assert classify_stall(pollypm_worker_ctx) == "awaiting_operator"
+
+
+def test_no_question_preserves_legitimate_idle_behavior() -> None:
+    """Regression guard: placeholder + no question text must still
+    classify as ``legitimate_idle``. The new awaiting_operator branch
+    fires only when the question text is present.
+    """
+    ctx = _ctx(
+        role="worker",
+        has_pending_work=True,
+        pane_is_idle_placeholder=True,
+        awaiting_operator_question=None,
+    )
+    assert classify_stall(ctx) == "legitimate_idle"
+
+
+def test_pane_ends_with_unanswered_question_detects_coffeeboardnm_pattern() -> None:
+    """The exact regression: coffeeboardnm worker emitted a "Ready to
+    proceed when you give the nod — anything you want to steer first?"
+    turn and sat at the empty ``❯`` prompt. Detector must return the
+    question text so the heartbeat can surface it.
+    """
+    from pollypm.idle_placeholders import pane_ends_with_unanswered_question
+
+    pane_text = "\n".join([
+        "⏺ Hi — settled in.",
+        "",
+        "  Where I am: worktree coffeeboardnm-1, task implement node.",
+        "",
+        "  Plan, roughly: read SKILL → research NM venues → outline → render.",
+        "",
+        "  Ready to proceed when you give the nod — anything you want "
+        "to steer first (scope, depth, visual style, \"skip section X\")?",
+        "",
+        "✻ Cogitated for 1m 34s",
+        "",
+        "──────────────────────────────────────────────────────",
+        "❯ ",
+        "──────────────────────────────────────────────────────",
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+    ])
+
+    result = pane_ends_with_unanswered_question(pane_text)
+    assert result is not None
+    assert "ready to proceed" in result.lower()
+    assert "?" in result
+
+
+def test_pane_ends_with_unanswered_question_none_for_normal_idle() -> None:
+    """An idle empty prompt with no recent question pattern (e.g., the
+    worker just finished a task and is awaiting next-task input)
+    must NOT trigger awaiting_operator.
+    """
+    from pollypm.idle_placeholders import pane_ends_with_unanswered_question
+
+    pane_text = "\n".join([
+        "⏺ Task coffeeboardnm/1 complete. Deployed to coffeeboardnm.itsalive.co.",
+        "",
+        "✻ Cooked for 3m 12s",
+        "",
+        "──────────────────────────────────────────────────────",
+        "❯ ",
+        "──────────────────────────────────────────────────────",
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+    ])
+
+    assert pane_ends_with_unanswered_question(pane_text) is None
+
+
+def test_pane_ends_with_unanswered_question_skips_when_already_answered() -> None:
+    """If a user-input line (``❯ <text>``) sits between the question
+    and the prompt, the operator already answered — don't re-surface.
+    """
+    from pollypm.idle_placeholders import pane_ends_with_unanswered_question
+
+    pane_text = "\n".join([
+        "⏺ Should I proceed?",
+        "",
+        "✻ Cogitated for 12s",
+        "",
+        "❯ go ahead",
+        "",
+        "──────────────────────────────────────────────────────",
+        "❯ ",
+        "──────────────────────────────────────────────────────",
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+    ])
+
+    assert pane_ends_with_unanswered_question(pane_text) is None
+
+
+def test_pane_ends_with_unanswered_question_none_when_pane_is_mid_turn() -> None:
+    """If the pane shows a status spinner / no empty prompt at the
+    tail, the agent is mid-turn — not awaiting an answer.
+    """
+    from pollypm.idle_placeholders import pane_ends_with_unanswered_question
+
+    pane_text = "\n".join([
+        "⏺ Should I proceed?",
+        "",
+        "⏺ Bash(pm task get coffeeboardnm/1)",
+        "  ⎿  ID: coffeeboardnm/1 — POC plan",
+        "",
+        "✶ Cooking… (12s · ↓ 1.2k tokens · still thinking)",
+    ])
+
+    assert pane_ends_with_unanswered_question(pane_text) is None
+
+
 def test_alert_channel_classifies_three_tiers() -> None:
     """#765 — public alert-channel policy. Operational alerts never
     earn a toast; informational alerts don't either; only

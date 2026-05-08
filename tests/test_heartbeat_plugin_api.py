@@ -131,7 +131,7 @@ class FakeHeartbeatAPI:
     def get_cursor(self, session_name: str):
         return None
 
-    def update_cursor(self, session_name: str, *, source_path: str, last_offset: int, snapshot_hash: str = "", verdict: str = "", reason: str = "") -> None:
+    def update_cursor(self, session_name: str, *, source_path: str, last_offset: int, snapshot_hash: str = "", verdict: str = "", reason: str = "", quiet_tick_count: int = 0) -> None:
         self.cursor_updates.append({
             "session_name": session_name,
             "source_path": source_path,
@@ -139,6 +139,7 @@ class FakeHeartbeatAPI:
             "snapshot_hash": snapshot_hash,
             "verdict": verdict,
             "reason": reason,
+            "quiet_tick_count": quiet_tick_count,
         })
 
     def record_observation(self, context: HeartbeatSessionContext) -> None:

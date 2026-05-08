@@ -104,6 +104,7 @@ class SupervisorHeartbeatAPI:
         snapshot_hash: str = "",
         verdict: str = "",
         reason: str = "",
+        quiet_tick_count: int = 0,
     ) -> None:
         cursors = self._load_cursors()
         cursors[session_name] = HeartbeatCursor(
@@ -114,6 +115,7 @@ class SupervisorHeartbeatAPI:
             last_snapshot_hash=snapshot_hash,
             last_verdict=verdict,
             last_reason=reason,
+            quiet_tick_count=max(0, int(quiet_tick_count)),
         )
         self._save_cursors(cursors)
 

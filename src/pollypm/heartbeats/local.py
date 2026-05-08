@@ -486,6 +486,35 @@ def _select_snippet(text: str, *, max_len: int = 120) -> str:
     return "(continuing without a clear summary line)"
 
 
+# Number of consecutive ticks a session may sit with no fresh transcript
+# output before the heartbeat marks its reason ``flow=quiet`` (#1501).
+# Three ticks ≈ 90s in a 30s heartbeat cadence — long enough to filter
+# out a long thinking pause, short enough to surface an actual stall
+# before the user notices.
+_QUIET_TICKS_FOR_FLOW_MARKER: int = 3
+
+# Reason prefix used by ``pm status`` consumers to detect the marker
+# without parsing free-form English. Kept stable and module-exported so
+# tests + cockpit pill renderers can match on it.
+FLOW_QUIET_REASON_PREFIX: str = "flow=quiet: "
+
+# Reason emitted by :meth:`LocalHeartbeatBackend._classify` when the
+# transcript hasn't advanced. The exact string is the trigger for the
+# quiet-tick counter — anything else resets the counter.
+_NO_TRANSCRIPT_REASON: str = "No new transcript output since last heartbeat"
+
+# Roles that are *expected* to sit silent — they're event-driven (#765
+# `_EVENT_DRIVEN_ROLES` in stall_classifier.py). The progress-signal
+# accounting must skip them or every heartbeat / operator-pm row would
+# accumulate quiet ticks and falsely flow=quiet.
+_PROGRESS_SIGNAL_EXEMPT_ROLES: frozenset[str] = frozenset({
+    "heartbeat-supervisor",
+    "operator-pm",
+    "reviewer",
+    "architect",
+})
+
+
 class LocalHeartbeatBackend(HeartbeatBackend):
     name = "local"
     _UNMANAGED_WINDOW_ALERT_PREFIX = "unmanaged_window:"
@@ -1115,6 +1144,39 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                             reason=reason,
                         )
 
+        # Progress-signal accounting (#1501). The classifier treats
+        # "no new transcript output" as the inconclusive bucket, but on
+        # its own that's silent — ``pm status`` reports ``healthy
+        # running=yes`` indefinitely. Track consecutive ticks of that
+        # state for non-event-driven roles, and after the threshold
+        # prepend ``flow=quiet:`` so operators can distinguish "alive
+        # and silent" from "actively producing output." The counter is
+        # persisted in :class:`HeartbeatCursor`.
+        prev_quiet = (
+            context.cursor.quiet_tick_count
+            if context.cursor is not None else 0
+        )
+        if context.role in _PROGRESS_SIGNAL_EXEMPT_ROLES or mechanical_only:
+            quiet_tick_count = 0
+        elif verdict == "unclear" and reason == _NO_TRANSCRIPT_REASON:
+            quiet_tick_count = prev_quiet + 1
+        else:
+            quiet_tick_count = 0
+
+        if (
+            quiet_tick_count >= _QUIET_TICKS_FOR_FLOW_MARKER
+            and not reason.startswith(FLOW_QUIET_REASON_PREFIX)
+            and not status_locked
+        ):
+            flow_quiet_reason = f"{FLOW_QUIET_REASON_PREFIX}{reason}"
+            self._set_session_status(
+                api,
+                context,
+                "healthy",
+                reason=flow_quiet_reason,
+            )
+            reason = flow_quiet_reason
+
         api.record_checkpoint(context, alerts=alerts)
         api.update_cursor(
             context.session_name,
@@ -1123,6 +1185,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             snapshot_hash=context.snapshot_hash,
             verdict=verdict,
             reason=reason,
+            quiet_tick_count=quiet_tick_count,
         )
 
         # Use the structured classification engine for intervention decisions

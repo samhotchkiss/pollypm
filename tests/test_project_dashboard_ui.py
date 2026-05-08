@@ -3483,6 +3483,58 @@ def test_c_keybinding_dispatches_to_pm(dashboard_env, dashboard_app) -> None:
     _run(body())
 
 
+def test_pm_dispatch_reattaches_recent_duplicate_context(
+    dashboard_app, monkeypatch,
+) -> None:
+    """Re-entering the same PM Chat routes back without re-sending primer."""
+    sent: list[tuple[str, str]] = []
+    routed: list[str] = []
+    notices: list[str] = []
+    now = 100.0
+
+    def fake_dispatch(cockpit_key: str, context_line: str) -> None:
+        sent.append((cockpit_key, context_line))
+
+    def fake_route(cockpit_key: str):
+        routed.append(cockpit_key)
+        return (None, "", None)
+
+    def fake_call_from_thread(fn, *args, **kwargs):
+        fn(*args, **kwargs)
+
+    monkeypatch.setattr(dashboard_app, "_perform_pm_dispatch", fake_dispatch)
+    monkeypatch.setattr(dashboard_app, "_route_pm_target", fake_route)
+    monkeypatch.setattr(
+        dashboard_app, "_pm_dispatch_now", lambda: now,
+    )
+    monkeypatch.setattr(dashboard_app, "call_from_thread", fake_call_from_thread)
+    monkeypatch.setattr(
+        dashboard_app,
+        "notify",
+        lambda message, **_kw: notices.append(message),
+    )
+
+    context_line = 're: project/demo "dashboard discussion"'
+    dashboard_app._dispatch_to_pm_sync(
+        "project:demo:session", context_line, "Project PM",
+    )
+    now += 30.0
+    dashboard_app._dispatch_to_pm_sync(
+        "project:demo:session", context_line, "Project PM",
+    )
+    now += dashboard_app._PM_CONTEXT_REATTACH_WINDOW_SECONDS + 1.0
+    dashboard_app._dispatch_to_pm_sync(
+        "project:demo:session", context_line, "Project PM",
+    )
+
+    assert sent == [
+        ("project:demo:session", context_line),
+        ("project:demo:session", context_line),
+    ]
+    assert routed == ["project:demo:session"]
+    assert any("Re-attached to existing PM Chat" in note for note in notices)
+
+
 # ---------------------------------------------------------------------------
 # 7. Keybinding — `q` routes home without exiting the pane
 # ---------------------------------------------------------------------------

@@ -14335,6 +14335,7 @@ class PollyProjectDashboardApp(App[None]):
         "j/k scroll \u00b7 g/G top/bottom \u00b7 v explainer "
         "\u00b7 o editor \u00b7 p back \u00b7 q exit"
     )
+    _PM_CONTEXT_REATTACH_WINDOW_SECONDS = 300.0
 
     def __init__(self, config_path: Path, project_key: str) -> None:
         super().__init__()
@@ -14488,6 +14489,7 @@ class PollyProjectDashboardApp(App[None]):
         # timer is the deferred-commit handle so ``u`` can cancel it.
         self._pending_plan_approval: dict | None = None
         self._pending_plan_approval_timer = None
+        self._last_pm_context_dispatch: tuple[str, str, float] | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -16576,11 +16578,30 @@ class PollyProjectDashboardApp(App[None]):
     def _dispatch_to_pm_sync(
         self, cockpit_key: str, context_line: str, pm_label: str,
     ) -> None:
+        now = self._pm_dispatch_now()
+        reattach = self._should_reattach_pm_context(
+            cockpit_key, context_line, now,
+        )
         try:
-            self._perform_pm_dispatch(cockpit_key, context_line)
+            if reattach:
+                self._route_pm_target(cockpit_key)
+            else:
+                self._perform_pm_dispatch(cockpit_key, context_line)
         except Exception as exc:  # noqa: BLE001
             self.call_from_thread(
                 self.notify, f"Jump to PM failed: {exc}", severity="error",
+            )
+            return
+        self._remember_pm_context_dispatch(cockpit_key, context_line, now)
+        if reattach:
+            self.call_from_thread(
+                self.notify,
+                (
+                    "Re-attached to existing PM Chat for "
+                    f"{self.project_key}."
+                ),
+                severity="information",
+                timeout=3.0,
             )
             return
         self.call_from_thread(
@@ -16590,12 +16611,48 @@ class PollyProjectDashboardApp(App[None]):
             timeout=3.0,
         )
 
+    def _pm_dispatch_now(self) -> float:
+        return time.monotonic()
+
+    def _should_reattach_pm_context(
+        self, cockpit_key: str, context_line: str, now: float,
+    ) -> bool:
+        last = self._last_pm_context_dispatch
+        if last is None:
+            return False
+        last_cockpit_key, last_context_line, last_sent_at = last
+        if (last_cockpit_key, last_context_line) != (
+            cockpit_key, context_line,
+        ):
+            return False
+        return (
+            now - last_sent_at
+            <= self._PM_CONTEXT_REATTACH_WINDOW_SECONDS
+        )
+
+    def _remember_pm_context_dispatch(
+        self, cockpit_key: str, context_line: str, sent_at: float,
+    ) -> None:
+        self._last_pm_context_dispatch = (
+            cockpit_key, context_line, sent_at,
+        )
+
     def _perform_pm_dispatch(self, cockpit_key: str, context_line: str) -> None:
         """Route the cockpit to the PM pane and inject a context line.
 
         Split out exactly like the inbox path so the same
         ``monkeypatch`` strategy works for the dashboard's chat keybind.
         """
+        router, window_target, right_pane = self._route_pm_target(cockpit_key)
+        if right_pane is None:
+            router.tmux.send_keys(window_target, context_line, press_enter=False)
+            return
+        router.tmux.send_keys(right_pane, context_line, press_enter=False)
+
+    def _route_pm_target(
+        self, cockpit_key: str,
+    ) -> tuple[CockpitRouter, str, str | None]:
+        """Route the cockpit right pane without injecting chat context."""
         from pollypm.dev_network_simulation import raise_if_network_dead
 
         raise_if_network_dead(
@@ -16608,10 +16665,7 @@ class PollyProjectDashboardApp(App[None]):
             f"{supervisor.config.project.tmux_session}:{router._COCKPIT_WINDOW}"
         )
         right_pane = router._right_pane_id(window_target)
-        if right_pane is None:
-            router.tmux.send_keys(window_target, context_line, press_enter=False)
-            return
-        router.tmux.send_keys(right_pane, context_line, press_enter=False)
+        return router, window_target, right_pane
 
     def action_jump_inbox(self) -> None:
         """Route the cockpit right-pane to the inbox.

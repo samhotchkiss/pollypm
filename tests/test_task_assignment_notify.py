@@ -123,6 +123,16 @@ class TestRoleCandidates:
             "reviewer_bikepath", "reviewer-bikepath", "reviewer", "pm-reviewer",
         ]
 
+    def test_reviewer_with_task_number_still_uses_reviewer_lane(self):
+        # #1439 — a still-open per-task worker pane must not steal
+        # review-node handoff pings from the long-lived reviewer lane.
+        assert role_candidate_names("reviewer", "savethenovel", task_number=12) == [
+            "reviewer_savethenovel",
+            "reviewer-savethenovel",
+            "reviewer",
+            "pm-reviewer",
+        ]
+
     def test_reviewer_without_project_pins_to_singleton(self):
         # Empty project key → singleton-only (legacy behaviour).
         assert role_candidate_names("reviewer", "") == ["reviewer", "pm-reviewer"]
@@ -185,6 +195,21 @@ class TestSessionRoleIndexResolve:
         assert handle is not None
         assert handle.name == "pm-reviewer"
 
+    def test_reviewer_ignores_matching_task_window(self):
+        svc = FakeSessionService(handles=[
+            FakeHandle("task-savethenovel-12"),
+            FakeHandle("reviewer_savethenovel"),
+        ])
+        index = SessionRoleIndex(svc)
+        handle = index.resolve(
+            ActorType.ROLE,
+            "reviewer",
+            "savethenovel",
+            task_number=12,
+        )
+        assert handle is not None
+        assert handle.name == "reviewer_savethenovel"
+
     def test_agent_exact_name(self):
         svc = FakeSessionService(handles=[
             FakeHandle("polly"), FakeHandle("pm-reviewer"),
@@ -224,6 +249,35 @@ class TestSessionRoleIndexResolve:
         handle = index.resolve(ActorType.ROLE, "worker", "demo")
         assert handle is not None
         assert handle.name == "worker_demo"
+
+
+class TestReviewerNotifyRouting:
+    def test_review_ping_targets_reviewer_not_task_worker(self, state_store):
+        svc = FakeSessionService(handles=[
+            FakeHandle("task-savethenovel-12"),
+            FakeHandle("reviewer_savethenovel"),
+        ])
+        services = _RuntimeServices(
+            session_service=svc,
+            state_store=state_store,
+            work_service=None,
+            project_root=Path("."),
+        )
+        event = _event(
+            task_id="savethenovel/12",
+            project="savethenovel",
+            actor_name="reviewer",
+            current_node="code_review",
+            current_node_kind="review",
+            work_status="review",
+        )
+
+        outcome = notify(event, services=services)
+
+        assert outcome["outcome"] == "sent"
+        assert outcome["session"] == "reviewer_savethenovel"
+        assert svc.sent[0][0] == "reviewer_savethenovel"
+        assert "Review needed" in svc.sent[0][1]
 
 
 def test_load_runtime_services_uses_workspace_root_work_db(tmp_path, monkeypatch) -> None:

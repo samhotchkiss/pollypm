@@ -169,28 +169,20 @@ def role_candidate_names(
     project that still runs a long-lived worker (e.g. booktalk's pre-
     existing setup) keeps working.
 
-    #1057 — the per-task window also fulfills NON-worker roles for that
+    #1057 — the per-task window also fulfills ad-hoc task roles for that
     specific task. When the planner spawns critic subtasks the task is
     in_progress with assignee ``critic_simplicity`` (or similar planner-
     emitted role) and a ``task-<project>-<N>`` window is doing the work.
     The role-assignment resolver must accept that window as fulfillment
     so the ``no_session_for_assignment`` alert doesn't fire spuriously.
-    The shape: when ``task_number`` is supplied for *any* role, prepend
-    ``task-<project>-<N>`` ahead of the role-specific candidates. The
-    long-lived ``<role>-<project>`` / ``<role>_<project>`` candidates
-    stay so workspaces that still run dedicated role sessions keep
-    resolving via the legacy fallback.
+    Static control roles (reviewer / operator / triage / heartbeat)
+    deliberately skip that fallback; a still-open worker task pane must
+    not steal reviewer handoff pings from the reviewer session (#1439).
     """
     key = role.strip().lower()
-    # #1057 — per-task worker windows fulfill ANY role for their
-    # specific task. Compute the per-task candidate once and prepend
-    # below so it takes precedence over role-specific candidates.
-    # Note: the simpler "per-task worker fulfills any role" semantics
-    # is the shipped behavior (#1057 CLOSED). If we ever decide a
-    # per-task pane should only fulfill the role it was spawned to
-    # handle (e.g. because the window's persona was overwritten),
-    # narrow this check by reading the task's ``assignee`` and matching
-    # it against ``role``.
+    # #1057 — per-task worker windows fulfill task-local roles such as
+    # worker, critic_*, and planner-emitted ad-hoc roles. They do not
+    # fulfill static control lanes handled by long-lived sessions.
     per_task_candidate: str | None = None
     if task_number is not None and project:
         per_task_candidate = f"task-{project}-{int(task_number)}"
@@ -230,10 +222,6 @@ def role_candidate_names(
     if not project_key:
         return static
     project_scoped = [f"{key}_{project_key}", f"{key}-{project_key}"]
-    # #1057 — per-task window also fulfills singleton-named control
-    # roles (reviewer/operator/triage/heartbeat) for that task.
-    if per_task_candidate is not None:
-        return [per_task_candidate, *project_scoped, *static]
     return project_scoped + static
 
 

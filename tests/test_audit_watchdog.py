@@ -14,7 +14,6 @@ from pathlib import Path
 
 import pytest
 
-from pollypm.audit import emit
 from pollypm.audit.log import (
     EVENT_MARKER_CREATED,
     EVENT_MARKER_LEAKED,
@@ -954,6 +953,72 @@ def test_cadence_handler_dispatches_eligible_finding(
     ]
     assert len(dispatch_rows) == 1
     assert dispatch_rows[0]["metadata"]["finding_type"] == RULE_TASK_REVIEW_STALE
+
+
+def test_cadence_handler_dispatches_stuck_draft(
+    now: datetime, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale draft finding triggers an architect dispatch (#1440)."""
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _scan_one_project,
+    )
+
+    task = _StatefulTask(
+        project="savethenovel",
+        task_number=8,
+        work_status="draft",
+        created_at=now - timedelta(hours=12),
+        updated_at=now - timedelta(hours=12),
+        created_by="architect",
+        title="Decide next chapter plan",
+    )
+
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._send_brief_to_architect",
+        lambda target, brief: sent.append((target, brief)) or True,
+    )
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._gather_storage_windows",
+        lambda name: [],
+    )
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._gather_open_tasks",
+        lambda key, path: [task],
+    )
+
+    store = _RecordingStore()
+    counters = _scan_one_project(
+        project_key="savethenovel",
+        project_path=None,
+        msg_store=store,
+        state_store=None,
+        now=now,
+        config=WatchdogConfig(),
+        storage_closet_name="pollypm-storage-closet",
+    )
+
+    assert counters["findings"] == 1
+    assert counters["dispatches_sent"] == 1
+    assert counters["dispatches_throttled"] == 0
+    assert len(sent) == 1
+    target, brief = sent[0]
+    assert target == "pollypm-storage-closet:architect-savethenovel"
+    assert RULE_STUCK_DRAFT in brief
+    assert "savethenovel/8" in brief
+
+    rows = [
+        json.loads(line)
+        for line in central_log_path("savethenovel")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    dispatch_rows = [
+        r for r in rows if r["event"] == "watchdog.escalation_dispatched"
+    ]
+    assert len(dispatch_rows) == 1
+    assert dispatch_rows[0]["metadata"]["finding_type"] == RULE_STUCK_DRAFT
 
 
 def test_cadence_handler_throttles_repeat_dispatch(

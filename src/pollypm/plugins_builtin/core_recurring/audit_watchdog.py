@@ -34,6 +34,7 @@ from pollypm.audit.watchdog import (
     ESCALATION_THROTTLE_SECONDS,
     Finding,
     RULE_ROLE_SESSION_MISSING,
+    RULE_STUCK_DRAFT,
     RULE_TASK_ON_HOLD_STALE,
     RULE_TASK_REVIEW_STALE,
     RULE_WORKER_SESSION_DEAD_LOOP,
@@ -51,10 +52,14 @@ from pollypm.audit.watchdog import (
 
 
 # #1414 — only the auto-unstick rules are eligible for architect dispatch.
-# Existing rules (orphan_marker, stuck_draft, etc.) already have
+# Legacy forensic rules (orphan_marker, marker_leaked, etc.) already have
 # operator-actionable alerts and predate this dispatch path; we leave
 # them additive-only to keep the blast radius small.
 _DISPATCHABLE_RULES: frozenset[str] = frozenset({
+    # #1440 — stale drafts are architect-originated planning stalls. Alerting
+    # alone leaves them parked forever; dispatch the architect to queue,
+    # cancel, or rewrite them.
+    RULE_STUCK_DRAFT,
     RULE_TASK_REVIEW_STALE,
     RULE_ROLE_SESSION_MISSING,
     RULE_WORKER_SESSION_DEAD_LOOP,

@@ -125,7 +125,7 @@ def _user_waiting_task_ids(ctx: RailContext) -> frozenset[str]:
     return user_waiting_task_ids(config)
 
 
-def _active_task_numbers(project: Any, *, config: Any = None) -> list[int]:
+def active_task_numbers(project: Any, *, config: Any = None) -> list[int]:
     """Return per-task task numbers that the DB considers actively worked.
 
     DB-truth source for the rail's per-project ``Task #N`` rows (#1002).
@@ -153,9 +153,9 @@ def _active_task_numbers(project: Any, *, config: Any = None) -> list[int]:
     project_key = getattr(project, "key", None)
     if not project_key:
         return []
-    from pollypm.work.task_state import active_task_numbers
+    from pollypm.work.task_state import active_task_numbers as work_active_task_numbers
 
-    return active_task_numbers(project, config=config)
+    return work_active_task_numbers(project, config=config)
 
 
 def _polly_state(ctx: RailContext) -> str:
@@ -433,7 +433,7 @@ def _project_rows(ctx: RailContext) -> list[RailRow]:
                 label="  Tasks",
                 state="sub",
             ))
-            for task_num in _active_task_numbers(project, config=config):
+            for task_num in active_task_numbers(project, config=config):
                 rows.append(RailRow(
                     key=f"project:{project_key}:task:{task_num}",
                     label=f"  \u27f3 Task #{task_num}",
@@ -574,3 +574,6 @@ plugin = PollyPMPlugin(
     ),
     initialize=_initialize,
 )
+
+
+__all__ = ["active_task_numbers", "plugin"]

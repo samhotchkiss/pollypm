@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,7 @@ from pollypm.audit.watchdog import (
     Finding,
     RULE_DUPLICATE_ADVISOR_TASKS,
     RULE_LEGACY_DB_SHADOW,
+    RULE_PLAN_MISSING_ALERT_CHURN,
     RULE_PLAN_REVIEW_MISSING,
     RULE_ROLE_SESSION_MISSING,
     RULE_STUCK_DRAFT,
@@ -73,6 +74,21 @@ class _LegacyDbShadow:
     legacy_db: Path
     canonical_row_count: int
     legacy_row_count: int
+
+
+@dataclass(slots=True, frozen=True)
+class _PlanMissingClear:
+    """One ``alert.cleared`` event for a ``plan_missing`` alert (#1524).
+
+    Used by :func:`_gather_plan_missing_clears` to feed the pure
+    ``plan_missing_alert_churn`` detector. ``scope`` mirrors the
+    synthetic ``plan_gate-<project>`` scope the sweep handler uses on
+    the alert; ``cleared_at`` is the message row's ``created_at``
+    timestamp (i.e. when the clear event was recorded).
+    """
+
+    scope: str
+    cleared_at: datetime
 
 
 # #1414 — only the auto-unstick rules are eligible for architect dispatch.
@@ -521,6 +537,96 @@ def _gather_legacy_db_shadows(
     return shadows
 
 
+def _gather_plan_missing_clears(
+    *,
+    services: Any,
+    now: datetime,
+    config: WatchdogConfig,
+) -> list[_PlanMissingClear]:
+    """Return one record per ``alert.cleared`` event for ``plan_missing``
+    alerts inside the churn window.
+
+    #1524 — feeds the pure
+    :func:`pollypm.audit.watchdog._detect_plan_missing_alert_churn`
+    detector. The clear lifecycle is recorded in the ``messages``
+    table (see :meth:`SQLAlchemyStore.clear_alert`): one ``event`` row
+    with ``subject='alert.cleared'`` and ``sender='plan_missing'`` per
+    closed row. We query the messages table over the configured churn
+    window and return one descriptor per match. The detector groups
+    by scope and counts.
+
+    Best-effort: any I/O failure returns an empty list so a transient
+    DB hiccup doesn't fire a false-positive churn finding.
+    """
+    msg_store = getattr(services, "msg_store", None) or getattr(
+        services, "state_store", None,
+    )
+    if msg_store is None:
+        return []
+    query = getattr(msg_store, "query_messages", None)
+    if not callable(query):
+        return []
+    cutoff = now - timedelta(seconds=config.plan_missing_churn_window_seconds)
+    try:
+        rows = query(
+            type="event",
+            sender="plan_missing",
+            since=cutoff,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: plan_missing-clear query failed", exc_info=True,
+        )
+        return []
+
+    clears: list[_PlanMissingClear] = []
+    for row in rows or ():
+        # ``record_event`` stamps subject='alert.cleared' on every clear
+        # event; defensive check in case other event-shaped rows ever
+        # land with sender='plan_missing'.
+        subject_raw = row.get("subject", "") if isinstance(row, dict) else ""
+        if not isinstance(subject_raw, str):
+            continue
+        # Strip the optional ``[Audit]`` / ``[Event]`` title-contract
+        # prefix the store applies to ``subject`` so we still match
+        # rows whose subject was rewritten.
+        subject_text = subject_raw
+        if subject_text.startswith("["):
+            close = subject_text.find("] ")
+            if close > 0:
+                subject_text = subject_text[close + 2:]
+        if subject_text != "alert.cleared":
+            continue
+        scope = row.get("scope", "") if isinstance(row, dict) else ""
+        if not isinstance(scope, str) or not scope:
+            continue
+        if not scope.startswith("plan_gate-"):
+            continue
+        cleared_at_raw = (
+            row.get("created_at") if isinstance(row, dict) else None
+        )
+        cleared_at = _coerce_clear_timestamp(cleared_at_raw)
+        if cleared_at is None:
+            continue
+        if cleared_at < cutoff:
+            continue
+        clears.append(_PlanMissingClear(scope=scope, cleared_at=cleared_at))
+    return clears
+
+
+def _coerce_clear_timestamp(value: Any) -> datetime | None:
+    """Coerce a messages-table timestamp into tz-aware ``datetime``."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    if isinstance(value, str) and value:
+        try:
+            ts = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
+    return None
+
+
 def _self_heal_legacy_db_shadow(
     finding: Finding,
     *,
@@ -961,6 +1067,7 @@ def _scan_one_project(
     config: WatchdogConfig,
     storage_closet_name: str | None = None,
     legacy_db_shadows: list[_LegacyDbShadow] | None = None,
+    plan_missing_clears: list[_PlanMissingClear] | None = None,
 ) -> dict[str, int]:
     """Scan one project and route every finding. Returns counters."""
     counters = {
@@ -976,6 +1083,7 @@ def _scan_one_project(
         "plan_review_backfill_failed": 0,
         "legacy_db_shadows_migrated": 0,
         "legacy_db_shadows_failed": 0,
+        "plan_missing_churn_detected": 0,
     }
     open_tasks = _gather_open_tasks(project_key, project_path)
     storage_window_names = _gather_storage_windows(storage_closet_name)
@@ -992,6 +1100,14 @@ def _scan_one_project(
         s for s in (legacy_db_shadows or [])
         if s.project_key == project_key
     ]
+    # #1524 — filter the workspace-wide clear list down to this
+    # project's plan_gate-<project> scope so the pure detector only
+    # sees what's in scope for the current scan_project call.
+    expected_scope = f"plan_gate-{project_key}"
+    project_clears: list[_PlanMissingClear] = [
+        c for c in (plan_missing_clears or [])
+        if c.scope == expected_scope
+    ]
     try:
         findings = scan_project(
             project_key,
@@ -1003,6 +1119,7 @@ def _scan_one_project(
             done_plan_tasks=done_plan_tasks,
             plan_review_present=plan_review_present,
             legacy_db_shadows=project_shadows or None,
+            plan_missing_clears=project_clears or None,
         )
     except Exception:  # noqa: BLE001
         logger.debug(
@@ -1075,6 +1192,14 @@ def _scan_one_project(
             counters["legacy_db_shadows_migrated"] += heal["migrated"]
             counters["legacy_db_shadows_failed"] += heal["failed"]
             continue
+        # #1524 — plan_missing_alert_churn is detection-only. The repair
+        # is Part A (the deterministic precompute in the task-assignment
+        # sweep). The finding + alert + audit-log row are the canary so
+        # future-us notices when the regression returns; no architect
+        # dispatch and no self-heal action.
+        if finding.rule == RULE_PLAN_MISSING_ALERT_CHURN:
+            counters["plan_missing_churn_detected"] += 1
+            continue
         # #1414 — eligible findings get an architect dispatch on top
         # of the alert. Throttle window is owned by the audit log so
         # repeat dispatches are deduped across cadence-process restarts.
@@ -1141,6 +1266,7 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
         "plan_review_backfill_failed": 0,
         "legacy_db_shadows_migrated": 0,
         "legacy_db_shadows_failed": 0,
+        "plan_missing_churn_detected": 0,
     }
 
     try:
@@ -1158,6 +1284,18 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 "audit.watchdog: legacy-db-shadow probe failed", exc_info=True,
             )
             legacy_db_shadows = []
+        # #1524 — gather plan_missing alert.cleared events once per tick
+        # for the churn detector. Single messages-table query per tick;
+        # the per-project scan filters down to its own scope.
+        try:
+            plan_missing_clears = _gather_plan_missing_clears(
+                services=services, now=now, config=config,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "audit.watchdog: plan_missing-clear probe failed", exc_info=True,
+            )
+            plan_missing_clears = []
         for project in services.known_projects or ():
             project_key = getattr(project, "key", None)
             if not project_key or project_key in seen_projects:
@@ -1173,6 +1311,7 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 config=config,
                 storage_closet_name=storage_closet_name,
                 legacy_db_shadows=legacy_db_shadows,
+                plan_missing_clears=plan_missing_clears,
             )
             totals["projects_scanned"] += 1
             for k, v in partial.items():

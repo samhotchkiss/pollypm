@@ -558,3 +558,174 @@ def task_bypasses_plan_gate(task: Any) -> bool:
         return True
     labels = getattr(task, "labels", None) or []
     return BYPASS_LABEL in labels
+
+
+def project_has_plan_gated_work(work_service: Any, project_key: str) -> bool:
+    """Return True iff ``project_key`` has any non-terminal queued task
+    that the plan gate would block.
+
+    A project is considered to have plan-gated work iff at least one
+    task on the project is in :class:`WorkStatus.QUEUED` and is NOT
+    exempt via :func:`task_bypasses_plan_gate` (i.e. not a planning
+    flow and not labelled ``bypass_plan_gate``). Review / in-progress
+    tasks already in flight are intentionally excluded — the gate only
+    blocks fresh delegation, not recovery pings on existing work.
+
+    Used by the sweep handler's deterministic plan-missing precompute
+    (#1524): a project with no plan but no queued blocked tasks does
+    not warrant a fresh alert this tick. Pairs with
+    :func:`has_acceptable_plan` — a missing plan only matters when
+    there is work waiting to flow through the gate.
+
+    Returns False on any I/O error so the caller fails closed (no
+    spurious alert when we can't read the DB).
+    """
+    if work_service is None or not project_key:
+        return False
+    try:
+        tasks = work_service.list_tasks(
+            project=project_key,
+            work_status=WorkStatus.QUEUED.value,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "plan_presence: list_tasks(queued) failed for project %s",
+            project_key, exc_info=True,
+        )
+        return False
+    for task in tasks:
+        if task_bypasses_plan_gate(task):
+            continue
+        return True
+    return False
+
+
+def compute_plan_missing_projects(
+    projects: Any,
+    *,
+    work_service_for_project: Any,
+    plan_dir: str = "docs/plan",
+) -> dict[str, str | None]:
+    """Return a mapping of plan-gated project keys to an example blocked task id.
+
+    A project lands in the result iff (a) its plan-presence gate is
+    closed, AND (b) it has at least one queued non-bypass task waiting
+    on the gate. The value is one example queued ``task_id`` (for
+    alert copy) or ``None`` when no example was reachable.
+
+    Issue #1524 — the sweep handler used to derive this set as a side
+    effect of two separate loops (the workspace-root sweep and the
+    per-project auto-claim path), and a project would only land in the
+    set on ticks that happened to traverse the right loop. After the
+    per-project legacy DB was drained (post-#1519) the per-project
+    fallback at the end of the sweep would clear the alert on every
+    other tick, producing the "Waiting on you / Queued" banner flash
+    described in the issue.
+
+    Computing the set up front from a deterministic source (canonical
+    workspace DB) means the same project lands in the set every tick
+    until its plan is approved, so the clear path becomes idempotent.
+
+    Args:
+        projects: an iterable of project records exposing ``key``,
+            ``path``, and (optionally) ``enforce_plan``. Typically
+            ``services.known_projects``.
+        work_service_for_project: a callable taking a project record
+            and returning either an open work-service (canonical
+            workspace DB scoped to the project) or ``None``. The
+            helper closes the returned service before moving on.
+        plan_dir: the configured ``[planner].plan_dir`` value.
+
+    Returns: mapping ``project_key -> example_task_id_or_None``.
+    Projects with no work_service available, no path on disk, no
+    queued blocked tasks, or with the gate explicitly disabled are
+    NOT included even if their plan looks unacceptable — the alert
+    isn't actionable when the user has nothing waiting.
+    """
+    missing: dict[str, str | None] = {}
+    if not projects:
+        return missing
+    for project in projects:
+        project_key = getattr(project, "key", None)
+        project_path = getattr(project, "path", None)
+        if not project_key or project_path is None:
+            continue
+        # Per-project ``enforce_plan`` override: explicit ``False`` means
+        # the gate is disabled and there's no plan_missing condition to
+        # report regardless of plan presence. ``None`` defers to the
+        # global default — the helper assumes the global default is
+        # enforce-on (the caller can drop the project from ``projects``
+        # if the global flag is off).
+        if getattr(project, "enforce_plan", None) is False:
+            continue
+        try:
+            project_work = work_service_for_project(project)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "plan_presence: work_service_for_project failed for %s",
+                project_key, exc_info=True,
+            )
+            continue
+        if project_work is None:
+            continue
+        try:
+            example_task_id = _first_blocked_queued_task_id(
+                project_work, project_key,
+            )
+            if example_task_id is None:
+                continue
+            try:
+                acceptable = has_acceptable_plan(
+                    project_key,
+                    Path(project_path),
+                    project_work,
+                    plan_dir=plan_dir,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "plan_presence: has_acceptable_plan raised for %s",
+                    project_key, exc_info=True,
+                )
+                acceptable = False
+            if not acceptable:
+                missing[str(project_key)] = example_task_id
+        finally:
+            closer = getattr(project_work, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:  # noqa: BLE001
+                    pass
+    return missing
+
+
+def _first_blocked_queued_task_id(
+    work_service: Any, project_key: str,
+) -> str | None:
+    """Return one queued non-bypass task_id on ``project_key``, or None.
+
+    Companion to :func:`compute_plan_missing_projects` — surfaces a
+    concrete task_id so plan_missing alert copy can name the task the
+    user's planning decision is blocking. Returns ``None`` when no
+    queued non-bypass task exists (so the caller can skip the alert).
+    """
+    if work_service is None or not project_key:
+        return None
+    try:
+        tasks = work_service.list_tasks(
+            project=project_key,
+            work_status=WorkStatus.QUEUED.value,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "plan_presence: list_tasks(queued) failed for %s",
+            project_key, exc_info=True,
+        )
+        return None
+    for task in tasks:
+        if task_bypasses_plan_gate(task):
+            continue
+        task_id = getattr(task, "task_id", None)
+        if task_id:
+            return str(task_id)
+    return None

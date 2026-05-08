@@ -1408,3 +1408,247 @@ class TestSweepHandlerGateIntegration:
         assert result["by_outcome"].get("skipped_plan_missing", 0) == 1
 
         store.close()
+
+
+class TestPlanMissingAlertStability1524:
+    """#1524 — plan_missing alert stays stable across consecutive ticks
+    when the canonical workspace DB carries the queued task and the
+    per-project legacy DB has been drained (post-#1519). Pre-fix, the
+    sweep handler's per-project fallback at line 2089-2090 cleared the
+    alert on every other tick because ``plan_missing_projects`` was
+    populated as a side effect of the auto-claim loop, which only ran
+    for projects with auto-claim enabled. The pre-compute step in
+    ``_task_assignment_sweep_body`` makes the set deterministic.
+    """
+
+    def _setup_workspace_db_no_per_project(
+        self, *, tmp_path, project_key, queued_label=None,
+    ):
+        """Workspace DB carries a queued task; the per-project DB is absent.
+
+        Mirrors the post-#1519 coffeeboardnm shape: canonical workspace
+        ``state.db`` has the queued advisor_review (here, a standard
+        impl task — same gate behaviour) and the per-project
+        ``state.db`` has been drained / never created. Returns the
+        workspace_db path and the project_path.
+        """
+        proj_path = tmp_path / project_key
+        proj_path.mkdir()
+        # Ensure the per-project DB does NOT exist — that's the post-
+        # #1519 drain shape we want to reproduce.
+        assert not (proj_path / ".pollypm" / "state.db").exists()
+
+        workspace_db = tmp_path / ".pollypm" / "state.db"
+        workspace_db.parent.mkdir(parents=True, exist_ok=True)
+        bus.clear_listeners()
+        ws_work = SQLiteWorkService(db_path=workspace_db, project_path=tmp_path)
+        try:
+            task = ws_work.create(
+                title="Queued impl on canonical DB",
+                description="x",
+                type="task",
+                project=project_key,
+                flow_template="standard",
+                roles={"worker": "agent-1", "reviewer": "agent-2"},
+                priority="normal",
+                labels=[queued_label] if queued_label else None,
+            )
+            ws_work.queue(task.task_id, "pm")
+        finally:
+            ws_work.close()
+        return workspace_db, proj_path
+
+    def _factory_with_workspace_db(
+        self, *, store, session_svc, workspace_db, tmp_path,
+        project_key, project_path, auto_claim=True,
+    ):
+        def factory():
+            return _RuntimeServices(
+                session_service=session_svc,
+                state_store=store,
+                work_service=SQLiteWorkService(
+                    db_path=workspace_db, project_path=tmp_path,
+                ),
+                project_root=tmp_path,
+                known_projects=(
+                    FakeKnownProject(key=project_key, path=project_path),
+                ),
+                enforce_plan=True,
+                plan_dir="docs/plan",
+                auto_claim=auto_claim,
+            )
+
+        return factory
+
+    def test_alert_id_stable_across_consecutive_ticks_post_drain(
+        self, tmp_path, monkeypatch,
+    ):
+        """Two sweeps in a row, no state change, no per-project DB.
+
+        Pre-#1524: the alert ID changed each tick (clear → re-emit
+        cycle). Post-fix: same row stays open, ``upsert_alert`` just
+        refreshes it.
+        """
+        workspace_db, proj_path = self._setup_workspace_db_no_per_project(
+            tmp_path=tmp_path, project_key="coffeeboardnm",
+        )
+
+        store = StateStore(tmp_path / "workspace_state.db")
+        session_svc = FakeSessionService(handles=[])  # no sessions wired
+
+        _install_fake_loader(monkeypatch, self._factory_with_workspace_db(
+            store=store, session_svc=session_svc,
+            workspace_db=workspace_db, tmp_path=tmp_path,
+            project_key="coffeeboardnm", project_path=proj_path,
+        ))
+
+        first = task_assignment_sweep_handler({})
+        first_alerts = [
+            a for a in store.open_alerts() if a.alert_type == "plan_missing"
+        ]
+        assert len(first_alerts) == 1, first
+        assert first_alerts[0].session_name == "plan_gate-coffeeboardnm"
+        first_alert_id = first_alerts[0].alert_id
+
+        # Second tick — same state.
+        second = task_assignment_sweep_handler({})
+        second_alerts = [
+            a for a in store.open_alerts() if a.alert_type == "plan_missing"
+        ]
+        # Exactly one open alert, and it's the SAME row as before (the
+        # row was refreshed in place, not closed-and-re-opened).
+        assert len(second_alerts) == 1, second
+        assert second_alerts[0].alert_id == first_alert_id, (
+            "plan_missing alert was cleared and re-emitted between ticks; "
+            f"expected stable alert_id {first_alert_id}, got "
+            f"{second_alerts[0].alert_id}. This is the #1524 banner-flash "
+            "regression."
+        )
+        # Result counter still records the project as plan-missing.
+        assert second["plan_missing_alerts"] >= 1
+
+        store.close()
+
+    def test_alert_stable_when_auto_claim_disabled(
+        self, tmp_path, monkeypatch,
+    ):
+        """Pre-fix, the auto-claim loop was the source-of-truth for
+        ``plan_missing_projects``; if auto-claim was disabled (global
+        flag off, or per-project ``auto_claim=false``), the project
+        never landed in the set and the per-project fallback cleared
+        the alert on every tick. The pre-compute step is independent
+        of auto-claim, so the alert stays stable regardless.
+        """
+        workspace_db, proj_path = self._setup_workspace_db_no_per_project(
+            tmp_path=tmp_path, project_key="coffeeboardnm",
+        )
+
+        store = StateStore(tmp_path / "workspace_state.db")
+        session_svc = FakeSessionService(handles=[])
+
+        _install_fake_loader(monkeypatch, self._factory_with_workspace_db(
+            store=store, session_svc=session_svc,
+            workspace_db=workspace_db, tmp_path=tmp_path,
+            project_key="coffeeboardnm", project_path=proj_path,
+            auto_claim=False,  # globally disabled — pre-fix this hid the project
+        ))
+
+        first = task_assignment_sweep_handler({})
+        first_alerts = [
+            a for a in store.open_alerts() if a.alert_type == "plan_missing"
+        ]
+        assert len(first_alerts) == 1, first
+        first_alert_id = first_alerts[0].alert_id
+
+        second = task_assignment_sweep_handler({})
+        second_alerts = [
+            a for a in store.open_alerts() if a.alert_type == "plan_missing"
+        ]
+        assert len(second_alerts) == 1, second
+        assert second_alerts[0].alert_id == first_alert_id, (
+            "plan_missing alert flapped when auto-claim was disabled; "
+            "Part A precompute should not depend on the auto-claim path."
+        )
+
+        store.close()
+
+    def test_no_alert_when_no_queued_blocked_work(
+        self, tmp_path, monkeypatch,
+    ):
+        """A project with no plan but no queued non-bypass tasks does
+        not get a plan_missing alert — the alert isn't actionable when
+        nothing is waiting. (Sanity check for the precompute filter.)
+        """
+        proj_path = tmp_path / "fresh"
+        proj_path.mkdir()
+
+        workspace_db = tmp_path / ".pollypm" / "state.db"
+        workspace_db.parent.mkdir(parents=True, exist_ok=True)
+        # Workspace DB exists but carries no tasks for this project.
+        bus.clear_listeners()
+        ws_work = SQLiteWorkService(db_path=workspace_db, project_path=tmp_path)
+        ws_work.close()
+
+        store = StateStore(tmp_path / "workspace_state.db")
+        session_svc = FakeSessionService(handles=[])
+
+        _install_fake_loader(monkeypatch, self._factory_with_workspace_db(
+            store=store, session_svc=session_svc,
+            workspace_db=workspace_db, tmp_path=tmp_path,
+            project_key="fresh", project_path=proj_path,
+        ))
+
+        result = task_assignment_sweep_handler({})
+
+        plan_missing = [
+            a for a in store.open_alerts() if a.alert_type == "plan_missing"
+        ]
+        assert plan_missing == []
+        assert result.get("plan_missing_alerts", 0) == 0
+
+        store.close()
+
+    def test_compute_plan_missing_projects_helper_is_deterministic(
+        self, tmp_path,
+    ):
+        """Unit-level: the helper returns the same mapping for the same
+        inputs across repeated calls — no hidden mutation of inputs.
+        """
+        from pollypm.plan_presence import compute_plan_missing_projects
+
+        proj_path = tmp_path / "demo"
+        proj_path.mkdir()
+        workspace_db = tmp_path / ".pollypm" / "state.db"
+        workspace_db.parent.mkdir(parents=True, exist_ok=True)
+        bus.clear_listeners()
+        ws_work = SQLiteWorkService(db_path=workspace_db, project_path=tmp_path)
+        try:
+            task = ws_work.create(
+                title="x", description="x", type="task",
+                project="demo", flow_template="standard",
+                roles={"worker": "agent-1", "reviewer": "agent-2"},
+                priority="normal",
+            )
+            ws_work.queue(task.task_id, "pm")
+        finally:
+            ws_work.close()
+
+        def _opener(_project):
+            return SQLiteWorkService(
+                db_path=workspace_db, project_path=tmp_path,
+            )
+
+        projects = (FakeKnownProject(key="demo", path=proj_path),)
+        first = compute_plan_missing_projects(
+            projects, work_service_for_project=_opener,
+        )
+        second = compute_plan_missing_projects(
+            projects, work_service_for_project=_opener,
+        )
+        # Both calls report the project as plan-missing with a concrete
+        # task_id. Same inputs → same shape (the example task may be
+        # any queued non-bypass task; we only assert it's non-empty).
+        assert set(first.keys()) == {"demo"}
+        assert set(second.keys()) == {"demo"}
+        assert first["demo"] is not None
+        assert second["demo"] is not None

@@ -93,6 +93,7 @@ __all__ = [
     "RULE_DUPLICATE_ADVISOR_TASKS",
     "RULE_PLAN_REVIEW_MISSING",
     "RULE_LEGACY_DB_SHADOW",
+    "RULE_PLAN_MISSING_ALERT_CHURN",
     "ON_HOLD_HUMAN_NEEDED_TAG",
     "ON_HOLD_ARCHITECT_TAG",
     "scan_events",
@@ -165,6 +166,16 @@ RULE_PLAN_REVIEW_MISSING = "plan_review_missing"
 # ``state.db.legacy-1004`` only after every row was either copied or
 # matched).
 RULE_LEGACY_DB_SHADOW = "legacy_db_shadow"
+# #1524 — plan_missing alert churn. Part A's deterministic precompute
+# in the task-assignment sweep should keep ``plan_missing`` alerts
+# stable across consecutive ticks; if the same project still racks up
+# multiple emit-clear pairs in a short window, something has regressed
+# and the user is back to seeing the banner flash. The detector is the
+# canary — it does not repair (Part A is the repair) — so future-us
+# notices when the regression returns instead of the user noticing it
+# in the cockpit. Threshold defaults to >=3 clear events on the same
+# ``plan_gate-<project>`` scope inside ``plan_missing_churn_window_seconds``.
+RULE_PLAN_MISSING_ALERT_CHURN = "plan_missing_alert_churn"
 
 # Reason-string tags reviewers use to hint the watchdog routing. The
 # default (no tag) is architect-actionable. ``ON_HOLD_HUMAN_NEEDED_TAG``
@@ -260,6 +271,15 @@ class WatchdogConfig:
     # is wide enough to catch plans the user genuinely hasn't reviewed
     # yet without re-firing forever on long-since-abandoned drafts.
     plan_review_lookback_seconds: int = 14 * 24 * 60 * 60
+    # #1524 — plan_missing alert churn. Window + threshold for the
+    # canary detector that fires when the sweep handler is bouncing
+    # the same plan_missing alert open/closed across consecutive ticks
+    # (the regression Part A repairs). 10 min covers ~12 sweep ticks
+    # at the @every 50s cadence; 3 clears in that window is well above
+    # the steady-state of zero (Part A means the alert refreshes in
+    # place, never closes-and-reopens).
+    plan_missing_churn_window_seconds: int = 600
+    plan_missing_churn_threshold: int = 3
 
 
 @dataclass(slots=True, frozen=True)
@@ -1616,6 +1636,122 @@ def _detect_legacy_db_shadow(
 
 
 # ---------------------------------------------------------------------------
+# Plan_missing alert churn detector (#1524)
+# ---------------------------------------------------------------------------
+
+
+# Project-key extractor for synthetic ``plan_gate-<project>`` scopes.
+# Pinned to a regex so a future scope-rename catches itself in tests.
+_PLAN_GATE_SCOPE_RE = re.compile(r"^plan_gate-(?P<project>.+)$")
+
+
+def _detect_plan_missing_alert_churn(
+    *,
+    now: datetime,
+    config: WatchdogConfig,
+    plan_missing_clears: Sequence[Any] | None = None,
+) -> list[Finding]:
+    """Rule (#1524): a project's ``plan_missing`` alert is being cleared
+    + re-emitted repeatedly inside a short window — the banner-flash
+    regression that Part A of #1524 repairs.
+
+    Pre-#1524 the task-assignment sweep handler had a fragile coupling
+    between the auto-claim loop's side-effect-populated
+    ``plan_missing_projects`` set and the per-project DB clear path.
+    After the per-project legacy DB was drained (post-#1519), a
+    project's ``plan_missing`` alert was being cleared on ticks where
+    the auto-claim path didn't traverse it and re-emitted on the next
+    tick from the workspace-root pass — producing alternating
+    "Waiting on you" / "Queued" banner state and a fresh alert row
+    every other sweep tick. Part A (the deterministic precompute in
+    ``_task_assignment_sweep_body``) is the repair; this detector is
+    the canary that catches the regression returning.
+
+    Pure detector — no I/O. The cadence handler queries the
+    ``messages`` table for ``alert.cleared`` events with
+    ``sender='plan_missing'`` in the configured window and passes the
+    clear records in here (one entry per clear event, exposing
+    ``scope`` and ``cleared_at``). The detector groups by scope,
+    counts clears per project, and emits a finding for each scope at
+    or above ``plan_missing_churn_threshold``.
+
+    Each clear record must expose:
+
+    * ``scope`` — the alert ``scope`` (synthetic
+      ``plan_gate-<project>`` for plan_missing alerts).
+    * ``cleared_at`` — a tz-aware ``datetime`` (or ISO-8601 string)
+      for when the clear landed.
+
+    ``plan_missing_clears=None`` disables the rule (the right default
+    when the cadence caller can't query the messages table).
+    """
+    findings: list[Finding] = []
+    if not plan_missing_clears:
+        return findings
+    cutoff = now - timedelta(seconds=config.plan_missing_churn_window_seconds)
+
+    by_project: dict[str, list[datetime]] = {}
+    for record in plan_missing_clears:
+        scope_value = getattr(record, "scope", None)
+        if not scope_value:
+            continue
+        match = _PLAN_GATE_SCOPE_RE.match(str(scope_value))
+        if match is None:
+            # Non-plan-gate scope — wrong rule for this row.
+            continue
+        project_key = match.group("project")
+        if not project_key:
+            continue
+        cleared_at_raw = getattr(record, "cleared_at", None)
+        cleared_at = _coerce_datetime(cleared_at_raw)
+        if cleared_at is None:
+            continue
+        if cleared_at < cutoff:
+            continue
+        by_project.setdefault(project_key, []).append(cleared_at)
+
+    for project_key, clears in by_project.items():
+        if len(clears) < config.plan_missing_churn_threshold:
+            continue
+        clears.sort()
+        latest_iso = clears[-1].isoformat()
+        first_iso = clears[0].isoformat()
+        scope_str = f"plan_gate-{project_key}"
+        findings.append(Finding(
+            rule=RULE_PLAN_MISSING_ALERT_CHURN,
+            project=project_key,
+            subject=scope_str,
+            message=(
+                f"Project {project_key} had {len(clears)} ``plan_missing`` "
+                f"alert clear events between {first_iso} and {latest_iso} "
+                f"(window: "
+                f"{config.plan_missing_churn_window_seconds // 60} min). "
+                f"The sweep handler is bouncing the alert open/closed each "
+                f"tick — the #1524 banner-flash regression has returned."
+            ),
+            recommendation=(
+                f"Inspect the task-assignment sweep handler "
+                f"(``_task_assignment_sweep_body`` + "
+                f"``_precompute_plan_missing_projects``). The pre-compute "
+                f"step in Part A of #1524 should keep "
+                f"plan_gate-{project_key} stable across consecutive ticks; "
+                f"a regression in that path almost always traces to the "
+                f"per-project DB clear branch firing for a project the "
+                f"precompute should have flagged."
+            ),
+            metadata={
+                "project_key": project_key,
+                "clear_count": len(clears),
+                "window_seconds": config.plan_missing_churn_window_seconds,
+                "first_clear_at": first_iso,
+                "latest_clear_at": latest_iso,
+                "detected_via": "state",
+            },
+        ))
+    return findings
+
+
+# ---------------------------------------------------------------------------
 # Public API — scan_events / scan_project
 # ---------------------------------------------------------------------------
 
@@ -1631,6 +1767,7 @@ def scan_events(
     done_plan_tasks: Sequence[Any] | None = None,
     plan_review_present: Any = None,
     legacy_db_shadows: Sequence[Any] | None = None,
+    plan_missing_clears: Sequence[Any] | None = None,
 ) -> list[Finding]:
     """Run every detection rule against ``events`` and return findings.
 
@@ -1726,6 +1863,15 @@ def scan_events(
     findings.extend(_detect_legacy_db_shadow(
         legacy_db_shadows=legacy_db_shadows,
     ))
+    # #1524 — plan_missing alert churn. State-only detector; the cadence
+    # handler queries the messages table for ``alert.cleared`` events on
+    # ``plan_gate-<project>`` scopes and passes one record per clear in
+    # so this function stays pure.
+    findings.extend(_detect_plan_missing_alert_churn(
+        now=now,
+        config=config,
+        plan_missing_clears=plan_missing_clears,
+    ))
     return findings
 
 
@@ -1740,6 +1886,7 @@ def scan_project(
     done_plan_tasks: Sequence[Any] | None = None,
     plan_review_present: Any = None,
     legacy_db_shadows: Sequence[Any] | None = None,
+    plan_missing_clears: Sequence[Any] | None = None,
 ) -> list[Finding]:
     """Read audit events for ``project`` and scan them.
 
@@ -1752,9 +1899,10 @@ def scan_project(
     for the auto-unstick rules (#1414); ``done_plan_tasks`` +
     ``plan_review_present`` are pass-through for the plan_review_missing
     rule (#1511); ``legacy_db_shadows`` is pass-through for the
-    legacy_db_shadow rule (#1519). When omitted those rules become
-    no-ops, which is the right default for callers that only have
-    audit events on hand.
+    legacy_db_shadow rule (#1519); ``plan_missing_clears`` is
+    pass-through for the plan_missing_alert_churn rule (#1524). When
+    omitted those rules become no-ops, which is the right default for
+    callers that only have audit events on hand.
     """
     from pollypm.audit.log import read_events
 
@@ -1783,6 +1931,7 @@ def scan_project(
         done_plan_tasks=done_plan_tasks,
         plan_review_present=plan_review_present,
         legacy_db_shadows=legacy_db_shadows,
+        plan_missing_clears=plan_missing_clears,
     )
 
 

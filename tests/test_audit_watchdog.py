@@ -3060,3 +3060,173 @@ def test_legacy_db_shadow_gather_finds_shadowed_project(tmp_path: Path) -> None:
     assert s.legacy_row_count == 5
     assert s.canonical_db == canonical_db
     assert s.legacy_db == legacy_db
+
+
+# ---------------------------------------------------------------------------
+# Rule (#1524): plan_missing alert churn
+# ---------------------------------------------------------------------------
+
+
+class _PlanMissingClearStub:
+    """Stand-in for the cadence handler's ``_PlanMissingClear`` dataclass.
+
+    Mirrors the duck-typed contract the detector reads: ``scope`` (the
+    synthetic ``plan_gate-<project>`` alert scope) + ``cleared_at``
+    (tz-aware datetime).
+    """
+
+    def __init__(self, *, scope: str, cleared_at: datetime) -> None:
+        self.scope = scope
+        self.cleared_at = cleared_at
+
+
+def test_plan_missing_alert_churn_fires_when_threshold_exceeded(
+    now: datetime,
+) -> None:
+    """#1524 — N+1 clears in the window → finding fires for that project."""
+    from pollypm.audit.watchdog import RULE_PLAN_MISSING_ALERT_CHURN
+
+    config = WatchdogConfig()
+    # Threshold defaults to 3; seed 4 clears in the last 5 minutes for
+    # ``coffeeboardnm`` and 1 clear (not enough) for ``savethenovel``.
+    clears = [
+        _PlanMissingClearStub(
+            scope="plan_gate-coffeeboardnm",
+            cleared_at=now - timedelta(minutes=4),
+        ),
+        _PlanMissingClearStub(
+            scope="plan_gate-coffeeboardnm",
+            cleared_at=now - timedelta(minutes=3),
+        ),
+        _PlanMissingClearStub(
+            scope="plan_gate-coffeeboardnm",
+            cleared_at=now - timedelta(minutes=2),
+        ),
+        _PlanMissingClearStub(
+            scope="plan_gate-coffeeboardnm",
+            cleared_at=now - timedelta(minutes=1),
+        ),
+        _PlanMissingClearStub(
+            scope="plan_gate-savethenovel",
+            cleared_at=now - timedelta(minutes=1),
+        ),
+    ]
+    findings = scan_events(
+        [], now=now, config=config, plan_missing_clears=clears,
+    )
+    matched = [f for f in findings if f.rule == RULE_PLAN_MISSING_ALERT_CHURN]
+    assert len(matched) == 1
+    f = matched[0]
+    assert f.project == "coffeeboardnm"
+    assert f.subject == "plan_gate-coffeeboardnm"
+    assert f.metadata["clear_count"] == 4
+    assert f.metadata["project_key"] == "coffeeboardnm"
+    # Recommendation calls out the producer to inspect.
+    assert "_precompute_plan_missing_projects" in f.recommendation
+
+
+def test_plan_missing_alert_churn_silent_below_threshold(
+    now: datetime,
+) -> None:
+    """Two clears in the window — below the default threshold of 3 — no finding."""
+    from pollypm.audit.watchdog import RULE_PLAN_MISSING_ALERT_CHURN
+
+    config = WatchdogConfig()
+    clears = [
+        _PlanMissingClearStub(
+            scope="plan_gate-demo",
+            cleared_at=now - timedelta(minutes=2),
+        ),
+        _PlanMissingClearStub(
+            scope="plan_gate-demo",
+            cleared_at=now - timedelta(minutes=1),
+        ),
+    ]
+    findings = scan_events(
+        [], now=now, config=config, plan_missing_clears=clears,
+    )
+    assert not any(
+        f.rule == RULE_PLAN_MISSING_ALERT_CHURN for f in findings
+    )
+
+
+def test_plan_missing_alert_churn_drops_clears_outside_window(
+    now: datetime,
+) -> None:
+    """Clears older than the window don't count toward the threshold.
+
+    Three clears total but only one inside the 10-minute window — no finding.
+    """
+    from pollypm.audit.watchdog import RULE_PLAN_MISSING_ALERT_CHURN
+
+    config = WatchdogConfig()
+    clears = [
+        _PlanMissingClearStub(
+            scope="plan_gate-demo",
+            cleared_at=now - timedelta(minutes=30),  # outside
+        ),
+        _PlanMissingClearStub(
+            scope="plan_gate-demo",
+            cleared_at=now - timedelta(minutes=20),  # outside
+        ),
+        _PlanMissingClearStub(
+            scope="plan_gate-demo",
+            cleared_at=now - timedelta(minutes=2),  # inside
+        ),
+    ]
+    findings = scan_events(
+        [], now=now, config=config, plan_missing_clears=clears,
+    )
+    assert not any(
+        f.rule == RULE_PLAN_MISSING_ALERT_CHURN for f in findings
+    )
+
+
+def test_plan_missing_alert_churn_noop_when_input_none(
+    now: datetime,
+) -> None:
+    """``plan_missing_clears=None`` (the default) disables the rule."""
+    from pollypm.audit.watchdog import RULE_PLAN_MISSING_ALERT_CHURN
+
+    findings = scan_events([], now=now)
+    assert not any(
+        f.rule == RULE_PLAN_MISSING_ALERT_CHURN for f in findings
+    )
+
+
+def test_plan_missing_alert_churn_skips_non_plan_gate_scopes(
+    now: datetime,
+) -> None:
+    """Clear records whose scope isn't ``plan_gate-<project>`` are ignored.
+
+    A clear whose scope happens to be ``worker-foo`` (the no_session
+    family lives there) is unrelated to plan-missing churn even if it
+    somehow surfaced through the gather; the regex scope filter drops it.
+    """
+    from pollypm.audit.watchdog import RULE_PLAN_MISSING_ALERT_CHURN
+
+    config = WatchdogConfig()
+    clears = [
+        _PlanMissingClearStub(
+            scope="worker-demo",
+            cleared_at=now - timedelta(minutes=1),
+        ),
+        _PlanMissingClearStub(
+            scope="worker-demo",
+            cleared_at=now - timedelta(minutes=2),
+        ),
+        _PlanMissingClearStub(
+            scope="worker-demo",
+            cleared_at=now - timedelta(minutes=3),
+        ),
+        _PlanMissingClearStub(
+            scope="worker-demo",
+            cleared_at=now - timedelta(minutes=4),
+        ),
+    ]
+    findings = scan_events(
+        [], now=now, config=config, plan_missing_clears=clears,
+    )
+    assert not any(
+        f.rule == RULE_PLAN_MISSING_ALERT_CHURN for f in findings
+    )

@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any
 
 from pollypm.plan_presence import (
+    compute_plan_missing_projects,
     has_acceptable_plan,
     task_bypasses_plan_gate,
 )
@@ -1872,6 +1873,46 @@ def _wire_session_manager(svc: Any, project_root: Path, services: Any) -> None:
         )
 
 
+def _precompute_plan_missing_projects(services: Any) -> dict[str, str | None]:
+    """Return a mapping of plan-gated project keys → an example queued task_id.
+
+    #1524 — computed up front from the canonical workspace DB so the
+    sweep handler's emit/clear decisions are deterministic across the
+    workspace pass + per-project pass. Without this precompute the set
+    was populated as a side effect of the auto-claim loop, which only
+    runs for projects with ``auto_claim`` enabled and a queued
+    worker-role task — so other plan-gated projects appeared and
+    disappeared from the set tick-to-tick depending on which loop
+    happened to traverse them, producing the banner flash.
+
+    Falls back to an empty mapping on any error so a transient I/O
+    hiccup doesn't accidentally clear every plan_missing alert.
+    """
+    try:
+        global_enforce = bool(getattr(services, "enforce_plan", True))
+        if not global_enforce:
+            return {}
+        known = list(getattr(services, "known_projects", ()) or ())
+        if not known:
+            return {}
+        plan_dir = getattr(services, "plan_dir", "docs/plan") or "docs/plan"
+
+        def _opener(project: Any) -> Any | None:
+            return _open_workspace_project_work_service(project, services)
+
+        return compute_plan_missing_projects(
+            known,
+            work_service_for_project=_opener,
+            plan_dir=plan_dir,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "task_assignment sweep: plan-missing precompute failed",
+            exc_info=True,
+        )
+        return {}
+
+
 def _open_workspace_project_work_service(project: Any, services: Any) -> Any | None:
     """Open the workspace-root DB with a project-specific runtime context."""
     project_path = getattr(project, "path", None)
@@ -2008,8 +2049,24 @@ def _task_assignment_sweep_body(
 
     totals: dict[str, Any] = {"considered": 0, "by_outcome": {}}
     alerted_pairs: set[tuple[str, str]] = set()
-    plan_missing_projects: set[str] = set()
+    # #1524 — pre-compute the set of projects that are plan-gated this
+    # tick so the emit/clear decision is deterministic across the
+    # workspace pass + per-project pass. Pre-#1524 this set was derived
+    # as a side effect of the auto-claim loop, so a project would only
+    # land in it on ticks that happened to traverse the right path.
+    # After the per-project legacy DB was drained (post-#1519) the
+    # per-project fallback then cleared the alert on every other tick,
+    # producing the "Waiting on you / Queued" banner flash described in
+    # the issue. Computing once up front means the clear paths skip
+    # plan-gated projects every tick, regardless of which loop runs.
+    precomputed_missing = _precompute_plan_missing_projects(services)
+    plan_missing_projects: set[str] = set(precomputed_missing.keys())
     plan_decisions: dict[str, bool] = {}
+    # Seed the per-tick gate cache with the precomputed answers so the
+    # workspace + per-project sweeps reuse the deterministic decision
+    # instead of recomputing (and potentially diverging) per task.
+    for missing_project in plan_missing_projects:
+        plan_decisions[missing_project] = False
     # #1053: ``(project, task_number)`` pairs for tasks observed in
     # ``review`` state during this sweep cycle. After the sweep, any
     # open ``review_pending`` alert whose key isn't in this set is
@@ -2017,6 +2074,21 @@ def _task_assignment_sweep_body(
     review_pending_tasks: set[tuple[str, int]] = set()
     projects_scanned = 0
     projects_skipped = 0
+
+    # #1524 — refresh the ``plan_missing`` alert row up front for every
+    # project in the precomputed set. This guarantees the alert stays
+    # open across consecutive ticks even when no queued task is reached
+    # in the per-project sweep body (e.g. legacy per-project DB has
+    # been drained but the canonical DB still has blocked work). The
+    # downstream per-task emit paths still fire to refresh the row when
+    # they encounter the first blocked task; the up-front refresh just
+    # ensures the row exists before any clear path could run.
+    for missing_project, example_task_id in precomputed_missing.items():
+        _emit_plan_missing_alert(
+            services,
+            project=missing_project,
+            example_task_id=example_task_id or missing_project,
+        )
 
     # #1001: clear stale ``no_session*`` alerts whose project key isn't
     # in the live registry. Run before the per-project sweeps so any

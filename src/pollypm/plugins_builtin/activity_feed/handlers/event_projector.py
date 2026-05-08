@@ -40,11 +40,12 @@ from __future__ import annotations
 import json
 import logging
 import re
-import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
+
+from pollypm.storage.work_transition_queries import activity_feed_transition_rows
 
 # Best-effort project inference for events whose alert/notify payload
 # omits an explicit ``project`` key but whose body names a task by
@@ -431,38 +432,11 @@ class EventProjector:
         since_ts: str | None,
         limit: int,
     ) -> list[FeedEntry]:
-        if not work_db.exists():
-            return []
-        conn = sqlite3.connect(
-            f"file:{work_db}?mode=ro", uri=True, check_same_thread=False,
+        rows = activity_feed_transition_rows(
+            work_db,
+            since_ts=since_ts,
+            limit=limit,
         )
-        try:
-            conn.row_factory = sqlite3.Row
-            has_work_transitions = conn.execute(
-                "SELECT 1 FROM sqlite_master "
-                "WHERE type = 'table' AND name = 'work_transitions'"
-            ).fetchone()
-            if has_work_transitions is None:
-                return []
-            params: list[Any] = []
-            where = ""
-            if since_ts is not None:
-                where = "WHERE created_at >= ?"
-                params.append(since_ts)
-            rows = conn.execute(
-                f"SELECT id, task_project, task_number, from_state, to_state, "
-                f"actor, reason, created_at FROM work_transitions {where} "
-                f"ORDER BY id DESC LIMIT ?",
-                (*params, int(limit)),
-            ).fetchall()
-        except sqlite3.DatabaseError:
-            logger.exception(
-                "activity_feed: work-db projection failed for %s (%s)",
-                project_key, work_db,
-            )
-            rows = []
-        finally:
-            conn.close()
 
         entries: list[FeedEntry] = []
         for row in rows:

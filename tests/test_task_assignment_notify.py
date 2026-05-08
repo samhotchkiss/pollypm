@@ -123,6 +123,16 @@ class TestRoleCandidates:
             "reviewer_bikepath", "reviewer-bikepath", "reviewer", "pm-reviewer",
         ]
 
+    def test_reviewer_with_task_number_still_uses_reviewer_lane(self):
+        # #1439 — a still-open per-task worker pane must not steal
+        # review-node handoff pings from the long-lived reviewer lane.
+        assert role_candidate_names("reviewer", "savethenovel", task_number=12) == [
+            "reviewer_savethenovel",
+            "reviewer-savethenovel",
+            "reviewer",
+            "pm-reviewer",
+        ]
+
     def test_reviewer_without_project_pins_to_singleton(self):
         # Empty project key → singleton-only (legacy behaviour).
         assert role_candidate_names("reviewer", "") == ["reviewer", "pm-reviewer"]
@@ -185,6 +195,21 @@ class TestSessionRoleIndexResolve:
         assert handle is not None
         assert handle.name == "pm-reviewer"
 
+    def test_reviewer_ignores_matching_task_window(self):
+        svc = FakeSessionService(handles=[
+            FakeHandle("task-savethenovel-12"),
+            FakeHandle("reviewer_savethenovel"),
+        ])
+        index = SessionRoleIndex(svc)
+        handle = index.resolve(
+            ActorType.ROLE,
+            "reviewer",
+            "savethenovel",
+            task_number=12,
+        )
+        assert handle is not None
+        assert handle.name == "reviewer_savethenovel"
+
     def test_agent_exact_name(self):
         svc = FakeSessionService(handles=[
             FakeHandle("polly"), FakeHandle("pm-reviewer"),
@@ -224,6 +249,35 @@ class TestSessionRoleIndexResolve:
         handle = index.resolve(ActorType.ROLE, "worker", "demo")
         assert handle is not None
         assert handle.name == "worker_demo"
+
+
+class TestReviewerNotifyRouting:
+    def test_review_ping_targets_reviewer_not_task_worker(self, state_store):
+        svc = FakeSessionService(handles=[
+            FakeHandle("task-savethenovel-12"),
+            FakeHandle("reviewer_savethenovel"),
+        ])
+        services = _RuntimeServices(
+            session_service=svc,
+            state_store=state_store,
+            work_service=None,
+            project_root=Path("."),
+        )
+        event = _event(
+            task_id="savethenovel/12",
+            project="savethenovel",
+            actor_name="reviewer",
+            current_node="code_review",
+            current_node_kind="review",
+            work_status="review",
+        )
+
+        outcome = notify(event, services=services)
+
+        assert outcome["outcome"] == "sent"
+        assert outcome["session"] == "reviewer_savethenovel"
+        assert svc.sent[0][0] == "reviewer_savethenovel"
+        assert "Review needed" in svc.sent[0][1]
 
 
 def test_load_runtime_services_uses_workspace_root_work_db(tmp_path, monkeypatch) -> None:
@@ -1910,6 +1964,167 @@ class TestPerTaskWorkerFulfillsNonWorkerRoles:
         assert "pm worker-start --role critic_simplicity" not in message
         # And it should reference the per-task worker explanation.
         assert "task-polly_remote-24" in message or "#1057" in message
+
+
+class TestSingletonRolesNeverRouteToPerTaskPane:
+    """Regression — per-task panes (``task-<project>-<N>``) must never
+    fulfill singleton-named control roles (reviewer / operator / triage /
+    heartbeat). The per-task pane is the AUTHOR of the work; routing a
+    reviewer-kickoff prompt to it would land the prompt on the worker
+    that just produced the diff.
+
+    Live symptom that motivated this guard: savethenovel/15's per-task
+    worker pane received 5 misrouted reviewer-kickoff prompts (the
+    reviewer-singleton resolution short-circuited on the live per-task
+    pane via ``role_candidate_names``'s singleton-branch prepend) and
+    eventually auth-wedged on "Not logged in · /login" from the
+    repeated noise.
+    """
+
+    def test_reviewer_kickoff_does_not_route_to_per_task_worker(self):
+        # Reviewer kickoff for savethenovel/15 must route to the
+        # dedicated reviewer session, never to the per-task worker pane
+        # that owns the task. The per-task worker is the author of the
+        # work and cannot review it.
+        svc = FakeSessionService(handles=[
+            FakeHandle("task-savethenovel-15"),
+            FakeHandle("reviewer_savethenovel"),
+        ])
+        index = SessionRoleIndex(svc)
+        handle = index.resolve(
+            ActorType.ROLE, "reviewer", "savethenovel", task_number=15,
+        )
+        assert handle is not None
+        assert handle.name == "reviewer_savethenovel"
+
+    def test_reviewer_kickoff_falls_back_to_singleton_when_no_per_project(self):
+        # No per-project ``reviewer_<project>`` session live — fall
+        # through to the legacy singleton, NOT to the per-task pane.
+        svc = FakeSessionService(handles=[
+            FakeHandle("task-savethenovel-15"),
+            FakeHandle("pm-reviewer"),
+        ])
+        index = SessionRoleIndex(svc)
+        handle = index.resolve(
+            ActorType.ROLE, "reviewer", "savethenovel", task_number=15,
+        )
+        assert handle is not None
+        assert handle.name == "pm-reviewer"
+
+    def test_reviewer_kickoff_returns_none_when_only_per_task_pane_alive(self):
+        # No reviewer session of any kind, even with a live per-task
+        # pane — resolver returns None so the alert path fires correctly
+        # rather than misrouting to the worker that authored the diff.
+        svc = FakeSessionService(handles=[
+            FakeHandle("task-savethenovel-15"),
+        ])
+        index = SessionRoleIndex(svc)
+        handle = index.resolve(
+            ActorType.ROLE, "reviewer", "savethenovel", task_number=15,
+        )
+        assert handle is None
+
+    def test_operator_kickoff_does_not_route_to_per_task_worker(self):
+        svc = FakeSessionService(handles=[
+            FakeHandle("task-savethenovel-15"),
+            FakeHandle("pm-operator"),
+        ])
+        index = SessionRoleIndex(svc)
+        handle = index.resolve(
+            ActorType.ROLE, "operator", "savethenovel", task_number=15,
+        )
+        assert handle is not None
+        assert handle.name == "pm-operator"
+
+    def test_triage_kickoff_does_not_route_to_per_task_worker(self):
+        svc = FakeSessionService(handles=[
+            FakeHandle("task-savethenovel-15"),
+            FakeHandle("pm-triage"),
+        ])
+        index = SessionRoleIndex(svc)
+        handle = index.resolve(
+            ActorType.ROLE, "triage", "savethenovel", task_number=15,
+        )
+        assert handle is not None
+        assert handle.name == "pm-triage"
+
+    def test_heartbeat_kickoff_does_not_route_to_per_task_worker(self):
+        svc = FakeSessionService(handles=[
+            FakeHandle("task-savethenovel-15"),
+            FakeHandle("pm-heartbeat"),
+        ])
+        index = SessionRoleIndex(svc)
+        handle = index.resolve(
+            ActorType.ROLE, "heartbeat", "savethenovel", task_number=15,
+        )
+        assert handle is not None
+        assert handle.name == "pm-heartbeat"
+
+    def test_role_candidates_for_reviewer_omits_per_task_pane(self):
+        # Pure candidate-list shape check — per-task pane must not be
+        # in the singleton-role candidate list at all, regardless of
+        # what's live in tmux.
+        names = role_candidate_names(
+            "reviewer", "savethenovel", task_number=15,
+        )
+        assert "task-savethenovel-15" not in names
+        # And the legitimate routing targets are still present.
+        assert names == [
+            "reviewer_savethenovel", "reviewer-savethenovel",
+            "reviewer", "pm-reviewer",
+        ]
+
+    def test_role_candidates_for_operator_omits_per_task_pane(self):
+        names = role_candidate_names("operator", "x", task_number=15)
+        assert "task-x-15" not in names
+        assert names == ["operator_x", "operator-x", "operator", "pm-operator"]
+
+    def test_role_candidates_for_triage_omits_per_task_pane(self):
+        names = role_candidate_names("triage", "x", task_number=15)
+        assert "task-x-15" not in names
+
+    def test_role_candidates_for_heartbeat_omits_per_task_pane(self):
+        names = role_candidate_names("heartbeat", "x", task_number=15)
+        assert "task-x-15" not in names
+
+    # --- pin the original #1057 behaviour so a future "clean up"
+    # doesn't undo the per-task-pane fulfillment for worker / critic_*.
+
+    def test_worker_role_still_resolves_to_per_task_pane(self):
+        # #1057 (still load-bearing): a per-task pane fulfills the
+        # ``worker`` role for that task. Don't regress.
+        svc = FakeSessionService(handles=[
+            FakeHandle("task-savethenovel-15"),
+        ])
+        index = SessionRoleIndex(svc)
+        handle = index.resolve(
+            ActorType.ROLE, "worker", "savethenovel", task_number=15,
+        )
+        assert handle is not None
+        assert handle.name == "task-savethenovel-15"
+
+    def test_critic_role_still_resolves_to_per_task_pane(self):
+        # #1057 (still load-bearing): a per-task pane fulfills
+        # ``critic_*`` roles for that task. Don't regress.
+        svc = FakeSessionService(handles=[
+            FakeHandle("task-savethenovel-15"),
+        ])
+        index = SessionRoleIndex(svc)
+        handle = index.resolve(
+            ActorType.ROLE, "critic_simplicity", "savethenovel", task_number=15,
+        )
+        assert handle is not None
+        assert handle.name == "task-savethenovel-15"
+
+    def test_role_candidates_for_worker_still_includes_per_task_pane(self):
+        names = role_candidate_names("worker", "savethenovel", task_number=15)
+        assert names[0] == "task-savethenovel-15"
+
+    def test_role_candidates_for_critic_still_includes_per_task_pane(self):
+        names = role_candidate_names(
+            "critic_simplicity", "savethenovel", task_number=15,
+        )
+        assert names[0] == "task-savethenovel-15"
 
 
 class TestNotifyRoutesToPerTaskSession:

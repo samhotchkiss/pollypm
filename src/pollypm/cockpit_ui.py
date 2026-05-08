@@ -66,6 +66,7 @@ from pollypm.cockpit_activity import (  # noqa: F401  (re-exported)
     _activity_type_colour,
 )
 from pollypm.cockpit_alerts import _action_view_alerts
+from pollypm.cockpit_apps.pane import PollyCockpitPaneApp  # noqa: F401
 from pollypm.cockpit_inbox import (
     InboxThreadRow,
     build_inbox_thread_rows,
@@ -106,7 +107,7 @@ from pollypm.cockpit_palette import (  # noqa: F401  (re-exported)
 from pollypm.cockpit_project_settings import PollyProjectSettingsApp  # noqa: F401
 from pollypm.cockpit_sections.action_bar import render_project_action_bar
 from pollypm.cockpit_settings_accounts import SETTINGS_ACCOUNT_ACTIONS
-from pollypm.plugins_builtin.project_planning.plan_presence import (
+from pollypm.plan_presence import (
     CANONICAL_PLAN_RELATIVE_PATHS as _PLAN_FILE_CANDIDATES,
 )
 from pollypm.cockpit_settings_history import (
@@ -123,7 +124,7 @@ from pollypm.cockpit_settings_history import (
 )
 from pollypm.cockpit_settings_projects import collect_settings_projects
 from pollypm.cockpit_workers import PollyWorkerRosterApp  # noqa: F401
-from pollypm.notify_task import is_notify_inbox_task
+from pollypm.notify_task import is_notify_inbox_task, strip_routing_tag_prefix
 from pollypm.rejection_feedback import (
     feedback_target_task_id,
     is_rejection_feedback_task,
@@ -136,7 +137,6 @@ from pollypm.rejection_feedback import (
 # parameter annotations below (``service: PollyPMService | None``).
 if TYPE_CHECKING:
     from pollypm.service_api import PollyPMService  # noqa: F401
-from pollypm.cockpit import build_cockpit_detail
 from pollypm.cockpit_navigation import (
     InMemoryNavigationStateStore,
     NavigationCommand,
@@ -3711,57 +3711,6 @@ class PollyDashboardApp(App[None]):
         ).jump_to_inbox()
 
 
-class PollyCockpitPaneApp(App[None]):
-    TITLE = "PollyPM"
-    SUB_TITLE = "Pane"
-    CSS = """
-    Screen {
-        background: #10161b;
-        color: #eef2f4;
-        padding: 1;
-    }
-    #body {
-        border: round #253140;
-        background: #111820;
-        padding: 1 2;
-    }
-    """
-
-    def __init__(self, config_path: Path, kind: str, target: str | None = None) -> None:
-        super().__init__()
-        self.config_path = config_path
-        self.kind = kind
-        self.target = target
-        self.body = Static("", id="body")
-
-    def compose(self) -> ComposeResult:
-        yield self.body
-
-    def on_mount(self) -> None:
-        self._refresh()
-        self.set_interval(5, self._refresh)
-        # #1109 follow-up — TTY-less keystroke bridge.
-        try:
-            from pollypm.cockpit_input_bridge import start_input_bridge
-            bridge_kind = f"pane-{self.kind}"
-            self._input_bridge_handle = start_input_bridge(
-                self, kind=bridge_kind, config_path=self.config_path,
-            )
-        except Exception:  # noqa: BLE001
-            self._input_bridge_handle = None
-
-    def on_unmount(self) -> None:
-        bridge = getattr(self, "_input_bridge_handle", None)
-        if bridge is not None:
-            try:
-                bridge.stop()
-            except Exception:  # noqa: BLE001
-                pass
-
-    def _refresh(self) -> None:
-        self.body.update(build_cockpit_detail(self.config_path, self.kind, self.target))
-
-
 # Re-export the extracted task screen so existing import paths keep working.
 from pollypm.cockpit_tasks import PollyTasksApp as PollyTasksApp  # noqa: E402,F401
 
@@ -4097,6 +4046,29 @@ def _collect_recent_tasks_by_account(
     return recent
 
 
+def _settings_session_refs_by_account(config) -> dict[str, list[dict[str, object]]]:
+    """Return configured session references grouped by pinned account."""
+    refs: dict[str, list[dict[str, object]]] = {}
+    sessions = getattr(config, "sessions", {}) or {}
+    for session_name, session in sorted(sessions.items()):
+        account_key = str(getattr(session, "account", "") or "")
+        if not account_key:
+            continue
+        provider = getattr(session, "provider", "")
+        provider_value = getattr(provider, "value", str(provider or ""))
+        refs.setdefault(account_key, []).append(
+            {
+                "name": str(getattr(session, "name", session_name) or session_name),
+                "role": str(getattr(session, "role", "") or ""),
+                "project": str(getattr(session, "project", "") or ""),
+                "provider": provider_value,
+                "enabled": bool(getattr(session, "enabled", True)),
+                "window_name": str(getattr(session, "window_name", "") or ""),
+            }
+        )
+    return refs
+
+
 def _gather_settings_data(
     config_path: Path,
     *,
@@ -4136,6 +4108,10 @@ def _gather_settings_data(
     fo_list = (
         list(getattr(pp, "failover_accounts", []) or [])
         if pp is not None else []
+    )
+    session_refs_by_account = (
+        _settings_session_refs_by_account(config)
+        if config is not None else {}
     )
     try:
         cached_usages = load_cached_account_usage(config_path) if config is not None else {}
@@ -4192,6 +4168,7 @@ def _gather_settings_data(
                     "Provider budgets come from the cached account_usage sampler so the UI stays offline-safe."
                 ),
                 "budget_rationale": budget_rationale,
+                "session_refs": session_refs_by_account.get(status.key, []),
                 "status_obj": status,
                 "index": idx,
             }
@@ -4584,6 +4561,7 @@ class PollySettingsPaneApp(App[None]):
         Binding("x", "remove_account", "Remove account", show=False),
         Binding("t", "toggle_project_tracked", "Toggle project", show=False),
         Binding("m", "make_controller", "Controller", show=False),
+        Binding("s", "reassign_account_sessions", "Reassign sessions", show=False),
         Binding("v", "toggle_failover", "Failover", show=False),
         Binding("a", "view_alerts", "Alerts", show=False),
         Binding("u", "undo_recent_change", "Undo", show=False),
@@ -4600,7 +4578,7 @@ class PollySettingsPaneApp(App[None]):
     _DEFAULT_HINT = (
         "j/k move \u00b7 Tab section \u00b7 / search \u00b7 r refresh \u00b7 "
         "b permissions \u00b7 c/o add account \u00b7 x remove \u00b7 "
-        "t project \u00b7 m controller \u00b7 v failover \u00b7 u undo \u00b7 q close"
+        "t project \u00b7 m controller \u00b7 s sessions \u00b7 v failover \u00b7 u undo \u00b7 q close"
     )
 
     def __init__(self, config_path: Path) -> None:
@@ -4710,7 +4688,7 @@ class PollySettingsPaneApp(App[None]):
                                 variant=spec.variant,
                             )
                         yield Static(
-                            "c/o add \u00b7 x remove \u00b7 u undo",
+                            "m controller \u00b7 s sessions \u00b7 x remove \u00b7 u undo",
                             id="settings-account-actions-note",
                         )
                     with Horizontal(id="settings-role-editor"):
@@ -5124,8 +5102,9 @@ class PollySettingsPaneApp(App[None]):
             f"Budget indicator: [b]{_escape(selected.get('budget_summary') or '-')}[/b] "
             f"([dim]{selected.get('budget_level', 'unknown')}[/dim])",
             f"Rationale: {_escape(selected.get('rationale') or 'No rationale available.')}",
+            f"Pinned sessions: [b]{len(selected.get('session_refs') or [])}[/b]",
             "[dim]Actions:[/] c add Claude · o add Codex · x remove selected",
-            "[dim]Keyboard:[/] b permissions · m controller · v failover · u undo",
+            "[dim]Keyboard:[/] b permissions · m controller · s reassign sessions · v failover · u undo",
         ]
         undo_action = self._current_undo_action()
         if undo_action is not None:
@@ -5366,7 +5345,7 @@ class PollySettingsPaneApp(App[None]):
             [
                 sep,
                 f"[dim]Rationale:[/dim]  {_escape(selected.get('rationale') or 'No rationale available.')}",
-                "[dim]Actions:[/dim]    c add Claude · o add Codex · x remove selected · u undo",
+                "[dim]Actions:[/dim]    m make controller · s reassign sessions · x remove selected · u undo",
             ]
         )
         if selected["usage_raw_text"]:
@@ -5377,6 +5356,30 @@ class PollySettingsPaneApp(App[None]):
                 lines.extend(f"  {_escape(line)}" for line in snippet)
         recent = selected.get("recent_tasks") or []
         lines.append(sep)
+        session_refs = selected.get("session_refs") or []
+        if session_refs:
+            lines.append("[dim]Pinned sessions:[/dim]")
+            for ref in session_refs[:8]:
+                enabled = "" if ref.get("enabled", True) else " disabled"
+                window = str(ref.get("window_name") or "")
+                window_text = f" window={window}" if window else ""
+                lines.append(
+                    "  "
+                    f"{_escape(str(ref.get('name') or ''))}"
+                    f"  [dim]{_escape(str(ref.get('role') or '-'))}"
+                    f" / {_escape(str(ref.get('project') or '-'))}"
+                    f" / {_escape(str(ref.get('provider') or '-'))}"
+                    f"{_escape(enabled)}{_escape(window_text)}[/dim]"
+                )
+            if len(session_refs) > 8:
+                lines.append(f"  [dim]+{len(session_refs) - 8} more[/dim]")
+            lines.append(
+                "[dim]Use s to move these sessions to another account; restarts are handled by PollyPM.[/dim]"
+            )
+            lines.append(sep)
+        else:
+            lines.append("[dim]Pinned sessions: none.[/dim]")
+            lines.append(sep)
         if recent:
             lines.append("[dim]Recent tasks:[/dim]")
             for task in recent[:3]:
@@ -5980,6 +5983,29 @@ class PollySettingsPaneApp(App[None]):
                 pass
             return
         self._refresh()
+        try:
+            self.notify(f"{key} is now the controller account.", timeout=1.5)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def action_reassign_account_sessions(self) -> None:
+        if self._active_section != "accounts":
+            return
+        key = self._current_accounts_key()
+        if not key:
+            try:
+                self.notify("No account selected.", severity="warning")
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        self._prompt_reassign_account_references(
+            key,
+            title="Reassign account references",
+            prompt=(
+                f"Move sessions pinned to {key} to another account. "
+                "Affected sessions will restart."
+            ),
+        )
 
     def action_toggle_failover(self) -> None:
         if self._active_section != "accounts":
@@ -6062,6 +6088,26 @@ class PollySettingsPaneApp(App[None]):
             except Exception:  # noqa: BLE001
                 pass
             return
+        is_controller, session_refs = self._account_references_for_removal(key)
+        if is_controller or session_refs:
+            reasons: list[str] = []
+            if is_controller:
+                reasons.append("it is the controller account")
+            if session_refs:
+                session_word = "session" if len(session_refs) == 1 else "sessions"
+                names = ", ".join(str(ref.get("name") or "") for ref in session_refs[:6])
+                if len(session_refs) > 6:
+                    names = f"{names}, +{len(session_refs) - 6} more"
+                reasons.append(f"{len(session_refs)} pinned {session_word}: {names}")
+            self._prompt_reassign_account_references(
+                key,
+                title="Reassign before removing",
+                prompt=(
+                    f"Cannot remove {key} yet because {' and '.join(reasons)}. "
+                    "Pick a target account to move those references first, then press x again to remove."
+                ),
+            )
+            return
         self.push_screen(
             _SettingsConfirmModal(
                 title="Remove account",
@@ -6135,6 +6181,175 @@ class PollySettingsPaneApp(App[None]):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _account_references_for_removal(
+        self, key: str,
+    ) -> tuple[bool, list[dict[str, object]]]:
+        try:
+            config = load_config(self.config_path)
+            is_controller = (
+                str(getattr(config.pollypm, "controller_account", "") or "") == key
+            )
+            session_refs = _settings_session_refs_by_account(config).get(key, [])
+            return is_controller, session_refs
+        except Exception:  # noqa: BLE001
+            rows = self._visible_account_rows
+            selected = next((row for row in rows if row.get("key") == key), None)
+            if selected is None:
+                return False, []
+            return bool(selected.get("is_controller")), list(
+                selected.get("session_refs") or [],
+            )
+
+    def _target_account_options(
+        self, source_key: str,
+    ) -> list[tuple[str, str]]:
+        data = self.data
+        rows = list(data.accounts if data is not None else self._visible_account_rows)
+        options: list[tuple[str, str]] = []
+        for account in rows:
+            key = str(account.get("key") or "")
+            if not key or key == source_key:
+                continue
+            provider = str(account.get("provider") or "-")
+            email = str(account.get("email") or "-")
+            options.append((f"{key} ({provider}, {email})", key))
+        return options
+
+    def _prompt_reassign_account_references(
+        self,
+        key: str,
+        *,
+        title: str,
+        prompt: str,
+    ) -> None:
+        is_controller, session_refs = self._account_references_for_removal(key)
+        if not is_controller and not session_refs:
+            try:
+                self.notify(
+                    f"No sessions or controller reference {key}.",
+                    timeout=1.5,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        target_options = self._target_account_options(key)
+        if not target_options:
+            try:
+                self.notify(
+                    "Add another account before reassigning sessions.",
+                    severity="warning",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        self.push_screen(
+            _SettingsAccountReassignModal(
+                source_key=key,
+                session_refs=session_refs,
+                target_options=target_options,
+                include_controller=is_controller,
+                title=title,
+                prompt=prompt,
+            ),
+            lambda target_key: self._confirm_reassign_account_references(
+                key,
+                target_key,
+            ),
+        )
+
+    def _confirm_reassign_account_references(
+        self,
+        source_key: str,
+        target_key: str | None,
+    ) -> None:
+        if not target_key:
+            return
+        setter = getattr(self.service, "set_controller_account", None)
+        switcher = getattr(self.service, "switch_session_account", None)
+        is_controller, session_refs = self._account_references_for_removal(source_key)
+        session_names = [
+            str(ref.get("name") or "")
+            for ref in session_refs
+            if str(ref.get("name") or "")
+        ]
+        if is_controller and setter is None:
+            return
+        if session_names and switcher is None:
+            return
+        try:
+            if is_controller:
+                setter(target_key)
+                record_settings_history(
+                    "account.controller",
+                    f"controller {target_key}",
+                    {
+                        "account": target_key,
+                        "previous_account": source_key,
+                    },
+                )
+            for session_name in session_names:
+                switcher(session_name, target_key)
+                record_settings_history(
+                    "session.switch",
+                    f"switch {session_name} to {target_key}",
+                    {
+                        "session_name": session_name,
+                        "from_account": source_key,
+                        "to_account": target_key,
+                    },
+                )
+            self._persist_session_account_targets(
+                {session_name: target_key for session_name in session_names},
+            )
+            self._selected_account_key = source_key
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.notify(
+                    f"Reassign failed: {exc}", severity="error",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        self._refresh()
+        parts: list[str] = []
+        if is_controller:
+            parts.append("controller")
+        if session_names:
+            session_word = "session" if len(session_names) == 1 else "sessions"
+            parts.append(f"{len(session_names)} {session_word}")
+        try:
+            self.notify(
+                f"Moved {' and '.join(parts)} from {source_key} to {target_key}.",
+                timeout=2.0,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _persist_session_account_targets(
+        self,
+        assignments: dict[str, str],
+    ) -> None:
+        if not assignments:
+            return
+        config = load_config(self.config_path)
+        sessions = getattr(config, "sessions", {}) or {}
+        accounts = getattr(config, "accounts", {}) or {}
+        changed = False
+        for session_name, target_key in assignments.items():
+            session = sessions.get(session_name)
+            account = accounts.get(target_key)
+            if session is None or account is None:
+                continue
+            if getattr(session, "account", None) != target_key:
+                session.account = target_key
+                changed = True
+            provider = getattr(account, "provider", None)
+            if provider is not None and getattr(session, "provider", None) != provider:
+                session.provider = provider
+                changed = True
+        if changed:
+            write_config(config, self.config_path, force=True)
 
     def _active_table(self) -> DataTable | None:
         if self._active_section == "accounts":
@@ -6210,6 +6425,14 @@ class PollySettingsPaneApp(App[None]):
     @on(Button.Pressed, "#settings-account-refresh-usage")
     def on_refresh_account_usage_pressed(self, _event: Button.Pressed) -> None:
         self.action_refresh_selected_account_usage()
+
+    @on(Button.Pressed, "#settings-account-make-controller")
+    def on_make_controller_pressed(self, _event: Button.Pressed) -> None:
+        self.action_make_controller()
+
+    @on(Button.Pressed, "#settings-account-reassign-sessions")
+    def on_reassign_sessions_pressed(self, _event: Button.Pressed) -> None:
+        self.action_reassign_account_sessions()
 
     @on(Button.Pressed, "#settings-account-remove")
     def on_remove_account_pressed(self, _event: Button.Pressed) -> None:
@@ -6313,6 +6536,116 @@ class PollySettingsPaneApp(App[None]):
             self.notify(f"Removed account {key}.", timeout=1.5)
         except Exception:  # noqa: BLE001
             pass
+
+
+class _SettingsAccountReassignModal(ModalScreen[str | None]):
+    CSS = """
+    Screen {
+        align: center middle;
+    }
+    #settings-account-reassign {
+        width: 86;
+        max-height: 34;
+        padding: 1 2;
+        background: $panel;
+        border: heavy $primary;
+    }
+    #settings-account-reassign-title {
+        padding-bottom: 1;
+        text-style: bold;
+    }
+    #settings-account-reassign-list {
+        max-height: 12;
+        padding-top: 1;
+        padding-bottom: 1;
+    }
+    #settings-account-reassign-target {
+        width: 1fr;
+    }
+    #settings-account-reassign-buttons {
+        height: auto;
+        align-horizontal: right;
+        padding-top: 1;
+    }
+    #settings-account-reassign-buttons Button {
+        margin-left: 1;
+    }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(
+        self,
+        *,
+        source_key: str,
+        session_refs: list[dict[str, object]],
+        target_options: list[tuple[str, str]],
+        include_controller: bool,
+        title: str,
+        prompt: str,
+    ) -> None:
+        super().__init__()
+        self._source_key = source_key
+        self._session_refs = list(session_refs)
+        self._target_options = list(target_options)
+        self._include_controller = include_controller
+        self._title = title
+        self._prompt = prompt
+
+    def compose(self) -> ComposeResult:
+        default_value = (
+            self._target_options[0][1]
+            if self._target_options else Select.NULL
+        )
+        with Vertical(id="settings-account-reassign"):
+            yield Static(self._title, id="settings-account-reassign-title")
+            yield Static(self._prompt)
+            with VerticalScroll(id="settings-account-reassign-list"):
+                if self._include_controller:
+                    yield Static(
+                        f"Controller account: {self._source_key}",
+                    )
+                if self._session_refs:
+                    yield Static("Pinned sessions:")
+                    for ref in self._session_refs:
+                        role = str(ref.get("role") or "-")
+                        project = str(ref.get("project") or "-")
+                        provider = str(ref.get("provider") or "-")
+                        yield Static(
+                            f"  {ref.get('name') or ''}  {role} / {project} / {provider}",
+                        )
+                else:
+                    yield Static("Pinned sessions: none.")
+            yield Static("Target account")
+            yield Select(
+                self._target_options,
+                allow_blank=False,
+                value=default_value,
+                id="settings-account-reassign-target",
+            )
+            with Horizontal(id="settings-account-reassign-buttons"):
+                yield Button("Cancel", id="cancel")
+                yield Button("Reassign", variant="primary", id="confirm")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id != "confirm":
+            self.dismiss(None)
+            return
+        try:
+            select = self.query_one(
+                "#settings-account-reassign-target",
+                Select,
+            )
+            value = select.value
+        except Exception:  # noqa: BLE001
+            value = None
+        if value is Select.NULL or not value:
+            self.dismiss(None)
+            return
+        self.dismiss(str(value))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class _SettingsConfirmModal(ModalScreen[bool]):
@@ -6474,7 +6807,7 @@ def _archive_success_message(item, task_id: str) -> str:
         return f"Archived {task_id}"
     title = str(getattr(item, "title", "") or "").strip()
     if title:
-        return f"Archived {_strip_action_subject_prefix(title)}"
+        return f"Archived {strip_routing_tag_prefix(title)}"
     return "Archived notification"
 
 
@@ -6622,7 +6955,7 @@ def _format_inbox_row(
     # stamping every title with "[Action]" is redundant noise that
     # eats list-pane width and buries the actual subject.
     if getattr(task, "triage_bucket", "") == "action":
-        subject = _strip_action_subject_prefix(subject)
+        subject = strip_routing_tag_prefix(subject)
     reply_suffix = ""
     if reply_count:
         noun = "reply" if reply_count == 1 else "replies"
@@ -9012,7 +9345,7 @@ class PollyInboxApp(App[None]):
         # header should not lead with "[Action]" boilerplate.
         subject = item.title or "(no subject)"
         if _triage_bucket(item) == "action":
-            subject = _strip_action_subject_prefix(subject)
+            subject = strip_routing_tag_prefix(subject)
         sections.append(f"[b #eef2f4]{_escape(subject)}[/b #eef2f4]")
         meta_bits = [f"[#5b8aff]{_escape(sender)}[/#5b8aff]"]
         if when:
@@ -9199,7 +9532,7 @@ class PollyInboxApp(App[None]):
         # Same routing-tag strip as the list rail — the focused message
         # header should not lead with "[Action]" boilerplate.
         if getattr(task, "triage_bucket", "") == "action":
-            subject = _strip_action_subject_prefix(subject)
+            subject = strip_routing_tag_prefix(subject)
         sections.append(f"[b #eef2f4]{_escape(subject)}[/b #eef2f4]")
         meta_bits = [f"[#5b8aff]{_escape(sender)}[/#5b8aff]"]
         if when:
@@ -11573,7 +11906,7 @@ def _dashboard_plan_staleness(
         _PLAN_STALENESS_CACHE.move_to_end(cache_key)
         return _PLAN_STALENESS_CACHE[cache_key]
     try:
-        from pollypm.plugins_builtin.project_planning.plan_presence import (
+        from pollypm.plan_presence import (
             _find_approved_plan_task,
             _plan_approved_at,
         )
@@ -11948,7 +12281,15 @@ def _dashboard_task_blocker_body_with_kind(task: object) -> tuple[str, str]:
 
 
 def _dashboard_task_db_paths(config: object, project_path: Path) -> list[Path]:
-    """Return task DBs that can hold work for a registered project."""
+    """Return task DBs that can hold work for a registered project.
+
+    Order (#1004): workspace-root canonical DB first, per-project
+    ``<project>/.pollypm/state.db`` as a legacy fallback. Must mirror
+    :meth:`pollypm.cockpit_tasks.PollyTasksApp._candidate_dbs` —
+    a divergence here surfaces as split-brain rendering between the
+    dashboard (which unions across DBs) and the Tasks pane (which
+    picks the first DB with matching rows).
+    """
     candidates: list[Path] = []
 
     def _add(path: object) -> None:
@@ -11959,12 +12300,12 @@ def _dashboard_task_db_paths(config: object, project_path: Path) -> list[Path]:
         if candidate not in candidates and candidate.exists():
             candidates.append(candidate)
 
-    _add(project_path / ".pollypm" / "state.db")
-
     project_settings = getattr(config, "project", None)
     workspace_root = getattr(project_settings, "workspace_root", None)
     if workspace_root is not None:
         _add(Path(workspace_root) / ".pollypm" / "state.db")
+
+    _add(project_path / ".pollypm" / "state.db")
 
     state_db = getattr(project_settings, "state_db", None)
     if state_db is not None:
@@ -13437,29 +13778,6 @@ def _action_card_click_hint(action_items: list[dict]) -> str:
 def _dashboard_action_key(index: int, slot: str) -> str:
     offset = {"primary": 1, "secondary": 2, "other": 3}[slot]
     return str(index * 3 + offset)
-
-
-_ROUTING_TAG_PREFIXES = ("[action]", "[alert]")
-
-
-def _strip_action_subject_prefix(subject: str) -> str:
-    """Drop a leading routing tag (``[Action]``, ``[Alert]``) from a
-    user-facing subject.
-
-    These bracketed prefixes are tier/recipient routing labels added by
-    the notify CLI and the supervisor's alert path; they have no
-    natural-language value for the operator reading the subject. The
-    inbox list rail already strips ``[Action]`` for action-bucket rows;
-    the detail pane and the activity feed mirror the strip so a focused
-    message or feed row doesn't lead with the routing tag.
-    """
-    if not subject:
-        return subject
-    lowered = subject.lower()
-    for tag in _ROUTING_TAG_PREFIXES:
-        if lowered.startswith(tag):
-            return subject[len(tag):].lstrip(" :-—")
-    return subject
 
 
 def _clean_hold_reason(

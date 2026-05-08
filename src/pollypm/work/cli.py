@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import typer
 
@@ -635,24 +635,24 @@ def task_create(
     title: str = typer.Argument(..., help="Task title"),
     project: str = typer.Option(..., "--project", "-p", help="Project name"),
     flow: str = typer.Option("standard", "--flow", "-f", help="Flow template name"),
-    role: Optional[list[str]] = typer.Option(None, "--role", "-r", help="Role assignment (key=value)"),
+    role: list[str] | None = typer.Option(None, "--role", "-r", help="Role assignment (key=value)"),
     priority: str = typer.Option("normal", "--priority", help="Priority: critical, high, normal, low"),
     description: str = typer.Option("", "--description", "-d", help="Task description"),
     task_type: str = typer.Option("task", "--type", "-t", help="Task type: task, bug, spike, epic, subtask"),
-    label: Optional[list[str]] = typer.Option(
+    label: list[str] | None = typer.Option(
         None, "--label", help="Label to attach (repeatable).",
     ),
-    acceptance_criteria: Optional[list[str]] = typer.Option(
+    acceptance_criteria: list[str] | None = typer.Option(
         None,
         "--acceptance-criteria",
         help="Acceptance criteria line. Repeatable — multiple values are joined with newlines.",
     ),
-    constraints: Optional[list[str]] = typer.Option(
+    constraints: list[str] | None = typer.Option(
         None,
         "--constraints",
         help="Constraint line (what NOT to do). Repeatable — joined with newlines.",
     ),
-    relevant_files: Optional[list[str]] = typer.Option(
+    relevant_files: list[str] | None = typer.Option(
         None,
         "--relevant-files",
         help="Explicit file path / pattern the worker should touch (repeatable).",
@@ -726,9 +726,9 @@ def task_get(
 
 @task_app.command("list")
 def task_list(
-    status: Optional[str] = typer.Option(None, "--status", "-s", help="Filter by work_status"),
-    project: Optional[str] = _PROJECT_OPTION,
-    assignee: Optional[str] = typer.Option(None, "--assignee", "-a", help="Filter by assignee"),
+    status: str | None = typer.Option(None, "--status", "-s", help="Filter by work_status"),
+    project: str | None = _PROJECT_OPTION,
+    assignee: str | None = typer.Option(None, "--assignee", "-a", help="Filter by assignee"),
     with_tokens: bool = typer.Option(
         False,
         "--with-tokens",
@@ -760,14 +760,14 @@ def task_list(
 @task_app.command("update")
 def task_update(
     task_id: str = typer.Argument(..., help="Task ID (project/number)"),
-    title: Optional[str] = typer.Option(None, "--title", help="New title"),
-    description: Optional[str] = typer.Option(None, "--description", "-d", help="New description"),
-    priority: Optional[str] = typer.Option(None, "--priority", help="New priority: critical, high, normal, low"),
-    label: Optional[list[str]] = typer.Option(None, "--label", help="Replace labels (repeatable)"),
-    role: Optional[list[str]] = typer.Option(None, "--role", "-r", help="Replace roles (key=value, repeatable)"),
-    acceptance_criteria: Optional[str] = typer.Option(None, "--acceptance-criteria", help="New acceptance criteria"),
-    constraints: Optional[str] = typer.Option(None, "--constraints", help="New constraints"),
-    relevant_files: Optional[list[str]] = typer.Option(None, "--relevant-files", help="Replace relevant files (repeatable)"),
+    title: str | None = typer.Option(None, "--title", help="New title"),
+    description: str | None = typer.Option(None, "--description", "-d", help="New description"),
+    priority: str | None = typer.Option(None, "--priority", help="New priority: critical, high, normal, low"),
+    label: list[str] | None = typer.Option(None, "--label", help="Replace labels (repeatable)"),
+    role: list[str] | None = typer.Option(None, "--role", "-r", help="Replace roles (key=value, repeatable)"),
+    acceptance_criteria: str | None = typer.Option(None, "--acceptance-criteria", help="New acceptance criteria"),
+    constraints: str | None = typer.Option(None, "--constraints", help="New constraints"),
+    relevant_files: list[str] | None = typer.Option(None, "--relevant-files", help="Replace relevant files (repeatable)"),
     db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
@@ -1040,8 +1040,8 @@ def task_done(
 @task_app.command("approve")
 def task_approve(
     task_id: str = typer.Argument(..., help="Task ID (project/number)"),
-    reason: Optional[str] = typer.Option(None, "--reason", help="Approval reason"),
-    actor: Optional[str] = typer.Option(
+    reason: str | None = typer.Option(None, "--reason", help="Approval reason"),
+    actor: str | None = typer.Option(
         None,
         "--actor",
         help="Actor approving (defaults to the task's bound reviewer/human approver)",
@@ -1079,7 +1079,7 @@ def task_approve(
 def task_reject(
     task_id: str = typer.Argument(..., help="Task ID (project/number)"),
     reason: str = typer.Option(..., "--reason", help="Rejection reason (required)"),
-    actor: Optional[str] = typer.Option(
+    actor: str | None = typer.Option(
         None,
         "--actor",
         help="Actor rejecting (defaults to the task's bound reviewer/human approver)",
@@ -1120,8 +1120,8 @@ def task_reject(
 
 @task_app.command("next")
 def task_next(
-    project: Optional[str] = _PROJECT_OPTION,
-    agent: Optional[str] = typer.Option(None, "--agent", help="Filter by agent (worker role)"),
+    project: str | None = _PROJECT_OPTION,
+    agent: str | None = typer.Option(None, "--agent", help="Filter by agent (worker role)"),
     db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
@@ -1366,8 +1366,8 @@ def task_dependents(
 @task_app.command("get-execution")
 def task_get_execution(
     task_id: str = typer.Argument(..., help="Task ID (project/number)"),
-    node: Optional[str] = typer.Option(None, "--node", help="Filter by node_id"),
-    visit: Optional[int] = typer.Option(None, "--visit", help="Filter by visit number"),
+    node: str | None = typer.Option(None, "--node", help="Filter by node_id"),
+    visit: int | None = typer.Option(None, "--visit", help="Filter by visit number"),
     db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
@@ -1515,17 +1515,17 @@ def task_context(
 
 @task_app.command("backfill-review-summaries")
 def task_backfill_review_summaries(
-    task_id: Optional[str] = typer.Argument(
+    task_id: str | None = typer.Argument(
         None,
         help="Optional task ID (project/number). Omit to scan a project or DB.",
     ),
-    project: Optional[str] = _PROJECT_OPTION,
+    project: str | None = _PROJECT_OPTION,
     force: bool = typer.Option(
         False,
         "--force",
         help="Write a new generated summary even when one already exists.",
     ),
-    limit: Optional[int] = typer.Option(
+    limit: int | None = typer.Option(
         None,
         "--limit",
         min=1,
@@ -1645,7 +1645,7 @@ def task_status(
 
 @task_app.command("counts")
 def task_counts(
-    project: Optional[str] = _PROJECT_OPTION,
+    project: str | None = _PROJECT_OPTION,
     db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
@@ -1675,7 +1675,7 @@ def task_mine(
 
 @task_app.command("blocked")
 def task_blocked(
-    project: Optional[str] = _PROJECT_OPTION,
+    project: str | None = _PROJECT_OPTION,
     db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
@@ -1692,7 +1692,7 @@ def task_blocked(
 
 @flow_app.command("list")
 def flow_list(
-    project: Optional[str] = _PROJECT_OPTION,
+    project: str | None = _PROJECT_OPTION,
     db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
@@ -1721,7 +1721,7 @@ def flow_validate(
         metavar="NAME_OR_PATH",
         help="Registered flow name (e.g. 'standard') or path to a flow YAML file.",
     ),
-    project: Optional[str] = _PROJECT_OPTION,
+    project: str | None = _PROJECT_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Validate a flow template by registered name or YAML file path.
@@ -1825,7 +1825,7 @@ def flow_validate(
 
 @task_app.command("sync")
 def task_sync(
-    project: Optional[str] = _PROJECT_OPTION,
+    project: str | None = _PROJECT_OPTION,
     issues_dir: str = typer.Option("issues", "--issues-dir", help="Path to issues directory for file sync"),
     db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
@@ -1922,14 +1922,14 @@ def _parse_since(value: str | None) -> int | None:
 
 @task_app.command("pickup-log")
 def task_pickup_log(
-    since: Optional[str] = typer.Option(
+    since: str | None = typer.Option(
         None, "--since",
         help="Only show entries newer than this (e.g. 24h, 90m, 7d).",
     ),
-    project: Optional[str] = typer.Option(
+    project: str | None = typer.Option(
         None, "--project", "-p", help="Filter by project key.",
     ),
-    task_id: Optional[str] = typer.Option(
+    task_id: str | None = typer.Option(
         None, "--task-id", help="Filter by task id (project/number).",
     ),
     limit: int = typer.Option(

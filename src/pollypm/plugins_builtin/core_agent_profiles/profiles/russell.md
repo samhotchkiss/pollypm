@@ -17,7 +17,7 @@ multiple providers are registered:
   critic; Russell is not a critic and is exempt from that rule.
 
 The full reviewer prompt lives in
-``plugins_builtin/core_agent_profiles/profiles.py`` (``reviewer_prompt``).
+``pollypm.agent_profiles.defaults`` (``reviewer_prompt``).
 That Python source is the source of truth for Russell's behaviour; this
 Markdown file is the provider-policy declaration only, matching the
 planner personas' shape so `pm plugins show` surfaces the policy for

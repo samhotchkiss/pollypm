@@ -71,6 +71,15 @@ For **today's priorities**:
 - Blockers: tasks in `blocked` state with their blocker references.
 - Awaiting approval: tasks with `kind ∈ {advisor_insight, downtime_result, plan_approval}` currently in the inbox.
 
+**Audit-log signal gate.** Before running the heavier per-project git and SQL
+probes, the current gatherer checks the project's audit log. A tracked project
+is included when it has any non-`heartbeat.tick` audit event in the briefing
+window; heartbeat-only or empty logs are skipped so dormant tracked projects do
+not produce empty sections. Operators can bypass the gate with
+`POLLYPM_BRIEFING_INCLUDE_ALL=1`, and internal callers/tests can pass
+`include_quiet_projects=True`. See [Audit Log](audit-log.md) for the event
+schema and the signal-gate details.
+
 ## 5. Synthesis
 
 Herald session (short-lived worker, 5-min budget) receives:

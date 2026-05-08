@@ -2234,7 +2234,7 @@ def _guide_source_path(role: str) -> Path | None:
     if role == "architect":
         return here / "plugins_builtin" / "project_planning" / "profiles" / "architect.md"
     if role in {"worker", "reviewer"}:
-        return here / "plugins_builtin" / "core_agent_profiles" / "profiles.py"
+        return here / "agent_profiles" / "defaults.py"
     return None
 
 
@@ -2274,11 +2274,11 @@ def _built_in_guide_body(role: str) -> str:
             raise ValueError(f"unknown guide role: {role}")
         return source.read_text(encoding="utf-8")
     if role == "worker":
-        from pollypm.plugins_builtin.core_agent_profiles.profiles import worker_prompt
+        from pollypm.agent_profiles.defaults import worker_prompt
 
         return worker_prompt()
     if role == "reviewer":
-        from pollypm.plugins_builtin.core_agent_profiles.profiles import reviewer_prompt
+        from pollypm.agent_profiles.defaults import reviewer_prompt
 
         return reviewer_prompt()
     raise ValueError(f"unknown guide role: {role}")

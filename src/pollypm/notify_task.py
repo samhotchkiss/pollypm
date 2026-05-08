@@ -54,6 +54,19 @@ _NOTIFY_TITLE_PREFIXES: tuple[str, ...] = (
     "Repeated stale",
 )
 
+_ROUTING_TAG_PREFIXES = ("[action]", "[alert]")
+
+
+def strip_routing_tag_prefix(subject: str) -> str:
+    """Drop a leading notify/supervisor routing tag from a subject."""
+    if not subject:
+        return subject
+    lowered = subject.lower()
+    for tag in _ROUTING_TAG_PREFIXES:
+        if lowered.startswith(tag):
+            return subject[len(tag):].lstrip(" :-—")
+    return subject
+
 
 def _coerce_roles(value: object) -> dict[str, str]:
     """Best-effort coerce ``task.roles`` into a ``{str: str}`` mapping.
@@ -156,4 +169,5 @@ __all__ = [
     "NOTIFY_LABEL",
     "is_notify_inbox_task",
     "is_notify_only_inbox_entry",
+    "strip_routing_tag_prefix",
 ]

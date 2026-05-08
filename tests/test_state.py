@@ -1,10 +1,29 @@
+import ast
 import os
 from pathlib import Path
 
 import pytest
 
+import pollypm.storage.state as state_module
 from pollypm.storage.state import TokenUsageHourlyRecord
 from pollypm.storage.state import StateStore
+
+
+def test_state_store_has_no_silent_broad_exception_passes() -> None:
+    source = Path(state_module.__file__).read_text()
+    tree = ast.parse(source)
+
+    offenders = [
+        handler.lineno
+        for handler in ast.walk(tree)
+        if isinstance(handler, ast.ExceptHandler)
+        and isinstance(handler.type, ast.Name)
+        and handler.type.id == "Exception"
+        and len(handler.body) == 1
+        and isinstance(handler.body[0], ast.Pass)
+    ]
+
+    assert offenders == []
 
 
 def test_state_store_alerts_leases_and_heartbeats(tmp_path: Path) -> None:

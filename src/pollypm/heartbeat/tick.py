@@ -139,6 +139,9 @@ class Heartbeat:
                 entry.first_seen_at = now
 
             if self._is_due(entry, now, prev):
+                if self._dedupe_recent_or_active(entry, now):
+                    result.skipped_not_due += 1
+                    continue
                 payload_snapshot = _snapshot_payload(entry.payload)
                 job_id = self.queue.enqueue(
                     entry.handler_name,
@@ -186,6 +189,30 @@ class Heartbeat:
 
         # Unknown schedule type — be strict, don't fire.
         return False
+
+    def _dedupe_recent_or_active(
+        self,
+        entry: RosterEntry,
+        now: datetime,
+    ) -> bool:
+        """Coalesce same-window ``@every`` dedupe keys across live rails.
+
+        ``JobQueue.enqueue(dedupe_key=...)`` suppresses only queued/claimed
+        rows. If a cadence job finishes quickly, a second HeartbeatRail with a
+        slightly different in-memory anchor can otherwise enqueue the same
+        handler again seconds later. Conversely, if the previous row is still
+        active, treating that deduped enqueue as a fire consumes the next beat.
+        """
+        if not entry.dedupe_key or not isinstance(entry.schedule, EverySchedule):
+            return False
+        checker = getattr(self.queue, "has_recent_or_active_dedupe", None)
+        if not callable(checker):
+            return False
+        since = now - entry.schedule.interval
+        try:
+            return bool(checker(entry.dedupe_key, since=since))
+        except Exception:  # noqa: BLE001
+            return False
 
     def _every_is_due(
         self,

@@ -36,6 +36,7 @@ from pollypm.audit.watchdog import (
     RULE_ROLE_SESSION_MISSING,
     RULE_STUCK_DRAFT,
     RULE_TASK_ON_HOLD_STALE,
+    RULE_TASK_PROGRESS_STALE,
     RULE_TASK_REVIEW_STALE,
     RULE_WORKER_SESSION_DEAD_LOOP,
     WATCHDOG_ALERT_TYPE,
@@ -61,6 +62,7 @@ _DISPATCHABLE_RULES: frozenset[str] = frozenset({
     # cancel, or rewrite them.
     RULE_STUCK_DRAFT,
     RULE_TASK_REVIEW_STALE,
+    RULE_TASK_PROGRESS_STALE,
     RULE_ROLE_SESSION_MISSING,
     RULE_WORKER_SESSION_DEAD_LOOP,
     # #1424 — on_hold escalation lands in the architect's pane with the
@@ -136,6 +138,7 @@ def _config_from_payload(payload: dict[str, Any]) -> WatchdogConfig:
         "stuck_draft_seconds",
         "cancel_grace_seconds",
         "review_stale_seconds",
+        "progress_stale_seconds",
         "on_hold_stale_seconds",
     ):
         raw = payload.get(field_name)
@@ -160,10 +163,11 @@ def _gather_open_tasks(project_key: str, project_path: Path | None) -> list[Any]
     ``db_path`` here. ``project_key`` is forwarded for resolver warnings
     and ``project_path`` for project-aware audit metadata only.
 
-    Powers four rules: ``role_session_missing`` (since #1414), and the
-    state-based variants of ``task_review_stale``, ``task_on_hold_stale``,
-    and ``stuck_draft`` (#1433). For tasks at the watched states
-    (review / on_hold / draft) we re-fetch via :meth:`get` so
+    Powers five rules: ``role_session_missing`` (since #1414),
+    ``task_progress_stale`` (#1444), and the state-based variants of
+    ``task_review_stale``, ``task_on_hold_stale``, and ``stuck_draft``
+    (#1433). For tasks at the watched states
+    (in_progress / review / on_hold / draft) we re-fetch via :meth:`get` so
     ``transitions`` are hydrated — :meth:`list_nonterminal_tasks` skips
     transition loading for non-plan-review tasks (it only includes
     history for plan-review labelled rows). Without transitions the
@@ -174,7 +178,7 @@ def _gather_open_tasks(project_key: str, project_path: Path | None) -> list[Any]
     even when the work-service is unreachable; the affected rules
     simply no-op for that project.
     """
-    _STATE_RULE_STATES = frozenset({"review", "on_hold", "draft"})
+    _STATE_RULE_STATES = frozenset({"in_progress", "review", "on_hold", "draft"})
     try:
         from pollypm.work import create_work_service
 
@@ -309,7 +313,7 @@ def _gather_reviewer_evidence(
     subject: str,
     msg_store: Any,
     limit_executions: int = 2,
-    limit_messages: int = 2,
+    limit_messages: int = 5,
 ) -> list[str]:
     """Collect reviewer execution rows + recent inbox messages for ``subject``.
 
@@ -386,7 +390,24 @@ def _gather_reviewer_evidence(
     # canonical ``project/N`` string is considered relevant.
     try:
         if msg_store is not None and hasattr(msg_store, "query_messages"):
-            rows = msg_store.query_messages(project=project_key) or []
+            scopes = [project_key] if project_key else []
+            if "inbox" not in scopes:
+                # Pre-#1425 reviewer notifies could land in the global
+                # inbox scope even when the subject was project-specific.
+                # Include that legacy scope so forensic briefs see the
+                # actual reviewer finding instead of only the transition
+                # reason that parked the task.
+                scopes.append("inbox")
+            rows: list[dict[str, Any]] = []
+            seen_message_ids: set[Any] = set()
+            for scope in scopes:
+                for row in msg_store.query_messages(scope=scope) or []:
+                    message_id = row.get("id")
+                    if message_id is not None:
+                        if message_id in seen_message_ids:
+                            continue
+                        seen_message_ids.add(message_id)
+                    rows.append(row)
             matched: list[dict[str, Any]] = []
             for row in rows:
                 body = (

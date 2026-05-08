@@ -363,6 +363,45 @@ class JobQueue:
             label="JobQueue.enqueue",
         )
 
+    def has_recent_or_active_dedupe(
+        self,
+        dedupe_key: str,
+        *,
+        since: datetime,
+    ) -> bool:
+        """Return True if ``dedupe_key`` is active or already fired since ``since``.
+
+        ``enqueue(dedupe_key=...)`` only dedupes queued/claimed rows. A
+        second HeartbeatRail can therefore enqueue the same cadence handler
+        seconds after the first one completes. Recurring ticks use this
+        read-side guard to coalesce same-window pulses across rails without
+        permanently reserving the dedupe key.
+        """
+        if not dedupe_key:
+            return False
+        since_iso = since.astimezone(UTC).isoformat()
+
+        def _do_check() -> bool:
+            with self._lock:
+                row = self._conn.execute(
+                    """
+                    SELECT id FROM work_jobs
+                    WHERE dedupe_key = ?
+                      AND (
+                        status IN ('queued', 'claimed')
+                        OR enqueued_at > ?
+                      )
+                    LIMIT 1
+                    """,
+                    (dedupe_key, since_iso),
+                ).fetchone()
+                return row is not None
+
+        return self._retry_reopening_closed_connection(
+            _do_check,
+            label="JobQueue.has_recent_or_active_dedupe",
+        )
+
     # ------------------------------------------------------------------
     # Claim / complete / fail
     # ------------------------------------------------------------------

@@ -338,7 +338,7 @@ def _resolve_plan_path(project_path: Path) -> Path:
        the architect's revision lands somewhere the inline-render path
        (#1397) will pick up.
 
-    Mirrors :data:`pollypm.plugins_builtin.project_planning.plan_presence.CANONICAL_PLAN_RELATIVE_PATHS`
+    Mirrors :data:`pollypm.plan_presence.CANONICAL_PLAN_RELATIVE_PATHS`
     so both reads + writes follow the same path resolution.
     """
 

@@ -146,6 +146,27 @@ class _FakeAccount:
         self.email = email or f"{key}@example.com"
 
 
+class _FakeSession:
+    def __init__(
+        self,
+        name: str,
+        *,
+        role: str,
+        account: str,
+        provider: ProviderKind = ProviderKind.CLAUDE,
+        project: str = "pollypm",
+        window_name: str | None = None,
+        enabled: bool = True,
+    ) -> None:
+        self.name = name
+        self.role = role
+        self.account = account
+        self.provider = provider
+        self.project = project
+        self.window_name = window_name
+        self.enabled = enabled
+
+
 class _FakePollyPM:
     def __init__(self, controller: str = "claude_demo") -> None:
         self.controller_account = controller
@@ -190,6 +211,27 @@ class _FakeConfig:
         self.planner = _FakePlanner()
         self.plugins = _FakePlugins()
         self.accounts: dict[str, object] = {}
+        self.sessions: dict[str, _FakeSession] = {
+            "operator": _FakeSession(
+                "operator",
+                role="operator-pm",
+                account=controller,
+                window_name="pm-operator",
+            ),
+            "heartbeat": _FakeSession(
+                "heartbeat",
+                role="heartbeat-supervisor",
+                account=controller,
+                window_name="heartbeat",
+            ),
+            "reviewer": _FakeSession(
+                "reviewer",
+                role="reviewer",
+                account="codex_demo",
+                provider=ProviderKind.CODEX,
+                window_name="reviewer",
+            ),
+        }
 
 
 class _FakeService:
@@ -202,6 +244,7 @@ class _FakeService:
         self.failover_calls: list[str] = []
         self.add_calls: list[ProviderKind] = []
         self.remove_calls: list[str] = []
+        self.switch_calls: list[tuple[str, str]] = []
         self.refresh_usage_calls: list[str] = []
         self.cached_calls = 0
         self.live_calls = 0
@@ -226,6 +269,16 @@ class _FakeService:
     def set_controller_account(self, key: str) -> None:
         self.controller_calls.append(key)
         self._config.pollypm.controller_account = key
+        account = self._config.accounts[key]
+        for session_name in ("operator", "heartbeat"):
+            session = self._config.sessions.get(session_name)
+            if session is None:
+                continue
+            session.account = key
+            session.provider = account.provider
+
+    def switch_session_account(self, session_name: str, account_name: str) -> None:
+        self.switch_calls.append((session_name, account_name))
 
     def toggle_failover_account(self, key: str) -> tuple[str, bool]:
         self.failover_calls.append(key)
@@ -512,7 +565,80 @@ def test_accounts_section_exposes_account_action_buttons(settings_env) -> None:
             assert app.query_one("#settings-account-add-claude", Button) is not None
             assert app.query_one("#settings-account-add-codex", Button) is not None
             assert app.query_one("#settings-account-refresh-usage", Button) is not None
+            assert app.query_one("#settings-account-make-controller", Button) is not None
+            assert app.query_one("#settings-account-reassign-sessions", Button) is not None
             assert app.query_one("#settings-account-remove", Button) is not None
+
+    _run(body())
+
+
+def test_accounts_detail_lists_pinned_sessions(settings_env) -> None:
+    app = settings_env["app"]
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            detail = str(app.detail.render())
+            assert "Pinned sessions" in detail
+            assert "operator" in detail
+            assert "heartbeat" in detail
+
+    _run(body())
+
+
+def test_reassign_sessions_moves_pins_and_controller(settings_env, monkeypatch) -> None:
+    app = settings_env["app"]
+    service = settings_env["service"]
+    config = settings_env["config"]
+
+    def _choose_codex(screen, callback):
+        assert screen._source_key == "claude_demo"
+        assert {ref["name"] for ref in screen._session_refs} == {
+            "operator",
+            "heartbeat",
+        }
+        assert screen._include_controller is True
+        callback("codex_demo")
+
+    monkeypatch.setattr(app, "push_screen", _choose_codex)
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            app.action_reassign_account_sessions()
+            await pilot.pause()
+            assert service.controller_calls == ["codex_demo"]
+            assert service.switch_calls == [
+                ("heartbeat", "codex_demo"),
+                ("operator", "codex_demo"),
+            ]
+            assert config.pollypm.controller_account == "codex_demo"
+            assert config.sessions["heartbeat"].account == "codex_demo"
+            assert config.sessions["operator"].account == "codex_demo"
+
+    _run(body())
+
+
+def test_remove_account_with_refs_prompts_reassign_instead(settings_env, monkeypatch) -> None:
+    app = settings_env["app"]
+    service = settings_env["service"]
+
+    def _choose_codex(screen, callback):
+        assert screen._source_key == "claude_demo"
+        callback("codex_demo")
+
+    monkeypatch.setattr(app, "push_screen", _choose_codex)
+
+    async def body() -> None:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("x")
+            await pilot.pause()
+            assert service.remove_calls == []
+            assert service.switch_calls == [
+                ("heartbeat", "codex_demo"),
+                ("operator", "codex_demo"),
+            ]
 
     _run(body())
 

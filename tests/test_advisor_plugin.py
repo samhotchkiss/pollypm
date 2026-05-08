@@ -531,155 +531,171 @@ class TestThrottle:
 
 
 # ---------------------------------------------------------------------------
-# State-db path resolution — #1037 dual-path probe
+# advisor.tick spam fix (#1004 follow-up): canonical resolver + lazy throttle
 # ---------------------------------------------------------------------------
+#
+# Pre-fix: ``has_in_progress_advisor_task(work_service=None)`` short-
+# circuited to ``False`` and the production tick (which always passes
+# ``payload={}`` so ``work_service is None``) skipped the throttle
+# completely. ``enqueue_advisor_review`` resolved ``state.db`` via a
+# private dual-path helper that preferred the deprecated
+# ``<project>/.pollypm/state.db``, so writes landed in a DB the throttle
+# couldn't see — savethenovel piled up 68 duplicate "Advisor review"
+# rows in 9 hours.
+#
+# These tests pin both fixes:
+#   1. With one queued advisor task already in the canonical DB and
+#      ``work_service=None``, the throttle lazy-builds a service against
+#      the canonical resolver and returns True (no second enqueue).
+#   2. With both a per-project DB (containing rows) and a workspace
+#      canonical DB (empty), ``enqueue_advisor_review`` writes to the
+#      canonical DB; the per-project DB does not gain a new row.
 
 
-class TestResolveStateDb:
-    """The advisor probe needs to find ``state.db`` under either layout:
+class TestAdvisorSpamFix:
+    """Regression coverage for the advisor.tick task-spam fix."""
 
-    * Per-project ``<project_path>/.pollypm/state.db`` (legacy / explicit).
-    * Workspace-root ``<ancestor>/.pollypm/state.db`` (post-#339 default).
-
-    Without the dual-path resolve, every tick on a workspace-root install
-    sees ``not db_path.exists()`` → ``has_project_stagnation_candidate``
-    returns False → ``_should_review`` returns ``no-changes`` → no
-    decision ever lands. That's the user-facing failure in #1037.
-    """
-
-    def test_returns_per_project_when_present(self, tmp_path: Path) -> None:
-        from pollypm.plugins_builtin.advisor.handlers.advisor_tick import (
-            _resolve_state_db,
-        )
-        proj = tmp_path / "proj"
-        (proj / ".pollypm").mkdir(parents=True)
-        per_proj_db = proj / ".pollypm" / "state.db"
-        per_proj_db.write_text("")
-        resolved = _resolve_state_db(proj)
-        assert resolved == per_proj_db
-
-    def test_walks_up_to_workspace_root(self, tmp_path: Path) -> None:
-        from pollypm.plugins_builtin.advisor.handlers.advisor_tick import (
-            _resolve_state_db,
-        )
-        workspace = tmp_path / "ws"
-        proj = workspace / "proj"
-        proj.mkdir(parents=True)
-        # Workspace-root state.db only — no per-project file.
-        ws_db_dir = workspace / ".pollypm"
-        ws_db_dir.mkdir()
-        ws_db = ws_db_dir / "state.db"
-        ws_db.write_text("")
-        resolved = _resolve_state_db(proj)
-        # Compare resolved on both sides — _resolve_state_db calls
-        # Path.resolve internally to handle symlinks.
-        assert resolved is not None
-        assert resolved.resolve() == ws_db.resolve()
-
-    def test_prefers_per_project_over_workspace_root(
-        self, tmp_path: Path
+    def _write_workspace_config(
+        self,
+        *,
+        tmp_path: Path,
+        project_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Per-project layout wins when both exist (#1037: don't blindly
-        prefer workspace — an explicit per-project DB is intentional)."""
-        from pollypm.plugins_builtin.advisor.handlers.advisor_tick import (
-            _resolve_state_db,
-        )
-        workspace = tmp_path / "ws"
-        proj = workspace / "proj"
-        proj.mkdir(parents=True)
-        (workspace / ".pollypm").mkdir()
-        (workspace / ".pollypm" / "state.db").write_text("")
-        (proj / ".pollypm").mkdir()
-        per_proj_db = proj / ".pollypm" / "state.db"
-        per_proj_db.write_text("")
-        resolved = _resolve_state_db(proj)
-        assert resolved == per_proj_db
-
-    def test_returns_none_when_neither_exists(self, tmp_path: Path) -> None:
-        from pollypm.plugins_builtin.advisor.handlers.advisor_tick import (
-            _resolve_state_db,
-        )
-        proj = tmp_path / "proj"
-        proj.mkdir()
-        assert _resolve_state_db(proj) is None
-
-    def test_stagnation_probe_uses_workspace_root_db(
-        self, tmp_path: Path
-    ) -> None:
-        """End-to-end #1037: a project living under a workspace-root
-        state.db (no per-project file) is still discoverable by the
-        stagnation probe. Pre-fix this returned False on every tick.
+        """Patch ``resolve_work_db_path`` + ``load_config`` so the
+        canonical resolver lands on a workspace-root state.db under
+        ``tmp_path``. Avoids reaching into the real PollyPMConfig stack.
         """
-        from pollypm.plugins_builtin.advisor.handlers.advisor_tick import (
-            has_project_stagnation_candidate,
-        )
-        workspace = tmp_path / "ws"
-        proj = workspace / "proj"
-        proj.mkdir(parents=True)
-        (workspace / ".pollypm").mkdir()
-        (workspace / ".pollypm" / "state.db").write_text("")
+        canonical = tmp_path / ".pollypm" / "state.db"
+        canonical.parent.mkdir(parents=True, exist_ok=True)
 
-        # We don't want to actually open a real SQLiteWorkService against
-        # the empty file; the probe only needs to *find* the file. Verify
-        # via _resolve_state_db (which is what the probe calls first).
-        from pollypm.plugins_builtin.advisor.handlers.advisor_tick import (
-            _resolve_state_db,
-        )
-        assert _resolve_state_db(proj) is not None
+        # The factory imports resolve_work_db_path locally on each call.
+        from pollypm.work import db_resolver as _resolver
 
-        # And confirm the probe path itself: with work_service=None it
-        # tries to open SQLiteWorkService against the resolved path. We
-        # can't easily mock that mid-call without monkeypatch on
-        # SQLiteWorkService, so assert at least the probe returns False
-        # (empty DB) gracefully without raising.
-        result = has_project_stagnation_candidate(
+        def _fake_resolve(*_args, **_kwargs):
+            canonical.parent.mkdir(parents=True, exist_ok=True)
+            return canonical
+
+        monkeypatch.setattr(_resolver, "resolve_work_db_path", _fake_resolve)
+
+    def test_throttle_lazy_builds_when_work_service_is_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Throttle regression for advisor.tick spam fix (#1004 follow-up).
+
+        With ``work_service=None`` (the production payload state) and
+        an existing queued advisor task in the canonical DB, the
+        throttle MUST find it via the lazy-build path. Pre-fix this
+        returned False unconditionally and the next tick stacked
+        another duplicate row.
+        """
+        project_root = tmp_path / "proj"
+        project_root.mkdir()
+        self._write_workspace_config(
+            tmp_path=tmp_path,
+            project_root=project_root,
+            monkeypatch=monkeypatch,
+        )
+
+        # Pre-seed the canonical DB with a queued advisor task. We use
+        # the real factory so the schema matches production.
+        from pollypm.work import create_work_service
+
+        seed = create_work_service(
+            project_path=project_root,
             project_key="proj",
-            project_path=proj,
+        )
+        try:
+            task = seed.create(
+                title="Advisor review for proj",
+                description="seed",
+                type="task",
+                project="proj",
+                flow_template="advisor_review",
+                roles={"advisor": "advisor"},
+                priority="normal",
+                created_by="test.seed",
+                labels=["advisor"],
+                requires_human_review=False,
+            )
+            seed.queue(task.task_id, "test.seed")
+        finally:
+            close = getattr(seed, "close", None)
+            if callable(close):
+                close()
+
+        # Throttle with work_service=None must lazy-build and find it.
+        # Sentinel-string for the post-install grep check (advisor.tick
+        # spam fix lazy-throttle marker).
+        assert (
+            has_in_progress_advisor_task(
+                project_key="proj",
+                work_service=None,
+                project_path=project_root,
+            )
+            is True
+        )
+
+    def test_enqueue_routes_to_canonical_resolver_not_per_project(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Resolver fix for advisor.tick spam fix (#1004 follow-up).
+
+        With both a per-project DB and a workspace canonical DB,
+        ``enqueue_advisor_review`` MUST write to canonical. Pre-fix the
+        write landed in per-project (invisible to other engines) which
+        is how savethenovel accumulated 68 duplicate rows.
+        """
+        import sqlite3
+
+        project_root = tmp_path / "proj"
+        project_root.mkdir()
+        self._write_workspace_config(
+            tmp_path=tmp_path,
+            project_root=project_root,
+            monkeypatch=monkeypatch,
+        )
+
+        # Pre-create the deprecated per-project DB. It must NOT receive
+        # the new advisor row.
+        per_project_db_dir = project_root / ".pollypm"
+        per_project_db_dir.mkdir(parents=True, exist_ok=True)
+        per_project_db = per_project_db_dir / "state.db"
+        # Initialise as an empty real sqlite DB so post-write file
+        # comparisons aren't fooled by the file simply not existing.
+        sqlite3.connect(per_project_db).close()
+        per_project_db_size_before = per_project_db.stat().st_size
+
+        from pollypm.plugins_builtin.advisor.handlers.advisor_tick import (
+            enqueue_advisor_review,
+        )
+
+        outcome = enqueue_advisor_review(
+            project_key="proj",
+            project_path=project_root,
+            config=None,
             work_service=None,
         )
-        # Either False (open failed because empty file isn't a sqlite DB)
-        # or False (no tasks). Both are valid; the key invariant is "no
-        # crash + the path probe got past db_path.exists()."
-        assert result is False
+        assert outcome["enqueued"] is True
+        assert outcome["task_id"].startswith("proj/")
 
-    def test_stagnation_probe_returns_false_when_no_db_anywhere(
-        self, tmp_path: Path
-    ) -> None:
-        from pollypm.plugins_builtin.advisor.handlers.advisor_tick import (
-            has_project_stagnation_candidate,
-        )
-        proj = tmp_path / "proj"
-        proj.mkdir()
-        assert (
-            has_project_stagnation_candidate(
-                project_key="proj",
-                project_path=proj,
-                work_service=None,
-            )
-            is False
-        )
+        # Canonical DB must hold exactly one queued advisor row.
+        canonical = tmp_path / ".pollypm" / "state.db"
+        assert canonical.exists()
+        with sqlite3.connect(canonical) as conn:
+            row_count = conn.execute(
+                "SELECT COUNT(*) FROM work_tasks "
+                "WHERE project = 'proj' AND work_status = 'queued'"
+            ).fetchone()[0]
+        assert row_count == 1
 
-    def test_transitions_db_path_walks_up(self, tmp_path: Path) -> None:
-        """detect_changes._transitions_db_path uses the same probe."""
-        from pollypm.plugins_builtin.advisor.handlers.detect_changes import (
-            _transitions_db_path,
-        )
-        workspace = tmp_path / "ws"
-        proj = workspace / "proj"
-        proj.mkdir(parents=True)
-        (workspace / ".pollypm").mkdir()
-        ws_db = workspace / ".pollypm" / "state.db"
-        ws_db.write_text("")
-        resolved = _transitions_db_path(proj)
-        assert resolved is not None
-        assert resolved.resolve() == ws_db.resolve()
-
-    def test_transitions_db_path_returns_none_when_missing(
-        self, tmp_path: Path
-    ) -> None:
-        from pollypm.plugins_builtin.advisor.handlers.detect_changes import (
-            _transitions_db_path,
-        )
-        proj = tmp_path / "proj"
-        proj.mkdir()
-        assert _transitions_db_path(proj) is None
+        # Per-project DB must NOT have been written to.
+        assert per_project_db.stat().st_size == per_project_db_size_before
+        with sqlite3.connect(per_project_db) as conn:
+            tables = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            ]
+        assert "work_tasks" not in tables

@@ -130,6 +130,50 @@ bugs (#831, #826) where data was correct but the rendered help
 diverged from runtime behavior. Sourcing help from runtime
 `BINDINGS` makes that class of drift impossible.
 
+### 8. Project Dashboard first-touch states are explicit
+
+The Project Dashboard is the first cockpit surface a user lands in
+after selecting a project from the rail. It must not render as a bare
+glyph or empty body when there is no executable work yet.
+
+For a project whose path exists and whose task counts total zero across
+all `work_tasks` status buckets, the dashboard renders the
+`#proj-empty-state` affordance at the top of `#proj-body`, before the
+inbox/action sections. The panel is inline, not a modal. It tells the
+operator that the project has no tasks and names the two available
+ways to move it forward:
+
+* `pm project plan <project>` — start the architect/planning flow.
+* `pm task create` — add a task manually.
+
+That empty-state affordance ends as soon as any task row exists in any
+bucket. It is also suppressed when the project path is missing on disk,
+because the topbar owns that louder missing-project state.
+
+Draft work is also part of the dashboard contract. A task in
+`work_status="draft"` is visible in the Task pipeline strip and row
+groups; drafts are not allowed to disappear merely because they are not
+yet `queued`. When `draft > 0` and there is no live work
+(`queued + in_progress + review == 0`), the dashboard additionally
+renders `#proj-drafts-pending` directly below the empty-state slot. The
+panel shows the number of pending drafts, lists up to three
+`<project>/<number>` refs, and points at `pm task queue <id>` as the
+promotion path from draft to queued.
+
+`#proj-drafts-pending` hides when there are no drafts, when any live
+work exists, or when the project path is missing. In mixed states,
+where drafts coexist with queued/in-progress/review tasks, the pipeline
+draft bucket is the visible surface and the standalone panel stays
+hidden to avoid duplicating the same signal.
+
+The drafts panel does not introduce a new APP binding. The promotion
+action is the existing work-service transition exposed by
+`pm task queue <id>`. If a future cockpit action or keybinding promotes
+drafts directly, that PR must update the runtime `BINDINGS`,
+`ScreenContract`, and `help_text_for_app(app)` output together; this
+document should continue to describe the state contract instead of
+copying a separate keymap.
+
 ## Migration
 
 The contract is enforced for surfaces that register a
@@ -163,4 +207,4 @@ Per-surface bindings are declared in each App's `BINDINGS` list and
 mirrored into the registered `ScreenContract`. Use
 `help_text_for_app(app)` at runtime; do not duplicate the list.
 
-*Last updated: 2026-04-27.*
+*Last updated: 2026-05-07.*

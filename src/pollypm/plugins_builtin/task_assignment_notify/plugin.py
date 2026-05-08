@@ -38,10 +38,13 @@ from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
 )
 from pollypm.plugins_builtin.task_assignment_notify.resolver import (
     DEDUPE_WINDOW_SECONDS,
+    clear_alerts_for_cancelled_task,
+    clear_no_session_alert_for_task,
     load_runtime_services,
     notify,
 )
 from pollypm.session_services import base as _session_bus
+from pollypm.work import task_assignment_alerts as _assignment_alert_bus
 from pollypm.work import task_assignment as _task_assignment_bus
 
 logger = logging.getLogger(__name__)
@@ -156,6 +159,26 @@ def _session_created_listener(event) -> None:
                     pass
 
 
+def _assignment_alert_cleanup_listener(
+    event: _assignment_alert_bus.TaskAssignmentAlertEvent,
+) -> None:
+    """Clear assignment alerts made stale by work-service transitions."""
+    if isinstance(event, _assignment_alert_bus.CancelledTaskAssignmentAlertsEvent):
+        clear_alerts_for_cancelled_task(
+            task_id=event.task_id,
+            project=event.project,
+            role_names=tuple(event.role_names),
+            has_other_active_for_role=dict(event.has_other_active_for_role),
+            store=event.store,
+        )
+        return
+    if isinstance(event, _assignment_alert_bus.ClearNoSessionAlertForTaskEvent):
+        clear_no_session_alert_for_task(
+            task_id=event.task_id,
+            store=event.store,
+        )
+
+
 def _register_handlers(api: JobHandlerAPI) -> None:
     # Notify is idempotent (dedupe table throttles duplicate pings), so
     # we give it a generous retry count. The sweeper is a @every job so
@@ -191,6 +214,7 @@ def _initialize(api: PluginAPI) -> None:
     subscribers.
     """
     _task_assignment_bus.register_listener(_in_process_listener)
+    _assignment_alert_bus.register_listener(_assignment_alert_cleanup_listener)
     # #246: subscribe to session births so a restarted worker gets its
     # resume ping inside ~1s instead of on the next sweeper cycle.
     _session_bus.register_session_listener(_session_created_listener)

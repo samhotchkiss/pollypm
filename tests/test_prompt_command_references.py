@@ -30,7 +30,7 @@ def _prompt_command_surfaces() -> list[Path]:
         repo_root / "docs/getting-started.md",
         repo_root / "src/pollypm/memory_prompts.py",
         repo_root / "src/pollypm/recovery_prompt.py",
-        repo_root / "src/pollypm/plugins_builtin/core_agent_profiles/profiles.py",
+        repo_root / "src/pollypm/agent_profiles/defaults.py",
         *builtin_profiles,
     ]
 
@@ -146,7 +146,7 @@ def test_prompt_command_references_resolve_against_real_cli() -> None:
 def test_core_agent_profile_prompt_commands_resolve_against_real_cli() -> None:
     runner = CliRunner()
     repo_root = _repo_root()
-    path = repo_root / "src/pollypm/plugins_builtin/core_agent_profiles/profiles.py"
+    path = repo_root / "src/pollypm/agent_profiles/defaults.py"
     broken: list[str] = []
 
     for command_text in sorted(_extract_command_references(path.read_text(encoding="utf-8"))):

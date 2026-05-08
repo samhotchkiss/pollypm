@@ -30,6 +30,7 @@ from pollypm.audit.watchdog import (
     RULE_MARKER_LEAKED,
     RULE_ORPHAN_MARKER,
     RULE_STUCK_DRAFT,
+    RULE_TASK_PROGRESS_STALE,
     Finding,
     WatchdogConfig,
     emit_finding,
@@ -87,13 +88,13 @@ def _make_event(
 
 
 def test_orphan_marker_detected_when_no_release_or_terminal(now: datetime) -> None:
-    """A marker.created with neither release nor terminal transition fires."""
+    """An old marker.created with neither release nor terminal transition fires."""
     events = [
         _make_event(
             event=EVENT_MARKER_CREATED,
             project="demo",
             subject="/proj/demo/.pollypm/worker-markers/task-demo-1.fresh",
-            ts=now - timedelta(minutes=20),
+            ts=now - timedelta(minutes=40),
         ),
     ]
     findings = scan_events(events, now=now)
@@ -105,12 +106,36 @@ def test_orphan_marker_detected_when_no_release_or_terminal(now: datetime) -> No
     assert "pm task cancel demo/1" in orphans[0].recommendation
 
 
+def test_orphan_marker_recent_marker_ignored_even_when_task_is_old(
+    now: datetime,
+) -> None:
+    """Regression #1436: threshold age is marker age, not task age."""
+    marker = "/proj/demo/.pollypm/worker-markers/task-demo-1.fresh"
+    events = [
+        _make_event(
+            event=EVENT_TASK_CREATED,
+            subject="demo/1",
+            ts=now - timedelta(hours=6),
+        ),
+        _make_event(
+            event=EVENT_MARKER_CREATED,
+            subject=marker,
+            ts=now - timedelta(minutes=4),
+        ),
+    ]
+    findings = [
+        f for f in scan_events(events, now=now)
+        if f.rule == RULE_ORPHAN_MARKER
+    ]
+    assert findings == []
+
+
 def test_orphan_marker_silenced_by_release(now: datetime) -> None:
     marker = "/proj/demo/.pollypm/worker-markers/task-demo-1.fresh"
     events = [
         _make_event(
             event=EVENT_MARKER_CREATED, subject=marker,
-            ts=now - timedelta(minutes=20),
+            ts=now - timedelta(minutes=40),
         ),
         _make_event(
             event=EVENT_MARKER_RELEASED, subject=marker,
@@ -127,7 +152,7 @@ def test_orphan_marker_silenced_by_terminal_transition(now: datetime) -> None:
     events = [
         _make_event(
             event=EVENT_MARKER_CREATED, subject=marker,
-            ts=now - timedelta(minutes=25),
+            ts=now - timedelta(minutes=40),
         ),
         _make_event(
             event=EVENT_TASK_STATUS_CHANGED,
@@ -140,13 +165,13 @@ def test_orphan_marker_silenced_by_terminal_transition(now: datetime) -> None:
     assert findings == []
 
 
-def test_orphan_marker_outside_window_ignored(now: datetime) -> None:
+def test_orphan_marker_within_threshold_ignored(now: datetime) -> None:
     config = WatchdogConfig(window_seconds=600)
     marker = "/proj/demo/.pollypm/worker-markers/task-demo-1.fresh"
     events = [
         _make_event(
             event=EVENT_MARKER_CREATED, subject=marker,
-            ts=now - timedelta(hours=2),
+            ts=now - timedelta(minutes=9),
         ),
     ]
     findings = scan_events(events, now=now, config=config)
@@ -382,12 +407,12 @@ def test_scan_project_against_synthetic_log(now: datetime, tmp_path: Path) -> No
     Exercises the central-tail read path the cadence handler will use
     in production.
     """
-    # Older orphan marker event (within 30 min window).
-    old_ts = now - timedelta(minutes=20)
+    # Older orphan marker event (past the 30 min threshold).
+    old_ts = now - timedelta(minutes=40)
     # Use the writer with a manual ts bypass — emit() stamps "now",
     # so we shape the event by writing JSON directly to the central
     # tail. This mirrors what an in-process producer would have
-    # written 20 minutes ago.
+    # written 40 minutes ago.
     central = central_log_path("savethenovel")
     central.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -470,7 +495,7 @@ def test_cadence_handler_routes_finding_to_alert_sink(now: datetime) -> None:
     central.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema": 1,
-        "ts": (now - timedelta(minutes=20)).isoformat(),
+        "ts": (now - timedelta(minutes=40)).isoformat(),
         "project": "demo",
         "event": EVENT_MARKER_CREATED,
         "subject": "/x/demo/.pollypm/worker-markers/task-demo-1.fresh",
@@ -1104,7 +1129,7 @@ def test_cadence_handler_skips_dispatch_for_legacy_rules(
     central.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema": 1,
-        "ts": (now - timedelta(minutes=20)).isoformat(),
+        "ts": (now - timedelta(minutes=40)).isoformat(),
         "project": "demo",
         "event": EVENT_MARKER_CREATED,
         "subject": "/x/demo/.pollypm/worker-markers/task-demo-1.fresh",
@@ -1526,11 +1551,12 @@ def test_format_unstick_brief_on_hold_includes_evidence_and_default() -> None:
     assert "Project: savethenovel" in brief
     assert "Finding: task_on_hold_stale" in brief
     assert "20 minutes" in brief
-    # The on_hold reason / reviewer rationale must be visible verbatim.
+    # The on_hold transition reason and reviewer evidence must both be visible.
     assert "Footer.astro:20" in brief
+    assert "On-hold transition reason:" in brief
     assert "Routing: architect-actionable" in brief
     # Reviewer evidence section must list both lines.
-    assert "Recent reviewer evidence" in brief
+    assert "Recent reviewer/inbox rationale evidence" in brief
     assert "code_review" in brief
     assert "russell" in brief
     # Default action must steer the architect to fix and re-queue.
@@ -1539,6 +1565,47 @@ def test_format_unstick_brief_on_hold_includes_evidence_and_default() -> None:
     assert "pm task approve savethenovel/11" in brief
     # Escalation path is mentioned but framed as last-resort.
     assert "pm notify" in brief
+
+
+def test_format_unstick_brief_on_hold_distinguishes_transition_reason() -> None:
+    """A policy/merge hold reason must not be mislabeled as reviewer rationale."""
+    from pollypm.audit.watchdog import (
+        RULE_TASK_ON_HOLD_STALE,
+        format_unstick_brief,
+    )
+
+    finding = Finding(
+        rule=RULE_TASK_ON_HOLD_STALE,
+        project="savethenovel",
+        subject="savethenovel/11",
+        metadata={
+            "stuck_minutes": 126,
+            "on_hold_since": "2026-05-07T15:46:17.005979+00:00",
+            "from": "review",
+            "reason": (
+                "Waiting on operator: review passed, but approve auto-merge "
+                "is blocked because the project root has untracked planning docs."
+            ),
+            "routing": "architect-actionable",
+            "reviewer_evidence": [
+                "inbox msg from reviewer_savethenovel: review decision blocked "
+                "savethenovel/11 — Decision would be reject: Criterion 3 "
+                "(No placeholders) fails. Live evidence: "
+                "src/components/Footer.astro:20-22 renders placeholder copy.",
+            ],
+        },
+    )
+
+    brief = format_unstick_brief(finding)
+
+    assert "Reviewer rationale: Waiting on operator" not in brief
+    assert "On-hold transition reason: Waiting on operator" in brief
+    assert "Recent reviewer/inbox rationale evidence" in brief
+    assert "Decision would be reject" in brief
+    assert "Footer.astro:20-22" in brief
+    assert brief.index("Decision would be reject") < brief.index(
+        "On-hold transition reason"
+    )
 
 
 def test_format_unstick_brief_on_hold_handles_missing_evidence() -> None:
@@ -1562,8 +1629,92 @@ def test_format_unstick_brief_on_hold_handles_missing_evidence() -> None:
     )
     brief = format_unstick_brief(finding)
     assert "no transition reason" in brief.lower()
-    # Don't include a stale "Recent reviewer evidence" header.
+    # Don't include a stale reviewer-evidence header.
     assert "No additional reviewer execution rows" in brief
+
+
+def test_gather_reviewer_evidence_checks_project_and_global_inbox_scopes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy reviewer notifies may be global inbox rows, not project-scoped rows."""
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _gather_reviewer_evidence,
+    )
+
+    def _boom_create_work_service(*_args, **_kwargs):
+        raise RuntimeError("skip execution lookup")
+
+    monkeypatch.setattr(
+        "pollypm.work.create_work_service",
+        _boom_create_work_service,
+    )
+
+    class _MsgStore:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def query_messages(self, **filters):  # noqa: ANN001
+            self.calls.append(filters)
+            if filters.get("scope") == "savethenovel":
+                return [
+                    {
+                        "id": 1,
+                        "subject": "savethenovel/11 approval blocked",
+                        "body": "Reviewed savethenovel/11 as approve-blocked.",
+                        "sender": "heartbeat",
+                        "created_at": "2026-05-07T15:46:31+00:00",
+                    },
+                ]
+            if filters.get("scope") == "inbox":
+                return [
+                    {
+                        "id": 4,
+                        "subject": "savethenovel/11 review completed but task is on_hold",
+                        "body": (
+                            "Russell completed code review for savethenovel/11. "
+                            "Verdict would be APPROVE after the hold is cleared."
+                        ),
+                        "sender": "heartbeat",
+                        "created_at": "2026-05-07T15:49:50+00:00",
+                    },
+                    {
+                        "id": 3,
+                        "subject": "savethenovel/11 review complete but task is on_hold",
+                        "body": (
+                            "Russell completed code review for savethenovel/11 "
+                            "and would approve it, but pm task approve is blocked."
+                        ),
+                        "sender": "heartbeat",
+                        "created_at": "2026-05-07T15:48:08+00:00",
+                    },
+                    {
+                        "id": 2,
+                        "subject": "review decision blocked: savethenovel/11 on_hold",
+                        "body": (
+                            "Decision would be reject: Criterion 3 "
+                            "(No placeholders) fails. Live evidence: "
+                            "src/components/Footer.astro:20-22 renders "
+                            "placeholder copy."
+                        ),
+                        "sender": "reviewer_savethenovel",
+                        "created_at": "2026-05-07T15:47:13+00:00",
+                    },
+                ]
+            return []
+
+    store = _MsgStore()
+
+    evidence = _gather_reviewer_evidence(
+        project_key="savethenovel",
+        project_path=None,
+        subject="savethenovel/11",
+        msg_store=store,
+    )
+
+    assert {"scope": "savethenovel"} in store.calls
+    assert {"scope": "inbox"} in store.calls
+    assert any("Decision would be reject" in line for line in evidence)
+    assert any("Footer.astro:20-22" in line for line in evidence)
 
 
 def test_cadence_handler_dispatches_on_hold_with_reviewer_evidence(
@@ -1852,6 +2003,19 @@ class _FakeTransition:
         self.reason = reason
 
 
+class _FakeContext:
+    """Minimal stand-in for ``work.models.ContextEntry``."""
+
+    def __init__(
+        self,
+        *,
+        timestamp: datetime,
+        entry_type: str = "note",
+    ) -> None:
+        self.timestamp = timestamp
+        self.entry_type = entry_type
+
+
 class _StatefulTask:
     """Stand-in for ``work.models.Task`` with state + transitions + timestamps."""
 
@@ -1870,6 +2034,9 @@ class _StatefulTask:
         updated_at: datetime | None = None,
         created_by: str = "polly",
         title: str = "",
+        context: list[_FakeContext] | None = None,
+        assignee: str | None = None,
+        current_node_id: str | None = None,
     ) -> None:
         self.project = project
         self.task_number = task_number
@@ -1879,9 +2046,11 @@ class _StatefulTask:
         self.updated_at = updated_at
         self.created_by = created_by
         self.title = title
+        self.context = list(context or [])
         # Keep the role-session detector happy when reused.
         self.roles: dict[str, str] = {}
-        self.assignee: str | None = None
+        self.assignee: str | None = assignee
+        self.current_node_id = current_node_id
 
 
 def test_task_review_stale_state_based_fires_for_old_entry(now: datetime) -> None:
@@ -2161,9 +2330,230 @@ def test_stuck_draft_state_dedupes_with_event_path(now: datetime) -> None:
     assert matched[0].metadata["detected_via"] == "state"
 
 
+def test_task_progress_stale_state_based_fires_for_old_in_progress(
+    now: datetime,
+) -> None:
+    """#1444 — an old in_progress claim with no activity escalates."""
+    task = _StatefulTask(
+        project="savethenovel",
+        task_number=15,
+        work_status="in_progress",
+        transitions=[
+            _FakeTransition(
+                from_state="queued",
+                to_state="in_progress",
+                timestamp=now - timedelta(minutes=25),
+                actor="worker",
+            ),
+        ],
+        updated_at=now - timedelta(minutes=25),
+        assignee="claude:worker",
+        current_node_id="implement",
+    )
+    findings = scan_events([], now=now, open_tasks=[task])
+    matched = [f for f in findings if f.rule == RULE_TASK_PROGRESS_STALE]
+    assert len(matched) == 1
+    f = matched[0]
+    assert f.subject == "savethenovel/15"
+    assert f.metadata["detected_via"] == "state"
+    assert f.metadata["last_activity_kind"] == "state_entry"
+    assert f.metadata["stuck_minutes"] >= 20
+    assert "auth" in f.recommendation
+
+
+def test_task_progress_stale_state_based_silent_when_recent_context(
+    now: datetime,
+) -> None:
+    """A recent task-context progress note keeps an old claim fresh."""
+    task = _StatefulTask(
+        project="demo",
+        task_number=7,
+        work_status="in_progress",
+        transitions=[
+            _FakeTransition(
+                from_state="queued",
+                to_state="in_progress",
+                timestamp=now - timedelta(minutes=45),
+            ),
+        ],
+        updated_at=now - timedelta(minutes=45),
+        context=[
+            _FakeContext(
+                timestamp=now - timedelta(minutes=5),
+                entry_type="note",
+            ),
+        ],
+    )
+    findings = scan_events([], now=now, open_tasks=[task])
+    assert not any(f.rule == RULE_TASK_PROGRESS_STALE for f in findings)
+
+
+def test_task_progress_stale_state_path_dedupes_event_fallback_with_context(
+    now: datetime,
+) -> None:
+    """Recent task context suppresses stale event fallback for the same task."""
+    task = _StatefulTask(
+        project="demo",
+        task_number=7,
+        work_status="in_progress",
+        transitions=[
+            _FakeTransition(
+                from_state="queued",
+                to_state="in_progress",
+                timestamp=now - timedelta(minutes=45),
+            ),
+        ],
+        updated_at=now - timedelta(minutes=45),
+        context=[
+            _FakeContext(
+                timestamp=now - timedelta(minutes=5),
+                entry_type="note",
+            ),
+        ],
+    )
+    events = [
+        _make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            project="demo",
+            subject="demo/7",
+            metadata={"from": "queued", "to": "in_progress"},
+            ts=now - timedelta(minutes=45),
+        ),
+    ]
+    findings = scan_events(events, now=now, open_tasks=[task])
+    assert not any(f.rule == RULE_TASK_PROGRESS_STALE for f in findings)
+
+
+def test_task_progress_stale_event_path_silent_with_recent_worker_heartbeat(
+    now: datetime,
+) -> None:
+    """A worker.heartbeat after the in_progress transition suppresses the finding."""
+    events = [
+        _make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            project="demo",
+            subject="demo/8",
+            metadata={"from": "queued", "to": "in_progress"},
+            ts=now - timedelta(minutes=45),
+        ),
+        _make_event(
+            event="worker.heartbeat",
+            project="demo",
+            subject="demo/8",
+            metadata={"task_id": "demo/8"},
+            ts=now - timedelta(minutes=5),
+        ),
+    ]
+    findings = scan_events(events, now=now)
+    assert not any(f.rule == RULE_TASK_PROGRESS_STALE for f in findings)
+
+
+def test_task_progress_stale_event_path_fires_without_heartbeat(
+    now: datetime,
+) -> None:
+    events = [
+        _make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            project="demo",
+            subject="demo/8",
+            metadata={"from": "queued", "to": "in_progress"},
+            ts=now - timedelta(minutes=45),
+        ),
+    ]
+    findings = scan_events(events, now=now)
+    matched = [f for f in findings if f.rule == RULE_TASK_PROGRESS_STALE]
+    assert len(matched) == 1
+    assert matched[0].subject == "demo/8"
+    assert matched[0].metadata["detected_via"] == "event"
+
+
+def test_format_unstick_brief_progress_stale_mentions_auth() -> None:
+    from pollypm.audit.watchdog import format_unstick_brief
+
+    finding = Finding(
+        rule=RULE_TASK_PROGRESS_STALE,
+        project="savethenovel",
+        subject="savethenovel/15",
+        message="Task savethenovel/15 has been in_progress with no activity.",
+        metadata={
+            "stuck_minutes": 25,
+            "in_progress_minutes": 25,
+            "in_progress_since": "2026-05-07T20:03:09+00:00",
+            "last_activity_at": "2026-05-07T20:03:09+00:00",
+            "last_activity_kind": "state_entry",
+            "assignee": "claude:worker",
+            "current_node_id": "implement",
+        },
+    )
+    brief = format_unstick_brief(finding)
+    assert "task_progress_stale" in brief
+    assert "auth" in brief.lower()
+    assert "sandbox" in brief.lower()
+    assert "pm task cancel savethenovel/15" in brief
+
+
+def test_cadence_handler_dispatches_task_progress_stale(
+    now: datetime, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The new in_progress detector is part of the architect dispatch set."""
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _scan_one_project,
+    )
+
+    task = _StatefulTask(
+        project="savethenovel",
+        task_number=15,
+        work_status="in_progress",
+        transitions=[
+            _FakeTransition(
+                from_state="queued",
+                to_state="in_progress",
+                timestamp=now - timedelta(minutes=25),
+                actor="worker",
+            ),
+        ],
+        updated_at=now - timedelta(minutes=25),
+        assignee="claude:worker",
+        current_node_id="implement",
+    )
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._gather_open_tasks",
+        lambda key, path: [task],
+    )
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._gather_storage_windows",
+        lambda name: ["worker-savethenovel", "architect-savethenovel"],
+    )
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._send_brief_to_architect",
+        lambda target, brief: sent.append((target, brief)) or True,
+    )
+
+    store = _RecordingStore()
+    counters = _scan_one_project(
+        project_key="savethenovel",
+        project_path=None,
+        msg_store=store,
+        state_store=None,
+        now=now,
+        config=WatchdogConfig(),
+        storage_closet_name="pollypm-storage-closet",
+    )
+
+    assert counters["findings"] >= 1
+    assert counters["dispatches_sent"] == 1
+    assert len(sent) == 1
+    target, brief = sent[0]
+    assert target == "pollypm-storage-closet:architect-savethenovel"
+    assert RULE_TASK_PROGRESS_STALE in brief
+    assert "savethenovel/15" in brief
+
+
 def test_state_based_detectors_silent_when_open_tasks_empty(now: datetime) -> None:
     """No open_tasks → state path no-ops, original event path still works."""
     from pollypm.audit.watchdog import (
+        RULE_TASK_PROGRESS_STALE,
         RULE_TASK_ON_HOLD_STALE,
         RULE_TASK_REVIEW_STALE,
     )
@@ -2171,6 +2561,11 @@ def test_state_based_detectors_silent_when_open_tasks_empty(now: datetime) -> No
     findings = scan_events([], now=now, open_tasks=[])
     # No events, no tasks → nothing should fire.
     assert not any(
-        f.rule in (RULE_TASK_REVIEW_STALE, RULE_TASK_ON_HOLD_STALE, RULE_STUCK_DRAFT)
+        f.rule in (
+            RULE_TASK_REVIEW_STALE,
+            RULE_TASK_ON_HOLD_STALE,
+            RULE_TASK_PROGRESS_STALE,
+            RULE_STUCK_DRAFT,
+        )
         for f in findings
     )

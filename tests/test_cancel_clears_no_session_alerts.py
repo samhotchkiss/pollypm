@@ -41,6 +41,7 @@ from pollypm.work.models import (
 )
 from pollypm.storage.state import StateStore
 from pollypm.work import task_assignment as bus
+from pollypm.work import task_assignment_alerts as alert_bus
 from pollypm.work.sqlite_service import SQLiteWorkService
 
 
@@ -77,6 +78,7 @@ class _FakeSessionService:
 
 def _make_environment(tmp_path: Path) -> tuple[SQLiteWorkService, StateStore]:
     bus.clear_listeners()
+    alert_bus.clear_listeners()
     work = SQLiteWorkService(db_path=tmp_path / "work.db")
     store = StateStore(tmp_path / "state.db")
     return work, store
@@ -156,6 +158,11 @@ def _install_resolver_loader(monkeypatch, services: _RuntimeServices) -> None:
         "pollypm.work.service_transition_manager.WorkTransitionManager._resolve_alert_store",
         staticmethod(lambda: None),
     )
+    from pollypm.plugins_builtin.task_assignment_notify.plugin import (
+        _assignment_alert_cleanup_listener,
+    )
+
+    alert_bus.register_listener(_assignment_alert_cleanup_listener)
 
 
 def _install_sweep_loader(monkeypatch, services: _RuntimeServices) -> None:
@@ -364,6 +371,7 @@ class TestClearHelperRespectsHasOtherActive:
         self, tmp_path, monkeypatch,
     ):
         bus.clear_listeners()
+        alert_bus.clear_listeners()
         store = StateStore(tmp_path / "state.db")
         store.upsert_alert(
             "task_assignment",
@@ -393,6 +401,7 @@ class TestClearHelperRespectsHasOtherActive:
         self, tmp_path, monkeypatch,
     ):
         bus.clear_listeners()
+        alert_bus.clear_listeners()
         store = StateStore(tmp_path / "state.db")
         store.upsert_alert(
             "task_assignment",
@@ -707,6 +716,7 @@ class TestClearNoSessionAlertHelper:
 
     def test_clears_per_task_alert_only(self, tmp_path, monkeypatch):
         bus.clear_listeners()
+        alert_bus.clear_listeners()
         store = StateStore(tmp_path / "state.db")
         store.upsert_alert(
             "task_assignment",
@@ -735,3 +745,54 @@ class TestClearNoSessionAlertHelper:
             "project-level alert must NOT be cleared by the approve-side "
             "helper; only the per-task alert is unambiguously stale"
         )
+
+
+class TestPluginAlertCleanupSubscription:
+    def test_initialize_subscribes_to_alert_cleanup_bus(
+        self, tmp_path, monkeypatch,
+    ):
+        bus.clear_listeners()
+        alert_bus.clear_listeners()
+        from pollypm.session_services import base as session_bus
+
+        session_bus.clear_session_listeners()
+        store = StateStore(tmp_path / "state.db")
+        store.upsert_alert(
+            "task_assignment",
+            "no_session_for_assignment:demo/1",
+            "warning",
+            "msg",
+        )
+        services = _RuntimeServices(
+            session_service=None,
+            state_store=store,
+            work_service=None,
+            project_root=tmp_path,
+            msg_store=store,
+        )
+        monkeypatch.setattr(
+            "pollypm.plugins_builtin.task_assignment_notify.resolver.load_runtime_services",
+            lambda *, config_path=None: services,
+        )
+
+        from pollypm.plugin_api.v1 import PluginAPI
+        from pollypm.plugins_builtin.task_assignment_notify.plugin import _initialize
+
+        _initialize(
+            PluginAPI(
+                plugin_name="task_assignment_notify",
+                roster_api=None,
+                jobs_api=None,
+            )
+        )
+        alert_bus.dispatch(
+            alert_bus.ClearNoSessionAlertForTaskEvent(task_id="demo/1")
+        )
+
+        assert (
+            "task_assignment",
+            "no_session_for_assignment:demo/1",
+        ) not in _open_alerts(store)
+        bus.clear_listeners()
+        alert_bus.clear_listeners()
+        session_bus.clear_session_listeners()

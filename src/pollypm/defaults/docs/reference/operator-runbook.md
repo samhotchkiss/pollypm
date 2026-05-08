@@ -17,6 +17,7 @@ Step-by-step procedures for common operations.
 | Deploy a Site with ItsAlive | 134 |
 | Handle a Heartbeat Escalation | 152 |
 | Check System Health | 166 |
+| Understand Background Maintenance | 202 |
 
 ## Delegate Work to a Worker
 
@@ -198,3 +199,156 @@ pm debug           # diagnostics
 pm mail            # inbox items
 pm task counts     # task counts across projects
 ```
+
+## Understand Background Maintenance
+
+PollyPM runs a few cleanup paths in the background so local state does
+not grow forever or leave stale launch markers behind. They are meant
+to be observable and conservative: they only touch PollyPM-owned paths,
+they prefer leaking a file over deleting something they cannot classify,
+and they log what they remove.
+
+The three operator-visible surfaces are log rotation, the socket reaper,
+and the worker-marker reaper.
+
+### Log Rotation
+
+What runs:
+
+- `pollypm.plugins_builtin.core_recurring.maintenance::log_rotate_handler`
+  is the hourly `log.rotate` recurring handler for `config.project.logs_dir`.
+- `pollypm.log_rotation::make_rotating_file_handler` wraps Python logging
+  sinks with a `RotatingFileHandler`.
+- `pollypm.log_rotation::bootstrap_truncate_if_too_big` handles spawned
+  subprocess logs whose file descriptors cannot be rotated live.
+
+When it runs:
+
+- The recurring `log.rotate` job is registered by the `core_recurring`
+  plugin and normally runs once per hour.
+- `RotatingFileHandler`-based logs rotate during writes.
+- Spawned logs are checked just before the next rail daemon or phantom
+  client process starts.
+
+What it touches:
+
+- Session pane logs under `config.project.logs_dir`, including nested
+  `logs/<session>/<window>.log` paths.
+- `~/.pollypm/errors.log` and `~/.pollypm/cockpit_debug.log`.
+- `~/.pollypm/rail_daemon.log` and `~/.pollypm/phantom_client.log`.
+- Rotations appear beside the source log as `.log.<timestamp>.gz` for
+  recurring/bootstrap rotation, or as `.1`, `.2`, etc. for Python
+  `RotatingFileHandler` backups.
+
+How to tune or disable:
+
+- Tune limits in `~/.pollypm/pollypm.toml`:
+  ```toml
+  [logging]
+  rotate_size_mb = 20
+  rotate_keep = 3
+  ```
+- `rotate_size_mb` is the per-file threshold. `rotate_keep` is retained
+  archive count. Invalid or negative values fall back to defaults.
+- There is no supported per-log disable switch. If you need temporary
+  non-rotation for an investigation, raise `rotate_size_mb` and restore
+  it afterward rather than disabling the `core_recurring` plugin, which
+  also owns unrelated maintenance jobs.
+
+What an operator sees:
+
+- `pm doctor --fix` can run `log.rotate` immediately for oversized
+  workspace logs.
+- Rotation failure is best-effort and logged at debug level; it should
+  not block `pm up`.
+- Log rotation does not emit an audit-log event today. Inspect archive
+  files and the live log size when investigating rotation behavior.
+
+### Cockpit Socket Reaper
+
+What runs:
+
+- `pollypm.cockpit_socket_reaper::reap_stale_cockpit_sockets`, called
+  from `pollypm.supervisor.Supervisor._bootstrap_clear_markers`.
+
+When it runs:
+
+- Once during supervisor bootstrap, before new cockpit or per-task
+  worker panes are launched.
+
+What it touches:
+
+- `~/.pollypm/cockpit_inputs/*.sock`.
+- `$TMPDIR/pollypm-cockpit_inputs/*.sock`, the AF_UNIX fallback used
+  when the primary socket path is too long.
+- Only socket inodes named like `<kind>-<pid>.sock` are candidates. A
+  candidate is removed only when the encoded PID is no longer alive.
+  Live PIDs, unparseable names, directories, and regular files are left
+  alone.
+
+How to tune or disable:
+
+- There is no tuning knob and no supported disable switch.
+- Custom tooling should not place durable sockets in `cockpit_inputs/`
+  using PollyPM's `<kind>-<pid>.sock` naming shape. Use another
+  directory or a name that does not encode a dead owner PID.
+
+What an operator sees:
+
+- A reaped socket produces a warning like `cockpit_socket_reaper: reaped
+  ...`.
+- Each removal emits a `socket.reaped` audit event under the `_workspace`
+  audit stream with `path`, `kind`, `pid`, and `reason` metadata.
+- If a custom socket disappeared, first check whether it was a real
+  socket file in one of the reaper directories and whether its filename
+  encoded a PID that had already exited.
+
+### Worker-Marker Reaper
+
+What runs:
+
+- `pollypm.work.worker_marker_reaper::reap_orphan_worker_markers`, called
+  from `pollypm.supervisor.Supervisor._bootstrap_clear_markers`.
+- `pollypm.work.worker_marker_reaper::sweep_worker_markers`, called from
+  the supervisor heartbeat sweep after startup.
+
+When it runs:
+
+- Bootstrap: once while the supervisor is starting, before per-task
+  workers are alive.
+- Runtime: on heartbeat sweeps, so markers orphaned after startup do not
+  wait for the next `pm up`.
+
+What it touches:
+
+- Each configured project's
+  `<project>/.pollypm/worker-markers/*.fresh` files.
+- The task row behind a marker's `task-<project>-<number>` window name.
+- The storage-closet tmux session's live task windows. The runtime sweep
+  may also kill a stale tmux window matching a marker it reaped.
+- Markers are removed when the task row is missing, the task is terminal
+  (`done`, `cancelled`, or `abandoned`), or the task is non-terminal but
+  the corresponding tmux window is gone. Fresh installs, missing DBs,
+  and unrecognized marker names are skipped.
+
+How to tune or disable:
+
+- There is no tuning knob and no supported disable switch. These markers
+  are an internal launch contract.
+- Do not put custom files under `.pollypm/worker-markers/` using the
+  `task-<project>-<number>.fresh` shape.
+- If you need to inspect a suspected orphan before cleanup, run
+  `pm doctor` before booting the cockpit; the doctor check reports
+  missing-row and terminal-task markers without unlinking them.
+
+What an operator sees:
+
+- Bootstrap/runtime removal logs a warning and prints
+  `[worker_marker_reaper] reaped ...`.
+- Each removal emits a `worker.session_reaped` audit event with the task
+  subject and marker path metadata.
+- `pm doctor` reports `orphan-worker-markers` when it can classify stale
+  markers without mutating the filesystem.
+- Repeated `worker.session_reaped` events for the same task can trip the
+  watchdog's dead-loop rule and route an escalation to the project
+  architect.

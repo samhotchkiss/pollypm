@@ -11,6 +11,8 @@ for non-faults the user already sees as yellow.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from pollypm.dashboard_data import _stuck_alert_already_user_waiting
 
 
@@ -538,6 +540,14 @@ def test_user_waiting_task_ids_skips_non_tracked_projects(
     # blocked task does NOT (would have leaked into stuck-alert dedup).
     assert "tracked/1" in waiting
     assert "ghost/99" not in waiting
+
+
+def test_dashboard_data_routes_user_waiting_reads_through_work_facade() -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    source = (repo_root / "src/pollypm/dashboard_data.py").read_text(encoding="utf-8")
+
+    assert "import sqlite3" not in source
+    assert "sqlite3.connect" not in source
 
 
 def test_recent_inbox_messages_skips_non_tracked_projects(

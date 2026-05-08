@@ -21,6 +21,7 @@ locations.
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,7 @@ from pollypm.audit import (
 )
 from pollypm.audit.log import (
     EVENT_TASK_CREATED,
+    EVENT_TASK_DELETED,
     EVENT_TASK_STATUS_CHANGED,
     EVENT_WORK_DB_OPENED,
     SCHEMA_VERSION,
@@ -409,6 +411,62 @@ def test_workservice_transition_emits_status_changed(tmp_path: Path) -> None:
     assert "from" in last.metadata
     assert "to" in last.metadata
     assert last.metadata["to"] == "queued"
+
+
+def test_workservice_flushes_raw_work_task_delete_to_audit(
+    tmp_path: Path,
+) -> None:
+    """A raw SQL sweeper cannot make a work_tasks row vanish silently.
+
+    The delete trigger records the old task id in an outbox inside the
+    work DB. The next work-service open flushes that outbox to the JSONL
+    audit stream as ``task.deleted``.
+    """
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    project_root = tmp_path / "savethenovel"
+    (project_root / ".pollypm").mkdir(parents=True)
+    db_path = tmp_path / "work.db"
+
+    svc = SQLiteWorkService(db_path=db_path, project_path=project_root)
+    try:
+        task = svc.create(
+            title="Advisor review for savethenovel",
+            description="Review recent project trajectory.",
+            type="task",
+            project="savethenovel",
+            flow_template="advisor_review",
+            roles={"advisor": "advisor"},
+            priority="normal",
+            created_by="advisor.tick",
+            labels=["advisor"],
+        )
+        svc.queue(task.task_id, "advisor.tick")
+    finally:
+        svc.close()
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "DELETE FROM work_transitions "
+            "WHERE task_project = ? AND task_number = ?",
+            (task.project, task.task_number),
+        )
+        conn.execute(
+            "DELETE FROM work_tasks WHERE project = ? AND task_number = ?",
+            (task.project, task.task_number),
+        )
+        conn.commit()
+
+    svc2 = SQLiteWorkService(db_path=db_path, project_path=project_root)
+    svc2.close()
+
+    deleted = read_events(
+        "savethenovel", project_path=project_root, event=EVENT_TASK_DELETED,
+    )
+    assert len(deleted) == 1
+    assert deleted[0].subject == task.task_id
+    assert deleted[0].metadata["flow_template"] == "advisor_review"
+    assert deleted[0].metadata["previous_status"] == "queued"
 
 
 # ---------------------------------------------------------------------------

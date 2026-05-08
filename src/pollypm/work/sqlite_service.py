@@ -767,6 +767,7 @@ class SQLiteWorkService:
             )
         except Exception:  # noqa: BLE001 — audit must never break init
             pass
+        self._flush_task_delete_audit_outbox()
         self._gate_registry = GateRegistry(project_path=project_path)
         self._flow_cache: dict[tuple[str, int], FlowTemplate] = {}
         self._work_output_cache: dict[str, dict[str, Any]] = {}
@@ -790,9 +791,56 @@ class SQLiteWorkService:
 
     def close(self) -> None:
         """Close the database connection."""
+        if not self._conn.in_transaction:
+            self._flush_task_delete_audit_outbox()
         self._flow_cache.clear()
         self._work_output_cache.clear()
         self._conn.close()
+
+    def _flush_task_delete_audit_outbox(self) -> int:
+        """Emit JSONL audit rows captured by the work_tasks delete trigger."""
+        try:
+            rows = self._conn.execute(
+                "SELECT id, project, task_number, title, flow_template_id, "
+                "previous_status, created_by, deleted_at "
+                "FROM work_task_delete_audit_outbox ORDER BY id"
+            ).fetchall()
+        except sqlite3.Error:
+            return 0
+        if not rows:
+            return 0
+
+        try:
+            from pollypm.audit import emit as _audit_emit
+            from pollypm.audit.log import EVENT_TASK_DELETED
+
+            for row in rows:
+                project = str(row["project"])
+                task_number = int(row["task_number"])
+                _audit_emit(
+                    event=EVENT_TASK_DELETED,
+                    project=project,
+                    subject=f"{project}/{task_number}",
+                    actor="system",
+                    metadata={
+                        "reason": "work_tasks_delete_trigger",
+                        "title": row["title"],
+                        "flow_template": row["flow_template_id"],
+                        "previous_status": row["previous_status"],
+                        "created_by": row["created_by"],
+                        "deleted_at": row["deleted_at"],
+                    },
+                    project_path=self._project_path,
+                )
+            self._conn.executemany(
+                "DELETE FROM work_task_delete_audit_outbox WHERE id = ?",
+                [(row["id"],) for row in rows],
+            )
+            self._conn.commit()
+            return len(rows)
+        except Exception:  # noqa: BLE001
+            self._conn.rollback()
+            return 0
 
     def __enter__(self):
         return self
@@ -2628,29 +2676,7 @@ class SQLiteWorkService:
         except Exception:
             self._conn.rollback()
             raise
-        # Audit hook (#savethenovel) — record the row delete.
-        # work_tasks is the spine; once a row leaves it the only
-        # forensic trail of "this task ever existed" is the audit
-        # log. Emit AFTER commit so we don't record phantom
-        # deletes for rolled-back transactions.
-        try:
-            from pollypm.audit import emit as _audit_emit
-            from pollypm.audit.log import EVENT_TASK_DELETED
-
-            _audit_emit(
-                event=EVENT_TASK_DELETED,
-                project=task.project,
-                subject=task.task_id,
-                actor="system",
-                metadata={
-                    "reason": "prune_cancelled_critique_child",
-                    "flow_template": task.flow_template_id,
-                    "title": task.title,
-                },
-                project_path=self._project_path,
-            )
-        except Exception:  # noqa: BLE001
-            pass
+        self._flush_task_delete_audit_outbox()
 
     def _on_task_done(self, task_id: str, actor: str) -> None:
         """Post-commit hook — fire milestone/digest flush on done transitions.

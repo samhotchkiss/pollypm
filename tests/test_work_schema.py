@@ -29,6 +29,7 @@ EXPECTED_TABLES = [
     "work_node_executions",
     "work_context_entries",
     "work_transitions",
+    "work_task_delete_audit_outbox",
 ]
 
 
@@ -270,10 +271,8 @@ def test_legacy_db_gets_hot_query_indexes_and_schema_bump(conn):
     version = conn.execute(
         "SELECT COALESCE(MAX(version), 0) FROM work_schema_version"
     ).fetchone()[0]
-    # Migration 8 (#1398) records the plan_version + predecessor_task_id
-    # column bumps on work_tasks so plan-task evolution metadata
-    # surfaces on legacy DBs without a backfill pass.
-    assert version == 8
+    # Migration 9 records the task-delete audit outbox/trigger.
+    assert version == 9
 
 
 def test_migration_6_adds_provider_columns_to_work_sessions(conn):
@@ -309,10 +308,10 @@ def test_migration_7_adds_kickoff_sent_at_to_work_node_executions(conn):
         "SELECT COALESCE(MAX(version), 0) FROM work_schema_version"
     ).fetchone()[0]
     # The migration walk applies every pending step in order, so a v6
-    # legacy DB ends up at the latest version (v8 after #1398) — not
+    # legacy DB ends up at the latest version (v9 after #1442) — not
     # at v7. Asserting the whole walk completed protects future
     # migrations from a stale floor here.
-    assert version == 8
+    assert version == 9
 
 
 def test_migration_8_adds_plan_metadata_columns_to_work_tasks(conn):
@@ -324,7 +323,7 @@ def test_migration_8_adds_plan_metadata_columns_to_work_tasks(conn):
       * existing rows default to ``plan_version=1`` and
         ``predecessor_task_id=NULL`` (additive migration — no data
         loss / shape change),
-      * the schema_version row bumps to v8.
+      * the schema_version row bumps to the latest migration.
     """
     # Create a v7-shaped work_tasks table (no plan_version /
     # predecessor_task_id columns) plus the schema_version row that
@@ -398,9 +397,52 @@ def test_migration_8_adds_plan_metadata_columns_to_work_tasks(conn):
     version = conn.execute(
         "SELECT COALESCE(MAX(version), 0) FROM work_schema_version"
     ).fetchone()[0]
-    assert version == 8
+    assert version == 9
 
     idxs = _indexes(conn)
     assert "idx_work_tasks_predecessor" in idxs, (
         "successors lookup index should be created on legacy DB"
     )
+
+
+def test_migration_9_adds_task_delete_audit_outbox_and_trigger(conn):
+    """#1442: raw work_tasks deletes leave a durable audit outbox row."""
+    create_work_tables(conn)
+
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    assert "work_task_delete_audit_outbox" in tables
+
+    trigger = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type='trigger' AND name='trg_work_tasks_delete_audit_outbox'"
+    ).fetchone()
+    assert trigger is not None
+
+    conn.execute(
+        "INSERT INTO work_tasks "
+        "(project, task_number, title, type, flow_template_id, "
+        "created_at, created_by, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "demo",
+            1,
+            "to be swept",
+            "task",
+            "standard",
+            "2026-01-01T00:00:00+00:00",
+            "tester",
+            "2026-01-01T00:00:00+00:00",
+        ),
+    )
+    conn.execute("DELETE FROM work_tasks WHERE project = ? AND task_number = ?", ("demo", 1))
+
+    row = conn.execute(
+        "SELECT project, task_number, title, flow_template_id, previous_status, "
+        "created_by FROM work_task_delete_audit_outbox"
+    ).fetchone()
+    assert row == ("demo", 1, "to be swept", "standard", "draft", "tester")

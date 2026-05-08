@@ -123,7 +123,7 @@ from pollypm.cockpit_settings_history import (
 )
 from pollypm.cockpit_settings_projects import collect_settings_projects
 from pollypm.cockpit_workers import PollyWorkerRosterApp  # noqa: F401
-from pollypm.notify_task import is_notify_inbox_task
+from pollypm.notify_task import is_notify_inbox_task, strip_routing_tag_prefix
 from pollypm.rejection_feedback import (
     feedback_target_task_id,
     is_rejection_feedback_task,
@@ -6858,7 +6858,7 @@ def _archive_success_message(item, task_id: str) -> str:
         return f"Archived {task_id}"
     title = str(getattr(item, "title", "") or "").strip()
     if title:
-        return f"Archived {_strip_action_subject_prefix(title)}"
+        return f"Archived {strip_routing_tag_prefix(title)}"
     return "Archived notification"
 
 
@@ -7006,7 +7006,7 @@ def _format_inbox_row(
     # stamping every title with "[Action]" is redundant noise that
     # eats list-pane width and buries the actual subject.
     if getattr(task, "triage_bucket", "") == "action":
-        subject = _strip_action_subject_prefix(subject)
+        subject = strip_routing_tag_prefix(subject)
     reply_suffix = ""
     if reply_count:
         noun = "reply" if reply_count == 1 else "replies"
@@ -9396,7 +9396,7 @@ class PollyInboxApp(App[None]):
         # header should not lead with "[Action]" boilerplate.
         subject = item.title or "(no subject)"
         if _triage_bucket(item) == "action":
-            subject = _strip_action_subject_prefix(subject)
+            subject = strip_routing_tag_prefix(subject)
         sections.append(f"[b #eef2f4]{_escape(subject)}[/b #eef2f4]")
         meta_bits = [f"[#5b8aff]{_escape(sender)}[/#5b8aff]"]
         if when:
@@ -9583,7 +9583,7 @@ class PollyInboxApp(App[None]):
         # Same routing-tag strip as the list rail — the focused message
         # header should not lead with "[Action]" boilerplate.
         if getattr(task, "triage_bucket", "") == "action":
-            subject = _strip_action_subject_prefix(subject)
+            subject = strip_routing_tag_prefix(subject)
         sections.append(f"[b #eef2f4]{_escape(subject)}[/b #eef2f4]")
         meta_bits = [f"[#5b8aff]{_escape(sender)}[/#5b8aff]"]
         if when:
@@ -13821,29 +13821,6 @@ def _action_card_click_hint(action_items: list[dict]) -> str:
 def _dashboard_action_key(index: int, slot: str) -> str:
     offset = {"primary": 1, "secondary": 2, "other": 3}[slot]
     return str(index * 3 + offset)
-
-
-_ROUTING_TAG_PREFIXES = ("[action]", "[alert]")
-
-
-def _strip_action_subject_prefix(subject: str) -> str:
-    """Drop a leading routing tag (``[Action]``, ``[Alert]``) from a
-    user-facing subject.
-
-    These bracketed prefixes are tier/recipient routing labels added by
-    the notify CLI and the supervisor's alert path; they have no
-    natural-language value for the operator reading the subject. The
-    inbox list rail already strips ``[Action]`` for action-bucket rows;
-    the detail pane and the activity feed mirror the strip so a focused
-    message or feed row doesn't lead with the routing tag.
-    """
-    if not subject:
-        return subject
-    lowered = subject.lower()
-    for tag in _ROUTING_TAG_PREFIXES:
-        if lowered.startswith(tag):
-            return subject[len(tag):].lstrip(" :-—")
-    return subject
 
 
 def _clean_hold_reason(

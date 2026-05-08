@@ -43,7 +43,7 @@ from pollypm.cockpit_task_review import (
 from pollypm.cockpit_formatting import format_event_time
 from pollypm.cockpit_formatting import format_relative_age as _format_relative_age
 from pollypm.config import load_config, project_config_path
-from pollypm.plugins_builtin.project_planning.plan_presence import (
+from pollypm.plan_presence import (
     plan_approval_task,
     plan_blocked_task_ids,
 )

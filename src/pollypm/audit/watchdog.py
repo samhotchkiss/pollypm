@@ -1065,6 +1065,7 @@ def _detect_task_progress_stale(
                 last_activity = context_ts
                 last_activity_kind = context_kind
 
+            seen_subjects.add(subject)
             if last_activity > cutoff:
                 continue
             stuck_minutes = max(
@@ -1073,7 +1074,6 @@ def _detect_task_progress_stale(
             in_progress_minutes = max(
                 1, int((now - entry_ts).total_seconds() // 60),
             )
-            seen_subjects.add(subject)
             findings.append(Finding(
                 rule=RULE_TASK_PROGRESS_STALE,
                 project=project,

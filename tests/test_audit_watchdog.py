@@ -2364,6 +2364,42 @@ def test_task_progress_stale_state_based_silent_when_recent_context(
     assert not any(f.rule == RULE_TASK_PROGRESS_STALE for f in findings)
 
 
+def test_task_progress_stale_state_path_dedupes_event_fallback_with_context(
+    now: datetime,
+) -> None:
+    """Recent task context suppresses stale event fallback for the same task."""
+    task = _StatefulTask(
+        project="demo",
+        task_number=7,
+        work_status="in_progress",
+        transitions=[
+            _FakeTransition(
+                from_state="queued",
+                to_state="in_progress",
+                timestamp=now - timedelta(minutes=45),
+            ),
+        ],
+        updated_at=now - timedelta(minutes=45),
+        context=[
+            _FakeContext(
+                timestamp=now - timedelta(minutes=5),
+                entry_type="note",
+            ),
+        ],
+    )
+    events = [
+        _make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            project="demo",
+            subject="demo/7",
+            metadata={"from": "queued", "to": "in_progress"},
+            ts=now - timedelta(minutes=45),
+        ),
+    ]
+    findings = scan_events(events, now=now, open_tasks=[task])
+    assert not any(f.rule == RULE_TASK_PROGRESS_STALE for f in findings)
+
+
 def test_task_progress_stale_event_path_silent_with_recent_worker_heartbeat(
     now: datetime,
 ) -> None:

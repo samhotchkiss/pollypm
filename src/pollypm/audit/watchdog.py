@@ -39,6 +39,11 @@ Detection rules (each returns a list of :class:`Finding`):
    following ``cancel_grace_seconds`` window. Indicates a planning
    stall after a self-cancel (savethenovel/1's class — a worker
    self-cancels but Polly never queues a follow-up).
+5. ``task_progress_stale`` — a live task currently at ``in_progress``
+   whose worker has produced no transition / heartbeat / task-context
+   activity for longer than ``progress_stale_seconds``. Catches the
+   alive-but-unproductive worker class, including auth-blocked panes
+   that keep accepting nudges but cannot make API calls.
 
 Severity is ``"warn"`` for every rule today. The recovery hint is
 attached to each finding so the alert message can include a
@@ -81,6 +86,7 @@ __all__ = [
     "RULE_STUCK_DRAFT",
     "RULE_CANCEL_NO_PROMOTION",
     "RULE_TASK_REVIEW_STALE",
+    "RULE_TASK_PROGRESS_STALE",
     "RULE_ROLE_SESSION_MISSING",
     "RULE_WORKER_SESSION_DEAD_LOOP",
     "RULE_TASK_ON_HOLD_STALE",
@@ -116,6 +122,7 @@ RULE_CANCEL_NO_PROMOTION = "cancellation_no_promotion"
 # matching role tmux session, and a worker reaper firing in a loop on
 # the same task.
 RULE_TASK_REVIEW_STALE = "task_review_stale"
+RULE_TASK_PROGRESS_STALE = "task_progress_stale"
 RULE_ROLE_SESSION_MISSING = "role_session_missing"
 RULE_WORKER_SESSION_DEAD_LOOP = "worker_session_dead_loop"
 # #1424 — task_on_hold_stale catches the savethenovel/11 pattern where
@@ -176,7 +183,7 @@ _MARKER_NAME_RE = re.compile(
 
 @dataclass(slots=True, frozen=True)
 class WatchdogConfig:
-    """Tunable thresholds for the four detection rules.
+    """Tunable thresholds for watchdog detection rules.
 
     All durations are in seconds. Defaults match the spec in the
     task brief — 30 min lookback for orphan/leak rules, 5 min for
@@ -198,6 +205,12 @@ class WatchdogConfig:
     # most recent transition older than this before we fire. 30 min
     # mirrors the savethenovel/10 case (reviewer agent never spawned).
     review_stale_seconds: int = 1800
+    # #1444 — task_progress_stale: a task at status=in_progress with no
+    # transition / worker heartbeat / task-context activity for this
+    # long is treated as a silent worker stall. 20 min is intentionally
+    # shorter than review stale because an implementing worker should
+    # either advance the task, emit progress context, or heartbeat.
+    progress_stale_seconds: int = 1200
     # #1424 — task_on_hold_stale: a task at status=on_hold for longer
     # than this triggers the architect-first escalation. Defaults to
     # 15 min — shorter than ``review_stale_seconds`` because on_hold is
@@ -250,6 +263,17 @@ def _parse_iso(stamp: str) -> datetime | None:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def _coerce_datetime(value: Any) -> datetime | None:
+    """Coerce datetime-ish values from models / events to tz-aware UTC."""
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+    if isinstance(value, str):
+        return _parse_iso(value)
+    return None
 
 
 def _marker_task_key(subject: str) -> tuple[str, int] | None:
@@ -946,6 +970,204 @@ def _detect_task_on_hold_stale(
     return findings
 
 
+def _latest_worker_heartbeat_time(
+    events: Sequence[AuditEvent],
+    *,
+    subject: str,
+    since: datetime,
+) -> datetime | None:
+    """Return the latest ``worker.heartbeat`` timestamp for ``subject``."""
+    latest: datetime | None = None
+    for ev in events:
+        if ev.event != "worker.heartbeat":
+            continue
+        meta = ev.metadata or {}
+        event_subjects = {
+            ev.subject,
+            str(meta.get("task_id") or ""),
+            str(meta.get("subject") or ""),
+        }
+        if subject not in event_subjects:
+            continue
+        ts = _parse_iso(ev.ts)
+        if ts is None or ts < since:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
+
+
+def _latest_task_context_time(
+    task: Any, *, since: datetime,
+) -> tuple[datetime | None, str]:
+    """Return latest task-context timestamp after ``since``, if loaded."""
+    latest: datetime | None = None
+    latest_kind = ""
+    for entry in getattr(task, "context", None) or []:
+        ts = _coerce_datetime(getattr(entry, "timestamp", None))
+        if ts is None or ts < since:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+            entry_type = getattr(entry, "entry_type", None) or "context"
+            latest_kind = f"context:{entry_type}"
+    return latest, latest_kind
+
+
+def _detect_task_progress_stale(
+    events: Sequence[AuditEvent],
+    *,
+    now: datetime,
+    config: WatchdogConfig,
+    open_tasks: Sequence[Any] | None = None,
+) -> list[Finding]:
+    """Rule 5c (#1444): ``in_progress`` tasks with no recent progress.
+
+    The production path uses ``open_tasks`` so the detector keys off the
+    authoritative current work state, then measures activity from the
+    latest of entry into ``in_progress``, a future ``worker.heartbeat``
+    audit row for the same task, or a loaded task-context entry.
+
+    Audit-event fallback keeps ``scan_events`` useful for synthetic
+    fixtures and future producers that emit ``worker.heartbeat``.
+    """
+    findings: list[Finding] = []
+    seen_subjects: set[str] = set()
+    cutoff = now - timedelta(seconds=config.progress_stale_seconds)
+
+    if open_tasks:
+        for task in open_tasks:
+            status = getattr(task, "work_status", None)
+            status_value = getattr(status, "value", status)
+            if status_value != "in_progress":
+                continue
+            project = getattr(task, "project", "") or ""
+            task_number = getattr(task, "task_number", None)
+            if not project or task_number is None:
+                continue
+            subject = f"{project}/{task_number}"
+            entry_ts, tr_meta = _state_entry_time(task, "in_progress")
+            if entry_ts is None:
+                continue
+
+            last_activity = entry_ts
+            last_activity_kind = "state_entry"
+            heartbeat_ts = _latest_worker_heartbeat_time(
+                events, subject=subject, since=entry_ts,
+            )
+            if heartbeat_ts is not None and heartbeat_ts > last_activity:
+                last_activity = heartbeat_ts
+                last_activity_kind = "worker.heartbeat"
+            context_ts, context_kind = _latest_task_context_time(
+                task, since=entry_ts,
+            )
+            if context_ts is not None and context_ts > last_activity:
+                last_activity = context_ts
+                last_activity_kind = context_kind
+
+            if last_activity > cutoff:
+                continue
+            stuck_minutes = max(
+                1, int((now - last_activity).total_seconds() // 60),
+            )
+            in_progress_minutes = max(
+                1, int((now - entry_ts).total_seconds() // 60),
+            )
+            seen_subjects.add(subject)
+            findings.append(Finding(
+                rule=RULE_TASK_PROGRESS_STALE,
+                project=project,
+                subject=subject,
+                message=(
+                    f"Task {subject} has been at status=in_progress for "
+                    f"~{in_progress_minutes} min with no worker heartbeat "
+                    f"or progress activity for ~{stuck_minutes} min."
+                ),
+                recommendation=(
+                    f"Architect: inspect the worker for {subject}; check "
+                    f"auth, sandbox, and worker logic, then reassign, "
+                    f"resume, or cancel the task."
+                ),
+                metadata={
+                    "in_progress_since": entry_ts.isoformat(),
+                    "in_progress_minutes": in_progress_minutes,
+                    "last_activity_at": last_activity.isoformat(),
+                    "last_activity_kind": last_activity_kind,
+                    "stuck_minutes": stuck_minutes,
+                    "from": tr_meta.get("from"),
+                    "actor": tr_meta.get("actor"),
+                    "assignee": getattr(task, "assignee", None),
+                    "current_node_id": getattr(task, "current_node_id", None),
+                    "detected_via": "state",
+                },
+            ))
+
+    latest_transition: dict[str, tuple[datetime, AuditEvent]] = {}
+    for ev in events:
+        if ev.event != EVENT_TASK_STATUS_CHANGED:
+            continue
+        ts = _parse_iso(ev.ts)
+        if ts is None:
+            continue
+        prior = latest_transition.get(ev.subject)
+        if prior is None or ts > prior[0]:
+            latest_transition[ev.subject] = (ts, ev)
+
+    for subject, (entry_ts, ev) in latest_transition.items():
+        if subject in seen_subjects:
+            continue
+        meta = ev.metadata or {}
+        if meta.get("to") != "in_progress":
+            continue
+        key = _task_subject_key(subject)
+        if key is None:
+            continue
+        project, _ = key
+        last_activity = entry_ts
+        last_activity_kind = "task.status_changed"
+        heartbeat_ts = _latest_worker_heartbeat_time(
+            events, subject=subject, since=entry_ts,
+        )
+        if heartbeat_ts is not None and heartbeat_ts > last_activity:
+            last_activity = heartbeat_ts
+            last_activity_kind = "worker.heartbeat"
+        if last_activity > cutoff:
+            continue
+        stuck_minutes = max(
+            1, int((now - last_activity).total_seconds() // 60),
+        )
+        in_progress_minutes = max(
+            1, int((now - entry_ts).total_seconds() // 60),
+        )
+        seen_subjects.add(subject)
+        findings.append(Finding(
+            rule=RULE_TASK_PROGRESS_STALE,
+            project=project,
+            subject=subject,
+            message=(
+                f"Task {subject} has been at status=in_progress for "
+                f"~{in_progress_minutes} min with no worker heartbeat "
+                f"or progress activity for ~{stuck_minutes} min."
+            ),
+            recommendation=(
+                f"Architect: inspect the worker for {subject}; check "
+                f"auth, sandbox, and worker logic, then reassign, "
+                f"resume, or cancel the task."
+            ),
+            metadata={
+                "in_progress_since": ev.ts,
+                "in_progress_minutes": in_progress_minutes,
+                "last_activity_at": last_activity.isoformat(),
+                "last_activity_kind": last_activity_kind,
+                "stuck_minutes": stuck_minutes,
+                "from": meta.get("from"),
+                "actor": ev.actor,
+                "detected_via": "event",
+            },
+        ))
+    return findings
+
+
 def _detect_role_session_missing(
     events: Sequence[AuditEvent],
     *,
@@ -1151,6 +1373,9 @@ def scan_events(
         materialised, now=now, config=config, open_tasks=open_tasks,
     ))
     findings.extend(_detect_task_on_hold_stale(
+        materialised, now=now, config=config, open_tasks=open_tasks,
+    ))
+    findings.extend(_detect_task_progress_stale(
         materialised, now=now, config=config, open_tasks=open_tasks,
     ))
     findings.extend(_detect_role_session_missing(
@@ -1443,6 +1668,46 @@ def format_unstick_brief(finding: Finding) -> str:
             f"(b) review the work yourself and call `pm task done {subject}` "
             "if it's correct, "
             "(c) escalate to user via `pm notify` with a clear summary."
+        )
+    elif finding.rule == RULE_TASK_PROGRESS_STALE:
+        stuck_minutes = meta.get("stuck_minutes")
+        in_progress_minutes = meta.get("in_progress_minutes")
+        in_progress_since = meta.get("in_progress_since")
+        last_activity_at = meta.get("last_activity_at")
+        last_activity_kind = meta.get("last_activity_kind") or "<unknown>"
+        assignee = meta.get("assignee") or "<unknown>"
+        node = meta.get("current_node_id") or "<unknown>"
+        lines.append(
+            f"Stuck for: {stuck_minutes} minutes without progress activity"
+            if stuck_minutes else "Stuck for: unknown duration"
+        )
+        if in_progress_minutes:
+            lines.append(f"In progress for: {in_progress_minutes} minutes")
+        lines.append("Observed evidence:")
+        if in_progress_since:
+            lines.append(
+                f"- Task transitioned to status=in_progress at {in_progress_since}"
+            )
+        if last_activity_at:
+            lines.append(
+                f"- Last progress signal: {last_activity_kind} at {last_activity_at}"
+            )
+        lines.append(f"- Assignee: {assignee}; node: {node}")
+        lines.append(
+            "- Worker pane may be alive but unproductive: common causes "
+            "include auth failure, sandbox denial, quota/capacity, or "
+            "worker logic stuck after a nudge."
+        )
+        lines.append("")
+        lines.append(
+            "Your job: investigate and unstick. Options: "
+            "(a) inspect the worker pane and account/auth state, then "
+            "restart or fail over the worker if auth/quota is broken, "
+            "(b) reassign or resume the task and verify progress, "
+            f"(c) cancel and re-plan (`pm task cancel {subject}`) if the "
+            "claim cannot be recovered, "
+            "(d) escalate to user via `pm notify` only if credentials, "
+            "org policy, or external access need human action."
         )
     elif finding.rule == RULE_ROLE_SESSION_MISSING:
         expected = meta.get("expected_window") or "<unknown>"

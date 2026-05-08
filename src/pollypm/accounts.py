@@ -154,6 +154,41 @@ def _cached_account_usage_summary(account: AccountConfig) -> tuple[str, str, str
     return ("unknown", "unknown", "status unavailable")
 
 
+_AUTH_BROKEN_STATUSES = frozenset({"auth_broken", "auth-broken", "signed-out"})
+
+
+def is_account_status_unhealthy(value: str | None) -> bool:
+    """Return True when ``value`` denotes an unhealthy account status.
+
+    Accepts both ``"auth_broken"`` (canonical underscore form written by
+    runtime writers in ``heartbeats/api.py`` and ``supervisor.py``) and
+    ``"auth-broken"`` (hyphen form used by ``CapacityState`` /
+    ``account_usage.health``). Centralising the check makes readers
+    tolerant of either form so account-runtime writes always reach the
+    "skip this account" branches in worker selection (#1437).
+    """
+    return value in _AUTH_BROKEN_STATUSES
+
+
+def is_account_runtime_unavailable(value: str | None) -> bool:
+    """Return True when an ``account_runtime.status`` should block use.
+
+    Mirrors the canonical list used by ``Supervisor._account_is_viable``
+    (auth_broken / exhausted / provider_outage / blocked) but also
+    tolerates the hyphenated ``"auth-broken"`` form so legacy rows or
+    UI-driven writes still match.
+    """
+    if value is None:
+        return False
+    return value in {
+        "auth_broken",
+        "auth-broken",
+        "exhausted",
+        "provider_outage",
+        "blocked",
+    }
+
+
 def _effective_logged_in(
     account: AccountConfig,
     *,
@@ -161,9 +196,9 @@ def _effective_logged_in(
     runtime_status: str | None = None,
     probe_live: bool = True,
 ) -> bool:
-    if runtime_status in {"auth-broken", "signed-out"}:
+    if is_account_status_unhealthy(runtime_status):
         return False
-    if cached_health in {"auth-broken", "signed-out"}:
+    if is_account_status_unhealthy(cached_health):
         return False
     if not probe_live:
         if cached_health:

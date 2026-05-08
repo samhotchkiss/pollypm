@@ -101,7 +101,9 @@ def _first_matching_account(
     *,
     provider: object,
     preferred_names: list[str],
+    excluded_names: frozenset[str] | set[str] | None = None,
 ) -> tuple[str, object] | tuple[None, None]:
+    excluded = excluded_names or frozenset()
     ordered: list[str] = []
     for name in preferred_names:
         if name and name not in ordered:
@@ -110,10 +112,47 @@ def _first_matching_account(
         if name not in ordered:
             ordered.append(name)
     for name in ordered:
+        if name in excluded:
+            continue
         account = accounts.get(name)
         if account is not None and getattr(account, "provider", None) is provider:
             return name, account
     return None, None
+
+
+def _unavailable_account_names(config: object) -> frozenset[str]:
+    """Return account names whose runtime status marks them unavailable.
+
+    Mirrors ``Supervisor._candidate_accounts`` / ``_account_is_viable``
+    so per-task worker spawn skips the same accounts the control-plane
+    failover skips. Reads ``account_runtime`` from the project state DB
+    and consults ``is_account_runtime_unavailable`` (auth_broken,
+    auth-broken, exhausted, provider_outage, blocked).
+
+    Returns an empty frozenset when the state DB is unreachable so a
+    transient store error does not block all worker launches — the
+    supervisor still owns the authoritative gating, this filter just
+    prevents the obviously-wedged account from being picked first.
+    """
+    project = getattr(config, "project", None)
+    state_db = getattr(project, "state_db", None) if project is not None else None
+    if state_db is None:
+        return frozenset()
+    try:
+        from pollypm.accounts import is_account_runtime_unavailable
+        from pollypm.storage.state import StateStore
+
+        unavailable: set[str] = set()
+        accounts = getattr(config, "accounts", {}) or {}
+        with StateStore(state_db) as store:
+            for name in accounts:
+                runtime = store.get_account_runtime(name)
+                if runtime is not None and is_account_runtime_unavailable(runtime.status):
+                    unavailable.add(name)
+        return frozenset(unavailable)
+    except Exception:  # noqa: BLE001
+        logger.exception("worker launch: account-runtime filter failed; allowing all")
+        return frozenset()
 
 
 # ---------------------------------------------------------------------------
@@ -501,7 +540,7 @@ class SessionManager:
             # archival reads ambient env (legacy behaviour).
             return legacy_cmd, "claude", agent_name, None, None
 
-        from pollypm.models import SessionConfig
+        from pollypm.models import ProviderKind, SessionConfig
         from pollypm.onboarding import default_session_args
         from pollypm.providers import get_provider
         from pollypm.runtimes import get_runtime
@@ -517,22 +556,64 @@ class SessionManager:
                 f"Worker routing for project {project} resolved an unknown provider "
                 f"{routed_assignment.provider!r}: {exc}"
             ) from exc
+        # Per #1437: filter out accounts whose runtime status marks them
+        # unavailable (auth_broken / exhausted / provider_outage / blocked)
+        # before account selection. Without this, a heartbeat that just
+        # marked claude_main as ``auth_broken`` would still see the next
+        # per-task worker spawn pick claude_main, leaving the user wedged
+        # until manual ``pm reset``. Mirrors Supervisor._candidate_accounts.
+        unavailable_accounts = _unavailable_account_names(config)
+        # Thread configured failover accounts into the preference list so
+        # a healthy fallback wins selection once the primary is filtered.
+        pollypm_settings = getattr(config, "pollypm", None)
+        failover_accounts: list[str] = list(
+            getattr(pollypm_settings, "failover_accounts", []) or []
+        )
         preferred_names = [
             agent_name if agent_name in accounts else "",
-            getattr(getattr(config, "pollypm", None), "controller_account", ""),
+            getattr(pollypm_settings, "controller_account", ""),
+            *failover_accounts,
         ]
         if routed_assignment.source == "fallback":
             legacy_name = preferred_names[0] or preferred_names[1]
-            account_name = legacy_name
-            account = accounts.get(account_name)
+            account_name = (
+                legacy_name if legacy_name not in unavailable_accounts else ""
+            )
+            account = accounts.get(account_name) if account_name else None
+            if account is None:
+                # Walk failover accounts before resorting to first-available.
+                for candidate in failover_accounts:
+                    if candidate in accounts and candidate not in unavailable_accounts:
+                        account_name, account = candidate, accounts[candidate]
+                        break
             if account is None and accounts:
+                for candidate_name, candidate_account in accounts.items():
+                    if candidate_name in unavailable_accounts:
+                        continue
+                    account_name, account = candidate_name, candidate_account
+                    break
+            if account is None and accounts:
+                # All accounts are flagged unavailable — fall back to the
+                # first one rather than failing outright. The supervisor
+                # owns the authoritative recovery ladder; this stay-alive
+                # behaviour matches the pre-#1437 fallback semantics.
                 account_name, account = next(iter(accounts.items()))
         else:
             account_name, account = _first_matching_account(
                 accounts,
                 provider=routed_provider,
                 preferred_names=preferred_names,
+                excluded_names=unavailable_accounts,
             )
+            if account is None and accounts:
+                # Final fallback: ignore the unavailable filter so we
+                # still produce a launch bundle. The supervisor will
+                # observe the failure and run its own recovery ladder.
+                account_name, account = _first_matching_account(
+                    accounts,
+                    provider=routed_provider,
+                    preferred_names=preferred_names,
+                )
         if account is None:
             if accounts:
                 raise ProvisionError(
@@ -564,6 +645,20 @@ class SessionManager:
                 routed_assignment.source,
             )
 
+        session_args = default_session_args(
+            session_provider,
+            open_permissions=config.pollypm.open_permissions_by_default,
+            role="worker",
+            model=session_model,
+        )
+        if session_provider is ProviderKind.CODEX:
+            # Per-task workers run from ``.pollypm/worktrees/<task>``.
+            # Codex's workspace-write sandbox otherwise allows that
+            # worktree but rejects the parent project state directory
+            # that ``pm task done`` must update (#1437).
+            project_state_dir = (self._project_path / ".pollypm").resolve()
+            session_args = [*session_args, "--add-dir", str(project_state_dir)]
+
         session = SessionConfig(
             name=window_name,
             role="worker",
@@ -572,12 +667,7 @@ class SessionManager:
             cwd=worktree_path,
             project=project,
             window_name=window_name,
-            args=default_session_args(
-                session_provider,
-                open_permissions=config.pollypm.open_permissions_by_default,
-                role="worker",
-                model=session_model,
-            ),
+            args=session_args,
         )
         provider = get_provider(session_provider, root_dir=config.project.root_dir)
         runtime = get_runtime(account.runtime, root_dir=config.project.root_dir)

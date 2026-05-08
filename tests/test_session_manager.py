@@ -897,6 +897,174 @@ class TestProvisionWorker:
         assert argv[1:] == []
 
 
+class TestWorkerLaunchBundleAccountFilter:
+    """Regression tests for #1437 (Bug B): per-task worker spawn must
+    skip accounts whose ``account_runtime.status`` marks them
+    auth_broken/exhausted/etc., or the relaunch after an auth-block
+    just lands back on the same wedged account."""
+
+    def _multi_account_config(
+        self, tmp_project: Path, *, primary_home: Path, fallback_home: Path
+    ) -> PollyPMConfig:
+        base_dir = tmp_project / ".pollypm"
+        base_dir.mkdir(parents=True, exist_ok=True)
+        return PollyPMConfig(
+            project=ProjectSettings(
+                name="Fixture",
+                root_dir=tmp_project,
+                tmux_session="pollypm",
+                base_dir=base_dir,
+                logs_dir=base_dir / "logs",
+                snapshots_dir=base_dir / "snapshots",
+                state_db=base_dir / "state.db",
+            ),
+            pollypm=PollyPMSettings(
+                controller_account="claude_main",
+                failover_accounts=["claude_backup"],
+                failover_enabled=True,
+            ),
+            accounts={
+                "claude_main": AccountConfig(
+                    name="claude_main",
+                    provider=ProviderKind.CLAUDE,
+                    runtime=RuntimeKind.LOCAL,
+                    home=primary_home,
+                ),
+                "claude_backup": AccountConfig(
+                    name="claude_backup",
+                    provider=ProviderKind.CLAUDE,
+                    runtime=RuntimeKind.LOCAL,
+                    home=fallback_home,
+                ),
+            },
+            sessions={},
+        )
+
+    def test_worker_launch_bundle_skips_auth_broken_primary(
+        self, mock_tmux, mock_svc, tmp_project, tmp_path,
+    ):
+        """When the primary account has runtime status ``auth_broken``
+        (the canonical underscore form supervisor + heartbeat writers
+        emit), ``_worker_launch_bundle`` must pick the configured
+        failover account instead. Pre-#1437 the primary was selected
+        unconditionally, so a heartbeat-marked auth break could not
+        clear without manual ``pm reset``."""
+        from pollypm.storage.state import StateStore
+
+        primary_home = tmp_path / "claude-main-home"
+        fallback_home = tmp_path / "claude-backup-home"
+        config = self._multi_account_config(
+            tmp_project, primary_home=primary_home, fallback_home=fallback_home,
+        )
+
+        # Mark the primary account auth_broken in the project state DB.
+        with StateStore(config.project.state_db) as store:
+            store.upsert_account_runtime(
+                account_name="claude_main",
+                provider=ProviderKind.CLAUDE.value,
+                status="auth_broken",
+                reason="live session reported authentication failure",
+            )
+
+        manager = SessionManager(
+            mock_tmux,
+            mock_svc,
+            tmp_project,
+            config=config,
+            session_service=MagicMock(),
+        )
+
+        worktree_path = tmp_project / ".pollypm" / "worktrees" / "proj-1"
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        (
+            _command,
+            _provider_name,
+            account_name,
+            _fresh_marker,
+            _provider_home,
+        ) = manager._worker_launch_bundle(
+            worktree_path=worktree_path,
+            agent_name="claude_main",
+            window_name="task-proj-1",
+            project="proj",
+        )
+
+        assert account_name == "claude_backup", (
+            "Worker spawn must avoid the auth_broken primary and pick the "
+            f"failover; got {account_name!r}"
+        )
+
+    def test_worker_launch_bundle_accepts_legacy_hyphen_form(
+        self, mock_tmux, mock_svc, tmp_project, tmp_path,
+    ):
+        """Legacy rows (or UI writes) may still use ``"auth-broken"``
+        with a hyphen — the filter must skip them too."""
+        from pollypm.storage.state import StateStore
+
+        primary_home = tmp_path / "claude-main-home"
+        fallback_home = tmp_path / "claude-backup-home"
+        config = self._multi_account_config(
+            tmp_project, primary_home=primary_home, fallback_home=fallback_home,
+        )
+
+        with StateStore(config.project.state_db) as store:
+            store.upsert_account_runtime(
+                account_name="claude_main",
+                provider=ProviderKind.CLAUDE.value,
+                status="auth-broken",
+                reason="legacy hyphen form",
+            )
+
+        manager = SessionManager(
+            mock_tmux,
+            mock_svc,
+            tmp_project,
+            config=config,
+            session_service=MagicMock(),
+        )
+
+        worktree_path = tmp_project / ".pollypm" / "worktrees" / "proj-1"
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        (_cmd, _prov, account_name, _fresh, _home) = manager._worker_launch_bundle(
+            worktree_path=worktree_path,
+            agent_name="claude_main",
+            window_name="task-proj-1",
+            project="proj",
+        )
+
+        assert account_name == "claude_backup"
+
+    def test_worker_launch_bundle_keeps_healthy_primary(
+        self, mock_tmux, mock_svc, tmp_project, tmp_path,
+    ):
+        """Sanity check: when no account is marked auth_broken, the
+        existing preference order still wins (primary keeps the slot)."""
+        primary_home = tmp_path / "claude-main-home"
+        fallback_home = tmp_path / "claude-backup-home"
+        config = self._multi_account_config(
+            tmp_project, primary_home=primary_home, fallback_home=fallback_home,
+        )
+
+        manager = SessionManager(
+            mock_tmux,
+            mock_svc,
+            tmp_project,
+            config=config,
+            session_service=MagicMock(),
+        )
+
+        worktree_path = tmp_project / ".pollypm" / "worktrees" / "proj-1"
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        (_cmd, _prov, account_name, _fresh, _home) = manager._worker_launch_bundle(
+            worktree_path=worktree_path,
+            agent_name="claude_main",
+            window_name="task-proj-1",
+            project="proj",
+        )
+
+        assert account_name == "claude_main"
+
+
 # ---------------------------------------------------------------------------
 # Teardown tests
 # ---------------------------------------------------------------------------

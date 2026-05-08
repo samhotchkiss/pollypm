@@ -133,6 +133,18 @@ def on_task_done(service: "SQLiteWorkService", task_id: str, actor: str) -> None
             exc_info=True,
         )
 
+    try:
+        from pollypm.task_shipped import emit_task_shipped_card
+
+        emit_task_shipped_card(service, task_id, actor or "polly")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "task_shipped card emit skipped for %s: %s",
+            task_id,
+            exc,
+            exc_info=True,
+        )
+
 
 def on_task_transition(
     service: "SQLiteWorkService",

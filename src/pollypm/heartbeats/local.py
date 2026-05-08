@@ -532,6 +532,20 @@ class LocalHeartbeatBackend(HeartbeatBackend):
     )
     _WORKER_MUTATING_SESSION_ROLES = frozenset({"worker"})
 
+    # #1506 — role-respawn-on-crash. Roles that can crash (Claude/codex
+    # process exits leaving the tmux pane at a shell prompt) and need
+    # auto-respawn when there is active work to do. Operator/heartbeat
+    # roles are deliberately excluded — those crashes are rare and the
+    # operator-attention surface is elsewhere.
+    _CRASH_RECOVERY_ROLES = frozenset({"worker", "architect", "reviewer"})
+
+    # After this many cumulative recovery attempts on a session, an
+    # additional crash escalates to the ``crash_loop`` alert instead of
+    # respawning yet again. Conservative — uses the existing
+    # ``recovery_attempts`` counter from session_runtime so any
+    # recovery (auth, missing window, pane_dead, role_crashed) counts.
+    _CRASH_LOOP_ATTEMPT_THRESHOLD = 2
+
     _AUTH_FAILURE_PATTERNS = (
         "authentication failure",
         "not authenticated",
@@ -823,6 +837,69 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             alerts.append("shell_returned")
         else:
             api.clear_alert(context.session_name, "shell_returned")
+
+        # #1506 — role-respawn-on-crash. The ``shell_returned`` alert
+        # above tells the operator something is wrong; this block does
+        # something about it. When the pane is at a shell prompt
+        # (Claude/codex process exited but tmux pane still alive) AND
+        # the role has active work, treat as crashed and auto-respawn
+        # this tick instead of waiting for ``_MAX_NUDGES_BEFORE_RECOVERY``
+        # ticks of nudge-unresponsive (which never fires when the
+        # Claude PID is gone — there's nothing to nudge).
+        # Distinct from ``pane_dead`` (whole tmux pane gone — already
+        # recovered above) and stalled-but-running (Claude PID alive,
+        # just silent — nudge ladder via #1495 / #1505).
+        if (
+            (context.pane_command or "") in {"bash", "zsh", "sh", "fish"}
+            and context.role in self._CRASH_RECOVERY_ROLES
+            and self._has_pending_work(api, context)
+        ):
+            runtime = None
+            try:
+                runtime = api.supervisor.store.get_session_runtime(
+                    context.session_name
+                )
+            except (AttributeError, Exception):  # noqa: BLE001
+                pass  # API may not have supervisor (e.g., tests)
+            prev_attempts = runtime.recovery_attempts if runtime else 0
+            if prev_attempts >= self._CRASH_LOOP_ATTEMPT_THRESHOLD:
+                _emit_routed_alert(
+                    api,
+                    session_name=context.session_name,
+                    alert_type="crash_loop",
+                    severity="error",
+                    message=(
+                        f"{context.session_name} crashed and "
+                        f"respawned {prev_attempts} times — "
+                        "escalating to operator."
+                    ),
+                    subject=f"{context.session_name} crash loop",
+                    suggested_action=(
+                        "Check the role's account state and "
+                        "investigate the underlying crash before "
+                        "respawning again."
+                    ),
+                )
+                alerts.append("crash_loop")
+            else:
+                self._set_session_status(
+                    api,
+                    context,
+                    "recovering",
+                    reason="Role pane crashed (process exited)",
+                )
+                self._recover_session(
+                    api,
+                    context,
+                    failure_type="role_crashed",
+                    message=(
+                        f"Role pane returned to shell "
+                        f"({context.pane_command})"
+                    ),
+                )
+                alerts.append("role_crashed")
+        else:
+            api.clear_alert(context.session_name, "crash_loop")
 
         stopped_reason = "Pane process is stopped (SIGSTOP)"
         if context.pane_stopped:

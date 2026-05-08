@@ -90,6 +90,7 @@ __all__ = [
     "RULE_ROLE_SESSION_MISSING",
     "RULE_WORKER_SESSION_DEAD_LOOP",
     "RULE_TASK_ON_HOLD_STALE",
+    "RULE_DUPLICATE_ADVISOR_TASKS",
     "ON_HOLD_HUMAN_NEEDED_TAG",
     "ON_HOLD_ARCHITECT_TAG",
     "scan_events",
@@ -133,6 +134,14 @@ RULE_WORKER_SESSION_DEAD_LOOP = "worker_session_dead_loop"
 # reviewer's findings and either fixes them or, if the issue genuinely
 # requires human judgement, calls ``pm notify`` itself.
 RULE_TASK_ON_HOLD_STALE = "task_on_hold_stale"
+# #1510 — duplicate_advisor_tasks catches a pile-up of non-terminal
+# advisor-labeled tasks for the same project. The advisor.tick handler
+# is supposed to enqueue at most one ``advisor_review`` per project at
+# a time; if a tick race or an external write produces multiples, the
+# self-healing path cancels every duplicate except the most recently
+# created one. This rule is the detector — the cleanup runs from the
+# cadence handler which holds a work-service handle.
+RULE_DUPLICATE_ADVISOR_TASKS = "duplicate_advisor_tasks"
 
 # Reason-string tags reviewers use to hint the watchdog routing. The
 # default (no tag) is architect-actionable. ``ON_HOLD_HUMAN_NEEDED_TAG``
@@ -1316,6 +1325,89 @@ def _detect_worker_session_dead_loop(
     return findings
 
 
+def _detect_duplicate_advisor_tasks(
+    *,
+    open_tasks: Sequence[Any] | None,
+) -> list[Finding]:
+    """Rule (#1510): >1 non-terminal advisor-labeled task on the same project.
+
+    The advisor.tick handler enqueues at most one ``advisor_review`` per
+    project per cycle (see ``has_in_progress_advisor_task``). Two ticks
+    racing on the throttle pre-#1510 produced clusters of 2–3 duplicates;
+    even with the lock-based fix, a stale workspace can still carry the
+    historical pile-up. This detector finds the wedge so the cadence
+    handler can cancel every duplicate except the newest one.
+
+    Pure detector — no I/O. The cadence handler does the cancel via the
+    work-service API once the finding lands. ``metadata['duplicate_ids']``
+    enumerates the task ids slated for cleanup so the action path
+    doesn't have to re-walk ``open_tasks``.
+    """
+    if not open_tasks:
+        return []
+
+    by_project: dict[str, list[Any]] = {}
+    for task in open_tasks:
+        labels = list(getattr(task, "labels", []) or [])
+        if "advisor" not in labels:
+            continue
+        status = getattr(task, "work_status", None)
+        status_value = getattr(status, "value", status)
+        if status_value not in ("draft", "queued", "in_progress", "review", "rework"):
+            continue
+        project = getattr(task, "project", "") or ""
+        task_number = getattr(task, "task_number", None)
+        if not project or task_number is None:
+            continue
+        by_project.setdefault(project, []).append(task)
+
+    findings: list[Finding] = []
+    for project, tasks in by_project.items():
+        if len(tasks) <= 1:
+            continue
+        # Sort newest first by created_at, falling back to task_number
+        # so a corrupted timestamp still produces a deterministic
+        # "keep the highest task_number" outcome.
+        def _sort_key(t: Any) -> tuple[Any, int]:
+            created_at = getattr(t, "created_at", None)
+            if created_at is None:
+                # Coerce missing timestamps to epoch so they sort oldest.
+                created_at = datetime.min.replace(tzinfo=timezone.utc)
+            elif getattr(created_at, "tzinfo", None) is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            return (created_at, getattr(t, "task_number", 0) or 0)
+
+        tasks_sorted = sorted(tasks, key=_sort_key, reverse=True)
+        keep = tasks_sorted[0]
+        duplicates = tasks_sorted[1:]
+        keep_id = f"{project}/{getattr(keep, 'task_number', '?')}"
+        duplicate_ids = [
+            f"{project}/{getattr(t, 'task_number', '?')}" for t in duplicates
+        ]
+        findings.append(Finding(
+            rule=RULE_DUPLICATE_ADVISOR_TASKS,
+            project=project,
+            subject=keep_id,
+            message=(
+                f"Project {project} has {len(tasks)} non-terminal "
+                f"advisor-labeled tasks; expected 1. Keeping the newest "
+                f"({keep_id}) and cleaning up "
+                f"{len(duplicates)} duplicate(s)."
+            ),
+            recommendation=(
+                f"The cadence handler will cancel: "
+                f"{', '.join(duplicate_ids)}. No operator action required."
+            ),
+            metadata={
+                "keep_task_id": keep_id,
+                "duplicate_ids": duplicate_ids,
+                "total_count": len(tasks),
+                "detected_via": "state",
+            },
+        ))
+    return findings
+
+
 # ---------------------------------------------------------------------------
 # Public API — scan_events / scan_project
 # ---------------------------------------------------------------------------
@@ -1392,6 +1484,11 @@ def scan_events(
     findings.extend(_detect_worker_session_dead_loop(
         materialised, now=now, config=config,
     ))
+    # #1510 — duplicate advisor tasks. State-only detector; no audit
+    # events required because the wedge is observable from current
+    # ``open_tasks`` alone (it's a write-time invariant violation, not
+    # a temporal pattern).
+    findings.extend(_detect_duplicate_advisor_tasks(open_tasks=open_tasks))
     return findings
 
 

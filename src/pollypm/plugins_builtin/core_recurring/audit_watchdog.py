@@ -34,6 +34,7 @@ from pollypm.audit.watchdog import (
     ESCALATION_THROTTLE_SECONDS,
     Finding,
     RULE_DUPLICATE_ADVISOR_TASKS,
+    RULE_PLAN_REVIEW_MISSING,
     RULE_ROLE_SESSION_MISSING,
     RULE_STUCK_DRAFT,
     RULE_TASK_ON_HOLD_STALE,
@@ -150,6 +151,146 @@ def _config_from_payload(payload: dict[str, Any]) -> WatchdogConfig:
         except (TypeError, ValueError):
             continue
     return WatchdogConfig(**kwargs) if kwargs else WatchdogConfig()
+
+
+def _gather_done_plan_tasks(
+    project_key: str, project_path: Path | None,
+) -> list[Any]:
+    """Best-effort load of recent ``done`` plan-shaped tasks for ``project_key``.
+
+    Powers the ``plan_review_missing`` rule (#1511). Filters to:
+
+    * ``work_status=done``
+    * Plan-shaped labels (poc-plan / plan / project-plan)
+    * Non-plan_project flow (``plan_project`` / ``critique_flow`` already
+      emit plan_review through their reflection nodes)
+
+    Returns an empty list on any failure — the watchdog rule then no-ops
+    for that project, which is safer than firing false-positive findings.
+    """
+    try:
+        from pollypm.work import create_work_service
+        from pollypm.work.models import WorkStatus
+        from pollypm.work.plan_review_emit import task_is_eligible_for_backstop
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: plan-review imports failed", exc_info=True,
+        )
+        return []
+    try:
+        with create_work_service(
+            project_path=project_path,
+            project_key=project_key,
+        ) as svc:
+            list_fn = getattr(svc, "list_tasks", None)
+            if not callable(list_fn):
+                return []
+            tasks = list(
+                list_fn(work_status=WorkStatus.DONE.value, project=project_key)
+            )
+            return [task for task in tasks if task_is_eligible_for_backstop(task)]
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: done-plan-task load failed for %s",
+            project_key, exc_info=True,
+        )
+        return []
+
+
+def _make_plan_review_probe(project_key: str, project_path: Path | None):
+    """Return a ``(project, plan_task_id) -> bool`` probe over the messages table.
+
+    Resolves the canonical workspace state DB through the work-service
+    factory (same path :func:`_gather_open_tasks` uses) so the probe
+    queries the same ``messages`` table the cockpit inbox renders from.
+    """
+    try:
+        from pollypm.work import create_work_service
+        from pollypm.work.plan_review_emit import already_has_plan_review_message
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: plan-review probe imports failed", exc_info=True,
+        )
+        return None
+    try:
+        # Resolve the DB path via a short-lived service open. Avoids
+        # plumbing the resolver directly here.
+        with create_work_service(
+            project_path=project_path,
+            project_key=project_key,
+        ) as svc:
+            db_path = getattr(svc, "_db_path", None)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: probe db_path resolve failed for %s",
+            project_key, exc_info=True,
+        )
+        return None
+    if db_path is None:
+        return None
+    resolved_db_path = Path(db_path)
+
+    def _probe(project: str, plan_task_id: str) -> bool:
+        return already_has_plan_review_message(
+            db_path=resolved_db_path,
+            project=project,
+            plan_task_id=plan_task_id,
+        )
+
+    return _probe
+
+
+def _backfill_plan_review_for_finding(
+    finding: Finding,
+    *,
+    project_key: str,
+    project_path: Path | None,
+) -> str | None:
+    """Emit the missing plan_review row for a ``plan_review_missing`` finding.
+
+    Best-effort — any failure is logged and swallowed. Returns the new
+    inbox task id on success, ``None`` on skip / failure. Idempotent
+    because :func:`emit_plan_review_for_task` re-checks the messages
+    table before writing.
+    """
+    plan_task_id = (finding.metadata or {}).get("plan_task_id") or finding.subject
+    if not plan_task_id:
+        return None
+    try:
+        from pollypm.work import create_work_service
+        from pollypm.work.plan_review_emit import emit_plan_review_for_task
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: backfill imports failed", exc_info=True,
+        )
+        return None
+    try:
+        with create_work_service(
+            project_path=project_path,
+            project_key=project_key,
+        ) as svc:
+            try:
+                task = svc.get(plan_task_id)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "audit.watchdog: get(%s) failed during plan_review backfill",
+                    plan_task_id, exc_info=True,
+                )
+                return None
+            if task is None:
+                return None
+            return emit_plan_review_for_task(
+                svc=svc,
+                task=task,
+                actor="audit_watchdog",
+                requester="user",
+            )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: plan_review backfill failed for %s",
+            plan_task_id, exc_info=True,
+        )
+        return None
 
 
 def _gather_open_tasks(project_key: str, project_path: Path | None) -> list[Any]:
@@ -604,9 +745,17 @@ def _scan_one_project(
         "dispatches_failed": 0,
         "advisor_duplicates_cancelled": 0,
         "advisor_duplicates_failed": 0,
+        "plan_review_backfilled": 0,
+        "plan_review_backfill_failed": 0,
     }
     open_tasks = _gather_open_tasks(project_key, project_path)
     storage_window_names = _gather_storage_windows(storage_closet_name)
+    done_plan_tasks = _gather_done_plan_tasks(project_key, project_path)
+    plan_review_present = (
+        _make_plan_review_probe(project_key, project_path)
+        if done_plan_tasks
+        else None
+    )
     try:
         findings = scan_project(
             project_key,
@@ -615,6 +764,8 @@ def _scan_one_project(
             config=config,
             open_tasks=open_tasks,
             storage_window_names=storage_window_names,
+            done_plan_tasks=done_plan_tasks,
+            plan_review_present=plan_review_present,
         )
     except Exception:  # noqa: BLE001
         logger.debug(
@@ -652,6 +803,25 @@ def _scan_one_project(
             counters["advisor_duplicates_cancelled"] += heal["cancelled"]
             counters["advisor_duplicates_failed"] += heal["failed"]
             # Skip dispatch — this rule is auto-healed, not architect-routed.
+            continue
+        # #1511 — plan_review_missing findings are self-healing: the
+        # cadence handler emits the missing inbox row via the same
+        # code path the post-done hook uses (Part A). Idempotent because
+        # ``emit_plan_review_for_task`` re-checks the messages table
+        # before writing. No architect dispatch needed; the user sees
+        # the backfilled card directly in their inbox.
+        if finding.rule == RULE_PLAN_REVIEW_MISSING:
+            backfilled = _backfill_plan_review_for_finding(
+                finding,
+                project_key=project_key,
+                project_path=project_path,
+            )
+            if backfilled is not None:
+                counters["plan_review_backfilled"] += 1
+            else:
+                counters["plan_review_backfill_failed"] += 1
+            # Skip the dispatch path for this rule — the architect has
+            # nothing to unstick; the watchdog itself just fixed it.
             continue
         # #1414 — eligible findings get an architect dispatch on top
         # of the alert. Throttle window is owned by the audit log so
@@ -715,6 +885,8 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
         "dispatches_failed": 0,
         "advisor_duplicates_cancelled": 0,
         "advisor_duplicates_failed": 0,
+        "plan_review_backfilled": 0,
+        "plan_review_backfill_failed": 0,
     }
 
     try:

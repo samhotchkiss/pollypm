@@ -145,6 +145,28 @@ def on_task_done(service: "SQLiteWorkService", task_id: str, actor: str) -> None
             exc_info=True,
         )
 
+    # #1511 — backstop emit for plan-shaped tasks that finished outside
+    # the ``plan_project`` flow. Plan-review approval cards used to depend
+    # on the architect's reflection node (#1399) firing inside that flow;
+    # tasks completed on ``standard`` / other flows reached done with no
+    # ``plan_review`` row in the messages table, so the cockpit's 2-line
+    # approval card never rendered. The hook is no-op for plan_project
+    # tasks (the reflection node owns the canonical emit) and for tasks
+    # that already have an open plan_review row.
+    try:
+        from pollypm.work.plan_review_emit import (
+            maybe_emit_plan_review_on_task_done,
+        )
+
+        maybe_emit_plan_review_on_task_done(service, task_id, actor or "polly")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "plan_review backstop emit skipped for %s: %s",
+            task_id,
+            exc,
+            exc_info=True,
+        )
+
 
 def on_task_transition(
     service: "SQLiteWorkService",

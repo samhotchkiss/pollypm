@@ -648,6 +648,42 @@ class TestPlanApprovedAtTimestamp:
         finally:
             work.close()
 
+    def test_gate_ignores_terminal_tasks_newer_than_plan_approval(self, tmp_path):
+        """Done/cancelled rows do not represent active backlog drift."""
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        _write_plan(proj)
+
+        stale = datetime.now(timezone.utc) - timedelta(hours=1)
+        _create_done_approved_plan_task(
+            proj, project_key="proj", approved_at=stale,
+        )
+        done_task_id = _create_queued_impl_task(
+            proj, project_key="proj", title="Already done",
+        )
+        cancelled_task_id = _create_queued_impl_task(
+            proj, project_key="proj", title="Cancelled spam",
+        )
+
+        db_path = proj / ".pollypm" / "state.db"
+        work = SQLiteWorkService(db_path=db_path, project_path=proj)
+        try:
+            for task_id, status in (
+                (done_task_id, WorkStatus.DONE.value),
+                (cancelled_task_id, WorkStatus.CANCELLED.value),
+            ):
+                project, number = task_id.rsplit("/", 1)
+                work._conn.execute(
+                    "UPDATE work_tasks SET work_status = ? "
+                    "WHERE project = ? AND task_number = ?",
+                    (status, project, int(number)),
+                )
+            work._conn.commit()
+
+            assert has_acceptable_plan("proj", proj, work) is True
+        finally:
+            work.close()
+
     def test_gate_falls_back_to_execution_completed_at_for_prefix_projects(
         self, tmp_path,
     ):

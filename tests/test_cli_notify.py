@@ -569,3 +569,200 @@ class TestNotifyReviewerEscalations:
         assert held == []
         task = svc.get(task_id)
         assert task.work_status == WorkStatus.REVIEW
+
+
+def _patch_tmux_session(monkeypatch, *, window_name: str, sessions: dict[str, object]):
+    """Wire up a fake tmux client + ``load_config`` for project-inference tests.
+
+    The fake tmux always reports a single window with ``window_name`` so
+    the session match is deterministic; ``sessions`` mirrors the
+    ``SessionConfig`` shape (``window_name`` + ``project``) the inference
+    helpers consume. Returns nothing — the monkeypatch installs both
+    seams in-place.
+    """
+
+    class _Tmux:
+        def current_session_name(self):
+            return "pollypm-storage-closet"
+
+        def current_window_index(self):
+            return "2"
+
+        def list_windows(self, _session_name):
+            return [SimpleNamespace(index=2, name=window_name)]
+
+    config = SimpleNamespace(sessions=sessions)
+    monkeypatch.setattr(
+        "pollypm.session_services.create_tmux_client",
+        lambda: _Tmux(),
+    )
+    monkeypatch.setattr(
+        "pollypm.config.load_config",
+        lambda _path=None: config,
+    )
+
+
+class TestNotifyDefaultProjectInference:
+    """Issue #1425 — ``pm notify`` from a project-scoped pane should
+    default-route to that project, not the synthetic global ``inbox``
+    bucket. Regression caught when reviewer-savethenovel's substantive
+    review feedback landed at ``project=inbox`` and was invisible from
+    every project-filtered surface."""
+
+    def test_infer_notify_project_from_reviewer_window(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        from pollypm.cli_features.session_runtime import _infer_notify_project
+
+        _patch_tmux_session(
+            monkeypatch,
+            window_name="reviewer-savethenovel",
+            sessions={
+                "reviewer_savethenovel": SimpleNamespace(
+                    window_name="reviewer-savethenovel",
+                    project="savethenovel",
+                ),
+            },
+        )
+
+        inferred = _infer_notify_project(tmp_path / "pollypm.toml")
+
+        assert inferred == "savethenovel"
+
+    def test_infer_notify_project_returns_none_without_match(
+        self, monkeypatch, tmp_path: Path,
+    ):
+        from pollypm.cli_features.session_runtime import _infer_notify_project
+
+        _patch_tmux_session(
+            monkeypatch,
+            window_name="some-unrelated-window",
+            sessions={
+                "reviewer_savethenovel": SimpleNamespace(
+                    window_name="reviewer-savethenovel",
+                    project="savethenovel",
+                ),
+            },
+        )
+
+        assert _infer_notify_project(tmp_path / "pollypm.toml") is None
+
+    def test_notify_without_project_uses_inferred_project(
+        self, monkeypatch, db_path,
+    ):
+        """Reviewer-savethenovel calls ``pm notify`` (no ``--project``).
+        The message + task should land at ``project=savethenovel``."""
+        monkeypatch.setattr(
+            "pollypm.cli_features.session_runtime._infer_notify_project",
+            lambda _config_path: "savethenovel",
+        )
+
+        result = _invoke_notify(
+            db_path,
+            "Rejecting savethenovel/11",
+            "Footer.astro:20-22 still has placeholder copy.",
+        )
+        assert result.exit_code == 0, result.output
+
+        rows = _fetch_messages(db_path)
+        assert len(rows) == 1
+        row = rows[0]
+        # Message scope + payload.project both reflect the inferred key.
+        assert row["scope"] == "savethenovel"
+        payload = json.loads(row["payload_json"])
+        assert payload["project"] == "savethenovel"
+
+        # The work-service inbox task created for immediate-priority
+        # notifies inherits the same project.
+        svc = SQLiteWorkService(db_path=db_path)
+        try:
+            task = svc.get(payload["task_id"])
+        finally:
+            svc.close()
+        assert task.project == "savethenovel"
+
+    def test_notify_explicit_project_wins_over_inference(
+        self, monkeypatch, db_path,
+    ):
+        """``--project inbox`` (or any explicit value) must override the
+        inferred project so global broadcasts still work from a
+        project-scoped pane."""
+        monkeypatch.setattr(
+            "pollypm.cli_features.session_runtime._infer_notify_project",
+            lambda _config_path: "savethenovel",
+        )
+
+        result = _invoke_notify(
+            db_path,
+            "Site-wide announcement",
+            "Cockpit reboot in 5m.",
+            "--project", "inbox",
+        )
+        assert result.exit_code == 0, result.output
+
+        rows = _fetch_messages(db_path)
+        assert rows[0]["scope"] == "inbox"
+        payload = json.loads(rows[0]["payload_json"])
+        assert payload["project"] == "inbox"
+
+    def test_notify_falls_back_to_inbox_without_inferred_project(
+        self, monkeypatch, db_path,
+    ):
+        """Outside a managed pane (no tmux match), ``pm notify`` keeps
+        its legacy ``project=inbox`` default so existing scripts and
+        ad-hoc operator invocations don't silently change semantics."""
+        monkeypatch.setattr(
+            "pollypm.cli_features.session_runtime._infer_notify_project",
+            lambda _config_path: None,
+        )
+
+        result = _invoke_notify(
+            db_path,
+            "Operator note",
+            "Posted from a bare shell.",
+        )
+        assert result.exit_code == 0, result.output
+
+        rows = _fetch_messages(db_path)
+        assert rows[0]["scope"] == "inbox"
+        payload = json.loads(rows[0]["payload_json"])
+        assert payload["project"] == "inbox"
+
+    def test_reviewer_savethenovel_integration(self, monkeypatch, db_path):
+        """Integration: simulate the exact reviewer-savethenovel pane
+        from issue #1425. The reviewer calls ``pm notify`` (no flags)
+        and the resulting message + inbox task carry
+        ``project=savethenovel`` — visible from
+        ``pm message list --project savethenovel`` and the cockpit's
+        project-filtered inbox."""
+        _patch_tmux_session(
+            monkeypatch,
+            window_name="reviewer-savethenovel",
+            sessions={
+                "reviewer_savethenovel": SimpleNamespace(
+                    window_name="reviewer-savethenovel",
+                    project="savethenovel",
+                ),
+            },
+        )
+
+        result = _invoke_notify(
+            db_path,
+            "Rejecting savethenovel/11",
+            "Footer.astro:20-22 still has placeholder copy. "
+            "Needs operator decision before re-queue.",
+        )
+        assert result.exit_code == 0, result.output
+
+        rows = _fetch_messages(db_path)
+        assert len(rows) == 1
+        row = rows[0]
+        # Sender flips from default ``polly`` to the matched session
+        # name (existing actor inference behavior).
+        assert row["sender"] == "reviewer_savethenovel"
+        # And the project routing — the regression — lands at
+        # ``savethenovel`` rather than the synthetic ``inbox`` bucket.
+        assert row["scope"] == "savethenovel"
+        payload = json.loads(row["payload_json"])
+        assert payload["project"] == "savethenovel"
+        assert payload["actor"] == "reviewer_savethenovel"

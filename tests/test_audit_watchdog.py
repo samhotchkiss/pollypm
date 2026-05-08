@@ -88,13 +88,13 @@ def _make_event(
 
 
 def test_orphan_marker_detected_when_no_release_or_terminal(now: datetime) -> None:
-    """A marker.created with neither release nor terminal transition fires."""
+    """An old marker.created with neither release nor terminal transition fires."""
     events = [
         _make_event(
             event=EVENT_MARKER_CREATED,
             project="demo",
             subject="/proj/demo/.pollypm/worker-markers/task-demo-1.fresh",
-            ts=now - timedelta(minutes=20),
+            ts=now - timedelta(minutes=40),
         ),
     ]
     findings = scan_events(events, now=now)
@@ -106,12 +106,36 @@ def test_orphan_marker_detected_when_no_release_or_terminal(now: datetime) -> No
     assert "pm task cancel demo/1" in orphans[0].recommendation
 
 
+def test_orphan_marker_recent_marker_ignored_even_when_task_is_old(
+    now: datetime,
+) -> None:
+    """Regression #1436: threshold age is marker age, not task age."""
+    marker = "/proj/demo/.pollypm/worker-markers/task-demo-1.fresh"
+    events = [
+        _make_event(
+            event=EVENT_TASK_CREATED,
+            subject="demo/1",
+            ts=now - timedelta(hours=6),
+        ),
+        _make_event(
+            event=EVENT_MARKER_CREATED,
+            subject=marker,
+            ts=now - timedelta(minutes=4),
+        ),
+    ]
+    findings = [
+        f for f in scan_events(events, now=now)
+        if f.rule == RULE_ORPHAN_MARKER
+    ]
+    assert findings == []
+
+
 def test_orphan_marker_silenced_by_release(now: datetime) -> None:
     marker = "/proj/demo/.pollypm/worker-markers/task-demo-1.fresh"
     events = [
         _make_event(
             event=EVENT_MARKER_CREATED, subject=marker,
-            ts=now - timedelta(minutes=20),
+            ts=now - timedelta(minutes=40),
         ),
         _make_event(
             event=EVENT_MARKER_RELEASED, subject=marker,
@@ -128,7 +152,7 @@ def test_orphan_marker_silenced_by_terminal_transition(now: datetime) -> None:
     events = [
         _make_event(
             event=EVENT_MARKER_CREATED, subject=marker,
-            ts=now - timedelta(minutes=25),
+            ts=now - timedelta(minutes=40),
         ),
         _make_event(
             event=EVENT_TASK_STATUS_CHANGED,
@@ -141,13 +165,13 @@ def test_orphan_marker_silenced_by_terminal_transition(now: datetime) -> None:
     assert findings == []
 
 
-def test_orphan_marker_outside_window_ignored(now: datetime) -> None:
+def test_orphan_marker_within_threshold_ignored(now: datetime) -> None:
     config = WatchdogConfig(window_seconds=600)
     marker = "/proj/demo/.pollypm/worker-markers/task-demo-1.fresh"
     events = [
         _make_event(
             event=EVENT_MARKER_CREATED, subject=marker,
-            ts=now - timedelta(hours=2),
+            ts=now - timedelta(minutes=9),
         ),
     ]
     findings = scan_events(events, now=now, config=config)
@@ -383,12 +407,12 @@ def test_scan_project_against_synthetic_log(now: datetime, tmp_path: Path) -> No
     Exercises the central-tail read path the cadence handler will use
     in production.
     """
-    # Older orphan marker event (within 30 min window).
-    old_ts = now - timedelta(minutes=20)
+    # Older orphan marker event (past the 30 min threshold).
+    old_ts = now - timedelta(minutes=40)
     # Use the writer with a manual ts bypass — emit() stamps "now",
     # so we shape the event by writing JSON directly to the central
     # tail. This mirrors what an in-process producer would have
-    # written 20 minutes ago.
+    # written 40 minutes ago.
     central = central_log_path("savethenovel")
     central.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -471,7 +495,7 @@ def test_cadence_handler_routes_finding_to_alert_sink(now: datetime) -> None:
     central.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema": 1,
-        "ts": (now - timedelta(minutes=20)).isoformat(),
+        "ts": (now - timedelta(minutes=40)).isoformat(),
         "project": "demo",
         "event": EVENT_MARKER_CREATED,
         "subject": "/x/demo/.pollypm/worker-markers/task-demo-1.fresh",
@@ -1105,7 +1129,7 @@ def test_cadence_handler_skips_dispatch_for_legacy_rules(
     central.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema": 1,
-        "ts": (now - timedelta(minutes=20)).isoformat(),
+        "ts": (now - timedelta(minutes=40)).isoformat(),
         "project": "demo",
         "event": EVENT_MARKER_CREATED,
         "subject": "/x/demo/.pollypm/worker-markers/task-demo-1.fresh",

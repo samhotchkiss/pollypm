@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 import typer
 
@@ -518,7 +518,7 @@ def init_guide_cmd(
         ...,
         help="Role guide to fork: architect, reviewer, or worker.",
     ),
-    project: Optional[str] = typer.Option(
+    project: str | None = typer.Option(
         None,
         "--project",
         help=(
@@ -551,7 +551,7 @@ def init_guide_cmd(
 
 @project_app.command("list-guides")
 def list_guides_cmd(
-    project: Optional[str] = typer.Option(
+    project: str | None = typer.Option(
         None,
         "--project",
         help=(
@@ -582,7 +582,7 @@ def guide_diff_cmd(
         ...,
         help="Role guide to diff: architect, reviewer, or worker.",
     ),
-    project: Optional[str] = typer.Option(
+    project: str | None = typer.Option(
         None,
         "--project",
         help=(
@@ -676,7 +676,7 @@ def rename_cmd(
 
 @project_app.command("plan")
 def plan_cmd(
-    project: Optional[str] = typer.Argument(
+    project: str | None = typer.Argument(
         None,
         help=(
             "Project key, alias, or path. Defaults to the project whose "
@@ -733,7 +733,7 @@ def plan_cmd(
 
 @project_app.command("replan")
 def replan_cmd(
-    project: Optional[str] = typer.Argument(
+    project: str | None = typer.Argument(
         None,
         help=(
             "Project key, alias, or path. Defaults to the project whose "
@@ -808,7 +808,7 @@ def new_cmd(
     repo_path: Path = typer.Argument(
         ..., help="Path to the project folder (must be a git repo).",
     ),
-    name: Optional[str] = typer.Option(
+    name: str | None = typer.Option(
         None, "--name", help="Optional display name.",
     ),
     skip_planner: bool = typer.Option(
@@ -834,7 +834,7 @@ def new_cmd(
             "or work-service rows."
         ),
     ),
-    slug: Optional[str] = typer.Option(
+    slug: str | None = typer.Option(
         None, "--slug",
         help=(
             "Explicit project slug (key). When omitted, the slug is "

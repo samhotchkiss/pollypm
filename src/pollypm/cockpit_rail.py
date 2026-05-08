@@ -354,6 +354,39 @@ def _stuck_alert_already_user_waiting(
     return bool(task_id) and task_id in user_waiting_task_ids
 
 
+def _alert_type_is_user_action_waiting(alert_type: str | None) -> bool:
+    """True when ``alert_type`` represents a "Waiting on you:" decision.
+
+    Mirrors the actionability filter in
+    ``cockpit_ui._dashboard_active_worker``: an alert is "Waiting on you"
+    when it is non-empty AND not classified as operational by
+    :func:`pollypm.cockpit_alerts.is_operational_alert`. The dashboard
+    banner uses the same filter to drive ``_alert_banner_copy`` ("Waiting
+    on you: ..."); using it here keeps the rail glyph and the banner
+    consistent — if the banner says "Waiting on you", the rail says
+    "Waiting on you" too.
+
+    Surfaceable operational alerts (``stuck_on_task:``,
+    ``no_session_for_assignment:``, ``recovery_limit``) are explicitly
+    re-classified as user-actionable by ``is_operational_alert`` (via
+    ``is_surfaceable_operational_alert``), so they correctly surface on
+    the rail.
+
+    Used by :meth:`_indicator` (#1520) to render a "needs attention"
+    glyph on the project rail row, overriding the idle ``♡·`` /
+    active-worker ``♥·`` heartbeat pair so a project waiting on the user
+    no longer reads as quiet or merely-busy.
+    """
+    if not alert_type:
+        return False
+    # Local import to avoid a cycle: cockpit_alerts pulls in textual,
+    # which is fine at call time but heavier than the rail module wants
+    # at import time (the rail loads in every cockpit pane).
+    from pollypm.cockpit_alerts import is_operational_alert
+
+    return not is_operational_alert(alert_type)
+
+
 def _selected_project_key(selected: object) -> str | None:
     """Extract the project key from the ``selected`` cockpit state."""
     if not isinstance(selected, str) or not selected.startswith("project:"):
@@ -4248,6 +4281,23 @@ class PollyCockpitRail:
                     else PALETTE["alert_indicator"]
                 )
                 return "\u25b2", color
+            # #1520 \u2014 A "Waiting on you:" alert family on the project's
+            # sessions (plan_missing, worker_question, recovery_limit,
+            # auth_broken, stuck_on_task:, no_session_for_assignment:,
+            # etc.) outranks both the project-rollup glyphs *and* the
+            # heartbeat \u2665\u00b7/\u2661\u00b7 pair below. The dashboard banner already
+            # says "Waiting on you: ..." for these; the rail must mirror
+            # that signal so the user can see at a glance which projects
+            # owe them a decision instead of drilling into each one. Use
+            # the same \u25c6 glyph the dashboard pill renders for "needs
+            # attention" so the rail and the banner agree visually;
+            # warn_indicator (amber) reads as "user action" not
+            # "operational fault" (which keeps the \u25b2 triangle above).
+            # Operational alerts (``pane:*``, ``unmanaged_window:*``)
+            # are filtered out by ``_alert_type_is_user_action_waiting``
+            # \u2014 the worker's stuck \u26a0 glyph already covers them.
+            if _alert_type_is_user_action_waiting(item.alert_type):
+                return "\u25c6", PALETTE["warn_indicator"]
             if item.state == "project-yellow":
                 # #1092 \u2014 use \u25c6 to match the dashboard's "needs attention"
                 # diamond. ``\u2022`` (U+2022) and the idle ``\u00b7`` (U+00B7) are

@@ -1042,6 +1042,223 @@ def test_cockpit_raw_rail_on_hold_affordance_fits_narrow_pane() -> None:
     assert "(2⚠)" in row.text
 
 
+def test_alert_type_is_user_action_waiting_classifies_families() -> None:
+    """#1520 — the helper that drives the new rail glyph must agree with
+    the dashboard banner's actionability filter: every "Waiting on you:"
+    alert family in ``cockpit_ui._alert_banner_copy`` must classify as
+    actionable, and operational alert prefixes (``pane:`` /
+    ``unmanaged_window:``) must classify as not actionable so the rail
+    doesn't double-render the worker's ⚠ stuck glyph as ◆.
+    """
+    from pollypm.cockpit_rail import _alert_type_is_user_action_waiting
+
+    # Empty / None — never user-action waiting.
+    assert _alert_type_is_user_action_waiting(None) is False
+    assert _alert_type_is_user_action_waiting("") is False
+
+    # Banner-copy "Waiting on you:" families — every one must surface.
+    assert _alert_type_is_user_action_waiting("plan_missing") is True
+    assert _alert_type_is_user_action_waiting("worker_question") is True
+    assert _alert_type_is_user_action_waiting("auth_broken") is True
+    # Surfaceable operational prefixes (cli_features.alerts) — actionable.
+    assert _alert_type_is_user_action_waiting("recovery_limit") is True
+    assert _alert_type_is_user_action_waiting("stuck_on_task:demo/3") is True
+    assert (
+        _alert_type_is_user_action_waiting("no_session_for_assignment:demo/3")
+        is True
+    )
+
+    # Operational prefixes — NOT actionable; the worker's ⚠ stuck glyph
+    # already covers these via ``_session_work_glyph``.
+    assert _alert_type_is_user_action_waiting("pane:auth_expired") is False
+    assert _alert_type_is_user_action_waiting("pane:permission_prompt") is False
+    assert _alert_type_is_user_action_waiting("unmanaged_window:foo") is False
+    assert _alert_type_is_user_action_waiting("suspected_loop") is False
+
+
+def test_cockpit_raw_rail_user_action_waiting_overrides_idle_session_glyph() -> None:
+    """#1520 — A project carrying a "Waiting on you:" alert family
+    (plan_missing, worker_question, recovery_limit, ...) must surface
+    the ◆ "needs attention" glyph on the rail, not the heartbeat ``♡·``
+    pair, so the user can see at a glance that the project owes them
+    a decision. Reproduces the coffeeboardnm symptom: an idle worker
+    session on a project with an open plan_missing alert was reading
+    as quiet (♡·) even though the dashboard banner said "Waiting on you:
+    this project has no plan yet".
+    """
+    rail = PollyCockpitRail.__new__(PollyCockpitRail)
+    rail.selected_key = "polly"
+    rail.spinner_index = 0
+
+    glyph, _color = rail._indicator(
+        CockpitItem(
+            "project:coffeeboardnm",
+            "CoffeeBoardNM",
+            "ready",
+            session_name="worker_coffeeboardnm",
+            work_state="idle",
+            heartbeat_at="2026-05-08T16:00:00+00:00",
+            alert_severity="warn",
+            alert_type="plan_missing",
+        ),
+    )
+
+    assert glyph == "◆"
+    # The heartbeat pair must NOT leak through — the whole point of
+    # this glyph is to *not* read as a quiet idle worker.
+    assert "♡" not in glyph
+    assert "♥" not in glyph
+
+
+def test_cockpit_raw_rail_user_action_waiting_overrides_active_worker_glyph() -> None:
+    """#1520 — Decision-pending must outrank an active worker. A worker
+    actively heartbeating on a project that *also* has a "Waiting on you:"
+    alert is, from the user's perspective, blocked on the user's input —
+    the worker's progress is irrelevant until the user acts. The rail
+    glyph must reflect the decision, not the spinner.
+    """
+    rail = PollyCockpitRail.__new__(PollyCockpitRail)
+    rail.selected_key = "polly"
+    rail.spinner_index = 0
+
+    glyph, _color = rail._indicator(
+        CockpitItem(
+            "project:coffeeboardnm",
+            "CoffeeBoardNM",
+            "● live",
+            session_name="worker_coffeeboardnm",
+            work_state="writing",
+            heartbeat_at="2026-05-08T16:00:00+00:00",
+            alert_severity="warn",
+            alert_type="worker_question",
+        ),
+    )
+
+    assert glyph == "◆"
+    # The active-worker pulse must NOT leak through.
+    assert "♥" not in glyph
+
+
+def test_cockpit_raw_rail_active_worker_keeps_heartbeat_glyph_without_alert() -> None:
+    """#1520 — guard against over-reach: a project with an active worker
+    but *no* attached alert keeps its existing ``♥·`` / ``♡·`` heartbeat
+    indicator. The new branch only fires when ``alert_type`` is set.
+    """
+    class _FakeTmux:
+        def current_session_name(self) -> str | None:
+            return "pollypm"
+
+        def list_clients(self, session_name: str) -> str:
+            del session_name
+            return "client"
+
+    rail = PollyCockpitRail.__new__(PollyCockpitRail)
+    rail.selected_key = "polly"
+    rail.spinner_index = 0
+    rail.presence = CockpitPresence(_FakeTmux())
+
+    glyph, _color = rail._indicator(
+        CockpitItem(
+            "project:demo",
+            "Demo",
+            "ready",
+            session_name="worker_demo",
+            work_state="writing",
+            heartbeat_at="2026-04-21T23:00:00+00:00",
+            alert_severity=None,
+            alert_type=None,
+        ),
+    )
+
+    # Active worker → heartbeat-paired writing glyph (♡ + spinner / …).
+    assert glyph != "◆"
+    assert "♡" in glyph or "♥" in glyph
+
+
+def test_cockpit_raw_rail_idle_project_without_alert_stays_idle() -> None:
+    """#1520 — guard against over-reach: a project row with neither a
+    session nor an alert falls through to the existing idle ``○`` glyph,
+    unchanged. The new branch only fires when ``alert_type`` is set.
+    """
+    rail = PollyCockpitRail.__new__(PollyCockpitRail)
+    rail.selected_key = "polly"
+    rail.spinner_index = 0
+
+    glyph, _color = rail._indicator(
+        CockpitItem(
+            "project:savethenovel",
+            "savethenovel",
+            "idle",
+        ),
+    )
+
+    assert glyph == "○"
+
+
+def test_cockpit_raw_rail_user_action_waiting_does_not_override_operational_red() -> None:
+    """#1520 — operational fault (project-red) keeps its dedicated ▲
+    triangle. The supervisor raises ``project-red`` only for genuinely
+    broken states (``stuck_on_task:`` on a non-user-waiting task,
+    ``no_session_for_assignment``, etc.), and the triangle's job is
+    "something is broken, the system needs help". Replacing it with the
+    user-action diamond would lose that signal.
+    """
+    rail = PollyCockpitRail.__new__(PollyCockpitRail)
+    rail.selected_key = "polly"
+    rail.spinner_index = 0
+
+    glyph, _color = rail._indicator(
+        CockpitItem(
+            "project:demo",
+            "Demo",
+            "project-red",
+            alert_severity="error",
+            alert_type="no_session_for_assignment:demo/3",
+        ),
+    )
+
+    assert glyph == "▲"
+
+
+def test_cockpit_ui_rail_item_user_action_waiting_overrides_idle_session_glyph(
+    monkeypatch,
+) -> None:
+    """#1520 — Textual ``RailItem`` mirror of the raw-rail check: a project
+    with an attached "Waiting on you:" alert renders ◆, not the
+    heartbeat ♡· pair.
+    """
+    monkeypatch.setattr(RailItem, "update_body", lambda self: None)
+
+    class _FakeTmux:
+        def current_session_name(self) -> str | None:
+            return "pollypm"
+
+        def list_clients(self, session_name: str) -> str:
+            del session_name
+            return "client"
+
+    presence = CockpitPresence(_FakeTmux())
+    item = RailItem(
+        CockpitItem(
+            "project:coffeeboardnm",
+            "CoffeeBoardNM",
+            "ready",
+            session_name="worker_coffeeboardnm",
+            work_state="idle",
+            heartbeat_at="2026-05-08T16:00:00+00:00",
+            alert_severity="warn",
+            alert_type="plan_missing",
+        ),
+        active_view=False,
+        presence=presence,
+    )
+
+    glyph, _color = item._indicator()
+    assert glyph == "◆"
+    assert "♡" not in glyph
+    assert "♥" not in glyph
+
+
 def test_cockpit_rail_session_indicator_combines_pulse_and_work_glyph(monkeypatch, tmp_path: Path) -> None:
     config_path = tmp_path / "pollypm.toml"
     config_path.write_text(

@@ -1,6 +1,7 @@
+import ast
 from pathlib import Path
 
-from pollypm.plugins_builtin.core_agent_profiles.profiles import heartbeat_prompt, polly_prompt
+from pollypm.agent_profiles.defaults import heartbeat_prompt, polly_prompt
 from pollypm.config import (
     load_config,
     project_config_path,
@@ -19,6 +20,24 @@ from pollypm.models import (
     ProviderKind,
     SessionConfig,
 )
+
+
+def test_config_does_not_import_core_agent_profiles_plugin() -> None:
+    source_path = Path(__file__).resolve().parents[1] / "src" / "pollypm" / "config.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module.startswith("pollypm.plugins_builtin.core_agent_profiles"):
+                offenders.append(f"line {node.lineno}: from {module} import ...")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("pollypm.plugins_builtin.core_agent_profiles"):
+                    offenders.append(f"line {node.lineno}: import {alias.name}")
+
+    assert offenders == []
 
 
 def test_load_example_config(tmp_path: Path) -> None:

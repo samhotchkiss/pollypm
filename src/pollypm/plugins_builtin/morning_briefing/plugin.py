@@ -28,7 +28,7 @@ from pollypm.plugin_api.v1 import (
     PollyPMPlugin,
     RosterAPI,
 )
-from pollypm.plugins_builtin.core_agent_profiles.profiles import StaticPromptProfile
+from pollypm.agent_profiles.defaults import StaticPromptProfile
 from pollypm.plugins_builtin.morning_briefing.handlers.briefing_tick import (
     briefing_tick_handler,
 )

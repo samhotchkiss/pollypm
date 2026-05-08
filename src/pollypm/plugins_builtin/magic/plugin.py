@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pollypm.plugins_builtin.core_agent_profiles.profiles import StaticPromptProfile
+from pollypm.agent_profiles.defaults import StaticPromptProfile
 from pollypm.itsalive import build_deploy_instructions
 from pollypm.plugin_api.v1 import Capability, PollyPMPlugin
 

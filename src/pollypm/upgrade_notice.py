@@ -104,7 +104,7 @@ def _resolve_role_guide_path(role: str, project_path: Path | None) -> Path | Non
     if resolved.exists():
         return resolved.resolve()
 
-    # For the reviewer, built_in_guide_source_path returns profiles.py
+    # For the reviewer, built_in_guide_source_path returns defaults.py
     # (the module that builds russell_prompt()) which isn't a useful
     # reread target. role_guide_path normalizes to the same path, so
     # the fallback below only kicks in when BOTH the project-local

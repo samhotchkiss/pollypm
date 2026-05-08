@@ -167,6 +167,9 @@ def _is_private_conn_owner(rel: str) -> bool:
 _PLAN_PRESENCE_PLUGIN_MODULE = (
     "pollypm.plugins_builtin.project_planning.plan_presence"
 )
+_TASK_ASSIGNMENT_NOTIFY_API_MODULE = (
+    "pollypm.plugins_builtin.task_assignment_notify.api"
+)
 
 
 def _imports_module(source_file: Path, module: str) -> bool:
@@ -190,6 +193,19 @@ def test_non_plugin_sources_do_not_import_project_planning_plan_presence() -> No
         if "/plugins_builtin/" in rel:
             continue
         if _imports_module(source_file, _PLAN_PRESENCE_PLUGIN_MODULE):
+            offenders.append(rel)
+    assert offenders == []
+
+
+def test_non_plugin_sources_do_not_import_task_assignment_notify_api() -> None:
+    """Task-assignment notification routes through the core event bus."""
+    root = _project_root()
+    offenders: list[str] = []
+    for source_file in _iter_source_files(root):
+        rel = _relative_posix(source_file, root)
+        if "/plugins_builtin/" in rel:
+            continue
+        if _imports_module(source_file, _TASK_ASSIGNMENT_NOTIFY_API_MODULE):
             offenders.append(rel)
     assert offenders == []
 

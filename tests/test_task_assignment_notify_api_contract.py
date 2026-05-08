@@ -16,12 +16,14 @@ Two shapes are pinned here:
 
 2. **Boundary enforcement** — no file under ``src/pollypm/`` outside
    the plugin itself imports from
-   ``task_assignment_notify.handlers.*`` or
-   ``task_assignment_notify.resolver``. The companion
-   :mod:`tests.test_plugin_boundary_conformance` only catches
-   plugin-to-plugin private imports; this test extends that contract
-   to the core-to-plugin direction the issue (#939) flagged. The work
-   layer is stricter after #1364: it must not import this plugin at all.
+``task_assignment_notify.handlers.*`` or
+``task_assignment_notify.resolver``. The companion
+:mod:`tests.test_plugin_boundary_conformance` only catches
+plugin-to-plugin private imports; this test extends that contract
+to the core-to-plugin direction the issue (#939) flagged. The work
+layer is stricter after #1364: it must not import this plugin at all,
+and non-plugin runtime modules route task-assignment notifications
+through the core event bus after #1363.
 """
 
 from __future__ import annotations
@@ -223,14 +225,9 @@ def test_work_layer_does_not_import_task_assignment_notify_plugin() -> None:
     )
 
 
-def test_known_non_work_callers_use_public_api() -> None:
-    """Spot-check that the non-work runtime callers cited in #939 import
-    from ``api`` specifically — guards against a future refactor
-    that leaves the boundary technically clean (no private import)
-    but routes through some other ad-hoc shim."""
+def test_peer_plugin_callers_use_public_api() -> None:
+    """Peer plugins that still call notifier-owned helpers use ``api``."""
     targets = (
-        SRC_ROOT / "cockpit_tasks.py",
-        SRC_ROOT / "heartbeats" / "local.py",
         SRC_ROOT / "plugins_builtin" / "core_recurring" / "sweeps.py",
     )
     for target in targets:

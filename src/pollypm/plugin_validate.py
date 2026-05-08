@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from pollypm.plugin_api.v1 import PollyPMPlugin
-from pollypm.plugin_host import ExtensionHost
+
+if TYPE_CHECKING:
+    from pollypm.plugin_host import ExtensionHost
 
 logger = logging.getLogger(__name__)
 

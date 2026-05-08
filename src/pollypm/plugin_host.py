@@ -46,6 +46,7 @@ from pollypm.plugin_api.v1 import (
     check_requires_api,
 )
 from pollypm.plugin_trust import warn_third_party_extension_trust_once
+from pollypm.plugin_validate import validate_plugin
 
 logger = logging.getLogger(__name__)
 
@@ -653,7 +654,6 @@ class ExtensionHost:
                 return
             # Validate the plugin implements its declared interfaces
             try:
-                from pollypm.plugin_validate import validate_plugin
                 result = validate_plugin(plugin)
                 if not result.passed:
                     failures = ", ".join(c.message for c in result.checks if not c.passed)

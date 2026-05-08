@@ -30,6 +30,7 @@ from pollypm.audit.watchdog import (
     RULE_MARKER_LEAKED,
     RULE_ORPHAN_MARKER,
     RULE_STUCK_DRAFT,
+    RULE_TASK_PROGRESS_STALE,
     Finding,
     WatchdogConfig,
     emit_finding,
@@ -1978,6 +1979,19 @@ class _FakeTransition:
         self.reason = reason
 
 
+class _FakeContext:
+    """Minimal stand-in for ``work.models.ContextEntry``."""
+
+    def __init__(
+        self,
+        *,
+        timestamp: datetime,
+        entry_type: str = "note",
+    ) -> None:
+        self.timestamp = timestamp
+        self.entry_type = entry_type
+
+
 class _StatefulTask:
     """Stand-in for ``work.models.Task`` with state + transitions + timestamps."""
 
@@ -1996,6 +2010,9 @@ class _StatefulTask:
         updated_at: datetime | None = None,
         created_by: str = "polly",
         title: str = "",
+        context: list[_FakeContext] | None = None,
+        assignee: str | None = None,
+        current_node_id: str | None = None,
     ) -> None:
         self.project = project
         self.task_number = task_number
@@ -2005,9 +2022,11 @@ class _StatefulTask:
         self.updated_at = updated_at
         self.created_by = created_by
         self.title = title
+        self.context = list(context or [])
         # Keep the role-session detector happy when reused.
         self.roles: dict[str, str] = {}
-        self.assignee: str | None = None
+        self.assignee: str | None = assignee
+        self.current_node_id = current_node_id
 
 
 def test_task_review_stale_state_based_fires_for_old_entry(now: datetime) -> None:
@@ -2287,9 +2306,230 @@ def test_stuck_draft_state_dedupes_with_event_path(now: datetime) -> None:
     assert matched[0].metadata["detected_via"] == "state"
 
 
+def test_task_progress_stale_state_based_fires_for_old_in_progress(
+    now: datetime,
+) -> None:
+    """#1444 — an old in_progress claim with no activity escalates."""
+    task = _StatefulTask(
+        project="savethenovel",
+        task_number=15,
+        work_status="in_progress",
+        transitions=[
+            _FakeTransition(
+                from_state="queued",
+                to_state="in_progress",
+                timestamp=now - timedelta(minutes=25),
+                actor="worker",
+            ),
+        ],
+        updated_at=now - timedelta(minutes=25),
+        assignee="claude:worker",
+        current_node_id="implement",
+    )
+    findings = scan_events([], now=now, open_tasks=[task])
+    matched = [f for f in findings if f.rule == RULE_TASK_PROGRESS_STALE]
+    assert len(matched) == 1
+    f = matched[0]
+    assert f.subject == "savethenovel/15"
+    assert f.metadata["detected_via"] == "state"
+    assert f.metadata["last_activity_kind"] == "state_entry"
+    assert f.metadata["stuck_minutes"] >= 20
+    assert "auth" in f.recommendation
+
+
+def test_task_progress_stale_state_based_silent_when_recent_context(
+    now: datetime,
+) -> None:
+    """A recent task-context progress note keeps an old claim fresh."""
+    task = _StatefulTask(
+        project="demo",
+        task_number=7,
+        work_status="in_progress",
+        transitions=[
+            _FakeTransition(
+                from_state="queued",
+                to_state="in_progress",
+                timestamp=now - timedelta(minutes=45),
+            ),
+        ],
+        updated_at=now - timedelta(minutes=45),
+        context=[
+            _FakeContext(
+                timestamp=now - timedelta(minutes=5),
+                entry_type="note",
+            ),
+        ],
+    )
+    findings = scan_events([], now=now, open_tasks=[task])
+    assert not any(f.rule == RULE_TASK_PROGRESS_STALE for f in findings)
+
+
+def test_task_progress_stale_state_path_dedupes_event_fallback_with_context(
+    now: datetime,
+) -> None:
+    """Recent task context suppresses stale event fallback for the same task."""
+    task = _StatefulTask(
+        project="demo",
+        task_number=7,
+        work_status="in_progress",
+        transitions=[
+            _FakeTransition(
+                from_state="queued",
+                to_state="in_progress",
+                timestamp=now - timedelta(minutes=45),
+            ),
+        ],
+        updated_at=now - timedelta(minutes=45),
+        context=[
+            _FakeContext(
+                timestamp=now - timedelta(minutes=5),
+                entry_type="note",
+            ),
+        ],
+    )
+    events = [
+        _make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            project="demo",
+            subject="demo/7",
+            metadata={"from": "queued", "to": "in_progress"},
+            ts=now - timedelta(minutes=45),
+        ),
+    ]
+    findings = scan_events(events, now=now, open_tasks=[task])
+    assert not any(f.rule == RULE_TASK_PROGRESS_STALE for f in findings)
+
+
+def test_task_progress_stale_event_path_silent_with_recent_worker_heartbeat(
+    now: datetime,
+) -> None:
+    """A worker.heartbeat after the in_progress transition suppresses the finding."""
+    events = [
+        _make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            project="demo",
+            subject="demo/8",
+            metadata={"from": "queued", "to": "in_progress"},
+            ts=now - timedelta(minutes=45),
+        ),
+        _make_event(
+            event="worker.heartbeat",
+            project="demo",
+            subject="demo/8",
+            metadata={"task_id": "demo/8"},
+            ts=now - timedelta(minutes=5),
+        ),
+    ]
+    findings = scan_events(events, now=now)
+    assert not any(f.rule == RULE_TASK_PROGRESS_STALE for f in findings)
+
+
+def test_task_progress_stale_event_path_fires_without_heartbeat(
+    now: datetime,
+) -> None:
+    events = [
+        _make_event(
+            event=EVENT_TASK_STATUS_CHANGED,
+            project="demo",
+            subject="demo/8",
+            metadata={"from": "queued", "to": "in_progress"},
+            ts=now - timedelta(minutes=45),
+        ),
+    ]
+    findings = scan_events(events, now=now)
+    matched = [f for f in findings if f.rule == RULE_TASK_PROGRESS_STALE]
+    assert len(matched) == 1
+    assert matched[0].subject == "demo/8"
+    assert matched[0].metadata["detected_via"] == "event"
+
+
+def test_format_unstick_brief_progress_stale_mentions_auth() -> None:
+    from pollypm.audit.watchdog import format_unstick_brief
+
+    finding = Finding(
+        rule=RULE_TASK_PROGRESS_STALE,
+        project="savethenovel",
+        subject="savethenovel/15",
+        message="Task savethenovel/15 has been in_progress with no activity.",
+        metadata={
+            "stuck_minutes": 25,
+            "in_progress_minutes": 25,
+            "in_progress_since": "2026-05-07T20:03:09+00:00",
+            "last_activity_at": "2026-05-07T20:03:09+00:00",
+            "last_activity_kind": "state_entry",
+            "assignee": "claude:worker",
+            "current_node_id": "implement",
+        },
+    )
+    brief = format_unstick_brief(finding)
+    assert "task_progress_stale" in brief
+    assert "auth" in brief.lower()
+    assert "sandbox" in brief.lower()
+    assert "pm task cancel savethenovel/15" in brief
+
+
+def test_cadence_handler_dispatches_task_progress_stale(
+    now: datetime, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The new in_progress detector is part of the architect dispatch set."""
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _scan_one_project,
+    )
+
+    task = _StatefulTask(
+        project="savethenovel",
+        task_number=15,
+        work_status="in_progress",
+        transitions=[
+            _FakeTransition(
+                from_state="queued",
+                to_state="in_progress",
+                timestamp=now - timedelta(minutes=25),
+                actor="worker",
+            ),
+        ],
+        updated_at=now - timedelta(minutes=25),
+        assignee="claude:worker",
+        current_node_id="implement",
+    )
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._gather_open_tasks",
+        lambda key, path: [task],
+    )
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._gather_storage_windows",
+        lambda name: ["worker-savethenovel", "architect-savethenovel"],
+    )
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.core_recurring.audit_watchdog._send_brief_to_architect",
+        lambda target, brief: sent.append((target, brief)) or True,
+    )
+
+    store = _RecordingStore()
+    counters = _scan_one_project(
+        project_key="savethenovel",
+        project_path=None,
+        msg_store=store,
+        state_store=None,
+        now=now,
+        config=WatchdogConfig(),
+        storage_closet_name="pollypm-storage-closet",
+    )
+
+    assert counters["findings"] >= 1
+    assert counters["dispatches_sent"] == 1
+    assert len(sent) == 1
+    target, brief = sent[0]
+    assert target == "pollypm-storage-closet:architect-savethenovel"
+    assert RULE_TASK_PROGRESS_STALE in brief
+    assert "savethenovel/15" in brief
+
+
 def test_state_based_detectors_silent_when_open_tasks_empty(now: datetime) -> None:
     """No open_tasks → state path no-ops, original event path still works."""
     from pollypm.audit.watchdog import (
+        RULE_TASK_PROGRESS_STALE,
         RULE_TASK_ON_HOLD_STALE,
         RULE_TASK_REVIEW_STALE,
     )
@@ -2297,6 +2537,11 @@ def test_state_based_detectors_silent_when_open_tasks_empty(now: datetime) -> No
     findings = scan_events([], now=now, open_tasks=[])
     # No events, no tasks → nothing should fire.
     assert not any(
-        f.rule in (RULE_TASK_REVIEW_STALE, RULE_TASK_ON_HOLD_STALE, RULE_STUCK_DRAFT)
+        f.rule in (
+            RULE_TASK_REVIEW_STALE,
+            RULE_TASK_ON_HOLD_STALE,
+            RULE_TASK_PROGRESS_STALE,
+            RULE_STUCK_DRAFT,
+        )
         for f in findings
     )

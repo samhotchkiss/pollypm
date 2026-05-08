@@ -47,6 +47,17 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from pollypm.plan_presence import (
+    has_acceptable_plan,
+    task_bypasses_plan_gate,
+)
+from pollypm.plugins_builtin.task_assignment_notify.resolver import (
+    SWEEPER_COOLDOWN_SECONDS,
+    _known_project_keys,
+    _mark_kickoff_delivered,
+    load_runtime_services,
+    notify,
+)
 from pollypm.work.models import ActorType, ExecutionStatus, WorkStatus
 from pollypm.work.task_assignment import (
     SessionRoleIndex,
@@ -90,18 +101,6 @@ SPAWN_FAILED_PERSISTENT_ALERT_TYPE = "spawn_failed_persistent"
 # can't silently reset the streak counter and let the loop run forever.
 RATE_BREAKER_WINDOW_SECONDS = 600  # 10 minutes
 RATE_BREAKER_MAX_ABANDONMENTS = 5
-
-from pollypm.plugins_builtin.project_planning.plan_presence import (
-    has_acceptable_plan,
-    task_bypasses_plan_gate,
-)
-from pollypm.plugins_builtin.task_assignment_notify.resolver import (
-    SWEEPER_COOLDOWN_SECONDS,
-    _known_project_keys,
-    _mark_kickoff_delivered,
-    load_runtime_services,
-    notify,
-)
 
 logger = logging.getLogger(__name__)
 

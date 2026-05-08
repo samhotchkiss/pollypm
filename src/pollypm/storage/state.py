@@ -23,6 +23,7 @@ left is domain-data migration.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -34,6 +35,21 @@ from pollypm.storage.sqlite_pragmas import (
     apply_workspace_pragmas,
     retry_on_database_locked,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _bump_state_epoch(action: str) -> None:
+    try:
+        from pollypm.state_epoch import bump
+    except ImportError:
+        logger.debug(
+            "StateStore: state epoch bump unavailable after %s",
+            action,
+            exc_info=True,
+        )
+        return
+    bump()
 
 
 SCHEMA = """
@@ -683,11 +699,7 @@ class StateStore:
             deleted = int(cursor.rowcount or 0)
             self._conn.commit()
         # Bump epoch outside the lock — matches commit()'s contract.
-        try:
-            from pollypm.state_epoch import bump
-            bump()
-        except Exception:  # noqa: BLE001
-            pass
+        _bump_state_epoch("memory TTL sweep")
         return deleted
 
     def _deduplicate_alerts(self) -> None:
@@ -702,8 +714,11 @@ class StateStore:
                 AND type = 'alert' AND state = 'open'
             """)
             self._conn.commit()
-        except Exception:  # noqa: BLE001
-            pass
+        except sqlite3.DatabaseError:
+            logger.warning(
+                "StateStore: failed to deduplicate alert rows before schema retry",
+                exc_info=True,
+            )
 
     def __enter__(self):
         return self
@@ -715,9 +730,8 @@ class StateStore:
         with self._lock:
             try:
                 self._conn.close()
-            except Exception:  # noqa: BLE001
-                import logging
-                logging.getLogger(__name__).debug("Error closing StateStore", exc_info=True)
+            except sqlite3.Error:
+                logger.debug("StateStore: close failed", exc_info=True)
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         """Thread-safe execute."""
@@ -730,11 +744,7 @@ class StateStore:
             self._conn.commit()
         # Bump epoch outside the lock — commit is already durable and
         # the bump only touches a sentinel file's mtime.
-        try:
-            from pollypm.state_epoch import bump
-            bump()
-        except Exception:  # noqa: BLE001
-            pass
+        _bump_state_epoch("commit")
 
     def _now(self) -> str:
         return datetime.now(UTC).isoformat()
@@ -871,7 +881,11 @@ class StateStore:
                 "SELECT COALESCE(MAX(version), 0) FROM schema_version"
             ).fetchone()
             current = row[0] if row else 0
-        except Exception:  # noqa: BLE001
+        except sqlite3.DatabaseError:
+            logger.debug(
+                "StateStore: schema_version lookup failed; replaying migrations from zero",
+                exc_info=True,
+            )
             current = 0
 
         for version, description, stmts in self._MIGRATIONS:
@@ -1554,11 +1568,7 @@ class StateStore:
                         ),
                     )
             self._conn.commit()
-            try:
-                from pollypm.state_epoch import bump
-                bump()
-            except Exception:  # noqa: BLE001
-                pass
+            _bump_state_epoch("alert upsert")
 
     def _select_open_alert(
         self, session_name: str, alert_type: str
@@ -1832,11 +1842,7 @@ class StateStore:
             self._conn.commit()
             rowid = int(cursor.lastrowid or 0)
         # Bump epoch outside the lock — same pattern as :meth:`commit`.
-        try:
-            from pollypm.state_epoch import bump
-            bump()
-        except Exception:  # noqa: BLE001
-            pass
+        _bump_state_epoch("notification claim")
         return rowid or None
 
     def update_notification_status(

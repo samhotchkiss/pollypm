@@ -66,6 +66,7 @@ from pollypm.cockpit_activity import (  # noqa: F401  (re-exported)
     _activity_type_colour,
 )
 from pollypm.cockpit_alerts import _action_view_alerts
+from pollypm.cockpit_apps.pane import PollyCockpitPaneApp  # noqa: F401
 from pollypm.cockpit_inbox import (
     InboxThreadRow,
     build_inbox_thread_rows,
@@ -106,7 +107,7 @@ from pollypm.cockpit_palette import (  # noqa: F401  (re-exported)
 from pollypm.cockpit_project_settings import PollyProjectSettingsApp  # noqa: F401
 from pollypm.cockpit_sections.action_bar import render_project_action_bar
 from pollypm.cockpit_settings_accounts import SETTINGS_ACCOUNT_ACTIONS
-from pollypm.plugins_builtin.project_planning.plan_presence import (
+from pollypm.plan_presence import (
     CANONICAL_PLAN_RELATIVE_PATHS as _PLAN_FILE_CANDIDATES,
 )
 from pollypm.cockpit_settings_history import (
@@ -123,7 +124,7 @@ from pollypm.cockpit_settings_history import (
 )
 from pollypm.cockpit_settings_projects import collect_settings_projects
 from pollypm.cockpit_workers import PollyWorkerRosterApp  # noqa: F401
-from pollypm.notify_task import is_notify_inbox_task
+from pollypm.notify_task import is_notify_inbox_task, strip_routing_tag_prefix
 from pollypm.rejection_feedback import (
     feedback_target_task_id,
     is_rejection_feedback_task,
@@ -136,7 +137,6 @@ from pollypm.rejection_feedback import (
 # parameter annotations below (``service: PollyPMService | None``).
 if TYPE_CHECKING:
     from pollypm.service_api import PollyPMService  # noqa: F401
-from pollypm.cockpit import build_cockpit_detail
 from pollypm.cockpit_navigation import (
     InMemoryNavigationStateStore,
     NavigationCommand,
@@ -3711,57 +3711,6 @@ class PollyDashboardApp(App[None]):
         ).jump_to_inbox()
 
 
-class PollyCockpitPaneApp(App[None]):
-    TITLE = "PollyPM"
-    SUB_TITLE = "Pane"
-    CSS = """
-    Screen {
-        background: #10161b;
-        color: #eef2f4;
-        padding: 1;
-    }
-    #body {
-        border: round #253140;
-        background: #111820;
-        padding: 1 2;
-    }
-    """
-
-    def __init__(self, config_path: Path, kind: str, target: str | None = None) -> None:
-        super().__init__()
-        self.config_path = config_path
-        self.kind = kind
-        self.target = target
-        self.body = Static("", id="body")
-
-    def compose(self) -> ComposeResult:
-        yield self.body
-
-    def on_mount(self) -> None:
-        self._refresh()
-        self.set_interval(5, self._refresh)
-        # #1109 follow-up — TTY-less keystroke bridge.
-        try:
-            from pollypm.cockpit_input_bridge import start_input_bridge
-            bridge_kind = f"pane-{self.kind}"
-            self._input_bridge_handle = start_input_bridge(
-                self, kind=bridge_kind, config_path=self.config_path,
-            )
-        except Exception:  # noqa: BLE001
-            self._input_bridge_handle = None
-
-    def on_unmount(self) -> None:
-        bridge = getattr(self, "_input_bridge_handle", None)
-        if bridge is not None:
-            try:
-                bridge.stop()
-            except Exception:  # noqa: BLE001
-                pass
-
-    def _refresh(self) -> None:
-        self.body.update(build_cockpit_detail(self.config_path, self.kind, self.target))
-
-
 # Re-export the extracted task screen so existing import paths keep working.
 from pollypm.cockpit_tasks import PollyTasksApp as PollyTasksApp  # noqa: E402,F401
 
@@ -6858,7 +6807,7 @@ def _archive_success_message(item, task_id: str) -> str:
         return f"Archived {task_id}"
     title = str(getattr(item, "title", "") or "").strip()
     if title:
-        return f"Archived {_strip_action_subject_prefix(title)}"
+        return f"Archived {strip_routing_tag_prefix(title)}"
     return "Archived notification"
 
 
@@ -7006,7 +6955,7 @@ def _format_inbox_row(
     # stamping every title with "[Action]" is redundant noise that
     # eats list-pane width and buries the actual subject.
     if getattr(task, "triage_bucket", "") == "action":
-        subject = _strip_action_subject_prefix(subject)
+        subject = strip_routing_tag_prefix(subject)
     reply_suffix = ""
     if reply_count:
         noun = "reply" if reply_count == 1 else "replies"
@@ -9396,7 +9345,7 @@ class PollyInboxApp(App[None]):
         # header should not lead with "[Action]" boilerplate.
         subject = item.title or "(no subject)"
         if _triage_bucket(item) == "action":
-            subject = _strip_action_subject_prefix(subject)
+            subject = strip_routing_tag_prefix(subject)
         sections.append(f"[b #eef2f4]{_escape(subject)}[/b #eef2f4]")
         meta_bits = [f"[#5b8aff]{_escape(sender)}[/#5b8aff]"]
         if when:
@@ -9583,7 +9532,7 @@ class PollyInboxApp(App[None]):
         # Same routing-tag strip as the list rail — the focused message
         # header should not lead with "[Action]" boilerplate.
         if getattr(task, "triage_bucket", "") == "action":
-            subject = _strip_action_subject_prefix(subject)
+            subject = strip_routing_tag_prefix(subject)
         sections.append(f"[b #eef2f4]{_escape(subject)}[/b #eef2f4]")
         meta_bits = [f"[#5b8aff]{_escape(sender)}[/#5b8aff]"]
         if when:
@@ -11957,7 +11906,7 @@ def _dashboard_plan_staleness(
         _PLAN_STALENESS_CACHE.move_to_end(cache_key)
         return _PLAN_STALENESS_CACHE[cache_key]
     try:
-        from pollypm.plugins_builtin.project_planning.plan_presence import (
+        from pollypm.plan_presence import (
             _find_approved_plan_task,
             _plan_approved_at,
         )
@@ -12332,7 +12281,15 @@ def _dashboard_task_blocker_body_with_kind(task: object) -> tuple[str, str]:
 
 
 def _dashboard_task_db_paths(config: object, project_path: Path) -> list[Path]:
-    """Return task DBs that can hold work for a registered project."""
+    """Return task DBs that can hold work for a registered project.
+
+    Order (#1004): workspace-root canonical DB first, per-project
+    ``<project>/.pollypm/state.db`` as a legacy fallback. Must mirror
+    :meth:`pollypm.cockpit_tasks.PollyTasksApp._candidate_dbs` —
+    a divergence here surfaces as split-brain rendering between the
+    dashboard (which unions across DBs) and the Tasks pane (which
+    picks the first DB with matching rows).
+    """
     candidates: list[Path] = []
 
     def _add(path: object) -> None:
@@ -12343,12 +12300,12 @@ def _dashboard_task_db_paths(config: object, project_path: Path) -> list[Path]:
         if candidate not in candidates and candidate.exists():
             candidates.append(candidate)
 
-    _add(project_path / ".pollypm" / "state.db")
-
     project_settings = getattr(config, "project", None)
     workspace_root = getattr(project_settings, "workspace_root", None)
     if workspace_root is not None:
         _add(Path(workspace_root) / ".pollypm" / "state.db")
+
+    _add(project_path / ".pollypm" / "state.db")
 
     state_db = getattr(project_settings, "state_db", None)
     if state_db is not None:
@@ -13821,29 +13778,6 @@ def _action_card_click_hint(action_items: list[dict]) -> str:
 def _dashboard_action_key(index: int, slot: str) -> str:
     offset = {"primary": 1, "secondary": 2, "other": 3}[slot]
     return str(index * 3 + offset)
-
-
-_ROUTING_TAG_PREFIXES = ("[action]", "[alert]")
-
-
-def _strip_action_subject_prefix(subject: str) -> str:
-    """Drop a leading routing tag (``[Action]``, ``[Alert]``) from a
-    user-facing subject.
-
-    These bracketed prefixes are tier/recipient routing labels added by
-    the notify CLI and the supervisor's alert path; they have no
-    natural-language value for the operator reading the subject. The
-    inbox list rail already strips ``[Action]`` for action-bucket rows;
-    the detail pane and the activity feed mirror the strip so a focused
-    message or feed row doesn't lead with the routing tag.
-    """
-    if not subject:
-        return subject
-    lowered = subject.lower()
-    for tag in _ROUTING_TAG_PREFIXES:
-        if lowered.startswith(tag):
-            return subject[len(tag):].lstrip(" :-—")
-    return subject
 
 
 def _clean_hold_reason(

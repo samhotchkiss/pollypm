@@ -418,11 +418,9 @@ def _render_message_display(row: dict[str, Any]) -> list[str]:
     # Strip notify/supervisor routing tags ("[Action]", "[Alert]") so
     # the user-facing CLI matches the cockpit-pane inbox detail
     # rendering. Raw tags are routing artefacts, not natural language.
-    try:
-        from pollypm.cockpit_ui import _strip_action_subject_prefix
-        subject = _strip_action_subject_prefix(subject)
-    except Exception:  # noqa: BLE001
-        pass
+    from pollypm.notify_task import strip_routing_tag_prefix
+
+    subject = strip_routing_tag_prefix(subject)
     sender = row.get("sender") or "(unknown)"
     recipient = row.get("recipient") or "user"
     scope = row.get("scope") or "-"

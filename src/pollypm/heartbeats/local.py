@@ -510,6 +510,8 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         "please login",
         "please log in",
         "invalid api key",
+        "disabled claude subscription",
+        "use an anthropic api key",
     )
     _WAITING_PATTERNS = (
         "let me know",
@@ -1006,6 +1008,20 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             )
             alerts.append("auth_broken")
             status_locked = True
+            # #1437 — without this call the recovery ladder never fires
+            # for per-task workers that hit an auth-block on their
+            # provider account. The heartbeat would mark the account
+            # ``auth_broken`` and pin the session status, but the wedged
+            # tmux window kept running until manual ``pm reset``.
+            # ``recover_session`` routes through Supervisor.maybe_recover
+            # which (combined with #1437 Fix #3 in session_manager.py)
+            # picks a healthy failover account on the relaunch.
+            self._recover_session(
+                api,
+                context,
+                failure_type="auth_broken",
+                message="Authentication failure reported",
+            )
         else:
             api.clear_alert(context.session_name, "auth_broken")
 

@@ -43,7 +43,7 @@ from pollypm.cockpit_task_review import (
 from pollypm.cockpit_formatting import format_event_time
 from pollypm.cockpit_formatting import format_relative_age as _format_relative_age
 from pollypm.config import load_config, project_config_path
-from pollypm.plugins_builtin.project_planning.plan_presence import (
+from pollypm.plan_presence import (
     plan_approval_task,
     plan_blocked_task_ids,
 )
@@ -1578,6 +1578,16 @@ class PollyTasksApp(App[None]):
         created via ``pm task ...`` with no project DB seeded) render
         with zero rows even though ``pm task counts`` reports them
         — issue #919/#920.
+
+        Order (#1004): the workspace-root canonical DB is preferred
+        first because the work-DB resolver collapsed to workspace-root
+        as the single source of truth. The per-project
+        ``<project>/.pollypm/state.db`` is retained as a legacy
+        fallback so unmigrated projects still render, but workspace
+        wins when both DBs hold rows for the project — otherwise the
+        Tasks pane (which picks the FIRST candidate with any matching
+        rows in :meth:`_get_svc`) latches onto a stale per-project DB
+        and shows split-brain results vs. the live worker session.
         """
         config = load_config(self.config_path)
         project = config.projects.get(self.project_key)
@@ -1596,11 +1606,11 @@ class PollyTasksApp(App[None]):
             seen.add(candidate)
             candidates.append((candidate, project.path))
 
-        _add(project.path / ".pollypm" / "state.db")
         project_settings = getattr(config, "project", None)
         workspace_root = getattr(project_settings, "workspace_root", None)
         if workspace_root is not None:
             _add(Path(workspace_root) / ".pollypm" / "state.db")
+        _add(project.path / ".pollypm" / "state.db")
         state_db = getattr(project_settings, "state_db", None)
         if state_db is not None:
             _add(state_db)

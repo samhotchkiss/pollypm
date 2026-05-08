@@ -1763,7 +1763,7 @@ class CockpitRouter:
         db_path = project_path / ".pollypm" / "state.db"
         if not db_path.exists():
             return [], False
-        from pollypm.plugins_builtin.project_planning.plan_presence import has_acceptable_plan
+        from pollypm.plan_presence import has_acceptable_plan
         from pollypm.work import create_work_service
         from pollypm.work.project_aliases import project_storage_aliases
 

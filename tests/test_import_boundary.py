@@ -39,6 +39,7 @@ this unavoidable?" before merging.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -157,6 +158,40 @@ def _is_private_conn_owner(rel: str) -> bool:
     if rel in _PRIVATE_CONN_ALLOWLIST:
         return True
     return any(rel.startswith(prefix) for prefix in _PRIVATE_CONN_OWNING_PREFIXES)
+
+
+# ---------------------------------------------------------------------------
+# Core -> built-in plugin import slices
+# ---------------------------------------------------------------------------
+
+_PLAN_PRESENCE_PLUGIN_MODULE = (
+    "pollypm.plugins_builtin.project_planning.plan_presence"
+)
+
+
+def _imports_module(source_file: Path, module: str) -> bool:
+    tree = ast.parse(source_file.read_text(encoding="utf-8"), filename=str(source_file))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == module:
+            return True
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == module or alias.name.startswith(f"{module}."):
+                    return True
+    return False
+
+
+def test_non_plugin_sources_do_not_import_project_planning_plan_presence() -> None:
+    """The shared plan gate lives in core, not in the optional plugin tree."""
+    root = _project_root()
+    offenders: list[str] = []
+    for source_file in _iter_source_files(root):
+        rel = _relative_posix(source_file, root)
+        if "/plugins_builtin/" in rel:
+            continue
+        if _imports_module(source_file, _PLAN_PRESENCE_PLUGIN_MODULE):
+            offenders.append(rel)
+    assert offenders == []
 
 
 # ---------------------------------------------------------------------------

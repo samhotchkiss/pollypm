@@ -106,7 +106,7 @@ from pollypm.cockpit_palette import (  # noqa: F401  (re-exported)
 from pollypm.cockpit_project_settings import PollyProjectSettingsApp  # noqa: F401
 from pollypm.cockpit_sections.action_bar import render_project_action_bar
 from pollypm.cockpit_settings_accounts import SETTINGS_ACCOUNT_ACTIONS
-from pollypm.plugins_builtin.project_planning.plan_presence import (
+from pollypm.plan_presence import (
     CANONICAL_PLAN_RELATIVE_PATHS as _PLAN_FILE_CANDIDATES,
 )
 from pollypm.cockpit_settings_history import (
@@ -11957,7 +11957,7 @@ def _dashboard_plan_staleness(
         _PLAN_STALENESS_CACHE.move_to_end(cache_key)
         return _PLAN_STALENESS_CACHE[cache_key]
     try:
-        from pollypm.plugins_builtin.project_planning.plan_presence import (
+        from pollypm.plan_presence import (
             _find_approved_plan_task,
             _plan_approved_at,
         )

@@ -150,7 +150,12 @@ from pollypm.cockpit_navigation_client import (
     cockpit_navigation_queue_path,
     file_navigation_client,
 )
-from pollypm.cockpit_rail import CockpitItem, CockpitPresence, CockpitRouter
+from pollypm.cockpit_rail import (
+    CockpitItem,
+    CockpitPresence,
+    CockpitRouter,
+    _alert_type_is_user_action_waiting,
+)
 
 
 import re as _re
@@ -765,6 +770,21 @@ class RailItem(ListItem):
                 return "▶", "#ff5f6d"
             if self.item.state == "project-red":
                 return "▲", alert_color
+            # #1520 — A "Waiting on you:" alert family on the project's
+            # sessions (plan_missing, worker_question, recovery_limit,
+            # auth_broken, stuck_on_task:, no_session_for_assignment:,
+            # etc.) outranks both the project-rollup glyphs *and* the
+            # heartbeat ♥·/♡· pair below. The dashboard banner already
+            # says "Waiting on you:" for these; the rail must mirror
+            # that signal so the user can see at a glance which projects
+            # owe them a decision. Same ◆ glyph the dashboard pill uses
+            # for "needs attention". Operational alerts (``pane:*``)
+            # are filtered out by ``_alert_type_is_user_action_waiting``
+            # — the worker's stuck ⚠ glyph already covers them.
+            if _alert_type_is_user_action_waiting(
+                getattr(self.item, "alert_type", None)
+            ):
+                return "◆", "#f0a030"
             if self.item.state == "project-yellow":
                 # #1092 — use ◆ to match the dashboard's "needs attention"
                 # diamond. ``•`` and the idle ``·`` are visually

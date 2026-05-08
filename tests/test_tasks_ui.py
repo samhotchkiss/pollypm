@@ -351,6 +351,49 @@ def test_tasks_pane_default_active_filter_includes_in_progress(
     assert _task_matches_status(in_progress_task, app._status_filter)
 
 
+# Issue #1513: cockpit Tasks "Active" filter used to be ``status not in
+# {done, cancelled}`` which counted plan-gated queued, draft, on_hold,
+# and blocked tasks as Active. The filter now only matches in-flight
+# work. The matrix below pins each WorkStatus × plan_blocked combination
+# to the post-fix expectation so a future refactor can't quietly widen
+# Active again.
+@pytest.mark.parametrize(
+    ("status", "plan_blocked", "expected_active"),
+    [
+        # Worker is doing the work right now → Active.
+        (WorkStatus.IN_PROGRESS, False, True),
+        (WorkStatus.REWORK, False, True),
+        # Reviewer is pending → still in-flight, still Active.
+        (WorkStatus.REVIEW, False, True),
+        # Queued is Active only when unambiguously claimable. Production
+        # ``plan_blocked_task_ids`` (plan_presence.py) only ever flags
+        # QUEUED rows, so QUEUED × plan_blocked=True is the realistic
+        # plan-gated case — the headline #1513 bug.
+        (WorkStatus.QUEUED, False, True),
+        (WorkStatus.QUEUED, True, False),
+        # Parked / gated states are NOT Active — they each have their own
+        # bucket (Drafts, Paused, Plan-Gated, Blocked).
+        (WorkStatus.DRAFT, False, False),
+        (WorkStatus.ON_HOLD, False, False),
+        (WorkStatus.BLOCKED, False, False),
+        # Terminal states never count as Active.
+        (WorkStatus.DONE, False, False),
+        (WorkStatus.CANCELLED, False, False),
+    ],
+)
+def test_active_filter_excludes_parked_and_gated_tasks(
+    status: WorkStatus, plan_blocked: bool, expected_active: bool
+) -> None:
+    """#1513 — Active = in-flight work, not "everything except done/cancelled"."""
+    from pollypm.cockpit_tasks import _task_matches_status
+
+    task = _task(node_id="research", status=status)
+    assert (
+        _task_matches_status(task, "active", plan_blocked=plan_blocked)
+        is expected_active
+    )
+
+
 def test_tasks_pane_header_uses_canonical_display_label(tmp_path: Path) -> None:
     """#920 — Tasks pane header must echo the project's display name
     (``blackjack-trainer``), not the slugified config key
@@ -1544,6 +1587,10 @@ def test_task_app_leads_on_hold_feedback_with_paused_review_summary(
 
     app = PollyTasksApp(env["config_path"], "demo")
     app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
+    # Show parked tasks too — after #1513 the on_hold work_task no longer
+    # surfaces under the default Active filter, but this test is about
+    # the on_hold review-summary overview, not about Active visibility.
+    app._status_filter = "all"
 
     async def body() -> None:
         async with app.run_test(size=(140, 50)) as pilot:
@@ -1605,11 +1652,16 @@ def test_task_app_all_filter_uses_human_readable_status_labels(
 
     app = PollyTasksApp(env["config_path"], "demo")
     app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
+    # Pre-select the All filter before mount so the on_mount refresh
+    # doesn't auto-flip to Done. After #1513 narrowed Active to in-flight
+    # tasks only, this fixture (on_hold + draft + done) leaves Active
+    # empty, which triggers the done-only auto-flip and pins the cursor
+    # on the Done row.
+    app._status_filter = "all"
 
     async def body() -> None:
         async with app.run_test(size=(140, 50)) as pilot:
             await pilot.pause()
-            app._status_filter = "all"
             app._sync_filter_buttons()
             app._render_table(select_first=True)
             await pilot.pause()
@@ -1777,6 +1829,11 @@ def test_task_app_surfaces_plan_blocked_queued_tasks(env, monkeypatch) -> None:
 
     app = PollyTasksApp(env["config_path"], "demo")
     app._get_svc = lambda: fake_svc  # type: ignore[method-assign]
+    # #1513: plan-gated queued tasks no longer surface under the default
+    # Active filter — they belong in the Blocked bucket via the synthetic
+    # ``waiting_on_plan`` overlay. Use the All filter here so the
+    # overlay rendering is still visible to the assertions below.
+    app._status_filter = "all"
 
     async def body() -> None:
         async with app.run_test(size=(140, 50)) as pilot:

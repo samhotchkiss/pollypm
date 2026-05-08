@@ -26,6 +26,8 @@ want to see "this fired N ticks in a row" as a signal of severity.
 from __future__ import annotations
 
 import logging
+import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -34,6 +36,7 @@ from pollypm.audit.watchdog import (
     ESCALATION_THROTTLE_SECONDS,
     Finding,
     RULE_DUPLICATE_ADVISOR_TASKS,
+    RULE_LEGACY_DB_SHADOW,
     RULE_PLAN_REVIEW_MISSING,
     RULE_ROLE_SESSION_MISSING,
     RULE_STUCK_DRAFT,
@@ -52,6 +55,24 @@ from pollypm.audit.watchdog import (
     was_recently_dispatched,
     watchdog_alert_session_name,
 )
+
+
+@dataclass(slots=True, frozen=True)
+class _LegacyDbShadow:
+    """One project's canonical-vs-legacy DB shadow descriptor (#1519).
+
+    Used by :func:`_gather_legacy_db_shadows` to feed the pure
+    ``legacy_db_shadow`` detector. Carries enough context that the
+    detector can build a useful Finding and the self-heal action can
+    target the right project without re-walking the registry.
+    """
+
+    project_key: str
+    project_path: Path
+    canonical_db: Path
+    legacy_db: Path
+    canonical_row_count: int
+    legacy_row_count: int
 
 
 # #1414 — only the auto-unstick rules are eligible for architect dispatch.
@@ -368,6 +389,211 @@ def _gather_open_tasks(project_key: str, project_path: Path | None) -> list[Any]
             project_key, exc_info=True,
         )
         return []
+
+
+def _count_work_tasks_for_project(db_path: Path, project_key: str) -> int:
+    """Return the number of ``work_tasks`` rows for ``project_key`` in ``db_path``.
+
+    Best-effort; opens read-only and swallows every exception, returning
+    ``0`` on any failure. We deliberately avoid going through the
+    work-service factory so this probe doesn't pin a connection or
+    trigger resolver migration side-effects — it's a pure peek.
+
+    Powers the #1519 ``legacy_db_shadow`` detector. Returning 0 on a
+    missing / unreadable DB means the detector treats that side as
+    empty, which is the right default — we only fire when *both* sides
+    are non-empty.
+    """
+    if not db_path.exists():
+        return 0
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return 0
+    try:
+        try:
+            cur = conn.execute(
+                "SELECT COUNT(*) FROM work_tasks WHERE project = ?",
+                (project_key,),
+            )
+            row = cur.fetchone()
+        except sqlite3.Error:
+            return 0
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+    if not row:
+        return 0
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return 0
+
+
+def _gather_legacy_db_shadows(
+    *,
+    services: Any,
+) -> list[_LegacyDbShadow]:
+    """Probe each known project for canonical/legacy DB shadowing (#1519).
+
+    Walks ``services.known_projects`` once per cadence tick and returns
+    one descriptor per project whose canonical workspace DB AND legacy
+    per-project DB BOTH carry rows. The pure
+    :func:`_detect_legacy_db_shadow` then emits findings; the cadence
+    handler invokes :func:`_self_heal_legacy_db_shadow` to drain the
+    legacy file via the existing
+    :func:`migrate_legacy_per_project_dbs` helper (idempotent —
+    rows already in canonical are skipped, source archived to
+    ``state.db.legacy-1004`` only after every row was matched/copied).
+
+    Returns an empty list if the workspace root can't be determined or
+    if no projects are registered. Filesystem / sqlite failures for an
+    individual project are swallowed and that project is skipped — the
+    rule is additive ("alert only when we're sure"), not gated.
+    """
+    config = getattr(services, "config", None)
+    if config is None:
+        return []
+    project_settings = getattr(config, "project", None)
+    workspace_root_raw = getattr(project_settings, "workspace_root", None)
+    if workspace_root_raw is None:
+        return []
+    try:
+        workspace_root = Path(workspace_root_raw)
+    except TypeError:
+        return []
+    canonical_db = workspace_root / ".pollypm" / "state.db"
+    if not canonical_db.exists():
+        # No canonical DB yet — nothing can shadow it. Returning empty
+        # means we don't pre-emptively migrate a project before its
+        # canonical DB is even populated.
+        return []
+    canonical_real: Path | None
+    try:
+        canonical_real = canonical_db.resolve()
+    except OSError:
+        canonical_real = None
+
+    shadows: list[_LegacyDbShadow] = []
+    known = getattr(services, "known_projects", None) or ()
+    for project in known:
+        project_key = getattr(project, "key", None) or getattr(
+            project, "name", None,
+        )
+        project_path_raw = getattr(project, "path", None)
+        if not project_key or project_path_raw is None:
+            continue
+        try:
+            project_path = Path(project_path_raw)
+        except TypeError:
+            continue
+        legacy_db = project_path / ".pollypm" / "state.db"
+        if not legacy_db.exists():
+            continue
+        # Skip the project whose path *is* the workspace root — its
+        # legacy DB IS the canonical DB; nothing to migrate.
+        try:
+            if canonical_real is not None and legacy_db.resolve() == canonical_real:
+                continue
+        except OSError:
+            continue
+        legacy_rows = _count_work_tasks_for_project(legacy_db, project_key)
+        if legacy_rows <= 0:
+            continue
+        canonical_rows = _count_work_tasks_for_project(canonical_db, project_key)
+        if canonical_rows <= 0:
+            # Pure-legacy project — Part A's read-path fallback already
+            # routes to legacy, so the dashboard renders correctly. We
+            # could still migrate proactively here, but staying additive
+            # keeps the action-side of this rule narrowly scoped to the
+            # actual divergence (rows on both sides).
+            continue
+        shadows.append(_LegacyDbShadow(
+            project_key=project_key,
+            project_path=project_path,
+            canonical_db=canonical_db,
+            legacy_db=legacy_db,
+            canonical_row_count=canonical_rows,
+            legacy_row_count=legacy_rows,
+        ))
+    return shadows
+
+
+def _self_heal_legacy_db_shadow(
+    finding: Finding,
+    *,
+    project_key: str,
+    project_path: Path | None,
+) -> dict[str, int]:
+    """Drain one project's legacy per-project DB into the canonical workspace DB.
+
+    #1519 self-healing action. Calls
+    :func:`pollypm.storage.legacy_per_project_db.migrate_one` which is
+    idempotent: rows already present in the workspace DB are skipped,
+    source is archived to ``state.db.legacy-1004`` only after every row
+    was either copied or matched. A re-run on an already-migrated
+    workspace is a no-op (the source file is renamed away on success
+    so the next probe finds no shadow).
+
+    Returns ``{"migrated": 1, "failed": 0}`` on success or
+    ``{"migrated": 0, "failed": 1}`` on any failure. Best-effort: a
+    failure leaves the source DB in place so the next cadence tick can
+    retry.
+    """
+    counters = {"migrated": 0, "failed": 0}
+    if project_path is None:
+        counters["failed"] = 1
+        return counters
+    try:
+        from pollypm.storage.legacy_per_project_db import migrate_one
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: legacy migrate import failed", exc_info=True,
+        )
+        counters["failed"] = 1
+        return counters
+    canonical_db_raw = (finding.metadata or {}).get("canonical_db")
+    if not canonical_db_raw:
+        counters["failed"] = 1
+        return counters
+    try:
+        report = migrate_one(
+            project_key=project_key,
+            project_path=Path(project_path),
+            workspace_db=Path(canonical_db_raw),
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "audit.watchdog: legacy_db_shadow migrate raised for %s",
+            project_key, exc_info=True,
+        )
+        counters["failed"] = 1
+        return counters
+    if report.errors:
+        logger.warning(
+            "audit.watchdog: legacy_db_shadow migrate had errors for %s: %s",
+            project_key, report.errors,
+        )
+        counters["failed"] = 1
+        return counters
+    # ``migrate_one`` returns ``succeeded=False`` when it skipped — the
+    # source DB is missing or IS the workspace DB. Both are "no-op
+    # success" for our purposes: a re-run on an already-healed project
+    # (source archived to ``.legacy-1004`` on the previous tick) hits
+    # this branch and should not be counted as a failure.
+    logger.info(
+        "audit.watchdog: legacy_db_shadow drained %s → canonical "
+        "(copied=%s skipped=%s archived_to=%s skip_reason=%s)",
+        project_key,
+        {k: v for k, v in report.rows_copied.items() if v},
+        {k: v for k, v in report.rows_skipped.items() if v},
+        report.archived_to,
+        report.skipped_reason,
+    )
+    counters["migrated"] = 1
+    return counters
 
 
 def _gather_storage_windows(storage_closet_name: str | None) -> list[str]:
@@ -734,6 +960,7 @@ def _scan_one_project(
     now: datetime,
     config: WatchdogConfig,
     storage_closet_name: str | None = None,
+    legacy_db_shadows: list[_LegacyDbShadow] | None = None,
 ) -> dict[str, int]:
     """Scan one project and route every finding. Returns counters."""
     counters = {
@@ -747,6 +974,8 @@ def _scan_one_project(
         "advisor_duplicates_failed": 0,
         "plan_review_backfilled": 0,
         "plan_review_backfill_failed": 0,
+        "legacy_db_shadows_migrated": 0,
+        "legacy_db_shadows_failed": 0,
     }
     open_tasks = _gather_open_tasks(project_key, project_path)
     storage_window_names = _gather_storage_windows(storage_closet_name)
@@ -756,6 +985,13 @@ def _scan_one_project(
         if done_plan_tasks
         else None
     )
+    # #1519 — filter the workspace-wide shadow list down to this
+    # project's entry (if any) so the pure detector only sees what's
+    # in scope for the current scan_project call.
+    project_shadows: list[_LegacyDbShadow] = [
+        s for s in (legacy_db_shadows or [])
+        if s.project_key == project_key
+    ]
     try:
         findings = scan_project(
             project_key,
@@ -766,6 +1002,7 @@ def _scan_one_project(
             storage_window_names=storage_window_names,
             done_plan_tasks=done_plan_tasks,
             plan_review_present=plan_review_present,
+            legacy_db_shadows=project_shadows or None,
         )
     except Exception:  # noqa: BLE001
         logger.debug(
@@ -822,6 +1059,21 @@ def _scan_one_project(
                 counters["plan_review_backfill_failed"] += 1
             # Skip the dispatch path for this rule — the architect has
             # nothing to unstick; the watchdog itself just fixed it.
+            continue
+        # #1519 — legacy_db_shadow findings are self-healing: drain the
+        # legacy per-project DB into canonical via ``migrate_one``. The
+        # helper is idempotent (rows already in canonical are skipped,
+        # source archived to ``state.db.legacy-1004`` only after a clean
+        # copy), so a re-run on an already-healed workspace is a no-op.
+        # No architect dispatch — the action is mechanical.
+        if finding.rule == RULE_LEGACY_DB_SHADOW:
+            heal = _self_heal_legacy_db_shadow(
+                finding,
+                project_key=project_key,
+                project_path=project_path,
+            )
+            counters["legacy_db_shadows_migrated"] += heal["migrated"]
+            counters["legacy_db_shadows_failed"] += heal["failed"]
             continue
         # #1414 — eligible findings get an architect dispatch on top
         # of the alert. Throttle window is owned by the audit log so
@@ -887,6 +1139,8 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
         "advisor_duplicates_failed": 0,
         "plan_review_backfilled": 0,
         "plan_review_backfill_failed": 0,
+        "legacy_db_shadows_migrated": 0,
+        "legacy_db_shadows_failed": 0,
     }
 
     try:
@@ -894,6 +1148,16 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
         storage_closet_name = getattr(
             services, "storage_closet_name", None,
         )
+        # #1519 — probe the canonical-vs-legacy DB shadow once per tick
+        # so every project's scan can read its own entry without
+        # re-walking the registry. Best-effort; failures return [].
+        try:
+            legacy_db_shadows = _gather_legacy_db_shadows(services=services)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "audit.watchdog: legacy-db-shadow probe failed", exc_info=True,
+            )
+            legacy_db_shadows = []
         for project in services.known_projects or ():
             project_key = getattr(project, "key", None)
             if not project_key or project_key in seen_projects:
@@ -908,6 +1172,7 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 now=now,
                 config=config,
                 storage_closet_name=storage_closet_name,
+                legacy_db_shadows=legacy_db_shadows,
             )
             totals["projects_scanned"] += 1
             for k, v in partial.items():

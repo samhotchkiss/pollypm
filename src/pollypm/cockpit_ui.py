@@ -11987,6 +11987,17 @@ def _dashboard_gather_tasks(
     the overall dashboard tick stays cheap when the work service has
     no new writes. Only small dict views of each task are cached (never
     full ``Task`` objects) to keep the cache footprint bounded.
+
+    #1519 — read from a SINGLE DB per render. ``_dashboard_task_db_paths``
+    returns the canonical workspace DB first and the legacy per-project
+    DB second; we now mirror :meth:`pollypm.cockpit_tasks.PollyTasksApp
+    ._candidate_dbs`/``_get_svc`` "first DB with matching rows" semantics
+    so a stale legacy per-project DB no longer pads counts on top of
+    canonical. Pre-#1519 the dashboard unioned every returned DB, which
+    surfaced as the coffeeboardnm pipeline reading 6 queued (1 canonical
+    + 5 stale legacy advisor_review rows) instead of 1. The watchdog
+    drains the legacy file separately (#1519 Part B) — this read-path
+    fix is the user-visible repair.
     """
     db_paths = _dashboard_task_db_paths(config, project_path)
     if not db_paths:
@@ -12027,6 +12038,13 @@ def _dashboard_gather_tasks(
     # results (tasks are deduped by ``task_id`` below).
     aliases = _project_storage_aliases(config, project_key)
     task_rows: dict[str, tuple[str, dict]] = {}
+    # #1519 — pick a SINGLE DB. Walk the candidate list in order
+    # (canonical first, legacy fallback second) and stop as soon as one
+    # yields tasks for any project alias. Mirrors the Tasks-pane's
+    # ``_get_svc``/``_candidate_dbs`` semantics so the dashboard's
+    # pipeline counts agree with the table the user opens next. Falling
+    # back when canonical is empty keeps unmigrated projects renderable
+    # off the legacy per-project DB.
     for db_path in db_paths:
         # #915 — extend the static alias list with whatever the DB
         # actually stores. Catches drift between create-time labels
@@ -12036,9 +12054,9 @@ def _dashboard_gather_tasks(
         for discovered in _dashboard_discover_db_aliases(db_path, aliases):
             if discovered not in db_aliases:
                 db_aliases.append(discovered)
+        tasks: list = []
         try:
             with create_work_service(db_path=db_path, project_path=project_path) as svc:
-                tasks: list = []
                 seen_ids: set[str] = set()
                 for alias in db_aliases:
                     for found in svc.list_tasks(project=alias):
@@ -12057,6 +12075,12 @@ def _dashboard_gather_tasks(
                         seen_ids.add(tid)
                         tasks.append(found)
         except Exception:  # noqa: BLE001
+            # This DB blew up — fall through to the next candidate
+            # rather than silently dropping the project's counts.
+            continue
+        if not tasks:
+            # Empty DB — try the next candidate. This is the canonical
+            # → legacy fallback for projects that never migrated.
             continue
         for t in tasks:
             status = getattr(t.work_status, "value", "")
@@ -12121,6 +12145,17 @@ def _dashboard_gather_tasks(
                 > str(existing[1].get("updated_at") or "")
             ):
                 task_rows[t.task_id] = (status, row)
+        # #1519 — first DB with any matching pipeline rows wins (mirrors
+        # ``cockpit_tasks._get_svc`` "first candidate with matching
+        # rows"). Stop walking candidates so the canonical DB's counts
+        # aren't padded by stale rows from a legacy per-project DB still
+        # on disk. ``tasks`` already excludes notification-shaped rows
+        # (see ``is_notify_inbox_task`` above) — those don't pad pipeline
+        # counts in either DB, so excluding them from the gate keeps the
+        # fallback logic from latching onto a canonical DB that holds
+        # only inbox messages.
+        if tasks:
+            break
 
     for status, row in task_rows.values():
         buckets[status].append(row)

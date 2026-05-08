@@ -6,6 +6,8 @@ and working design docs. If you are not sure where to start, start here:
 - [Getting Started](getting-started.md) — install PollyPM, register a project,
   and run your first task.
 - [Architecture](architecture.md) — high-level system map and core boundaries.
+- [Audit Log](audit-log.md) — JSONL audit trail, watchdog findings, and
+  operator/contributor recipes.
 - [Worker Guide](worker-guide.md) — the operating manual for spawned worker
   sessions.
 - [Plugin Authoring](plugin-authoring.md) — the shortest path to building and
@@ -19,6 +21,8 @@ and working design docs. If you are not sure where to start, start here:
   first end-to-end workflow.
 - [Work Service Specification](work-service-spec.md) — the current task,
   workflow, and governance model behind `pm task`.
+- [Audit Log](audit-log.md) — where task/marker lifecycle events land and how
+  watchdog findings surface.
 - [Issue Tracker](issue-tracker.md) — explains the legacy file-based tracker
   and why the work service is now the source of truth.
 - Plugin feature specs such as
@@ -47,6 +51,8 @@ and working design docs. If you are not sure where to start, start here:
 - [Architecture](architecture.md) — current system design and service boundary
   notes.
 - [Conventions](conventions.md) — coding, testing, and import-boundary rules.
+- [Audit Log](audit-log.md) — hook contract for emitting audit events and
+  adding watchdog rules.
 - [Worker Guide](worker-guide.md) — task lifecycle and handoff expectations for
   implementation work.
 - [Release-Fix Packaging](release-fix-packaging.md) — review and rollback

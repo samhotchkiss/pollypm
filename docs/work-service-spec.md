@@ -115,6 +115,18 @@ Callers that genuinely need a non-canonical path (legacy migration,
 tests, explicit `--db` overrides) may pass `db_path=...` explicitly so the
 deviation is visible at the callsite.
 
+### Audit Hooks
+
+The current work-service implementation emits audit-log events for task
+creation, status transitions, task deletion/pruning, and every SQLite work DB
+open. The `work_db.opened` event is the forensic breadcrumb for the workspace
+vs. messages-side DB confusion: its metadata records whether the opened file
+already had a `messages` table and whether work tables had to be created.
+
+See [Audit Log](audit-log.md) for the JSONL schema, on-disk paths, watchdog
+rules that consume these events, and the contributor contract for adding new
+event types.
+
 - **Startup**: no dedicated service bootstrap. Each caller resolves config and
   builds the service object when needed.
 - **Failure mode**: a caller-side failure aborts only that operation. The next

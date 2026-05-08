@@ -20,10 +20,14 @@ is logged and the next project still gets its turn.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import logging
+import os
+import re
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from pollypm.plugins_builtin.advisor.settings import (
     AdvisorSettings,
@@ -97,6 +101,93 @@ def detect_changes(
     return report.has_changes
 
 
+_SAFE_PROJECT_KEY_RE = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def _advisor_lock_path(project_key: str) -> Path:
+    """Return the per-project advisor enqueue lock file path.
+
+    The lock lives next to the canonical workspace state.db
+    (``<workspace_root>/.pollypm/state.db``) so every process that
+    writes to that DB also serialises through the same lock. We keep
+    the lock filename ASCII-safe and stable across runs so concurrent
+    ticks land on the same inode.
+
+    Falls back to a cwd-relative ``.pollypm/`` directory when the
+    canonical resolver can't load config (tests, half-bootstrapped
+    workspaces). The lock is best-effort: a lock-acquisition failure
+    is logged and the caller proceeds without serialisation — that
+    preserves the pre-#1510 behaviour rather than silently dropping
+    advisor enqueues.
+    """
+    safe_key = _SAFE_PROJECT_KEY_RE.sub("_", project_key) or "_"
+    try:
+        from pollypm.work.db_resolver import resolve_work_db_path
+
+        db_path = resolve_work_db_path(project=project_key)
+        lock_dir = db_path.parent
+    except Exception:  # noqa: BLE001
+        lock_dir = Path(".pollypm")
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:  # noqa: BLE001
+        # Best-effort — if we can't create the dir we'll still try to
+        # open(); that may fail and the caller will skip the lock.
+        pass
+    return lock_dir / f"advisor-{safe_key}.lock"
+
+
+@contextlib.contextmanager
+def _advisor_enqueue_lock(project_key: str) -> Iterator[bool]:
+    """Per-project exclusive lock around the advisor throttle+enqueue window.
+
+    Yields ``True`` when the exclusive lock was acquired, ``False`` when
+    we couldn't obtain a lock (filesystem error, fcntl unavailable on a
+    weird platform, etc.). Callers that get ``False`` should still
+    proceed — best-effort throttling is better than dropping the tick.
+
+    The lock file is keyed on (canonical-DB-dir, project_key) so two
+    advisor ticks in the same workspace serialise on the same inode
+    while two workspaces stay independent. ``fcntl.flock`` is process-
+    advisory and survives `fork`, which is exactly what we want for
+    the heartbeat/scheduler split.
+    """
+    lock_path = _advisor_lock_path(project_key)
+    fd: int | None = None
+    try:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+        except OSError as exc:
+            logger.debug(
+                "advisor: enqueue-lock open failed for %s at %s: %s",
+                project_key, lock_path, exc,
+            )
+            yield False
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError as exc:
+            logger.debug(
+                "advisor: enqueue-lock acquire failed for %s: %s",
+                project_key, exc,
+            )
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def enqueue_advisor_review(
     *,
     project_key: str,
@@ -108,6 +199,16 @@ def enqueue_advisor_review(
 
     Kept as a module-level callable so unit tests can monkeypatch the
     enqueue path without touching the work service.
+
+    #1510: this function holds the authoritative race-safe gate. The
+    high-level ``_should_review`` check is a fast-path; here we take a
+    per-project advisory file lock around (a) a fresh throttle re-check
+    against the canonical work DB and (b) the actual ``create`` +
+    ``queue``. Two ticks racing on the same workspace serialise on the
+    lock, the loser observes the winner's freshly-enqueued task, and
+    short-circuits with ``"skipped": "throttled"``. The check + insert
+    are inside the same lock so a parallel tick cannot interleave a
+    duplicate enqueue between them.
     """
     close_service = False
     if work_service is None:
@@ -125,27 +226,51 @@ def enqueue_advisor_review(
         close_service = True
 
     try:
-        task = work_service.create(
-            title=f"Advisor review for {project_key}",
-            description=(
-                "Review recent project trajectory, identify stalls or human "
-                "blockers, and emit a structured advisor decision."
-            ),
-            type="task",
-            project=project_key,
-            flow_template="advisor_review",
-            roles={"advisor": "advisor"},
-            priority="normal",
-            created_by="advisor.tick",
-            labels=["advisor"],
-            requires_human_review=False,
-        )
-        queued = work_service.queue(task.task_id, "advisor.tick")
-        return {
-            "enqueued": True,
-            "project": project_key,
-            "task_id": queued.task_id,
-        }
+        with _advisor_enqueue_lock(project_key) as acquired:
+            # Re-check the throttle inside the lock. The fast-path in
+            # ``_should_review`` may have read pre-tick state; the
+            # authoritative check happens here so a sibling tick that
+            # already enqueued is observed before we double-write.
+            # Even when ``acquired`` is False (lock open failed), the
+            # re-check is still a strict improvement over no check —
+            # it'll catch all but truly-simultaneous racers.
+            if has_in_progress_advisor_task(
+                project_key=project_key,
+                work_service=work_service,
+                project_path=project_path,
+            ):
+                logger.debug(
+                    "advisor: enqueue skipped for %s — sibling tick "
+                    "already enqueued (lock acquired=%s)",
+                    project_key, acquired,
+                )
+                return {
+                    "enqueued": False,
+                    "skipped": "throttled",
+                    "project": project_key,
+                }
+
+            task = work_service.create(
+                title=f"Advisor review for {project_key}",
+                description=(
+                    "Review recent project trajectory, identify stalls or human "
+                    "blockers, and emit a structured advisor decision."
+                ),
+                type="task",
+                project=project_key,
+                flow_template="advisor_review",
+                roles={"advisor": "advisor"},
+                priority="normal",
+                created_by="advisor.tick",
+                labels=["advisor"],
+                requires_human_review=False,
+            )
+            queued = work_service.queue(task.task_id, "advisor.tick")
+            return {
+                "enqueued": True,
+                "project": project_key,
+                "task_id": queued.task_id,
+            }
     finally:
         if close_service:
             close = getattr(work_service, "close", None)

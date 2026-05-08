@@ -33,6 +33,7 @@ from typing import Any
 from pollypm.audit.watchdog import (
     ESCALATION_THROTTLE_SECONDS,
     Finding,
+    RULE_DUPLICATE_ADVISOR_TASKS,
     RULE_ROLE_SESSION_MISSING,
     RULE_STUCK_DRAFT,
     RULE_TASK_ON_HOLD_STALE,
@@ -528,6 +529,61 @@ def _maybe_dispatch_to_architect(
     return "dispatched"
 
 
+def _self_heal_duplicate_advisor_tasks(
+    finding: Finding,
+    *,
+    project_key: str,
+    project_path: Path | None,
+) -> dict[str, int]:
+    """Cancel every duplicate advisor task except the most-recently-created.
+
+    #1510 self-healing action. The detector already chose which task to
+    keep (``finding.metadata['keep_task_id']``) and which to cancel
+    (``finding.metadata['duplicate_ids']``). We just iterate the list
+    and call ``WorkService.cancel`` for each — using the work-service
+    API rather than raw SQL so cancellation observers (audit emit,
+    sync, alert teardown) all run.
+
+    Returns ``{"cancelled": N, "failed": M}`` for the per-project
+    counters. Best-effort: a per-task failure is logged and we keep
+    going so a single bad row doesn't strand the rest.
+    """
+    counters = {"cancelled": 0, "failed": 0}
+    duplicate_ids: list[str] = list(
+        finding.metadata.get("duplicate_ids") or []
+    )
+    if not duplicate_ids:
+        return counters
+    reason = f"duplicate advisor_review (auto-cleanup #1510)"
+    try:
+        from pollypm.work import create_work_service
+
+        with create_work_service(
+            project_path=project_path,
+            project_key=project_key,
+        ) as svc:
+            for task_id in duplicate_ids:
+                try:
+                    svc.cancel(task_id, "audit_watchdog", reason)
+                    counters["cancelled"] += 1
+                except Exception:  # noqa: BLE001
+                    counters["failed"] += 1
+                    logger.warning(
+                        "audit.watchdog: duplicate-advisor cleanup failed "
+                        "for %s",
+                        task_id, exc_info=True,
+                    )
+    except Exception:  # noqa: BLE001
+        # If we can't even open the work service, mark every duplicate
+        # as failed so the totals reflect the wedge accurately.
+        counters["failed"] += len(duplicate_ids) - counters["cancelled"]
+        logger.warning(
+            "audit.watchdog: duplicate-advisor cleanup could not open "
+            "work service for %s", project_key, exc_info=True,
+        )
+    return counters
+
+
 def _scan_one_project(
     *,
     project_key: str,
@@ -546,6 +602,8 @@ def _scan_one_project(
         "dispatches_sent": 0,
         "dispatches_throttled": 0,
         "dispatches_failed": 0,
+        "advisor_duplicates_cancelled": 0,
+        "advisor_duplicates_failed": 0,
     }
     open_tasks = _gather_open_tasks(project_key, project_path)
     storage_window_names = _gather_storage_windows(storage_closet_name)
@@ -581,6 +639,20 @@ def _scan_one_project(
                 finding.rule, finding.project, finding.subject,
                 finding.message, finding.recommendation,
             )
+        # #1510 — duplicate-advisor cleanup is a self-healing action,
+        # not an architect dispatch. The fix is mechanical (cancel all
+        # but the newest), idempotent across ticks, and doesn't need a
+        # human in the loop, so we run it inline here.
+        if finding.rule == RULE_DUPLICATE_ADVISOR_TASKS:
+            heal = _self_heal_duplicate_advisor_tasks(
+                finding,
+                project_key=project_key,
+                project_path=project_path,
+            )
+            counters["advisor_duplicates_cancelled"] += heal["cancelled"]
+            counters["advisor_duplicates_failed"] += heal["failed"]
+            # Skip dispatch — this rule is auto-healed, not architect-routed.
+            continue
         # #1414 — eligible findings get an architect dispatch on top
         # of the alert. Throttle window is owned by the audit log so
         # repeat dispatches are deduped across cadence-process restarts.
@@ -641,6 +713,8 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
         "dispatches_sent": 0,
         "dispatches_throttled": 0,
         "dispatches_failed": 0,
+        "advisor_duplicates_cancelled": 0,
+        "advisor_duplicates_failed": 0,
     }
 
     try:

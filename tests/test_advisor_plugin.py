@@ -699,3 +699,215 @@ class TestAdvisorSpamFix:
                 ).fetchall()
             ]
         assert "work_tasks" not in tables
+
+
+# ---------------------------------------------------------------------------
+# advisor.tick race + self-healing watchdog (#1510)
+# ---------------------------------------------------------------------------
+#
+# Pre-fix: ``has_in_progress_advisor_task`` + ``enqueue_advisor_review``
+# were two separate calls. Two concurrent ticks both read pre-tick state
+# and both inserted, producing 2-3 duplicates per cron cycle. The fix
+# wraps the throttle re-check + insert in a per-project file lock and
+# re-checks the throttle inside the lock. ``coffeeboardnm`` had piled up
+# 27 identical advisor_review rows over ~7 hours by the time the issue
+# was filed.
+
+
+class TestAdvisorRaceFix:
+    """Regression coverage for the advisor.tick race fix (#1510)."""
+
+    def _setup_canonical_workspace(
+        self, *, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> Path:
+        canonical = tmp_path / ".pollypm" / "state.db"
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+
+        from pollypm.work import db_resolver as _resolver
+
+        def _fake_resolve(*_args, **_kwargs):
+            canonical.parent.mkdir(parents=True, exist_ok=True)
+            return canonical
+
+        monkeypatch.setattr(_resolver, "resolve_work_db_path", _fake_resolve)
+        return canonical
+
+    def test_concurrent_enqueue_only_creates_one_task(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Two threads racing on ``enqueue_advisor_review`` must produce one task.
+
+        Sentinel: pre-#1510 this test produced 2 rows because the
+        throttle check + insert were not serialised. Post-fix the file
+        lock + in-lock re-check ensures the loser observes the winner's
+        row and short-circuits.
+        """
+        import sqlite3
+        import threading
+
+        project_root = tmp_path / "proj"
+        project_root.mkdir()
+        canonical = self._setup_canonical_workspace(
+            tmp_path=tmp_path, monkeypatch=monkeypatch,
+        )
+
+        from pollypm.plugins_builtin.advisor.handlers.advisor_tick import (
+            enqueue_advisor_review,
+        )
+
+        # Pre-initialize the canonical DB schema so both threads land
+        # on a fully-migrated DB. Real workspaces are always
+        # pre-initialized by the time advisor.tick fires; running
+        # schema migrations concurrently from two threads is a
+        # separate concern (the real workspace state.db has long
+        # since done its bootstrap).
+        from pollypm.work import create_work_service as _seed_factory
+
+        _seed = _seed_factory(project_path=project_root, project_key="proj")
+        _close = getattr(_seed, "close", None)
+        if callable(_close):
+            _close()
+
+        results: list[dict[str, Any]] = []
+        results_lock = threading.Lock()
+        # Barrier so both threads attempt the lock in lockstep.
+        gate = threading.Barrier(2)
+
+        def _runner() -> None:
+            gate.wait()
+            outcome = enqueue_advisor_review(
+                project_key="proj",
+                project_path=project_root,
+                config=None,
+                work_service=None,
+            )
+            with results_lock:
+                results.append(outcome)
+
+        t1 = threading.Thread(target=_runner)
+        t2 = threading.Thread(target=_runner)
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+        assert not t1.is_alive()
+        assert not t2.is_alive()
+
+        # Exactly one outcome must report enqueued; the other is throttled.
+        enqueued = [r for r in results if r.get("enqueued")]
+        throttled = [r for r in results if r.get("skipped") == "throttled"]
+        assert len(enqueued) == 1, results
+        assert len(throttled) == 1, results
+
+        # And the canonical DB must hold exactly one queued advisor task.
+        with sqlite3.connect(canonical) as conn:
+            row_count = conn.execute(
+                "SELECT COUNT(*) FROM work_tasks "
+                "WHERE project = 'proj' AND work_status = 'queued'"
+            ).fetchone()[0]
+        assert row_count == 1
+
+    def test_sequential_ticks_are_idempotent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A second tick after a successful enqueue must short-circuit.
+
+        This pins the in-lock re-check: the second call must see the
+        first call's freshly-queued row and return ``skipped=throttled``,
+        not stack a duplicate.
+        """
+        import sqlite3
+
+        project_root = tmp_path / "proj"
+        project_root.mkdir()
+        canonical = self._setup_canonical_workspace(
+            tmp_path=tmp_path, monkeypatch=monkeypatch,
+        )
+
+        from pollypm.plugins_builtin.advisor.handlers.advisor_tick import (
+            enqueue_advisor_review,
+        )
+
+        first = enqueue_advisor_review(
+            project_key="proj",
+            project_path=project_root,
+            config=None,
+            work_service=None,
+        )
+        assert first["enqueued"] is True
+
+        second = enqueue_advisor_review(
+            project_key="proj",
+            project_path=project_root,
+            config=None,
+            work_service=None,
+        )
+        assert second.get("enqueued") is False
+        assert second.get("skipped") == "throttled"
+
+        with sqlite3.connect(canonical) as conn:
+            row_count = conn.execute(
+                "SELECT COUNT(*) FROM work_tasks "
+                "WHERE project = 'proj' AND work_status = 'queued'"
+            ).fetchone()[0]
+        assert row_count == 1
+
+    def test_advisor_tick_handler_double_invocation_single_enqueue(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Integration: two ``advisor_tick_handler({})`` calls in quick
+        succession enqueue exactly one task end-to-end.
+
+        Mirrors the production cluster pattern (#16/#17/#18 within 10s).
+        """
+        import sqlite3
+
+        project_root = tmp_path / "proj"
+        project_root.mkdir()
+        base_dir = project_root / ".pollypm"
+        base_dir.mkdir()
+        canonical = self._setup_canonical_workspace(
+            tmp_path=tmp_path, monkeypatch=monkeypatch,
+        )
+
+        config_path = tmp_path / "pollypm.toml"
+        config_path.write_text("[advisor]\nenabled = true\n")
+
+        cfg = FakeConfig(
+            projects={
+                "proj": FakeKnownProject(
+                    key="proj", path=project_root, tracked=True,
+                )
+            },
+            project=FakeProjectSection(
+                base_dir=base_dir, root_dir=project_root, name="proj",
+            ),
+        )
+        monkeypatch.setattr("pollypm.config.load_config", lambda _p: cfg)
+        monkeypatch.setattr(
+            "pollypm.config.resolve_config_path", lambda _p: config_path,
+        )
+        monkeypatch.setattr(
+            tick_module, "detect_changes",
+            lambda *_args, **_kwargs: True,
+        )
+
+        # Both calls go through the real ``enqueue_advisor_review``
+        # (no monkeypatch on it). The fast-path may say "fire" twice
+        # before either insert completes, but the in-lock re-check
+        # must still ensure only one row lands.
+        first = advisor_tick_handler({"config_path": str(config_path)})
+        second = advisor_tick_handler({"config_path": str(config_path)})
+
+        assert first["fired"] is True
+        assert second["fired"] is True
+        # First tick enqueues; second observes the row and skips.
+        assert "proj" in first["enqueued"]
+        assert second["enqueued"] == []
+
+        with sqlite3.connect(canonical) as conn:
+            row_count = conn.execute(
+                "SELECT COUNT(*) FROM work_tasks "
+                "WHERE project = 'proj' AND work_status = 'queued'"
+            ).fetchone()[0]
+        assert row_count == 1

@@ -2569,3 +2569,215 @@ def test_state_based_detectors_silent_when_open_tasks_empty(now: datetime) -> No
         )
         for f in findings
     )
+
+
+# ---------------------------------------------------------------------------
+# Rule (#1510): duplicate advisor tasks
+# ---------------------------------------------------------------------------
+
+
+class _AdvisorTask:
+    """Stand-in for ``work.models.Task`` carrying the fields the
+    duplicate-advisor detector reads."""
+
+    class _Status:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+    def __init__(
+        self,
+        *,
+        project: str,
+        task_number: int,
+        work_status: str = "queued",
+        labels: list[str] | None = None,
+        created_at: datetime | None = None,
+    ) -> None:
+        self.project = project
+        self.task_number = task_number
+        self.work_status = self._Status(work_status)
+        self.labels = list(labels or ["advisor"])
+        self.created_at = created_at
+
+
+def test_duplicate_advisor_tasks_detected_and_keep_newest(now: datetime) -> None:
+    """5 non-terminal advisor tasks → finding cancels 4, keeps newest."""
+    from pollypm.audit.watchdog import RULE_DUPLICATE_ADVISOR_TASKS
+
+    tasks = [
+        _AdvisorTask(
+            project="coffeeboardnm",
+            task_number=n,
+            work_status="queued",
+            labels=["advisor"],
+            created_at=now - timedelta(minutes=60 - n * 5),
+        )
+        for n in (16, 17, 18, 24, 27)
+    ]
+    findings = scan_events([], now=now, open_tasks=tasks)
+    matched = [f for f in findings if f.rule == RULE_DUPLICATE_ADVISOR_TASKS]
+    assert len(matched) == 1
+    f = matched[0]
+    assert f.project == "coffeeboardnm"
+    # Newest is task_number=27 (created at now-25 min, latest of the bunch).
+    assert f.subject == "coffeeboardnm/27"
+    assert f.metadata["keep_task_id"] == "coffeeboardnm/27"
+    assert sorted(f.metadata["duplicate_ids"]) == [
+        "coffeeboardnm/16",
+        "coffeeboardnm/17",
+        "coffeeboardnm/18",
+        "coffeeboardnm/24",
+    ]
+    assert f.metadata["total_count"] == 5
+
+
+def test_duplicate_advisor_tasks_silent_with_one_task(now: datetime) -> None:
+    """A single advisor task is the steady state — must not fire."""
+    from pollypm.audit.watchdog import RULE_DUPLICATE_ADVISOR_TASKS
+
+    tasks = [
+        _AdvisorTask(
+            project="coffeeboardnm",
+            task_number=27,
+            work_status="queued",
+            created_at=now - timedelta(minutes=10),
+        )
+    ]
+    findings = scan_events([], now=now, open_tasks=tasks)
+    assert not any(f.rule == RULE_DUPLICATE_ADVISOR_TASKS for f in findings)
+
+
+def test_duplicate_advisor_tasks_ignores_non_advisor_labels(now: datetime) -> None:
+    """Non-advisor tasks with the same project must not be folded in."""
+    from pollypm.audit.watchdog import RULE_DUPLICATE_ADVISOR_TASKS
+
+    tasks = [
+        _AdvisorTask(
+            project="proj",
+            task_number=1,
+            work_status="queued",
+            labels=["advisor"],
+            created_at=now - timedelta(minutes=10),
+        ),
+        _AdvisorTask(
+            project="proj",
+            task_number=2,
+            work_status="queued",
+            labels=["feature"],
+            created_at=now - timedelta(minutes=5),
+        ),
+    ]
+    findings = scan_events([], now=now, open_tasks=tasks)
+    assert not any(f.rule == RULE_DUPLICATE_ADVISOR_TASKS for f in findings)
+
+
+def test_duplicate_advisor_tasks_ignores_terminal_states(now: datetime) -> None:
+    """Cancelled / done duplicates are not counted."""
+    from pollypm.audit.watchdog import RULE_DUPLICATE_ADVISOR_TASKS
+
+    tasks = [
+        _AdvisorTask(
+            project="proj",
+            task_number=1,
+            work_status="cancelled",
+            created_at=now - timedelta(minutes=30),
+        ),
+        _AdvisorTask(
+            project="proj",
+            task_number=2,
+            work_status="queued",
+            created_at=now - timedelta(minutes=5),
+        ),
+    ]
+    findings = scan_events([], now=now, open_tasks=tasks)
+    assert not any(f.rule == RULE_DUPLICATE_ADVISOR_TASKS for f in findings)
+
+
+def test_duplicate_advisor_cleanup_cancels_all_but_newest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cadence handler self-heals: 5 advisor tasks → 4 cancelled, 1 queued."""
+    import sqlite3
+
+    from pollypm.audit.watchdog import (
+        Finding,
+        RULE_DUPLICATE_ADVISOR_TASKS,
+    )
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _self_heal_duplicate_advisor_tasks,
+    )
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    canonical = tmp_path / ".pollypm" / "state.db"
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+
+    from pollypm.work import db_resolver as _resolver
+
+    def _fake_resolve(*_args, **_kwargs):
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        return canonical
+
+    monkeypatch.setattr(_resolver, "resolve_work_db_path", _fake_resolve)
+
+    # Pre-populate canonical DB with 5 non-terminal advisor tasks.
+    from pollypm.work import create_work_service
+
+    seed = create_work_service(project_path=project_root, project_key="proj")
+    task_ids: list[str] = []
+    try:
+        for i in range(5):
+            task = seed.create(
+                title=f"Advisor review for proj #{i}",
+                description="seed",
+                type="task",
+                project="proj",
+                flow_template="advisor_review",
+                roles={"advisor": "advisor"},
+                priority="normal",
+                created_by="test.seed",
+                labels=["advisor"],
+                requires_human_review=False,
+            )
+            seed.queue(task.task_id, "test.seed")
+            task_ids.append(task.task_id)
+    finally:
+        close = getattr(seed, "close", None)
+        if callable(close):
+            close()
+
+    # Build a Finding the same way the detector would.
+    duplicate_ids = task_ids[:-1]  # all but the last (newest)
+    keep_id = task_ids[-1]
+    finding = Finding(
+        rule=RULE_DUPLICATE_ADVISOR_TASKS,
+        project="proj",
+        subject=keep_id,
+        message="duplicate advisor tasks",
+        recommendation="auto-cleanup",
+        metadata={
+            "keep_task_id": keep_id,
+            "duplicate_ids": duplicate_ids,
+            "total_count": 5,
+        },
+    )
+    counters = _self_heal_duplicate_advisor_tasks(
+        finding,
+        project_key="proj",
+        project_path=project_root,
+    )
+    assert counters == {"cancelled": 4, "failed": 0}
+
+    # Verify final DB state: 4 cancelled, 1 queued.
+    with sqlite3.connect(canonical) as conn:
+        queued = conn.execute(
+            "SELECT COUNT(*) FROM work_tasks "
+            "WHERE project = 'proj' AND work_status = 'queued'"
+        ).fetchone()[0]
+        cancelled = conn.execute(
+            "SELECT COUNT(*) FROM work_tasks "
+            "WHERE project = 'proj' AND work_status = 'cancelled'"
+        ).fetchone()[0]
+    assert queued == 1
+    assert cancelled == 4
+

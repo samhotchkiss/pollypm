@@ -78,6 +78,20 @@ def test_no_cross_plugin_private_imports() -> None:
     assert violations == [], "\n".join(v.summary for v in violations)
 
 
+def test_transition_query_plugin_handlers_do_not_open_sqlite_directly() -> None:
+    """Issue #1376: plugin handlers route work-transition reads via storage."""
+    rels = (
+        "src/pollypm/plugins_builtin/activity_feed/handlers/event_projector.py",
+        "src/pollypm/plugins_builtin/advisor/handlers/detect_changes.py",
+    )
+    offenders: list[str] = []
+    for rel in rels:
+        text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        if "sqlite3.connect" in text or "import sqlite3" in text:
+            offenders.append(rel)
+    assert offenders == []
+
+
 def test_scanner_recognizes_private_symbol() -> None:
     """Scanner detects ``from X import _foo`` correctly."""
     # Synthetic test using the public `_split_imports` indirectly.

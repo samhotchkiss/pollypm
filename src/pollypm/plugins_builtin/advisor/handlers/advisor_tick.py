@@ -42,30 +42,25 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Storage-layout resolution (#1037)
+# Storage-layout resolution — #1004 / advisor.tick spam fix
 # ---------------------------------------------------------------------------
-
-
-def _resolve_state_db(project_path: Path) -> Path | None:
-    """Return the on-disk ``state.db`` that backs ``project_path``, or None.
-
-    Mirrors the dual-path canonical pattern in
-    :func:`pollypm.cockpit_inbox._inbox_db_sources`: per-project
-    ``<project_path>/.pollypm/state.db`` first (legacy / per-project
-    layout), then walk up the parents looking for a workspace-root
-    ``<ancestor>/.pollypm/state.db`` (the layout #339 collapsed everything
-    onto). Returns ``None`` when neither exists.
-
-    Used by :func:`has_project_stagnation_candidate`,
-    :func:`enqueue_advisor_review`, and ``detect_changes._transitions_db_path``
-    so a tracked project that lives under a workspace-root state.db
-    (every install post-#339) is still discoverable. Without this the
-    advisor probe returns False on every tick and the user sees
-    ``last run: (never)`` forever — see #1037.
-    """
-    from pollypm.plugins_builtin.advisor.db_paths import resolve_state_db
-
-    return resolve_state_db(project_path)
+#
+# Historically this module had its own ``_resolve_state_db`` helper that
+# preferred ``<project_path>/.pollypm/state.db`` over the workspace-root
+# DB. That bypassed the canonical resolver in
+# :mod:`pollypm.work.db_resolver` and caused advisor tasks to land in
+# deprecated per-project DBs invisible to every other engine — the
+# savethenovel project accumulated 68 identical "Advisor review for
+# savethenovel" rows in 9 hours because the throttle (which queries
+# the work service) couldn't see them.
+#
+# The advisor now routes every work-service open through
+# :func:`pollypm.work.create_work_service`, which composes
+# :func:`pollypm.work.db_resolver.resolve_work_db_path` and always lands
+# on the workspace-canonical DB (per #1004). The legacy per-project DBs
+# can be migrated by
+# :func:`pollypm.storage.legacy_per_project_db.migrate_legacy_per_project_dbs`
+# at the user's discretion.
 
 
 # ---------------------------------------------------------------------------
@@ -118,15 +113,15 @@ def enqueue_advisor_review(
     if work_service is None:
         from pollypm.work import create_work_service
 
-        # Prefer an existing state.db (per-project or workspace-root,
-        # #1037). Only synthesize the per-project path when neither
-        # exists — matches the pre-#339 fallback so first-run installs
-        # still get a writable target.
-        db_path = _resolve_state_db(project_path)
-        if db_path is None:
-            db_path = project_path / ".pollypm" / "state.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        work_service = create_work_service(db_path=db_path, project_path=project_path)
+        # Route through the canonical resolver (#1004 / advisor.tick spam
+        # fix). ``create_work_service`` with no ``db_path=`` calls
+        # ``resolve_work_db_path`` and always lands on the workspace-root
+        # state.db, so advisor tasks are visible to every engine that
+        # reads canonical (the throttle in particular).
+        work_service = create_work_service(
+            project_path=project_path,
+            project_key=project_key,
+        )
         close_service = True
 
     try:
@@ -162,6 +157,7 @@ def has_in_progress_advisor_task(
     *,
     project_key: str,
     work_service: Any,
+    project_path: Path | None = None,
 ) -> bool:
     """Return True if any advisor task is currently active for the project.
 
@@ -171,11 +167,41 @@ def has_in_progress_advisor_task(
     is still running from a previous tick we skip instead of stacking
     work.
 
+    When ``work_service`` is ``None`` and a ``project_path`` is supplied
+    the throttle lazily opens a work service against the canonical
+    workspace DB (mirrors :func:`enqueue_advisor_review` /
+    :func:`has_project_stagnation_candidate`). Without this lazy build
+    the production tick — which fires with ``payload={}`` so
+    ``work_service`` is always None — would short-circuit to ``False``
+    and the throttle would never trigger. That regression filled the
+    savethenovel project's per-project DB with 68 duplicate advisor
+    review rows in 9 hours (see Bug A / advisor.tick spam fix).
+
     Non-raising. A work-service lookup failure is logged and treated
     as "no advisor task active" so the tick can proceed.
     """
+    close_service = False
     if work_service is None:
-        return False
+        # Without a project_path we can't lazy-build; preserve the
+        # historical "return False on no service" contract so callers
+        # that don't know the path (older test stubs) still work.
+        if project_path is None:
+            return False
+        try:
+            from pollypm.work import create_work_service
+
+            work_service = create_work_service(
+                project_path=project_path,
+                project_key=project_key,
+            )
+            close_service = True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "advisor: throttle lazy-build failed for %s: %s",
+                project_key,
+                exc,
+            )
+            return False
     try:
         # Ask for everything non-terminal on the project, then filter
         # by the advisor label client-side — the service protocol
@@ -198,6 +224,14 @@ def has_in_progress_advisor_task(
     except Exception as exc:  # noqa: BLE001
         logger.debug("advisor: throttle lookup failed for %s: %s", project_key, exc)
         return False
+    finally:
+        if close_service:
+            close = getattr(work_service, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 def has_project_stagnation_candidate(
@@ -215,12 +249,14 @@ def has_project_stagnation_candidate(
     """
     close_service = False
     if work_service is None:
-        db_path = _resolve_state_db(project_path)
-        if db_path is None:
-            return False
         try:
             from pollypm.work import create_work_service
-            work_service = create_work_service(db_path=db_path, project_path=project_path)
+
+            # Canonical resolver only — see #1004 / advisor.tick spam fix.
+            work_service = create_work_service(
+                project_path=project_path,
+                project_key=project_key,
+            )
             close_service = True
         except Exception:  # noqa: BLE001
             return False
@@ -356,7 +392,11 @@ def _should_review(
     else:
         reason = "ok"
 
-    if has_in_progress_advisor_task(project_key=project_key, work_service=work_service):
+    if has_in_progress_advisor_task(
+        project_key=project_key,
+        work_service=work_service,
+        project_path=project_path,
+    ):
         return False, "in-progress"
 
     return True, reason

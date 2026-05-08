@@ -244,8 +244,815 @@ def _remove_account_entry(config_path: Path, account: str, *, delete_home: bool 
     return remove_account_entry(config_path, account, delete_home=delete_home)
 
 
+def doctor(
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit machine-readable JSON instead of the human checklist.",
+    ),
+    fix: bool = typer.Option(
+        False,
+        "--fix",
+        help="Auto-fix the safe subset (missing dirs, stale panes).",
+    ),
+    fix_dry_run: bool = typer.Option(
+        False,
+        "--fix-dry-run",
+        help="Show what --fix WOULD do, without mutating anything.",
+    ),
+) -> None:
+    from pollypm.doctor import (
+        apply_fixes,
+        manual_fixes,
+        planned_fixes,
+        release_channel_line,
+        render_fix_dry_run,
+        render_fix_summary,
+        render_human,
+        render_json,
+        run_checks,
+        setup_tag_line,
+        verify_fix_results,
+    )
+
+    report = run_checks()
+    if fix_dry_run:
+        planned = planned_fixes(report)
+        manual = manual_fixes(report)
+        typer.echo(render_fix_dry_run(planned, manual))
+        raise typer.Exit(code=0 if report.ok else 1)
+    fix_summary: str | None = None
+    if fix:
+        raw_fix_results = apply_fixes(report)
+        manual_before_rerun = manual_fixes(report)
+        # Issue #1063: re-run checks BEFORE rendering so we can mark
+        # any "fix succeeded according to fix_fn but check still
+        # failing" entries honestly. Without this, --fix used to
+        # confidently announce "Applied N fixes" while the same
+        # warnings persisted on the next pm doctor run.
+        if raw_fix_results:
+            report = run_checks()
+            fix_results = verify_fix_results(raw_fix_results, report)
+        else:
+            fix_results = raw_fix_results
+        if fix_results:
+            for name, success, message in fix_results:
+                glyph = "fixed" if success else "fix failed"
+                typer.echo(f"  [{glyph}] {name}: {message}")
+        unverified = [
+            (name, message)
+            for (name, ok, message), (_, raw_ok, _) in zip(
+                fix_results, raw_fix_results, strict=False
+            )
+            if raw_ok and not ok
+        ]
+        fix_summary = render_fix_summary(
+            fix_results, manual_before_rerun, unverified=unverified
+        )
+    if json_output:
+        typer.echo(render_json(report))
+    else:
+        from pollypm.release_check import update_banner_line
+
+        banner = update_banner_line()
+        if banner:
+            typer.echo(banner)
+            typer.echo("")
+        typer.echo(render_human(report))
+        typer.echo("")
+        typer.echo(release_channel_line())
+        typer.echo(setup_tag_line())
+    if fix_summary:
+        typer.echo("")
+        typer.echo(fix_summary)
+
+    # #savethenovel-followup: emit a ``pm.doctor_run`` audit event
+    # so the heartbeat watchdog can correlate doctor runs with
+    # subsequent state mutations (e.g. "the user ran pm doctor and
+    # then the table got wiped" vs "the table wiped without
+    # operator intervention"). Best-effort; never blocks the CLI.
+    try:
+        from pollypm.audit import emit as _audit_emit
+
+        _audit_emit(
+            event="pm.doctor_run",
+            project="_workspace",
+            subject="pm doctor",
+            actor="user",
+            status="ok" if report.ok else "warn",
+            metadata={
+                "findings_total": len(report.errors) + len(report.warnings),
+                "errors": len(report.errors),
+                "warnings": len(report.warnings),
+                "checks_total": len(report.results),
+                "passed": report.passed_count,
+                "skipped": report.skipped_count,
+                "duration_seconds": round(report.duration_seconds, 3),
+                "json_output": bool(json_output),
+                "fix_applied": bool(fix),
+            },
+        )
+    except Exception:  # noqa: BLE001 — audit must never break CLI
+        pass
+
+    raise typer.Exit(code=0 if report.ok else 1)
+
+def accounts(
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    for account in _list_account_statuses(config_path):
+        typer.echo(
+            f"- {account.key}: {account.email} [{account.provider.value}] "
+            f"logged_in={'yes' if account.logged_in else 'no'} "
+            f"health={account.health} usage={account.usage_summary} "
+            f"isolation={account.isolation_status}"
+        )
+        typer.echo(
+            f"  isolation_summary={account.isolation_summary} "
+            f"auth_storage={account.auth_storage} "
+            f"profile_root={account.profile_root or '-'}"
+        )
+        if account.isolation_recommendation:
+            typer.echo(
+                f"  isolation_recommendation="
+                f"{account.isolation_recommendation}"
+            )
+        if account.available_at or account.access_expires_at or account.reason:
+            typer.echo(
+                f"  reason={account.reason or '-'} "
+                f"available_at={account.available_at or '-'} "
+                f"access_expires_at={account.access_expires_at or '-'}"
+            )
+
+def errors(
+    raw: bool = typer.Option(
+        False, "--raw",
+        help=(
+            "Stream the literal ~/.pollypm/errors.log file (the pre-#1040 "
+            "behavior). Implied by --tail/--follow/--grep."
+        ),
+    ),
+    tail: int = typer.Option(
+        50, "--tail", "-n",
+        help="Raw-mode only: show the last N lines (0 = whole file).",
+    ),
+    follow: bool = typer.Option(
+        False, "--follow", "-f",
+        help="Raw-mode only: follow the log as new records land.",
+    ),
+    grep: str = typer.Option(
+        "", "--grep", "-g",
+        help="Raw-mode only: filter lines to those containing this substring.",
+    ),
+    since: str = typer.Option(
+        "24h", "--since",
+        help=(
+            "Summary window for ERROR-source rollup (e.g. 1h, 24h, 7d). "
+            "Ignored in raw mode."
+        ),
+    ),
+    fingerprint: str = typer.Option(
+        "", "--fingerprint",
+        help=(
+            "Expand one fingerprint hash (12-char prefix from "
+            "`error_log/critical_error:<hash>`) to its full traceback."
+        ),
+    ),
+) -> None:
+    """Triage view over ``~/.pollypm/errors.log``.
+
+    Default (no flags) prints a summary: top ERROR sources by
+    ``pollypm.<module>`` over the last ``--since`` window plus
+    active fingerprints (>= 3 occurrences in the last hour) so
+    the user can see "what's broken" without scanning 40k log
+    lines. ``--raw`` (or ``--tail/--follow/--grep``) restores the
+    literal file dump for ``grep``-style spelunking.
+    """
+    import subprocess as _sp
+    from datetime import datetime
+    from pollypm.error_log import path as _error_log_path
+    from pollypm import error_log_summary as _els
+
+    log_path = _error_log_path()
+    if not log_path.exists():
+        typer.echo(f"No error log yet at {log_path}. All quiet.")
+        raise typer.Exit(code=0)
+
+    # ``--tail/--follow/--grep`` are raw-mode features. If any of
+    # them are set, keep the legacy behavior even without ``--raw``
+    # so existing muscle memory keeps working.
+    raw_mode_requested = (
+        raw or follow or bool(grep) or tail != 50
+    )
+
+    if not raw_mode_requested and not fingerprint:
+        try:
+            window = _els.parse_duration(since)
+        except ValueError as exc:
+            typer.echo(f"Invalid --since value: {exc}", err=True)
+            raise typer.Exit(code=2)
+        records = _els.read_log(log_path)
+        now = datetime.now()
+        summary = _els.summarize(
+            records,
+            now=now,
+            since=window,
+            window_label=since,
+        )
+        typer.echo(_els.render_summary(summary, now=now))
+        raise typer.Exit(code=0)
+
+    if fingerprint:
+        records = _els.read_log(log_path)
+        matches = _els.find_fingerprint_records(records, fingerprint)
+        typer.echo(_els.render_fingerprint(matches, fingerprint))
+        raise typer.Exit(code=0 if matches else 1)
+
+    # Raw mode — preserve the original tail/follow/grep behavior.
+    cmd: list[str] = ["tail"]
+    if tail <= 0:
+        cmd = ["cat", str(log_path)]
+    else:
+        cmd += ["-n", str(tail)]
+        if follow:
+            cmd.append("-F")
+        cmd.append(str(log_path))
+    if grep:
+        # Pipe through grep when a filter is requested. Keep the
+        # exit status from grep so "no matches" returns 1 to the
+        # shell per grep convention.
+        proc1 = _sp.Popen(cmd, stdout=_sp.PIPE)
+        proc2 = _sp.Popen(["grep", "--line-buffered", grep], stdin=proc1.stdout)
+        proc1.stdout.close()  # allow SIGPIPE to reach proc1 if proc2 exits
+        raise typer.Exit(code=proc2.wait())
+    raise typer.Exit(code=_sp.call(cmd))
+
+def account_doctor(
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    config = load_config(config_path)
+    statuses = _list_account_statuses(config_path)
+    if not statuses:
+        typer.echo("No configured accounts.")
+        return
+    for account in statuses:
+        typer.echo(f"[{account.key}]")
+        typer.echo(f"provider = {account.provider.value}")
+        typer.echo(f"runtime = {config.accounts[account.key].runtime.value}")
+        typer.echo(f"logged_in = {'yes' if account.logged_in else 'no'}")
+        typer.echo(f"isolation_status = {account.isolation_status}")
+        typer.echo(f"auth_storage = {account.auth_storage}")
+        typer.echo(f"profile_root = {account.profile_root or '-'}")
+        typer.echo(f"summary = {account.isolation_summary}")
+        if account.isolation_recommendation:
+            typer.echo(
+                f"recommendation = {account.isolation_recommendation}"
+            )
+        typer.echo("")
+
+def refresh_usage(
+    account: str = typer.Argument(..., help="Account key or email."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    status = _probe_account_usage(config_path, account)
+    typer.echo(
+        f"{status.key}: plan={status.plan} health={status.health} "
+        f"usage={status.usage_summary}"
+    )
+
+def tokens_sync(
+    account: str | None = typer.Option(None, "--account", help="Optional account key or email to limit scanning."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    service = _service(config_path)
+    count = service.sync_token_ledger(account=account)
+    sample_word = "sample" if count == 1 else "samples"
+    typer.echo(f"Synced {count} transcript token {sample_word}.")
+
+def tokens(
+    limit: int = typer.Option(10, "--limit", min=1, max=100, help="Maximum rows to show."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    service = _service(config_path)
+    rows = service.recent_token_usage(limit=limit)
+    if not rows:
+        typer.echo("No token usage recorded yet.")
+        return
+    for row in rows:
+        typer.echo(
+            f"- {row.hour_bucket} {row.project_key} {row.account_name} "
+            f"{row.provider}/{row.model_name}: {row.tokens_used} tokens"
+        )
+
+def costs(
+    project: str | None = typer.Option(None, "--project", help="Filter by project key."),
+    days: int = typer.Option(7, "--days", help="Look back N days."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    """Show token usage by project for the last N days."""
+    rows = token_usage_costs(config_path, project=project, days=days)
+    if not rows:
+        typer.echo("No token usage data.")
+        return
+    days_word = "day" if days == 1 else "days"
+    typer.echo(f"Token usage (last {days} {days_word}):\n")
+    total_all = 0
+    cache_all = 0
+    for row in rows:
+        proj_key = row.project_key
+        total = row.tokens_used
+        cache = row.cache_read_tokens
+        days_active = row.days_active
+        cache_str = f" + {cache:,} cached" if cache else ""
+        day_word = "day" if days_active == 1 else "days"
+        typer.echo(
+            f"  {proj_key}: {total:,} tokens{cache_str} "
+            f"({days_active} active {day_word})"
+        )
+        total_all += total
+        cache_all += cache
+    cache_str = f" + {cache_all:,} cached" if cache_all else ""
+    typer.echo(f"\n  Total: {total_all:,} tokens{cache_str}")
+
+def worktrees(
+    project: str | None = typer.Option(None, "--project", help="Optional project key filter."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    items = list_project_worktrees(config_path, project)
+    if not items:
+        typer.echo("No tracked worktrees.")
+        return
+    for item in items:
+        typer.echo(
+            f"- {item.project_key} {item.lane_kind}/{item.lane_key}: "
+            f"{item.path} [{item.branch}] status={item.status}"
+        )
+
+def add_account(
+    provider: str = typer.Argument(..., help="Provider to add: codex or claude."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    provider_kind = ProviderKind(provider.lower())
+    key, email = _add_account_via_login(config_path, provider_kind)
+    typer.echo(f"Added {email} as {key}")
+
+def relogin(
+    account: str = typer.Argument(..., help="Account key or email."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    key, email = _relogin_account(config_path, account)
+    typer.echo(f"Re-authenticated {email} ({key})")
+
+def remove_account(
+    account: str = typer.Argument(..., help="Account key or email."),
+    delete_home: bool = typer.Option(False, "--delete-home", help="Also delete the isolated account home."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    key, email = _remove_account_entry(
+        config_path,
+        account,
+        delete_home=delete_home,
+    )
+    typer.echo(f"Removed {email} ({key})")
+
+def repair(
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+    check_only: bool = typer.Option(False, "--check", help="Report problems without fixing."),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show what `pm repair` WOULD write, without mutating anything.",
+    ),
+) -> None:
+    """Check and repair PollyPM project scaffolding, docs, and state."""
+    from pollypm import cli as cli_mod
+
+    if check_only and dry_run:
+        typer.echo(
+            "--check and --dry-run are mutually exclusive: --check reports "
+            "problems, --dry-run previews fixes.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    config_path = cli_mod._discover_config_path(config_path)
+    if not config_path.exists():
+        typer.echo(format_config_not_found_error(config_path), err=True)
+        raise typer.Exit(code=1)
+    config = load_config(config_path)
+    all_problems: list[RepairProblem] = []
+    all_actions: list[str] = []
+    # ``apply`` is False for both --check and --dry-run; the difference
+    # is only in the trailing message.
+    apply = not (check_only or dry_run)
+
+    global_problems = verify_docs(GLOBAL_CONFIG_DIR)
+    if global_problems:
+        for problem in global_problems:
+            klass, path = _split_doc_problem(problem)
+            all_problems.append(
+                RepairProblem(
+                    project="global",
+                    klass=klass,
+                    path=path,
+                    group=_problem_group(klass, path),
+                )
+            )
+        if apply:
+            actions = repair_docs(GLOBAL_CONFIG_DIR)
+            for action in actions:
+                all_actions.append(f"[global] {action}")
+
+    for key, project in config.projects.items():
+        project_root = project.path
+        if not project_root.exists():
+            msg = f"project path does not exist: {project_root}"
+            all_problems.append(
+                RepairProblem(
+                    project=key,
+                    klass="config",
+                    path=msg,
+                    group=_problem_group("config", msg),
+                )
+            )
+            continue
+
+        state_dir = project_root / ".pollypm"
+        for subdir in [
+            "dossier",
+            "logs",
+            "artifacts",
+            "checkpoints",
+            "worktrees",
+            "rules",
+            "magic",
+        ]:
+            target = state_dir / subdir
+            if target.exists():
+                continue
+            rel = str(target.relative_to(project_root))
+            all_problems.append(
+                RepairProblem(
+                    project=key,
+                    klass="missing",
+                    path=rel,
+                    group=_problem_group("missing", rel),
+                )
+            )
+            if apply:
+                target.mkdir(parents=True, exist_ok=True)
+                all_actions.append(f"[{key}] created {rel}")
+
+        doc_problems = verify_docs(project_root)
+        for problem in doc_problems:
+            klass, path = _split_doc_problem(problem)
+            all_problems.append(
+                RepairProblem(
+                    project=key,
+                    klass=klass,
+                    path=path,
+                    group=_problem_group(klass, path),
+                )
+            )
+        if apply and doc_problems:
+            actions = repair_docs(project_root)
+            for action in actions:
+                all_actions.append(f"[{key}] {action}")
+
+        gitignore = project_root / ".gitignore"
+        if gitignore.exists():
+            content = gitignore.read_text()
+            if ".pollypm/" not in content:
+                rel = ".gitignore missing .pollypm/ entry"
+                all_problems.append(
+                    RepairProblem(
+                        project=key,
+                        klass="config",
+                        path=rel,
+                        group=_problem_group("config", rel),
+                    )
+                )
+                if apply:
+                    with gitignore.open("a") as handle:
+                        if not content.endswith("\n"):
+                            handle.write("\n")
+                        handle.write(".pollypm/\n")
+                    all_actions.append(
+                        f"[{key}] added .pollypm/ to .gitignore"
+                    )
+
+    if not all_problems:
+        typer.echo("All projects healthy. No repairs needed.")
+        return
+
+    for line in _format_aggregated_report(all_problems):
+        typer.echo(line)
+
+    if check_only:
+        typer.echo("")
+        typer.echo(
+            "Run `pm repair` to fix all (safe; rewrites scaffolding only)."
+        )
+        typer.echo("Run `pm repair --dry-run` to preview writes.")
+        typer.echo("")
+        typer.echo(_format_summary_line(all_problems))
+        return
+
+    if dry_run:
+        typer.echo("")
+        typer.echo("Dry-run; no writes performed.")
+        typer.echo("Run `pm repair` to apply.")
+        typer.echo("")
+        typer.echo(_format_summary_line(all_problems))
+        return
+
+    fix_word = "fix" if len(all_actions) == 1 else "fixes"
+    typer.echo("")
+    typer.echo(f"Applied {len(all_actions)} {fix_word}:")
+    for action in all_actions:
+        typer.echo(f"  + {action}")
+    typer.echo("")
+    typer.echo(_format_summary_line(all_problems))
+
+def upgrade(
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+    check_only: bool = typer.Option(False, "--check", help="Only check if an upgrade is available."),
+) -> None:
+    """Check for and install PollyPM updates from GitHub."""
+    import importlib.metadata
+
+    try:
+        current = importlib.metadata.version("pollypm")
+    except importlib.metadata.PackageNotFoundError:
+        current = "dev"
+
+    try:
+        result = subprocess.run(
+            ["gh", "api", "repos/samhotchkiss/pollypm/releases/latest", "-q", ".tag_name"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            result = subprocess.run(
+                ["git", "ls-remote", "--tags", "https://github.com/samhotchkiss/pollypm.git"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                typer.echo("Could not check for updates. Are you online?")
+                raise typer.Exit(code=1)
+            tags = [
+                line.split("refs/tags/")[-1]
+                for line in result.stdout.strip().splitlines()
+                if "refs/tags/" in line
+            ]
+            tags = [tag.lstrip("v") for tag in tags if not tag.endswith("^{}")]
+            if not tags:
+                typer.echo(
+                    f"Current version: {current}. No releases found on GitHub."
+                )
+                return
+            # Sort by semver, not lexicographically — otherwise the
+            # ``git ls-remote`` fallback picks ``1.9.0`` over ``1.10.0``
+            # the moment the project crosses the v1.10 line. The ``gh``
+            # API path above already returns the latest by release time.
+            latest = sorted(tags, key=_semver_sort_key)[-1]
+        else:
+            latest = result.stdout.strip().lstrip("v")
+    except FileNotFoundError:
+        typer.echo("Neither `gh` nor `git` found. Cannot check for updates.")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"Current: {current}")
+    typer.echo(f"Latest:  {latest}")
+
+    if current == latest or current == "dev":
+        if current == "dev":
+            typer.echo("Running from source (dev). Use `git pull` to update.")
+        else:
+            typer.echo("Already up to date.")
+        if not check_only:
+            typer.echo("\nRegenerating docs from current templates...")
+            config = load_config(config_path)
+            repair_docs(GLOBAL_CONFIG_DIR)
+            for key, project in config.projects.items():
+                if not project.path.exists():
+                    continue
+                actions = repair_docs(project.path)
+                if actions:
+                    doc_word = "doc" if len(actions) == 1 else "docs"
+                    typer.echo(f"  [{key}] {len(actions)} {doc_word} updated")
+            typer.echo("Done.")
+        return
+
+    if check_only:
+        typer.echo(f"\nUpgrade available: {current} -> {latest}")
+        typer.echo("Run `pm upgrade` to install.")
+        return
+
+    typer.echo(f"\nUpgrading {current} -> {latest}...")
+    uv = shutil.which("uv")
+    if uv:
+        pip_cmd = [uv, "pip", "install", "--upgrade", f"pollypm=={latest}"]
+    else:
+        pip_cmd = ["pip", "install", "--upgrade", f"pollypm=={latest}"]
+
+    install_result = subprocess.run(pip_cmd, capture_output=True, text=True)
+    if install_result.returncode != 0:
+        typer.echo("PyPI install failed, trying GitHub source...")
+        if uv:
+            pip_cmd = [
+                uv,
+                "pip",
+                "install",
+                f"git+https://github.com/samhotchkiss/pollypm.git@v{latest}",
+            ]
+        else:
+            pip_cmd = [
+                "pip",
+                "install",
+                f"git+https://github.com/samhotchkiss/pollypm.git@v{latest}",
+            ]
+        install_result = subprocess.run(
+            pip_cmd,
+            capture_output=True,
+            text=True,
+        )
+        if install_result.returncode != 0:
+            typer.echo(f"Upgrade failed:\n{install_result.stderr}")
+            raise typer.Exit(code=1)
+
+    typer.echo("Package updated. Regenerating docs...")
+    config = load_config(config_path)
+    repair_docs(GLOBAL_CONFIG_DIR)
+    for key, project in config.projects.items():
+        if not project.path.exists():
+            continue
+        actions = repair_docs(project.path)
+        if actions:
+            doc_word = "doc" if len(actions) == 1 else "docs"
+            typer.echo(f"  [{key}] {len(actions)} {doc_word} updated")
+    typer.echo(
+        f"Upgrade to {latest} complete. Running sessions are unaffected — "
+        "restart with `pm reset && pm up` when ready."
+    )
+
+def backup_cmd(
+    output: Path | None = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Custom destination path for the snapshot. Default: ~/.pollypm/backups/state-db-<ts>.db.gz",
+    ),
+    full: bool = typer.Option(
+        False,
+        "--full",
+        help="Bundle state.db + ~/.pollypm/ tree into a single .tar.gz. Not subject to retention.",
+    ),
+    keep: int = typer.Option(
+        None,
+        "--keep",
+        help="Keep N most recent DB snapshots; prune the rest. Ignored with --full.",
+    ),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    """Snapshot ~/.pollypm/state.db using SQLite's online backup API."""
+    from pollypm import backup as backup_mod
+
+    try:
+        config = load_config(config_path)
+    except FileNotFoundError:
+        typer.echo(
+            f"Config not found at {config_path}. Run `pm` to onboard first.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    state_db = config.project.state_db
+    base_dir = config.project.base_dir
+    keep_value = backup_mod.DEFAULT_KEEP if keep is None else keep
+
+    try:
+        result = backup_mod.backup_state_db(
+            state_db,
+            base_dir=base_dir,
+            output=output,
+            full=full,
+            keep=keep_value,
+        )
+    except FileNotFoundError as exc:
+        typer.echo(f"Backup failed: {exc}", err=True)
+        raise typer.Exit(code=1)
+    except Exception as exc:
+        typer.echo(f"Backup failed: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    before = backup_mod.humanize_bytes(result.db_size_before)
+    after = backup_mod.humanize_bytes(result.archive_size)
+    typer.echo(
+        f"Backed up to {result.path}. DB size before: {before}. "
+        f"Archive size: {after}."
+    )
+    if result.pruned:
+        snap_word = "snapshot" if len(result.pruned) == 1 else "snapshots"
+        typer.echo(
+            f"Pruned {len(result.pruned)} older {snap_word} "
+            f"(keep={keep_value})."
+        )
+
+def restore_cmd(
+    snapshot_path: Path = typer.Argument(..., help="Path to a .db.gz DB snapshot or --full .tar.gz archive."),
+    confirm: bool = typer.Option(
+        False,
+        "--confirm",
+        help="Required to actually replace the live DB. Without this flag, restore refuses.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Describe what would happen without touching any files.",
+    ),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    """Restore state.db from a snapshot produced by ``pm backup``."""
+    from pollypm import backup as backup_mod
+    from pollypm.session_services import probe_session
+
+    try:
+        config = load_config(config_path)
+    except FileNotFoundError:
+        typer.echo(
+            f"Config not found at {config_path}. Run `pm` to onboard first.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    live_db = config.project.state_db
+
+    try:
+        plan = backup_mod.plan_restore(snapshot_path, live_db)
+    except FileNotFoundError as exc:
+        typer.echo(f"Restore failed: {exc}", err=True)
+        raise typer.Exit(code=1)
+    except ValueError as exc:
+        typer.echo(f"Restore failed: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    if dry_run:
+        typer.echo("Dry run — no files will be touched.")
+        typer.echo(f"  snapshot:      {plan.snapshot_path}")
+        typer.echo(f"  live DB:       {plan.live_db_path}")
+        typer.echo(f"  safety copy:   {plan.safety_path}")
+        typer.echo(
+            f"  snapshot kind: {'full tar.gz' if plan.is_tar else 'db snapshot'}"
+        )
+        return
+
+    if not confirm:
+        session_name = config.project.tmux_session
+        typer.echo("Restore refused — this replaces the live state.db.")
+        typer.echo("")
+        typer.echo("Before you proceed:")
+        typer.echo(
+            f"  1. Stop the cockpit: `tmux kill-session -t {session_name}` "
+            "(or `pm reset`)."
+        )
+        typer.echo("  2. Re-run with `--confirm`:")
+        typer.echo(f"       pm restore {snapshot_path} --confirm")
+        typer.echo("")
+        typer.echo(
+            "A safety copy of the live DB will be written to "
+            f"{plan.safety_path} before anything is replaced."
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        if probe_session(config.project.tmux_session):
+            typer.echo(
+                f"WARNING: tmux session '{config.project.tmux_session}' "
+                "appears to still be running. Stop it first or the "
+                "restored DB may be overwritten by the live cockpit."
+            )
+    except Exception:
+        pass
+
+    try:
+        result = backup_mod.execute_restore(plan)
+    except Exception as exc:
+        typer.echo(f"Restore failed mid-flight: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    typer.echo(f"Restored {result.live_db_path} from {result.snapshot_path}.")
+    typer.echo(f"Safety copy of the previous live DB: {result.safety_path}")
+    typer.echo("")
+    typer.echo("Next steps:")
+    typer.echo("  pm up                  # relaunch the cockpit")
+    typer.echo("  pm doctor              # verify the restored state")
+
 def register_maintenance_commands(app: typer.Typer) -> None:
-    @app.command(
+    app.command(
         help=help_with_examples(
             "Run the diagnostic checklist and optionally apply safe fixes.",
             [
@@ -254,871 +1061,81 @@ def register_maintenance_commands(app: typer.Typer) -> None:
                 ("pm doctor --json", "emit the report as machine-readable JSON"),
             ],
         )
-    )
-    def doctor(
-        json_output: bool = typer.Option(
-            False,
-            "--json",
-            help="Emit machine-readable JSON instead of the human checklist.",
-        ),
-        fix: bool = typer.Option(
-            False,
-            "--fix",
-            help="Auto-fix the safe subset (missing dirs, stale panes).",
-        ),
-        fix_dry_run: bool = typer.Option(
-            False,
-            "--fix-dry-run",
-            help="Show what --fix WOULD do, without mutating anything.",
-        ),
-    ) -> None:
-        from pollypm.doctor import (
-            apply_fixes,
-            manual_fixes,
-            planned_fixes,
-            release_channel_line,
-            render_fix_dry_run,
-            render_fix_summary,
-            render_human,
-            render_json,
-            run_checks,
-            setup_tag_line,
-            verify_fix_results,
-        )
+    )(doctor)
 
-        report = run_checks()
-        if fix_dry_run:
-            planned = planned_fixes(report)
-            manual = manual_fixes(report)
-            typer.echo(render_fix_dry_run(planned, manual))
-            raise typer.Exit(code=0 if report.ok else 1)
-        fix_summary: str | None = None
-        if fix:
-            raw_fix_results = apply_fixes(report)
-            manual_before_rerun = manual_fixes(report)
-            # Issue #1063: re-run checks BEFORE rendering so we can mark
-            # any "fix succeeded according to fix_fn but check still
-            # failing" entries honestly. Without this, --fix used to
-            # confidently announce "Applied N fixes" while the same
-            # warnings persisted on the next pm doctor run.
-            if raw_fix_results:
-                report = run_checks()
-                fix_results = verify_fix_results(raw_fix_results, report)
-            else:
-                fix_results = raw_fix_results
-            if fix_results:
-                for name, success, message in fix_results:
-                    glyph = "fixed" if success else "fix failed"
-                    typer.echo(f"  [{glyph}] {name}: {message}")
-            unverified = [
-                (name, message)
-                for (name, ok, message), (_, raw_ok, _) in zip(
-                    fix_results, raw_fix_results, strict=False
-                )
-                if raw_ok and not ok
-            ]
-            fix_summary = render_fix_summary(
-                fix_results, manual_before_rerun, unverified=unverified
-            )
-        if json_output:
-            typer.echo(render_json(report))
-        else:
-            from pollypm.release_check import update_banner_line
-
-            banner = update_banner_line()
-            if banner:
-                typer.echo(banner)
-                typer.echo("")
-            typer.echo(render_human(report))
-            typer.echo("")
-            typer.echo(release_channel_line())
-            typer.echo(setup_tag_line())
-        if fix_summary:
-            typer.echo("")
-            typer.echo(fix_summary)
-
-        # #savethenovel-followup: emit a ``pm.doctor_run`` audit event
-        # so the heartbeat watchdog can correlate doctor runs with
-        # subsequent state mutations (e.g. "the user ran pm doctor and
-        # then the table got wiped" vs "the table wiped without
-        # operator intervention"). Best-effort; never blocks the CLI.
-        try:
-            from pollypm.audit import emit as _audit_emit
-
-            _audit_emit(
-                event="pm.doctor_run",
-                project="_workspace",
-                subject="pm doctor",
-                actor="user",
-                status="ok" if report.ok else "warn",
-                metadata={
-                    "findings_total": len(report.errors) + len(report.warnings),
-                    "errors": len(report.errors),
-                    "warnings": len(report.warnings),
-                    "checks_total": len(report.results),
-                    "passed": report.passed_count,
-                    "skipped": report.skipped_count,
-                    "duration_seconds": round(report.duration_seconds, 3),
-                    "json_output": bool(json_output),
-                    "fix_applied": bool(fix),
-                },
-            )
-        except Exception:  # noqa: BLE001 — audit must never break CLI
-            pass
-
-        raise typer.Exit(code=0 if report.ok else 1)
-
-    @app.command(
+    app.command(
         help=(
             "List configured provider accounts with login state, "
             "isolation, and usage summary."
         ),
-    )
-    def accounts(
-        config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
-    ) -> None:
-        for account in _list_account_statuses(config_path):
-            typer.echo(
-                f"- {account.key}: {account.email} [{account.provider.value}] "
-                f"logged_in={'yes' if account.logged_in else 'no'} "
-                f"health={account.health} usage={account.usage_summary} "
-                f"isolation={account.isolation_status}"
-            )
-            typer.echo(
-                f"  isolation_summary={account.isolation_summary} "
-                f"auth_storage={account.auth_storage} "
-                f"profile_root={account.profile_root or '-'}"
-            )
-            if account.isolation_recommendation:
-                typer.echo(
-                    f"  isolation_recommendation="
-                    f"{account.isolation_recommendation}"
-                )
-            if account.available_at or account.access_expires_at or account.reason:
-                typer.echo(
-                    f"  reason={account.reason or '-'} "
-                    f"available_at={account.available_at or '-'} "
-                    f"access_expires_at={account.access_expires_at or '-'}"
-                )
+    )(accounts)
 
-    @app.command()
-    def errors(
-        raw: bool = typer.Option(
-            False, "--raw",
-            help=(
-                "Stream the literal ~/.pollypm/errors.log file (the pre-#1040 "
-                "behavior). Implied by --tail/--follow/--grep."
-            ),
-        ),
-        tail: int = typer.Option(
-            50, "--tail", "-n",
-            help="Raw-mode only: show the last N lines (0 = whole file).",
-        ),
-        follow: bool = typer.Option(
-            False, "--follow", "-f",
-            help="Raw-mode only: follow the log as new records land.",
-        ),
-        grep: str = typer.Option(
-            "", "--grep", "-g",
-            help="Raw-mode only: filter lines to those containing this substring.",
-        ),
-        since: str = typer.Option(
-            "24h", "--since",
-            help=(
-                "Summary window for ERROR-source rollup (e.g. 1h, 24h, 7d). "
-                "Ignored in raw mode."
-            ),
-        ),
-        fingerprint: str = typer.Option(
-            "", "--fingerprint",
-            help=(
-                "Expand one fingerprint hash (12-char prefix from "
-                "`error_log/critical_error:<hash>`) to its full traceback."
-            ),
-        ),
-    ) -> None:
-        """Triage view over ``~/.pollypm/errors.log``.
+    app.command()(errors)
 
-        Default (no flags) prints a summary: top ERROR sources by
-        ``pollypm.<module>`` over the last ``--since`` window plus
-        active fingerprints (>= 3 occurrences in the last hour) so
-        the user can see "what's broken" without scanning 40k log
-        lines. ``--raw`` (or ``--tail/--follow/--grep``) restores the
-        literal file dump for ``grep``-style spelunking.
-        """
-        import subprocess as _sp
-        from datetime import datetime
-        from pollypm.error_log import path as _error_log_path
-        from pollypm import error_log_summary as _els
-
-        log_path = _error_log_path()
-        if not log_path.exists():
-            typer.echo(f"No error log yet at {log_path}. All quiet.")
-            raise typer.Exit(code=0)
-
-        # ``--tail/--follow/--grep`` are raw-mode features. If any of
-        # them are set, keep the legacy behavior even without ``--raw``
-        # so existing muscle memory keeps working.
-        raw_mode_requested = (
-            raw or follow or bool(grep) or tail != 50
-        )
-
-        if not raw_mode_requested and not fingerprint:
-            try:
-                window = _els.parse_duration(since)
-            except ValueError as exc:
-                typer.echo(f"Invalid --since value: {exc}", err=True)
-                raise typer.Exit(code=2)
-            records = _els.read_log(log_path)
-            now = datetime.now()
-            summary = _els.summarize(
-                records,
-                now=now,
-                since=window,
-                window_label=since,
-            )
-            typer.echo(_els.render_summary(summary, now=now))
-            raise typer.Exit(code=0)
-
-        if fingerprint:
-            records = _els.read_log(log_path)
-            matches = _els.find_fingerprint_records(records, fingerprint)
-            typer.echo(_els.render_fingerprint(matches, fingerprint))
-            raise typer.Exit(code=0 if matches else 1)
-
-        # Raw mode — preserve the original tail/follow/grep behavior.
-        cmd: list[str] = ["tail"]
-        if tail <= 0:
-            cmd = ["cat", str(log_path)]
-        else:
-            cmd += ["-n", str(tail)]
-            if follow:
-                cmd.append("-F")
-            cmd.append(str(log_path))
-        if grep:
-            # Pipe through grep when a filter is requested. Keep the
-            # exit status from grep so "no matches" returns 1 to the
-            # shell per grep convention.
-            proc1 = _sp.Popen(cmd, stdout=_sp.PIPE)
-            proc2 = _sp.Popen(["grep", "--line-buffered", grep], stdin=proc1.stdout)
-            proc1.stdout.close()  # allow SIGPIPE to reach proc1 if proc2 exits
-            raise typer.Exit(code=proc2.wait())
-        raise typer.Exit(code=_sp.call(cmd))
-
-    @app.command(
+    app.command(
         "account-doctor",
         help=(
             "Per-account health detail (provider, runtime, isolation, "
             "auth storage). Use to debug why an account isn't picking "
             "up sessions."
         ),
-    )
-    def account_doctor(
-        config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
-    ) -> None:
-        config = load_config(config_path)
-        statuses = _list_account_statuses(config_path)
-        if not statuses:
-            typer.echo("No configured accounts.")
-            return
-        for account in statuses:
-            typer.echo(f"[{account.key}]")
-            typer.echo(f"provider = {account.provider.value}")
-            typer.echo(f"runtime = {config.accounts[account.key].runtime.value}")
-            typer.echo(f"logged_in = {'yes' if account.logged_in else 'no'}")
-            typer.echo(f"isolation_status = {account.isolation_status}")
-            typer.echo(f"auth_storage = {account.auth_storage}")
-            typer.echo(f"profile_root = {account.profile_root or '-'}")
-            typer.echo(f"summary = {account.isolation_summary}")
-            if account.isolation_recommendation:
-                typer.echo(
-                    f"recommendation = {account.isolation_recommendation}"
-                )
-            typer.echo("")
+    )(account_doctor)
 
-    @app.command(
+    app.command(
         "refresh-usage",
         help="Probe one account's plan/usage and print the refreshed summary.",
-    )
-    def refresh_usage(
-        account: str = typer.Argument(..., help="Account key or email."),
-        config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
-    ) -> None:
-        status = _probe_account_usage(config_path, account)
-        typer.echo(
-            f"{status.key}: plan={status.plan} health={status.health} "
-            f"usage={status.usage_summary}"
-        )
+    )(refresh_usage)
 
-    @app.command(
+    app.command(
         "tokens-sync",
         help=(
             "Walk transcripts and ingest token-usage samples into the "
             "ledger. Used after relaunching from a backup or syncing "
             "across machines."
         ),
-    )
-    def tokens_sync(
-        account: str | None = typer.Option(None, "--account", help="Optional account key or email to limit scanning."),
-        config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
-    ) -> None:
-        service = _service(config_path)
-        count = service.sync_token_ledger(account=account)
-        sample_word = "sample" if count == 1 else "samples"
-        typer.echo(f"Synced {count} transcript token {sample_word}.")
+    )(tokens_sync)
 
-    @app.command(
+    app.command(
         "tokens",
         help="List the most recent token-usage samples (one row per hour bucket).",
-    )
-    def tokens(
-        limit: int = typer.Option(10, "--limit", min=1, max=100, help="Maximum rows to show."),
-        config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
-    ) -> None:
-        service = _service(config_path)
-        rows = service.recent_token_usage(limit=limit)
-        if not rows:
-            typer.echo("No token usage recorded yet.")
-            return
-        for row in rows:
-            typer.echo(
-                f"- {row.hour_bucket} {row.project_key} {row.account_name} "
-                f"{row.provider}/{row.model_name}: {row.tokens_used} tokens"
-            )
+    )(tokens)
 
-    @app.command("costs")
-    def costs(
-        project: str | None = typer.Option(None, "--project", help="Filter by project key."),
-        days: int = typer.Option(7, "--days", help="Look back N days."),
-        config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
-    ) -> None:
-        """Show token usage by project for the last N days."""
-        rows = token_usage_costs(config_path, project=project, days=days)
-        if not rows:
-            typer.echo("No token usage data.")
-            return
-        days_word = "day" if days == 1 else "days"
-        typer.echo(f"Token usage (last {days} {days_word}):\n")
-        total_all = 0
-        cache_all = 0
-        for row in rows:
-            proj_key = row.project_key
-            total = row.tokens_used
-            cache = row.cache_read_tokens
-            days_active = row.days_active
-            cache_str = f" + {cache:,} cached" if cache else ""
-            day_word = "day" if days_active == 1 else "days"
-            typer.echo(
-                f"  {proj_key}: {total:,} tokens{cache_str} "
-                f"({days_active} active {day_word})"
-            )
-            total_all += total
-            cache_all += cache
-        cache_str = f" + {cache_all:,} cached" if cache_all else ""
-        typer.echo(f"\n  Total: {total_all:,} tokens{cache_str}")
+    app.command("costs")(costs)
 
-    @app.command(
+    app.command(
         "worktrees",
         help="List per-task git worktrees PollyPM is tracking.",
-    )
-    def worktrees(
-        project: str | None = typer.Option(None, "--project", help="Optional project key filter."),
-        config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
-    ) -> None:
-        items = list_project_worktrees(config_path, project)
-        if not items:
-            typer.echo("No tracked worktrees.")
-            return
-        for item in items:
-            typer.echo(
-                f"- {item.project_key} {item.lane_kind}/{item.lane_key}: "
-                f"{item.path} [{item.branch}] status={item.status}"
-            )
+    )(worktrees)
 
-    @app.command(
+    app.command(
         help=(
             "Authenticate a new provider account (Claude or Codex) "
             "and register it in PollyPM."
         ),
-    )
-    def add_account(
-        provider: str = typer.Argument(..., help="Provider to add: codex or claude."),
-        config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
-    ) -> None:
-        provider_kind = ProviderKind(provider.lower())
-        key, email = _add_account_via_login(config_path, provider_kind)
-        typer.echo(f"Added {email} as {key}")
+    )(add_account)
 
-    @app.command(
+    app.command(
         help=(
             "Re-run provider login for an existing account so PollyPM "
             "picks up a fresh session token."
         ),
-    )
-    def relogin(
-        account: str = typer.Argument(..., help="Account key or email."),
-        config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
-    ) -> None:
-        key, email = _relogin_account(config_path, account)
-        typer.echo(f"Re-authenticated {email} ({key})")
+    )(relogin)
 
-    @app.command(
+    app.command(
         help=(
             "Unregister a provider account from PollyPM. Optionally "
             "wipes the isolated account home directory too."
         ),
-    )
-    def remove_account(
-        account: str = typer.Argument(..., help="Account key or email."),
-        delete_home: bool = typer.Option(False, "--delete-home", help="Also delete the isolated account home."),
-        config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
-    ) -> None:
-        key, email = _remove_account_entry(
-            config_path,
-            account,
-            delete_home=delete_home,
-        )
-        typer.echo(f"Removed {email} ({key})")
+    )(remove_account)
 
-    @app.command()
-    def repair(
-        config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
-        check_only: bool = typer.Option(False, "--check", help="Report problems without fixing."),
-        dry_run: bool = typer.Option(
-            False,
-            "--dry-run",
-            help="Show what `pm repair` WOULD write, without mutating anything.",
-        ),
-    ) -> None:
-        """Check and repair PollyPM project scaffolding, docs, and state."""
-        from pollypm import cli as cli_mod
+    app.command()(repair)
 
-        if check_only and dry_run:
-            typer.echo(
-                "--check and --dry-run are mutually exclusive: --check reports "
-                "problems, --dry-run previews fixes.",
-                err=True,
-            )
-            raise typer.Exit(code=2)
+    app.command()(upgrade)
 
-        config_path = cli_mod._discover_config_path(config_path)
-        if not config_path.exists():
-            typer.echo(format_config_not_found_error(config_path), err=True)
-            raise typer.Exit(code=1)
-        config = load_config(config_path)
-        all_problems: list[RepairProblem] = []
-        all_actions: list[str] = []
-        # ``apply`` is False for both --check and --dry-run; the difference
-        # is only in the trailing message.
-        apply = not (check_only or dry_run)
+    app.command("backup")(backup_cmd)
 
-        global_problems = verify_docs(GLOBAL_CONFIG_DIR)
-        if global_problems:
-            for problem in global_problems:
-                klass, path = _split_doc_problem(problem)
-                all_problems.append(
-                    RepairProblem(
-                        project="global",
-                        klass=klass,
-                        path=path,
-                        group=_problem_group(klass, path),
-                    )
-                )
-            if apply:
-                actions = repair_docs(GLOBAL_CONFIG_DIR)
-                for action in actions:
-                    all_actions.append(f"[global] {action}")
+    app.command("restore")(restore_cmd)
 
-        for key, project in config.projects.items():
-            project_root = project.path
-            if not project_root.exists():
-                msg = f"project path does not exist: {project_root}"
-                all_problems.append(
-                    RepairProblem(
-                        project=key,
-                        klass="config",
-                        path=msg,
-                        group=_problem_group("config", msg),
-                    )
-                )
-                continue
-
-            state_dir = project_root / ".pollypm"
-            for subdir in [
-                "dossier",
-                "logs",
-                "artifacts",
-                "checkpoints",
-                "worktrees",
-                "rules",
-                "magic",
-            ]:
-                target = state_dir / subdir
-                if target.exists():
-                    continue
-                rel = str(target.relative_to(project_root))
-                all_problems.append(
-                    RepairProblem(
-                        project=key,
-                        klass="missing",
-                        path=rel,
-                        group=_problem_group("missing", rel),
-                    )
-                )
-                if apply:
-                    target.mkdir(parents=True, exist_ok=True)
-                    all_actions.append(f"[{key}] created {rel}")
-
-            doc_problems = verify_docs(project_root)
-            for problem in doc_problems:
-                klass, path = _split_doc_problem(problem)
-                all_problems.append(
-                    RepairProblem(
-                        project=key,
-                        klass=klass,
-                        path=path,
-                        group=_problem_group(klass, path),
-                    )
-                )
-            if apply and doc_problems:
-                actions = repair_docs(project_root)
-                for action in actions:
-                    all_actions.append(f"[{key}] {action}")
-
-            gitignore = project_root / ".gitignore"
-            if gitignore.exists():
-                content = gitignore.read_text()
-                if ".pollypm/" not in content:
-                    rel = ".gitignore missing .pollypm/ entry"
-                    all_problems.append(
-                        RepairProblem(
-                            project=key,
-                            klass="config",
-                            path=rel,
-                            group=_problem_group("config", rel),
-                        )
-                    )
-                    if apply:
-                        with gitignore.open("a") as handle:
-                            if not content.endswith("\n"):
-                                handle.write("\n")
-                            handle.write(".pollypm/\n")
-                        all_actions.append(
-                            f"[{key}] added .pollypm/ to .gitignore"
-                        )
-
-        if not all_problems:
-            typer.echo("All projects healthy. No repairs needed.")
-            return
-
-        for line in _format_aggregated_report(all_problems):
-            typer.echo(line)
-
-        if check_only:
-            typer.echo("")
-            typer.echo(
-                "Run `pm repair` to fix all (safe; rewrites scaffolding only)."
-            )
-            typer.echo("Run `pm repair --dry-run` to preview writes.")
-            typer.echo("")
-            typer.echo(_format_summary_line(all_problems))
-            return
-
-        if dry_run:
-            typer.echo("")
-            typer.echo("Dry-run; no writes performed.")
-            typer.echo("Run `pm repair` to apply.")
-            typer.echo("")
-            typer.echo(_format_summary_line(all_problems))
-            return
-
-        fix_word = "fix" if len(all_actions) == 1 else "fixes"
-        typer.echo("")
-        typer.echo(f"Applied {len(all_actions)} {fix_word}:")
-        for action in all_actions:
-            typer.echo(f"  + {action}")
-        typer.echo("")
-        typer.echo(_format_summary_line(all_problems))
-
-    @app.command()
-    def upgrade(
-        config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
-        check_only: bool = typer.Option(False, "--check", help="Only check if an upgrade is available."),
-    ) -> None:
-        """Check for and install PollyPM updates from GitHub."""
-        import importlib.metadata
-
-        try:
-            current = importlib.metadata.version("pollypm")
-        except importlib.metadata.PackageNotFoundError:
-            current = "dev"
-
-        try:
-            result = subprocess.run(
-                ["gh", "api", "repos/samhotchkiss/pollypm/releases/latest", "-q", ".tag_name"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode != 0:
-                result = subprocess.run(
-                    ["git", "ls-remote", "--tags", "https://github.com/samhotchkiss/pollypm.git"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                if result.returncode != 0:
-                    typer.echo("Could not check for updates. Are you online?")
-                    raise typer.Exit(code=1)
-                tags = [
-                    line.split("refs/tags/")[-1]
-                    for line in result.stdout.strip().splitlines()
-                    if "refs/tags/" in line
-                ]
-                tags = [tag.lstrip("v") for tag in tags if not tag.endswith("^{}")]
-                if not tags:
-                    typer.echo(
-                        f"Current version: {current}. No releases found on GitHub."
-                    )
-                    return
-                # Sort by semver, not lexicographically — otherwise the
-                # ``git ls-remote`` fallback picks ``1.9.0`` over ``1.10.0``
-                # the moment the project crosses the v1.10 line. The ``gh``
-                # API path above already returns the latest by release time.
-                latest = sorted(tags, key=_semver_sort_key)[-1]
-            else:
-                latest = result.stdout.strip().lstrip("v")
-        except FileNotFoundError:
-            typer.echo("Neither `gh` nor `git` found. Cannot check for updates.")
-            raise typer.Exit(code=1)
-
-        typer.echo(f"Current: {current}")
-        typer.echo(f"Latest:  {latest}")
-
-        if current == latest or current == "dev":
-            if current == "dev":
-                typer.echo("Running from source (dev). Use `git pull` to update.")
-            else:
-                typer.echo("Already up to date.")
-            if not check_only:
-                typer.echo("\nRegenerating docs from current templates...")
-                config = load_config(config_path)
-                repair_docs(GLOBAL_CONFIG_DIR)
-                for key, project in config.projects.items():
-                    if not project.path.exists():
-                        continue
-                    actions = repair_docs(project.path)
-                    if actions:
-                        doc_word = "doc" if len(actions) == 1 else "docs"
-                        typer.echo(f"  [{key}] {len(actions)} {doc_word} updated")
-                typer.echo("Done.")
-            return
-
-        if check_only:
-            typer.echo(f"\nUpgrade available: {current} -> {latest}")
-            typer.echo("Run `pm upgrade` to install.")
-            return
-
-        typer.echo(f"\nUpgrading {current} -> {latest}...")
-        uv = shutil.which("uv")
-        if uv:
-            pip_cmd = [uv, "pip", "install", "--upgrade", f"pollypm=={latest}"]
-        else:
-            pip_cmd = ["pip", "install", "--upgrade", f"pollypm=={latest}"]
-
-        install_result = subprocess.run(pip_cmd, capture_output=True, text=True)
-        if install_result.returncode != 0:
-            typer.echo("PyPI install failed, trying GitHub source...")
-            if uv:
-                pip_cmd = [
-                    uv,
-                    "pip",
-                    "install",
-                    f"git+https://github.com/samhotchkiss/pollypm.git@v{latest}",
-                ]
-            else:
-                pip_cmd = [
-                    "pip",
-                    "install",
-                    f"git+https://github.com/samhotchkiss/pollypm.git@v{latest}",
-                ]
-            install_result = subprocess.run(
-                pip_cmd,
-                capture_output=True,
-                text=True,
-            )
-            if install_result.returncode != 0:
-                typer.echo(f"Upgrade failed:\n{install_result.stderr}")
-                raise typer.Exit(code=1)
-
-        typer.echo("Package updated. Regenerating docs...")
-        config = load_config(config_path)
-        repair_docs(GLOBAL_CONFIG_DIR)
-        for key, project in config.projects.items():
-            if not project.path.exists():
-                continue
-            actions = repair_docs(project.path)
-            if actions:
-                doc_word = "doc" if len(actions) == 1 else "docs"
-                typer.echo(f"  [{key}] {len(actions)} {doc_word} updated")
-        typer.echo(
-            f"Upgrade to {latest} complete. Running sessions are unaffected — "
-            "restart with `pm reset && pm up` when ready."
-        )
-
-    @app.command("backup")
-    def backup_cmd(
-        output: Path | None = typer.Option(
-            None,
-            "--output",
-            "-o",
-            help="Custom destination path for the snapshot. Default: ~/.pollypm/backups/state-db-<ts>.db.gz",
-        ),
-        full: bool = typer.Option(
-            False,
-            "--full",
-            help="Bundle state.db + ~/.pollypm/ tree into a single .tar.gz. Not subject to retention.",
-        ),
-        keep: int = typer.Option(
-            None,
-            "--keep",
-            help="Keep N most recent DB snapshots; prune the rest. Ignored with --full.",
-        ),
-        config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
-    ) -> None:
-        """Snapshot ~/.pollypm/state.db using SQLite's online backup API."""
-        from pollypm import backup as backup_mod
-
-        try:
-            config = load_config(config_path)
-        except FileNotFoundError:
-            typer.echo(
-                f"Config not found at {config_path}. Run `pm` to onboard first.",
-                err=True,
-            )
-            raise typer.Exit(code=1)
-
-        state_db = config.project.state_db
-        base_dir = config.project.base_dir
-        keep_value = backup_mod.DEFAULT_KEEP if keep is None else keep
-
-        try:
-            result = backup_mod.backup_state_db(
-                state_db,
-                base_dir=base_dir,
-                output=output,
-                full=full,
-                keep=keep_value,
-            )
-        except FileNotFoundError as exc:
-            typer.echo(f"Backup failed: {exc}", err=True)
-            raise typer.Exit(code=1)
-        except Exception as exc:
-            typer.echo(f"Backup failed: {exc}", err=True)
-            raise typer.Exit(code=1)
-
-        before = backup_mod.humanize_bytes(result.db_size_before)
-        after = backup_mod.humanize_bytes(result.archive_size)
-        typer.echo(
-            f"Backed up to {result.path}. DB size before: {before}. "
-            f"Archive size: {after}."
-        )
-        if result.pruned:
-            snap_word = "snapshot" if len(result.pruned) == 1 else "snapshots"
-            typer.echo(
-                f"Pruned {len(result.pruned)} older {snap_word} "
-                f"(keep={keep_value})."
-            )
-
-    @app.command("restore")
-    def restore_cmd(
-        snapshot_path: Path = typer.Argument(..., help="Path to a .db.gz DB snapshot or --full .tar.gz archive."),
-        confirm: bool = typer.Option(
-            False,
-            "--confirm",
-            help="Required to actually replace the live DB. Without this flag, restore refuses.",
-        ),
-        dry_run: bool = typer.Option(
-            False,
-            "--dry-run",
-            help="Describe what would happen without touching any files.",
-        ),
-        config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
-    ) -> None:
-        """Restore state.db from a snapshot produced by ``pm backup``."""
-        from pollypm import backup as backup_mod
-        from pollypm.session_services import probe_session
-
-        try:
-            config = load_config(config_path)
-        except FileNotFoundError:
-            typer.echo(
-                f"Config not found at {config_path}. Run `pm` to onboard first.",
-                err=True,
-            )
-            raise typer.Exit(code=1)
-
-        live_db = config.project.state_db
-
-        try:
-            plan = backup_mod.plan_restore(snapshot_path, live_db)
-        except FileNotFoundError as exc:
-            typer.echo(f"Restore failed: {exc}", err=True)
-            raise typer.Exit(code=1)
-        except ValueError as exc:
-            typer.echo(f"Restore failed: {exc}", err=True)
-            raise typer.Exit(code=1)
-
-        if dry_run:
-            typer.echo("Dry run — no files will be touched.")
-            typer.echo(f"  snapshot:      {plan.snapshot_path}")
-            typer.echo(f"  live DB:       {plan.live_db_path}")
-            typer.echo(f"  safety copy:   {plan.safety_path}")
-            typer.echo(
-                f"  snapshot kind: {'full tar.gz' if plan.is_tar else 'db snapshot'}"
-            )
-            return
-
-        if not confirm:
-            session_name = config.project.tmux_session
-            typer.echo("Restore refused — this replaces the live state.db.")
-            typer.echo("")
-            typer.echo("Before you proceed:")
-            typer.echo(
-                f"  1. Stop the cockpit: `tmux kill-session -t {session_name}` "
-                "(or `pm reset`)."
-            )
-            typer.echo("  2. Re-run with `--confirm`:")
-            typer.echo(f"       pm restore {snapshot_path} --confirm")
-            typer.echo("")
-            typer.echo(
-                "A safety copy of the live DB will be written to "
-                f"{plan.safety_path} before anything is replaced."
-            )
-            raise typer.Exit(code=1)
-
-        try:
-            if probe_session(config.project.tmux_session):
-                typer.echo(
-                    f"WARNING: tmux session '{config.project.tmux_session}' "
-                    "appears to still be running. Stop it first or the "
-                    "restored DB may be overwritten by the live cockpit."
-                )
-        except Exception:
-            pass
-
-        try:
-            result = backup_mod.execute_restore(plan)
-        except Exception as exc:
-            typer.echo(f"Restore failed mid-flight: {exc}", err=True)
-            raise typer.Exit(code=1)
-
-        typer.echo(f"Restored {result.live_db_path} from {result.snapshot_path}.")
-        typer.echo(f"Safety copy of the previous live DB: {result.safety_path}")
-        typer.echo("")
-        typer.echo("Next steps:")
-        typer.echo("  pm up                  # relaunch the cockpit")
-        typer.echo("  pm doctor              # verify the restored state")
 
 
 @debug_app.command(
